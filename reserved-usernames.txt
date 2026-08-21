@@ -1,0 +1,102 @@
+# Reserved usernames for kyriakon.net signup
+#
+# Every entry here is unavailable as a username (= OS account name = public
+# username.kyriakon.net subdomain). One name per line, lowercase, no comments
+# on the same line as an entry.
+#
+# See docs/decisions/kyriakon-net-project-proposal.md §5.9 in the `kyriakon`
+# meta repo for the policy behind these categories and their known limits
+# (the impersonation and offensive-name categories are backstopped by abuse
+# monitoring/reporting, §5.8 — this list is a first line of defence, not a
+# complete one).
+#
+# RULE: any new kyriakon-* repo, service, or subdomain gets its name added
+# here before it launches, not after.
+
+# --- Infrastructure / protocol names -----------------------------------
+www
+mail
+smtp
+imap
+imap4
+pop
+pop3
+mx
+ns
+ns1
+ns2
+dns
+ftp
+sftp
+git
+ssh
+ssl
+tls
+api
+cdn
+static
+assets
+files
+docs
+status
+blog
+gemini
+gmi
+capsule
+onboard
+onboarding
+portal
+pay
+payment
+billing
+checkout
+webhook
+stripe
+admin
+administrator
+root
+webmaster
+postmaster
+hostmaster
+noreply
+no-reply
+abuse
+support
+helpdesk
+help
+info
+
+# --- Impersonation / authority-sounding names ---------------------------
+# Incomplete by design — see the note in the proposal §5.9. These are the
+# generic words most likely to be combined with a brand name for a
+# phishing-style subdomain (e.g. paypal-verify.kyriakon.net).
+login
+signin
+sign-in
+signup
+sign-up
+register
+account
+accounts
+verify
+verification
+secure
+official
+service
+services
+team
+staff
+security
+
+# --- Project / brand reserved names --------------------------------------
+kyriakon
+kleio
+dev
+press
+
+# --- Inappropriate / offensive names --------------------------------------
+# Starter list only — pull in an established open-source wordlist (e.g. an
+# LDNOOBW-style list) rather than hand-maintaining this section, and
+# normalize input (lowercase, strip separators, basic leetspeak
+# substitution) before comparing against it. Static matching alone will
+# never be complete; pair with the reporting path in §5.9/§5.8.
