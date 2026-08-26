@@ -176,7 +176,7 @@ fn encrypts_whole_message_round_trip() {
         !outer.contains("Subject:"),
         "plaintext headers leaked into envelope"
     );
-    // Ciphertext decrypts to the exact input — headers and body.
+    // Ciphertext decrypts to the exact input - headers and body.
     assert_eq!(env.decrypt(&octet_stream(&out)), MESSAGE);
 }
 

@@ -1,4 +1,4 @@
-# Snapshots have a description, not a name — select by label and always take
+# Snapshots have a description, not a name - select by label and always take
 # the newest matching snapshot, so a re-snapshot after a patch cycle is picked
 # up without editing this file.
 data "hcloud_image" "openbsd" {

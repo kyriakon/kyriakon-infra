@@ -3,7 +3,7 @@
 //! Turns an RFC 5322 message into whole-message RFC 3156 PGP/MIME ciphertext.
 //! The OpenPGP engine is GnuPG; this crate only resolves the keyring, drives
 //! gpg, and wraps the result in the `multipart/encrypted` envelope. No private
-//! key is ever touched — encryption is to public certs only.
+//! key is ever touched - encryption is to public certs only.
 //!
 //! Keyring: a directory of `<base-localpart>.asc` armored public certs, the
 //! on-box sync of the git-tracked published set. Recipients with a `+tag`
@@ -26,19 +26,19 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// On-box keyring location — sync of the git-tracked published key set.
+/// On-box keyring location - sync of the git-tracked published key set.
 pub const DEFAULT_KEYRING: &str = "/etc/kyriakon/keys";
 /// Daemon socket; the Dovecot C shim talks to us here.
 pub const DEFAULT_SOCKET: &str = "/var/run/kyriakon/encrypt.sock";
 /// gpg homedir. gpg writes pubring.kbx/random_seed here even with
-/// `--recipient-file`, so it must be a writable, private dir — never a user's
+/// `--recipient-file`, so it must be a writable, private dir - never a user's
 /// `$HOME`. Provision owns it and keeps it out of any account path.
 pub const DEFAULT_GPG_HOME: &str = "/var/run/kyriakon/gpg";
 
 #[derive(Debug)]
 pub enum Error {
     /// Recipient base localpart is empty or contains characters outside
-    /// `[A-Za-z0-9._-]` — anything else could escape the keyring directory.
+    /// `[A-Za-z0-9._-]` - anything else could escape the keyring directory.
     InvalidUser(String),
     /// No `<base-localpart>.asc` in the keyring.
     MissingKey(String),
@@ -82,7 +82,7 @@ pub fn base_localpart(user: &str) -> Result<&str, Error> {
 
 /// Encrypt `input` (an RFC 5322 message) to `user`'s public cert in
 /// `keyring`, returning the RFC 3156 `multipart/encrypted` envelope. The
-/// message bytes — headers and body — are encrypted verbatim. `gpg_home` is
+/// message bytes - headers and body - are encrypted verbatim. `gpg_home` is
 /// the writable dir gpg uses for its scratch keybox/seed.
 pub fn encrypt(
     user: &str,
@@ -151,7 +151,7 @@ fn ensure_gpg_home(gpg_home: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// RFC 3156 §4 envelope: `multipart/encrypted` with the `Version: 1` part and
+/// RFC 3156 section 4 envelope: `multipart/encrypted` with the `Version: 1` part and
 /// the armored ciphertext as `application/octet-stream`.
 fn rfc3156_envelope(boundary: &str, armor: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(armor.len() + 256);

@@ -1,10 +1,10 @@
 //! kyriakon-encrypt CLI.
 //!
 //! Two modes:
-//! - `encrypt --user <localpart> [--keyring DIR] [--gpg-home DIR]` — read an
+//! - `encrypt --user <localpart> [--keyring DIR] [--gpg-home DIR]` - read an
 //!   RFC 5322 message on stdin, write RFC 3156 PGP/MIME ciphertext to stdout.
 //!   The test seam, and the same path the daemon serves.
-//! - `serve [--socket PATH] [--keyring DIR] [--gpg-home DIR]` — long-lived
+//! - `serve [--socket PATH] [--keyring DIR] [--gpg-home DIR]` - long-lived
 //!   daemon on a unix socket for the Dovecot C shim.
 
 use std::io::{Read, Write};
