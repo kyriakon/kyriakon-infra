@@ -1,37 +1,38 @@
 //! kyriakon-encrypt CLI.
 //!
 //! Two modes:
-//! - `encrypt --user <localpart> [--keyring DIR]` — read RFC 5322 message on
-//!   stdin, write RFC 3156 PGP/MIME ciphertext to stdout. The test seam, and
-//!   the same path the daemon serves.
-//! - `serve [--socket PATH] [--keyring DIR]` — long-lived daemon on a unix
-//!   socket for the Dovecot C shim.
+//! - `encrypt --user <localpart> [--keyring DIR] [--gpg-home DIR]` — read an
+//!   RFC 5322 message on stdin, write RFC 3156 PGP/MIME ciphertext to stdout.
+//!   The test seam, and the same path the daemon serves.
+//! - `serve [--socket PATH] [--keyring DIR] [--gpg-home DIR]` — long-lived
+//!   daemon on a unix socket for the Dovecot C shim.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use kyriakon_encrypt::{encrypt, serve, DEFAULT_KEYRING, DEFAULT_SOCKET};
+use kyriakon_encrypt::{encrypt, serve, DEFAULT_GPG_HOME, DEFAULT_KEYRING, DEFAULT_SOCKET};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: kyriakon-encrypt encrypt --user <localpart> [--keyring DIR]\n\
-         \x20      kyriakon-encrypt serve [--socket PATH] [--keyring DIR]"
+        "usage: kyriakon-encrypt encrypt --user <localpart> [--keyring DIR] [--gpg-home DIR]\n\
+         \x20      kyriakon-encrypt serve [--socket PATH] [--keyring DIR] [--gpg-home DIR]"
     );
     std::process::exit(2);
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let cfg = parse_flags(&args[1..]);
     match args.first().map(String::as_str) {
         Some("encrypt") => {
-            let (user, keyring) = parse_flags(&args[1..], true);
+            let Some(user) = cfg.user else { usage() };
             let mut input = Vec::new();
             if std::io::stdin().read_to_end(&mut input).is_err() {
                 eprintln!("kyriakon-encrypt: cannot read message from stdin");
                 return ExitCode::FAILURE;
             }
-            match encrypt(&user, &keyring, &input) {
+            match encrypt(&user, &cfg.keyring, &cfg.gpg_home, &input) {
                 Ok(out) => {
                     std::io::stdout().write_all(&out).ok();
                     ExitCode::SUCCESS
@@ -43,14 +44,8 @@ fn main() -> ExitCode {
             }
         }
         Some("serve") => {
-            let (_, keyring) = parse_flags(&args[1..], false);
-            let socket = args
-                .iter()
-                .skip(1)
-                .position(|a| a == "--socket")
-                .map(|i| PathBuf::from(&args[i + 2]))
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET));
-            match serve(&socket, &keyring) {
+            let socket = cfg.socket.unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET));
+            match serve(&socket, &cfg.keyring, &cfg.gpg_home) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("kyriakon-encrypt: {e}");
@@ -62,36 +57,48 @@ fn main() -> ExitCode {
     }
 }
 
-/// Parse `--user` and `--keyring` (order-independent). `need_user` is true
-/// for `encrypt` (user is mandatory); `serve` ignores `--user`.
-fn parse_flags(args: &[String], need_user: bool) -> (String, PathBuf) {
-    let mut user = None;
-    let mut keyring = PathBuf::from(DEFAULT_KEYRING);
+/// Command-line config. One struct so every flag is parsed exactly once;
+/// modes read only the fields they document.
+struct Config {
+    user: Option<String>,
+    keyring: PathBuf,
+    socket: Option<PathBuf>,
+    gpg_home: PathBuf,
+}
+
+/// Parse `--user`, `--keyring`, `--socket`, `--gpg-home` (order-independent).
+fn parse_flags(args: &[String]) -> Config {
+    let mut cfg = Config {
+        user: None,
+        keyring: PathBuf::from(DEFAULT_KEYRING),
+        socket: None,
+        gpg_home: PathBuf::from(DEFAULT_GPG_HOME),
+    };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--user" => {
-                user = args.get(i + 1).cloned();
+                cfg.user = args.get(i + 1).cloned();
                 i += 2;
             }
             "--keyring" => {
                 if let Some(dir) = args.get(i + 1) {
-                    keyring = PathBuf::from(dir);
+                    cfg.keyring = PathBuf::from(dir);
                 }
                 i += 2;
             }
             "--socket" => {
-                // Consumed by serve's own --socket handling; skip value here.
+                cfg.socket = args.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            "--gpg-home" => {
+                if let Some(dir) = args.get(i + 1) {
+                    cfg.gpg_home = PathBuf::from(dir);
+                }
                 i += 2;
             }
             _ => usage(),
         }
     }
-    if need_user {
-        if let Some(u) = user {
-            return (u, keyring);
-        }
-        usage();
-    }
-    (user.unwrap_or_default(), keyring)
+    cfg
 }

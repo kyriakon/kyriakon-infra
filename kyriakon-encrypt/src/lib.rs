@@ -30,6 +30,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const DEFAULT_KEYRING: &str = "/etc/kyriakon/keys";
 /// Daemon socket; the Dovecot C shim talks to us here.
 pub const DEFAULT_SOCKET: &str = "/var/run/kyriakon/encrypt.sock";
+/// gpg homedir. gpg writes pubring.kbx/random_seed here even with
+/// `--recipient-file`, so it must be a writable, private dir — never a user's
+/// `$HOME`. Provision owns it and keeps it out of any account path.
+pub const DEFAULT_GPG_HOME: &str = "/var/run/kyriakon/gpg";
 
 #[derive(Debug)]
 pub enum Error {
@@ -77,22 +81,31 @@ pub fn base_localpart(user: &str) -> Result<&str, Error> {
 }
 
 /// Encrypt `input` (an RFC 5322 message) to `user`'s public cert in
-/// `keyring`, returning the RFC 3156 `multipart/encrypted` envelope.
-/// The message bytes — headers and body — are encrypted verbatim.
-pub fn encrypt(user: &str, keyring: &Path, input: &[u8]) -> Result<Vec<u8>, Error> {
+/// `keyring`, returning the RFC 3156 `multipart/encrypted` envelope. The
+/// message bytes — headers and body — are encrypted verbatim. `gpg_home` is
+/// the writable dir gpg uses for its scratch keybox/seed.
+pub fn encrypt(
+    user: &str,
+    keyring: &Path,
+    gpg_home: &Path,
+    input: &[u8],
+) -> Result<Vec<u8>, Error> {
     let base = base_localpart(user)?;
     let key = keyring.join(format!("{base}.asc"));
     if !key.is_file() {
         return Err(Error::MissingKey(base.to_string()));
     }
-    let armor = armored_ciphertext(&key, input)?;
+    let armor = armored_ciphertext(&key, gpg_home, input)?;
     Ok(rfc3156_envelope(&make_boundary(), &armor))
 }
 
-fn armored_ciphertext(key: &Path, input: &[u8]) -> Result<Vec<u8>, Error> {
+fn armored_ciphertext(key: &Path, gpg_home: &Path, input: &[u8]) -> Result<Vec<u8>, Error> {
+    ensure_gpg_home(gpg_home)?;
     // --recipient-file reads the armored cert directly: no key import, no
-    // gpg homedir setup, and the keyring file stays the single source.
-    // --no-options ignores any user gpg.conf (e.g. a default-key).
+    // trustdb, and the keyring file stays the single source. --homedir points
+    // gpg at the daemon's writable scratch dir (gpg writes pubring.kbx and
+    // random_seed even for --recipient-file). --no-options ignores any user
+    // gpg.conf (e.g. a default-key).
     let mut child = Command::new("gpg")
         .args([
             "--batch",
@@ -104,6 +117,8 @@ fn armored_ciphertext(key: &Path, input: &[u8]) -> Result<Vec<u8>, Error> {
             "--recipient-file",
         ])
         .arg(key)
+        .arg("--homedir")
+        .arg(gpg_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -124,6 +139,16 @@ fn armored_ciphertext(key: &Path, input: &[u8]) -> Result<Vec<u8>, Error> {
         ));
     }
     Ok(out.stdout)
+}
+
+/// Create the gpg scratch dir (0700). Idempotent; run per message because a
+/// save-path daemon can't assume external setup completed.
+fn ensure_gpg_home(gpg_home: &Path) -> Result<(), Error> {
+    std::fs::create_dir_all(gpg_home)
+        .map_err(|e| Error::Gpg(format!("cannot create gpg homedir: {e}")))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(gpg_home, std::fs::Permissions::from_mode(0o700)).ok();
+    Ok(())
 }
 
 /// RFC 3156 §4 envelope: `multipart/encrypted` with the `Version: 1` part and
@@ -166,7 +191,7 @@ fn make_boundary() -> String {
 
 /// Run the daemon: serve one request per connection on `socket`.
 /// Returns only when the listener fails (socket dir missing, bind error).
-pub fn serve(socket: &Path, keyring: &Path) -> Result<(), Error> {
+pub fn serve(socket: &Path, keyring: &Path, gpg_home: &Path) -> Result<(), Error> {
     // Stale socket from a previous crash; safe to remove because bind would
     // fail on it, and a live daemon would make bind fail anyway.
     let _ = std::fs::remove_file(socket);
@@ -175,7 +200,8 @@ pub fn serve(socket: &Path, keyring: &Path) -> Result<(), Error> {
         match conn {
             Ok(stream) => {
                 let keyring = keyring.to_path_buf();
-                thread::spawn(move || handle_conn(stream, &keyring));
+                let gpg_home = gpg_home.to_path_buf();
+                thread::spawn(move || handle_conn(stream, &keyring, &gpg_home));
             }
             Err(e) => eprintln!("kyriakon-encrypt: accept: {e}"),
         }
@@ -183,7 +209,7 @@ pub fn serve(socket: &Path, keyring: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn handle_conn(mut stream: UnixStream, keyring: &Path) {
+fn handle_conn(mut stream: UnixStream, keyring: &Path, gpg_home: &Path) {
     let mut buf = Vec::new();
     if stream.read_to_end(&mut buf).is_err() {
         return;
@@ -193,7 +219,7 @@ fn handle_conn(mut stream: UnixStream, keyring: &Path) {
         return;
     };
     let user = String::from_utf8_lossy(&buf[..nl]);
-    match encrypt(&user, keyring, &buf[nl + 1..]) {
+    match encrypt(&user, keyring, gpg_home, &buf[nl + 1..]) {
         Ok(out) => {
             if stream.write_all(&out).is_err() {
                 eprintln!("kyriakon-encrypt: write response: client gone");
