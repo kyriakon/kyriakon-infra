@@ -168,7 +168,8 @@ kyriakon_save_begin(struct mail_save_context *ctx, struct istream *input)
 	cipher = kyriakon_encrypt(box, input, &error);
 	if (cipher == NULL) {
 		mail_storage_set_error(box->storage, MAIL_ERROR_TEMP,
-				       "kyriakon-encrypt: %s", error);
+				       t_strdup_printf("kyriakon-encrypt: %s",
+						       error));
 		return -1;
 	}
 
