@@ -1,5 +1,5 @@
 variable "server_name" {
-  description = "Hostname of the mail box. Host-identifying — set it in terraform.tfvars (gitignored), never hardcode it here."
+  description = "Hostname of the mail box. Host-identifying - set it in terraform.tfvars (gitignored), never hardcode it here."
   type        = string
 }
 

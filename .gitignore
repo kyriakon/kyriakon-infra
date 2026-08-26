@@ -1,10 +1,21 @@
-# Terraform — never commit provider cache, state, or host-identifying tfvars.
+# Rust build output.
+target/
+
+# Terraform - never commit provider cache, state, or host-identifying tfvars.
 .terraform/
 *.tfstate
 *.tfstate.*
-terraform.tfvars
+
+# Variable files can hold host-specific values (AGENTS.md "Code style"); real
+# values stay behind variables, so commit *.tfvars.example instead.
+*.tfvars
 *.tfvars.json
+
+# Terraform crash logs and local overrides.
 crash.log
 crash.*.log
 override.tf
 override.tf.json
+
+# macOS desktop metadata.
+.DS_Store
