@@ -1,12 +1,12 @@
 /* kyriakon-encrypt Dovecot plugin: encrypt every message on the lib-storage
  * save path, covering both LMTP delivery and IMAP APPEND.
  *
- * This is a thin shim. It overrides mailbox_vfuncs.save_begin so the raw RFC
- * 5322 message is piped to the kyriakon-encrypt daemon over its unix socket,
- * and the returned whole-message RFC 3156 PGP/MIME ciphertext is handed to the
- * wrapped save_begin in place of the plaintext. No crypto, keyring, parsing,
- * or private key lives here - the daemon owns all of that. See
- * docs/planning/research/zero-access-mail-imap-append.md.
+ * This is a thin shim. It overrides mailbox_vfuncs.save_begin/save_finish so
+ * the raw RFC 5322 message is piped to the kyriakon-encrypt daemon over its
+ * unix socket, and the returned whole-message RFC 3156 PGP/MIME ciphertext is
+ * handed to the wrapped save_begin in place of the plaintext. No crypto,
+ * keyring, parsing, or private key lives here - the daemon owns all of that.
+ * See docs/planning/research/zero-access-mail-imap-append.md.
  *
  * Fail-closed: any error (socket, gpg, missing key) aborts the save before
  * anything is written, so plaintext never reaches the Maildir.
@@ -35,6 +35,10 @@
 
 /* Must match kyriakon-encrypt's DEFAULT_SOCKET. */
 #define KYRIAKON_SOCKET "/var/run/kyriakon/encrypt.sock"
+/* First line of the RFC 3156 envelope the daemon emits; the save_finish
+   backstop checks the saved mail starts with this. */
+#define KYRIAKON_MARKER \
+	"Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";"
 
 const char *kyriakon_encrypt_plugin_version = DOVECOT_ABI_VERSION;
 
@@ -175,6 +179,38 @@ kyriakon_save_begin(struct mail_save_context *ctx, struct istream *input)
 	return ret;
 }
 
+static int
+kyriakon_save_finish(struct mail_save_context *ctx)
+{
+	struct mailbox *box = ctx->transaction->box;
+	struct kyriakon_mailbox *mbox =
+		MODULE_CONTEXT_REQUIRE(box, kyriakon_mailbox_module);
+	struct istream *input;
+	const unsigned char *data;
+	size_t size;
+	bool ok = FALSE;
+
+	if (mbox->module_ctx.super.save_finish(ctx) < 0)
+		return -1;
+
+	/* Fail-closed backstop: what landed in storage must be our RFC 3156
+	   envelope, never plaintext. */
+	if (mail_get_stream(ctx->dest_mail, NULL, NULL, &input) < 0)
+		return -1;
+	if (i_stream_read(input) > 0) {
+		data = i_stream_get_data(input, &size);
+		ok = size >= sizeof(KYRIAKON_MARKER) - 1 &&
+		     memcmp(data, KYRIAKON_MARKER,
+			    sizeof(KYRIAKON_MARKER) - 1) == 0;
+	}
+	if (!ok) {
+		mail_storage_set_error(box->storage, MAIL_ERROR_NOTPOSSIBLE,
+			"saved mail is not kyriakon ciphertext");
+		return -1;
+	}
+	return 0;
+}
+
 static void
 kyriakon_mailbox_allocated(struct mailbox *box)
 {
@@ -186,6 +222,11 @@ kyriakon_mailbox_allocated(struct mailbox *box)
 	box->vlast = &mbox->module_ctx.super;
 
 	v->save_begin = kyriakon_save_begin;
+	v->save_finish = kyriakon_save_finish;
+	/* copy is intentionally not overridden: phase 1 is single-user, so an
+	   IMAP COPY hardlinks the same user's ciphertext, which is already
+	   correct. Cross-user copy into a shared mailbox would need
+	   re-encryption to the destination key and is a phase 3 concern. */
 
 	MODULE_CONTEXT_SET(box, kyriakon_mailbox_module, mbox);
 }
