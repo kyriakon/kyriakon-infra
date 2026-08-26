@@ -1,1 +1,21 @@
+# Rust build output.
 target/
+
+# Terraform: local provider cache from `terraform init` — regenerated, never committed.
+.terraform/
+
+# Terraform state; local state can embed provider/credential values.
+*.tfstate
+*.tfstate.*
+
+# Host-specific values live behind Terraform variables (AGENTS.md "Code style"),
+# so variable files stay untracked; commit *.tfvars.example instead.
+*.tfvars
+*.tfvars.json
+
+# Terraform crash logs, which can contain sensitive arguments.
+crash.log
+crash.*.log
+
+# macOS desktop metadata.
+.DS_Store
