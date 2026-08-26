@@ -15,9 +15,9 @@
 
 DOVECOT_CONFIG ?= dovecot-config
 CC ?= cc
-CFLAGS += -fPIC -shared -Wall -Wextra -O2
+CFLAGS += -fPIC -Wall -Wextra -O2
 CFLAGS += $(shell $(DOVECOT_CONFIG) --cflags)
-LDFLAGS += -shared $(shell $(DOVECOT_CONFIG) --libs)
+LDFLAGS += -shared
 
 MODULEDIR ?= $(shell $(DOVECOT_CONFIG) --moduledir)
 ABI ?= $(shell $(DOVECOT_CONFIG) --abiversion)
