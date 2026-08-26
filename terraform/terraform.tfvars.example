@@ -1,0 +1,4 @@
+# Copy to terraform.tfvars and set the real value. terraform.tfvars is gitignored
+# because server_name is host-identifying. The rest have defaults; uncomment to
+# override (see variables.tf).
+server_name = "example.invalid"

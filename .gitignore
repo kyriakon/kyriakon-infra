@@ -1,21 +1,21 @@
 # Rust build output.
 target/
 
-# Terraform: local provider cache from `terraform init` — regenerated, never committed.
+# Terraform — never commit provider cache, state, or host-identifying tfvars.
 .terraform/
-
-# Terraform state; local state can embed provider/credential values.
 *.tfstate
 *.tfstate.*
 
-# Host-specific values live behind Terraform variables (AGENTS.md "Code style"),
-# so variable files stay untracked; commit *.tfvars.example instead.
+# Variable files can hold host-specific values (AGENTS.md "Code style"); real
+# values stay behind variables, so commit *.tfvars.example instead.
 *.tfvars
 *.tfvars.json
 
-# Terraform crash logs, which can contain sensitive arguments.
+# Terraform crash logs and local overrides.
 crash.log
 crash.*.log
+override.tf
+override.tf.json
 
 # macOS desktop metadata.
 .DS_Store
