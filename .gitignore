@@ -1,0 +1,10 @@
+# Terraform — never commit provider cache, state, or host-identifying tfvars.
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
+override.tf
+override.tf.json
