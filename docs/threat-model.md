@@ -22,6 +22,12 @@ proposal are `../kyriakon/docs/decisions/kyriakon-net-project-proposal.md`.
   or seize it outright — can intercept *future* mail as it relays in plaintext, or
   serve modified software. Zero-access is a *storage* property, not an *interception*
   property. This is the same ceiling every encrypted-mail provider has.
+- **The transient SMTP spool.** Between smtpd accepting a message and Dovecot writing
+  the ciphertext, the message sits in `/var/spool/smtpd/` in plaintext for
+  seconds-to-minutes. `queue encryption` encrypts that spool (AES-256-GCM), but its
+  key is a platform-held startup passphrase — so this closes the walked-away-disk
+  window, not the compelled-admin window. It is the one residual plaintext-at-rest
+  point in the mail path.
 - **Correspondence metadata.** Envelope addresses, timestamps, and message sizes are
   visible to the server — mail cannot be routed without them — and appear in SMTP logs
   and the outer message wrapper. Logs are retained only as long as operationally
