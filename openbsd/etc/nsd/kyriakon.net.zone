@@ -1,17 +1,17 @@
 $ORIGIN kyriakon.net.
 $TTL 3600
 
-; kyriakon.net — hidden-primary zone file.
+; kyriakon.net - hidden-primary zone file.
 ; On-box path: /var/nsd/etc/kyriakon.net.zone.
 ; All IPs below are RFC 5737 (203.0.113.0/24) and RFC 3849 (2001:db8::/32)
-; documentation placeholders — substitute the box's real Hetzner IPv4/IPv6
+; documentation placeholders - substitute the box's real Hetzner IPv4/IPv6
 ; before deploy.
 
 @	IN	SOA	ns0.kyriakon.net. hostmaster.kyriakon.net. (
-		2026082701	; serial — YYYYMMDDNN, bump on EVERY edit (see note below)
-		3600		; refresh — HE re-checks at least this often
+		2026082701	; serial - YYYYMMDDNN, bump on EVERY edit (see note below)
+		3600		; refresh - HE re-checks at least this often
 		900		; retry
-		1209600		; expire — 14 days: HE keeps serving if the primary dies
+		1209600		; expire - 14 days: HE keeps serving if the primary dies
 		3600		; negative-cache TTL
 		)
 
@@ -21,7 +21,7 @@ $TTL 3600
 ; stale zone. Bump it on every edit.
 
 ; Public delegation: HE's anycast secondaries ONLY. The hidden primary
-; (ns0 / this box) is deliberately ABSENT from NS — hidden, not public.
+; (ns0 / this box) is deliberately ABSENT from NS - hidden, not public.
 @	IN	NS	ns1.he.net.
 @	IN	NS	ns2.he.net.
 @	IN	NS	ns3.he.net.
@@ -33,29 +33,29 @@ $TTL 3600
 ns0	IN	A	203.0.113.10
 ns0	IN	AAAA	2001:db8::10
 
-; Apex — the box's real IPs. Mail, SSH/git, Gemini, and the landing site all
+; Apex - the box's real IPs. Mail, SSH/git, Gemini, and the landing site all
 ; resolve here.
 @	IN	A	203.0.113.10
 @	IN	AAAA	2001:db8::10
 
-; MX — mail delivered to the box. Single MX, no secondary in MVP.
+; MX - mail delivered to the box. Single MX, no secondary in MVP.
 @	IN	MX	10 mail.kyriakon.net.
 mail	IN	A	203.0.113.10
 mail	IN	AAAA	2001:db8::10
 
-; SPF — the box is the only sender. "mx" authorizes the MX host; "-all"
+; SPF - the box is the only sender. "mx" authorizes the MX host; "-all"
 ; hard-fails everything else.
 @	IN	TXT	"v=spf1 mx -all"
 
-; DKIM — public half only, at selector "mail". The private key lives on the box
+; DKIM - public half only, at selector "mail". The private key lives on the box
 ; at /etc/mail/dkim/private.key and is NEVER in this repo. Replace REPLACE_ME
 ; with the real base64 public key (the "p=" value) at go-live.
 mail._domainkey	IN	TXT	"v=DKIM1; k=rsa; p=REPLACE_ME"
 
-; DMARC — start p=none (monitor only) with aggregate reporting; tighten later.
+; DMARC - start p=none (monitor only) with aggregate reporting; tighten later.
 _dmarc	IN	TXT	"v=DMARC1; p=none; rua=mailto:dmarc@kyriakon.net"
 
-; Wildcard — one record serves every per-user subdomain (username.kyriakon.net).
+; Wildcard - one record serves every per-user subdomain (username.kyriakon.net).
 ; A record, NOT a cert: acme-client is HTTP-01 only, so per-user certs are
 ; issued individually per signup.
 *	IN	A	203.0.113.10
