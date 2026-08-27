@@ -1,0 +1,14 @@
+# spamd.alloweddomains — greylist pass-through list for spamd(8).
+#
+# On-box path: /etc/mail/spamd.alloweddomains.
+#
+# spamd greylists new senders and traps mail to destination addresses whose
+# domain is NOT listed here (see spamd(8) GREYTRAPPING). List every domain we
+# accept mail for, otherwise legitimate mail to kyriakon.net users would be
+# trapped and the sender blacklisted.
+#
+# NOTE: greylisting itself is switched on at the pf layer (divert-to), which is
+# a propose-only change — see the pf.conf fragment in the PR body. This file is
+# the data half; it is safe to commit because it contains no secrets.
+
+@kyriakon.net
