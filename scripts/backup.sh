@@ -4,7 +4,10 @@
 # restic reads its config from the environment (it natively honours
 # RESTIC_REPOSITORY and RESTIC_PASSWORD_FILE), so nothing is hardcoded here.
 # Required env (set from root's crontab or a mode-0600 wrapper — see bottom):
-#   RESTIC_REPOSITORY       sftp:uXXXXX@uXXXXX.your-storagebox.de:./kyriakon-backup
+#   RESTIC_REPOSITORY       sftp://uXXXXX@uXXXXX.your-storagebox.de:23/kyriakon-backup
+#                           Storage Box SSH is on port 23, not 22 — the
+#                           sftp://…:23/… URL form is required; the scp-style
+#                           sftp:user@host:path form has no port and dials 22.
 #   RESTIC_PASSWORD_FILE    path to the repo password file, mode 0600, root-only.
 #                           The password IS the key — restic has no keyfile, so
 #                           keep an offline copy (proposal §5.5), never the only
