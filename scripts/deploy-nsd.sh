@@ -58,8 +58,11 @@ sed '/he-transfer-ip/s/^/# /' "$conf_src" > "$conf_dst"
 
 chmod 0644 "$zone_dst" "$conf_dst"
 
-# Guard: no placeholder may survive into the deployed copies.
-if grep -Eq '203\.0\.113|2001:db8' "$zone_dst"; then
+# Guard: no placeholder may survive into the deployed RECORDS. Skip `;` comment
+# lines — the header legitimately names the RFC 5737 (203.0.113.0/24) and
+# RFC 3849 (2001:db8::/32) ranges as documentation, which are prose, not
+# placeholders to substitute, so a whole-file grep false-positives on them.
+if grep -v '^;' "$zone_dst" | grep -Eq '203\.0\.113|2001:db8'; then
 	printf 'zone still contains documentation placeholders - check your ipv4/ipv6 args\n' >&2
 	exit 1
 fi
