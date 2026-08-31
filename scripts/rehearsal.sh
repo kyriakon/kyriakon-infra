@@ -22,16 +22,13 @@
 
 set -euo pipefail
 
+# shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
+. "$(dirname "$0")/lib.sh"
+
 : "${RESTIC_REPOSITORY:?RESTIC_REPOSITORY is required}"
 : "${RESTIC_PASSWORD_FILE:?RESTIC_PASSWORD_FILE is required}"
 
-hc_fail() {
-	if [ -n "${REHEARSAL_HEALTHCHECKS_URL:-}" ]; then
-		curl -fsS -m 10 --retry 3 "$REHEARSAL_HEALTHCHECKS_URL/fail" >/dev/null 2>&1 || true
-	fi
-	exit 1
-}
-trap hc_fail ERR
+trap 'hc_fail "$REHEARSAL_HEALTHCHECKS_URL"' ERR
 
 # --target / puts /home/... back under the box's real /home paths.
 restic restore latest --target /

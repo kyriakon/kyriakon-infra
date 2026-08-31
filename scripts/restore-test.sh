@@ -19,6 +19,9 @@
 
 set -euo pipefail
 
+# shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
+. "$(dirname "$0")/lib.sh"
+
 : "${RESTIC_REPOSITORY:?RESTIC_REPOSITORY is required}"
 : "${RESTIC_PASSWORD_FILE:?RESTIC_PASSWORD_FILE is required}"
 
@@ -26,20 +29,11 @@ snapshot_max_age_hours="${SNAPSHOT_MAX_AGE_HOURS:-30}"
 target_root="${RESTORE_TARGET_ROOT:-/var/restore-test}"
 target="$target_root/$(date +%F)"
 
-# Must match the canary content written by backup.sh verbatim.
-canary_text='kyriakon backup canary v1'
-
-hc_fail() {
-	if [ -n "${HEALTHCHECKS_URL:-}" ]; then
-		curl -fsS -m 10 --retry 3 "$HEALTHCHECKS_URL/fail" >/dev/null 2>&1 || true
-	fi
-	exit 1
-}
-trap hc_fail ERR
+trap 'hc_fail "$HEALTHCHECKS_URL"' ERR
 
 die() {
 	printf '%s\n' "$1" >&2
-	hc_fail
+	hc_fail "$HEALTHCHECKS_URL"
 }
 
 # --- 1. snapshot recency ------------------------------------------------
@@ -67,8 +61,8 @@ restic restore latest --target "$target"
 # --- 4. canary byte-identical ------------------------------------------
 expected=$(mktemp) || die "mktemp failed"
 trap 'rm -f "$expected"' EXIT
-printf '%s\n' "$canary_text" > "$expected"
-cmp -s "$expected" "$target/home/.kyriakon-backup-canary" \
+printf '%s\n' "$CANARY_TEXT" > "$expected"
+cmp -s "$expected" "$target$CANARY_PATH" \
 	|| die "canary missing or altered — backup did not include /home"
 rm -f "$expected"
 
@@ -108,7 +102,7 @@ printf 'restored %s files (matches snapshot stats)\n' "$restored_files"
 
 # --- 8. Healthchecks ping (success) ------------------------------------
 if [ -n "${HEALTHCHECKS_URL:-}" ]; then
-	curl -fsS -m 10 --retry 3 "$HEALTHCHECKS_URL" >/dev/null
+	ping_url "$HEALTHCHECKS_URL"
 fi
 printf 'restore test passed\n'
 

@@ -27,6 +27,9 @@
 
 set -euo pipefail
 
+# shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
+. "$(dirname "$0")/lib.sh"
+
 : "${RESTIC_REPOSITORY:?RESTIC_REPOSITORY is required (sftp:...)}"
 : "${RESTIC_PASSWORD_FILE:?RESTIC_PASSWORD_FILE is required}"
 
@@ -41,11 +44,9 @@ if [ "$perm" != "600" ] && [ "$perm" != "400" ]; then
 	exit 1
 fi
 
-canary='/home/.kyriakon-backup-canary'
-# Fixed content — must match canary_text in restore-test.sh verbatim (a
-# cross-machine contract: the two scripts run on different boxes).
-canary_text='kyriakon backup canary v1'
-printf '%s\n' "$canary_text" > "$canary"
+# Canary path + content are single-sourced in lib.sh (cross-machine contract with
+# restore-test.sh, which asserts byte-identity).
+printf '%s\n' "$CANARY_TEXT" > "$CANARY_PATH"
 
 # Whole /home tree (Maildir + git repos + web roots).
 restic backup /home
