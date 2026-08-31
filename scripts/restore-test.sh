@@ -60,7 +60,7 @@ restic check
 
 # --- 3. full restore ----------------------------------------------------
 mkdir -p "$target_root"
-rm -rf "$target_root"/* 2>/dev/null || true   # stop weekly restores accumulating
+rm -rf "${target_root:?}"/* 2>/dev/null || true   # stop weekly restores accumulating; :? guards RESTORE_TARGET_ROOT=/
 mkdir -p "$target"
 restic restore latest --target "$target"
 
@@ -111,3 +111,7 @@ if [ -n "${HEALTHCHECKS_URL:-}" ]; then
 	curl -fsS -m 10 --retry 3 "$HEALTHCHECKS_URL" >/dev/null
 fi
 printf 'restore test passed\n'
+
+# crontab (root, on the SEPARATE read-only test machine) — weekly:
+#   45 3 * * 0  RESTIC_REPOSITORY='sftp:…' RESTIC_PASSWORD_FILE=/root/.restic-pass \
+#               HEALTHCHECKS_URL='https://hc-ping.com/…' /root/bin/restore-test.sh
