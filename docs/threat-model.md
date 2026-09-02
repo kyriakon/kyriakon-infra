@@ -30,10 +30,37 @@ proposal are `../kyriakon/docs/decisions/kyriakon-net-project-proposal.md`.
   point in the mail path.
 - **Correspondence metadata.** Envelope addresses, timestamps, and message sizes are
   visible to the server — mail cannot be routed without them — and appear in SMTP logs
-  and the outer message wrapper. Logs are retained only as long as operationally
-  necessary (~7 days) to minimise exposure.
+  and the outer message wrapper. This is a *routing necessity*, not a log-hygiene
+  choice: no encrypted-mail provider can hide it, and any "no logs" claim to the
+  contrary is marketing. What we *can* minimize is how long the record persists and
+  whether the raw IP is retained: `openbsd/etc/newsyslog.conf` enforces a 7-day
+  retention bound on `maillog`/`authlog`/`nsd.log`, and abuse monitoring reads
+  aggregate *counts* only — never a per-IP identifier (see "Log minimization"
+  below).
 - **A user's own compromised key or device.** A seized private key or device makes that
   user's mail readable. The only backstop is the user-held recovery phrase.
+
+## Log minimization
+
+Logs carrying user-identifiable data are bounded, not eliminated. `newsyslog.conf`
+enforces a 7-day retention window on `maillog` (smtpd envelope + Dovecot auth),
+`authlog` (sshd), and `nsd.log`, so the raw per-user record — source IP, timestamps,
+message size — expires roughly a week after it is written. 7 days is the shortest
+window that still lets abuse monitoring catch a slow-burn compromise (a low-and-slow
+relay, a credential-stuffing ramp) without keeping a permanent per-user log.
+
+Abuse monitoring (`scripts/abuse-monitor.sh`) reads **aggregate counts only** — relay
+volume, auth-failure count, greylist churn — never a per-IP identifier. Raw IPs are
+discarded at rotation. Hashing IPs to retain a longer-lived collision signal was
+considered and rejected: a retained hash is a pseudonymous identifier, not data
+minimization, and every signal it would serve is already a plain count the monitor
+keeps without the raw IP.
+
+Greylisting (`spamd`) is the one store that keeps a literal source IP, and it is not a
+user log: entries self-expire in hours as a functional anti-spam mechanism, not a
+retention window. The Phase 3 onboarding service will emit its own log; it is to be
+born already bounded by a `newsyslog.conf` entry the day it lands, not grandfathered in
+after the fact.
 
 ## What the admin can and cannot see
 
