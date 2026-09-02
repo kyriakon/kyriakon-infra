@@ -20,3 +20,11 @@ Terraform image source for all future provisioning. Contrasted with the
 autoinstall-response-file approach, which is unproven against Hetzner's rescue
 environment.
 _Avoid_: golden image (implies a broader image-management practice than exists here)
+
+**Log minimization**:
+The posture that bounds, rather than eliminates, user-identifiable logs: a 7-day
+`newsyslog.conf` retention window on `maillog`/`authlog`/`nsd.log`, with abuse
+monitoring running on aggregate counts only. Raw IPs are discarded at rotation, and
+hashing them for longer retention was rejected — a retained hash is a pseudonymous
+identifier, not data minimization. See `docs/threat-model.md` "Log minimization".
+_Avoid_: no logs (unachievable — correspondence metadata is a routing necessity).
