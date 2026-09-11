@@ -5,7 +5,7 @@ Ticket: configure `nsd` (OpenBSD base) as the hidden primary for `kyriakon.net`,
 ## Recommended shape (short answer)
 
 1. `nsd` on the box is the **hidden primary**: it serves the zone file as source of truth and answers AXFR/NOTIFY to HE, but is **not listed in the public NS records** (those point only at HE's anycast secondaries).
-2. `nsd.conf` declares one `server:` clause and one `zone:` clause per zone; the hidden-primary role is three lines — `notify:` + `provide-xfr:` (plus `outgoing-interface:` if the box has multiple IPs) pointing at HE's transfer servers.
+2. `nsd.conf` declares one `server:` clause and one `zone:` clause per zone; the hidden-primary role is a `key:` block plus two `provide-xfr:` lines naming that key. No source-IP list is needed, because nsd serves only an AXFR signed with `kyriakon-he`.
 3. The zone file holds the full record set (§4); the public NS set is `ns1.he.net` … `ns5.he.net`, and the box's own name is absent from NS.
 4. At HE, the domain is added as a **slave/secondary** domain pointing at the box's IP; HE pulls AXFR, validates it, then listens for NOTIFY and refreshes on the SOA/`refresh` timer.
 5. **Ordering:** zone published (AXFR to HE, verified) **before** mail goes live — MX/SPF/DKIM/DMARC must resolve publicly first, and PTR set at Hetzner, before the first send.
@@ -26,28 +26,43 @@ server:
 	logfile: /var/log/nsd.log
 	xfrdfile: /var/nsd/run/xfrd.state
 
+# OpenBSD's /etc/rc.d/nsd starts nsd via `nsd-control start` (which execs nsd)
+# but checks, reloads and stops it over this socket, so it has to be enabled:
+# rcctl check reports nsd(failed) with the upstream default of no.
+remote-control:
+	control-enable: yes
+	control-interface: /var/run/nsd.sock
+
+key:
+	name: kyriakon-he
+	algorithm: hmac-sha256
+	secret: "<base64 secret, substituted at deploy time, never committed>"
+
 zone:
 	name: kyriakon.net
 	zonefile: /var/nsd/etc/kyriakon.net.zone
-	# HE secondary: send it NOTIFY and allow it to AXFR. NOKEY = no TSIG.
-	notify: <he-transfer-ip-1> NOKEY
-	notify: <he-transfer-ip-2> NOKEY
-	provide-xfr: <he-transfer-ip-1> NOKEY
-	provide-xfr: <he-transfer-ip-2> NOKEY
+	# HE pulls AXFR over TCP/53 and signs the request with kyriakon-he. nsd
+	# refuses an unsigned or wrong-key request, so the ACL stays wide: the key
+	# authenticates the transfer, the source IP does not have to.
+	provide-xfr: 0.0.0.0/0 kyriakon-he
+	provide-xfr: ::0/0 kyriakon-he
+	notify: 216.218.133.2 kyriakon-he
 ```
 
-The three directives, from the man page:
+The `notify:` address is HE's transfer source, observed in nsd's log during the first AXFR on 2026-09-11 (`axfr for kyriakon.net. from 216.218.133.2`). It is not one of the `ns1`-`ns5` anycast query addresses, and HE does not publish it, so it is an inference: if nsd logs notify failures, re-read the log for HE's current source and correct the line.
+
+The directives that matter, from the man page:
 
 - `notify: <ip-address> <key-name | NOKEY>` — "The listed address (a secondary) is notified of updates to this zone via UDP" ([nsd.conf(5), notify](https://man.openbsd.org/nsd.conf.5)).
 - `provide-xfr: <ip-spec> <key-name | NOKEY | BLOCKED> [tls-auth-name]` — "The listed address (a secondary) is allowed to request XFR from this server. Zone data will be provided to the address" ([nsd.conf(5), provide-xfr](https://man.openbsd.org/nsd.conf.5)).
 - `outgoing-interface: <ip-address>` — "used to request AXFR|IXFR (in case of a secondary) or used to send notifies (in case of a primary)"; needed only if the box has multiple routable IPs and the notify/XFR source address matters ([nsd.conf(5), outgoing-interface](https://man.openbsd.org/nsd.conf.5)).
 
-Reload after a zone-file edit with `kill -HUP` to the `nsd` pid ("Then, use kill -HUP to reload changes from primary zone files", [nsd.conf(5), EXAMPLE](https://man.openbsd.org/nsd.conf.5)).
+Reload after a zone-file edit with `rcctl reload nsd`, which OpenBSD's rc script implements as `nsd-control reconfig` followed by `nsd-control reload` ([OpenBSD `etc/rc.d/nsd`](https://github.com/openbsd/src/blob/master/etc/rc.d/nsd)). The man page's own `kill -HUP` advice does not apply when the rc script is driving the daemon, and it cannot be used at all without knowing the pid file path.
 
 Two operational points the man page implies but doesn't decide:
 
-- **HE's AXFR source IPs are not published** in the public dns.he.net docs. `provide-xfr`/`notify` are IP-based ACLs, so the exact HE transfer source IPs must be pinned down at signup (the dns.he.net portal's slave-validation flow confirms the transfer; see §3). Do **not** leave `provide-xfr: 0.0.0.0/0` — that would let anyone AXFR the whole zone (which also leaks the DKIM/TXT set and every per-user hostname pattern). Grab HE's real transfer IPs and list them.
-- **TSIG is available but not required by HE's free service.** The man page supports `key:` + named keys instead of `NOKEY` ([nsd.conf(5), FILE FORMAT](https://man.openbsd.org/nsd.conf.5)). HE's free secondary docs don't require TSIG, so `NOKEY` + IP ACL is the MVP floor; TSIG is a later hardening step, not a go-live blocker.
+- HE's AXFR source IPs are not published in the public dns.he.net docs, and they do not need to be. A `provide-xfr` entry that names a key authenticates the transfer by the key instead of the source address: `acl_key_matches()` in nsd's `options.c` returns 0 when the request has no TSIG, has a TSIG error, names a different key, or uses the wrong algorithm, so `provide-xfr: 0.0.0.0/0 kyriakon-he` serves only a signed AXFR. The dangerous form is a wide `provide-xfr` with `NOKEY`, which hands the whole zone (DKIM record, wildcard, every hostname) to anyone who asks.
+- TSIG is what this deployment uses, not a later hardening step. HE rolled out TSIG-authenticated AXFR in 2019 ([ctrl.blog](https://www.ctrl.blog/entry/he-2nd-dns-tsig.html)); the key name and algorithm in `nsd.conf` must match the portal's slave entry for `kyriakon.net`.
 
 ---
 
@@ -111,7 +126,7 @@ Zone-file mechanics worth stating explicitly:
 
 - **Serial must increment on every edit** or HE's secondaries won't pick up the change. The SOA `serial` is the single source of "has the zone changed" for both NOTIFY-triggered and refresh-timer-triggered transfers (SOA semantics, [RFC 1035 §3.3.13](https://www.rfc-editor.org/rfc/rfc1035)).
 - **The `refresh` value is HE's re-check floor.** HE "mak[es] periodic checks (depending on your TTL)" ([dns.he.net](https://dns.he.net/)); with NOTIFY working, transfers are prompt, but `refresh` bounds worst-case staleness if a NOTIFY is lost.
-- `nsd` answers AXFR on TCP port 53 — the box's `pf.conf` must allow **TCP/53 from HE's transfer IPs** (and only them) inbound, separate from the UDP/53 public-query rule. This is the one firewall change the hidden-primary pattern adds over a plain authoritative server.
+- `nsd` answers AXFR on TCP port 53, so the box's `pf.conf` needs an inbound TCP/53 rule. It is not pinned to HE's IPs: the TSIG key authenticates the transfer and the source addresses are unpublished. UDP/53 stays closed, so the box answers no ordinary public queries. This is the one firewall change the hidden-primary pattern adds over a plain authoritative server.
 - `@` is shorthand for `$ORIGIN`; the trailing dots matter (FQDN vs. relative-to-origin). The template above keeps them explicit.
 
 ---
@@ -128,8 +143,8 @@ HE's free DNS is the `dns.he.net` portal. Primary-source facts:
 Consequences for the primary:
 
 1. The box's IP **must be reachable on TCP/53 by HE** for the initial AXFR and any refresh transfer (AXFR runs over TCP; `nsd` serves it per [nsd.conf(5)](https://man.openbsd.org/nsd.conf.5)). This is the "box IP is public by design" reality from §5.7 made concrete — the hidden-primary pattern hides the DNS *answering* service from public NS records, not the box from the network.
-2. `provide-xfr` must allow **HE's transfer source IPs** (not the anycast query IPs necessarily — capture them at validation time, §1).
-3. `notify` must reach HE so changes propagate immediately rather than waiting out `refresh`.
+2. `provide-xfr` must accept HE's signed requests. The key authorises them, so no source address has to be captured before the first transfer (§1).
+3. `notify` needs an address to send to, and HE publishes none, so the line uses the transfer source observed in nsd's log. If nsd logs notify failures, that inference is wrong and the address needs correcting from a fresh log read.
 
 HE free secondary is DNS-only redundancy: it keeps answering from the last transferred zone if the box goes down (§5.7, §6.11), but it does not queue or deliver mail (that's the deferred secondary-MX layer, §6.11 layer 3).
 
