@@ -92,12 +92,16 @@ fi
 # algorithm, secret base64, and that every provide-xfr references a defined key.
 nsd-checkconf "$conf_dst"
 
+# Any nsd left over from a config without remote-control cannot be signalled
+# through nsd-control, and a second nsd would fail to bind port 53. Clear it by
+# name so this script is idempotent from any prior state.
+pkill -x nsd >/dev/null 2>&1 || true
+sleep 1
+
 rcctl enable nsd
-if rcctl check nsd >/dev/null 2>&1; then
-	rcctl restart nsd
-else
-	rcctl start nsd
-fi
+rcctl start nsd
+rcctl check nsd >/dev/null 2>&1 \
+	|| { printf 'nsd did not start; see /var/log/nsd.log and /var/log/messages\n' >&2; exit 1; }
 
 # Verify the box answers with exactly the IPs we just wrote.
 serial=$(dig @127.0.0.1 kyriakon.net SOA +short | awk '{print $3}')

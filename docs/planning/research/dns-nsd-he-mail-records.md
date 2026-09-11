@@ -26,6 +26,13 @@ server:
 	logfile: /var/log/nsd.log
 	xfrdfile: /var/nsd/run/xfrd.state
 
+# OpenBSD's /etc/rc.d/nsd starts nsd via `nsd-control start` (which execs nsd)
+# but checks, reloads and stops it over this socket, so it has to be enabled:
+# rcctl check reports nsd(failed) with the upstream default of no.
+remote-control:
+	control-enable: yes
+	control-interface: /var/run/nsd.sock
+
 key:
 	name: kyriakon-he
 	algorithm: hmac-sha256
@@ -49,7 +56,7 @@ The directives that matter, from the man page:
 - `provide-xfr: <ip-spec> <key-name | NOKEY | BLOCKED> [tls-auth-name]` — "The listed address (a secondary) is allowed to request XFR from this server. Zone data will be provided to the address" ([nsd.conf(5), provide-xfr](https://man.openbsd.org/nsd.conf.5)).
 - `outgoing-interface: <ip-address>` — "used to request AXFR|IXFR (in case of a secondary) or used to send notifies (in case of a primary)"; needed only if the box has multiple routable IPs and the notify/XFR source address matters ([nsd.conf(5), outgoing-interface](https://man.openbsd.org/nsd.conf.5)).
 
-Reload after a zone-file edit with `kill -HUP` to the `nsd` pid ("Then, use kill -HUP to reload changes from primary zone files", [nsd.conf(5), EXAMPLE](https://man.openbsd.org/nsd.conf.5)).
+Reload after a zone-file edit with `rcctl reload nsd`, which OpenBSD's rc script implements as `nsd-control reconfig` followed by `nsd-control reload` ([OpenBSD `etc/rc.d/nsd`](https://github.com/openbsd/src/blob/master/etc/rc.d/nsd)). The man page's own `kill -HUP` advice does not apply when the rc script is driving the daemon, and it cannot be used at all without knowing the pid file path.
 
 Two operational points the man page implies but doesn't decide:
 
