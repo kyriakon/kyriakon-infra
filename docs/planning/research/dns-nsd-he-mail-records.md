@@ -26,6 +26,13 @@ server:
 	logfile: /var/log/nsd.log
 	xfrdfile: /var/nsd/run/xfrd.state
 
+# OpenBSD's /etc/rc.d/nsd starts nsd via `nsd-control start` (which execs nsd)
+# but checks, reloads and stops it over this socket, so it has to be enabled:
+# rcctl check reports nsd(failed) with the upstream default of no.
+remote-control:
+	control-enable: yes
+	control-interface: /var/run/nsd.sock
+
 key:
 	name: kyriakon-he
 	algorithm: hmac-sha256
@@ -39,9 +46,10 @@ zone:
 	# authenticates the transfer, the source IP does not have to.
 	provide-xfr: 0.0.0.0/0 kyriakon-he
 	provide-xfr: ::0/0 kyriakon-he
+	notify: 216.218.133.2 kyriakon-he
 ```
 
-No `notify:` lines yet. HE's transfer sources are unpublished, and it refreshes on the SOA timer (3600s) until they are captured and one `notify: <he-ip> kyriakon-he` line per IP is added.
+The `notify:` address is HE's transfer source, observed in nsd's log during the first AXFR on 2026-09-11 (`axfr for kyriakon.net. from 216.218.133.2`). It is not one of the `ns1`-`ns5` anycast query addresses, and HE does not publish it, so it is an inference: if nsd logs notify failures, re-read the log for HE's current source and correct the line.
 
 The directives that matter, from the man page:
 
@@ -49,7 +57,7 @@ The directives that matter, from the man page:
 - `provide-xfr: <ip-spec> <key-name | NOKEY | BLOCKED> [tls-auth-name]` — "The listed address (a secondary) is allowed to request XFR from this server. Zone data will be provided to the address" ([nsd.conf(5), provide-xfr](https://man.openbsd.org/nsd.conf.5)).
 - `outgoing-interface: <ip-address>` — "used to request AXFR|IXFR (in case of a secondary) or used to send notifies (in case of a primary)"; needed only if the box has multiple routable IPs and the notify/XFR source address matters ([nsd.conf(5), outgoing-interface](https://man.openbsd.org/nsd.conf.5)).
 
-Reload after a zone-file edit with `kill -HUP` to the `nsd` pid ("Then, use kill -HUP to reload changes from primary zone files", [nsd.conf(5), EXAMPLE](https://man.openbsd.org/nsd.conf.5)).
+Reload after a zone-file edit with `rcctl reload nsd`, which OpenBSD's rc script implements as `nsd-control reconfig` followed by `nsd-control reload` ([OpenBSD `etc/rc.d/nsd`](https://github.com/openbsd/src/blob/master/etc/rc.d/nsd)). The man page's own `kill -HUP` advice does not apply when the rc script is driving the daemon, and it cannot be used at all without knowing the pid file path.
 
 Two operational points the man page implies but doesn't decide:
 
@@ -136,7 +144,7 @@ Consequences for the primary:
 
 1. The box's IP **must be reachable on TCP/53 by HE** for the initial AXFR and any refresh transfer (AXFR runs over TCP; `nsd` serves it per [nsd.conf(5)](https://man.openbsd.org/nsd.conf.5)). This is the "box IP is public by design" reality from §5.7 made concrete — the hidden-primary pattern hides the DNS *answering* service from public NS records, not the box from the network.
 2. `provide-xfr` must accept HE's signed requests. The key authorises them, so no source address has to be captured before the first transfer (§1).
-3. `notify` reaches HE only once its source addresses are known; until then changes wait out `refresh`.
+3. `notify` needs an address to send to, and HE publishes none, so the line uses the transfer source observed in nsd's log. If nsd logs notify failures, that inference is wrong and the address needs correcting from a fresh log read.
 
 HE free secondary is DNS-only redundancy: it keeps answering from the last transferred zone if the box goes down (§5.7, §6.11), but it does not queue or deliver mail (that's the deferred secondary-MX layer, §6.11 layer 3).
 
