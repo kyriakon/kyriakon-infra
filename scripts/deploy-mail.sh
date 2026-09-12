@@ -173,6 +173,17 @@ start_service smtpd
 
 if id oliver >/dev/null 2>&1; then
 	printf 'account exists: oliver\n'
+	home=$(awk -F: '$1 == "oliver" { print $6 }' /etc/passwd)
+	[ -n "$home" ] || { printf 'cannot read the home directory for oliver from /etc/passwd\n' >&2; exit 1; }
+	# add-user.sh creates these; an account made by hand may not have them, and
+	# Dovecot's maildir:~/Maildir needs them, so create them either way.
+	for d in cur new tmp; do
+		install -d -m 0700 -o oliver -g oliver "$home/Maildir/$d"
+	done
+	printf 'Maildir: %s/Maildir\n' "$home"
+	shell=$(awk -F: '$1 == "oliver" { print $7 }' /etc/passwd)
+	[ "$shell" = /sbin/nologin ] \
+		|| printf 'note: oliver shell is %s, not /sbin/nologin (expected for an admin account, not for a standard-tier one)\n' "$shell"
 else
 	ksh "$repo_dir/scripts/add-user.sh" oliver
 	printf 'set the password with: doas passwd oliver\n'
