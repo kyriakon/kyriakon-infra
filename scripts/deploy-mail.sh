@@ -171,23 +171,35 @@ start_service smtpd
 
 # --- 7. account ---------------------------------------------------------
 
+# oliver is the operator account: it doubles as the admin login for the box,
+# so it keeps an interactive shell. That is the deliberate difference from
+# add-user.sh, which forces /sbin/nologin because standard-tier accounts must
+# not have one. The Maildir is what the mail stack needs, and it is created
+# either way.
+say "account oliver"
 if id oliver >/dev/null 2>&1; then
 	printf 'account exists: oliver\n'
-	home=$(awk -F: '$1 == "oliver" { print $6 }' /etc/passwd)
-	[ -n "$home" ] || { printf 'cannot read the home directory for oliver from /etc/passwd\n' >&2; exit 1; }
-	# add-user.sh creates these; an account made by hand may not have them, and
-	# Dovecot's maildir:~/Maildir needs them, so create them either way.
-	for d in cur new tmp; do
-		install -d -m 0700 -o oliver -g oliver "$home/Maildir/$d"
-	done
-	printf 'Maildir: %s/Maildir\n' "$home"
-	shell=$(awk -F: '$1 == "oliver" { print $7 }' /etc/passwd)
-	[ "$shell" = /sbin/nologin ] \
-		|| printf 'note: oliver shell is %s, not /sbin/nologin (expected for an admin account, not for a standard-tier one)\n' "$shell"
 else
-	ksh "$repo_dir/scripts/add-user.sh" oliver
+	useradd -m -d /home/oliver -s /bin/ksh -g =uid oliver
+	printf 'created oliver with an interactive shell\n'
 	printf 'set the password with: doas passwd oliver\n'
 fi
+
+home=$(awk -F: '$1 == "oliver" { print $6 }' /etc/passwd)
+[ -n "$home" ] || { printf 'cannot read the home directory for oliver from /etc/passwd\n' >&2; exit 1; }
+shell=$(awk -F: '$1 == "oliver" { print $7 }' /etc/passwd)
+if [ "$shell" = /sbin/nologin ]; then
+	chsh -s /bin/ksh oliver
+	shell=/bin/ksh
+	printf 'set oliver shell to /bin/ksh (operator account, not a standard-tier one)\n'
+fi
+
+# add-user.sh creates these for standard accounts; an account made by hand may
+# not have them, and Dovecot's maildir:~/Maildir needs them.
+for d in cur new tmp; do
+	install -d -m 0700 -o oliver -g oliver "$home/Maildir/$d"
+done
+printf 'Maildir: %s/Maildir (shell %s)\n' "$home" "$shell"
 
 # --- 8. verify ----------------------------------------------------------
 
