@@ -88,16 +88,24 @@ command -v gpg >/dev/null || { printf 'gpg missing after pkg_add gnupg\n' >&2; e
 
 # The headers are the real prerequisite for the plugin build. There is nothing
 # to run: OpenBSD ships dovecot-config as a 0644 shell variable file rather than
-# an executable, so just report what it says.
-[ -d /usr/local/include/dovecot ] \
-	|| { printf 'dovecot headers missing (/usr/local/include/dovecot); is the dovecot package installed?\n' >&2; exit 1; }
+# an executable, so source it for the two paths the plugin build needs.
+dovecot_include_dir=/usr/local/include/dovecot
+dovecot_module_dir=/usr/local/lib/dovecot
 if [ -r /usr/local/lib/dovecot/dovecot-config ]; then
 	# shellcheck source=/dev/null
 	. /usr/local/lib/dovecot/dovecot-config
-	# shellcheck disable=SC2154  # both names come from the sourced file
-	printf 'dovecot: include %s, modules %s\n' "$dovecot_pkgincludedir" "$dovecot_moduledir"
+	# The sourced file defines dovecot_pkgincludedir and dovecot_moduledir, which
+	# is why these locals carry different names: same-name assignment would be a
+	# no-op.
+	# shellcheck disable=SC2154
+	dovecot_include_dir=${dovecot_pkgincludedir:-$dovecot_include_dir}
+	# shellcheck disable=SC2154
+	dovecot_module_dir=${dovecot_moduledir:-$dovecot_module_dir}
 fi
+[ -d "$dovecot_include_dir" ] \
+	|| { printf 'dovecot headers missing (%s); is the dovecot package installed?\n' "$dovecot_include_dir" >&2; exit 1; }
 command -v dovecot >/dev/null || { printf 'dovecot binary not found on PATH\n' >&2; exit 1; }
+printf 'dovecot: include %s, modules %s\n' "$dovecot_include_dir" "$dovecot_module_dir"
 
 # --- 2. TLS --------------------------------------------------------------
 
@@ -178,8 +186,11 @@ esac
 # --- 5. components ------------------------------------------------------
 
 say "dovecot plugin"
-# The Makefile sources dovecot-config for the include and module directories.
-( cd "$repo_dir/dovecot-plugin" && make && make install )
+# The Makefile defaults to the packaged layout; pass the values read from
+# dovecot-config so a relocated layout still builds and installs correctly.
+( cd "$repo_dir/dovecot-plugin" \
+	&& make INCLUDEDIR="$dovecot_include_dir" MODULEDIR="$dovecot_module_dir" \
+	&& make INCLUDEDIR="$dovecot_include_dir" MODULEDIR="$dovecot_module_dir" install )
 
 say "kyriakon-encrypt"
 ( cd "$repo_dir/kyriakon-encrypt" && cargo build --release )
