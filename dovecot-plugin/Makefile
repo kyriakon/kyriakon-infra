@@ -1,7 +1,8 @@
 # Build the kyriakon-encrypt Dovecot plugin.
 #
-# Requires Dovecot development headers (dovecot-config on PATH). On OpenBSD:
-#   pkg_add dovecot        # ships /usr/local/bin/dovecot-config
+# Requires Dovecot's headers, seeded by the dovecot package on OpenBSD:
+#   pkg_add dovecot        # ships /usr/local/lib/dovecot/dovecot-config,
+#                          # NOT on PATH, and include/dovecot/*.h
 #
 #   make                  # produces lib<abi>_kyriakon_encrypt_plugin.so
 #   doas make install     # installs into $(dovecot-config --moduledir)
@@ -13,7 +14,10 @@
 # (see ../kyriakon-encrypt). Compile-verify this on a real OpenBSD host - it
 # is not buildable in CI without Dovecot headers, per docs/planning/specs.
 
-DOVECOT_CONFIG ?= dovecot-config
+# Upstream installs dovecot-config into the library directory, so it is not
+# found by name on OpenBSD. Prefer that path when it exists, and fall back to a
+# PATH lookup for systems that put it elsewhere.
+DOVECOT_CONFIG ?= $(firstword $(wildcard /usr/local/lib/dovecot/dovecot-config) dovecot-config)
 CC ?= cc
 CFLAGS += -fPIC -Wall -Wextra -O2
 CFLAGS += $(shell $(DOVECOT_CONFIG) --cflags)

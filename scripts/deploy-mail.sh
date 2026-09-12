@@ -27,6 +27,11 @@ set -euo pipefail
 
 repo_dir="${1:-/root/src/kyriakon-infra}"
 
+# Everything this installs lives under /usr/local, and doas, cron and rcctl all
+# hand over a minimal PATH, so set it explicitly instead of trusting the caller.
+PATH="/usr/local/sbin:/usr/local/bin:$PATH"
+export PATH
+
 queue_key_file=/etc/mail/queue.key
 dkim_key=/etc/mail/dkim/private.rsa.key
 keyring_dir=/etc/kyriakon/keys
@@ -47,8 +52,11 @@ need_pkg() {
 	if pkg_info -q -e "$1" >/dev/null 2>&1 || pkg_info -q -e "$1-*" >/dev/null 2>&1; then
 		printf 'ok: %s already installed\n' "$1"
 	else
-		printf 'installing %s\n' "$1"
-		pkg_add "$1"
+		# -I: no questions. Interactive is the default on a tty, and a deploy
+		# that stops on a prompt (a same-version replacement of quirks, for
+		# instance) looks exactly like a hung fetch.
+		printf 'installing %s (fetching; can take a minute)\n' "$1"
+		pkg_add -I "$1"
 	fi
 }
 
@@ -72,9 +80,15 @@ need_pkg gnupg
 need_pkg rust
 need_pkg opensmtpd-filter-dkimsign
 
-command -v dovecot-config >/dev/null || { printf 'dovecot-config missing after pkg_add dovecot\n' >&2; exit 1; }
 command -v cargo >/dev/null || { printf 'cargo missing after pkg_add rust\n' >&2; exit 1; }
 command -v gpg >/dev/null || { printf 'gpg missing after pkg_add gnupg\n' >&2; exit 1; }
+
+# dovecot-config lives in the library directory on OpenBSD, not on PATH.
+dovecot_config=/usr/local/lib/dovecot/dovecot-config
+[ -x "$dovecot_config" ] || dovecot_config=$(command -v dovecot-config || true)
+[ -n "$dovecot_config" ] \
+	|| { printf 'dovecot-config not found; is the dovecot package installed?\n' >&2; exit 1; }
+printf 'dovecot-config: %s (abi %s)\n' "$dovecot_config" "$("$dovecot_config" --abiversion)"
 
 # --- 2. TLS --------------------------------------------------------------
 
@@ -144,7 +158,9 @@ esac
 # --- 5. components ------------------------------------------------------
 
 say "dovecot plugin"
-( cd "$repo_dir/dovecot-plugin" && make && make install )
+( cd "$repo_dir/dovecot-plugin" \
+	&& make DOVECOT_CONFIG="$dovecot_config" \
+	&& make DOVECOT_CONFIG="$dovecot_config" install )
 
 say "kyriakon-encrypt"
 ( cd "$repo_dir/kyriakon-encrypt" && cargo build --release )
