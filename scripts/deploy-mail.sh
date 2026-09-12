@@ -1,0 +1,198 @@
+#!/bin/ksh
+# deploy-mail.sh — bring the kyriakon.net mail stack up on the box.
+#
+# Runs ON the box as root (invoke under doas). It does NOT touch pf.conf: the
+# mail port rules and the spamd divert-to greylisting stay propose-only human
+# steps.
+#
+# Usage:
+#   doas ksh deploy-mail.sh [repo_dir]
+#
+#   repo_dir   checkout to install from; defaults to /root/src/kyriakon-infra
+#
+# Idempotent. Re-running reinstalls the configs, rebuilds the two components,
+# and restarts what is already running. It:
+#   1. installs the packages the build and the daemons need
+#   2. installs httpd.conf + acme-client.conf and issues the mail certificate
+#   3. installs smtpd.conf (with the queue key) and dovecot.conf
+#   4. generates the DKIM key if absent and checks the published record
+#   5. builds and installs the Dovecot plugin and the kyriakon-encrypt daemon
+#   6. syncs the published keyring, starts every service, creates oliver
+#
+# The queue-encryption key is generated once and persisted in
+# /etc/mail/queue.key (0600 root). It must stay stable: changing it makes
+# queued mail undecryptable.
+
+set -euo pipefail
+
+repo_dir="${1:-/root/src/kyriakon-infra}"
+
+queue_key_file=/etc/mail/queue.key
+dkim_key=/etc/mail/dkim/private.rsa.key
+keyring_dir=/etc/kyriakon/keys
+encrypt_bin=/usr/local/sbin/kyriakon-encrypt
+
+[ "$(id -u)" -eq 0 ] || { printf 'run as root (doas ksh %s)\n' "$0" >&2; exit 1; }
+[ -d "$repo_dir" ] || { printf 'repo_dir not found: %s\n' "$repo_dir" >&2; exit 1; }
+
+for f in openbsd/etc/smtpd.conf openbsd/etc/httpd.conf openbsd/etc/acme-client.conf \
+	openbsd/etc/rc.d/kyriakon_encrypt openbsd/dovecot/dovecot.conf \
+	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml keys; do
+	[ -e "$repo_dir/$f" ] || { printf 'missing from repo_dir: %s\n' "$f" >&2; exit 1; }
+done
+
+say() { printf '== %s\n' "$*"; }
+
+need_pkg() {
+	if pkg_info -q -e "$1" >/dev/null 2>&1 || pkg_info -q -e "$1-*" >/dev/null 2>&1; then
+		printf 'ok: %s already installed\n' "$1"
+	else
+		printf 'installing %s\n' "$1"
+		pkg_add "$1"
+	fi
+}
+
+start_service() {
+	rcctl enable "$1"
+	if rcctl check "$1" >/dev/null 2>&1; then
+		rcctl restart "$1"
+	else
+		rcctl start "$1"
+	fi
+	rcctl check "$1" >/dev/null 2>&1 \
+		|| { printf '%s did not start; check /var/log/messages\n' "$1" >&2; exit 1; }
+	printf 'running: %s\n' "$1"
+}
+
+# --- 1. packages ---------------------------------------------------------
+
+say "packages"
+need_pkg dovecot
+need_pkg gnupg
+need_pkg rust
+need_pkg opensmtpd-filter-dkimsign
+
+command -v dovecot-config >/dev/null || { printf 'dovecot-config missing after pkg_add dovecot\n' >&2; exit 1; }
+command -v cargo >/dev/null || { printf 'cargo missing after pkg_add rust\n' >&2; exit 1; }
+command -v gpg >/dev/null || { printf 'gpg missing after pkg_add gnupg\n' >&2; exit 1; }
+
+# --- 2. TLS --------------------------------------------------------------
+
+say "TLS"
+install -d -m 0755 /var/www/acme
+install -d -m 0700 /etc/acme
+install -m 0644 "$repo_dir/openbsd/etc/httpd.conf" /etc/httpd.conf
+install -m 0644 "$repo_dir/openbsd/etc/acme-client.conf" /etc/acme-client.conf
+httpd -n -f /etc/httpd.conf
+start_service httpd
+
+# acme-client exits 0 on change, 2 when the certificate is already current.
+acme_rc=0
+acme-client -v mail.kyriakon.net || acme_rc=$?
+case "$acme_rc" in
+	0) printf 'certificate issued or renewed\n' ;;
+	2) printf 'certificate already current\n' ;;
+	*) printf 'acme-client failed (exit %s); is port 80 reachable and\n' "$acme_rc" >&2
+	   printf 'the challenge directory served? see /var/www/acme\n' >&2
+	   exit 1 ;;
+esac
+for f in /etc/ssl/mail.kyriakon.net.fullchain.pem /etc/ssl/private/mail.kyriakon.net.key; do
+	[ -s "$f" ] || { printf 'missing certificate file: %s\n' "$f" >&2; exit 1; }
+done
+
+# --- 3. smtpd + dovecot configs -----------------------------------------
+
+say "configs"
+if [ -s "$queue_key_file" ]; then
+	queue_key=$(cat "$queue_key_file")
+else
+	queue_key=$(openssl rand -base64 32)
+	(umask 077; printf '%s\n' "$queue_key" > "$queue_key_file")
+	printf 'generated queue-encryption key in %s - store it in your password manager.\n' "$queue_key_file"
+fi
+
+# '|' delimits the s/// because base64 keys contain '/'. The deployed file
+# holds the key, hence 0600.
+sed -e "s|REPLACE_ME_QUEUE_KEY|$queue_key|" "$repo_dir/openbsd/etc/smtpd.conf" > /etc/mail/smtpd.conf
+chmod 0600 /etc/mail/smtpd.conf
+grep -q 'REPLACE_ME_QUEUE_KEY' /etc/mail/smtpd.conf \
+	&& { printf 'queue key substitution failed\n' >&2; exit 1; }
+smtpd -n -f /etc/mail/smtpd.conf
+
+install -m 0644 "$repo_dir/openbsd/dovecot/dovecot.conf" /etc/dovecot/dovecot.conf
+doveconf -n >/dev/null
+
+# --- 4. DKIM -------------------------------------------------------------
+
+say "DKIM"
+if [ ! -s "$dkim_key" ]; then
+	install -d -o _dkimsign -g _dkimsign -m 0700 /etc/mail/dkim
+	openssl genrsa -out "$dkim_key" 2048
+	chown _dkimsign:_dkimsign "$dkim_key"
+	chmod 0600 "$dkim_key"
+	printf 'generated %s\n' "$dkim_key"
+fi
+dkim_pub=$(openssl rsa -in "$dkim_key" -pubout -outform DER | openssl base64 -A)
+published=$(dig +short @ns1.he.net mail._domainkey.kyriakon.net TXT | tr -d '"')
+case "$published" in
+	*"$dkim_pub"*) printf 'zone record matches the on-box key\n' ;;
+	*) printf 'zone record does NOT match. Publish this in\n'
+	   printf 'openbsd/etc/nsd/kyriakon.net.zone (bump the SOA serial), then redeploy nsd:\n\n'
+	   printf '\tmail._domainkey IN TXT "v=DKIM1; k=rsa; p=%s"\n\n' "$dkim_pub" ;;
+esac
+
+# --- 5. components ------------------------------------------------------
+
+say "dovecot plugin"
+( cd "$repo_dir/dovecot-plugin" && make && make install )
+
+say "kyriakon-encrypt"
+( cd "$repo_dir/kyriakon-encrypt" && cargo build --release )
+install -m 0755 "$repo_dir/kyriakon-encrypt/target/release/kyriakon-encrypt" "$encrypt_bin"
+
+say "keyring"
+install -d -m 0755 "$keyring_dir"
+for k in "$repo_dir"/keys/*.asc; do
+	[ -e "$k" ] || continue
+	install -m 0644 "$k" "$keyring_dir/$(basename "$k")"
+	printf 'installed %s\n' "$(basename "$k")"
+done
+
+# --- 6. services --------------------------------------------------------
+
+say "services"
+install -m 0755 "$repo_dir/openbsd/etc/rc.d/kyriakon_encrypt" /etc/rc.d/kyriakon_encrypt
+start_service kyriakon_encrypt
+[ -S /var/run/kyriakon/encrypt.sock ] \
+	|| { printf 'encryptor socket missing; delivery would fail closed\n' >&2; exit 1; }
+
+start_service dovecot
+start_service smtpd
+
+# --- 7. account ---------------------------------------------------------
+
+if id oliver >/dev/null 2>&1; then
+	printf 'account exists: oliver\n'
+else
+	ksh "$repo_dir/scripts/add-user.sh" oliver
+	printf 'set the password with: doas passwd oliver\n'
+fi
+
+# --- 8. verify ----------------------------------------------------------
+
+say "verify"
+for s in dovecot smtpd kyriakon_encrypt httpd; do
+	printf '%-18s %s\n' "$s" "$(rcctl check "$s" 2>&1 || true)"
+done
+printf 'MX:   %s\n' "$(dig +short @ns1.he.net kyriakon.net MX)"
+printf 'mail: %s %s\n' "$(dig +short @ns1.he.net mail.kyriakon.net A)" \
+	"$(dig +short @ns1.he.net mail.kyriakon.net AAAA)"
+printf 'PTR4: %s\n' "$(dig +short -x 95.216.152.17)"
+printf 'PTR6: %s\n' "$(dig +short -x 2a01:4f9:c013:7888::1)"
+
+printf '\nmail stack is up. Remaining manual steps:\n'
+printf '  1. doas passwd oliver, then configure your client:\n'
+printf '     IMAP mail.kyriakon.net:993 (TLS), submission :465 (auth)\n'
+printf '  2. inbound test from an external mailbox, then check the Maildir:\n'
+printf '     ls -t /home/oliver/Maildir/new/* | head -1\n'
+printf '  3. outbound test, then SPF/DKIM/DMARC and inbox placement at a public checker\n'

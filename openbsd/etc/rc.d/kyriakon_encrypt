@@ -1,0 +1,29 @@
+#!/bin/ksh
+#
+# rc.d script for the kyriakon-encrypt daemon: the zero-access save path the
+# Dovecot plugin talks to over /var/run/kyriakon/encrypt.sock.
+#
+# deploy-mail.sh installs this as /etc/rc.d/kyriakon_encrypt. No rc.subr
+# override for pexp is needed: rc_check matches the full command line
+# (`/usr/local/sbin/kyriakon-encrypt serve`), which is exactly what runs.
+
+daemon="/usr/local/sbin/kyriakon-encrypt"
+daemon_flags="serve"
+
+. /etc/rc.d/rc.subr
+
+# serve() is a foreground accept loop and does not daemonize, so rc.subr has to
+# background it or the boot would block here.
+rc_bg=YES
+rc_reload=NO
+
+# The daemon's only diagnostics go to stderr, which rc.subr otherwise discards.
+daemon_logger="daemon.info"
+
+# /var/run is cleared at boot and the daemon creates its gpg home but not the
+# socket's parent directory, so both are recreated before every start.
+rc_pre() {
+	install -d -m 0700 /var/run/kyriakon /var/run/kyriakon/gpg
+}
+
+rc_cmd $1
