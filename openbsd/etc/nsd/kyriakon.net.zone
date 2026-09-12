@@ -8,7 +8,7 @@ $TTL 3600
 ; before deploy.
 
 @	IN	SOA	ns0.kyriakon.net. hostmaster.kyriakon.net. (
-		2026082701	; serial - YYYYMMDDNN, bump on EVERY edit (see note below)
+		2026091201	; serial - YYYYMMDDNN, bump on EVERY edit (see note below)
 		3600		; refresh - HE re-checks at least this often
 		900		; retry
 		1209600		; expire - 14 days: HE keeps serving if the primary dies
@@ -48,9 +48,11 @@ mail	IN	AAAA	2001:db8::10
 @	IN	TXT	"v=spf1 mx -all"
 
 ; DKIM - public half only, at selector "mail". The private key lives on the box
-; at /etc/mail/dkim/private.key and is NEVER in this repo. Replace REPLACE_ME
-; with the real base64 public key (the "p=" value) at go-live.
-mail._domainkey	IN	TXT	"v=DKIM1; k=rsa; p=REPLACE_ME"
+; at /etc/mail/dkim/private.rsa.key (the path smtpd.conf's dkimsign filter
+; reads, owned by _dkimsign, mode 0600) and is NEVER in this repo.
+; deploy-mail.sh prints this base64 value when the on-box key does not match
+; what is published here, which is how it was generated.
+mail._domainkey	IN	TXT	"v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzD06rNwCr6k6jHwH5TTqB1dgnIS2TehRQ88ygp++duHGV7S9TGaxblMeiiCcMe/BOE5KJy6qHUjOM/POB/wLY7i0+nYhlMV5dUW67oGVX68dOFDj63V6uR/SqotPFLVU+uVFzx79LAGm3HogwwmYiAa5RlwsRaYPjS/pyqEEQaVWVa1qMo85Fvwb0JYkjERAxTTJ5IwH9Fe1zqt5qL2jazc6UB2jzb5weWgVm167uvxNkn37FqDl/GHDJATi+hJoq2iLtiSHXru1a4iARZmJCih+2Ak9fA3NF/fI1EfqqS3xU7P4zzdUnOvR+GQ2Qz4L+jRUvUX9yHu/8FIZ09ssywIDAQAB"
 
 ; DMARC - start p=none (monitor only) with aggregate reporting; tighten later.
 _dmarc	IN	TXT	"v=DMARC1; p=none; rua=mailto:dmarc@kyriakon.net"
