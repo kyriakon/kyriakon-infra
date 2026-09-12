@@ -1,38 +1,51 @@
 # Build the kyriakon-encrypt Dovecot plugin.
 #
-# Requires Dovecot development headers (dovecot-config on PATH). On OpenBSD:
-#   pkg_add dovecot        # ships /usr/local/bin/dovecot-config
+# Requires Dovecot's headers, seeded on OpenBSD by the dovecot package:
+#   pkg_add dovecot        # ships include/dovecot/*.h and lib/dovecot/*.so
 #
-#   make                  # produces lib<abi>_kyriakon_encrypt_plugin.so
-#   doas make install     # installs into $(dovecot-config --moduledir)
+#   make                  # produces libkyriakon_encrypt_plugin.so
+#   doas make install     # installs into $(MODULEDIR)
 #
-# Enable in dovecot.conf:
-#   mail_plugins = $mail_plugins kyriakon_encrypt
+# Paths default to the packaged OpenBSD layout and can be overridden:
+#   make INCLUDEDIR=/usr/include/dovecot MODULEDIR=/usr/lib/dovecot
+# deploy-mail.sh sources lib/dovecot/dovecot-config on the box and passes both,
+# so the defaults here only matter for a hand run.
 #
-# and run the kyriakon-encrypt daemon on /var/run/kyriakon/encrypt.sock
-# (see ../kyriakon-encrypt). Compile-verify this on a real OpenBSD host - it
-# is not buildable in CI without Dovecot headers, per docs/planning/specs.
+# The filename deliberately carries no ABI prefix. src/lib/module-dir.c derives
+# the plugin name from the filename as [lib][nn_]name(.so), so
+# lib2.3_kyriakon_encrypt_plugin.so registers as "2.3_kyriakon_encrypt" and the
+# `mail_plugins = kyriakon_encrypt` lookup never matches it. A run of digits
+# followed by "_" is stripped, so a numeric priority prefix would work, but
+# nothing here needs a load order.
+#
+# Plain make syntax only, on purpose: OpenBSD's make is bmake, which has no
+# $(shell) or $(wildcard), and macOS ships GNU make 3.81, which has no !=.
 
-DOVECOT_CONFIG ?= dovecot-config
+INCLUDEDIR ?= /usr/local/include/dovecot
+MODULEDIR ?= /usr/local/lib/dovecot
+
 CC ?= cc
 CFLAGS += -fPIC -Wall -Wextra -O2
-CFLAGS += $(shell $(DOVECOT_CONFIG) --cflags)
+CFLAGS += -I${INCLUDEDIR}
 LDFLAGS += -shared
 
-MODULEDIR ?= $(shell $(DOVECOT_CONFIG) --moduledir)
-ABI ?= $(shell $(DOVECOT_CONFIG) --abiversion)
+PLUGIN = libkyriakon_encrypt_plugin.so
 
-PLUGIN = lib$(ABI)_kyriakon_encrypt_plugin.so
+all: check ${PLUGIN}
 
-all: $(PLUGIN)
+check:
+	@if [ ! -d "${INCLUDEDIR}" ]; then \
+		echo "Dovecot headers not found in ${INCLUDEDIR}: install the dovecot package, or pass INCLUDEDIR="; \
+		exit 1; \
+	fi
 
-$(PLUGIN): kyriakon-encrypt-plugin.c
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+${PLUGIN}: kyriakon-encrypt-plugin.c check
+	${CC} ${CFLAGS} ${LDFLAGS} -o ${PLUGIN} kyriakon-encrypt-plugin.c
 
-install: $(PLUGIN)
-	install -m 0644 $(PLUGIN) $(MODULEDIR)/$(PLUGIN)
+install: check ${PLUGIN}
+	install -m 0644 ${PLUGIN} ${MODULEDIR}/${PLUGIN}
 
 clean:
-	rm -f $(PLUGIN)
+	rm -f ${PLUGIN}
 
-.PHONY: all install clean
+.PHONY: all check install clean
