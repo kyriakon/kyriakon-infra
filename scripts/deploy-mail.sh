@@ -33,6 +33,9 @@ PATH="/usr/local/sbin:/usr/local/bin:$PATH"
 export PATH
 
 queue_key_file=/etc/mail/queue.key
+# smtpd's crypto_setup() requires exactly this many characters (KEY_SIZE in
+# usr.sbin/smtpd/crypto.c) and uses them verbatim as the AES-256 key.
+queue_key_len=32
 dkim_key=/etc/mail/dkim/private.rsa.key
 keyring_dir=/etc/kyriakon/keys
 encrypt_bin=/usr/local/sbin/kyriakon-encrypt
@@ -123,12 +126,23 @@ done
 # --- 3. smtpd + dovecot configs -----------------------------------------
 
 say "configs"
+queue_key=
 if [ -s "$queue_key_file" ]; then
 	queue_key=$(cat "$queue_key_file")
-else
-	queue_key=$(openssl rand -base64 32)
+fi
+if [ "${#queue_key}" -ne "$queue_key_len" ]; then
+	if [ -n "$queue_key" ]; then
+		printf 'warning: %s holds a %s-character key and smtpd requires %s; replacing it. Anything still queued under the old key becomes undecryptable.\n' \
+			"$queue_key_file" "${#queue_key}" "$queue_key_len"
+	fi
+	# 32 hex characters, as smtpd's crypto_setup() comment suggests. base64 of
+	# 32 bytes is 44 characters and is rejected at startup.
+	queue_key=$(openssl rand -hex 16)
 	(umask 077; printf '%s\n' "$queue_key" > "$queue_key_file")
-	printf 'generated queue-encryption key in %s - store it in your password manager.\n' "$queue_key_file"
+	# umask only governs creation, so an existing file could carry looser bits.
+	chmod 0600 "$queue_key_file"
+	printf 'generated the queue-encryption key in %s (%s characters) - store it in your password manager.\n' \
+		"$queue_key_file" "$queue_key_len"
 fi
 
 # '|' delimits the s/// because base64 keys contain '/'. The deployed file
