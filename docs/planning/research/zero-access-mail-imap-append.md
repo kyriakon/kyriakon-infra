@@ -128,6 +128,16 @@ points. Two things must therefore be a single source of truth shared by both pat
    `multipart/encrypted; protocol="application/pgp-encrypted"` with the message
    (headers **and** body) as the encrypted payload.
    [RFC 3156 §4](https://www.rfc-editor.org/rfc/rfc3156)
+
+   The payload packet matters as much as the MIME shape. GnuPG 2.4 and later
+   encrypt with AEAD (OCB, packet tag 20) when the recipient key advertises it,
+   via a `pref-aead-algos` subpacket plus the AEAD feature bit, and no flag on
+   the encrypt side overrides that (`--rfc4880` does not stop it). RNP, which is
+   Thunderbird's OpenPGP, cannot read AEAD, so such mail arrives unreadable. The
+   fix is on the key: `setpref` without OCB clears both adverts and gpg then
+   emits SEIPD (tag 18, AES-256 with MDC). `deploy-mail.sh` warns when a
+   published key still advertises AEAD. The fingerprint is unaffected, so a
+   `setpref` change can be published as a replacement key file.
 2. **Keyring** — the user's public key, from the git-tracked set published in
    `kyriakon-infra` (proposal §5.6), so key substitution stays auditable.
 

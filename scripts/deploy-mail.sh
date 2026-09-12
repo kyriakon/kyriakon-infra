@@ -202,6 +202,17 @@ for k in "$repo_dir"/keys/*.asc; do
 	[ -e "$k" ] || continue
 	install -m 0644 "$k" "$keyring_dir/$(basename "$k")"
 	printf 'installed %s\n' "$(basename "$k")"
+	# gpg picks AEAD (OCB, packet tag 20) when the recipient key advertises it,
+	# and no flag on the encrypt side overrides that: --rfc4880 does not stop it.
+	# RNP, which is Thunderbird's OpenPGP, has no AEAD support, so mail encrypted
+	# that way cannot be read. Dropping OCB from the key's preferences (setpref)
+	# removes both the pref-aead subpacket and the AEAD feature bit, which makes
+	# gpg emit SEIPD (tag 18) instead. Warn here rather than let it surface as
+	# mail the client cannot open.
+	if gpg --list-packets "$k" 2>/dev/null | grep -q 'pref-aead-algos'; then
+		printf 'warning: %s advertises AEAD/OCB, which Thunderbird cannot decrypt.\n' "$(basename "$k")" >&2
+		printf '  fix on the key: gpg --edit-key <fpr> then setpref without OCB (see docs)\n' >&2
+	fi
 done
 
 # --- 6. services --------------------------------------------------------
