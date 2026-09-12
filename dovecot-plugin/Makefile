@@ -26,6 +26,16 @@ MODULEDIR ?= /usr/local/lib/dovecot
 
 CC ?= cc
 CFLAGS += -fPIC -Wall -Wextra -O2
+# Dovecot's lib.h gates its config.h on this define:
+#   #ifdef HAVE_CONFIG_H
+#   #  include "config.h"
+#   #endif
+# Without it none of the SIZEOF_*, UOFF_T_* or STATIC_ARRAY defines exist, and
+# the headers fail against the system's stdint.h with "uoff_t size not set",
+# "typedef redefinition" and the rest. The dovecot package installs
+# include/dovecot/config.h, and the quoted include finds it beside lib.h, so no
+# extra -I is needed.
+CFLAGS += -DHAVE_CONFIG_H
 CFLAGS += -I${INCLUDEDIR}
 LDFLAGS += -shared
 
