@@ -83,12 +83,18 @@ need_pkg opensmtpd-filter-dkimsign
 command -v cargo >/dev/null || { printf 'cargo missing after pkg_add rust\n' >&2; exit 1; }
 command -v gpg >/dev/null || { printf 'gpg missing after pkg_add gnupg\n' >&2; exit 1; }
 
-# dovecot-config lives in the library directory on OpenBSD, not on PATH.
-dovecot_config=/usr/local/lib/dovecot/dovecot-config
-[ -x "$dovecot_config" ] || dovecot_config=$(command -v dovecot-config || true)
-[ -n "$dovecot_config" ] \
-	|| { printf 'dovecot-config not found; is the dovecot package installed?\n' >&2; exit 1; }
-printf 'dovecot-config: %s (abi %s)\n' "$dovecot_config" "$("$dovecot_config" --abiversion)"
+# The headers are the real prerequisite for the plugin build. There is nothing
+# to run: OpenBSD ships dovecot-config as a 0644 shell variable file rather than
+# an executable, so just report what it says.
+[ -d /usr/local/include/dovecot ] \
+	|| { printf 'dovecot headers missing (/usr/local/include/dovecot); is the dovecot package installed?\n' >&2; exit 1; }
+if [ -r /usr/local/lib/dovecot/dovecot-config ]; then
+	# shellcheck source=/dev/null
+	. /usr/local/lib/dovecot/dovecot-config
+	# shellcheck disable=SC2154  # both names come from the sourced file
+	printf 'dovecot: include %s, modules %s\n' "$dovecot_pkgincludedir" "$dovecot_moduledir"
+fi
+command -v dovecot >/dev/null || { printf 'dovecot binary not found on PATH\n' >&2; exit 1; }
 
 # --- 2. TLS --------------------------------------------------------------
 
@@ -158,9 +164,8 @@ esac
 # --- 5. components ------------------------------------------------------
 
 say "dovecot plugin"
-( cd "$repo_dir/dovecot-plugin" \
-	&& make DOVECOT_CONFIG="$dovecot_config" \
-	&& make DOVECOT_CONFIG="$dovecot_config" install )
+# The Makefile sources dovecot-config for the include and module directories.
+( cd "$repo_dir/dovecot-plugin" && make && make install )
 
 say "kyriakon-encrypt"
 ( cd "$repo_dir/kyriakon-encrypt" && cargo build --release )
