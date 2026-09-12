@@ -88,9 +88,11 @@ if grep -Eq 'REPLACE_ME|NOKEY' "$conf_dst"; then
 	exit 1
 fi
 
-# Syntax-check (must print nothing). nsd-checkconf validates the key block:
-# algorithm, secret base64, and that every provide-xfr references a defined key.
+# Syntax-check both, and check the *zone* rather than only the config:
+# nsd-checkconf validates nsd.conf, while a zone parse error leaves nsd running
+# and serving nothing for that domain, which looks like a silent outage.
 nsd-checkconf "$conf_dst"
+nsd-checkzone kyriakon.net "$zone_dst"
 
 # Any nsd left over from a config without remote-control cannot be signalled
 # through nsd-control, and a second nsd would fail to bind port 53. Clear it by

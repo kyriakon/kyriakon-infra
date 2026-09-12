@@ -52,7 +52,14 @@ mail	IN	AAAA	2001:db8::10
 ; reads, owned by _dkimsign, mode 0600) and is NEVER in this repo.
 ; deploy-mail.sh prints this base64 value when the on-box key does not match
 ; what is published here, which is how it was generated.
-mail._domainkey	IN	TXT	"v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzD06rNwCr6k6jHwH5TTqB1dgnIS2TehRQ88ygp++duHGV7S9TGaxblMeiiCcMe/BOE5KJy6qHUjOM/POB/wLY7i0+nYhlMV5dUW67oGVX68dOFDj63V6uR/SqotPFLVU+uVFzx79LAGm3HogwwmYiAa5RlwsRaYPjS/pyqEEQaVWVa1qMo85Fvwb0JYkjERAxTTJ5IwH9Fe1zqt5qL2jazc6UB2jzb5weWgVm167uvxNkn37FqDl/GHDJATi+hJoq2iLtiSHXru1a4iARZmJCih+2Ak9fA3NF/fI1EfqqS3xU7P4zzdUnOvR+GQ2Qz4L+jRUvUX9yHu/8FIZ09ssywIDAQAB"
+;
+; The value is 410 bytes, and a TXT character-string caps at 255, so the record
+; is written as two adjacent quoted strings. Resolvers concatenate them into the
+; single string DKIM expects. Publishing it as one quoted string makes the zone
+; unparseable, and nsd then serves nothing at all for the domain rather than
+; complaining.
+mail._domainkey	IN	TXT	( "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzD06rNwCr6k6jHwH5TTqB1dgnIS2TehRQ88ygp++duHGV7S9TGaxblMeiiCcMe/BOE5KJy6qHUjOM/POB/wLY7i0+nYhlMV5dUW67oGVX68dOFDj63V6uR/SqotPFLVU+uVFzx79LAGm3HogwwmYiAa5RlwsRaYPjS/pyqEEQaVWVa1qMo85Fvwb0JYkjERAx"
+				"TTJ5IwH9Fe1zqt5qL2jazc6UB2jzb5weWgVm167uvxNkn37FqDl/GHDJATi+hJoq2iLtiSHXru1a4iARZmJCih+2Ak9fA3NF/fI1EfqqS3xU7P4zzdUnOvR+GQ2Qz4L+jRUvUX9yHu/8FIZ09ssywIDAQAB" )
 
 ; DMARC - start p=none (monitor only) with aggregate reporting; tighten later.
 _dmarc	IN	TXT	"v=DMARC1; p=none; rua=mailto:dmarc@kyriakon.net"
