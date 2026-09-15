@@ -156,6 +156,19 @@ points. Two things must therefore be a single source of truth shared by both pat
 2. **Keyring** — the user's public key, from the git-tracked set published in
    `kyriakon-infra` (proposal §5.6), so key substitution stays auditable.
 
+   The published key is certify and encrypt only (`caps=ecEC`) with no subkeys,
+   which is everything the box needs because it only ever encrypts to it. One
+   consequence worth knowing: Thunderbird will not offer it as an account's
+   personal key. Its lookup for a personal key by address
+   (`getAllSecretKeysByEmail` in
+   `mail/extensions/openpgp/content/modules/keyRing.sys.mjs`) requires the key
+   to be valid for signing as well as encryption, so a key that cannot sign is
+   never accepted, however often it is imported or marked as personal in Key
+   Properties. Reading delivery does not depend on that setting, and the
+   account's key selection is what governs signing and encrypting outgoing
+   mail. Signing outbound mail with this key would mean adding a signing
+   subkey.
+
 Because the save-path plugin is the single place where *both* LMTP delivery and
 IMAP APPEND land, the cleanest shape is to make **the Dovecot plugin the one and
 only encryption point** and let SMTP stay plaintext across the local LMTP hop.
