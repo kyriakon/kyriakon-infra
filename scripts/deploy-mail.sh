@@ -255,11 +255,22 @@ if [ "$shell" = /sbin/nologin ]; then
 fi
 
 # add-user.sh creates these for standard accounts; an account made by hand may
-# not have them, and Dovecot's maildir:~/Maildir needs them.
-for d in cur new tmp; do
-	install -d -m 0700 -o oliver -g oliver "$home/Maildir/$d"
+# not have them, and Dovecot's maildir:~/Maildir needs them. The root of the
+# Maildir is in the list too, because Dovecot creates dovecot-uidlist and its
+# index files there, not only in the subdirectories. install -d creates missing
+# parents itself and leaves the owner of a directory it did not create alone, so
+# a Maildir root left behind by an earlier run stays root-owned, every service
+# still reports healthy, and then each IMAP session fails with
+# "file_dotlock_create ... Permission denied". Hence the explicit chown and the
+# ownership check below.
+for d in "$home/Maildir" "$home/Maildir/cur" "$home/Maildir/new" "$home/Maildir/tmp"; do
+	install -d -m 0700 -o oliver -g oliver "$d"
+	chown oliver:oliver "$d"
 done
-printf 'Maildir: %s/Maildir (shell %s)\n' "$home" "$shell"
+
+owner=$(stat -f '%Su' "$home/Maildir")
+[ "$owner" = oliver ] || { printf 'Maildir root is owned by %s, not oliver; Dovecot cannot open INBOX\n' "$owner" >&2; exit 1; }
+printf 'Maildir: %s/Maildir (owner %s, shell %s)\n' "$home" "$owner" "$shell"
 
 # --- 8. verify ----------------------------------------------------------
 

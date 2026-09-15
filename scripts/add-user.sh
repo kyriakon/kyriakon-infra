@@ -44,8 +44,18 @@ fi
 home="/home/$user"
 useradd -m -d "$home" -s /sbin/nologin -g =uid "$user"
 
-install -d -m 0700 -o "$user" -g "$user" \
-	"$home/Maildir/cur" "$home/Maildir/new" "$home/Maildir/tmp"
+# The Maildir root as well as its subdirectories. Dovecot creates
+# dovecot-uidlist and its index files in the root, and install -d creates
+# missing parents itself, which would leave a root-owned root behind: the
+# account then authenticates, every service reports healthy, and each IMAP
+# session fails with "file_dotlock_create ... Permission denied".
+for d in "$home/Maildir" "$home/Maildir/cur" "$home/Maildir/new" "$home/Maildir/tmp"; do
+	install -d -m 0700 -o "$user" -g "$user" "$d"
+	chown "$user:$user" "$d"
+done
+
+owner=$(stat -f '%Su' "$home/Maildir")
+[ "$owner" = "$user" ] || { printf 'Maildir root owned by %s, not %s\n' "$owner" "$user" >&2; exit 1; }
 
 printf 'created %s (shell /sbin/nologin, Maildir %s/Maildir)\n' "$user" "$home"
 printf 'next: set password (doas passwd %s) and sync %s.asc into the keyring\n' \
