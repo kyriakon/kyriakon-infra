@@ -13,7 +13,8 @@
 # Idempotent. Re-running reinstalls the configs, rebuilds the two components,
 # and restarts what is already running. It:
 #   1. installs the packages the build and the daemons need
-#   2. installs httpd.conf + acme-client.conf and issues the mail certificate
+#   2. installs httpd.conf + acme-client.conf and issues the mail and site
+#      certificates
 #   3. installs smtpd.conf (with the queue key) and dovecot.conf
 #   4. generates the DKIM key if absent and checks the published record
 #   5. builds and installs the Dovecot plugin and the kyriakon-encrypt daemon
@@ -112,24 +113,42 @@ printf 'dovecot: include %s, modules %s\n' "$dovecot_include_dir" "$dovecot_modu
 say "TLS"
 install -d -m 0755 /var/www/acme
 install -d -m 0700 /etc/acme
+# Document root for the landing site. httpd serves it read-only; the content
+# itself comes from a kyriakon-site checkout (see the tail of this script).
+install -d -m 0755 /var/www/kyriakon.net
 install -m 0644 "$repo_dir/openbsd/etc/httpd.conf" /etc/httpd.conf
 install -m 0644 "$repo_dir/openbsd/etc/acme-client.conf" /etc/acme-client.conf
 httpd -n -f /etc/httpd.conf
 start_service httpd
 
 # acme-client exits 0 on change, 2 when the certificate is already current.
+# The mail certificate is fatal: smtpd and Dovecot do not start without it.
 acme_rc=0
 acme-client -v mail.kyriakon.net || acme_rc=$?
 case "$acme_rc" in
-	0) printf 'certificate issued or renewed\n' ;;
-	2) printf 'certificate already current\n' ;;
-	*) printf 'acme-client failed (exit %s); is port 80 reachable and\n' "$acme_rc" >&2
-	   printf 'the challenge directory served? see /var/www/acme\n' >&2
+	0) printf 'mail certificate issued or renewed\n' ;;
+	2) printf 'mail certificate already current\n' ;;
+	*) printf 'acme-client failed for mail.kyriakon.net (exit %s); is port 80\n' "$acme_rc" >&2
+	   printf 'reachable and the challenge directory served? see /var/www/acme\n' >&2
 	   exit 1 ;;
 esac
 for f in /etc/ssl/mail.kyriakon.net.fullchain.pem /etc/ssl/private/mail.kyriakon.net.key; do
 	[ -s "$f" ] || { printf 'missing certificate file: %s\n' "$f" >&2; exit 1; }
 done
+
+# The landing site's certificate is issued here because this script is what
+# installs httpd.conf, and the site's vhosts reference it. A failure warns
+# instead of exiting: the mail stack does not depend on the site, and a broken
+# challenge should not stop a mail deploy. Issue #55 covers serving it over TLS.
+acme_rc=0
+acme-client -v kyriakon.net || acme_rc=$?
+case "$acme_rc" in
+	0) printf 'site certificate issued or renewed\n' ;;
+	2) printf 'site certificate already current\n' ;;
+	*) printf 'warning: acme-client failed for kyriakon.net (exit %s); the landing\n' "$acme_rc" >&2
+	   printf '  site has no certificate until that succeeds. Check that the\n' >&2
+	   printf '  kyriakon.net and www.kyriakon.net vhosts serve the challenge.\n' >&2 ;;
+esac
 
 # --- 3. smtpd + dovecot configs -----------------------------------------
 
@@ -290,3 +309,6 @@ printf '     IMAP mail.kyriakon.net:993 (TLS), submission :465 (auth)\n'
 printf '  2. inbound test from an external mailbox, then check the Maildir:\n'
 printf '     ls -t /home/oliver/Maildir/new/* | head -1\n'
 printf '  3. outbound test, then SPF/DKIM/DMARC and inbox placement at a public checker\n'
+printf '  4. landing site: deploy the kyriakon-site checkout into\n'
+printf '     /var/www/kyriakon.net (git clone once, git pull to update), and open\n'
+printf '     443 in pf.conf for the TLS vhost (propose-only, issue #55)\n'
