@@ -7,11 +7,18 @@
 #
 # Why: gpg 2.4+ encrypts with AEAD (packet tag 20) whenever the recipient key
 # advertises a pref-aead subpacket, and nothing on the encrypt side overrides
-# that — not even --rfc4880. RNP, which is Thunderbird's OpenPGP, has no AEAD
-# support, so mail encrypted that way arrives unreadable. Re-signing the
-# self-signature with setpref drops both the pref-aead subpacket and the AEAD
-# feature bit (features 07 -> 05), after which gpg emits SEIPD (tag 18, AES with
-# MDC) instead.
+# that, not even --rfc4880. That leaves delivery depending on the reader's AEAD
+# support, where SEIPD (tag 18) is read everywhere, and Thunderbird's feature
+# check (MDC alone) reports such a key as advertising an unsupported feature.
+# Re-signing the self-signature with setpref drops both the pref-aead subpacket
+# and the AEAD feature bit (features 07 -> 05), after which gpg emits SEIPD
+# (tag 18, AES with MDC) instead.
+#
+# What this does not fix: GnuPG 2.5 writes the v5 public key feature bit (0x04)
+# into every self-signature (add_feature_v5 in g10/keygen.c) and no gpg option
+# removes it, so the features octet lands at 05, not 01, and Thunderbird still
+# reports the key as advertising a feature it does not implement. That warning
+# is about key format, not about reading mail.
 #
 # This is a replacement, not a rotation: setpref leaves the fingerprint alone,
 # so the published file is rewritten in place and no key material on the box
