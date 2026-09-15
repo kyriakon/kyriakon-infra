@@ -231,12 +231,23 @@ if [ ! -s "$dkim_key" ]; then
 	printf 'generated %s\n' "$dkim_key"
 fi
 dkim_pub=$(openssl rsa -in "$dkim_key" -pubout -outform DER | openssl base64 -A)
-published=$(dig +short @ns1.he.net mail._domainkey.kyriakon.net TXT | tr -d '"')
+# A TXT value over 255 bytes is served as adjacent character-strings, and dig
+# prints one space between them once the quoting is stripped, while the base64
+# from openssl contains no spaces. Drop the whitespace before comparing, or a
+# correct record reads as a mismatch on every run, which is exactly what
+# happened the first time this record was published.
+published=$(dig +short @ns1.he.net mail._domainkey.kyriakon.net TXT | tr -d '"' | tr -d '[:space:]')
 case "$published" in
 	*"$dkim_pub"*) printf 'zone record matches the on-box key\n' ;;
 	*) printf 'zone record does NOT match. Publish this in\n'
 	   printf 'openbsd/etc/nsd/kyriakon.net.zone (bump the SOA serial), then redeploy nsd:\n\n'
-	   printf '\tmail._domainkey IN TXT "v=DKIM1; k=rsa; p=%s"\n\n' "$dkim_pub" ;;
+	   # split at 255 bytes including the "v=DKIM1; k=rsa; p=" prefix, because
+	   # nsd rejects a single longer character-string and stops serving the
+	   # zone entirely rather than complaining
+	   printf '\tmail._domainkey\tIN\tTXT\t( "v=DKIM1; k=rsa; p=%s"\n' \
+		   "$(printf '%s' "$dkim_pub" | cut -c1-$((255 - 18)))"
+	   printf '\t\t\t\t"%s" )\n\n' "$(printf '%s' "$dkim_pub" | cut -c$((255 - 18 + 1))-)"
+	   ;;
 esac
 
 # --- 5. components ------------------------------------------------------
