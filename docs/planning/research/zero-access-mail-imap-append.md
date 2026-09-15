@@ -153,6 +153,18 @@ points. Two things must therefore be a single source of truth shared by both pat
    option removes it, so that warning survives the AEAD change; it concerns key
    format, not reading mail. And the reader needs the secret key: without it,
    delivery is unreadable whatever the packet shape.
+
+   Which headers a client can display depends on which side of the encryption
+   they sit, and those two sets are not the same. The wrapper keeps the envelope
+   metadata the store cannot hide anyway (From, To, Cc, Reply-To, Date,
+   Message-ID) plus a `Subject: ...` placeholder, because that is where a client
+   reads the sender and the date. The payload is the whole message with
+   `protected-headers="v1"` added to its Content-Type, the Protected Headers
+   convention (draft-autocrypt-lamps-protected-headers) that Thunderbird and K-9
+   read after decrypting to replace the placeholder with the real Subject. Both
+   halves are needed: Thunderbird recovers only the subject from the payload
+   (`extractProtectedHeaders` in `mime.sys.mjs`), so a wrapper with no headers at
+   all leaves every message showing an empty sender and an empty subject.
 2. **Keyring** — the user's public key, from the git-tracked set published in
    `kyriakon-infra` (proposal §5.6), so key substitution stays auditable.
 
