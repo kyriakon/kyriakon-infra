@@ -21,9 +21,14 @@ rc_reload=NO
 daemon_logger="daemon.info"
 
 # /var/run is cleared at boot and the daemon creates its gpg home but not the
-# socket's parent directory, so both are recreated before every start.
+# socket's parent directory, so both are recreated before every start. The two
+# modes differ on purpose: the socket sits directly in /var/run/kyriakon and
+# Dovecot's save path connects to it as the mailbox user, so that directory has
+# to be traversable, while the gpg scratch home stays 0700 because only the
+# daemon (root) uses it.
 rc_pre() {
-	install -d -m 0700 /var/run/kyriakon /var/run/kyriakon/gpg
+	install -d -m 0755 /var/run/kyriakon
+	install -d -m 0700 /var/run/kyriakon/gpg
 }
 
 rc_cmd $1

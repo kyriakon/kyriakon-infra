@@ -196,6 +196,15 @@ pub fn serve(socket: &Path, keyring: &Path, gpg_home: &Path) -> Result<(), Error
     // fail on it, and a live daemon would make bind fail anyway.
     let _ = std::fs::remove_file(socket);
     let listener = UnixListener::bind(socket)?;
+
+    // Dovecot's save path runs as the mailbox user, not as root, so a socket
+    // only root can write to fails closed on every delivery. Set the mode here
+    // rather than rely on umask, which rc.subr does not control. Any local
+    // account can then ask for encryption, which exposes nothing: the keyring
+    // it encrypts to is world-readable (/etc/kyriakon/keys/*.asc, 0644).
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
+
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
