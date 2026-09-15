@@ -15,7 +15,8 @@
 #   1. installs the packages the build and the daemons need
 #   2. installs httpd.conf + acme-client.conf and issues the mail and site
 #      certificates
-#   3. installs smtpd.conf (with the queue key) and dovecot.conf
+#   3. installs smtpd.conf (with the queue key), dovecot.conf and the mail
+#      aliases the domain has to answer for
 #   4. generates the DKIM key if absent and checks the published record
 #   5. builds and installs the Dovecot plugin and the kyriakon-encrypt daemon
 #   6. syncs the published keyring, starts every service, creates oliver
@@ -182,6 +183,42 @@ smtpd -n -f /etc/mail/smtpd.conf
 
 install -m 0644 "$repo_dir/openbsd/dovecot/dovecot.conf" /etc/dovecot/dovecot.conf
 doveconf -n >/dev/null
+
+# Addresses the domain has to answer for. RFC 2142 requires every mail domain
+# to accept postmaster@ and abuse@; docs/aup.md sends abuse reports to
+# abuse@kyriakon.net; the DMARC record points aggregate reports at
+# dmarc@kyriakon.net. On a fresh box none of them land anywhere useful: abuse
+# and dmarc have no entry at all, and postmaster resolves to root, whose
+# mailbox nobody reads. Delivering them to the operator account means they
+# arrive in a mailbox that is read, encrypted at rest like any other delivery.
+#
+# OpenBSD has no alias database and no newaliases, so smtpd reads this file
+# directly and picks up the edit when the service step reloads it below.
+# Rewritten rather than edited in place with sed -i: that flag takes its suffix
+# differently on BSD and GNU sed, and this way the same code can be exercised
+# off the box.
+aliases=/etc/mail/aliases
+aliases_tmp=$(mktemp "$aliases.XXXXXX")
+trap 'rm -f "$aliases_tmp"' EXIT
+# make sure an append starts on a line of its own
+[ -n "$(tail -c 1 "$aliases")" ] && printf '\n' >> "$aliases"
+for entry in "root: oliver" "postmaster: oliver" "abuse: oliver" "dmarc: oliver"; do
+	alias_name=${entry%%:*}
+	if grep -q "^${alias_name}:" "$aliases"; then
+		sed "s|^${alias_name}:.*|${entry}|" "$aliases" > "$aliases_tmp"
+		# copied over the original rather than moved into place, so the file
+		# keeps the ownership and mode the base system gave it
+		cat "$aliases_tmp" > "$aliases"
+		printf 'alias %s set\n' "$alias_name"
+	else
+		printf '%s\n' "$entry" >> "$aliases"
+		printf 'alias %s added\n' "$alias_name"
+	fi
+done
+for alias_name in root postmaster abuse dmarc; do
+	grep -q "^${alias_name}: oliver" "$aliases" \
+		|| { printf 'alias %s did not land in %s\n' "$alias_name" "$aliases" >&2; exit 1; }
+done
 
 # --- 4. DKIM -------------------------------------------------------------
 
