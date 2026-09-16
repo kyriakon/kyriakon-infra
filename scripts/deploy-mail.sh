@@ -17,7 +17,8 @@
 #      certificates
 #   3. installs smtpd.conf (with the queue key), dovecot.conf and the mail
 #      aliases the domain has to answer for
-#   4. generates the DKIM key if absent and checks the published record
+#   4. generates the DKIM key if absent, and checks the published DKIM and SPF
+#      records
 #   5. builds and installs the Dovecot plugin and the kyriakon-encrypt daemon
 #   6. syncs the published keyring, starts every service, creates oliver
 #
@@ -248,6 +249,24 @@ case "$published" in
 		   "$(printf '%s' "$dkim_pub" | cut -c1-$((255 - 18)))"
 	   printf '\t\t\t\t"%s" )\n\n' "$(printf '%s' "$dkim_pub" | cut -c$((255 - 18 + 1))-)"
 	   ;;
+esac
+
+say "SPF"
+# The mail host is a sending identity of its own. Cron output, the daily
+# security(8) mail and smtpd's own bounces leave here with mail.kyriakon.net as
+# both their envelope and From domain, so SPF is checked against that name and
+# not the apex. A missing record there returns "none" and gives those messages
+# no SPF pass at all: Google's aggregate reports showed spf=fail on every row
+# from this box, with DKIM the only thing carrying them.
+mail_spf="v=spf1 a -all"
+published_spf=$(dig +short @ns1.he.net mail.kyriakon.net TXT | tr -d '"')
+case "$published_spf" in
+	*"$mail_spf"*) printf 'mail SPF record published: %s\n' "$published_spf" ;;
+	*) printf 'mail SPF record missing or different (want "%s", got "%s").\n' \
+		   "$mail_spf" "$published_spf"
+	   printf 'Publish it in openbsd/etc/nsd/kyriakon.net.zone (bump the SOA\n'
+	   printf 'serial), then redeploy nsd:\n\n'
+	   printf '\tmail\tIN\tTXT\t"%s"\n\n' "$mail_spf" ;;
 esac
 
 # --- 5. components ------------------------------------------------------

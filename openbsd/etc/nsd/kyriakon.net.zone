@@ -8,7 +8,7 @@ $TTL 3600
 ; before deploy.
 
 @	IN	SOA	ns0.kyriakon.net. hostmaster.kyriakon.net. (
-		2026091201	; serial - YYYYMMDDNN, bump on EVERY edit (see note below)
+		2026091601	; serial - YYYYMMDDNN, bump on EVERY edit (see note below)
 		3600		; refresh - HE re-checks at least this often
 		900		; retry
 		1209600		; expire - 14 days: HE keeps serving if the primary dies
@@ -46,6 +46,18 @@ mail	IN	AAAA	2001:db8::10
 ; SPF - the box is the only sender. "mx" authorizes the MX host; "-all"
 ; hard-fails everything else.
 @	IN	TXT	"v=spf1 mx -all"
+
+; SPF for the mail host itself. The host sends mail as its own hostname: cron
+; output, the daily security(8) mail, and smtpd's bounces from MAILER-DAEMON
+; all carry mail.kyriakon.net as both the envelope and the From domain, so SPF
+; is evaluated against this name rather than the apex. With no record here the
+; check returns "none", that message gets no SPF pass, and DMARC then rests on
+; DKIM alone. Google's aggregate report for 2026-09-15 showed exactly that:
+; spf=fail on every row from this box, accepted on the DKIM signature.
+;
+; The mechanism is "a", not "mx". This name has no MX record of its own, so an
+; mx lookup would match nothing and authorize nobody.
+mail	IN	TXT	"v=spf1 a -all"
 
 ; DKIM - public half only, at selector "mail". The private key lives on the box
 ; at /etc/mail/dkim/private.rsa.key (the path smtpd.conf's dkimsign filter

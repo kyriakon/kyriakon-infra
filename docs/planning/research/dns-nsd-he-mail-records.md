@@ -159,6 +159,7 @@ HE free secondary is DNS-only redundancy: it keeps answering from the last trans
 | MX | `@` | MX | `10 mail.kyriakon.net.` | Mail routing; `10` = preference (lower wins). Single MX — no secondary in MVP ([RFC 5321 §5.1](https://www.rfc-editor.org/rfc/rfc5321)). |
 | A / AAAA | `mail` | A/AAAA | box IPv4 / IPv6 | The MX target must resolve. |
 | SPF | `@` | TXT | `v=spf1 mx -all` | Authorizes the MX host as the only sender; `-all` hard-fails all else ([RFC 7208 §4](https://www.rfc-editor.org/rfc/rfc7208)). |
+| SPF | `mail` | TXT | `v=spf1 a -all` | The mail host sends as its own name: cron output, the daily `security(8)` mail and `MAILER-DAEMON` bounces all carry `mail.kyriakon.net` as their envelope and From domain, so SPF is evaluated against this name. `a` rather than `mx`, because this name has no MX of its own. Without it those messages get `spf=none` and DMARC depends on DKIM alone. |
 | DKIM | `mail._domainkey` | TXT | `v=DKIM1; k=rsa; p=<base64>` | Public key at `<selector>._domainkey.<domain>` ([RFC 6376 §3.6.1](https://www.rfc-editor.org/rfc/rfc6376)). |
 | DMARC | `_dmarc` | TXT | `v=DMARC1; p=none; rua=mailto:dmarc@kyriakon.net` | `p=none` (monitor only) + aggregate reporting, per §6.2 ([RFC 7489 §6.3](https://www.rfc-editor.org/rfc/rfc7489)). |
 | Wildcard | `*` | A/AAAA | box IPv4 / IPv6 | Per-user subdomains (§5.2). |

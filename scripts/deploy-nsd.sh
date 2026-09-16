@@ -61,7 +61,11 @@ esac
 printf '%s' "$secret" | grep -Eq '^[A-Za-z0-9+/=]+$' \
 	|| { printf 'tsig-secret is not clean base64\n' >&2; exit 1; }
 
-install -d -m 0755 /var/nsd/etc
+# 0750 root:_nsd, as /etc/mtree/special declares for this path. A bare
+# `install -d` gives 0755 root:wheel, and the daily security(8) mail reports the
+# difference. The group is part of the fix: nsd runs as _nsd inside the /var/nsd
+# chroot, so it has to be able to read its own etc directory.
+install -d -m 0750 -o root -g _nsd /var/nsd/etc
 
 # Zone: substitute the RFC 5737/3849 documentation placeholders with the real
 # IPs (appear in five records each: ns0, apex, mail, wildcard).
