@@ -23,6 +23,13 @@ resource "hcloud_server" "mail" {
     ignore_changes = [image]
   }
 
+  # Both default to false in the provider. Declaring them is what stops a later
+  # apply, which sees the defaults as the desired state, from quietly removing
+  # protection from the only copy of the mail. Rebuild protection matters for the
+  # same reason as delete: a rebuild replaces the root disk with an image.
+  delete_protection  = true
+  rebuild_protection = true
+
   public_net {
     ipv4_enabled = true
     ipv6_enabled = true
