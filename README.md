@@ -27,7 +27,7 @@ Built on OpenBSD via Hetzner + Terraform.
 
 ```
 terraform/              hcloud provider - provisions the VPS
-openbsd/etc/            pf.conf, httpd.conf, smtpd.conf, sshd_config
+openbsd/etc/            httpd.conf, smtpd.conf, acme-client.conf, newsyslog.conf
 openbsd/dovecot/        Dovecot config
 scripts/                provisioning, add/del user, backup, abuse monitoring
 docs/                   threat-model, AUP; planning under docs/planning/
