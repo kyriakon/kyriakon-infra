@@ -13,6 +13,16 @@ resource "hcloud_server" "mail" {
   location    = var.location
   image       = data.hcloud_image.openbsd.id
 
+  # The live box must never be rebuilt from whatever the selector currently
+  # resolves to. `image` is ForceNew in the provider, so a change to the data
+  # source is not an in-place update: it is destroy and recreate, and the server
+  # it would destroy is the only copy of the mail. The selector moves on its own
+  # as snapshots are taken and relabelled, and the existing server's image is a
+  # historical fact about when it was built, not a setting to keep in sync.
+  lifecycle {
+    ignore_changes = [image]
+  }
+
   public_net {
     ipv4_enabled = true
     ipv6_enabled = true

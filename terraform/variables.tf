@@ -16,7 +16,7 @@ variable "location" {
 }
 
 variable "snapshot_selector" {
-  description = "Label selector matching the OpenBSD snapshot, set at `hcloud server create-image --label ...` time. Snapshots have no name; the selector is the stable handle across re-snapshots."
+  description = "Label selector matching the OpenBSD snapshot, set at `hcloud server create-image --label ...` time. Snapshots have no name; the selector is the stable handle across re-snapshots. Convention: only images meant for provisioning carry this label (`kind=gold`), while point-in-time copies of the live box are labelled `kind=dr` so they can never be picked up here."
   type        = string
-  default     = "os=openbsd"
+  default     = "kind=gold"
 }
