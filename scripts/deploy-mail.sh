@@ -331,6 +331,13 @@ else
 	printf 'set the password with: doas passwd oliver\n'
 fi
 
+# Where the operator's cron scripts live. The crontab lines in backup.sh,
+# abuse-monitor.sh, restore-test.sh and renew-acme.sh all call /root/bin/<script>,
+# and nothing else creates the directory, so a fresh box fails on the first
+# install with "install: /root/bin/INS@...: No such file or directory".
+# 0755 inside /root, which is already 0700 root.
+install -d -m 0755 /root/bin
+
 home=$(awk -F: '$1 == "oliver" { print $6 }' /etc/passwd)
 [ -n "$home" ] || { printf 'cannot read the home directory for oliver from /etc/passwd\n' >&2; exit 1; }
 shell=$(awk -F: '$1 == "oliver" { print $7 }' /etc/passwd)
