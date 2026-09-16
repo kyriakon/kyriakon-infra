@@ -1,6 +1,9 @@
 #!/bin/ksh
 # deploy-nsd.sh — install the kyriakon.net zone + nsd.conf on the box, start
-# nsd, and verify it answers locally.
+# nsd, and verify it answers locally. Also installs /etc/hostname.vio0, since
+# this script is what publishes the box's IPv6 address in DNS and Hetzner does
+# not send router advertisements, so an unconfigured interface would answer no
+# AAAA at all.
 #
 # Runs ON the box as root (invoke under doas). It does NOT touch pf.conf — the
 # inbound TCP/53 rule is the propose-only half of #24 and stays a manual, human
@@ -24,7 +27,8 @@
 #                   value is never echoed and lands only in
 #                   /var/nsd/etc/nsd.conf (chmod 0640, root).
 #   src_dir         dir containing kyriakon.net.zone and nsd.conf; defaults to
-#                   this script's directory.
+#                   this script's directory. hostname.vio0 is read from
+#                   src_dir/.. , which is openbsd/etc/ in the repo layout.
 
 set -euo pipefail
 
@@ -43,9 +47,13 @@ zone_src="$src_dir/kyriakon.net.zone"
 conf_src="$src_dir/nsd.conf"
 zone_dst=/var/nsd/etc/kyriakon.net.zone
 conf_dst=/var/nsd/etc/nsd.conf
+# hostname.vio0 lives in openbsd/etc/, one level up from openbsd/etc/nsd/.
+iface_src="$src_dir/../hostname.vio0"
+iface_dst=/etc/hostname.vio0
 
 [ -r "$zone_src" ] || { printf 'zone not found: %s\n' "$zone_src" >&2; exit 1; }
 [ -r "$conf_src" ] || { printf 'nsd.conf not found: %s\n' "$conf_src" >&2; exit 1; }
+[ -r "$iface_src" ] || { printf 'hostname.vio0 not found: %s\n' "$iface_src" >&2; exit 1; }
 
 # Trust-boundary guards — refuse obviously-wrong inputs, never serve a bogus
 # zone or leak a malformed secret into a live config. Loose on purpose.
@@ -71,6 +79,13 @@ install -d -m 0750 -o root -g _nsd /var/nsd/etc
 # IPs (appear in five records each: ns0, apex, mail, wildcard).
 sed -e "s/203\.0\.113\.10/$ipv4/g" -e "s/2001:db8::10/$ipv6/g" "$zone_src" > "$zone_dst"
 
+# Interface config: the same documentation IPv6 placeholder, so the address the
+# zone advertises is the address the box holds. Nothing else sets this up, and
+# Hetzner sends no router advertisement, so without this file the box serves an
+# AAAA it cannot answer.
+sed -e "s/2001:db8::10/$ipv6/g" "$iface_src" > "$iface_dst"
+chmod 0644 "$iface_dst"
+
 # nsd.conf: substitute the TSIG secret. '|' delimits the s/// because base64
 # secrets routinely contain '/', which would end a '/'-delimited expression
 # mid-secret. The secret is written only into the deployed file, never stdout.
@@ -90,6 +105,23 @@ fi
 if grep -Eq 'REPLACE_ME|NOKEY' "$conf_dst"; then
 	printf 'nsd.conf still contains a placeholder (REPLACE_ME / NOKEY)\n' >&2
 	exit 1
+fi
+if grep -Eq '2001:db8' "$iface_dst"; then
+	printf 'hostname.vio0 still contains the documentation placeholder\n' >&2
+	exit 1
+fi
+
+# Put the address on the interface now, if it is not already there. Services
+# bind interface addresses at startup, so anything started before this would
+# come up without it and the box would publish an AAAA nothing answers. Adding
+# an address does not disturb the interface or drop the session running this.
+if ifconfig vio0 | grep -q "$ipv6"; then
+	printf 'vio0 already holds %s\n' "$ipv6"
+else
+	printf 'adding %s to vio0\n' "$ipv6"
+	ifconfig vio0 inet6 "$ipv6" prefixlen 64
+	route add -inet6 default fe80::1%vio0 2>/dev/null \
+		|| printf 'default v6 route already present, or the add failed; check route -n show -inet6\n'
 fi
 
 # Syntax-check both, and check the *zone* rather than only the config:
@@ -117,8 +149,11 @@ printf 'SOA serial: %s\n' "$serial"
 printf 'MX:         %s\n' "$(dig @127.0.0.1 kyriakon.net MX +short)"
 printf 'A:          %s\n' "$got4"
 printf 'AAAA:       %s\n' "$got6"
+printf 'IPv6 addr:  %s\n' "$(ifconfig vio0 | awk '/inet6 .*prefixlen 64/ && !/fe80/ {print $2}')"
 [ "$got4" = "$ipv4" ] || { printf 'A record mismatch: wanted %s got %s\n' "$ipv4" "$got4" >&2; exit 1; }
 [ "$got6" = "$ipv6" ] || { printf 'AAAA record mismatch: wanted %s got %s\n' "$ipv6" "$got6" >&2; exit 1; }
+ifconfig vio0 | grep -q "$ipv6" \
+	|| { printf 'vio0 does not hold %s, so the AAAA just published is unanswered\n' "$ipv6" >&2; exit 1; }
 
 printf 'nsd is serving kyriakon.net locally, TSIG key kyriakon-he.\n' >&2
 printf 'next (manual): confirm the pf TCP/53 inbound rule, then run the HE portal\n' >&2

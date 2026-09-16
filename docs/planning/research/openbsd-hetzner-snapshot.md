@@ -69,7 +69,14 @@ The snapshot is the frozen gold image, so everything below must be done **before
 1. `syspatch` (base-system patches) — apply to current.
 2. `pkg_add` Dovecot + rspamd (and any other packages), then `pkg_add -u`.
 3. Install the provisioned config (mail/git/web/DNS), keys, `provision.sh`, etc.
-4. **Shut down cleanly** (`shutdown -h now` from inside, or `hcloud server shutdown`) so the snapshot captures a consistent FFS filesystem — a snapshot of a running server can capture a mid-write filesystem.
+4. Configure the interface, IPv6 included: `openbsd/etc/hostname.vio0`, which
+   `deploy-nsd.sh` installs. Hetzner sets a cloud server's primary IPv6 address
+   from its metadata service and sends no router advertisement, so `inet6
+   autoconf` leaves only a link-local address while the zone still publishes an
+   AAAA for the box. A box in that state serves IPv4 fine and black-holes every
+   client that prefers IPv6, which shows up as mail and IMAP that hang rather
+   than fail. `fe80::1` is Hetzner's IPv6 gateway.
+5. **Shut down cleanly** (`shutdown -h now` from inside, or `hcloud server shutdown`) so the snapshot captures a consistent FFS filesystem — a snapshot of a running server can capture a mid-write filesystem.
 
 Then snapshot (§2), and optionally keep the throwaway box or delete it.
 
