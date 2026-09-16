@@ -27,11 +27,24 @@
 
 set -euo pipefail
 
+script_dir="$(dirname "$0")"
+if [ ! -f "$script_dir/lib.sh" ]; then
+	printf '%s: lib.sh is not in %s. Install the two files together, as lib.sh describes.\n' \
+		"$0" "$script_dir" >&2
+	exit 1
+fi
+
 # shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
-. "$(dirname "$0")/lib.sh"
+. "$script_dir/lib.sh"
 
 : "${RESTIC_REPOSITORY:?RESTIC_REPOSITORY is required (sftp:...)}"
 : "${RESTIC_PASSWORD_FILE:?RESTIC_PASSWORD_FILE is required}"
+
+# restic caches repository metadata under $HOME, and cron hands these scripts
+# HOME=/var/log, so the cache would sit in the log directory instead. All three
+# run as root.
+: "${RESTIC_CACHE_DIR:=/root/.cache/restic}"
+export RESTIC_CACHE_DIR
 
 pw_file="$RESTIC_PASSWORD_FILE"
 [ -f "$pw_file" ] || { printf 'password file %s not found\n' "$pw_file" >&2; exit 1; }
