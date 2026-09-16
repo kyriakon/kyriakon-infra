@@ -30,8 +30,12 @@ resource "hcloud_server" "mail" {
   delete_protection  = true
   rebuild_protection = true
 
-  public_net {
-    ipv4_enabled = true
-    ipv6_enabled = true
-  }
+  # public_net is deliberately not declared. The provider's update path for it
+  # powers the server off, does its work, and powers it back on, and this box
+  # needs its softraid passphrase typed at the console on every boot, so any
+  # public_net diff that reaches apply costs an outage until someone is at a
+  # keyboard. The block only matters at creation, and omitting it still gets both
+  # primary IPs generated, which is all it was asking for. The provider also
+  # suppresses the diff when the block is absent, so state and config agree
+  # without it.
 }

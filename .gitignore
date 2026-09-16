@@ -17,5 +17,11 @@ crash.*.log
 override.tf
 override.tf.json
 
+# Saved plan files. A plan embeds the full before/after of every resource,
+# including values that state holds, so it is never a thing to commit.
+tfplan
+*.tfplan
+tfplan.*
+
 # macOS desktop metadata.
 .DS_Store
