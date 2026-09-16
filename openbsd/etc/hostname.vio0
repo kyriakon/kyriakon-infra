@@ -1,0 +1,26 @@
+# /etc/hostname.vio0 - the Hetzner Cloud virtio NIC.
+#
+# IPv4 comes from DHCP. IPv6 does NOT come from SLAAC, and `inet6 autoconf`
+# must not be used here. Hetzner configures a cloud server's primary IPv6
+# address from its metadata service rather than by sending router
+# advertisements, so autoconf leaves the interface holding only a link-local
+# address. The zone still publishes an AAAA for it, and a published address that
+# nothing answers is worse than no address at all: packets reach Hetzner's route
+# for the /64 and die at the NIC, so clients and mail senders see a hang instead
+# of a refusal. That is what an unconfigured box did until 2026-09-16, when the
+# interface had fe80::9000:6ff:fecf:8850 and nothing else while every name
+# carried an AAAA.
+#
+# The address is the ::1 of the /64 Hetzner routes to this box (terraform output
+# ipv6_address, and the address Hetzner sets the PTR for). fe80::1 is Hetzner's
+# IPv6 gateway for cloud servers, from their static-configuration documentation.
+#
+# deploy-nsd.sh substitutes the RFC 3849 documentation placeholder below and
+# installs this file, because the script that publishes the AAAA is the script
+# that must ensure the box can answer it.
+#
+# Hetzner docs: https://docs.hetzner.com/cloud/servers/static-configuration/
+
+inet autoconf
+inet6 2001:db8::10 prefixlen 64
+!route add -inet6 default fe80::1%vio0
