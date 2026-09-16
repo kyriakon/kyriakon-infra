@@ -95,8 +95,9 @@ pub fn encrypt(
     if !key.is_file() {
         return Err(Error::MissingKey(base.to_string()));
     }
-    let armor = armored_ciphertext(&key, gpg_home, input)?;
-    Ok(rfc3156_envelope(&make_boundary(), &armor))
+    let payload = protected_payload(input);
+    let armor = armored_ciphertext(&key, gpg_home, &payload)?;
+    Ok(rfc3156_envelope(&make_boundary(), &armor, input))
 }
 
 fn armored_ciphertext(key: &Path, gpg_home: &Path, input: &[u8]) -> Result<Vec<u8>, Error> {
@@ -151,14 +152,165 @@ fn ensure_gpg_home(gpg_home: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// RFC 3156 section 4 envelope: `multipart/encrypted` with the `Version: 1` part and
-/// the armored ciphertext as `application/octet-stream`.
-fn rfc3156_envelope(boundary: &str, armor: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(armor.len() + 256);
+/// (headers, separator, body) of an RFC 5322 message: the header block without
+/// its terminating empty line, that empty line itself, and everything after it.
+/// A message with no empty line has no body.
+fn split_message(msg: &[u8]) -> (&[u8], &[u8], &[u8]) {
+    let mut pos = 0;
+    while pos < msg.len() {
+        let Some(off) = msg[pos..].iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let nl = pos + off;
+        let line_end = if nl > pos && msg[nl - 1] == b'\r' {
+            nl - 1
+        } else {
+            nl
+        };
+        if line_end == pos {
+            return (&msg[..pos], &msg[pos..=nl], &msg[nl + 1..]);
+        }
+        pos = nl + 1;
+    }
+    (msg, b"", b"")
+}
+
+/// The span of every header in a block: its lowercase name, and the byte range
+/// covering it plus any folded continuation lines, excluding the final line
+/// ending. A line that is neither a header nor a continuation is folded into
+/// the preceding header, so a message that is only being rewritten never loses
+/// bytes.
+fn header_spans(block: &[u8]) -> Vec<(String, usize, usize)> {
+    let mut spans: Vec<(String, usize, usize)> = Vec::new();
+    let mut pos = 0;
+    while pos < block.len() {
+        let (line_end, next) = match block[pos..].iter().position(|&b| b == b'\n') {
+            Some(off) => {
+                let nl = pos + off;
+                let line_end = if nl > pos && block[nl - 1] == b'\r' {
+                    nl - 1
+                } else {
+                    nl
+                };
+                (line_end, nl + 1)
+            }
+            None => (block.len(), block.len()),
+        };
+        let line = &block[pos..line_end];
+        let name = match line.first() {
+            Some(b' ') | Some(b'\t') => None,
+            _ => line
+                .iter()
+                .position(|&b| b == b':')
+                .map(|c| String::from_utf8_lossy(&line[..c]).to_ascii_lowercase()),
+        };
+        match name {
+            Some(name) => spans.push((name, pos, line_end)),
+            None => {
+                if let Some(last) = spans.last_mut() {
+                    last.2 = line_end;
+                }
+            }
+        }
+        pos = next;
+    }
+    spans
+}
+
+/// Line ending to synthesize with, matching the message rather than guessing.
+fn nl_style(msg: &[u8]) -> &'static [u8] {
+    if msg.contains(&b'\r') {
+        b"\r\n"
+    } else {
+        b"\n"
+    }
+}
+
+/// The cryptographic payload: the message as received, with
+/// `protected-headers="v1"` added to its Content-Type.
+///
+/// The whole message, headers included, stays inside the ciphertext. That
+/// parameter is how a client is told where the real headers are: Thunderbird,
+/// K-9 and others read them back after decrypting and display the real Subject
+/// instead of the wrapper's placeholder (Protected Headers for Cryptographic
+/// E-mail, draft-autocrypt-lamps-protected-headers). Without it the placeholder
+/// is all a client can show for every message.
+fn protected_payload(msg: &[u8]) -> Vec<u8> {
+    let (block, sep, body) = split_message(msg);
+    let mut out = Vec::with_capacity(msg.len() + 64);
+
+    match header_spans(block)
+        .into_iter()
+        .find(|(name, _, _)| name == "content-type")
+    {
+        Some((_, _, end)) => {
+            out.extend_from_slice(&block[..end]);
+            // A parameter list that already ends in ';' must not gain an empty
+            // parameter, so add the separator only when it is missing.
+            if block[..end].iter().rev().find(|b| !b.is_ascii_whitespace()) == Some(&b';') {
+                out.extend_from_slice(b" protected-headers=\"v1\"");
+            } else {
+                out.extend_from_slice(b"; protected-headers=\"v1\"");
+            }
+            out.extend_from_slice(&block[end..]);
+        }
+        None => {
+            // No Content-Type at all, so the RFC 2045 default applies. Naming it
+            // changes nothing about how the body reads and gives the parameter a
+            // home.
+            out.extend_from_slice(block);
+            if !block.is_empty() {
+                out.extend_from_slice(nl_style(block));
+            }
+            out.extend_from_slice(
+                b"Content-Type: text/plain; charset=us-ascii; protected-headers=\"v1\"",
+            );
+            out.extend_from_slice(nl_style(block));
+        }
+    }
+
+    if sep.is_empty() {
+        out.extend_from_slice(nl_style(block));
+    } else {
+        out.extend_from_slice(sep);
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+/// The wrapper keeps the envelope-level who and when: these are what the mail
+/// store cannot hide anyway, since mail is routed on them and they appear in
+/// the SMTP logs (docs/threat-model.md, "Correspondence metadata"), and clients
+/// read the sender and date from them. Everything else stays in the payload.
+const EXPOSED_HEADERS: [&str; 6] = ["from", "to", "cc", "reply-to", "date", "message-id"];
+
+/// RFC 3156 section 4 envelope: `multipart/encrypted` with the `Version: 1` part
+/// and the armored ciphertext as `application/octet-stream`.
+///
+/// The wrapper carries the exposed headers and a Subject placeholder, never the
+/// real subject: the mail store holds this in the clear and must not reveal
+/// correspondence content. The placeholder keeps a client from showing an empty
+/// subject before it decrypts, and `protected_payload` is what lets it replace
+/// the placeholder with the real one afterwards.
+fn rfc3156_envelope(boundary: &str, armor: &[u8], msg: &[u8]) -> Vec<u8> {
+    let (block, _, _) = split_message(msg);
+    let mut out = Vec::with_capacity(armor.len() + msg.len().min(4096) + 512);
     out.extend_from_slice(
         format!(
             "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";\n\
-             \tboundary=\"{boundary}\"\n\
+             \tboundary=\"{boundary}\"\n"
+        )
+        .as_bytes(),
+    );
+    for (name, start, end) in header_spans(block) {
+        if EXPOSED_HEADERS.contains(&name.as_str()) {
+            out.extend_from_slice(&block[start..end]);
+            out.push(b'\n');
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "Subject: ...\n\
              MIME-Version: 1.0\n\
              \n\
              This is an OpenPGP/MIME encrypted message (RFC 4880 and 3156).\n\
@@ -196,6 +348,15 @@ pub fn serve(socket: &Path, keyring: &Path, gpg_home: &Path) -> Result<(), Error
     // fail on it, and a live daemon would make bind fail anyway.
     let _ = std::fs::remove_file(socket);
     let listener = UnixListener::bind(socket)?;
+
+    // Dovecot's save path runs as the mailbox user, not as root, so a socket
+    // only root can write to fails closed on every delivery. Set the mode here
+    // rather than rely on umask, which rc.subr does not control. Any local
+    // account can then ask for encryption, which exposes nothing: the keyring
+    // it encrypts to is world-readable (/etc/kyriakon/keys/*.asc, 0644).
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
+
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
@@ -230,5 +391,87 @@ fn handle_conn(mut stream: UnixStream, keyring: &Path, gpg_home: &Path) {
             // as a failed save. Never emit plaintext on the wire.
             eprintln!("kyriakon-encrypt: {user}: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MESSAGE: &[u8] = b"From: alice@example.invalid\n\
+        To: bob@example.invalid\n\
+        Subject: hello\n\
+        Date: Mon, 1 Jan 2024 00:00:00 +0000\n\
+        Content-Type: text/plain; charset=utf-8\n\
+        \n\
+        body line\n";
+
+    fn payload(msg: &[u8]) -> String {
+        String::from_utf8_lossy(&protected_payload(msg)).into_owned()
+    }
+
+    #[test]
+    fn payload_marks_the_content_type_protected() {
+        let p = payload(MESSAGE);
+        assert!(
+            p.contains("Content-Type: text/plain; charset=utf-8; protected-headers=\"v1\"\n"),
+            "{p}"
+        );
+        // Headers and body both survive: the payload is still the whole message.
+        assert!(p.contains("Subject: hello\n"), "{p}");
+        assert!(p.ends_with("\n\nbody line\n"), "{p}");
+    }
+
+    #[test]
+    fn payload_adds_a_content_type_when_there_is_none() {
+        let p = payload(b"From: a@b\nSubject: x\n\nbody\n");
+        assert!(
+            p.contains("Content-Type: text/plain; charset=us-ascii; protected-headers=\"v1\"\n"),
+            "{p}"
+        );
+        assert!(p.ends_with("\n\nbody\n"), "{p}");
+    }
+
+    #[test]
+    fn payload_keeps_a_folded_content_type_intact() {
+        let p = payload(
+            b"Subject: x\r\nContent-Type: multipart/mixed;\r\n\tboundary=\"b\"\r\n\r\nparts\r\n",
+        );
+        assert!(
+            p.contains("boundary=\"b\"; protected-headers=\"v1\"\r\n"),
+            "{p}"
+        );
+        assert!(!p.contains(";;"), "empty parameter introduced:\n{p}");
+        assert!(p.ends_with("\r\n\r\nparts\r\n"), "{p}");
+    }
+
+    #[test]
+    fn payload_terminates_headers_when_the_message_has_no_blank_line() {
+        let p = payload(b"Subject: x\n");
+        assert!(p.contains("protected-headers=\"v1\"\n\n"), "{p}");
+    }
+
+    #[test]
+    fn envelope_exposes_transport_metadata_only() {
+        let env = String::from_utf8_lossy(&rfc3156_envelope("b", b"ARMOR", MESSAGE)).into_owned();
+        assert!(
+            env.starts_with("Content-Type: multipart/encrypted;"),
+            "{env}"
+        );
+        assert!(env.contains("From: alice@example.invalid\n"), "{env}");
+        assert!(
+            env.contains("Date: Mon, 1 Jan 2024 00:00:00 +0000\n"),
+            "{env}"
+        );
+        assert!(env.contains("Subject: ...\n"), "{env}");
+        assert!(
+            !env.contains("Subject: hello"),
+            "the real subject must stay in the payload:\n{env}"
+        );
+        assert!(!env.contains("body line"), "the body leaked:\n{env}");
+        assert!(
+            !env.contains("Content-Type: text/plain"),
+            "the payload's Content-Type leaked:\n{env}"
+        );
     }
 }

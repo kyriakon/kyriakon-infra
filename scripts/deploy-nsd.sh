@@ -61,7 +61,11 @@ esac
 printf '%s' "$secret" | grep -Eq '^[A-Za-z0-9+/=]+$' \
 	|| { printf 'tsig-secret is not clean base64\n' >&2; exit 1; }
 
-install -d -m 0755 /var/nsd/etc
+# 0750 root:_nsd, as /etc/mtree/special declares for this path. A bare
+# `install -d` gives 0755 root:wheel, and the daily security(8) mail reports the
+# difference. The group is part of the fix: nsd runs as _nsd inside the /var/nsd
+# chroot, so it has to be able to read its own etc directory.
+install -d -m 0750 -o root -g _nsd /var/nsd/etc
 
 # Zone: substitute the RFC 5737/3849 documentation placeholders with the real
 # IPs (appear in five records each: ns0, apex, mail, wildcard).
@@ -88,9 +92,11 @@ if grep -Eq 'REPLACE_ME|NOKEY' "$conf_dst"; then
 	exit 1
 fi
 
-# Syntax-check (must print nothing). nsd-checkconf validates the key block:
-# algorithm, secret base64, and that every provide-xfr references a defined key.
+# Syntax-check both, and check the *zone* rather than only the config:
+# nsd-checkconf validates nsd.conf, while a zone parse error leaves nsd running
+# and serving nothing for that domain, which looks like a silent outage.
 nsd-checkconf "$conf_dst"
+nsd-checkzone kyriakon.net "$zone_dst"
 
 # Any nsd left over from a config without remote-control cannot be signalled
 # through nsd-control, and a second nsd would fail to bind port 53. Clear it by

@@ -149,19 +149,35 @@ fn octet_stream(envelope: &[u8]) -> Vec<u8> {
     text[start..end].as_bytes().to_vec()
 }
 
+/// What the ciphertext must decrypt to: the original message with the
+/// protected-headers parameter added to its Content-Type, which is what tells a
+/// client where the real headers are.
+fn expected_payload() -> String {
+    String::from_utf8_lossy(MESSAGE).replace(
+        "Content-Type: text/plain; charset=utf-8\n",
+        "Content-Type: text/plain; charset=utf-8; protected-headers=\"v1\"\n",
+    )
+}
+
 fn assert_valid_envelope(envelope: &[u8]) {
-    let head = String::from_utf8_lossy(&envelope[..envelope.len().min(300)]);
+    let text = String::from_utf8_lossy(envelope);
     assert!(
-        head.starts_with(
+        text.starts_with(
             "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";"
         ),
-        "not multipart/encrypted:\n{head}"
+        "not multipart/encrypted:\n{text}"
     );
     assert!(
-        head.contains("Content-Type: application/pgp-encrypted"),
+        text.contains("\nContent-Type: application/pgp-encrypted\n"),
         "missing version part"
     );
-    assert!(head.contains("Version: 1"), "missing Version: 1");
+    assert!(text.contains("\nVersion: 1\n"), "missing Version: 1");
+    // Exposed headers come first, so the version part is not within any fixed
+    // prefix of the envelope; scan the whole thing.
+    assert!(
+        !text.contains("\nContent-Type: text/plain"),
+        "the payload's Content-Type leaked into the wrapper"
+    );
 }
 
 #[test]
@@ -170,14 +186,33 @@ fn encrypts_whole_message_round_trip() {
     let (ok, out) = encrypt_seam(env, "alice");
     assert!(ok, "encrypt failed for alice");
     assert_valid_envelope(&out);
-    // Outer envelope must not leak message headers.
+
+    // The wrapper carries the envelope metadata a mail store cannot hide and a
+    // subject placeholder. The real subject and the body stay in the payload.
     let outer = String::from_utf8_lossy(&out);
     assert!(
-        !outer.contains("Subject:"),
-        "plaintext headers leaked into envelope"
+        outer.contains("From: alice@example.invalid\n"),
+        "a client reads the sender from the wrapper"
     );
-    // Ciphertext decrypts to the exact input - headers and body.
-    assert_eq!(env.decrypt(&octet_stream(&out)), MESSAGE);
+    assert!(
+        outer.contains("Subject: ...\n"),
+        "expected a subject placeholder in the wrapper"
+    );
+    assert!(
+        !outer.contains("test \u{2615}"),
+        "the real subject leaked into the wrapper"
+    );
+    assert!(
+        !outer.contains("Hello, this is a test body."),
+        "the body leaked into the wrapper"
+    );
+
+    // Ciphertext decrypts to the whole message, marked protected.
+    assert_eq!(
+        env.decrypt(&octet_stream(&out)),
+        expected_payload().as_bytes(),
+        "payload must carry the message plus the protected-headers parameter"
+    );
 }
 
 #[test]
@@ -185,7 +220,10 @@ fn plus_tag_resolves_to_base_localpart() {
     let env = TestEnv::get();
     let (ok, out) = encrypt_seam(env, "alice+work");
     assert!(ok, "encrypt failed for alice+work");
-    assert_eq!(env.decrypt(&octet_stream(&out)), MESSAGE);
+    assert_eq!(
+        env.decrypt(&octet_stream(&out)),
+        expected_payload().as_bytes()
+    );
 }
 
 #[test]
@@ -243,7 +281,10 @@ fn daemon_serves_over_unix_socket() {
 
     let ok = request("alice+tag");
     assert_valid_envelope(&ok);
-    assert_eq!(env.decrypt(&octet_stream(&ok)), MESSAGE);
+    assert_eq!(
+        env.decrypt(&octet_stream(&ok)),
+        expected_payload().as_bytes()
+    );
 
     // Fail-closed over the socket: empty response for a missing key.
     assert!(

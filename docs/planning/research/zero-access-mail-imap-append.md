@@ -128,8 +128,58 @@ points. Two things must therefore be a single source of truth shared by both pat
    `multipart/encrypted; protocol="application/pgp-encrypted"` with the message
    (headers **and** body) as the encrypted payload.
    [RFC 3156 §4](https://www.rfc-editor.org/rfc/rfc3156)
+
+   The payload packet matters as much as the MIME shape. GnuPG 2.4 and later
+   encrypt with AEAD (packet tag 20, OCB or EAX) when the recipient key
+   advertises it, via a `pref-aead-algos` subpacket plus the AEAD feature bit,
+   and no flag on the encrypt side overrides that (`--rfc4880` does not stop
+   it). Thunderbird's own support mask is MDC alone: `getSupportedFeatureFlags`
+   in `mail/extensions/openpgp/content/modules/RNP.sys.mjs` returns only
+   `PGP_KEY_FEATURE_MDC`, so a key advertising AEAD or v5 public keys is
+   reported as advertising an unsupported feature. RNP itself gained AEAD
+   support in 0.11.0 and Thunderbird bundles 0.18.1, so this is not a hard
+   interoperability wall, but keeping the advert off the key holds delivery in
+   SEIPD (tag 18, AES-256 with MDC), the format every implementation reads,
+   rather than depending on the reader's AEAD support.
+   The fix is on the key: `scripts/rekey-mail-key.sh` re-signs the
+   self-signature with `setpref` and the AEAD preference left out, which clears
+   both adverts. `deploy-mail.sh` warns when a published key still advertises
+   AEAD. The fingerprint is unaffected, so the corrected key is published as a
+   replacement of the same file.
+
+   Two things that change does not settle. Thunderbird's check also flags the
+   version 5 public key feature bit (0x04) that GnuPG 2.5 writes into every
+   self-signature (`add_feature_v5 (sig, 1)` in `g10/keygen.c`), and no gpg
+   option removes it, so that warning survives the AEAD change; it concerns key
+   format, not reading mail. And the reader needs the secret key: without it,
+   delivery is unreadable whatever the packet shape.
+
+   Which headers a client can display depends on which side of the encryption
+   they sit, and those two sets are not the same. The wrapper keeps the envelope
+   metadata the store cannot hide anyway (From, To, Cc, Reply-To, Date,
+   Message-ID) plus a `Subject: ...` placeholder, because that is where a client
+   reads the sender and the date. The payload is the whole message with
+   `protected-headers="v1"` added to its Content-Type, the Protected Headers
+   convention (draft-autocrypt-lamps-protected-headers) that Thunderbird and K-9
+   read after decrypting to replace the placeholder with the real Subject. Both
+   halves are needed: Thunderbird recovers only the subject from the payload
+   (`extractProtectedHeaders` in `mime.sys.mjs`), so a wrapper with no headers at
+   all leaves every message showing an empty sender and an empty subject.
 2. **Keyring** — the user's public key, from the git-tracked set published in
    `kyriakon-infra` (proposal §5.6), so key substitution stays auditable.
+
+   The published key is certify and encrypt only (`caps=ecEC`) with no subkeys,
+   which is everything the box needs because it only ever encrypts to it. One
+   consequence worth knowing: Thunderbird will not offer it as an account's
+   personal key. Its lookup for a personal key by address
+   (`getAllSecretKeysByEmail` in
+   `mail/extensions/openpgp/content/modules/keyRing.sys.mjs`) requires the key
+   to be valid for signing as well as encryption, so a key that cannot sign is
+   never accepted, however often it is imported or marked as personal in Key
+   Properties. Reading delivery does not depend on that setting, and the
+   account's key selection is what governs signing and encrypting outgoing
+   mail. Signing outbound mail with this key would mean adding a signing
+   subkey.
 
 Because the save-path plugin is the single place where *both* LMTP delivery and
 IMAP APPEND land, the cleanest shape is to make **the Dovecot plugin the one and
