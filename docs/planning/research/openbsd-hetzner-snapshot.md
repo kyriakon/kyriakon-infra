@@ -77,6 +77,8 @@ The snapshot is the frozen gold image, so everything below must be done **before
    client that prefers IPv6, which shows up as mail and IMAP that hang rather
    than fail. `fe80::1` is Hetzner's IPv6 gateway.
 5. **Shut down cleanly** (`shutdown -h now` from inside, or `hcloud server shutdown`) so the snapshot captures a consistent FFS filesystem — a snapshot of a running server can capture a mid-write filesystem.
+6. Authorise a provisioning public key for `root`. Hetzner does not inject `server create --ssh-key` into a server built from a custom snapshot, because the image carries no cloud-init to write it. A box created from gold therefore comes up with only the `authorized_keys` the image already holds, and if that is empty or unknown the first ssh fails and the only way in is the VNC console. Confirmed on 2026-09-18: a box created from `kind=gold` with `--ssh-key oliver@kyriakon.net` refused that key, while the same key authenticated fine against the mail box.
+7. Record that the disk is encrypted, so every boot stops at the softraid passphrase prompt on the VNC console and nothing answers on the network, ssh included, until someone types it. A box in that state reports as running in the API and silently accepts no connections.
 
 Then snapshot (§2), and optionally keep the throwaway box or delete it.
 
