@@ -48,7 +48,7 @@ encrypt_bin=/usr/local/sbin/kyriakon-encrypt
 
 for f in openbsd/etc/smtpd.conf openbsd/etc/httpd.conf openbsd/etc/acme-client.conf \
 	openbsd/etc/rc.d/kyriakon_encrypt openbsd/dovecot/dovecot.conf \
-	openbsd/etc/spamd.alloweddomains \
+	openbsd/etc/spamd.alloweddomains openbsd/etc/spamd.conf \
 	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml keys; do
 	[ -e "$repo_dir/$f" ] || { printf 'missing from repo_dir: %s\n' "$f" >&2; exit 1; }
 done
@@ -186,17 +186,19 @@ smtpd -n -f /etc/mail/smtpd.conf
 install -m 0644 "$repo_dir/openbsd/dovecot/dovecot.conf" /etc/dovecot/dovecot.conf
 doveconf -n >/dev/null
 
+# spamd.conf holds no blacklists, and greylisting needs no list to run: it is
+# spamd's default mode, and <spamd-white> is maintained by spamd itself from
+# /var/db/spamd rather than by spamd-setup. The file is installed because
+# /etc/rc.d/spamd runs spamd-setup(8) on every start and spamd-setup refuses to
+# run without an `all` tag, which would make `rcctl start spamd` return nonzero
+# and take this script down with it.
+install -m 0644 "$repo_dir/openbsd/etc/spamd.conf" /etc/mail/spamd.conf
+
 # The greytrap destination allowlist. spamd reads this fixed path itself, and it
 # is not a spamd.conf(5) list: a greylisted host sending to a destination whose
 # domain matches none of these suffixes is blacklisted for 24 hours, so mail to a
 # kyriakon.net address must not be what teaches spamd that a new sender is a
 # spammer.
-#
-# No spamd.conf is installed, on purpose. Greylisting is spamd's default mode and
-# needs no list to run; spamd.conf(5) and spamd-setup(8) exist to load
-# blacklists, and <spamd-white>, the table that lets a host through after it
-# retries, is maintained by spamd itself from /var/db/spamd rather than by
-# spamd-setup. See docs/planning/research/spamd-greylisting.md.
 install -m 0644 "$repo_dir/openbsd/etc/spamd.alloweddomains" /etc/mail/spamd.alloweddomains
 
 # Addresses the domain has to answer for. RFC 2142 requires every mail domain
@@ -358,8 +360,17 @@ start_service smtpd
 # below and a first-contact test readable. spamd ships in base, so there is no
 # package to add. It is inert until the pf divert is applied: with no divert,
 # nothing reaches it and no mail is greylisted.
+#
+# enable first, then set flags: rcctl refuses to write variables for a daemon
+# that is not enabled yet, and under "set -e" that aborts the deploy before the
+# daemon is ever started. The first run of this script did exactly that.
+rcctl enable spamd
 rcctl set spamd flags -v
 start_service spamd
+# The config test for this half: the greytrap allowlist is read by the daemon,
+# and the blacklist loader is what the rc.d start path runs. Dry run, so nothing
+# is shipped to spamd.
+/usr/libexec/spamd-setup -n
 
 # --- 7. account ---------------------------------------------------------
 
