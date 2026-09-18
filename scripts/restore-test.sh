@@ -38,6 +38,13 @@ fi
 : "${RESTIC_CACHE_DIR:=/root/.cache/restic}"
 export RESTIC_CACHE_DIR
 
+# Every restic call here passes --no-lock. This runs on the weekly test machine
+# against a read-only storage sub-account, so it cannot create the lock file that
+# snapshots, check, restore and stats otherwise write: without the flag each of
+# them fails with "unable to create lock in backend". The sub-account is
+# deliberate, since read-only means a fault on the test machine cannot delete the
+# backups it exists to verify.
+
 snapshot_max_age_hours="${SNAPSHOT_MAX_AGE_HOURS:-30}"
 target_root="${RESTORE_TARGET_ROOT:-/var/restore-test}"
 target="$target_root/$(date +%F)"
@@ -55,7 +62,7 @@ die() {
 # --- 1. snapshot recency ------------------------------------------------
 # If the nightly backup silently stopped, snapshots/check/restore still pass on
 # whatever is there; only freshness proves the backup is actually still running.
-latest_epoch=$(restic snapshots --json \
+latest_epoch=$(restic snapshots --json --no-lock \
 	| jq -r 'max_by(.time).time | sub("\\..*Z$"; "Z") | fromdateiso8601')
 now=$(date +%s)
 age=$(( now - latest_epoch ))
@@ -66,13 +73,13 @@ fi
 
 # --- 2. check (repo structure + pack integrity; cheap) ------------------
 # Full data re-read is covered by the restore below, so no nightly --read-data.
-restic check
+restic check --no-lock
 
 # --- 3. full restore ----------------------------------------------------
 mkdir -p "$target_root"
 rm -rf "${target_root:?}"/* 2>/dev/null || true   # stop weekly restores accumulating; :? guards RESTORE_TARGET_ROOT=/
 mkdir -p "$target"
-restic restore latest --target "$target"
+restic restore latest --target "$target" --no-lock
 
 # --- 4. canary byte-identical ------------------------------------------
 expected=$(mktemp) || die "mktemp failed"
@@ -117,7 +124,7 @@ fi
 # has to count nodes too, and -mindepth 1 drops the restore target itself, which
 # is not a snapshot node. The first real run caught this: a files-only count
 # reported 61 against a snapshot of 87, which is 61 files plus 26 directories.
-snapshot_nodes=$(restic stats latest --json | jq -r '.total_file_count')
+snapshot_nodes=$(restic stats latest --json --no-lock | jq -r '.total_file_count')
 restored_nodes=$(find "$target" -mindepth 1 | wc -l | tr -d ' ')
 if [ "$(( restored_nodes - snapshot_nodes ))" -ne 0 ]; then
 	die "node count mismatch: snapshot=$snapshot_nodes restored=$restored_nodes"
