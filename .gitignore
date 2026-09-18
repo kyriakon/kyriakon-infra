@@ -25,3 +25,8 @@ tfplan.*
 
 # macOS desktop metadata.
 .DS_Store
+
+# Compiled Dovecot plugin output. dovecot-plugin/Makefile builds it in place and
+# `install` copies it to Dovecot's module directory, so the in-tree copy is only
+# ever a build artifact and never something to commit. `make clean` removes it.
+dovecot-plugin/*.so
