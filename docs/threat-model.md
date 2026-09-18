@@ -59,10 +59,13 @@ minimization, and every signal it would serve is already a plain count the monit
 keeps without the raw IP.
 
 Greylisting (`spamd`) is the one store that keeps a literal source IP, and it is not a
-user log: entries self-expire in hours as a functional anti-spam mechanism, not a
-retention window. The Phase 3 onboarding service will emit its own log; it is to be
-born already bounded by a `newsyslog.conf` entry the day it lands, not grandfathered in
-after the fact.
+user log. Greylist tuples are dropped after 4 hours if the sending host never retries,
+and a host that does retry is whitelisted for about 36 days (`greyexp` and `whiteexp`
+in spamd(8)). Both lifetimes are set by the anti-spam mechanism rather than by a
+retention window, and `scripts/abuse-monitor.sh` keeps aggregate counts only.
+
+The Phase 3 onboarding service will emit its own log; it is to be born already bounded
+by a `newsyslog.conf` entry the day it lands, not grandfathered in after the fact.
 
 ## Hostile-state suppression
 

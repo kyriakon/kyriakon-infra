@@ -7,8 +7,9 @@
 # accept mail for, otherwise legitimate mail to kyriakon.net users would be
 # trapped and the sender blacklisted.
 #
-# NOTE: greylisting itself is switched on at the pf layer (divert-to), which is
-# a propose-only change — see the pf.conf fragment in the PR body. This file is
-# the data half; it is safe to commit because it contains no secrets.
+# NOTE: greylisting itself is switched on at the pf layer (divert-to), which is a
+# propose-only change; the fragment, its rationale and the checks are in
+# docs/planning/research/spamd-greylisting.md. This file is the data half, and it
+# is safe to commit because it contains no secrets.
 
 @kyriakon.net
