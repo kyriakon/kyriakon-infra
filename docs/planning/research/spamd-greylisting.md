@@ -21,12 +21,20 @@ placed before the stock `pass all` line is silently overridden by it.
 	    divert-to 127.0.0.1 port spamd
 	pass in log on egress proto tcp from <spamd-white> to any port smtp
 
-Three details, all from spamd(8).
+Three details.
 
-The `table <spamd-white> persist` line is required. spamd continuously writes the
-hosts it has decided to let through into that table, and pf(4) refuses to load a
-ruleset that references a table which does not exist. The two-line version of
-this fragment that issue #43 carried would have failed to load.
+The `table <spamd-white> persist` line is upstream's own, from the example in
+spamd(8). spamd writes the hosts it decides to let through into that table, and
+`persist` is what keeps the table in the kernel when no rule refers to it:
+pf.conf(5) removes a non-persistent table as soon as the last rule referring to
+it is flushed, so a reload would otherwise throw the learned whitelist away.
+
+An earlier draft of this fragment left the line out, on the theory that pf
+refuses to load a rule referencing an undeclared table. That is not something a
+parse check can show: table existence is a kernel property, so `pfctl -nf`
+accepts the rule either way, and the claim was never verified against a real
+load. The line stays because spamd needs a table to write into and because
+upstream declares it, not because the alternative is proven broken.
 
 `<spamd-white>` is maintained by spamd itself, from the `/var/db/spamd`
 database. Neither `spamd-setup(8)` nor `spamd.alloweddomains` fills it. It is how
@@ -73,8 +81,18 @@ Defaults, from `-G passtime:greyexp:whiteexp` in spamd(8):
 	doas cp /tmp/pf.conf.new /etc/pf.conf
 	doas pfctl -f /etc/pf.conf
 
-`pfctl -nf` is the check that matters here, since it is what catches a table that
-was never declared before the ruleset goes live.
+`pfctl -nf` checks syntax only. It does not check tables, which live in the
+kernel, so it accepts a ruleset referencing a table nobody declared and will not
+catch that class of mistake. To test the load itself without touching the live
+ruleset, load the fragment into a scratch anchor:
+
+	pfctl -a spamd-test -f /tmp/pf-frag-test.conf
+	pfctl -sT | grep spamd            # the tables now exist in the kernel
+	pfctl -a spamd-test -sr           # the three rules parsed into the anchor
+	pfctl -a spamd-test -F rules      # drop the scratch anchor; tables remain
+
+Nothing routes through an anchor the main ruleset does not reference, so this
+changes no traffic, and the tables it creates are the ones the real load needs.
 
 Reverting is the same in reverse: remove the three lines, then `pfctl -f
 /etc/pf.conf`. `rcctl disable spamd` plus `rcctl stop spamd` retires the daemon.
