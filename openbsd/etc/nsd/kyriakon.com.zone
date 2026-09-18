@@ -1,0 +1,52 @@
+$ORIGIN kyriakon.com.
+$TTL 3600
+
+; kyriakon.com - defensive registration.
+; On-box path: /var/nsd/etc/kyriakon.com.zone.
+;
+; This domain never sends mail and serves nothing. It is registered so that
+; nobody else can use the name, and every record below is a statement of "no".
+; The wildcards matter: a forger can pick any name under a domain, not just the
+; apex, so a per-name denial would leave the rest of the namespace open.
+;
+; The serial is separate from kyriakon.net's, since each zone refreshes on its
+; own timer at Hurricane Electric.
+
+@	IN	SOA	ns0.kyriakon.net. hostmaster.kyriakon.net. (
+		2026091801	; serial - YYYYMMDDNN, bump on EVERY edit
+		3600		; refresh
+		900		; retry
+		1209600		; expire - 14 days
+		3600		; negative-cache TTL
+		)
+
+@	IN	NS	ns1.he.net.
+@	IN	NS	ns2.he.net.
+@	IN	NS	ns3.he.net.
+@	IN	NS	ns4.he.net.
+@	IN	NS	ns5.he.net.
+
+; Null MX, RFC 7505: a record that says "this domain accepts no mail". Stronger
+; than having no MX at all, because a sender with no MX falls back to the A
+; record and will happily try to deliver there if one exists.
+@	IN	MX	0 .
+*	IN	MX	0 .
+
+; SPF denial, apex and subdomains. -all with no mechanisms authorises nothing,
+; and it is also what stops the domain being useful to someone forging it.
+@	IN	TXT	"v=spf1 -all"
+*	IN	TXT	"v=spf1 -all"
+
+; Any selector, empty key: a forged signature claiming to come from this domain
+; fails verification rather than merely being absent, which is the answer a
+; receiver can act on.
+*._domainkey	IN	TXT	"v=DKIM1; p="
+
+; DMARC reject, with aggregate reports going to the alias already read on the
+; .net side. Subdomains inherit p= per RFC 7489, so no sp= is required.
+_dmarc	IN	TXT	"v=DMARC1; p=reject; rua=mailto:dmarc@kyriakon.net"
+
+; Deliberately no A, AAAA or wildcard address record. Nothing is served under
+; this name, so no hostname below it should resolve. A visitor typing the .com
+; gets nothing rather than the wrong site, and the redirect to kyriakon.net is
+; a separate decision that would need an address record and a certificate.
