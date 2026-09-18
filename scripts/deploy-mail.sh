@@ -203,7 +203,20 @@ aliases_tmp=$(mktemp "$aliases.XXXXXX")
 trap 'rm -f "$aliases_tmp"' EXIT
 # make sure an append starts on a line of its own
 [ -n "$(tail -c 1 "$aliases")" ] && printf '\n' >> "$aliases"
-for entry in "root: oliver" "postmaster: oliver" "abuse: oliver" "dmarc: oliver"; do
+# Every address the domain promises to answer, all landing in the operator's
+# mailbox. One list drives the write and the check below, because they were two
+# separate copies and an address added to only one of them would pass its own
+# check. Read line by line rather than split on whitespace: each line is a
+# "name: value" pair, and word splitting would tear the pair apart and write an
+# alias with an empty right-hand side, which silently stops delivering mail to
+# that address. security@ is absent on purpose, since the base aliases already
+# point it at root, which resolves here to oliver.
+alias_entries="root: oliver
+postmaster: oliver
+abuse: oliver
+dmarc: oliver
+admin: oliver"
+while IFS= read -r entry; do
 	alias_name=${entry%%:*}
 	if grep -q "^${alias_name}:" "$aliases"; then
 		sed "s|^${alias_name}:.*|${entry}|" "$aliases" > "$aliases_tmp"
@@ -215,11 +228,12 @@ for entry in "root: oliver" "postmaster: oliver" "abuse: oliver" "dmarc: oliver"
 		printf '%s\n' "$entry" >> "$aliases"
 		printf 'alias %s added\n' "$alias_name"
 	fi
-done
-for alias_name in root postmaster abuse dmarc; do
+done <<< "$alias_entries"
+while IFS= read -r entry; do
+	alias_name=${entry%%:*}
 	grep -q "^${alias_name}: oliver" "$aliases" \
 		|| { printf 'alias %s did not land in %s\n' "$alias_name" "$aliases" >&2; exit 1; }
-done
+done <<< "$alias_entries"
 
 # --- 4. DKIM -------------------------------------------------------------
 
