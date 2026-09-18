@@ -81,6 +81,9 @@ printf '%s\n' "$CANARY_TEXT" > "$expected"
 cmp -s "$expected" "$target$CANARY_PATH" \
 	|| die "canary missing or altered — backup did not include /home"
 rm -f "$expected"
+# Printed on success too: the acceptance criterion names the canary, and a test
+# that only speaks when it fails gives the log nothing to point at.
+printf 'canary byte-identical at %s\n' "$CANARY_PATH"
 
 # --- 5. Maildir-is-PGP-ciphertext --------------------------------------
 # Zero-access regression guard: every restored message must carry the ASCII-armor
