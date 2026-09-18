@@ -45,21 +45,28 @@ The third rule only works because it sits after the divert. For a whitelisted
 host the later `pass` overrides the earlier redirect, and for everyone else the
 divert stands.
 
-## What is not needed for greylisting
+## What is not needed for greylisting, and the one file that is
 
-`spamd.conf` and a `spamd-setup` cron entry exist to load blacklists, from DNSBLs
-or from local files. Greylisting is spamd's default mode and runs with no lists
-at all, which is why this repository has no `spamd.conf`.
+Greylisting is spamd's default mode and needs no list to run. `spamd.conf` and
+`spamd-setup(8)` exist to load blacklists, so neither is needed *for greylisting*.
+
+`spamd.conf` is installed anyway, for an unrelated reason: /etc/rc.d/spamd runs
+`spamd-setup` on every start, and spamd-setup reads that fixed path and aborts with
+`Can't find "all" in spamd config` when the tag is absent. A start that returns
+nonzero takes the deploy down with it under `set -e`. The file carries an empty
+`all:` and no lists, so it loads nothing.
+
+A `spamd-setup` cron entry is not needed either. The rc.d start path already runs
+it, and with no blacklists there is nothing to refresh.
 
 `spamd.alloweddomains` is not a `spamd.conf` white list. It holds destination
 domain suffixes, while a `:white:` list in `spamd.conf` holds source addresses
 that get removed from a preceding blacklist. Pointing a `:white:` entry at the
-domains file would either do nothing or fail to parse, and the config test below
-would fail with it.
+domains file would fail to parse as an address, and a list needs its own
+`:file=` besides.
 
-If blacklists are wanted later, that is when `spamd.conf` (an `all:` line plus
-the list entries) and the cron entry earn their place. Address traps are separate
-again and are added with `spamdb -T -a 'spamtrap@kyriakon.net'`.
+If blacklists are wanted later, the `all:` tag is where they get listed. Address
+traps are separate again and are added with `spamdb -T -a 'spamtrap@kyriakon.net'`.
 
 ## Timing
 
