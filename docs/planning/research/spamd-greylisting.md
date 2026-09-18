@@ -45,6 +45,20 @@ The third rule only works because it sits after the divert. For a whitelisted
 host the later `pass` overrides the earlier redirect, and for everyone else the
 divert stands.
 
+## The second daemon
+
+`spamlogd` is not optional, and leaving it out looks exactly like a broken
+firewall. spamd(8) says so twice: whitelist entries in `/var/db/spamd` are updated
+by spamlogd when it sees connections pass to the real MTA on the SMTP port, and
+they are removed when no such activity is seen within `whiteexp`. It reads the
+pflog interface, which is why the passthrough rule carries `log`.
+
+Without it nothing is ever whitelisted. `<spamd-white>` stays empty, rule 3 never
+matches, every contact is diverted to spamd, and a sender that retries forever is
+refused forever. That was the state of this box on 2026-09-18: the table existed
+and was empty, the divert worked, and three separate contacts from one outside
+host at 19:48, 20:17 and 20:18 were all answered by spamd.
+
 ## What is not needed for greylisting, and the one file that is
 
 Greylisting is spamd's default mode and needs no list to run. `spamd.conf` and
@@ -114,10 +128,17 @@ Reverting is the same in reverse: remove the three lines, then `pfctl -f
 
 ## Verifying
 
-	rcctl check spamd                        # ok
-	pfctl -sr | grep spamd                   # divert first, white pass second
-	spamdb | grep -c '^GREY|'                # grows on first contact
-	spamdb | grep '^WHITE|'                  # the host, after it retries
+	rcctl check spamd spamlogd                    # both; see the second daemon above
+	pfctl -sr | grep -E 'divert-to|spamd-white'   # the divert, then the passthrough
+	pfctl -t spamd-white -T show                  # fills once a host is whitelisted
+	doas spamdb | grep -c '^GREY|'                # grows on first contact
+	doas spamdb | grep '^WHITE|'                  # the host, after it retries
+
+`pfctl -sr` prints a service name as its port number, so the loaded divert rule
+reads `divert-to 127.0.0.1 port 8025`. Searching that output for "spamd" finds the
+passthrough rule and not the divert, which reads as a missing redirect on a box
+where the redirect is present and working. `spamdb` needs root: as an ordinary
+user it prints nothing at all, which reads as an empty database.
 
 First contact from a new sender is deferred with a 4xx and appears as a `GREY`
 tuple. Once the host retries, past `passtime`, the mail is accepted and the host

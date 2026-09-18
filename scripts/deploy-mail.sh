@@ -367,6 +367,14 @@ start_service smtpd
 rcctl enable spamd
 rcctl set spamd flags -v
 start_service spamd
+# spamlogd is not optional and is easy to miss. It reads the pflog interface and
+# writes the whitelist entries in /var/db/spamd when it sees a connection pass to
+# the real MTA on the SMTP port, which is the only way <spamd-white> ever gets
+# populated. Without it greylisting never lets anyone through: the earlier deploy
+# started only spamd, and three separate contacts from one host were all refused
+# while the table stayed empty. The `log` keyword on the passthrough rule exists
+# for this daemon to read.
+start_service spamlogd
 # The config test for this half: the greytrap allowlist is read by the daemon,
 # and the blacklist loader is what the rc.d start path runs. Dry run, so nothing
 # is shipped to spamd.
@@ -431,7 +439,11 @@ done
 # The daemon being up says nothing about whether greylisting is on: the switch is
 # the pf divert, which this script must not apply. Report which state the box is
 # actually in rather than implying the enabled one.
-if pfctl -sr 2>/dev/null | grep -q 'divert-to 127.0.0.1 port spamd'; then
+#
+# Match on "divert-to 127.0.0.1" alone. pfctl -sr renders the service name "spamd"
+# as its port number, so a pattern containing "port spamd" never matches a loaded
+# ruleset and the check reports OFF on a box where greylisting is running.
+if pfctl -sr 2>/dev/null | grep -q 'divert-to 127.0.0.1'; then
 	printf 'greylisting: on (%s greylisted host(s))\n' \
 		"$(spamdb 2>/dev/null | grep -c '^GREY|' || true)"
 else
