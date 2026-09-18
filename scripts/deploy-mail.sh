@@ -210,12 +210,15 @@ trap 'rm -f "$aliases_tmp"' EXIT
 # "name: value" pair, and word splitting would tear the pair apart and write an
 # alias with an empty right-hand side, which silently stops delivering mail to
 # that address. security@ is absent on purpose, since the base aliases already
-# point it at root, which resolves here to oliver.
+# point it at root, which resolves here to oliver. hello@ is here because the
+# landing site publishes it as the contact address, so mail to the platform
+# bounces without it.
 alias_entries="root: oliver
 postmaster: oliver
 abuse: oliver
 dmarc: oliver
-admin: oliver"
+admin: oliver
+hello: oliver"
 # Fed to each loop through a here-document rather than a here-string. OpenBSD's
 # /bin/ksh is pdksh-derived and has no `<<<`, which fails at parse time with
 # "syntax error: `< ' unexpected" and takes the whole deploy down with it. The
