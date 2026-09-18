@@ -41,7 +41,9 @@ fi
 : "${RESTIC_CACHE_DIR:=/root/.cache/restic}"
 export RESTIC_CACHE_DIR
 
-trap 'hc_fail "$REHEARSAL_HEALTHCHECKS_URL"' ERR
+# Same guard as restore-test.sh: the trap expands when it runs, and an unset
+# variable under `set -u` would make the error handler die instead of reporting.
+trap 'hc_fail "${REHEARSAL_HEALTHCHECKS_URL:-}"' ERR
 
 # --target / puts /home/... back under the box's real /home paths.
 restic restore latest --target /

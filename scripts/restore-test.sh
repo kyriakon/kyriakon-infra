@@ -42,11 +42,14 @@ snapshot_max_age_hours="${SNAPSHOT_MAX_AGE_HOURS:-30}"
 target_root="${RESTORE_TARGET_ROOT:-/var/restore-test}"
 target="$target_root/$(date +%F)"
 
-trap 'hc_fail "$HEALTHCHECKS_URL"' ERR
+# Expansion happens when the trap runs, so an unset HEALTHCHECKS_URL must not be
+# fatal here: under `set -u` it made the error handler itself die with "parameter
+# not set", which replaced the real failure message with a shell error.
+trap 'hc_fail "${HEALTHCHECKS_URL:-}"' ERR
 
 die() {
 	printf '%s\n' "$1" >&2
-	hc_fail "$HEALTHCHECKS_URL"
+	hc_fail "${HEALTHCHECKS_URL:-}"
 }
 
 # --- 1. snapshot recency ------------------------------------------------
@@ -105,13 +108,18 @@ else
 	printf 'git fsck clean on %s restored repos\n' "$repo_count"
 fi
 
-# --- 7. stats count ------------------------------------------------------
-snapshot_files=$(restic stats latest --json | jq -r '.total_file_count')
-restored_files=$(find "$target" -type f | wc -l | tr -d ' ')
-if [ "$(( restored_files - snapshot_files ))" -ne 0 ]; then
-	die "file count mismatch: snapshot=$snapshot_files restored=$restored_files"
+# --- 7. node count --------------------------------------------------------
+# restic's total_file_count counts every node in the snapshot, directories
+# included, which is why its restore summary reads "files/dirs". The comparison
+# has to count nodes too, and -mindepth 1 drops the restore target itself, which
+# is not a snapshot node. The first real run caught this: a files-only count
+# reported 61 against a snapshot of 87, which is 61 files plus 26 directories.
+snapshot_nodes=$(restic stats latest --json | jq -r '.total_file_count')
+restored_nodes=$(find "$target" -mindepth 1 | wc -l | tr -d ' ')
+if [ "$(( restored_nodes - snapshot_nodes ))" -ne 0 ]; then
+	die "node count mismatch: snapshot=$snapshot_nodes restored=$restored_nodes"
 fi
-printf 'restored %s files (matches snapshot stats)\n' "$restored_files"
+printf 'restored %s nodes (matches snapshot stats)\n' "$restored_nodes"
 
 # --- 8. Healthchecks ping (success) ------------------------------------
 if [ -n "${HEALTHCHECKS_URL:-}" ]; then
