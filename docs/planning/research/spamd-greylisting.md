@@ -45,6 +45,20 @@ The third rule only works because it sits after the divert. For a whitelisted
 host the later `pass` overrides the earlier redirect, and for everyone else the
 divert stands.
 
+## The second daemon
+
+`spamlogd` is not optional, and leaving it out looks exactly like a broken
+firewall. spamd(8) says so twice: whitelist entries in `/var/db/spamd` are updated
+by spamlogd when it sees connections pass to the real MTA on the SMTP port, and
+they are removed when no such activity is seen within `whiteexp`. It reads the
+pflog interface, which is why the passthrough rule carries `log`.
+
+Without it nothing is ever whitelisted. `<spamd-white>` stays empty, rule 3 never
+matches, every contact is diverted to spamd, and a sender that retries forever is
+refused forever. That was the state of this box on 2026-09-18: the table existed
+and was empty, the divert worked, and three separate contacts from one outside
+host at 19:48, 20:17 and 20:18 were all answered by spamd.
+
 ## What is not needed for greylisting, and the one file that is
 
 Greylisting is spamd's default mode and needs no list to run. `spamd.conf` and

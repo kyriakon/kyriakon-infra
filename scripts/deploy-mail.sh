@@ -367,6 +367,14 @@ start_service smtpd
 rcctl enable spamd
 rcctl set spamd flags -v
 start_service spamd
+# spamlogd is not optional and is easy to miss. It reads the pflog interface and
+# writes the whitelist entries in /var/db/spamd when it sees a connection pass to
+# the real MTA on the SMTP port, which is the only way <spamd-white> ever gets
+# populated. Without it greylisting never lets anyone through: the earlier deploy
+# started only spamd, and three separate contacts from one host were all refused
+# while the table stayed empty. The `log` keyword on the passthrough rule exists
+# for this daemon to read.
+start_service spamlogd
 # The config test for this half: the greytrap allowlist is read by the daemon,
 # and the blacklist loader is what the rc.d start path runs. Dry run, so nothing
 # is shipped to spamd.
