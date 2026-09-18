@@ -42,11 +42,14 @@ snapshot_max_age_hours="${SNAPSHOT_MAX_AGE_HOURS:-30}"
 target_root="${RESTORE_TARGET_ROOT:-/var/restore-test}"
 target="$target_root/$(date +%F)"
 
-trap 'hc_fail "$HEALTHCHECKS_URL"' ERR
+# Expansion happens when the trap runs, so an unset HEALTHCHECKS_URL must not be
+# fatal here: under `set -u` it made the error handler itself die with "parameter
+# not set", which replaced the real failure message with a shell error.
+trap 'hc_fail "${HEALTHCHECKS_URL:-}"' ERR
 
 die() {
 	printf '%s\n' "$1" >&2
-	hc_fail "$HEALTHCHECKS_URL"
+	hc_fail "${HEALTHCHECKS_URL:-}"
 }
 
 # --- 1. snapshot recency ------------------------------------------------
