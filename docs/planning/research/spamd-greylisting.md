@@ -56,6 +56,14 @@ Greylisting is spamd's default mode and needs no list to run. `spamd.conf` and
 nonzero takes the deploy down with it under `set -e`. The file carries an empty
 `all:` and no lists, so it loads nothing.
 
+That tag is easy to get wrong. `all:\` with nothing after the backslash is an
+unterminated capability record, and cgetent(3) then fails to find the tag while
+reporting the failure with a stale errno from an earlier open, so the message
+reads `Can't find "all" in spamd config: No such file or directory` while the
+file sits there readable. Confirmed with a throwaway cgetent harness on the box:
+the bare `all:` is found, and so is `all:\` followed by a whitespace-only
+continuation line. The deploy's `spamd-setup -n` is the check that catches it.
+
 A `spamd-setup` cron entry is not needed either. The rc.d start path already runs
 it, and with no blacklists there is nothing to refresh.
 
