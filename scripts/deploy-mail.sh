@@ -408,3 +408,8 @@ printf '  3. outbound test, then SPF/DKIM/DMARC and inbox placement at a public 
 printf '  4. landing site: the vhosts serve it from /var/www/kyriakon.net, so a\n'
 printf '     kyriakon-site checkout there is all it needs (git clone once, then\n'
 printf '     git pull to update). No pf change is required for 443.\n'
+printf '  5. personal site: same shape, at /var/www/oliver.kyriakon.net, from\n'
+printf '     https://github.com/OliverBrotchie/oliver.kyriakon.net . The vhost\n'
+printf '     blocks /.git, so keep it a checkout rather than a copy of the files:\n'
+printf '     git clone once as root, then git pull to update. It carries both\n'
+printf '     index.html for HTTP and index.gmi for the Gemini side.\n'
