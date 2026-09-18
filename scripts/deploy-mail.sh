@@ -216,6 +216,10 @@ postmaster: oliver
 abuse: oliver
 dmarc: oliver
 admin: oliver"
+# Fed to each loop through a here-document rather than a here-string. OpenBSD's
+# /bin/ksh is pdksh-derived and has no `<<<`, which fails at parse time with
+# "syntax error: `< ' unexpected" and takes the whole deploy down with it. The
+# delimiter is unquoted so the variable expands, one alias per line.
 while IFS= read -r entry; do
 	alias_name=${entry%%:*}
 	if grep -q "^${alias_name}:" "$aliases"; then
@@ -228,12 +232,16 @@ while IFS= read -r entry; do
 		printf '%s\n' "$entry" >> "$aliases"
 		printf 'alias %s added\n' "$alias_name"
 	fi
-done <<< "$alias_entries"
+done <<EOF
+$alias_entries
+EOF
 while IFS= read -r entry; do
 	alias_name=${entry%%:*}
 	grep -q "^${alias_name}: oliver" "$aliases" \
 		|| { printf 'alias %s did not land in %s\n' "$alias_name" "$aliases" >&2; exit 1; }
-done <<< "$alias_entries"
+done <<EOF
+$alias_entries
+EOF
 
 # --- 4. DKIM -------------------------------------------------------------
 
