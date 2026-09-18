@@ -4,8 +4,15 @@
 #
 #   . "$(dirname "$0")/lib.sh"
 #
-# Deployed alongside each script (scp into the same dir — the crontab examples
-# assume /root/bin/<script> and /root/bin/lib.sh).
+# Deployed alongside each script (install both into the same dir; the crontab
+# examples assume /root/bin/<script> and /root/bin/lib.sh).
+
+# cron(8) runs jobs with PATH=/usr/bin:/bin, and OpenBSD keeps packages under
+# /usr/local. Without this the nightly run dies at its first restic call with
+# "restic: not found" and nothing reaches the storage box. Set here rather than
+# in each caller so backup.sh, restore-test.sh and rehearsal.sh cannot drift.
+PATH="/usr/local/bin:$PATH"
+export PATH
 
 # ping_url <url> — best-effort GET that never fails the caller. A monitoring ping
 # must not turn a transient curl failure into a script failure / cron mail storm.
