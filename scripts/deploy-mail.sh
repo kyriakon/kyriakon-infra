@@ -48,6 +48,7 @@ encrypt_bin=/usr/local/sbin/kyriakon-encrypt
 
 for f in openbsd/etc/smtpd.conf openbsd/etc/httpd.conf openbsd/etc/acme-client.conf \
 	openbsd/etc/rc.d/kyriakon_encrypt openbsd/dovecot/dovecot.conf \
+	openbsd/etc/spamd.alloweddomains \
 	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml keys; do
 	[ -e "$repo_dir/$f" ] || { printf 'missing from repo_dir: %s\n' "$f" >&2; exit 1; }
 done
@@ -184,6 +185,19 @@ smtpd -n -f /etc/mail/smtpd.conf
 
 install -m 0644 "$repo_dir/openbsd/dovecot/dovecot.conf" /etc/dovecot/dovecot.conf
 doveconf -n >/dev/null
+
+# The greytrap destination allowlist. spamd reads this fixed path itself, and it
+# is not a spamd.conf(5) list: a greylisted host sending to a destination whose
+# domain matches none of these suffixes is blacklisted for 24 hours, so mail to a
+# kyriakon.net address must not be what teaches spamd that a new sender is a
+# spammer.
+#
+# No spamd.conf is installed, on purpose. Greylisting is spamd's default mode and
+# needs no list to run; spamd.conf(5) and spamd-setup(8) exist to load
+# blacklists, and <spamd-white>, the table that lets a host through after it
+# retries, is maintained by spamd itself from /var/db/spamd rather than by
+# spamd-setup. See docs/planning/research/spamd-greylisting.md.
+install -m 0644 "$repo_dir/openbsd/etc/spamd.alloweddomains" /etc/mail/spamd.alloweddomains
 
 # Addresses the domain has to answer for. RFC 2142 requires every mail domain
 # to accept postmaster@ and abuse@; docs/aup.md sends abuse reports to
@@ -340,6 +354,13 @@ start_service kyriakon_encrypt
 start_service dovecot
 start_service smtpd
 
+# -v logs each greylist decision, which is what makes the deploy's own check
+# below and a first-contact test readable. spamd ships in base, so there is no
+# package to add. It is inert until the pf divert is applied: with no divert,
+# nothing reaches it and no mail is greylisted.
+rcctl set spamd flags -v
+start_service spamd
+
 # --- 7. account ---------------------------------------------------------
 
 # oliver is the operator account: it doubles as the admin login for the box,
@@ -393,9 +414,19 @@ printf 'Maildir: %s/Maildir (owner %s, shell %s)\n' "$home" "$owner" "$shell"
 # --- 8. verify ----------------------------------------------------------
 
 say "verify"
-for s in dovecot smtpd kyriakon_encrypt httpd; do
+for s in dovecot smtpd kyriakon_encrypt httpd spamd; do
 	printf '%-18s %s\n' "$s" "$(rcctl check "$s" 2>&1 || true)"
 done
+# The daemon being up says nothing about whether greylisting is on: the switch is
+# the pf divert, which this script must not apply. Report which state the box is
+# actually in rather than implying the enabled one.
+if pfctl -sr 2>/dev/null | grep -q 'divert-to 127.0.0.1 port spamd'; then
+	printf 'greylisting: on (%s greylisted host(s))\n' \
+		"$(spamdb 2>/dev/null | grep -c '^GREY|' || true)"
+else
+	printf 'greylisting: OFF - inbound mail is not diverted to spamd.\n'
+	printf '              Apply the pf fragment in step 6 below.\n'
+fi
 printf 'MX:   %s\n' "$(dig +short @ns1.he.net kyriakon.net MX)"
 printf 'mail: %s %s\n' "$(dig +short @ns1.he.net mail.kyriakon.net A)" \
 	"$(dig +short @ns1.he.net mail.kyriakon.net AAAA)"
@@ -416,3 +447,16 @@ printf '     https://github.com/OliverBrotchie/oliver.kyriakon.net . The vhost\n
 printf '     blocks /.git, so keep it a checkout rather than a copy of the files:\n'
 printf '     git clone once as root, then git pull to update. It carries both\n'
 printf '     index.html for HTTP and index.gmi for the Gemini side.\n'
+printf '  6. greylisting: append this to the END of /etc/pf.conf (pf is\n'
+printf '     last-match-wins, so it must follow the stock pass rule), then\n'
+printf '     "pfctl -nf" it and load it. Rationale and checks:\n'
+printf '     docs/planning/research/spamd-greylisting.md\n'
+printf '\n'
+printf '\t\t table <spamd-white> persist\n'
+printf '\t\t pass in on egress proto tcp to any port smtp \\\n'
+printf '\t\t     divert-to 127.0.0.1 port spamd\n'
+printf '\t\t pass in log on egress proto tcp from <spamd-white> to any port smtp\n'
+printf '\n'
+printf '  7. LMTP socket: after the next delivery, confirm smtpd still connects to\n'
+printf '     /var/dovecot/lmtp now that it is root:wheel 0600, and watch for\n'
+printf '     "Permission denied" in maillog.\n'
