@@ -46,7 +46,11 @@ $TTL 3600
 ; .net side. Subdomains inherit p= per RFC 7489, so no sp= is required.
 _dmarc	IN	TXT	"v=DMARC1; p=reject; rua=mailto:dmarc@kyriakon.net"
 
-; Deliberately no A, AAAA or wildcard address record. Nothing is served under
-; this name, so no hostname below it should resolve. A visitor typing the .com
-; gets nothing rather than the wrong site, and the redirect to kyriakon.net is
-; a separate decision that would need an address record and a certificate.
+; The apex resolves and does exactly one thing: redirects to kyriakon.net, so
+; someone who types the wrong domain lands on the right site. This is safe
+; precisely because of the null MX above, since a sender with no MX falls back
+; to the address record and RFC 7505 exists to remove that fallback, so an A
+; record here cannot become a delivery path. No wildcard address record:
+; nothing else under this name should resolve, so there is no subdomain to serve.
+@	IN	A	203.0.113.10
+@	IN	AAAA	2001:db8::10

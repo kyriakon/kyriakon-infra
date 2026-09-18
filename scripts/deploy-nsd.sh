@@ -81,9 +81,8 @@ printf '%s' "$secret" | grep -Eq '^[A-Za-z0-9+/=]+$' \
 install -d -m 0750 -o root -g _nsd /var/nsd/etc
 
 # Zones: substitute the RFC 5737/3849 documentation placeholders with the real
-# IPs. kyriakon.net carries them in four record sets (ns0, apex, mail, wildcard);
-# a zone without them passes through sed unchanged, which is the case for the
-# defensive kyriakon.com zone.
+# IPs. kyriakon.net carries them in four record sets (ns0, apex, mail and a
+# wildcard), kyriakon.com in one (the apex, which only redirects).
 zone_names=
 for zone_src in "$src_dir"/*.zone; do
 	[ -r "$zone_src" ] || continue
