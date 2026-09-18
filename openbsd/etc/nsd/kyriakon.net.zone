@@ -8,7 +8,7 @@ $TTL 3600
 ; before deploy.
 
 @	IN	SOA	ns0.kyriakon.net. hostmaster.kyriakon.net. (
-		2026091601	; serial - YYYYMMDDNN, bump on EVERY edit (see note below)
+		2026091801	; serial - YYYYMMDDNN, bump on EVERY edit (see note below)
 		3600		; refresh - HE re-checks at least this often
 		900		; retry
 		1209600		; expire - 14 days: HE keeps serving if the primary dies
@@ -73,8 +73,13 @@ mail	IN	TXT	"v=spf1 a -all"
 mail._domainkey	IN	TXT	( "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzD06rNwCr6k6jHwH5TTqB1dgnIS2TehRQ88ygp++duHGV7S9TGaxblMeiiCcMe/BOE5KJy6qHUjOM/POB/wLY7i0+nYhlMV5dUW67oGVX68dOFDj63V6uR/SqotPFLVU+uVFzx79LAGm3HogwwmYiAa5RlwsRaYPjS/pyqEEQaVWVa1qMo85Fvwb0JYkjERAx"
 				"TTJ5IwH9Fe1zqt5qL2jazc6UB2jzb5weWgVm167uvxNkn37FqDl/GHDJATi+hJoq2iLtiSHXru1a4iARZmJCih+2Ak9fA3NF/fI1EfqqS3xU7P4zzdUnOvR+GQ2Qz4L+jRUvUX9yHu/8FIZ09ssywIDAQAB" )
 
-; DMARC - start p=none (monitor only) with aggregate reporting; tighten later.
-_dmarc	IN	TXT	"v=DMARC1; p=none; rua=mailto:dmarc@kyriakon.net"
+; DMARC now enforces quarantine on authentication failures. The record started as
+; p=none with aggregate reporting so the first reports could be measured, and the
+; Google report for 2026-09-18 showed spf=pass and dkim=pass on every row, which
+; was the condition recorded in the research note for tightening the policy.
+; Quarantine comes before reject because the first enforcement step should not be
+; able to bounce a legitimate sender outright.
+_dmarc	IN	TXT	"v=DMARC1; p=quarantine; rua=mailto:dmarc@kyriakon.net"
 
 ; Wildcard - one record serves every per-user subdomain (username.kyriakon.net).
 ; A record, NOT a cert: acme-client is HTTP-01 only, so per-user certs are
