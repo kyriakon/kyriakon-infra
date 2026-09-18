@@ -20,6 +20,13 @@
 # (the research note's /var/www /var/gemini /var/git predates §6.9's
 # per-user-under-/home layout — /home is the authoritative, current path.)
 #
+# /etc/mail is the one exception: it holds the DKIM signing key and smtpd's queue
+# key, which are secrets rather than git-tracked config and exist nowhere else.
+# Without them a rebuild from git plus this repository comes back unable to sign
+# mail or read an existing queue. The whole directory is taken rather than those
+# two files by name, so a rotation cannot silently escape the backup. TLS keys
+# stay out: acme-client reissues them on renewal, so they are not data either.
+#
 # The canary: a fixed-content file written before each run and included in the
 # snapshot. restore-test.sh asserts it returns byte-identical, so a backup job
 # that silently stops including /home fails the restore test even though
@@ -61,8 +68,9 @@ fi
 # restore-test.sh, which asserts byte-identity).
 printf '%s\n' "$CANARY_TEXT" > "$CANARY_PATH"
 
-# Whole /home tree (Maildir + git repos + web roots).
-restic backup /home
+# Whole /home tree (Maildir + git repos + web roots), plus the /etc/mail secrets
+# that exist nowhere else. See the header for why these paths and no other config.
+restic backup /home /etc/mail
 
 # Retention is the purge mechanism: a content-addressed repo cannot target-delete
 # a file, so the keep-* window bounds how long a deleted account's data survives
