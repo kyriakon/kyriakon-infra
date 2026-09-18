@@ -1,6 +1,6 @@
 # DNS — `nsd` hidden primary + Hurricane Electric secondary, and the mail go-live record set
 
-Ticket: configure `nsd` (OpenBSD base) as the hidden primary for `kyriakon.net`, with Hurricane Electric's free DNS as the public secondary via AXFR/NOTIFY (proposal §5.7, §6.13), and define the exact record set so mail can go live — MX, SPF, DKIM (selector + key placement), DMARC (`p=none` start, §6.2), PTR (via Hetzner, not the zone), and the `*.kyriakon.net` wildcard A/AAAA for per-user subdomains (§5.2).
+Ticket: configure `nsd` (OpenBSD base) as the hidden primary for `kyriakon.net`, with Hurricane Electric's free DNS as the public secondary via AXFR/NOTIFY (proposal §5.7, §6.13), and define the exact record set so mail can go live — MX, SPF, DKIM (selector + key placement), DMARC (`p=quarantine`, §6.2), PTR (via Hetzner, not the zone), and the `*.kyriakon.net` wildcard A/AAAA for per-user subdomains (§5.2).
 
 ## Recommended shape (short answer)
 
@@ -112,8 +112,10 @@ mail	IN	AAAA	2001:db8::10
 ; to make yearly rotation trivial, §6.2). Base64 body is the public half only.
 mail._domainkey	IN	TXT	"v=DKIM1; k=rsa; p=<base64-public-key>"
 
-; DMARC — start p=none with aggregate reporting, tighten later (§6.2).
-_dmarc	IN	TXT	"v=DMARC1; p=none; rua=mailto:dmarc@kyriakon.net"
+; DMARC now enforces quarantine on authentication failures, with aggregate
+; reporting. It started as p=none so the first reports could be measured; the
+; Google report for 2026-09-18 showed spf=pass and dkim=pass on every row (§6.2).
+_dmarc	IN	TXT	"v=DMARC1; p=quarantine; rua=mailto:dmarc@kyriakon.net"
 
 ; Wildcard — one record serves every per-user subdomain (username.kyriakon.net,
 ; §5.2). This is a wildcard A/AAAA RECORD, not a wildcard cert: acme-client is
@@ -161,7 +163,7 @@ HE free secondary is DNS-only redundancy: it keeps answering from the last trans
 | SPF | `@` | TXT | `v=spf1 mx -all` | Authorizes the MX host as the only sender; `-all` hard-fails all else ([RFC 7208 §4](https://www.rfc-editor.org/rfc/rfc7208)). |
 | SPF | `mail` | TXT | `v=spf1 a -all` | The mail host sends as its own name: cron output, the daily `security(8)` mail and `MAILER-DAEMON` bounces all carry `mail.kyriakon.net` as their envelope and From domain, so SPF is evaluated against this name. `a` rather than `mx`, because this name has no MX of its own. Without it those messages get `spf=none` and DMARC depends on DKIM alone. |
 | DKIM | `mail._domainkey` | TXT | `v=DKIM1; k=rsa; p=<base64>` | Public key at `<selector>._domainkey.<domain>` ([RFC 6376 §3.6.1](https://www.rfc-editor.org/rfc/rfc6376)). |
-| DMARC | `_dmarc` | TXT | `v=DMARC1; p=none; rua=mailto:dmarc@kyriakon.net` | `p=none` (monitor only) + aggregate reporting, per §6.2 ([RFC 7489 §6.3](https://www.rfc-editor.org/rfc/rfc7489)). |
+| DMARC | `_dmarc` | TXT | `v=DMARC1; p=quarantine; rua=mailto:dmarc@kyriakon.net` | Quarantine on authentication failures, with aggregate reporting (§6.2). The record began as `p=none` so the first reports could be measured, and the Google report for 2026-09-18 showed `spf=pass` and `dkim=pass` on every row, so the policy tightened. Quarantine precedes reject because the first enforcement step should not be able to bounce a legitimate sender ([RFC 7489 §6.3](https://www.rfc-editor.org/rfc/rfc7489)). |
 | Wildcard | `*` | A/AAAA | box IPv4 / IPv6 | Per-user subdomains (§5.2). |
 | PTR | — (not in zone) | PTR | `203.0.113.10` → `mail.kyriakon.net.` | Set at **Hetzner**, see below. |
 
