@@ -46,7 +46,7 @@ export RESTIC_CACHE_DIR
 trap 'hc_fail "${REHEARSAL_HEALTHCHECKS_URL:-}"' ERR
 
 # --target / puts /home/... back under the box's real /home paths.
-restic restore latest --target /
+restic restore latest --target / --no-lock
 
 printf '\nrestore complete — now the manual full-dress steps:\n'
 cat <<'EOF'
