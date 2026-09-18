@@ -1,6 +1,6 @@
 #!/bin/ksh
-# renew-acme.sh: renew the mail and landing-site certificates, restarting only
-# the daemons whose certificate changed.
+# renew-acme.sh: renew the mail, landing-site and defensive-domain certificates,
+# restarting only the daemons whose certificate changed.
 #
 # Runs ON the box as root (invoke under doas).
 #
@@ -51,6 +51,10 @@ renew() {
 
 renew mail.kyriakon.net dovecot smtpd
 renew kyriakon.net httpd
+# The defensive domain's certificate is held by httpd as well, so a renewal here
+# needs the same restart. It renews on its own schedule, which is why it is a
+# separate line rather than folded into the one above.
+renew kyriakon.com httpd
 
 if [ "$failed" -ne 0 ]; then
 	exit 1

@@ -43,15 +43,20 @@ ipv6="$2"
 secret="$3"
 src_dir="${4:-$(dirname "$0")}"
 
-zone_src="$src_dir/kyriakon.net.zone"
+# Every *.zone beside nsd.conf is served: kyriakon.net is the mail domain and
+# kyriakon.com is a defensive registration, and both live here so the second one
+# cannot drift from the first. Adding a third zone is adding a file.
 conf_src="$src_dir/nsd.conf"
-zone_dst=/var/nsd/etc/kyriakon.net.zone
 conf_dst=/var/nsd/etc/nsd.conf
 # hostname.vio0 lives in openbsd/etc/, one level up from openbsd/etc/nsd/.
 iface_src="$src_dir/../hostname.vio0"
 iface_dst=/etc/hostname.vio0
 
-[ -r "$zone_src" ] || { printf 'zone not found: %s\n' "$zone_src" >&2; exit 1; }
+zone_count=0
+for z in "$src_dir"/*.zone; do
+	[ -r "$z" ] && zone_count=$((zone_count + 1))
+done
+[ "$zone_count" -gt 0 ] || { printf 'no *.zone files found in %s\n' "$src_dir" >&2; exit 1; }
 [ -r "$conf_src" ] || { printf 'nsd.conf not found: %s\n' "$conf_src" >&2; exit 1; }
 [ -r "$iface_src" ] || { printf 'hostname.vio0 not found: %s\n' "$iface_src" >&2; exit 1; }
 
@@ -75,9 +80,18 @@ printf '%s' "$secret" | grep -Eq '^[A-Za-z0-9+/=]+$' \
 # chroot, so it has to be able to read its own etc directory.
 install -d -m 0750 -o root -g _nsd /var/nsd/etc
 
-# Zone: substitute the RFC 5737/3849 documentation placeholders with the real
-# IPs (appear in five records each: ns0, apex, mail, wildcard).
-sed -e "s/203\.0\.113\.10/$ipv4/g" -e "s/2001:db8::10/$ipv6/g" "$zone_src" > "$zone_dst"
+# Zones: substitute the RFC 5737/3849 documentation placeholders with the real
+# IPs. kyriakon.net carries them in four record sets (ns0, apex, mail and a
+# wildcard), kyriakon.com in one (the apex, which only redirects).
+zone_names=
+for zone_src in "$src_dir"/*.zone; do
+	[ -r "$zone_src" ] || continue
+	zone_name=$(basename "$zone_src" .zone)
+	zone_dst="/var/nsd/etc/$zone_name.zone"
+	sed -e "s/203\.0\.113\.10/$ipv4/g" -e "s/2001:db8::10/$ipv6/g" "$zone_src" > "$zone_dst"
+	chmod 0644 "$zone_dst"
+	zone_names="$zone_names $zone_name"
+done
 
 # Interface config: the same documentation IPv6 placeholder, so the address the
 # zone advertises is the address the box holds. Nothing else sets this up, and
@@ -94,14 +108,20 @@ sed -e "s|REPLACE_ME|$secret|" "$conf_src" > "$conf_dst"
 # On-box perms: nsd chroots to /var/nsd and reads this before dropping to
 # _nsd, so root-only is right and the secret stays out of the chroot's reach.
 chmod 0640 "$conf_dst"
-chmod 0644 "$zone_dst"
 
-# Guard: no placeholder may survive into the deployed files. Skip `;` comment
-# lines in the zone — the header legitimately names the RFC ranges as prose.
-if grep -v '^;' "$zone_dst" | grep -Eq '203\.0\.113|2001:db8'; then
-	printf 'zone still contains documentation placeholders - check your ipv4/ipv6 args\n' >&2
-	exit 1
-fi
+# Per-zone guards, run over what the loop above actually wrote. A surviving
+# placeholder means the IP arguments were wrong, and a parse error leaves nsd
+# running and serving nothing for that domain, which looks like a silent outage.
+# `;` comment lines are skipped because the zone headers legitimately name the
+# RFC ranges as prose.
+for zone_name in $zone_names; do
+	zone_dst="/var/nsd/etc/$zone_name.zone"
+	if grep -v '^;' "$zone_dst" | grep -Eq '203\.0\.113|2001:db8'; then
+		printf '%s still contains documentation placeholders - check your ipv4/ipv6 args\n' "$zone_name" >&2
+		exit 1
+	fi
+	nsd-checkzone "$zone_name" "$zone_dst"
+done
 if grep -Eq 'REPLACE_ME|NOKEY' "$conf_dst"; then
 	printf 'nsd.conf still contains a placeholder (REPLACE_ME / NOKEY)\n' >&2
 	exit 1
@@ -128,7 +148,6 @@ fi
 # nsd-checkconf validates nsd.conf, while a zone parse error leaves nsd running
 # and serving nothing for that domain, which looks like a silent outage.
 nsd-checkconf "$conf_dst"
-nsd-checkzone kyriakon.net "$zone_dst"
 
 # Any nsd left over from a config without remote-control cannot be signalled
 # through nsd-control, and a second nsd would fail to bind port 53. Clear it by
@@ -141,7 +160,11 @@ rcctl start nsd
 rcctl check nsd >/dev/null 2>&1 \
 	|| { printf 'nsd did not start; see /var/log/nsd.log and /var/log/messages\n' >&2; exit 1; }
 
-# Verify the box answers with exactly the IPs we just wrote.
+# Verify the box answers with exactly the IPs we just wrote, and that it serves
+# every zone at all: a zone nsd refuses to load would otherwise pass unnoticed.
+for zone_name in $zone_names; do
+	printf 'SOA %-13s %s\n' "$zone_name" "$(dig @127.0.0.1 "$zone_name" SOA +short | awk '{print $3}')"
+done
 serial=$(dig @127.0.0.1 kyriakon.net SOA +short | awk '{print $3}')
 got4=$(dig @127.0.0.1 kyriakon.net A +short)
 got6=$(dig @127.0.0.1 kyriakon.net AAAA +short)
