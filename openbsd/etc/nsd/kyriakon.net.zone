@@ -8,7 +8,7 @@ $TTL 3600
 ; before deploy.
 
 @	IN	SOA	ns0.kyriakon.net. hostmaster.kyriakon.net. (
-		2026091801	; serial - YYYYMMDDNN, bump on EVERY edit (see note below)
+		2026091901	; serial - YYYYMMDDNN, bump on EVERY edit (see note below)
 		3600		; refresh - HE re-checks at least this often
 		900		; retry
 		1209600		; expire - 14 days: HE keeps serving if the primary dies
@@ -39,9 +39,19 @@ ns0	IN	AAAA	2001:db8::10
 @	IN	AAAA	2001:db8::10
 
 ; MX - mail delivered to the box. Single MX, no secondary in MVP.
+;
+; The mail host has an A and deliberately no AAAA. Greylisting is enforced by a
+; pf divert-to rule whose redirect target is 127.0.0.1, which pins that rule to
+; IPv4, so an inbound SMTP connection arriving over IPv6 never reaches spamd.
+; Confirmed on 2026-09-19: mail from Google came in over IPv6 and was delivered
+; with no connection from that host in spamd's log at all, while the same
+; sender's IPv4 traffic was diverted correctly. spamd binds a single address
+; (-l, default 127.0.0.1), so covering IPv6 means a second instance bound to
+; ::1, with its own port and pf rules. Publishing only an A keeps every inbound
+; sender on the path that is filtered. The apex AAAA stays, since web, IMAP and
+; Gemini do not pass through the divert.
 @	IN	MX	10 mail.kyriakon.net.
 mail	IN	A	203.0.113.10
-mail	IN	AAAA	2001:db8::10
 
 ; SPF - the box is the only sender. "mx" authorizes the MX host; "-all"
 ; hard-fails everything else.
@@ -57,7 +67,11 @@ mail	IN	AAAA	2001:db8::10
 ;
 ; The mechanism is "a", not "mx". This name has no MX record of its own, so an
 ; mx lookup would match nothing and authorize nobody.
-mail	IN	TXT	"v=spf1 a -all"
+;
+; The ip6 literal is required now that this name has no AAAA (see the MX block):
+; an outbound message sent over IPv6 would otherwise match nothing here, where
+; the AAAA used to cover it.
+mail	IN	TXT	"v=spf1 a ip6:2001:db8::10 -all"
 
 ; DKIM - public half only, at selector "mail". The private key lives on the box
 ; at /etc/mail/dkim/private.rsa.key (the path smtpd.conf's dkimsign filter
