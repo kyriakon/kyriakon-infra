@@ -12,6 +12,9 @@
 //! Fail-closed: no key file for the recipient => error, and the caller never
 //! sees plaintext.
 //!
+//! Input that is already an envelope of ours for that recipient is returned
+//! unchanged, so a client re-uploading a message cannot have it encrypted twice.
+//!
 //! Socket protocol (daemon): one request per connection. Request = `<user>\n`
 //! followed by the raw message; message end is the client's half-close (EOF).
 //! Response = ciphertext only on success; on error the connection is closed
@@ -95,6 +98,9 @@ pub fn encrypt(
     if !key.is_file() {
         return Err(Error::MissingKey(base.to_string()));
     }
+    if already_encrypted(input, &key, gpg_home) {
+        return Ok(input.to_vec());
+    }
     let payload = protected_payload(input);
     let armor = armored_ciphertext(&key, gpg_home, &payload)?;
     Ok(rfc3156_envelope(&make_boundary(), &armor, input))
@@ -140,6 +146,108 @@ fn armored_ciphertext(key: &Path, gpg_home: &Path, input: &[u8]) -> Result<Vec<u
         ));
     }
     Ok(out.stdout)
+}
+
+/// The first line of every envelope this crate produces. The Dovecot C shim
+/// carries the same string as KYRIAKON_MARKER for its save_finish backstop, so
+/// the two have to stay in step.
+const ENVELOPE_MARKER: &str =
+    "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";";
+
+/// Whether `input` is already an envelope this crate built for the recipient of
+/// `cert`, in which case it is saved as it stands rather than encrypted again.
+///
+/// A second encryption does not lose the message, but it breaks it: the store
+/// holds a ciphertext whose payload is another envelope, so a client decrypts
+/// once and shows an encrypted blob where the mail should be. A client that
+/// files a message by re-uploading it on the save path did that on the live box.
+///
+/// The marker alone cannot be trusted to mean ciphertext, since a sender could
+/// mail a file that begins with it and have plaintext written to the store as
+/// though it were encrypted. So the input has to name a key of the recipient's
+/// own cert in a public-key encrypted session key packet. Ciphertext addressed
+/// to another key, a copy of the cert carried inline, and a stream gpg cannot
+/// parse all fall through to normal encryption.
+fn already_encrypted(input: &[u8], cert: &Path, gpg_home: &Path) -> bool {
+    if !input.starts_with(ENVELOPE_MARKER.as_bytes()) {
+        return false;
+    }
+    let Ok(cert_packets) = std::fs::read(cert) else {
+        return false;
+    };
+    let ours = cert_key_ids(&list_packets(&cert_packets, gpg_home));
+    if ours.is_empty() {
+        return false;
+    }
+    message_key_ids(&list_packets(input, gpg_home))
+        .iter()
+        .any(|id| ours.contains(id))
+}
+
+/// Long key ids of the public key packets in a dump of a cert: its primary key
+/// and any subkeys. These sit on a line of their own with no packet-type
+/// prefix, which is what separates them from ids mentioned inside signature
+/// packets on the same line as the packet.
+fn cert_key_ids(packets: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(packets)
+        .lines()
+        .filter(|line| !line.trim_start().starts_with(':'))
+        .filter_map(|line| line.trim().strip_prefix("keyid:").map(str::trim))
+        .filter_map(long_key_id)
+        .collect()
+}
+
+/// Long key ids from the public-key encrypted session key packets of a dump:
+/// one per recipient, and present only where the stream really is ciphertext
+/// addressed to a key. A stream that mentions a key anywhere else yields
+/// nothing, which is what keeps a message carrying a copy of a cert from being
+/// mistaken for ciphertext.
+fn message_key_ids(packets: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(packets)
+        .lines()
+        .filter(|line| line.trim_start().starts_with(":pubkey enc packet:"))
+        .filter_map(|line| line.split("keyid").nth(1))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .filter_map(long_key_id)
+        .collect()
+}
+
+fn long_key_id(id: &str) -> Option<String> {
+    (id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_string())
+}
+
+/// `gpg --list-packets` over `input`. Inspection only, and best effort: a
+/// stream gpg cannot parse produces no output, which the caller reads as "not
+/// our ciphertext" and encrypts as usual rather than failing the save.
+fn list_packets(input: &[u8], gpg_home: &Path) -> Vec<u8> {
+    if ensure_gpg_home(gpg_home).is_err() {
+        return Vec::new();
+    }
+    let spawned = Command::new("gpg")
+        .args([
+            "--batch",
+            "--no-tty",
+            "--no-options",
+            "--list-packets",
+            "--homedir",
+        ])
+        .arg(gpg_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = spawned else {
+        return Vec::new();
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(input).is_err() {
+            return Vec::new();
+        }
+    }
+    match child.wait_with_output() {
+        Ok(out) if out.status.success() => out.stdout,
+        _ => Vec::new(),
+    }
 }
 
 /// Create the gpg scratch dir (0700). Idempotent; run per message because a
@@ -473,5 +581,28 @@ mod tests {
             !env.contains("Content-Type: text/plain"),
             "the payload's Content-Type leaked:\n{env}"
         );
+    }
+
+    #[test]
+    fn only_session_key_packets_count_as_being_addressed_to_a_key() {
+        // A cert: the key id is on a line of its own, under the key packet.
+        let cert = b":public key packet:\n\
+            \tversion 4, algo 1, created 0, expires 0\n\
+            \tkeyid: DC81B0FDFE212297\n\
+            :signature packet: algo 1, keyid DC81B0FDFE212297\n";
+        assert_eq!(cert_key_ids(cert), vec!["DC81B0FDFE212297".to_string()]);
+        // A message carrying that cert inline mentions the key and is still not
+        // ciphertext for it. Skipping on a mention would store the message in
+        // the clear.
+        assert!(message_key_ids(cert).is_empty());
+
+        // Real ciphertext names its recipient in the session key packet.
+        let msg = b":pubkey enc packet: version 3, algo 1, keyid DC81B0FDFE212297\n\
+            \tdata: [3070 bits]\n\
+            :encrypted data packet:\n\
+            \tlength: unknown\n\
+            \tmdc_method: 2\n";
+        assert_eq!(message_key_ids(msg), vec!["DC81B0FDFE212297".to_string()]);
+        assert!(cert_key_ids(msg).is_empty());
     }
 }

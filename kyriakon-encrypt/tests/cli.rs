@@ -50,43 +50,44 @@ impl TestEnv {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&gpg_home, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-            // No-passphrase encrypt-only key, 2048-bit RSA (fast to generate).
-            let gen = Command::new("gpg")
-                .env("GNUPGHOME", &gpg_home)
-                .args([
-                    "--batch",
-                    "--no-tty",
-                    "--pinentry-mode",
-                    "loopback",
-                    "--passphrase",
-                    "",
-                    "--quick-generate-key",
-                    "kyriakon test <test@example.invalid>",
-                    "rsa2048",
-                    "encr",
-                    "0",
-                ])
-                .output()
-                .expect("gpg available");
-            assert!(
-                gen.status.success(),
-                "keygen failed: {}",
-                String::from_utf8_lossy(&gen.stderr)
-            );
+            // No-passphrase encrypt-only keys, 2048-bit RSA (fast to generate).
+            // Two of them: alice for the recipient under test, and a second key
+            // so a message encrypted to someone else can be told apart from an
+            // envelope of ours.
+            let make_key = |uid: &str, file: &str| {
+                let gen = Command::new("gpg")
+                    .env("GNUPGHOME", &gpg_home)
+                    .args([
+                        "--batch",
+                        "--no-tty",
+                        "--pinentry-mode",
+                        "loopback",
+                        "--passphrase",
+                        "",
+                        "--quick-generate-key",
+                        uid,
+                        "rsa2048",
+                        "encr",
+                        "0",
+                    ])
+                    .output()
+                    .expect("gpg available");
+                assert!(
+                    gen.status.success(),
+                    "keygen failed: {}",
+                    String::from_utf8_lossy(&gen.stderr)
+                );
 
-            let export = Command::new("gpg")
-                .env("GNUPGHOME", &gpg_home)
-                .args([
-                    "--batch",
-                    "--no-tty",
-                    "--armor",
-                    "--export",
-                    "test@example.invalid",
-                ])
-                .output()
-                .expect("gpg available");
-            assert!(export.status.success(), "key export failed");
-            std::fs::write(keyring.join("alice.asc"), &export.stdout).unwrap();
+                let export = Command::new("gpg")
+                    .env("GNUPGHOME", &gpg_home)
+                    .args(["--batch", "--no-tty", "--armor", "--export", uid])
+                    .output()
+                    .expect("gpg available");
+                assert!(export.status.success(), "key export failed");
+                std::fs::write(keyring.join(file), &export.stdout).unwrap();
+            };
+            make_key("kyriakon test <test@example.invalid>", "alice.asc");
+            make_key("kyriakon second <second@example.invalid>", "bob.asc");
 
             TestEnv { gpg_home, keyring }
         })
@@ -114,6 +115,11 @@ impl TestEnv {
 }
 
 fn encrypt_seam(env: &TestEnv, user: &str) -> (bool, Vec<u8>) {
+    encrypt_seam_input(env, user, MESSAGE)
+}
+
+/// The same seam with the caller's bytes, so a test can feed it ciphertext.
+fn encrypt_seam_input(env: &TestEnv, user: &str, input: &[u8]) -> (bool, Vec<u8>) {
     let mut child = Command::new(BIN)
         .args(["encrypt", "--user", user, "--keyring"])
         .arg(&env.keyring)
@@ -124,7 +130,7 @@ fn encrypt_seam(env: &TestEnv, user: &str) -> (bool, Vec<u8>) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(MESSAGE).unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
     let out = child.wait_with_output().unwrap();
     (out.status.success(), out.stdout)
 }
@@ -244,6 +250,48 @@ fn traversal_user_rejected() {
     let (ok, out) = encrypt_seam(env, "../x");
     assert!(!ok, "path-traversal user must fail");
     assert!(out.is_empty());
+}
+
+#[test]
+fn resaving_our_own_envelope_does_not_encrypt_it_again() {
+    let env = TestEnv::get();
+    let (ok, envelope) = encrypt_seam(env, "alice");
+    assert!(ok, "encrypt failed for alice");
+    assert_valid_envelope(&envelope);
+
+    // What a client re-uploading a message does to it: ciphertext goes back
+    // through the save path. It has to come back untouched, one layer deep, or
+    // a client decrypting once shows an encrypted blob instead of the mail.
+    let (ok, again) = encrypt_seam_input(env, "alice", &envelope);
+    assert!(ok, "re-saving our own ciphertext must succeed");
+    assert_eq!(again, envelope, "the envelope must come back byte for byte");
+    assert_eq!(
+        env.decrypt(&octet_stream(&again)),
+        expected_payload().as_bytes(),
+        "one decrypt must yield the message, not another envelope"
+    );
+}
+
+#[test]
+fn a_lookalike_for_another_key_is_still_encrypted() {
+    let env = TestEnv::get();
+    // A real envelope, but for bob. It carries the marker, so only the key id
+    // separates it from ours, and skipping on the marker alone would store a
+    // sender's file unencrypted.
+    let (ok, for_bob) = encrypt_seam(env, "bob");
+    assert!(ok, "encrypt failed for bob");
+
+    let (ok, for_alice) = encrypt_seam_input(env, "alice", &for_bob);
+    assert!(ok, "encrypting a lookalike must succeed");
+    assert_ne!(for_alice, for_bob, "it is encrypted again, not skipped");
+    assert_valid_envelope(&for_alice);
+
+    let inner = octet_stream(&for_bob);
+    let payload = env.decrypt(&octet_stream(&for_alice));
+    assert!(
+        payload.windows(inner.len()).any(|w| w == inner),
+        "the other key's ciphertext belongs inside the new envelope"
+    );
 }
 
 #[test]
