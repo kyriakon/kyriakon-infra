@@ -219,6 +219,12 @@ fn long_key_id(id: &str) -> Option<String> {
 /// `gpg --list-packets` over `input`. Inspection only, and best effort: a
 /// stream gpg cannot parse produces no output, which the caller reads as "not
 /// our ciphertext" and encrypts as usual rather than failing the save.
+///
+/// The exit status is deliberately ignored. gpg prints the packet listing and
+/// then exits non-zero for a message it cannot decrypt, which is every message
+/// here: the daemon's gpg homedir holds no secret key, by design. Treating that
+/// status as fatal discards the listing and the caller sees no recipients at
+/// all.
 fn list_packets(input: &[u8], gpg_home: &Path) -> Vec<u8> {
     if ensure_gpg_home(gpg_home).is_err() {
         return Vec::new();
@@ -245,8 +251,8 @@ fn list_packets(input: &[u8], gpg_home: &Path) -> Vec<u8> {
         }
     }
     match child.wait_with_output() {
-        Ok(out) if out.status.success() => out.stdout,
-        _ => Vec::new(),
+        Ok(out) => out.stdout,
+        Err(_) => Vec::new(),
     }
 }
 

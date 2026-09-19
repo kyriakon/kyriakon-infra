@@ -115,16 +115,22 @@ impl TestEnv {
 }
 
 fn encrypt_seam(env: &TestEnv, user: &str) -> (bool, Vec<u8>) {
-    encrypt_seam_input(env, user, MESSAGE)
+    encrypt_seam_input(env, user, MESSAGE, &env.gpg_home)
 }
 
-/// The same seam with the caller's bytes, so a test can feed it ciphertext.
-fn encrypt_seam_input(env: &TestEnv, user: &str, input: &[u8]) -> (bool, Vec<u8>) {
+/// The same seam with the caller's bytes and a chosen gpg homedir, so a test
+/// can feed it ciphertext and give it the homedir the daemon really has.
+fn encrypt_seam_input(
+    env: &TestEnv,
+    user: &str,
+    input: &[u8],
+    gpg_home: &std::path::Path,
+) -> (bool, Vec<u8>) {
     let mut child = Command::new(BIN)
         .args(["encrypt", "--user", user, "--keyring"])
         .arg(&env.keyring)
         .arg("--gpg-home")
-        .arg(&env.gpg_home)
+        .arg(gpg_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -133,6 +139,18 @@ fn encrypt_seam_input(env: &TestEnv, user: &str, input: &[u8]) -> (bool, Vec<u8>
     child.stdin.take().unwrap().write_all(input).unwrap();
     let out = child.wait_with_output().unwrap();
     (out.status.success(), out.stdout)
+}
+
+/// A gpg homedir with no secret keys, which is what the daemon has in
+/// production: its scratch directory under /var/run. A test that hands the
+/// daemon the keyring's own homedir instead lets gpg decrypt, and anything
+/// reading that dump then behaves differently from the deployed daemon.
+fn scratch_gpg_home(env: &TestEnv) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = env.keyring.parent().unwrap().join("scratch-gnupg");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
 }
 
 /// Extract the `application/octet-stream` part (the armored ciphertext) from
@@ -260,9 +278,9 @@ fn resaving_our_own_envelope_does_not_encrypt_it_again() {
     assert_valid_envelope(&envelope);
 
     // What a client re-uploading a message does to it: ciphertext goes back
-    // through the save path. It has to come back untouched, one layer deep, or
-    // a client decrypting once shows an encrypted blob instead of the mail.
-    let (ok, again) = encrypt_seam_input(env, "alice", &envelope);
+    // through the save path, and the daemon's own scratch homedir holds no
+    // secret key, which is what gpg sees in production.
+    let (ok, again) = encrypt_seam_input(env, "alice", &envelope, &scratch_gpg_home(env));
     assert!(ok, "re-saving our own ciphertext must succeed");
     assert_eq!(again, envelope, "the envelope must come back byte for byte");
     assert_eq!(
@@ -281,7 +299,7 @@ fn a_lookalike_for_another_key_is_still_encrypted() {
     let (ok, for_bob) = encrypt_seam(env, "bob");
     assert!(ok, "encrypt failed for bob");
 
-    let (ok, for_alice) = encrypt_seam_input(env, "alice", &for_bob);
+    let (ok, for_alice) = encrypt_seam_input(env, "alice", &for_bob, &scratch_gpg_home(env));
     assert!(ok, "encrypting a lookalike must succeed");
     assert_ne!(for_alice, for_bob, "it is encrypted again, not skipped");
     assert_valid_envelope(&for_alice);
