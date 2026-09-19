@@ -299,7 +299,14 @@ say "SPF"
 # not the apex. A missing record there returns "none" and gives those messages
 # no SPF pass at all: Google's aggregate reports showed spf=fail on every row
 # from this box, with DKIM the only thing carrying them.
-mail_spf="v=spf1 a -all"
+#
+# The record names the box's own IPv6 address. The mail host has no AAAA, so
+# that address is not one the "a" mechanism can match, and an outbound message
+# sent over IPv6 would find nothing authorizing it. Read from the interface
+# here rather than written out, so this check cannot drift from the value the
+# zone template's substitution produces.
+box_v6=$(ifconfig vio0 | awk '/inet6 .*prefixlen 64/ && !/fe80/ {print $2; exit}')
+mail_spf="v=spf1 a ip6:${box_v6} -all"
 published_spf=$(dig +short @ns1.he.net mail.kyriakon.net TXT | tr -d '"')
 case "$published_spf" in
 	*"$mail_spf"*) printf 'mail SPF record published: %s\n' "$published_spf" ;;
