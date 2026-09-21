@@ -60,32 +60,30 @@ case "$role" in
 mail)
 	needed_scripts="abuse-monitor.sh renew-acme.sh backup.sh"
 	needed_vars="ALERT_EMAIL HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE"
-	block=$(cat <<'EOF'
-
-# --- kyriakon: monitoring and maintenance (scripts/cron-apply.sh) ---
-*/15 * * * * . /root/.kyriakon-env; /root/bin/abuse-monitor.sh
-0 3 * * * . /root/.kyriakon-env; /root/bin/renew-acme.sh
-30 2 * * * . /root/.kyriakon-env; /root/bin/backup.sh
-# --- end kyriakon ---
-EOF
-)
 	;;
 restore)
 	needed_scripts="restore-test.sh"
 	needed_vars="HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE"
-	block=$(cat <<'EOF'
-
-# --- kyriakon: weekly restore test (scripts/cron-apply.sh) ---
-45 3 * * 0 . /root/.kyriakon-env; /root/bin/restore-test.sh
-# --- end kyriakon ---
-EOF
-)
 	;;
 *)
 	printf 'unknown role: %s\n' "$role" >&2
 	exit 2
 	;;
 esac
+
+# The crontab line for one script. Built per script rather than as one block for
+# the role: a block would duplicate the lines of scripts that are already
+# scheduled, which is what the first real run did, leaving the backup and the
+# renewal running twice.
+line_for() {
+	case "$1" in
+	abuse-monitor.sh) printf '*/15 * * * * . /root/.kyriakon-env; /root/bin/abuse-monitor.sh\n' ;;
+	renew-acme.sh) printf '0 3 * * * . /root/.kyriakon-env; /root/bin/renew-acme.sh\n' ;;
+	backup.sh) printf '30 2 * * * . /root/.kyriakon-env; /root/bin/backup.sh\n' ;;
+	restore-test.sh) printf '45 3 * * 0 . /root/.kyriakon-env; /root/bin/restore-test.sh\n' ;;
+	*) return 1 ;;
+	esac
+}
 
 die() {
 	printf 'cron-apply: %s\n' "$*" >&2
@@ -98,9 +96,14 @@ current=$(crontab -l 2>/dev/null || true)
 
 missing_scripts=""
 to_add=""
+pending=$(mktemp)
+: >"$pending"
 for s in $needed_scripts; do
 	[ -f "/root/bin/$s" ] || missing_scripts="$missing_scripts $s"
-	printf '%s\n' "$current" | grep -q "bin/$s" || to_add="$to_add $s"
+	if ! printf '%s\n' "$current" | grep -q "bin/$s"; then
+		to_add="$to_add $s"
+		line_for "$s" >>"$pending"
+	fi
 done
 
 printf 'role: %s\n' "$role"
@@ -108,12 +111,26 @@ if [ -n "$missing_scripts" ]; then
 	printf 'not installed in /root/bin:%s\n' "$missing_scripts"
 fi
 if [ -z "$to_add" ]; then
+	rm -f "$pending"
 	printf 'nothing to do: every script this role schedules is already in the crontab\n\n'
-	printf 'Compare what is there against the block this would have added:\n'
-	printf '%s\n' "$block"
+	printf 'Compare what is there against the lines this would have added:\n\n'
+	for s in $needed_scripts; do
+		line_for "$s"
+	done
 	exit 0
 fi
 printf 'to be added:%s\n' "$to_add"
+
+# The block is assembled in a file, not a variable: command substitution strips
+# the trailing newline, which puts the closing marker on the last cron line and
+# leaves that job running a command with a comment glued to the end of it.
+block=$(mktemp)
+{
+	printf '\n# --- kyriakon: scheduled by scripts/cron-apply.sh ---\n'
+	cat "$pending"
+	printf '# --- end kyriakon ---\n'
+} >"$block"
+rm -f "$pending"
 
 if [ -n "$missing_scripts" ]; then
 	die "install the missing scripts first; the mail deploy does it"
@@ -147,7 +164,8 @@ before=$(mktemp)
 bak=/root/crontab.bak.$(date +%Y%m%d%H%M%S)
 printf '%s\n' "$current" > "$before"
 printf '%s\n' "$current" > "$work"
-printf '%s\n' "$block" >> "$work"
+cat "$block" >> "$work"
+rm -f "$block"
 
 if [ "$check_only" = yes ]; then
 	printf '\n--- the change that would be made ---\n'
