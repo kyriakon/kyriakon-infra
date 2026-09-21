@@ -87,9 +87,15 @@ need_pkg dovecot
 need_pkg gnupg
 need_pkg rust
 need_pkg opensmtpd-filter-dkimsign
+# Operators' editor, not something a service needs: the mail stack runs without
+# one. helix is what the person running this box edits with, and it needs no
+# config to behave, unlike vim, which starts in compatible mode on a fresh
+# account and looks exactly like the vi nobody wants.
+need_pkg helix
 
 command -v cargo >/dev/null || { printf 'cargo missing after pkg_add rust\n' >&2; exit 1; }
 command -v gpg >/dev/null || { printf 'gpg missing after pkg_add gnupg\n' >&2; exit 1; }
+command -v hx >/dev/null || { printf 'hx missing after pkg_add helix\n' >&2; exit 1; }
 
 # The headers are the real prerequisite for the plugin build. There is nothing
 # to run: OpenBSD ships dovecot-config as a 0644 shell variable file rather than
