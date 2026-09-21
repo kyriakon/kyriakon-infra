@@ -1,0 +1,82 @@
+#!/bin/ksh
+# check-hygiene.sh — two questions about a box, answered with the noise filtered.
+#
+#   doas ksh scripts/check-hygiene.sh
+#
+# 1. Permission and ownership drift against mtree's whole-system spec.
+#    `/etc/mtree/special` covers /etc, /root, /usr and /var, and is root-only, so
+#    both `-f` and `-p /` are needed: the spec's paths are rooted at /, and passing
+#    `-p /etc` makes every spec path report as missing and every real file as
+#    extra, which is a very long list that means nothing. Even run correctly,
+#    mtree calls every file it does not already know about `extra`, and on a box
+#    with a mail stack that is most of /etc. The differences worth reading are
+#    mode, uid, gid, type, size and link, so those are the only ones printed.
+#
+#    The daily security(8) mail runs the same comparison, which is the automatic
+#    version of this. This is the one to run when you want the answer now.
+#
+# 2. Whether this box's address is on Spamhaus Zen. Ask a resolver on the box
+#    first, because Spamhaus refuses shared resolvers and every resolver a Hetzner
+#    box is handed is one: through those the answer is 127.255.255.254, which
+#    looks like a listing and is a refusal. A resolver serving one machine is
+#    answered, and 127.0.0.2 to 127.0.0.11 is a real listing whose last octet names
+#    the list. The same distinction is in abuse-monitor.sh, which checks every
+#    fifteen minutes; keep the two in step if either changes.
+#
+# Read-only. Exits non-zero when something is wrong, so cron could run it, though
+# the daily mail already covers the permissions half.
+
+set -euo pipefail
+
+dnsbl_zone="${DNSBL_ZONE:-zen.spamhaus.org}"
+status=0
+
+# --- 1. permission and ownership drift -----------------------------------
+if [ "$(id -u)" -eq 0 ]; then
+	drift=$(mtree -q -f /etc/mtree/special -p / 2>&1 \
+		| grep -E '^(mode|uid|gid|type|size|link)' || true)
+	if [ -n "$drift" ]; then
+		printf 'permissions: drift from /etc/mtree/special\n%s\n' "$drift"
+		status=1
+	else
+		printf 'permissions: no drift from /etc/mtree/special\n'
+	fi
+else
+	printf 'permissions: skipped, needs root to read /etc/mtree/special\n'
+fi
+
+# --- 2. blocklist --------------------------------------------------------
+ip="${PUBLIC_IP:-$(ifconfig egress inet 2>/dev/null | awk '/inet / { print $2; exit }')}"
+if [ -z "$ip" ]; then
+	printf 'blocklist: cannot determine this box address\n'
+	exit "$status"
+fi
+rev=$(printf '%s\n' "$ip" | awk -F. '{ print $4"."$3"."$2"."$1 }')
+if dig +short +time=2 +tries=1 @127.0.0.1 . NS >/dev/null 2>&1; then
+	answer=$(dig +short +time=5 +tries=2 @127.0.0.1 "$rev.$dnsbl_zone" A 2>/dev/null || true)
+	via="the resolver on this box"
+else
+	answer=$(dig +short +time=5 +tries=2 "$rev.$dnsbl_zone" A 2>/dev/null || true)
+	via="the system resolver"
+fi
+case "$answer" in
+"")
+	printf 'blocklist: %s is not listed on %s (via %s)\n' "$ip" "$dnsbl_zone" "$via"
+	;;
+127.255.255.*)
+	printf 'blocklist: cannot check, %s refuses %s. A resolver on the box is answered and is not refused; unbound ships in base\n' \
+		"$dnsbl_zone" "$via"
+	status=1
+	;;
+127.0.0.*)
+	printf 'blocklist: %s IS listed on %s as 127.0.0.%s. That code names the list; look it up at check.spamhaus.org\n' \
+		"$ip" "$dnsbl_zone" "$(printf '%s\n' "$answer" | head -1 | awk -F. '{ print $4 }')"
+	status=1
+	;;
+*)
+	printf 'blocklist: %s gave an unexpected answer: %s\n' "$dnsbl_zone" "$answer"
+	status=1
+	;;
+esac
+
+exit "$status"
