@@ -92,7 +92,28 @@ rm -f "$expected"
 # that only speaks when it fails gives the log nothing to point at.
 printf 'canary byte-identical at %s\n' "$CANARY_PATH"
 
-# --- 5. Maildir-is-PGP-ciphertext --------------------------------------
+# --- 5. secrets, in both directions ------------------------------------
+# The backup takes /home and /etc/mail, and nothing else. /etc/mail carries the
+# DKIM signing key and smtpd's queue key, which exist nowhere else, so a rebuild
+# without them comes back unable to sign mail or read an existing queue. /root
+# carries the box's env file and the restic password; the TSIG key in the former is
+# DNS control for the domain, and the repository this test reads with read-only
+# credentials is no place for it. Asserting both directions means an edit to the
+# backup paths fails here, rather than quietly dropping a key or shipping a secret
+# to the storage box.
+for need in /etc/mail/dkim/private.rsa.key /etc/mail/smtpd.conf; do
+	if [ ! -e "$target$need" ]; then
+		die "missing from the snapshot: $need — the backup no longer covers /etc/mail"
+	fi
+done
+for secret in /root/.kyriakon-env /root/.restic-pass; do
+	if [ -e "$target$secret" ]; then
+		die "present in the snapshot: $secret — the backup covers a path it should not"
+	fi
+done
+printf 'verified /etc/mail secrets are in the snapshot and /root secrets are not\n'
+
+# --- 6. Maildir-is-PGP-ciphertext --------------------------------------
 # Zero-access regression guard: every restored message must carry the ASCII-armor
 # header. A plaintext message (or a quote of "BEGIN PGP MESSAGE") must not pass.
 # cur/ and new/ contain only messages (Dovecot indexes live in the Maildir root),
@@ -105,7 +126,7 @@ for msg in "$target"/home/*/Maildir/cur/* "$target"/home/*/Maildir/new/*; do
 done
 printf 'verified %s restored Maildir messages are PGP ciphertext\n' "$msg_count"
 
-# --- 6. git fsck on restored bare repos ---------------------------------
+# --- 7. git fsck on restored bare repos ---------------------------------
 repo_count=0
 for repo in "$target"/home/*/repos/*.git; do
 	[ -d "$repo" ] || continue
@@ -118,7 +139,7 @@ else
 	printf 'git fsck clean on %s restored repos\n' "$repo_count"
 fi
 
-# --- 7. node count --------------------------------------------------------
+# --- 8. node count --------------------------------------------------------
 # restic's total_file_count counts every node in the snapshot, directories
 # included, which is why its restore summary reads "files/dirs". The comparison
 # has to count nodes too, and -mindepth 1 drops the restore target itself, which
@@ -131,7 +152,7 @@ if [ "$(( restored_nodes - snapshot_nodes ))" -ne 0 ]; then
 fi
 printf 'restored %s nodes (matches snapshot stats)\n' "$restored_nodes"
 
-# --- 8. Healthchecks ping (success) ------------------------------------
+# --- 9. Healthchecks ping (success) ------------------------------------
 if [ -n "${HEALTHCHECKS_URL:-}" ]; then
 	ping_url "$HEALTHCHECKS_URL"
 fi
