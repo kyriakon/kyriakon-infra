@@ -1,18 +1,25 @@
-#	$OpenBSD: sshd_config,v 1.106 2026/07/10 17:21:19 naddy Exp $
+#	$OpenBSD: sshd_config,v 1.105 2024/12/03 14:12:47 dtucker Exp $
 
-# Kyriakon: this is OpenSSH's stock file, not a copy of the live one. The live
-# box's copy was edited by hand from the same stock with the three lines below
-# uncommented, so diff the two before applying this anywhere:
-#
-#   doas diff -u openbsd/etc/sshd_config /etc/ssh/sshd_config
+# Kyriakon: a copy of the live box's file, not a starting point to diff. Every
+# difference from /etc/ssh/sshd_config is in this header, checked on 2026-09-21.
+# It is OpenBSD's shipped file, v1.105 in 7.9, which the release trims from the
+# upstream one, so a newer upstream copy is not a substitute.
+
+# Two settings here depart from the stock file. Both are deliberate.
 #
 # Nothing on this box can authenticate by password. The operator account is in
 # wheel and has doas, so a guessed password would be root on the mail host, and
-# this host is scanned for account names thousands of times a day. Password and
-# keyboard-interactive are both off for that reason; keyboard-interactive matters
-# because it defaults to on and would otherwise offer the same guessing surface
-# under another name. Keys are unaffected, and doas still prompts for the local
+# this host takes thousands of named-account guesses a day. Password and
+# keyboard-interactive are both off; keyboard-interactive matters because it
+# defaults to on and would otherwise offer the same guessing surface under
+# another name. Keys are unaffected, and doas still prompts for the local
 # password, which sshd never sees.
+#
+# ClientAliveInterval 30 with ClientAliveCountMax 6 drops a session whose far end
+# has stopped answering after about three minutes, a laptop that went to sleep, for
+# instance. Set here rather than left at OpenSSH's default of no probing, so a
+# connection nobody is on the other end of does not sit open. A client that is
+# still there answers the probes, so long-running commands are unaffected.
 #
 # Applied by hand, never by a deploy: this file is reviewed line by line.
 #
@@ -20,8 +27,6 @@
 
 # This is the sshd server system-wide configuration file.  See
 # sshd_config(5) for more information.
-
-# This sshd was compiled with PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 # The strategy used for options in the default sshd_config shipped with
 # OpenSSH is to specify options with their default value where
@@ -36,7 +41,6 @@
 #HostKey /etc/ssh/ssh_host_rsa_key
 #HostKey /etc/ssh/ssh_host_ecdsa_key
 #HostKey /etc/ssh/ssh_host_ed25519_key
-#HostKey /etc/ssh/ssh_host_mldsa44_ed25519_key
 
 # Ciphers and keying
 #RekeyLimit default none
@@ -69,7 +73,7 @@ AuthorizedKeysFile	.ssh/authorized_keys
 # Change to yes if you don't trust ~/.ssh/known_hosts for
 # HostbasedAuthentication
 #IgnoreUserKnownHosts no
-# Don't read the user's ~/.rhosts and .shosts files
+# Don't read the user's ~/.rhosts and ~/.shosts files
 #IgnoreRhosts yes
 
 # To disable tunneled clear text passwords, change to "no" here!
@@ -80,27 +84,6 @@ PasswordAuthentication no
 # the system's configuration, this may involve passwords, challenge-response,
 # one-time passwords or some combination of these and other methods.
 KbdInteractiveAuthentication no
-
-# Kerberos options
-#KerberosAuthentication no
-#KerberosOrLocalPasswd yes
-#KerberosTicketCleanup yes
-#KerberosGetAFSToken no
-
-# GSSAPI options
-#GSSAPIAuthentication no
-#GSSAPICleanupCredentials yes
-
-# Set this to 'yes' to enable PAM authentication, account processing,
-# and session processing. If this is enabled, PAM authentication will
-# be allowed through the KbdInteractiveAuthentication and
-# PasswordAuthentication.  Depending on your PAM configuration,
-# PAM authentication via KbdInteractiveAuthentication may bypass
-# the setting of "PermitRootLogin prohibit-password".
-# If you just want the PAM account and session checks to run without
-# PAM authentication, then enable this but set PasswordAuthentication
-# and KbdInteractiveAuthentication to 'no'.
-#UsePAM no
 
 #AllowAgentForwarding yes
 #AllowTcpForwarding yes
@@ -114,8 +97,8 @@ KbdInteractiveAuthentication no
 #TCPKeepAlive yes
 #PermitUserEnvironment no
 #Compression delayed
-#ClientAliveInterval 0
-#ClientAliveCountMax 3
+ClientAliveInterval 30
+ClientAliveCountMax 6
 #UseDNS no
 #PidFile /var/run/sshd.pid
 #MaxStartups 10:30:100
