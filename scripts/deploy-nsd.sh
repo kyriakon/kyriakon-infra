@@ -10,38 +10,62 @@
 # step. This script substitutes the box's real IPs and the HMAC-SHA256 TSIG
 # secret HE signs its AXFR requests with into the deployed nsd.conf.
 #
-# Usage:
-#   doas ksh deploy-nsd.sh <ipv4> <ipv6> <tsig-secret> [src_dir]
+# On a fresh box, run scripts/setup-env.sh first: this script reads its values
+# from /root/.kyriakon-env, and nothing else creates that file early enough.
 #
-#   <ipv4> <ipv6>   the box's real Hetzner IPs
-#                   (terraform output ipv4_address ipv6_address)
+# Usage:
+#   doas ksh deploy-nsd.sh [ipv4] [ipv6] [tsig-secret] [src_dir]
+#
+#   <ipv4> <ipv6>   the box's real Hetzner IPs. Omit them to take
+#                   KYRIAKON_IPV4 / KYRIAKON_IPV6 from /root/.kyriakon-env
+#                   (terraform output ipv4_address ipv6_address).
 #   <tsig-secret>   the base64 HMAC-SHA256 secret shared with HE. Key name is
 #                   kyriakon-he and the algorithm is hmac-sha256, both fixed in
 #                   nsd.conf; the same name/algorithm must be set on the HE
 #                   portal's slave entry for kyriakon.net. Generate your own
 #                   with `openssl rand -base64 32`, or paste what HE generated.
-#                   NOTE: argv is visible to other users on the box via ps(1)
-#                   for the run's lifetime, and a literal in the command would
-#                   be recorded in the shell's history file. Assign it with
-#                   `read -rs` or export it instead of typing it inline. The
-#                   value is never echoed and lands only in
-#                   /var/nsd/etc/nsd.conf (chmod 0640, root).
+#                   Omit it to take KYRIAKON_TSIG_SECRET from /root/.kyriakon-env,
+#                   which is mode 0600, and never type it inline: argv is visible
+#                   to other users through ps(1) for the run's lifetime, and a
+#                   literal is recorded in the shell's history. The value is never
+#                   echoed and lands only in /var/nsd/etc/nsd.conf (0640, root).
 #   src_dir         dir containing kyriakon.net.zone and nsd.conf; defaults to
 #                   this script's directory. hostname.vio0 is read from
 #                   src_dir/.. , which is openbsd/etc/ in the repo layout.
 
 set -euo pipefail
 
+env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
+if [ -r "$env_file" ]; then
+	# shellcheck disable=SC1090 # the path is the operator's, not a fixed literal
+	. "$env_file"
+fi
+
 usage() {
-	printf 'usage: doas ksh %s <ipv4> <ipv6> <tsig-secret> [src_dir]\n' "$0" >&2
+	printf 'usage: doas ksh %s [ipv4] [ipv6] [tsig-secret] [src_dir]\n' "$0" >&2
+	printf '       anything omitted is read from %s, whose template is\n' "$env_file" >&2
+	printf '       openbsd/etc/kyriakon.env in this repo\n' >&2
 	exit 2
 }
 
-[ "$#" -ge 3 ] || usage
-ipv4="$1"
-ipv6="$2"
-secret="$3"
+# Arguments first, so a box that is not this one can be served from elsewhere, and
+# the env file otherwise, so a rebuild is one command with nothing retyped.
+ipv4="${1:-${KYRIAKON_IPV4:-}}"
+ipv6="${2:-${KYRIAKON_IPV6:-}}"
+secret="${3:-${KYRIAKON_TSIG_SECRET:-}}"
 src_dir="${4:-$(dirname "$0")}"
+if [ -z "$ipv4" ] || [ -z "$ipv6" ] || [ -z "$secret" ]; then
+	if [ ! -f "$env_file" ]; then
+		printf 'deploy-nsd: %s does not exist on this box yet.\n' "$env_file" >&2
+		printf 'Run this first: doas ksh %s/setup-env.sh\n' "$(dirname "$0")" >&2
+	else
+		printf 'deploy-nsd: %s is missing one of KYRIAKON_IPV4, KYRIAKON_IPV6 or\n' "$env_file" >&2
+		printf 'KYRIAKON_TSIG_SECRET, or one is still a placeholder. Check it with:\n' >&2
+		printf '  doas ksh %s/setup-env.sh\n' "$(dirname "$0")" >&2
+	fi
+	printf 'Arguments still work: doas ksh %s <ipv4> <ipv6> <tsig-secret>\n' "$0" >&2
+	exit 2
+fi
 
 # Every *.zone beside nsd.conf is served: kyriakon.net is the mail domain and
 # kyriakon.com is a defensive registration, and both live here so the second one

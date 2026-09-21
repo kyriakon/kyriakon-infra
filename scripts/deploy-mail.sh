@@ -49,7 +49,8 @@ encrypt_bin=/usr/local/sbin/kyriakon-encrypt
 for f in openbsd/etc/smtpd.conf openbsd/etc/httpd.conf openbsd/etc/acme-client.conf \
 	openbsd/etc/rc.d/kyriakon_encrypt openbsd/dovecot/dovecot.conf \
 	openbsd/etc/spamd.alloweddomains openbsd/etc/spamd.conf openbsd/etc/nospamd \
-	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml keys; do
+	openbsd/etc/kyriakon.env \
+	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml keys scripts/setup-env.sh; do
 	[ -e "$repo_dir/$f" ] || { printf 'missing from repo_dir: %s\n' "$f" >&2; exit 1; }
 done
 
@@ -427,6 +428,26 @@ fi
 # install with "install: /root/bin/INS@...: No such file or directory".
 # 0755 inside /root, which is already 0700 root.
 install -d -m 0755 /root/bin
+# The scripts themselves. Nothing used to put them there, so every box had them
+# copied by hand from the repo and each crontab line pasted by hand too, which is
+# how the monitor spent a week unscheduled. cron-apply.sh puts the lines in; it
+# can only do that if the files it names are deployed first.
+for s in lib.sh abuse-monitor.sh backup.sh renew-acme.sh; do
+	install -m 0755 "$repo_dir/scripts/$s" "/root/bin/$s"
+done
+printf 'cron scripts installed into /root/bin\n'
+
+# The box's values. setup-env.sh owns the install and is called rather than
+# duplicated here, so a box gets the file whichever deploy runs first: this one
+# needs nothing from it, but nsd and cron-apply do, and nsd runs before mail.
+say "env"
+env_dst=/root/.kyriakon-env
+if [ -f "$env_dst" ]; then
+	printf 'kept existing %s\n' "$env_dst"
+else
+	ksh "$repo_dir/scripts/setup-env.sh" \
+		|| printf 'WARNING: fill in %s before deploy-nsd or cron-apply\n' "$env_dst"
+fi
 
 home=$(awk -F: '$1 == "oliver" { print $6 }' /etc/passwd)
 [ -n "$home" ] || { printf 'cannot read the home directory for oliver from /etc/passwd\n' >&2; exit 1; }
@@ -526,6 +547,19 @@ printf '\t\t pass in on egress proto tcp from <nospamd> to any port smtp\n'
 printf '\n'
 printf '     Rationale, including why the second one exists, and checks:\n'
 printf '     docs/planning/research/spamd-greylisting.md\n'
-printf '  7. LMTP socket: leave it at the Dovecot default. smtpd mda runs as the\n'
+printf '  7. cron: the monitoring, backup and renewal lines:\n'
+printf '\n'
+printf '\t\t doas ksh scripts/cron-apply.sh --check\n'
+printf '\t\t doas ksh scripts/cron-apply.sh\n'
+printf '\n'
+printf '     Values come from /root/.kyriakon-env (mode 0600), which the nsd\n'
+printf '     deploy reads too, so nothing is retyped. On a fresh box that file is\n'
+printf '     created by scripts/setup-env.sh, before the nsd deploy rather than\n'
+printf '     after it.\n'
+printf '  8. quarterly rehearsal: create a Healthchecks check with a ~90-day\n'
+printf '     period, then run scripts/rehearsal.sh on a throwaway box. The check is\n'
+printf '     the reminder: a skipped quarter leaves it stale and it alerts, which no\n'
+printf '     cron entry on this box could do for you if the box is the problem.\n'
+printf '  9. LMTP socket: leave it at the Dovecot default. smtpd mda runs as the\n'
 printf '     recipient, not as root, so a root:wheel 0600 socket answers\n'
 printf '     "mail.lmtp: connect: Permission denied" and mail queues.\n'
