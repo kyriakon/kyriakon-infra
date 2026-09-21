@@ -15,7 +15,7 @@
 # The lines carry no values. Per-box settings come from /root/.kyriakon-env,
 # sourced by each line:
 #
-#   export ALERT_TOPIC='kyriakon-alerts'                      # ntfy topic (mail)
+#   export ALERT_EMAIL='you@example.invalid'                   # off-box alert address
 #   export HEALTHCHECKS_URL='https://hc-ping.com/<uuid>'       # dead-man's switch
 #   export RESTIC_REPOSITORY='sftp://<user>@<host>:23/<repo>'
 #   export RESTIC_PASSWORD_FILE='/root/.restic-pass'
@@ -59,7 +59,7 @@ env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
 case "$role" in
 mail)
 	needed_scripts="abuse-monitor.sh renew-acme.sh backup.sh"
-	needed_vars="ALERT_TOPIC HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE"
+	needed_vars="ALERT_EMAIL HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE"
 	block=$(cat <<'EOF'
 
 # --- kyriakon: monitoring and maintenance (scripts/cron-apply.sh) ---

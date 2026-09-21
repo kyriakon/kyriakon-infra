@@ -6,7 +6,7 @@
 #   doas ksh scripts/setup-env.sh                       # install the template, report what is unfilled
 #   doas ksh scripts/setup-env.sh --ipv4 ... --ipv6 ... --tsig-secret ... \
 #        --restic-repository ... --restic-password-file ... \
-#        --alert-topic ... --healthchecks-url ... --rehearsal-healthchecks-url ...
+#        --alert-email ... --healthchecks-url ... --rehearsal-healthchecks-url ...
 #
 # With no arguments it installs the repo template if the file is absent and
 # reports what still needs filling in. With arguments it writes the file from
@@ -29,13 +29,13 @@ script_dir="$(dirname "$0")"
 template="${KYRIAKON_ENV_TEMPLATE:-$script_dir/../openbsd/etc/kyriakon.env}"
 env_dst="${KYRIAKON_ENV:-/root/.kyriakon-env}"
 
-vars="KYRIAKON_IPV4 KYRIAKON_IPV6 KYRIAKON_TSIG_SECRET RESTIC_REPOSITORY RESTIC_PASSWORD_FILE ALERT_TOPIC HEALTHCHECKS_URL REHEARSAL_HEALTHCHECKS_URL"
+vars="KYRIAKON_IPV4 KYRIAKON_IPV6 KYRIAKON_TSIG_SECRET RESTIC_REPOSITORY RESTIC_PASSWORD_FILE ALERT_EMAIL HEALTHCHECKS_URL REHEARSAL_HEALTHCHECKS_URL"
 
 usage() {
 	cat >&2 <<'EOF'
 usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
                              --restic-repository D --restic-password-file E
-                             --alert-topic F --healthchecks-url G
+                             --alert-email F --healthchecks-url G
                              --rehearsal-healthchecks-url H]
 
   No arguments: install the template if /root/.kyriakon-env is absent, then
@@ -49,7 +49,7 @@ usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
       --tsig-secret "$(openssl rand -base64 32)" \
       --restic-repository 'sftp://user@host:23/kyriakon-backup' \
       --restic-password-file /root/.restic-pass \
-      --alert-topic kyriakon-alerts \
+      --alert-email you@example.invalid \
       --healthchecks-url https://hc-ping.com/<uuid> \
       --rehearsal-healthchecks-url https://hc-ping.com/<uuid>
 EOF
@@ -61,7 +61,7 @@ a_ipv6=
 a_tsig=
 a_repo=
 a_pass=
-a_topic=
+a_email=
 a_hc=
 a_reh=
 while [ "$#" -gt 0 ]; do
@@ -72,7 +72,7 @@ while [ "$#" -gt 0 ]; do
 	--tsig-secret) a_tsig="$2" ;;
 	--restic-repository) a_repo="$2" ;;
 	--restic-password-file) a_pass="$2" ;;
-	--alert-topic) a_topic="$2" ;;
+	--alert-email) a_email="$2" ;;
 	--healthchecks-url) a_hc="$2" ;;
 	--rehearsal-healthchecks-url) a_reh="$2" ;;
 	*) usage ;;
@@ -81,7 +81,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 given=0
-for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_topic" "$a_hc" "$a_reh"; do
+for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_reh"; do
 	if [ -n "$v" ]; then
 		given=$((given + 1))
 	fi
@@ -94,7 +94,7 @@ if [ "$given" -gt 0 ]; then
 	if [ -z "$a_tsig" ]; then missing="$missing KYRIAKON_TSIG_SECRET"; fi
 	if [ -z "$a_repo" ]; then missing="$missing RESTIC_REPOSITORY"; fi
 	if [ -z "$a_pass" ]; then missing="$missing RESTIC_PASSWORD_FILE"; fi
-	if [ -z "$a_topic" ]; then missing="$missing ALERT_TOPIC"; fi
+	if [ -z "$a_email" ]; then missing="$missing ALERT_EMAIL"; fi
 	if [ -z "$a_hc" ]; then missing="$missing HEALTHCHECKS_URL"; fi
 	if [ -z "$a_reh" ]; then missing="$missing REHEARSAL_HEALTHCHECKS_URL"; fi
 	if [ -n "$missing" ]; then
@@ -118,7 +118,7 @@ if [ "$given" -gt 0 ]; then
 	done
 	# The file expresses values as single-quoted shell words, so a value
 	# containing a quote cannot be represented in it.
-	for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_topic" "$a_hc" "$a_reh"; do
+	for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_reh"; do
 		case "$v" in
 		*"'"*) printf 'setup-env: a value contains a single quote, which this file cannot express\n' >&2; exit 2 ;;
 		esac
@@ -132,7 +132,7 @@ if [ "$given" -gt 0 ]; then
 		printf "export KYRIAKON_TSIG_SECRET='%s'\n" "$a_tsig"
 		printf "export RESTIC_REPOSITORY='%s'\n" "$a_repo"
 		printf "export RESTIC_PASSWORD_FILE='%s'\n" "$a_pass"
-		printf "export ALERT_TOPIC='%s'\n" "$a_topic"
+		printf "export ALERT_EMAIL='%s'\n" "$a_email"
 		printf "export HEALTHCHECKS_URL='%s'\n" "$a_hc"
 		printf "export REHEARSAL_HEALTHCHECKS_URL='%s'\n" "$a_reh"
 	} > "$tmp"
@@ -171,7 +171,7 @@ if [ -n "$missing" ] || [ -n "$placeholder" ]; then
 	printf '  KYRIAKON_TSIG_SECRET           the kyriakon-he key in /var/nsd/etc/nsd.conf\n'
 	printf '  RESTIC_REPOSITORY             the crontab line of a backup that works\n'
 	printf '  RESTIC_PASSWORD_FILE          /root/.restic-pass\n'
-	printf '  ALERT_TOPIC                   an ntfy.sh topic you invent, and keep secret\n'
+	printf '  ALERT_EMAIL                   an address off this box, where alerts are mailed\n'
 	printf '  HEALTHCHECKS_URL              this box'"'"'s own check, not another box'"'"'s\n'
 	printf '  REHEARSAL_HEALTHCHECKS_URL    belongs on the rehearsal box, not this one\n'
 	exit 1

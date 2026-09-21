@@ -11,12 +11,14 @@
 # Plus the dead-man's switch (§34/35): a Healthchecks.io ping on a clean run.
 # If this script stops running, or the box goes silent, Healthchecks alerts from
 # OUTSIDE the box (the only channel that still works when the box is compromised).
-# Content-rich detail goes to a separate external channel (ntfy.sh push) so the
-# two concerns — liveness and content — stay split as the spec intends.
+# Findings go out as mail to ALERT_EMAIL and mark that same check down, so the
+# external channel carries them too.
 #
 # Env (all optional — the script degrades to stderr output):
-#   ALERT_TOPIC            ntfy.sh topic for content-rich alerts (no topic = stderr only)
-#   HEALTHCHECKS_URL       Healthchecks ping URL for the dead-man's switch
+#   ALERT_EMAIL            address to mail alerts to, off this box, so an alert
+#                          survives this box being the broken thing
+#   HEALTHCHECKS_URL       this box's check: a plain ping on a clean run, and
+#                          /fail with the finding when something trips
 #   PUBLIC_IP              IPv4 for the DNSBL check (default: auto-detect from `ifconfig egress`)
 #   DNSBL_ZONE             DNSBL to query (default zen.spamhaus.org)
 #   MAIL_SPIKE_MAX         outbound msgs per run that counts as a spike (default 200)
@@ -44,7 +46,15 @@ quota_warn_pct="${QUOTA_WARN_PCT:-80}"
 grey_max="${GREY_MAX:-200}"
 dnsbl_zone="${DNSBL_ZONE:-zen.spamhaus.org}"
 
-# --- alert: content-rich, external channel, rate-limited -----------------
+# --- alert: content-rich mail, plus the external check --------------------
+# Alerts go out as mail to ALERT_EMAIL, an address off this box, and the same
+# event marks the Healthchecks check down so the external channel carries it too.
+#
+# Two channels because they fail differently. Mail is what can describe a finding:
+# the check's dashboard shows a stored body but the notification itself does not
+# repeat it. And the check is what survives this box being the broken thing: mail
+# cannot report a broken mail path, and the check's silence covers that case.
+#
 # ponytail: single global cooldown (one state file). Per-check cooldowns if a
 # real incident ever suppresses a second check within the window.
 alert() {
@@ -56,11 +66,18 @@ alert() {
 		return 0
 	fi
 	printf '%s\n' "$now" > "$state/alert.last"
-	if [ -n "${ALERT_TOPIC:-}" ]; then
-		curl -fsS -m 10 --retry 3 -H "Title: $title" -d "$body" \
-			"https://ntfy.sh/$ALERT_TOPIC" >/dev/null 2>&1 || true
+	when=$(date '+%F %T')
+	if [ -n "${ALERT_EMAIL:-}" ]; then
+		printf '%s\n\n%s on %s\n' "$body" "$title" "$(hostname)" \
+			| mail -s "kyriakon: $title" "$ALERT_EMAIL" >/dev/null 2>&1 || true
 	fi
-	printf '%s — %s: %s\n' "$(date '+%F %T')" "$title" "$body" >&2
+	# The body lands in the check's event log, which is what makes an alert
+	# raised while mail is broken still readable somewhere.
+	if [ -n "${HEALTHCHECKS_URL:-}" ]; then
+		curl -fsS -m 10 --retry 3 --data "$when $title: $body" \
+			"$HEALTHCHECKS_URL/fail" >/dev/null 2>&1 || true
+	fi
+	printf '%s — %s: %s\n' "$when" "$title" "$body" >&2
 }
 
 # --- new_lines: emit log lines appended since last run -------------------
@@ -154,7 +171,7 @@ fi
 # --- dead-man's switch: Healthchecks ping on a clean run ------------------
 # Any hard failure above exits before here (set -e) and the ping is skipped →
 # Healthchecks alerts on silence. This is the channel that survives a
-# compromised box, unlike the ntfy push.
+# compromised box, unlike the alert mail this same script sends.
 if [ -n "${HEALTHCHECKS_URL:-}" ]; then
 	curl -fsS -m 10 --retry 3 "$HEALTHCHECKS_URL" >/dev/null 2>&1 || true
 fi
