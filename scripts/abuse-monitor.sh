@@ -1,12 +1,13 @@
 #!/bin/ksh
 # abuse-monitor.sh — cron-driven abuse + health monitoring for the mail box.
 #
-# Watches five signals (spec §30-33), each tripping a content-rich alert:
+# Watches six signals (spec §30-33), each tripping a content-rich alert:
 #   1. outbound mail-volume spike  — relayed message count (MTA sessions)
 #   2. repeated auth failures       — smtpd + dovecot (maillog), sshd (authlog)
 #   3. quota approach               — per-user edquota usage vs soft limit
 #   4. spamd greylist/blocklist     — greylist churn + new TRAPPED (blacklisted) hosts
-#   5. IP reputation blocklist      — reversed-IPv4 A lookup on a DNSBL
+#   5. senders deferred from several addresses — mail lost to a rotating retry IP
+#   6. IP reputation blocklist      — reversed-IPv4 A lookup on a DNSBL
 #
 # Plus the dead-man's switch (§34/35): a Healthchecks.io ping on a clean run.
 # If this script stops running, or the box goes silent, Healthchecks alerts from
@@ -23,6 +24,8 @@
 #   AUTH_FAIL_MAX          auth failures per run before alert (default 10)
 #   QUOTA_WARN_PCT         quota usage % of soft limit that trips the alert (default 80)
 #   GREY_MAX               spamd greylist entries before "flood" alert (default 200)
+#   DEFER_MIN              distinct addresses one sender may be deferred from before it alerts (default 3)
+#   DAEMONLOG              spamd's verbose log, carrying greylist envelopes (default /var/log/daemon)
 #   ALERT_COOLDOWN_MINUTES alert suppression window (default 60)
 #   STATE_DIR              state-file dir (default /var/db/kyriakon-monitor)
 #
@@ -42,6 +45,8 @@ mail_spike_max="${MAIL_SPIKE_MAX:-200}"
 auth_fail_max="${AUTH_FAIL_MAX:-10}"
 quota_warn_pct="${QUOTA_WARN_PCT:-80}"
 grey_max="${GREY_MAX:-200}"
+defer_min="${DEFER_MIN:-3}"
+daemon_log="${DAEMONLOG:-/var/log/daemon}"
 dnsbl_zone="${DNSBL_ZONE:-zen.spamhaus.org}"
 
 # --- alert: content-rich, external channel, rate-limited -----------------
@@ -140,7 +145,43 @@ if [ -f "$state/spamd-trapped" ]; then
 fi
 printf '%s\n' "$trapped" > "$state/spamd-trapped"
 
-# --- 5. IP reputation blocklist ------------------------------------------
+# --- 5. senders deferred from several addresses --------------------------
+# Greylisting promotes an address only when a retry arrives for the same tuple,
+# and a tuple is keyed on the connecting IP, so a sender that rotates its outbound
+# address between retries is never promoted: it is deferred until it gives up and
+# its mail bounces. Outlook.com and Exchange Online do that, and one such message
+# was lost on 2026-09-20 before the nospamd exemption existed. This is the check
+# that would have said so at the time.
+#
+# The signal sits in one log. A sender whose address has been whitelisted stops
+# appearing in greylist decisions, so a real correspondent that keeps being
+# deferred shows up as the same envelope-from arriving from several different
+# addresses in a day. The delivery log is deliberately not consulted: maillog
+# rotates daily while this one does not, so the two windows would not line up and
+# a delivery older than the rotation would read as a failure to deliver.
+#
+# spamd -v (set by deploy-mail.sh) logs the envelope of every decision:
+#   "… (GREY) <ip>: <from> -> <to>"
+# With no -v there is nothing to count, and this reports nothing.
+today=$(date '+%b %e')
+flagged=$(awk -v day="$today" -v min="$defer_min" '
+	$0 ~ "^" day && /\(GREY\)/ {
+		f = $8; gsub(/[<>]/, "", f)
+		pair = f "|" $7
+		if (!(pair in seen)) { seen[pair] = 1; n[f]++ }
+	}
+	END { for (f in n) if (n[f] >= min) print n[f], f }
+' "$daemon_log" 2>/dev/null | sort -rn || true)
+# One alert for the day's set, carrying how many addresses each sender used. The
+# state file is a snapshot of what has been reported, rewritten every run, so it
+# prunes itself and a sender stuck for days is not news on every run.
+reported=$(cat "$state/deferred-senders" 2>/dev/null || true)
+if [ -n "$flagged" ] && [ "$flagged" != "$reported" ]; then
+	alert "greylisted senders" "deferred from several addresses today: $(printf '%s' "$flagged" | tr '\n' ';') — if one is a real correspondent, add its mail ranges to /etc/mail/nospamd (docs/planning/research/spamd-greylisting.md)"
+fi
+printf '%s\n' "$flagged" > "$state/deferred-senders"
+
+# --- 6. IP reputation blocklist ------------------------------------------
 ip="${PUBLIC_IP:-$(ifconfig egress inet 2>/dev/null | awk '/inet / { print $2; exit }')}"
 if [ -n "$ip" ]; then
 	rev=$(printf '%s\n' "$ip" | awk -F. '{ print $4"."$3"."$2"."$1 }')
