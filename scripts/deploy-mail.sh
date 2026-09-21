@@ -48,7 +48,7 @@ encrypt_bin=/usr/local/sbin/kyriakon-encrypt
 
 for f in openbsd/etc/smtpd.conf openbsd/etc/httpd.conf openbsd/etc/acme-client.conf \
 	openbsd/etc/rc.d/kyriakon_encrypt openbsd/dovecot/dovecot.conf \
-	openbsd/etc/spamd.alloweddomains openbsd/etc/spamd.conf \
+	openbsd/etc/spamd.alloweddomains openbsd/etc/spamd.conf openbsd/etc/nospamd \
 	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml keys; do
 	[ -e "$repo_dir/$f" ] || { printf 'missing from repo_dir: %s\n' "$f" >&2; exit 1; }
 done
@@ -387,6 +387,24 @@ start_service spamlogd
 # is shipped to spamd.
 /usr/libexec/spamd-setup -n
 
+# The list of senders that skip greylisting, read by pf as a table file. spamd
+# promotes an address only when a retry arrives for the same tuple, and a tuple is
+# keyed on the source IP, so a sender that rotates its outbound address between
+# retries is never promoted and is deferred until it gives up. Outlook.com and
+# Exchange Online do that; the pf rules that read this file are added by
+# scripts/pf-apply.sh, and openbsd/etc/nospamd records where the ranges come from.
+say "nospamd"
+nospamd_src="$repo_dir/openbsd/etc/nospamd"
+# A pf table file holds addresses only. A stray line here would fail the later
+# load, which is a human-run step, so it is rejected at deploy time instead.
+bad=$(grep -v -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$|^[0-9A-Fa-f:]+(/[0-9]{1,3})?$' "$nospamd_src" | head -3 || true)
+[ -z "$bad" ] || {
+	printf 'not an address or network in openbsd/etc/nospamd:\n%s\n' "$bad" >&2
+	exit 1
+}
+install -m 0644 -o root -g wheel "$nospamd_src" /etc/mail/nospamd
+printf 'installed /etc/mail/nospamd (%s networks)\n' "$(grep -c . /etc/mail/nospamd)"
+
 # --- 7. account ---------------------------------------------------------
 
 # oliver is the operator account: it doubles as the admin login for the box,
@@ -455,7 +473,17 @@ if pfctl -sr 2>/dev/null | grep -q 'divert-to 127.0.0.1'; then
 		"$(spamdb 2>/dev/null | grep -c '^GREY|' || true)"
 else
 	printf 'greylisting: OFF - inbound mail is not diverted to spamd.\n'
-	printf '              Apply the pf fragment in step 6 below.\n'
+	printf '             Apply it with: doas ksh scripts/pf-apply.sh\n'
+fi
+# The exemption is reported separately because its absence is not visible in the
+# greylisting line above: with the divert on and no exempt list, everything looks
+# healthy while senders on rotating addresses are deferred until they give up.
+if pfctl -sr 2>/dev/null | grep -q 'from <nospamd>'; then
+	printf 'greylist exemption: on (%s network(s) exempt)\n' \
+		"$(grep -c . /etc/mail/nospamd 2>/dev/null || true)"
+else
+	printf 'greylist exemption: OFF - senders that rotate their IP will be deferred until they give up.\n'
+	printf '                    Apply it with: doas ksh scripts/pf-apply.sh\n'
 fi
 printf 'MX:   %s\n' "$(dig +short @ns1.he.net kyriakon.net MX)"
 printf 'mail: %s %s\n' "$(dig +short @ns1.he.net mail.kyriakon.net A)" \
@@ -477,16 +505,27 @@ printf '     https://github.com/OliverBrotchie/oliver.kyriakon.net . The vhost\n
 printf '     blocks /.git, so keep it a checkout rather than a copy of the files:\n'
 printf '     git clone once as root, then git pull to update. It carries both\n'
 printf '     index.html for HTTP and index.gmi for the Gemini side.\n'
-printf '  6. greylisting: append this to the END of /etc/pf.conf (pf is\n'
-printf '     last-match-wins, so it must follow the stock pass rule), then\n'
-printf '     "pfctl -nf" it and load it. Rationale and checks:\n'
-printf '     docs/planning/research/spamd-greylisting.md\n'
+printf '  6. pf: two fragments, appended at the END of /etc/pf.conf (pf is\n'
+printf '     last-match-wins, so they must follow the stock pass rule). Review\n'
+printf '     the diff, then apply:\n'
+printf '\n'
+printf '\t\t doas ksh scripts/pf-apply.sh --check\n'
+printf '\t\t doas ksh scripts/pf-apply.sh\n'
+printf '\n'
+printf '     It appends only what is missing, checks the candidate with\n'
+printf '     "pfctl -n" before touching the live file, keeps a timestamped copy\n'
+printf '     of that file, and loads nothing pfctl rejects. The fragments:\n'
 printf '\n'
 printf '\t\t table <spamd-white> persist\n'
 printf '\t\t pass in on egress proto tcp to any port smtp \\\n'
 printf '\t\t     divert-to 127.0.0.1 port spamd\n'
 printf '\t\t pass in log on egress proto tcp from <spamd-white> to any port smtp\n'
 printf '\n'
+printf '\t\t table <nospamd> persist file "/etc/mail/nospamd"\n'
+printf '\t\t pass in on egress proto tcp from <nospamd> to any port smtp\n'
+printf '\n'
+printf '     Rationale, including why the second one exists, and checks:\n'
+printf '     docs/planning/research/spamd-greylisting.md\n'
 printf '  7. LMTP socket: leave it at the Dovecot default. smtpd mda runs as the\n'
 printf '     recipient, not as root, so a root:wheel 0600 socket answers\n'
 printf '     "mail.lmtp: connect: Permission denied" and mail queues.\n'
