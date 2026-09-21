@@ -127,6 +127,14 @@ if [ "$given" -gt 0 ]; then
 	tmp=$(mktemp)
 	{
 		printf '# Written by setup-env.sh. Mode 0600: this file holds secrets.\n'
+		# Quoted heredoc: $PATH is the literal text to write, not this script's
+		# value, which is what shellcheck's SC2016 would otherwise flag.
+		cat <<-'EOF'
+			# cron(8) jobs get PATH=/usr/bin:/bin, where curl, ifconfig and
+			# acme-client are all absent; every cron line sources this file.
+			PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
+			export PATH
+		EOF
 		printf "export KYRIAKON_IPV4='%s'\n" "$a_ipv4"
 		printf "export KYRIAKON_IPV6='%s'\n" "$a_ipv6"
 		printf "export KYRIAKON_TSIG_SECRET='%s'\n" "$a_tsig"

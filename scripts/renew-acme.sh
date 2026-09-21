@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-PATH="/usr/local/sbin:/usr/local/bin:$PATH"
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
 export PATH
 
 [ "$(id -u)" -eq 0 ] || { printf 'run as root (doas ksh %s)\n' "$0" >&2; exit 1; }

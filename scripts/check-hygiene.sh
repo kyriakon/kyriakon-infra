@@ -23,10 +23,23 @@
 #    the list. The same distinction is in abuse-monitor.sh, which checks every
 #    fifteen minutes; keep the two in step if either changes.
 #
+# 3. Whether a cron job can reach the tools the cron jobs need. cron(8) hands
+#    jobs PATH=/usr/bin:/bin, packages live in /usr/local and ifconfig in /sbin,
+#    so a job whose PATH is not restored finds neither. abuse-monitor.sh's
+#    Healthchecks ping is `curl ... || true`, which makes that look like a clean
+#    run: the box reads as monitored while nothing is sent. This section sources
+#    /root/.kyriakon-env on cron's PATH and asks what a job would find.
+#
 # Read-only. Exits non-zero when something is wrong, so cron could run it, though
 # the daily mail already covers the permissions half.
 
 set -euo pipefail
+
+# cron(8) jobs are given PATH=/usr/bin:/bin, and packages live in /usr/local while
+# ifconfig lives in /sbin. Whether this file is run by hand or by cron, put them
+# back, for the reason section 3 exists.
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
+export PATH
 
 dnsbl_zone="${DNSBL_ZONE:-zen.spamhaus.org}"
 status=0
@@ -78,5 +91,29 @@ case "$answer" in
 	status=1
 	;;
 esac
+
+# --- 3. does the cron environment still reach the tools cron needs? ------
+# cron(8) gives jobs PATH=/usr/bin:/bin. Packages live in /usr/local and ifconfig
+# in /sbin, so a job that does not put those back finds neither, and
+# abuse-monitor.sh's Healthchecks ping is `curl ... || true`, which turns that
+# into a failure indistinguishable from a clean run: the box looks monitored
+# while no ping is being sent. Source the env exactly as a cron line does, on
+# cron's PATH, and ask what a job would find.
+if [ "$(id -u)" -eq 0 ] && [ -f /root/.kyriakon-env ]; then
+	absent=""
+	for tool in curl ifconfig; do
+		env -i PATH=/usr/bin:/bin sh -c ". /root/.kyriakon-env; command -v $tool" >/dev/null 2>&1 \
+			|| absent="$absent $tool"
+	done
+	if [ -n "$absent" ]; then
+		printf 'cron environment: a cron job would not find:%s\n' "$absent"
+		printf '  the fix is the PATH line in /root/.kyriakon-env, which every cron line sources\n'
+		status=1
+	else
+		printf 'cron environment: curl and ifconfig both reachable as a cron job sees them\n'
+	fi
+else
+	printf 'cron environment: skipped, needs root and /root/.kyriakon-env\n'
+fi
 
 exit "$status"
