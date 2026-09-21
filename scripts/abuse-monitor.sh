@@ -3,7 +3,8 @@
 #
 # Watches six signals (spec §30-33), each tripping a content-rich alert:
 #   1. outbound mail-volume spike  — relayed message count (MTA sessions)
-#   2. repeated auth failures       — smtpd + dovecot (maillog), sshd (authlog)
+#   2. auth failures                — smtpd + dovecot (maillog), sshd (authlog)
+#                                     mail-side any; ssh per source address
 #   3. quota approach               — per-user edquota usage vs soft limit
 #   4. spamd greylist/blocklist     — greylist churn + new TRAPPED (blacklisted) hosts
 #   5. senders deferred from several addresses — mail lost to a rotating retry IP
@@ -23,7 +24,7 @@
 #   PUBLIC_IP              IPv4 for the DNSBL check (default: auto-detect from `ifconfig egress`)
 #   DNSBL_ZONE             DNSBL to query (default zen.spamhaus.org)
 #   MAIL_SPIKE_MAX         outbound msgs per run that counts as a spike (default 200)
-#   AUTH_FAIL_MAX          auth failures per run before alert (default 10)
+#   AUTH_FAIL_MAX          failed ssh logins from one address before alert (default 10)
 #   QUOTA_WARN_PCT         quota usage % of soft limit that trips the alert (default 80)
 #   GREY_MAX               spamd greylist entries before "flood" alert (default 200)
 #   DEFER_MIN              distinct addresses one sender may be deferred from before it alerts (default 3)
@@ -118,18 +119,44 @@ if [ "$outbound" -gt "$mail_spike_max" ]; then
 	alert "mail spike" "outbound: $outbound messages relayed since last run (max $mail_spike_max)"
 fi
 
-# --- 2. repeated auth failures -------------------------------------------
-# smtpd (smtp_session.c): "smtp authentication user=X result=permfail|tempfail".
-# dovecot PAM (passdb-pam.c): "auth: ... pam_authenticate() failed" / "unknown user".
-# sshd (authlog): "Failed password" / "Invalid user".
-auth=$(printf '%s\n' "$new_maillog" "$new_authlog" \
+# --- 2. auth failures ----------------------------------------------------
+# Split by kind, because the two mean opposite things. Mail-side failures are rare
+# and each is a real client getting its password wrong, so the first one is worth
+# knowing about. sshd failures are the background noise of any public box: this one
+# takes a steady trickle of dictionary guesses from all over, and a total summed
+# across mail and ssh says nothing except that the internet is on. Twelve guesses
+# from twelve addresses is that background; twelve from one address is somebody
+# working through a list, and that is the one worth waking up for. Nothing here can
+# succeed: every account authenticates by key, and no password login has ever been
+# accepted, which is why the per-address count is a tidiness signal, not an alarm.
+#   smtpd (smtp_session.c): "smtp authentication user=X result=permfail|tempfail"
+#   dovecot PAM (passdb-pam.c): "auth: ... pam_authenticate() failed" / "unknown user"
+#   sshd (authlog): "Failed password for ... from <ip> port ..." / "Invalid user ... from <ip>"
+mail_auth=$(printf '%s\n' "$new_maillog" \
 	| awk '
 		/smtp authentication user=.*result=(perm|temp)fail/ { c++ }
 		/auth:.*(pam_authenticate\(\) failed|unknown user)/ { c++ }
-		/Failed password|Invalid user/ { c++ }
 		END { print c+0 }')
-if [ "$auth" -gt "$auth_fail_max" ]; then
-	alert "auth failures" "$auth failed SMTP/IMAP/SSH logins since last run (max $auth_fail_max)"
+if [ "$mail_auth" -gt 0 ]; then
+	alert "mail auth failures" "$mail_auth failed SMTP/IMAP logins since last run. Each one is a client whose password is wrong, so check the address before assuming a stranger: a phone with a stale password looks exactly like this"
+fi
+
+# sshd, tallied by source address, reporting the worst one and the total.
+ssh_auth=$(printf '%s\n' "$new_authlog" \
+	| awk '
+		/Failed password|Invalid user/ {
+			for (i = 1; i < NF; i++) if ($i == "from") { n[$(i+1)]++; t++; break }
+		}
+		END {
+			worst = ""; high = 0
+			for (ip in n) if (n[ip] > high) { high = n[ip]; worst = ip }
+			printf "%s %d %d\n", worst, high, t+0
+		}')
+ssh_ip=$(printf '%s\n' "$ssh_auth" | awk '{ print $1 }')
+ssh_high=$(printf '%s\n' "$ssh_auth" | awk '{ print $2+0 }')
+ssh_total=$(printf '%s\n' "$ssh_auth" | awk '{ print $3+0 }')
+if [ "$ssh_high" -gt "$auth_fail_max" ]; then
+	alert "ssh guesses" "$ssh_ip made $ssh_high failed ssh logins since last run, out of $ssh_total from all addresses (max per address $auth_fail_max). Password auth is off everywhere, so none of this can succeed; it is worth a look only because one source is working through a list"
 fi
 
 for dir in /home/*/; do
