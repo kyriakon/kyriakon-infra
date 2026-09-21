@@ -444,6 +444,22 @@ say "env"
 env_dst=/root/.kyriakon-env
 if [ -f "$env_dst" ]; then
 	printf 'kept existing %s\n' "$env_dst"
+	# A box installed before the PATH line existed still has a file without it,
+	# and cron would go on finding no curl: the Healthchecks ping fails into
+	# `|| true`, so the box reads as monitored while nothing is sent. Append the
+	# line rather than rewriting the file, which must never lose its values.
+	if ! grep -q '^PATH=' "$env_dst"; then
+		# Quoted heredoc: $PATH here is the literal text to write, not this
+		# script's value, which is what shellcheck's SC2016 would flag.
+		cat >> "$env_dst" <<-'EOF'
+
+			# cron(8) runs jobs with PATH=/usr/bin:/bin; packages live in
+			# /usr/local and ifconfig in /sbin. Every cron line sources this.
+			PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
+			export PATH
+		EOF
+		printf 'added the cron PATH line to %s\n' "$env_dst"
+	fi
 else
 	ksh "$repo_dir/scripts/setup-env.sh" \
 		|| printf 'WARNING: fill in %s before deploy-nsd or cron-apply\n' "$env_dst"
