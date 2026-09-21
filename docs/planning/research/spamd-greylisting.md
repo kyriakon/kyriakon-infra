@@ -172,6 +172,32 @@ Add other large senders the same way once one is seen being deferred from a
 rotating address. Whitelisting single addresses with `spamdb -a` does not help
 with a pool, since each retry arrives on a different one.
 
+### What is in the list, and where each entry came from
+
+Two providers, each taken from its own mailing SPF rather than from memory:
+
+	Microsoft (Outlook.com, Exchange Online)
+	  dig +short TXT spf.protection.outlook.com
+	Google (Gmail, Workspace)
+	  dig +short TXT _spf.google.com
+
+Microsoft's entries are its mail relays. Google's `74.125.0.0/16` and
+`209.85.128.0/17` are its mail range and not its cloud, which is the distinction
+that matters: the hosts this box spent 2026-09-20 tarpitting were
+`*.bc.googleusercontent.com` addresses in `34.76.x`, `35.187.x`, `34.38.x` and
+`207.175.x`, and none of them fall inside either block. Google's IPv6 blocks are
+listed for the day inbound SMTP is diverted on IPv6 as well; today an IPv6
+connection skips the divert entirely, so they change nothing.
+
+Repeat that check before adding anything: a range that contains a host already
+seen abusing this box is a range that undoes the protection, and the abuse is
+where the cheap cloud compute is, not where the mail relays are. The hosts worth
+comparing against are the ones spamd has been tarpitting, which the verbose log
+names:
+
+	grep connected /var/log/daemon | awk '{ print $6 }' | sort | uniq -c | sort -rn
+
+
 ## Verifying
 
 	rcctl check spamd spamlogd                    # both; see the second daemon above
