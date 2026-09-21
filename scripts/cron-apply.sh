@@ -118,10 +118,31 @@ printf 'to be added:%s\n' "$to_add"
 if [ -n "$missing_scripts" ]; then
 	die "install the missing scripts first; the mail deploy does it"
 fi
-[ -f "$env_file" ] || die "$env_file is missing. Create it mode 0600 with one 'export VAR=value' per line for: $needed_vars"
+# A missing or half-filled env is the likely first run, so print what to write
+# rather than naming the variables and leaving the rest to a search.
+hint() {
+	case "$1" in
+	ALERT_TOPIC) printf "'kyriakon-alerts'  # the ntfy.sh topic to push alerts to" ;;
+	HEALTHCHECKS_URL) printf "'https://hc-ping.com/<uuid>'  # this box's check" ;;
+	RESTIC_REPOSITORY) printf "'sftp://<user>@<host>:23/<repo>'" ;;
+	RESTIC_PASSWORD_FILE) printf "'/root/.restic-pass'  # mode 0600" ;;
+	*) printf "'<value>'" ;;
+	esac
+}
+
+missing_vars=""
 for v in $needed_vars; do
-	grep -q "^export $v=" "$env_file" || die "$env_file does not set $v"
+	grep -q "^export $v=" "$env_file" 2>/dev/null || missing_vars="$missing_vars $v"
 done
+if [ -n "$missing_vars" ]; then
+	printf 'cron-apply: %s does not set:%s\n\nCreate it mode 0600 with:\n\n' \
+		"$env_file" "$missing_vars" >&2
+	for v in $missing_vars; do
+		printf '  export %s=%s\n' "$v" "$(hint "$v")" >&2
+	done
+	printf '\nThen re-run this script. Nothing was written.\n' >&2
+	exit 1
+fi
 
 work=$(mktemp)
 before=$(mktemp)
