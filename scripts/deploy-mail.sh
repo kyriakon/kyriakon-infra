@@ -500,8 +500,17 @@ fi
 # greylisting line above: with the divert on and no exempt list, everything looks
 # healthy while senders on rotating addresses are deferred until they give up.
 if pfctl -sr 2>/dev/null | grep -q 'from <nospamd>'; then
-	printf 'greylist exemption: on (%s network(s) exempt)\n' \
-		"$(grep -c . /etc/mail/nospamd 2>/dev/null || true)"
+	# Count what the kernel holds, not what the file says: a `persist file` table is
+	# read at load time, so a list that was replaced after the last load leaves the
+	# old entries in place while the file looks right. The first run of this check
+	# counted the file and reported 19 networks while the kernel held 11.
+	kernel_n=$(pfctl -t nospamd -T show 2>/dev/null | grep -c . || true)
+	file_n=$(grep -c . /etc/mail/nospamd 2>/dev/null || true)
+	printf 'greylist exemption: on (%s network(s) loaded)\n' "$kernel_n"
+	if [ "$kernel_n" != "$file_n" ]; then
+		printf '                    but /etc/mail/nospamd holds %s: the table is stale.\n' "$file_n"
+		printf '                    Run: doas ksh scripts/pf-apply.sh\n'
+	fi
 else
 	printf 'greylist exemption: OFF - senders that rotate their IP will be deferred until they give up.\n'
 	printf '                    Apply it with: doas ksh scripts/pf-apply.sh\n'

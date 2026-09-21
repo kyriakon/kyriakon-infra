@@ -101,8 +101,41 @@ EOF
 fi
 
 if [ "$added" -eq 0 ]; then
+	# A `persist file` table is read when the ruleset loads, so replacing the list
+	# file leaves the kernel holding the old one until something reloads. Compare
+	# them, ignoring order, and reload when they differ: that is what makes this
+	# idempotent after the deploy installs an updated list. Two temp files rather
+	# than process substitution, which OpenBSD's ksh does not have.
+	known=$(mktemp)
+	want=$(mktemp)
+	# A table that does not exist yet returns non-zero, which under `set -e` with
+	# pipefail would end the script before it could reload and create it.
+	{ pfctl -t nospamd -T show 2>/dev/null || true; } | tr -d ' ' | sort > "$known"
+	sort "$nospamd" > "$want"
+	same=no
+	if cmp -s "$known" "$want"; then
+		same=yes
+	fi
+	rm -f "$known" "$want"
+	if [ "$same" = yes ]; then
+		rm -f "$work"
+		printf '\nnothing to do: %s carries both fragments and <nospamd> matches %s\n' \
+			"$pf_conf" "$nospamd"
+		exit 0
+	fi
+	printf '\nthe fragments are in place, but <nospamd> in the kernel does not match %s\n' "$nospamd"
+	printf 'reloading %s to pick the list up\n' "$pf_conf"
+	if [ "$check_only" = yes ]; then
+		rm -f "$work"
+		printf '\n--check: a reload is what is needed. Nothing was written.\n'
+		exit 0
+	fi
+	cp -p "$pf_conf" "$bak"
+	pfctl -f "$pf_conf" || die "reload failed; the running ruleset is unchanged"
 	rm -f "$work"
-	printf '\nnothing to do: %s already carries both fragments\n' "$pf_conf"
+	printf '\nbacked up as %s\n' "$bak"
+	printf 'reloaded %s\n\n' "$pf_conf"
+	printf '<nospamd> now holds %s entries\n' "$(pfctl -t nospamd -T show 2>/dev/null | grep -c .)"
 	exit 0
 fi
 
