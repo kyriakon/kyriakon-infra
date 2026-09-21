@@ -102,6 +102,20 @@ Defaults, from `-G passtime:greyexp:whiteexp` in spamd(8):
 
 ## Applying and reverting
 
+The supported way is
+
+	doas ksh scripts/pf-apply.sh --check     # show the diff, write nothing
+	doas ksh scripts/pf-apply.sh             # append, check, back up, load
+
+It appends whichever fragment is missing, skips one whose rules are already
+present, refuses to install a candidate that `pfctl -n` rejects, keeps the file
+it replaced as `/etc/pf.conf.bak.<timestamp>`, and loads nothing that fails to
+re-check. It only appends: it never removes a rule, and it does not touch sshd.
+pf loads a ruleset atomically, so a rejected load leaves the running ruleset in
+place. Running it is a human step.
+
+The recipe below is what that script does, for reading:
+
 	doas cp /etc/pf.conf /tmp/pf.conf.new
 	cat >> /tmp/pf.conf.new <<'EOF'
 	...fragment...
@@ -125,6 +139,38 @@ changes no traffic, and the tables it creates are the ones the real load needs.
 
 Reverting is the same in reverse: remove the three lines, then `pfctl -f
 /etc/pf.conf`. `rcctl disable spamd` plus `rcctl stop spamd` retires the daemon.
+
+## Senders that rotate their address
+
+Promotion needs a retry for the same tuple, and a tuple is the connecting IP plus
+the HELO, envelope-from and envelope-to, per spamd(8). A sender that picks a
+different outbound address for every retry never presents the same tuple twice,
+so it is never promoted, stays greylisted, and is eventually bounced.
+
+That is what happened on 2026-09-20 to mail from an Outlook-hosted domain. One
+message, five attempts in four hours, five different `52.101.x` addresses:
+
+	10:55:47 (GREY) 52.101.196.120: <oliver.brotchie@edinburgh-orthodox.org.uk> -> <oliver@kyriakon.net>
+	11:55:45 (GREY) 52.101.95.123:  same envelope
+	12:56:17 (GREY) 52.101.96.136:  same envelope
+	13:56:29 (GREY) 52.101.196.122: same envelope
+	14:57:19 (GREY) 52.101.195.135: same envelope
+
+Google's mail the same morning got through, because its retry came from the same
+address as its first attempt: `209.85.216.74` connected at 10:49 and again at
+13:07, which promoted the address and let the delivery in at 14:38.
+
+The fix is the `nospamd` table in the man page's fragment, which sends inbound
+SMTP from listed networks straight to smtpd. `openbsd/etc/nospamd` holds
+Microsoft's published outbound ranges and the deploy installs it; the two pf
+rules that read it are the second fragment `pf-apply.sh` adds. Refresh the list
+from the same source, which is Microsoft's own SPF record:
+
+	dig +short TXT spf.protection.outlook.com
+
+Add other large senders the same way once one is seen being deferred from a
+rotating address. Whitelisting single addresses with `spamdb -a` does not help
+with a pool, since each retry arrives on a different one.
 
 ## Verifying
 
