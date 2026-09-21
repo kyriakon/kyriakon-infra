@@ -35,3 +35,15 @@ hc_fail() {
 # per script. Exported (not just set) so shellcheck sees the cross-file use.
 export CANARY_PATH='/home/.kyriakon-backup-canary'
 export CANARY_TEXT='kyriakon backup canary v1'
+
+# Per-box values, so nothing has to be retyped or passed on a command line:
+# /root/.kyriakon-env, mode 0600, one 'export VAR=value' per line. The tracked
+# template is openbsd/etc/kyriakon.env in the repo, which deploy-mail.sh installs.
+# Sourced rather than parsed, which is also how the cron lines read it, so the two
+# cannot disagree about the format. Override the path with KYRIAKON_ENV.
+KYRIAKON_ENV="${KYRIAKON_ENV:-/root/.kyriakon-env}"
+export KYRIAKON_ENV
+if [ -r "$KYRIAKON_ENV" ]; then
+	# shellcheck disable=SC1090 # the path is the operator's, not a fixed literal
+	. "$KYRIAKON_ENV"
+fi

@@ -12,7 +12,7 @@
 # line was pasted by hand, and the monitor's was missed for a week. The lines live
 # in this file now, so the pull request that changes them is the review.
 #
-# The lines carry no values. Per-box settings come from /root/.kyriakon-cron-env,
+# The lines carry no values. Per-box settings come from /root/.kyriakon-env,
 # sourced by each line:
 #
 #   export ALERT_TOPIC='kyriakon-alerts'                      # ntfy topic (mail)
@@ -55,7 +55,7 @@ while [ "$#" -gt 0 ]; do
 	shift
 done
 
-env_file=/root/.kyriakon-cron-env
+env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
 case "$role" in
 mail)
 	needed_scripts="abuse-monitor.sh renew-acme.sh backup.sh"
@@ -63,9 +63,9 @@ mail)
 	block=$(cat <<'EOF'
 
 # --- kyriakon: monitoring and maintenance (scripts/cron-apply.sh) ---
-*/15 * * * * . /root/.kyriakon-cron-env; /root/bin/abuse-monitor.sh
-0 3 * * * . /root/.kyriakon-cron-env; /root/bin/renew-acme.sh
-30 2 * * * . /root/.kyriakon-cron-env; /root/bin/backup.sh
+*/15 * * * * . /root/.kyriakon-env; /root/bin/abuse-monitor.sh
+0 3 * * * . /root/.kyriakon-env; /root/bin/renew-acme.sh
+30 2 * * * . /root/.kyriakon-env; /root/bin/backup.sh
 # --- end kyriakon ---
 EOF
 )
@@ -76,7 +76,7 @@ restore)
 	block=$(cat <<'EOF'
 
 # --- kyriakon: weekly restore test (scripts/cron-apply.sh) ---
-45 3 * * 0 . /root/.kyriakon-cron-env; /root/bin/restore-test.sh
+45 3 * * 0 . /root/.kyriakon-env; /root/bin/restore-test.sh
 # --- end kyriakon ---
 EOF
 )
@@ -131,8 +131,13 @@ hint() {
 }
 
 missing_vars=""
+placeholder_vars=""
 for v in $needed_vars; do
-	grep -q "^export $v=" "$env_file" 2>/dev/null || missing_vars="$missing_vars $v"
+	if ! grep -q "^export $v=" "$env_file" 2>/dev/null; then
+		missing_vars="$missing_vars $v"
+	elif grep -q "^export $v='*REPLACE_ME" "$env_file"; then
+		placeholder_vars="$placeholder_vars $v"
+	fi
 done
 if [ -n "$missing_vars" ]; then
 	printf 'cron-apply: %s does not set:%s\n\nCreate it mode 0600 with:\n\n' \
@@ -141,6 +146,13 @@ if [ -n "$missing_vars" ]; then
 		printf '  export %s=%s\n' "$v" "$(hint "$v")" >&2
 	done
 	printf '\nThen re-run this script. Nothing was written.\n' >&2
+	exit 1
+fi
+if [ -n "$placeholder_vars" ]; then
+	printf 'cron-apply: %s still holds template placeholders for:%s\n\n' \
+		"$env_file" "$placeholder_vars" >&2
+	printf 'Fill in the real values first. A dead-man'"'"'s switch that pings nowhere is worse\n' >&2
+	printf 'than none, because it reports health it cannot know.\n' >&2
 	exit 1
 fi
 

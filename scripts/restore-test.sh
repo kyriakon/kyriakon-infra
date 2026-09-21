@@ -139,5 +139,5 @@ printf 'restore test passed\n'
 
 # crontab (root, on the SEPARATE read-only test machine) — weekly. Install it
 # there with scripts/cron-apply.sh --role restore, which takes the values from
-# /root/.kyriakon-cron-env so the tab holds no secrets:
-#   45 3 * * 0 . /root/.kyriakon-cron-env; /root/bin/restore-test.sh
+# /root/.kyriakon-env so the tab holds no secrets:
+#   45 3 * * 0 . /root/.kyriakon-env; /root/bin/restore-test.sh

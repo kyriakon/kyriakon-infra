@@ -160,6 +160,6 @@ if [ -n "${HEALTHCHECKS_URL:-}" ]; then
 fi
 
 # crontab (root) — every 15 min; the interval is the detection window. Install it
-# with scripts/cron-apply.sh, which takes the values from /root/.kyriakon-cron-env
+# with scripts/cron-apply.sh, which takes the values from /root/.kyriakon-env
 # so the tab holds no secrets:
-#   */15 * * * * . /root/.kyriakon-cron-env; /root/bin/abuse-monitor.sh
+#   */15 * * * * . /root/.kyriakon-env; /root/bin/abuse-monitor.sh

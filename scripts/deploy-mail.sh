@@ -49,6 +49,7 @@ encrypt_bin=/usr/local/sbin/kyriakon-encrypt
 for f in openbsd/etc/smtpd.conf openbsd/etc/httpd.conf openbsd/etc/acme-client.conf \
 	openbsd/etc/rc.d/kyriakon_encrypt openbsd/dovecot/dovecot.conf \
 	openbsd/etc/spamd.alloweddomains openbsd/etc/spamd.conf openbsd/etc/nospamd \
+	openbsd/etc/kyriakon.env \
 	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml keys; do
 	[ -e "$repo_dir/$f" ] || { printf 'missing from repo_dir: %s\n' "$f" >&2; exit 1; }
 done
@@ -436,6 +437,18 @@ for s in lib.sh abuse-monitor.sh backup.sh renew-acme.sh; do
 done
 printf 'cron scripts installed into /root/bin\n'
 
+# The box's values, in one file that everything sources. Installed only when it
+# is absent: the real copy holds the TSIG secret and the alert topic, and
+# rewriting it from the repo template would replace them with placeholders.
+env_dst=/root/.kyriakon-env
+if [ -f "$env_dst" ]; then
+	printf 'kept existing %s\n' "$env_dst"
+else
+	install -m 0600 "$repo_dir/openbsd/etc/kyriakon.env" "$env_dst"
+	printf 'installed %s from the repo template\n' "$env_dst"
+	printf 'FILL IT IN before cron-apply or deploy-nsd, which refuse placeholders\n'
+fi
+
 home=$(awk -F: '$1 == "oliver" { print $6 }' /etc/passwd)
 [ -n "$home" ] || { printf 'cannot read the home directory for oliver from /etc/passwd\n' >&2; exit 1; }
 shell=$(awk -F: '$1 == "oliver" { print $7 }' /etc/passwd)
@@ -539,10 +552,9 @@ printf '\n'
 printf '\t\t doas ksh scripts/cron-apply.sh --check\n'
 printf '\t\t doas ksh scripts/cron-apply.sh\n'
 printf '\n'
-printf '     They read their values from /root/.kyriakon-cron-env (mode 0600),\n'
-printf '     which the script refuses to run without, so the tab holds no secrets\n'
-printf '     and its output stays safe to paste. The restore box has its own line:\n'
-printf '     --role restore, run there.\n'
+printf '     They read their values from /root/.kyriakon-env (mode 0600), which\n'
+printf '     the script refuses to run without, and which deploy-nsd.sh reads too,\n'
+printf '     so nothing is retyped. Fill in the copy this deploy installed.\n'
 printf '  8. quarterly rehearsal: create a Healthchecks check with a ~90-day\n'
 printf '     period, then run scripts/rehearsal.sh on a throwaway box. The check is\n'
 printf '     the reminder: a skipped quarter leaves it stale and it alerts, which no\n'
