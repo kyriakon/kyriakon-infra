@@ -137,6 +137,7 @@ if [ -n "${HEALTHCHECKS_URL:-}" ]; then
 fi
 printf 'restore test passed\n'
 
-# crontab (root, on the SEPARATE read-only test machine) — weekly:
-#   45 3 * * 0  RESTIC_REPOSITORY='sftp:…' RESTIC_PASSWORD_FILE=/root/.restic-pass \
-#               HEALTHCHECKS_URL='https://hc-ping.com/…' /root/bin/restore-test.sh
+# crontab (root, on the SEPARATE read-only test machine) — weekly. Install it
+# there with scripts/cron-apply.sh --role restore, which takes the values from
+# /root/.kyriakon-cron-env so the tab holds no secrets:
+#   45 3 * * 0 . /root/.kyriakon-cron-env; /root/bin/restore-test.sh

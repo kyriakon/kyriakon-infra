@@ -427,6 +427,14 @@ fi
 # install with "install: /root/bin/INS@...: No such file or directory".
 # 0755 inside /root, which is already 0700 root.
 install -d -m 0755 /root/bin
+# The scripts themselves. Nothing used to put them there, so every box had them
+# copied by hand from the repo and each crontab line pasted by hand too, which is
+# how the monitor spent a week unscheduled. cron-apply.sh puts the lines in; it
+# can only do that if the files it names are deployed first.
+for s in lib.sh abuse-monitor.sh backup.sh renew-acme.sh; do
+	install -m 0755 "$repo_dir/scripts/$s" "/root/bin/$s"
+done
+printf 'cron scripts installed into /root/bin\n'
 
 home=$(awk -F: '$1 == "oliver" { print $6 }' /etc/passwd)
 [ -n "$home" ] || { printf 'cannot read the home directory for oliver from /etc/passwd\n' >&2; exit 1; }
@@ -526,6 +534,19 @@ printf '\t\t pass in on egress proto tcp from <nospamd> to any port smtp\n'
 printf '\n'
 printf '     Rationale, including why the second one exists, and checks:\n'
 printf '     docs/planning/research/spamd-greylisting.md\n'
-printf '  7. LMTP socket: leave it at the Dovecot default. smtpd mda runs as the\n'
+printf '  7. cron: the monitoring, backup and renewal lines:\n'
+printf '\n'
+printf '\t\t doas ksh scripts/cron-apply.sh --check\n'
+printf '\t\t doas ksh scripts/cron-apply.sh\n'
+printf '\n'
+printf '     They read their values from /root/.kyriakon-cron-env (mode 0600),\n'
+printf '     which the script refuses to run without, so the tab holds no secrets\n'
+printf '     and its output stays safe to paste. The restore box has its own line:\n'
+printf '     --role restore, run there.\n'
+printf '  8. quarterly rehearsal: create a Healthchecks check with a ~90-day\n'
+printf '     period, then run scripts/rehearsal.sh on a throwaway box. The check is\n'
+printf '     the reminder: a skipped quarter leaves it stale and it alerts, which no\n'
+printf '     cron entry on this box could do for you if the box is the problem.\n'
+printf '  9. LMTP socket: leave it at the Dovecot default. smtpd mda runs as the\n'
 printf '     recipient, not as root, so a root:wheel 0600 socket answers\n'
 printf '     "mail.lmtp: connect: Permission denied" and mail queues.\n'

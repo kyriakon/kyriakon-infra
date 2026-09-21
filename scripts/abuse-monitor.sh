@@ -159,6 +159,7 @@ if [ -n "${HEALTHCHECKS_URL:-}" ]; then
 	curl -fsS -m 10 --retry 3 "$HEALTHCHECKS_URL" >/dev/null 2>&1 || true
 fi
 
-# crontab (root) — every 15 min; the interval is the detection window:
-#   */15 * * * *  ALERT_TOPIC='kyriakon-alerts' \
-#                 HEALTHCHECKS_URL='https://hc-ping.com/<uuid>' /root/bin/abuse-monitor.sh
+# crontab (root) — every 15 min; the interval is the detection window. Install it
+# with scripts/cron-apply.sh, which takes the values from /root/.kyriakon-cron-env
+# so the tab holds no secrets:
+#   */15 * * * * . /root/.kyriakon-cron-env; /root/bin/abuse-monitor.sh

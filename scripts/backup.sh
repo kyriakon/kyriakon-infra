@@ -77,5 +77,7 @@ restic backup /home /etc/mail
 # (proposal §5.5). Window from docs/planning/research/encrypted-backup-restore.md.
 restic forget --keep-daily 30 --keep-weekly 8 --keep-monthly 6 --prune
 
-# crontab (root) — nightly after mail's quiet hours:
-#   30 2 * * *  RESTIC_REPOSITORY='sftp:…' RESTIC_PASSWORD_FILE=/root/.restic-pass /root/bin/backup.sh
+# crontab (root) — nightly after mail's quiet hours. Install it with
+# scripts/cron-apply.sh, which takes the values from /root/.kyriakon-cron-env so
+# the tab holds no secrets:
+#   30 2 * * * . /root/.kyriakon-cron-env; /root/bin/backup.sh
