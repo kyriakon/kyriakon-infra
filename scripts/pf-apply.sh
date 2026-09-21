@@ -10,7 +10,7 @@
 # request that changes them is the review of the firewall change, and every box
 # ends up with the same rules.
 #
-# Both blocks are additive and go at the END of the file: pf is last-match-wins,
+# Every block is additive and goes at the END of the file: pf is last-match-wins,
 # so a divert placed before the stock pass rule would never match.
 #
 # Safety properties:
@@ -100,6 +100,25 @@ EOF
 	printf 'nospamd:      to be added\n'
 fi
 
+# --- gemini -----------------------------------------------------------------
+# gmid has no proxy layer, so the capsule is reached on 1965 directly and needs
+# its own inbound pass rather than riding on 443. Logged, like the greylisting
+# rules, so that a scrape or a probe is attributable in pflog instead of
+# invisible. Note that this opens the port; gmid itself only serves hostnames
+# named in its config, and answers anything else with a 59.
+if grep -q 'port 1965' "$pf_conf"; then
+	printf 'gemini:       already in %s\n' "$pf_conf"
+else
+	cat >>"$work" <<'EOF'
+
+# --- kyriakon: gemini (openbsd/etc/gmid.conf) ---
+pass in log on egress proto tcp to any port 1965
+# --- end kyriakon: gemini ---
+EOF
+	added=$((added + 1))
+	printf 'gemini:       to be added\n'
+fi
+
 if [ "$added" -eq 0 ]; then
 	# A `persist file` table is read when the ruleset loads, so replacing the list
 	# file leaves the kernel holding the old one until something reloads. Compare
@@ -119,7 +138,7 @@ if [ "$added" -eq 0 ]; then
 	rm -f "$known" "$want"
 	if [ "$same" = yes ]; then
 		rm -f "$work"
-		printf '\nnothing to do: %s carries both fragments and <nospamd> matches %s\n' \
+		printf '\nnothing to do: %s carries every fragment and <nospamd> matches %s\n' \
 			"$pf_conf" "$nospamd"
 		exit 0
 	fi
