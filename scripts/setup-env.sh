@@ -171,8 +171,8 @@ if [ -n "$missing" ] || [ -n "$placeholder" ]; then
 	printf '  KYRIAKON_TSIG_SECRET           the kyriakon-he key in /var/nsd/etc/nsd.conf\n'
 	printf '  RESTIC_REPOSITORY             the crontab line of a backup that works\n'
 	printf '  RESTIC_PASSWORD_FILE          /root/.restic-pass\n'
-	printf '  ALERT_TOPIC                   the ntfy.sh topic alerts are pushed to\n'
-	printf '  HEALTHCHECKS_URL              this box'"'"'s Healthchecks check\n'
+	printf '  ALERT_TOPIC                   an ntfy.sh topic you invent, and keep secret\n'
+	printf '  HEALTHCHECKS_URL              this box'"'"'s own check, not another box'"'"'s\n'
 	printf '  REHEARSAL_HEALTHCHECKS_URL    belongs on the rehearsal box, not this one\n'
 	exit 1
 fi
