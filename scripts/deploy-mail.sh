@@ -50,7 +50,7 @@ for f in openbsd/etc/smtpd.conf openbsd/etc/httpd.conf openbsd/etc/acme-client.c
 	openbsd/etc/rc.d/kyriakon_encrypt openbsd/dovecot/dovecot.conf \
 	openbsd/etc/spamd.alloweddomains openbsd/etc/spamd.conf openbsd/etc/nospamd \
 	openbsd/etc/kyriakon.env \
-	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml keys; do
+	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml keys scripts/setup-env.sh; do
 	[ -e "$repo_dir/$f" ] || { printf 'missing from repo_dir: %s\n' "$f" >&2; exit 1; }
 done
 
@@ -437,16 +437,16 @@ for s in lib.sh abuse-monitor.sh backup.sh renew-acme.sh; do
 done
 printf 'cron scripts installed into /root/bin\n'
 
-# The box's values, in one file that everything sources. Installed only when it
-# is absent: the real copy holds the TSIG secret and the alert topic, and
-# rewriting it from the repo template would replace them with placeholders.
+# The box's values. setup-env.sh owns the install and is called rather than
+# duplicated here, so a box gets the file whichever deploy runs first: this one
+# needs nothing from it, but nsd and cron-apply do, and nsd runs before mail.
+say "env"
 env_dst=/root/.kyriakon-env
 if [ -f "$env_dst" ]; then
 	printf 'kept existing %s\n' "$env_dst"
 else
-	install -m 0600 "$repo_dir/openbsd/etc/kyriakon.env" "$env_dst"
-	printf 'installed %s from the repo template\n' "$env_dst"
-	printf 'FILL IT IN before cron-apply or deploy-nsd, which refuse placeholders\n'
+	ksh "$repo_dir/scripts/setup-env.sh" \
+		|| printf 'WARNING: fill in %s before deploy-nsd or cron-apply\n' "$env_dst"
 fi
 
 home=$(awk -F: '$1 == "oliver" { print $6 }' /etc/passwd)
@@ -552,9 +552,10 @@ printf '\n'
 printf '\t\t doas ksh scripts/cron-apply.sh --check\n'
 printf '\t\t doas ksh scripts/cron-apply.sh\n'
 printf '\n'
-printf '     They read their values from /root/.kyriakon-env (mode 0600), which\n'
-printf '     the script refuses to run without, and which deploy-nsd.sh reads too,\n'
-printf '     so nothing is retyped. Fill in the copy this deploy installed.\n'
+printf '     Values come from /root/.kyriakon-env (mode 0600), which the nsd\n'
+printf '     deploy reads too, so nothing is retyped. On a fresh box that file is\n'
+printf '     created by scripts/setup-env.sh, before the nsd deploy rather than\n'
+printf '     after it.\n'
 printf '  8. quarterly rehearsal: create a Healthchecks check with a ~90-day\n'
 printf '     period, then run scripts/rehearsal.sh on a throwaway box. The check is\n'
 printf '     the reminder: a skipped quarter leaves it stale and it alerts, which no\n'

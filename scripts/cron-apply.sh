@@ -118,18 +118,8 @@ printf 'to be added:%s\n' "$to_add"
 if [ -n "$missing_scripts" ]; then
 	die "install the missing scripts first; the mail deploy does it"
 fi
-# A missing or half-filled env is the likely first run, so print what to write
-# rather than naming the variables and leaving the rest to a search.
-hint() {
-	case "$1" in
-	ALERT_TOPIC) printf "'kyriakon-alerts'  # the ntfy.sh topic to push alerts to" ;;
-	HEALTHCHECKS_URL) printf "'https://hc-ping.com/<uuid>'  # this box's check" ;;
-	RESTIC_REPOSITORY) printf "'sftp://<user>@<host>:23/<repo>'" ;;
-	RESTIC_PASSWORD_FILE) printf "'/root/.restic-pass'  # mode 0600" ;;
-	*) printf "'<value>'" ;;
-	esac
-}
-
+# A missing or half-filled env is the likely first run, so report which variables
+# are at fault and point at the one script that owns the file.
 missing_vars=""
 placeholder_vars=""
 for v in $needed_vars; do
@@ -139,20 +129,16 @@ for v in $needed_vars; do
 		placeholder_vars="$placeholder_vars $v"
 	fi
 done
-if [ -n "$missing_vars" ]; then
-	printf 'cron-apply: %s does not set:%s\n\nCreate it mode 0600 with:\n\n' \
-		"$env_file" "$missing_vars" >&2
-	for v in $missing_vars; do
-		printf '  export %s=%s\n' "$v" "$(hint "$v")" >&2
-	done
-	printf '\nThen re-run this script. Nothing was written.\n' >&2
-	exit 1
-fi
-if [ -n "$placeholder_vars" ]; then
-	printf 'cron-apply: %s still holds template placeholders for:%s\n\n' \
-		"$env_file" "$placeholder_vars" >&2
-	printf 'Fill in the real values first. A dead-man'"'"'s switch that pings nowhere is worse\n' >&2
-	printf 'than none, because it reports health it cannot know.\n' >&2
+if [ -n "$missing_vars" ] || [ -n "$placeholder_vars" ]; then
+	printf 'cron-apply: %s is not usable\n' "$env_file" >&2
+	if [ -n "$missing_vars" ]; then
+		printf '  not set:%s\n' "$missing_vars" >&2
+	fi
+	if [ -n "$placeholder_vars" ]; then
+		printf '  still a placeholder:%s\n' "$placeholder_vars" >&2
+	fi
+	printf 'Run: doas ksh %s/setup-env.sh\n' "$(dirname "$0")" >&2
+	printf 'Nothing was written.\n' >&2
 	exit 1
 fi
 

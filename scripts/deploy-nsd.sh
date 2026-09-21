@@ -10,6 +10,9 @@
 # step. This script substitutes the box's real IPs and the HMAC-SHA256 TSIG
 # secret HE signs its AXFR requests with into the deployed nsd.conf.
 #
+# On a fresh box, run scripts/setup-env.sh first: this script reads its values
+# from /root/.kyriakon-env, and nothing else creates that file early enough.
+#
 # Usage:
 #   doas ksh deploy-nsd.sh [ipv4] [ipv6] [tsig-secret] [src_dir]
 #
@@ -52,7 +55,16 @@ ipv6="${2:-${KYRIAKON_IPV6:-}}"
 secret="${3:-${KYRIAKON_TSIG_SECRET:-}}"
 src_dir="${4:-$(dirname "$0")}"
 if [ -z "$ipv4" ] || [ -z "$ipv6" ] || [ -z "$secret" ]; then
-	usage
+	if [ ! -f "$env_file" ]; then
+		printf 'deploy-nsd: %s does not exist on this box yet.\n' "$env_file" >&2
+		printf 'Run this first: doas ksh %s/setup-env.sh\n' "$(dirname "$0")" >&2
+	else
+		printf 'deploy-nsd: %s is missing one of KYRIAKON_IPV4, KYRIAKON_IPV6 or\n' "$env_file" >&2
+		printf 'KYRIAKON_TSIG_SECRET, or one is still a placeholder. Check it with:\n' >&2
+		printf '  doas ksh %s/setup-env.sh\n' "$(dirname "$0")" >&2
+	fi
+	printf 'Arguments still work: doas ksh %s <ipv4> <ipv6> <tsig-secret>\n' "$0" >&2
+	exit 2
 fi
 
 # Every *.zone beside nsd.conf is served: kyriakon.net is the mail domain and
