@@ -202,11 +202,30 @@ printf '%s\n' "$flagged" > "$state/deferred-senders"
 ip="${PUBLIC_IP:-$(ifconfig egress inet 2>/dev/null | awk '/inet / { print $2; exit }')}"
 if [ -n "$ip" ]; then
 	rev=$(printf '%s\n' "$ip" | awk -F. '{ print $4"."$3"."$2"."$1 }')
-	listed=$(dig +short +time=5 +tries=2 "$rev.$dnsbl_zone" A 2>/dev/null \
-		| grep -Ec '^[0-9]' || true)
-	if [ "$listed" -gt 0 ]; then
-		alert "blocklisted" "$ip is listed on $dnsbl_zone — deliverability at risk"
+	# Zen answers 127.0.0.2 to 127.0.0.11 for a real listing, the last octet naming
+	# the list that matched, and 127.255.255.0/24 when it refuses the resolver
+	# asking. The refusal is the common case: the system resolver on this box, on
+	# the workstation, and every public resolver tried all get it, because Spamhaus
+	# does not answer shared resolvers. A resolver serving one machine is answered,
+	# so ask one here if it exists.
+	if dig +short +time=2 +tries=1 @127.0.0.1 . NS >/dev/null 2>&1; then
+		answer=$(dig +short +time=5 +tries=2 @127.0.0.1 "$rev.$dnsbl_zone" A 2>/dev/null || true)
+		via="the resolver on this box"
+	else
+		answer=$(dig +short +time=5 +tries=2 "$rev.$dnsbl_zone" A 2>/dev/null || true)
+		via="the system resolver, which this box has no resolver of its own behind"
 	fi
+	case "$answer" in
+	127.255.255.*)
+		# Reporting this as a listing is a false alarm, and staying silent about it
+		# is worse: a real listing would go unnoticed. Say what it is, once per
+		# cooldown, and name the fix.
+		alert "blocklist check" "cannot check $dnsbl_zone via $via: Spamhaus refuses it, so a listing would go unnoticed. A local recursive resolver is answered and is not refused; unbound ships in base"
+		;;
+	127.0.0.*)
+		alert "blocklisted" "$ip is on $dnsbl_zone as 127.0.0.$(printf '%s\n' "$answer" | head -1 | awk -F. '{ print $4 }') — deliverability at risk. That code names the list; look it up and request removal at check.spamhaus.org"
+		;;
+	esac
 fi
 
 # --- dead-man's switch: Healthchecks ping on a clean run ------------------

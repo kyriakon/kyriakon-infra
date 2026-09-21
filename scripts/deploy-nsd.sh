@@ -122,7 +122,11 @@ done
 # Hetzner sends no router advertisement, so without this file the box serves an
 # AAAA it cannot answer.
 sed -e "s/2001:db8::10/$ipv6/g" "$iface_src" > "$iface_dst"
-chmod 0644 "$iface_dst"
+# 0600 rather than the 0644 a plain install would leave: the daily security(8)
+# mail reports any world-readable /etc/hostname.* file, which is how this was
+# found, and the nsd directory above is 0750 for the same reason. Only root reads
+# it; netstart runs as root.
+chmod 0600 "$iface_dst"
 
 # nsd.conf: substitute the TSIG secret. '|' delimits the s/// because base64
 # secrets routinely contain '/', which would end a '/'-delimited expression
