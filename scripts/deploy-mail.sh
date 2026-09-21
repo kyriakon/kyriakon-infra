@@ -46,7 +46,8 @@ encrypt_bin=/usr/local/sbin/kyriakon-encrypt
 [ "$(id -u)" -eq 0 ] || { printf 'run as root (doas ksh %s)\n' "$0" >&2; exit 1; }
 [ -d "$repo_dir" ] || { printf 'repo_dir not found: %s\n' "$repo_dir" >&2; exit 1; }
 
-for f in openbsd/etc/smtpd.conf openbsd/etc/httpd.conf openbsd/etc/acme-client.conf \
+for f in openbsd/etc/smtpd.conf openbsd/etc/httpd.conf openbsd/etc/gmid.conf \
+	openbsd/etc/acme-client.conf \
 	openbsd/etc/rc.d/kyriakon_encrypt openbsd/dovecot/dovecot.conf \
 	openbsd/etc/spamd.alloweddomains openbsd/etc/spamd.conf openbsd/etc/nospamd \
 	openbsd/etc/kyriakon.env \
@@ -87,6 +88,9 @@ need_pkg dovecot
 need_pkg gnupg
 need_pkg rust
 need_pkg opensmtpd-filter-dkimsign
+# The Gemini server. C, OpenBSD-native, and the choice the proposal records over
+# Agate for ecosystem fit rather than performance.
+need_pkg gmid
 # Operators' editor, not something a service needs: the mail stack runs without
 # one. helix is what the person running this box edits with, and it needs no
 # config to behave, unlike vim, which starts in compatible mode on a fresh
@@ -159,6 +163,27 @@ case "$acme_rc" in
 	   printf '  site has no certificate until that succeeds. Check that the\n' >&2
 	   printf '  kyriakon.net and www.kyriakon.net vhosts serve the challenge.\n' >&2 ;;
 esac
+
+# The capsule's hostname, which httpd.conf also has a vhost for. It was not in
+# this list, so its certificate was issued by hand and nothing renewed it: left
+# that way it expires silently and takes HTTPS and Gemini down together for that
+# hostname, since both present the same file.
+acme_rc=0
+acme-client -v oliver.kyriakon.net || acme_rc=$?
+case "$acme_rc" in
+	0) printf 'capsule certificate issued or renewed\n' ;;
+	2) printf 'capsule certificate already current\n' ;;
+	*) printf 'warning: acme-client failed for oliver.kyriakon.net (exit %s); the\n' "$acme_rc" >&2
+	   printf '  capsule has no certificate and gmid will not start without one.\n' >&2 ;;
+esac
+
+# --- Gemini --------------------------------------------------------------
+
+# The same content tree httpd serves, to a second protocol (issue #95). gmid -n
+# validates the config the way httpd -n does, before anything restarts.
+install -m 0644 "$repo_dir/openbsd/etc/gmid.conf" /etc/gmid.conf
+gmid -n -c /etc/gmid.conf
+start_service gmid
 
 # --- 3. smtpd + dovecot configs -----------------------------------------
 
