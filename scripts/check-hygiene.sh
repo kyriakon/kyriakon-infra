@@ -109,16 +109,20 @@ esac
 # cron's PATH, and ask what a job would find.
 if [ "$(id -u)" -eq 0 ] && [ -f /root/.kyriakon-env ]; then
 	absent=""
-	for tool in curl ifconfig; do
+	tools="curl ifconfig jq"
+	for tool in $tools; do
 		env -i PATH=/usr/bin:/bin sh -c ". /root/.kyriakon-env; command -v $tool" >/dev/null 2>&1 \
 			|| absent="$absent $tool"
 	done
 	if [ -n "$absent" ]; then
 		printf 'cron environment: a cron job would not find:%s\n' "$absent"
 		printf '  the fix is the PATH line in /root/.kyriakon-env, which every cron line sources\n'
+		case "$absent" in
+		*jq*) printf '  jq is a package: doas pkg_add jq\n' ;;
+		esac
 		status=1
 	else
-		printf 'cron environment: curl and ifconfig both reachable as a cron job sees them\n'
+		printf 'cron environment: %s all reachable as a cron job sees them\n' "$tools"
 	fi
 else
 	printf 'cron environment: skipped, needs root and /root/.kyriakon-env\n'

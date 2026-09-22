@@ -29,19 +29,21 @@ script_dir="$(dirname "$0")"
 template="${KYRIAKON_ENV_TEMPLATE:-$script_dir/../openbsd/etc/kyriakon.env}"
 env_dst="${KYRIAKON_ENV:-/root/.kyriakon-env}"
 
-vars="KYRIAKON_IPV4 KYRIAKON_IPV6 KYRIAKON_TSIG_SECRET RESTIC_REPOSITORY RESTIC_PASSWORD_FILE ALERT_EMAIL HEALTHCHECKS_URL REHEARSAL_HEALTHCHECKS_URL"
+vars="KYRIAKON_IPV4 KYRIAKON_IPV6 KYRIAKON_TSIG_SECRET RESTIC_REPOSITORY RESTIC_PASSWORD_FILE ALERT_EMAIL HEALTHCHECKS_URL REHEARSAL_HEALTHCHECKS_URL HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL"
 
 usage() {
 	cat >&2 <<'EOF'
 usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
                              --restic-repository D --restic-password-file E
                              --alert-email F --healthchecks-url G
-                             --rehearsal-healthchecks-url H]
+                             --rehearsal-healthchecks-url H
+                             --hcloud-token I --restore-test-repository J
+                             --restore-test-healthchecks-url K]
 
   No arguments: install the template if /root/.kyriakon-env is absent, then
   report which values are still missing or placeholders.
 
-  All eight arguments: write the file from them, mode 0600. All or nothing, and
+  All eleven arguments: write the file from them, mode 0600. All or nothing, and
   each value is checked before anything is written.
 
     doas ksh scripts/setup-env.sh \
@@ -51,7 +53,10 @@ usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
       --restic-password-file /root/.restic-pass \
       --alert-email you@example.invalid \
       --healthchecks-url https://hc-ping.com/<uuid> \
-      --rehearsal-healthchecks-url https://hc-ping.com/<uuid>
+      --rehearsal-healthchecks-url https://hc-ping.com/<uuid> \
+      --hcloud-token "$(pass kyriakon/hetzner-terraform-api-key)" \
+      --restore-test-repository 'sftp://user-sub1@host:23/' \
+      --restore-test-healthchecks-url https://hc-ping.com/<uuid>
 EOF
 	exit 2
 }
@@ -64,6 +69,9 @@ a_pass=
 a_email=
 a_hc=
 a_reh=
+a_hcloud=
+a_restrepo=
+a_resthc=
 while [ "$#" -gt 0 ]; do
 	[ "$#" -ge 2 ] || usage
 	case "$1" in
@@ -75,13 +83,16 @@ while [ "$#" -gt 0 ]; do
 	--alert-email) a_email="$2" ;;
 	--healthchecks-url) a_hc="$2" ;;
 	--rehearsal-healthchecks-url) a_reh="$2" ;;
+	--hcloud-token) a_hcloud="$2" ;;
+	--restore-test-repository) a_restrepo="$2" ;;
+	--restore-test-healthchecks-url) a_resthc="$2" ;;
 	*) usage ;;
 	esac
 	shift 2
 done
 
 given=0
-for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_reh"; do
+for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_reh" "$a_hcloud" "$a_restrepo" "$a_resthc"; do
 	if [ -n "$v" ]; then
 		given=$((given + 1))
 	fi
@@ -97,6 +108,9 @@ if [ "$given" -gt 0 ]; then
 	if [ -z "$a_email" ]; then missing="$missing ALERT_EMAIL"; fi
 	if [ -z "$a_hc" ]; then missing="$missing HEALTHCHECKS_URL"; fi
 	if [ -z "$a_reh" ]; then missing="$missing REHEARSAL_HEALTHCHECKS_URL"; fi
+	if [ -z "$a_hcloud" ]; then missing="$missing HCLOUD_TOKEN"; fi
+	if [ -z "$a_restrepo" ]; then missing="$missing RESTORE_TEST_REPOSITORY"; fi
+	if [ -z "$a_resthc" ]; then missing="$missing RESTORE_TEST_HEALTHCHECKS_URL"; fi
 	if [ -n "$missing" ]; then
 		printf 'setup-env: missing an argument for:%s\n\n' "$missing" >&2
 		usage
@@ -112,13 +126,23 @@ if [ "$given" -gt 0 ]; then
 	esac
 	printf '%s' "$a_tsig" | grep -Eq '^[A-Za-z0-9+/=]+$' \
 		|| { printf 'setup-env: tsig-secret is not clean base64\n' >&2; exit 2; }
-	for u in "$a_hc" "$a_reh"; do
+	for u in "$a_hc" "$a_reh" "$a_resthc"; do
 		printf '%s' "$u" | grep -Eq '^https?://' \
 			|| { printf 'setup-env: not a URL: %s\n' "$u" >&2; exit 2; }
 	done
+	printf '%s' "$a_restrepo" | grep -Eq '^sftp://' \
+		|| { printf 'setup-env: not an sftp URL: %s\n' "$a_restrepo" >&2; exit 2; }
+	# The restore test must hold read-only credentials, or a fault on a throwaway box
+	# could damage the repository it is checking. Hetzner names a storage sub-account
+	# after its parent, so the absence of -sub is worth saying out loud rather than
+	# refusing on: it is a convention, not a guarantee.
+	case "$a_restrepo" in
+	*sub*) ;;
+	*) printf 'setup-env: warning: %s does not look like a sub-account URL. The restore test must not hold the backup account credentials.\n' "$a_restrepo" >&2 ;;
+	esac
 	# The file expresses values as single-quoted shell words, so a value
 	# containing a quote cannot be represented in it.
-	for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_reh"; do
+	for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_reh" "$a_hcloud" "$a_restrepo" "$a_resthc"; do
 		case "$v" in
 		*"'"*) printf 'setup-env: a value contains a single quote, which this file cannot express\n' >&2; exit 2 ;;
 		esac
@@ -143,6 +167,9 @@ if [ "$given" -gt 0 ]; then
 		printf "export ALERT_EMAIL='%s'\n" "$a_email"
 		printf "export HEALTHCHECKS_URL='%s'\n" "$a_hc"
 		printf "export REHEARSAL_HEALTHCHECKS_URL='%s'\n" "$a_reh"
+		printf "export HCLOUD_TOKEN='%s'\n" "$a_hcloud"
+		printf "export RESTORE_TEST_REPOSITORY='%s'\n" "$a_restrepo"
+		printf "export RESTORE_TEST_HEALTHCHECKS_URL='%s'\n" "$a_resthc"
 	} > "$tmp"
 	install -m 0600 "$tmp" "$env_dst"
 	rm -f "$tmp"

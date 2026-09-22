@@ -6,9 +6,9 @@ offline (§5.5), and a schedulable restore-test that runs against the storage bo
 touching the live box.
 
 **Answer:** **restic**, writing over the **SFTP backend** to the storage box, with a single
-repository password held offline. Restore-test is a weekly cron job on a *separate* machine
-that does a real `restic restore` from the storage box and verifies the output, plus a
-quarterly full-dress rebuild.
+repository password held offline. Restore-test is a weekly cron job that stands up a
+throwaway box, does a real `restic restore` there and verifies the output, then deletes the
+box, plus a quarterly full-dress rebuild.
 
 ---
 
@@ -140,13 +140,22 @@ possible in a content-addressed repo; the retention window *is* the purge mechan
 The test must prove three things a green `restic backup` does **not**: the repo is readable,
 the data is **decryptable**, and the files are actually **restorable** to a working state.
 
-**Where it runs:** a *separate* machine — cheapest is a disposable Hetzner VPS (or Oliver's
-workstation) running OpenBSD + `restic`, holding **read-only** storage-box credentials (a
-sub-account restricted to the repo path) and a copy of the repository password. It never
-connects to the live box; the only path is test-machine ↔ storage-box over SFTP. The live
-box's only role is as the backup *source*.
+**Where it runs:** a disposable machine, and *disposable* is now literal. The test used to
+run on a second box that was always on, which cost more per month than the mail box itself,
+and nothing about it needs a permanent machine. `scripts/restore-standup.sh`, cron'd on the
+mail box, creates one from a snapshot of that old box, runs the test on it over ssh, and
+deletes it on every exit path, so the cost is the minutes it runs rather than a month.
 
-**Automated weekly job (cron on the test machine):**
+The snapshot carries the **read-only** storage sub-account credentials (restricted to the repo
+path) and the repository password, so nothing secret moves at run time, and a fault on a
+throwaway box cannot damage the repository it is testing. The box never connects to the live
+box; the only path is test-box ↔ storage-box over SFTP, and the mail box's only other role is
+as the backup *source*. What that costs is the independence of the orchestrator: a compromised
+mail box could stand up a box that reports success without testing. The mitigation is that the
+ping comes from the throwaway box and the check's period is weekly, so a run that never
+happens alerts on its own.
+
+**Automated weekly job (cron on the mail box, which stands the test machine up):**
 
 1. `restic -r sftp:… snapshots` → assert `latest` is within the retention window (else the
    *backup* itself has silently stopped — fail loudly).
