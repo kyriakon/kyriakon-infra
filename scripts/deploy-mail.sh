@@ -236,11 +236,19 @@ trap 'rm -f "$aliases_tmp"' EXIT
 # point it at root, which resolves here to oliver. hello@ is here because the
 # landing site publishes it as the contact address, so mail to the platform
 # bounces without it.
+#
+# admin@ uses Dovecot's recipient_delimiter (+ in dovecot.conf) so it lands in the
+# .Admin folder rather than the INBOX. It was previously an INBOX delivery with a
+# Thunderbird filter expected to move it, and that filter matches on the sender
+# being root@, so it filed machine mail and could never have caught correspondence
+# addressed to admin@. Filing it at delivery means it works on every client, not
+# only the one somebody configured, and the folder name here has to match the
+# existing .Admin exactly, since the detail part is used as written.
 alias_entries="root: oliver
 postmaster: oliver
 abuse: oliver
 dmarc: oliver
-admin: oliver
+admin: oliver+Admin
 hello: oliver"
 # Fed to each loop through a here-document rather than a here-string. OpenBSD's
 # /bin/ksh is pdksh-derived and has no `<<<`, which fails at parse time with
