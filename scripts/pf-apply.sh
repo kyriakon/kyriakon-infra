@@ -119,6 +119,25 @@ EOF
 	printf 'gemini:       to be added\n'
 fi
 
+# --- finger -----------------------------------------------------------------
+# fingerd is spawned by inetd rather than listening on its own, so the port has
+# to be opened here before the deploy's inetd line is reachable at all. Logged,
+# like the rest, so that a probe is attributable in pflog. max-src-conn bounds a
+# single source: inetd forks per connection and the protocol is one line of
+# input, which would otherwise make this the cheapest port on the box to flood.
+if grep -q 'to any port 79$' "$pf_conf"; then
+	printf 'finger:       already in %s\n' "$pf_conf"
+else
+	cat >>"$work" <<'EOF'
+
+# --- kyriakon: finger (openbsd/etc/kyriakon-finger) ---
+pass in log on egress proto tcp to any port 79 keep state (max-src-conn 5)
+# --- end kyriakon: finger ---
+EOF
+	added=$((added + 1))
+	printf 'finger:       to be added\n'
+fi
+
 if [ "$added" -eq 0 ]; then
 	# A `persist file` table is read when the ruleset loads, so replacing the list
 	# file leaves the kernel holding the old one until something reloads. Compare

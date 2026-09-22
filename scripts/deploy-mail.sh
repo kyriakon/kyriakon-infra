@@ -185,6 +185,44 @@ install -m 0644 "$repo_dir/openbsd/etc/gmid.conf" /etc/gmid.conf
 gmid -n -c /etc/gmid.conf
 start_service gmid
 
+# --- Finger --------------------------------------------------------------
+
+# A static page on port 79, spawned per connection by inetd rather than run as a
+# daemon, which is why there is no rc.d entry for it here. Everything it serves
+# is already public: gen-finger-page.sh derives the endpoint list from the httpd
+# and gmid configs installed above, so adding a vhost is the only edit needed for
+# it to appear, and the page cannot advertise something the box does not serve.
+#
+# Deliberately not fingerd's default provider, which answers with login names,
+# real names and .plan contents, and -p only removes part of that; -P replaces it
+# outright. -s stops a query being forwarded to another host. -l is left off
+# because it logs the requesting host and the query, which would make this the
+# one service on the box keeping a record of who looked. This is a finger service
+# for an easter egg, not a directory of the box's users.
+say "finger"
+install -d -m 0755 /etc/kyriakon
+install -d -m 0755 /usr/local/libexec
+finger_tmp=$(mktemp)
+ksh "$repo_dir/scripts/gen-finger-page.sh" > "$finger_tmp"
+install -m 0644 "$finger_tmp" /etc/kyriakon/finger.txt
+rm -f "$finger_tmp"
+install -m 0755 "$repo_dir/openbsd/etc/kyriakon-finger" /usr/local/libexec/kyriakon-finger
+
+# The page and the provider are read by the _fingerd account, so both have to stay
+# world-readable. The service is spawned by inetd, and OpenBSD's base install
+# ships no /etc/inetd.conf at all, only a commented example under /etc/examples,
+# so this creates the file. The guard matches an uncommented finger line only: the
+# shipped example has one commented out, which a bare search for the word would
+# mistake for a configured service.
+inetd_conf=/etc/inetd.conf
+if grep -Eq '^[[:space:]]*finger[[:space:]]' "$inetd_conf" 2>/dev/null; then
+	printf 'inetd: finger already configured\n'
+else
+	printf '%s\n' 'finger stream tcp nowait _fingerd /usr/libexec/fingerd fingerd -s -P /usr/local/libexec/kyriakon-finger' >> "$inetd_conf"
+	printf 'inetd: finger line added to %s\n' "$inetd_conf"
+fi
+start_service inetd
+
 # --- 3. smtpd + dovecot configs -----------------------------------------
 
 say "configs"
@@ -534,7 +572,7 @@ printf 'Maildir: %s/Maildir (owner %s, shell %s)\n' "$home" "$owner" "$shell"
 # --- 8. verify ----------------------------------------------------------
 
 say "verify"
-for s in dovecot smtpd kyriakon_encrypt httpd spamd; do
+for s in dovecot smtpd kyriakon_encrypt httpd spamd inetd; do
 	printf '%-18s %s\n' "$s" "$(rcctl check "$s" 2>&1 || true)"
 done
 # The daemon being up says nothing about whether greylisting is on: the switch is
