@@ -102,9 +102,15 @@ Its snapshot selector is `kind=restore`, a third label beside `kind=gold` for pr
 ## Discipline
 
 - `terraform apply`/`destroy` against the live root are human-run, never by an agent and
-  never unattended. The one exception is `terraform/throwaway`, which
-  `scripts/restore-standup.sh` applies and destroys weekly from cron. It holds only the
-  disposable test box, in its own state, and that separation is what stops the exception
-  reaching the mail box.
+  never unattended. The one automated path is `terraform/throwaway`, which
+  `scripts/restore-standup.sh` applies and destroys weekly from cron on the mail box. It
+  holds only the disposable test box, in its own state, and that separation is what keeps
+  the automation from reaching the mail box.
+- The mail box has three refusals in front of a mistaken destroy: the throwaway root's
+  state check, which refuses to run if anything but the test box is in it; the live
+  root's `prevent_destroy`, which stops a plan from proposing the removal at all; and
+  Hetzner's `delete_protection`, which refuses the request even if it gets through.
+- Terraform is never run automatically off the boxes: no cron, no launchd agent, nothing
+  on a workstation that applies without someone at the keyboard.
 - No secrets or host-identifying values in tracked files: `terraform.tfvars`,
   state, and `.terraform/` are gitignored.

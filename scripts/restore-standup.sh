@@ -111,6 +111,7 @@ trap 'exit 1' INT TERM HUP
 
 if [ "$dry_run" = yes ]; then
 	printf 'dry-run: terraform -chdir=%s init -input=false\n' "$tf_root"
+	printf 'dry-run: terraform -chdir=%s state list   # must hold only the test box\n' "$tf_root"
 	printf 'dry-run: terraform -chdir=%s apply -auto-approve -input=false -no-color\n' "$tf_root"
 	printf 'dry-run: terraform -chdir=%s output -raw ipv4_address\n' "$tf_root"
 	printf 'dry-run: ssh -i %s root@<address> RESTIC_REPOSITORY=... /root/bin/restore-test.sh\n' "$ssh_key"
@@ -120,6 +121,23 @@ if [ "$dry_run" = yes ]; then
 fi
 
 command -v terraform >/dev/null 2>&1 || die "no terraform on this box, run: doas pkg_add terraform"
+
+# The one thing this script must never do is delete the box it is running on. State
+# isolation is why that is structurally true, and this is the check that proves the
+# separation has not quietly broken. Anything in this state beyond the throwaway box and
+# its image lookup means the root has drifted, and the run stops before it touches
+# anything rather than finding out inside a destroy. The three refusals in front of a
+# mistaken destroy are, in order: this, the live root's prevent_destroy, and Hetzner's
+# own delete_protection on the mail box.
+# `|| true` because the first run has no state file, which is an error to terraform and
+# an empty answer here.
+state_list=$(terraform -chdir="$tf_root" state list 2>/dev/null || true)
+if [ -n "$state_list" ]; then
+	unexpected=$(printf '%s\n' "$state_list" | grep -Ev '^(data\.)?hcloud_(server|image)\.restore$' || true)
+	if [ -n "$unexpected" ]; then
+		die "the throwaway state holds something that is not the test box: $(printf '%s' "$unexpected" | tr '\n' ' ')"
+	fi
+fi
 
 # Init is a no-op once the provider is installed, and it is what makes a lock file that
 # arrived by git pull take effect without anyone remembering. A failure here is not fatal
