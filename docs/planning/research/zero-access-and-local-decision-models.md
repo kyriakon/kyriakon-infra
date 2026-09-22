@@ -1,19 +1,23 @@
-# Zero-access mail and local decision models (Phase 1, §5.9/§6.11)
+# Triage model on the operator host (Phase 1, §5.9/§6.11)
 
-**Question:** a typed-decision model that reads message content would remove most of the
-manual triage in onboarding applications and in Oliver's admin mail. Where may such a model
-run, what may it read, and what is the smallest build that is actually safe?
+**Question:** a local model that reads message content would remove most of the manual triage
+in account applications and in the operator's mail. Where may such a model run, what may it
+read, and what is the smallest build that is actually safe?
 
-**Answer, in two parts.**
+**Answer, in three parts.**
 
-*Where:* on **Oliver's own always-on machine** (a Mac mini, or whatever the always-on box
-ends up being), holding **Oliver's own key**,
+*Where:* on the **operator host**, an always-on machine of Oliver's own (a Mac mini is one
+candidate), holding **his own key**,
 reading **Oliver's own mailbox**. Never on the mail box, and the platform never holds a mail
 private key for it. That is not a preference about hardware. Zero-access is a promise about
 *the platform*, and the platform is the mail box and everything it controls. Oliver reading
 his own mail is not the platform reading it, which is the same trust position as his
-Thunderbird profile today, just always on. The moment the classifier serves a second user's
+Thunderbird profile today, just always on. The moment the triage model serves a second user's
 mail, it has become the platform and the promise is false again.
+
+*What is allowed:* nothing on this path may be sent to a third-party inference service, ever,
+and the model must be open-weight. Both are recorded as cross-cutting decisions (ADR 0003 and
+ADR 0004 in `../kyriakon/docs/decisions/`).
 
 *How much to trust it:* less than it appears. The safety mechanism one reaches for first,
 routing low-confidence decisions to a human, **does not work on this model family and fails
@@ -36,25 +40,25 @@ Four documents carry the promise, and all four bind the *server*:
 
 The threat model has already traced this to its conclusions: "abuse monitoring runs on
 metadata only; spam classification still runs at the relay", and "No server-side body/header
-search or threading … they are client-side". A content classifier on the mail box would
+search or threading … they are client-side". A triage model reading content on the mail box would
 falsify every claim above, and would convert the documented *honest ceiling* ("does not stop a
 compelled admin from modifying the delivery pipeline to capture mail in plaintext") into the
-guaranteed steady state. Locality does not rescue that: a local classifier on the mail box
-fixes *extraction* (no third party sees content) but not *zero-access* (the platform still
+guaranteed steady state. Locality does not rescue that: a locally-run model on the mail box
+fixes *disclosure to a third party* but not *zero-access* (the platform still
 reads every message, and now holds the key as well). Those are two different properties and
 only one of them is a published promise.
 
-## 2. What the client position restores
+## 2. What the operator-host position restores
 
-Running on the client is not a compromise, it is the better engineering position for anything
+Running on the operator host is not a compromise, it is the better engineering position for anything
 content-dependent. Two mechanisms compose, and today's `admin@` change is already half of it:
 
 | Layer | Runs on | Reads | Cost | Covers |
 |---|---|---|---|---|
 | Alias and plus-addressing | mail box | envelope only (recipient address) | free, deterministic | routing by *address*, on every device |
-| Decision model | Oliver's own machine | content, locally, with Oliver's key | free per call, private | routing by *content*, on every device |
+| Triage model | operator host | content, locally, with Oliver's key | free per call, private | routing by *content*, on every device |
 
-The client is also the only place server-side body search and threading can exist at all
+The operator host is also the only place server-side body search and threading can exist at all
 (`THREAD=REFERENCES` and full-text search are impossible over ciphertext). Moving intelligence
 to where the key already is gives back everything zero-access had to give up, with no sentence
 in the AUP changing.
@@ -132,10 +136,29 @@ so realistically a 32 GB machine, while a low-power device instead caps out arou
 model with a corresponding drop in drafting quality. Generation is not latency-critical, since
 drafts are read later, so the binding constraint is memory rather than speed.
 
-The consequence for the purchase decision is one line. The triage classifier described here
-does not justify a Mac mini, because it runs on almost anything. A Mac mini bought for other
-work justifies the classifier, which rides along as one more process at no extra cost. Buying
-the box for the classifier would be buying it for the cheaper half of the job.
+The consequence for the purchase decision is one line. The triage model described here does
+not justify a Mac mini, because it runs on almost anything. A Mac mini bought for other work
+justifies it, and it rides along as one more process at no extra cost. Buying the box for the
+triage model would be buying it for the cheaper half of the job.
+
+### The model is a placeholder, not the decision
+
+The model named above is a current candidate, not the choice. This class is moving quickly and
+its quality will improve well before the hardware exists, so pinning a specific model in a
+decision record would be wrong twice over: ignored later, or treated as binding by someone who
+read the name rather than the property.
+
+What is durable is the list any replacement has to satisfy:
+
+- typed `choice`/`score`/`noul` output with calibrated probabilities, not free text to parse;
+- runs on the operator host, with no network inference (ADR 0003);
+- open weights, so the claim is checkable (ADR 0004);
+- handles non-Latin scripts, or refuses to send them to a checkpoint that cannot read them;
+- encoder-scale rather than frontier-scale, so it fits a small always-on box;
+- no third-party dependency for serving or calibration.
+
+The fitting requirement in §6 and the measured ceilings in §4 and §5 are the evaluation criteria
+for whatever replaces it.
 
 ## 4. Routing must happen before the forward pass, not after it
 
@@ -158,7 +181,7 @@ Their conclusion, and it is correct: "the model's own confidence gives no warnin
 cannot read the input script … confidence gating cannot protect you."
 
 This lands directly on this platform. An Orthodox community writes in Greek and Cyrillic, and
-the onboarding form and `hello@` will receive both. The design that says "act when confidence
+the application form and `hello@` will receive both. The design that says "act when confidence
 is high, escalate when it is not" would therefore act confidently and wrongly on exactly the
 applicants it is least acceptable to mishandle, and it would *file them away silently*, which
 is worse than doing nothing.
@@ -170,7 +193,7 @@ checkpoint before inference. Detection overhead is 0.09 ms for English, 0.54 ms 
 needed checkpoints resident and avoids a 7 to 10 second cold swap when input alternates
 between languages, which on a single small box is the difference between usable and not.
 
-Where a decision model like this is genuinely safe, the routing step is not the only guard.
+Where a triage model is genuinely safe, the routing step is not the only guard.
 Anything acting on a non-Latin input must also be validated against the multilingual
 checkpoint specifically, because the English checkpoint's numbers for those languages are not
 merely weak but anti-correlated with its own confidence.
@@ -199,7 +222,7 @@ The measured per-workflow numbers say the same thing in more useful detail:
 Read against the two jobs here: the *built-in* workhorse categories (spam, phishing, and
 binary safety questions) are near-solved out of the box, which is exactly what the "is this
 noise or a genuine application" question needs. Arbitrary custom taxonomies are not. A 6-way
-admin category set with 0.522-class accuracy is wrong about half the time, which is fine as a
+category set with 0.522-class accuracy is wrong about half the time, which is fine as a
 *suggestion* attached to a message and unacceptable as an *action*.
 
 So the build splits:
@@ -209,7 +232,7 @@ So the build splits:
   questions.
 - **Ship as suggestions only, until fine-tuned:** the multi-way `category` taxonomies. Fine
   tuning is a real option and not a research project, the upstream repository ships a Kaggle
-  notebook that trains a custom decision model in roughly four hours on free 2xT4 GPUs.
+  notebook that trains a custom model in roughly four hours on free 2xT4 GPUs.
 
 Two further constraints on question design, both from the authors' ceilings section. Choice
 questions degrade past about 20 options, because the option block shares a 192 to 256 token
@@ -237,7 +260,7 @@ per question type on real inputs and the resulting buckets are checked against o
 Both are the same shape: a text state, a handful of frozen labels, an action that must be
 cheap to reverse.
 
-**Onboarding applications** (`kyriakon-onboard`, §5.9.1) are the stronger of the two. They are
+**Account applications** (`kyriakon-onboard`, §5.9.1) are the stronger of the two. They are
 structured data submitted to the platform deliberately, so no zero-access question arises at
 all. The form is internet-facing before any vet, so it is the unbounded-volume surface, and
 the proposal already notes a floodable application form is a DoS on Oliver. It also already
@@ -262,7 +285,7 @@ questions = {
 }
 ```
 
-**Oliver's admin mail** is the weaker job and should be scoped as such. Volume is one mailbox,
+**The operator's mail** is the weaker job and should be scoped as such. Volume is one mailbox,
 so the value is prioritisation, not throughput. This is the mail alias routing has already
 filed into `.Admin` by envelope, and content decides only *within* the folder. Note that mail
 has one advantage over the application form: the spam and phishing questions, where the base
@@ -287,9 +310,9 @@ questions = {
 ```
 
 A general local model server remains the right tool for the *generation* side: drafting
-replies, summarising a thread. The decision model handles frozen-label triage. Two roles on
-one box, not two implementations of one role. Asking a decision model to write prose is a
-category error, it cannot, by construction.
+replies, summarising a thread. The triage model handles frozen-label triage. Two roles on one
+box, not two implementations of one role. Asking a triage model to write prose is a category
+error, it cannot, by construction.
 
 ## 8. Pre-processing is mandatory
 
@@ -331,7 +354,7 @@ Three hard rules, load-bearing rather than stylistic:
 Account creation stays manual and this design deliberately does not touch it. The proposal
 keeps approval as Oliver's call ("fast-tracks approval but is not required"), and `add-user.sh`
 plus credential issuance are outward-facing and irreversible. Classify into a queue; never
-approve from a classifier.
+approve from a triage model.
 
 ## 10. Rollout: shadow mode first
 
@@ -355,9 +378,9 @@ any available box can process, and its output is the evidence that decides wheth
 encoder is sufficient, whether the multilingual checkpoint is enough on its own, and whether a
 27B model is needed at all. Measuring first is cheaper than guessing in either direction.
 
-## 11. Key and machine hygiene
+## 11. Key, machine and data hygiene
 
-That machine now holds the key to Oliver's mail, in addition to whatever model server it runs.
+The operator host holds the key to Oliver's mail, in addition to whatever model server it runs.
 
 - Full-disk encryption, treating it as a machine holding mail private keys, because it is.
 - The decrypting path is a local IPC endpoint, not a TCP port. If the model server is exposed
@@ -365,14 +388,29 @@ That machine now holds the key to Oliver's mail, in addition to whatever model s
 - The key lives in an encrypted local store, not a config file, not an environment variable,
   and not this repository.
 
+### What is retained
+
+Only decisions, scores and outcome labels are kept (ADR 0005). Message and application text is
+purged on the 90-day window that proposal §5.9.1 already applies to applications, and that window
+also governs anything resting on the triage model or its runtime here.
+
+This costs something real. Calibration has to be fitted inside the window, and purged text cannot
+be refitted against, so a change to a question set cannot be validated against older mail. What
+persists is the fitted temperature and the measured accuracy, both scalars: enough for the
+thresholds in §9, and not enough to reconstruct anyone's mail.
+
 ## 12. Status, and what this does not do
 
-Not a ticket, and not buildable yet. `kyriakon-onboard` is fast-follow per the proposal and
-MVP is dogfooding with one mailbox, so there is no application volume to triage and no support
-queue to drain. This document fixes the boundary and records the model's measured ceilings
-before anything is built against either, in the same spirit as the ingress docs: the decision
-to keep this off the mail box is the durable part, and the component is small enough to write
-when the service it reads from exists.
+Tracked as `kyriakon` issue #5, and not buildable yet. `kyriakon-onboard` is fast-follow per the
+proposal and MVP is dogfooding with one mailbox, so there is no application volume to triage and
+no support queue to drain. This document fixes the boundary and records the model's measured
+ceilings before anything is built against either, in the same spirit as the ingress docs: the
+decision to keep this off the mail box is the durable part, and the component is small enough to
+write when the service it reads from exists.
+
+The decisions this note argues for are recorded as ADRs 0002 to 0005 in
+`../kyriakon/docs/decisions/`, which is what a reader should treat as settled. This note is
+working material, and can be pruned.
 
 It also does not cover spam on the mail box. Spam classification stays at the relay, on the
 envelope, where the platform already put it. Deliberate, deterministic and auditable beats
@@ -386,7 +424,7 @@ Open questions:
 - Whether fine-tuning for the custom taxonomies is worth four hours of free GPU time, or the
   category questions stay suggestions indefinitely.
 - Whether generation is in scope, which is what decides between a low-power always-on device
-  and a 32 GB machine. The classifier does not decide it: everything in this document runs on
+  and a 32 GB machine. The triage model does not decide it: everything in this document runs on
   a small box. That answer also settles the runtime, since MLX needs Apple Silicon and anything
   else falls back to the official torch path or an INT8 ONNX export.
 
@@ -409,8 +447,10 @@ Open questions:
 - `docs/threat-model.md` (Zero-access mail, Consequences, Honest ceiling) and `docs/aup.md`
   (Zero-access boundary) in this repo — the promises §1 must not falsify.
 - `../kyriakon/docs/CONTEXT.md` — the zero-access mail and recovery phrase definitions.
-- Project proposal §5.1 (ingress encryption), §5.9.1 (onboarding applications, approval not
+- Project proposal §5.1 (ingress encryption), §5.9.1 (account applications, approval not
   automatic), §6.11 (monitoring), §6.14 (password reset paths).
+- ADRs 0002 to 0005 in `../kyriakon/docs/decisions/`, and `kyriakon` issue #5 — the decisions
+  this note argues for, and the deferred build.
 - `docs/planning/research/zero-access-mail-smtp-ingress.md` — sibling decision; establishes
   that plus-addressing is already part of the ingress design and that the envelope is outside
   the protected set.
