@@ -187,7 +187,7 @@ ccTLDs reduce this rather than eliminating it, and the reduction is uneven:
   the United Kingdom, so they carry the same exposure as `.net` with less neutrality on record.
 
 ADR 0006 in the meta repository holds the decision: both current names stay where they are, a `.ch`
-is acquired at a revenue gate of eight paying members, the registrar must be outside the European
+is acquired at a revenue gate of ten paying members, the registrar must be outside the European
 Union, which for `.ch` means a Swiss registrar, and a re-home would be registry, registrar and
 hosting jurisdiction together or not at all. Porkbun cannot register `.ch` at all, which was checked
 against its own public pricing endpoint: 909 TLDs, `.ch` not among them.
