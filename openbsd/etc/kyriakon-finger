@@ -14,7 +14,8 @@
 #
 # A query naming a user is refused, because answering it would make this an oracle
 # for whether an account exists, and this platform has users whose names are
-# deliberately not published.
+# deliberately not published. The refusal points at the main site first, since finger
+# renders plain text and cannot carry a hyperlink.
 #
 # Output is plain LF. fingerd converts every newline to CRLF itself as it copies
 # the pipe out, so emitting CRLF here produces a doubled carriage return on every
@@ -43,7 +44,9 @@ case "$query" in
 	cat "$page"
 	;;
 *)
-	printf 'This service publishes one page. Ask for it without a name.\n'
+	printf 'The main site is https://kyriakon.net\n'
+	printf '\n'
+	printf 'This service has one page of its own. Ask for it without a name:\n'
 	printf '\n'
 	printf '  finger @kyriakon.net\n'
 	;;
