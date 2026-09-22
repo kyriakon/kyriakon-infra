@@ -6,7 +6,8 @@ run, what may it read, and what is the smallest build that is actually safe?
 
 **Answer, in two parts.**
 
-*Where:* on **Oliver's own always-on machine** (a Mac mini), holding **Oliver's own key**,
+*Where:* on **Oliver's own always-on machine** (a Mac mini, or whatever the always-on box
+ends up being), holding **Oliver's own key**,
 reading **Oliver's own mailbox**. Never on the mail box, and the platform never holds a mail
 private key for it. That is not a preference about hardware. Zero-access is a promise about
 *the platform*, and the platform is the mail box and everything it controls. Oliver reading
@@ -51,14 +52,14 @@ content-dependent. Two mechanisms compose, and today's `admin@` change is alread
 | Layer | Runs on | Reads | Cost | Covers |
 |---|---|---|---|---|
 | Alias and plus-addressing | mail box | envelope only (recipient address) | free, deterministic | routing by *address*, on every device |
-| Decision model | Oliver's Mac mini | content, locally, with Oliver's key | free per call, private | routing by *content*, on every device |
+| Decision model | Oliver's own machine | content, locally, with Oliver's key | free per call, private | routing by *content*, on every device |
 
 The client is also the only place server-side body search and threading can exist at all
 (`THREAD=REFERENCES` and full-text search are impossible over ciphertext). Moving intelligence
 to where the key already is gives back everything zero-access had to give up, with no sentence
 in the AUP changing.
 
-## 3. Model choice
+## 3. Model, runtime and hardware choice
 
 `convaiinnovations/laya` is the open-weight typed-decision family: `choice`/`score`/`noul`,
 one bidirectional forward pass, Apache-2.0 weights, with published papers and open training
@@ -75,7 +76,7 @@ inspectable, and cannot depend on a closed endpoint for a decision it will act o
 
 The main repository bundles all three and the SDK downloads one subfolder at a time.
 
-Two runtimes are viable on a Mac mini. The official `pip install laya` is torch-based. The
+Two runtimes are viable, and which one applies depends on the box. The official `pip install laya` is torch-based. The
 independent MLX port `mizorewww/laya-mlx` is native Apple Silicon and is the one whose numbers
 are measured below, on an M3 Max, FP16, model load excluded, covering prompt preparation,
 tokenization, inference, calibration and formatting:
@@ -95,6 +96,46 @@ the state.** Each question row is encoded against the state, so `n` questions co
 encoder passes batched together. Jev's "ingest the state once, evaluate every question in
 parallel" does not hold here. Compute is local and free, so this is a latency note, but a
 40-question fan-out over a long state is 40 encoder passes, not one.
+
+### What this actually requires of the machine
+
+Worth stating plainly, because the answer is that the hardware decision is not driven by this
+design:
+
+| Requirement | What the triage design needs |
+|---|---|
+| Memory | 687 MiB for the 322M multilingual checkpoint at FP16, 944 MiB for the 421M English one, less again at INT8. Both resident only if routing is used. |
+| Latency | Nothing tight. Mail is asynchronous and applications are not interactive, so 200 ms and two seconds are equally acceptable. The 13 ms figure is an M3 Max GPU result, not a requirement. |
+| Throughput | A handful of decisions per day at dogfooding volume, with the application form the only unbounded surface. |
+| Accelerator | None. Encoders of this size are CPU-viable, and a third-party INT8 ONNX export reports 15.6 ms per question on a four-core CPU. |
+
+So a low-power always-on device is sufficient for everything in this document. The one
+portability constraint is that MLX is Apple Silicon only, so a non-Apple box uses the official
+torch package or an INT8 ONNX export, and gives up the measured 13 ms figure without giving up
+the design.
+
+### The simplification worth taking on a small machine
+
+Section 4's failure mode exists only because two checkpoints are deployed and one of them
+cannot read non-Latin scripts. Deploying the multilingual checkpoint alone removes the failure
+mode by construction, and it is cheaper on every axis that matters to a small box: 322M rather
+than 421M, 687 MiB rather than 944 MiB, 1024 context rather than 512, and 2.2x faster on the
+authors' own measurement. The cost is whatever accuracy the specialised English checkpoint adds
+on English text, which the authors do not publish separately. On a low-power device, one
+checkpoint and no router is both the simpler and the safer configuration.
+
+### Where a 27B-class model changes the answer
+
+Reply drafting and thread summarisation are a different requirement, and that is the one that
+drives hardware. A 27B model at four-bit precision is on the order of 15 to 17 GB of weights,
+so realistically a 32 GB machine, while a low-power device instead caps out around a 3B to 8B
+model with a corresponding drop in drafting quality. Generation is not latency-critical, since
+drafts are read later, so the binding constraint is memory rather than speed.
+
+The consequence for the purchase decision is one line. The triage classifier described here
+does not justify a Mac mini, because it runs on almost anything. A Mac mini bought for other
+work justifies the classifier, which rides along as one more process at no extra cost. Buying
+the box for the classifier would be buying it for the cheaper half of the job.
 
 ## 4. Routing must happen before the forward pass, not after it
 
@@ -127,12 +168,16 @@ inspects Unicode scripts across 22 alphabets and Latin stopword distributions an
 checkpoint before inference. Detection overhead is 0.09 ms for English, 0.54 ms for Indic, and
 0.73 ms for large nested JSON, against a 33 ms forward pass. `Router(preload=True)` keeps the
 needed checkpoints resident and avoids a 7 to 10 second cold swap when input alternates
-between languages, which on a single Mac mini is the difference between usable and not.
+between languages, which on a single small box is the difference between usable and not.
 
 Where a decision model like this is genuinely safe, the routing step is not the only guard.
 Anything acting on a non-Latin input must also be validated against the multilingual
 checkpoint specifically, because the English checkpoint's numbers for those languages are not
 merely weak but anti-correlated with its own confidence.
+
+The cheaper alternative is to skip routing entirely and deploy only the multilingual
+checkpoint, which makes this failure mode unreachable rather than mitigated. Section 3 covers
+when that trade is the right one.
 
 ## 5. Expect the base model to be weak on a custom taxonomy
 
@@ -304,9 +349,15 @@ bucket is measured. Compilation and prefix-cache options (`compile`, `pad_to_mul
 `cache_prompts`) default to disabled and nothing here is latency-critical, so they can stay
 off.
 
+One sequencing note: shadow mode is also how the hardware question gets answered, so do not buy
+a machine in order to find out. Its input is one mailbox and a handful of applications, which
+any available box can process, and its output is the evidence that decides whether a 322M
+encoder is sufficient, whether the multilingual checkpoint is enough on its own, and whether a
+27B model is needed at all. Measuring first is cheaper than guessing in either direction.
+
 ## 11. Key and machine hygiene
 
-The Mac mini now holds the key to Oliver's mail, in addition to whatever model server it runs.
+That machine now holds the key to Oliver's mail, in addition to whatever model server it runs.
 
 - Full-disk encryption, treating it as a machine holding mail private keys, because it is.
 - The decrypting path is a local IPC endpoint, not a TCP port. If the model server is exposed
@@ -334,8 +385,10 @@ Open questions:
   a general local model over the already-filed `.Admin` folder.
 - Whether fine-tuning for the custom taxonomies is worth four hours of free GPU time, or the
   category questions stay suggestions indefinitely.
-- Which runtime, official torch `laya` or the MLX port, given the port is independent and the
-  official path carries the update cadence.
+- Whether generation is in scope, which is what decides between a low-power always-on device
+  and a 32 GB machine. The classifier does not decide it: everything in this document runs on
+  a small box. That answer also settles the runtime, since MLX needs Apple Silicon and anything
+  else falls back to the official torch path or an INT8 ONNX export.
 
 ## 13. Primary sources
 
