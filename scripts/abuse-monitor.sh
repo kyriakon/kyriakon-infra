@@ -19,8 +19,9 @@
 # Env (all optional — the script degrades to stderr output):
 #   ALERT_EMAIL            address to mail alerts to, off this box, so an alert
 #                          survives this box being the broken thing
-#   HEALTHCHECKS_URL       this box's check: a plain ping on a clean run, and
-#                          /fail with the finding when something trips
+#   HEALTHCHECKS_URL       this box's check: a ping every run, with any finding
+#                          attached to the event log. Not /fail, because a finding
+#                          is not an outage; silence is what marks it down.
 #   PUBLIC_IP              IPv4 for the DNSBL check (default: auto-detect from `ifconfig egress`)
 #   DNSBL_ZONE             DNSBL to query (default zen.spamhaus.org)
 #   MAIL_SPIKE_MAX         outbound msgs per run that counts as a spike (default 200)
@@ -79,9 +80,19 @@ alert() {
 	fi
 	# The body lands in the check's event log, which is what makes an alert
 	# raised while mail is broken still readable somewhere.
+	#
+	# Pinned to the success URL rather than /fail on purpose. A finding is not an
+	# outage: pinging /fail marked the dead-man's switch down and the ping at the
+	# end of the same run brought it straight back up, so Healthchecks mailed
+	# "is UP, the downtime lasted 0 seconds" every time the monitor had something
+	# to say, which is noise that trains you to ignore the one channel that
+	# survives this box going away. The check's state now means "the monitor is
+	# running". /fail belongs to a run that could not do its job, and under set -e
+	# such a run dies before reaching any ping, leaving Healthchecks to alert on
+	# silence, which is what the switch is for.
 	if [ -n "${HEALTHCHECKS_URL:-}" ]; then
 		curl -fsS -m 10 --retry 3 --data "$when $title: $body" \
-			"$HEALTHCHECKS_URL/fail" >/dev/null 2>&1 || true
+			"$HEALTHCHECKS_URL" >/dev/null 2>&1 || true
 	fi
 	printf '%s — %s: %s\n' "$when" "$title" "$body" >&2
 }
