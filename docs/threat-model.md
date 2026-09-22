@@ -137,7 +137,7 @@ with neither a test nor a trigger does not belong on this list.
 | Defence | What it costs | What it buys | How it is checked |
 |---|---|---|---|
 | Zero-access content | Already built | A seized box or a compelled keyring yields ciphertext, so suppression cannot read users retroactively | Test: read the published configuration, and no private key exists on the box |
-| Domain resilience, a non-EU name | About £12/yr, once eight members are paying | A delegation that can be re-pointed without the current host's cooperation | Trigger: eight paying members (ADR 0006) |
+| Domain resilience, a non-EU name | About £12/yr, once ten members are paying | A delegation that can be re-pointed without the current host's cooperation | Trigger: ten paying members (ADR 0006) |
 | Registry lock on `kyriakon.net` | An answer from the registrar | Update, Delete and Transfer blocked at the registry, not only at the registrar | Test: all three status lines read `server...Prohibited` (ADR 0001) |
 | Log minimization | Already built | A seven-day bound on the per-user record | Test: `openbsd/etc/newsyslog.conf` |
 | Offline copy of the backup repository | An SSD already owned, plus quarterly attention | The only copy that survives a compromise of the running machine | Test: restore from it during the quarterly rehearsal |
