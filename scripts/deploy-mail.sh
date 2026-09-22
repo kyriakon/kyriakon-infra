@@ -211,16 +211,24 @@ install -m 0755 "$repo_dir/openbsd/etc/kyriakon-finger" /usr/local/libexec/kyria
 # The page and the provider are read by the _fingerd account, so both have to stay
 # world-readable. The service is spawned by inetd, and OpenBSD's base install
 # ships no /etc/inetd.conf at all, only a commented example under /etc/examples,
-# so this creates the file. The guard matches an uncommented finger line only: the
-# shipped example has one commented out, which a bare search for the word would
-# mistake for a configured service.
+# so this creates the file.
+#
+# Two lines, not one. inetd takes the socket family from the protocol field, so a
+# lone `tcp` entry listens on IPv4 only and the box refuses connections on its IPv6
+# address: `finger @kyriakon.net` then works or not depending on which address the
+# resolver returns first, which is how the first deploy looked healthy while being
+# half-open. The shipped example carries both lines for this reason. Each family is
+# guarded separately so that adding the missing one works on a box where the other
+# is already installed, which is exactly the state the first deploy left behind.
 inetd_conf=/etc/inetd.conf
-if grep -Eq '^[[:space:]]*finger[[:space:]]' "$inetd_conf" 2>/dev/null; then
-	printf 'inetd: finger already configured\n'
-else
-	printf '%s\n' 'finger stream tcp nowait _fingerd /usr/libexec/fingerd fingerd -s -P /usr/local/libexec/kyriakon-finger' >> "$inetd_conf"
-	printf 'inetd: finger line added to %s\n' "$inetd_conf"
-fi
+for proto in tcp tcp6; do
+	if grep -Eq "^[[:space:]]*finger[[:space:]]+stream[[:space:]]+${proto}[[:space:]]" "$inetd_conf" 2>/dev/null; then
+		printf 'inetd: finger/%s already configured\n' "$proto"
+	else
+		printf '%s\n' "finger stream ${proto} nowait _fingerd /usr/libexec/fingerd fingerd -s -P /usr/local/libexec/kyriakon-finger" >> "$inetd_conf"
+		printf 'inetd: finger/%s line added to %s\n' "$proto" "$inetd_conf"
+	fi
+done
 start_service inetd
 
 # --- 3. smtpd + dovecot configs -----------------------------------------
