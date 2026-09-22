@@ -1,0 +1,30 @@
+#!/bin/ksh
+# kyriakon-finger — fingerd's information provider, set with fingerd -P.
+#
+# fingerd(8) passes the client's query line as the single argument. A bare query
+# gets the published page. Anything else is refused, because answering a login
+# name would make this an oracle for whether an account exists, and this platform
+# has users whose names are deliberately not published.
+#
+# Being a script rather than finger(1) is the point: the base provider answers
+# with login names, real names and .plan contents, and -p only removes part of
+# that. -P replaces it outright, so no user input reaches a command, a path or a
+# filesystem lookup, which is what keeps a 1970s protocol from also being the
+# softest service on the box.
+
+set -eu
+
+# Overridable so the refusal path can be exercised without writing to /etc, the
+# same shape lib.sh uses for KYRIAKON_ENV. The deploy installs it unchanged.
+page="${KYRIAKON_FINGER_PAGE:-/etc/kyriakon/finger.txt}"
+
+case "${1:-}" in
+'')
+	cat "$page"
+	;;
+*)
+	printf 'This service publishes one page. Ask for it without a name.\r\n'
+	printf '\r\n'
+	printf '  finger @kyriakon.net\r\n'
+	;;
+esac

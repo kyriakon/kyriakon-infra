@@ -1,0 +1,15 @@
+kyriakon.net
+
+A small, low-extraction hosting platform for the Orthodox Christian
+community: mail the platform cannot read, static and Gemini sites, and
+pass-compatible git repositories. One box, published configuration, and no
+JavaScript anywhere in the stack.
+
+Nobody here has a shell. That is the design rather than a limit applied on
+top of it.
+
+Public services
+---------------
+
+Generated from the server configurations on the box, so this is what is
+actually served rather than what somebody remembered to update.
