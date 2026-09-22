@@ -1,3 +1,13 @@
+     ____
+     |   |
+     |___|
+     |
+ \   |   /
+  \  |  /
+   \ | /
+    \|/
+     |
+
 Kyriakon.net
 
 Secure email, static web hosting, and pass repositories. Principled hosting,
