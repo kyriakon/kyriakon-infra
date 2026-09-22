@@ -1,16 +1,30 @@
 #!/bin/ksh
 # kyriakon-finger — fingerd's information provider, set with fingerd -P.
 #
-# fingerd(8) passes the client's query line as the single argument. A bare query
-# gets the published page. Anything else is refused, because answering a login
-# name would make this an oracle for whether an account exists, and this platform
-# has users whose names are deliberately not published.
+# fingerd(8) does not pass the query as it arrived. It reads one line, splits it on
+# whitespace, translates a leading /W or /w into -l, and always inserts a "--"
+# terminator before the query tokens (libexec/fingerd/fingerd.c). The arguments are
+# therefore:
 #
-# Being a script rather than finger(1) is the point: the base provider answers
-# with login names, real names and .plan contents, and -p only removes part of
-# that. -P replaces it outright, so no user input reaches a command, a path or a
-# filesystem lookup, which is what keeps a 1970s protocol from also being the
-# softest service on the box.
+#   kyriakon-finger [-l] -- [name ...]
+#
+# so an empty request arrives as just "--" and reading $1 is always wrong: it is
+# "--", or "-l" when the client asked for the long format. Everything up to the
+# terminator is dropped below, and what follows it is the query.
+#
+# A query naming a user is refused, because answering it would make this an oracle
+# for whether an account exists, and this platform has users whose names are
+# deliberately not published.
+#
+# Output is plain LF. fingerd converts every newline to CRLF itself as it copies
+# the pipe out, so emitting CRLF here produces a doubled carriage return on every
+# line and a stray blank line between each.
+#
+# Being a script rather than finger(1) is the point: the base provider answers with
+# login names, real names and .plan contents, and -p only removes part of that.
+# -P replaces it outright, so no user input reaches a command, a path or a
+# filesystem lookup, which keeps a 1970s protocol from also being the softest
+# service on the box.
 
 set -eu
 
@@ -18,13 +32,19 @@ set -eu
 # same shape lib.sh uses for KYRIAKON_ENV. The deploy installs it unchanged.
 page="${KYRIAKON_FINGER_PAGE:-/etc/kyriakon/finger.txt}"
 
-case "${1:-}" in
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+	shift
+done
+[ "$#" -gt 0 ] && shift
+query="${1:-}"
+
+case "$query" in
 '')
 	cat "$page"
 	;;
 *)
-	printf 'This service publishes one page. Ask for it without a name.\r\n'
-	printf '\r\n'
-	printf '  finger @kyriakon.net\r\n'
+	printf 'This service publishes one page. Ask for it without a name.\n'
+	printf '\n'
+	printf '  finger @kyriakon.net\n'
 	;;
 esac
