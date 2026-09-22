@@ -158,7 +158,7 @@ if [ -n "${HEALTHCHECKS_URL:-}" ]; then
 fi
 printf 'restore test passed\n'
 
-# crontab (root, on the SEPARATE read-only test machine) — weekly. Install it
-# there with scripts/cron-apply.sh --role restore, which takes the values from
-# /root/.kyriakon-env so the tab holds no secrets:
-#   45 3 * * 0 . /root/.kyriakon-env; /root/bin/restore-test.sh
+# This script is run by scripts/restore-standup.sh, over ssh, on a box that exists
+# for the length of the run: cron on the mail box creates it, runs this with
+# RESTIC_REPOSITORY, RESTIC_PASSWORD_FILE and HEALTHCHECKS_URL in the environment,
+# and deletes it again. There is no crontab here, and no box of its own.
