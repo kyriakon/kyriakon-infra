@@ -14,12 +14,12 @@
 # the ACME challenge. A gmid block is public by definition, since gmid has no
 # other reason to name a host.
 #
-# RFC 1288 terminates response lines with CRLF, so they are written that way here
-# rather than converted on every query.
+# Output is plain LF, not CRLF. fingerd converts every newline to CRLF itself while
+# copying the provider's stdout out to the client, so writing CRLF here doubles the
+# carriage return on every line and inserts a stray blank line between them.
 #
-# Prints CRLF-terminated text for a finger client, so it looks wrong in a
-# pager. Run deploy-mail.sh with this in place and read /etc/kyriakon/finger.txt
-# on the box to see what is actually served.
+# Prints for a finger client, so reading it with cat on the box is the way to see
+# what is actually served.
 
 set -euo pipefail
 
@@ -36,36 +36,34 @@ for f in "$prose" "$httpd_conf" "$gmid_conf"; do
 	fi
 done
 
+cat "$prose"
+printf '\n'
+
 {
-	cat "$prose"
-	printf '\n'
+	awk '
+		/^#/ { next }
+		/^server "/ {
+			name = $2
+			gsub(/"/, "", name)
+			inblock = 1
+			tls = 0
+			redirect = 0
+			next
+		}
+		inblock && /listen on .*tls port 443/ { tls = 1 }
+		inblock && /block return/ { redirect = 1 }
+		inblock && /^}/ {
+			if (tls && !redirect) { print "https://" name }
+			inblock = 0
+		}
+	' "$httpd_conf"
 
-	{
-		awk '
-			/^#/ { next }
-			/^server "/ {
-				name = $2
-				gsub(/"/, "", name)
-				inblock = 1
-				tls = 0
-				redirect = 0
-				next
-			}
-			inblock && /listen on .*tls port 443/ { tls = 1 }
-			inblock && /block return/ { redirect = 1 }
-			inblock && /^}/ {
-				if (tls && !redirect) { print "https://" name }
-				inblock = 0
-			}
-		' "$httpd_conf"
-
-		awk '
-			/^#/ { next }
-			/^server "/ {
-				name = $2
-				gsub(/"/, "", name)
-				print "gemini://" name
-			}
-		' "$gmid_conf"
-	} | sort -u | awk '{ print "  " $0 }'
-} | awk '{ printf "%s\r\n", $0 }'
+	awk '
+		/^#/ { next }
+		/^server "/ {
+			name = $2
+			gsub(/"/, "", name)
+			print "gemini://" name
+		}
+	' "$gmid_conf"
+} | sort -u | awk '{ print "  " $0 }'
