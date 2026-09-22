@@ -150,10 +150,20 @@ else
 	printf 'finger: %s missing or not executable; port 79 would answer nothing\n' "$finger_provider"
 	status=1
 fi
-if [ -f /etc/inetd.conf ] && grep -Eq '^[[:space:]]*finger[[:space:]]' /etc/inetd.conf; then
-	printf 'finger: inetd line present\n'
+# Both families, because inetd takes the socket family from the protocol field and
+# a single `tcp` line leaves the IPv6 address refusing connections. Checking only
+# that some finger line exists is what let the first version of this ship half-open.
+if [ -f /etc/inetd.conf ]; then
+	for proto in tcp tcp6; do
+		if grep -Eq "^[[:space:]]*finger[[:space:]]+stream[[:space:]]+${proto}[[:space:]]" /etc/inetd.conf; then
+			printf 'finger: inetd line present (%s)\n' "$proto"
+		else
+			printf 'finger: no finger/%s line in /etc/inetd.conf; that family is dark\n' "$proto"
+			status=1
+		fi
+	done
 else
-	printf 'finger: no finger line in /etc/inetd.conf; port 79 is dark\n'
+	printf 'finger: /etc/inetd.conf is missing; port 79 is dark on both families\n'
 	status=1
 fi
 

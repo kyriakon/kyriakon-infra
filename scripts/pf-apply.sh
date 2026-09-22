@@ -200,5 +200,5 @@ pfctl -f "$pf_conf"
 printf '\nbacked up as %s\n' "$bak"
 printf 'loaded %s\n\n' "$pf_conf"
 printf 'rules now loaded from these fragments:\n'
-pfctl -sr | grep -E 'divert-to 127\.0\.0\.1|spamd-white|nospamd' | awk '{print "\t" $0}'
+pfctl -sr | grep -E 'divert-to 127\.0\.0\.1|spamd-white|nospamd|port = 1965|port = 79' | awk '{print "\t" $0}'
 printf '\nrevert with: pfctl -f %s\n' "$bak"
