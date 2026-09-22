@@ -522,11 +522,15 @@ for s in lib.sh abuse-monitor.sh backup.sh renew-acme.sh restore-standup.sh; do
 done
 printf 'cron scripts installed into /root/bin\n'
 
-# restore-standup.sh talks to the Hetzner API with curl and jq. curl is already here
-# for the monitor; jq is not part of this deploy, and the weekly job cannot install
-# it, so say so now rather than letting it fail at 03:45 on a Sunday.
-if ! command -v jq >/dev/null 2>&1; then
-	printf 'note: jq is missing and restore-standup.sh needs it: doas pkg_add jq\n'
+# restore-standup.sh drives terraform/throwaway to create the test box, so it needs
+# terraform installed and that root initialised once. Neither is part of this deploy,
+# and the weekly job cannot do either itself, so say so now rather than letting it fail
+# at 03:45 on a Sunday.
+if ! command -v terraform >/dev/null 2>&1; then
+	printf 'note: terraform is missing and restore-standup.sh needs it: doas pkg_add terraform\n'
+fi
+if [ ! -d "$repo_dir/terraform/throwaway/.terraform" ]; then
+	printf 'note: initialise the throwaway root once: terraform -chdir=%s/terraform/throwaway init\n' "$repo_dir"
 fi
 
 # The box's values. setup-env.sh owns the install and is called rather than

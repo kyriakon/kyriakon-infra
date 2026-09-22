@@ -144,7 +144,10 @@ the data is **decryptable**, and the files are actually **restorable** to a work
 run on a second box that was always on, which cost more per month than the mail box itself,
 and nothing about it needs a permanent machine. `scripts/restore-standup.sh`, cron'd on the
 mail box, creates one from a snapshot of that old box, runs the test on it over ssh, and
-deletes it on every exit path, so the cost is the minutes it runs rather than a month.
+deletes it on every exit path, so the cost is the minutes it runs rather than a month. The
+box's definition lives in `terraform/throwaway`, a root with its own state file, which is what
+makes an unattended destroy safe: terraform can only remove what is in the state it is run
+against, and the mail box is in the live root's state, not this one.
 
 The snapshot carries the **read-only** storage sub-account credentials (restricted to the repo
 path) and the repository password, so nothing secret moves at run time, and a fault on a

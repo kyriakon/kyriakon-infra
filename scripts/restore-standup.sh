@@ -1,49 +1,45 @@
 #!/bin/ksh
-# restore-standup.sh — stand up a throwaway restore-test box, run the test on it,
-# tear it down again.
+# restore-standup.sh — run the weekly restore test on a box that exists for the run.
 #
 # Runs ON the mail box, weekly from cron, installed into /root/bin by
 # scripts/deploy-mail.sh.
 #
-# The restore test used to run on a second box that was always on, which cost more
-# per month than the mail box itself. Nothing about the test needs a permanent
-# machine: it needs a box for the minutes the restore takes, and it needs that box
-# to not be the mail box. So this creates one from a snapshot, runs restore-test.sh
-# on it over ssh, and deletes it on every exit path.
+# The test used to run on a second box that was always on, which cost more per month than
+# the mail box itself. Nothing about it needs a permanent machine: it needs a box for the
+# minutes the restore takes, and it needs that box to not be the mail box. So this applies
+# terraform to create one, runs restore-test.sh on it over ssh, and destroys it again on
+# every exit path.
 #
-# The snapshot carries everything the test needs, so no secret moves at run time and
-# nothing is reinstalled:
-#
-#   /root/bin/restore-test.sh and lib.sh   the test
-#   /root/.restic-pass                     the repository password
-#   /root/.ssh/id_ed25519 and known_hosts  the read-only storage sub-account
+# Terraform rather than the API by hand because the box's definition belongs in code, in
+# terraform/throwaway, with its own state file separate from the live root's. That
+# separation is what makes an unattended destroy safe: terraform can only remove what is
+# in the state it is run against, and the mail box is not in this one. See that root's
+# providers.tf before changing anything about it.
 #
 # Requires, in /root/.kyriakon-env:
-#   HCLOUD_TOKEN                    Hetzner Cloud API token, the one terraform uses
+#   HCLOUD_TOKEN                    the Hetzner Cloud token terraform reads
 #   RESTORE_TEST_REPOSITORY         READ-ONLY sub-account url, not the backup one
 #   RESTORE_TEST_HEALTHCHECKS_URL   the restore check, whose period is weekly
 #
-# Also requires `jq` on this box (pkg_add jq), a snapshot carrying a label that
-# RESTORE_TEST_IMAGE_SELECTOR matches, and a private key at
-# /root/.ssh/kyriakon-standup whose public half is in that snapshot's
+# Also requires terraform (pkg_add terraform), a one-time init in the root, and a private
+# key at /root/.ssh/kyriakon-standup whose public half is in the template snapshot's
 # /root/.ssh/authorized_keys.
 #
-# The read-only sub-account is the point rather than a detail: the test restores
-# from the repository and must not be able to write to it, so a fault on a
-# throwaway box cannot damage the backup it is testing.
+# The read-only sub-account is the point rather than a detail: the test restores from the
+# repository and must not be able to write to it, so a fault on a throwaway box cannot
+# damage the backup it is testing.
 #
 # Usage:
-#   ksh restore-standup.sh             # create, test, delete
-#   ksh restore-standup.sh --dry-run   # print the calls, create nothing
+#   ksh restore-standup.sh             # apply, test, destroy
+#   ksh restore-standup.sh --dry-run   # print what it would run, touch nothing
 #
 # The exit status is the test's, so cron and the healthcheck see a real failure. The
-# deletion lives in an EXIT trap rather than at the end of the script, because a box
-# created and not deleted bills by the month, which is the cost this exists to avoid.
+# destroy lives in an EXIT trap rather than at the end of the script, because a box
+# created and not destroyed bills by the month, which is the cost this exists to avoid.
 
 set -euo pipefail
 umask 077
 
-api_base="${HETZNER_API:-https://api.hetzner.cloud/v1}"
 dry_run=no
 if [ "${1:-}" = "--dry-run" ]; then
 	dry_run=yes
@@ -62,10 +58,10 @@ die() {
 	exit 1
 }
 
-# Alert off-box. cron mails root once and then silence looks exactly like health,
-# which is the failure mode this box has already been bitten by. The healthcheck is
-# the real dead-man's switch: a run that never reaches the test leaves its weekly
-# check unpinned, and the check alerts on its own.
+# Alert off-box. cron mails root once and then silence looks exactly like health, which
+# this job has already been bitten by. The healthcheck is the real dead-man's switch: a
+# run that never reaches the test leaves its weekly check unpinned, and the check alerts
+# on its own.
 # Called from the trap path rather than inline, which shellcheck cannot follow.
 # shellcheck disable=SC2329
 alert() {
@@ -76,59 +72,33 @@ alert() {
 : "${HCLOUD_TOKEN:?HCLOUD_TOKEN is required, in $env_file}"
 : "${RESTORE_TEST_REPOSITORY:?RESTORE_TEST_REPOSITORY is required, in $env_file}"
 
-server_label='role=restore-test'
-image_selector="${RESTORE_TEST_IMAGE_SELECTOR:-kind=restore}"
-server_type="${RESTORE_TEST_SERVER_TYPE:-cx23}"
-location="${RESTORE_TEST_LOCATION:-fsn1}"
+tf_root="${RESTORE_TEST_TF_ROOT:-/root/kyriakon-infra/terraform/throwaway}"
 ssh_key="${RESTORE_TEST_SSH_KEY:-/root/.ssh/kyriakon-standup}"
 known_hosts="${RESTORE_TEST_KNOWN_HOSTS:-/root/.ssh/known_hosts.standup}"
 healthchecks="${RESTORE_TEST_HEALTHCHECKS_URL:-}"
-run_name="kyriakon-restore-test-$(date +%Y%m%dT%H%M%S)"
-created_id=''
 server_ip=''
-test_status=0
+applied=no
 
-# The two values that travel to the far side inside a shell command line. A single
-# quote would end that quoting early and run the rest as a command, so refuse them
-# rather than escaping: setup-env.sh refuses them for the same reason.
+# The two values that travel to the far side inside a shell command line. A single quote
+# would end that quoting early and run the rest as a command, so refuse them rather than
+# escaping: setup-env.sh refuses them for the same reason.
 case "${RESTORE_TEST_REPOSITORY}${healthchecks}" in
 *"'"*) die "a repository url or healthcheck url contains a single quote" ;;
 esac
 
+[ -d "$tf_root" ] || die "no terraform root at $tf_root"
+[ -d "$tf_root/.terraform" ] || die "$tf_root has never been initialised, run: terraform -chdir=$tf_root init"
 [ -f "$ssh_key" ] || die "no ssh key at $ssh_key"
 
-api() {
-	api_method="$1"
-	api_path="$2"
-	api_body="${3:-}"
-	if [ "$dry_run" = yes ]; then
-		printf 'dry-run: %s %s%s\n' "$api_method" "$api_base" "$api_path"
-		if [ -n "$api_body" ]; then
-			printf '         body %s\n' "$api_body"
-		fi
-		return 0
-	fi
-	if [ -n "$api_body" ]; then
-		curl -fsS -X "$api_method" -H "Authorization: Bearer $HCLOUD_TOKEN" \
-			-H 'Content-Type: application/json' -d "$api_body" "$api_base$api_path"
-	else
-		# -s with -S so a failure prints why, without a progress meter in cron mail.
-		curl -fsS -X "$api_method" -H "Authorization: Bearer $HCLOUD_TOKEN" "$api_base$api_path"
-	fi
-}
-
-# The server is created before the trap that knows how to delete it, so the id is
-# checked inside the trap rather than there being two cleanup paths.
 # The EXIT trap below invokes this, which shellcheck cannot follow.
 # shellcheck disable=SC2329
 cleanup() {
 	cleanup_status=$?
-	if [ -n "$created_id" ]; then
-		printf 'deleting server %s\n' "$created_id"
-		if ! api DELETE "/servers/$created_id" >/dev/null; then
-			printf 'restore-standup: could not delete %s. It bills until it is gone.\n' \
-				"$created_id" >&2
-			alert "could not delete server $created_id, and it bills until it is gone"
+	if [ "$applied" = yes ]; then
+		printf 'destroying the box\n'
+		if ! terraform -chdir="$tf_root" destroy -auto-approve -input=false -no-color; then
+			printf 'restore-standup: the box is still there. It bills until it is gone.\n' >&2
+			alert "terraform destroy failed in $tf_root, and the box bills until it is gone"$'\n'"run: terraform -chdir=$tf_root destroy -auto-approve"
 		fi
 	fi
 	if [ "$cleanup_status" -ne 0 ]; then
@@ -139,55 +109,39 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' INT TERM HUP
 
-# A box left behind by a run that was killed mid-flight bills every month, which is
-# the cost this script exists to avoid. Only this script sets that label, so anything
-# wearing it is ours to remove.
-printf 'looking for boxes left by earlier runs\n'
-stale_json=$(api GET "/servers?label_selector=$server_label")
-if [ "$dry_run" = no ]; then
-	stale_ids=$(printf '%s' "$stale_json" | jq -r '.servers[]?.id')
-	stale_names=$(printf '%s' "$stale_json" | jq -r '.servers[]?.name' | tr '\n' ' ')
-	if [ -n "$stale_names" ]; then
-		printf 'removing %s\n' "$stale_names"
-	fi
-	for stale_id in $stale_ids; do
-		api DELETE "/servers/$stale_id" >/dev/null \
-			|| printf 'restore-standup: could not delete %s\n' "$stale_id" >&2
-	done
-fi
-
-# The newest snapshot that matches, by id, rather than by a sort parameter: ids
-# increase, and the label is the contract.
-images_json=$(api GET "/images?type=snapshot&label_selector=$image_selector")
 if [ "$dry_run" = yes ]; then
-	image_id='<newest snapshot matching the selector>'
-	printf 'dry-run: would use %s\n' "$image_selector"
-else
-	image_id=$(printf '%s' "$images_json" | jq -r '[.images[]?.id] | max // empty')
-	[ -n "$image_id" ] || die "no snapshot matches label $image_selector"
-	printf 'image: %s\n' "$image_id"
-fi
-
-create_body=$(printf '{"name":"%s","server_type":"%s","image":%s,"location":"%s","start_after_create":true,"labels":{"role":"restore-test"}}' \
-	"$run_name" "$server_type" "$image_id" "$location")
-create_json=$(api POST /servers "$create_body")
-
-if [ "$dry_run" = yes ]; then
-	server_ip='the address the API returns'
-	printf 'dry-run: nothing was created, nothing was deleted\n'
+	printf 'dry-run: terraform -chdir=%s init -input=false\n' "$tf_root"
+	printf 'dry-run: terraform -chdir=%s apply -auto-approve -input=false -no-color\n' "$tf_root"
+	printf 'dry-run: terraform -chdir=%s output -raw ipv4_address\n' "$tf_root"
+	printf 'dry-run: ssh -i %s root@<address> RESTIC_REPOSITORY=... /root/bin/restore-test.sh\n' "$ssh_key"
+	printf 'dry-run: terraform -chdir=%s destroy -auto-approve -input=false -no-color\n' "$tf_root"
+	printf 'dry-run: nothing was created, nothing was destroyed\n'
 	exit 0
 fi
 
-created_id=$(printf '%s' "$create_json" | jq -r '.server.id // empty')
-server_ip=$(printf '%s' "$create_json" | jq -r '.server.public_net.ipv4.ip // empty')
-[ -n "$created_id" ] || die "the create call returned no server id"
-[ -n "$server_ip" ] || die "the create call returned no address"
-printf 'created %s as %s\n' "$created_id" "$server_ip"
+command -v terraform >/dev/null 2>&1 || die "no terraform on this box, run: doas pkg_add terraform"
 
-# The box is new, so its host key is unknown by definition. accept-new pins it on
-# this first connection and the file is truncated at the start of every run, so the
-# pin lasts exactly as long as the box: no growing file, and no second chance for a
-# key that changes mid-run.
+# Init is a no-op once the provider is installed, and it is what makes a lock file that
+# arrived by git pull take effect without anyone remembering. A failure here is not fatal
+# on its own: what matters is whether the apply below can run, and that says so plainly.
+if ! terraform -chdir="$tf_root" init -input=false -no-color >/dev/null 2>&1; then
+	printf 'restore-standup: terraform init failed, continuing with what is installed\n' >&2
+fi
+
+# Set before the apply rather than after, so an apply that half-succeeds still gets its
+# destroy: the trap is the only thing standing between a failed run and a monthly bill.
+applied=yes
+printf 'applying %s\n' "$tf_root"
+terraform -chdir="$tf_root" apply -auto-approve -input=false -no-color
+
+server_ip=$(terraform -chdir="$tf_root" output -raw ipv4_address)
+[ -n "$server_ip" ] || die "terraform reported no ipv4_address"
+printf 'box is at %s\n' "$server_ip"
+
+# The box is new, so its host key is unknown by definition. accept-new pins it on this
+# first connection, and the file is truncated at the start of every run, so the pin lasts
+# exactly as long as the box: no growing file, and no second chance for a key that changes
+# mid-run.
 : >"$known_hosts"
 
 remote() {
@@ -196,6 +150,8 @@ remote() {
 		"root@$server_ip" "$@"
 }
 
+# terraform apply returns once the provider sees the box running, so this is a short wait
+# for the boot to finish rather than for the API.
 attempt=0
 until remote true 2>/dev/null; do
 	attempt=$((attempt + 1))
@@ -206,8 +162,8 @@ until remote true 2>/dev/null; do
 done
 printf 'ssh answered after %ss\n' "$((attempt * 10))"
 
-# The test's own exit status is the script's, so a failure is a failure for cron and
-# for the healthcheck, which the test pings itself.
+# The test's own exit status is the script's, so a failure is a failure for cron and for
+# the healthcheck, which the test pings itself.
 set +e
 remote "RESTIC_REPOSITORY='$RESTORE_TEST_REPOSITORY' RESTIC_PASSWORD_FILE=/root/.restic-pass HEALTHCHECKS_URL='$healthchecks' /root/bin/restore-test.sh"
 test_status=$?
