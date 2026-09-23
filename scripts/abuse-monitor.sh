@@ -257,10 +257,13 @@ if [ -n "$ip" ]; then
 		rm -f "$state/dnsbl.unchecked"
 		;;
 	clean*)
-		# A named list answered. That is a fact about that list and not about
-		# blocklists in general, so name it on the way past, to stderr rather than
-		# as an alert.
-		printf 'blocklist: %s is not listed on %s\n' "$ip" "${verdict#clean }" >&2
+		# Nothing to say, and this must stay that way. This branch exists only to
+		# clear the unchecked state; printing the verdict here looked helpful and
+		# was not, because cron mails anything a job writes to stderr and this job
+		# runs every fifteen minutes. A clean verdict became an email every quarter
+		# of an hour, which is the same failure as alerting on a refusal and harder
+		# to spot, since the message reads like good news. A human asking
+		# check-hygiene.sh gets the zone named; the monitor stays quiet.
 		rm -f "$state/dnsbl.unchecked"
 		;;
 	*)
