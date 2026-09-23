@@ -10,6 +10,11 @@ with them only because the law currently requires it, and we read every such law
 as narrowly as it can honestly be read. Scottish law is the more restrictive of
 the two and is the one most likely to bear on religious speech (see §2).
 
+**Companion documents.** Three documents carry the security claims rather than
+this policy: `threat-model.md`, for what the platform protects against and what
+it does not; `transparency.md`, for what an operator can be made to produce; and
+`refusals.md`, for what the platform will not build and cannot do.
+
 ## 1. Mail abuse
 
 - No sending spam, bulk unsolicited mail, or mail to harvested addresses.
