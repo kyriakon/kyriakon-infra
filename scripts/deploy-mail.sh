@@ -97,6 +97,13 @@ need_pkg gmid
 # account and looks exactly like the vi nobody wants.
 need_pkg helix
 
+# The blocklist check asks Spamhaus, and Spamhaus refuses to answer any resolver
+# serving more than one machine, which is every resolver a Hetzner box is handed.
+# A resolver on the box is what lets the strongest list answer rather than the
+# fallback zones carrying the verdict, so it is installed with everything else.
+need_pkg unbound
+start_service unbound
+
 command -v cargo >/dev/null || { printf 'cargo missing after pkg_add rust\n' >&2; exit 1; }
 command -v gpg >/dev/null || { printf 'gpg missing after pkg_add gnupg\n' >&2; exit 1; }
 command -v hx >/dev/null || { printf 'hx missing after pkg_add helix\n' >&2; exit 1; }

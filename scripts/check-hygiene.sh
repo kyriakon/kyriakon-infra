@@ -15,13 +15,14 @@
 #    The daily security(8) mail runs the same comparison, which is the automatic
 #    version of this. This is the one to run when you want the answer now.
 #
-# 2. Whether this box's address is on Spamhaus Zen. Ask a resolver on the box
-#    first, because Spamhaus refuses shared resolvers and every resolver a Hetzner
-#    box is handed is one: through those the answer is 127.255.255.254, which
-#    looks like a listing and is a refusal. A resolver serving one machine is
-#    answered, and 127.0.0.2 to 127.0.0.11 is a real listing whose last octet names
-#    the list. The same distinction is in abuse-monitor.sh, which checks every
-#    fifteen minutes; keep the two in step if either changes.
+# 2. Whether this box's address is on the blocklists, and which list said so.
+#    Spamhaus Zen refuses shared resolvers, and every resolver a Hetzner box is
+#    handed is one, so it answers 127.255.255.254 to this box and to a public
+#    resolver alike. That is a refusal rather than a listing: a listing is 127.0.0.x
+#    and its last octet names the matching list. So the check asks a list of zones,
+#    takes the first that gives a verdict, and names it, because a clean answer from
+#    SpamCop is a fact about SpamCop and not about Spamhaus. Both this and
+#    abuse-monitor.sh go through dnsbl_verdict in lib.sh, so they cannot drift.
 #
 # 3. Whether a cron job can reach the tools the cron jobs need. cron(8) hands
 #    jobs PATH=/usr/bin:/bin, packages live in /usr/local and ifconfig in /sbin,
@@ -49,7 +50,16 @@ set -euo pipefail
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
 export PATH
 
-dnsbl_zone="${DNSBL_ZONE:-zen.spamhaus.org}"
+script_dir="$(dirname "$0")"
+if [ ! -f "$script_dir/lib.sh" ]; then
+	printf '%s: lib.sh is not in %s. Install the two files together, as lib.sh describes.\n' \
+		"$0" "$script_dir" >&2
+	exit 1
+fi
+
+# shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
+. "$script_dir/lib.sh"
+
 status=0
 
 # --- 1. permission and ownership drift -----------------------------------
@@ -72,33 +82,30 @@ if [ -z "$ip" ]; then
 	printf 'blocklist: cannot determine this box address\n'
 	exit "$status"
 fi
-rev=$(printf '%s\n' "$ip" | awk -F. '{ print $4"."$3"."$2"."$1 }')
-if dig +short +time=2 +tries=1 @127.0.0.1 . NS >/dev/null 2>&1; then
-	answer=$(dig +short +time=5 +tries=2 @127.0.0.1 "$rev.$dnsbl_zone" A 2>/dev/null || true)
-	via="the resolver on this box"
-else
-	answer=$(dig +short +time=5 +tries=2 "$rev.$dnsbl_zone" A 2>/dev/null || true)
-	via="the system resolver"
-fi
-case "$answer" in
-"")
-	printf 'blocklist: %s is not listed on %s (via %s)\n' "$ip" "$dnsbl_zone" "$via"
-	;;
-127.255.255.*)
-	printf 'blocklist: cannot check, %s refuses %s. A resolver on the box is answered and is not refused; unbound ships in base\n' \
-		"$dnsbl_zone" "$via"
+verdict=$(dnsbl_verdict "$ip")
+case "$verdict" in
+listed*)
+	printf 'blocklist: %s is listed: %s. That names the list and the code; look it up and request removal\n' \
+		"$ip" "${verdict#listed }"
 	status=1
 	;;
-127.0.0.*)
-	printf 'blocklist: %s IS listed on %s as 127.0.0.%s. That code names the list; look it up at check.spamhaus.org\n' \
-		"$ip" "$dnsbl_zone" "$(printf '%s\n' "$answer" | head -1 | awk -F. '{ print $4 }')"
-	status=1
+clean*)
+	printf 'blocklist: %s is not listed on %s\n' "$ip" "${verdict#clean }"
 	;;
 *)
-	printf 'blocklist: %s gave an unexpected answer: %s\n' "$dnsbl_zone" "$answer"
+	printf 'blocklist: %s. A listing would go unnoticed until one answers\n' "$verdict"
 	status=1
 	;;
 esac
+
+# Which resolver answered is worth knowing on its own: Spamhaus, the list that matters
+# for deliverability, only answers one that serves a single machine, so its absence
+# silently downgrades the verdict to a weaker zone rather than failing the check.
+if dig +short +time=2 +tries=1 @127.0.0.1 . NS >/dev/null 2>&1; then
+	printf 'blocklist: asked through the resolver on this box, which Spamhaus answers\n'
+else
+	printf 'blocklist: no resolver on this box, so Spamhaus refuses and the fallback zones carry the verdict. unbound ships in base\n'
+fi
 
 # --- 3. does the cron environment still reach the tools cron needs? ------
 # cron(8) gives jobs PATH=/usr/bin:/bin. Packages live in /usr/local and ifconfig

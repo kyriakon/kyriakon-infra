@@ -23,7 +23,8 @@
 #                          attached to the event log. Not /fail, because a finding
 #                          is not an outage; silence is what marks it down.
 #   PUBLIC_IP              IPv4 for the DNSBL check (default: auto-detect from `ifconfig egress`)
-#   DNSBL_ZONE             DNSBL to query (default zen.spamhaus.org)
+#   DNSBL_ZONES            blocklists to query, strongest first (default:
+#                          zen.spamhaus.org bl.spamcop.net all.s5h.net dnsbl.dronebl.org)
 #   MAIL_SPIKE_MAX         outbound msgs per run that counts as a spike (default 200)
 #   AUTH_FAIL_MAX          failed ssh logins from one address before alert (default 10)
 #   QUOTA_WARN_PCT         quota usage % of soft limit that trips the alert (default 80)
@@ -39,6 +40,17 @@
 # to OpenBSD 7.x sources and should be re-checked against the live box on first run.
 
 set -euo pipefail
+
+script_dir="$(dirname "$0")"
+if [ ! -f "$script_dir/lib.sh" ]; then
+	printf '%s: lib.sh is not in %s. Install the two files together, as lib.sh describes.\n' \
+		"$0" "$script_dir" >&2
+	exit 1
+fi
+
+# shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
+. "$script_dir/lib.sh"
+
 maillog="${MAILLOG:-/var/log/maillog}"
 authlog="${AUTHLOG:-/var/log/authlog}"
 state="${STATE_DIR:-/var/db/kyriakon-monitor}"
@@ -51,7 +63,6 @@ quota_warn_pct="${QUOTA_WARN_PCT:-80}"
 grey_max="${GREY_MAX:-200}"
 defer_min="${DEFER_MIN:-3}"
 daemon_log="${DAEMONLOG:-/var/log/daemon}"
-dnsbl_zone="${DNSBL_ZONE:-zen.spamhaus.org}"
 
 # --- alert: content-rich mail, plus the external check --------------------
 # Alerts go out as mail to ALERT_EMAIL, an address off this box, and the same
@@ -239,29 +250,28 @@ printf '%s\n' "$flagged" > "$state/deferred-senders"
 # --- 6. IP reputation blocklist ------------------------------------------
 ip="${PUBLIC_IP:-$(ifconfig egress inet 2>/dev/null | awk '/inet / { print $2; exit }')}"
 if [ -n "$ip" ]; then
-	rev=$(printf '%s\n' "$ip" | awk -F. '{ print $4"."$3"."$2"."$1 }')
-	# Zen answers 127.0.0.2 to 127.0.0.11 for a real listing, the last octet naming
-	# the list that matched, and 127.255.255.0/24 when it refuses the resolver
-	# asking. The refusal is the common case: the system resolver on this box, on
-	# the workstation, and every public resolver tried all get it, because Spamhaus
-	# does not answer shared resolvers. A resolver serving one machine is answered,
-	# so ask one here if it exists.
-	if dig +short +time=2 +tries=1 @127.0.0.1 . NS >/dev/null 2>&1; then
-		answer=$(dig +short +time=5 +tries=2 @127.0.0.1 "$rev.$dnsbl_zone" A 2>/dev/null || true)
-		via="the resolver on this box"
-	else
-		answer=$(dig +short +time=5 +tries=2 "$rev.$dnsbl_zone" A 2>/dev/null || true)
-		via="the system resolver, which this box has no resolver of its own behind"
-	fi
-	case "$answer" in
-	127.255.255.*)
-		# Reporting this as a listing is a false alarm, and staying silent about it
-		# is worse: a real listing would go unnoticed. Say what it is, once per
-		# cooldown, and name the fix.
-		alert "blocklist check" "cannot check $dnsbl_zone via $via: Spamhaus refuses it, so a listing would go unnoticed. A local recursive resolver is answered and is not refused; unbound ships in base"
+	verdict=$(dnsbl_verdict "$ip")
+	case "$verdict" in
+	listed*)
+		alert "blocklisted" "$ip is listed: ${verdict#listed }. That code names the list, which the verdict names too; look it up and request removal. Deliverability is at risk until it clears"
+		rm -f "$state/dnsbl.unchecked"
 		;;
-	127.0.0.*)
-		alert "blocklisted" "$ip is on $dnsbl_zone as 127.0.0.$(printf '%s\n' "$answer" | head -1 | awk -F. '{ print $4 }') — deliverability at risk. That code names the list; look it up and request removal at check.spamhaus.org"
+	clean*)
+		# A named list answered. That is a fact about that list and not about
+		# blocklists in general, so name it on the way past, to stderr rather than
+		# as an alert.
+		printf 'blocklist: %s is not listed on %s\n' "$ip" "${verdict#clean }" >&2
+		rm -f "$state/dnsbl.unchecked"
+		;;
+	*)
+		# Every configured zone refused. That is a hole rather than a finding, and
+		# it is the state this check was in for its whole life before the list
+		# existed, mailing an alert every cooldown. Report the transition, stay
+		# quiet while it persists, and speak again if it clears and returns.
+		if [ "$(cat "$state/dnsbl.unchecked" 2>/dev/null || true)" != "$verdict" ]; then
+			alert "blocklist check" "$verdict for $ip, so a listing would go unnoticed. Every configured zone refused, which points at DNS on this box rather than at the lists"
+			printf '%s\n' "$verdict" > "$state/dnsbl.unchecked"
+		fi
 		;;
 	esac
 fi
