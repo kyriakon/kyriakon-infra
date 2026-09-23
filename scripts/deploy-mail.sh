@@ -508,7 +508,7 @@ else
 fi
 
 # Where the operator's cron scripts live. The crontab lines in backup.sh,
-# abuse-monitor.sh, restore-test.sh and renew-acme.sh all call /root/bin/<script>,
+# abuse-monitor.sh, restore-standup.sh and renew-acme.sh all call /root/bin/<script>,
 # and nothing else creates the directory, so a fresh box fails on the first
 # install with "install: /root/bin/INS@...: No such file or directory".
 # 0755 inside /root, which is already 0700 root.
@@ -517,10 +517,21 @@ install -d -m 0755 /root/bin
 # copied by hand from the repo and each crontab line pasted by hand too, which is
 # how the monitor spent a week unscheduled. cron-apply.sh puts the lines in; it
 # can only do that if the files it names are deployed first.
-for s in lib.sh abuse-monitor.sh backup.sh renew-acme.sh; do
+for s in lib.sh abuse-monitor.sh backup.sh renew-acme.sh restore-standup.sh; do
 	install -m 0755 "$repo_dir/scripts/$s" "/root/bin/$s"
 done
 printf 'cron scripts installed into /root/bin\n'
+
+# restore-standup.sh drives terraform/throwaway to create the test box, so it needs
+# terraform installed and that root initialised once. Neither is part of this deploy,
+# and the weekly job cannot do either itself, so say so now rather than letting it fail
+# at 03:45 on a Sunday.
+if ! command -v terraform >/dev/null 2>&1; then
+	printf 'note: terraform is missing and restore-standup.sh needs it: doas pkg_add terraform\n'
+fi
+if [ ! -d "$repo_dir/terraform/throwaway/.terraform" ]; then
+	printf 'note: initialise the throwaway root once: terraform -chdir=%s/terraform/throwaway init\n' "$repo_dir"
+fi
 
 # The box's values. setup-env.sh owns the install and is called rather than
 # duplicated here, so a box gets the file whichever deploy runs first: this one

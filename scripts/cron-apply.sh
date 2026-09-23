@@ -5,7 +5,8 @@
 #
 #   doas ksh scripts/cron-apply.sh --check                # show the diff, write nothing
 #   doas ksh scripts/cron-apply.sh                        # add what is missing
-#   doas ksh scripts/cron-apply.sh --role restore         # on the restore box instead
+# The restore test has no box of its own to schedule on: restore-standup.sh runs
+# here and creates one for the minutes the test takes.
 #
 # Each script here documents the crontab line it needs in its own header, and
 # nothing installed them: the mail deploy creates /root/bin and stops, so every
@@ -19,6 +20,8 @@
 #   export HEALTHCHECKS_URL='https://hc-ping.com/<uuid>'       # dead-man's switch
 #   export RESTIC_REPOSITORY='sftp://<user>@<host>:23/<repo>'
 #   export RESTIC_PASSWORD_FILE='/root/.restic-pass'
+#   export HCLOUD_TOKEN='...'                                  # restore-standup.sh
+#   export RESTORE_TEST_REPOSITORY='sftp://<user>-sub1@<host>:23/'
 #
 # A mode-0600 file rather than literals in the tab, so `crontab -l` stays safe to
 # paste and host-specific values stay out of this repo.
@@ -38,17 +41,12 @@
 set -euo pipefail
 umask 077
 
-role=mail
 check_only=no
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 	--check) check_only=yes ;;
-	--role)
-		shift
-		role="${1:-}"
-		;;
 	*)
-		printf 'usage: doas ksh %s [--check] [--role mail|restore]\n' "$0" >&2
+		printf 'usage: doas ksh %s [--check]\n' "$0" >&2
 		exit 2
 		;;
 	esac
@@ -56,23 +54,11 @@ while [ "$#" -gt 0 ]; do
 done
 
 env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
-case "$role" in
-mail)
-	needed_scripts="abuse-monitor.sh renew-acme.sh backup.sh"
-	needed_vars="ALERT_EMAIL HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE"
-	;;
-restore)
-	needed_scripts="restore-test.sh"
-	needed_vars="HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE"
-	;;
-*)
-	printf 'unknown role: %s\n' "$role" >&2
-	exit 2
-	;;
-esac
+needed_scripts="abuse-monitor.sh renew-acme.sh backup.sh restore-standup.sh"
+needed_vars="ALERT_EMAIL HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL"
 
-# The crontab line for one script. Built per script rather than as one block for
-# the role: a block would duplicate the lines of scripts that are already
+# The crontab line for one script. Built per script rather than as one block: a
+# block would duplicate the lines of scripts that are already
 # scheduled, which is what the first real run did, leaving the backup and the
 # renewal running twice.
 line_for() {
@@ -80,7 +66,7 @@ line_for() {
 	abuse-monitor.sh) printf '*/15 * * * * . /root/.kyriakon-env; /root/bin/abuse-monitor.sh\n' ;;
 	renew-acme.sh) printf '0 3 * * * . /root/.kyriakon-env; /root/bin/renew-acme.sh\n' ;;
 	backup.sh) printf '30 2 * * * . /root/.kyriakon-env; /root/bin/backup.sh\n' ;;
-	restore-test.sh) printf '45 3 * * 0 . /root/.kyriakon-env; /root/bin/restore-test.sh\n' ;;
+	restore-standup.sh) printf '45 3 * * 0 . /root/.kyriakon-env; /root/bin/restore-standup.sh\n' ;;
 	*) return 1 ;;
 	esac
 }
@@ -106,13 +92,12 @@ for s in $needed_scripts; do
 	fi
 done
 
-printf 'role: %s\n' "$role"
 if [ -n "$missing_scripts" ]; then
 	printf 'not installed in /root/bin:%s\n' "$missing_scripts"
 fi
 if [ -z "$to_add" ]; then
 	rm -f "$pending"
-	printf 'nothing to do: every script this role schedules is already in the crontab\n\n'
+	printf 'nothing to do: every script this schedules is already in the crontab\n\n'
 	printf 'Compare what is there against the lines this would have added:\n\n'
 	for s in $needed_scripts; do
 		line_for "$s"

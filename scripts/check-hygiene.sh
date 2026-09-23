@@ -109,16 +109,20 @@ esac
 # cron's PATH, and ask what a job would find.
 if [ "$(id -u)" -eq 0 ] && [ -f /root/.kyriakon-env ]; then
 	absent=""
-	for tool in curl ifconfig; do
+	tools="curl ifconfig terraform"
+	for tool in $tools; do
 		env -i PATH=/usr/bin:/bin sh -c ". /root/.kyriakon-env; command -v $tool" >/dev/null 2>&1 \
 			|| absent="$absent $tool"
 	done
 	if [ -n "$absent" ]; then
 		printf 'cron environment: a cron job would not find:%s\n' "$absent"
 		printf '  the fix is the PATH line in /root/.kyriakon-env, which every cron line sources\n'
+		case "$absent" in
+		*terraform*) printf '  terraform is a package: doas pkg_add terraform\n' ;;
+		esac
 		status=1
 	else
-		printf 'cron environment: curl and ifconfig both reachable as a cron job sees them\n'
+		printf 'cron environment: %s all reachable as a cron job sees them\n' "$tools"
 	fi
 else
 	printf 'cron environment: skipped, needs root and /root/.kyriakon-env\n'
@@ -164,6 +168,39 @@ if [ -f /etc/inetd.conf ]; then
 	done
 else
 	printf 'finger: /etc/inetd.conf is missing; port 79 is dark on both families\n'
+	status=1
+fi
+# --- 5. terraform --------------------------------------------------------
+# One automated path exists in this repo: the weekly restore standup applies
+# terraform/throwaway to create a disposable box and destroy it again. Two things make
+# that safe rather than reckless, and both fail silently, which is why they are checked
+# here rather than trusted. The first is that the live root's server refuses to be
+# destroyed. The second is that the throwaway root's state holds the test box and never
+# the mail box. This section is what says so before a destroy has to find out.
+tf_dir=/root/kyriakon-infra/terraform
+if grep -q 'prevent_destroy[[:space:]]*=[[:space:]]*true' "$tf_dir/main.tf" 2>/dev/null; then
+	printf 'terraform: the live root refuses to plan the removal of its server\n'
+else
+	printf 'terraform: no prevent_destroy in %s/main.tf; only delete_protection would stand between a bad plan and the mail box\n' "$tf_dir"
+	status=1
+fi
+if [ -d "$tf_dir/throwaway/.terraform" ]; then
+	# grep -E returns non-zero when everything matches, which under set -e would end
+	# the script before it could report.
+	tf_state=$(terraform -chdir="$tf_dir/throwaway" state list 2>/dev/null || true)
+	if [ -n "$tf_state" ]; then
+		tf_unexpected=$(printf '%s\n' "$tf_state" | grep -Ev '^(data\.)?hcloud_(server|image)\.restore$' || true)
+		if [ -n "$tf_unexpected" ]; then
+			printf 'terraform: the throwaway state holds %s, which is not the test box\n' "$(printf '%s' "$tf_unexpected" | tr '\n' ' ')"
+			status=1
+		else
+			printf 'terraform: the throwaway state holds only the test box\n'
+		fi
+	else
+		printf 'terraform: the throwaway state is empty, which is what it should be between runs\n'
+	fi
+else
+	printf 'terraform: %s/throwaway has never been initialised, so the weekly restore test cannot run\n' "$tf_dir"
 	status=1
 fi
 

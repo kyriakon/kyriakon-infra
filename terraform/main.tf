@@ -21,6 +21,14 @@ resource "hcloud_server" "mail" {
   # historical fact about when it was built, not a setting to keep in sync.
   lifecycle {
     ignore_changes = [image]
+
+    # Terraform is refused the chance to plan this server's removal at all, replacement
+    # included, since any ForceNew change plans as a destroy. delete_protection below is
+    # the provider's refusal, which only helps if the request gets that far; this is the
+    # plan-time one. Together with the live root's state never appearing in
+    # terraform/throwaway, a mistaken destroy meets three independent refusals. Removing
+    # this line is the deliberate ceremony for a rebuild.
+    prevent_destroy = true
   }
 
   # Both default to false in the provider. Declaring them is what stops a later

@@ -91,8 +91,26 @@ vulnerable rspamd (section 6.10).
 | `location`          | `hel1`         | region the storage box is NOT in |
 | `snapshot_selector` | `os=openbsd`   | set at `create-image` time |
 
+## The throwaway root
+
+`terraform/throwaway/` is a second root, with its own state file, managing exactly one thing: the box the weekly restore test runs on. `scripts/restore-standup.sh` applies it, reads the address from `output -raw ipv4_address`, runs the test over ssh, and destroys it in an exit trap.
+
+The separate state is the safety property rather than tidiness. `terraform destroy` can only remove what is in the state it is run against, and the mail box is in the state in this directory rather than in that one, so an unattended destroy cannot reach it. The rule that follows: nothing under `terraform/throwaway/` may declare, reference or import anything from the live root, and if a resource belonging to the mail box ever appears in that state, that root has become dangerous and the answer is to stop using it.
+
+Its snapshot selector is `kind=restore`, a third label beside `kind=gold` for provisioning images and `kind=dr` for point-in-time copies, so neither of those can be picked up by a test run. The template carries the test scripts, the repository password and the read-only storage sub-account key, which is what keeps a weekly run short and moves no secret at run time.
+
 ## Discipline
 
-- `terraform apply`/`destroy` are human-run, never by an agent (propose-only).
+- `terraform apply`/`destroy` against the live root are human-run, never by an agent and
+  never unattended. The one automated path is `terraform/throwaway`, which
+  `scripts/restore-standup.sh` applies and destroys weekly from cron on the mail box. It
+  holds only the disposable test box, in its own state, and that separation is what keeps
+  the automation from reaching the mail box.
+- The mail box has three refusals in front of a mistaken destroy: the throwaway root's
+  state check, which refuses to run if anything but the test box is in it; the live
+  root's `prevent_destroy`, which stops a plan from proposing the removal at all; and
+  Hetzner's `delete_protection`, which refuses the request even if it gets through.
+- Terraform is never run automatically off the boxes: no cron, no launchd agent, nothing
+  on a workstation that applies without someone at the keyboard.
 - No secrets or host-identifying values in tracked files: `terraform.tfvars`,
   state, and `.terraform/` are gitignored.
