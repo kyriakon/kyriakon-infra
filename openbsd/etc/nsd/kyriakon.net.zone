@@ -8,7 +8,7 @@ $TTL 3600
 ; before deploy.
 
 @	IN	SOA	ns0.kyriakon.net. hostmaster.kyriakon.net. (
-		2026091901	; serial - YYYYMMDDNN, bump on EVERY edit (see note below)
+		2026092401	; serial - YYYYMMDDNN, bump on EVERY edit (see note below)
 		3600		; refresh - HE re-checks at least this often
 		900		; retry
 		1209600		; expire - 14 days: HE keeps serving if the primary dies
