@@ -21,9 +21,26 @@
 #   RESTORE_TEST_REPOSITORY         READ-ONLY sub-account url, not the backup one
 #   RESTORE_TEST_HEALTHCHECKS_URL   the restore check, whose period is weekly
 #
-# Also requires terraform (pkg_add terraform), a one-time init in the root, and a private
-# key at /root/.ssh/kyriakon-standup whose public half is in the template snapshot's
-# /root/.ssh/authorized_keys.
+# Also requires terraform (pkg_add terraform), a one-time init in the root, a private key
+# at /root/.ssh/kyriakon-standup whose public half is in the template's
+# /root/.ssh/authorized_keys, and two files this box already has: the restic password at
+# /root/.restic-pass, and the READ-ONLY storage sub-account's private key.
+#
+# The template is a plain box, and that is forced rather than chosen. A softraid crypto
+# root stops at the passphrase prompt, and nobody is at the console at 03:45 on a Sunday,
+# so a template built from an encrypted box never reaches ssh and the run dies on its own
+# timeout every week without testing anything. The template therefore carries no softraid
+# at all, and the credentials it needs arrive after every boot: this script copies the
+# restic password and the read-only key over ssh before the test runs. Nothing secret is
+# baked into the image, which is also the better arrangement, since an image outlives the
+# box it was made from.
+#
+# The cost of that is the throwaway's disk, which is plaintext for the minutes the run
+# takes and is not wiped when Hetzner frees it. The restored mail is PGP ciphertext and
+# the read-only key cannot write to the repository, so what a future holder of that disk
+# could read is the restored site and git content plus read access to the backups. An
+# encrypted scratch volume would remove that, and is a follow-up rather than part of this:
+# it needs a throwaway box to prove the unlock works on, and there is no spare box.
 #
 # The read-only sub-account is the point rather than a detail: the test restores from the
 # repository and must not be able to write to it, so a fault on a throwaway box cannot
@@ -75,6 +92,8 @@ alert() {
 tf_root="${RESTORE_TEST_TF_ROOT:-/root/kyriakon-infra/terraform/throwaway}"
 ssh_key="${RESTORE_TEST_SSH_KEY:-/root/.ssh/kyriakon-standup}"
 known_hosts="${RESTORE_TEST_KNOWN_HOSTS:-/root/.ssh/known_hosts.standup}"
+ro_key="${RESTORE_TEST_RO_KEY:-/root/.ssh/kyriakon-restore-readonly}"
+ro_password="${RESTORE_TEST_PASSWORD_FILE:-/root/.restic-pass}"
 healthchecks="${RESTORE_TEST_HEALTHCHECKS_URL:-}"
 server_ip=''
 applied=no
@@ -89,6 +108,8 @@ esac
 [ -d "$tf_root" ] || die "no terraform root at $tf_root"
 [ -d "$tf_root/.terraform" ] || die "$tf_root has never been initialised, run: terraform -chdir=$tf_root init"
 [ -f "$ssh_key" ] || die "no ssh key at $ssh_key"
+[ -f "$ro_key" ] || die "no read-only storage key at $ro_key"
+[ -f "$ro_password" ] || die "no restic password file at $ro_password"
 
 # The EXIT trap below invokes this, which shellcheck cannot follow.
 # shellcheck disable=SC2329
@@ -114,6 +135,9 @@ if [ "$dry_run" = yes ]; then
 	printf 'dry-run: terraform -chdir=%s state list   # must hold only the test box\n' "$tf_root"
 	printf 'dry-run: terraform -chdir=%s apply -auto-approve -input=false -no-color\n' "$tf_root"
 	printf 'dry-run: terraform -chdir=%s output -raw ipv4_address\n' "$tf_root"
+	printf 'dry-run: ssh -i %s root@<address> mkdir -p /root/.ssh\n' "$ssh_key"
+	printf 'dry-run: scp-equivalent: %s -> root@<address>:/root/.ssh/id_ed25519\n' "$ro_key"
+	printf 'dry-run: scp-equivalent: %s -> root@<address>:/root/.restic-pass\n' "$ro_password"
 	printf 'dry-run: ssh -i %s root@<address> RESTIC_REPOSITORY=... /root/bin/restore-test.sh\n' "$ssh_key"
 	printf 'dry-run: terraform -chdir=%s destroy -auto-approve -input=false -no-color\n' "$tf_root"
 	printf 'dry-run: nothing was created, nothing was destroyed\n'
@@ -168,6 +192,13 @@ remote() {
 		"root@$server_ip" "$@"
 }
 
+# Copy one local file to the box, for the credentials the template cannot carry. Written
+# as a redirect rather than scp so it travels down the same ssh invocation as everything
+# else, with the same key and the same host-key pin.
+push() {
+	remote "cat > $1 && chmod 600 $1" <"$2"
+}
+
 # terraform apply returns once the provider sees the box running, so this is a short wait
 # for the boot to finish rather than for the API.
 attempt=0
@@ -182,6 +213,15 @@ printf 'ssh answered after %ss\n' "$((attempt * 10))"
 
 # The test's own exit status is the script's, so a failure is a failure for cron and for
 # the healthcheck, which the test pings itself.
+# The credentials, after the boot and before the test. The mailbox's own known_hosts
+# comes along because restic's sftp backend shells out to sftp, which has none of the
+# flags above and would otherwise refuse the storage host as unknown.
+remote 'mkdir -p /root/.ssh'
+push /root/.ssh/id_ed25519 "$ro_key"
+push /root/.ssh/known_hosts /root/.ssh/known_hosts
+push /root/.restic-pass "$ro_password"
+printf 'credentials in place\n'
+
 set +e
 remote "RESTIC_REPOSITORY='$RESTORE_TEST_REPOSITORY' RESTIC_PASSWORD_FILE=/root/.restic-pass HEALTHCHECKS_URL='$healthchecks' /root/bin/restore-test.sh"
 test_status=$?
