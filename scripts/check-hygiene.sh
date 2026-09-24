@@ -116,7 +116,7 @@ fi
 # cron's PATH, and ask what a job would find.
 if [ "$(id -u)" -eq 0 ] && [ -f /root/.kyriakon-env ]; then
 	absent=""
-	tools="curl ifconfig terraform"
+	tools="curl ifconfig hcloud jq"
 	for tool in $tools; do
 		env -i PATH=/usr/bin:/bin sh -c ". /root/.kyriakon-env; command -v $tool" >/dev/null 2>&1 \
 			|| absent="$absent $tool"
@@ -125,7 +125,7 @@ if [ "$(id -u)" -eq 0 ] && [ -f /root/.kyriakon-env ]; then
 		printf 'cron environment: a cron job would not find:%s\n' "$absent"
 		printf '  the fix is the PATH line in /root/.kyriakon-env, which every cron line sources\n'
 		case "$absent" in
-		*terraform*) printf '  terraform is a package: doas pkg_add terraform\n' ;;
+		*hcloud*|*jq*) printf '  %s is a package: doas pkg_add %s\n' "$tool" "$tool" ;;
 		esac
 		status=1
 	else
@@ -178,36 +178,39 @@ else
 	status=1
 fi
 # --- 5. terraform --------------------------------------------------------
-# One automated path exists in this repo: the weekly restore standup applies
-# terraform/throwaway to create a disposable box and destroy it again. Two things make
-# that safe rather than reckless, and both fail silently, which is why they are checked
-# here rather than trusted. The first is that the live root's server refuses to be
-# destroyed. The second is that the throwaway root's state holds the test box and never
-# the mail box. This section is what says so before a destroy has to find out.
-tf_dir=/root/kyriakon-infra/terraform
+# The repo's one automated path is the weekly restore standup, which now drives the
+# Hetzner API with the hcloud CLI and deletes only the server id it created that run. The
+# refusals in front of a mistaken destroy are the id discipline in that script, the live
+# root's prevent_destroy, and Hetzner's delete_protection. Only the second is checked
+# here, because it is the one that lives in a file that can silently lose it.
+#
+# The path is a variable rather than hardcoded, because the box's checkout is not where
+# the repo's own instructions assume and a wrong path reads exactly like a missing guard.
+repo_root="${KYRIAKON_REPO:-/root/src/kyriakon-infra}"
+tf_dir="$repo_root/terraform"
 if grep -q 'prevent_destroy[[:space:]]*=[[:space:]]*true' "$tf_dir/main.tf" 2>/dev/null; then
 	printf 'terraform: the live root refuses to plan the removal of its server\n'
 else
 	printf 'terraform: no prevent_destroy in %s/main.tf; only delete_protection would stand between a bad plan and the mail box\n' "$tf_dir"
 	status=1
 fi
-if [ -d "$tf_dir/throwaway/.terraform" ]; then
-	# grep -E returns non-zero when everything matches, which under set -e would end
-	# the script before it could report.
-	tf_state=$(terraform -chdir="$tf_dir/throwaway" state list 2>/dev/null || true)
-	if [ -n "$tf_state" ]; then
-		tf_unexpected=$(printf '%s\n' "$tf_state" | grep -Ev '^(data\.)?hcloud_(server|image)\.restore$' || true)
-		if [ -n "$tf_unexpected" ]; then
-			printf 'terraform: the throwaway state holds %s, which is not the test box\n' "$(printf '%s' "$tf_unexpected" | tr '\n' ' ')"
-			status=1
-		else
-			printf 'terraform: the throwaway state holds only the test box\n'
-		fi
+# The restore image is what the weekly run creates its box from, so an absent or
+# mislabelled one means the test cannot run. Checked by looking for the image, which is
+# what the standup does too, rather than by trusting a label convention in a document.
+# The token lives in the box's env file, which this script does not source into its own
+# environment, so it is read the way the cron PATH check reads it: in a subshell that
+# sources that file and nothing else.
+if [ "$(id -u)" -eq 0 ] && [ -f /root/.kyriakon-env ]; then
+	restore_image=$(env -i PATH=/usr/bin:/bin:/usr/local/bin sh -c \
+		". /root/.kyriakon-env; hcloud image list -t snapshot -l ${RESTORE_TEST_IMAGE_LABEL:-kind=restore} -o noheader -o columns=id" 2>/dev/null | head -1)
+	if [ -n "$restore_image" ]; then
+		printf 'terraform: a snapshot labelled %s exists, so the weekly test has a template\n' "${RESTORE_TEST_IMAGE_LABEL:-kind=restore}"
 	else
-		printf 'terraform: the throwaway state is empty, which is what it should be between runs\n'
+		printf 'terraform: no snapshot labelled %s; the weekly restore test has no template to create from\n' "${RESTORE_TEST_IMAGE_LABEL:-kind=restore}"
+		status=1
 	fi
 else
-	printf 'terraform: %s/throwaway has never been initialised, so the weekly restore test cannot run\n' "$tf_dir"
+	printf 'terraform: hcloud and the env file are both needed to check the restore image\n'
 	status=1
 fi
 

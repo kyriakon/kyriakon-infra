@@ -7,22 +7,28 @@
 # The test used to run on a second box that was always on, which cost more per month than
 # the mail box itself. Nothing about it needs a permanent machine: it needs a box for the
 # minutes the restore takes, and it needs that box to not be the mail box. So this applies
-# terraform to create one, runs restore-test.sh on it over ssh, and destroys it again on
+# the hcloud CLI to create one, runs restore-test.sh on it over ssh, and destroys it on
 # every exit path.
 #
-# Terraform rather than the API by hand because the box's definition belongs in code, in
-# terraform/throwaway, with its own state file separate from the live root's. That
-# separation is what makes an unattended destroy safe: terraform can only remove what is
-# in the state it is run against, and the mail box is not in this one. See that root's
-# providers.tf before changing anything about it.
+# The API by CLI rather than terraform, because the hcloud provider publishes no OpenBSD
+# build. `terraform init` on a root using it fails on this platform at every provider
+# version, so terraform cannot drive this box from here at all. The CLI is packaged for
+# OpenBSD, which the provider is not.
+#
+# What terraform was there for was the destroy being unable to reach the mail box, since
+# destroy only removes what is in the state it runs against. The same property holds here
+# by a narrower route: the server is created once, its id captured, and everything after
+# that in this script refers to that id and never to a name or a list. A delete cannot
+# resolve to anything but the box this run made. The mail box keeps its own protection
+# besides, the live root's prevent_destroy and Hetzner's delete_protection, both unchanged.
 #
 # Requires, in /root/.kyriakon-env:
-#   HCLOUD_TOKEN                    the Hetzner Cloud token terraform reads
+#   HCLOUD_TOKEN                    the Hetzner Cloud token the hcloud CLI reads
 #   RESTORE_TEST_REPOSITORY         READ-ONLY sub-account url, not the backup one
 #   RESTORE_TEST_HEALTHCHECKS_URL   the restore check, whose period is weekly
 #
-# Also requires terraform (pkg_add terraform), a one-time init in the root, a private key
-# at /root/.ssh/kyriakon-standup whose public half is in the template's
+# Also requires the hcloud CLI and jq (doas pkg_add hcloud jq), a private key at
+# /root/.ssh/kyriakon-standup whose public half is in the template's
 # /root/.ssh/authorized_keys, and two files this box already has: the restic password at
 # /root/.restic-pass, and the READ-ONLY storage sub-account's private key.
 #
@@ -89,14 +95,17 @@ alert() {
 : "${HCLOUD_TOKEN:?HCLOUD_TOKEN is required, in $env_file}"
 : "${RESTORE_TEST_REPOSITORY:?RESTORE_TEST_REPOSITORY is required, in $env_file}"
 
-tf_root="${RESTORE_TEST_TF_ROOT:-/root/kyriakon-infra/terraform/throwaway}"
+image_label="${RESTORE_TEST_IMAGE_LABEL:-kind=restore}"
+server_name="${RESTORE_TEST_SERVER_NAME:-kyriakon-restore-test}"
+server_type="${RESTORE_TEST_SERVER_TYPE:-cx23}"
+location="${RESTORE_TEST_LOCATION:-fsn1}"
+server_id=''
 ssh_key="${RESTORE_TEST_SSH_KEY:-/root/.ssh/kyriakon-standup}"
 known_hosts="${RESTORE_TEST_KNOWN_HOSTS:-/root/.ssh/known_hosts.standup}"
 ro_key="${RESTORE_TEST_RO_KEY:-/root/.ssh/kyriakon-restore-readonly}"
 ro_password="${RESTORE_TEST_PASSWORD_FILE:-/root/.restic-pass}"
 healthchecks="${RESTORE_TEST_HEALTHCHECKS_URL:-}"
 server_ip=''
-applied=no
 
 # The two values that travel to the far side inside a shell command line. A single quote
 # would end that quoting early and run the rest as a command, so refuse them rather than
@@ -105,8 +114,6 @@ case "${RESTORE_TEST_REPOSITORY}${healthchecks}" in
 *"'"*) die "a repository url or healthcheck url contains a single quote" ;;
 esac
 
-[ -d "$tf_root" ] || die "no terraform root at $tf_root"
-[ -d "$tf_root/.terraform" ] || die "$tf_root has never been initialised, run: terraform -chdir=$tf_root init"
 [ -f "$ssh_key" ] || die "no ssh key at $ssh_key"
 [ -f "$ro_key" ] || die "no read-only storage key at $ro_key"
 [ -f "$ro_password" ] || die "no restic password file at $ro_password"
@@ -115,11 +122,11 @@ esac
 # shellcheck disable=SC2329
 cleanup() {
 	cleanup_status=$?
-	if [ "$applied" = yes ]; then
-		printf 'destroying the box\n'
-		if ! terraform -chdir="$tf_root" destroy -auto-approve -input=false -no-color; then
+	if [ -n "$server_id" ]; then
+		printf 'deleting server %s\n' "$server_id"
+		if ! hcloud server delete "$server_id"; then
 			printf 'restore-standup: the box is still there. It bills until it is gone.\n' >&2
-			alert "terraform destroy failed in $tf_root, and the box bills until it is gone"$'\n'"run: terraform -chdir=$tf_root destroy -auto-approve"
+			alert "hcloud server delete failed for id $server_id, and the box bills until it is gone"$'\n'"run: hcloud server delete $server_id"
 		fi
 	fi
 	if [ "$cleanup_status" -ne 0 ]; then
@@ -131,53 +138,40 @@ trap cleanup EXIT
 trap 'exit 1' INT TERM HUP
 
 if [ "$dry_run" = yes ]; then
-	printf 'dry-run: terraform -chdir=%s init -input=false\n' "$tf_root"
-	printf 'dry-run: terraform -chdir=%s state list   # must hold only the test box\n' "$tf_root"
-	printf 'dry-run: terraform -chdir=%s apply -auto-approve -input=false -no-color\n' "$tf_root"
-	printf 'dry-run: terraform -chdir=%s output -raw ipv4_address\n' "$tf_root"
+	printf 'dry-run: hcloud image list -t snapshot -l %s -o noheader -o columns=id\n' "$image_label"
+	printf 'dry-run: hcloud server create --name %s --type %s --image <id> --location %s -o json\n' "$server_name" "$server_type" "$location"
+	printf 'dry-run: hcloud server ip <id>\n'
 	printf 'dry-run: ssh -i %s root@<address> mkdir -p /root/.ssh\n' "$ssh_key"
 	printf 'dry-run: scp-equivalent: %s -> root@<address>:/root/.ssh/id_ed25519\n' "$ro_key"
 	printf 'dry-run: scp-equivalent: %s -> root@<address>:/root/.restic-pass\n' "$ro_password"
 	printf 'dry-run: ssh -i %s root@<address> RESTIC_REPOSITORY=... /root/bin/restore-test.sh\n' "$ssh_key"
-	printf 'dry-run: terraform -chdir=%s destroy -auto-approve -input=false -no-color\n' "$tf_root"
+	printf 'dry-run: hcloud server delete <id>       # the id this run created, never a name\n'
 	printf 'dry-run: nothing was created, nothing was destroyed\n'
 	exit 0
 fi
 
-command -v terraform >/dev/null 2>&1 || die "no terraform on this box, run: doas pkg_add terraform"
+command -v hcloud >/dev/null 2>&1 || die "no hcloud on this box, run: doas pkg_add hcloud"
+command -v jq >/dev/null 2>&1 || die "no jq on this box, run: doas pkg_add jq"
 
-# The one thing this script must never do is delete the box it is running on. State
-# isolation is why that is structurally true, and this is the check that proves the
-# separation has not quietly broken. Anything in this state beyond the throwaway box and
-# its image lookup means the root has drifted, and the run stops before it touches
-# anything rather than finding out inside a destroy. The three refusals in front of a
-# mistaken destroy are, in order: this, the live root's prevent_destroy, and Hetzner's
-# own delete_protection on the mail box.
-# `|| true` because the first run has no state file, which is an error to terraform and
-# an empty answer here.
-state_list=$(terraform -chdir="$tf_root" state list 2>/dev/null || true)
-if [ -n "$state_list" ]; then
-	unexpected=$(printf '%s\n' "$state_list" | grep -Ev '^(data\.)?hcloud_(server|image)\.restore$' || true)
-	if [ -n "$unexpected" ]; then
-		die "the throwaway state holds something that is not the test box: $(printf '%s' "$unexpected" | tr '\n' ' ')"
-	fi
-fi
+# The image is looked up by label rather than pinned by id, so rebuilding the template is
+# snapshot and label with nothing to edit here. An empty answer stops the run, because
+# creating from a missing image gives a box that cannot boot and a waste of a month's
+# billing to notice.
+image_id=$(hcloud image list -t snapshot -l "$image_label" -o noheader -o columns=id | head -1)
+[ -n "$image_id" ] || die "no snapshot labelled $image_label; build the template, or set RESTORE_TEST_IMAGE_LABEL"
 
-# Init is a no-op once the provider is installed, and it is what makes a lock file that
-# arrived by git pull take effect without anyone remembering. A failure here is not fatal
-# on its own: what matters is whether the apply below can run, and that says so plainly.
-if ! terraform -chdir="$tf_root" init -input=false -no-color >/dev/null 2>&1; then
-	printf 'restore-standup: terraform init failed, continuing with what is installed\n' >&2
-fi
+# The id is captured here and used for every later reference. That is the whole safety
+# argument: no name lookup, no list, nothing that could resolve to another server.
+printf 'creating %s from image %s\n' "$server_name" "$image_id"
+server_id=$(hcloud server create --name "$server_name" --type "$server_type" \
+	--image "$image_id" --location "$location" -o json | jq -r '.id')
+case "${server_id:-}" in
+''|null) die "hcloud did not report a server id, so there is nothing this run may delete" ;;
+esac
+printf 'server id %s\n' "$server_id"
 
-# Set before the apply rather than after, so an apply that half-succeeds still gets its
-# destroy: the trap is the only thing standing between a failed run and a monthly bill.
-applied=yes
-printf 'applying %s\n' "$tf_root"
-terraform -chdir="$tf_root" apply -auto-approve -input=false -no-color
-
-server_ip=$(terraform -chdir="$tf_root" output -raw ipv4_address)
-[ -n "$server_ip" ] || die "terraform reported no ipv4_address"
+server_ip=$(hcloud server ip "$server_id")
+[ -n "$server_ip" ] || die "hcloud reported no ipv4_address for server $server_id"
 printf 'box is at %s\n' "$server_ip"
 
 # The box is new, so its host key is unknown by definition. accept-new pins it on this
@@ -199,8 +193,8 @@ push() {
 	remote "cat > $1 && chmod 600 $1" <"$2"
 }
 
-# terraform apply returns once the provider sees the box running, so this is a short wait
-# for the boot to finish rather than for the API.
+# hcloud server create returns once the API has the server, which is before it has
+# finished booting, so this is a short wait for ssh rather than for the API.
 attempt=0
 until remote true 2>/dev/null; do
 	attempt=$((attempt + 1))
