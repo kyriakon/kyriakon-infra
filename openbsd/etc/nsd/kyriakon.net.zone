@@ -53,9 +53,18 @@ ns0	IN	AAAA	2001:db8::10
 @	IN	MX	10 mail.kyriakon.net.
 mail	IN	A	203.0.113.10
 
-; SPF - the box is the only sender. "mx" authorizes the MX host; "-all"
-; hard-fails everything else.
-@	IN	TXT	"v=spf1 mx -all"
+; SPF - the box is the only sender. "mx" authorizes the MX host's A record, and
+; "-all" hard-fails everything else.
+;
+; "mx" does not cover the box's IPv6 address, because the MX host deliberately
+; carries no AAAA (see the MX block) and the mechanism resolves that name. The
+; ip6 literal is required for the same reason the mail host's own record carries
+; one: a message sent over IPv6 would otherwise match nothing here, and SPF would
+; fail on a message this box legitimately sent. It matters more here than there,
+; because a member's mail has the apex as its envelope domain, so this record is
+; the one that decides for it, while the mail host's record only decides for cron
+; output and bounces.
+@	IN	TXT	"v=spf1 mx ip6:2001:db8::10 -all"
 
 ; SPF for the mail host itself. The host sends mail as its own hostname: cron
 ; output, the daily security(8) mail, and smtpd's bounces from MAILER-DAEMON
