@@ -143,15 +143,19 @@ the data is **decryptable**, and the files are actually **restorable** to a work
 **Where it runs:** a disposable machine, and *disposable* is now literal. The test used to
 run on a second box that was always on, which cost more per month than the mail box itself,
 and nothing about it needs a permanent machine. `scripts/restore-standup.sh`, cron'd on the
-mail box, creates one from a snapshot of that old box, runs the test on it over ssh, and
-deletes it on every exit path, so the cost is the minutes it runs rather than a month. The
-box's definition lives in `terraform/throwaway`, a root with its own state file, which is what
-makes an unattended destroy safe: terraform can only remove what is in the state it is run
-against, and the mail box is in the live root's state, not this one.
+mail box, creates one from a plain template image, runs the test on it over ssh, and deletes
+it on every exit path, so the cost is the minutes it runs rather than a month. The box's
+definition lives in `terraform/throwaway`, a root with its own state file, which is what makes
+an unattended destroy safe: terraform can only remove what is in the state it is run against,
+and the mail box is in the live root's state, not this one.
 
-The snapshot carries the **read-only** storage sub-account credentials (restricted to the repo
-path) and the repository password, so nothing secret moves at run time, and a fault on a
-throwaway box cannot damage the repository it is testing. The box never connects to the live
+The template is plain, without softraid, and that is forced: a crypto root stops at the
+passphrase prompt, and nobody is at the console when cron runs. The credentials therefore
+travel after the boot rather than inside the image. The standup copies the repository password
+and the read-only sub-account key (restricted to the repo path) over ssh before the test runs.
+An image outlives the box it was made from, so keeping them out of it is the better
+arrangement anyway. A fault on a throwaway box still cannot damage the repository it is
+testing, since the key it holds cannot write. The box never connects to the live
 box; the only path is test-box ↔ storage-box over SFTP, and the mail box's only other role is
 as the backup *source*. What that costs is the independence of the orchestrator: a compromised
 mail box could stand up a box that reports success without testing. The mitigation is that the
