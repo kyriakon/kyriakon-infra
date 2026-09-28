@@ -111,6 +111,18 @@ copied to the throwaway after each boot by `scripts/restore-standup.sh`. What th
 throwaway does hold, in plaintext for the minutes it runs, is the restored data, and that
 residue is the open follow-up recorded in #111 rather than a property of this image.
 
+Two things about the installed sshd cost real time here and are worth knowing.
+
+The installer writes `PermitRootLogin no`, uncommented, so a fresh install refuses root
+over ssh whatever is in `authorized_keys`. Keys are read per connection and the policy is
+applied after, so sshd answers `Server accepts key` and then refuses the login anyway,
+which reads like the key being wrong. The template needs `PermitRootLogin prohibit-password`.
+
+sshd reads that file only at startup. Editing it changes nothing until the daemon restarts,
+which is indistinguishable from an edit that failed to apply. `sshd -T | grep
+permitrootlogin` reports what the daemon would use, and is the check to make before
+believing an edit landed.
+
 So the template is section 1 with these differences:
 
 - Answer **no** to disk encryption at the installer's prompt.
