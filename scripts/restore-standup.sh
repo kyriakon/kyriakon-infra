@@ -163,10 +163,25 @@ image_id=$(hcloud image list -t snapshot -l "$image_label" -o noheader -o column
 # The id is captured here and used for every later reference. That is the whole safety
 # argument: no name lookup, no list, nothing that could resolve to another server.
 printf 'creating %s from image %s\n' "$server_name" "$image_id"
-server_id=$(hcloud server create --name "$server_name" --type "$server_type" \
-	--image "$image_id" --location "$location" -o json | jq -r '.id')
+create_out=$(hcloud server create --name "$server_name" --type "$server_type" \
+	--image "$image_id" --location "$location" -o json)
+# hcloud has reported this as a bare object and as a one-element array across its
+# versions, and `.id` on an array is null, which is how a created box came to have no id
+# recorded for it. Accept either, and make the expression total: an empty array or a
+# malformed reply yields an empty id rather than a jq error under set -e, so every
+# unexpected shape reaches the message below, which prints what hcloud actually said.
+server_id=$(printf '%s' "$create_out" \
+	| jq -r 'if type == "array" then .[0] else . end | .id? // ""' 2>/dev/null || true)
 case "${server_id:-}" in
-''|null) die "hcloud did not report a server id, so there is nothing this run may delete" ;;
+''|null)
+	# Blank it, so the exit path cannot fall back to a name: without an id there is no
+	# way to be sure which server a delete would reach, and a name may be one that
+	# already existed. The box created above is the operator's to find and remove.
+	server_id=''
+	die "hcloud reported no server id for $server_name, so this run may not delete it. \
+That server now exists and bills until it is gone; remove it by hand. \
+hcloud $(hcloud version) said: ${create_out:-<nothing>}"
+	;;
 esac
 printf 'server id %s\n' "$server_id"
 
