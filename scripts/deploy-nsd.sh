@@ -53,7 +53,12 @@ usage() {
 ipv4="${1:-${KYRIAKON_IPV4:-}}"
 ipv6="${2:-${KYRIAKON_IPV6:-}}"
 secret="${3:-${KYRIAKON_TSIG_SECRET:-}}"
-src_dir="${4:-$(dirname "$0")}"
+# The sources are not beside this script: the zones live under openbsd/etc/nsd and
+# hostname.vio0 one level above them in the repo. Deriving from the script's own
+# directory rather than the working directory means a checkout anywhere works, and the
+# fourth argument still overrides it for a box served from elsewhere.
+script_dir=$(dirname -- "$0")
+src_dir="${4:-$script_dir/../openbsd/etc/nsd}"
 if [ -z "$ipv4" ] || [ -z "$ipv6" ] || [ -z "$secret" ]; then
 	if [ ! -f "$env_file" ]; then
 		printf 'deploy-nsd: %s does not exist on this box yet.\n' "$env_file" >&2
