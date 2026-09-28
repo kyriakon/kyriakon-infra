@@ -395,20 +395,33 @@ say "SPF"
 #
 # The record names the box's own IPv6 address. The mail host has no AAAA, so
 # that address is not one the "a" mechanism can match, and an outbound message
-# sent over IPv6 would find nothing authorizing it. Read from the interface
-# here rather than written out, so this check cannot drift from the value the
-# zone template's substitution produces.
-box_v6=$(ifconfig vio0 | awk '/inet6 .*prefixlen 64/ && !/fe80/ {print $2; exit}')
-mail_spf="v=spf1 a ip6:${box_v6} -all"
-published_spf=$(dig +short @ns1.he.net mail.kyriakon.net TXT | tr -d '"')
-case "$published_spf" in
-	*"$mail_spf"*) printf 'mail SPF record published: %s\n' "$published_spf" ;;
-	*) printf 'mail SPF record missing or different (want "%s", got "%s").\n' \
-		   "$mail_spf" "$published_spf"
-	   printf 'Publish it in openbsd/etc/nsd/kyriakon.net.zone (bump the SOA\n'
-	   printf 'serial), then redeploy nsd:\n\n'
-	   printf '\tmail\tIN\tTXT\t"%s"\n\n' "$mail_spf" ;;
-esac
+# sent over IPv6 would find nothing authorizing it.
+#
+# Read from the env file, which is what deploy-nsd.sh substitutes into the zone,
+# rather than from the interface. The interface is not that value: it is empty
+# whenever the address is not up, so reading it here produced an expected record
+# of "ip6:" with nothing after it, and reported a correct published record as
+# wrong. Anchoring on the substitution's own source is what keeps the two in step,
+# and the interface is one of the things the substitution changes.
+env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
+# shellcheck disable=SC1090 # root's own env file, whose path resolves at runtime
+box_v6=$(. "$env_file" 2>/dev/null; printf '%s' "${KYRIAKON_IPV6:-}")
+if [ -z "$box_v6" ]; then
+	printf 'mail SPF: no KYRIAKON_IPV6 in %s, so the zone would be published\n' "$env_file"
+	printf 'with "ip6:" and no address after it. Set it in that file, then:\n'
+	printf '  doas ksh %s/deploy-nsd.sh\n\n' "$(dirname "$0")"
+else
+	mail_spf="v=spf1 a ip6:${box_v6} -all"
+	published_spf=$(dig +short @ns1.he.net mail.kyriakon.net TXT | tr -d '"')
+	case "$published_spf" in
+		*"$mail_spf"*) printf 'mail SPF record published: %s\n' "$published_spf" ;;
+		*) printf 'mail SPF record missing or different (want "%s", got "%s").\n' \
+			   "$mail_spf" "$published_spf"
+		   printf 'That is what the zone template substitutes to. Redeploy it, which\n'
+		   printf 'bumps the serial and derives the record from the same value:\n\n'
+		   printf '  doas ksh %s/deploy-nsd.sh\n\n' "$(dirname "$0")" ;;
+	esac
+fi
 
 # --- 5. components ------------------------------------------------------
 
