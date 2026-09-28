@@ -22,6 +22,11 @@ The hidden-primary role is exactly the "this server is the primary and 192.0.2.1
 server:
 	server-count: 1
 	username: _nsd
+	# Bind the box's public addresses, not every interface: unbound is also
+	# running here and holds 127.0.0.1:53 and ::1:53, which a wildcard UDP bind
+	# loses to (see the loopback point below).
+	ip-address: <box ipv4>
+	ip-address: <box ipv6>
 	zonelistfile: /var/nsd/db/zone.list
 	logfile: /var/log/nsd.log
 	xfrdfile: /var/nsd/run/xfrd.state
@@ -59,8 +64,9 @@ The directives that matter, from the man page:
 
 Reload after a zone-file edit with `rcctl reload nsd`, which OpenBSD's rc script implements as `nsd-control reconfig` followed by `nsd-control reload` ([OpenBSD `etc/rc.d/nsd`](https://github.com/openbsd/src/blob/master/etc/rc.d/nsd)). The man page's own `kill -HUP` advice does not apply when the rc script is driving the daemon, and it cannot be used at all without knowing the pid file path.
 
-Two operational points the man page implies but doesn't decide:
+Three operational points the man page implies but doesn't decide:
 
+- **The box runs a resolver, so nsd must not bind wildcards.** `deploy-mail.sh` installs and starts `unbound` for the blocklist lookups, and stock `/var/unbound/etc/unbound.conf` listens on `127.0.0.1` and `::1`. nsd binds its UDP sockets without `SO_REUSEADDR` (`open_udp_socket()` in nsd's `server.c` calls `bind()` directly), and on OpenBSD a wildcard UDP bind fails against a specific-address bind that set `SO_REUSEADDR` — so nsd refuses to start with `can't bind udp socket ::@53: Address already in use`, reported by rcctl only as `nsd(failed)`. `ip-address:` lines for the two public addresses avoid the collision entirely and also keep nsd off loopback, where the resolver lives. Observed live 2026-09-28.
 - HE's AXFR source IPs are not published in the public dns.he.net docs, and they do not need to be. A `provide-xfr` entry that names a key authenticates the transfer by the key instead of the source address: `acl_key_matches()` in nsd's `options.c` returns 0 when the request has no TSIG, has a TSIG error, names a different key, or uses the wrong algorithm, so `provide-xfr: 0.0.0.0/0 kyriakon-he` serves only a signed AXFR. The dangerous form is a wide `provide-xfr` with `NOKEY`, which hands the whole zone (DKIM record, wildcard, every hostname) to anyone who asks.
 - TSIG is what this deployment uses, not a later hardening step. HE rolled out TSIG-authenticated AXFR in 2019 ([ctrl.blog](https://www.ctrl.blog/entry/he-2nd-dns-tsig.html)); the key name and algorithm in `nsd.conf` must match the portal's slave entry for `kyriakon.net`.
 
