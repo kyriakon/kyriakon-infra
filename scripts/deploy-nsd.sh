@@ -133,10 +133,14 @@ sed -e "s/2001:db8::10/$ipv6/g" "$iface_src" > "$iface_dst"
 # it; netstart runs as root.
 chmod 0600 "$iface_dst"
 
-# nsd.conf: substitute the TSIG secret. '|' delimits the s/// because base64
-# secrets routinely contain '/', which would end a '/'-delimited expression
-# mid-secret. The secret is written only into the deployed file, never stdout.
-sed -e "s|REPLACE_ME|$secret|" "$conf_src" > "$conf_dst"
+# nsd.conf: substitute the TSIG secret and the two addresses nsd binds. '|'
+# delimits the secret's s/// because base64 secrets routinely contain '/', which
+# would end a '/'-delimited expression mid-secret. The secret is written only
+# into the deployed file, never stdout. The IP substitution is the same two
+# expressions the zone loop above uses, so nsd listens on exactly the addresses
+# the zones advertise.
+sed -e "s|REPLACE_ME|$secret|" -e "s/203\.0\.113\.10/$ipv4/g" -e "s/2001:db8::10/$ipv6/g" \
+	"$conf_src" > "$conf_dst"
 
 # On-box perms: nsd chroots to /var/nsd and reads this before dropping to
 # _nsd, so root-only is right and the secret stays out of the chroot's reach.
@@ -155,8 +159,8 @@ for zone_name in $zone_names; do
 	fi
 	nsd-checkzone "$zone_name" "$zone_dst"
 done
-if grep -Eq 'REPLACE_ME|NOKEY' "$conf_dst"; then
-	printf 'nsd.conf still contains a placeholder (REPLACE_ME / NOKEY)\n' >&2
+if grep -Eq 'REPLACE_ME|NOKEY|203\.0\.113|2001:db8' "$conf_dst"; then
+	printf 'nsd.conf still contains a placeholder (REPLACE_ME / NOKEY / a documentation IP)\n' >&2
 	exit 1
 fi
 if grep -Eq '2001:db8' "$iface_dst"; then
@@ -184,25 +188,38 @@ nsd-checkconf "$conf_dst"
 
 # Any nsd left over from a config without remote-control cannot be signalled
 # through nsd-control, and a second nsd would fail to bind port 53. Clear it by
-# name so this script is idempotent from any prior state.
+# name so this script is idempotent from any prior state, and wait for the
+# process to actually go: nsd binds the same sockets the outgoing one holds, so
+# starting against a still-running nsd fails with EADDRINUSE and looks exactly
+# like a config fault. A fixed sleep is a guess at how long a shutdown takes.
 pkill -x nsd >/dev/null 2>&1 || true
-sleep 1
+waited=0
+while pgrep -x nsd >/dev/null 2>&1 && [ "$waited" -lt 10 ]; do
+	sleep 1
+	waited=$((waited + 1))
+done
 
 rcctl enable nsd
-rcctl start nsd
+# rcctl start reports a failure as nsd(failed) and exits non-zero, which set -e
+# would turn into a silent stop before the diagnostic below.
+rcctl start nsd || true
 rcctl check nsd >/dev/null 2>&1 \
 	|| { printf 'nsd did not start; see /var/log/nsd.log and /var/log/messages\n' >&2; exit 1; }
 
 # Verify the box answers with exactly the IPs we just wrote, and that it serves
 # every zone at all: a zone nsd refuses to load would otherwise pass unnoticed.
+# The queries go to the addresses nsd now binds, over TCP: 127.0.0.1 is unbound,
+# not nsd, so a query there is answered out of the resolver's cache even with nsd
+# dead (2026-09-28: it returned the SOA while nsd was down) and proves nothing.
+# TCP because the box's own UDP/53 is blocked in pf, as designed.
 for zone_name in $zone_names; do
-	printf 'SOA %-13s %s\n' "$zone_name" "$(dig @127.0.0.1 "$zone_name" SOA +short | awk '{print $3}')"
+	printf 'SOA %-13s %s\n' "$zone_name" "$(dig +tcp @"$ipv4" "$zone_name" SOA +short | awk '{print $3}')"
 done
-serial=$(dig @127.0.0.1 kyriakon.net SOA +short | awk '{print $3}')
-got4=$(dig @127.0.0.1 kyriakon.net A +short)
-got6=$(dig @127.0.0.1 kyriakon.net AAAA +short)
+serial=$(dig +tcp @"$ipv4" kyriakon.net SOA +short | awk '{print $3}')
+got4=$(dig +tcp @"$ipv4" kyriakon.net A +short)
+got6=$(dig +tcp @"$ipv6" kyriakon.net AAAA +short)
 printf 'SOA serial: %s\n' "$serial"
-printf 'MX:         %s\n' "$(dig @127.0.0.1 kyriakon.net MX +short)"
+printf 'MX:         %s\n' "$(dig +tcp @"$ipv4" kyriakon.net MX +short)"
 printf 'A:          %s\n' "$got4"
 printf 'AAAA:       %s\n' "$got6"
 printf 'IPv6 addr:  %s\n' "$(ifconfig vio0 | awk '/inet6 .*prefixlen 64/ && !/fe80/ {print $2}')"
