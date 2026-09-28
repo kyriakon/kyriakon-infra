@@ -145,6 +145,13 @@ write-up installs something other than what it says. The prompts that bit are `P
 root account?` and `Use (A)uto layout, (E)dit auto layout, or create (C)ustom layout?`,
 neither of which appears in older guides in that form.
 
+Before any of that, the disk needs writing, and the rescue host is where that happens:
+`openbsd/restore-template/prepare-disk.sh`, run as root there, fetches the miniroot, checks it
+against the hash that was verified with `signify` on the mail box, writes it to the disk, and
+extends the MBR's OpenBSD partition to the end of the disk. That last step is the one a person
+performs interactively as `Use (W)hole disk MBR, whole disk (G)PT`; without it the installer
+allocates its layout inside a 5 MB partition and the run stops with nowhere to prefetch.
+
 Two ways to put that file in front of the installer.
 
 Straightforward, and what the four differences above assume: choose **(A)utoinstall** at the
