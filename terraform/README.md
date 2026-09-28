@@ -38,7 +38,8 @@ Hetzner has no native OpenBSD image, so install once by hand and snapshot it:
    ```
 5. Complete the **interactive** installer over the VNC console. Choose **full-disk
    `softraid` encryption** when prompted - now-or-never, and required by the
-   threat model (proposal section 2).
+   threat model (proposal section 2). Answer **no** at that prompt only when
+   building the restore template, for the reason in "The restore template" below.
 6. Post-install, before snapshotting:
    ```sh
    syspatch
@@ -90,6 +91,38 @@ vulnerable rspamd (section 6.10).
 | `server_type`       | `cx23`         | disk >= snapshot's source disk |
 | `location`          | `hel1`         | region the storage box is NOT in |
 | `snapshot_selector` | `os=openbsd`   | set at `create-image` time |
+
+## The restore template
+
+The weekly test box comes from a snapshot labelled `kind=restore`, and that snapshot is
+built by section 1 with **one answer changed**: no disk encryption.
+
+This is forced rather than preferred. A softraid crypto root stops at the passphrase
+prompt, ssh never answers while it waits, and cron at 03:45 has nobody to type it. The
+snapshot research already recorded the shape of that failure: a box in that state reports
+as running in the API and silently accepts no connections. Building the template from the
+gold image in section 1 therefore produces a box that boots, waits, and is deleted again
+by the standup's own timeout, every week, without ever testing a restore.
+
+Declining encryption costs nothing here, because the template holds nothing worth
+protecting: a base install, `restic jq git`, the two test scripts, and a public key. It
+carries no user data, no repository password, and no storage key. Those two secrets are
+copied to the throwaway after each boot by `scripts/restore-standup.sh`. What the
+throwaway does hold, in plaintext for the minutes it runs, is the restored data, and that
+residue is the open follow-up recorded in #111 rather than a property of this image.
+
+So the template is section 1 with these differences:
+
+- Answer **no** to disk encryption at the installer's prompt.
+- Install `restic jq git` rather than `dovecot rspamd restic`.
+- `mkdir -p /root/bin`, and put `lib.sh` and `restore-test.sh` in it, mode 0755. They are
+  in this repo at `scripts/`, and the box can fetch them from the public repository.
+- Append the mail box's `/root/.ssh/kyriakon-standup.pub` to `/root/.ssh/authorized_keys`.
+  The standup reaches the throwaway with it after every boot, since the template carries
+  it into the snapshot.
+- Snapshot with `--label kind=restore`, not the `os=openbsd` label section 1 uses, so a
+  test run can never pick up a provisioning image and provisioning can never pick up the
+  template.
 
 ## The weekly restore box
 
