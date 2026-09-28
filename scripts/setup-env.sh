@@ -9,10 +9,15 @@
 #        --alert-email ... --healthchecks-url ... --rehearsal-healthchecks-url ...
 #
 # With no arguments it installs the repo template if the file is absent and
-# reports what still needs filling in. With arguments it writes the file from
-# them, and refuses unless every value is given: a partial set is a typo, not an
-# intention, and the failure belongs here rather than halfway through a deploy.
-# Nothing is written until every value has been checked.
+# reports what still needs filling in. With arguments, and the file already
+# present, it merges: only the values given change, and every other line keeps
+# what it had, comments included. Giving one value to a box that knows the rest
+# is an update, not a typo.
+#
+# With arguments and no file at all, it writes the whole file and insists on all
+# eleven, because there is nothing to merge into and a half-filled new file is
+# more likely a mistake than an intention. Nothing is written until the values it
+# was given have been checked.
 #
 # Why it is its own step rather than part of a deploy: more than one deploy script
 # needs those values, and nsd runs before mail, so leaving the install to any one
@@ -43,8 +48,12 @@ usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
   No arguments: install the template if /root/.kyriakon-env is absent, then
   report which values are still missing or placeholders.
 
-  All eleven arguments: write the file from them, mode 0600. All or nothing, and
-  each value is checked before anything is written.
+  Some arguments, file present: update just those values. Everything else keeps
+  what it had, comments and the PATH block included. This is how a box that is
+  already deployed is given a value it did not have.
+
+  All eleven arguments, no file: write it from them, mode 0600. All or nothing
+  when creating one, and each value is checked before anything is written.
 
     doas ksh scripts/setup-env.sh \
       --ipv4 203.0.113.10 --ipv6 2001:db8::10 \
@@ -99,44 +108,58 @@ for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$
 done
 
 if [ "$given" -gt 0 ]; then
-	missing=""
-	if [ -z "$a_ipv4" ]; then missing="$missing KYRIAKON_IPV4"; fi
-	if [ -z "$a_ipv6" ]; then missing="$missing KYRIAKON_IPV6"; fi
-	if [ -z "$a_tsig" ]; then missing="$missing KYRIAKON_TSIG_SECRET"; fi
-	if [ -z "$a_repo" ]; then missing="$missing RESTIC_REPOSITORY"; fi
-	if [ -z "$a_pass" ]; then missing="$missing RESTIC_PASSWORD_FILE"; fi
-	if [ -z "$a_email" ]; then missing="$missing ALERT_EMAIL"; fi
-	if [ -z "$a_hc" ]; then missing="$missing HEALTHCHECKS_URL"; fi
-	if [ -z "$a_reh" ]; then missing="$missing REHEARSAL_HEALTHCHECKS_URL"; fi
-	if [ -z "$a_hcloud" ]; then missing="$missing HCLOUD_TOKEN"; fi
-	if [ -z "$a_restrepo" ]; then missing="$missing RESTORE_TEST_REPOSITORY"; fi
-	if [ -z "$a_resthc" ]; then missing="$missing RESTORE_TEST_HEALTHCHECKS_URL"; fi
-	if [ -n "$missing" ]; then
-		printf 'setup-env: missing an argument for:%s\n\n' "$missing" >&2
-		usage
+	# Both paths need every value present, and the merge path is the only one that
+	# may arrive without them.
+	if [ ! -f "$env_dst" ]; then
+		missing=""
+		if [ -z "$a_ipv4" ]; then missing="$missing KYRIAKON_IPV4"; fi
+		if [ -z "$a_ipv6" ]; then missing="$missing KYRIAKON_IPV6"; fi
+		if [ -z "$a_tsig" ]; then missing="$missing KYRIAKON_TSIG_SECRET"; fi
+		if [ -z "$a_repo" ]; then missing="$missing RESTIC_REPOSITORY"; fi
+		if [ -z "$a_pass" ]; then missing="$missing RESTIC_PASSWORD_FILE"; fi
+		if [ -z "$a_email" ]; then missing="$missing ALERT_EMAIL"; fi
+		if [ -z "$a_hc" ]; then missing="$missing HEALTHCHECKS_URL"; fi
+		if [ -z "$a_reh" ]; then missing="$missing REHEARSAL_HEALTHCHECKS_URL"; fi
+		if [ -z "$a_hcloud" ]; then missing="$missing HCLOUD_TOKEN"; fi
+		if [ -z "$a_restrepo" ]; then missing="$missing RESTORE_TEST_REPOSITORY"; fi
+		if [ -z "$a_resthc" ]; then missing="$missing RESTORE_TEST_HEALTHCHECKS_URL"; fi
+		if [ -n "$missing" ]; then
+			printf 'setup-env: %s does not exist yet, so all eleven arguments are needed; missing:%s\n\n' "$env_dst" "$missing" >&2
+			usage
+		fi
 	fi
 
 	# Check before writing anything, so a typo fails here and not in a deploy.
-	printf '%s' "$a_ipv4" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' \
-		|| { printf 'setup-env: not an IPv4 address: %s\n' "$a_ipv4" >&2; exit 2; }
-	printf '%s' "$a_ipv6" | grep -q ':' \
-		|| { printf 'setup-env: not an IPv6 address: %s\n' "$a_ipv6" >&2; exit 2; }
-	case "$a_tsig" in
-	REPLACE_ME|'') printf 'setup-env: tsig-secret is a placeholder\n' >&2; exit 2 ;;
-	esac
-	printf '%s' "$a_tsig" | grep -Eq '^[A-Za-z0-9+/=]+$' \
-		|| { printf 'setup-env: tsig-secret is not clean base64\n' >&2; exit 2; }
+	# Only the values actually given are checked; the merge path has no others.
+	if [ -n "$a_ipv4" ]; then
+		printf '%s' "$a_ipv4" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' \
+			|| { printf 'setup-env: not an IPv4 address: %s\n' "$a_ipv4" >&2; exit 2; }
+	fi
+	if [ -n "$a_ipv6" ]; then
+		printf '%s' "$a_ipv6" | grep -q ':' \
+			|| { printf 'setup-env: not an IPv6 address: %s\n' "$a_ipv6" >&2; exit 2; }
+	fi
+	if [ -n "$a_tsig" ]; then
+		case "$a_tsig" in
+		REPLACE_ME) printf 'setup-env: tsig-secret is a placeholder\n' >&2; exit 2 ;;
+		esac
+		printf '%s' "$a_tsig" | grep -Eq '^[A-Za-z0-9+/=]+$' \
+			|| { printf 'setup-env: tsig-secret is not clean base64\n' >&2; exit 2; }
+	fi
 	for u in "$a_hc" "$a_reh" "$a_resthc"; do
+		[ -n "$u" ] || continue
 		printf '%s' "$u" | grep -Eq '^https?://' \
 			|| { printf 'setup-env: not a URL: %s\n' "$u" >&2; exit 2; }
 	done
-	printf '%s' "$a_restrepo" | grep -Eq '^sftp://' \
-		|| { printf 'setup-env: not an sftp URL: %s\n' "$a_restrepo" >&2; exit 2; }
+	if [ -n "$a_restrepo" ]; then
+		printf '%s' "$a_restrepo" | grep -Eq '^sftp://' \
+			|| { printf 'setup-env: not an sftp URL: %s\n' "$a_restrepo" >&2; exit 2; }
+	fi
 	# The restore test must hold read-only credentials, or a fault on a throwaway box
 	# could damage the repository it is checking. Hetzner names a storage sub-account
 	# after its parent, so the absence of -sub is worth saying out loud rather than
 	# refusing on: it is a convention, not a guarantee.
-	case "$a_restrepo" in
+	case "${a_restrepo:-sub}" in
 	*sub*) ;;
 	*) printf 'setup-env: warning: %s does not look like a sub-account URL. The restore test must not hold the backup account credentials.\n' "$a_restrepo" >&2 ;;
 	esac
@@ -148,6 +171,47 @@ if [ "$given" -gt 0 ]; then
 		esac
 	done
 
+	if [ -f "$env_dst" ]; then
+		# Merge. Each given value replaces its own line, or is appended if the
+		# file has never had it. Everything else, comments and the PATH block
+		# included, is passed through untouched.
+		pairs=""
+		for kv in "KYRIAKON_IPV4=$a_ipv4" "KYRIAKON_IPV6=$a_ipv6" "KYRIAKON_TSIG_SECRET=$a_tsig" \
+			"RESTIC_REPOSITORY=$a_repo" "RESTIC_PASSWORD_FILE=$a_pass" "ALERT_EMAIL=$a_email" \
+			"HEALTHCHECKS_URL=$a_hc" "REHEARSAL_HEALTHCHECKS_URL=$a_reh" "HCLOUD_TOKEN=$a_hcloud" \
+			"RESTORE_TEST_REPOSITORY=$a_restrepo" "RESTORE_TEST_HEALTHCHECKS_URL=$a_resthc"; do
+			case "$kv" in
+			*=) continue ;;
+			esac
+			pairs="$pairs
+$kv"
+		done
+		tmp=$(mktemp)
+		# Through the environment rather than -v: awk reinterprets escape
+		# sequences in a -v assignment, and these pairs are newline-separated,
+		# which -v rejects outright.
+		PAIRS="$pairs" awk -v q="'" '
+			BEGIN { n = split(ENVIRON["PAIRS"], p, "\n")
+				for (i = 1; i <= n; i++) {
+					eq = index(p[i], "=")
+					if (eq > 0) want[substr(p[i], 1, eq - 1)] = substr(p[i], eq + 1)
+				} }
+			{
+				for (k in want) {
+					if (index($0, "export " k "=") == 1) {
+						print "export " k "=" q want[k] q
+						delete want[k]
+						next
+					}
+				}
+				print
+			}
+			END { for (k in want) print "export " k "=" q want[k] q }
+		' "$env_dst" > "$tmp"
+		install -m 0600 "$tmp" "$env_dst"
+		rm -f "$tmp"
+		printf 'updated %s with %s value(s); the rest kept what they had\n' "$env_dst" "$given"
+	else
 	tmp=$(mktemp)
 	{
 		printf '# Written by setup-env.sh. Mode 0600: this file holds secrets.\n'
@@ -174,6 +238,7 @@ if [ "$given" -gt 0 ]; then
 	install -m 0600 "$tmp" "$env_dst"
 	rm -f "$tmp"
 	printf 'wrote %s from the arguments\n' "$env_dst"
+	fi
 elif [ ! -f "$env_dst" ]; then
 	[ -r "$template" ] || {
 		printf 'setup-env: no %s, and no template at %s\n' "$env_dst" "$template" >&2
