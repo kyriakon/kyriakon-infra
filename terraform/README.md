@@ -139,11 +139,15 @@ ramdisk's prompt. Hetzner's DHCP carries no `next-server`, so it then asks `Resp
 location?`, and the answer is that file's URL. One prompt at the console instead of twenty.
 
 Fully unattended: `openbsd/restore-template/make-bsdrd.sh`, run as root on the mail box,
-mounts the ramdisk and drops the same file in as `/auto_install.conf`, which autoinstall
-finds without asking anything at all. Write its output to the disk in place of the stock
-image. This modifies a signed release image; the chain still holds where it counts, since
-the installer verifies the sets against the release key the ramdisk already carries, and
-that key is untouched.
+takes the signature-verified miniroot, puts the same file inside the installer kernel's
+ramdisk as `/auto_install.conf`, and writes a patched whole-disk image. The rescue host
+writes that to the disk instead of the stock miniroot. autoinstall finds a local response
+file without asking for a location, so the install needs no console input; the boot menu
+still appears, so leave the console alone and let the timeout start it.
+
+This breaks the image's own signature, which is the point of verifying it first. The chain
+still holds where it counts: the installer verifies the sets it downloads against the
+release key inside the ramdisk, and that key is untouched. Only an answer file is added.
 
 ## The weekly restore box
 
