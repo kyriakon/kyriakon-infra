@@ -157,8 +157,16 @@ command -v jq >/dev/null 2>&1 || die "no jq on this box, run: doas pkg_add jq"
 # snapshot and label with nothing to edit here. An empty answer stops the run, because
 # creating from a missing image gives a box that cannot boot and a waste of a month's
 # billing to notice.
-image_id=$(hcloud image list -t snapshot -l "$image_label" -o noheader -o columns=id | head -1)
-[ -n "$image_id" ] || die "no snapshot labelled $image_label; build the template, or set RESTORE_TEST_IMAGE_LABEL"
+image_ids=$(hcloud image list -t snapshot -l "$image_label" -o noheader -o columns=id)
+[ -n "$image_ids" ] || die "no snapshot labelled $image_label; build the template, or set RESTORE_TEST_IMAGE_LABEL"
+# Exactly one. hcloud lists oldest first, so taking the first match would quietly
+# boot the oldest of a set, and a repaired template sitting beside the one it
+# replaced is the ordinary way to end up with two. Which of them runs the test is
+# a decision for a person, not for the order of an API reply.
+image_count=$(printf '%s\n' "$image_ids" | grep -c .)
+[ "$image_count" -eq 1 ] \
+	|| die "$image_count snapshots are labelled $image_label, so which one boots the test is a coin toss; remove or relabel all but one: $(printf '%s' "$image_ids" | tr '\n' ' ')"
+image_id=$image_ids
 
 # The id is captured here and used for every later reference. That is the whole safety
 # argument: no name lookup, no list, nothing that could resolve to another server.
