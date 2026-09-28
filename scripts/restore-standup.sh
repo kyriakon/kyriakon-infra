@@ -246,6 +246,13 @@ remote 'mkdir -p /root/scratch && mount -t tmpfs -o -s128M -o -m0700 tmpfs /root
 	|| die "could not mount the scratch tmpfs on $server_ip"
 remote 'df -h /root/scratch | tail -1'
 printf 'scratch is a memory filesystem\n'
+# That the tmpfs is safe rests on one assumption: pages pushed out to swap are encrypted
+# with a key the kernel made at boot and keeps only in memory. If encryption were off, the
+# same pages would sit in the clear on a disk that outlives the box, which is precisely
+# what putting them in memory was for, so it is checked rather than assumed.
+remote 'sysctl vm.swapencrypt.enable' | grep -q '=1' \
+	|| die "swap encryption is off on $server_ip, so the scratch tmpfs would not keep the secrets off the disk"
+printf 'swap is encrypted, so anything paged out is unreadable once this box is gone\n'
 
 # The test's own exit status is the script's, so a failure is a failure for cron and for
 # the healthcheck, which the test pings itself.
