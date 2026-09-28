@@ -138,16 +138,26 @@ Straightforward, and what the four differences above assume: choose **(A)utoinst
 ramdisk's prompt. Hetzner's DHCP carries no `next-server`, so it then asks `Response file
 location?`, and the answer is that file's URL. One prompt at the console instead of twenty.
 
-Fully unattended: `openbsd/restore-template/make-bsdrd.sh`, run as root on the mail box,
-takes the signature-verified miniroot, puts the same file inside the installer kernel's
-ramdisk as `/auto_install.conf`, and writes a patched whole-disk image. The rescue host
-writes that to the disk instead of the stock miniroot. autoinstall finds a local response
-file without asking for a location, so the install needs no console input; the boot menu
-still appears, so leave the console alone and let the timeout start it.
+Fully unattended is not built yet, and the image's shape is why.
 
-This breaks the image's own signature, which is the point of verifying it first. The chain
-still holds where it counts: the installer verifies the sets it downloads against the
-release key inside the ramdisk, and that key is untouched. Only an answer file is added.
+`miniroot79.img` has no disklabel and no OpenBSD filesystem. It is an MBR with x86 boot
+code at sector 0, then a FAT partition starting at sector 64 whose OEM name is `BSD  4.4`,
+holding the installer kernel under the name `bsd` rather than `bsd.rd`. The first attempt at
+a patch script mounted `/dev/vnd0a` and `/dev/vnd0c` looking for an FFS, found neither, and
+reported the kernel as missing when the truth was that nothing had mounted at all. That
+script is deleted rather than left to be run.
+
+The unattended route is worth having and needs the kernel patched rather than a filesystem
+mounted: the response file has to reach `/auto_install.conf` inside the kernel's ramdisk, so
+the work is to lift `/bsd` out of the FAT partition, `gunzip` it, `rdsetroot -x` the ramdisk,
+add the file, put both back, and write the result where the FAT expects the kernel. The
+signature-verified `bsd.rd` from the release directory is the same kernel under its release
+name, which is where the ramdisk can be built from without touching the FAT at all, if the
+kernel can be put back afterwards.
+
+Until that exists, the URL route is the one to use, and the URL is kept short deliberately:
+`https://kyriakon.net/install.conf`, served from the site's document root, which is a git
+checkout. The canonical copy is in this repo at `openbsd/restore-template/install.conf`.
 
 ## The weekly restore box
 
