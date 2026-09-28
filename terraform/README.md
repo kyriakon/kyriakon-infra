@@ -124,6 +124,27 @@ So the template is section 1 with these differences:
   test run can never pick up a provisioning image and provisioning can never pick up the
   template.
 
+The installer's answers live in `openbsd/restore-template/install.conf`, written against the
+question text 7.9 actually uses, read out of the release's own `bsd.rd` ramdisk. This
+matters: autoinstall matches questions by their text and silently falls back to the
+installer's default when it cannot match an answer, so a response file taken from an older
+write-up installs something other than what it says. The prompts that bit are `Password for
+root account?` and `Use (A)uto layout, (E)dit auto layout, or create (C)ustom layout?`,
+neither of which appears in older guides in that form.
+
+Two ways to put that file in front of the installer.
+
+Straightforward, and what the four differences above assume: choose **(A)utoinstall** at the
+ramdisk's prompt. Hetzner's DHCP carries no `next-server`, so it then asks `Response file
+location?`, and the answer is that file's URL. One prompt at the console instead of twenty.
+
+Fully unattended: `openbsd/restore-template/make-bsdrd.sh`, run as root on the mail box,
+mounts the ramdisk and drops the same file in as `/auto_install.conf`, which autoinstall
+finds without asking anything at all. Write its output to the disk in place of the stock
+image. This modifies a signed release image; the chain still holds where it counts, since
+the installer verifies the sets against the release key the ramdisk already carries, and
+that key is untouched.
+
 ## The weekly restore box
 
 `scripts/restore-standup.sh` creates the box the weekly restore test runs on, runs the test over ssh, and deletes the box in an exit trap. It uses the `hcloud` CLI rather than terraform, because the hcloud provider publishes no OpenBSD build: `terraform init` against any provider version fails on this platform, so terraform cannot drive a box from the mail box at all.
