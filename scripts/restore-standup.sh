@@ -141,9 +141,10 @@ if [ "$dry_run" = yes ]; then
 	printf 'dry-run: hcloud image list -t snapshot -l %s -o noheader -o columns=id\n' "$image_label"
 	printf 'dry-run: hcloud server create --name %s --type %s --image <id> --location %s -o json\n' "$server_name" "$server_type" "$location"
 	printf 'dry-run: hcloud server ip <id>\n'
+	printf 'dry-run: mount -t tmpfs … /root/scratch, with the credentials, the restore target and the cache inside it\n'
 	printf 'dry-run: ssh -i %s root@<address> mkdir -p /root/.ssh\n' "$ssh_key"
 	printf 'dry-run: scp-equivalent: %s -> root@<address>:/root/.ssh/id_ed25519\n' "$ro_key"
-	printf 'dry-run: scp-equivalent: %s -> root@<address>:/root/.restic-pass\n' "$ro_password"
+	printf 'dry-run: scp-equivalent: %s -> root@<address>:/root/scratch/restic-pass\n' "$ro_password"
 	printf 'dry-run: ssh -i %s root@<address> RESTIC_REPOSITORY=... /root/bin/restore-test.sh\n' "$ssh_key"
 	printf 'dry-run: hcloud server delete <id>       # the id this run created, never a name\n'
 	printf 'dry-run: nothing was created, nothing was destroyed\n'
@@ -233,6 +234,19 @@ until remote true 2>/dev/null; do
 done
 printf 'ssh answered after %ss\n' "$((attempt * 10))"
 
+# The scratch everything sensitive lands in is a memory filesystem. Hetzner frees a
+# deleted server's disk without wiping it, so anything written to that disk may be read
+# by whoever gets the physical device next, and what a run writes is the restored
+# /etc/mail with the DKIM keys in it and the backup repository's password. A tmpfs is
+# backed by memory and swap, and OpenBSD encrypts swap with keys generated fresh at every
+# boot and held only in memory, so its contents do not outlive the box that held them.
+# One mount is enough: the restore target lives inside it, and the test's own wipe of
+# that target cannot reach the password sitting beside it.
+remote 'mkdir -p /root/scratch && mount -t tmpfs -o -s128M -o -m0700 tmpfs /root/scratch' \
+	|| die "could not mount the scratch tmpfs on $server_ip"
+remote 'df -h /root/scratch | tail -1'
+printf 'scratch is a memory filesystem\n'
+
 # The test's own exit status is the script's, so a failure is a failure for cron and for
 # the healthcheck, which the test pings itself.
 # The credentials, after the boot and before the test. The mailbox's own known_hosts
@@ -241,11 +255,21 @@ printf 'ssh answered after %ss\n' "$((attempt * 10))"
 remote 'mkdir -p /root/.ssh'
 push /root/.ssh/id_ed25519 "$ro_key"
 push /root/.ssh/known_hosts /root/.ssh/known_hosts
-push /root/.restic-pass "$ro_password"
+# The key stays where ssh looks for it, because restic's sftp backend shells out to ssh
+# and only a change to the test script could point it elsewhere. On its own that key is
+# read-only against one sub-account and reveals ciphertext, since the repository is
+# encrypted; the password is what makes it readable, which is why that one has to be
+# somewhere the box does not keep.
+push /root/scratch/restic-pass "$ro_password"
 printf 'credentials in place\n'
 
 set +e
-remote "RESTIC_REPOSITORY='$RESTORE_TEST_REPOSITORY' RESTIC_PASSWORD_FILE=/root/.restic-pass HEALTHCHECKS_URL='$healthchecks' /root/bin/restore-test.sh"
+remote "RESTIC_REPOSITORY='$RESTORE_TEST_REPOSITORY' \
+RESTIC_PASSWORD_FILE=/root/scratch/restic-pass \
+RESTORE_TARGET_ROOT=/root/scratch/restore \
+RESTIC_CACHE_DIR=/root/scratch/restic-cache \
+TMPDIR=/root/scratch \
+HEALTHCHECKS_URL='$healthchecks' /root/bin/restore-test.sh"
 test_status=$?
 set -e
 
