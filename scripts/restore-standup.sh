@@ -141,7 +141,7 @@ if [ "$dry_run" = yes ]; then
 	printf 'dry-run: hcloud image list -t snapshot -l %s -o noheader -o columns=id\n' "$image_label"
 	printf 'dry-run: hcloud server create --name %s --type %s --image <id> --location %s -o json\n' "$server_name" "$server_type" "$location"
 	printf 'dry-run: hcloud server ip <id>\n'
-	printf 'dry-run: mount -t tmpfs … /root/scratch, with the credentials, the restore target and the cache inside it\n'
+	printf 'dry-run: mount_mfs -s 128M swap /root/scratch, with the credentials, the restore target and the cache inside it\n'
 	printf 'dry-run: ssh -i %s root@<address> mkdir -p /root/.ssh\n' "$ssh_key"
 	printf 'dry-run: scp-equivalent: %s -> root@<address>:/root/.ssh/id_ed25519\n' "$ro_key"
 	printf 'dry-run: scp-equivalent: %s -> root@<address>:/root/scratch/restic-pass\n' "$ro_password"
@@ -235,23 +235,29 @@ done
 printf 'ssh answered after %ss\n' "$((attempt * 10))"
 
 # The scratch everything sensitive lands in is a memory filesystem. Hetzner frees a
-# deleted server's disk without wiping it, so anything written to that disk may be read
-# by whoever gets the physical device next, and what a run writes is the restored
-# /etc/mail with the DKIM keys in it and the backup repository's password. A tmpfs is
-# backed by memory and swap, and OpenBSD encrypts swap with keys generated fresh at every
-# boot and held only in memory, so its contents do not outlive the box that held them.
-# One mount is enough: the restore target lives inside it, and the test's own wipe of
-# that target cannot reach the password sitting beside it.
-remote 'mkdir -p /root/scratch && mount -t tmpfs -o -s128M -o -m0700 tmpfs /root/scratch' \
-	|| die "could not mount the scratch tmpfs on $server_ip"
-remote 'df -h /root/scratch | tail -1'
+# deleted server's disk without wiping it, so anything written to that disk may be read by
+# whoever gets the physical device next, and what a run writes is the restored /etc/mail
+# with the DKIM keys in it and the backup repository's password. mount_mfs builds a file
+# system in virtual memory, backed by swap when memory runs low, and OpenBSD encrypts swap
+# with keys generated fresh at every boot and held only in memory, so its contents do not
+# outlive the box that held them. One mount is enough: the restore target lives inside it,
+# and the test's own wipe of that target cannot reach the password sitting beside it.
+#
+# It is mfs and not tmpfs. mount_tmpfs is still installed, but tmpfs was removed from the
+# kernel years ago, so the binary existing proves nothing and the mount fails with
+# "Operation not supported". On mount_mfs the -m flag is the minfree percentage rather than
+# a mode, so the mount point's own mode is what the filesystem inherits, and it is set
+# there. -s takes a size with a multiplier, or sectors.
+remote 'mkdir -p -m 0700 /root/scratch && mount_mfs -s 128M swap /root/scratch' \
+	|| die "could not mount the scratch memory filesystem on $server_ip"
+remote 'mount | grep " /root/scratch "'
 printf 'scratch is a memory filesystem\n'
 # That the tmpfs is safe rests on one assumption: pages pushed out to swap are encrypted
 # with a key the kernel made at boot and keeps only in memory. If encryption were off, the
 # same pages would sit in the clear on a disk that outlives the box, which is precisely
 # what putting them in memory was for, so it is checked rather than assumed.
 remote 'sysctl vm.swapencrypt.enable' | grep -q '=1' \
-	|| die "swap encryption is off on $server_ip, so the scratch tmpfs would not keep the secrets off the disk"
+	|| die "swap encryption is off on $server_ip, so the scratch memory filesystem would not keep the secrets off the disk"
 printf 'swap is encrypted, so anything paged out is unreadable once this box is gone\n'
 
 # The test's own exit status is the script's, so a failure is a failure for cron and for
