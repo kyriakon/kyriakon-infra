@@ -165,22 +165,27 @@ image_id=$(hcloud image list -t snapshot -l "$image_label" -o noheader -o column
 printf 'creating %s from image %s\n' "$server_name" "$image_id"
 create_out=$(hcloud server create --name "$server_name" --type "$server_type" \
 	--image "$image_id" --location "$location" -o json)
-# hcloud has reported this as a bare object and as a one-element array across its
-# versions, and `.id` on an array is null, which is how a created box came to have no id
-# recorded for it. Accept either, and make the expression total: an empty array or a
-# malformed reply yields an empty id rather than a jq error under set -e, so every
-# unexpected shape reaches the message below, which prints what hcloud actually said.
+# This reply has come back wrapped as {"server": {...}, "root_password": "..."}, and
+# older hcloud reported a bare object or a one-element array. Accept all three, and keep
+# the expression total: anything else yields an empty id rather than a jq error under
+# set -e, so every unexpected shape reaches the message below instead of dying at the
+# assignment.
 server_id=$(printf '%s' "$create_out" \
-	| jq -r 'if type == "array" then .[0] else . end | .id? // ""' 2>/dev/null || true)
+	| jq -r '.server?.id? // .id? // .[0]?.id? // ""' 2>/dev/null || true)
 case "${server_id:-}" in
 ''|null)
 	# Blank it, so the exit path cannot fall back to a name: without an id there is no
 	# way to be sure which server a delete would reach, and a name may be one that
 	# already existed. The box created above is the operator's to find and remove.
 	server_id=''
+	# The reply carries root_password for the new box, and this message reaches both the
+	# operator and the alert mail, so the password is removed from it here. It is not
+	# rendered at all next to an id, since that path never prints the reply.
+	said=$(printf '%s' "$create_out" | jq -c 'del(.root_password)' 2>/dev/null \
+		|| printf '%s' "${create_out:-<nothing>}")
 	die "hcloud reported no server id for $server_name, so this run may not delete it. \
 That server now exists and bills until it is gone; remove it by hand. \
-hcloud $(hcloud version) said: ${create_out:-<nothing>}"
+$(hcloud version) said: $said"
 	;;
 esac
 printf 'server id %s\n' "$server_id"
