@@ -191,6 +191,26 @@ Until that exists, the URL route is the one to use, and the URL is kept short de
 `https://kyriakon.net/install.conf`, served from the site's document root, which is a git
 checkout. The canonical copy is in this repo at `openbsd/restore-template/install.conf`.
 
+The client's config is a trap of its own, found the hard way. `PermitRootLogin` is an
+`sshd_config` directive. In `/etc/ssh/ssh_config`, which is the client's file, ssh refuses
+to parse the file at all, so every outbound connection from the box fails, and the restore
+test is one of them: it reaches the storage box over sftp. One build wrote that line into
+the wrong file by hand, `template-setup.sh` checked the server file and had nothing to say
+about the client one, and the snapshot carried the line until a test run failed with `Bad
+configuration option: permitrootlogin`. The setup script now removes such a line, and
+parses the client file with `ssh -G` to prove it, so a build that repeats the slip says so
+instead of shipping a box that cannot reach the network.
+
+The other trap on this box is that `sshd` reads `sshd_config` only when it starts. An edit
+without a restart looks exactly like an edit that failed, which is why the setup script
+prints both what the file says and what `sshd -T` reports, and restarts rather than
+signalling.
+
+Repairing a snapshot without rebuilding it: create a box from it, remove the line, confirm
+`ssh -G localhost` parses, snapshot that box under the same `kind=restore` label, then
+delete the old image and the box. The standup takes the first image carrying the label, so
+the old one has to go, or the label has to be taken off it.
+
 ## The weekly restore box
 
 `scripts/restore-standup.sh` creates the box the weekly restore test runs on, runs the test over ssh, and deletes the box in an exit trap. It uses the `hcloud` CLI rather than terraform, because the hcloud provider publishes no OpenBSD build: `terraform init` against any provider version fails on this platform, so terraform cannot drive a box from the mail box at all.
