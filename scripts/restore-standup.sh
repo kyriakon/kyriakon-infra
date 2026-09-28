@@ -286,9 +286,9 @@ HEALTHCHECKS_URL='$healthchecks' /root/bin/restore-test.sh"
 test_status=$?
 set -e
 
-if [ "$test_status" -eq 0 ]; then
-	printf 'restore test passed\n'
-else
+# The test announces its own success, so only the failure needs saying here. Saying it
+# twice makes the log read as though two things passed.
+if [ "$test_status" -ne 0 ]; then
 	printf 'restore-standup: the restore test failed with status %s\n' "$test_status" >&2
 fi
 exit "$test_status"
