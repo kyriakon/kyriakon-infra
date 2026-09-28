@@ -125,7 +125,20 @@ So the template is section 1 with these differences:
   template.
 
 The installer's answers live in `openbsd/restore-template/install.conf`, written against the
-question text 7.9 actually uses, read out of the release's own `bsd.rd` ramdisk. This
+question text 7.9 actually uses, read out of the release's own `bsd.rd` ramdisk. The file
+carries no comments and no blank lines, only `question = answer`, so that nothing about
+parsing is left to chance. This section is where the reasoning lives.
+
+That file is served verbatim at `https://kyriakon.net/install.conf`, since the site's
+document root is a git checkout and the URL has to be short enough to type into a VNC
+console. It must keep the name `install.conf`: the installer reads install-versus-upgrade
+out of the URL's filename, and answering that prompt is one more thing to type.
+
+The prompts worth knowing, all read out of the ramdisk: the location prompt re-asks when the
+answer is empty, so a mistyped URL costs a retry rather than a Ctrl-C, and the questions
+this file answers are `System hostname? (short form, e.g. 'foo')`, `Password for root
+account?`, `Public ssh key for root account?`, `What timezone are you in?`, `Location of
+sets?`, `HTTP Server?`, and `Encrypt the root disk with a (p)assphrase or (k)eydisk?`. This
 matters: autoinstall matches questions by their text and silently falls back to the
 installer's default when it cannot match an answer, so a response file taken from an older
 write-up installs something other than what it says. The prompts that bit are `Password for
