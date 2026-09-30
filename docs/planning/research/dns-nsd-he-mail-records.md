@@ -51,10 +51,10 @@ zone:
 	# authenticates the transfer, the source IP does not have to.
 	provide-xfr: 0.0.0.0/0 kyriakon-he
 	provide-xfr: ::0/0 kyriakon-he
-	notify: 216.218.133.2 kyriakon-he
+	notify: 216.218.130.2 kyriakon-he
 ```
 
-The `notify:` address is HE's transfer source, observed in nsd's log during the first AXFR on 2026-09-11 (`axfr for kyriakon.net. from 216.218.133.2`). It is not one of the `ns1`-`ns5` anycast query addresses, and HE does not publish it, so it is an inference: if nsd logs notify failures, re-read the log for HE's current source and correct the line.
+One address answers a NOTIFY, and it is not the one this document first inferred. Measured 2026-09-30 from the box with `dig +opcode=notify @<addr> <zone>`: `216.218.130.2` (ns1.he.net) answers NOERROR, and `216.218.131.2`, `216.218.132.2`, `216.66.1.2` and `216.66.80.18` answer REFUSED, for both zones, whether nsd signs the notify or dig sends it plain. The test has to run from the box, because HE authorises a notify by source address and refuses every address when the query arrives from anywhere else. All five nameservers answer the same SOA serial, so the four that refuse are not stale: HE moves the zone internally once ns1 has pulled it. The entry this document started with, `216.218.133.2`, is HE's AXFR source in `grep axfr /var/log/nsd.log` and never a notify target, which is why it only ever logged "max notify send count reached ... unreachable". The SOA `refresh` (3600) remains the backstop when a notify is lost.
 
 The directives that matter, from the man page:
 
@@ -152,7 +152,7 @@ Consequences for the primary:
 
 1. The box's IP **must be reachable on TCP/53 by HE** for the initial AXFR and any refresh transfer (AXFR runs over TCP; `nsd` serves it per [nsd.conf(5)](https://man.openbsd.org/nsd.conf.5)). This is the "box IP is public by design" reality from §5.7 made concrete — the hidden-primary pattern hides the DNS *answering* service from public NS records, not the box from the network.
 2. `provide-xfr` must accept HE's signed requests. The key authorises them, so no source address has to be captured before the first transfer (§1).
-3. `notify` needs an address to send to, and HE publishes none, so the line uses the transfer source observed in nsd's log. If nsd logs notify failures, that inference is wrong and the address needs correcting from a fresh log read.
+3. `notify` has one working destination, `216.218.130.2` (ns1.he.net), and it must be sent from the box: HE authorises the notify by source address, so the same query from another host is refused everywhere. The other four nameserver addresses refuse every notify for both zones, and they still serve the current serial, so they are fed internally by HE rather than by us. Re-test with `dig +opcode=notify @<addr> <zone>` from the box whenever this list is touched. The SOA `refresh` (3600) covers a lost notify.
 
 HE free secondary is DNS-only redundancy: it keeps answering from the last transferred zone if the box goes down (§5.7, §6.11), but it does not queue or deliver mail (that's the deferred secondary-MX layer, §6.11 layer 3).
 
