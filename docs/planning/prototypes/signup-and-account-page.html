@@ -57,17 +57,18 @@
   <a href="#form">3. Application</a>
   <a href="#keys">4. Keys and walkthrough</a>
   <a href="#submitted">5. Application received</a>
+  <a href="#status">6. Status link</a>
   <div class="grp">The operator</div>
-  <a href="#approval">6. Approval email</a>
-  <a href="#decline">7. Decline email</a>
+  <a href="#approval">7. Approval email</a>
+  <a href="#decline">8. Decline email</a>
   <div class="grp">Payment and live</div>
-  <a href="#pay">8. Payment, card</a>
-  <a href="#prepaid">9. Payment, cash and Monero</a>
-  <a href="#live">10. Account live</a>
+  <a href="#pay">9. Payment, card</a>
+  <a href="#prepaid">10. Payment, cash and Monero</a>
+  <a href="#live">11. Account live</a>
   <div class="grp">The account page</div>
-  <a href="#account">11. Status</a>
-  <a href="#keys2">12. Key rotation</a>
-  <a href="#close">13. Closing</a>
+  <a href="#account">12. Status</a>
+  <a href="#keys2">13. Key rotation</a>
+  <a href="#close">14. Closing</a>
 </nav>
 
 <main>
@@ -121,9 +122,11 @@
     <label>Username <span class="opt">(lowercase letters, digits and hyphens, up to 31)</span></label>
     <input type="text" value="frseraphim">
     <p class="hint">Available. This becomes your address, <span class="mono">frseraphim@kyriakon.net</span>, and your site, <span class="mono">frseraphim.kyriakon.net</span>.</p>
-    <label>An address outside this platform <span class="opt">(required)</span></label>
+    <label>An address outside this platform <span class="opt">(optional)</span></label>
     <input type="text" value="someone@example.invalid">
-    <p class="hint">We write to you here as well as at your new address, including if the account is ever in trouble. If your mail here fails, we hold on longer before doing anything final.</p>
+    <p class="hint">We write here as well as to your new address, including if the account is ever in trouble, and if this address bounces we hold on longer before doing anything final. It is used for notices only, it is never shared, and we never use it to look you up anywhere else. You can add or remove one from your account page at any time.</p>
+    <p class="hint"><strong>If you leave it empty,</strong> we can only reach you inside this account. If you lose your key or your mail client, you will not hear from us, and an unpaid account will still lapse and in time be deleted, with the mail. Nothing else changes.</p>
+    <p><input type="checkbox"> I understand that we can only reach me inside this account.</p>
     <label>Mail password <span class="opt">(you will type this in your mail client)</span></label>
     <input type="password" value="hunter2hunter2">
   </div>
@@ -212,7 +215,9 @@
 <section id="submitted">
   <h2>Thank you, that is with us</h2>
   <div class="card">
-    <p>Your application is with one person, who reads every one. You will hear back at <span class="mono">someone@example.invalid</span>.</p>
+    <p>Your application is with one person, who reads every one. If you gave an address outside this platform you will hear back there. Either way, this link shows where it has got to, and it is what carries the payment step if you are approved:</p>
+    <p class="mono" style="font-size:16px">kyriakon.net/status/KYR-4F2M-9QH7-XT3B</p>
+    <p class="hint">Keep it or print it. If you gave no other address, this is the only way we can tell you a decision, and it works until the application is cleared away, a week after a decision.</p>
     <h3>What happens now</h3>
     <ul>
       <li><strong>Read.</strong> Usually within a few days, sometimes sooner.</li>
@@ -222,6 +227,21 @@
     </ul>
     <p>If we cannot approve it, we will say so and tell you how to ask us to look again. Nothing is held for more than a week after we decide.</p>
     <p class="hint">Your username is held for you while this is being read. If nothing is heard for a week, the application is deleted and the name is free again.</p>
+  </div>
+</section>
+
+<section id="status">
+  <h2>Where your application has got to</h2>
+  <p class="lede mono">kyriakon.net/status/KYR-4F2M-9QH7-XT3B</p>
+  <div class="card">
+    <table>
+      <tr><td>Received</td><td>30 September 2026. A person reads every application. Nothing is charged yet.</td></tr>
+      <tr><td>Approved</td><td>1 October 2026. Your account is open: <span class="mono">frseraphim@kyriakon.net</span>, with mail working and your site answering on HTTP until its certificate arrives. What is left is payment.</td></tr>
+      <tr><td>Declined</td><td>We were not able to open an account, and we will look again if you ask us to.</td></tr>
+    </table>
+    <button class="btn" onclick="go('pay')">Pay £20</button>
+    <button class="btn alt" onclick="go('prepaid')">Cash or Monero</button>
+    <p class="hint">Anyone holding this link can read this page, so keep it as you would a password. It works until the application is cleared away, a week after a decision, and then the account page is where everything lives.</p>
   </div>
 </section>
 
@@ -269,6 +289,7 @@
   <div class="card">
     <p class="hint">A monastic application is the one case where the message names what is missing, because what is missing is a conversation: <em>"We have not been able to reach your elder. If you can ask him to write to us, or send us his blessing, we will look again."</em></p>
     <p class="hint">No reason is given otherwise, the application is held seven days in case a word arrives, and then it is purged and the username released. Nothing about a declined application is kept beyond that week.</p>
+    <p class="hint">A member who gave no address outside the platform reads this on their status link instead, which is why that link is worth keeping. To have us look again they reply if we wrote to them, or write to <span class="mono">admin@kyriakon.net</span> from anywhere.</p>
   </div>
 </section>
 
@@ -341,6 +362,7 @@
     <tr><td>Certificate</td><td>Valid until 27 December 2026</td></tr>
     <tr><td>Mail key fingerprint</td><td class="mono">…7C41 A9D2</td></tr>
     <tr><td>Upload keys</td><td>1 key, added 30 September 2026</td></tr>
+    <tr><td>Notices also go to</td><td class="mono">someone@example.invalid</td></tr>
   </table>
 
   <h3>Notices</h3>
@@ -350,14 +372,15 @@
       <tr><td>30 Sep 2026</td><td>Payment received, £20, card. Paid until 30 Sep 2027.</td></tr>
       <tr><td>30 Sep 2026</td><td>Certificate issued.</td></tr>
     </table>
-    <p class="hint">Every notice we send you, at either address, is listed here with its date and what it said.</p>
+    <p class="hint">Every notice we send you, at every address we have for you, is listed here with its date and what it said.</p>
   </div>
 
   <h3>What you can do here</h3>
   <div class="card">
     <ul>
-      <li><a href="#keys2">Replace my mail key</a>. Confirmed from both your addresses, with three days to change your mind.</li>
+      <li><a href="#keys2">Replace my mail key</a>. Confirmed from your other address if you gave one, and with three days to change your mind either way.</li>
       <li>Add or remove an upload key.</li>
+      <li>Add, change or remove the address we write to when something needs your attention.</li>
       <li>Change my mail password.</li>
       <li>Take my site down, or put it back. Mail is unaffected.</li>
       <li>Stop the yearly renewal, which leaves the account running until the year is out.</li>
@@ -384,6 +407,7 @@
     <button class="btn alt">Stop this change</button>
     <p class="hint">Already have mail under the new key, signed by it? A signed request applies straight away with no waiting, because the old key cannot have been taken.</p>
     <p class="hint">Nothing encrypted to the old key becomes readable with the new one. Keep the old private key if you want to read your history.</p>
+    <p class="hint">Gave no address outside the platform? The change waits the full three days and we warn you by mail encrypted to your old key, which only you can read. A request signed by your new key still applies at once.</p>
   </div>
 </section>
 
