@@ -4,6 +4,9 @@ Working notes for the signup prototype. Each section of member-facing copy has t
 three options and a recommendation. Pick one per section and the mock is rebuilt from
 the picks.
 
+Picks are recorded under "Settled so far" at the end of this file, and the recommended
+option stands wherever nothing is recorded there.
+
 Three things run through all of it. The tone is plain and unhurried, which suits a small
 platform whose operator you can write to. Nothing promises more than it does. Every limit
 appears where the promise is made, not in a policy nobody opens.
@@ -35,9 +38,13 @@ Heading options for the mail block:
 - A. Mail you can read and we cannot.
 - B. Your mail, sealed with your key.
 - C. Private mail.
+- D. Secure encrypted mail. (chosen)
 
 A is the plainest and leads with the property that matters. B is gentler and less
-specific. C is a claim anyone can make.
+specific. C is a claim anyone can make. D is the phrase a reader already recognises, which
+matters more for this audience than being distinctive, and it works because the paragraph
+under it carries the fact that makes this platform different: that we hold ciphertext and
+no key. The heading may stay familiar as long as the sentence under it is exact.
 
 Body options for the mail block:
 
@@ -69,6 +76,16 @@ qualify.
 
 Recommended: B. The thing that stops people asking is not knowing whether the offer
 applies to them, so the copy should say who decides and how.
+
+Both are settled in principle. The price line stays as B, and a parish wanting its own
+domain or several addresses is invited to write to us rather than quoted a price. What is
+still open is the tier set itself, because the £50/yr in the proposal looks high for a
+rural parish beside providers that sell a domain with several addresses for less, and
+because nobody has established what an organisation account costs to run here. Both
+questions are out to research in tickets [#189](https://github.com/kyriakon/kyriakon-infra/issues/189)
+and [#190](https://github.com/kyriakon/kyriakon-infra/issues/190), and the decision that
+waits on them is [#188](https://github.com/kyriakon/kyriakon-infra/issues/188). No price
+for the parish tier appears on the site until then.
 
 ## 4. Key check: heading and first line
 
@@ -504,3 +521,21 @@ The reminder to take a copy first, which should not be a footnote:
 - B. Download your data before you close.
 
 Recommended: A. It answers the question the reader will otherwise ask after closing.
+
+## Settled so far
+
+- Section 2, the mail heading: **Secure encrypted mail**. The paragraph under it does not
+  change, because that paragraph carries the fact that makes this platform different, and
+  the heading is the phrase a reader already recognises.
+- Section 10, the recovery phrase: option A, which says who could read the mail and why
+  nobody here can help.
+- Section 13, the questions about you: both, the line about the door first and the handling
+  of the answers after it.
+- Section 3, the price line: option B, plus an invitation for a parish to write rather than
+  a quoted price, since the parish tier is not priced yet.
+- The free tier reaches people rather than bodies: clergy, monastics and anyone who cannot
+  pay. Whether an institution can be granted an account without charge stays open in
+  [#177](https://github.com/kyriakon/kyriakon-infra/issues/177), and the working position is
+  that an institution with a treasurer pays.
+
+Every other section stands at the recommended option until it is overruled.
