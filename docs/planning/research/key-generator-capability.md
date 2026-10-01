@@ -126,15 +126,50 @@ library with a generation entry point and a check entry point, loaded by a page 
 Content-Security-Policy forbids external requests, which is the acceptance the ticket
 already specifies.
 
+## The check half works, and the crate's API has two traps in it
+
+The same crate reads a submitted key well enough to produce the three verdicts, and the
+spike now has a `check` mode that does it. Four keys were run through it:
+
+```
+OK   /tmp/kg-ed25519/public.asc     a key this generator produced
+FAIL /tmp/kg-aead.asc               a key from gpg 2.5 that advertises AEAD
+FAIL /tmp/kg-signonly.asc           a key with no encryption subkey
+FAIL /tmp/kg-expired.asc            a key whose subkey expired in 2020
+```
+
+Two of those results were wrong before they were right, which is the reason to test this
+rather than read it.
+
+**The AEAD preference is not the variant whose name matches it.** gpg writes the AEAD
+ciphersuite preference as subpacket type 34, and rpgp 0.20 parses that into
+`PreferredEncryptionModes`. The variant called `PreferredAeadAlgorithms` is a different
+subpacket entirely. A check that matches the name which looks correct reports a clean key
+for one that advertises AEAD, which is the dangerous direction: the member is told they
+are fine and their first message will not open.
+
+**Half the feature byte is unreadable.** rpgp exposes `Features::seipd_v1()` and
+`Features::seipd_v2()`, and keeps the bit gpg actually sets, the one it inherited from
+LibrePGP, behind a private field that only shows up in debug output. The subpacket check
+covers the case that matters, so this is a note rather than a blocker, but a checker built
+only on the crate's public feature accessors would miss it.
+
+**And the warning will fire often.** Every key gpg generated during this testing
+advertised AEAD without being asked to, because present-day GnuPG sets an AEAD mode in
+its default preferences. So this is not a warning for unusual keys. It is what a member
+gets if they follow the obvious path of making a key in gpg, which is an argument for the
+generator and for the walkthrough naming the warning rather than the member meeting it
+unexplained.
+
 ## What this settles for the design
 
 The generator is buildable in the repository from `pgp` 0.20.0 with no patch to the
 crate, using a version 4 certificate, an EdDSA primary key, an ECDH Curve25519
 encryption subkey, the three explicit preference lists, and passphrase protection, all of
-which the spike produces and gpg accepts end to end. The same crate can carry the key
-inspection that the check page and the signup path both need, since parsing a submitted
-key and reading its subpackets and preferences is the reading half of what the builder
-writes.
+which the spike produces and gpg accepts end to end. The check half is written and passes
+its test matrix, the same crate reading a submitted key and returning the three verdicts,
+with the AEAD test written against the subpacket gpg actually writes rather than the
+variant whose name matches.
 
 ## What is not verified
 
@@ -142,9 +177,8 @@ writes.
   available here, so the claim that mobile works is still unproven and the walkthrough
   copy that promises it stays unearned until somebody runs it.
 - The browser page itself. The module compiles; nothing loads it, and no bindings exist.
-- The key inspection and the three verdicts. The spike writes keys and does not read
-  arbitrary ones, so the check that warns about a missing encryption subkey, an AEAD
-  advertisement, or an expiry is still to be written.
+- The key inspection against a key larger than the four in the matrix. The verdicts come
+  from reading signatures and subpackets, and only the cases above were run.
 - Why the RSA secret key failed to unlock on the first attempt and then worked on the
   second, and whether an unprotected Ed25519 key imports where an unprotected RSA key
   does not. Both want retesting before anything ships.
