@@ -110,6 +110,8 @@ To replace a key by hand, before the service is built:
 
 Do not edit the keyring on the box by hand. The next deploy overwrites it from the repository, so the edit either disappears or leaves the published set disagreeing with what delivers, which is the drift the check in #171 exists to alert on.
 
+The drift check in #171 runs daily on the box and compares the fingerprints in `/etc/kyriakon/keys` against the merged published set in `keys/`. It alerts when a published key is missing from the box, when a fingerprint differs between the two, or when a key has sat unpublished for more than seven days. An off-box run compares the published set against a recorded copy in a repository the box's publish token cannot write, so a rewrite of a key that already reached `main` is seen even if the box made the commit. Delivery does not change when this alerts, since the box keyring is what delivers, so the repair is a human's: merge the pending publication, or put back the key the member expects. The check is not on main at this commit.
+
 ### A member who has lost their key
 
 A member who still holds the recovery phrase restores the same key from it, so the public half does not change and nothing needs doing on the box. That is the path the signup flow is built around, and it is why rotation never requires a signing key.
@@ -248,9 +250,9 @@ The test already runs these checks, in this order: the newest snapshot is less t
 
 To prove a restored copy becomes a working mail server, rather than merely restoring, run the rehearsal on a throwaway box provisioned from the template.
 
-1. Restore the latest snapshot into the box's real paths.
+1. Restore the latest snapshot into the box's real paths. `doas` resets the environment, so the credentials go through `doas env`.
 
-		RESTIC_REPOSITORY=... RESTIC_PASSWORD_FILE=... doas ksh scripts/rehearsal.sh
+		doas env RESTIC_REPOSITORY=... RESTIC_PASSWORD_FILE=... ksh scripts/rehearsal.sh
 
 2. Work through the checklist the script prints. Start the daemons, clone a test `pass` repository over ssh, send a message from an address outside the platform and read it back over IMAP with a PGP client, confirm MX and PTR point at this box for the window, record the date and the snapshot id, then ping the rehearsal check. The check carries a period of about 90 days, so a skipped quarter alerts on its own.
 
@@ -313,7 +315,7 @@ Read the filesystems first.
 
 Then find where the space went.
 
-	du -sh /home/*
+	doas du -sh /home/*
 	doas quota -u <username>
 	doas repquota -a
 	doas du -sh /var/log /var/spool/smtpd /var/nsd /root/.cache/restic
@@ -408,7 +410,7 @@ A rotation that keeps sending unbroken needs a second selector, because a messag
 
 4. Confirm outbound mail still passes DKIM, then leave the old selector published until every message signed with it is older than the mail queue lifetime of four days, with a margin. A week is the practical figure.
 
-5. Revoke the old selector by publishing an empty `p=` value at it.
+5. Revoke the old selector by publishing an empty `p=` value at it, then bump the SOA serial and deploy the zone as in step 2.
 
 		<oldselector>._domainkey	IN	TXT	"v=DKIM1; k=rsa; p="
 
@@ -445,7 +447,10 @@ The base system and the packages move on different clocks. `syspatch` carries ba
 
 		. /root/.kyriakon-env
 		image_id=$(hcloud image list -t snapshot -l kind=gold -o noheader -o columns=id | tail -1)
-		hcloud server create --name kyriakon-gold --type cx23 --image "$image_id" --location "$RESTORE_TEST_LOCATION" -o json | jq -r '.server.id'
+		hcloud server create --name kyriakon-gold --type "${RESTORE_TEST_SERVER_TYPE:-cx23}" \
+			--image "$image_id" --location "${RESTORE_TEST_LOCATION:-fsn1}" -o json | jq -r '.server.id'
+
+   Match the type and the location to the live box in `terraform/terraform.tfvars` so the image is built on the same footing the box runs on.
 
    On that box, apply the patches and shut it down, because a snapshot of a running filesystem can capture a write in progress.
 
