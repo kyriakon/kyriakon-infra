@@ -5,7 +5,8 @@
 # It is OpenBSD's shipped file, v1.105 in 7.9, which the release trims from the
 # upstream one, so a newer upstream copy is not a substitute.
 
-# Two settings here depart from the stock file. Both are deliberate.
+# Three changes here depart from the stock file. All are deliberate: the two
+# hardening settings below, and the member-hosting fragment at the end.
 #
 # Nothing on this box can authenticate by password. The operator account is in
 # wheel and has doas, so a guessed password would be root on the mail host, and
@@ -21,6 +22,24 @@
 # connection nobody is on the other end of does not sit open. A client that is
 # still there answers the probes, so long-running commands are unaffected.
 #
+# The member fragment adds port 2222 and the two Match blocks at the end of the
+# file. A member uploads with sftp and pushes to pass repositories with git-shell
+# from one account and one key, and ChrootDirectory applies to every session of a
+# user, so the two cannot share a chroot: a chrooted session has no
+# /usr/local/bin/git-shell inside it, and OpenBSD has no nullfs to lend it one.
+# sshd separates them by port instead. sftp keeps the default port 22, where
+# ForceCommand internal-sftp is handled inside sshd before the login shell is
+# exec'd; git-shell stays on 2222, unchrooted.
+#
+# Both blocks were checked against the live binary on 2026-10-01, with a
+# throwaway host key under /tmp and no change to the box: `sshd -T -f <fragment>
+# -h <throwaway key> -C user=oliver,lport=22` reports chrootdirectory
+# /home/www/%u.kyriakon.net and forcecommand "internal-sftp -u 0022", the same
+# check with lport=2222 reports chrootdirectory none and forcecommand none, and a
+# port matching neither block (lport=23) also reports none. The %u token is left
+# unexpanded by -T; sshd expands it when the session starts. The test account was
+# in wheel rather than members, because no members group exists yet.
+#
 # Applied by hand, never by a deploy: this file is reviewed line by line.
 #
 #   doas sshd -t && doas kill -HUP "$(cat /var/run/sshd.pid)"
@@ -33,7 +52,13 @@
 # possible, but leave them commented.  Uncommented options override the
 # default value.
 
-#Port 22
+# The member-hosting port split needs both ports named: once any Port directive
+# is present, sshd listens on exactly those and ignores the compiled-in default.
+# 22 keeps the upload path on the default port, so a member never types a port to
+# put a site up; 2222 carries the git-shell sessions for pass repositories and is
+# opened in pf.
+Port 22
+Port 2222
 #AddressFamily any
 #ListenAddress 0.0.0.0
 #ListenAddress ::
@@ -118,3 +143,38 @@ Subsystem	sftp	/usr/libexec/sftp-server
 #	AllowTcpForwarding no
 #	PermitTTY no
 #	ForceCommand cvs server
+
+# --- member hosting ---------------------------------------------------------
+#
+# The members group holds member accounts and nothing else, so both blocks below
+# apply to members only. The group is set at signup, and it is also the switch
+# that turns the restrictions on: an account left out of it keeps an
+# unrestricted shell if its shell is ever set to one, which is why membership is
+# a provisioning step rather than a later hardening pass.
+#
+# The first block is the shared hardening and has to come first. When two Match
+# blocks both apply, sshd applies the first instance of each keyword and ignores
+# the later one, so every keyword both blocks need belongs here.
+#
+# The second block is the chrooted upload session, on 22 only. Its root is the
+# member's public directory, /home/www/<name>.kyriakon.net, which contains www/
+# and gemini/ and nothing else: Maildir and repos stay under /home/<name>,
+# outside everything this session can reach. sshd checks the chroot root and
+# every component above it for root ownership and no group or other write bit
+# (safely_chroot in session.c), so the signup path leaves that directory
+# root:wheel 0755 and gives the two subdirectories to the member.
+#
+# There is deliberately no LocalPort 2222 block. 2222 is where the member's login
+# shell runs, and that shell is /usr/local/bin/git-shell, so a push arrives as
+# `git-shell -c '<client command>'`. A ForceCommand there would replace the
+# client's command and break the push, and a ChrootDirectory would put git-shell
+# outside the filesystem. An account still carrying /sbin/nologin uploads on 22
+# but cannot push, because nologin ignores -c and exits.
+Match Group members
+	AuthenticationMethods publickey
+	DisableForwarding yes
+	PermitTTY no
+
+Match Group members LocalPort 22
+	ChrootDirectory /home/www/%u.kyriakon.net
+	ForceCommand internal-sftp -u 0022

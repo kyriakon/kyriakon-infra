@@ -132,11 +132,49 @@ printf 'dovecot: include %s, modules %s\n' "$dovecot_include_dir" "$dovecot_modu
 # --- 2. TLS --------------------------------------------------------------
 
 say "TLS"
-install -d -m 0755 /var/www/acme
+# The web tree lives under /home/www and both daemons chroot there, so the
+# platform's own sites and the ACME challenge directory sit beside the directory
+# each member gets: /home/www/<host>/{www,gemini}. /home/www is root-owned 0755
+# because sshd checks every component of a member's ChrootDirectory for root
+# ownership and no group or other write bit, and members' directories sit under
+# this one.
+install -d -m 0755 /home/www
+# httpd derives its log directory from the chroot (the chroot plus /logs) and
+# refuses to start without it, so it is created here owned the way /var/www/logs
+# was: root:daemon 0755.
+install -d -m 0755 -o root -g daemon /home/www/logs
+# acme-client writes the HTTP-01 challenge here. The challenge is served by the
+# httpd vhosts, so it has to be inside httpd's chroot, and the default of
+# /var/www/acme is not any more. Every domain block in acme-client.conf names
+# this directory rather than relying on the default.
+install -d -m 0755 -o root -g daemon /home/www/acme
 install -d -m 0700 /etc/acme
-# Document root for the landing site. httpd serves it read-only; the content
-# itself comes from a kyriakon-site checkout (see the tail of this script).
-install -d -m 0755 /var/www/kyriakon.net
+# The generated vhost indexes the two daemons include. include is an fopen of one
+# path, so a missing index fails the whole configuration rather than being
+# skipped: the file has to exist before httpd -n or gmid -n runs, and an empty
+# one is valid.
+install -d -m 0755 /etc/httpd.d /etc/gmid.d
+for i in /etc/httpd.d/index.conf /etc/gmid.d/index.conf; do
+	[ -e "$i" ] || : >"$i"
+	chmod 0644 "$i"
+done
+# One root per hostname the box serves, each with the www and gemini halves, so
+# httpd's root "/<host>/www" and gmid's root "/<host>/gemini" are relative to the
+# same chroot and the whole public surface is one tree that the backup covers.
+# www.kyriakon.net is absent because it only redirects. The signup hostname has
+# no capsule, so it gets www only.
+for host in kyriakon.net oliver.kyriakon.net kleio.kyriakon.net press.kyriakon.net; do
+	install -d -m 0755 "/home/www/$host/www" "/home/www/$host/gemini"
+done
+install -d -m 0755 /home/www/signup.kyriakon.net/www
+# The vhosts serve from /home/www now, and the directories above are created
+# empty. If the old tree is still there, its content has not moved, and saying so
+# here is cheaper than debugging a site that returns 404 with every service up.
+if [ -d /var/www/kyriakon.net ] || [ -d /var/www/oliver.kyriakon.net ]; then
+	printf 'note: /var/www still holds site content, and the vhosts serve /home/www.\n' >&2
+	printf '      Move it before relying on the site; the exact commands are in the\n' >&2
+	printf '      pull request that introduced /home/www.\n' >&2
+fi
 install -m 0644 "$repo_dir/openbsd/etc/httpd.conf" /etc/httpd.conf
 install -m 0644 "$repo_dir/openbsd/etc/acme-client.conf" /etc/acme-client.conf
 httpd -n -f /etc/httpd.conf
@@ -150,7 +188,7 @@ case "$acme_rc" in
 	0) printf 'mail certificate issued or renewed\n' ;;
 	2) printf 'mail certificate already current\n' ;;
 	*) printf 'acme-client failed for mail.kyriakon.net (exit %s); is port 80\n' "$acme_rc" >&2
-	   printf 'reachable and the challenge directory served? see /var/www/acme\n' >&2
+	   printf 'reachable and the challenge directory served? see /home/www/acme\n' >&2
 	   exit 1 ;;
 esac
 for f in /etc/ssl/mail.kyriakon.net.fullchain.pem /etc/ssl/private/mail.kyriakon.net.key; do
@@ -645,8 +683,16 @@ fi
 printf 'MX:   %s\n' "$(dig +short @ns1.he.net kyriakon.net MX)"
 printf 'mail: %s %s\n' "$(dig +short @ns1.he.net mail.kyriakon.net A)" \
 	"$(dig +short @ns1.he.net mail.kyriakon.net AAAA)"
-printf 'PTR4: %s\n' "$(dig +short -x 95.216.152.17)"
-printf 'PTR6: %s\n' "$(dig +short -x 2a01:4f9:c013:7888::1)"
+# The box's own addresses, read from the egress interface rather than written
+# here: this repo is public and the addresses are host-specific, so the value
+# belongs to the box. Same idiom as scripts/check-hygiene.sh.
+ip4=$(ifconfig egress inet 2>/dev/null | awk '/inet / { print $2; exit }')
+# The interface carries a link-local address too, and a PTR lookup for fe80::...
+# is not the record the box publishes, so the first non-link-local one is the
+# global address.
+ip6=$(ifconfig egress inet6 2>/dev/null | awk '$1 == "inet6" && $2 !~ /^fe80/ { print $2; exit }')
+printf 'PTR4: %s\n' "$(dig +short -x "$ip4")"
+printf 'PTR6: %s\n' "$(dig +short -x "$ip6")"
 
 printf '\nmail stack is up. Remaining manual steps:\n'
 printf '  1. doas passwd oliver, then configure your client:\n'
@@ -654,15 +700,15 @@ printf '     IMAP mail.kyriakon.net:993 (TLS), submission :465 (auth)\n'
 printf '  2. inbound test from an external mailbox, then check the Maildir:\n'
 printf '     ls -t /home/oliver/Maildir/new/* | head -1\n'
 printf '  3. outbound test, then SPF/DKIM/DMARC and inbox placement at a public checker\n'
-printf '  4. landing site: the vhosts serve it from /var/www/kyriakon.net, so a\n'
-printf '     kyriakon-site checkout there is all it needs (git clone once, then\n'
+printf '  4. landing site: the vhosts serve it from /home/www/kyriakon.net/www, so\n'
+printf '     a kyriakon-site checkout there is all it needs (git clone once, then\n'
 printf '     git pull to update). No pf change is required for 443.\n'
-printf '  5. personal site: same shape, at /var/www/oliver.kyriakon.net, from\n'
+printf '  5. personal site: same shape, at /home/www/oliver.kyriakon.net/www, from\n'
 printf '     https://github.com/OliverBrotchie/oliver.kyriakon.net . The vhost\n'
 printf '     blocks /.git, so keep it a checkout rather than a copy of the files:\n'
-printf '     git clone once as root, then git pull to update. It carries both\n'
-printf '     index.html for HTTP and index.gmi for the Gemini side.\n'
-printf '  6. pf: two fragments, appended at the END of /etc/pf.conf (pf is\n'
+printf '     git clone once as root, then git pull to update. index.html goes in\n'
+printf '     www/ and index.gmi in gemini/, which gmid serves for the same name.\n'
+printf '  6. pf: the fragments, appended at the END of /etc/pf.conf (pf is\n'
 printf '     last-match-wins, so they must follow the stock pass rule). Review\n'
 printf '     the diff, then apply:\n'
 printf '\n'
@@ -692,6 +738,12 @@ printf '     Values come from /root/.kyriakon-env (mode 0600), which the nsd\n'
 printf '     deploy reads too, so nothing is retyped. On a fresh box that file is\n'
 printf '     created by scripts/setup-env.sh, before the nsd deploy rather than\n'
 printf '     after it.\n'
+printf '     The same script applies the generated vhost indexes, which is what\n'
+printf '     gives a signup its vhost, in one pass and one reload per daemon:\n'
+printf '\n'
+printf '\t\t doas ksh scripts/cron-apply.sh --web --check\n'
+printf '\t\t doas ksh scripts/cron-apply.sh --web\n'
+printf '\n'
 printf '  8. quarterly rehearsal: create a Healthchecks check with a ~90-day\n'
 printf '     period, then run scripts/rehearsal.sh on a throwaway box. The check is\n'
 printf '     the reminder: a skipped quarter leaves it stale and it alerts, which no\n'
