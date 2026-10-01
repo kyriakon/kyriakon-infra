@@ -406,6 +406,12 @@ Recommended: A. Naming the account page turns a subscription into something they
 Recommended: both, in that order. B is the kind of limit this platform states rather than
 leaves for someone to discover.
 
+Monero does not take the token. The spec in `docs/planning/specs/prepaid-rails.md` found
+that long payment identifiers were removed from the wallet in release 0.15, so attribution
+is by a subaddress unique to the account. The page should give the address and say that
+the address is the reference, rather than printing a payment identifier that a modern
+wallet cannot attach.
+
 The window, and what happens at the end of it.
 
 - A. Your payment window is 14 days, and it is shown on your account page. If the money
