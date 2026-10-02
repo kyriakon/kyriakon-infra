@@ -60,7 +60,7 @@ The price is £20 and it is denominated in pounds. Monero is a way to settle tha
 
 **The payment identifier.** The transaction id is what the service deduplicates on. The credit command takes `--txid`, the drain records it on the ledger line, and a second credit for the same transaction is refused.
 
-**Confirmations.** A payment is credited once the operator sees ten confirmations, which is the depth the wallet itself asks for before the funds can be spent. The site's copy promises no timing for the rail.
+**Confirmations.** A payment is credited once the operator sees ten confirmations, which is the depth the wallet itself asks for before the funds can be spent. How long a member should expect to wait is a promise about the site, and what the site may promise about the rail is #178's to settle rather than this spec's.
 
 **What [#178](https://github.com/kyriakon/kyriakon-infra/issues/178) still owns.** The wallet's home, whether the box holds a full wallet, a view-only wallet, a spend key or nothing, how the subaddress is derived and stored, when it rotates, and what tells the operator that a payment arrived. This spec depends on one interface and nothing else: at approval the drain obtains an address string and writes it to the account, and at credit time it is given a transaction id, an amount in XMR, and a subaddress. A view key is enough to see incoming payments and is not enough to spend them, and the Moneropedia entry states that the balance read through a view key cannot be relied on, so whichever component watches does not need the spending key.
 
