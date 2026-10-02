@@ -1,5 +1,5 @@
 #!/bin/ksh
-# check-keyring-drift.sh — notice a member's mail key changing under the platform's feet.
+# check-keyring-drift.sh: notice a member's mail key changing under the platform's feet.
 #
 # Two rules, one script, both comparing public fingerprints and never key bodies:
 #
@@ -129,7 +129,7 @@ trap 'rm -rf "$tmp"' EXIT
 export GNUPGHOME="$tmp/gnupg"
 mkdir -m 700 "$GNUPGHOME"
 
-# die <message> — the check could not do its job. An unattended run that cannot see
+# die <message>: the check could not do its job. An unattended run that cannot see
 # the keyring is not the same as a clean one, so say so on the same off-box channel
 # and leave a status that cron and a human can tell apart from drift.
 die() {
@@ -140,7 +140,7 @@ die() {
 	exit 2
 }
 
-# alert <title> <body> — mail off the box, and carry the body into the check's
+# alert <title> <body>: mail off the box, and carry the body into the check's
 # event log. Never fails the caller: an alert that cannot be sent must not become a
 # second failure stacked on the one being reported.
 alert() {
@@ -158,7 +158,7 @@ alert() {
 	printf '%s %s: %s\n%s\n' "$when" "$title" "$(hostname)" "$body" >&2
 }
 
-# fpr_of <file> — the primary fingerprint of the first key in a public key file, or
+# fpr_of <file>: the primary fingerprint of the first key in a public key file, or
 # empty if gpg cannot read it. --show-keys is the call rekey-mail-key.sh already
 # uses, and it reads the file without importing anything.
 fpr_of() {
