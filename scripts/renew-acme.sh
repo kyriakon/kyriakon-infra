@@ -58,7 +58,8 @@
 # attempt is the next daily run, which is longer than the 202-minute refill.
 #
 # Depends on: /etc/acme-client.conf, the challenge directory it names (or
-# /var/www/acme), openssl from base, and lib.sh installed beside this file.
+# /home/www/acme, the one the web chroot can see), openssl from base, and lib.sh
+# installed beside this file.
 
 set -euo pipefail
 
@@ -138,11 +139,14 @@ if [ -z "$domains" ]; then
 fi
 
 # The HTTP-01 challenge file is written into the block's challengedir, or into
-# /var/www/acme when a block names none. One missing directory fails every name at
+# /home/www/acme when a block names none. The fallback has to be inside httpd's
+# chroot: a file written under /var/www is no longer served once httpd chroots to
+# /home/www, so a challenge written there would never be read and every name
+# would fail validation. One missing directory fails every name at
 # once, and each failure spends one of the five authorization attempts allowed per
 # identifier per hour, so the run stops before asking rather than spending them.
 challenge_dirs=$(awk -F'"' '/challengedir/ { print $2 }' "$acme_conf")
-[ -n "$challenge_dirs" ] || challenge_dirs=/var/www/acme
+[ -n "$challenge_dirs" ] || challenge_dirs=/home/www/acme
 for dir in $challenge_dirs; do
 	if [ ! -d "$dir" ]; then
 		printf '%s: the ACME challenge directory %s does not exist.\n' "$0" "$dir" >&2
