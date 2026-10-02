@@ -17,7 +17,7 @@ unit and one subscription writes one paid-until date, which is ADR 0009's token 
 account replaced by the group. The parish's certificate is ordinary HTTP-01 against somebody
 else's DNS, and it spends the parish's own 50-per-week budget rather than `kyriakon.net`'s.
 
-**Tested against versus read from sources.** The box (`mail.kyriakon.net`, OpenBSD 7.9
+**Tested against versus read from sources.** The box (OpenBSD 7.9
 GENERIC.MP#11 amd64) was read over SSH as an unprivileged user, with the only writes under
 `/tmp` on the box: `doveconf -n`, `man` pages for `filter-dkimsign(8)`, `aliases(5)`,
 `smtpd.conf(5)`, `edquota(8)` and `acme-client(1)`, reads of `/etc/fstab`, `/etc/group`,
@@ -249,7 +249,7 @@ already names as the reason deletion is admin-mediated.
 Certificates here are HTTP-01 only. `acme-client(1)` on the box documents the one challenge
 type and the default challenge directory `/var/www/acme`, and the repo's `acme-client.conf`
 carries one `domain` block per certificate with a comment repeating that DNS-01 is not
-implemented. A parish domain is what that pattern already does for `oliver.kyriakon.net`:
+implemented. A parish domain is what that pattern already does for the operator's own subdomain:
 one `domain` block, one port 80 vhost serving `/.well-known/acme-challenge/`, one port 443
 vhost for the site, and, if Gemini is wanted, a matching `gmid` server block using the same
 certificate.
@@ -279,7 +279,7 @@ pause it until a human unpauses it in Let's Encrypt's Self-Service Portal (same 
 platform can see that only in the client's output, which reaches cron mail on this box.
 
 One mechanical task follows: `scripts/renew-acme.sh` renews a hardcoded list of handles
-(`mail.kyriakon.net`, `kyriakon.net`, `kyriakon.com`). A parish handle has to be added there,
+(the mail host, the apex and the legacy second domain). A parish handle has to be added there,
 or the script generalised to iterate the `domain` blocks in `acme-client.conf`. A failure on
 one handle already does not stop the others and still exits non-zero, which is the behaviour
 wanted here.
@@ -383,7 +383,7 @@ Beyond the individual fields in proposal §5.9.1, an organisation application ne
   `reserved-usernames.txt` in this repo, read 2026-10-01.
 - `man filter-dkimsign` (OpenBSD 7.9), `man aliases`, `man smtpd.conf`, `man edquota`,
   `man acme-client`, `doveconf -n`, `/etc/fstab`, `/etc/group`, `/etc/mail/aliases`,
-  `/etc/kyriakon/keys` on `mail.kyriakon.net`, read 2026-10-01.
+  `/etc/kyriakon/keys` on the box, read 2026-10-01.
 - OpenSMTPD `usr.sbin/smtpd/aliases.c`, `aliases_get()` and `aliases_virtual_get()`,
   https://raw.githubusercontent.com/openbsd/src/master/usr.sbin/smtpd/aliases.c, read
   2026-10-01.
