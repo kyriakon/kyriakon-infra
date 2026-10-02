@@ -1,6 +1,7 @@
 #!/bin/ksh
-# lib.sh — shared helpers for the scripts that run on the box (backup.sh,
-# restore-test.sh, rehearsal.sh, abuse-monitor.sh, check-hygiene.sh). Source it
+# lib.sh: shared helpers for the scripts that run on the box (backup.sh,
+# restore-test.sh, rehearsal.sh, abuse-monitor.sh, check-hygiene.sh,
+# check-keyring-drift.sh). Source it
 # from the script's own directory:
 #
 #   . "$(dirname "$0")/lib.sh"
