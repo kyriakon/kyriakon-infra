@@ -4,7 +4,7 @@
 website and one bill, what does that need on this box and in this service that an
 individual account does not already need?
 
-**Answer, in six lines.** Mail for the parish's own domain is a line in the `mail_domains`
+**Answer, in five lines.** Mail for the parish's own domain is a line in the `mail_domains`
 table and either a virtual alias table or the global aliases file, but not both: OpenSMTPD
 refuses `alias` and `virtual` on the same action, and the global aliases file is keyed on the
 localpart, so two parishes both wanting `secretary` collide in it. DKIM is one key per filter
