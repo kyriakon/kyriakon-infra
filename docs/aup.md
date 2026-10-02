@@ -141,6 +141,6 @@ operator knows personally.
 3. **Suspend.** Outbound mail stops and the site and capsule go down. Inbound mail
    keeps arriving, and the account page stays open so you can see the reason and
    respond.
-4. **Delete.** Suspension starts a 40-day grace period. We send a final notice 7 days
+4. **Delete.** A suspension that is not resolved starts a 40-day grace period, so answering a warning ends it before this step is reached. We send a final notice 7 days
    before the end, and the account is then deleted automatically. Copies in the backup
    repository expire within about seven months.
