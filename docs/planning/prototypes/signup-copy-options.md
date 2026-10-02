@@ -538,7 +538,8 @@ Recommended: A. It answers the question the reader will otherwise ask after clos
 - Section 13, the questions about you: both, the line about the door first and the handling
   of the answers after it.
 - Section 3, the price line: option B, plus an invitation for a parish to write rather than
-  a quoted price, since the parish tier is not priced yet.
+  a quoted price, since the parish tier is not priced yet. The mock carries both, and its
+  lede was corrected to match.
 - The free tier reaches people rather than bodies: clergy, monastics and anyone who cannot
   pay. Whether an institution can be granted an account without charge stays open in
   [#177](https://github.com/kyriakon/kyriakon-infra/issues/177), and the working position is

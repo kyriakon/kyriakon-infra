@@ -75,7 +75,7 @@
 
 <section id="landing">
   <h2>Mail, a website and git repositories, for Orthodox Christians and their parishes</h2>
-  <p class="lede">£20 a year. Clergy, monastics, and anyone who cannot pay are not charged.</p>
+  <p class="lede">£20 a year, or nothing at all if you are clergy, a monastic, or unable to pay. Say so on the form and that is the end of it. A parish that wants its own domain, or several addresses, should write to us.</p>
   <div class="card">
     <h3>Secure encrypted mail</h3>
     <p>Your mail is encrypted to your own key the moment it arrives. The server holds ciphertext and no key, so we cannot read your messages, and no request, order or fault on our side changes that. The cost is that if you lose your key and your recovery phrase, the mail is gone: nobody here can restore it. Keep the two in different places.</p>
@@ -111,6 +111,9 @@
     <div class="warn">
       <strong>There is no encryption subkey.</strong> This key can sign but cannot be encrypted to, so mail to you would be refused at our end rather than delivered. Make a key with an encryption subkey.
     </div>
+    <div class="warn">
+      <strong>This key has expired, or its encryption subkey has.</strong> A key that has run out cannot receive mail, and a subkey can run out while the rest of the key still looks usable. Either extend it in your mail program, or make a new key with the generator and tell us the new one.
+    </div>
   </div>
 </section>
 
@@ -121,7 +124,7 @@
     <h3>You</h3>
     <label>Username <span class="opt">(lowercase letters, digits and hyphens, up to 31)</span></label>
     <input type="text" value="frseraphim">
-    <p class="hint">Available. This becomes your address, <span class="mono">frseraphim@kyriakon.net</span>, and your site, <span class="mono">frseraphim.kyriakon.net</span>.</p>
+    <p class="hint">Available. This becomes your address, <span class="mono">frseraphim@kyriakon.net</span>, and your site, <span class="mono">frseraphim.kyriakon.net</span>. The names the platform uses itself are held back, so <span class="mono">mail</span>, <span class="mono">www</span>, <span class="mono">kleio</span>, <span class="mono">press</span> and <span class="mono">signup</span> are not available, and a web address in this namespace is a username in it too.</p>
     <label>An address outside this platform <span class="opt">(optional)</span></label>
     <input type="text" value="someone@example.invalid">
     <p class="hint">We write here as well as to your new address, including if the account is ever in trouble, and if this address bounces we hold on longer before doing anything final. It is used for notices only, it is never shared, and we never use it to look you up anywhere else. You can add or remove one from your account page at any time.</p>
@@ -216,14 +219,14 @@
   <h2>Thank you, that is with us</h2>
   <div class="card">
     <p>Your application is with one person, who reads every one. If you gave an address outside this platform you will hear back there. Either way, this link shows where it has got to, and it is what carries the payment step if you are approved:</p>
-    <p class="mono" style="font-size:16px">kyriakon.net/status/KYR-4F2M-9QH7-XT3B</p>
+    <p class="mono" style="font-size:16px">signup.kyriakon.net/status/KYR-4F2M-9QH7-XT3B</p>
     <p class="hint">Keep it or print it. If you gave no other address, this is the only way we can tell you a decision, and it works until the application is cleared away, a week after a decision.</p>
     <h3>What happens now</h3>
     <ul>
       <li><strong>Read.</strong> Usually within a few days, sometimes sooner.</li>
       <li><strong>Approved.</strong> You get a link to pay, or a note that there is nothing to pay.</li>
       <li><strong>Live.</strong> Your address starts accepting mail. Mail arriving before you have configured your client will sit there waiting, encrypted, and it will be readable once your client is set up.</li>
-      <li><strong>Site.</strong> Your certificate is requested after the account exists and usually arrives within a few hours. Until then your site answers on HTTP only.</li>
+      <li><strong>Site.</strong> Your certificate is requested once the account exists and usually arrives within a few hours. Until it does, your site does not answer at all: we do not serve a member site over plain HTTP, only the challenge that proves the domain is yours.</li>
     </ul>
     <p>If we cannot approve it, we will say so and tell you how to ask us to look again. Nothing is held for more than a week after we decide.</p>
     <p class="hint">Your username is held for you while this is being read. If nothing is heard for a week, the application is deleted and the name is free again.</p>
@@ -232,11 +235,11 @@
 
 <section id="status">
   <h2>Where your application has got to</h2>
-  <p class="lede mono">kyriakon.net/status/KYR-4F2M-9QH7-XT3B</p>
+  <p class="lede mono">signup.kyriakon.net/status/KYR-4F2M-9QH7-XT3B</p>
   <div class="card">
     <table>
       <tr><td>Received</td><td>30 September 2026. A person reads every application. Nothing is charged yet.</td></tr>
-      <tr><td>Approved</td><td>1 October 2026. Your account is open: <span class="mono">frseraphim@kyriakon.net</span>, with mail working and your site answering on HTTP until its certificate arrives. What is left is payment.</td></tr>
+      <tr><td>Approved</td><td>1 October 2026. Your account is open: <span class="mono">frseraphim@kyriakon.net</span>, with mail working and its certificate requested, so the site answers once that arrives. What is left is payment.</td></tr>
       <tr><td>Declined</td><td>We were not able to open an account, and we will look again if you ask us to.</td></tr>
     </table>
     <button class="btn" onclick="go('pay')">Pay £20</button>
@@ -342,7 +345,7 @@
       <tr><td>Your site</td><td class="mono">frseraphim.kyriakon.net</td></tr>
       <tr><td>Upload your site</td><td class="mono">sftp frseraphim@kyriakon.net</td> <span class="hint">(port 22, the default)</span></td></tr>
       <tr><td>Repositories</td><td class="mono">ssh://frseraphim@kyriakon.net:2222/myrepo.git</td></tr>
-      <tr><td>Certificate</td><td>Requested. Usually a few hours; your site answers on HTTP until then.</td></tr>
+      <tr><td>Certificate</td><td>Requested. Usually a few hours; your site answers once it is issued.</td></tr>
       <tr><td>Paid until</td><td>30 September 2027</td></tr>
     </table>
     <p><strong>The first message in your mailbox is encrypted.</strong> If you can read it, your setup works. If you cannot, nothing is lost: it is in <a href="#keys">the walkthrough</a>, under "it will not decrypt".</p>
@@ -364,6 +367,18 @@
     <tr><td>Upload keys</td><td>1 key, added 30 September 2026</td></tr>
     <tr><td>Notices also go to</td><td class="mono">someone@example.invalid</td></tr>
   </table>
+
+  <h3>While you are unpaid</h3>
+  <div class="card">
+    <table>
+      <tr><td>State</td><td>Active, unpaid <span class="tag">14 days left</span></td></tr>
+      <tr><td>Paid until</td><td>Not paid yet. The window closes on 14 October 2026.</td></tr>
+      <tr><td>Your token</td><td class="mono">KYR-4F2M-9QH7-XT3B</td> <span class="hint">for the envelope, or for the payment</span></td></tr>
+      <tr><td>What works meanwhile</td><td>Mail arrives and you can read it, your site and capsule answer, uploads and pushes work. Nothing is held back while the money is in the post.</td></tr>
+      <tr><td>At the end of the window</td><td>The account lapses rather than closes. Mail you already have stays readable, your site stays up, and sending, uploading and pushing stop. Nothing is deleted, and paying at any time brings it back.</td></tr>
+    </table>
+    <p class="hint">Lapsed and suspended are the same page with different words in the first row and a different sentence about what stops. The notices list below is where the member sees what we have told them, and the closing page is where they end it themselves.</p>
+  </div>
 
   <h3>Notices</h3>
   <div class="card">
