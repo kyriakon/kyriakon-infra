@@ -61,6 +61,7 @@ fn generate(variant: &str) -> Result<SignedSecretKey, Box<dyn std::error::Error>
         ])
         .preferred_compression_algorithms(smallvec![
             CompressionAlgorithm::ZLIB,
+            CompressionAlgorithm::BZip2,
             CompressionAlgorithm::ZIP,
             CompressionAlgorithm::Uncompressed,
         ])
@@ -163,6 +164,44 @@ fn check(path: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
             findings.push(format!(
                 "The key expired at {expires_at} seconds since the epoch and cannot be used."
             ));
+        }
+    }
+
+    // A subkey carries its own expiry and its own revocation, in its binding signature.
+    // Reading only the primary key's signatures reports a clean key whose encryption
+    // subkey died years ago, which is a false clean in the direction that loses mail.
+    let now = Timestamp::now().as_secs();
+    for sub in &key.public_subkeys {
+        let sub_created = sub.key.created_at().as_secs();
+        let mut sub_expires: Option<u32> = None;
+        let mut sub_revoked = false;
+        for sig in &sub.signatures {
+            if sig.typ() == Some(pgp::packet::SignatureType::SubkeyRevocation) {
+                sub_revoked = true;
+            }
+            if let Some(config) = sig.config() {
+                for subpacket in config.hashed_subpackets() {
+                    if let SubpacketData::KeyExpirationTime(duration) = &subpacket.data {
+                        sub_expires = Some(duration.as_secs());
+                    }
+                }
+            }
+        }
+        let encrypts = sub.key.algorithm().can_encrypt();
+        if sub_revoked && encrypts {
+            findings.push(format!(
+                "The encryption subkey {:?} has been revoked, so mail cannot be encrypted to it.",
+                sub.key.fingerprint()
+            ));
+        }
+        if let (true, Some(lifetime)) = (encrypts, sub_expires) {
+            let expires_at = sub_created.saturating_add(lifetime);
+            if expires_at <= now {
+                findings.push(format!(
+                    "The encryption subkey expired at {expires_at} seconds since the epoch, \
+                     so mail encrypted to this key may not open."
+                ));
+            }
         }
     }
 

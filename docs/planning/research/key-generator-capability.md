@@ -126,7 +126,7 @@ library with a generation entry point and a check entry point, loaded by a page 
 Content-Security-Policy forbids external requests, which is the acceptance the ticket
 already specifies.
 
-## The check half works, and the crate's API has two traps in it
+## The check half works, and the crate's API has three traps in it
 
 The same crate reads a submitted key well enough to produce the three verdicts, and the
 spike now has a `check` mode that does it. Four keys were run through it:
@@ -154,12 +154,29 @@ LibrePGP, behind a private field that only shows up in debug output. The subpack
 covers the case that matters, so this is a note rather than a blocker, but a checker built
 only on the crate's public feature accessors would miss it.
 
+**A subkey's expiry is not the primary key's expiry.** The first version of this check read
+`KeyExpirationTime` from the direct and user id signatures only, which is where a primary
+key carries it. A subkey carries its own, in its binding signature, so a key whose primary
+lives on while its encryption subkey died years ago came back clean. That is the same false
+clean in the same dangerous direction, found by review rather than by testing, and the
+check now reads subkey binding signatures for both expiry and revocation. The case could
+not be constructed here to prove the fix, because gpg refuses to export an expired subkey
+at all, in the plain and the `--export-options backup` forms, so an artifact from gpg
+either carries a usable subkey or none.
+
 **And the warning will fire often.** Every key gpg generated during this testing
 advertised AEAD without being asked to, because present-day GnuPG sets an AEAD mode in
 its default preferences. So this is not a warning for unusual keys. It is what a member
 gets if they follow the obvious path of making a key in gpg, which is an argument for the
 generator and for the walkthrough naming the warning rather than the member meeting it
 unexplained.
+
+**On the features byte, a verdict rather than a question.** The generated key carries
+`features: 01` where the keys deployed today carry `features: 05`, and the extra bit in
+those is the version 5 public key advertisement that GnuPG 2.5 sets. The platform's
+requirement is the absence of the AEAD bit, which both satisfy. So `01` is not a defect
+and not a difference worth reconciling: it says the key supports modification detection,
+which is the property that matters, and says nothing about key versions it does not use.
 
 ## What this settles for the design
 
@@ -177,12 +194,8 @@ variant whose name matches.
   available here, so the claim that mobile works is still unproven and the walkthrough
   copy that promises it stays unearned until somebody runs it.
 - The browser page itself. The module compiles; nothing loads it, and no bindings exist.
-- The key inspection against a key larger than the four in the matrix. The verdicts come
-  from reading signatures and subpackets, and only the cases above were run.
+- The key inspection against a key larger than the five in the matrix, and the subkey
+  expiry path in particular, which gpg would not let me build a case for.
 - Why the RSA secret key failed to unlock on the first attempt and then worked on the
   second, and whether an unprotected Ed25519 key imports where an unprotected RSA key
   does not. Both want retesting before anything ships.
-- Whether `features: 01` matters where the deployed keys carry `features: 05`. The extra
-  bit in those keys advertises support for version 5 public key packets, which this
-  generator does not set, and gpg in both directions handled the difference without
-  comment in this test.
