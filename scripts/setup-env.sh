@@ -1,6 +1,14 @@
 #!/bin/ksh
 # setup-env.sh — install and check the box's values file, /root/.kyriakon-env.
 #
+# A value here overrides the default inside the script that reads it, which is the
+# point, and also a trap: when a threshold is re-baselined in the script, a box whose
+# env file still pins the old value keeps the old value. The ssh attempt threshold sat
+# at 10 on the box for three weeks after the code moved to 300, because the env file
+# was written when 10 was the default, and the monitor mailed the operator about
+# ordinary scanning every hour until someone read the number in the alert. When a
+# default changes, either update the line here or delete it and let the script decide.
+#
 # Run this FIRST on a box, before deploy-nsd.sh and deploy-mail.sh:
 #
 #   doas ksh scripts/setup-env.sh                       # install the template, report what is unfilled
