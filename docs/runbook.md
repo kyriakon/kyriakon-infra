@@ -32,6 +32,8 @@ These procedures name the pieces that exist at this commit, and mark the ones th
 - The onboarding service, its drain and the `onboardctl` command are decided in #156 and not built. Provisioning a member is manual until they land.
 - The per-member hosting configuration is merged into the repository and not applied: the chroot under `/home/www`, the generated vhost indexes, the port split that separates git from the chrooted sftp server, and the quota on `/home`. Applying it is a sequence of propose-only steps rather than a script, so it is done once, by hand, and the order is in the pull request that added it (#160).
 - The quota itself is scripted: `scripts/quota-apply.sh --enable` turns quotas on and `--all` applies the 5 GB allowance to the accounts that already exist. `scripts/add-user.sh` sets it at creation.
+
+  `/home` carries user quotas only, since every account has its own group of the same name. The boot-time check in `/etc/rc` runs `quotaon -a` without that restriction, so it prints one line about the missing `/home/quota.group` on every boot before it reports user quotas turned on. That line is expected, and it is the only place it appears, because `--enable` passes `-u` and stays quiet.
 - Per-member certificates and the queue that holds them against the Let's Encrypt refill rate are decided in #166 and not built. A member's own vhost has no certificate to serve yet.
 - The offline copy of the backup repository is #109 and #116, both open.
 - The keyring drift check, the drain health signal, the snapshot-recency signal and the root filesystem signal are built and deployed by `scripts/deploy-mail.sh` with the cron lines from `scripts/cron-apply.sh`.
@@ -229,10 +231,10 @@ Deletion is a sequence, and the order stops access before anything is destroyed,
 
 7. Clear the quota entry. `edquota` has no delete operation, and a limit of zero means no limit is imposed.
 
-		doas edquota -u <username>
-		doas repquota -a
+		doas ksh /usr/local/src/kyriakon-infra/scripts/quota-apply.sh --clear <username>
+		doas repquota -u /home
 
-   This step is inert until `/home` carries a quota, which #154 turns on. Until then no quota entry exists to clear.
+   The allowance is read back before the command reports success, so a clear that did not take says so rather than passing quietly. Nothing about the account's files changes here: this removes the limit, and the deletion that follows removes the data.
 
 8. Regenerate the finger page, which is derived from the httpd and gmid configuration.
 
