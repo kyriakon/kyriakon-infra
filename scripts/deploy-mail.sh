@@ -565,6 +565,19 @@ else
 	printf 'set the password with: doas passwd oliver\n'
 fi
 
+# The members group is what openbsd/etc/sshd_config matches, to give member
+# sessions the chrooted sftp server on 22 and git-shell on 2222 and to give the
+# operator account neither. sshd refuses a configuration naming a group that does
+# not exist, so the group has to be here before that fragment can be applied.
+# add-user.sh puts each member into it; anyone created before this ran needs
+# "doas usermod -G members <username>" once.
+if getent group members >/dev/null 2>&1; then
+	printf 'group exists: members\n'
+else
+	groupadd members
+	printf 'created the members group\n'
+fi
+
 # Where the operator's cron scripts live. The crontab lines in backup.sh,
 # abuse-monitor.sh, check-keyring-drift.sh, restore-standup.sh and renew-acme.sh all
 # call /root/bin/<script>,

@@ -23,10 +23,11 @@ Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box witho
 These procedures name the pieces that exist at this commit, and mark the ones that do not:
 
 - The onboarding service, its drain and the `onboardctl` command are decided in #156 and not built. Provisioning a member is manual until they land.
-- The per-member hosting layout is decided in #154 and not built: the generated vhost includes, the port split that separates git from the chrooted sftp server, and the quota on `/home`.
-- Per-member certificates and the queue that holds them against the Let's Encrypt refill rate are decided in #166 and not built.
+- The per-member hosting configuration is merged into the repository and not applied: the chroot under `/home/www`, the generated vhost indexes, the port split that separates git from the chrooted sftp server, and the quota on `/home`. Applying it is a sequence of propose-only steps rather than a script, so it is done once, by hand, and the order is in the pull request that added it (#160).
+- The quota itself is scripted: `scripts/quota-apply.sh --enable` turns quotas on and `--all` applies the 5 GB allowance to the accounts that already exist. `scripts/add-user.sh` sets it at creation.
+- Per-member certificates and the queue that holds them against the Let's Encrypt refill rate are decided in #166 and not built. A member's own vhost has no certificate to serve yet.
 - The offline copy of the backup repository is #109 and #116, both open.
-- The keyring drift check is #171 and the drain, snapshot and root filesystem signals are #173, both open.
+- The keyring drift check, the drain health signal, the snapshot-recency signal and the root filesystem signal are built and deployed by `scripts/deploy-mail.sh` with the cron lines from `scripts/cron-apply.sh`.
 
 ## Provision a member
 
@@ -38,6 +39,8 @@ Provisioning is manual today. The service that will take it over is covered in t
 		doas passwd <username>
 
    `add-user.sh` creates the OS account with `/sbin/nologin` as its shell and an empty Maildir at `/home/<username>/Maildir`. The account starts with no password, which is why `passwd` follows.
+
+   It also sets the account's 5 GB allowance, and joins it to the `members` group that the sshd configuration matches for sftp and git. If either is missing on the box it prints a note instead of failing, because neither is needed for mail: `doas ksh scripts/quota-apply.sh --enable` turns quotas on, and `doas ksh scripts/deploy-mail.sh` creates the group. An account created before either ran needs `doas usermod -G members <username>` and `doas ksh scripts/quota-apply.sh <username>`.
 
 2. Publish the member's public key. Put their ASCII-armored key at `keys/<localpart>.asc`, commit it, and deploy.
 
@@ -62,7 +65,7 @@ Provisioning is manual today. The service that will take it over is covered in t
 
 Do not give the account a shell. `chsh -s /bin/ksh <username>` undoes the platform's central safety property. The operator account is the one exception, and `deploy-mail.sh` flips it back to `/bin/ksh` on every run.
 
-The per-member hosting design in #154 adds three things to this path when it lands: the `members` group on the account, the generated `httpd` and `gmid` include lines for the site, and the quota entry. `scripts/add-user.sh` does none of them today.
+The per-member hosting design in #154 adds three things to this path: membership of the `members` group, the generated `httpd` and `gmid` include lines for the site, and the quota entry. Two of the three are scripted now, and `add-user.sh` does them. The third is the include line for a member's own vhost, which `scripts/cron-apply.sh --web` rewrites from `/etc/httpd.d` and `/etc/gmid.d` once member sites exist.
 
 ## Provision through the onboarding service
 

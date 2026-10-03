@@ -18,6 +18,8 @@
 
 set -euo pipefail
 
+script_dir=$(cd "$(dirname "$0")" && pwd)
+
 if [ "$#" -ne 1 ]; then
 	printf 'usage: %s <username>\n' "$0" >&2
 	exit 2
@@ -41,8 +43,21 @@ fi
 # flag, and base has no getent — so pin the path rather than look it up).
 # -s forces nologin; -g =uid gives a fresh matching uid/gid (one OS user per
 # person — clean per-user isolation for Maildir and git).
+#
+# Membership of the members group is what sshd matches to give a member the
+# chrooted sftp server and git-shell and nothing more (openbsd/etc/sshd_config).
+# deploy-mail.sh creates that group, so a box that has not run it since this was
+# written has none, and an account without the membership is still a working mail
+# account. Say so rather than failing: mail is the account's first job.
 home="/home/$user"
-useradd -m -d "$home" -s /sbin/nologin -g =uid "$user"
+if getent group members >/dev/null 2>&1; then
+	useradd -m -d "$home" -s /sbin/nologin -g =uid -G members "$user"
+else
+	useradd -m -d "$home" -s /sbin/nologin -g =uid "$user"
+	printf 'note: no members group, so %s has no sftp or git access yet.\n' "$user" >&2
+	printf '  doas ksh scripts/deploy-mail.sh   # creates the group\n' >&2
+	printf '  doas usermod -G members %s\n' "$user" >&2
+fi
 
 # The Maildir root as well as its subdirectories. Dovecot creates
 # dovecot-uidlist and its index files in the root, and install -d creates
@@ -56,6 +71,19 @@ done
 
 owner=$(stat -f '%Su' "$home/Maildir")
 [ "$owner" = "$user" ] || { printf 'Maildir root owned by %s, not %s\n' "$owner" "$user" >&2; exit 1; }
+
+# The 5 GB allowance the site promises for this account, across mail, web and git.
+# Exit 3 means quotas are not on for the mount yet, which is a state rather than a
+# failure of provisioning: the account is usable, and its allowance follows when
+# scripts/quota-apply.sh --enable has been run. Any other failure is reported and
+# the account is still left usable, because delivery does not depend on the quota.
+if ! quota_out=$(ksh "$script_dir/quota-apply.sh" "$user" 2>&1); then
+	rc=$?
+	case $rc in
+	3) printf 'note: %s\n' "$quota_out" >&2 ;;
+	*) printf 'warning: the allowance was not set: %s\n' "$quota_out" >&2 ;;
+	esac
+fi
 
 printf 'created %s (shell /sbin/nologin, Maildir %s/Maildir)\n' "$user" "$home"
 printf 'next: set password (doas passwd %s) and sync %s.asc into the keyring\n' \
