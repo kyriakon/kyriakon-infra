@@ -493,13 +493,27 @@ if [ -n "$ip" ]; then
 		# is compared against the head of the configured list, which lib.sh
 		# leaves in dnsbl_zones, and a downgrade is reported once per change of
 		# zone rather than every hour.
-		zone=${verdict#clean }
+		zone=$(printf '%s' "$verdict" | awk '{print $2}')
 		# shellcheck disable=SC2154 # dnsbl_zones is set by lib.sh when sourced
 		strongest=${dnsbl_zones%% *}
+		# Why the strongest list was skipped decides what to say, and lib.sh
+		# records it in the verdict. A zone that answered with a refusal is a
+		# policy aimed at this resolver and nothing here is broken; a zone that
+		# said nothing at all is this box's DNS. Sending the reader to check
+		# unbound for the first is what this alert did on 2026-10-03, to an
+		# operator whose unbound was answering everything else.
+		skipped=$(printf '%s' "$verdict" | sed -n 's/.*\[skipped: //p' | sed 's/\]$//')
+		first_zone=${skipped%%=*}
+		reason=${skipped#*=}
+		reason=${reason%% *}
 		if [ "$zone" != "$strongest" ]; then
-			if [ "$(cat "$state/dnsbl.downgraded" 2>/dev/null || true)" != "$zone" ]; then
-				alert "blocklist downgraded" "$ip is clean on $zone only; $strongest did not answer. The strongest list is the one that matters for deliverability, so a listing there would go unnoticed. Check that unbound is running on this box: rcctl check unbound"
-				printf '%s\n' "$zone" > "$state/dnsbl.downgraded"
+			if [ "$(cat "$state/dnsbl.downgraded" 2>/dev/null || true)" != "$zone:$reason" ]; then
+				if [ "$first_zone" = "$strongest" ] && [ "$reason" = refused ]; then
+					alert "blocklist downgraded" "$ip is clean on $zone only; $strongest refused the query, which is its answer to a resolver it will not serve rather than a listing, and nothing on this box needs fixing for it. A listing on $strongest would go unnoticed until it answers"
+				else
+					alert "blocklist downgraded" "$ip is clean on $zone only; $strongest did not answer. The strongest list is the one that matters for deliverability, so a listing there would go unnoticed. Check that unbound is running on this box: rcctl check unbound"
+				fi
+				printf '%s\n' "$zone:$reason" > "$state/dnsbl.downgraded"
 			fi
 		else
 			rm -f "$state/dnsbl.downgraded"
@@ -512,7 +526,7 @@ if [ -n "$ip" ]; then
 		# existed, mailing an alert every cooldown. Report the transition, stay
 		# quiet while it persists, and speak again if it clears and returns.
 		if [ "$(cat "$state/dnsbl.unchecked" 2>/dev/null || true)" != "$verdict" ]; then
-			alert "blocklist check" "$verdict for $ip, so a listing would go unnoticed. Every configured zone refused, which points at DNS on this box rather than at the lists"
+			alert "blocklist check" "$verdict for $ip, so a listing would go unnoticed. refused above means the zone answered and will not serve this resolver; silent means it said nothing at all, which is DNS on this box"
 			printf '%s\n' "$verdict" > "$state/dnsbl.unchecked"
 		fi
 		;;
