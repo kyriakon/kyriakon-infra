@@ -259,8 +259,15 @@ cmd_enable() {
 	if [ "$(quotas_state)" = on ]; then
 		printf 'the quota file for %s is in place; running quotaon anyway\n' "$mount"
 	fi
+	# -u: user quotas only. The fstab line carries userquota and no groupquota, because
+	# every account already has its own group of the same name (add-user.sh passes
+	# -g =uid), so a group quota would be a second mechanism measuring the same thing.
+	# Without -u, quotaon asks for both and prints "group quotas using
+	# /home/quota.group: No such file or directory" before turning user quotas on.
+	# /etc/rc runs `quotaon -a` the same way at boot, so that one line in the boot log
+	# is expected and harmless: the same call still reports user quotas turned on.
 	printf 'running quotaon on %s\n' "$mount"
-	if quotaon -v "$mount"; then
+	if quotaon -u -v "$mount"; then
 		printf 'quotaon reported success\n'
 	else
 		printf 'quotaon exited non-zero. It does that when quotas are already enabled,\n'
