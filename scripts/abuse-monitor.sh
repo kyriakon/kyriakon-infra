@@ -68,6 +68,85 @@ fi
 # shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
 . "$script_dir/lib.sh"
 
+newest_snapshot_epoch() {
+	# Reads `restic snapshots --json` on stdin and prints the newest snapshot time
+	# as an epoch, or nothing if none can be read.
+	#
+	# restic writes each time as RFC3339. The form depends on the zone the snapshot
+	# was taken in: this box is UTC and restic gives it as
+	# "2026-10-01T13:00:09.510876011Z", while a machine in a named zone gets a
+	# numeric offset, which can be written +02:00 or +0200. date -j -f takes %z as
+	# Z, +hhmm or +hh:mm, so the fraction is dropped, Z becomes +0000, and an
+	# offset with a colon loses it.
+	typeset newest time epoch
+	newest=""
+	# The value is taken by matching around it rather than by field position: restic
+	# prints each object on its own line today, but nothing in the format promises
+	# that, and a field number that reads the key instead of the value would parse
+	# as empty and silence the check.
+	for time in $(awk 'match($0, /"time":"[^"]+"/) { print substr($0, RSTART + 8, RLENGTH - 9) }' 2>/dev/null || true); do
+		time=$(printf '%s' "$time" | sed 's/\.[0-9]*//; s/Z$/+0000/; s/\([+-][0-9][0-9]\):\([0-9][0-9]\)$/\1\2/')
+		epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$time" +%s 2>/dev/null || true)
+		[ -n "$epoch" ] || continue
+		if [ -z "$newest" ] || [ "$epoch" -gt "$newest" ]; then
+			newest="$epoch"
+		fi
+	done
+	[ -n "$newest" ] && printf '%s' "$newest"
+	return 0
+}
+
+self_test() {
+	typeset fails=0
+	check() {
+		if [ "$2" = "$3" ]; then
+			printf '  ok   %s\n' "$1"
+		else
+			printf '  FAIL %s: expected [%s], got [%s]\n' "$1" "$3" "$2"
+			fails=$((fails + 1))
+		fi
+	}
+	# Two groups, the newer one with the larger time, and the older listed first:
+	# the shape that produced the false "364 hours old".
+	two_groups='{"snapshots":[
+	{"time":"2026-09-18T14:42:12.000000000Z","paths":["/home"]},
+	{"time":"2026-10-03T02:30:01.000000000Z","paths":["/etc/mail","/home"]}]}'
+	expect=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "2026-10-03T02:30:01+0000" +%s)
+	check "the newest of two groups is chosen" \
+		"$(printf '%s' "$two_groups" | newest_snapshot_epoch)" "$expect"
+
+	# One group, both stale: the newest of them is still what is reported.
+	both_old='{"snapshots":[
+	{"time":"2026-09-18T14:42:12.000000000Z"},
+	{"time":"2026-09-19T02:30:01.000000000Z"}]}'
+	expect_old=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "2026-09-19T02:30:01+0000" +%s)
+	check "an all-stale repository reports its newest" \
+		"$(printf '%s' "$both_old" | newest_snapshot_epoch)" "$expect_old"
+
+	# A named-zone offset, which restic writes off this box.
+	offset='{"snapshots":[{"time":"2026-10-03T04:30:01.000000000+02:00"}]}'
+	check "a numeric offset parses" \
+		"$(printf '%s' "$offset" | newest_snapshot_epoch)" "$expect"
+
+	check "nothing to parse prints nothing" \
+		"$(printf '%s' '' | newest_snapshot_epoch)" ""
+
+	if [ "$fails" -eq 0 ]; then
+		printf 'self-test: all checks passed\n'
+	else
+		printf 'self-test: %s failed\n' "$fails" >&2
+		exit 1
+	fi
+}
+
+# --self-test runs the parse checks and leaves, before any signal reads a log or
+# writes state, so it is safe to run as an unprivileged user on any machine.
+if [ "${1:-}" = "--self-test" ]; then
+	self_test
+	exit 0
+fi
+
+
 maillog="${MAILLOG:-/var/log/maillog}"
 authlog="${AUTHLOG:-/var/log/authlog}"
 state="${STATE_DIR:-/var/db/kyriakon-monitor}"
@@ -441,6 +520,14 @@ fi
 # run or by the storage box being slow does not alert, and a missed night does.
 # Nothing in the dogfood window can fit this, since it holds one snapshot per
 # night and no failure.
+#
+# The trap this check fell into on 2026-10-03: --latest 1 returns the latest
+# snapshot per group, and a group here is a host and a set of paths. Adding
+# /etc/mail to the payload made a second group, so the listing held one snapshot
+# from the old payload and one from the new, and taking the first time reported
+# the old one's age as if it were the newest. It alerted "364 hours old" while
+# the newest snapshot was eighteen hours old. The newest across everything is
+# the answer, whatever the grouping does.
 if [ -n "${RESTIC_REPOSITORY:-}" ] && [ -n "${RESTIC_PASSWORD_FILE:-}" ]; then
 	: "${RESTIC_CACHE_DIR:=/root/.cache/restic}"
 	export RESTIC_CACHE_DIR
@@ -449,13 +536,8 @@ if [ -n "${RESTIC_REPOSITORY:-}" ] && [ -n "${RESTIC_PASSWORD_FILE:-}" ]; then
 	# "2026-10-01T13:00:09.510876011Z", while a machine in a named zone gets a
 	# numeric offset instead. date -j -f takes %z as Z, +hhmm or +hh:mm and not
 	# as a fraction, so the fraction is dropped and Z is turned into +0000.
-	snap_time=$(restic snapshots --latest 1 --json --no-lock 2>/dev/null \
-		| awk -F'"' '/"time"/ { print $4; exit }' || true)
-	snap_time=$(printf '%s' "$snap_time" | sed 's/\.[0-9]*//; s/Z$/+0000/')
-	snap_epoch=""
-	if [ -n "$snap_time" ]; then
-		snap_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$snap_time" +%s 2>/dev/null || true)
-	fi
+	snap_epoch=$(restic snapshots --latest 1 --json --no-lock 2>/dev/null \
+		| newest_snapshot_epoch || true)
 	if [ -z "$snap_epoch" ]; then
 		# The repository could not be read, which is not the same finding as an
 		# old snapshot and must not be reported every hour as if it were. Report
