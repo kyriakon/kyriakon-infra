@@ -10,11 +10,18 @@ Every command runs on the mail box as root unless the step says otherwise. `doas
 
 Three paths appear throughout:
 
-- `/root/src/kyriakon-infra` is the box's checkout. Update it with `cd /root/src/kyriakon-infra && git pull --ff-only`.
+- `/usr/local/src/kyriakon-infra` is the box's checkout. It is owned by root and readable by everyone, so the operator can read it and run what is in it through `doas` without a root login, while root stays the only account that can change it. Update it with `doas git -C /usr/local/src/kyriakon-infra pull --ff-only`.
+
+  A box whose checkout is still under `/root` cannot be read by the operator at all, because `/root` is mode 0700. Move it once:
+
+		doas install -d -m 0755 -o root -g wheel /usr/local/src
+		doas mv /root/src/kyriakon-infra /usr/local/src/kyriakon-infra
+		doas chown -R root:wheel /usr/local/src/kyriakon-infra
+		ls /usr/local/src/kyriakon-infra   # as the operator, this should list
 - `/root/bin` holds the copies that cron runs. `scripts/deploy-mail.sh` installs `lib.sh`, `abuse-monitor.sh`, `backup.sh`, `renew-acme.sh` and `restore-standup.sh` there, and `scripts/cron-apply.sh` writes the crontab lines that call them.
 - `/root/.kyriakon-env` holds the box's values, mode 0600, one `export VAR=value` per line. `scripts/setup-env.sh` installs and merges it, and every cron line sources it, so no value is typed twice.
 
-Deploy the configuration with `doas ksh scripts/deploy-mail.sh` from the checkout. It is idempotent, it installs the mail and web configuration, it rebuilds the Dovecot plugin and the encryptor, it installs every `keys/*.asc` into the keyring, and it restarts the daemons. It prints the firewall and `sshd_config` steps instead of taking them, because both are propose-only changes that a human applies.
+Deploy the configuration with `doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-mail.sh`. It is idempotent, it installs the mail and web configuration, it rebuilds the Dovecot plugin and the encryptor, it installs every `keys/*.asc` into the keyring, and it restarts the daemons. It prints the firewall and `sshd_config` steps instead of taking them, because both are propose-only changes that a human applies.
 
 Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box without changing anything. It reports permission drift against mtree, the blocklist verdict for the box's address, whether a cron job can still reach the tools it needs, whether the finger service is intact, and whether the terraform guard and the restore snapshot are still in place. It exits non-zero when something is wrong.
 
@@ -40,11 +47,12 @@ Provisioning is manual today. The service that will take it over is covered in t
 
    `add-user.sh` creates the OS account with `/sbin/nologin` as its shell and an empty Maildir at `/home/<username>/Maildir`. The account starts with no password, which is why `passwd` follows.
 
-   It also sets the account's 5 GB allowance, and joins it to the `members` group that the sshd configuration matches for sftp and git. If either is missing on the box it prints a note instead of failing, because neither is needed for mail: `doas ksh scripts/quota-apply.sh --enable` turns quotas on, and `doas ksh scripts/deploy-mail.sh` creates the group. An account created before either ran needs `doas usermod -G members <username>` and `doas ksh scripts/quota-apply.sh <username>`.
+   It also sets the account's 5 GB allowance, and joins it to the `members` group that the sshd configuration matches for sftp and git. `doas ksh scripts/quota-apply.sh --clear <username>` removes an account's allowance and leaves everything else about it alone, where an account without a limit is unlimited: that is the way to exempt one account from the 5 GB, not a way to stop it using disk. If either is missing on the box it prints a note instead of failing, because neither is needed for mail: `doas ksh scripts/quota-apply.sh --enable` turns quotas on, and `doas ksh scripts/deploy-mail.sh` creates the group. An account created before either ran needs `doas usermod -G members <username>` and `doas ksh scripts/quota-apply.sh <username>`.
 
 2. Publish the member's public key. Put their ASCII-armored key at `keys/<localpart>.asc`, commit it, and deploy.
 
-		cd /root/src/kyriakon-infra && git pull --ff-only && doas ksh scripts/deploy-mail.sh
+		doas git -C /usr/local/src/kyriakon-infra pull --ff-only
+		doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-mail.sh
 
    Delivery reads the keyring per message, so an account with no usable key bounces inbound mail immediately instead of queueing it.
 
@@ -91,7 +99,8 @@ To replace a key by hand, before the service is built:
 
 1. Put the new public key in `keys/<localpart>.asc` and deploy.
 
-		cd /root/src/kyriakon-infra && git pull --ff-only && doas ksh scripts/deploy-mail.sh
+		doas git -C /usr/local/src/kyriakon-infra pull --ff-only
+		doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-mail.sh
 
 2. Check the deployed key.
 
@@ -407,7 +416,8 @@ A rotation that keeps sending unbroken needs a second selector, because a messag
 
 3. Point the signing filter at the new selector in `openbsd/etc/smtpd.conf`, deploy both files, and wait for the new record to be served. The zone's default TTL is 3600 seconds.
 
-		cd /root/src/kyriakon-infra && git pull --ff-only && doas ksh scripts/deploy-nsd.sh
+		doas git -C /usr/local/src/kyriakon-infra pull --ff-only
+		doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-nsd.sh
 		doas ksh scripts/deploy-mail.sh
 		doas dig +short @ns1.he.net <newselector>._domainkey.kyriakon.net TXT
 

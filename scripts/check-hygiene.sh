@@ -186,7 +186,7 @@ fi
 #
 # The path is a variable rather than hardcoded, because the box's checkout is not where
 # the repo's own instructions assume and a wrong path reads exactly like a missing guard.
-repo_root="${KYRIAKON_REPO:-/root/src/kyriakon-infra}"
+repo_root="${KYRIAKON_REPO:-/usr/local/src/kyriakon-infra}"
 tf_dir="$repo_root/terraform"
 if grep -q 'prevent_destroy[[:space:]]*=[[:space:]]*true' "$tf_dir/main.tf" 2>/dev/null; then
 	printf 'terraform: the live root refuses to plan the removal of its server\n'

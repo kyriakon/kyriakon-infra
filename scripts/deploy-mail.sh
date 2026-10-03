@@ -8,7 +8,7 @@
 # Usage:
 #   doas ksh deploy-mail.sh [repo_dir]
 #
-#   repo_dir   checkout to install from; defaults to /root/src/kyriakon-infra
+#   repo_dir   checkout to install from; defaults to /usr/local/src/kyriakon-infra
 #
 # Idempotent. Re-running reinstalls the configs, rebuilds the two components,
 # and restarts what is already running. It:
@@ -28,7 +28,7 @@
 
 set -euo pipefail
 
-repo_dir="${1:-/root/src/kyriakon-infra}"
+repo_dir="${1:-/usr/local/src/kyriakon-infra}"
 
 # Everything this installs lives under /usr/local, and doas, cron and rcctl all
 # hand over a minimal PATH, so set it explicitly instead of trusting the caller.
