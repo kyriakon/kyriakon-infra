@@ -10,6 +10,7 @@
 #   doas ksh scripts/quota-apply.sh --enable        turn quotas on for the mount
 #   doas ksh scripts/quota-apply.sh <username>      set the standard allowance
 #   doas ksh scripts/quota-apply.sh --all           set it on every member
+#   doas ksh scripts/quota-apply.sh --clear <name>  remove one account's allowance
 #   doas ksh scripts/quota-apply.sh --show          report the state, change nothing
 #   ksh scripts/quota-apply.sh --self-test          check the logic against stubs
 #
@@ -23,6 +24,11 @@
 # edquota(8) counts kilobytes, and "setting a quota to zero indicates that no quota
 # should be imposed", which is why an account with no limits set is unaffected by
 # quotas being switched on.
+#
+# Clearing an account is setting both of its limits to zero on this same path, so the
+# account keeps every file and nothing is enforced against it. That is for exempting
+# one account from the published 5 GB, not for stopping one: an account that must stop
+# using disk is the lifecycle's suspension, not a quota.
 #
 # The grace period is one week, the default from MAX_DQ_TIME; `edquota -t` shows it
 # and writes it explicitly. A member past the soft limit has that week to delete
@@ -67,6 +73,7 @@ usage: quota-apply.sh --enable | <username> | --all | --show | --self-test
                 quotaon, and report what the box will do at the next boot
   <username>    set the standard allowance on one account and read it back
   --all         the same for every member account (no shell, home on the mount)
+  --clear <name>  set that account's limits back to zero, which is no quota at all
   --show        report quotas and per-account limits, change nothing
   --self-test   exercise the fstab, filter and read-back logic against stubs
 USAGE
@@ -204,6 +211,20 @@ set_limits() {
 		die "$user reads back as soft $soft_read hard $hard_read, not soft $soft_kb hard $hard_kb. The edquota file format may have changed; check by hand with: doas edquota $user"
 	fi
 	printf '%s: soft %s KB, hard %s KB (read back from quota)\n' "$user" "$soft_read" "$hard_read"
+}
+
+# Clearing is the same write with zeroes, so it goes through the same filter and the
+# same read-back: a clear that did not take must fail as loudly as a set that did not.
+clear_limits() {
+	typeset soft_save hard_save
+	[ "$#" -eq 1 ] || die "usage: $0 --clear <username>"
+	soft_save=$soft_kb
+	hard_save=$hard_kb
+	soft_kb=0
+	hard_kb=0
+	set_limits "$1"
+	soft_kb=$soft_save
+	hard_kb=$hard_save
 }
 
 # --- modes ----------------------------------------------------------------
@@ -383,6 +404,26 @@ EOF
 	check "quotas off exits 3" "$rc" "3"
 	: > "$mount/quota.user"
 
+	# 5b. clearing: the same filter with zeroes, and the read-back agreeing.
+	cat > "$work/sample2" <<EOF
+Quotas for user member:
+$test_mount: KBytes in use: 412980, limits (soft = 5242880, hard = 5767168)
+		inodes in use: 1234, limits (soft = 0, hard = 0)
+EOF
+	QUOTA_SOFT_KB=0 QUOTA_HARD_KB=0 EDITOR_MOUNT="$test_mount" "$work/filter" "$work/sample2"
+	check "clearing writes zero limits" \
+		"$(awk -v m="$test_mount" '$0 ~ "^" m ":" { print $0 }' "$work/sample2" | sed 's/.*limits/limits/')" \
+		"limits (soft = 0, hard = 0)"
+
+	STUB_SOFT=0
+	STUB_HARD=0
+	export STUB_SOFT STUB_HARD
+	set +e
+	( clear_limits member ) >/dev/null 2>&1
+	rc=$?
+	set -e
+	check "clearing an account exits 0 when read back as zero" "$rc" "0"
+
 	# 6. the state probe, which is how --enable and --show ask the question that
 	#    OpenBSD's quotaon cannot answer for them.
 	STUB_NONE=1
@@ -402,6 +443,7 @@ EOF
 case "${1:-}" in
 --enable) cmd_enable ;;
 --all) cmd_all ;;
+--clear) [ "$#" -eq 2 ] || usage; clear_limits "$2" ;;
 --show) cmd_show ;;
 --self-test) self_test ;;
 "") usage ;;

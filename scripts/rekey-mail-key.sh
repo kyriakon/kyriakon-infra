@@ -170,7 +170,7 @@ printf '       git add %s\n' "$published"
 printf '       git commit -m "fix(mail): drop AEAD from the published key so clients can read delivery"\n'
 printf '       git push\n'
 printf '  2. on the box, deploy it:\n'
-printf '       cd /root/src/kyriakon-infra && git pull --ff-only && doas ksh scripts/deploy-mail.sh\n'
+printf '       cd /usr/local/src/kyriakon-infra && git pull --ff-only && doas ksh scripts/deploy-mail.sh\n'
 printf '     the keyring section must install %s with no AEAD warning\n' "${published##*/}"
 printf '  3. on the box, encrypt the way the daemon does and check the packet shape:\n'
 printf '       echo test | doas gpg --batch --no-tty --no-options --encrypt --armor \\\n'
