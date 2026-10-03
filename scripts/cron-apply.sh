@@ -1,10 +1,23 @@
 #!/bin/ksh
-# cron-apply.sh — put this repo's cron lines into root's crontab.
+# cron-apply.sh - apply this repo's pending on-box state.
+#
+# Two jobs, because they run on different clocks.
+#
+#   1. Root's crontab lines for the scheduled scripts (the default mode).
+#   2. The generated vhost indexes that httpd.conf and gmid.conf include, from
+#      the per-member files the signup path has written (--web).
 #
 # Runs ON the box as root:
 #
 #   doas ksh scripts/cron-apply.sh --check                # show the diff, write nothing
 #   doas ksh scripts/cron-apply.sh                        # add what is missing
+#   doas ksh scripts/cron-apply.sh --web --check           # show the index diff
+#   doas ksh scripts/cron-apply.sh --web                  # rewrite the indexes, reload
+#
+# The crontab half runs once, when a scheduled script or its line changes. The
+# web half runs whenever member files may have appeared, which is the drain's
+# pass, and it is batched: see the note above regen_index.
+#
 # The restore test has no box of its own to schedule on: restore-standup.sh runs
 # here and creates one for the minutes the test takes.
 #
@@ -46,11 +59,13 @@ set -euo pipefail
 umask 077
 
 check_only=no
+web_only=no
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 	--check) check_only=yes ;;
+	--web) web_only=yes ;;
 	*)
-		printf 'usage: doas ksh %s [--check]\n' "$0" >&2
+		printf 'usage: doas ksh %s [--web] [--check]\n' "$0" >&2
 		exit 2
 		;;
 	esac
@@ -81,7 +96,116 @@ die() {
 	exit 1
 }
 
-[ "$(id -u)" -eq 0 ] || die "run this with doas: it writes root's crontab"
+[ "$(id -u)" -eq 0 ] || die "run this with doas: it writes root's crontab and the generated vhost indexes"
+
+# --- the generated vhost indexes (--web) ------------------------------------
+#
+# httpd.conf and gmid.conf each carry an include of a generated index, and the
+# index lists one file per member, because no daemon in this stack can include a
+# directory: include opens a single path with fopen, and a directory path is read
+# as nothing rather than refused. The signup path writes the member files; this
+# rewrites the indexes and tells the daemons, and it does the whole directory in
+# one pass.
+#
+# One pass is the point. Both rc.d scripts here can be reloaded: rc.subr's reload
+# action runs the script's configtest and then sends rc_reload_signal, which
+# defaults to HUP, and httpd(8) and gmid(8) each document SIGHUP as a reread of
+# the configuration. So a batch of vhost changes costs one action per daemon
+# rather than one per member, and nothing already connected is dropped. Only the
+# daemon whose index changed is reloaded, and the configtest runs before the
+# signal, so a bad member file leaves the running configuration alone.
+#
+# The order is member file, then index, then reload. The index never lists a file
+# that is not there, because the drain writes each member file with
+# temp-then-rename and this reads the directory. A file that appears after the
+# index rewrite waits for the next pass, which is the harmless direction.
+
+httpd_d=/etc/httpd.d
+gmid_d=/etc/gmid.d
+httpd_conf=/etc/httpd.conf
+gmid_conf=/etc/gmid.conf
+
+# regen_index <dir>: rebuild <dir>/index.conf from the member files present.
+# Returns 1 when the index already matches, so the caller skips the reload.
+regen_index() {
+	dir="$1"
+	index="$dir/index.conf"
+	work="$index.$$"
+	: >"$work"
+	for f in "$dir"/*.conf; do
+		[ -e "$f" ] || continue
+		[ "$f" = "$index" ] && continue
+		printf 'include "%s"\n' "$f" >>"$work"
+	done
+	if [ -f "$index" ] && cmp -s "$work" "$index"; then
+		rm -f "$work"
+		return 1
+	fi
+	if [ "$check_only" = yes ]; then
+		printf '\n--- %s ---\n' "$index"
+		if [ -f "$index" ]; then
+			diff -u "$index" "$work" || true
+		else
+			cat "$work"
+		fi
+		rm -f "$work"
+		return 0
+	fi
+	# The index that works is kept until both configs have been checked, so a pass
+	# that produces an unparseable one leaves the box with something it can start
+	# from rather than nothing.
+	if [ -f "$index" ]; then
+		cp -p "$index" "$index.saved.$$"
+	fi
+	chmod 0644 "$work"
+	mv "$work" "$index"
+	return 0
+}
+
+restore_indexes() {
+	for f in "$httpd_d/index.conf.saved.$$" "$gmid_d/index.conf.saved.$$"; do
+		[ -f "$f" ] || continue
+		mv "$f" "${f%.saved."$$"}"
+	done
+}
+
+apply_web() {
+	changed=""
+	regen_index "$httpd_d" && changed="$changed httpd"
+	regen_index "$gmid_d" && changed="$changed gmid"
+	if [ -z "$changed" ]; then
+		printf 'vhost indexes: nothing to change, nothing reloaded\n'
+		return 0
+	fi
+	printf 'vhost indexes to rewrite:%s\n' "$changed"
+	if [ "$check_only" = yes ]; then
+		printf '\n--check: nothing was written and nothing was reloaded.\n'
+		return 0
+	fi
+	# Check both configs before either reload. rcctl runs the same configtest, but
+	# doing it here names the failing file while both daemons are still serving.
+	if ! httpd -n -f "$httpd_conf"; then
+		restore_indexes
+		die "${httpd_conf} does not check, so the running configuration was left alone"
+	fi
+	if ! gmid -n -c "$gmid_conf"; then
+		restore_indexes
+		die "${gmid_conf} does not check, so the running configuration was left alone"
+	fi
+	for d in $changed; do
+		case "$d" in
+		httpd) rcctl reload httpd || die "rcctl reload httpd failed" ;;
+		gmid) rcctl reload gmid || die "rcctl reload gmid failed" ;;
+		esac
+	done
+	rm -f "$httpd_d/index.conf.saved.$$" "$gmid_d/index.conf.saved.$$"
+	printf 'reloaded:%s\n' "$changed"
+}
+
+if [ "$web_only" = yes ]; then
+	apply_web
+	exit 0
+fi
 
 current=$(crontab -l 2>/dev/null || true)
 

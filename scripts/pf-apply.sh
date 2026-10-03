@@ -119,6 +119,26 @@ EOF
 	printf 'gemini:       to be added\n'
 fi
 
+# --- git over ssh -----------------------------------------------------------
+# Members push to their pass repositories over ssh on 2222. The chroot on the
+# sftp path is what forces the split (see openbsd/etc/sshd_config), so this is a
+# new inbound service rather than more of the ssh already allowed on 22, and it
+# needs its own rule. Logged, like the rest, so a probe is attributable in pflog
+# instead of invisible. No max-src-conn: sshd's own MaxStartups bounds what a
+# source can open before authentication.
+if grep -q 'to any port 2222$' "$pf_conf"; then
+	printf 'git:          already in %s\n' "$pf_conf"
+else
+	cat >>"$work" <<'EOF'
+
+# --- kyriakon: git over ssh (openbsd/etc/sshd_config) ---
+pass in log on egress proto tcp to any port 2222
+# --- end kyriakon: git over ssh ---
+EOF
+	added=$((added + 1))
+	printf 'git:          to be added\n'
+fi
+
 # --- finger -----------------------------------------------------------------
 # fingerd is spawned by inetd rather than listening on its own, so the port has
 # to be opened here before the deploy's inetd line is reachable at all. Logged,
@@ -200,5 +220,5 @@ pfctl -f "$pf_conf"
 printf '\nbacked up as %s\n' "$bak"
 printf 'loaded %s\n\n' "$pf_conf"
 printf 'rules now loaded from these fragments:\n'
-pfctl -sr | grep -E 'divert-to 127\.0\.0\.1|spamd-white|nospamd|port = 1965|port = 79' | awk '{print "\t" $0}'
+pfctl -sr | grep -E 'divert-to 127\.0\.0\.1|spamd-white|nospamd|port = 1965|port = 2222|port = 79' | awk '{print "\t" $0}'
 printf '\nrevert with: pfctl -f %s\n' "$bak"
