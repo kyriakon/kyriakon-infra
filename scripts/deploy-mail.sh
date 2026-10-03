@@ -100,8 +100,16 @@ need_pkg helix
 # The blocklist check asks Spamhaus, and Spamhaus refuses to answer any resolver
 # serving more than one machine, which is every resolver a Hetzner box is handed.
 # A resolver on the box is what lets the strongest list answer rather than the
-# fallback zones carrying the verdict, so it is installed with everything else.
-need_pkg unbound
+# fallback zones carrying the verdict.
+#
+# unbound is part of the base system, not a package, so it is checked rather than
+# installed. This used to call need_pkg, which could never succeed and printed
+# "Can't find unbound" on every deploy: an error line that is not an error, in a
+# script whose failures have to be readable at a glance.
+[ -x /usr/sbin/unbound ] || {
+	printf 'unbound is missing from the base system\n' >&2
+	exit 1
+}
 start_service unbound
 
 command -v cargo >/dev/null || { printf 'cargo missing after pkg_add rust\n' >&2; exit 1; }
