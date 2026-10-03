@@ -68,6 +68,24 @@ fi
 # shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
 . "$script_dir/lib.sh"
 
+# A storm keeps a signal true for hours, and telling the operator the same thing
+# every hour is how an alert channel stops being read. These two are the ones a
+# stranger can hold true indefinitely: a source working through a list of
+# usernames, and a spamtrap campaign. Everything else fires on a condition that
+# has to be dealt with, so the shorter default suits it.
+cooldown_for() {
+	case "$1" in
+	"ssh guesses" | "spamd blocklist") printf '%s' "${STORM_COOLDOWN_MINUTES:-360}" ;;
+	*) printf '%s' "${alert_cooldown:-60}" ;;
+	esac
+}
+
+# Entries in the first list that are not in the second. Files rather than strings,
+# so a caller can hand it a state file and a fresh dump.
+new_entries() {
+	awk 'NR == FNR { old[$0] = 1; next } NF && !($0 in old) { print }' "$2" "$1"
+}
+
 newest_snapshot_epoch() {
 	# Reads `restic snapshots --json` on stdin and prints the newest snapshot time
 	# as an epoch, or nothing if none can be read.
@@ -98,6 +116,8 @@ newest_snapshot_epoch() {
 
 self_test() {
 	typeset fails=0
+	work=$(mktemp -d "${TMPDIR:-/tmp}/kyriakon-monitor-test.XXXXXX")
+	trap 'rm -rf "$work"' EXIT
 	check() {
 		if [ "$2" = "$3" ]; then
 			printf '  ok   %s\n' "$1"
@@ -131,6 +151,19 @@ self_test() {
 	check "nothing to parse prints nothing" \
 		"$(printf '%s' '' | newest_snapshot_epoch)" ""
 
+	# The trap diff: one new entry is churn and has to stay quiet, several at once
+	# is the burst the signal is for.
+	printf '%s\n' '10.0.0.1' '10.0.0.2' '10.0.0.3' > "$work/old"
+	printf '%s\n' '10.0.0.1' '10.0.0.2' '10.0.0.3' '10.0.0.9' > "$work/new1"
+	check "one new trap entry is seen" "$(new_entries "$work/new1" "$work/old" | tr '\n' ' ')" "10.0.0.9 "
+	printf '%s\n' '10.0.0.1' '10.0.0.2' '10.0.0.3' '10.0.0.9' '10.0.0.10' '10.0.0.11' > "$work/new3"
+	check "three new trap entries are seen" "$(new_entries "$work/new3" "$work/old" | grep -c .)" "3"
+	check "an unchanged list has none" "$(new_entries "$work/old" "$work/old" | grep -c .)" "0"
+
+	# The cooldown two signals get for being holdable by a stranger.
+	check "a storm signal waits six hours" "$(cooldown_for "ssh guesses")" "360"
+	check "an ordinary signal waits the default hour" "$(cooldown_for "quota")" "60"
+
 	if [ "$fails" -eq 0 ]; then
 		printf 'self-test: all checks passed\n'
 	else
@@ -157,6 +190,8 @@ mail_spike_max="${MAIL_SPIKE_MAX:-50}"
 auth_fail_max="${AUTH_FAIL_MAX:-300}"
 quota_warn_pct="${QUOTA_WARN_PCT:-80}"
 grey_max="${GREY_MAX:-100}"
+trapped_rise_min="${TRAPPED_RISE_MIN:-3}"
+trapped_max="${TRAPPED_MAX:-20}"
 defer_min="${DEFER_MIN:-6}"
 daemon_log="${DAEMONLOG:-/var/log/daemon}"
 onboard_dir="${ONBOARD_DIR:-/var/db/kyriakon-onboard}"
@@ -185,7 +220,7 @@ alert() {
 	last_file="$state/alert.last.$(printf '%s' "$title" | tr 'A-Z ' 'a-z-' | tr -cd 'a-z0-9-')"
 	last=0
 	[ -f "$last_file" ] && last=$(cat "$last_file")
-	if [ "$(( now - last ))" -lt "$(( alert_cooldown * 60 ))" ]; then
+	if [ "$(( now - last ))" -lt "$(( $(cooldown_for "$title") * 60 ))" ]; then
 		return 0
 	fi
 	printf '%s\n' "$now" > "$last_file"
@@ -364,14 +399,26 @@ trapped=$(printf '%s\n' "$spamdb_out" | grep -c '^TRAPPED|' || true)
 if [ "$grey" -gt "$grey_max" ]; then
 	alert "spamd greylist" "$grey greylisted hosts (max $grey_max), possible mail flood"
 fi
-prev_trapped=0
-if [ -f "$state/spamd-trapped" ]; then
-	prev_trapped=$(cat "$state/spamd-trapped")
-	if [ "$trapped" -gt "$prev_trapped" ]; then
-		alert "spamd blocklist" "$(( trapped - prev_trapped )) new blacklisted host(s), total $trapped"
+# Thresholds 3 new and 20 total. Trap entries carry an expiry, so the count rises
+# and falls by one all day as hosts come and go, which is churn and not news: this
+# alerted hourly on it until 2026-10-03, always "1 new, total 6". A burst of three
+# at once, or a total that has grown past where ordinary churn sits, is the event
+# worth a mail. The new hosts are named, because a legitimate sender caught in the
+# trap is the case a person has to recognise rather than a number.
+trapped_list=$(printf '%s\n' "$spamdb_out" | awk -F'|' '/^TRAPPED\|/ { print $2 }')
+work_trapped=$(mktemp "${TMPDIR:-/tmp}/kyriakon-trapped.XXXXXX")
+printf '%s\n' "$trapped_list" > "$work_trapped"
+if [ -f "$state/spamd-trapped-list" ]; then
+	new_trapped=$(new_entries "$work_trapped" "$state/spamd-trapped-list")
+	new_count=$(printf '%s\n' "$new_trapped" | grep -c . || true)
+	if [ "$new_count" -ge "$trapped_rise_min" ] || [ "$trapped" -ge "$trapped_max" ]; then
+		named=$(printf '%s\n' "$new_trapped" | head -5 | tr '\n' ' ')
+		alert "spamd blocklist" "$new_count new blacklisted host(s), total $trapped (burst at $trapped_rise_min, total at $trapped_max): $named"
 	fi
 fi
+rm -f "$work_trapped"
 printf '%s\n' "$trapped" > "$state/spamd-trapped"
+printf '%s\n' "$trapped_list" > "$state/spamd-trapped-list"
 
 # --- 5. senders deferred from several addresses --------------------------
 # Greylisting promotes an address only when a retry arrives for the same tuple,
