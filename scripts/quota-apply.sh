@@ -160,29 +160,42 @@ member_accounts() {
 editor_filter() {
 	cat <<'FILTER'
 #!/bin/ksh
+# edquota hands the editor its temporary file and writes back whatever is left
+# there. This filter rewrites the limits, and keeps a copy of what it was given and
+# what it left, because that is the only way to tell a write that did not take from
+# a kernel that has not noticed a write that did.
 file="$1"
+[ -n "${EDITOR_DUMP_DIR:-}" ] || { printf 'EDITOR_DUMP_DIR is not set\n' >&2; exit 1; }
+cp -p "$file" "$EDITOR_DUMP_DIR/received" 2>/dev/null || true
 grep -q "^$EDITOR_MOUNT:" "$file" ||
 	{ printf 'no line for %s in %s\n' "$EDITOR_MOUNT" "$file" >&2; exit 1; }
 tmp="$file.kyriakon"
 awk -v m="$EDITOR_MOUNT" -v soft="$QUOTA_SOFT_KB" -v hard="$QUOTA_HARD_KB" '
-	$0 ~ ("^" m ":") {
-		sub(/limits \(soft = [0-9]+, hard = [0-9]+\)/,
-		    "limits (soft = " soft ", hard = " hard ")")
-	}
+	$0 ~ ("^" m ":") { sub(/limits.*/, "limits (soft = " soft ", hard = " hard ")") }
 	{ print }
 ' "$file" > "$tmp" && mv "$tmp" "$file"
+cp -p "$file" "$EDITOR_DUMP_DIR/after" 2>/dev/null || true
 FILTER
 }
 
-# quota(1), verbose, in the classic BSD layout:
-#   Filesystem  blocks  quota  limit  grace  files  quota  limit  grace
-#   /home       412980  5242880 5767168       1234   0      0
+# The limits as they stand in a dump of edquota's file. One field at a time, so a
+# caller can compare each against what it asked for.
+dump_limit() {
+	awk -v m="$mount" -v want="$2" '
+		$0 ~ ("^" m ":") {
+			if (match($0, /soft = [0-9]+/)) s = substr($0, RSTART + 7, RLENGTH - 7)
+			if (match($0, /hard = [0-9]+/)) h = substr($0, RSTART + 7, RLENGTH - 7)
+			print (want == 1 ? s : h)
+			exit
+		}' "$1"
+}
+
 read_limits() {
 	quota -v -u "$1" 2>/dev/null | awk -v m="$mount" '$1 == m { print $3, $4; exit }'
 }
 
 set_limits() {
-	typeset user home filter read soft_read hard_read
+	typeset user home diag filter soft_read hard_read read
 	user="$1"
 	home=$(account_home "$user")
 	[ -n "$home" ] || die "$user is not in $passwd_file"
@@ -197,25 +210,41 @@ set_limits() {
 		exit 3
 	}
 
-	filter=$(mktemp "${TMPDIR:-/tmp}/kyriakon-quota-editor.XXXXXX")
+	# The dump directory holds what the editor was given and what it left, so a run
+	# that goes wrong can be read afterwards rather than guessed at. It is removed on
+	# success and kept on failure, where the message names it.
+	diag=$(mktemp -d "${TMPDIR:-/tmp}/kyriakon-quota-diag.XXXXXX")
+	chmod 0700 "$diag"
+	filter="$diag/editor"
 	editor_filter > "$filter"
 	chmod 0700 "$filter"
 	trap 'rm -f "$filter"' EXIT
 
-	# The filter reads these from the environment, which edquota passes through.
 	QUOTA_SOFT_KB="$soft_kb" QUOTA_HARD_KB="$hard_kb" EDITOR_MOUNT="$mount" \
-		EDITOR="$filter" edquota -u "$user" ||
-		die "edquota failed for $user"
+		EDITOR_DUMP_DIR="$diag" EDITOR="$filter" edquota -u "$user" ||
+		die "edquota failed for $user, so nothing was written"
 
-	read=$(read_limits "$user")
-	[ -n "$read" ] ||
-		die "set the allowance for $user but quota -v -u $user does not list $mount, so nothing can be confirmed"
-	soft_read=$(printf '%s' "$read" | awk '{ print $1 }')
-	hard_read=$(printf '%s' "$read" | awk '{ print $2 }')
+	# What the editor left is what edquota writes back, which makes it the thing to
+	# check. quota(1) reads through the kernel, and the kernel caches limits per user
+	# without noticing a write made in userland, so it can report the old figures for
+	# a write that worked. Checking the dump first keeps that from reading as failure.
+	[ -f "$diag/after" ] ||
+		die "edquota never ran the editor: there is no $diag/after, so nothing was written. Keep $diag and report it"
+	soft_read=$(dump_limit "$diag/after" 1)
+	hard_read=$(dump_limit "$diag/after" 2)
 	if [ "$soft_read" != "$soft_kb" ] || [ "$hard_read" != "$hard_kb" ]; then
-		die "$user reads back as soft $soft_read hard $hard_read, not soft $soft_kb hard $hard_kb. The edquota file format may have changed; check by hand with: doas edquota $user"
+		die "the editor left soft $soft_read hard $hard_read for $mount, not soft $soft_kb hard $hard_kb. What it was given and what it left are both in $diag"
 	fi
-	printf '%s: soft %s KB, hard %s KB (read back from quota)\n' "$user" "$soft_read" "$hard_read"
+	printf '%s: soft %s KB, hard %s KB written to the quota file\n' "$user" "$soft_read" "$hard_read"
+
+	# Secondary, and a difference here is expected rather than a failure.
+	read=$(read_limits "$user")
+	if [ "$read" != "$soft_kb $hard_kb" ]; then
+		printf 'note: quota -v -u %s reports "%s" until the kernel re-reads the quota file.\n' \
+			"$user" "$(if [ -n "$read" ]; then printf '%s' "$read"; else printf 'nothing'; fi)"
+		printf 'A reboot does it, and so should: doas quotaoff -v %s && doas quotaon -u -v %s\n' "$mount" "$mount"
+	fi
+	rm -rf "$diag"
 }
 
 # Clearing is the same write with zeroes, so it goes through the same filter and the
@@ -320,7 +349,7 @@ cmd_all() {
 }
 
 self_test() {
-	typeset work fails
+	typeset work fails filter rc out
 	work=$(mktemp -d "${TMPDIR:-/tmp}/kyriakon-quota-test.XXXXXX")
 	trap 'rm -rf "$work"' EXIT
 	fails=0
@@ -332,12 +361,21 @@ self_test() {
 			fails=$((fails + 1))
 		fi
 	}
+	limits_of() {
+		awk -v m="$1" '$0 ~ ("^" m ":")' "$2" 2>/dev/null | sed 's/.*limits/limits/'
+	}
+	sample() {
+		cat > "$1" <<EOF
+Quotas for user member:
+$test_mount: KBytes in use: 412980, limits (soft = $2, hard = $3)
+		inodes in use: 1234, limits (soft = 0, hard = 0)
+EOF
+	}
 
 	test_mount="$work/home"
 	mkdir -p "$test_mount"
 	: > "$test_mount/quota.user"
 
-	# A fixture fstab without the option, and a fixture passwd with one member.
 	cat > "$work/fstab" <<EOF
 aaa.a / ffs rw 1 1
 bbb.b $test_mount ffs rw,nodev,nosuid 1 2
@@ -347,15 +385,14 @@ root:*:0:0:daemon:/root:/bin/ksh
 oliver:*:1000:1000:operator:/home/oliver:/bin/ksh
 member:*:1001:1001:member:$test_mount/member:/sbin/nologin
 EOF
-	# Point the script's own variables at the fixtures. These are the same names
-	# the env supplies at startup, reassigned here so no test can touch the real
-	# /etc/fstab, /etc/passwd or /home.
+	# Point the script's own variables at the fixtures, so no check can touch the
+	# real fstab, passwd or mount.
 	fstab="$work/fstab"
 	passwd_file="$work/passwd"
 	mount="$test_mount"
 	quota_file="$mount/quota.user"
 
-	# 1. detection and patching
+	# 1. fstab detection and patching
 	check "fstab starts without userquota" "$(fstab_has_userquota && echo yes || echo no)" "no"
 	fstab_patch >/dev/null
 	check "fstab gains userquota" "$(fstab_has_userquota && echo yes || echo no)" "yes"
@@ -364,25 +401,32 @@ EOF
 	check "patching twice changes nothing" "$(cmp -s "$work/fstab" "$work/fstab.once" && echo same || echo differs)" "same"
 	check "the backup holds the original" "$(grep -c userquota "$work/fstab.kyriakon.bak")" "0"
 
-	# 2. the editor filter, driven the way edquota drives it
-	cat > "$work/sample" <<EOF
-Quotas for user member:
-$test_mount: KBytes in use: 412980, limits (soft = 0, hard = 0)
-		inodes in use: 1234, limits (soft = 0, hard = 0)
-EOF
+	# 2. the editor filter, driven the way edquota drives it, and the dumps it leaves
 	filter="$work/filter"
 	editor_filter > "$filter"
 	chmod 0700 "$filter"
+	mkdir -p "$work/d1"
+	sample "$work/sample1" 0 0
 	QUOTA_SOFT_KB=5242880 QUOTA_HARD_KB=5767168 EDITOR_MOUNT="$test_mount" \
-		"$filter" "$work/sample"
-	check "block limits rewritten" \
-		"$(awk -v m="$test_mount" '$0 ~ "^" m ":" { print $0 }' "$work/sample" | sed 's/.*limits/limits/')" \
-		"limits (soft = 5242880, hard = 5767168)"
-	check "inode line left alone" \
-		"$(sed -n '3p' "$work/sample" | sed 's/.*limits/limits/')" \
-		"limits (soft = 0, hard = 0)"
+		EDITOR_DUMP_DIR="$work/d1" "$filter" "$work/sample1"
+	check "the file edquota gets back carries the limits" \
+		"$(limits_of "$test_mount" "$work/d1/after")" "limits (soft = 5242880, hard = 5767168)"
+	check "what the editor received is kept" \
+		"$(limits_of "$test_mount" "$work/d1/received")" "limits (soft = 0, hard = 0)"
+	check "the inode line is left alone" \
+		"$(sed -n '3p' "$work/d1/after" | sed 's/.*limits/limits/')" "limits (soft = 0, hard = 0)"
 
-	# 3. the read-back, both ways round
+	mkdir -p "$work/d2"
+	sample "$work/sample2" 5242880 5767168
+	QUOTA_SOFT_KB=0 QUOTA_HARD_KB=0 EDITOR_MOUNT="$test_mount" \
+		EDITOR_DUMP_DIR="$work/d2" "$filter" "$work/sample2"
+	check "clearing writes zero limits" \
+		"$(limits_of "$test_mount" "$work/d2/after")" "limits (soft = 0, hard = 0)"
+
+	check "the soft limit is read from a dump" "$(dump_limit "$work/d1/after" 1)" "5242880"
+	check "the hard limit is read from a dump" "$(dump_limit "$work/d1/after" 2)" "5767168"
+
+	# 3. the stubs, and quota(1) reporting the kernel's view
 	mkdir -p "$work/bin"
 	cat > "$work/bin/quota" <<EOF
 #!/bin/ksh
@@ -396,27 +440,45 @@ printf '%s       412980  %s %s             1234       0       0\n' "$test_mount"
 EOF
 	chmod 0700 "$work/bin/quota"
 	PATH="$work/bin:$PATH"
-	check "read-back parses the limits" "$(read_limits member)" "5242880 5767168"
+	check "the kernel's view parses" "$(read_limits member)" "5242880 5767168"
 
-	# 4. a read-back that disagrees must fail the run, not pass quietly
+	# 4. the whole path, through an edquota stub that behaves like the real one
+	cat > "$work/bin/edquota" <<EOF
+#!/bin/ksh
+tmp="$work/edquota.tmp"
+cat > "\$tmp" <<'SAMPLE'
+Quotas for user member:
+$test_mount: KBytes in use: 412980, limits (soft = 0, hard = 0)
+		inodes in use: 1234, limits (soft = 0, hard = 0)
+SAMPLE
+"\$EDITOR" "\$tmp" || exit 1
+cp "\$tmp" "$work/applied"
+EOF
+	chmod 0700 "$work/bin/edquota"
+	set +e
+	( set_limits member ) >/dev/null 2>&1
+	rc=$?
+	set -e
+	check "setting an allowance succeeds" "$rc" "0"
+	check "and edquota applied the new limits" \
+		"$(limits_of "$test_mount" "$work/applied")" "limits (soft = 5242880, hard = 5767168)"
+
+	# 4b. an edquota that never runs the editor says so instead of passing
 	cat > "$work/bin/edquota" <<'EOF'
 #!/bin/ksh
 exit 0
 EOF
 	chmod 0700 "$work/bin/edquota"
-	STUB_SOFT=0
-	STUB_HARD=0
-	export STUB_SOFT STUB_HARD
 	set +e
 	( set_limits member ) > "$work/err.txt" 2>&1
 	rc=$?
 	set -e
 	out=$(cat "$work/err.txt")
-	check "a limit that did not take exits 1" "$rc" "1"
-	check "and says what it read" "$(printf '%s' "$out" | grep -c 'reads back as soft 0 hard 0')" "1"
+	check "an editor that never ran exits 1" "$rc" "1"
+	check "and the message names it" "$(printf '%s' "$out" | grep -c 'never ran the editor')" "1"
+	check "and says nothing was written" "$(printf '%s' "$out" | grep -c 'so nothing was written')" "1"
 
-	# 5. the contract add-user.sh branches on: quotas off is exit 3, a state, and
-	#    not the same thing as a failed run.
+	# 5. quotas off is exit 3, a state rather than a failure
 	rm -f "$mount/quota.user"
 	set +e
 	( set_limits member ) >/dev/null 2>&1
@@ -425,28 +487,7 @@ EOF
 	check "quotas off exits 3" "$rc" "3"
 	: > "$mount/quota.user"
 
-	# 5b. clearing: the same filter with zeroes, and the read-back agreeing.
-	cat > "$work/sample2" <<EOF
-Quotas for user member:
-$test_mount: KBytes in use: 412980, limits (soft = 5242880, hard = 5767168)
-		inodes in use: 1234, limits (soft = 0, hard = 0)
-EOF
-	QUOTA_SOFT_KB=0 QUOTA_HARD_KB=0 EDITOR_MOUNT="$test_mount" "$work/filter" "$work/sample2"
-	check "clearing writes zero limits" \
-		"$(awk -v m="$test_mount" '$0 ~ "^" m ":" { print $0 }' "$work/sample2" | sed 's/.*limits/limits/')" \
-		"limits (soft = 0, hard = 0)"
-
-	STUB_SOFT=0
-	STUB_HARD=0
-	export STUB_SOFT STUB_HARD
-	set +e
-	( clear_limits member ) >/dev/null 2>&1
-	rc=$?
-	set -e
-	check "clearing an account exits 0 when read back as zero" "$rc" "0"
-
-	# 6. the state probe, which is how --enable and --show ask the question that
-	#    OpenBSD's quotaon cannot answer for them.
+	# 6. the state probe
 	STUB_NONE=1
 	export STUB_NONE
 	check "quota reporting none reads as off" "$(quotas_state)" "off"
