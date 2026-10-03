@@ -18,6 +18,10 @@
 #
 #   export ALERT_EMAIL='you@example.invalid'                   # off-box alert address
 #   export HEALTHCHECKS_URL='https://hc-ping.com/<uuid>'       # dead-man's switch
+# check-keyring-drift.sh has its own check, with a daily period. It cannot be
+# HEALTHCHECKS_URL above: that period belongs to the fifteen-minute monitor, and a
+# second, daily pinger would make its liveness say nothing.
+#   export KEYRING_HEALTHCHECKS_URL='https://hc-ping.com/<uuid>'
 #   export RESTIC_REPOSITORY='sftp://<user>@<host>:23/<repo>'
 #   export RESTIC_PASSWORD_FILE='/root/.restic-pass'
 #   export HCLOUD_TOKEN='...'                                  # restore-standup.sh
@@ -54,8 +58,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
-needed_scripts="abuse-monitor.sh renew-acme.sh backup.sh restore-standup.sh"
-needed_vars="ALERT_EMAIL HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL"
+needed_scripts="abuse-monitor.sh check-keyring-drift.sh renew-acme.sh backup.sh restore-standup.sh"
+needed_vars="ALERT_EMAIL HEALTHCHECKS_URL KEYRING_HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL"
 
 # The crontab line for one script. Built per script rather than as one block: a
 # block would duplicate the lines of scripts that are already
@@ -64,6 +68,7 @@ needed_vars="ALERT_EMAIL HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE
 line_for() {
 	case "$1" in
 	abuse-monitor.sh) printf '*/15 * * * * . /root/.kyriakon-env; /root/bin/abuse-monitor.sh\n' ;;
+	check-keyring-drift.sh) printf '0 4 * * * . /root/.kyriakon-env; /root/bin/check-keyring-drift.sh --box\n' ;;
 	renew-acme.sh) printf '0 3 * * * . /root/.kyriakon-env; /root/bin/renew-acme.sh\n' ;;
 	backup.sh) printf '30 2 * * * . /root/.kyriakon-env; /root/bin/backup.sh\n' ;;
 	restore-standup.sh) printf '45 3 * * 0 . /root/.kyriakon-env; /root/bin/restore-standup.sh\n' ;;
