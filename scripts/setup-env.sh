@@ -6,7 +6,8 @@
 #   doas ksh scripts/setup-env.sh                       # install the template, report what is unfilled
 #   doas ksh scripts/setup-env.sh --ipv4 ... --ipv6 ... --tsig-secret ... \
 #        --restic-repository ... --restic-password-file ... \
-#        --alert-email ... --healthchecks-url ... --rehearsal-healthchecks-url ...
+#        --alert-email ... --healthchecks-url ... --keyring-healthchecks-url ... \
+#        --rehearsal-healthchecks-url ...
 #
 # With no arguments it installs the repo template if the file is absent and
 # reports what still needs filling in. With arguments, and the file already
@@ -34,16 +35,17 @@ script_dir="$(dirname "$0")"
 template="${KYRIAKON_ENV_TEMPLATE:-$script_dir/../openbsd/etc/kyriakon.env}"
 env_dst="${KYRIAKON_ENV:-/root/.kyriakon-env}"
 
-vars="KYRIAKON_IPV4 KYRIAKON_IPV6 KYRIAKON_TSIG_SECRET RESTIC_REPOSITORY RESTIC_PASSWORD_FILE ALERT_EMAIL HEALTHCHECKS_URL REHEARSAL_HEALTHCHECKS_URL HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL"
+vars="KYRIAKON_IPV4 KYRIAKON_IPV6 KYRIAKON_TSIG_SECRET RESTIC_REPOSITORY RESTIC_PASSWORD_FILE ALERT_EMAIL HEALTHCHECKS_URL KEYRING_HEALTHCHECKS_URL REHEARSAL_HEALTHCHECKS_URL HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL"
 
 usage() {
 	cat >&2 <<'EOF'
 usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
                              --restic-repository D --restic-password-file E
                              --alert-email F --healthchecks-url G
-                             --rehearsal-healthchecks-url H
-                             --hcloud-token I --restore-test-repository J
-                             --restore-test-healthchecks-url K]
+                             --keyring-healthchecks-url H
+                             --rehearsal-healthchecks-url I
+                             --hcloud-token J --restore-test-repository K
+                             --restore-test-healthchecks-url L]
 
   No arguments: install the template if /root/.kyriakon-env is absent, then
   report which values are still missing or placeholders.
@@ -52,7 +54,7 @@ usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
   what it had, comments and the PATH block included. This is how a box that is
   already deployed is given a value it did not have.
 
-  All eleven arguments, no file: write it from them, mode 0600. All or nothing
+  All twelve arguments, no file: write it from them, mode 0600. All or nothing
   when creating one, and each value is checked before anything is written.
 
     doas ksh scripts/setup-env.sh \
@@ -77,6 +79,7 @@ a_repo=
 a_pass=
 a_email=
 a_hc=
+a_keyring_hc=
 a_reh=
 a_hcloud=
 a_restrepo=
@@ -91,6 +94,7 @@ while [ "$#" -gt 0 ]; do
 	--restic-password-file) a_pass="$2" ;;
 	--alert-email) a_email="$2" ;;
 	--healthchecks-url) a_hc="$2" ;;
+	--keyring-healthchecks-url) a_keyring_hc="$2" ;;
 	--rehearsal-healthchecks-url) a_reh="$2" ;;
 	--hcloud-token) a_hcloud="$2" ;;
 	--restore-test-repository) a_restrepo="$2" ;;
@@ -101,7 +105,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 given=0
-for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_reh" "$a_hcloud" "$a_restrepo" "$a_resthc"; do
+for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_keyring_hc" "$a_reh" "$a_hcloud" "$a_restrepo" "$a_resthc"; do
 	if [ -n "$v" ]; then
 		given=$((given + 1))
 	fi
@@ -119,12 +123,13 @@ if [ "$given" -gt 0 ]; then
 		if [ -z "$a_pass" ]; then missing="$missing RESTIC_PASSWORD_FILE"; fi
 		if [ -z "$a_email" ]; then missing="$missing ALERT_EMAIL"; fi
 		if [ -z "$a_hc" ]; then missing="$missing HEALTHCHECKS_URL"; fi
+		if [ -z "$a_keyring_hc" ]; then missing="$missing KEYRING_HEALTHCHECKS_URL"; fi
 		if [ -z "$a_reh" ]; then missing="$missing REHEARSAL_HEALTHCHECKS_URL"; fi
 		if [ -z "$a_hcloud" ]; then missing="$missing HCLOUD_TOKEN"; fi
 		if [ -z "$a_restrepo" ]; then missing="$missing RESTORE_TEST_REPOSITORY"; fi
 		if [ -z "$a_resthc" ]; then missing="$missing RESTORE_TEST_HEALTHCHECKS_URL"; fi
 		if [ -n "$missing" ]; then
-			printf 'setup-env: %s does not exist yet, so all eleven arguments are needed; missing:%s\n\n' "$env_dst" "$missing" >&2
+			printf 'setup-env: %s does not exist yet, so all twelve arguments are needed; missing:%s\n\n' "$env_dst" "$missing" >&2
 			usage
 		fi
 	fi
@@ -146,7 +151,7 @@ if [ "$given" -gt 0 ]; then
 		printf '%s' "$a_tsig" | grep -Eq '^[A-Za-z0-9+/=]+$' \
 			|| { printf 'setup-env: tsig-secret is not clean base64\n' >&2; exit 2; }
 	fi
-	for u in "$a_hc" "$a_reh" "$a_resthc"; do
+	for u in "$a_hc" "$a_keyring_hc" "$a_reh" "$a_resthc"; do
 		[ -n "$u" ] || continue
 		printf '%s' "$u" | grep -Eq '^https?://' \
 			|| { printf 'setup-env: not a URL: %s\n' "$u" >&2; exit 2; }
@@ -165,7 +170,7 @@ if [ "$given" -gt 0 ]; then
 	esac
 	# The file expresses values as single-quoted shell words, so a value
 	# containing a quote cannot be represented in it.
-	for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_reh" "$a_hcloud" "$a_restrepo" "$a_resthc"; do
+	for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_keyring_hc" "$a_reh" "$a_hcloud" "$a_restrepo" "$a_resthc"; do
 		case "$v" in
 		*"'"*) printf 'setup-env: a value contains a single quote, which this file cannot express\n' >&2; exit 2 ;;
 		esac
@@ -178,7 +183,8 @@ if [ "$given" -gt 0 ]; then
 		pairs=""
 		for kv in "KYRIAKON_IPV4=$a_ipv4" "KYRIAKON_IPV6=$a_ipv6" "KYRIAKON_TSIG_SECRET=$a_tsig" \
 			"RESTIC_REPOSITORY=$a_repo" "RESTIC_PASSWORD_FILE=$a_pass" "ALERT_EMAIL=$a_email" \
-			"HEALTHCHECKS_URL=$a_hc" "REHEARSAL_HEALTHCHECKS_URL=$a_reh" "HCLOUD_TOKEN=$a_hcloud" \
+			"HEALTHCHECKS_URL=$a_hc" "KEYRING_HEALTHCHECKS_URL=$a_keyring_hc" \
+			"REHEARSAL_HEALTHCHECKS_URL=$a_reh" "HCLOUD_TOKEN=$a_hcloud" \
 			"RESTORE_TEST_REPOSITORY=$a_restrepo" "RESTORE_TEST_HEALTHCHECKS_URL=$a_resthc"; do
 			case "$kv" in
 			*=) continue ;;
@@ -230,6 +236,7 @@ $kv"
 		printf "export RESTIC_PASSWORD_FILE='%s'\n" "$a_pass"
 		printf "export ALERT_EMAIL='%s'\n" "$a_email"
 		printf "export HEALTHCHECKS_URL='%s'\n" "$a_hc"
+		printf "export KEYRING_HEALTHCHECKS_URL='%s'\n" "$a_keyring_hc"
 		printf "export REHEARSAL_HEALTHCHECKS_URL='%s'\n" "$a_reh"
 		printf "export HCLOUD_TOKEN='%s'\n" "$a_hcloud"
 		printf "export RESTORE_TEST_REPOSITORY='%s'\n" "$a_restrepo"
@@ -253,7 +260,7 @@ placeholder=""
 for v in $vars; do
 	if ! grep -q "^export $v=" "$env_dst"; then
 		missing="$missing $v"
-	elif grep -q "^export $v='*REPLACE_ME" "$env_dst"; then
+	elif grep -q "^export $v='.*REPLACE_ME" "$env_dst"; then
 		placeholder="$placeholder $v"
 	fi
 done
