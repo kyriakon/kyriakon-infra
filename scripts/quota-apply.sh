@@ -117,11 +117,16 @@ fstab_patch() {
 
 # --- state ----------------------------------------------------------------
 
-# OpenBSD's quotaon has no -p flag to ask whether quotas are on, so the question is
-# put to quota(1) instead. With no quotas on the filesystem it prints a single line
-# ending "none"; with quotas on it prints the per-filesystem table. That is the only
-# observable difference, and it is why this prints a state rather than a yes or no:
-# a quota(1) that fails for another reason is unknown, not off.
+# OpenBSD's quotaon has no -p flag to ask whether quotas are on, so the question is put
+# to quota(1): with no quota file for the filesystem it prints a single line ending
+# "none", and with one it prints the per-filesystem table.
+#
+# What that cannot tell you is whether the kernel is enforcing right now, because
+# quota(1) reads the same file the kernel does. A quota file that quotacheck has just
+# created reads as "on" before any quotaon has run, which is why --enable attempts
+# quotaon whatever this says rather than using it to skip the step. Treat "on" as "the
+# file is in place", not as "enforcement is live": a reboot makes enforcement certain,
+# through check_quotas=YES.
 quotas_state() {
 	out=$(quota -v -u "$(first_account)" 2>&1) || { printf 'unknown'; return; }
 	case "$out" in
@@ -248,18 +253,26 @@ cmd_enable() {
 	# quotaon is attempted whenever the state is not already on. It exits non-zero
 	# when the filesystem is already enabled, which is not a failure, so the state is
 	# what decides rather than the exit code.
+	# Always attempted. Skipping it when the probe said "on" was wrong: the probe goes
+	# on seeing the quota file, which quotacheck has just created, so the enable would
+	# report success while doing nothing.
 	if [ "$(quotas_state)" = on ]; then
-		printf 'quotas are already on for %s\n' "$mount"
+		printf 'the quota file for %s is in place; running quotaon anyway\n' "$mount"
+	fi
+	printf 'running quotaon on %s\n' "$mount"
+	if quotaon -v "$mount"; then
+		printf 'quotaon reported success\n'
 	else
-		printf 'running quotaon on %s\n' "$mount"
-		quotaon -v "$mount" || printf 'quotaon exited non-zero; checking the state below\n'
+		printf 'quotaon exited non-zero. It does that when quotas are already enabled,\n'
+		printf 'which is not a failure here, so the state is checked below.\n'
 	fi
 
 	[ -f "$quota_file" ] || die "$quota_file still does not exist, so quotas are not on"
 	case "$(quotas_state)" in
-	on) printf 'confirmed: %s carries quotas\n' "$mount" ;;
+	on) printf 'the quota file exists and quota(1) lists %s. If quotaon succeeded above,\n' "$mount"
+	    printf 'enforcement is live now; the next boot makes it certain either way.\n' ;;
 	off) die "quotaon ran but quota -v -u $(first_account) still reports none. Check by hand: doas quota -v -u $(first_account)" ;;
-	*) printf 'could not confirm from quota(1); check by hand: doas repquota -u %s\n' "$mount" ;;
+	*) printf 'could not read the state from quota(1); check by hand: doas repquota -u %s\n' "$mount" ;;
 	esac
 	printf '\nquotas are on. Two things left:\n'
 	printf '  doas edquota -t              # confirm the grace period, one week by default\n'
@@ -278,7 +291,8 @@ cmd_show() {
 		printf 'fstab:   the %s line does NOT carry userquota, so quotas cannot be on\n' "$mount"
 	fi
 	printf 'quotafile: %s\n' "$(if [ -f "$quota_file" ]; then echo present; else echo missing; fi)"
-	printf 'quota state: %s (from quota -v -u %s)\n' "$(quotas_state)" "$(first_account)"
+	printf 'quota file on the mount: %s (quota -v -u %s says %s; this cannot show\n' "$(if [ -f "$quota_file" ]; then echo present; else echo missing; fi)" "$(first_account)" "$(quotas_state)"
+	printf 'whether the kernel is enforcing, which a reboot settles)\n'
 	printf 'repquota -u %s:\n' "$mount"
 	repquota -u "$mount" 2>&1 | sed 's/^/  /' || true
 	printf 'member accounts on %s:\n' "$mount"
