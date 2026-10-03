@@ -1,0 +1,9 @@
+[package]
+name = "keygen-spike"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pgp = { version = "0.20.0", features = ["wasm"] }
+rand = "0.8"
+smallvec = "1"
