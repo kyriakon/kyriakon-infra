@@ -1,0 +1,463 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Signup and account page, mock (throwaway)</title>
+<!--
+  Throwaway prototype for the wayfinder ticket "Prototype the application-to-provision
+  flow and the account page". Records the flow agreed in that ticket's grilling session.
+  Real copy, no styling framework, no external requests of any kind (the same rule the
+  real pages carry). Retired once the spec in docs/planning/specs/ is written from it.
+-->
+<style>
+  :root { --ink:#1b1b1b; --dim:#5d5d5d; --line:#d8d4cc; --bg:#fbfaf7; --accent:#7a4b1e; --warn:#8a3b12; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",serif; color:var(--ink); background:var(--bg); display:flex; }
+  nav { width:250px; min-height:100vh; padding:18px 14px; border-right:1px solid var(--line); background:#f4f1ea; position:sticky; top:0; align-self:flex-start; }
+  nav h1 { font-size:15px; margin:0 0 4px; }
+  nav p { font-size:12px; color:var(--dim); margin:0 0 14px; }
+  nav a { display:block; padding:5px 8px; font-size:13.5px; color:var(--ink); text-decoration:none; border-radius:4px; }
+  nav a:hover { background:#e7e2d7; }
+  nav a.on { background:var(--accent); color:#fff; }
+  nav .grp { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin:14px 0 4px; }
+  main { flex:1; padding:34px 44px 80px; max-width:820px; }
+  section { display:none; }
+  section.on { display:block; }
+  h2 { font-size:26px; margin:0 0 6px; }
+  h3 { font-size:17px; margin:26px 0 6px; }
+  .lede { color:var(--dim); margin:0 0 20px; }
+  .card { border:1px solid var(--line); background:#fff; border-radius:6px; padding:16px 18px; margin:14px 0; }
+  label { display:block; font-weight:600; font-size:14.5px; margin:16px 0 4px; }
+  label .opt { font-weight:400; color:var(--dim); }
+  input[type=text], input[type=password], textarea, select { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:4px; font:inherit; background:#fff; }
+  textarea { min-height:64px; }
+  .hint { font-size:13px; color:var(--dim); margin:4px 0 0; }
+  .btn { display:inline-block; background:var(--accent); color:#fff; padding:10px 18px; border-radius:5px; border:0; font:inherit; cursor:pointer; margin:18px 12px 0 0; }
+  .btn.alt { background:#fff; color:var(--ink); border:1px solid var(--line); }
+  .btn.no { background:#8a3b12; }
+  .tag { display:inline-block; font-size:12px; border:1px solid var(--line); border-radius:99px; padding:2px 9px; color:var(--dim); margin-left:6px; }
+  .warn { border-left:3px solid var(--warn); padding:6px 0 6px 12px; margin:14px 0; font-size:14.5px; }
+  .ok { border-left:3px solid #2f6b3a; padding:6px 0 6px 12px; margin:14px 0; font-size:14.5px; }
+  table { width:100%; border-collapse:collapse; margin:12px 0; font-size:14.5px; }
+  td { padding:7px 0; border-bottom:1px solid var(--line); vertical-align:top; }
+  td:first-child { color:var(--dim); width:210px; }
+  ul { margin:8px 0; padding-left:20px; }
+  li { margin:5px 0; }
+  .mail { border:1px solid var(--line); border-radius:6px; background:#fff; padding:0; overflow:hidden; }
+  .mail header { padding:12px 16px; border-bottom:1px solid var(--line); background:#f7f5f0; font-size:14px; }
+  .mail .body { padding:16px; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13.5px; }
+  .who { font-size:12px; text-transform:uppercase; letter-spacing:.07em; color:var(--dim); margin-bottom:2px; }
+</style>
+
+<nav>
+  <h1>Signup and account page</h1>
+  <p>Throwaway mock. Real copy. Click through every screen.</p>
+  <div class="grp">The applicant</div>
+  <a href="#landing">1. Hosting page</a>
+  <a href="#keycheck">2. Key check</a>
+  <a href="#form">3. Application</a>
+  <a href="#keys">4. Keys and walkthrough</a>
+  <a href="#submitted">5. Application received</a>
+  <a href="#status">6. Status link</a>
+  <div class="grp">The operator</div>
+  <a href="#approval">7. Approval email</a>
+  <a href="#decline">8. Decline email</a>
+  <div class="grp">Payment and live</div>
+  <a href="#pay">9. Payment, card</a>
+  <a href="#prepaid">10. Payment, cash and Monero</a>
+  <a href="#live">11. Account live</a>
+  <div class="grp">The account page</div>
+  <a href="#account">12. Status</a>
+  <a href="#keys2">13. Key rotation</a>
+  <a href="#close">14. Closing</a>
+</nav>
+
+<main>
+
+<section id="landing">
+  <h2>Mail, a website and git repositories, for Orthodox Christians and their parishes</h2>
+  <p class="lede">£20 a year, or nothing at all if you are clergy, a monastic, or unable to pay. Say so on the form and that is the end of it. A parish that wants its own domain, or several addresses, should write to us.</p>
+  <div class="card">
+    <h3>Secure encrypted mail</h3>
+    <p>Your mail is encrypted to your own key the moment it arrives. The server holds ciphertext and no key, so we cannot read your messages, and no request, order or fault on our side changes that. The cost is that if you lose your key and your recovery phrase, the mail is gone: nobody here can restore it. Keep the two in different places.</p>
+    <h3>A website and a capsule</h3>
+    <p>Your own site at <span class="mono">yourname.kyriakon.net</span>, uploaded over sftp on port 22. A gemini capsule at the same name if you want one. Your `pass` repositories over ssh on port 2222.</p>
+    <h3>What you get, and its limits</h3>
+    <ul>
+      <li>5 GB, across mail, site and repositories together.</li>
+      <li>One server, one operator. We make no uptime promise.</li>
+      <li>You can cancel within 14 days of paying and be refunded in full.</li>
+      <li>If you close your account your data is deleted. Copies in backups expire within about seven months.</li>
+      <li>Our <a href="#landing">threat model</a> and <a href="#landing">refusals</a> say what we will not do.</li>
+    </ul>
+    <button class="btn" onclick="go('form')">Apply</button>
+    <button class="btn alt" onclick="go('keycheck')">Check a key you already have</button>
+  </div>
+</section>
+
+<section id="keycheck">
+  <h2>Does your key work here?</h2>
+  <p class="lede">Paste your public key. The check runs in your browser and nothing is sent to us.</p>
+  <div class="card">
+    <label>Your public key <span class="opt">(the file ending .asc, or the block starting BEGIN PGP PUBLIC KEY BLOCK)</span></label>
+    <textarea class="mono" placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----"></textarea>
+    <button class="btn">Check</button>
+    <div class="ok">
+      <strong>This key will work.</strong> It has an encryption subkey, it asks for no AEAD cipher, and it is not expired.
+    </div>
+    <p class="hint">Example of the other two answers:</p>
+    <div class="warn">
+      <strong>Your mail would be unreadable.</strong> This key asks for an AEAD cipher (packet tag 20). GnuPG will use it when we encrypt to you and some mail clients cannot open the result. Ask your client to remove AEAD from the key's preferred ciphers, or make a new key with the generator on the application page.
+    </div>
+    <div class="warn">
+      <strong>There is no encryption subkey.</strong> This key can sign but cannot be encrypted to, so mail to you would be refused at our end rather than delivered. Make a key with an encryption subkey.
+    </div>
+    <div class="warn">
+      <strong>This key has expired, or its encryption subkey has.</strong> A key that has run out cannot receive mail, and a subkey can run out while the rest of the key still looks usable. Either extend it in your mail program, or make a new key with the generator and tell us the new one.
+    </div>
+  </div>
+</section>
+
+<section id="form">
+  <h2>Apply</h2>
+  <p class="lede">A person reads every application. Nothing here is charged until it is approved.</p>
+  <div class="card">
+    <h3>You</h3>
+    <label>Username <span class="opt">(lowercase letters, digits and hyphens, up to 31)</span></label>
+    <input type="text" value="frseraphim">
+    <p class="hint">Available. This becomes your address, <span class="mono">frseraphim@kyriakon.net</span>, and your site, <span class="mono">frseraphim.kyriakon.net</span>. The names the platform uses itself are held back, so <span class="mono">mail</span>, <span class="mono">www</span>, <span class="mono">kleio</span>, <span class="mono">press</span> and <span class="mono">signup</span> are not available, and a web address in this namespace is a username in it too.</p>
+    <label>An address outside this platform <span class="opt">(optional)</span></label>
+    <input type="text" value="someone@example.invalid">
+    <p class="hint">We write here as well as to your new address, including if the account is ever in trouble, and if this address bounces we hold on longer before doing anything final. It is used for notices only, it is never shared, and we never use it to look you up anywhere else. You can add or remove one from your account page at any time.</p>
+    <p class="hint"><strong>If you leave it empty,</strong> we can only reach you inside this account. If you lose your key or your mail client, you will not hear from us, and an unpaid account will still lapse and in time be deleted, with the mail. Nothing else changes.</p>
+    <p><input type="checkbox"> I understand that we can only reach me inside this account.</p>
+    <label>Mail password <span class="opt">(you will type this in your mail client)</span></label>
+    <input type="password" value="hunter2hunter2">
+  </div>
+
+  <div class="card">
+    <h3>Your mail key</h3>
+    <label>Your public key</label>
+    <textarea class="mono" placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----"></textarea>
+    <p class="hint"><button class="btn alt" onclick="go('keys')">Make me a key</button> Opens the walkthrough: it generates a key in your browser, gives you a recovery phrase to write down, and tells you where to keep it.</p>
+    <label>Your upload key <span class="opt">(optional; needed for a website or repositories)</span></label>
+    <textarea class="mono" placeholder="ssh-ed25519 AAAA... "></textarea>
+  </div>
+
+  <div class="card">
+    <h3>How you will pay</h3>
+    <label>Choose one</label>
+    <select>
+      <option>Card, £20 a year, renews each year</option>
+      <option>Cash by post</option>
+      <option>Monero</option>
+      <option>I cannot pay, and would like an account without charge</option>
+    </select>
+    <p class="hint">Clergy, monastics, and anyone without the means to pay are not charged. There is nothing to prove and no means test: say so below and the same person who reviews the application decides it.</p>
+  </div>
+
+  <div class="card">
+    <h3>What to tell us about you</h3>
+    <p>These are the questions we would ask if you came to the door. <strong>All of this is optional.</strong> It goes to one person, it is not published, and it is deleted with your application. Answers here make approval quicker and more likely.</p>
+    <label>Diocese <span class="opt">(optional)</span></label>
+    <input type="text">
+    <label>Are you a priest, deacon, monk, nun, or a layman? <span class="opt">(optional)</span></label>
+    <input type="text">
+    <label>If you are a monk or a nun, do you have your elder's blessing to keep this account? <span class="opt">(required for monastics)</span></label>
+    <textarea placeholder="Who your elder is, and whether they have agreed."></textarea>
+    <label>If you are a layman, do you have your spiritual father's blessing to keep a website? <span class="opt">(optional; an email from him is enough)</span></label>
+    <textarea></textarea>
+    <label>If you are unable to pay and would like an account without charge, tell us here <span class="opt">(optional)</span></label>
+    <textarea></textarea>
+    <label>What do you hope to use this for? <span class="opt">(optional)</span></label>
+    <textarea placeholder="A parish site, my own writing, mail, repositories..."></textarea>
+    <label>Anything else <span class="opt">(optional)</span></label>
+    <textarea></textarea>
+  </div>
+
+  <div class="card">
+    <h3>Before you send</h3>
+    <p><input type="checkbox" checked> I accept the <a href="#form">terms</a>, the <a href="#form">acceptable use policy</a> and the <a href="#form">privacy notice</a>. <span class="tag">terms 2026-09-30, commit 1a2b3c4</span></p>
+    <button class="btn" onclick="go('submitted')">Send application</button>
+  </div>
+</section>
+
+<section id="keys">
+  <h2>Your keys</h2>
+  <p class="lede">Both keys are made here, in your browser. Nothing is sent anywhere until you copy the public parts into the application.</p>
+  <div class="card">
+    <h3>1. Your mail key</h3>
+    <p>This is the key your mail is encrypted to. Two things happen when you press the button:</p>
+    <ul>
+      <li>A key pair is made on your computer, using an algorithm your mail client supports.</li>
+      <li>You are given a recovery phrase of eight words. Write it down, on paper, now.</li>
+    </ul>
+    <button class="btn">Make my mail key</button>
+    <div class="ok">
+      <p><strong>Your recovery phrase, write it down:</strong></p>
+      <p class="mono" style="font-size:19px">harbour lantern thistle quarry almond vesper ridge marrow</p>
+      <p>Then download your key file:</p>
+      <button class="btn alt">Download my-mail-key.asc</button>
+      <p class="hint">The file is locked with that phrase. You need both, and you need them apart: the file on a disk or in your backups, the phrase on paper. Anyone who has both can read your mail. We have neither, which is why we cannot read it, and why nobody here can recover it for you.</p>
+      <label>Type three of the words back to be sure <span class="opt">(words 2, 5 and 7)</span></label>
+      <input type="text" placeholder="word 2, word 5, word 7">
+    </div>
+  </div>
+  <div class="card">
+    <h3>2. Your upload key</h3>
+    <p>This is what lets you put a website up and push to your repositories. It is not the mail key and it does not decrypt anything. Pressing this gives you a private key file and a public key to paste.</p>
+    <button class="btn">Make my upload key</button>
+    <p class="hint">Keep the private file somewhere safe: it is the only copy. We never see it, and the public half is all we get.</p>
+  </div>
+  <div class="card">
+    <h3>3. Put the mail key in your mail client</h3>
+    <p>Step by step, with pictures, for Thunderbird on a computer and Thunderbird on a phone: <a href="#keys">kyriakon.net/keys</a>.</p>
+    <p class="hint">When we have your account open we send you one message, encrypted. If you can read it, everything works. If you cannot, the walkthrough has a section for exactly that.</p>
+  </div>
+</section>
+
+<section id="submitted">
+  <h2>Thank you, that is with us</h2>
+  <div class="card">
+    <p>Your application is with one person, who reads every one. If you gave an address outside this platform you will hear back there. Either way, this link shows where it has got to, and it is what carries the payment step if you are approved:</p>
+    <p class="mono" style="font-size:16px">signup.kyriakon.net/status/KYR-4F2M-9QH7-XT3B</p>
+    <p class="hint">Keep it or print it. If you gave no other address, this is the only way we can tell you a decision, and it works until the application is cleared away, a week after a decision.</p>
+    <h3>What happens now</h3>
+    <ul>
+      <li><strong>Read.</strong> Usually within a few days, sometimes sooner.</li>
+      <li><strong>Approved.</strong> You get a link to pay, or a note that there is nothing to pay.</li>
+      <li><strong>Live.</strong> Your address starts accepting mail. Mail arriving before you have configured your client will sit there waiting, encrypted, and it will be readable once your client is set up.</li>
+      <li><strong>Site.</strong> Your certificate is requested once the account exists and usually arrives within a few hours. Until it does, your site does not answer at all: we do not serve a member site over plain HTTP, only the challenge that proves the domain is yours.</li>
+    </ul>
+    <p>If we cannot approve it, we will say so and tell you how to ask us to look again. Nothing is held for more than a week after we decide.</p>
+    <p class="hint">Your username is held for you while this is being read. If nothing is heard for a week, the application is deleted and the name is free again.</p>
+  </div>
+</section>
+
+<section id="status">
+  <h2>Where your application has got to</h2>
+  <p class="lede mono">signup.kyriakon.net/status/KYR-4F2M-9QH7-XT3B</p>
+  <div class="card">
+    <table>
+      <tr><td>Received</td><td>30 September 2026. A person reads every application. Nothing is charged yet.</td></tr>
+      <tr><td>Approved</td><td>1 October 2026. Your account is open: <span class="mono">frseraphim@kyriakon.net</span>, with mail working and its certificate requested, so the site answers once that arrives. What is left is payment.</td></tr>
+      <tr><td>Declined</td><td>We were not able to open an account, and we will look again if you ask us to.</td></tr>
+    </table>
+    <button class="btn" onclick="go('pay')">Pay £20</button>
+    <button class="btn alt" onclick="go('prepaid')">Cash or Monero</button>
+    <p class="hint">Anyone holding this link can read this page, so keep it as you would a password. It works until the application is cleared away, a week after a decision, and then the account page is where everything lives.</p>
+  </div>
+</section>
+
+<section id="approval">
+  <h2>The email you receive <span class="tag">operator view, signed one-click links</span></h2>
+  <div class="mail">
+    <header><div class="who">From</div>onboard@kyriakon.net<div class="who" style="margin-top:8px">Subject</div>Application: frseraphim</header>
+    <div class="body">
+      <p>Username <span class="mono">frseraphim</span><br>
+      Outside address <span class="mono">someone@example.invalid</span><br>
+      Rail chosen: card, £20 a year<br>
+      Free tier claimed: no<br>
+      Mail key check: works. Encryption subkey present, no AEAD, not expired.<br>
+      Upload key supplied: yes</p>
+      <p><strong>Diocese</strong><br>Diocese of Sourozh</p>
+      <p><strong>Orders</strong><br>Priest</p>
+      <p><strong>Monastic blessing</strong><br>n/a</p>
+      <p><strong>Spiritual father's blessing</strong><br>Yes, he knows and is glad of it.</p>
+      <p><strong>Unable to pay</strong><br>n/a</p>
+      <p><strong>Intended use</strong><br>A site for the parish, with the services and the calendar, and mail for me and the deacon.</p>
+      <p><strong>Anything else</strong><br>Fr John at the cathedral suggested I write.</p>
+      <p style="margin-top:18px">
+        <button class="btn">Approve, £20 a year</button>
+        <button class="btn">Approve, no charge</button>
+        <button class="btn no">Decline</button>
+      </p>
+      <p class="hint">These links are signed and work once. The same three actions are available as <span class="mono">onboardctl approve frseraphim</span> if you would rather do it from the box.</p>
+    </div>
+  </div>
+  <div class="card">
+    <p class="hint">The whole application is in this message so the decision can be made from a phone without opening a terminal. That means a stranger's words and their address sit in the operator's mailbox, which is itself on this box and encrypted to the operator's key.</p>
+  </div>
+</section>
+
+<section id="decline">
+  <h2>The decline, and the way back</h2>
+  <div class="mail">
+    <header><div class="who">From</div>admin@kyriakon.net<div class="who" style="margin-top:8px">Subject</div>Your application</header>
+    <div class="body">
+      <p>We are not able to open an account for you at the moment.</p>
+      <p>If you think we have this wrong, reply to this message. A word from your priest, or from someone we already know, usually settles it, and we are glad to look again.</p>
+      <p>We will hold the application for a week. After that it is deleted, with everything you wrote, and the username is free for anyone to take.</p>
+    </div>
+  </div>
+  <div class="card">
+    <p class="hint">A monastic application is the one case where the message names what is missing, because what is missing is a conversation: <em>"We have not been able to reach your elder. If you can ask him to write to us, or send us his blessing, we will look again."</em></p>
+    <p class="hint">No reason is given otherwise, the application is held seven days in case a word arrives, and then it is purged and the username released. Nothing about a declined application is kept beyond that week.</p>
+    <p class="hint">A member who gave no address outside the platform reads this on their status link instead, which is why that link is worth keeping. To have us look again they reply if we wrote to them, or write to <span class="mono">admin@kyriakon.net</span> from anywhere.</p>
+  </div>
+</section>
+
+<section id="pay">
+  <h2>Payment</h2>
+  <p class="lede">Approved. Your account exists and your address is already accepting mail; this is the last step.</p>
+  <div class="card">
+    <h3>Two things before you pay</h3>
+    <p><input type="checkbox" checked> I ask you to begin supplying the service immediately, and I understand that this is digital content supplied at once.</p>
+    <p class="hint">You keep the right to cancel within 14 days of paying and to be refunded in full. Asking for immediate supply does not take that away. <a href="#pay">How to cancel, and what happens.</a></p>
+    <h3>£20 for a year</h3>
+    <p>Payment is taken on Stripe's own page. Your card details never reach this server and we never see them.</p>
+    <button class="btn">Pay £20 on Stripe</button>
+    <p class="hint">Renews each year on this date. We email you before it renews, and you can stop it at any time from the account page.</p>
+  </div>
+  <div class="card">
+    <h3>After you pay</h3>
+    <p>You get a receipt with the wording you accepted, the version of each document, and the cancellation terms. If you close the tab before the confirmation page, the account is already open: payment is what opens it, not the page you are looking at.</p>
+  </div>
+</section>
+
+<section id="prepaid">
+  <h2>Cash and Monero</h2>
+  <p class="lede">Approved. Your account is open and mail is already being delivered. Your payment window is 14 days, shown on your account page.</p>
+  <div class="card">
+    <h3>Cash by post</h3>
+    <p>Put £20 and this token in an envelope:</p>
+    <p class="mono" style="font-size:18px">KYR-4F2M-9QH7-XT3B</p>
+    <p>Post it to the address on the account page. The token is how the money is matched to your account. Without it we cannot tell whose it is.</p>
+    <p class="hint">Cash is not refundable by card, so a refund means posting the money back. Nothing about your account is on the envelope and nothing on the envelope is kept after it is dealt with.</p>
+  </div>
+  <div class="card">
+    <h3>Monero</h3>
+    <p>Send the equivalent of £20 to this address:</p>
+    <p class="mono" style="font-size:14px">4A...your-subaddress...</p>
+    <p class="hint">This address is yours alone, which is how the payment is matched to your account. Monero wallets no longer attach the long payment identifiers this used to rely on, so the address itself carries the reference. Nothing else needs to go with the payment, and the account page shows it again if you lose this page.</p>
+  </div>
+  <div class="card">
+    <h3>If the money does not arrive in 14 days</h3>
+    <p>The account lapses: mail already delivered stays readable, your site stays up, and sending, uploading and pushing stop. Nothing is deleted at that point. Paying at any time brings it back. We email both of your addresses before and after it lapses, and if the outside address bounces we hold on longer.</p>
+  </div>
+</section>
+
+<section id="live">
+  <h2>Your account is live</h2>
+  <div class="card">
+    <table>
+      <tr><td>Your address</td><td class="mono">frseraphim@kyriakon.net</td></tr>
+      <tr><td>Mail sent to you</td><td>Encrypted to your key <span class="mono">…7C41 A9D2</span> as it arrives</td></tr>
+      <tr><td>Your site</td><td class="mono">frseraphim.kyriakon.net</td></tr>
+      <tr><td>Upload your site</td><td class="mono">sftp frseraphim@kyriakon.net</td> <span class="hint">(port 22, the default)</span></td></tr>
+      <tr><td>Repositories</td><td class="mono">ssh://frseraphim@kyriakon.net:2222/myrepo.git</td></tr>
+      <tr><td>Certificate</td><td>Requested. Usually a few hours; your site answers once it is issued.</td></tr>
+      <tr><td>Paid until</td><td>30 September 2027</td></tr>
+    </table>
+    <p><strong>The first message in your mailbox is encrypted.</strong> If you can read it, your setup works. If you cannot, nothing is lost: it is in <a href="#keys">the walkthrough</a>, under "it will not decrypt".</p>
+    <button class="btn" onclick="go('account')">Go to my account</button>
+  </div>
+</section>
+
+<section id="account">
+  <h2>Your account</h2>
+  <table>
+    <tr><td>State</td><td>Active</td></tr>
+    <tr><td>Paid until</td><td>30 September 2027 <span class="tag">renews yearly</span></td></tr>
+    <tr><td>Space used</td><td>412 MB of 5 GB <span class="hint">(mail, site and repositories together)</span></td></tr>
+    <tr><td>Mail</td><td>Working. Zero-access: we cannot read it.</td></tr>
+    <tr><td>Site</td><td class="mono">frseraphim.kyriakon.net</td> <span class="tag">serving</span></td></tr>
+    <tr><td>Capsule</td><td class="mono">gemini://frseraphim.kyriakon.net</td> <span class="tag">not set up</span></td></tr>
+    <tr><td>Certificate</td><td>Valid until 27 December 2026</td></tr>
+    <tr><td>Mail key fingerprint</td><td class="mono">…7C41 A9D2</td></tr>
+    <tr><td>Upload keys</td><td>1 key, added 30 September 2026</td></tr>
+    <tr><td>Notices also go to</td><td class="mono">someone@example.invalid</td></tr>
+  </table>
+
+  <h3>While you are unpaid</h3>
+  <div class="card">
+    <table>
+      <tr><td>State</td><td>Active, unpaid <span class="tag">14 days left</span></td></tr>
+      <tr><td>Paid until</td><td>Not paid yet. The window closes on 14 October 2026.</td></tr>
+      <tr><td>Your token</td><td class="mono">KYR-4F2M-9QH7-XT3B</td> <span class="hint">for the envelope, or for the payment</span></td></tr>
+      <tr><td>What works meanwhile</td><td>Mail arrives and you can read it, your site and capsule answer, uploads and pushes work. Nothing is held back while the money is in the post.</td></tr>
+      <tr><td>At the end of the window</td><td>The account lapses rather than closes. Mail you already have stays readable, your site stays up, and sending, uploading and pushing stop. Nothing is deleted, and paying at any time brings it back.</td></tr>
+    </table>
+    <p class="hint">Lapsed and suspended are the same page with different words in the first row and a different sentence about what stops. The notices list below is where the member sees what we have told them, and the closing page is where they end it themselves.</p>
+  </div>
+
+  <h3>Notices</h3>
+  <div class="card">
+    <table>
+      <tr><td>30 Sep 2026</td><td>Application approved, account opened.</td></tr>
+      <tr><td>30 Sep 2026</td><td>Payment received, £20, card. Paid until 30 Sep 2027.</td></tr>
+      <tr><td>30 Sep 2026</td><td>Certificate issued.</td></tr>
+    </table>
+    <p class="hint">Every notice we send you, at every address we have for you, is listed here with its date and what it said.</p>
+  </div>
+
+  <h3>What you can do here</h3>
+  <div class="card">
+    <ul>
+      <li><a href="#keys2">Replace my mail key</a>. Confirmed from your other address if you gave one, and with three days to change your mind either way.</li>
+      <li>Add or remove an upload key.</li>
+      <li>Add, change or remove the address we write to when something needs your attention.</li>
+      <li>Change my mail password.</li>
+      <li>Take my site down, or put it back. Mail is unaffected.</li>
+      <li>Stop the yearly renewal, which leaves the account running until the year is out.</li>
+      <li>Take everything out: your mail, your sites, your repositories.</li>
+      <li><a href="#close">Close the account</a>. Seven days, and you can stop it in that week.</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>What we cannot do</h3>
+    <p>Read your mail. Recover your key. Restore mail you deleted. Give you a shell. Change anything about your key except replacing the public half you send us.</p>
+  </div>
+</section>
+
+<section id="keys2">
+  <h2>Replacing your mail key</h2>
+  <div class="card">
+    <p>We are asking both of your addresses to confirm this, because a key change is how someone who has taken over a mailbox would read future mail.</p>
+    <table>
+      <tr><td>New key fingerprint</td><td class="mono">…B31E 4407</td></tr>
+      <tr><td>Confirmation</td><td>Waiting for <span class="mono">someone@example.invalid</span></td></tr>
+      <tr><td>Change happens</td><td>Friday 3 October, 09:14 <span class="tag">can be stopped until then</span></td></tr>
+      <tr><td>Mail until then</td><td>Still encrypted to the old key, <span class="mono">…7C41 A9D2</span></td></tr>
+    </table>
+    <button class="btn alt">Stop this change</button>
+    <p class="hint">Already have mail under the new key, signed by it? A signed request applies straight away with no waiting, because the old key cannot have been taken.</p>
+    <p class="hint">Nothing encrypted to the old key becomes readable with the new one. Keep the old private key if you want to read your history.</p>
+    <p class="hint">Gave no address outside the platform? The change waits the full three days and we warn you by mail encrypted to your old key, which only you can read. A request signed by your new key still applies at once.</p>
+  </div>
+</section>
+
+<section id="close">
+  <h2>Closing the account</h2>
+  <div class="card">
+    <p>You can close the account now, and stop it within seven days.</p>
+    <table>
+      <tr><td>Closing on</td><td>7 October 2026</td></tr>
+      <tr><td>Until then</td><td>Mail works as normal, and you can stop the closure from this page.</td></tr>
+      <tr><td>On that day</td><td>Mail stops being accepted, your site and capsule stop answering, the account is deleted. Your repositories are deleted with it.</td></tr>
+      <tr><td>Afterwards</td><td>Copies in our backups expire within about seven months. Your username is free again after 90 days.</td></tr>
+      <tr><td>Refund</td><td>Inside 14 days of payment, in full. After that, none: the year has been bought.</td></tr>
+    </table>
+    <p>Take a copy of everything first: <button class="btn alt">Take my data out</button></p>
+    <p class="hint">Your mail is stored here encrypted to your key, so what you get out is the ciphertext, readable with the key you already hold. Repositories and site files come out as they are.</p>
+    <button class="btn no">Close my account</button>
+  </div>
+</section>
+
+</main>
+
+<script>
+  function go(id) { location.hash = id; }
+  function show() {
+    var id = location.hash.slice(1) || 'landing';
+    var found = false;
+    document.querySelectorAll('section').forEach(function (s) {
+      var on = s.id === id; s.classList.toggle('on', on); if (on) found = true;
+    });
+    if (!found) document.getElementById('landing').classList.add('on');
+    document.querySelectorAll('nav a').forEach(function (a) {
+      a.classList.toggle('on', a.getAttribute('href') === '#' + id);
+    });
+    window.scrollTo(0, 0);
+  }
+  addEventListener('hashchange', show); show();
+</script>
