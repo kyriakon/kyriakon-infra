@@ -110,10 +110,24 @@ fstab_patch() {
 
 # --- state ----------------------------------------------------------------
 
-quotas_on() {
-	[ -f "$quota_file" ] || return 1
-	quotaon -p 2>/dev/null | grep -q "$mount" || return 1
-	return 0
+# OpenBSD's quotaon has no -p flag to ask whether quotas are on, so the question is
+# put to quota(1) instead. With no quotas on the filesystem it prints a single line
+# ending "none"; with quotas on it prints the per-filesystem table. That is the only
+# observable difference, and it is why this prints a state rather than a yes or no:
+# a quota(1) that fails for another reason is unknown, not off.
+quotas_state() {
+	out=$(quota -v -u "$(first_account)" 2>&1) || { printf 'unknown'; return; }
+	case "$out" in
+	*none*) printf 'off' ;;
+	*"$mount"*) printf 'on' ;;
+	*) printf 'unknown' ;;
+	esac
+}
+
+# The first account that can carry a quota, member or operator: the probe for
+# quotas_state, which needs somebody to ask about.
+first_account() {
+	awk -F: -v min=1000 '$3 >= min { print $1; exit }' "$passwd_file"
 }
 
 account_home() {
@@ -210,14 +224,22 @@ cmd_enable() {
 		quotacheck -v "$mount" || die "quotacheck failed"
 	fi
 
-	if quotas_on; then
+	# quotaon is attempted whenever the state is not already on. It exits non-zero
+	# when the filesystem is already enabled, which is not a failure, so the state is
+	# what decides rather than the exit code.
+	if [ "$(quotas_state)" = on ]; then
 		printf 'quotas are already on for %s\n' "$mount"
 	else
 		printf 'running quotaon on %s\n' "$mount"
-		quotaon -v "$mount" || die "quotaon failed"
+		quotaon -v "$mount" || printf 'quotaon exited non-zero; checking the state below\n'
 	fi
 
 	[ -f "$quota_file" ] || die "$quota_file still does not exist, so quotas are not on"
+	case "$(quotas_state)" in
+	on) printf 'confirmed: %s carries quotas\n' "$mount" ;;
+	off) die "quotaon ran but quota -v -u $(first_account) still reports none. Check by hand: doas quota -v -u $(first_account)" ;;
+	*) printf 'could not confirm from quota(1); check by hand: doas repquota -u %s\n' "$mount" ;;
+	esac
 	printf '\nquotas are on. Two things left:\n'
 	printf '  doas edquota -t              # confirm the grace period, one week by default\n'
 	printf '  doas reboot                  # the clean path, since rc.conf has check_quotas=YES\n'
@@ -235,8 +257,7 @@ cmd_show() {
 		printf 'fstab:   the %s line does NOT carry userquota, so quotas cannot be on\n' "$mount"
 	fi
 	printf 'quotafile: %s\n' "$(if [ -f "$quota_file" ]; then echo present; else echo missing; fi)"
-	printf 'quotaon -p:\n'
-	quotaon -p 2>&1 | sed 's/^/  /' || true
+	printf 'quota state: %s (from quota -v -u %s)\n' "$(quotas_state)" "$(first_account)"
 	printf 'repquota -u %s:\n' "$mount"
 	repquota -u "$mount" 2>&1 | sed 's/^/  /' || true
 	printf 'member accounts on %s:\n' "$mount"
@@ -323,6 +344,10 @@ EOF
 	mkdir -p "$work/bin"
 	cat > "$work/bin/quota" <<EOF
 #!/bin/ksh
+if [ -n "\${STUB_NONE:-}" ]; then
+	printf 'Disk quotas for user member (uid 1001): none\n'
+	exit 0
+fi
 printf 'Disk quotas for user member (uid 1001):\n'
 printf 'Filesystem   blocks   quota   limit   grace   files   quota   limit   grace\n'
 printf '%s       412980  %s %s             1234       0       0\n' "$test_mount" "\${STUB_SOFT:-5242880}" "\${STUB_HARD:-5767168}"
@@ -357,6 +382,14 @@ EOF
 	set -e
 	check "quotas off exits 3" "$rc" "3"
 	: > "$mount/quota.user"
+
+	# 6. the state probe, which is how --enable and --show ask the question that
+	#    OpenBSD's quotaon cannot answer for them.
+	STUB_NONE=1
+	export STUB_NONE
+	check "quota reporting none reads as off" "$(quotas_state)" "off"
+	unset STUB_NONE
+	check "quota listing the mount reads as on" "$(quotas_state)" "on"
 
 	if [ "$fails" -eq 0 ]; then
 		printf 'self-test: all checks passed\n'
