@@ -309,7 +309,8 @@ The blessing question, for monastics, which is the one required answer.
 A 
 
 Recommended: A, and B's second sentence if you want it to be easy to comply. C states a
-requirement without saying how to satisfy it.
+requirement without saying how to satisfy it. The question about a layperson's spiritual father was dropped at review, so the
+monastic blessing is the only blessing asked for.
 
 ## 14. Application: the acceptance checkbox
 

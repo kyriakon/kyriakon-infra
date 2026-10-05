@@ -55,7 +55,7 @@
   <a href="#landing">1. Hosting page</a>
   <a href="#keycheck">2. Key check</a>
   <a href="#form">3. Application</a>
-  <a href="#keys">4. Keys and walkthrough</a>
+  <a href="#keys">4. Keys</a>
   <a href="#submitted">5. Application received</a>
   <a href="#status">6. Status link</a>
   <div class="grp">The operator</div>
@@ -162,11 +162,9 @@
     <input type="text">
     <label>Are you a priest, deacon, monk, nun, or a layman? <span class="opt">(optional)</span></label>
     <input type="text">
-    <label>If you are a monk or a nun, do you have your elder's blessing to keep this account? <span class="opt">(required for monastics)</span></label>
+    <label>If you are a monastic, do you have your elder's or confessor's blessing to have an account? <span class="opt">(required for monastics)</span></label>
     <textarea placeholder="Who your elder is, and whether they have agreed."></textarea>
-    <label>If you are a layman, do you have your spiritual father's blessing to keep a website? <span class="opt">(optional; an email from him is enough)</span></label>
-    <textarea></textarea>
-    <label>If you are clergy, a monastic, or unable to pay, and would like an account without charge, tell us here <span class="opt">(optional)</span></label>
+    <label>If you are unable to pay, please tell us here. <span class="opt">(optional)</span></label>
     <textarea></textarea>
     <label>What do you hope to use this for? <span class="opt">(optional)</span></label>
     <textarea placeholder="A parish site, my own writing, mail, repositories..."></textarea>
@@ -182,7 +180,7 @@
 </section>
 
 <section id="keys">
-  <h2>Your keys</h2>
+  <h2>Keys</h2>
   <p class="lede">Both keys are made here, in your browser. Nothing is sent anywhere until you copy the public parts into the application.</p>
   <div class="card">
     <h3>1. Your mail key</h3>
@@ -197,6 +195,9 @@
       <p class="mono" style="font-size:19px">harbour lantern thistle quarry almond vesper ridge marrow</p>
       <p>Then download your key file:</p>
       <button class="btn alt">Download my-mail-key.asc</button>
+      <label>Your public key <span class="opt">(paste the block that starts BEGIN PGP PUBLIC KEY BLOCK)</span></label>
+      <textarea placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----"></textarea>
+      <button class="btn alt">Use this key in my application</button>
       <p class="hint">The file is locked with that phrase. You need both, and you need them apart: the file on a disk or in your backups, the phrase on paper. Anyone who has both can read your mail. We have neither, which is why we cannot read it, and why nobody here can recover it for you.</p>
       <label>Type three of the words back to be sure <span class="opt">(words 2, 5 and 7)</span></label>
       <input type="text" placeholder="word 2, word 5, word 7">
@@ -207,6 +208,9 @@
     <p>This is what lets you put a website up and push to your repositories. It is not the mail key and it does not decrypt anything. Pressing this gives you a private key file and a public key to paste.</p>
     <button class="btn">Make my upload key</button>
     <p class="hint">Keep the private file somewhere safe: it is the only copy. We never see it, and the public half is all we get.</p>
+    <label>Your upload public key <span class="opt">(optional; needed for a website or repositories)</span></label>
+    <textarea placeholder="ssh-ed25519 AAAA..."></textarea>
+    <button class="btn alt">Use this key in my application</button>
   </div>
   <div class="card">
     <h3>3. Put the mail key in your mail client</h3>
