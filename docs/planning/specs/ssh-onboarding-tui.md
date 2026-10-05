@@ -12,7 +12,7 @@ What remains is the shape of that program and its session: the config file, port
 
 ## Solution
 
-A second `sshd` instance runs from its own config file on a port chosen when the box is built, and the only account it can serve is a password-less system account named `onboard`. Nothing is asked of the applicant: no password, no key, no published credential. The account has no shell and the instance forces one program, a line-oriented TUI, so the connection is a text pipe into an application form.
+A second `sshd` instance runs from its own config file on a port chosen when the box is built, and the only account it can serve is a password-less system account named `onboard`. The applicant reaches it as `ssh onboard@signup.kyriakon.net`, the instruction the site publishes on the signup page: the username is part of that instruction, because `AllowUsers onboard` refuses every other name before authentication, so the address on its own lands a connection as the applicant's own local user and is refused. Nothing is asked once the connection is made: no password, no key, no published credential. The account has no shell and the instance forces one program, a line-oriented TUI, so the connection is a text pipe into an application form.
 
 The TUI prints a first screen that says what it is, then walks the shared question list one question at a time with a counter, then prints the key walkthrough, accepts a pasted public key and checks it with the same crate the web form uses, then shows a summary to confirm, then files one intent through the onboarding handler and hands back the status token. It can read that status back later by token. Its per-address counters answer an over-eager source with a plain screen. It holds no privilege, no secrets and no shell, and the human approval stays the real gate.
 
@@ -38,6 +38,7 @@ PidFile /var/run/sshd.onboard.pid
 # needs: userauth_none() calls mm_auth_password("") only when
 # permit_empty_passwd and password_authentication are both on (auth2-none.c).
 AllowUsers onboard
+PasswordAuthentication yes
 PermitRootLogin no
 LoginGraceTime 30
 
@@ -49,7 +50,6 @@ PerSourceMaxStartups 2
 PerSourceNetBlockSize 32:128
 
 Banner none
-VersionAddendum none
 
 # Every connection lands in authlog, where the abuse monitor counts it.
 LogLevel VERBOSE
@@ -60,7 +60,6 @@ Match User onboard
 	# or publish. The account is password-less, which is the condition the
 	# none method documents.
 	PermitEmptyPasswords yes
-	PasswordAuthentication yes
 	AuthenticationMethods none
 	KbdInteractiveAuthentication no
 
@@ -76,7 +75,7 @@ Match User onboard
 	ForceCommand /usr/local/sbin/kyriakon-onboard-tui
 ```
 
-`PermitEmptyPasswords` in the `Match` block is inside the subset of keywords `sshd_config(5)` allows after `Match`. `PerSourceMaxStartups` is not, so it sits at the top level, which is harmless because `AllowUsers onboard` makes the instance serve one account. `Banner none` is the documented default and is written out so a future default change cannot quietly reintroduce a banner; a banner is read by every scanner and by nobody the platform wants. The protocol identification string itself cannot be removed, and `VersionAddendum none` stops it carrying the local operating system suffix.
+`PermitEmptyPasswords` in the `Match` block is inside the subset of keywords `sshd_config(5)` allows after `Match`. `PasswordAuthentication` sits at the top level, as the resolution has it, and `PerSourceMaxStartups` sits there too because `sshd_config(5)` does not allow it after `Match`; both are harmless there because `AllowUsers onboard` makes the instance serve one account. `Banner none` is the documented default and is written out so a future default change cannot quietly reintroduce a banner; a banner is read by every scanner and by nobody the platform wants. The protocol identification string itself cannot be removed, and its version addendum already defaults to `none`, so it carries no local operating system suffix.
 
 ### The account
 
@@ -136,17 +135,17 @@ The operator enables it with `rcctl enable kyriakon_onboard`, starts it with `rc
 
 The port is a deployment value, chosen when the box is built from what is free, and recorded exactly once in `/etc/kyriakon/onboard/tui.env` as `TUI_PORT`. Ports 22 and 2222 are already taken by the member sshd and git. The build walks the reserved range 2200 to 2299 in order, skips anything already listening (`netstat -naf inet` plus the same check for `inet6`) and anything named in `/etc/services`, and takes the first free value. The default on a fresh box is therefore 2200. If no candidate in the range is free the build fails rather than picking an arbitrary port, because an unreviewed listener is worse than a stopped build.
 
-The chosen value is substituted into three places from that one file: the `Port` line in the installed sshd config, the `pass` rule below, and the connection instructions the site publishes. The repository carries `REPLACE_ME` in each, the same deploy-value convention the postal address uses.
+The chosen value reaches three places from that one file. The `Port` line in the installed sshd config and the connection instructions the site publishes on the signup page carry it substituted at install, and the repository carries `REPLACE_ME` in both, the same deploy-value convention the postal address uses. The firewall is the third, and it is not installed anywhere: `scripts/pf-apply.sh` is run in place, so it reads `TUI_PORT` from that file at run time and expands it into the rule as it builds the candidate. The block is added when the file is there and skipped with a note when it is not, so the script still runs on a box without the TUI, and a value that is not a port number stops it rather than writing a rule `pfctl -n` rejects.
 
 The firewall change is propose-only. It is a new block in `scripts/pf-apply.sh`, beside the existing 2222 block and in the same shape:
 
 ```
 # --- kyriakon: onboarding TUI (openbsd/etc/sshd_config.onboard) ---
-pass in log on egress proto tcp to any port 2200 keep state (max-src-conn 4)
+pass in log on egress proto tcp to any port ${TUI_PORT} keep state (max-src-conn 4)
 # --- end kyriakon: onboarding TUI ---
 ```
 
-`log` makes a probe or a flood attributable in `pflog` instead of invisible, and `max-src-conn 4` bounds established connections from one source while sshd's `PerSourceMaxStartups 2` bounds the unauthenticated ones and the TUI's counter bounds whole sessions. The block, with its port substituted at install, is reviewed in the pull request; the live command is the operator's manual step, `doas ksh scripts/pf-apply.sh`, which builds the candidate in a temp file, checks it with `pfctl -n`, backs up the current file and loads it. The spec does not run it and no deploy runs it, exactly as the existing fragments work.
+`log` makes a probe or a flood attributable in `pflog` instead of invisible, and `max-src-conn 4` bounds established connections from one source while sshd's `PerSourceMaxStartups 2` bounds the unauthenticated ones and the TUI's counter bounds whole sessions. The block, with its port read from `/etc/kyriakon/onboard/tui.env` when the candidate is built, is reviewed in the pull request; the live command is the operator's manual step, `doas ksh scripts/pf-apply.sh`, which builds the candidate in a temp file, checks it with `pfctl -n`, backs up the current file and loads it. The spec does not run it and no deploy runs it, exactly as the existing fragments work.
 
 The rule covers IPv4 and IPv6 because it has no `inet` qualifier, and it needs to: `signup.kyriakon.net` resolves through the zone's wildcard, which carries both an `A` and an `AAAA`, so a client that prefers IPv6 reaches the port too.
 
@@ -188,7 +187,7 @@ The TUI holds its answers in memory for the life of the connection and files not
 
 ## The key
 
-The web form's walkthrough serves three front-ends, and the TUI prints the part of it that applies to the applicant's own machine: Thunderbird desktop as the primary path, Thunderbird for Android as the mobile one once the prototype has tested it end to end, and the address of the browser generator on `signup.kyriakon.net` for anyone who would rather not make a key by hand. It states the two upload ports plainly, sftp on 22 for uploads and git on 2222 for `pass` repositories, and it presents the upload key as a step for anyone who wants a website rather than an optional extra, because both paths are key-based and a member who skips the key gets mail and nothing else ([#154](https://github.com/kyriakon/kyriakon-infra/issues/154)). For an applicant at a terminal it also prints the `ssh-keygen -t ed25519` line that makes the upload key.
+The web form's walkthrough serves three front-ends, and the TUI prints the part of it that applies to the applicant's own machine: Thunderbird desktop as the primary path, Thunderbird for Android as the mobile one once the prototype has tested it end to end, and the address of the browser generator on `signup.kyriakon.net` for anyone who would rather not make a key by hand. It states the two upload ports plainly, sftp on 22 for uploads and git on 2222 for `pass` repositories, and it presents the upload key as a step for anyone who wants a website rather than an optional extra, because both paths are key-based and a member who skips the key gets mail and nothing else ([#154](https://github.com/kyriakon/kyriakon-infra/issues/154)).
 
 The TUI never generates a key and never sees a private key. It accepts a pasted public key on stdin, reading to the armor's end line, and it can accept a long one: SSH has no 1024 byte request limit, so the paste that can fail on the capsule works here. It runs the same inspection the web form runs, from the same crate ([#176](https://github.com/kyriakon/kyriakon-infra/issues/176), [#185](https://github.com/kyriakon/kyriakon-infra/issues/185)), built natively where the browser builds it to WASM, so the two verdicts cannot disagree.
 
@@ -277,7 +276,7 @@ The web form and the capsule, which have their own specs. The onboarding service
 
 ## Sources
 
-- OpenBSD 7.9 `sshd_config(5)`, read at <https://man.openbsd.org/sshd_config.5> on 2026-10-05: the `none` method "used for access to password-less accounts when `PermitEmptyPasswords` is enabled"; `PermitEmptyPasswords`; ForceCommand's command "invoked by using the user's login shell with the -c option"; the list of keywords allowed after `Match`; `Banner none`; `MaxSessions`, `MaxStartups`, `PerSourceMaxStartups`, `PerSourceNetBlockSize`.
+- OpenBSD 7.9 `sshd_config(5)`, read at <https://man.openbsd.org/sshd_config.5> on 2026-10-05: the `none` method "used for access to password-less accounts when `PermitEmptyPasswords` is enabled"; `PermitEmptyPasswords`; ForceCommand's command "invoked by using the user's login shell with the -c option"; the list of keywords allowed after `Match`; `Banner none`; the version addendum's `none` default; `MaxSessions`, `MaxStartups`, `PerSourceMaxStartups`, `PerSourceNetBlockSize`.
 - OpenBSD source, read on 2026-10-05: `usr.bin/ssh/auth2-none.c`, where `userauth_none()` calls `mm_auth_password(ssh, "")` only when `options.permit_empty_passwd && options.password_authentication`, `usr.bin/ssh/auth.c`, where `lc = login_getclass(pw->pw_class)` takes the session's login class from the account, and `usr.bin/ssh/session.c`, where `do_child()` runs a forced command as `execve(shell, {shell, "-c", command})` after taking `shell` from that class. The stock unit is `etc/rc.d/sshd`.
 - OpenBSD `useradd(8)` and `usr.sbin/user/user.c`, read on 2026-10-05: `-p` stores its argument as the password field, so `-p ''` writes an empty one.
 - Repo notes and files: `docs/planning/research/openbsd-per-member-hosting.md` (the chroot, `git-shell` and the tested refusal of non-sftp forced commands under `nologin`, section 4), `docs/planning/research/alert-thresholds.md` (the SSH per-address threshold), `scripts/pf-apply.sh`, `scripts/abuse-monitor.sh`, `openbsd/etc/sshd_config` and `docs/planning/prototypes/keygen-spike/`.
