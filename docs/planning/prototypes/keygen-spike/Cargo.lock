@@ -782,6 +782,7 @@ dependencies = [
  "pgp",
  "rand",
  "smallvec",
+ "wasm-bindgen",
 ]
 
 [[package]]

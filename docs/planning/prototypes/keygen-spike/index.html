@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Key generator spike (throwaway)</title>
+    <!--
+      The policy is the point of the page. default-src 'none' removes everything, and the
+      only allowances are same-origin scripts and styles, which is what it takes to load the
+      module at all. connect-src 'self' is narrower than it looks: the page never fetches
+      anything after load, and the browser run recorded in README.md checks that by
+      intercepting every request the tab makes.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self'; img-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <h1>Key generator spike</h1>
+    <p class="warn">
+      Throwaway. It exists to prove the browser half of kyriakon-infra#185 compiles, loads and
+      runs with no network access. Not the real page, and no key it makes is worth keeping.
+    </p>
+
+    <section>
+      <h2>Make a mail key</h2>
+      <p>
+        Nothing is uploaded. The private key is written by this page, in this tab, and the
+        download below is the only copy of it.
+      </p>
+      <button id="gen">Make a key</button>
+      <dl id="gen-out"></dl>
+      <a id="download" hidden>Download the passphrase-protected private key</a>
+    </section>
+
+    <section>
+      <h2>Check a public key</h2>
+      <p>
+        Paste a public key to see the three conditions that break delivery. Nothing is
+        uploaded; the check runs here, against the same code the signup path would use.
+      </p>
+      <textarea id="armor" rows="8" placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----"></textarea>
+      <button id="chk">Check it</button>
+      <ul id="check-out"></ul>
+    </section>
+
+    <section>
+      <h2>What this page loaded</h2>
+      <p>
+        Nothing outside this directory. The list is read out of the browser's own resource
+        timing, so the page can say it without being asked to trust itself.
+      </p>
+      <ul id="resources"></ul>
+    </section>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
