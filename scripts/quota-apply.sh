@@ -218,7 +218,14 @@ set_limits() {
 	filter="$diag/editor"
 	editor_filter > "$filter"
 	chmod 0700 "$filter"
-	trap 'rm -f "$filter"' EXIT
+	# The trap reads a script-scope name, not the local one. A ksh function's
+	# `typeset` variables have no scope left by the time an EXIT trap runs, and with
+	# `set -u` that makes every run end in `filter: parameter not set`, the runs that
+	# worked included, which is noise on a line an operator has to be able to trust.
+	# Only the editor script goes: on the failure path the directory it sits in is
+	# what the message tells the operator to read, so that outlives the run.
+	trap_diag="$diag"
+	trap 'rm -f "$trap_diag/editor"' EXIT
 
 	QUOTA_SOFT_KB="$soft_kb" QUOTA_HARD_KB="$hard_kb" EDITOR_MOUNT="$mount" \
 		EDITOR_DUMP_DIR="$diag" EDITOR="$filter" edquota -u "$user" ||
@@ -237,12 +244,26 @@ set_limits() {
 	fi
 	printf '%s: soft %s KB, hard %s KB written to the quota file\n' "$user" "$soft_read" "$hard_read"
 
-	# Secondary, and a difference here is expected rather than a failure.
+	# Secondary, and a difference here is expected rather than a failure. The kernel
+	# caches limits per user and does not notice a write made in userland, so quota(1)
+	# can report the old figures for a write that worked, and the note says so rather
+	# than pretending the write failed.
+	#
+	# The order in the advice is the safe one, and the obvious order is not. Turning
+	# quotas off flushes the kernel's in-core figures back to the quota file, so
+	# running quotaoff *after* a write can put those cached figures straight back over
+	# it and undo the write. Turning them off before the write leaves nothing cached
+	# to overwrite with, and the quotaon that follows loads the file the write made.
+	# That is the refresh without the reboot. The 2026-10-05 run on the box is what
+	# turned this up: the advice here was the other order, the operator followed it,
+	# and the allowance it had just applied read back as no allowance at all.
 	read=$(read_limits "$user")
 	if [ "$read" != "$soft_kb $hard_kb" ]; then
 		printf 'note: quota -v -u %s reports "%s" until the kernel re-reads the quota file.\n' \
 			"$user" "$(if [ -n "$read" ]; then printf '%s' "$read"; else printf 'nothing'; fi)"
-		printf 'A reboot does it, and so should: doas quotaoff -v %s && doas quotaon -u -v %s\n' "$mount" "$mount"
+		printf 'To have the kernel read it without a reboot, turn quotas off first, then apply, then on:\n'
+		printf '  doas quotaoff -v %s\n  doas ksh %s/quota-apply.sh %s\n  doas quotaon -u -v %s\n' \
+			"$mount" "$script_dir" "$user" "$mount"
 	fi
 	rm -rf "$diag"
 }
@@ -351,7 +372,12 @@ cmd_all() {
 self_test() {
 	typeset work fails filter rc out
 	work=$(mktemp -d "${TMPDIR:-/tmp}/kyriakon-quota-test.XXXXXX")
-	trap 'rm -rf "$work"' EXIT
+	# Script scope, for the reason set_limits gives: a function's `typeset` names are
+	# gone by the time an EXIT trap runs, and `set -u` turns that into a line on stderr
+	# and a non-zero exit on a run where every check passed. Seen on the box on
+	# 2026-10-05, where the self-test printed "all checks passed" and exited 1.
+	self_test_work="$work"
+	trap 'rm -rf "$self_test_work"' EXIT
 	fails=0
 	check() {
 		if [ "$2" = "$3" ]; then
