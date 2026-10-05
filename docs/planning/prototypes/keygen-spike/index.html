@@ -7,8 +7,8 @@
       The policy is the point of the page. default-src 'none' removes everything, and the
       only allowances are same-origin scripts and styles, which is what it takes to load the
       module at all. connect-src 'self' is narrower than it looks: the page never fetches
-      anything after load, and the browser run recorded in README.md checks that by
-      intercepting every request the tab makes.
+      anything after load, and the browser run recorded in README.md logs every request the tab
+      makes.
     -->
     <meta
       http-equiv="Content-Security-Policy"
