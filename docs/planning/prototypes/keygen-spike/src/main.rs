@@ -6,7 +6,6 @@
 
 use keygen_spike::{check_public_key, generate_key, self_check, DEFAULT_USER_ID};
 use pgp::composed::{Deserializable, SignedPublicKey, SignedSecretKey};
-use pgp::types::KeyDetails;
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
