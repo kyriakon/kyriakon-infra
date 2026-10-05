@@ -343,6 +343,8 @@ Check what is queued before removing anything from the queue.
 	doas smtpctl show queue
 	doas smtpctl show stats
 
+An account's allowance is a 32-byte record in `/home/quota.user`, and `scripts/quota-apply.sh` writes it directly. The kernel reads that record the first time it accounts for a user and keeps its own copy after that, so an account it has already seen does not pick up a changed allowance, and `quotaoff` followed by `quotaon` does not help: the release drops the reference while leaving the record in the cache. Changing an existing account's limits therefore takes the order the script prints, write with quotas off and then reboot. An account being created needs none of it, because nothing has read its record yet.
+
 Do not delete files under `/home` to free space. The account lifecycle is the path that removes member data, and a hand deletion leaves the account, the keyring entry and the vhosts behind. Do not remove the DKIM key at `/etc/mail/dkim/private.rsa.key`, the queue key at `/etc/mail/queue.key`, or anything under the restic repository. The first two exist nowhere else, and the third is the backup.
 
 ## When mail is not flowing
