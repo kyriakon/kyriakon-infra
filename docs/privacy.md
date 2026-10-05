@@ -21,7 +21,7 @@ Article 6 of the UK GDPR requires a lawful basis for each purpose, and the same 
 | Billing, renewal and receipts | The paid-until date, the rail, and the payment ledger keyed by your token | Contract, Article 6(1)(b) |
 | Abuse detection, outbound-mail spike watching, authentication-failure counting, rate limiting and blocklist checks | Log lines and aggregate counts | Legitimate interests, Article 6(1)(f), including the recognised interest in the security of network and information systems |
 | Security logging that identifies you by address or timestamp | The raw per-user record | Legitimate interests, Article 6(1)(f). The seven-day window is what makes the balance defensible |
-| The triage classifier | The message text and application text it reads, and the decisions and scores it makes | Contract, Article 6(1)(b), as part of delivering the mail service |
+| The triage classifier | The message text and application text it reads on the operator host, and the decisions and scores it makes | Contract, Article 6(1)(b). Classification belongs on the operator host and never on the mail box, and no text it reads is sent to a third-party inference service |
 
 We rely on consent for nothing. Membership and delivery rest on the contract, and security logging rests on legitimate interests, so there is no consent to withdraw.
 
@@ -35,9 +35,9 @@ We collect no legal name and no postal address, at signup or at approval. We hol
 
 ## Zero-access mail, and its limit
 
-Your message bodies, subjects and protected headers are PGP ciphertext on our server, encrypted to your public key when they arrive. We hold no private key and nothing that could derive one, so we cannot read your mail.
+Your message bodies, subjects and protected headers are PGP ciphertext on our server, encrypted to your public key when they arrive. We hold no private key and nothing that could derive one, so no key exists here that opens your mail, and an order to disclose its content produces ciphertext.
 
-That covers stored content, not the addressing information mail needs to move. Sender, recipient, timestamp and size appear in the SMTP logs and in the outer message wrapper, and the seven-day window is what bounds how long the raw record exists. It is also a claim about mail at rest: it does not cover a message in transit, and it does not reach a copy that was already delivered to someone else.
+That covers stored content, not the addressing information mail needs to move. Sender, recipient, timestamp and size appear in the SMTP logs and in the outer message wrapper, and the seven-day window is what bounds how long the raw record exists. It is also a claim about mail at rest: it does not cover a message in transit through the spool, it does not hold against a delivery pipeline modified to capture mail in plaintext as it relays, and it does not reach a copy that was already delivered to someone else.
 
 ## How long we keep things
 

@@ -8,7 +8,7 @@ If anything here is unclear, write to admin@kyriakon.net before you pay and we w
 
 kyriakon.net is run by Oliver Brotchie, a sole trader in the United Kingdom. The address at which the business is established is REPLACE_ME_TRADING_ADDRESS. The contact address for everything in these terms is admin@kyriakon.net.
 
-We are not registered for VAT, so there is no VAT number to show. The price does not include VAT because there is no VAT to include, and we do not describe a charge as including VAT while that is true.
+We are not registered for UK VAT, so there is no VAT number to show and no VAT is added to the price.
 
 ## What you are buying
 
@@ -23,7 +23,7 @@ The 5 GB is shared across mail, web and git. Every account needs an SSH key for 
 
 ## Price and payment
 
-The price is stated in pounds, and the number on this page is the number you pay. If you are a consumer in the European Union, the rate of VAT that applies where you live is taken out of the price rather than added to it, so we do not add a surcharge at checkout and no page needs an asterisk. We absorb the difference.
+The price is stated in pounds, and the number on this page is the number you pay. If you are a consumer in the European Union, the rate of VAT that applies where you live is accounted for out of the price rather than added to it, so we do not add a surcharge at checkout and no page needs an asterisk.
 
 You pay by card through Stripe, by cash by post, by cash in hand, or in Monero. Card payment happens on Stripe's own site and your card details never reach us. For the other rails we give you a payment token, and a postal address or a Monero subaddress. The amount owed is in pounds even when it is quoted in Monero.
 
@@ -31,9 +31,15 @@ When we approve your application we open a fourteen-day payment window. Pay insi
 
 Stripe sends a receipt for every successful card payment. It is a receipt, not a VAT invoice, and there is no VAT number on it because there is none.
 
+## Businesses and bodies
+
+The account is sold to a person, whether they apply for themselves or for a body. A body applying in the course of business is not a consumer, so the footing is a business one.
+
+Only the consumer clauses change with it. The cancellation right in the next section does not reach a body buying in the course of business, and neither do the statutory consumer rights under Our liability or the Union consumer protection under Governing law. Everything else applies as it does to a person: the same service, the same acceptable use policy, and the same renewal, lapse and deletion.
+
 ## Your right to cancel
 
-By law you have fourteen days to cancel, starting the day the contract is made. The right is unconditional: you can cancel for any reason, or none. An email to admin@kyriakon.net saying that you want to cancel is enough, and you can use the form below if you would rather.
+If you are a consumer, you have fourteen days to cancel, starting the day the contract is made. The right is unconditional: you can cancel for any reason, or none. An email to admin@kyriakon.net saying that you want to cancel is enough, and you can use the form below if you would rather.
 
 Provisioning does not take the right away, and we refund in full if you cancel inside the window. To supply you inside the fourteen days we need two things from you, both recorded before you pay:
 
@@ -98,7 +104,7 @@ There is one restriction on who may apply. Applications from residents of countr
 
 ## Keys and your account
 
-The platform holds no key that opens your mail. Your mail key is made on your own machine, and the private half never reaches us. The recovery phrase you write down, together with the key file, is the only way back into the mailbox. If you lose your device and the recovery phrase, the mail is gone permanently: we cannot restore it, because we cannot read it either. Keep the file and the phrase in separate places.
+The platform holds no key that opens your mail. Your mail key is made on your own machine, and the private half never reaches us. The recovery phrase you write down, together with the key file, is the only way back into the mailbox. If you lose your device and the recovery phrase, the mail is gone permanently: we cannot restore it, because no key exists here to open it. Keep the file and the phrase in separate places.
 
 You submit your mail public key and, if you want a website, an SSH key for uploads. The private keys and the recovery phrase stay with you. Zero-access covers message content and not the addressing information mail needs to move, and the hosting page states that limit wherever the property is claimed.
 
