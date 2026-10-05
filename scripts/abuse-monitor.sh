@@ -121,9 +121,25 @@ newest_snapshot_epoch() {
 				line = substr(line, RSTART + RLENGTH)
 			}
 		}' 2>/dev/null || true); do
-		time=$(printf '%s' "$time" | sed 's/\.[0-9]*//; s/Z$/+0000/; s/\([+-][0-9][0-9]\):\([0-9][0-9]\)$/\1\2/')
-		epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$time" +%s 2>/dev/null || true)
+		# The offset is applied by arithmetic rather than handed to `date -j -f %z`,
+		# because OpenBSD's date ignores the offset: 2026-10-03T02:30:01+02:00 parsed
+		# there as 02:30:01 UTC, two hours out, and the self-test caught it on the box
+		# while passing on the machine the case was written on. Splitting the string
+		# into a naive part and an offset in seconds behaves the same on both, and UTC
+		# is what the subtraction is against.
+		time=$(printf '%s' "$time" | sed 's/\.[0-9]*//; s/Z$/+00:00/')
+		naive=$(printf '%s' "$time" | sed 's/[+-][0-9][0-9]:[0-9][0-9]$//')
+		offset=$(printf '%s' "$time" | sed -n 's/.*\([+-]\)\([0-9][0-9]\):\([0-9][0-9]\)$/\1 \2 \3/p' | tr -d ' ')
+		epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%S" "$naive" +%s 2>/dev/null || true)
 		[ -n "$epoch" ] || continue
+		if [ -n "$offset" ]; then
+			# "+" means the instant is the naive reading less the offset.
+			secs=$(( (10#$(printf '%s' "$offset" | cut -c2-3) * 60 + 10#$(printf '%s' "$offset" | cut -c4-5)) * 60 ))
+			case "$offset" in
+			-*) epoch=$((epoch + secs)) ;;
+			*) epoch=$((epoch - secs)) ;;
+			esac
+		fi
 		if [ -z "$newest" ] || [ "$epoch" -gt "$newest" ]; then
 			newest="$epoch"
 		fi
@@ -192,6 +208,46 @@ self_test() {
 	# The cooldown two signals get for being holdable by a stranger.
 	check "a storm signal waits six hours" "$(cooldown_for "ssh guesses")" "360"
 	check "an ordinary signal waits the default hour" "$(cooldown_for "quota")" "60"
+
+	# A cold resolver must be retried rather than skipped past, which is the
+	# 2026-10-05 alert: the box had just rebooted, the probe gave up, the query fell
+	# through to the system resolver, Spamhaus ignored that by design, and the verdict
+	# came from the next list down, which reads as a downgrade of the strongest one.
+	# The stub answers the root prime slowly, the way a resolver with an empty cache
+	# or a slow link does, and answers nothing at all unless it is asked of the local
+	# resolver, which is how a shared one looks to Spamhaus.
+	mkdir -p "$work/bin"
+	cat > "$work/bin/dig" <<'STUB'
+#!/bin/sh
+at=""; name=""; qtype=""; tmo=5
+for a in "$@"; do
+	case "$a" in
+	@*) at="$a" ;;
+	+time=*) tmo="${a#+time=}" ;;
+	+*) : ;;
+	*) if [ -z "$name" ]; then name="$a"; else qtype="$a"; fi ;;
+	esac
+done
+# A shared resolver gets silence from the strongest lists, which is the fallback.
+[ "$at" = "@127.0.0.1" ] || exit 0
+if [ "$name" = "." ] && [ "$qtype" = "NS" ]; then
+	# The deadline is the thing under test, so the stub honours +time the way the
+	# real dig does and answers the prime a little slower than the old one allowed.
+	sleep 3
+	[ "$tmo" -ge 3 ] || exit 9
+	printf 'x. 3600 IN NS a.root-servers.net.\n'
+	exit 0
+fi
+case "$name" in
+2.0.0.127.*) printf '127.0.0.2\n' ;;  # the zone answering its own control entry
+*) printf ';; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 1\n' ;;
+esac
+exit 0
+STUB
+	chmod 0700 "$work/bin/dig"
+	export PATH="$work/bin:$PATH"
+	check "a cold local resolver is retried, so the strongest list still answers" \
+		"$(dnsbl_verdict 203.0.113.9)" "clean zen.spamhaus.org"
 
 	if [ "$fails" -eq 0 ]; then
 		printf 'self-test: all checks passed\n'
@@ -547,7 +603,14 @@ if [ -n "$ip" ]; then
 					alert "blocklist downgraded" "$ip is clean on $zone only: $strongest gave $reason rather than a verdict. Spamhaus documents this and the fix is one line in unbound.conf, in the runbook's blocklist section. Nothing is listed on $strongest as far as this check can tell, and nothing else on this box needs changing"
 					;;
 				*)
-					alert "blocklist downgraded" "$ip is clean on $zone only; $strongest did not answer. The strongest list is the one that matters for deliverability, so a listing there would go unnoticed. Check that unbound is running on this box: rcctl check unbound"
+					# Something said nothing at all, which has two causes and only one
+					# of them is this box's DNS. Either unbound is not answering, or it
+					# was not answering in time and the query went to the system
+					# resolver, which Spamhaus ignores by design: a silent zen through
+					# that fallback is expected, not a finding. The old advice named
+					# only the first and sent the operator to check a healthy resolver
+					# after a reboot on 2026-10-05.
+					alert "blocklist downgraded" "$ip is clean on $zone only; $strongest did not answer. The strongest list is the one that matters for deliverability, so a listing there would go unnoticed. If unbound is not running on this box, rcctl -f start unbound. If it is running, the query fell back to the system resolver because the local one did not answer in time, and a reboot with an empty cache is the usual reason for one alert like this: the next run should be clean"
 					;;
 				esac
 				printf '%s\n' "$zone:$reason" > "$state/dnsbl.downgraded"
