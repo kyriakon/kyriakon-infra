@@ -503,16 +503,24 @@ if [ -n "$ip" ]; then
 		# unbound for the first is what this alert did on 2026-10-03, to an
 		# operator whose unbound was answering everything else.
 		skipped=$(printf '%s' "$verdict" | sed -n 's/.*\[skipped: //p' | sed 's/\]$//')
-		first_zone=${skipped%%=*}
 		reason=${skipped#*=}
 		reason=${reason%% *}
 		if [ "$zone" != "$strongest" ]; then
 			if [ "$(cat "$state/dnsbl.downgraded" 2>/dev/null || true)" != "$zone:$reason" ]; then
-				if [ "$first_zone" = "$strongest" ] && [ "$reason" = refused ]; then
-					alert "blocklist downgraded" "$ip is clean on $zone only; $strongest refused the query, which is its answer to a resolver it will not serve rather than a listing, and nothing on this box needs fixing for it. A listing on $strongest would go unnoticed until it answers"
-				else
+				case "$reason" in
+				refused | servfail)
+					# The cause is known and documented, so the alert names it rather
+					# than sending the reader to check a resolver that is fine.
+					# Spamhaus's zones answer NS and SOA queries in a way that does not
+					# match RFC 1034, and QNAME minimisation needs those answers, so a
+					# listing resolves and a clean answer does not. Spamhaus recommends
+					# turning minimisation off for this; the runbook has the line.
+					alert "blocklist downgraded" "$ip is clean on $zone only: $strongest gave $reason rather than a verdict. Spamhaus documents this and the fix is one line in unbound.conf, in the runbook's blocklist section. Nothing is listed on $strongest as far as this check can tell, and nothing else on this box needs changing"
+					;;
+				*)
 					alert "blocklist downgraded" "$ip is clean on $zone only; $strongest did not answer. The strongest list is the one that matters for deliverability, so a listing there would go unnoticed. Check that unbound is running on this box: rcctl check unbound"
-				fi
+					;;
+				esac
 				printf '%s\n' "$zone:$reason" > "$state/dnsbl.downgraded"
 			fi
 		else

@@ -129,7 +129,16 @@ dnsbl_verdict() {
 			return 0
 			;;
 		*)
-			dnsbl_skipped="$dnsbl_skipped $dnsbl_zone=unanswered"
+			# The status says which kind of nothing this was. SERVFAIL is what
+			# Spamhaus's zones look like through QNAME minimisation, because their
+			# NS and SOA answers do not match RFC 1034 and minimisation needs them;
+			# a bare timeout carries no status at all.
+			case "$dnsbl_status" in
+			SERVFAIL) dnsbl_skipped="$dnsbl_skipped $dnsbl_zone=servfail" ;;
+			REFUSED) dnsbl_skipped="$dnsbl_skipped $dnsbl_zone=refused" ;;
+			"") dnsbl_skipped="$dnsbl_skipped $dnsbl_zone=no-answer" ;;
+			*) dnsbl_skipped="$dnsbl_skipped $dnsbl_zone=$dnsbl_status" ;;
+			esac
 			continue
 			;;
 		esac
