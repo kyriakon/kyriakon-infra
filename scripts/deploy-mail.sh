@@ -110,6 +110,17 @@ need_pkg helix
 	printf 'unbound is missing from the base system\n' >&2
 	exit 1
 }
+
+# The resolver config is tracked for one setting in it: without
+# `qname-minimisation: no` Spamhaus gives no verdict for a clean address, so the
+# blocklist check reports coverage it does not have. Installed and then validated
+# before the service is signalled, which is the order the nsd deploy uses and for
+# the same reason: a bad file on disk with the resolver still running its old
+# config is recoverable, and the reverse is not, because this resolver is DNS for
+# everything else on the box. The service's own rc_pre repeats the check, so a
+# file that slips past here fails loudly at the restart instead of half-starting.
+install -m 0644 "$repo_dir/openbsd/etc/unbound.conf" /var/unbound/etc/unbound.conf
+unbound-checkconf /var/unbound/etc/unbound.conf
 start_service unbound
 
 command -v cargo >/dev/null || { printf 'cargo missing after pkg_add rust\n' >&2; exit 1; }

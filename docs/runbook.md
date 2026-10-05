@@ -415,10 +415,14 @@ The reason is in the alert, and the two reasons need different responses.
 
 		qname-minimisation: no
 
-	Add it to the existing `server:` section rather than appending a second one, then:
+	That line is in the tracked `openbsd/etc/unbound.conf`, which is the base system's file plus this setting, and `scripts/deploy-mail.sh` installs it, validates it with `unbound-checkconf`, and restarts the resolver. Fixing it on a running box without a deploy is the same three steps:
 
+		doas cp /usr/local/src/kyriakon-infra/openbsd/etc/unbound.conf /var/unbound/etc/unbound.conf
+		doas unbound-checkconf /var/unbound/etc/unbound.conf
 		doas rcctl restart unbound
 		doas ksh /usr/local/src/kyriakon-infra/scripts/check-hygiene.sh
+
+	Validate before restarting, always: this resolver is DNS for everything else on the box, so a config that is wrong on disk while the old one is still loaded is recoverable, and the reverse is not.
 
 	The setting is global, because unbound has no per-zone form of it: every query from this box stops using QNAME minimisation, not only the blocklist ones. Spamhaus's argument for accepting that is that all queries in a blocklist lookup go to the same nameserver, so the privacy gain there is nil, and their measurement is that a lookup costing five queries costs one without it. ISC disagrees, holding that the resolver should not give up a privacy feature for a server's non-compliance. Treat it as a workaround with a decision attached, and revisit it if Spamhaus fixes the zone or unbound grows a per-zone setting.
 
