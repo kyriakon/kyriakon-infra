@@ -18,16 +18,17 @@ Placeholders in the copy: the example member is `theophilus`, the outside addres
 
 It has to say what this is, and who it is for, in one line.
 
-- A. Mail, a website and git repositories, for Orthodox Christians and their parishes.
+- A. Secure encrypted email and website hosting for Orthodox Christians.
 - B. A home on the internet for Orthodox parishes and people.
 - C. Secure email, a website, and git repositories, run by Orthodox Christians.
 
-A lists what you get and reads like a specification. B is warmer and says what it is for,
-at the cost of not saying what it is. C is the splash as it stands today, so it keeps one
-voice with the capsule mirror.
+A names the two things and who they are for, and reads plainly.
+B is warmer and says what it is for, at the cost of not saying what it is. C is the splash as
+it stands today, so it keeps one voice with the capsule mirror.
 
-Recommended: A. People arrive knowing what mail and a website are, and the list is what
-they came to check.
+Recommended: A. People arrive knowing what mail and a website are, and the heading names
+both. Git hosting stays out of it, because it is a third thing and belongs in the
+paragraph below.
 
 - Secure Encrypted Email and Hosting, run by Orthodox Christians.
 
@@ -79,7 +80,14 @@ qualify.
 Recommended: B. The thing that stops people asking is not knowing whether the offer
 applies to them, so the copy should say who decides and how.
 
-Both are settled, and the parish tier is priced. [#188](https://github.com/kyriakon/kyriakon-infra/issues/188) set the tiers: £20 a year for an individual, £40 for an organisation's own domain with up to ten addresses each at the standard 5 GB, and £150 a year or more for a managed instance, which is the one ordered by enquiry. The own-domain tier is a form path rather than a letter: the same application carries a community block for a body, per [#233](https://github.com/kyriakon/kyriakon-infra/issues/233), and it is automated before the release. So the copy quotes £40 and says what it includes, and only the managed instance invites writing to us.
+Both are settled. The price line stays as B, and an organisation that wants its own
+domain, or several addresses, is quoted £40 a year for it, with up to ten addresses,
+rather than invited to write to us. That is
+[#188](https://github.com/kyriakon/kyriakon-infra/issues/188), which set all four tiers,
+and [#233](https://github.com/kyriakon/kyriakon-infra/issues/233), which put a body's
+application on the same form with a community block. The own-domain path is automated
+before the release, so the copy quotes the price and says what it includes. Only the
+managed instance is ordered by enquiry.
 
 - £20 a year. Free for clergy, monastics, and those who are unable to pay. Please let us know on the form!
 
@@ -255,7 +263,7 @@ difference is worth the extra sentence.
 A
 
 Recommended: A. The promise of pictures is what stops someone deciding this is beyond
-them, and it has to be true when the page ships. The phone stays out until the key generator prototype has tested Thunderbird for Android, per [#176](https://github.com/kyriakon/kyriakon-infra/issues/176); the walkthrough claims mobile only once it works.
+them, and it has to be true when the page ships. The phone stays out until the prototype has tested Thunderbird for Android ([#176](https://github.com/kyriakon/kyriakon-infra/issues/176)); the walkthrough claims it only then.
 
 The first mail, which belongs here as well as later:
 
@@ -318,7 +326,7 @@ identifiers belong next to it rather than in the email alone.
 - B. Received. A person will read it.
 - C. That is with us. Nothing more is needed from you today.
 
-Received, thank you for your application! A person will read it, and this page's status link is where the answer appears.
+Received, thank you for your application! A person will read it, and we will tell you the answer on this page's status link.
 
 
 Recommended: B, or C if the page also has to tell them about the status link. Naming the
@@ -360,13 +368,13 @@ to notice the missing padlock and worry.
 
 The declined state:
 
-- A. I am sorry we were not able to open an account for you. If you think we have this
-  wrong, reply to this message. A word from your priest, or from someone we already know,
+- A. I am very sorry, but we are not able to open an account for you at this time. If you
+  think we have this wrong, please write to us: A word from your priest, or from someone we already know,
   usually settles it, and we are glad to look again. We will hold the application for a
   week, and after that it is deleted and the name is free for anyone to take.
 - B. Not approved this time, and I am sorry about that. You are welcome to write to us about it.
 
-Recommended: A. It apologises for the outcome rather than the decision, which is the distinction that matters when no reason is given: an apology for the decision invites "why", and there is no answer to give. It offers the vouch rather than an open invitation to argue by correspondence, and it carries the clock.
+Recommended: A. It is sorry for the outcome rather than the decision, which is what matters when no reason is given: being sorry for the decision invites the question why, and there is no answer. It offers the way back rather than an open invitation to write at length, and it says how long the application is held.
 
 The monastic decline stays distinct rather than reusing this text, because it is the one case where the message says what is missing, deliberately: what is missing is a conversation. Its wording needs one correction, though. It says we could not reach the elder, and we never try, since the applicant supplies the blessing. It should read: "The blessing of your elder did not reach us. If you can ask him to write to us, or send his blessing, we will look again."
 
@@ -417,7 +425,7 @@ Recommended: A. It says what would fix it and leaves the initiative with the app
 
 The acknowledgement, which has legal weight and has to be readable anyway. It is two acts, not one sentence: [#149](https://github.com/kyriakon/kyriakon-infra/issues/149) requires an express request to begin inside the fourteen days and, separately, an acknowledgement that this is digital content supplied at once. Two boxes, and the record keeps both.
 
-- A. Tick both. Start my account now, before the fourteen days are up. / I understand that
+- A. Tick both. I ask you to begin supplying the service immediately. / I understand that
   this is digital content supplied at once.
 - B. Please start my account now. / I understand that this is digital content, supplied
   immediately.
@@ -506,7 +514,7 @@ gives up.
 
 The certificate line, which sets a real expectation:
 
-- A. Your certificate has been requested. It is queued, and usually arrives within a day or three, and until then your site answers on HTTP.
+- A. Your certificate has been requested. It usually arrives within a day or three, and until then your site answers on HTTP.
 - B. Your site is up. The padlock will appear shortly.
 
 A
@@ -624,7 +632,7 @@ Recommended: A. It answers the question the reader will otherwise ask after clos
   [#177](https://github.com/kyriakon/kyriakon-infra/issues/177), and the working position is
   that an institution with a treasurer pays.
 
-- Section 3, the tiers: the parish tier is priced at £40 and reached by the form rather
+- Section 3, the tiers: an organisation's own domain is priced at £40 and reached by the form rather
   than a letter, per [#188](https://github.com/kyriakon/kyriakon-infra/issues/188) and
   [#233](https://github.com/kyriakon/kyriakon-infra/issues/233).
 - Section 12: no phone, until the key generator prototype tests Thunderbird for Android.
