@@ -102,7 +102,25 @@ newest_snapshot_epoch() {
 	# prints each object on its own line today, but nothing in the format promises
 	# that, and a field number that reads the key instead of the value would parse
 	# as empty and silence the check.
-	for time in $(awk 'match($0, /"time":"[^"]+"/) { print substr($0, RSTART + 8, RLENGTH - 9) }' 2>/dev/null || true); do
+	#
+	# Every match on a line is taken, not the first, and that is what this check got
+	# wrong a second time on 2026-10-05: restic 0.19 prints the whole array on one
+	# line, and a single match() per line read only the first object in it. With
+	# --latest 1 returning one snapshot per group and the older group listed first,
+	# the newest time was never seen, so the box reported the old payload's snapshot
+	# from 18 September as the latest while the real one was minutes old. The
+	# fixtures below were multi-line, so the self-test agreed with the bug.
+	for time in $(awk '
+		{
+			line = $0
+			while (match(line, /"time"[ \t]*:[ \t]*"[^"]+"/)) {
+				value = substr(line, RSTART, RLENGTH)
+				sub(/^"time"[ \t]*:[ \t]*"/, "", value)
+				sub(/"$/, "", value)
+				print value
+				line = substr(line, RSTART + RLENGTH)
+			}
+		}' 2>/dev/null || true); do
 		time=$(printf '%s' "$time" | sed 's/\.[0-9]*//; s/Z$/+0000/; s/\([+-][0-9][0-9]\):\([0-9][0-9]\)$/\1\2/')
 		epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$time" +%s 2>/dev/null || true)
 		[ -n "$epoch" ] || continue
@@ -127,21 +145,32 @@ self_test() {
 		fi
 	}
 	# Two groups, the newer one with the larger time, and the older listed first:
-	# the shape that produced the false "364 hours old".
-	two_groups='{"snapshots":[
-	{"time":"2026-09-18T14:42:12.000000000Z","paths":["/home"]},
-	{"time":"2026-10-03T02:30:01.000000000Z","paths":["/etc/mail","/home"]}]}'
+	# the shape that produced the false "364 hours old". Written the way restic
+	# 0.19 actually prints it, on one line, because the multi-line form is what let
+	# the check agree with itself while reading only the first object.
+	two_groups='[{"time":"2026-09-18T14:42:12.000000000Z","paths":["/home"]},{"time":"2026-10-03T02:30:01.000000000Z","paths":["/etc/mail","/home"]}]'
 	expect=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "2026-10-03T02:30:01+0000" +%s)
 	check "the newest of two groups is chosen" \
 		"$(printf '%s' "$two_groups" | newest_snapshot_epoch)" "$expect"
 
 	# One group, both stale: the newest of them is still what is reported.
-	both_old='{"snapshots":[
-	{"time":"2026-09-18T14:42:12.000000000Z"},
-	{"time":"2026-09-19T02:30:01.000000000Z"}]}'
+	both_old='[{"time":"2026-09-18T14:42:12.000000000Z"},{"time":"2026-09-19T02:30:01.000000000Z"}]'
 	expect_old=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "2026-09-19T02:30:01+0000" +%s)
 	check "an all-stale repository reports its newest" \
 		"$(printf '%s' "$both_old" | newest_snapshot_epoch)" "$expect_old"
+
+	# The same times spread over lines, which is what `jq` prints if anyone ever
+	# pipes the listing through it: one match per line has to keep working.
+	spread='[
+	{
+		"time": "2026-09-18T14:42:12.000000000Z"
+	},
+	{
+		"time": "2026-10-03T02:30:01.000000000Z"
+	}
+]'
+	check "a listing spread over lines parses too" \
+		"$(printf '%s' "$spread" | newest_snapshot_epoch)" "$expect"
 
 	# A named-zone offset, which restic writes off this box.
 	offset='{"snapshots":[{"time":"2026-10-03T04:30:01.000000000+02:00"}]}'
