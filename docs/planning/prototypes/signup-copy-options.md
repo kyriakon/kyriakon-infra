@@ -11,7 +11,7 @@ Three things run through all of it. The tone is plain and unhurried, which suits
 platform whose operator you can write to. Nothing promises more than it does. Every limit
 appears where the promise is made, not in a policy nobody opens.
 
-Placeholders in the copy: the example member is `frseraphim`, the outside address is
+Placeholders in the copy: the example member is `theophilus`, the outside address is
 `someone@example.invalid`, and prices, dates and counts are the ones in the mock.
 
 ## 1. Splash: the heading
@@ -29,6 +29,8 @@ voice with the capsule mirror.
 Recommended: A. People arrive knowing what mail and a website are, and the list is what
 they came to check.
 
+- Secure Encrypted Email and Hosting, run by Orthodox Christians.
+
 ## 2. Splash: what you get, and the limits
 
 Three short blocks, each heading followed by two or three sentences.
@@ -38,7 +40,7 @@ Heading options for the mail block:
 - A. Mail you can read and we cannot.
 - B. Your mail, sealed with your key.
 - C. Private mail.
-- D. Secure encrypted mail. (chosen)
+- D. Secure encrypted email. (chosen)
 
 A is the plainest and leads with the property that matters. B is gentler and less
 specific. C is a claim anyone can make. D is the phrase a reader already recognises, which
@@ -87,10 +89,12 @@ and [#190](https://github.com/kyriakon/kyriakon-infra/issues/190), and the decis
 waits on them is [#188](https://github.com/kyriakon/kyriakon-infra/issues/188). No price
 for the parish tier appears on the site until then.
 
+- £20 a year. Free for clergy, monastics, and those who are unable to pay. Please let us know on the form!
+
 ## 4. Key check: heading and first line
 
-- A. Does your key work here? Paste your public key. The check runs in your browser and
-  nothing is sent to us.
+- A. Does your key work here? Paste your public key. Nothing leaves your
+  browser.
 - B. Will your mail work with us? Paste your public key and find out. Nothing leaves your
   browser.
 - C. Check your key before you apply.
@@ -101,6 +105,9 @@ it.
 
 Recommended: A, with B's phrase "nothing leaves your browser" if you want the privacy
 point stated more gently than "nothing is sent to us".
+
+- Does your key work here? Paste your public key to check. Nothing leaves your
+  browser.
 
 ## 5. Key check: the three answers
 
@@ -113,6 +120,8 @@ The success line.
 
 A names the three things checked, which teaches the reader what matters. B is friendlier
 and tells them nothing they could act on later.
+
+B
 
 The failure lines, which are the ones that matter, because a member who reads one has a
 problem to fix.
@@ -128,6 +137,8 @@ problem to fix.
 Recommended: keep A's shape, which names what is wrong, what it would do, and what to do
 about it. A warning that does not say what to do is a support ticket.
 
+A 
+
 ## 6. Application: the opening line
 
 - A. A person reads every application. Nothing is charged until it is approved.
@@ -141,12 +152,14 @@ yet. B is warmer and puts the human first. C leaves both facts to be discovered.
 Recommended: A, or B if you want the page to open gently. Either way the two facts have to
 be there.
 
+B
+
 ## 7. Application: the username
 
 Label and help text.
 
-- A. Username. This becomes your address, frseraphim@kyriakon.net, and your site,
-  frseraphim.kyriakon.net.
+- A. Username. This becomes your address, theophilus@kyriakon.net, and your site,
+  theophilus.kyriakon.net.
 - B. The name you want. It becomes both your mail address and your website address.
   Lowercase letters, digits and hyphens, up to 31 characters.
 - C. Your name here. Checked as you type.
@@ -154,6 +167,8 @@ Label and help text.
 Recommended: B. It explains the consequence before the reader commits, and states the
 rules in the same place. The example address in A is worth keeping underneath, since
 seeing the finished address is what makes it click.
+
+B with the example address under it.
 
 ## 8. Application: the address outside the platform
 
@@ -167,12 +182,13 @@ that nobody thinks we are asking for their main address.
 
 Recommended: B. "Outside this platform" is precise and slightly cold, and "your other
 email" invites exactly the privacy question the field is meant to leave open.
+B
 
 The consequence, which has to be stated in full and without drama.
 
 - A. If you leave it empty, we can only reach you inside this account. If you lose your
-  key or your mail program, you will not hear from us, and an unpaid account will still
-  lapse and in time be deleted, with the mail. Nothing else changes.
+  key or your mail program, we will not be able to reach you. An unpaid account will be
+  deleted after some time along with its mail.
 - B. We would rather have a way to reach you, and we understand why you might not want to
   give one. Without it, everything still works until something goes wrong, and then we
   have no way to tell you.
@@ -180,17 +196,21 @@ The consequence, which has to be stated in full and without drama.
 Recommended: A. It is the version that says what happens rather than how we feel about it,
 and the reader can weigh it.
 
+A 
+
 Worth a sentence either way, and it belongs here rather than in the privacy notice: it is
 used for notices only, never shared, and never used to look you up anywhere else.
 
 ## 9. Application: the mail password
 
 - A. Mail password. You will type this into your mail program, not here.
-- B. Mail password. Choose something you can type on a phone. You can change it later from
+- B. Account password. Choose something you can type on a phone. You can change it later from
   your account page.
 
 Recommended: B. The first thing people do with a password field is worry about which
 password to use, and both facts answer the worry.
+
+B
 
 ## 10. Keys: the mail key and the recovery phrase
 
@@ -201,12 +221,12 @@ The step heading.
 - C. Your mail key.
 
 Recommended: A. It is a thing the reader does, not a thing they have.
+A
 
 The recovery phrase, which is the most important paragraph in the whole flow.
 
 - A. Write these eight words on paper, now. Anyone who has both the words and the key file
-  can read your mail. We have neither, which is why we cannot read it, and why nobody here
-  can recover it for you.
+  can read your mail. We do not have either of them, which is why we cannot read it, and why we cannot recover it for you.
 - B. Write these eight words down and keep them away from the file. If you lose both, your
   mail is gone. There is no reset, no security question, and no way for us to help.
 - C. These words are the only way back in if you lose the file. Somewhere separate, and
@@ -215,6 +235,8 @@ The recovery phrase, which is the most important paragraph in the whole flow.
 A explains who this protects against, which is what makes someone take it seriously. B is
 blunter and leads with loss. C is quiet and treats it as obvious, which is how people come
 to skip it.
+
+A
 
 Recommended: A. It says who can read the mail and why we cannot help, which is the
 sentence that makes people write the words down.
@@ -227,14 +249,18 @@ sentence that makes people write the words down.
 - B. Your upload key. Needed only if you want a website or repositories. We never see the
   private half.
 
+  A
+
 Recommended: A. The confusion between the two keys is the thing to prevent, so naming the
 difference is worth the extra sentence.
 
 ## 12. Keys: putting the key into a mail program
 
-- A. Put the key into your mail program. Step by step, with pictures: Thunderbird on a
-  computer, and Thunderbird on a phone.
+- A. Put the key into your mail program. Follow the walkthrough for Thunderbird, on a computer or a phone.
+
 - B. Setting up. Follow the walkthrough for Thunderbird, on a computer or a phone.
+
+A
 
 Recommended: A. The promise of pictures is what stops someone deciding this is beyond
 them, and it has to be true when the page ships.
@@ -249,15 +275,21 @@ The first mail, which belongs here as well as later:
 Recommended: A. "Nothing is lost" is the sentence that stops someone giving up at the
 first failure.
 
+A
+
 ## 13. Application: the questions about you
 
 The opening line, which decides whether people answer.
 
 - A. All of this is optional. It goes to one person, it is not published, and it is
-  deleted with your application. Answers here make approval quicker and more likely.
+  deleted with your application. These answers will make it easier and quicker for us to approve you.
 - B. These are the questions we would ask if you came to the door. None of them are
-  required, and they make approval quicker and more likely.
+  required but they make approval quicker and more likely. Plese
 - C. Tell us about yourself (optional).
+
+
+A 
+
 
 A states plainly what happens to the answers. B is warmer and explains why the questions
 are being asked at all, which is the honest answer to "why does a hosting company want to
@@ -268,10 +300,13 @@ personal and is owed both the reason and the handling.
 
 The blessing question, for monastics, which is the one required answer.
 
-- A. If you are a monk or a nun, do you have your elder's blessing to keep this account?
+- A. If you are a monastic, do you have your elder's or confessor's blessing to have an account?
 - B. For monastics: has your elder blessed you to keep an account here? If he has, a line
   from him is enough.
 - C. If you are a monk or a nun, the blessing of your elder is required.
+
+
+A 
 
 Recommended: A, and B's second sentence if you want it to be easy to comply. C states a
 requirement without saying how to satisfy it.
@@ -281,7 +316,7 @@ requirement without saying how to satisfy it.
 - A. I accept the terms, the acceptable use policy and the privacy notice.
 - B. I have read and accept the terms, the acceptable use policy and the privacy notice.
   (versions listed with dates)
-
+B
 Recommended: B. "I have read" is the wording that survives a dispute, and the version
 identifiers belong next to it rather than in the email alone.
 
@@ -291,19 +326,24 @@ identifiers belong next to it rather than in the email alone.
 - B. Received. A person will read it.
 - C. That is with us. Nothing more is needed from you today.
 
+Received, thank you for your application! A person will review it and get back to you.
+
+
 Recommended: B, or C if the page also has to tell them about the status link. Naming the
 human is the reassurance people are looking for after typing something personal into a
 form.
 
 The status link line:
 
-- A. Keep this link or print it. It shows where your application has got to, and it is how
-  we tell you a decision if you gave no other address.
+- A. Save this link or write it down. It will show your application's status and it is how
+  we tell you the outcome if you gave no other address.
 - B. Anyone with this link can see your application. Keep it as you would a password.
 
 Recommended: both, A first and B after it. The second sentence is the one that makes
 someone treat it carefully, and leaving it out is how a link ends up pasted into a group
 chat.
+
+Both.
 
 ## 16. Status link
 
@@ -315,10 +355,12 @@ Heading.
 
 Recommended: A. The others read like a database field.
 
+C
+
 The approved state, which is also the payment step:
 
-- A. Approved. Your account is open: frseraphim@kyriakon.net, with mail working and your
-  site answering on HTTP until its certificate arrives. What is left is payment.
+- A. Approved. Your account is open at: theophilus@kyriakon.net, with mail working and your
+  site answering on HTTP until its certificate arrives. The final step remaining is payment.
 - B. You are approved. Your address already works. One thing remains.
 
 Recommended: A, because it tells them the certificate is coming rather than leaving them
@@ -329,7 +371,11 @@ The declined state:
 - A. We were not able to open an account, and we will look again if you ask us to.
 - B. Not approved this time. You are welcome to write to us about it.
 
+ <!-- I am are very sorry but we have decided to decline your application at this time. Please write to us if you have any further information that may help us to reconsider. ! !!!! (give in input on this please)
 Recommended: A. "This time" and "you are welcome" are the parts that keep it courteous.
+
+ -->
+Perhapse its better to use the same text as the decline email.
 
 ## 17. Approval email
 
@@ -342,9 +388,11 @@ of you at the moment of deciding.
 
 You chose A already, so the only question left is the subject line.
 
-- A. Application: frseraphim
-- B. frseraphim has applied
+- A. Application: theophilus
+- B. theophilus has applied
 
+
+A 
 Recommended: A. It sorts and searches better in a mailbox you will come back to.
 
 ## 18. Decline
@@ -359,6 +407,8 @@ Recommended: A. It sorts and searches better in a mailbox you will come back to.
 Recommended: A. For a community this size the vouch is a real path back in, and naming it
 is what makes the decline feel like a door rather than a wall.
 
+A
+
 The monastic decline, which is the one case where the message says what is missing.
 
 - A. We have not been able to reach your elder. If you can ask him to write to us, or send
@@ -366,6 +416,9 @@ The monastic decline, which is the one case where the message says what is missi
 - B. The blessing of your elder is what we are waiting for.
 
 Recommended: A. It says what would fix it and leaves the initiative with the applicant.
+
+!!? Are we writing to the elder?? 
+
 
 ## 19. Payment: card
 
@@ -380,11 +433,15 @@ Recommended: A for the text recorded against the account, B for the checkbox if 
 the reader to feel they are asking for something rather than accepting a term. The
 recorded wording is the one that matters, so whichever is shown, A goes in the record.
 
+A
+
 The cancellation line:
 
 - A. You can still cancel within 14 days and have your money back in full. Asking us to
   start at once does not take that away.
 - B. For 14 days after paying you can change your mind and be refunded in full.
+
+A 
 
 Recommended: A. The second sentence answers the question the first one raises.
 
@@ -392,7 +449,10 @@ The renewal line:
 
 - A. Renews each year on this date. We email you before it renews, and you can stop it at
   any time from your account page.
-- B. This is a yearly subscription. We will write before it renews.
+- B. This is a yearly subscription. We email you before it renews, and you can stop it at
+  any time from your account page.
+
+B
 
 Recommended: A. Naming the account page turns a subscription into something they control.
 
@@ -402,6 +462,8 @@ Recommended: A. Naming the account page turns a subscription into something they
   account, so without it we cannot tell whose it is.
 - B. Post £20 with this token. Cash is not refundable by card, so a refund means posting
   the money back.
+
+Both
 
 Recommended: both, in that order. B is the kind of limit this platform states rather than
 leaves for someone to discover.
@@ -418,7 +480,10 @@ The window, and what happens at the end of it.
   does not arrive in that time the account lapses: mail you already have stays readable,
   your site stays up, and sending, uploading and pushing stop. Nothing is deleted, and
   paying at any time brings it back.
-- B. Please pay within 14 days. After that the account sleeps until we hear from you.
+- B.  Your payment window is 14 days, and it is shown on your account page. After that the account will be read-only until we hear from you: mail you already have stays readable,
+  your site stays up, but sending new mail and uploading or pushing to your websites stop. Paying at any time will bring it back.
+
+B
 
 Recommended: A. B is friendlier and leaves the reader unsure what "sleeps" means, which is
 the ambiguity that generates a support email.
@@ -431,6 +496,8 @@ Heading.
 - B. You are open for mail.
 - C. Everything is ready.
 
+A
+
 Recommended: A, with the second sentence under it saying what to do next.
 
 The line about the first message, which is the one that catches a broken setup:
@@ -438,6 +505,10 @@ The line about the first message, which is the one that catches a broken setup:
 - A. The first message in your mailbox is encrypted. If you can read it, everything works.
   If you cannot, nothing is lost: the walkthrough has a section for exactly that.
 - B. There is one message waiting for you. Being able to read it means you are finished.
+
+
+A
+
 
 Recommended: A. It is the difference between a setup that works and a member who quietly
 gives up.
@@ -448,6 +519,9 @@ The certificate line, which sets a real expectation:
   then your site answers on HTTP.
 - B. Your site is up. The padlock will appear shortly.
 
+A
+
+
 Recommended: A. B invites the reader to watch for a padlock on a site they cannot yet
 reach securely.
 
@@ -457,15 +531,17 @@ Status labels, which are read by people who are worried about something.
 
 - A. Active. Paid until 30 September 2027.
 - B. Everything is in order. Paid until 30 September 2027.
-
+A
 Recommended: A. "Everything is in order" reads like a bank, and this page is not a bank.
 
 The notices list, which is the record of what we told them.
 
-- A. Every notice we send you, at every address we have for you, is listed here with its
-  date and what it said.
+- A. This is every notice have written to you across all your addresses.
+  
 - B. This is everything we have written to you about your account, and everything we will
   write.
+
+  A
 
 Recommended: A. It says where the notices went, which is the part that matters when one
 of the addresses was wrong.
@@ -473,9 +549,11 @@ of the addresses was wrong.
 The limits of what we can do, which belongs on the page as a short list.
 
 - A. We cannot read your mail. We cannot recover your key. We cannot restore mail you have
-  deleted. We cannot give you a command line.
+  deleted. We cannot give you shell access.
 - B. What we cannot do: read your mail, recover your key, restore deleted mail, give you a
   shell.
+
+  A
 
 Recommended: A. Four short sentences, each one a promise kept, which is worth more here
 than a colon and a list.
@@ -487,6 +565,8 @@ than a colon and a list.
 - B. Change the key your mail is encrypted to. Both of your addresses have to confirm it,
   unless you gave only one, and you have three days to stop it.
 
+  A
+
 Recommended: A. The mechanism matters less here than the fact that it cannot be done to
 you in a moment.
 
@@ -497,14 +577,19 @@ The explanation of why, which the reader deserves.
 - B. This is the one change that can hand your future mail to someone else, so it is
   deliberately slow.
 
+
+  A
+
 Recommended: A. It explains the risk in the reader's terms rather than ours.
 
 ## 24. Closing the account
 
 Heading and the first line.
 
-- A. Closing the account. You can close it now and stop it within seven days.
+- A. Closing the account. You can end it now and it will terminate within seven days.
 - B. Close my account. Seven days, and you can change your mind in that week.
+
+a and b 
 
 Recommended: A on the page, B on the button. The heading states what the page is, the
 button says what pressing it does.
@@ -517,6 +602,8 @@ The consequences, which have to be complete:
 - B. Everything goes: mail, website, capsule, repositories. Backups fade within about
   seven months. The name comes free after 90 days.
 
+A
+
 Recommended: A. B is quicker to read and drops the detail someone needs to decide, and the
 detail is the whole point of the page.
 
@@ -525,6 +612,8 @@ The reminder to take a copy first, which should not be a footnote:
 - A. Take a copy of everything first. Your mail comes out encrypted to your key, so you
   will need the key you already hold to read it.
 - B. Download your data before you close.
+
+A
 
 Recommended: A. It answers the question the reader will otherwise ask after closing.
 
@@ -546,3 +635,5 @@ Recommended: A. It answers the question the reader will otherwise ask after clos
   that an institution with a treasurer pays.
 
 Every other section stands at the recommended option until it is overruled.
+
+
