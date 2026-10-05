@@ -68,3 +68,20 @@ Three of the four the capability note left open are now closed.
 Thunderbird on desktop and on Android, which need a client rather than a browser. The
 subkey-expiry path also stays unverified, because gpg refuses to export an expired subkey in
 any form, so an artifact from gpg carries either a usable subkey or none.
+
+## The harness
+
+`browser-run.js` is the script that was run, not a re-enactment. It opens the page, records
+every request the tab makes, generates a key, checks it, checks a gpg-made key that
+advertises AEAD, and asserts that every request was to the local server. It needs a browser
+script runner, which is part of the environment rather than the file, so the honest claim is
+that the run is reproducible with that runner and the outputs above are what it returned.
+
+## What the prototype does not implement from ticket 176
+
+The page hands over the secret key because ticket 176 says the generator does; that handover
+is 176's decision rather than this ticket's proof. What is not implemented here is the rest
+of 176's key design: the eight words come from a hardcoded placeholder rather than the
+vendored 2,048-word list, no entropy is computed, and the upload key is not generated. Those
+belong to the crate the release builds, and the prototype says so rather than implying
+otherwise.

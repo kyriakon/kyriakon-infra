@@ -313,9 +313,9 @@ pub fn self_check() -> Result<(), String> {
     if !findings.is_empty() {
         return Err(format!("a generated key did not check clean: {findings:?}"));
     }
-    let rot = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nnot a key\n-----END PGP PUBLIC KEY BLOCK-----\n";
-    if check_public_key(rot, 1_700_000_000).is_ok() {
-        return Err("rot did not fail".into());
+    let not_a_key = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nnot a key\n-----END PGP PUBLIC KEY BLOCK-----\n";
+    if check_public_key(not_a_key, 1_700_000_000).is_ok() {
+        return Err("a malformed key was accepted".into());
     }
     if findings_json(&["a \"quoted\" \\ line\nsecond".to_string()])
         != "{\"ok\":false,\"findings\":[\"a \\\"quoted\\\" \\\\ line\\nsecond\"]}"
