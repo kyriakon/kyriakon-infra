@@ -284,7 +284,7 @@ The opening line, which decides whether people answer.
 - A. All of this is optional. It goes to one person, it is not published, and it is
   deleted with your application. These answers will make it easier and quicker for us to approve you.
 - B. These are the questions we would ask if you came to the door. None of them are
-  required but they make approval quicker and more likely. Plese
+  required but they make approval quicker and more likely. Please
 - C. Tell us about yourself (optional).
 
 
@@ -371,11 +371,11 @@ The declined state:
 - A. We were not able to open an account, and we will look again if you ask us to.
 - B. Not approved this time. You are welcome to write to us about it.
 
- <!-- I am are very sorry but we have decided to decline your application at this time. Please write to us if you have any further information that may help us to reconsider. ! !!!! (give in input on this please)
+ <!-- I am very sorry but we have decided to decline your application at this time. Please write to us if you have any further information that may help us to reconsider. ! !!!! (give in input on this please)
 Recommended: A. "This time" and "you are welcome" are the parts that keep it courteous.
 
  -->
-Perhapse its better to use the same text as the decline email.
+Perhaps it is better to use the same text as the decline email.
 
 ## 17. Approval email
 
@@ -485,7 +485,7 @@ The window, and what happens at the end of it.
 
 B
 
-Recommended: A. B is friendlier and leaves the reader unsure what "sleeps" means, which is
+Recommended: A. B is friendlier and leaves the reader unsure what "read-only" means, which is
 the ambiguity that generates a support email.
 
 ## 21. Account live
@@ -536,7 +536,7 @@ Recommended: A. "Everything is in order" reads like a bank, and this page is not
 
 The notices list, which is the record of what we told them.
 
-- A. This is every notice have written to you across all your addresses.
+- A. This is every notice we have written to you across all your addresses.
   
 - B. This is everything we have written to you about your account, and everything we will
   write.
@@ -589,7 +589,7 @@ Heading and the first line.
 - A. Closing the account. You can end it now and it will terminate within seven days.
 - B. Close my account. Seven days, and you can change your mind in that week.
 
-a and b 
+Both: A on the page, B on the button.
 
 Recommended: A on the page, B on the button. The heading states what the page is, the
 button says what pressing it does.
