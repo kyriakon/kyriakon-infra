@@ -27,35 +27,39 @@ Choosing the body path opens the block below and changes three things on the res
 
 > ### The body
 >
-> **Name** *(required)*
+> **Name**
 > `________________`
-> The name you use, as you would say it out loud. A parish, a monastery, a mission, a school, a shop, a workshop. There is no list to choose from.
+> The name you use, as you would say it out loud. A parish, a monastery, a shop, a workshop. There is no list to choose from.
 >
-> **Kind** *(required)*
-> `[ ] parish  [ ] monastery  [ ] school  [ ] business  [ ] other: ________`
+> **Kind**
+> `[ ] parish  [ ] monastery  [ ] business  [ ] other: ________`
 > This tells us what sort of application it is when we read the queue. Nothing is decided on it.
 >
-> **Domain** *(required)*
+> **The elder's blessing** *(required if the body is a monastery)*
+> `[ ]` The monastery has the blessing of its elder, the same answer the monastics path asks for and requires.
+>
+> **VAT number** *(optional, only if the application is for a business)*
+> `________________`
+> If the application is for a business and it is registered for VAT, its number goes here. A Union business supply becomes a reverse-charge supply with no VAT charged. Leave it empty otherwise.
+>
+> **Domain**
 > `________________`
 > The domain the mail will live on. You keep control of it: you point its mail at us and we tell you exactly which records to create. Nothing here changes your domain's registration.
+> `[ ]` I can add the DNS records you will ask me to create.
 >
-> **Addresses** *(required, one row per address)*
+> **Addresses** *(one row per address)*
 >
-> | The part before the @ | Whose address it is | Its own mailbox, or an alias into one |
-> |---|---|---|
-> | `secretary` | the office | its own mailbox |
-> | `hall` | the hall bookings | alias into `secretary` |
-> | `father` | the priest | its own mailbox |
-> | `orders` | the shop | its own mailbox |
+> | The part before the @ | Whose address it is | Its own mailbox, or an alias into one | The account name |
+> |---|---|---|---|
+> | `secretary` | the office | its own mailbox | `theirparish-secretary` |
+> | `hall` | the hall bookings | alias into `secretary` | the same as `secretary` |
+> | `father` | the priest | its own mailbox | `theirparish-father` |
+> | `orders` | the shop | its own mailbox | `theiconshop-orders` |
 >
-> Up to ten. An address that is an alias shares the mailbox, and therefore the key, of the one it points at; an address with its own mailbox gets its own key and its own 5 GB.
+> Up to ten. An address that is an alias shares the mailbox, and therefore the key, of the one it points at; an address with its own mailbox gets its own key and its own 5 GB. The account name is the name the mailbox is known by on our machine, which is not the same as its address. We suggest one from the domain and the address, and you can change it. Two parishes may both have a `secretary@`, because the address carries the domain and the account name does not.
 >
-> **Mail keys** *(one per mailbox, required)*
+> **Mail keys** *(one per mailbox)*
 > One public key for each mailbox above, made in this page the same way the single-address path makes yours: nothing is uploaded, the private key never leaves your browser, and you write down the words that go with it. Two people who will both read `secretary` both need that mailbox's key, so make it somewhere you can both keep it.
->
-> **The account name** *(required, one per mailbox)*
-> `________________`
-> The name the account is known by on our machine, which is not the same as its address. We suggest one from the domain and the address, and you can change it. Two parishes may both have a `secretary@`, because the address carries the domain and the account name does not.
 >
 > **Upload key for the website** *(optional; only needed if the domain gets a site or repositories)*
 > `ssh-ed25519 AAAA...`
@@ -64,7 +68,7 @@ Choosing the body path opens the block below and changes three things on the res
 > `________________`
 > A name or an address of your choosing, or leave it empty and we will write to the address above. This is used while the records are being set up and is not kept afterwards.
 >
-> **How you will pay** *(required)*
+> **How you will pay**
 > The same three rails as the single-address path. The amount is £40 for the year, which covers the domain and up to ten addresses, and it does not change with the kind.
 >
 > **Before you send** *(required)*
@@ -83,7 +87,7 @@ Choosing the body path opens the block below and changes three things on the res
 
 ## What the reviewer sees
 
-The same queue, with a tag that says body, its kind and the domain on the row, filterable. The three outcomes do not change: approve paid, approve without charge, or decline. A body application carries two extra things for the reviewer to check, that the domain resolves and that the applicant can add its records, and one extra step after approval, that the domain's records and the mailboxes are issued rather than one address.
+The same queue, with a tag that says body, its kind and the domain on the row, filterable. The three outcomes do not change: approve paid, approve without charge, or decline. A body application carries one extra thing for the reviewer to check, that the domain resolves, and one extra step after approval, that the domain's records and the mailboxes are issued rather than one address.
 
 One thing the reviewer needs to know and the form cannot ask: a body applying in the course of business is not a consumer, so the fourteen-day cancellation right does not reach it the way it does a person. That is the terms' business, tracked in [Draft the terms and privacy notice](https://github.com/kyriakon/kyriakon-infra/issues/235), not a question for this form.
 
