@@ -184,7 +184,7 @@ After a credit, the block reads `Paid until <date>`, the token disappears, and t
 
 After the window closes with nothing recorded, the block reads `Lapsed`, repeats the close date, and states what still works and what has stopped, with the same wording the lapse notice uses. The token is shown again, because the account is unpaid and someone who lost the email still needs it, and the page keeps a line to `admin@` for anyone who has posted the money.
 
-An account whose approval was without charge has no window, no token and no payment block.
+An account whose approval was without charge has no window, no token and no payment block. It also has no paid-until date, so it never lapses and the closing sweep skips it, as [#177](https://github.com/kyriakon/kyriakon-infra/issues/177) decided. It carries the same 5 GB allowance and the same AUP as any other account, and one notice a year says that nothing is due and that the paid path is there if circumstances have changed.
 
 ## State
 
@@ -193,7 +193,7 @@ The store is the flat-file one from [#156](https://github.com/kyriakon/kyriakon-
 | Path | Status | What the prepaid rails put in it |
 |---|---|---|
 | `accounts/<username>/account.json` | modified | `payment.rail`, `payment.token_ref`, `payment.token_issued_at`, `payment.paid_until`, `payment.balance_gbp`, `payment.window{opened_at,closes_at,state,extensions}`, `payment.monero{address,quote_xmr,rate_gbp_per_xmr,rate_source,rate_at}` |
-| `accounts/<username>/notices.jsonl` | modified | `prepaid.window_open`, `prepaid.window_closing`, `prepaid.receipt`, `prepaid.lapsed`, `prepaid.refund`, one line per notice with its date and address |
+| `accounts/<username>/notices.jsonl` | modified | `prepaid.window_open`, `prepaid.window_closing`, `prepaid.receipt`, `prepaid.lapsed`, `prepaid.refund`, and `free.anniversary` for the yearly note to a member who pays nothing, one line per notice with its date and address |
 | `accounts/<username>/application.json` | modified | `status_link_until`, seven days after the decision; the answers themselves follow the existing 90-day purge (ADR 0005) |
 | `tokens/<token>.json` | new | the join: token, username, `issued_at`, `window_closes_at`, `state`. Created at approval, deleted by `onboardctl delete` |
 | `ledger/payments.jsonl` | new | append-only, keyed by token, no username. Every credit, every refund |
