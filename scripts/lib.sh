@@ -75,7 +75,14 @@ dnsbl_verdict() {
 	dnsbl_ip="$1"
 	dnsbl_rev=$(printf '%s\n' "$dnsbl_ip" | awk -F. '{ print $4"."$3"."$2"."$1 }')
 	# A resolver serving one machine is answered by everyone; a shared one is not.
-	if dig +short +time=2 +tries=1 @127.0.0.1 . NS >/dev/null 2>&1; then
+	# Patient on purpose, three tries at five seconds. This probe is itself the first
+	# query after a boot, so it is the one query that primes the root while the cache
+	# is empty, and a two-second version gave up on a resolver with nothing wrong with
+	# it. That is the 2026-10-05 alert: the box had just rebooted, the probe failed,
+	# the check fell through to the system resolver, Spamhaus ignored it by design,
+	# and the operator was told to go and look at a healthy unbound. A slow run here
+	# costs nothing, and a week of runs is still one query a quarter hour.
+	if dig +short +time=5 +tries=3 @127.0.0.1 . NS >/dev/null 2>&1; then
 		dnsbl_at="@127.0.0.1"
 	else
 		dnsbl_at=""
