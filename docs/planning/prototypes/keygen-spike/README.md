@@ -48,9 +48,23 @@ The message was encrypted **on the mail box** with `gpg --no-options --recipient
 decrypted on this machine with the generated secret key, so the kit is a live pair rather
 than a fixture.
 
+## The residual checks, run 2026-10-05
+
+Three of the four the capability note left open are now closed.
+
+- **A larger key is inspected correctly.** A gpg RSA-4096 key came back flagged twice, for
+  advertising AEAD and for having no key that can encrypt. The second is not a false alarm:
+  `gpg --list-keys` shows it as `rsa4096 [SC]` with key flags `03` and no subkey, so a key
+  made that way genuinely cannot receive mail. It is a shape a member could easily produce,
+  which is the argument for the check existing.
+- **The prototype's own RSA key checks clean**, so the generator's RSA path works as the
+  EdDSA path does.
+- **The RSA unlock oddity was an artefact.** A message encrypted to the prototype's RSA key
+  decrypted on two consecutive attempts with the passphrase, so the first-attempt failure the
+  capability note records came from pinentry without a terminal rather than from the key.
+
 ## What is still not verified
 
 Thunderbird on desktop and on Android, which need a client rather than a browser. The
-capability note in `docs/planning/research/key-generator-capability.md` lists the rest: the
-inspection against keys larger than its five-key matrix, the subkey-expiry path gpg would not
-let us build a case for, and the RSA unlock oddity.
+subkey-expiry path also stays unverified, because gpg refuses to export an expired subkey in
+any form, so an artifact from gpg carries either a usable subkey or none.
