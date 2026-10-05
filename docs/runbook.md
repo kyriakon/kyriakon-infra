@@ -403,6 +403,29 @@ Work inbound first, then outbound, and stop when you find it. `doas ksh scripts/
 
 Do not restart every daemon at once. It hides which one was broken, and the log that would have named it rotates with the restart. Do not turn greylisting off by editing `/etc/pf.conf` in place, because that file is reviewed line by line and `scripts/pf-apply.sh` only appends. Test with an ordinary message from an address outside the platform.
 
+## When the blocklist check stops answering
+
+`abuse-monitor.sh` asks four blocklists about this box's address every fifteen minutes, strongest first, and takes the first verdict any of them gives. When the strongest, `zen.spamhaus.org`, stops giving one, the alert says the address is clean on a weaker list only. That is a coverage report rather than a listing: nothing needs delisting, but a listing on the strongest list would go unnoticed, so the alert is worth acting on rather than muting.
+
+The reason is in the alert, and the two reasons need different responses.
+
+1. `refused` or `servfail`: the zone is reachable and the query reached it, and the fault is in how it answered. Spamhaus's DNSBL zones answer NS and SOA queries in a way that does not match RFC 1034, and QNAME minimisation, on by default in unbound, needs those answers. That makes the asymmetry worth recognising: a lookup that ends in a record resolves, while a lookup that ends clean does not, so a listed address is found and a clean one is not. Spamhaus's own write-up is at `spamhaus.org/resource-hub/dnsbl/qname-minimization-and-spamhaus-dnsbls/` and ISC's analysis at `kb.isc.org/qname-minimization-and-spamhaus`.
+
+	Spamhaus recommends turning the feature off for this, which in unbound is one line in the `server:` section of `/var/unbound/etc/unbound.conf`:
+
+		qname-minimisation: no
+
+	Add it to the existing `server:` section rather than appending a second one, then:
+
+		doas rcctl restart unbound
+		doas ksh /usr/local/src/kyriakon-infra/scripts/check-hygiene.sh
+
+	The setting is global, because unbound has no per-zone form of it: every query from this box stops using QNAME minimisation, not only the blocklist ones. Spamhaus's argument for accepting that is that all queries in a blocklist lookup go to the same nameserver, so the privacy gain there is nil, and their measurement is that a lookup costing five queries costs one without it. ISC disagrees, holding that the resolver should not give up a privacy feature for a server's non-compliance. Treat it as a workaround with a decision attached, and revisit it if Spamhaus fixes the zone or unbound grows a per-zone setting.
+
+2. `no-answer` or `silent`: nothing came back at all, which is DNS on this box rather than anything Spamhaus did. `rcctl check unbound` is the right first move for that one.
+
+A clean verdict names the zone it came from and what it skipped, and `scripts/check-hygiene.sh` prints the same verdict on demand, along with whether the resolver on this box was the one asked, since querying `127.0.0.1` and querying a public resolver get different answers from Spamhaus.
+
 ## Rotate or revoke the DKIM signing key
 
 The signing key is `/etc/mail/dkim/private.rsa.key`, the published record is at selector `mail` in `openbsd/etc/nsd/kyriakon.net.zone`, and the proposal records rotation yearly or on compromise.
