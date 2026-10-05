@@ -327,21 +327,35 @@ binds a UK trader selling into the Union asks for
 [a representative in the Union](https://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32016R0679)
 (OJ L 119, 4.5.2016, Article 27(1)).
 
-Article 27(2)(a) removes the duty only where the processing "is occasional", carries no
-large-scale special category data and is unlikely to risk anyone's rights. Hosting a platform's
-own member accounts is continuous and is the business itself, so the exemption does not apply and
-a representative is required *(interpretation)*. Article 27(3) then fixes where: "The
+Article 27(2)(a) removes the duty only where the processing "is occasional", does not include or
+is not likely to result in processing of "special categories of data" under Article 9(1) or of
+"personal data relating to criminal convictions and offences" under Article 10, and is unlikely
+to risk anyone's rights. Hosting a platform's own member accounts is continuous and is the
+business itself, so the exemption does not apply and a representative is required
+*(interpretation)*. Article 27(3) then fixes where: "The
 representative shall be established in one of the Member States where the data subjects, whose
 personal data are processed in relation to the offering of goods or services to them, or whose
-behaviour is monitored, are." A representative service sitting in a member state where the
-platform has no members does not meet that on its face, so the person or firm has to be in a
-country a member actually lives in *(interpretation)*. The privacy notice already has a slot for
+behaviour is monitored, are." A firm sitting in a member state where the platform has no members
+does not satisfy Article 27(3), whose words tie the representative to a state where the data
+subjects are, so the person or firm has to be in a country a member actually lives in
+*(interpretation)*. The privacy notice already has a slot for
 this, because Article 13(1)(a) requires "the identity and the contact details of the controller
 and, where applicable, of the controller's representative" (2.1).
 
 None of this changes what the member experiences, and none of it applies to a release that
 refuses Union applications outright. The release serves them, so the representative is an
-operator action, listed with setting up the Monero wallet.
+operator action on the checklist before the first payment (#175), alongside setting up the
+Monero wallet (#178).
+
+### 2.8 The terms' one limit, and a data-subject request
+
+Two further mechanics from #163 sit beside the representative. The terms state one limit on who
+may apply: applications from residents of countries under UK sanctions are declined, checked at
+approval against the consolidated list, and no other restriction is placed on where a member may
+be. That wording belongs to the terms, drafted under #235 *(decision in #163)*. A data-subject
+request is answered on the account page for export and delete, and by an operator-run script
+with a written record for everything else, with the one-month deadline the Union sets stated in
+the privacy notice. That path is specified in #241 *(decision in #163)*.
 
 ---
 
@@ -451,7 +465,8 @@ ask the consumer for details of either their billing address, including the coun
 telephone number", and from the payment provider "a notification advice containing the 2-digit
 country code of the consumer's country of residence"
 ([HMRC](https://www.gov.uk/guidance/the-vat-rules-if-you-supply-digital-services-to-private-consumers)).
-A card payment through Stripe supplies both without the platform asking anything of its own
+A card payment through Stripe supplies both without the platform asking anything of its own, and
+the signup form carries no country field, so the member record holds no location
 *(interpretation)*. A prepaid member supplies neither, so the platform has to keep the evidence
 itself, which is on the accountant list in section 6.
 
@@ -463,7 +478,8 @@ with the accountant *(interpretation)*.
 
 The price keeps its shape: the member pays the number on the site, and the destination rate is
 taken out of the £20 rather than added on top, so no page needs an asterisk and no prepaid quote
-changes. On the card rail Stripe Tax computes the destination rate, having already been pointed
+changes *(decision in #163, and the terms carry the wording under #235)*. On the card rail
+Stripe Tax computes the destination rate, having already been pointed
 at the fact that the merchant must be registered for it to help (3.2). If Union membership grows
 to where the absorbed rate matters, the pricing decision is revisited rather than the promise.
 
@@ -537,6 +553,7 @@ docs repository `../kyriakon/docs/decisions/`.
 | Encrypted backup repository, `/home` plus `/etc/mail` | up to about 7 months after the data leaves the live tree | [backup.sh](../../../scripts/backup.sh), `restic forget --keep-daily 30 --keep-weekly 8 --keep-monthly 6`. The oldest kept snapshot is the last one of the month six months back, so a file deleted today can survive in the repository for about seven months *(interpretation)* |
 | Billing and accounting records | 5 years after the 31 January submission deadline for that tax year, and 6 years once VAT-registered | [GOV.UK business records if you're self-employed](https://www.gov.uk/self-employed-records/how-long-to-keep-your-records); [GOV.UK keeping VAT records](https://www.gov.uk/charge-reclaim-record-vat/keeping-vat-records) |
 | Card data and payment records | never on the platform; held by Stripe | proposal §5.9.1 step 3, payment happens on Stripe's domain, so "the platform never touches card data, no PCI scope" |
+| Country evidence for a prepaid Union member (3.5) | not yet settled; with the accountant | section 3.5 creates the class, because a prepaid payment carries neither of the two pieces of country evidence HMRC asks for, and section 6 carries the question |
 
 Three things the schedule has to reconcile, and they are the reason it is a table rather than a
 paragraph *(interpretation)*.
@@ -569,14 +586,17 @@ paragraph *(interpretation)*.
 - Which of the three services is electronically supplied on its own, and whether the £20 bundle
   is a single supply or several, now that the registration route is settled as the non-Union OSS
   (3.5).
-- Who acts as the Union representative, and whether a representative firm can satisfy Article
-  27(3) from a member state where no member lives (2.7).
+- Who acts as the Union representative, established in a member state where members actually
+  live, as Article 27(3) requires (2.7).
 - Whether the triage classifier needs anything beyond a description in the policy (2.3).
 - The DMCCA subscription regime's commencement, if the release date moves near spring 2027 (1.5).
 - Whether the prepaid rails, as distinct from card payments, bring any regime of their own. The
   map puts them in scope; nothing in this note examines them. They also cannot produce the two
   pieces of country evidence HMRC asks for, so what a prepaid Union member's record has to carry
   is an accountant question (3.5).
+- The domestic consumer law of each member state, which this note does not examine. It reads the
+  UK regime and the Union instruments, so the choice of Scottish law and the mandatory rights a
+  Union consumer keeps need a lawyer's read (#235).
 
 ---
 
