@@ -256,7 +256,7 @@ placeholder_vars=""
 for v in $needed_vars; do
 	if ! grep -q "^export $v=" "$env_file" 2>/dev/null; then
 		missing_vars="$missing_vars $v"
-	elif grep -q "^export $v='*REPLACE_ME" "$env_file"; then
+	elif grep -q "^export $v='.*REPLACE_ME" "$env_file"; then
 		placeholder_vars="$placeholder_vars $v"
 	fi
 done
