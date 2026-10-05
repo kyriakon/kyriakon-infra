@@ -372,7 +372,9 @@ The declined state:
   think we have this wrong, please write to us: A word from your priest, or from someone we already know,
   usually settles it, and we are glad to look again. We will hold the application for a
   week, and after that it is deleted and the name is free for anyone to take.
-- B. Not approved this time, and I am sorry about that. You are welcome to write to us about it.
+- B. Not approved this time. You are welcome to write to us about it.
+- C. I am very sorry but we have decided to decline your application at this time. Please
+  write to us if you have any further information that may help us to reconsider.
 
 Recommended: A. It is sorry for the outcome rather than the decision, which is what matters when no reason is given: being sorry for the decision invites the question why, and there is no answer. It offers the way back rather than an open invitation to write at length, and it says how long the application is held.
 
@@ -617,7 +619,7 @@ Recommended: A. It answers the question the reader will otherwise ask after clos
 
 ## Settled so far
 
-- Section 2, the mail heading: **Secure encrypted mail**. The paragraph under it does not
+- Section 2, the mail heading: **Secure encrypted email**. The paragraph under it does not
   change, because that paragraph carries the fact that makes this platform different, and
   the heading is the phrase a reader already recognises.
 - Section 10, the recovery phrase: option A, which says who could read the mail and why
