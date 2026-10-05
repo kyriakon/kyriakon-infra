@@ -8,11 +8,11 @@ The public release sells the same £20 membership on two paths. Card payers keep
 
 That second path is where the platform's own record becomes the only record. There is no processor to ask whether a member has paid, no processor-held list of who they are, and no processor event to tell the service a payment arrived. The operator has to join an anonymous payment to an account, extend a date, keep a record good enough for HMRC, and do it without the account name ending up in six years of financial history.
 
-Two things make this work. Each approval issues one token, and that token is the payment reference the member posts or sends, the key the ledger holds, and the bearer secret of the status page. The paid-until date on the platform's own machine decides access, so a rail is only ever a way to extend a date.
+Two things make this work. Each paid approval issues one token, and that token is the payment reference the member posts or sends, the key the ledger holds, and the bearer secret of the status page. The paid-until date on the platform's own machine decides access, so a rail is only ever a way to extend a date.
 
 ## Solution
 
-Approval provisions the account, issues a token and opens a 14-day payment window. The member pays by card, by post, in hand, or in Monero. The operator records the payment as one action tagged with the rail, which writes a line to a ledger keyed by the token and moves the paid-until date. A window that closes with nothing recorded leaves the account lapsed, and the existing 40-day grace and deletion sweep from [#153](https://github.com/kyriakon/kyriakon-infra/issues/153) run from there.
+Approval provisions the account, and a paid approval issues a token and opens a 14-day payment window. The member pays by card, by post, in hand, or in Monero. The operator records the payment as one action tagged with the rail, which writes a line to a ledger keyed by the token and moves the paid-until date. A window that closes with nothing recorded leaves the account lapsed, and the existing 40-day grace and deletion sweep from [#153](https://github.com/kyriakon/kyriakon-infra/issues/153) run from there.
 
 The service keeps its two halves. The internet-facing handler renders the account page and files intents, and it holds no privilege. The one-minute cron drain issues tokens, applies credits, writes the ledger, extends dates and sends notices. There is one write path into payment state, and it is the drain's.
 
@@ -20,11 +20,11 @@ The service keeps its two halves. The internet-facing handler renders the accoun
 
 **Format.** `KYR-` followed by twelve characters drawn from Crockford base32 (the digits and the uppercase letters with `I`, `L`, `O` and `U` removed), grouped into three blocks of four, as in `KYR-4F2M-9QH7-XT3B`. Twelve characters at five bits each carry 60 bits of entropy, which is far beyond what a rate-limited lookup could be guessed against, and the alphabet keeps a token read off paper unambiguous.
 
-**Generation.** The drain draws the twelve characters from `getrandom` at approval and writes them into a new account. The token is not derived from the username, the mail key, the application answers or the date. A token that could be recomputed from the account would undo ADR 0009: the ledger would stop being unlinkable once an account is deleted.
+**Generation.** The drain draws the twelve characters from `getrandom` at a paid approval and writes them into a new account. An approval without charge issues no token. The token is not derived from the username, the mail key, the application answers or the date. A token that could be recomputed from the account would undo ADR 0009: the ledger would stop being unlinkable once an account is deleted.
 
 **Three jobs.** The token joins a payment to an account, it is the key the HMRC ledger holds with no username, and it is the string the account page shows while the window runs. This is [#159](https://github.com/kyriakon/kyriakon-infra/issues/159)'s reading of Mullvad's payment page, mapped onto the ledger key ADR 0009 already requires.
 
-**Lifetime.** The token is created at approval and the account carries a reference to it for as long as the account exists. The status page answers with it for seven days after the decision, and the account page shows it in full while `paid_until` is null. Once a credit has set a paid-until date, the account page stops showing it, which is the [#114](https://github.com/kyriakon/kyriakon-infra/issues/114) decision that the token is visible again only while the account is unpaid. The string stays in the ledger for the records duty, which runs five years past the filing deadline and six once VAT is registered, and the mapping from the string to the username is deleted with the account.
+**Lifetime.** The token is created at a paid approval and the account carries a reference to it for as long as the account exists. The status page answers with it for seven days after the decision, and the account page shows it in full while `paid_until` is null. Once a credit has set a paid-until date, the account page stops showing it, which is the [#114](https://github.com/kyriakon/kyriakon-infra/issues/114) decision that the token is visible again only while the account is unpaid. The string stays in the ledger for the records duty, which runs five years past the filing deadline and six once VAT is registered, and the mapping from the string to the username is deleted with the account.
 
 **Reissue.** There is no reissue. `onboardctl token resend` sends the same token again, because a second token for one account would leave the first one in the ledger as an entry that no longer resolves to the same member, and would orphan a payment already in flight.
 
@@ -81,7 +81,7 @@ The rate source's free-tier request limit is not stated on the endpoint and was 
 
 ## The window
 
-Approval opens the window. `paid_until` is null at that moment, the account state is `active`, and the window closes fourteen days later. A member who pays inside the window gets a year from the day the payment is recorded, not from the day the window opened, so paying early costs nothing and paying late costs nothing either.
+Approval opens the window. `paid_until` is null at that moment, the account state is `active`, and the window closes fourteen days later. The rail the member named at application is carried into the account, and the choice may change until a payment is recorded. A member who pays inside the window gets a year from the day the payment is recorded, not from the day the window opened, so paying early costs nothing and paying late costs nothing either.
 
 The window closes and the account lapses. Lapsed is the [#153](https://github.com/kyriakon/kyriakon-infra/issues/153) state, not a new one: mail keeps arriving and stays readable, everything published stays up, and sending, uploading and pushing stop. The account is not deleted. The 40-day grace and the notices that lead to deletion are the same ones the failed-renewal path already uses, and the seven-day final notice runs from the same sweep.
 
@@ -115,7 +115,7 @@ The ledger line is append-only and looks like this:
 
 Two payments sharing a token, where the first is already credited, are treated as a renewal. The second credit needs `--confirm-double`, because for cash the second envelope may be a stranger's with a copied token, and because the same member paying twice by accident is the likelier case only if they say so. If the second credit is applied it extends the date and lands under the 24-month ceiling; if the operator cannot tell whose money it is, it goes to the unattributed queue and the account keeps the first credit.
 
-A payment that carries no token, or a Monero payment to the wallet's main address rather than a member's subaddress, cannot be joined to anything. It goes to `ledger/unattributed.jsonl` and is held: recorded with the rail, the amount, the date and a free-text note, and marked `held`. It is not income until it is attributed or the tax year ends, and it is never silently absorbed into a member's credit. The operator tries the postmark, the date, the amount and any note, and either attributes it with `onboardctl reconcile attribute` or returns it with `onboardctl reconcile return`, which records the postal evidence and nothing about the person. Anything still held at the end of the tax year is recorded in the main ledger as a payment with no token, which is the one line in that file without a token and the only one without an invoice behind it.
+A payment that carries no token, or a Monero payment to the wallet's main address rather than a member's subaddress, cannot be joined to anything. It goes to `ledger/unattributed.jsonl` and is held: recorded with the rail, the amount, the date and a free-text note, and marked `held`. A payment to a deleted member's subaddress is held in the unattributed queue like any other and refunded in XMR to an address they give. It is not income until it is attributed or the tax year ends, and it is never silently absorbed into a member's credit. The operator tries the postmark, the date, the amount and any note, and either attributes it with `onboardctl reconcile attribute` or returns it with `onboardctl reconcile return`, which records the postal evidence and nothing about the person. Anything still held at the end of the tax year is recorded in the main ledger as a payment with no token, which is the one line in that file without a token and the only one without an invoice behind it.
 
 ## Refunds
 
@@ -184,7 +184,7 @@ After a credit, the block reads `Paid until <date>`, the token disappears, and t
 
 After the window closes with nothing recorded, the block reads `Lapsed`, repeats the close date, and states what still works and what has stopped, with the same wording the lapse notice uses. The token is shown again, because the account is unpaid and someone who lost the email still needs it, and the page keeps a line to `admin@` for anyone who has posted the money.
 
-An account whose approval was without charge has no window, no token and no payment block. It also has no paid-until date, so it never lapses and the closing sweep skips it, as [#177](https://github.com/kyriakon/kyriakon-infra/issues/177) decided. It carries the same 5 GB allowance and the same AUP as any other account, and one notice a year says that nothing is due and that the paid path is there if circumstances have changed.
+An account whose approval was without charge has no window, no token and no payment block, and it writes no ledger line, so the payment ledger stays a record of money received. It also has no paid-until date, so it never lapses and the closing sweep skips it, as [#177](https://github.com/kyriakon/kyriakon-infra/issues/177) decided. It carries the same 5 GB allowance and the same AUP as any other account, and one notice a year says that nothing is due and that the paid path is there if circumstances have changed. The concession is visible in the store as a count of accounts whose rail is free, and a free account ends by the member's request, a breach, or the operator closing one that is unreachable and unused for a year.
 
 ## State
 
@@ -195,7 +195,7 @@ The store is the flat-file one from [#156](https://github.com/kyriakon/kyriakon-
 | `accounts/<username>/account.json` | modified | `payment.rail`, `payment.token_ref`, `payment.token_issued_at`, `payment.paid_until`, `payment.balance_gbp`, `payment.window{opened_at,closes_at,state,extensions}`, `payment.monero{address,quote_xmr,rate_gbp_per_xmr,rate_source,rate_at}` |
 | `accounts/<username>/notices.jsonl` | modified | `prepaid.window_open`, `prepaid.window_closing`, `prepaid.receipt`, `prepaid.lapsed`, `prepaid.refund`, and `free.anniversary` for the yearly note to a member who pays nothing, one line per notice with its date and address |
 | `accounts/<username>/application.json` | modified | `status_link_until`, seven days after the decision; the answers themselves follow the existing 90-day purge (ADR 0005) |
-| `tokens/<token>.json` | new | the join: token, username, `issued_at`, `window_closes_at`, `state`. Created at approval, deleted by `onboardctl delete` |
+| `tokens/<token>.json` | new | the join: token, username, `issued_at`, `window_closes_at`, `state`. Created at a paid approval, deleted by `onboardctl delete` |
 | `ledger/payments.jsonl` | new | append-only, keyed by token, no username. Every credit, every refund |
 | `ledger/unattributed.jsonl` | new | payments with no token, held until attributed, returned or taken as income at the year end |
 | `rates/xmr-gbp.json` | new | the cached XMR/GBP rate, its source and its fetch time; read by the handler, written by the drain |
@@ -236,7 +236,7 @@ Notices are recorded before they are enqueued, and a crash between the record an
 | Refund | operator | `onboardctl refund ...`, then the Stripe refund, the Monero send, or the postal step, then `--settled <date>`; a posted-cash refund keeps the posting receipt |
 | Bank the cash, hold or sell the Monero | operator | no command |
 | Create the member's Monero subaddress | operator | `monero-wallet-cli` in the operator's own wallet, then `onboardctl monero address <username> <address>` |
-| Hold the wallet, its seed and its view key | operator | no command; the seed and the view key stay together off the box, and the seed is what rebuilds watching if the machine is lost |
+| Hold the wallet, its seed and its view key | operator | no command; the seed and the view key stay together off the box, and the view key is what rebuilds watching if the machine is lost |
 | Send the payment instructions again | operator | `onboardctl token resend <username>` |
 | Close the books for the year | operator | `onboardctl ledger export --tax-year <year> --format csv` |
 | Delete an account, which unlinks the ledger entry | operator | `onboardctl delete <username>` |
