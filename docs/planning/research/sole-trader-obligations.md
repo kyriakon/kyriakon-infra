@@ -1,8 +1,8 @@
 # Sole trader obligations: cancellation, privacy, VAT and identity (public release)
 
 **Question:** what must one UK sole trader publish and promise to sell a £20/yr
-hosted service (mail, static web, Gemini, `pass` git repos) to consumers online by card or by
-a prepaid rail, given that some members will be in the EU?
+hosted service (mail, static web, gemini, `pass` git repos) to consumers online by card or by
+a prepaid rail, given that members may be anywhere in the world, the EU included?
 
 **Answer:** four things have to be true before the public site goes up.
 
@@ -22,13 +22,15 @@ a prepaid rail, given that some members will be in the EU?
    [Article 6](https://www.legislation.gov.uk/eur/2016/679/article/6) basis per purpose, and
    state retention periods ([Article 13(2)(a)](https://www.legislation.gov.uk/eur/2016/679/article/13)).
    The seven-day, 90-day and restic windows are reconciled in section 5 below. The ICO's data
-   protection fee is due and is £52 at this scale.
-3. **No UK VAT registration at this revenue, but EU VAT on EU consumers from the first euro.**
+   protection fee is due and is £52 at this scale, and selling into the Union also requires a
+   representative established there (2.7).
+3. **No UK VAT registration at this revenue, and EU VAT handled through the non-Union OSS.**
    The threshold is
    [£90,000](https://www.gov.uk/register-for-vat), so £20/yr per member is three orders of
-   magnitude short. Stripe already issues a receipt per successful payment; it does not issue
-   anyone a VAT invoice. The EU position in section 3.4 is the one part of this note that
-   changes the product, not the paperwork *(interpretation)*.
+   magnitude short. Sales to consumers in the EU are the exception, where VAT is due from the
+   first euro: HMRC's route is the non-Union OSS in a member state of the trader's choosing, and
+   section 3.5 records what registering, filing and pricing involve. Stripe already issues a
+   receipt per successful payment; it does not issue anyone a VAT invoice.
 4. **Publish the trader, not a company.** Name, geographic address and a contact email, with
    no registered office and no company number to show
    ([E-Commerce Regs 2002 reg 6](https://www.legislation.gov.uk/uksi/2002/2013/regulation/6)).
@@ -314,14 +316,32 @@ every one of those descriptions, so the fee is due and the tier is 1: £52, or �
 debit *(interpretation)*. Non-payment carries fines described by the ICO as ranging from £400 to
 £4,000 ([ICO fee FAQs](https://ico.org.uk/for-organisations/data-protection-fee/faqs-data-protection-fee-payment-and-online-registration/)).
 
-### 2.7 EU members, flagged rather than answered
+### 2.7 EU members: the representative question, answered
 
-Selling to consumers in the EU likely brings the EU GDPR into scope, and an Article 27
-representative may then be required. This note cannot settle it: EUR-Lex refused every fetch
-attempt in this session, so the EU text was not read, and the applicable domestic consumer law
-of each member state was not examined either. It is on the lawyer list in section 6, and it
-belongs with the EU VAT question in 3.4, because both follow from the same act of selling into
-the EU *(interpretation, unverified)*.
+Selling to a consumer in the Union brings the EU GDPR in. Article 3(2)(a) applies where the
+controller "offers goods or services" to data subjects in the Union, and recital 23 says that
+holds "irrespective of whether connected to a payment", so a free account is as much in scope as
+a paid one. The [copy on legislation.gov.uk](https://www.legislation.gov.uk/eur/2016/679/article/27)
+is the retained UK version, which asks for a representative in the United Kingdom; the text that
+binds a UK trader selling into the Union asks for
+[a representative in the Union](https://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32016R0679)
+(OJ L 119, 4.5.2016, Article 27(1)).
+
+Article 27(2)(a) removes the duty only where the processing "is occasional", carries no
+large-scale special category data and is unlikely to risk anyone's rights. Hosting a platform's
+own member accounts is continuous and is the business itself, so the exemption does not apply and
+a representative is required *(interpretation)*. Article 27(3) then fixes where: "The
+representative shall be established in one of the Member States where the data subjects, whose
+personal data are processed in relation to the offering of goods or services to them, or whose
+behaviour is monitored, are." A representative service sitting in a member state where the
+platform has no members does not meet that on its face, so the person or firm has to be in a
+country a member actually lives in *(interpretation)*. The privacy notice already has a slot for
+this, because Article 13(1)(a) requires "the identity and the contact details of the controller
+and, where applicable, of the controller's representative" (2.1).
+
+None of this changes what the member experiences, and none of it applies to a release that
+refuses Union applications outright. The release serves them, so the representative is an
+operator action, listed with setting up the Monero wallet.
 
 ---
 
@@ -402,11 +422,54 @@ Directive 2006/112/EC, inserted by
 only disapplies the destination rule where the supplier "is established or ... usually resides
 only in one Member State", which a UK-established trader is not *(interpretation)*.
 
-Which of the three services are electronically supplied services, which member state to register
-in, and how to price a £20 product across twenty-seven VAT rates are accountant questions, not
-reading questions. The honest position for the map: if the site sells to EU consumers without
-saying otherwise, EU VAT is probably due from the first euro, and the cheapest fix is likely to
-be a decision about who the site sells to *(interpretation, needs an accountant)*.
+### 3.5 Registering, filing and pricing under the non-Union OSS
+
+The scheme fits this trader exactly: "Any taxable person, not established in the EU, who supplies
+services to non-taxable persons taking place in the EU, can register in the non-Union scheme"
+([European Commission, The One Stop Shop](https://vat-one-stop-shop.ec.europa.eu/one-stop-shop_en)).
+It is for services, so no intermediary is involved (that is the import scheme for goods), and the
+member state of identification is a free choice: "a taxable person ... can choose any Member
+State to be the Member State of identification", changeable at the end of any calendar quarter
+([Register to OSS](https://vat-one-stop-shop.ec.europa.eu/one-stop-shop/register-oss_en)). The
+scheme issues its own EU-format VAT number, and returns are quarterly. The OSS return is
+additional to any domestic return, and there is none here, because UK registration is not
+required at this revenue (3.1) *(interpretation)*.
+
+The threshold in 3.4 does not rescue anyone: the €10,000 one applies only where the supplier is
+established in a single member state, and a UK trader is not. The timing, however, is
+forgiving, and it is what makes opening applications before registering safe: registration
+normally begins with the next quarter, but "there may be situations in which a taxable person
+starts making supplies under the scheme before this date. If this is the case, then the taxable
+person can start using the scheme from the date of that first supply, provided he has informed
+the Member State of identification that he has started activities under the scheme by the tenth
+day of the month following that first supply." Miss that deadline and the trader "is required to
+register and account for the VAT in the Member State(s) of consumption directly"
+*(interpretation: notify the day the first Union payment lands, not later)*.
+
+Two pieces of evidence fix the consumer's country, and HMRC names them: "at the point of sale,
+ask the consumer for details of either their billing address, including the country, or their
+telephone number", and from the payment provider "a notification advice containing the 2-digit
+country code of the consumer's country of residence"
+([HMRC](https://www.gov.uk/guidance/the-vat-rules-if-you-supply-digital-services-to-private-consumers)).
+A card payment through Stripe supplies both without the platform asking anything of its own
+*(interpretation)*. A prepaid member supplies neither, so the platform has to keep the evidence
+itself, which is on the accountant list in section 6.
+
+Which of the services are electronically supplied is only half settled. HMRC names "website
+supply or web hosting services" in the list, so the bundle the platform sells is a digital
+service and VAT is due from the first euro for a Union consumer *(interpretation)*. Whether mail
+hosting alone would be, and whether a £20 bundle of three services is one supply or three, stay
+with the accountant *(interpretation)*.
+
+The price keeps its shape: the member pays the number on the site, and the destination rate is
+taken out of the £20 rather than added on top, so no page needs an asterisk and no prepaid quote
+changes. On the card rail Stripe Tax computes the destination rate, having already been pointed
+at the fact that the merchant must be registered for it to help (3.2). If Union membership grows
+to where the absorbed rate matters, the pricing decision is revisited rather than the promise.
+
+Regimes beyond the Union and the UK are not examined here. The release serves any country, so the
+map carries them as its own ticket.
+
 
 ---
 
@@ -503,14 +566,17 @@ paragraph *(interpretation)*.
   [reg 37](https://www.legislation.gov.uk/uksi/2013/3134/regulation/37), and whether the waiver
   wording in 1.3 is enough. The two provisions give different answers about a member who cancels
   on day three.
-- EU VAT on EU consumers: registration route, which of the three services are electronically
-  supplied, and whether to sell to EU consumers at all (3.4).
-- EU GDPR scope and the Article 27 representative question, which this session could not verify
-  because EUR-Lex blocked every fetch (2.7).
+- Which of the three services is electronically supplied on its own, and whether the £20 bundle
+  is a single supply or several, now that the registration route is settled as the non-Union OSS
+  (3.5).
+- Who acts as the Union representative, and whether a representative firm can satisfy Article
+  27(3) from a member state where no member lives (2.7).
 - Whether the triage classifier needs anything beyond a description in the policy (2.3).
 - The DMCCA subscription regime's commencement, if the release date moves near spring 2027 (1.5).
 - Whether the prepaid rails, as distinct from card payments, bring any regime of their own. The
-  map puts them in scope; nothing in this note examines them.
+  map puts them in scope; nothing in this note examines them. They also cannot produce the two
+  pieces of country evidence HMRC asks for, so what a prepaid Union member's record has to carry
+  is an accountant question (3.5).
 
 ---
 
@@ -529,10 +595,12 @@ Legislation, in the order it is used:
 - [Value Added Tax Regulations 1995, SI 1995/2518](https://www.legislation.gov.uk/uksi/1995/2518/contents): regs 13, 14.
 - [Companies Act 2006](https://www.legislation.gov.uk/ukpga/2006/46/contents): ss. 82, 83.
 - [Directive (EU) 2017/2455](https://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32017L2455), inserting Article 59c into Directive 2006/112/EC.
+- [Regulation (EU) 2016/679, as it stands in the Union](https://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32016R0679), OJ L 119, 4.5.2016: Articles 3(2) and 27, recitals 23 and 24, read against the [retained UK version](https://www.legislation.gov.uk/eur/2016/679/article/27).
 
 Regulators and processors:
 
 - ICO: [data protection fee](https://ico.org.uk/for-organisations/data-protection-fee/), [guide to the fee](https://ico.org.uk/for-organisations/data-protection-fee/data-protection-fee/), [fee changes](https://ico.org.uk/for-organisations/data-protection-fee/changes-to-the-data-protection-fee/), [fee FAQs](https://ico.org.uk/for-organisations/data-protection-fee/faqs-data-protection-fee-payment-and-online-registration/), [right to be informed](https://ico.org.uk/for-organisations/uk-gdpr-guidance-and-resources/individual-rights/the-right-to-be-informed/what-privacy-information-should-we-provide/), [storage limitation](https://ico.org.uk/for-organisations/uk-gdpr-guidance-and-resources/data-protection-principles/a-guide-to-the-data-protection-principles/storage-limitation/), [lawful basis](https://ico.org.uk/for-organisations/uk-gdpr-guidance-and-resources/lawful-basis/a-guide-to-lawful-basis/), [records of processing](https://ico.org.uk/for-organisations/uk-gdpr-guidance-and-resources/accountability-and-governance/documentation/who-needs-to-document-their-processing-activities/), [register of fee payers](https://ico.org.uk/about-the-ico/what-we-do/register-of-fee-payers/).
+- European Commission: [The One Stop Shop](https://vat-one-stop-shop.ec.europa.eu/one-stop-shop_en) and [Register to OSS](https://vat-one-stop-shop.ec.europa.eu/one-stop-shop/register-oss_en), for the non-Union scheme, the free choice of identification state, the quarterly return and the first-supply window.
 - HMRC and GOV.UK: [register for VAT](https://www.gov.uk/register-for-vat), [digital services to consumers](https://www.gov.uk/guidance/the-vat-rules-if-you-supply-digital-services-to-private-consumers), [keeping VAT records](https://www.gov.uk/charge-reclaim-record-vat/keeping-vat-records), [self-employed records](https://www.gov.uk/self-employed-records/how-long-to-keep-your-records), [invoices](https://www.gov.uk/invoicing-and-taking-payment-from-customers/invoices-what-they-must-include), [online and distance selling](https://www.gov.uk/online-and-distance-selling-for-businesses), [subscription contracts consultation response](https://www.gov.uk/government/consultations/consultation-on-the-implementation-of-the-new-subscription-contracts-regime/outcome/government-response-to-consultation-on-the-implementation-of-the-new-subscription-contracts-regime-web-accessible-version).
 - Stripe: [receipts](https://docs.stripe.com/receipts), [invoicing](https://docs.stripe.com/invoicing/customize), [how tax works](https://docs.stripe.com/tax/how-tax-works).
 - OpenBSD: [spamd(8)](https://man.openbsd.org/spamd.8).
