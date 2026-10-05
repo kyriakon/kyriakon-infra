@@ -493,13 +493,35 @@ if [ -n "$ip" ]; then
 		# is compared against the head of the configured list, which lib.sh
 		# leaves in dnsbl_zones, and a downgrade is reported once per change of
 		# zone rather than every hour.
-		zone=${verdict#clean }
+		zone=$(printf '%s' "$verdict" | awk '{print $2}')
 		# shellcheck disable=SC2154 # dnsbl_zones is set by lib.sh when sourced
 		strongest=${dnsbl_zones%% *}
+		# Why the strongest list was skipped decides what to say, and lib.sh
+		# records it in the verdict. A zone that answered with a refusal is a
+		# policy aimed at this resolver and nothing here is broken; a zone that
+		# said nothing at all is this box's DNS. Sending the reader to check
+		# unbound for the first is what this alert did on 2026-10-03, to an
+		# operator whose unbound was answering everything else.
+		skipped=$(printf '%s' "$verdict" | sed -n 's/.*\[skipped: //p' | sed 's/\]$//')
+		reason=${skipped#*=}
+		reason=${reason%% *}
 		if [ "$zone" != "$strongest" ]; then
-			if [ "$(cat "$state/dnsbl.downgraded" 2>/dev/null || true)" != "$zone" ]; then
-				alert "blocklist downgraded" "$ip is clean on $zone only; $strongest did not answer. The strongest list is the one that matters for deliverability, so a listing there would go unnoticed. Check that unbound is running on this box: rcctl check unbound"
-				printf '%s\n' "$zone" > "$state/dnsbl.downgraded"
+			if [ "$(cat "$state/dnsbl.downgraded" 2>/dev/null || true)" != "$zone:$reason" ]; then
+				case "$reason" in
+				refused | servfail)
+					# The cause is known and documented, so the alert names it rather
+					# than sending the reader to check a resolver that is fine.
+					# Spamhaus's zones answer NS and SOA queries in a way that does not
+					# match RFC 1034, and QNAME minimisation needs those answers, so a
+					# listing resolves and a clean answer does not. Spamhaus recommends
+					# turning minimisation off for this; the runbook has the line.
+					alert "blocklist downgraded" "$ip is clean on $zone only: $strongest gave $reason rather than a verdict. Spamhaus documents this and the fix is one line in unbound.conf, in the runbook's blocklist section. Nothing is listed on $strongest as far as this check can tell, and nothing else on this box needs changing"
+					;;
+				*)
+					alert "blocklist downgraded" "$ip is clean on $zone only; $strongest did not answer. The strongest list is the one that matters for deliverability, so a listing there would go unnoticed. Check that unbound is running on this box: rcctl check unbound"
+					;;
+				esac
+				printf '%s\n' "$zone:$reason" > "$state/dnsbl.downgraded"
 			fi
 		else
 			rm -f "$state/dnsbl.downgraded"
@@ -512,7 +534,7 @@ if [ -n "$ip" ]; then
 		# existed, mailing an alert every cooldown. Report the transition, stay
 		# quiet while it persists, and speak again if it clears and returns.
 		if [ "$(cat "$state/dnsbl.unchecked" 2>/dev/null || true)" != "$verdict" ]; then
-			alert "blocklist check" "$verdict for $ip, so a listing would go unnoticed. Every configured zone refused, which points at DNS on this box rather than at the lists"
+			alert "blocklist check" "$verdict for $ip, so a listing would go unnoticed. refused above means the zone answered and will not serve this resolver; silent means it said nothing at all, which is DNS on this box"
 			printf '%s\n' "$verdict" > "$state/dnsbl.unchecked"
 		fi
 		;;

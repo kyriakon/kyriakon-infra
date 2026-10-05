@@ -80,6 +80,7 @@ dnsbl_verdict() {
 	else
 		dnsbl_at=""
 	fi
+	dnsbl_skipped=""
 	for dnsbl_zone in $dnsbl_zones; do
 		# Prove the zone answers at all before trusting its silence. Every DNSBL
 		# publishes a test entry for this, 2.0.0.127, and the reason is exactly the
@@ -92,7 +93,18 @@ dnsbl_verdict() {
 		dnsbl_ctl=$(dig +short +time=5 +tries=2 $dnsbl_at "2.0.0.127.$dnsbl_zone" A 2>/dev/null | head -1 || true)
 		case "$dnsbl_ctl" in
 		127.0.0.*) ;;
-		*) continue ;;
+		127.255.255.*)
+			# Answered, and the answer is a refusal: the zone is up and will not
+			# serve this resolver. Recording which happened separates it from a zone
+			# that said nothing at all, and the two need different advice, because
+			# one is a policy and the other is DNS on this box.
+			dnsbl_skipped="$dnsbl_skipped $dnsbl_zone=refused"
+			continue
+			;;
+		*)
+			dnsbl_skipped="$dnsbl_skipped $dnsbl_zone=silent"
+			continue
+			;;
 		esac
 		# shellcheck disable=SC2086 # deliberately empty or one argument
 		dnsbl_out=$(dig +time=5 +tries=2 $dnsbl_at "$dnsbl_rev.$dnsbl_zone" A 2>/dev/null || true)
@@ -107,19 +119,30 @@ dnsbl_verdict() {
 		NOERROR:127.255.255.*)
 			# The zone refusing the resolver after passing its own control, which a
 			# proxy between here and there would explain. Not a verdict.
+			dnsbl_skipped="$dnsbl_skipped $dnsbl_zone=refused"
 			continue
 			;;
 		NOERROR:|NXDOMAIN:)
 			# Answered, and no record for this address: the verdict this whole
 			# function exists to be able to give.
-			printf 'clean %s\n' "$dnsbl_zone"
+			printf 'clean %s%s\n' "$dnsbl_zone" "${dnsbl_skipped:+ [skipped:$dnsbl_skipped]}"
 			return 0
 			;;
 		*)
+			# The status says which kind of nothing this was. SERVFAIL is what
+			# Spamhaus's zones look like through QNAME minimisation, because their
+			# NS and SOA answers do not match RFC 1034 and minimisation needs them;
+			# a bare timeout carries no status at all.
+			case "$dnsbl_status" in
+			SERVFAIL) dnsbl_skipped="$dnsbl_skipped $dnsbl_zone=servfail" ;;
+			REFUSED) dnsbl_skipped="$dnsbl_skipped $dnsbl_zone=refused" ;;
+			"") dnsbl_skipped="$dnsbl_skipped $dnsbl_zone=no-answer" ;;
+			*) dnsbl_skipped="$dnsbl_skipped $dnsbl_zone=$dnsbl_status" ;;
+			esac
 			continue
 			;;
 		esac
 	done
-	printf 'unchecked no zone answered\n'
+	printf 'unchecked no zone answered%s\n' "${dnsbl_skipped:+ [skipped:$dnsbl_skipped]}"
 	return 0
 }
