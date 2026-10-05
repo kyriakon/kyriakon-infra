@@ -89,6 +89,8 @@ application on the same form with a community block. The own-domain path is auto
 before the release, so the copy quotes the price and says what it includes. Only the
 managed instance is ordered by enquiry.
 
+The free tier carries no number: the offer stands as far as capacity allows, and the operator reviews the free share once it passes about a fifth of the accounts, which is what [#177](https://github.com/kyriakon/kyriakon-infra/issues/177) settled and what the lede now says.
+
 - £20 a year. Free for clergy, monastics, and those who are unable to pay. Please let us know on the form!
 
 ## 4. Key check: heading and first line
@@ -170,7 +172,29 @@ seeing the finished address is what makes it click.
 
 B with the example address under it.
 
-## 8. Application: the address outside the platform
+## 8. Application: for yourself, or for a body
+
+The second question of the page, and the one that opens a body's block. [#233](https://github.com/kyriakon/kyriakon-infra/issues/233) settled one form with a conditional block rather than a second form, so the question and the block stay on the same page and the applicant remains one person either way.
+
+- A. Is this for you, or for a body?
+- B. Who is this account for?
+- C. Are you applying for yourself, or for a parish, a monastery or a business?
+
+Recommended: A, with both answers written out, because the second has to name a class of thing rather than the bare word body:
+
+- Just me, one address at kyriakon.net
+- A body, with its own domain, like secretary@theirparish.example or orders@theiconshop.example
+
+A body is a parish, a monastery, a school or a small Orthodox business. Choosing that answer opens the community block, drafted in `community-block.md`, and changes three things below it: the price reads £40 a year rather than £20, the mail key becomes one per mailbox, and the account section asks about the domain.
+
+The VAT number, added by [#163](https://github.com/kyriakon/kyriakon-infra/issues/163) as an amendment to [#233](https://github.com/kyriakon/kyriakon-infra/issues/233):
+
+- A. VAT number (optional; a body in business, where you have one)
+- B. VAT number (optional)
+
+Recommended: A. The condition belongs in the label the way "required for monastics" does, so nobody reads it as a question for a person. With a number, a Union business supply is reverse-charged and no VAT is added; the price is otherwise unchanged.
+
+## 9. Application: the address outside the platform
 
 The label, then the consequence of leaving it empty. The label has to be clear enough
 that nobody thinks we are asking for their main address.
@@ -201,7 +225,7 @@ A
 Worth a sentence either way, and it belongs here rather than in the privacy notice: it is
 used for notices only, never shared, and never used to look you up anywhere else.
 
-## 9. Application: the mail password
+## 10. Application: the mail password
 
 - A. Mail password. You will type this into your mail program, not here.
 - B. Account password. Choose something you can type on a phone. You can change it later from
@@ -212,7 +236,7 @@ password to use, and both facts answer the worry.
 
 B
 
-## 10. Keys: the mail key and the recovery phrase
+## 11. Keys: the mail key and the recovery phrase
 
 The step heading.
 
@@ -241,7 +265,9 @@ A
 Recommended: A. It says who can read the mail and why we cannot help, which is the
 sentence that makes people write the words down.
 
-## 11. Keys: the upload key
+The phrase is eight words from a 2,048-word list, 88 bits, and the page states that beside the words ([#176](https://github.com/kyriakon/kyriakon-infra/issues/176)).
+
+## 12. Keys: the upload key
 
 - A. Your upload key. This is what lets you put a website up and push to your
   repositories. It is not the mail key and it does not unlock anything you have written.
@@ -254,7 +280,7 @@ sentence that makes people write the words down.
 Recommended: A. The confusion between the two keys is the thing to prevent, so naming the
 difference is worth the extra sentence.
 
-## 12. Keys: putting the key into a mail program
+## 13. Keys: putting the key into a mail program
 
 - A. Put the key into your mail program. Follow the walkthrough for Thunderbird on a computer.
 
@@ -277,7 +303,7 @@ first failure.
 
 A
 
-## 13. Application: the questions about you
+## 14. Application: the questions about you
 
 The opening line, which decides whether people answer.
 
@@ -312,7 +338,7 @@ Recommended: A, and B's second sentence if you want it to be easy to comply. C s
 requirement without saying how to satisfy it. The question about a layperson's spiritual father was dropped at review, so the
 monastic blessing is the only blessing asked for.
 
-## 14. Application: the acceptance checkbox
+## 15. Application: the acceptance checkbox
 
 - A. I accept the terms, the acceptable use policy and the privacy notice.
 - B. I have read and accept the terms, the acceptable use policy and the privacy notice.
@@ -321,7 +347,7 @@ B
 Recommended: B. "I have read" is the wording that survives a dispute, and the version
 identifiers belong next to it rather than in the email alone.
 
-## 15. Application received
+## 16. Application received
 
 - A. Thank you. That is with us.
 - B. Received. A person will read it.
@@ -346,7 +372,7 @@ chat.
 
 Both.
 
-## 16. Status link
+## 17. Status link
 
 Heading.
 
@@ -357,6 +383,8 @@ Heading.
 Recommended: A. The others read like a database field.
 
 C
+
+The three stages, from [#182](https://github.com/kyriakon/kyriakon-infra/issues/182): received, with the reviewer, and decided. The page shows which stage the application is at rather than all three at once, a decision is approved or declined, and nothing from the application itself is repeated here.
 
 The approved state, which is also the payment step:
 
@@ -379,9 +407,9 @@ The declined state:
 
 Recommended: A. It is sorry for the outcome rather than the decision, which is what matters when no reason is given: being sorry for the decision invites the question why, and there is no answer. It offers the way back rather than an open invitation to write at length, and it says how long the application is held.
 
-The monastic decline stays distinct rather than reusing this text, because it is the one case where the message says what is missing, deliberately: what is missing is a conversation. Its wording needs one correction, though. It says we could not reach the elder, and we never try, since the applicant supplies the blessing. It should read: "The blessing of your elder did not reach us. If you can ask him to write to us, or send his blessing, we will look again."
+The monastic decline stays distinct rather than reusing this text, because it is the one case where the message says what is missing, deliberately: what is missing is a conversation. We never write to the elder, since the applicant carries the blessing to us, so the message says the blessing did not reach us rather than that we could not reach him. It reads: "The blessing of your elder did not reach us. If you can ask him to write to us, or send his blessing, we will look again."
 
-## 17. Approval email
+## 18. Approval email
 
 This one is yours rather than a member's, so the choices are about what you want in front
 of you at the moment of deciding.
@@ -399,7 +427,9 @@ You chose A already, so the only question left is the subject line.
 A 
 Recommended: A. It sorts and searches better in a mailbox you will come back to.
 
-## 18. Decline
+One line belongs on the operator's screen at the moment of deciding, from [#163](https://github.com/kyriakon/kyriakon-infra/issues/163): check the applicant against the consolidated list of financial sanctions targets, since an application from a resident of a country under UK sanctions is declined.
+
+## 19. Decline
 
 - A. We are not able to open an account for you at the moment. If you think we have this
   wrong, reply to this message. A word from your priest, or from someone we already know,
@@ -415,16 +445,16 @@ A
 
 The monastic decline, which is the one case where the message says what is missing.
 
-- A. We have not been able to reach your elder. If you can ask him to write to us, or send
-  us his blessing, we will look again.
+- A. The blessing of your elder did not reach us. If you can ask him to write to us, or send
+  his blessing, we will look again.
 - B. The blessing of your elder is what we are waiting for.
 
-Recommended: A. It says what would fix it and leaves the initiative with the applicant.
+A
 
-!!? Are we writing to the elder?? 
+Recommended: A. We never write to the elder; the applicant carries the blessing to us, so the message says the blessing did not reach us rather than that we could not reach him. It says what would fix it and leaves the initiative with the applicant.
 
 
-## 19. Payment: card
+## 20. Payment: card
 
 The acknowledgement, which has legal weight and has to be readable anyway. It is two acts, not one sentence: [#149](https://github.com/kyriakon/kyriakon-infra/issues/149) requires an express request to begin inside the fourteen days and, separately, an acknowledgement that this is digital content supplied at once. Two boxes, and the record keeps both.
 
@@ -458,7 +488,7 @@ B
 
 Recommended: A. Naming the account page turns a subscription into something they control.
 
-## 20. Payment: cash and Monero
+## 21. Payment: cash and Monero
 
 - A. Put £20 and this token in an envelope. The token is how we match the money to your
   account, so without it we cannot tell whose it is.
@@ -490,7 +520,7 @@ B
 Recommended: A. B is friendlier and leaves the reader unsure what "read-only" means, which is
 the ambiguity that generates a support email.
 
-## 21. Account live
+## 22. Account live
 
 Heading.
 
@@ -526,7 +556,7 @@ A
 Recommended: A. B invites the reader to watch for a padlock on a site they cannot yet
 reach securely.
 
-## 22. Account page: status, notices and actions
+## 23. Account page: status, notices and actions
 
 Status labels, which are read by people who are worried about something.
 
@@ -559,7 +589,9 @@ The limits of what we can do, which belongs on the page as a short list.
 Recommended: A. Four short sentences, each one a promise kept, which is worth more here
 than a colon and a list.
 
-## 23. Key rotation
+The free state, from [#177](https://github.com/kyriakon/kyriakon-infra/issues/177), shows beside the unpaid one and looks deliberately unlike it: no payment window, no token and no paid-until date, and one notice a year saying that nothing is due, with the paid path named for anyone whose circumstances have changed. Lapse never applies.
+
+## 24. Key rotation
 
 - A. Replace my mail key. Confirmed from your other address if you gave one, and with
   three days to change your mind either way.
@@ -583,7 +615,7 @@ The explanation of why, which the reader deserves.
 
 Recommended: A. It explains the risk in the reader's terms rather than ours.
 
-## 24. Closing the account
+## 25. Closing the account
 
 Heading and the first line.
 
@@ -623,13 +655,13 @@ Recommended: A. It answers the question the reader will otherwise ask after clos
 - Section 2, the mail heading: **Secure encrypted email**. The paragraph under it does not
   change, because that paragraph carries the fact that makes this platform different, and
   the heading is the phrase a reader already recognises.
-- Section 10, the recovery phrase: option A, which says who could read the mail and why
+- Section 11, the recovery phrase: option A, which says who could read the mail and why
   nobody here can help.
-- Section 13, the questions about you: both, the line about the door first and the handling
+- Section 14, the questions about you: both, the line about the door first and the handling
   of the answers after it.
-- Section 3, the price line: option B, plus an invitation for a parish to write rather than
-  a quoted price, since the parish tier is not priced yet. The mock carries both, and its
-  lede was corrected to match.
+- Section 3, the price line: option B, and the lede carries it beside the body's own-domain
+  tier rather than an invitation to write for a price. No tier on the page is priced by
+  enquiry; only the managed instance is.
 - The free tier reaches people rather than bodies: clergy, monastics and anyone who cannot
   pay. Whether an institution can be granted an account without charge stays open in
   [#177](https://github.com/kyriakon/kyriakon-infra/issues/177), and the working position is
@@ -638,10 +670,23 @@ Recommended: A. It answers the question the reader will otherwise ask after clos
 - Section 3, the tiers: an organisation's own domain is priced at £40 and reached by the form rather
   than a letter, per [#188](https://github.com/kyriakon/kyriakon-infra/issues/188) and
   [#233](https://github.com/kyriakon/kyriakon-infra/issues/233).
-- Section 12: no phone, until the key generator prototype tests Thunderbird for Android.
-- Section 18: the decline apologises for the outcome, offers the vouch and carries the clock.
-- Section 19: two boxes, one request and one acknowledgement.
-- Section 21: the certificate is queued; a day or three is the honest figure.
+- Section 13: no phone, until the key generator prototype tests Thunderbird for Android.
+- Section 19: the decline apologises for the outcome, offers the vouch and carries the clock.
+- Section 20: two boxes, one request and one acknowledgement.
+- Section 22: the certificate is queued; a day or three is the honest figure.
+- Section 8, the branch question: option A, with both answers written out, and the body's
+  own-domain price and the community block opening from it.
+- Section 8, the VAT number: option A, asked only of a body in business, and optional.
+- Section 3, the capacity line: the offer stands as far as capacity allows, and the free
+  share is reviewed once it passes about a fifth of the accounts.
+- Section 11: the recovery phrase is eight words from a 2,048-word list, 88 bits, stated
+  beside the words.
+- Section 17: the three stages are received, with the reviewer, and decided.
+- Section 18: the approval screen carries the check against the consolidated list.
+- Section 19: the monastic decline says the blessing did not reach us, since we never write
+  to the elder.
+- Section 23: the free state has no window, no token and no paid-until date, and one yearly
+  notice saying nothing is due.
 
 Every other section stands at the recommended option until it is overruled.
 

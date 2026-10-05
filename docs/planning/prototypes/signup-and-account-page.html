@@ -75,7 +75,7 @@
 
 <section id="landing">
   <h2>Secure encrypted email and website hosting for Orthodox Christians</h2>
-  <p class="lede">£20 a year, or nothing at all if you are clergy, a monastic, or unable to pay. Say so on the form and that is the end of it. A parish, a monastery or a small Orthodox business with its own domain pays £40 a year and gets up to ten addresses.</p>
+  <p class="lede">£20 a year, or nothing at all if you are clergy, a monastic, or unable to pay. Say so on the form and that is the end of it. A parish, a monastery or a small Orthodox business with its own domain pays £40 a year and gets up to ten addresses. The offer stands as far as capacity allows, and the free share is reviewed once it passes about a fifth of the accounts.</p>
   <div class="card">
     <h3>Secure encrypted email</h3>
     <p>Your mail is encrypted to your own key the moment it arrives. The server holds ciphertext and no key, so we cannot read your messages, and no request or order on our side changes that. The cost is that if you lose your key and your recovery phrase, the mail is gone: nobody here can restore it. Keep the two in different places.</p>
@@ -125,6 +125,12 @@
     <label>Username <span class="opt">(lowercase letters, digits and hyphens, up to 31)</span></label>
     <input type="text" value="theophilus">
     <p class="hint">This becomes your address, <span class="mono">theophilus@kyriakon.net</span>, and your site, <span class="mono">theophilus.kyriakon.net</span>. The names the platform uses itself are held back, so <span class="mono">mail</span>, <span class="mono">www</span>, <span class="mono">kleio</span>, <span class="mono">press</span> and <span class="mono">signup</span> are not available, and a web address in this namespace is a username in it too.</p>
+    <label>Is this for you, or for a body?</label>
+    <p><input type="radio" name="whose" checked> Just me, one address at <span class="mono">kyriakon.net</span><br>
+      <input type="radio" name="whose"> A body, with its own domain, like <span class="mono">secretary@theirparish.example</span> or <span class="mono">orders@theiconshop.example</span></p>
+    <p class="hint">A body is a parish, a monastery, a school or a small Orthodox business. Answering for one opens the community block: the body's name and kind, its domain, its addresses and a mail key for each mailbox, and it pays £40 a year rather than £20. Whoever applies stays one person either way, and is who we reach, who accepts the terms and who pays.</p>
+    <label>VAT number <span class="opt">(optional; a body in business, where you have one)</span></label>
+    <input type="text">
     <label>An address outside this platform <span class="opt">(optional)</span></label>
     <input type="text" value="someone@example.invalid">
     <p class="hint">We write here as well as to your new address, including if the account is ever in trouble, and if this address bounces we hold on longer before doing anything final. It is used for notices only, it is never shared, and we never use it to look you up anywhere else. You can add or remove one from your account page at any time.</p>
@@ -187,7 +193,7 @@
     <p>This is the key your mail is encrypted to. Two things happen when you press the button:</p>
     <ul>
       <li>A key pair is made on your computer, using an algorithm your mail client supports.</li>
-      <li>You are given a recovery phrase of eight words. Write it down, on paper, now.</li>
+      <li>You are given a recovery phrase of eight words from a 2,048-word list, 88 bits. Write it down, on paper, now.</li>
     </ul>
     <button class="btn">Make my mail key</button>
     <div class="ok">
@@ -230,7 +236,7 @@
       <li><strong>Read.</strong> Usually within a few days, sometimes sooner.</li>
       <li><strong>Approved.</strong> You get a link to pay, or a note that there is nothing to pay.</li>
       <li><strong>Live.</strong> Your address starts accepting mail. Mail arriving before you have configured your client will sit there waiting, encrypted, and it will be readable once your client is set up.</li>
-      <li><strong>Site.</strong> Your certificate is requested once the account exists and usually arrives within a day or three. Until it does, your site does not answer at all: we do not serve a member site over plain HTTP, only the challenge that proves the domain is yours.</li>
+      <li><strong>Site.</strong> Your site answers on HTTP as soon as the account exists, and the certificate follows it: it is requested then and usually arrives within a day or three.</li>
     </ul>
     <p>If we cannot approve it, we will say so and tell you how to ask us to look again. Nothing is held for more than a week after we decide.</p>
     <p class="hint">Your username is held for you while this is being read. If nothing is heard for a week, the application is deleted and the name is free again.</p>
@@ -243,11 +249,12 @@
   <div class="card">
     <table>
       <tr><td>Received</td><td>30 September 2026. A person reads every application. Nothing is charged yet.</td></tr>
-      <tr><td>Approved</td><td>1 October 2026. Your account is open: <span class="mono">theophilus@kyriakon.net</span>, with mail working and its certificate requested, so the site answers once that arrives. What is left is payment.</td></tr>
-      <tr><td>Declined</td><td>We were not able to open an account, and we will look again if you ask us to.</td></tr>
+      <tr><td>With the reviewer</td><td>1 October 2026. One person reads every application, and yours is with them.</td></tr>
+      <tr><td>Decided</td><td>Approved, 1 October 2026. Your account is open: <span class="mono">theophilus@kyriakon.net</span>, with mail working and your site answering on HTTP until its certificate arrives. What is left is payment.</td></tr>
     </table>
     <button class="btn" onclick="go('pay')">Pay £20</button>
     <button class="btn alt" onclick="go('prepaid')">Cash or Monero</button>
+    <p class="hint">Three stages: received, with the reviewer, and decided. A decision is approved or declined, and the row says which; the page never repeats anything you wrote on the application.</p>
     <p class="hint">Anyone holding this link can read this page, so keep it as you would a password. It works until the application is cleared away, a week after a decision, and then the account page is where everything lives.</p>
   </div>
 </section>
@@ -266,10 +273,10 @@
       <p><strong>Diocese</strong><br>Diocese of Sourozh</p>
       <p><strong>Orders</strong><br>Priest</p>
       <p><strong>Monastic blessing</strong><br>n/a</p>
-      <p><strong>Spiritual father's blessing</strong><br>Yes, he knows and is glad of it.</p>
       <p><strong>Unable to pay</strong><br>n/a</p>
       <p><strong>Intended use</strong><br>A site for the parish, with the services and the calendar, and mail for me and the deacon.</p>
       <p><strong>Anything else</strong><br>Fr John at the cathedral suggested I write.</p>
+      <p><strong>Before you approve:</strong> check the applicant against the consolidated list of financial sanctions targets. An application from a resident of a country under UK sanctions is declined.</p>
       <p style="margin-top:18px">
         <button class="btn">Approve, £20 a year</button>
         <button class="btn">Approve, no charge</button>
@@ -294,7 +301,7 @@
     </div>
   </div>
   <div class="card">
-    <p class="hint">A monastic application is the one case where the message names what is missing, because what is missing is a conversation: <em>"We have not been able to reach your elder. If you can ask him to write to us, or send us his blessing, we will look again."</em></p>
+    <p class="hint">A monastic application is the one case where the message names what is missing, because what is missing is a conversation: <em>"The blessing of your elder did not reach us. If you can ask him to write to us, or send his blessing, we will look again."</em></p>
     <p class="hint">No reason is given otherwise, the application is held seven days in case a word arrives, and then it is purged and the username released. Nothing about a declined application is kept beyond that week.</p>
     <p class="hint">A member who gave no address outside the platform reads this on their status link instead, which is why that link is worth keeping. To have us look again they reply if we wrote to them, or write to <span class="mono">admin@kyriakon.net</span> from anywhere.</p>
   </div>
@@ -305,7 +312,8 @@
   <p class="lede">Approved. Your account exists and your address is already accepting mail; this is the last step.</p>
   <div class="card">
     <h3>Two things before you pay</h3>
-    <p><input type="checkbox" checked> I ask you to begin supplying the service immediately, and I understand that this is digital content supplied at once.</p>
+    <p><input type="checkbox" checked> I ask you to begin supplying the service immediately.</p>
+    <p><input type="checkbox" checked> I understand that this is digital content supplied at once.</p>
     <p class="hint">You keep the right to cancel within 14 days of paying and to be refunded in full. Asking for immediate supply does not take that away. <a href="#pay">How to cancel, and what happens.</a></p>
     <h3>£20 for a year</h3>
     <p>Payment is taken on Stripe's own page. Your card details never reach this server and we never see them.</p>
@@ -349,7 +357,7 @@
       <tr><td>Your site</td><td class="mono">theophilus.kyriakon.net</td></tr>
       <tr><td>Upload your site</td><td class="mono">sftp theophilus@kyriakon.net</td> <span class="hint">(port 22, the default)</span></td></tr>
       <tr><td>Repositories</td><td class="mono">ssh://theophilus@kyriakon.net:2222/myrepo.git</td></tr>
-      <tr><td>Certificate</td><td>Requested. Queued, so a day or three; your site answers once it is issued.</td></tr>
+      <tr><td>Certificate</td><td>Requested. Queued, so a day or three; until it is issued your site answers on HTTP.</td></tr>
       <tr><td>Paid until</td><td>30 September 2027</td></tr>
     </table>
     <p><strong>The first message in your mailbox is encrypted.</strong> If you can read it, your setup works. If you cannot, nothing is lost: it is in <a href="#keys">the walkthrough</a>, under "it will not decrypt".</p>
@@ -382,6 +390,17 @@
       <tr><td>At the end of the window</td><td>The account lapses rather than closes. Mail you already have stays readable, your site stays up, and sending, uploading and pushing stop. Nothing is deleted, and paying at any time brings it back.</td></tr>
     </table>
     <p class="hint">Lapsed and suspended are the same page with different words in the first row and a different sentence about what stops. The notices list below is where the member sees what we have told them, and the closing page is where they end it themselves.</p>
+  </div>
+
+  <h3>If you are not charged</h3>
+  <div class="card">
+    <table>
+      <tr><td>State</td><td>Active, free <span class="tag">no charge</span></td></tr>
+      <tr><td>Paid until</td><td>Nothing. A free account has no paid-until date, no payment window and no token.</td></tr>
+      <tr><td>What works</td><td>Everything a paid account has: the same 5 GB, mail, site, capsule and repositories.</td></tr>
+      <tr><td>Once a year</td><td>One notice says that nothing is due, and adds that if circumstances have changed, the paid path is here.</td></tr>
+    </table>
+    <p class="hint">Lapse never applies here, and the sweep that clears dormant accounts passes this one over. A free account ends when the member asks, on a breach, or if the operator closes one that is unreachable and unused for a year.</p>
   </div>
 
   <h3>Notices</h3>
