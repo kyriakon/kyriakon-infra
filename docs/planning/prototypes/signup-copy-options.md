@@ -80,9 +80,9 @@ qualify.
 Recommended: B. The thing that stops people asking is not knowing whether the offer
 applies to them, so the copy should say who decides and how.
 
-Both are settled. The price line stays as B, and an organisation that wants its own
-domain, or several addresses, is quoted £40 a year for it, with up to ten addresses,
-rather than invited to write to us. That is
+Both are settled. The price line stays as B, and a parish, a monastery or a small Orthodox business that wants its own domain, or
+several addresses, is quoted £40 a year for it, with up to ten addresses, rather than
+invited to write to us. That is
 [#188](https://github.com/kyriakon/kyriakon-infra/issues/188), which set all four tiers,
 and [#233](https://github.com/kyriakon/kyriakon-infra/issues/233), which put a body's
 application on the same form with a community block. The own-domain path is automated
