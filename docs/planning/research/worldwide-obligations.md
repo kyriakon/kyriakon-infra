@@ -20,13 +20,17 @@ here. Outside those two, the answer has three parts.
    the same kind of offer when section 3 commences, on or about 13 May 2027. Two size-based
    regimes do not reach a business of this size: California's CCPA as amended by the CPRA
    starts at [USD 26,625,000](https://cppa.ca.gov/regulations/cpi_adjustment.html) of revenue
-   or 100,000 consumers, and the Australian Privacy Act leaves a small business operator
+   or [100,000 consumers or households](https://cppa.ca.gov/pdf/20260101_ccpa_statute.pdf),
+   and the Australian Privacy Act leaves a small business operator
    turning over [AUD 3,000,000](https://www.legislation.gov.au/C2004A03712/latest) or less
    outside the Australian Privacy Principles.
-2. **On indirect tax, one jurisdiction charges from the first sale.** India taxes online
-   information and database access or retrieval services supplied from outside the country
-   to an unregistered recipient, with no turnover floor, so a UK supplier of hosted
-   services to an Indian consumer must take an Indian registration. Norway's
+2. **On indirect tax, one jurisdiction among those examined charges from the first sale.**
+   The regimes are the ones the ticket named, so the list is a floor rather than a ceiling
+   and a jurisdiction outside it is not examined; another country may charge from the first
+   sale without appearing here. India taxes online information and database access or
+   retrieval services supplied from outside the country to an unregistered recipient, with
+   no turnover floor, so a UK supplier of hosted services to an Indian consumer must take
+   an Indian registration. Norway's
    [NOK 50,000](https://lovdata.no/dokument/NL/lov/2009-06-19-58) over twelve months is the
    only other threshold a first year of tens of members could approach. Canada, New
    Zealand, Australia, Switzerland, Japan and Singapore each set a figure, from Canada's
@@ -60,6 +64,14 @@ is outside the law. The regimes this ticket asks about split cleanly into those 
 and the split decides the work. A connection-based regime has to be complied with from the
 first member in that country. A size-based regime only has to be watched.
 
+The ticket also asks which regimes are about consumers and which are about customers of any
+kind. The CCPA is the only one here whose unit is the consumer: it counts consumers or
+households. Every other regime attaches to personal information about an individual, so a
+customer of any kind is inside it. PIPEDA's personal information, the FADP's and the LGPD's
+natural persons, the DPDP Act's Data Principal and the APPI's person in Japan all cover a
+sole trader, an employee or a business contact, and the Australian Privacy Act does the
+same, although its size threshold keeps it out of reach here.
+
 ### 1.2 Regimes that apply at any scale
 
 #### Canada: PIPEDA and the real and substantial connection test
@@ -84,7 +96,8 @@ the OPC has asserted jurisdiction on less *(interpretation)*.
 The duties themselves are the ones the UK GDPR already imposes: identify the purpose,
 obtain consent, limit collection, safeguard the data, answer access and correction
 requests, and provide a route to challenge compliance. The marginal work is the report to
-the OPC where a breach of security safeguards creates a real risk of significant harm. The
+the OPC where a breach of security safeguards creates a real risk of significant harm
+([section 10.1](https://laws-lois.justice.gc.ca/eng/acts/P-8.6/section-10.1.html)). The
 OPC's [summary of privacy laws in Canada](https://www.priv.gc.ca/en/privacy-topics/privacy-laws-in-canada/02_05_d_15/)
 records that Alberta, British Columbia and Quebec have private-sector laws declared
 substantially similar, which apply instead of PIPEDA where an organisation operates
@@ -130,17 +143,19 @@ the controller must appoint an encarregado and publish the identity and contact 
 applies the Digital Personal Data Protection Act, 2023, to processing outside India "if
 such processing is in connection with any activity related to offering of goods or services
 to Data Principals within the territory of India". There is no threshold. The Act is
-staged into force, and the footnote to section 1 cites notification G.S.R. 843(E) of 13
-November 2025: sections 2 and 18 to 26 commenced that day, and sections 3 to 5, 6 except
-sub-section (9), and 7 to 17 commence eighteen months later, on or about 13 May 2027
-*(interpretation of the footnote)*. As of 5 October 2026 the extraterritorial limb is
-therefore not yet operative. When it commences, section 5 requires a notice describing the
-personal data, the purpose, the manner of exercising rights and the manner of complaining
-to the Data Protection Board, and section 5(3) requires the Data Principal to be able to
-access that notice "in English or any language specified in the Eighth Schedule to the
-Constitution". Section 6 requires consent that is "free, specific, informed, unconditional
-and unambiguous with a clear affirmative action". A signup flow built for the UK GDPR covers
-most of this, but the notice wording and the language option are additions
+staged into force by [notification G.S.R. 843(E) of 13 November 2025](https://www.meity.gov.in/static/uploads/2025/11/c56ceae6c383460ca69577428d36828b.pdf):
+sections 2 and 18 to 26 commenced that day, and sections 3 to 5, 6 except sub-section (9),
+and 7 to 17 commence eighteen months later, on or about 13 May 2027. The copy of the Act
+reached is the 2024 upload, which predates the notification and cannot carry it, so the
+dates rest on the notification rather than on a footnote to the Act. As of 5 October 2026
+the extraterritorial limb is therefore not yet operative. When it commences, section 5
+requires a notice describing the personal data, the purpose, the manner of exercising
+rights and the manner of complaining to the Data Protection Board, and section 5(3)
+requires the Data Principal to be able to access that notice "in English or any language
+specified in the Eighth Schedule to the Constitution". Section 6 requires consent that is
+"free, specific, informed, unconditional and unambiguous with a clear affirmative action". A
+signup flow built for the UK GDPR covers most of this, but the notice wording and the
+language option are additions
 *(interpretation)*.
 
 #### Japan: the APPI follows the supply to a person in Japan
@@ -150,8 +165,7 @@ on the Protection of Personal Information where, "in relation to supplying a goo
 to a person in Japan", a business handles that person's identifiable personal information
 in a foreign country. There is no threshold: Article 16(2) defines a business handling
 personal information as a person that uses a personal information database for business,
-and the only exclusions are government bodies, so the 5,000-person exemption that earlier
-versions carried is absent from the current text. The duties that add to a UK GDPR policy
+and the only exclusions are government bodies. The duties that add to a UK GDPR policy
 are the notification of the purpose of use when personal information is acquired
 (Article 21), the restrictions on providing personal data to third parties (Article 27) and
 to third parties in a foreign country (Article 28), and the disclosure, correction and
@@ -198,18 +212,26 @@ operation, but that question does not arise while section 6D applies.
 
 A country taxes a foreign supplier of hosted services in one of two ways. It either charges
 from the first sale to a consumer, or it sets a turnover figure below which the foreign
-supplier is left alone. Only India uses the first shape among the regimes this ticket lists.
-Every other regime has a figure, and the figures range from NOK 50,000 to SGD 1,000,000, so
-the practical question is not whether the release is liable but how far away each ceiling
-is. All of these regimes tax sales to consumers only, leaving sales to local registered
-businesses to the reverse charge or outside the scheme, which matters little here because
-the platform sells to individuals.
+supplier is left alone. Only India uses the first shape among the regimes this ticket
+lists, and the list is a floor rather than a ceiling: the ticket named these eight
+jurisdictions, and one outside them is not examined. Every other regime has a figure, and
+the figures range from NOK 50,000 to SGD 1,000,000, so the practical question is not whether
+the release is liable but how far away each ceiling is. The regimes are also not drawn the
+same way around the consumer. India and Australia turn on whether the recipient is
+registered, so an unregistered business is caught as much as an individual, while Japan,
+Singapore, Norway and Switzerland reach only the consumer or the non-business recipient.
+Canada and New Zealand are described in terms of the customer to whom the supply is made,
+which does not settle where their line falls. Sales to local registered businesses fall to
+the reverse charge or outside the scheme, which matters little here because the platform
+sells to individuals *(interpretation)*.
 
-The distance, at £20 a member and a rough rate to sterling, is about 190 members for
-Norway, about 800 for Canada, about 1,350 for New Zealand, about 1,900 for Australia, about
-2,600 for Japan and about 4,600 for Switzerland *(interpretation, rounded, and the figures
-count only members in the country concerned)*. California's revenue limb is further away
-again.
+Switzerland alone measures its figure differently: the CHF 100,000 is worldwide turnover, so
+business sales and sales outside Switzerland count toward it, and the ceiling is not
+confined to Swiss consumers. The distance, at £20 a member and a rough rate to sterling, is
+about 190 members for Norway, about 800 for Canada, about 1,350 for New Zealand, about 1,900
+for Australia, about 2,600 for Japan and about 4,600 for Switzerland *(interpretation,
+rounded, and the figures count members in the country concerned, except Switzerland's,
+which is worldwide)*. California's revenue limb is further away again.
 
 ### 2.2 India: no threshold, so the first sale is the trigger
 
@@ -388,9 +410,11 @@ the release notices when it approaches one.
   under section 6D(4)(c) of the Australian Privacy Act. If they do, the small business
   exemption falls away and the Australian Privacy Principles bind the release.
 - Whether the platform acts as controller or processor for each data set it holds. This
-  note treats it as controller of account, billing and log data, and the zero-access
-  design keeps message content out of its hands, but the DPDP Act, the LGPD and the APPI
-  draw the controller line differently from the UK GDPR *(interpretation)*.
+  note treats it as controller of account, billing and log data, and of the message text
+  the triage classifier sees, which the companion note's retention schedule holds for 90
+  days; the zero-access design keeps the rest of the message content out of its hands. The
+  DPDP Act, the LGPD and the APPI draw the controller line differently from the UK GDPR
+  *(interpretation)*.
 - What "encarregado" means in practice for a one-person business in Brazil, and whether the
   ANPD would accept a named individual who is not resident in Brazil.
 - Whether the DPDP notice in a scheduled language is a duty to translate or a duty to offer
@@ -414,13 +438,14 @@ Each entry carries the date it was checked.
 
 Data protection legislation:
 
-- [PIPEDA, S.C. 2000, c. 5, section 4](https://laws-lois.justice.gc.ca/eng/acts/P-8.6/section-4.html), checked 5 October 2026.
+- [PIPEDA, S.C. 2000, c. 5, section 4](https://laws-lois.justice.gc.ca/eng/acts/P-8.6/section-4.html) and [section 10.1](https://laws-lois.justice.gc.ca/eng/acts/P-8.6/section-10.1.html), checked 5 October 2026.
 - [OPC, Leading by Example, section 2.2](https://www.priv.gc.ca/en/privacy-topics/privacy-laws-in-canada/the-personal-information-protection-and-electronic-documents-act-pipeda/r_o_p/lbe_080523/), checked 5 October 2026. The page is archived, and the real and substantial connection factors are stated there.
 - [OPC, Summary of privacy laws in Canada](https://www.priv.gc.ca/en/privacy-topics/privacy-laws-in-canada/02_05_d_15/), checked 5 October 2026.
 - [Swiss FADP, SR 235.1](https://www.fedlex.admin.ch/filestore/fedlex.data.admin.ch/eli/cc/2022/491/20230901/en/pdf-a/fedlex-data-admin-ch-eli-cc-2022-491-20230901-en-pdf-a.pdf), Articles 2, 3, 12 and 14, checked 5 October 2026. English text is a translation with no legal force.
 - [Brazil LGPD, Lei 13.709/2018](https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2018/lei/L13709.htm), Articles 3 and 41, checked 5 October 2026.
 - [ANPD, Resolução CD/ANPD nº 2/2022](https://www.in.gov.br/web/dou/-/resolucao-cd/anpd-n-2-de-27-de-janeiro-de-2022-376562019), checked 5 October 2026.
-- [Digital Personal Data Protection Act, 2023](https://www.meity.gov.in/static/uploads/2024/06/2bf1f0e9f04e6fb4f8fef35e82c42aa5.pdf), sections 1, 3, 5 and 6, checked 5 October 2026. The commencement footnote cites G.S.R. 843(E) of 13 November 2025.
+- [Digital Personal Data Protection Act, 2023](https://www.meity.gov.in/static/uploads/2024/06/2bf1f0e9f04e6fb4f8fef35e82c42aa5.pdf), sections 1, 3, 5 and 6, checked 5 October 2026. The copy reached is the 2024 upload, which predates the commencement notification.
+- [Notification G.S.R. 843(E), 13 November 2025](https://www.meity.gov.in/static/uploads/2025/11/c56ceae6c383460ca69577428d36828b.pdf), checked 5 October 2026. The commencement dates in section 1.2 come from this notification, not from a footnote to the Act.
 - [APPI, Act No. 57 of 2003](https://www.japaneselawtranslation.go.jp/en/laws/view/4241/en), Articles 16, 21, 26, 27, 28 and 171, checked 5 October 2026.
 - [PPC, leak reporting](https://www.ppc.go.jp/personalinfo/legal/leakAction/), checked 5 October 2026. The 1,000-person trigger sits in the Commission's order rather than in the Act.
 - [California CCPA of 2018 as amended, text effective 1 January 2026](https://cppa.ca.gov/pdf/20260101_ccpa_statute.pdf), section 1798.140(d), checked 5 October 2026.
