@@ -79,15 +79,7 @@ qualify.
 Recommended: B. The thing that stops people asking is not knowing whether the offer
 applies to them, so the copy should say who decides and how.
 
-Both are settled in principle. The price line stays as B, and a parish wanting its own
-domain or several addresses is invited to write to us rather than quoted a price. What is
-still open is the tier set itself, because the £50/yr in the proposal looks high for a
-rural parish beside providers that sell a domain with several addresses for less, and
-because nobody has established what an organisation account costs to run here. Both
-questions are out to research in tickets [#189](https://github.com/kyriakon/kyriakon-infra/issues/189)
-and [#190](https://github.com/kyriakon/kyriakon-infra/issues/190), and the decision that
-waits on them is [#188](https://github.com/kyriakon/kyriakon-infra/issues/188). No price
-for the parish tier appears on the site until then.
+Both are settled, and the parish tier is priced. [#188](https://github.com/kyriakon/kyriakon-infra/issues/188) set the tiers: £20 a year for an individual, £40 for an organisation's own domain with up to ten addresses each at the standard 5 GB, and £150 a year or more for a managed instance, which is the one ordered by enquiry. The own-domain tier is a form path rather than a letter: the same application carries a community block for a body, per [#233](https://github.com/kyriakon/kyriakon-infra/issues/233), and it is automated before the release. So the copy quotes £40 and says what it includes, and only the managed instance invites writing to us.
 
 - £20 a year. Free for clergy, monastics, and those who are unable to pay. Please let us know on the form!
 
@@ -256,14 +248,14 @@ difference is worth the extra sentence.
 
 ## 12. Keys: putting the key into a mail program
 
-- A. Put the key into your mail program. Follow the walkthrough for Thunderbird, on a computer or a phone.
+- A. Put the key into your mail program. Follow the walkthrough for Thunderbird on a computer.
 
-- B. Setting up. Follow the walkthrough for Thunderbird, on a computer or a phone.
+- B. Setting up. Follow the walkthrough for Thunderbird on a computer.
 
 A
 
 Recommended: A. The promise of pictures is what stops someone deciding this is beyond
-them, and it has to be true when the page ships.
+them, and it has to be true when the page ships. The phone stays out until the key generator prototype has tested Thunderbird for Android, per [#176](https://github.com/kyriakon/kyriakon-infra/issues/176); the walkthrough claims mobile only once it works.
 
 The first mail, which belongs here as well as later:
 
@@ -326,7 +318,7 @@ identifiers belong next to it rather than in the email alone.
 - B. Received. A person will read it.
 - C. That is with us. Nothing more is needed from you today.
 
-Received, thank you for your application! A person will review it and get back to you.
+Received, thank you for your application! A person will read it, and this page's status link is where the answer appears.
 
 
 Recommended: B, or C if the page also has to tell them about the status link. Naming the
@@ -368,14 +360,15 @@ to notice the missing padlock and worry.
 
 The declined state:
 
-- A. We were not able to open an account, and we will look again if you ask us to.
-- B. Not approved this time. You are welcome to write to us about it.
+- A. I am sorry we were not able to open an account for you. If you think we have this
+  wrong, reply to this message. A word from your priest, or from someone we already know,
+  usually settles it, and we are glad to look again. We will hold the application for a
+  week, and after that it is deleted and the name is free for anyone to take.
+- B. Not approved this time, and I am sorry about that. You are welcome to write to us about it.
 
- <!-- I am very sorry but we have decided to decline your application at this time. Please write to us if you have any further information that may help us to reconsider. ! !!!! (give in input on this please)
-Recommended: A. "This time" and "you are welcome" are the parts that keep it courteous.
+Recommended: A. It apologises for the outcome rather than the decision, which is the distinction that matters when no reason is given: an apology for the decision invites "why", and there is no answer to give. It offers the vouch rather than an open invitation to argue by correspondence, and it carries the clock.
 
- -->
-Perhaps it is better to use the same text as the decline email.
+The monastic decline stays distinct rather than reusing this text, because it is the one case where the message says what is missing, deliberately: what is missing is a conversation. Its wording needs one correction, though. It says we could not reach the elder, and we never try, since the applicant supplies the blessing. It should read: "The blessing of your elder did not reach us. If you can ask him to write to us, or send his blessing, we will look again."
 
 ## 17. Approval email
 
@@ -422,16 +415,14 @@ Recommended: A. It says what would fix it and leaves the initiative with the app
 
 ## 19. Payment: card
 
-The acknowledgement, which has legal weight and has to be readable anyway.
+The acknowledgement, which has legal weight and has to be readable anyway. It is two acts, not one sentence: [#149](https://github.com/kyriakon/kyriakon-infra/issues/149) requires an express request to begin inside the fourteen days and, separately, an acknowledgement that this is digital content supplied at once. Two boxes, and the record keeps both.
 
-- A. I ask you to begin supplying the service immediately, and I understand that this is
-  digital content supplied at once.
-- B. Please start my account now. I understand that this is digital content, supplied
+- A. Tick both. Start my account now, before the fourteen days are up. / I understand that
+  this is digital content supplied at once.
+- B. Please start my account now. / I understand that this is digital content, supplied
   immediately.
 
-Recommended: A for the text recorded against the account, B for the checkbox if you want
-the reader to feel they are asking for something rather than accepting a term. The
-recorded wording is the one that matters, so whichever is shown, A goes in the record.
+Recommended: A, as two boxes. A single sentence carrying both invites the argument that only one happened, and the recorded wording is the one that has to survive that argument.
 
 A
 
@@ -515,8 +506,7 @@ gives up.
 
 The certificate line, which sets a real expectation:
 
-- A. Your certificate has been requested. It usually arrives within a few hours, and until
-  then your site answers on HTTP.
+- A. Your certificate has been requested. It is queued, and usually arrives within a day or three, and until then your site answers on HTTP.
 - B. Your site is up. The padlock will appear shortly.
 
 A
@@ -633,6 +623,14 @@ Recommended: A. It answers the question the reader will otherwise ask after clos
   pay. Whether an institution can be granted an account without charge stays open in
   [#177](https://github.com/kyriakon/kyriakon-infra/issues/177), and the working position is
   that an institution with a treasurer pays.
+
+- Section 3, the tiers: the parish tier is priced at £40 and reached by the form rather
+  than a letter, per [#188](https://github.com/kyriakon/kyriakon-infra/issues/188) and
+  [#233](https://github.com/kyriakon/kyriakon-infra/issues/233).
+- Section 12: no phone, until the key generator prototype tests Thunderbird for Android.
+- Section 18: the decline apologises for the outcome, offers the vouch and carries the clock.
+- Section 19: two boxes, one request and one acknowledgement.
+- Section 21: the certificate is queued; a day or three is the honest figure.
 
 Every other section stands at the recommended option until it is overruled.
 
