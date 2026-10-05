@@ -31,7 +31,7 @@ python3 -m http.server 8899 --bind 127.0.0.1
 - A key made by GnuPG 2.5.24 on this machine was flagged, with the message about `Ocb as an
   AEAD mode`. `gpg --list-packets` agrees with both verdicts: the gpg-made key carries
   `hashed subpkt 34 len 1 (pref-aead-algos: 2)` and `features: 07`, while the generated key
-  carries no `pref-aead-algos` subpacket at all and `features: 01`.
+  carries no `pref-aead-algos` subpacket at all and `features: 01`. The ticket names `features: 05`, which is what deployed keys carry because GnuPG 2.5 sets the version 5 public key advertisement; `01` omits that and keeps the modification-detection bit, so the criterion is met in substance, as the capability note records.
 - The tab made five requests in total and every one was this directory: `index.html`,
   `style.css`, `app.js`, `pkg/keygen_spike.js` and `pkg/keygen_spike_bg.wasm`. That is the
   ticket's browser acceptance, and it is the reason the page reports its own loaded resources
