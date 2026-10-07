@@ -168,18 +168,20 @@ if grep -Eq '2001:db8' "$iface_dst"; then
 	exit 1
 fi
 
-# Put the address on the interface now, if it is not already there. Services
-# bind interface addresses at startup, so anything started before this would
-# come up without it and the box would publish an AAAA nothing answers. Adding
-# an address does not disturb the interface or drop the session running this.
+# Put the address on the interface by applying the file, which is what a reboot
+# does. Configuring the interface here instead, as this once did, checks the
+# address and not the file: on 5 October the box came up with no IPv6 address and
+# nsd could not bind one, because hostname.vio0 asked for a prefix length the way
+# ifconfig takes it and netstart reads fields. Applying the file means a line
+# netstart cannot parse fails this deploy rather than the next boot. An address
+# that is already up makes netstart pass through ifconfig's EEXIST error and
+# return non-zero, so the address printed below is what decides.
 if ifconfig vio0 | grep -q "$ipv6"; then
-	printf 'vio0 already holds %s\n' "$ipv6"
+	printf 'vio0 already holds %s; reapplying hostname.vio0 to prove it parses\n' "$ipv6"
 else
-	printf 'adding %s to vio0\n' "$ipv6"
-	ifconfig vio0 inet6 "$ipv6" prefixlen 64
-	route add -inet6 default fe80::1%vio0 2>/dev/null \
-		|| printf 'default v6 route already present, or the add failed; check route -n show -inet6\n'
+	printf 'adding %s to vio0 from hostname.vio0\n' "$ipv6"
 fi
+/etc/netstart vio0 || true
 
 # Syntax-check both, and check the *zone* rather than only the config:
 # nsd-checkconf validates nsd.conf, while a zone parse error leaves nsd running

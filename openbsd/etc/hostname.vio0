@@ -20,7 +20,13 @@
 # that must ensure the box can answer it.
 #
 # Hetzner docs: https://docs.hetzner.com/cloud/servers/static-configuration/
-
+#
+# The prefix length is a field of its own here, not the ifconfig keyword that
+# deploy-nsd.sh passes on its command line. netstart(8) reads a line as fields
+# and rewrites the second one into the keyword, so writing "prefixlen 64" here
+# produced "prefixlen prefixlen 64", which ifconfig rejects. Every boot from
+# 5 October until this was fixed came up without the address, with nsd unable to
+# bind it, and the deploys hid it by putting the address up by hand.
 inet autoconf
-inet6 2001:db8::10 prefixlen 64
+inet6 2001:db8::10 64
 !route add -inet6 default fe80::1%vio0
