@@ -73,7 +73,7 @@ any form, so an artifact from gpg carries either a usable subkey or none.
 
 `browser-run.js` is the script that was run, not a re-enactment. It opens the page, records
 every request the tab makes, generates a key, checks it, checks a gpg-made key that
-advertises AEAD, and asserts that every request was to the local server. It needs a browser
+advertises AEAD, and records whether every request was to the local server, which the run's output carries. It needs a browser
 script runner, which is part of the environment rather than the file, so the honest claim is
 that the run is reproducible with that runner and the outputs above are what it returned.
 
