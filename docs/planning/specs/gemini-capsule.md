@@ -58,6 +58,7 @@ The handler is the same binary that answers HTTPS, started by its own `rc.d` uni
 ```
 daemon="/usr/local/sbin/kyriakon-onboard"
 daemon_flags="serve"
+daemon_user="_onboard"
 
 . /etc/rc.d/rc.subr
 
@@ -91,8 +92,6 @@ The token is 128 random bits drawn from `getrandom` when the draft is created, e
 A draft is a JSON document at `/var/db/onboard/drafts/<token>.json`: the answers given so far, the page cursor, the key fingerprints and check verdicts, `created_at` and `updated_at`. On file it becomes `/var/db/onboard/applications/<token>.json` and an `intents/<id>.json` is written for the drain, which validates and applies it the way it applies every other intent.
 
 The expiry is the protocol's. The answer arrives as the query of the page that asked for it, and the redirect to the next page drops it, so the query cannot accumulate answers, and a cancelled prompt sends nothing, so the server never learns the applicant stopped. There is no disconnect event. The drain purges any draft whose `updated_at` is more than seven days old. The status page answers for a filed application until the application is cleared away, seven days after a decision, which is [#159](https://github.com/kyriakon/kyriakon-infra/issues/159)'s hold; the answers themselves stay inside the 90-day window of ADR 0005.
-
-The store joins the backup set in `scripts/backup.sh`, so a restore does not lose an application that was in progress.
 
 ## The questions
 
@@ -149,7 +148,7 @@ The same walkthrough presents the upload key as a step for anyone who wants a we
 The mail public key is the field that may not fit. An armored Curve25519 block plus the path and the token runs at or past the 1024 bytes the specification allows, and a client that enforces the limit refuses to send it. So the key page takes the paste where it fits and says before the prompt what to do when it does not:
 
 ```
-10 Paste the public key for secretary@theirparish.example (question 11 of 24). Paste the whole
+10 (question 11 of 24) Paste the public key for secretary@theirparish.example. Paste the whole
 block. If your client refuses the paste because the address is too long, mail the block to
 apply@kyriakon.net with <token> as the subject instead, and name this mailbox in the message.
 ```
