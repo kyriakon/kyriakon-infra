@@ -21,7 +21,7 @@ Article 6 of the UK GDPR requires a lawful basis for each purpose, and the same 
 | Billing, renewal and receipts | The paid-until date, the rail, and the payment ledger keyed by your token | Contract, Article 6(1)(b) |
 | Abuse detection, outbound-mail spike watching, authentication-failure counting, rate limiting and blocklist checks | Log lines and aggregate counts | Legitimate interests, Article 6(1)(f), including the recognised interest in the security of network and information systems |
 | Security logging that identifies you by address or timestamp | The raw per-user record | Legitimate interests, Article 6(1)(f). The seven-day window is what makes the balance defensible |
-| The triage classifier | The message text and application text it reads on the operator host, and the decisions and scores it makes | Contract, Article 6(1)(b). Classification belongs on the operator host and never on the mail box, and no text it reads is sent to a third-party inference service |
+| The triage model | The message text and application text it reads on the operator host, and the decisions and scores it makes | Contract, Article 6(1)(b). Classification belongs on the operator host and never on the mail box, and no text it reads is sent to a third-party inference service |
 
 We rely on consent for nothing. Membership and delivery rest on the contract, and security logging rests on legitimate interests, so there is no consent to withdraw.
 
@@ -45,7 +45,7 @@ That covers stored content, not the addressing information mail needs to move. S
 | --- | --- |
 | Log records that identify you: smtpd envelope, Dovecot authentication, sshd, dns | 7 days |
 | Spam greylist and whitelist entries | about 36 days on the whitelist |
-| Application data for an application that is rejected or abandoned, and the text the classifier saw | 90 days |
+| Application data for an application that is rejected or abandoned, and the text the triage model saw | 90 days |
 | Your account, mailbox, website, gemini capsule and git repositories | while the account exists, then deleted |
 | A suspended account | a 40-day grace, then deletion |
 | An account after a failed renewal | a 40-day grace, then deletion |
