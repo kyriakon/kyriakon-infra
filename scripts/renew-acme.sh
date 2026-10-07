@@ -121,7 +121,16 @@ trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true' EXIT
 # One "<handle> <full chain path>" line per domain block. A block starts at
 # column 0 and its settings are indented, so the two patterns cannot collide.
 # Included files are deliberately not followed: those are the queue's names.
+#
+# Comment lines are skipped in this parse and in the challenge directory one
+# below, because the config's prose names the settings it explains and a parser
+# that reads prose finds settings that are not there. A comment reading
+# '("duplicate challengedir" is an error within one block)' was parsed as a
+# challenge directory called "duplicate", which stopped the run before a single
+# certificate was asked for, every night. A setting is a line that is not a
+# comment.
 domains=$(awk '
+	/^[ \t]*#/ { next }
 	/^domain[ \t]/ { handle = $2; next }
 	handle != "" && /domain full chain certificate/ {
 		path = $5
@@ -145,7 +154,7 @@ fi
 # would fail validation. One missing directory fails every name at
 # once, and each failure spends one of the five authorization attempts allowed per
 # identifier per hour, so the run stops before asking rather than spending them.
-challenge_dirs=$(awk -F'"' '/challengedir/ { print $2 }' "$acme_conf")
+challenge_dirs=$(awk -F'"' '!/^[ \t]*#/ && /challengedir/ { print $2 }' "$acme_conf")
 [ -n "$challenge_dirs" ] || challenge_dirs=/home/www/acme
 for dir in $challenge_dirs; do
 	if [ ! -d "$dir" ]; then
