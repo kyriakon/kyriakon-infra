@@ -28,19 +28,21 @@
 #
 # The ACME TLS keys stay out, but not for the reason once given here.
 # acme-client generates a key only when the file is missing, so a renewal reuses
-# the key it finds; a lost key is rebuilt and its certificate reissued, with no
-# reader asked to trust anything new. Replaceable, therefore not data.
+# the key it finds and a lost key is rebuilt. The file is regenerable if it goes
+# missing, not reissued on renewal, and that is why the pair is not data.
 #
 # A capsule's pair is the opposite. A capsule serves a long-lived self-signed
 # certificate, generated once with a ten-year life and never renewed, so nothing
-# mints its key again: the file is the only copy, and losing it changes every
-# capsule's certificate at once. Every reader then trusts once more, since a
-# gemini client pins the certificate on first use. The fingerprint on the help
-# page is what a reader checks against, and a regeneration is a runbook step
-# that updates it. Both halves enter the backup: the platform pair at
-# /etc/ssl/capsule-*.crt and /etc/ssl/private/capsule-*.key, and an own-domain
-# pair at /etc/ssl/capsule-<domain>.crt with its key. Only pairs present are
-# passed, since restic exits on a path that does not exist.
+# mints its key again: the file is the only copy. Losing the platform pair, which
+# serves kyriakon.net and *.kyriakon.net, changes every capsule's certificate at
+# once; an own-domain pair serves only that capsule, so losing it changes that
+# one certificate. Every reader then trusts once more, since a gemini client pins
+# the certificate on first use. The fingerprint on the help page is what a reader
+# checks against, and a regeneration is a runbook step that updates it. Both
+# halves enter the backup: the platform pair at /etc/ssl/capsule-*.crt and
+# /etc/ssl/private/capsule-*.key, and an own-domain pair at
+# /etc/ssl/capsule-<domain>.crt with its key. Only pairs present are passed,
+# since restic exits on a path that does not exist.
 #
 # The canary: a fixed-content file written before each run and included in the
 # snapshot. restore-test.sh asserts it returns byte-identical, so a backup job
