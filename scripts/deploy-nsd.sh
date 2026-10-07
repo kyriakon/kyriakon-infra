@@ -173,15 +173,20 @@ fi
 # address and not the file: on 5 October the box came up with no IPv6 address and
 # nsd could not bind one, because hostname.vio0 asked for a prefix length the way
 # ifconfig takes it and netstart reads fields. Applying the file means a line
-# netstart cannot parse fails this deploy rather than the next boot. An address
-# that is already up makes netstart pass through ifconfig's EEXIST error and
-# return non-zero, so the address printed below is what decides.
+# netstart cannot parse fails this deploy rather than the next boot.
+#
+# sh, not a direct call: /etc/netstart is mode 0644 on this base, so even root
+# cannot execute it, and /etc/rc runs it as 'sh /etc/netstart' for the same
+# reason, with an interface argument for pfsync0.
+#
+# An address that is already up makes netstart pass through ifconfig's EEXIST
+# error and return non-zero, so the address check below is what decides.
 if ifconfig vio0 | grep -q "$ipv6"; then
 	printf 'vio0 already holds %s; reapplying hostname.vio0 to prove it parses\n' "$ipv6"
 else
 	printf 'adding %s to vio0 from hostname.vio0\n' "$ipv6"
 fi
-/etc/netstart vio0 || true
+sh /etc/netstart vio0 || true
 
 # Syntax-check both, and check the *zone* rather than only the config:
 # nsd-checkconf validates nsd.conf, while a zone parse error leaves nsd running
