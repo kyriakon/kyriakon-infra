@@ -1,7 +1,7 @@
 # AGENTS.md
 
 kyriakon-infra is the public infrastructure repo for kyriakon.net — a low-extraction,
-no-shell hosting platform (mail, static/Gemini sites, `pass`-compatible git repos) for
+no-shell hosting platform (mail, static/gemini sites, `pass`-compatible git repos) for
 the Orthodox Christian community, running on OpenBSD via Hetzner + Terraform.
 
 ## Orientation
@@ -27,7 +27,7 @@ dogfooding, audit us). Repo-local terms specific to infra work: `CONTEXT.md` at 
 repo's own root. Two terms most likely to matter while working in this repo:
 
 - **Shell-less user**: the standard account tier. No interactive shell — mail via
-  IMAP/SMTP, static/Gemini hosting via `ftpd` upload, `pass` repos via `git-shell`.
+  IMAP/SMTP, static/gemini hosting via `sftp` upload, `pass` repos via `git-shell`.
   This is the whole platform's core safety property; don't propose or scaffold
   anything that grants a standard-tier user an interactive shell.
 - **Propose-only change**: any change that touches `pf.conf`, `sshd_config`, or would
