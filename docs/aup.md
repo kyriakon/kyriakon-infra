@@ -25,7 +25,7 @@ it does not; `transparency.md`, for what an operator can be made to produce; and
 
 ## 2. Published content
 
-What you host on `username.kyriakon.net` (HTTP/Gemini) is public.
+What you host on `username.kyriakon.net` (HTTP/gemini) is public.
 
 **Content floor.** The following are not permitted as published content:
 
@@ -119,7 +119,7 @@ cannot be policed, and this policy makes no claim to the contrary.
 
 ## 3. Resource use
 
-- 5 GB per account, across mail, web, and git combined, enforced via `edquota`.
+- 5 GB per account, across mail, web, and git combined, enforced by a per-account filesystem quota.
 - Approaching the quota alerts the operator, so disk exhaustion is caught before it
   takes the box down.
 
