@@ -283,7 +283,7 @@
       <li><strong>Read.</strong> Usually within a few days, sometimes sooner.</li>
       <li><strong>Approved.</strong> You get a link to pay, or a note that there is nothing to pay.</li>
       <li><strong>Live.</strong> Your address starts accepting mail. Mail arriving before you have configured your client will sit there waiting, encrypted, and it will be readable once your client is set up.</li>
-      <li><strong>Site.</strong> Your site answers on HTTP as soon as the account exists, and the certificate follows it: it is requested then and usually arrives within a day or three.</li>
+      <li><strong>Site.</strong> Your site goes live when its certificate lands: it is requested when the account opens, and usually arrives within a day or three.</li>
     </ul>
     <p>If we cannot approve it, we will say so and tell you how to ask us to look again. Nothing is held for more than a week after we decide.</p>
     <p class="hint">Your username is held for you while this is being read. If nothing is heard for a week, the application is deleted and the name is free again.</p>
@@ -297,7 +297,7 @@
     <table>
       <tr><td>Received</td><td>30 September 2026. A person reads every application. Nothing is charged yet.</td></tr>
       <tr><td>With the reviewer</td><td>1 October 2026. One person reads every application, and yours is with them.</td></tr>
-      <tr><td>Decided</td><td>Approved, 1 October 2026. Your account is open: <span class="mono">theophilus@kyriakon.net</span>, with mail working and your site answering on HTTP until its certificate arrives. What is left is payment.</td></tr>
+      <tr><td>Decided</td><td>Approved, 1 October 2026. Your account is open: <span class="mono">theophilus@kyriakon.net</span>, with mail working and your site going live when its certificate lands. What is left is payment.</td></tr>
     </table>
     <button class="btn" onclick="go('pay')">Pay £20</button>
     <button class="btn alt" onclick="go('prepaid')">Cash or Monero</button>
@@ -404,7 +404,7 @@
       <tr><td>Your site</td><td class="mono">theophilus.kyriakon.net</td></tr>
       <tr><td>Upload your site</td><td class="mono">sftp theophilus@kyriakon.net</td> <span class="hint">(port 22, the default)</span></td></tr>
       <tr><td>Repositories</td><td class="mono">ssh://theophilus@kyriakon.net:2222/myrepo.git</td></tr>
-      <tr><td>Certificate</td><td>Requested. Queued, so a day or three; until it is issued your site answers on HTTP.</td></tr>
+      <tr><td>Certificate</td><td>Requested. Queued, so a day or three. The site goes live when it lands.</td></tr>
       <tr><td>Paid until</td><td>30 September 2027</td></tr>
     </table>
     <p><strong>The first message in your mailbox is encrypted.</strong> If you can read it, your setup works. If you cannot, nothing is lost: it is in <a href="#keys">the walkthrough</a>, under "it will not decrypt".</p>
