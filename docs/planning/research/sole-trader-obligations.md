@@ -486,7 +486,6 @@ to where the absorbed rate matters, the pricing decision is revisited rather tha
 Regimes beyond the Union and the UK are not examined here. The release serves any country, so the
 map carries them as its own ticket.
 
-
 ---
 
 ## 4. Sole trader specifics
@@ -547,7 +546,7 @@ docs repository `../kyriakon/docs/decisions/`.
 | spamd greylist and whitelist entries | about 36 days on the whitelist | `docs/planning/research/spamd-greylisting.md`; `whiteexp` "defaults to ... 864 (hours, approximately 36 days)" ([spamd(8)](https://man.openbsd.org/spamd.8)). An anti-spam lifetime rather than a retention policy, as `docs/threat-model.md` says |
 | Application data, rejected or abandoned | 90 days | proposal §5.9.1, "Rejected/abandoned application data is purged after 90 days"; ADR 0005 |
 | Message text and application text seen by the triage classifier | 90 days | ADR 0005. Decisions, scores and outcome labels are kept, and fitted calibration scalars persist beyond the window |
-| Account data after deletion: mailbox, git repos, web and Gemini roots, OS account | deleted, admin-mediated, no scheduled window | proposal §5.9.1 account lifecycle, which names a `scripts/del-user.sh` that does not exist in either repository yet |
+| Account data after deletion: mailbox, git repos, web and gemini roots, OS account | deleted, admin-mediated, no scheduled window | proposal §5.9.1 account lifecycle, which names a `scripts/del-user.sh` that does not exist in either repository yet |
 | Suspended account (AUP enforcement ladder) | 40-day grace, then deletion | `docs/aup.md`, "after a 40-day grace period, the account is deleted by the admin" |
 | Account after failed renewal | read-only drop, email, 40 days, then human contact before deletion | proposal §5.9.1 account lifecycle |
 | Encrypted backup repository, `/home` plus `/etc/mail` | up to about 7 months after the data leaves the live tree | [backup.sh](../../../scripts/backup.sh), `restic forget --keep-daily 30 --keep-weekly 8 --keep-monthly 6`. The oldest kept snapshot is the last one of the month six months back, so a file deleted today can survive in the repository for about seven months *(interpretation)* |
