@@ -1,0 +1,16 @@
+body {
+  font: 16px/1.5 -apple-system, system-ui, sans-serif;
+  margin: 2rem auto;
+  max-width: 46rem;
+  padding: 0 1rem;
+}
+h1 { font-size: 1.5rem; }
+h2 { font-size: 1.1rem; margin-top: 2rem; }
+.warn { background: #fff6d5; border-left: 4px solid #d3a400; padding: 0.75rem; }
+pre { white-space: pre-wrap; word-break: break-all; background: #f4f4f4; padding: 0.75rem; }
+textarea { width: 100%; font-family: ui-monospace, monospace; }
+button { font-size: 1rem; padding: 0.4rem 0.9rem; }
+dt { font-weight: 600; margin-top: 0.75rem; }
+dd { margin: 0; }
+.good { color: #0a6b2e; }
+.bad { color: #9b1c1c; }

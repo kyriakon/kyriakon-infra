@@ -193,7 +193,7 @@ variant whose name matches.
 - Thunderbird on desktop and on Android, both of which the ticket names. No client was
   available here, so the claim that mobile works is still unproven and the walkthrough
   copy that promises it stays unearned until somebody runs it.
-- The browser page itself. The module compiles; nothing loads it, and no bindings exist.
+- The browser page itself. Loaded from a local server and run in a browser on 2026-10-05: the module generates a key and checks a key through wasm-bindgen, with no request after load ([#185](https://github.com/kyriakon/kyriakon-infra/pull/252)).
 - The key inspection against a key larger than the five in the matrix, and the subkey
   expiry path in particular, which gpg would not let me build a case for.
 - Why the RSA secret key failed to unlock on the first attempt and then worked on the
