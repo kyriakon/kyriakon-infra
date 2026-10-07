@@ -17,7 +17,7 @@ Built on OpenBSD via Hetzner + Terraform.
 | Anti-spam | `spamd` + rspamd |
 | Static sites | OpenBSD `httpd` |
 | Site upload | `sftp` chroot |
-| Gemini | `gmid` |
+| gemini | `gmid` |
 | Git / `pass` hosting | `git-shell` |
 | DNS | `nsd` (hidden primary) + Hurricane Electric secondary |
 | Firewall | `pf` |
