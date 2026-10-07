@@ -24,8 +24,23 @@
 # key, which are secrets rather than git-tracked config and exist nowhere else.
 # Without them a rebuild from git plus this repository comes back unable to sign
 # mail or read an existing queue. The whole directory is taken rather than those
-# two files by name, so a rotation cannot silently escape the backup. TLS keys
-# stay out: acme-client reissues them on renewal, so they are not data either.
+# two files by name, so a rotation cannot silently escape the backup.
+#
+# The ACME TLS keys stay out, but not for the reason once given here.
+# acme-client generates a key only when the file is missing, so a renewal reuses
+# the key it finds; a lost key is rebuilt and its certificate reissued, with no
+# reader asked to trust anything new. Replaceable, therefore not data.
+#
+# A capsule's pair is the opposite. A capsule serves a long-lived self-signed
+# certificate, generated once with a ten-year life and never renewed, so nothing
+# mints its key again: the file is the only copy, and losing it changes every
+# capsule's certificate at once. Every reader then trusts once more, since a
+# gemini client pins the certificate on first use. The fingerprint on the help
+# page is what a reader checks against, and a regeneration is a runbook step
+# that updates it. Both halves enter the backup: the platform pair at
+# /etc/ssl/capsule-*.crt and /etc/ssl/private/capsule-*.key, and an own-domain
+# pair at /etc/ssl/capsule-<domain>.crt with its key. Only pairs present are
+# passed, since restic exits on a path that does not exist.
 #
 # The canary: a fixed-content file written before each run and included in the
 # snapshot. restore-test.sh asserts it returns byte-identical, so a backup job
@@ -69,8 +84,15 @@ fi
 printf '%s\n' "$CANARY_TEXT" > "$CANARY_PATH"
 
 # Whole /home tree (Maildir + git repos + web roots), plus the /etc/mail secrets
-# that exist nowhere else. See the header for why these paths and no other config.
-restic backup /home /etc/mail
+# and any capsule pair, all of which exist nowhere else. See the header for why
+# these paths and no other config. The globs stay literal when no pair exists,
+# so each candidate is tested before it is passed.
+set -- /home /etc/mail
+for f in /etc/ssl/capsule-*.crt /etc/ssl/private/capsule-*.key; do
+	[ -f "$f" ] || continue
+	set -- "$@" "$f"
+done
+restic backup "$@"
 
 # Retention is the purge mechanism: a content-addressed repo cannot target-delete
 # a file, so the keep-* window bounds how long a deleted account's data survives
