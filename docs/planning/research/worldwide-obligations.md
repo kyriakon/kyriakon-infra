@@ -380,7 +380,7 @@ regime does not reach this release or the release already does the work.
 |---|---|---|---|---|
 | California, CCPA as amended by CPRA | [USD 26,625,000](https://cppa.ca.gov/regulations/cpi_adjustment.html) of revenue, or [100,000 consumers or households](https://cppa.ca.gov/pdf/20260101_ccpa_statute.pdf), or 50 percent of revenue from selling or sharing | No | Nothing | every limb is out of reach, and the platform sells no personal information |
 | Canada, PIPEDA | [None](https://laws-lois.justice.gc.ca/eng/acts/P-8.6/section-4.html) | Yes, where the connection is real and substantial | State a limit | the policy states the OPC route, and the release reports a harmful breach to the OPC |
-| Australia, Privacy Act 1988 | [AUD 3,000,000 annual turnover](https://www.legislation.gov.au/C2004A03712/latest) for the small business exemption | No | Nothing | turnover is far below the exemption and none of the section 6D(4) carve-outs applies |
+| Australia, Privacy Act 1988 | [AUD 3,000,000 annual turnover](https://www.legislation.gov.au/C2004A03712/latest) for the small business exemption | No | Nothing | turnover is far below the exemption, and none of the section 6D(4) carve-outs is known to apply, with the processor-disclosure reading left open in section 4 |
 | Switzerland, revised FADP | [None](https://www.fedlex.admin.ch/filestore/fedlex.data.admin.ch/eli/cc/2022/491/20230901/en/pdf-a/fedlex-data-admin-ch-eli-cc-2022-491-20230901-en-pdf-a.pdf) | Yes | Nothing | the duties match the UK GDPR ones already in place, and the representative duty needs large-scale processing |
 | Brazil, LGPD | [None](https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2018/lei/L13709.htm) | Yes | State a limit | Article 41 requires a published encarregado, and the small-agent relief is keyed to Brazilian legal forms |
 | India, DPDP Act 2023 | [None](https://www.meity.gov.in/static/uploads/2024/06/2bf1f0e9f04e6fb4f8fef35e82c42aa5.pdf) | Yes, when section 3 commences | State a limit | the notice and consent wording, with the scheduled-language option, has to be ready before 13 May 2027 |
@@ -394,9 +394,13 @@ regime does not reach this release or the release already does the work.
 | Switzerland, VAT | [CHF 100,000 of worldwide turnover](https://www.fedlex.admin.ch/filestore/fedlex.data.admin.ch/eli/cc/2009/615/20240101/en/html/fedlex-data-admin-ch-eli-cc-2009-615-20240101-en-html-4.html) | Yes, above the threshold | State a limit | the only threshold measured on worldwide turnover |
 | Singapore, GST | [SGD 1,000,000 global turnover and SGD 100,000 of Singapore sales](https://www.iras.gov.sg/taxes/goods-services-tax-(gst)/gst-and-digital-economy/overseas-businesses) | Yes, above both | State a limit | both limbs have to be exceeded |
 
-The one registration is the India OIDAR registration, and it is the only item in the table
-that has to be completed before the release takes money from a member in that country
-*(interpretation)*. The notice additions are small: an encarregado line for Brazil, a
+The one registration is the India OIDAR registration, and per
+[Decide the indirect-tax registrations a worldwide release needs](https://github.com/kyriakon/kyriakon-infra/issues/249)
+it is taken after the first Indian sale rather than before it: rule 10(2) of the CGST Rules
+gives thirty days from the date online services begin in India to apply, and the registration
+is backdated to that date when the reference number issues inside the window
+([Research what taking an Indian OIDAR registration involves](https://github.com/kyriakon/kyriakon-infra/issues/264)).
+So it is the one item in the table that has to be undertaken, and no item has to precede a sale. The notice additions are small: an encarregado line for Brazil, a
 purpose-of-use and complaint line for Japan, and the DPDP notice in a scheduled language
 for India once the provision commences. Everything else is a number written down so that
 the release notices when it approaches one.
