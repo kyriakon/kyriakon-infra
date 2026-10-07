@@ -1,6 +1,6 @@
 # Runbook
 
-This is the public half of the operational runbook for kyriakon.net. Each section below is a procedure for something that happens on this platform, written in the order the steps run. The procedures live here, beside the configuration they describe, so a reader can check them against it.
+This is the public half of the operational runbook for kyriakon.net. Each section below is a procedure for something that happens on this platform, written in the order the steps run, or a record of what was decided or checked where there is no step to run. The procedures live here, beside the configuration they describe, so a reader can check them against it.
 
 The other half stays off the repository. It holds who holds the second root credential, where the offline copy of the backup repository lives and what unlocks it, how to reach the operator when the operator is unreachable, and the dates the tokens were rotated. `docs/operations/private-half.md` lists the headings that half needs and what belongs under each.
 
@@ -83,7 +83,7 @@ The service is decided in #156 and not built. This section records the shape an 
 
 Two halves run with different privilege. The handler listens on loopback behind `relayd`, holds no secrets, writes the raw Stripe body and its signature header, files applications, and writes account-page intents. The drain is a one-minute cron job, with a second hourly job for the sweeps, and it owns provisioning, manual payment credits, key publication pull requests, certificate requests, the lifecycle transitions and their notices, the 90-day application purge and the grace sweeps. Notices leave through the local `smtpd` enqueuer, so `filter-dkimsign` signs them the way it signs everything else.
 
-The state is flat files, one directory per account. `account.json` holds the state, the contact and recovery addresses, the key fingerprints, the rail and token reference, the paid-until date and the approval decision. `notices.jsonl` appends each notice with its timestamp. `application.json` holds the application answers and the purge deletes it. A top level `intents/` directory holds pending work, one file per item, and `journal.jsonl` records transitions. The drain appends the journal entry before it carries the transition out, so a crash leaves a record it can rerun. The build fixes the store's path, and the drain adds that path to the payload of `scripts/backup.sh`, which today copies `/home` and `/etc/mail`.
+The state is flat files, one directory per account. `account.json` holds the state, the contact and recovery addresses, the key fingerprints, the rail and token reference, the paid-until date and the approval decision. `notices.jsonl` appends each notice with its timestamp. `application.json` holds the application answers and the purge deletes it. A top level `intents/` directory holds pending work, one file per item, and `journal.jsonl` records transitions. The drain appends the journal entry before it carries the transition out, so a crash leaves a record it can rerun. The build fixes the store's path, and the drain adds that path to the payload of `scripts/backup.sh`, which today copies `/home`, `/etc/mail` and the capsule certificate pair.
 
 Read a member's record by reading their `account.json`. The documents carry a version and the drain validates them on read, so a malformed file stops the drain with an error instead of being skipped.
 
@@ -251,7 +251,7 @@ Do not delete an account before its window ends, and do not delete by hand anyth
 
 ## Restore from backup
 
-`scripts/backup.sh` writes an encrypted restic snapshot of `/home` and `/etc/mail` to the storage box every night, with retention of 30 daily, 8 weekly and 6 monthly snapshots. `scripts/cron-apply.sh` installs its cron line.
+`scripts/backup.sh` writes an encrypted restic snapshot of `/home`, `/etc/mail` and the capsule certificate pair to the storage box every night, with retention of 30 daily, 8 weekly and 6 monthly snapshots. `scripts/cron-apply.sh` installs its cron line.
 
 The weekly test runs on a box that exists for the length of the run. From the mail box:
 
@@ -285,6 +285,19 @@ To prove a restored copy becomes a working mail server, rather than merely resto
 The offline copy of the repository does not exist yet (#109 and #116). Until it does, the repository password is the only thing standing between a lost storage box and a lost archive, and the storage box sits with the same provider as the box itself. Keep the offline copy of the password where the private half says.
 
 Do not restore over a live box's `/home` while the daemons are running, and do not give a test box write access to the repository. The weekly test holds a read-only sub-account for exactly that reason.
+
+### Regenerate the capsule certificate pair
+
+A capsule serves a long-lived self-signed certificate, generated once with a ten-year life and never renewed, so nothing mints its key again and the file is the only copy. Losing it changes every capsule's certificate at once and every reader's client trusts once more, because a gemini client pins the certificate on first use. The pair sits in the snapshot and a restore brings it back. When it is lost everywhere, generate it again, reload `gmid`, and update the fingerprint the help page publishes.
+
+1. Generate the pair with `openssl req -x509`, driven from a configuration file that sets `subjectAltName = DNS:kyriakon.net, DNS:*.kyriakon.net` and `basicConstraints = critical, CA:FALSE`. The platform pair is `/etc/ssl/capsule-kyriakon.net.crt` and `/etc/ssl/private/capsule-kyriakon.net.key`; an own-domain pair is `/etc/ssl/capsule-<domain>.crt` with its key under `/etc/ssl/private`. The LibreSSL on this box carries a configuration file rather than command-line extension flags.
+
+2. Check the result and reload `gmid`.
+
+		doas gmid -n -c /etc/gmid.conf
+		doas rcctl reload gmid
+
+3. Update the fingerprint the help page publishes. Nothing regenerates the pair on a schedule, because the fingerprint only changes when a human runs this step.
 
 ## A failed certificate renewal
 
@@ -527,11 +540,11 @@ These are operator actions, not code. They are tracked as a checklist in #175, a
 
 4. Create the Stripe objects and set the dashboard items listed in `docs/planning/research/stripe-rail-set.md`, section 6, and confirm the account verification before signup opens. The load-bearing ones are the live Product and yearly Price, the webhook endpoint with the named event list and its signing secret on the box, the restricted API key, the Payment Link, automatic receipts, the revenue recovery emails and the retry policy. The note records fifteen items and which of them are optional until a VAT registration exists.
 
-5. Confirm the payment state store is inside the backup set and that the restore test's canary comes back. `scripts/backup.sh` copies `/home` and `/etc/mail` today, and the store's path is fixed by the build in #156, so this item is checked again once the service lands. The canary is `/home/.kyriakon-backup-canary`, and the weekly test asserts it returns byte-identical.
+5. Confirm the payment state store is inside the backup set and that the restore test's canary comes back. `scripts/backup.sh` copies `/home`, `/etc/mail` and the capsule certificate pair today, and the store's path is fixed by the build in #156, so this item is checked again once the service lands. The canary is `/home/.kyriakon-backup-canary`, and the weekly test asserts it returns byte-identical.
 
 ## Run the quarterly indirect-tax check
 
-A worldwide release has to notice when a country's registration begins to bind. Eight jurisdictions outside the UK and the Union were examined, and each either sets a figure to watch or, like India, charges from the first sale. The figures are monitored numbers rather than things looked up once a member count starts to look large (decided in #249, from the research in #248). The card rail supplies the country evidence: Stripe reports a billing country for every card sale, so a member is attributed to the country they were billed in. The prepaid rail carries no country at all, so a prepaid sale cannot be attributed to any jurisdiction below and a prepaid member counts toward no figure here. That is a stated limit, left as it stands by the EU consumer decision in #163.
+A worldwide release has to notice when a country's registration begins to bind. Eight jurisdictions outside the UK and the Union were examined, and each either sets a figure to watch or, like India, charges from the first sale. The figures are monitored numbers rather than things looked up once a member count starts to look large (decided in #249, from the research in #248). The card rail supplies the country evidence: Stripe reports a billing country for every card sale, so a member is attributed to the country they were billed in. The prepaid rail carries no country at all, so a prepaid sale cannot be attributed to any jurisdiction below and a prepaid member counts toward no country's figure. It still counts toward the two worldwide figures, because those are read on the whole business. That is a stated limit, left as it stands by the EU consumer decision in #163.
 
 | jurisdiction | threshold | roughly | source |
 | --- | --- | --- | --- |
@@ -547,13 +560,15 @@ The member counts are the rough distance at £20 a member, rounded. They count m
 
 The check runs quarterly.
 
-1. Read the card rail's billing countries over the last twelve months and count the members in each jurisdiction in the table. A member counts in the country Stripe reports for their sale, and nowhere else, because the account holds no country.
+1. Read the card rail's billing countries over the last twelve months and count the members in each jurisdiction in the table, on the evidence the section opens with.
 
-2. Compare each count against its figure. Crossing one is a decision rather than an accident, and registration in that jurisdiction happens on crossing and not before. Norway adds filings only, because section 2-1(6) disapplies its representative duty for a business resident in the United Kingdom.
+2. Read the whole business's turnover over the last twelve months for the two worldwide figures, Switzerland's CHF 100,000 and Singapore's SGD 1,000,000. Both limbs include prepaid sales and sales outside those countries, so neither is a count of members.
 
-3. Look for a billing country outside the UK and the Union. India is the trigger line, because it sets no threshold: a single Indian card sale starts the registration. Rule 10(2) of the CGST Rules allows the application in FORM GST REG-10 within thirty days of the date online services begin in India, and backdates the registration to that date when the application reference number issues inside the window, so registering after the first Indian sale is on time and no pre-registration is needed. The registration is taken from the Indian portal, not by the operator, and the filings are done by an accountant or a compliance agent. Returns are monthly in FORM GSTR-5A by the 20th of the following month, and rule 64 states no nil exemption, so a month with no Indian sales still files. A supplier PAN is optional; an Indian authorised signatory holding a valid PAN is not. The registration is decided in #249 and the steps are researched in #264.
+3. Compare each count, and each worldwide figure, against its threshold. Crossing one is a decision rather than an accident, and registration in that jurisdiction happens on crossing and not before. Norway adds filings only, because section 2-1(6) disapplies its representative duty for a business resident in the United Kingdom.
 
-The list is a floor and not a ceiling. Only the eight jurisdictions named were examined, so a country outside them may charge from the first sale without appearing here at all, and absence from the table is not a statement that a country charges nothing. A billing country outside the UK, the Union and the table is unexamined, and nothing is claimed about it. The prepaid rail widens that gap, because a prepaid sale carries no country evidence to read.
+4. Look for a billing country outside the UK and the Union. India is the trigger line, because it sets no threshold: a single Indian card sale starts the registration. Rule 10(2) of the CGST Rules allows the application in FORM GST REG-10 within thirty days of the date online services begin in India, and backdates the registration to that date when the application reference number issues inside the window, so registering after the first Indian sale is on time and no pre-registration is needed. The registration is taken from the Indian portal, not by the operator, and the filings are done by an accountant or a compliance agent. Returns are monthly in FORM GSTR-5A by the 20th of the following month, and rule 64 states no nil exemption, so a month with no Indian sales still files. A supplier PAN is optional; an Indian authorised signatory holding a valid PAN is not. The registration is decided in #249 and the steps are researched in #264.
+
+The list is a floor and not a ceiling. Only the eight jurisdictions named were examined, so a country outside them may charge from the first sale without appearing here at all, and absence from the table is not a statement that a country charges nothing. A billing country outside the UK, the Union and the table is unexamined, and nothing is claimed about it. The prepaid rail widens that gap, for the reason given above.
 
 ## Answer a data-protection breach
 
@@ -561,20 +576,20 @@ One sentence is the rule: notify the ICO and every authority whose country had a
 
 The country evidence is the card rail's billing country, the same evidence the tax check reads, because the account holds no country. A member with no card sale cannot be placed in a country, so the rule reaches the members it can place and the notice's own breach paragraph covers the rest.
 
-| authority | trigger | where it goes | who sends it |
-| --- | --- | --- | --- |
-| Information Commissioner's Office | a breach of security that risks the rights of a member, within 72 hours of becoming aware, from Articles 33 and 34 of the UK GDPR | to verify | the operator sends it |
-| Office of the Privacy Commissioner of Canada | a breach of security safeguards that creates a real risk of significant harm, from section 10.1 of PIPEDA | to verify | the operator sends it |
-| Swiss Federal Data Protection and Information Commissioner | to verify: the FADP breach duty has the shape of the UK GDPR duty, and the research settled neither its article nor its risk test | to verify | the operator sends it |
-| Brazil's Autoridade Nacional de Proteção de Dados | to verify: the research did not settle the LGPD breach duty | to verify | the operator sends it |
-| Japan's Personal Information Protection Commission | a leak affecting more than 1,000 data subjects, which this release does not approach | www.ppc.go.jp/personalinfo/legal/leakAction/ | the operator sends it |
-| India's Data Protection Board | to verify, from commencement on 13 May 2027: the research did not settle the DPDP breach duty | to verify | the operator sends it |
+| authority | trigger | where it goes | who sends it | status |
+| --- | --- | --- | --- | --- |
+| Information Commissioner's Office | a breach of security that risks the rights of a member, within 72 hours of becoming aware, from Articles 33 and 34 of the UK GDPR | https://ico.org.uk/for-organisations/data-protection-fee/ | the operator sends it | settled |
+| Office of the Privacy Commissioner of Canada | a breach of security safeguards that creates a real risk of significant harm, from section 10.1 of PIPEDA | not settled | the operator sends it | to verify |
+| Swiss Federal Data Protection and Information Commissioner | the FADP breach duty, which has the shape of the UK GDPR duty; the research settled neither its article nor its risk test | not settled | the operator sends it | to verify |
+| Brazil's Autoridade Nacional de Proteção de Dados | the LGPD breach duty, which the research did not settle | not settled | the operator sends it | to verify |
+| Japan's Personal Information Protection Commission | a leak affecting more than 1,000 data subjects, which this release does not approach | www.ppc.go.jp/personalinfo/legal/leakAction/ | the operator sends it | settled |
+| India's Data Protection Board | the DPDP breach duty, from commencement on 13 May 2027, which the research did not settle | not settled | the operator sends it | to verify |
 
 A row marked to verify has no trigger or no address that the research settled, so confirm both with the authority before relying on the row. Until then the one-sentence rule above is what to act on. The research is in #248 and the decision is in #250.
 
 ## Revisit the notice on 13 May 2027
 
-The DPDP's section 3 commences on or about 13 May 2027, under the commencement notification cited in #248, and it is the provision that reaches a UK business offering services to people in India. What is revisited then is the notice's consent and notice wording. Section 5 requires a notice saying what personal data is held, the purpose it is held for, how rights are exercised and how to complain to the Data Protection Board; section 5(3) allows that notice in English or a scheduled language; and section 6 requires consent that is free, specific, informed, unconditional and unambiguous. A signup flow built for the UK GDPR covers most of it, so the additions are the notice wording and the language option. Decided in #250.
+The DPDP's section 3 commences on or about 13 May 2027, under the commencement notification cited in #248, and it is the provision that reaches a UK business offering services to people in India. What is revisited then is the notice's consent and notice wording. The notice stays in English, which section 5(3) permits, with a support line offering help in another language on request. Decided in #250.
 
 ## What the data-protection review checked
 
@@ -593,7 +608,7 @@ Read on 2026-10-01, unless the entry says otherwise.
 - RFC 6376, DomainKeys Identified Mail (DKIM) Signatures, sections 3.6.1, 6.1.2 and 8.7. https://www.rfc-editor.org/rfc/rfc6376. The `p=` revocation rule, the `t=s` flag, and the limit on revoking a key that signs many addresses.
 - Let's Encrypt, Rate Limits, last updated 5 August 2026. https://letsencrypt.org/docs/rate-limits/. The 50 certificates per registered domain per 7 days with a refill of one every 202 minutes, the 5 per exact set of identifiers with a refill of one every 34 hours, the 5 authorization failures per identifier per hour, and the 1,152 consecutive failures that pause an identifier.
 - ICO, Data protection fee, https://ico.org.uk/for-organisations/data-protection-fee/. The duty under the Data Protection (Charges and Information) Regulations 2018. The tier 1 amount of £52, or £47 by direct debit, is quoted in `docs/planning/research/sole-trader-obligations.md` from the Regulations, Schedule, regulation 3(1).
-- `docs/planning/research/worldwide-obligations.md`, the regimes that reach a worldwide seller, read 5 October 2026. Every threshold in the tax table, every breach trigger, the 13 May 2027 commencement date and the checked list come from it, and each figure there cites the statute or the regulator's page it was read from.
+- `docs/planning/research/worldwide-obligations.md`, the regimes that reach a worldwide seller, read 5 October 2026. Every threshold in the tax table, every breach trigger outside the UK and the Union, the 13 May 2027 commencement date and the checked list come from it, and each figure there cites the statute or the regulator's page it was read from. The note does not restate the UK and EU positions, so the ICO row's trigger is from Articles 33 and 34 of the UK GDPR instead.
 - The Indian OIDAR registration steps: the CGST Rules, rules 10, 14 and 64, and the GST portal's OIDAR manual and FAQ, read on 7 October 2026. Recorded in #264, with the decision to register on the first Indian sale in #249.
 - The box's own manual pages, read over ssh on 2026-10-01: `acme-client(1)` for the `http-01` challenge and the `-r` revocation flag, `syspatch(8)` for `-c` and `-l`, `sysupgrade(8)` for `-n`, and the `hcloud` command help for `server create-image` and `image list`.
 - Repository documents that carry the decisions these procedures follow: `docs/planning/specs/phase-1-foundations.md`, `docs/planning/research/encrypted-backup-restore.md`, `docs/planning/research/per-account-enforcement.md`, `docs/planning/research/cert-issuance-ceiling.md`, `docs/planning/research/stripe-rail-set.md`, `docs/planning/research/sole-trader-obligations.md`, `docs/aup.md`, and `docs/refusals.md`.
