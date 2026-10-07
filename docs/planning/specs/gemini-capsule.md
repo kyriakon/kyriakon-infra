@@ -20,7 +20,7 @@ The mail public key is pasted where it fits, and each prompt that can overrun th
 
 ## Where it lives
 
-The capsule is `gemini://signup.kyriakon.net`, the same hostname the web form and the account page use, because a hostname is protocol-agnostic. That name is already in the apex certificate's alternative-name list and already has port 80 and port 443 vhosts in `httpd.conf`, so the capsule costs one server block and a socket and no certificate work at all. It presents the apex certificate and key, the pair `httpd` serves for the same name, exactly as the Kleio and Press capsules reuse theirs.
+The capsule is `gemini://signup.kyriakon.net`, the same hostname the web form and the account page use, because a hostname is protocol-agnostic. That name is already in the apex certificate's alternative-name list and already has port 80 and port 443 vhosts in `httpd.conf`, so the capsule costs one server block and a socket and no certificate work at all. It presents the capsule certificate for its name, exactly as the Kleio and Press capsules serve theirs, rather than the ACME pair `httpd` serves for the same name.
 
 The repository's `gmid.conf` gains one block. The paths inside it are relative to gmid's chroot except `cert` and `key`, which stay absolute ([gmid.conf(5)](https://man.openbsd.org/gmid.conf.5), "All the paths in the configuration file are relative to the chroot directory, except for the cert, key and ocsp paths"):
 
@@ -28,8 +28,8 @@ The repository's `gmid.conf` gains one block. The paths inside it are relative t
 server "signup.kyriakon.net" {
 	listen on * port 1965
 
-	cert "/etc/ssl/kyriakon.net.fullchain.pem"
-	key "/etc/ssl/private/kyriakon.net.key"
+	cert "/etc/ssl/capsule-kyriakon.net.crt"
+	key "/etc/ssl/private/capsule-kyriakon.net.key"
 
 	# Every request URI carries the draft token and the applicant's answer, so
 	# gmid's own access log would record both. The handler keeps its own log
@@ -198,7 +198,7 @@ The capsule never claims general resistance to a government threat actor, that i
 
 ## The cost it accepts
 
-Trust on first use. The specification recommends it, and it means the capsule relies on a pin rather than a CA. An ACME certificate renews about a month before it expires, and that lands in the branch where the pinned certificate is still inside its validity window, which all three clients examined treat as suspicious: Amfora offers an accept button, Lagrange refuses until the certificate is trusted through Page Information, Kristall has no accept button on that error page and needs its stored entry cleared in settings. A first visit after a renewal may be refused outright, and the capsule cannot explain it on a page the client will not show. This is accepted because an onboarding capsule's visitors are one-time; a member's own capsule, whose visitors return, cannot accept it the same way and is a separate ticket.
+Trust on first use. The specification recommends it, and it means the capsule relies on a pin rather than a CA. The capsule certificate never changes, so no renewal lands inside the pin's validity window and no reader is ever handed a new certificate to accept. What remains is the first visit, which a client that warns about a self-signed certificate may refuse outright and the capsule cannot explain on a page the client will not show: Amfora offers an accept button, Lagrange refuses until the certificate is trusted through Page Information, Kristall has no accept button on that error page and needs its stored entry cleared in settings. This is accepted because it happens once, on the first visit; a member's own capsule, whose visitors return, meets it no differently from an onboarding capsule whose visitors are one-time.
 
 ## State on disk
 

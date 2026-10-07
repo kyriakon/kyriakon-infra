@@ -28,3 +28,11 @@ monitoring running on aggregate counts only. Raw IPs are discarded at rotation, 
 hashing them for longer retention was rejected — a retained hash is a pseudonymous
 identifier, not data minimization. See `docs/threat-model.md` "Log minimization".
 _Avoid_: no logs (unachievable — correspondence metadata is a routing necessity).
+
+**Capsule certificate**:
+The long-lived self-signed pair a gemini capsule serves, distinct from the ACME
+certificate the same hostname's HTTPS side serves. One pair covers `kyriakon.net`
+and `*.kyriakon.net` for every capsule the platform runs and every member hostname,
+generated once with a ten-year life; an own-domain capsule gets its own. The key is
+held in the backup set because nothing reissues a self-signed pair.
+_Avoid_: gemini certificate, TOFU certificate
