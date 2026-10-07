@@ -8,7 +8,7 @@ kyriakon.net is run by Oliver Brotchie, a sole trader in the United Kingdom. He 
 
 If you are in the European Union, our representative there is REPLACE_ME_REPRESENTATIVE, reached through REPLACE_ME_REPRESENTATIVE_CONTACT. The representative exists so that a Union member has somewhere in the Union to write about this notice.
 
-If you are in Brazil, the encarregado under Article 41 of the LGPD is Oliver Brotchie, reached at admin@kyriakon.net, and he is the controller as well.
+If you are in Brazil, the encarregado under Article 41 of the LGPD is Oliver Brotchie, reached at admin@kyriakon.net.
 
 This notice is one of the three documents you accept when you apply, alongside the terms of service and the acceptable use policy.
 
@@ -81,7 +81,7 @@ If a breach of security puts your data at risk, we tell the Information Commissi
 
 If you are unhappy with how we handle your data, tell us first at admin@kyriakon.net and we will try to put it right. You also have the right to complain to the Information Commissioner's Office at any time, and you do not have to come to us first. The ICO takes complaints at ico.org.uk/make-a-complaint and on 0303 123 1113.
 
-If you are in Canada, you have the right to complain to the Office of the Privacy Commissioner of Canada at any time, and you do not have to come to us first. The same is true of the Swiss Federal Data Protection and Information Commissioner, Brazil's Autoridade Nacional de Proteção de Dados, Japan's Personal Information Protection Commission, and India's Data Protection Board.
+If you are in Canada, you have the right to complain to the Office of the Privacy Commissioner of Canada at any time, and you do not have to come to us first. The Commissioner takes complaints at priv.gc.ca/en/report-a-concern. The same is true of the Swiss Federal Data Protection and Information Commissioner, which takes complaints at edoeb.admin.ch/en/submitting-a-complaint, Brazil's Autoridade Nacional de Proteção de Dados, which takes complaints at gov.br/anpd/pt-br/assuntos/denuncia-de-descumprimento-da-lgpd, and Japan's Personal Information Protection Commission, which takes complaints at ppc.go.jp/en/contactus. A complaint can also be made to India's Data Protection Board, which has no public portal.
 
 This notice is in English, which section 5(3) of India's Digital Personal Data Protection Act permits. If you would rather use another language, tell us at admin@kyriakon.net and we will help.
 
