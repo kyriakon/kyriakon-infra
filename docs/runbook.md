@@ -529,6 +529,63 @@ These are operator actions, not code. They are tracked as a checklist in #175, a
 
 5. Confirm the payment state store is inside the backup set and that the restore test's canary comes back. `scripts/backup.sh` copies `/home` and `/etc/mail` today, and the store's path is fixed by the build in #156, so this item is checked again once the service lands. The canary is `/home/.kyriakon-backup-canary`, and the weekly test asserts it returns byte-identical.
 
+## Run the quarterly indirect-tax check
+
+A worldwide release has to notice when a country's registration begins to bind. Eight jurisdictions outside the UK and the Union were examined, and each either sets a figure to watch or, like India, charges from the first sale. The figures are monitored numbers rather than things looked up once a member count starts to look large (decided in #249, from the research in #248). The card rail supplies the country evidence: Stripe reports a billing country for every card sale, so a member is attributed to the country they were billed in. The prepaid rail carries no country at all, so a prepaid sale cannot be attributed to any jurisdiction below and a prepaid member counts toward no figure here. That is a stated limit, left as it stands by the EU consumer decision in #163.
+
+| jurisdiction | threshold | roughly | source |
+| --- | --- | --- | --- |
+| Norway | NOK 50,000 over twelve months | about 190 members | Norwegian VAT Act, section 2-1 (#248) |
+| Canada | CAD 30,000 over twelve months | about 800 members | Excise Tax Act, section 211.12 (#248) |
+| New Zealand | NZD 60,000 over twelve months | about 1,350 members | Inland Revenue, supplying remote services (#248) |
+| Australia | AUD 75,000 of Australian-connected turnover | about 1,900 members | ATO, how Australian GST works (#248) |
+| Japan | JPY 10,000,000 in the base period | about 2,600 members | National Tax Agency, cross-border supplies of services (#248) |
+| Switzerland | CHF 100,000 | about 4,600, and measured against worldwide turnover rather than Swiss members | Swiss VAT Act, Article 10(2) (#248) |
+| Singapore | SGD 1,000,000 global turnover and SGD 100,000 of Singapore sales | no member count in #249, and both limbs have to be exceeded | IRAS, overseas businesses (#248) |
+
+The member counts are the rough distance at £20 a member, rounded. They count members in the country concerned except Switzerland, which counts the business and not the country, and Singapore, whose global-turnover limb also moves with the whole business. Japan counts business-to-consumer sales only, Australia leaves out sales to GST-registered businesses, and Canada counts only Canadian-facing supplies.
+
+The check runs quarterly.
+
+1. Read the card rail's billing countries over the last twelve months and count the members in each jurisdiction in the table. A member counts in the country Stripe reports for their sale, and nowhere else, because the account holds no country.
+
+2. Compare each count against its figure. Crossing one is a decision rather than an accident, and registration in that jurisdiction happens on crossing and not before. Norway adds filings only, because section 2-1(6) disapplies its representative duty for a business resident in the United Kingdom.
+
+3. Look for a billing country outside the UK and the Union. India is the trigger line, because it sets no threshold: a single Indian card sale starts the registration. Rule 10(2) of the CGST Rules allows the application in FORM GST REG-10 within thirty days of the date online services begin in India, and backdates the registration to that date when the application reference number issues inside the window, so registering after the first Indian sale is on time and no pre-registration is needed. The registration is taken from the Indian portal, not by the operator, and the filings are done by an accountant or a compliance agent. Returns are monthly in FORM GSTR-5A by the 20th of the following month, and rule 64 states no nil exemption, so a month with no Indian sales still files. A supplier PAN is optional; an Indian authorised signatory holding a valid PAN is not. The registration is decided in #249 and the steps are researched in #264.
+
+The list is a floor and not a ceiling. Only the eight jurisdictions named were examined, so a country outside them may charge from the first sale without appearing here at all, and absence from the table is not a statement that a country charges nothing. A billing country outside the UK, the Union and the table is unexamined, and nothing is claimed about it. The prepaid rail widens that gap, because a prepaid sale carries no country evidence to read.
+
+## Answer a data-protection breach
+
+One sentence is the rule: notify the ICO and every authority whose country had affected members. The ICO comes first, on the 72-hour clock that Articles 33 and 34 of the UK GDPR set and the notice already states; then every authority below whose country had a member affected by the same breach. The operator sends each one, by hand.
+
+The country evidence is the card rail's billing country, the same evidence the tax check reads, because the account holds no country. A member with no card sale cannot be placed in a country, so the rule reaches the members it can place and the notice's own breach paragraph covers the rest.
+
+| authority | trigger | where it goes | who sends it |
+| --- | --- | --- | --- |
+| Information Commissioner's Office | a breach of security that risks the rights of a member, within 72 hours of becoming aware, from Articles 33 and 34 of the UK GDPR | to verify | the operator sends it |
+| Office of the Privacy Commissioner of Canada | a breach of security safeguards that creates a real risk of significant harm, from section 10.1 of PIPEDA | to verify | the operator sends it |
+| Swiss Federal Data Protection and Information Commissioner | to verify: the FADP breach duty has the shape of the UK GDPR duty, and the research settled neither its article nor its risk test | to verify | the operator sends it |
+| Brazil's Autoridade Nacional de Proteção de Dados | to verify: the research did not settle the LGPD breach duty | to verify | the operator sends it |
+| Japan's Personal Information Protection Commission | a leak affecting more than 1,000 data subjects, which this release does not approach | www.ppc.go.jp/personalinfo/legal/leakAction/ | the operator sends it |
+| India's Data Protection Board | to verify, from commencement on 13 May 2027: the research did not settle the DPDP breach duty | to verify | the operator sends it |
+
+A row marked to verify has no trigger or no address that the research settled, so confirm both with the authority before relying on the row. Until then the one-sentence rule above is what to act on. The research is in #248 and the decision is in #250.
+
+## Revisit the notice on 13 May 2027
+
+The DPDP's section 3 commences on or about 13 May 2027, under the commencement notification cited in #248, and it is the provision that reaches a UK business offering services to people in India. What is revisited then is the notice's consent and notice wording. Section 5 requires a notice saying what personal data is held, the purpose it is held for, how rights are exercised and how to complain to the Data Protection Board; section 5(3) allows that notice in English or a scheduled language; and section 6 requires consent that is free, specific, informed, unconditional and unambiguous. A signup flow built for the UK GDPR covers most of it, so the additions are the notice wording and the language option. Decided in #250.
+
+## What the data-protection review checked
+
+The regimes below were read on 5 October 2026 and found not to reach this release, and each stays here with its reason so that a later reader meets the decision rather than repeating the reading (#248, decided in #250).
+
+- The Swiss representative duty in FADP Article 14 fails, because it applies only where processing is on a large scale and tens of members fails that limb.
+- The LGPD's small-agent relief is keyed to Brazilian legal forms, microempresas, empresas de pequeno porte and startups registered in Brazil, so a UK sole trader cannot use it and it relieves nothing here.
+- The CCPA's three limbs are all out of reach, at USD 26,625,000 of revenue, 100,000 consumers or households, or 50 percent of revenue from selling or sharing, and the platform sells no personal information.
+- The Australian section 6D exemption applies, because annual turnover is far below AUD 3,000,000 and none of the section 6D(4) carve-outs is known to apply. The section 6D(4)(c) question, whether routine disclosure to a processor counts as disclosing personal information "for a benefit, service or advantage", is flagged as a lawyer's read: if it does, the exemption falls away and the Australian Privacy Principles bind.
+- The APPI's report above 1,000 data subjects is out of reach at this size.
+
 ## Sources
 
 Read on 2026-10-01, unless the entry says otherwise.
@@ -536,6 +593,8 @@ Read on 2026-10-01, unless the entry says otherwise.
 - RFC 6376, DomainKeys Identified Mail (DKIM) Signatures, sections 3.6.1, 6.1.2 and 8.7. https://www.rfc-editor.org/rfc/rfc6376. The `p=` revocation rule, the `t=s` flag, and the limit on revoking a key that signs many addresses.
 - Let's Encrypt, Rate Limits, last updated 5 August 2026. https://letsencrypt.org/docs/rate-limits/. The 50 certificates per registered domain per 7 days with a refill of one every 202 minutes, the 5 per exact set of identifiers with a refill of one every 34 hours, the 5 authorization failures per identifier per hour, and the 1,152 consecutive failures that pause an identifier.
 - ICO, Data protection fee, https://ico.org.uk/for-organisations/data-protection-fee/. The duty under the Data Protection (Charges and Information) Regulations 2018. The tier 1 amount of £52, or £47 by direct debit, is quoted in `docs/planning/research/sole-trader-obligations.md` from the Regulations, Schedule, regulation 3(1).
+- `docs/planning/research/worldwide-obligations.md`, the regimes that reach a worldwide seller, read 5 October 2026. Every threshold in the tax table, every breach trigger, the 13 May 2027 commencement date and the checked list come from it, and each figure there cites the statute or the regulator's page it was read from.
+- The Indian OIDAR registration steps: the CGST Rules, rules 10, 14 and 64, and the GST portal's OIDAR manual and FAQ, read on 7 October 2026. Recorded in #264, with the decision to register on the first Indian sale in #249.
 - The box's own manual pages, read over ssh on 2026-10-01: `acme-client(1)` for the `http-01` challenge and the `-r` revocation flag, `syspatch(8)` for `-c` and `-l`, `sysupgrade(8)` for `-n`, and the `hcloud` command help for `server create-image` and `image list`.
 - Repository documents that carry the decisions these procedures follow: `docs/planning/specs/phase-1-foundations.md`, `docs/planning/research/encrypted-backup-restore.md`, `docs/planning/research/per-account-enforcement.md`, `docs/planning/research/cert-issuance-ceiling.md`, `docs/planning/research/stripe-rail-set.md`, `docs/planning/research/sole-trader-obligations.md`, `docs/aup.md`, and `docs/refusals.md`.
-- GitHub issues #148, #153, #154, #155, #156, #157, #158, #166, #168, #171, #173 and #175 in this repository.
+- GitHub issues #148, #153, #154, #155, #156, #157, #158, #163, #166, #168, #171, #173, #175, #248, #249, #250 and #264 in this repository.
