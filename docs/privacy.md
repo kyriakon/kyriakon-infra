@@ -8,6 +8,8 @@ kyriakon.net is run by Oliver Brotchie, a sole trader in the United Kingdom. He 
 
 If you are in the European Union, our representative there is REPLACE_ME_REPRESENTATIVE, reached through REPLACE_ME_REPRESENTATIVE_CONTACT. The representative exists so that a Union member has somewhere in the Union to write about this notice.
 
+If you are in Brazil, the encarregado under Article 41 of the LGPD is Oliver Brotchie, reached at admin@kyriakon.net, and he is the controller as well.
+
 This notice is one of the three documents you accept when you apply, alongside the terms of service and the acceptable use policy.
 
 ## What we hold, and why
@@ -73,11 +75,15 @@ You also have the right to complain to us about how we handle your data, under s
 
 ## If something goes wrong
 
-If a breach of security puts your data at risk, we tell the Information Commissioner's Office within 72 hours of becoming aware of it, where the law requires it, and we tell you without undue delay if the risk to you is high. Those duties come from Articles 33 and 34 of the UK GDPR. A suspected breach can be reported to admin@kyriakon.net.
+If a breach of security puts your data at risk, we tell the Information Commissioner's Office within 72 hours of becoming aware of it, where the law requires it, and we tell you without undue delay if the risk to you is high. Those duties come from Articles 33 and 34 of the UK GDPR. If you are in Canada, we also tell the Office of the Privacy Commissioner of Canada where the breach creates a real risk of significant harm, which is the test in PIPEDA section 10.1. If you are in Switzerland, we also tell the Swiss Federal Data Protection and Information Commissioner where the breach is likely to put your personality or fundamental rights at high risk, which is the test in the FADP. A suspected breach can be reported to admin@kyriakon.net.
 
 ## Complaints
 
 If you are unhappy with how we handle your data, tell us first at admin@kyriakon.net and we will try to put it right. You also have the right to complain to the Information Commissioner's Office at any time, and you do not have to come to us first. The ICO takes complaints at ico.org.uk/make-a-complaint and on 0303 123 1113.
+
+If you are in Canada, you have the right to complain to the Office of the Privacy Commissioner of Canada at any time, and you do not have to come to us first. The same is true of the Swiss Federal Data Protection and Information Commissioner, Brazil's Autoridade Nacional de Proteção de Dados, Japan's Personal Information Protection Commission, and India's Data Protection Board.
+
+This notice is in English, which section 5(3) of India's Digital Personal Data Protection Act permits. If you would rather use another language, tell us at admin@kyriakon.net and we will help.
 
 ## Changes to this notice
 
