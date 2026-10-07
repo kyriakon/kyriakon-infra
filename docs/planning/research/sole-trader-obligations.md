@@ -344,8 +344,12 @@ and, where applicable, of the controller's representative" (2.1).
 
 None of this changes what the member experiences, and none of it applies to a release that
 refuses Union applications outright. The release serves them, so the representative is an
-operator action on the checklist before the first payment (#175), alongside setting up the
-Monero wallet (#178).
+operator action on the checklist before the first payment (#175), alongside the OSS
+registration, which is the other action [#163](https://github.com/kyriakon/kyriakon-infra/issues/163)
+names.
+
+The gate is on our paperwork, not on the applicant: UK and rest-of-world applications open
+with the release, and the site says Union applications open once the two formalities exist.
 
 ### 2.8 The terms' one limit, and a data-subject request
 
@@ -468,7 +472,10 @@ country code of the consumer's country of residence"
 A card payment through Stripe supplies both without the platform asking anything of its own, and
 the signup form carries no country field, so the member record holds no location
 *(interpretation)*. A prepaid member supplies neither, so the platform has to keep the evidence
-itself, which is on the accountant list in section 6.
+itself, which is on the accountant list in section 6. Two kinds of member need none of it: a
+free member, because without consideration there is no VAT, and a business applicant, whose
+optional VAT number makes the supply reverse-charge with no VAT charged, so the paragraph
+above about the destination rate being absorbed does not describe a Union business.
 
 Which of the services are electronically supplied is only half settled. HMRC names "website
 supply or web hosting services" in the list, so the bundle the platform sells is a digital
