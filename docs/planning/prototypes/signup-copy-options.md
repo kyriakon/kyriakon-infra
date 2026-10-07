@@ -93,6 +93,27 @@ The free tier carries no number: the offer stands as far as capacity allows, and
 
 - £20 a year. Free for clergy, monastics, and those who are unable to pay. Please let us know on the form!
 
+**The tiers as a block.** The page states the tiers as prose in one paragraph, which is how the
+lede has read since it was written. The alternative is a block instead: four cards, each
+carrying who it is for, the price, and the few things that tier adds, with the limits every
+tier shares left in the list underneath.
+
+Cards rather than a table, on the evidence of the providers this platform is nearest to.
+[Proton](https://proton.me/mail/pricing) leads with cards, each carrying its price and a short
+bullet list, and puts the full comparison in a table further down the page.
+[Fastmail](https://www.fastmail.com/pricing/) puts an "all plans include" strip above the plans,
+so what every tier shares is stated once rather than four times. [Migadu](https://migadu.com/pricing/)
+is the closest business of the three, a flat-priced independent mail host, and the most useful
+line in its table is not a price but the list of who each plan is for: agencies and schools at
+one end, sole proprietorships and individuals at the other.
+
+The prose also never names the managed instance, which [#188](https://github.com/kyriakon/kyriakon-infra/issues/188)
+decided would be listed with its price and a contact address rather than reached by enquiry. A
+card for it closes that gap.
+
+Recommended: the cards. These tiers differ by who they are for at least as much as by what they
+include, and who a tier is for is the one thing a card states better than a sentence.
+
 ## 4. Key check: heading and first line
 
 - A. Does your key work here? Paste your public key. Nothing leaves your
@@ -670,6 +691,9 @@ Recommended: A. It answers the question the reader will otherwise ask after clos
 - Section 3, the tiers: an organisation's own domain is priced at £40 and reached by the form rather
   than a letter, per [#188](https://github.com/kyriakon/kyriakon-infra/issues/188) and
   [#233](https://github.com/kyriakon/kyriakon-infra/issues/233).
+- Section 3, how the tiers are laid out: four cards, each with who it is for, the price, and what
+  that tier adds, with the shared limits left in the list under them. The managed instance is one
+  of the four, priced on the page rather than reached by enquiry.
 - Section 13: no phone, until the key generator prototype tests Thunderbird for Android.
 - Section 19: the decline apologises for the outcome, offers the vouch and carries the clock.
 - Section 20: two boxes, one request and one acknowledgement.

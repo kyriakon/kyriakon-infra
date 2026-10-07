@@ -34,6 +34,13 @@
   .btn.alt { background:#fff; color:var(--ink); border:1px solid var(--line); }
   .btn.no { background:#8a3b12; }
   .tag { display:inline-block; font-size:12px; border:1px solid var(--line); border-radius:99px; padding:2px 9px; color:var(--dim); margin-left:6px; }
+  /* The tiers: one card each, the price on top, who it is for above it. Same weight as the
+     other cards, so the splash keeps one visual language. Wraps to two rows on a phone. */
+  .tiers { display:flex; flex-wrap:wrap; gap:12px; margin:16px 0 4px; }
+  .tier { flex:1 1 168px; margin:0; padding:13px 15px; }
+  .tier .price { font-size:18px; margin:1px 0 8px; }
+  .tier ul { margin:0; padding-left:18px; }
+  .tier li { font-size:13.5px; margin:4px 0; }
   .warn { border-left:3px solid var(--warn); padding:6px 0 6px 12px; margin:14px 0; font-size:14.5px; }
   .ok { border-left:3px solid #2f6b3a; padding:6px 0 6px 12px; margin:14px 0; font-size:14.5px; }
   table { width:100%; border-collapse:collapse; margin:12px 0; font-size:14.5px; }
@@ -75,7 +82,47 @@
 
 <section id="landing">
   <h2>Secure encrypted email and website hosting for Orthodox Christians</h2>
-  <p class="lede">£20 a year, or nothing at all if you are clergy, a monastic, or unable to pay. Say so on the form and that is the end of it. A parish, a monastery or a small Orthodox business with its own domain pays £40 a year and gets up to ten addresses. The offer stands as far as capacity allows, and the free share is reviewed once it passes about a fifth of the accounts.</p>
+  <p class="lede">£20 a year, or nothing at all if you are clergy, a monastic, or unable to pay. Say so on the form and that is the end of it.</p>
+
+  <!-- Four tiers, from http://github.com/kyriakon/kyriakon-infra/issues/188. Card shape follows
+       the providers this platform is closest to: a price, a line saying who it is for, and the
+       few things the tier adds. What every tier shares sits in the limits list further down. -->
+  <div class="tiers">
+    <div class="card tier">
+      <div class="who">One person</div>
+      <p class="price">£20 a year</p>
+      <ul>
+        <li>One address at <span class="mono">yourname.kyriakon.net</span>, with your site and capsule at the same name.</li>
+        <li>Your <span class="mono">pass</span> repositories.</li>
+        <li>5 GB across all of it.</li>
+      </ul>
+    </div>
+    <div class="card tier">
+      <div class="who">A parish, a monastery or a small Orthodox business</div>
+      <p class="price">£40 a year</p>
+      <ul>
+        <li>Its own domain, like <span class="mono">secretary@theirparish.example</span>.</li>
+        <li>Up to ten addresses, each mailbox with the same 5 GB.</li>
+        <li>A site and a capsule for that domain, and repositories per account.</li>
+      </ul>
+    </div>
+    <div class="card tier">
+      <div class="who">A body that wants its own server</div>
+      <p class="price">£150 a year and up</p>
+      <ul>
+        <li>A separate instance rather than a place on the shared box.</li>
+        <li>Ordered by hand: write to <span class="mono">admin@kyriakon.net</span> and we will say what it takes.</li>
+      </ul>
+    </div>
+    <div class="card tier">
+      <div class="who">Clergy, monastics, anyone who cannot pay</div>
+      <p class="price">Nothing <span class="tag">no charge</span></p>
+      <ul>
+        <li>The same account as the £20 tier, without a charge.</li>
+        <li>The offer stands as far as capacity allows, and the free share is reviewed once it passes about a fifth of the accounts.</li>
+      </ul>
+    </div>
+  </div>
   <div class="card">
     <h3>Secure encrypted email</h3>
     <p>Your mail is encrypted to your own key the moment it arrives. The server holds ciphertext and no key, so we cannot read your messages, and no request or order on our side changes that. The cost is that if you lose your key and your recovery phrase, the mail is gone: nobody here can restore it. Keep the two in different places.</p>
