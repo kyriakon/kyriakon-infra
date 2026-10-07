@@ -67,7 +67,7 @@ Mail you send is delivered to the recipient's mail server, which is outside our 
 
 You have the right to see the data we hold about you, to have it corrected, to have it erased, to restrict or object to some processing, and to receive it in a portable form. The full set comes from Articles 15 to 21 of the UK GDPR.
 
-To make a request, use the account page to export your data or to delete your account, or write to admin@kyriakon.net for anything else. We answer within one month of receiving the request, which is the deadline Article 12(3) sets. If a request is complex we may extend that by up to two further months, and we will tell you if we do. There is normally no charge. We may ask you to confirm control of the account before we act, and for an account that is not usually a document check.
+To make a request, use the account page to export your data or to delete your account, or write to admin@kyriakon.net for anything else. We answer within one month of receiving the request, which is the deadline Article 12(3) sets. If a request is complex we may extend that by up to two further months, and we will tell you if we do. There is normally no charge. We may ask you to confirm control of the account before we act. For an ordinary account that confirmation is made from inside the account itself, not by sending us a document.
 
 You also have the right to complain to us about how we handle your data, under section 164A of the Data Protection Act 2018, and the route to do that is below.
 
