@@ -35,9 +35,6 @@ Choosing the body path opens the block below and changes three things on the res
 > `[ ] parish  [ ] monastery  [ ] business  [ ] other: ________`
 > This tells us what sort of application it is when we read the queue. Nothing is decided on it.
 >
-> **The elder's blessing** *(required if the body is a monastery)*
-> `[ ]` The monastery has the blessing of its elder, the same answer the monastics path asks for and requires.
->
 > **VAT number** *(optional, only if the application is for a business)*
 > `________________`
 > If the application is for a business and it is registered for VAT, its number goes here. A Union business supply becomes a reverse-charge supply with no VAT charged. Leave it empty otherwise.
@@ -72,7 +69,7 @@ Choosing the body path opens the block below and changes three things on the res
 > The same three rails as the single-address path. The amount is £40 for the year, which covers the domain and up to ten addresses, and it does not change with the kind.
 >
 > **Before you send** *(required)*
-> `[ ]` I accept the terms, the acceptable use policy and the refusal list. The same three links as the single-address path.
+> `[ ]` I accept the terms, the acceptable use policy and the privacy notice. The same three links as the single-address path, because the block asks for the acceptances the page already carries and adds none.
 >
 > **Anything to tell us** *(optional)*
 > The same free-text field the page already has. This is where a monastery says it is a monastery, where a business says what it does, where an applicant asks to be considered without charge, and where anything we have not thought to ask about goes.
