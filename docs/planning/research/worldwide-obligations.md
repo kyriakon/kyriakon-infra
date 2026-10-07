@@ -411,7 +411,7 @@ the release notices when it approaches one.
   exemption falls away and the Australian Privacy Principles bind the release.
 - Whether the platform acts as controller or processor for each data set it holds. This
   note treats it as controller of account, billing and log data, and of the message text
-  the triage classifier sees, which the companion note's retention schedule holds for 90
+  the triage model sees, which the companion note's retention schedule holds for 90
   days; the zero-access design keeps the rest of the message content out of its hands. The
   DPDP Act, the LGPD and the APPI draw the controller line differently from the UK GDPR
   *(interpretation)*.
