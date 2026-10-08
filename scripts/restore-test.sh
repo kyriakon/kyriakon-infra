@@ -92,15 +92,17 @@ rm -f "$expected"
 # that only speaks when it fails gives the log nothing to point at.
 printf 'canary byte-identical at %s\n' "$CANARY_PATH"
 
-# --- 5. secrets, in both directions ------------------------------------
-# The backup takes /home and /etc/mail, and nothing else. /etc/mail carries the
-# DKIM signing key and smtpd's queue key, which exist nowhere else, so a rebuild
-# without them comes back unable to sign mail or read an existing queue. /root
-# carries the box's env file and the restic password; the TSIG key in the former is
-# DNS control for the domain, and the repository this test reads with read-only
-# credentials is no place for it. Asserting both directions means an edit to the
-# backup paths fails here, rather than quietly dropping a key or shipping a secret
-# to the storage box.
+# --- 5. secrets and the capsule pair -----------------------------------
+# The backup takes /home, /etc/mail, and any capsule certificate pair, and
+# nothing else. /etc/mail carries the DKIM signing key and smtpd's queue key,
+# which exist nowhere else, so a rebuild without them comes back unable to sign
+# mail or read an existing queue. A capsule key is the only copy of its
+# long-lived certificate, so a pair that arrives without its key half is a
+# broken backup. /root carries the box's env file and the restic password; the
+# TSIG key in the former is DNS control for the domain, and the repository this
+# test reads with read-only credentials is no place for it. Asserting both
+# directions means an edit to the backup paths fails here, rather than quietly
+# dropping a key or shipping a secret to the storage box.
 for need in /etc/mail/dkim/private.rsa.key /etc/mail/smtpd.conf; do
 	if [ ! -e "$target$need" ]; then
 		die "missing from the snapshot: $need — the backup no longer covers /etc/mail"
@@ -110,6 +112,21 @@ for secret in /root/.kyriakon-env /root/.restic-pass; do
 	if [ -e "$target$secret" ]; then
 		die "present in the snapshot: $secret — the backup covers a path it should not"
 	fi
+done
+# A capsule pair is two files that share a stem, the cert in /etc/ssl and the key
+# in /etc/ssl/private. Assert each restored half brings its mate, so a payload
+# that takes one and not the other fails here. A box with no pair passes
+# vacuously, the way the Maildir check does.
+for f in "$target"/etc/ssl/capsule-*.crt "$target"/etc/ssl/private/capsule-*.key; do
+	[ -f "$f" ] || continue
+	name=${f##*/}
+	stem=${name%.*}
+	case "$name" in
+	*.crt) mate="/etc/ssl/private/$stem.key" ;;
+	*)     mate="/etc/ssl/$stem.crt" ;;
+	esac
+	[ -f "$target$mate" ] \
+		|| die "capsule pair is split in the snapshot: ${f#"$target"} has no $mate"
 done
 printf 'verified /etc/mail secrets are in the snapshot and /root secrets are not\n'
 
