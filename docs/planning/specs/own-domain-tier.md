@@ -12,7 +12,7 @@ None of the machinery exists yet. The box receives mail for one domain, `kyriako
 
 One application from one accountable person, with the conditional community block, becomes one group record and one approval. The drain applies the group as one intent: an account for each mailbox, a virtual entry for each address, the domain in the mail domain table and in the DKIM filter, a generated vhost and capsule, a certificate added to the queue, and one subscription with one paid-until date that every account in the group references.
 
-Mail moves as soon as the domain resolves, the tables are applied and `smtpd` reloads. The website and capsule follow their certificate through the same oldest-first queue member certificates use, and spend the body's own issuance budget rather than `kyriakon.net`'s. The body publishes the platform's public DKIM key at the platform's selector in its own domain. The fee covers the whole group, so a mailbox added or removed inside the ten-address cap changes nothing about the price or the renewal date.
+Mail moves as soon as the domain resolves, the tables are applied and `smtpd` reloads. The website follows its certificate through the same oldest-first queue member certificates use, and spends the body's own issuance budget rather than `kyriakon.net`'s. The body publishes the platform's public DKIM key at the platform's selector in its own domain. The fee covers the whole group, so a mailbox added or removed inside the ten-address cap changes nothing about the price or the renewal date.
 
 The service keeps its two halves. The internet-facing handler files the application and holds no privilege; the drain owns provisioning, the approval token, the certificate requests and the lifecycle, and it validates every field of a group intent as strictly as a privilege boundary requires ([#156](https://github.com/kyriakon/kyriakon-infra/issues/156)).
 
@@ -27,7 +27,7 @@ On approval the drain applies one group intent. Every step is idempotent, so a r
 - It adds the domain to the mail domain table and writes one virtual entry for each address.
 - It adds the domain to the DKIM filter's domain list.
 - It writes the generated vhost, capsule and certificate block, with the site tree in the account named as the site owner.
-- It requests one certificate for the domain and `www`, through the queue.
+- It requests one certificate for the website, covering the domain and `www`, through the queue.
 - It issues one approval token, opens the payment window, and sends the approval email, which carries the payment instructions and the DNS recipe.
 
 The configuration writes land in one batched pass, applied by the same script that applies the vhost indexes, so a wave of approvals costs one reload per daemon rather than one per approval ([#154](https://github.com/kyriakon/kyriakon-infra/issues/154)).
@@ -86,7 +86,7 @@ server "parish.example" {
 }
 ```
 
-The generator writes the `www` vhost and its redirect, the port 80 challenge vhost, and the gmid server block with the same certificate and the gemini root. The files go under `/etc/httpd.d/`, `/etc/gmid.d/` and the certificate config's directory, each listed by the index the hand-written config includes, which the drain rewrites atomically ([#150](https://github.com/kyriakon/kyriakon-infra/issues/150)).
+The generator writes the `www` vhost and its redirect, the port 80 challenge vhost, and the gmid server block with the domain's capsule certificate and the gemini root. The files go under `/etc/httpd.d/`, `/etc/gmid.d/` and the certificate config's directory, each listed by the index the hand-written config includes, which the drain rewrites atomically ([#150](https://github.com/kyriakon/kyriakon-infra/issues/150)).
 
 The document root is the site owner's public directory rather than a directory named after the domain, because the upload session's chroot is `/home/www/%u.kyriakon.net` and `sshd_config` is applied by hand rather than written by the provisioning path. Reusing the member public directory keeps a body's upload path identical to a member's and needs no change to that file.
 
