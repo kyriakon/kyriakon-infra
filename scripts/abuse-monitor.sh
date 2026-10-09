@@ -591,7 +591,19 @@ if [ -n "$ip" ]; then
 		reason=${skipped#*=}
 		reason=${reason%% *}
 		if [ "$zone" != "$strongest" ]; then
-			if [ "$(cat "$state/dnsbl.downgraded" 2>/dev/null || true)" != "$zone:$reason" ]; then
+			# A zone that is slow rather than down gives one downgrade and then a
+			# clean run, and under a once-per-change rule that is an alert every
+			# other run. That is what reached the operator every few hours on
+			# 2026-10-09. A downgrade is reported only once it has held for three
+			# consecutive runs, three quarters of an hour, and the count resets the
+			# moment the zone gives a verdict again.
+			dnsbl_seen=$(cat "$state/dnsbl.downgraded" 2>/dev/null || true)
+			case "$dnsbl_seen" in
+			"$zone:$reason:"*) dnsbl_strikes=$((${dnsbl_seen##*:} + 1)) ;;
+			*) dnsbl_strikes=1 ;;
+			esac
+			printf '%s\n' "$zone:$reason:$dnsbl_strikes" > "$state/dnsbl.downgraded"
+			if [ "$dnsbl_strikes" -eq 3 ]; then
 				case "$reason" in
 				refused)
 					# A refusal is a policy aimed at this resolver, and nothing on
@@ -613,12 +625,12 @@ if [ -n "$ip" ]; then
 					# was not answering in time and the query went to the system
 					# resolver, which Spamhaus ignores by design: a silent zen through
 					# that fallback is expected, not a finding. The old advice named
-					# only the first and sent the operator to check a healthy resolver
-					# after a reboot on 2026-10-05.
-					alert "blocklist downgraded" "$ip is clean on $zone only; $strongest did not answer. The strongest list is the one that matters for deliverability, so a listing there would go unnoticed. If unbound is not running on this box, rcctl -f start unbound. If it is running, the query fell back to the system resolver because the local one did not answer in time, and a reboot with an empty cache is the usual reason for one alert like this: the next run should be clean"
+					# only the second and blamed a reboot, which sent the operator to
+					# a healthy resolver on 2026-10-05 and told them the next run
+					# would be clean when it was not.
+					alert "blocklist downgraded" "$ip is clean on $zone only; $strongest did not answer for three runs in a row. The strongest list is the one that matters for deliverability, so a listing there would go unnoticed. Either the zone is slow enough that the look-up times out, or unbound is not answering and the query went to the system resolver, which Spamhaus ignores by design. Run check-hygiene.sh by hand and rcctl check unbound, and the runbook's blocklist section says how to tell the two apart"
 					;;
 				esac
-				printf '%s\n' "$zone:$reason" > "$state/dnsbl.downgraded"
 			fi
 		else
 			rm -f "$state/dnsbl.downgraded"
