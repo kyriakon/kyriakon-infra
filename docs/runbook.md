@@ -30,8 +30,8 @@ Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box witho
 These procedures name the pieces that exist at this commit, and mark the ones that do not:
 
 - The onboarding service, its drain and the `onboardctl` command are decided in #156 and not built. Provisioning a member is manual until they land.
-- The per-member hosting configuration is merged into the repository and not applied: the chroot under `/home/www`, the generated vhost indexes, the port split that separates git from the chrooted sftp server, and the quota on `/home`. Applying it is a sequence of propose-only steps rather than a script, so it is done once, by hand, and the order is in the pull request that added it (#160).
-- The quota itself is scripted: `scripts/quota-apply.sh --enable` turns quotas on and `--all` applies the 5 GB allowance to the accounts that already exist. `scripts/add-user.sh` sets it at creation.
+- The per-member hosting configuration is merged into the repository and not applied: the chroot under `/home/www`, the generated vhost indexes, the port split that separates git from the chrooted sftp server. Applying it is a sequence of propose-only steps rather than a script, so it is done once, by hand, and the order is in the pull request that added it (#160).
+- The quota is scripted and has been applied: `scripts/quota-apply.sh --enable` turns quotas on and `--all` applies the 5 GB allowance to the accounts that already exist. `scripts/add-user.sh` sets it at creation.
 
   `/home` carries user quotas only, since every account has its own group of the same name. The boot-time check in `/etc/rc` runs `quotaon -a` without that restriction, so it prints one line about the missing `/home/quota.group` on every boot before it reports user quotas turned on. That line is expected, and it is the only place it appears, because `--enable` passes `-u` and stays quiet.
 - Per-member certificates and the queue that holds them against the Let's Encrypt refill rate are decided in #166 and not built. A member's own vhost has no certificate to serve yet.
@@ -180,6 +180,16 @@ The AUP ladder is detect, warn with 72 hours to respond, suspend, then delete af
 The generated include files, the `members` group and the account page all arrive with #154 and #156, so steps 2 and 3 are the shape those tickets decided rather than something an operator can do today.
 
 Do not refuse inbound mail as the default, and do not edit `pf.conf` or `sshd_config` on the box to enforce any of this. Both are propose-only changes; a pull request carries the diff and a human applies it.
+
+## When a member has died
+
+Nothing is released, and the ordinary paths apply. The rule in `docs/planning/specs/data-subject-requests.md` stands: a request from outside the account page is confirmed by the password or by a message from the account's own address signed with the member's key, and where neither can be produced the operator says so and does not answer as though identity were established. A bereaved family holds neither, so nothing can be handed over on their request.
+
+The platform holds nothing readable to hand over in any case: the mail is ciphertext under a key only the member holds, and the written record is the member's own data, whose one route out is the export the account page runs. The reply says both, that nothing is released and that nothing readable exists to release.
+
+The account then takes the ordinary sequence: the notices to every address held, the lapse for non-payment, the 40-day grace, and deletion, which is the section below. A monastery or a parish as the member is the same, its account lapsing and deleting like any other, and a domain on the own-domain tier lapses with it. A free account never lapses, so no lapse and no grace period run for it, and the account stays until the operator closes it under the rule for one that has been unreachable and unused for a year, or a breach of the acceptable use policy closes it sooner.
+
+Decided in #276.
 
 ## Close an account and delete it
 
@@ -347,7 +357,7 @@ Then find where the space went.
 	doas repquota -a
 	doas du -sh /var/log /var/spool/smtpd /var/nsd /root/.cache/restic
 
-Mail keeps arriving for an account whose password is locked, because delivery resolves the recipient from the user database and never from the password, and no account carries a quota today. That combination fills `/home` after a suspension, and the storage design in #154 is what puts a soft 5 GB and a hard 5.5 GB limit on it. The monitor's quota signal has never run for the same reason, and it starts running when that quota lands (#173).
+Mail keeps arriving for an account whose password is locked, because delivery resolves the recipient from the user database and never from the password, and the account's allowance is what bounds that. The allowance is live: `/home` is mounted with quotas, `/home/quota.user` holds the records, and each account is written a soft 5 GB and a hard 5.5 GB limit. Mail arriving after a suspension therefore fills an account to its limit and no further, which is what keeps the suspension recoverable instead of filling the disk.
 
 On the root filesystem the likely places are the log directory, which `openbsd/etc/newsyslog.conf` bounds at seven days, the mail queue, and the restic cache. The root filesystem alert is one of the signals in #173 and does not exist yet.
 
@@ -359,6 +369,19 @@ Check what is queued before removing anything from the queue.
 An account's allowance is a 32-byte record in `/home/quota.user`, and `scripts/quota-apply.sh` writes it directly. The kernel reads that record the first time it accounts for a user and keeps its own copy after that, so an account it has already seen does not pick up a changed allowance, and `quotaoff` followed by `quotaon` does not help: the release drops the reference while leaving the record in the cache. Changing an existing account's limits therefore takes the order the script prints, write with quotas off and then reboot. An account being created needs none of it, because nothing has read its record yet.
 
 Do not delete files under `/home` to free space. The account lifecycle is the path that removes member data, and a hand deletion leaves the account, the keyring entry and the vhosts behind. Do not remove the DKIM key at `/etc/mail/dkim/private.rsa.key`, the queue key at `/etc/mail/queue.key`, or anything under the restic repository. The first two exist nowhere else, and the third is the backup.
+
+### How much the box carries
+
+The box is a Hetzner `cx23` in `hel1`: 2 vCPU, 3.9 GiB of memory, and one 40 GB disk divided into partitions, of which `/home` is 8.2 GB. Every member is promised 5 GB, which is proposal 6.5 and is enforced: `/home` is mounted with quotas, `/home/quota.user` holds the records, and `scripts/quota-apply.sh` writes each account a soft 5 GB and a hard 5.5 GB limit. At that promise the partition carries one member and two would overrun it, and at the 1.9 MB of mail the account on it now uses, it would carry thousands.
+
+The promise is the one that is sold, so the box's resource is grown when it becomes the wall rather than a member count being fixed in advance, and the choice between the two ways of growing it is made at the time: attaching a volume, or moving to a larger server type.
+
+The trigger is the `/home` partition, looked at in the quarterly pass in `## Run the quarterly indirect-tax check`:
+
+	df -h /home
+	doas repquota -a
+
+At the same time, look at the storage box's usage in its console, because it holds the nightly repository and it is the only place a deleted account outlives its retention window. Approval is what rations the box, since a person approves every application before a payment link is sent, so no other count is needed. Decided in #275.
 
 ## When mail is not flowing
 
