@@ -68,6 +68,30 @@ fi
 # shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
 . "$script_dir/lib.sh"
 
+# --- one run at a time ------------------------------------------------------
+# mkdir is the atomic test-and-set available in base: this box has no shlock(1)
+# and no flock(1), only the flock(2) syscall, which has no shell wrapper. The
+# blocklist walk is patient by design, ten seconds and three tries per query over
+# four zones, so a run can take minutes, and two overlapping runs would race on
+# every file under $state. A lock left by a killed run is taken over once its pid
+# is gone, so a reboot cannot wedge the monitor, and --self-test does not release
+# it, which the next real run absorbs for the same reason.
+lock=/var/run/abuse-monitor.lock
+if ! mkdir -m 0700 "$lock" 2>/dev/null; then
+	holder=$(cat "$lock/pid" 2>/dev/null || true)
+	if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+		exit 0
+	fi
+	rm -f "$lock/pid"
+	rmdir "$lock" 2>/dev/null || true
+	if ! mkdir -m 0700 "$lock" 2>/dev/null; then
+		printf '%s: could not take %s, and no live process holds it\n' "$0" "$lock" >&2
+		exit 1
+	fi
+fi
+printf '%s\n' "$$" > "$lock/pid"
+trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true' EXIT
+
 # A storm keeps a signal true for hours, and telling the operator the same thing
 # every hour is how an alert channel stops being read. These two are the ones a
 # stranger can hold true indefinitely: a source working through a list of
@@ -628,7 +652,7 @@ if [ -n "$ip" ]; then
 					# only the second and blamed a reboot, which sent the operator to
 					# a healthy resolver on 2026-10-05 and told them the next run
 					# would be clean when it was not.
-					alert "blocklist downgraded" "$ip is clean on $zone only; $strongest did not answer for three runs in a row. The strongest list is the one that matters for deliverability, so a listing there would go unnoticed. Either the zone is slow enough that the look-up times out, or unbound is not answering and the query went to the system resolver, which Spamhaus ignores by design. Run check-hygiene.sh by hand and rcctl check unbound, and the runbook's blocklist section says how to tell the two apart"
+					alert "blocklist downgraded" "$ip is clean on $zone only; $strongest did not answer for three runs in a row. The strongest list is the one that matters for deliverability, so a listing there would go unnoticed. The look-up timed out rather than being answered: the zone's answers live ten seconds, so this check is a cold walk nearly every time, and Spamhaus's servers are occasionally slower than the query's patience. A query that goes to the system resolver is refused rather than left silent, so silence here is a timeout and not the wrong resolver. Run check-hygiene.sh by hand if it repeats, and the runbook's blocklist section says what to look at"
 					;;
 				esac
 			fi

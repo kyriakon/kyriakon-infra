@@ -470,7 +470,9 @@ The reason is in the alert, and the two reasons need different responses.
 
 	One `servfail` that does not repeat was that timeout, and nothing needs doing. A `refused` is Spamhaus's policy rather than a local fault, but it still says something about this box: the control answer comes back only after the query has left on the system resolver, so a refusal means the box's own resolver was not the one asked. The hand run prints which resolver answered.
 
-2. `no-answer` or `silent`: nothing came back at all, and the two causes are the same two as above rather than only a fault here. The zone's answers live ten seconds, so the check is a cold walk nearly every time, and a walk that Spamhaus's servers are slow enough to answer past the query's own timeout lands here as silence. `rcctl check unbound` is the first move, because an unbound that is not answering sends the query to the system resolver, which Spamhaus ignores by design. If it is running, run the check by hand and see whether the silence repeats: one slow run is not a finding.
+2. `no-answer` or `silent`: nothing came back at all, which means the look-up timed out rather than being answered. The zone's answers live ten seconds, so the check is a cold walk nearly every time, and Spamhaus's servers are occasionally slower than the query's patience. Run the check by hand and see whether the silence repeats.
+
+	A refusal is not this case, and neither is an unbound that has stopped: a query that leaves on the system resolver is answered with Spamhaus's control answer and recorded as `refused` above, so silence here means nothing answered in time rather than that the wrong resolver was asked.
 
 	The monitor counts a downgrade rather than mailing on each one, and reports it once it has held for three consecutive runs, three quarters of an hour apart. A single `no-answer` therefore passes quietly, and an alert means the condition has lasted.
 
