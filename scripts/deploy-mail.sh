@@ -170,10 +170,12 @@ install -d -m 0755 -o root -g daemon /home/www/acme
 install -d -m 0700 /etc/acme
 # The generated vhost indexes the two daemons include. include is an fopen of one
 # path, so a missing index fails the whole configuration rather than being
-# skipped: the file has to exist before httpd -n or gmid -n runs, and an empty
-# one is valid.
-install -d -m 0755 /etc/httpd.d /etc/gmid.d
-for i in /etc/httpd.d/index.conf /etc/gmid.d/index.conf; do
+# skipped: the file has to exist before httpd -n, gmid -n or acme-client parses
+# the config, and an empty one is valid. acme-client.d is the third lane, added
+# when member certificates arrived: each member's name gets its own domain block
+# there, so the tracked config never gains a per-member line.
+install -d -m 0755 /etc/httpd.d /etc/gmid.d /etc/acme-client.d
+for i in /etc/httpd.d/index.conf /etc/gmid.d/index.conf /etc/acme-client.d/index.conf; do
 	[ -e "$i" ] || : >"$i"
 	chmod 0644 "$i"
 done

@@ -4,8 +4,10 @@
 # Two jobs, because they run on different clocks.
 #
 #   1. Root's crontab lines for the scheduled scripts (the default mode).
-#   2. The generated vhost indexes that httpd.conf and gmid.conf include, from
-#      the per-member files the signup path has written (--web).
+#   2. The generated indexes that httpd.conf, gmid.conf and acme-client.conf
+#      include, from the per-member files the signup path has written (--web).
+#      httpd and gmid are reloaded after a rewrite; acme-client is not, because
+#      it reads its configuration when it runs rather than holding it open.
 #
 # Runs ON the box as root:
 #
@@ -122,6 +124,7 @@ die() {
 
 httpd_d=/etc/httpd.d
 gmid_d=/etc/gmid.d
+acme_d=/etc/acme-client.d
 httpd_conf=/etc/httpd.conf
 gmid_conf=/etc/gmid.conf
 
@@ -163,7 +166,8 @@ regen_index() {
 }
 
 restore_indexes() {
-	for f in "$httpd_d/index.conf.saved.$$" "$gmid_d/index.conf.saved.$$"; do
+	for f in "$httpd_d/index.conf.saved.$$" "$gmid_d/index.conf.saved.$$" \
+		"$acme_d/index.conf.saved.$$"; do
 		[ -f "$f" ] || continue
 		mv "$f" "${f%.saved."$$"}"
 	done
@@ -171,13 +175,20 @@ restore_indexes() {
 
 apply_web() {
 	changed=""
+	acme_changed=""
 	regen_index "$httpd_d" && changed="$changed httpd"
 	regen_index "$gmid_d" && changed="$changed gmid"
-	if [ -z "$changed" ]; then
-		printf 'vhost indexes: nothing to change, nothing reloaded\n'
+	# acme-client.conf's index is rewritten the same way and keeps the same saved
+	# copy, but nothing is reloaded: acme-client is not a daemon, and it reads the
+	# file when it next runs. The parse is still checked on the box, by the daily
+	# renewal rather than here, since the check that names a bad member block is
+	# acme-client itself.
+	regen_index "$acme_d" && acme_changed=yes
+	if [ -z "$changed" ] && [ -z "$acme_changed" ]; then
+		printf 'generated indexes: nothing to change, nothing reloaded\n'
 		return 0
 	fi
-	printf 'vhost indexes to rewrite:%s\n' "$changed"
+	printf 'indexes to rewrite:%s%s\n' "$changed" "${acme_changed:+ acme-client}"
 	if [ "$check_only" = yes ]; then
 		printf '\n--check: nothing was written and nothing was reloaded.\n'
 		return 0
@@ -198,8 +209,14 @@ apply_web() {
 		gmid) rcctl reload gmid || die "rcctl reload gmid failed" ;;
 		esac
 	done
-	rm -f "$httpd_d/index.conf.saved.$$" "$gmid_d/index.conf.saved.$$"
-	printf 'reloaded:%s\n' "$changed"
+	rm -f "$httpd_d/index.conf.saved.$$" "$gmid_d/index.conf.saved.$$" \
+		"$acme_d/index.conf.saved.$$"
+	if [ -n "$changed" ]; then
+		printf 'reloaded:%s\n' "$changed"
+	fi
+	if [ -n "$acme_changed" ]; then
+		printf 'acme-client index rewritten; it reads the file at its next run, so nothing was reloaded\n'
+	fi
 }
 
 if [ "$web_only" = yes ]; then
