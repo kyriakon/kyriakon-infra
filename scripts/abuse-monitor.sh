@@ -605,7 +605,7 @@ if [ -n "$ip" ]; then
 					# QNAME minimisation is already off in the tracked config, so a
 					# servfail is usually a lookup that timed out rather than a
 					# setting to change. The runbook's section says how to tell.
-					alert "blocklist downgraded" "$ip is clean on $zone only: $strongest gave servfail rather than a verdict. Nothing is listed on $strongest as far as this check can tell. The QNAME minimisation line is already in place on this box, so the likely cause is a lookup that timed out, and the runbook's blocklist section says how to tell"
+					alert "blocklist downgraded" "$ip is clean on $zone only: $strongest gave servfail rather than a verdict. Nothing is listed on $strongest as far as this check can tell. The tracked config sets the QNAME minimisation line to no, so if that has been deployed the likely cause is a lookup that timed out, and the runbook's blocklist section says how to tell"
 					;;
 				*)
 					# Something said nothing at all, which has two causes and only one
