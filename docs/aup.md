@@ -8,8 +8,11 @@ the terms of service and the privacy policy.
 **Our position on speech law.** We hold that the current British and Scottish
 restrictions on speech infringe freedom of speech and the law of God. We comply
 with them only because the law currently requires it, and we read every such law
-as narrowly as it can honestly be read. Scottish law is the more restrictive of
-the two and is the one most likely to bear on religious speech (see §2).
+as narrowly as it can honestly be read. Of the two, Scottish law is the one
+that reaches furthest into religious speech, and it is where the next change is
+being proposed: the Scottish stirring-up offence carries more characteristics
+than the English one, and the conversion-practices consultation, which this
+policy discusses below, is a Scottish one (see §2).
 
 **Companion documents.** Three documents carry the security claims rather than
 this policy: `threat-model.md`, for what the platform protects against and what
