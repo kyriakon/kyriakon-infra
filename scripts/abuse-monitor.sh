@@ -593,14 +593,19 @@ if [ -n "$ip" ]; then
 		if [ "$zone" != "$strongest" ]; then
 			if [ "$(cat "$state/dnsbl.downgraded" 2>/dev/null || true)" != "$zone:$reason" ]; then
 				case "$reason" in
-				refused | servfail)
-					# The cause is known and documented, so the alert names it rather
-					# than sending the reader to check a resolver that is fine.
-					# Spamhaus's zones answer NS and SOA queries in a way that does not
-					# match RFC 1034, and QNAME minimisation needs those answers, so a
-					# listing resolves and a clean answer does not. Spamhaus recommends
-					# turning minimisation off for this; the runbook has the line.
-					alert "blocklist downgraded" "$ip is clean on $zone only: $strongest gave $reason rather than a verdict. Spamhaus documents this and the fix is one line in unbound.conf, in the runbook's blocklist section. Nothing is listed on $strongest as far as this check can tell, and nothing else on this box needs changing"
+				refused)
+					# A refusal is a policy aimed at this resolver, and nothing on
+					# this box is broken. Spamhaus refuses a shared resolver with
+					# its control answer, which is what the second query gets; the
+					# check asks 127.0.0.1 first, so a refusal means the box's own
+					# resolver did not answer and the fallback was refused.
+					alert "blocklist downgraded" "$ip is clean on $zone only: $strongest refused the query rather than giving a verdict, which is Spamhaus's answer to a resolver it will not serve. Nothing is listed on $strongest as far as this check can tell, and the runbook's blocklist section reads this one"
+					;;
+				servfail)
+					# QNAME minimisation is already off in the tracked config, so a
+					# servfail is usually a lookup that timed out rather than a
+					# setting to change. The runbook's section says how to tell.
+					alert "blocklist downgraded" "$ip is clean on $zone only: $strongest gave servfail rather than a verdict. Nothing is listed on $strongest as far as this check can tell. The QNAME minimisation line is already in place on this box, so the likely cause is a lookup that timed out, and the runbook's blocklist section says how to tell"
 					;;
 				*)
 					# Something said nothing at all, which has two causes and only one
