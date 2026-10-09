@@ -68,6 +68,30 @@ fi
 # shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
 . "$script_dir/lib.sh"
 
+# --- one run at a time ------------------------------------------------------
+# mkdir is the atomic test-and-set available in base: this box has no shlock(1)
+# and no flock(1), only the flock(2) syscall, which has no shell wrapper. The
+# blocklist walk is patient by design, ten seconds and three tries per query over
+# four zones, so a run can take minutes, and two overlapping runs would race on
+# every file under $state. A lock left by a killed run is taken over once its pid
+# is gone, so a reboot cannot wedge the monitor, and --self-test does not release
+# it, which the next real run absorbs for the same reason.
+lock=/var/run/abuse-monitor.lock
+if ! mkdir -m 0700 "$lock" 2>/dev/null; then
+	holder=$(cat "$lock/pid" 2>/dev/null || true)
+	if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+		exit 0
+	fi
+	rm -f "$lock/pid"
+	rmdir "$lock" 2>/dev/null || true
+	if ! mkdir -m 0700 "$lock" 2>/dev/null; then
+		printf '%s: could not take %s, and no live process holds it\n' "$0" "$lock" >&2
+		exit 1
+	fi
+fi
+printf '%s\n' "$$" > "$lock/pid"
+trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true' EXIT
+
 # A storm keeps a signal true for hours, and telling the operator the same thing
 # every hour is how an alert channel stops being read. These two are the ones a
 # stranger can hold true indefinitely: a source working through a list of
@@ -591,16 +615,33 @@ if [ -n "$ip" ]; then
 		reason=${skipped#*=}
 		reason=${reason%% *}
 		if [ "$zone" != "$strongest" ]; then
-			if [ "$(cat "$state/dnsbl.downgraded" 2>/dev/null || true)" != "$zone:$reason" ]; then
+			# A zone that is slow rather than down gives one downgrade and then a
+			# clean run, and under a once-per-change rule that is an alert every
+			# other run. That is what reached the operator every few hours on
+			# 2026-10-09. A downgrade is reported only once it has held for three
+			# consecutive runs, three quarters of an hour, and the count resets the
+			# moment the zone gives a verdict again.
+			dnsbl_seen=$(cat "$state/dnsbl.downgraded" 2>/dev/null || true)
+			case "$dnsbl_seen" in
+			"$zone:$reason:"*) dnsbl_strikes=$((${dnsbl_seen##*:} + 1)) ;;
+			*) dnsbl_strikes=1 ;;
+			esac
+			printf '%s\n' "$zone:$reason:$dnsbl_strikes" > "$state/dnsbl.downgraded"
+			if [ "$dnsbl_strikes" -eq 3 ]; then
 				case "$reason" in
-				refused | servfail)
-					# The cause is known and documented, so the alert names it rather
-					# than sending the reader to check a resolver that is fine.
-					# Spamhaus's zones answer NS and SOA queries in a way that does not
-					# match RFC 1034, and QNAME minimisation needs those answers, so a
-					# listing resolves and a clean answer does not. Spamhaus recommends
-					# turning minimisation off for this; the runbook has the line.
-					alert "blocklist downgraded" "$ip is clean on $zone only: $strongest gave $reason rather than a verdict. Spamhaus documents this and the fix is one line in unbound.conf, in the runbook's blocklist section. Nothing is listed on $strongest as far as this check can tell, and nothing else on this box needs changing"
+				refused)
+					# A refusal is a policy aimed at this resolver, and nothing on
+					# this box is broken. Spamhaus refuses a shared resolver with
+					# its control answer, which is what the second query gets; the
+					# check asks 127.0.0.1 first, so a refusal means the box's own
+					# resolver did not answer and the fallback was refused.
+					alert "blocklist downgraded" "$ip is clean on $zone only: $strongest refused the query rather than giving a verdict, which is Spamhaus's answer to a resolver it will not serve. Nothing is listed on $strongest as far as this check can tell, and the runbook's blocklist section reads this one"
+					;;
+				servfail)
+					# QNAME minimisation is already off in the tracked config, so a
+					# servfail is usually a lookup that timed out rather than a
+					# setting to change. The runbook's section says how to tell.
+					alert "blocklist downgraded" "$ip is clean on $zone only: $strongest gave servfail rather than a verdict. Nothing is listed on $strongest as far as this check can tell. The tracked config sets the QNAME minimisation line to no, so if that has been deployed the likely cause is a lookup that timed out, and the runbook's blocklist section says how to tell"
 					;;
 				*)
 					# Something said nothing at all, which has two causes and only one
@@ -608,12 +649,12 @@ if [ -n "$ip" ]; then
 					# was not answering in time and the query went to the system
 					# resolver, which Spamhaus ignores by design: a silent zen through
 					# that fallback is expected, not a finding. The old advice named
-					# only the first and sent the operator to check a healthy resolver
-					# after a reboot on 2026-10-05.
-					alert "blocklist downgraded" "$ip is clean on $zone only; $strongest did not answer. The strongest list is the one that matters for deliverability, so a listing there would go unnoticed. If unbound is not running on this box, rcctl -f start unbound. If it is running, the query fell back to the system resolver because the local one did not answer in time, and a reboot with an empty cache is the usual reason for one alert like this: the next run should be clean"
+					# only the second and blamed a reboot, which sent the operator to
+					# a healthy resolver on 2026-10-05 and told them the next run
+					# would be clean when it was not.
+					alert "blocklist downgraded" "$ip is clean on $zone only; $strongest did not answer for three runs in a row. The strongest list is the one that matters for deliverability, so a listing there would go unnoticed. The look-up timed out rather than being answered: the zone's answers live ten seconds, so this check is a cold walk nearly every time, and Spamhaus's servers are occasionally slower than the query's patience. A query that goes to the system resolver is refused rather than left silent, so silence here is a timeout and not the wrong resolver. Run check-hygiene.sh by hand if it repeats, and the runbook's blocklist section says what to look at"
 					;;
 				esac
-				printf '%s\n' "$zone:$reason" > "$state/dnsbl.downgraded"
 			fi
 		else
 			rm -f "$state/dnsbl.downgraded"

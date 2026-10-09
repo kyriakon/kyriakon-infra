@@ -97,7 +97,7 @@ dnsbl_verdict() {
 		# as clean too. A zone that fails its own control is skipped rather than
 		# believed.
 		# shellcheck disable=SC2086 # deliberately empty or one argument
-		dnsbl_ctl=$(dig +short +time=5 +tries=2 $dnsbl_at "2.0.0.127.$dnsbl_zone" A 2>/dev/null | head -1 || true)
+		dnsbl_ctl=$(dig +short +time=10 +tries=3 $dnsbl_at "2.0.0.127.$dnsbl_zone" A 2>/dev/null | head -1 || true)
 		case "$dnsbl_ctl" in
 		127.0.0.*) ;;
 		127.255.255.*)
@@ -114,7 +114,7 @@ dnsbl_verdict() {
 			;;
 		esac
 		# shellcheck disable=SC2086 # deliberately empty or one argument
-		dnsbl_out=$(dig +time=5 +tries=2 $dnsbl_at "$dnsbl_rev.$dnsbl_zone" A 2>/dev/null || true)
+		dnsbl_out=$(dig +time=10 +tries=3 $dnsbl_at "$dnsbl_rev.$dnsbl_zone" A 2>/dev/null || true)
 		dnsbl_status=$(printf '%s\n' "$dnsbl_out" | awk '/status:/ { s=$6; sub(/,.*/, "", s); print s; exit }')
 		dnsbl_answer=$(printf '%s\n' "$dnsbl_out" \
 			| awk -F'[ \t]+' '/IN[ \t]+A[ \t]+/ && $1 !~ /^;/ { print $5; exit }')

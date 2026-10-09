@@ -464,7 +464,17 @@ The reason is in the alert, and the two reasons need different responses.
 
 	The setting is global, because unbound has no per-zone form of it: every query from this box stops using QNAME minimisation, not only the blocklist ones. Spamhaus's argument for accepting that is that all queries in a blocklist lookup go to the same nameserver, so the privacy gain there is nil, and their measurement is that a lookup costing five queries costs one without it. ISC disagrees, holding that the resolver should not give up a privacy feature for a server's non-compliance. Treat it as a workaround with a decision attached, and revisit it if Spamhaus fixes the zone or unbound grows a per-zone setting.
 
-2. `no-answer` or `silent`: nothing came back at all, which is DNS on this box rather than anything Spamhaus did. `rcctl check unbound` is the right first move for that one.
+	That line is in place on this box, so a `servfail` here needs the other reading as well. The zone's answers carry a ten-second negative time to live, so the check is a cold lookup almost every time, and a walk that Spamhaus's authoritative servers do not answer inside unbound's timeouts can surface as `servfail` rather than as silence. Run the check by hand before changing anything:
+
+		doas ksh /usr/local/src/kyriakon-infra/scripts/check-hygiene.sh
+
+	One `servfail` that does not repeat was that timeout, and nothing needs doing. A `refused` is Spamhaus's policy rather than a local fault, but it still says something about this box: the control answer comes back only after the query has left on the system resolver, so a refusal means the box's own resolver was not the one asked. The hand run prints which resolver answered.
+
+2. `no-answer` or `silent`: nothing came back at all, which means the look-up timed out rather than being answered. The zone's answers live ten seconds, so the check is a cold walk nearly every time, and Spamhaus's servers are occasionally slower than the query's patience. Run the check by hand and see whether the silence repeats.
+
+	A refusal is not this case, and neither is an unbound that has stopped: a query that leaves on the system resolver is answered with Spamhaus's control answer and recorded as `refused` above, so silence here means nothing answered in time rather than that the wrong resolver was asked.
+
+	The monitor counts a downgrade rather than mailing on each one, and reports it once it has held for three consecutive runs, three quarters of an hour apart. A single `no-answer` therefore passes quietly, and an alert means the condition has lasted.
 
 A clean verdict names the zone it came from and what it skipped, and `scripts/check-hygiene.sh` prints the same verdict on demand, along with whether the resolver on this box was the one asked, since querying `127.0.0.1` and querying a public resolver get different answers from Spamhaus.
 
