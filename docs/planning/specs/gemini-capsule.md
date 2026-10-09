@@ -53,7 +53,7 @@ The socket directory is created by the deploy, owned by the handler's user with 
 
 ## The process, its user and its state
 
-The handler is the same binary that answers HTTPS, started by its own `rc.d` unit:
+The handler is the same binary that answers HTTPS, started by its own `rc.d` unit, `/etc/rc.d/kyriakon_onboard`, kept in the repository at `openbsd/etc/rc.d/kyriakon_onboard`. The name is the binary's own; the SSH TUI's second sshd instance, which would otherwise be the obvious claimant of it, is `kyriakon_onboard_sshd`:
 
 ```
 daemon="/usr/local/sbin/kyriakon-onboard"
