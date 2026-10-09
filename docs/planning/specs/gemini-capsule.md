@@ -37,10 +37,10 @@ server "signup.kyriakon.net" {
 	log off
 
 	# The socket path is resolved after the chroot, so the file lives at
-	# <chroot>/run/onboard/onboard.sock on disk. The repository chroots to
-	# /home/www; the deployed box still chroots /var/www until the hosting
-	# change from #160 is applied, so the deploy creates the directory under
-	# whichever chroot the installed gmid.conf names.
+	# <chroot>/run/onboard/onboard.sock on disk. The hosting change from #160
+	# landed: the repository's config chroots to /home/www and so does the
+	# box. The deploy still reads the path from the installed gmid.conf rather
+	# than assuming it, so a chroot that moves again is one place to change.
 	fastcgi socket "/run/onboard/onboard.sock"
 }
 ```
@@ -81,9 +81,9 @@ rc_cmd $1
 
 The user is `_onboard`, created in the same shape as `_gmid`: a reserved numeric uid and gid, home `/var/empty`, shell `/sbin/nologin`, no group memberships beyond its own, and no `doas` rule. It must not be `_gmid`, because a fault in the form would then reach whatever `_gmid` can reach, and it must not be `www`, which is `slowcgi`'s default user. It takes the `default` login class rather than `daemon`, because `daemon` carries `openfiles-cur=128`, which is a connection limit for anything serving many applicants at once; the deploy sets it explicitly rather than inheriting it by accident.
 
-The trust boundary is the research note's. The handler reads its own state, its own log, and its socket directory, which is the one thing it has under the gmid chroot: the repository's config chroots to `/home/www`, so that directory sits inside the same `/home` until the hosting change from [#160](https://github.com/kyriakon/kyriakon-infra/issues/160) moves the chroot to `/var/www`. It reads no member's home and no `drafts` that are not its own, and it cannot read `/etc/ssl/private` because the private keys are root-only and gmid reads them before dropping privileges. It holds no provisioning credential: the drain does, under `/etc/kyriakon/onboard/`.
+The trust boundary is the research note's. The handler reads its own state, its own log, and its socket directory, which is the one thing it has under the gmid chroot: gmid chroots to `/home/www` (the hosting change from [#160](https://github.com/kyriakon/kyriakon-infra/issues/160) landed), so that directory sits inside the same `/home`. It reads no member's home and no `drafts` that are not its own, and it cannot read `/etc/ssl/private` because the private keys are root-only and gmid reads them before dropping privileges. It holds no provisioning credential: the drain does, under `/etc/kyriakon/onboard/`.
 
-The handler writes its log through the rc.d `daemon_logger` path and the deploy adds a `newsyslog.conf` entry with `count 7`, the same seven-day bound every other log on the box carries. The log holds the route with its token, the code and the client address, and never the query or an answer.
+The handler writes its log through the rc.d `daemon_logger` path, so its lines land in `/var/log/daemon`, which `openbsd/etc/newsyslog.conf` already bounds and which syslogd reopens without needing a signal, so the handler gets no entry of its own. The log holds the route with its token, the code and the client address, and never the query or an answer.
 
 ## The draft store
 
