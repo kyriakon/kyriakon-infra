@@ -30,8 +30,8 @@ Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box witho
 These procedures name the pieces that exist at this commit, and mark the ones that do not:
 
 - The onboarding service, its drain and the `onboardctl` command are decided in #156 and not built. Provisioning a member is manual until they land.
-- The per-member hosting configuration is merged into the repository and not applied: the chroot under `/home/www`, the generated vhost indexes, the port split that separates git from the chrooted sftp server, and the quota on `/home`. Applying it is a sequence of propose-only steps rather than a script, so it is done once, by hand, and the order is in the pull request that added it (#160).
-- The quota itself is scripted: `scripts/quota-apply.sh --enable` turns quotas on and `--all` applies the 5 GB allowance to the accounts that already exist. `scripts/add-user.sh` sets it at creation.
+- The per-member hosting configuration is merged into the repository and not applied: the chroot under `/home/www`, the generated vhost indexes, the port split that separates git from the chrooted sftp server. Applying it is a sequence of propose-only steps rather than a script, so it is done once, by hand, and the order is in the pull request that added it (#160).
+- The quota is scripted and has been applied: `scripts/quota-apply.sh --enable` turns quotas on and `--all` applies the 5 GB allowance to the accounts that already exist. `scripts/add-user.sh` sets it at creation.
 
   `/home` carries user quotas only, since every account has its own group of the same name. The boot-time check in `/etc/rc` runs `quotaon -a` without that restriction, so it prints one line about the missing `/home/quota.group` on every boot before it reports user quotas turned on. That line is expected, and it is the only place it appears, because `--enable` passes `-u` and stays quiet.
 - Per-member certificates and the queue that holds them against the Let's Encrypt refill rate are decided in #166 and not built. A member's own vhost has no certificate to serve yet.
@@ -183,11 +183,11 @@ Do not refuse inbound mail as the default, and do not edit `pf.conf` or `sshd_co
 
 ## When a member has died
 
-Nothing is released, and the ordinary paths apply. The rule in `docs/planning/specs/data-subject-requests.md` stands: a request from outside the account page is confirmed by the password or by a message signed with the member's key, and where neither can be produced the operator says so and does not answer as though identity were established. A bereaved family holds neither, so nothing can be handed over on their request.
+Nothing is released, and the ordinary paths apply. The rule in `docs/planning/specs/data-subject-requests.md` stands: a request from outside the account page is confirmed by the password or by a message from the account's own address signed with the member's key, and where neither can be produced the operator says so and does not answer as though identity were established. A bereaved family holds neither, so nothing can be handed over on their request.
 
 The platform holds nothing readable to hand over in any case: the mail is ciphertext under a key only the member holds, and the written record is the member's own data, whose one route out is the export the account page runs. The reply says both, that nothing is released and that nothing readable exists to release.
 
-The account then takes the ordinary sequence: the notices to every address held, the lapse for non-payment, the grace period of forty days, and deletion, which is the section below. A monastery or a parish as the member is the same, its account lapsing and deleting like any other, and a domain on the own-domain tier lapses with it. A free account never lapses, so a death on that tier is where the operator starts the closure from the account page and the same seven days apply.
+The account then takes the ordinary sequence: the notices to every address held, the lapse for non-payment, the 40-day grace, and deletion, which is the section below. A monastery or a parish as the member is the same, its account lapsing and deleting like any other, and a domain on the own-domain tier lapses with it. A free account never lapses, so no lapse and no grace period run for it, and the account stays until the operator closes it under the rule for one that has been unreachable and unused for a year, or a breach of the acceptable use policy closes it sooner.
 
 Decided in #276.
 
@@ -372,17 +372,16 @@ Do not delete files under `/home` to free space. The account lifecycle is the pa
 
 ### How much the box carries
 
-The box is a Hetzner `cx23` in `hel1`: 2 vCPU, 3.9 GiB of memory, and one 40 GB disk divided into partitions, of which `/home` is 8.2 GB. Every member is promised 5 GB, which is proposal 6.5 and is enforced: `/home` is mounted with quotas, `/home/quota.user` holds the records, and `scripts/quota-apply.sh` writes each account a soft 5 GB and a hard 5.5 GB limit. At that promise the partition holds one member and is nearly full at two. At what a member uses in practice, which is 2 MB of mail for the account on it now, it holds hundreds.
+The box is a Hetzner `cx23` in `hel1`: 2 vCPU, 3.9 GiB of memory, and one 40 GB disk divided into partitions, of which `/home` is 8.2 GB. Every member is promised 5 GB, which is proposal 6.5 and is enforced: `/home` is mounted with quotas, `/home/quota.user` holds the records, and `scripts/quota-apply.sh` writes each account a soft 5 GB and a hard 5.5 GB limit. At that promise the partition carries one member and two would overrun it, and at the 1.9 MB of mail the account on it now uses, it would carry thousands.
 
-The promise is the one that is sold, so the box's resource is grown when it becomes the wall rather than a member count being fixed in advance, and the choice between the two ways of growing it is made at the time: attaching a volume, or moving to a larger server type, which on a softraid box means a restore onto the new one rather than a move in place.
+The promise is the one that is sold, so the box's resource is grown when it becomes the wall rather than a member count being fixed in advance, and the choice between the two ways of growing it is made at the time: attaching a volume, or moving to a larger server type.
 
-The trigger is the `/home` partition, looked at in the quarterly pass beside the indirect-tax check:
+The trigger is the `/home` partition, looked at in the quarterly pass in `## Run the quarterly indirect-tax check`:
 
 	df -h /home
 	doas repquota -a
 
 At the same time, look at the storage box's usage in its console, because it holds the nightly repository and it is the only place a deleted account outlives its retention window. Approval is what rations the box, since a person approves every application before a payment link is sent, so no other count is needed. Decided in #275.
-
 
 ## When mail is not flowing
 
