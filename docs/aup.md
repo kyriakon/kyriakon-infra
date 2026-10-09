@@ -42,22 +42,30 @@ static hosting) fall outside that Act's "user-to-user service" definition, but w
 not rely on that to avoid removing illegal content when we become aware of it.
 
 **What the law prohibits, and what it does not.** This is our honest reading, not
-legal advice. The offences that most often bear on published speech are:
+legal advice, checked against legislation.gov.uk on 9 October 2026. The offences that most often bear on published speech are:
 
-- *Stirring up hatred.* The Hate Crime and Public Order (Scotland) Act 2021
-  criminalises threatening or abusive conduct that is intended to stir up hatred
-  against a group defined by age, disability, race, religion, sexual orientation,
-  or transgender identity. Note the two limits the statute itself draws: the
+- *Stirring up hatred.* In Scotland the Hate Crime and Public Order (Scotland) Act
+  2021, s 4, criminalises threatening or abusive conduct that is intended to stir
+  up hatred against a group defined by age, disability, race, religion, sexual orientation,
+  transgender identity, or variations in sex characteristics. S.S.I. 2026/150, made
+  but not yet in force, adds sex to that list on 5 April 2027. In England, Wales and
+  Northern Ireland the Public Order Act 1986 carries the equivalent offences, for
+  race, religion and sexual orientation, and its sections 18 to 21 were repealed in
+  Scotland on 1 April 2024. Note the two limits the statute itself draws: the
   conduct must be *threatening or abusive*, and it must be *intended* to stir up
   hatred. It expressly protects discussion and criticism of these matters, and
   expression of religious views, including views that others find offensive.
-- *Threats.* A threat of death or serious harm is illegal (Online Safety Act 2023
-  s181 and equivalent older offences).
+- *Threats.* A threat of death or serious harm is illegal under the Online Safety
+  Act 2023, s 181, in England, Wales and Northern Ireland, and under the Criminal
+  Justice and Licensing (Scotland) Act 2010, s 38, in Scotland.
 - *Knowingly false communications.* Sending information you know to be false, with
-  intent to cause non-trivial harm, is illegal (Online Safety Act 2023 s179).
-- *Grossly offensive or indecent communications.* The residual "grossly
-  offensive" offence (Communications Act 2003 s127, Malicious Communications Act
-  1988) is the vaguest of these and the one most abused in practice.
+  intent to cause non-trivial harm, is illegal under the Online Safety Act 2023,
+  s 179, in England, Wales and Northern Ireland.
+- *Grossly offensive or indecent communications.* The residual "grossly offensive"
+  offence (Communications Act 2003, s 127) covers the whole of the United Kingdom,
+  and the Malicious Communications Act 1988, s 1, adds an England and Wales offence
+  of sending an indecent or grossly offensive communication with intent to cause
+  distress. This is the vaguest of these and the one most abused in practice.
 
 **What you may say.** Sincere religious teaching, quotation of scripture,
 criticism of belief systems, and disagreement with prevailing views on sexuality,
