@@ -20,11 +20,11 @@ The TUI prints a first screen that says what it is, then walks the shared questi
 
 The instance is a stock `/usr/sbin/sshd` started with `-f /etc/ssh/sshd_config.onboard`, the file the repo keeps at `openbsd/etc/sshd_config.onboard`. It is a separate file, port, `PidFile` and account from the member sshd in `/etc/ssh/sshd_config`, which this change does not touch. It shares the box's host keys, because no `HostKey` line is set and sshd falls back to the same `/etc/ssh/ssh_host_*` files, so the box keeps one SSH identity.
 
-The file is applied by hand, like the member one, with `doas sshd -t -f /etc/ssh/sshd_config.onboard` and then an `rcctl restart kyriakon_onboard`. The port line carries the deploy value the build chose, written as `REPLACE_ME` in the repository and substituted from `/root/.kyriakon-env` at install.
+The file is applied by hand, like the member one, with `doas sshd -t -f /etc/ssh/sshd_config.onboard` and then an `rcctl restart kyriakon_onboard_sshd`. The port line carries the deploy value the build chose, written as `REPLACE_ME` in the repository and substituted from `/root/.kyriakon-env` at install.
 
 ```ssh_config
 # /etc/ssh/sshd_config.onboard
-# The applicant-facing sshd, run by /etc/rc.d/kyriakon_onboard. Separate file,
+# The applicant-facing sshd, run by /etc/rc.d/kyriakon_onboard_sshd. Separate file,
 # port, PidFile and account from the member sshd in /etc/ssh/sshd_config, which
 # is not touched. Reviewed line by line and applied by hand.
 
@@ -106,7 +106,7 @@ and `cap_mkdb /etc/login.conf` builds the database. Without the class the accoun
 
 ### The rc.d unit
 
-The unit is the stock `sshd` script with the second flag set, kept in the repo at `openbsd/etc/rc.d/kyriakon_onboard` and installed to `/etc/rc.d/kyriakon_onboard`:
+The unit is the stock `sshd` script with the second flag set, kept in the repo at `openbsd/etc/rc.d/kyriakon_onboard_sshd` and installed to `/etc/rc.d/kyriakon_onboard_sshd`. The name says which process it supervises: `kyriakon_onboard` is the onboarding handler's own unit, named after the binary it runs, and this is the second sshd instance beside it, so neither name can be mistaken for the other at an `rcctl` prompt:
 
 ```ksh
 #!/bin/ksh
@@ -129,7 +129,7 @@ rc_pre() {
 rc_cmd $1
 ```
 
-The operator enables it with `rcctl enable kyriakon_onboard`, starts it with `rcctl start kyriakon_onboard`, and applies a later config change with `rcctl reload kyriakon_onboard`, which `rc.subr` sends as `HUP` after running the config test above. The unit answers `rcctl` like any other OpenBSD service, so the runbook's service commands work on it unchanged.
+The operator enables it with `rcctl enable kyriakon_onboard_sshd`, starts it with `rcctl start kyriakon_onboard_sshd`, and applies a later config change with `rcctl reload kyriakon_onboard_sshd`, which `rc.subr` sends as `HUP` after running the config test above. The unit answers `rcctl` like any other OpenBSD service, so the runbook's service commands work on it unchanged.
 
 ## The port and the firewall
 

@@ -326,7 +326,7 @@ When it fails:
 2. Check that the web server is up and that the challenge directory exists.
 
 		doas rcctl check httpd
-		ls -d /var/www/acme
+		ls -d /home/www/acme
 
    `httpd.conf` serves the challenge from that directory, and `acme-client` writes the file there. `acme-client` implements the `http-01` challenge only, so a name that cannot be reached over port 80 cannot be validated.
 

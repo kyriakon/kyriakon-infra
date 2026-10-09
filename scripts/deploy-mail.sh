@@ -50,7 +50,7 @@ for f in openbsd/etc/smtpd.conf openbsd/etc/httpd.conf openbsd/etc/gmid.conf \
 	openbsd/etc/acme-client.conf \
 	openbsd/etc/rc.d/kyriakon_encrypt openbsd/dovecot/dovecot.conf \
 	openbsd/etc/spamd.alloweddomains openbsd/etc/spamd.conf openbsd/etc/nospamd \
-	openbsd/etc/kyriakon.env \
+	openbsd/etc/kyriakon.env openbsd/etc/newsyslog.conf \
 	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml keys scripts/setup-env.sh; do
 	[ -e "$repo_dir/$f" ] || { printf 'missing from repo_dir: %s\n' "$f" >&2; exit 1; }
 done
@@ -194,8 +194,23 @@ if [ -d /var/www/kyriakon.net ] || [ -d /var/www/oliver.kyriakon.net ]; then
 	printf '      Move it before relying on the site; the exact commands are in the\n' >&2
 	printf '      pull request that introduced /home/www.\n' >&2
 fi
+# Same move, different tree: httpd's logs follow its chroot, so the live files
+# are /home/www/logs and the pre-move archives under /var/www/logs are inert.
+# Nothing writes there now, and the newsyslog.conf installed below rotates the
+# live path, so those archives are safe to remove by hand.
+if [ -d /var/www/logs ]; then
+	printf 'note: /var/www/logs holds the pre-move log archives and nothing writes to it.\n' >&2
+	printf '      The live logs are /home/www/logs. Delete the stale tree when convenient:\n' >&2
+	printf '      doas rm -rf /var/www/logs\n' >&2
+fi
 install -m 0644 "$repo_dir/openbsd/etc/httpd.conf" /etc/httpd.conf
 install -m 0644 "$repo_dir/openbsd/etc/acme-client.conf" /etc/acme-client.conf
+
+# The log-rotation and retention bound. Installed whole rather than merged: it
+# carries the base system's entries as well as ours, because newsyslog has no
+# include, so a file holding only our own lines would stop rotating every log
+# that is not ours. See the file's header.
+install -m 0644 "$repo_dir/openbsd/etc/newsyslog.conf" /etc/newsyslog.conf
 httpd -n -f /etc/httpd.conf
 start_service httpd
 
