@@ -6,6 +6,8 @@
 #   1. Root's crontab lines for the scheduled scripts (the default mode).
 #   2. The generated indexes that httpd.conf, gmid.conf and acme-client.conf
 #      include, from the per-member files the signup path has written (--web).
+#      httpd and gmid are reloaded after a rewrite; acme-client is not, because
+#      it reads its configuration when it runs rather than holding it open.
 #
 # Runs ON the box as root:
 #
@@ -101,9 +103,9 @@ die() {
 
 # --- the generated vhost indexes (--web) ------------------------------------
 #
-# httpd.conf, gmid.conf and acme-client.conf each carry an include of a generated
-# index, and the index lists one file per member, because none of them can include
-# a directory: include opens a single path with fopen, and a directory path is read
+# httpd.conf and gmid.conf each carry an include of a generated index, and the
+# index lists one file per member, because no daemon in this stack can include a
+# directory: include opens a single path with fopen, and a directory path is read
 # as nothing rather than refused. The signup path writes the member files; this
 # rewrites the indexes and tells the daemons, and it does the whole directory in
 # one pass.
@@ -120,11 +122,6 @@ die() {
 # that is not there, because the drain writes each member file with
 # temp-then-rename and this reads the directory. A file that appears after the
 # index rewrite waits for the next pass, which is the harmless direction.
-#
-# acme-client is the exception to the reload: it is not a daemon and holds no
-# running copy of the config, so its index is rewritten and nothing is signalled.
-# It reads /etc/acme-client.conf, and so the index, on the next run of the
-# certificate queue.
 
 httpd_d=/etc/httpd.d
 gmid_d=/etc/gmid.d
@@ -170,63 +167,57 @@ regen_index() {
 }
 
 restore_indexes() {
-	for f in "$httpd_d/index.conf.saved.$$" "$gmid_d/index.conf.saved.$$" "$acme_d/index.conf.saved.$$"; do
+	for f in "$httpd_d/index.conf.saved.$$" "$gmid_d/index.conf.saved.$$" \
+		"$acme_d/index.conf.saved.$$"; do
 		[ -f "$f" ] || continue
 		mv "$f" "${f%.saved."$$"}"
 	done
 }
 
 apply_web() {
-	# changed is every index rewritten; reload is only the daemons that hold one,
-	# because acme-client is not a daemon and rereads its config on its next run.
 	changed=""
-	reload=""
-	regen_index "$httpd_d" && { changed="$changed httpd"; reload="$reload httpd"; }
-	regen_index "$gmid_d" && { changed="$changed gmid"; reload="$reload gmid"; }
-	# The acme-client directory arrives with the mail deploy. A box that has not
-	# run the deploy since this lane was added has none, and the lane is skipped
-	# with a note rather than aborting: the other two indexes are still worth
-	# rewriting, and the note names the gap.
-	if [ -d "$acme_d" ]; then
-		regen_index "$acme_d" && changed="$changed acme-client"
-	else
-		printf 'note: %s does not exist, so its index was not regenerated\n' "$acme_d" >&2
-	fi
-	if [ -z "$changed" ]; then
-		printf 'vhost indexes: nothing to change, nothing reloaded\n'
+	acme_changed=""
+	regen_index "$httpd_d" && changed="$changed httpd"
+	regen_index "$gmid_d" && changed="$changed gmid"
+	# acme-client.conf's index is rewritten the same way and keeps the same saved
+	# copy, but nothing is reloaded: acme-client is not a daemon, and it reads the
+	# file when it next runs. The parse is still checked on the box, by the daily
+	# renewal rather than here, since the check that names a bad member block is
+	# acme-client itself.
+	regen_index "$acme_d" && acme_changed=yes
+	if [ -z "$changed" ] && [ -z "$acme_changed" ]; then
+		printf 'generated indexes: nothing to change, nothing reloaded\n'
 		return 0
 	fi
-	printf 'indexes to rewrite:%s\n' "$changed"
+	printf 'indexes to rewrite:%s%s\n' "$changed" "${acme_changed:+ acme-client}"
 	if [ "$check_only" = yes ]; then
 		printf '\n--check: nothing was written and nothing was reloaded.\n'
 		return 0
 	fi
-	# Check each daemon config before reloading anything. rcctl runs the same
-	# configtest, but doing it here names the failing file while both daemons are
-	# still serving. Nothing is checked for acme-client: it is not a daemon, and a
-	# bad member block is rejected by the certificate queue on its next run rather
-	# than now.
-	if [ -n "$reload" ]; then
-		if ! httpd -n -f "$httpd_conf"; then
-			restore_indexes
-			die "${httpd_conf} does not check, so the running configuration was left alone"
-		fi
-		if ! gmid -n -c "$gmid_conf"; then
-			restore_indexes
-			die "${gmid_conf} does not check, so the running configuration was left alone"
-		fi
+	# Check both configs before either reload. rcctl runs the same configtest, but
+	# doing it here names the failing file while both daemons are still serving.
+	if ! httpd -n -f "$httpd_conf"; then
+		restore_indexes
+		die "${httpd_conf} does not check, so the running configuration was left alone"
 	fi
-	for d in $reload; do
+	if ! gmid -n -c "$gmid_conf"; then
+		restore_indexes
+		die "${gmid_conf} does not check, so the running configuration was left alone"
+	fi
+	for d in $changed; do
 		case "$d" in
 		httpd) rcctl reload httpd || die "rcctl reload httpd failed" ;;
 		gmid) rcctl reload gmid || die "rcctl reload gmid failed" ;;
 		esac
 	done
-	rm -f "$httpd_d/index.conf.saved.$$" "$gmid_d/index.conf.saved.$$" "$acme_d/index.conf.saved.$$"
-	if [ -n "$reload" ]; then
-		printf 'reloaded:%s\n' "$reload"
+	rm -f "$httpd_d/index.conf.saved.$$" "$gmid_d/index.conf.saved.$$" \
+		"$acme_d/index.conf.saved.$$"
+	if [ -n "$changed" ]; then
+		printf 'reloaded:%s\n' "$changed"
 	fi
-	printf 'indexes rewritten:%s\n' "$changed"
+	if [ -n "$acme_changed" ]; then
+		printf 'acme-client index rewritten; it reads the file at its next run, so nothing was reloaded\n'
+	fi
 }
 
 if [ "$web_only" = yes ]; then
