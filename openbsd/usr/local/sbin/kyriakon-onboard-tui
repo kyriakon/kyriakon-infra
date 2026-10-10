@@ -1,0 +1,1647 @@
+#!/bin/ksh
+# kyriakon-onboard-tui: the program an applicant's ssh session runs.
+#
+# Installed to /usr/local/sbin/kyriakon-onboard-tui, the path
+# openbsd/etc/login.conf.d/onboard gives the account as its session shell and the
+# path openbsd/etc/sshd_config.onboard pins with ForceCommand, so a connection to
+# the onboarding instance lands here and nowhere else. The source is kept under
+# openbsd/usr/local/sbin/ for the reason the box's configs are kept under
+# openbsd/etc/: the directory mirrors the tree on the box, so the install line is
+# the path and there is nothing to work out. No deploy installs it; it is
+# installed by hand, 0755 root:wheel:
+#
+#   doas install -m 0755 openbsd/usr/local/sbin/kyriakon-onboard-tui \
+#       /usr/local/sbin/kyriakon-onboard-tui
+#
+# The session, in the order the applicant meets it: a first screen that says what
+# this is, the shared question list one question at a time with a counter, the
+# key walkthrough, a summary to confirm, and one intent filed through the
+# onboarding handler, whose token and status address it hands back.
+#
+# What it never does, and the spec's list is the contract: it gives no shell, it
+# generates no key and never sees a private key, it writes nothing anywhere, it
+# logs no address and no answer, it never asks whether a username exists, it holds
+# no privilege and no secret, and it files nothing until the applicant confirms.
+# It cannot read the store, a member's files or the handler's records: its one
+# reach is an HTTP POST to the handler on loopback, which validates every field
+# again, so a bug here cannot become a privileged write.
+#
+# The questions, the prompts and the answer options are not in this file. They
+# are the shared list at /var/db/onboard/questions.tsv, installed by
+# scripts/onboard-store.sh, and this program renders whatever is there. The answer
+# types, the branches and the validation rule names are the ones
+# onboard/src/questions.rs and onboard/src/validate.rs define, and the refusals
+# are worded as validate.rs words them, so the SSH applicant and the web applicant
+# are refused in the same words.
+#
+# Nothing here is written to disk: no temporary file, no draft, no counter. The
+# account has no home and this ticket's work allows it no writable directory of
+# its own, so the answers live in shell variables for the life of the connection
+# and a dropped connection costs them and nothing else.
+#
+# Used by sshd with no arguments, and no argument can come from a client:
+# sshd_config(5)'s ForceCommand "ignor[es] any command supplied by the client",
+# which is why the flags below are a testing seam rather than a lever. By hand:
+#
+#   ksh kyriakon-onboard-tui [--questions PATH] [--reserved PATH] [--handler URL]
+#   ksh kyriakon-onboard-tui --self-test
+#
+# --self-test exercises the question list's parsing and every refusal it makes,
+# each validation rule, the branch counters, the summary, the token out of a
+# canned reply, and six scripted sessions against a stub handler: one that files,
+# one that leaves, one whose connection drops, the body path with a key per
+# mailbox, one that shows the fingerprint the shared check returns, and one that
+# is refused and re-asked. All of it without a terminal, a network or root. What
+# it cannot exercise is on the ticket: the real sshd session over the network,
+# and the live handler.
+#
+# Exit: 0 the session ended with quit or with an application filed; 1 the
+# connection dropped before the end, or the box is not ready to take one.
+
+set -euo pipefail
+
+script_dir=$(cd "$(dirname "$0")" && pwd)
+
+# The two shared lists, installed 0644 root:wheel by scripts/onboard-store.sh, and
+# read by all three front-ends. The handler's own config names its loopback
+# address and port, so the port is read from there rather than copied here: it is
+# a per-box value and a second copy of it is a second thing to get wrong.
+questions_file=/var/db/onboard/questions.tsv
+reserved_file=/var/db/onboard/reserved-usernames.txt
+handler_config=/etc/onboard/onboard.toml
+handler_url=""
+
+# The native half of the key check: the crate the browser walkthrough builds to
+# WASM (#185), built natively where this program can reach it (ticket #329). This
+# program holds no OpenPGP parser and computes no fingerprint of its own, and it
+# will not invent one when the answer is not there. The variable exists for
+# --self-test; an applicant cannot set it, because the onboard sshd instance
+# carries no AcceptEnv, so sshd never passes a client's variables into a session.
+keycheck=${KYRIAKON_KEYCHECK:-/usr/local/libexec/kyriakon-onboard-keycheck}
+
+# The site's own name, used as itself, and the one route that writes an intent.
+# Both are onboard/src/main.rs's: the status link is on signup.kyriakon.net and a
+# submission is a POST to /apply, the route the web form posts to, so there is one
+# intent writer rather than one per front end.
+host=signup.kyriakon.net
+apply_path=/apply
+
+# One array per column of the question list, indexed by file order, so the file's
+# order is the order the applicant is asked and nothing here sorts or groups.
+typeset -a id_of prompt_of type_of branch_of required_of rule_of
+typeset -a shown_at
+typeset -A answers is_reserved
+q_count=0
+shown_count=0
+is_body=0
+is_monastic=0
+walkthrough_shown=0
+client_ip=""
+status_token=""
+validate_reason=""
+answer=""
+
+usage() {
+	printf 'usage: %s [--questions PATH] [--reserved PATH] [--handler URL]\n       %s --self-test\n' \
+		"$0" "$0" >&2
+	exit 2
+}
+
+# unavailable <reason>: one applicant-facing apology for every broken-install
+# state. The reason is printed first because an ssh session has one channel, so
+# the operator testing by hand sees it too; it never names a secret, and nothing
+# an applicant typed is kept either way.
+unavailable() {
+	printf 'kyriakon-onboard-tui: %s\n' "$1" >&2
+	cat <<'EOF'
+
+This screen cannot take an application at the moment. Nothing you typed has been
+kept.
+
+The form at https://signup.kyriakon.net asks the same questions and needs no
+terminal.
+EOF
+	exit 1
+}
+
+# leaving: the applicant's own exit. Said plainly, because a session that ends
+# with the prompt closing looks like a failure.
+leaving() {
+	printf '\nLeft without filing anything. Nothing you typed has been kept.\n'
+	printf 'The form at https://%s is there whenever you want it.\n' "$host"
+}
+
+# clean <text>: the text as the applicant meant it. The session has no pty, so
+# what arrives is what the applicant's own console produced, and a Windows client
+# sends CR LF: the CR comes off. Whitespace at either end is not part of an
+# answer. Every rule is reasoned over the cleaned text and the cleaned text is
+# what is filed.
+clean() {
+	typeset s=$1
+	s=${s//$'\r'/}
+	s=${s#"${s%%[![:space:]]*}"}
+	s=${s%"${s##*[![:space:]]}"}
+	printf '%s' "$s"
+}
+
+# ask_line: read one line. Returns 1 at end of input, which is the dropped
+# connection the spec says costs the answers and nothing else.
+ask_line() {
+	if IFS= read -r answer; then
+		return 0
+	fi
+	return 1
+}
+
+# parse_list <file>: the question list, validated and echoed with its six columns
+# tab separated, one record per line, in file order. Every refusal names the line
+# it came from: a question that disappears silently is a question no front-end
+# asks. The checks are onboard/src/questions.rs's, and the header and the tokens
+# are the ones the three front-ends share.
+parse_list() {
+	awk -F'\t' -v OFS='\t' '
+	function bad(msg) {
+		printf "kyriakon-onboard-tui: the question list: %s\n", msg > "/dev/stderr"
+		stop = 1
+		exit 1
+	}
+	BEGIN {
+		header = "id\tprompt\ttype\tbranch\trequired\tvalidation"
+		seen = 0
+		stop = 0
+	}
+	/^[[:space:]]*$/ { next }
+	{
+		if (!seen) {
+			seen = 1
+			line = $0
+			sub(/[[:space:]]+$/, "", line)
+			if (line != header)
+				bad("the header is not id, prompt, type, branch, required, validation")
+			next
+		}
+		if (NF != 6) bad("line " FNR " has " NF " fields, expected 6")
+		if ($3 != "text" && $3 != "choice" && $3 != "yesno" && $3 != "multiline" &&
+		    $3 != "addresses" && $3 != "key" && $3 != "acceptance")
+			bad("line " FNR ": unknown answer type " $3)
+		if ($4 != "all" && $4 != "person" && $4 != "body" && $4 != "monastic")
+			bad("line " FNR ": unknown branch " $4)
+		if ($5 != "yes" && $5 != "no") bad("line " FNR ": required is " $5)
+		rule = $6
+		if (rule ~ /^choice:/) {
+			n = split(substr(rule, 8), opt, "|")
+			for (k = 1; k <= n; k++) {
+				if (opt[k] !~ /=/) bad("line " FNR ": choice option " opt[k] " is not value=label")
+				v = opt[k]
+				sub(/=.*/, "", v)
+				l = opt[k]
+				sub(/^[^=]*=/, "", l)
+				if (v == "" || l == "")
+					bad("line " FNR ": choice option " opt[k] " has an empty value or label")
+			}
+		} else if (rule ~ /^maxlen:/) {
+			if (substr(rule, 8) !~ /^[0-9]+$/)
+				bad("line " FNR ": maxlen needs a number, got " substr(rule, 8))
+		} else if (rule != "none" && rule != "username" && rule != "usernames" &&
+			   rule != "address" && rule != "domain" && rule != "mail-key" &&
+			   rule != "upload-key")
+			bad("line " FNR ": unknown validation " rule)
+		print $1, $2, $3, $4, $5, $6
+	}
+	END {
+		if (!stop && !seen) {
+			printf "kyriakon-onboard-tui: the question list is empty\n" > "/dev/stderr"
+			exit 1
+		}
+	}
+	' "$1"
+}
+
+# load_questions: read the installed list into the per-column arrays.
+load_questions() {
+	typeset list
+	if [ ! -r "$questions_file" ]; then
+		unavailable "the question list at $questions_file cannot be read"
+	fi
+	if ! list=$(parse_list "$questions_file"); then
+		unavailable "the question list at $questions_file could not be read"
+	fi
+	q_count=0
+	while IFS=$'\t' read -r id prompt kind branch required rule; do
+		if [ -z "$id" ]; then
+			continue
+		fi
+		q_count=$((q_count + 1))
+		id_of[q_count]=$id
+		prompt_of[q_count]=$prompt
+		type_of[q_count]=$kind
+		branch_of[q_count]=$branch
+		required_of[q_count]=$required
+		rule_of[q_count]=$rule
+	done <<<"$list"
+	if [ "$q_count" -eq 0 ]; then
+		unavailable "the question list at $questions_file has no questions"
+	fi
+}
+
+# load_reserved: the reserved set, one name per line, `#` comments and blank lines
+# skipped, folded to lowercase, exactly as onboard/src/validate.rs reads it. The
+# set is checked live for format and reserved names, and existence is never
+# checked at all: that is the no-oracle rule.
+load_reserved() {
+	typeset list name
+	if [ ! -r "$reserved_file" ]; then
+		unavailable "the reserved names file at $reserved_file cannot be read"
+	fi
+	if ! list=$(awk '
+		/^[[:space:]]*#/ { next }
+		{
+			gsub(/^[[:space:]]+/, "")
+			gsub(/[[:space:]]+$/, "")
+			if ($0 != "") print tolower($0)
+		}
+	' "$reserved_file"); then
+		unavailable "the reserved names file at $reserved_file could not be read"
+	fi
+	while IFS= read -r name; do
+		if [ -z "$name" ]; then
+			continue
+		fi
+		is_reserved[$name]=1
+	done <<<"$list"
+}
+
+# resolve_handler: the handler's address. Taken from its own config rather than
+# carried here, so one value on the box decides where the intent goes; --handler
+# is the test seam and is never passed on a live box.
+resolve_handler() {
+	typeset listen port
+	if [ -n "$handler_url" ]; then
+		return 0
+	fi
+	if [ ! -r "$handler_config" ]; then
+		unavailable "the onboarding handler's config at $handler_config cannot be read"
+	fi
+	listen=$(awk -F= '/^[[:space:]]*listen[[:space:]]*=/ {
+		gsub(/[[:space:]\"]/, "", $2); print $2; exit }' "$handler_config")
+	port=$(awk -F= '/^[[:space:]]*port[[:space:]]*=/ {
+		gsub(/[^0-9]/, "", $2); print $2; exit }' "$handler_config")
+	if [ -z "$listen" ] || [ -z "$port" ]; then
+		unavailable "$handler_config names no listen address and port"
+	fi
+	handler_url="http://$listen:$port"
+	return 0
+}
+
+# branch_for_answers: the path the applicant has chosen so far. `whose` is the
+# second question and its answer opens the community block; `orders` selects the
+# monastic path, which is what makes the elder's or confessor's blessing required
+# (onboard/src/questions.rs is_monastic).
+branch_for_answers() {
+	case ${answers[whose]:-} in
+	body) is_body=1 ;;
+	*) is_body=0 ;;
+	esac
+	case ${answers[orders]:-} in
+	monk | nun) is_monastic=1 ;;
+	*) is_monastic=0 ;;
+	esac
+}
+
+# derive: the questions this applicant's path actually asks, in the file's order,
+# into shown_id. A monastic question is asked only on the monastic path, which is
+# what makes the blessing move the counter; until the branch question is answered
+# the path is the individual one, so the individual count is what the counter
+# shows. The total is therefore the number of questions this applicant will be
+# asked, not a fixed number.
+derive() {
+	typeset i show
+	shown_count=0
+	i=1
+	while [ "$i" -le "$q_count" ]; do
+		case ${branch_of[$i]} in
+		all) show=1 ;;
+		person)
+			if [ "$is_body" = 0 ]; then show=1; else show=0; fi
+			;;
+		body)
+			if [ "$is_body" = 1 ]; then show=1; else show=0; fi
+			;;
+		monastic)
+			if [ "$is_monastic" = 1 ]; then show=1; else show=0; fi
+			;;
+		*) show=0 ;;
+		esac
+		if [ "$show" = 1 ]; then
+			shown_count=$((shown_count + 1))
+			shown_at[shown_count]=$i
+		fi
+		i=$((i + 1))
+	done
+}
+
+# username_reason <name>: the username rule, set into validate_reason. The shape
+# is the charset scripts/add-user.sh enforces and the wording is
+# onboard/src/validate.rs's, reserved set included, existence never checked.
+username_reason() {
+	typeset v=$1
+	validate_reason=""
+	if [ "${#v}" -gt 32 ]; then
+		validate_reason='a username is at most 32 characters'
+		return 0
+	fi
+	case $v in
+	[!a-z0-9]*)
+		validate_reason='a username starts with a lowercase letter or a digit'
+		return 0
+		;;
+	esac
+	case $v in
+	*[!a-z0-9._-]*)
+		validate_reason='a username is lowercase letters, digits, dot, underscore and hyphen'
+		return 0
+		;;
+	esac
+	if [ -n "${is_reserved[$v]:-}" ]; then
+		validate_reason='that name is held back by the platform'
+	fi
+	return 0
+}
+
+# usernames_reason <lines>: one name per line, each checked exactly as a single
+# username is, reserved set included, and the refusal names the offending line:
+# these lines become OS account names, created as root by the drain.
+usernames_reason() {
+	typeset line
+	validate_reason=""
+	while IFS= read -r line; do
+		line=$(clean "$line")
+		if [ -z "$line" ]; then
+			continue
+		fi
+		username_reason "$line"
+		if [ -n "$validate_reason" ]; then
+			validate_reason="the name \"$line\": $validate_reason"
+			return 0
+		fi
+	done <<<"$1"
+	return 0
+}
+
+# address_reason <address>: one address outside the platform, for the contact
+# address an applicant offers. One `@`, both sides present, no whitespace in the
+# domain, and a dot in it.
+address_reason() {
+	typeset v=$1 localpart domain rest
+	validate_reason='an address outside this platform is one, like someone@example.invalid'
+	case $v in
+	*@*) ;;
+	*) return 0 ;;
+	esac
+	localpart=${v%%@*}
+	rest=${v#*@}
+	domain=${rest%%@*}
+	case $rest in
+	*@*) return 0 ;;
+	esac
+	if [ -z "$localpart" ] || [ -z "$domain" ]; then
+		return 0
+	fi
+	case $domain in
+	*[[:space:]]*) return 0 ;;
+	esac
+	case $domain in
+	*.*) ;;
+	*) return 0 ;;
+	esac
+	validate_reason=""
+	return 0
+}
+
+# domain_reason <domain>: a dotted hostname. This value is the group key the drain
+# writes under and the DNS and certificate material, so a traversal or a space
+# must not reach it: lowercase letters, digits and hyphen, each label at most 63
+# characters and not beginning or ending with a hyphen, at least two labels.
+domain_reason() {
+	typeset v=$1 label n=0
+	validate_reason=""
+	while [ -n "$v" ]; do
+		case $v in
+		*.*)
+			label=${v%%.*}
+			v=${v#*.}
+			;;
+		*)
+			label=$v
+			v=""
+			;;
+		esac
+		n=$((n + 1))
+		if [ -z "$label" ]; then
+			validate_reason='a domain has no empty labels'
+			return 0
+		fi
+		if [ "${#label}" -gt 63 ]; then
+			validate_reason='a domain label is at most 63 characters'
+			return 0
+		fi
+		case $label in
+		*[!a-z0-9-]*)
+			validate_reason="the domain label \"$label\" is not lowercase letters, digits and hyphen"
+			return 0
+			;;
+		esac
+		case $label in
+		-* | *-)
+			validate_reason="the domain label \"$label\" begins or ends with a hyphen"
+			return 0
+			;;
+		esac
+	done
+	if [ "$n" -lt 2 ]; then
+		validate_reason='a domain has at least two labels, like theirparish.example'
+	fi
+	return 0
+}
+
+# mail_key_reason <material>: the armoured framing, and only that. This program
+# holds no OpenPGP parser: the structural reading is onboard/src/keycheck.rs's and
+# the three conditions that break delivery are the shared crate's, which ticket
+# #329 brings into this program. What is refused here is what the handler refuses,
+# text that is not an armoured public key block at all, so an applicant can fix it
+# on this screen rather than at the end.
+mail_key_reason() {
+	validate_reason=""
+	case $1 in
+	*"-----BEGIN PGP PUBLIC KEY BLOCK-----"*) ;;
+	*)
+		validate_reason='this is not an armoured PGP public key block'
+		return 0
+		;;
+	esac
+	case $1 in
+	*"-----END PGP PUBLIC KEY BLOCK-----"*) ;;
+	*)
+		validate_reason='this is not an armoured PGP public key block'
+		return 0
+		;;
+	esac
+	return 0
+}
+
+# upload_key_reason <line>: the shape sftp and git will accept, which is what
+# onboard/src/keycheck.rs checks and all it checks. The mail check does not apply
+# to an upload key.
+upload_key_reason() {
+	typeset kind rest blob
+	validate_reason=""
+	read -r kind rest <<<"$1"
+	if [ -z "$kind" ]; then
+		validate_reason='an upload key is needed'
+		return 0
+	fi
+	case $kind in
+	ssh-* | ecdsa-sha2-* | sk-*) ;;
+	*)
+		validate_reason='this is not an OpenSSH public key'
+		return 0
+		;;
+	esac
+	# The material is the second whitespace separated field; the comment after it
+	# is the applicant's own and is not part of the key.
+	blob=${rest%% *}
+	if [ -z "$blob" ]; then
+		validate_reason='the upload key has no key material'
+		return 0
+	fi
+	case $blob in
+	*[!A-Za-z0-9+/=]*)
+		validate_reason="the upload key's material does not decode"
+		return 0
+		;;
+	esac
+	return 0
+}
+
+# choice_reason <options> <answer>: the answer has to be one of the values the
+# question offers, which is where its answers live, because the fixed format has
+# no column for them.
+choice_reason() {
+	typeset list=$1 opt value
+	validate_reason='choose one of the answers offered'
+	while [ -n "$list" ]; do
+		opt=${list%%'|'*}
+		case $list in
+		*'|'*) list=${list#*'|'} ;;
+		*) list="" ;;
+		esac
+		value=${opt%%=*}
+		if [ "$value" = "$2" ]; then
+			validate_reason=""
+			return 0
+		fi
+	done
+	return 0
+}
+
+# validate <file index> <answer>: sets validate_reason, empty when the answer is
+# acceptable. The rule is the file's, named rather than carried, and the refusals
+# are the ones onboard/src/validate.rs gives, so the two front-ends agree.
+validate() {
+	typeset which=$1 value=$2
+	typeset rule=${rule_of[$which]} id=${id_of[$which]} required=${required_of[$which]}
+	validate_reason=""
+	if [ -z "$value" ]; then
+		if [ "$required" = no ]; then
+			return 0
+		fi
+		if [ "$rule" = username ]; then
+			validate_reason='a username is needed'
+		else
+			validate_reason='this is needed'
+		fi
+		return 0
+	fi
+	case $rule in
+	none) ;;
+	username) username_reason "$value" ;;
+	usernames) usernames_reason "$value" ;;
+	address) address_reason "$value" ;;
+	domain) domain_reason "$value" ;;
+	mail-key) mail_key_reason "$value" ;;
+	upload-key) upload_key_reason "$value" ;;
+	choice:*) choice_reason "${rule#choice:}" "$value" ;;
+	maxlen:*)
+		if [ "${#value}" -gt "${rule#maxlen:}" ]; then
+			validate_reason="at most ${rule#maxlen:} characters"
+		fi
+		;;
+	*) ;;
+	esac
+	# An `acceptance` question is the agreement itself, and the file's rule for it
+	# is `none`, so the one value that files an application is the one the web
+	# form's checkbox sends. The type is the file's, not this program's invention.
+	if [ "${type_of[$which]}" = acceptance ] && [ "$validate_reason" = "" ] &&
+		[ "$value" != yes ]; then
+		validate_reason='type yes to accept this, or quit to leave without filing'
+	fi
+	return 0
+}
+
+# option_label <options> <value>: the label shown for one answer, so a choice is
+# read as the words the applicant knows rather than as the token that is filed.
+option_label() {
+	typeset list=$1 opt value label
+	while [ -n "$list" ]; do
+		opt=${list%%'|'*}
+		case $list in
+		*'|'*) list=${list#*'|'} ;;
+		*) list="" ;;
+		esac
+		value=${opt%%=*}
+		label=${opt#*=}
+		if [ "$value" = "$2" ]; then
+			printf '%s' "$label"
+			return 0
+		fi
+	done
+	printf '%s' "$2"
+	return 0
+}
+
+# print_options <options>: the answers a choice question offers, numbered, with
+# the number accepted as well as the value, because nobody should have to type
+# `no_charge` correctly to answer a question.
+print_options() {
+	typeset list=$1 opt n=0
+	while [ -n "$list" ]; do
+		opt=${list%%'|'*}
+		case $list in
+		*'|'*) list=${list#*'|'} ;;
+		*) list="" ;;
+		esac
+		n=$((n + 1))
+		printf '  %s. %s\n' "$n" "${opt#*=}"
+	done
+	return 0
+}
+
+# option_value_by_number <options> <n>: the value behind the number printed above.
+option_value_by_number() {
+	typeset list=$1 want=$2 opt n=0
+	while [ -n "$list" ]; do
+		opt=${list%%'|'*}
+		case $list in
+		*'|'*) list=${list#*'|'} ;;
+		*) list="" ;;
+		esac
+		n=$((n + 1))
+		if [ "$n" = "$want" ]; then
+			printf '%s' "${opt%%=*}"
+			return 0
+		fi
+	done
+	printf '%s' "$2"
+	return 0
+}
+
+# read_key_block: one pasted public key, to the armour's own last line, so a long
+# key needs no terminator typed after it and the paste that can fail on the
+# capsule's 1024 byte prompt cannot fail here. An OpenSSH key is one line and is
+# the whole block. Sets $block. Returns 1 at end of input.
+read_key_block() {
+	typeset line
+	block=""
+	if ! ask_line; then
+		return 1
+	fi
+	line=$(clean "$answer")
+	if [ -z "$line" ]; then
+		return 0
+	fi
+	block=$line
+	case $line in
+	*"-----BEGIN PGP PUBLIC KEY BLOCK-----"*)
+		while :; do
+			if ! ask_line; then
+				return 1
+			fi
+			line=$(clean "$answer")
+			block="$block
+$line"
+			case $line in
+			*"-----END PGP PUBLIC KEY BLOCK-----"*) break ;;
+			esac
+		done
+		;;
+	esac
+	return 0
+}
+
+# mailbox_list <text>: the body's account names, trimmed and with blank lines
+# dropped, in the order given. The handler pairs one key with one mailbox in that
+# same order (onboard/src/main.rs mail_key_errors), so the question asks for the
+# blocks one mailbox at a time and names each.
+mailbox_list() {
+	printf '%s\n' "$1" | awk '{
+		gsub(/^[[:space:]]+/, "")
+		gsub(/[[:space:]]+$/, "")
+		if ($0 != "") print
+	}'
+}
+
+# ask_question <position>: print the counter and the question, read the answer and
+# refuse it on the same screen with the reason. Returns 0 answered, 1 the
+# connection dropped, 2 quit, 3 back.
+ask_question() {
+	typeset pos=$1 which=${shown_at[$1]} id=${id_of[${shown_at[$1]}]}
+	typeset kind=${type_of[${shown_at[$1]}]} rule=${rule_of[${shown_at[$1]}]}
+	typeset first=1 line block blocks want=1 block_count n mailbox
+	answer=""
+	while :; do
+		if [ "$first" = 1 ]; then
+			printf '\nquestion %s of %s\n\n' "$pos" "$shown_count"
+			printf '%s\n' "${prompt_of[$which]}"
+			case $kind in
+			choice | yesno)
+				printf '\n'
+				print_options "${rule#choice:}"
+				;;
+			acceptance)
+				printf '\n  type yes to accept this\n'
+				;;
+			multiline | addresses)
+				printf '\n  one answer per line; a line holding a single full stop ends it\n'
+				;;
+			key)
+				printf '\n  paste the key; it ends at its own last line\n'
+				;;
+			esac
+			printf '\n'
+			first=0
+		else
+			printf '\n%s\n\n' "$validate_reason"
+			printf '%s\n\n' "${prompt_of[$which]}"
+		fi
+		case $kind in
+		multiline | addresses)
+			block=""
+			while :; do
+				if ! ask_line; then
+					return 1
+				fi
+				line=$(clean "$answer")
+				if [ "$line" = "." ]; then
+					break
+				fi
+				if [ -n "$block" ]; then
+					block="$block
+$line"
+				else
+					block=$line
+				fi
+			done
+			answer=$block
+			;;
+		key)
+			# A body gives one block per mailbox and one question holds them all,
+			# so the blocks are pasted one after another, each named for the
+			# mailbox the handler will pair it with: onboard/src/main.rs
+			# mail_key_errors pairs the blocks with body_account_names in the
+			# order given. A person's single key is one block and no second
+			# prompt.
+			want=1
+			if [ "$id" = body_mail_key ]; then
+				want=$(mailbox_list "${answers[body_account_names]:-}" |
+					awk 'NF { n++ } END { print n + 0 }')
+				if [ "$want" -eq 0 ]; then
+					want=1
+				fi
+			fi
+			# The blocks accumulate in their own name: each read leaves the line
+			# it read in $answer, so $answer cannot hold the paste.
+			blocks=""
+			n=1
+			while [ "$n" -le "$want" ]; do
+				if [ "$want" -gt 1 ]; then
+					mailbox=$(mailbox_list "${answers[body_account_names]:-}" |
+						awk -v want="$n" 'NF { k++; if (k == want) print }')
+					printf 'key %s of %s, for %s\n' "$n" "$want" "$mailbox"
+				fi
+				if ! read_key_block; then
+					return 1
+				fi
+				if [ -z "$block" ]; then
+					# An empty paste is left to the rule, which refuses it in the
+					# handler's own words.
+					break
+				fi
+				if [ -z "$blocks" ]; then
+					blocks=$block
+				else
+					blocks="$blocks
+$block"
+				fi
+				n=$((n + 1))
+			done
+			answer=$blocks
+			;;
+		*)
+			if ! ask_line; then
+				return 1
+			fi
+			answer=$(clean "$answer")
+			;;
+		esac
+		case $answer in
+		back) return 3 ;;
+		quit) return 2 ;;
+		esac
+		# An empty line on a question that already has an answer keeps it: that is
+		# what going `back` is for, and re-typing an answer to change one word in
+		# it is not how anyone fixes a typo.
+		if [ -z "$answer" ] && [ -n "${answers[$id]:-}" ]; then
+			answer=${answers[$id]}
+		fi
+		if [ "$kind" = choice ] || [ "$kind" = yesno ]; then
+			# The number an option was printed as is accepted, and so is its value:
+			# nobody should have to spell `no_charge` to answer a question.
+			case $answer in
+			'' | *[!0-9]*) ;;
+			*) answer=$(option_value_by_number "${rule#choice:}" "$answer") ;;
+			esac
+		fi
+		# A body's keys are counted here as the handler counts them, so a missing
+		# block is refused on this screen rather than by the handler at the end.
+		validate_reason=""
+		if [ "$kind" = key ] && [ "${want:-1}" -gt 1 ]; then
+			block_count=$(printf '%s\n' "$answer" |
+				awk '/^-----BEGIN PGP PUBLIC KEY BLOCK-----$/ { n++ } END { print n + 0 }')
+			if [ "$block_count" -ne "$want" ]; then
+				validate_reason="one key per mailbox: $want mailboxes and $block_count keys"
+			fi
+		fi
+		if [ -z "$validate_reason" ]; then
+			validate "$which" "$answer"
+		fi
+		if [ -z "$validate_reason" ]; then
+			answers[$id]=$answer
+			return 0
+		fi
+	done
+	return 0
+}
+
+# fingerprints <material>: one fingerprint per armoured block, in the order the
+# blocks were pasted, from the shared crate's native build. Prints nothing when
+# there is no checker installed or it cannot read the key, because a fingerprint
+# this program cannot compute is one it must not invent.
+fingerprints() {
+	typeset out line
+	if [ ! -x "$keycheck" ]; then
+		return 0
+	fi
+	if ! out=$(printf '%s\n' "$1" | "$keycheck" --fingerprints 2>/dev/null); then
+		return 0
+	fi
+	while IFS= read -r line; do
+		if [ -z "$line" ]; then
+			continue
+		fi
+		printf '%s\n' "$line"
+	done <<<"$out"
+	return 0
+}
+
+# print_answer <file index> <answer>: one line of the confirm screen. A key's
+# material is not shown again: the applicant has just pasted it, and the
+# fingerprint is the part of it they need to compare against their own client.
+print_answer() {
+	typeset which=$1 value=$2 came=""
+	if [ -z "$value" ]; then
+		value='(nothing)'
+	fi
+	case ${type_of[$which]} in
+	key)
+		printf '%s:\n' "${prompt_of[$which]}"
+		came=$(fingerprints "$value")
+		if [ -n "$came" ]; then
+			printf '%s\n' "$came" | awk '{ printf "  %s\n", $0 }'
+		else
+			printf '  the fingerprint is not shown on this box\n'
+		fi
+		;;
+	choice | yesno)
+		# The words the option was offered as, not the token that is filed.
+		printf '%s: %s\n' "${prompt_of[$which]}" \
+			"$(option_label "${rule_of[$which]#choice:}" "$value")"
+		;;
+	*)
+		case $value in
+		*$'\n'*)
+			printf '%s:\n' "${prompt_of[$which]}"
+			printf '%s\n' "$value" | awk '{ printf "  %s\n", $0 }'
+			;;
+		*)
+			printf '%s: %s\n' "${prompt_of[$which]}" "$value"
+			;;
+		esac
+		;;
+	esac
+	return 0
+}
+
+# first_screen: what this is, that the web form is another way in and needs no
+# terminal, that a person reads every application, how to leave, and that it is
+# not a login. The only screen that makes a promise, and it makes the same one the
+# web form makes. Returns 0 to start, 1 the connection dropped, 2 the applicant
+# left.
+first_screen() {
+	cat <<'EOF'
+
+Kyriakon onboarding
+
+This is one of three ways to apply for a Kyriakon account. It is the SSH way.
+If you would rather not use a terminal, the same form is at
+https://signup.kyriakon.net and needs none.
+
+A person reads every application and decides. Nothing here is approved by a
+program, and nothing here asks you for a password or a key of ours.
+
+This is not a login. It files an application, or reads the status of one, and
+it cannot change anything.
+
+You can leave at any time with Ctrl-C or by closing the connection. Nothing is
+filed until you confirm at the end.
+
+Press Enter to start.
+EOF
+	while :; do
+		if ! ask_line; then
+			return 1
+		fi
+		answer=$(clean "$answer")
+		case $answer in
+		"") return 0 ;;
+		quit) return 2 ;;
+		*) printf '\nPress Enter to start, or type quit to leave.\n' ;;
+		esac
+	done
+	return 0
+}
+
+# walkthrough: the part of the key walkthrough that applies to the applicant's own
+# machine, printed once, before the first key question. It never makes a key and
+# never sees a private key: it says where to get one and what the public half is
+# for. The two upload ports are stated plainly, because without an upload key a
+# member gets mail and nothing else.
+walkthrough() {
+	cat <<'EOF'
+
+Making your key
+
+You need a key pair. The public half is what you paste; the private half stays on
+your machine and is never sent anywhere. Nothing here makes a key for you and
+nothing here ever sees the private half.
+
+Thunderbird on a desktop is the path most people take. It makes a key pair for
+you and keeps the private half in its own settings.
+
+If you would rather make one in a browser, the generator at
+https://signup.kyriakon.net runs on your own machine and hands you both halves.
+
+Keep the public half to paste at the next question. If you want a website as well
+as mail, you need a second, upload key: uploads arrive over sftp on port 22 and
+a pass repository arrives over git on port 2222. Both are key-based, so without
+an upload key you get mail and nothing else.
+EOF
+	return 0
+}
+
+# walk: the question list, one question at a time, with the counter the branch
+# decides. `back` returns to the previous question with the answer kept, and
+# `quit` leaves. Returns 0 when every question is answered, 1 the connection
+# dropped, 2 the applicant left.
+walk() {
+	typeset pos=1 status=0 kind
+	while :; do
+		branch_for_answers
+		derive
+		if [ "$pos" -gt "$shown_count" ]; then
+			return 0
+		fi
+		kind=${type_of[${shown_at[$pos]}]}
+		if [ "$kind" = key ] && [ "$walkthrough_shown" = 0 ]; then
+			walkthrough
+			walkthrough_shown=1
+		fi
+		ask_question "$pos" || status=$?
+		case $status in
+		0)
+			status=0
+			pos=$((pos + 1))
+			;;
+		3)
+			status=0
+			if [ "$pos" -gt 1 ]; then
+				pos=$((pos - 1))
+			else
+				printf '\nThis is the first question, so there is nothing before it.\n'
+			fi
+			;;
+		*)
+			return "$status"
+			;;
+		esac
+	done
+	return 0
+}
+
+# confirm: the answers once, with the key fingerprints, and then one decision.
+# Returns 0 confirmed, 1 the connection dropped, 2 the applicant left.
+confirm() {
+	typeset pos=1 which id
+	printf '\n\nCheck these over. Nothing is filed until you confirm.\n\n'
+	while [ "$pos" -le "$shown_count" ]; do
+		which=${shown_at[$pos]}
+		id=${id_of[$which]}
+		print_answer "$which" "${answers[$id]:-}"
+		pos=$((pos + 1))
+	done
+	printf '\nType confirm to file this application, or quit to leave without filing.\n'
+	while :; do
+		if ! ask_line; then
+			return 1
+		fi
+		answer=$(clean "$answer")
+		case $answer in
+		confirm) return 0 ;;
+		quit) return 2 ;;
+		*) printf '\nType confirm to file it, or quit to leave without filing.\n' ;;
+		esac
+	done
+	return 0
+}
+
+# token_from <reply>: the status token out of the handler's answer. The handler
+# answers a filed application with the page carrying the status link, which is
+# https://signup.kyriakon.net/status/<token>, and the token is 26 lowercase
+# Crockford base32 characters (onboard/src/store.rs crockford128). Nothing else in
+# the page looks like that, and nothing this program prints carries the token
+# anywhere else. The match is written without an interval expression, because not
+# every awk the box could have reads `{26}` as one.
+token_from() {
+	printf '%s' "$1" | awk '
+	{
+		i = index($0, "status/")
+		if (i == 0) next
+		t = substr($0, i + 7, 26)
+		if (length(t) == 26 && t ~ /^[0-9abcdefghjkmnpqrstvwxyz]+$/) {
+			print t
+			exit
+		}
+	}'
+}
+
+# file_intent: the one write this session is allowed, and it is not this program
+# that writes it. The form goes to the handler's own route, which validates every
+# field again and writes the record and the intent into the store. front_end names
+# this door, so a TUI application is not recorded as the web form's. No Origin
+# header is sent: that guard is for browsers posting from elsewhere, and this is
+# not a browser. Returns 0 filed, 1 not filed.
+file_intent() {
+	typeset -a args
+	typeset pos=1 which id rc=0 reply prints
+	args+=(--silent --show-error --max-time 30 --fail-with-body)
+	args+=(--data-urlencode "front_end=tui")
+	if [ -n "$client_ip" ]; then
+		args+=(-H "X-Forwarded-For: $client_ip")
+	fi
+	while [ "$pos" -le "$shown_count" ]; do
+		which=${shown_at[$pos]}
+		id=${id_of[$which]}
+		args+=(--data-urlencode "$id=${answers[$id]:-}")
+		if [ "${type_of[$which]}" = key ]; then
+			prints=$(fingerprints "${answers[$id]:-}")
+			if [ -n "$prints" ]; then
+				args+=(--data-urlencode "${id}_fingerprint=$prints")
+			fi
+		fi
+		pos=$((pos + 1))
+	done
+	args+=("$handler_url$apply_path")
+	reply=$(curl "${args[@]}" 2>/dev/null) || rc=$?
+	case $rc in
+	0) ;;
+	22)
+		printf '\nThe form refused one of the answers, or could not place the application.\n'
+		printf 'Nothing has been filed, and nothing you typed has been kept.\n\n'
+		printf 'The form at https://%s asks the same questions and shows which answer it\n' "$host"
+		printf 'refused.\n'
+		return 1
+		;;
+	*)
+		printf '\nThe application could not be filed: the form did not answer.\n'
+		printf 'Nothing can be shown here as filed. Try again in a few minutes, or use the\n'
+		printf 'form at https://%s.\n' "$host"
+		return 1
+		;;
+	esac
+	status_token=$(token_from "$reply")
+	if [ -z "$status_token" ]; then
+		printf '\nThe form answered, but without a status link, so nothing can be shown here.\n'
+		printf 'If the application was filed a person will still read it. The form at\n'
+		printf 'https://%s shows the same stage under your username.\n' "$host"
+		return 1
+	fi
+	return 0
+}
+
+# token_screen: the one thing the applicant takes away. The token is the only
+# thing that identifies the application for someone who gave no address outside
+# the platform, and the link shows the stage and never an answer.
+token_screen() {
+	printf '\nYour application is filed.\n\n'
+	printf 'Keep this link. It is the only thing that identifies your application:\n'
+	printf 'https://%s/status/%s\n\n' "$host" "$status_token"
+	printf 'The link shows the stage and never your answers. A person reads every\n'
+	printf 'application; approval is not automatic. If you gave an address, everything\n'
+	printf 'after this arrives there. Payment follows approval by email.\n\n'
+	printf 'Your account page, once there is an account, is on the web at\n'
+	printf 'https://%s.\n' "$host"
+}
+
+# session: everything above, in the order the applicant meets it.
+session() {
+	typeset status=0
+	if [ -n "${SSH_CONNECTION:-}" ]; then
+		client_ip=${SSH_CONNECTION%% *}
+	fi
+	load_reserved
+	load_questions
+	resolve_handler
+
+	first_screen || status=$?
+	case $status in
+	0) ;;
+	2)
+		leaving
+		return 0
+		;;
+	*) return 1 ;;
+	esac
+
+	status=0
+	walk || status=$?
+	case $status in
+	0) ;;
+	2)
+		leaving
+		return 0
+		;;
+	*) return 1 ;;
+	esac
+
+	status=0
+	confirm || status=$?
+	case $status in
+	0) ;;
+	2)
+		leaving
+		return 0
+		;;
+	*) return 1 ;;
+	esac
+
+	status=0
+	file_intent || status=$?
+	if [ "$status" != 0 ]; then
+		return 1
+	fi
+	token_screen
+	return 0
+}
+
+main() {
+	typeset mode=run
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--self-test)
+			mode=self-test
+			shift
+			;;
+		--questions)
+			if [ "$#" -lt 2 ]; then usage; fi
+			questions_file=$2
+			shift 2
+			;;
+		--reserved)
+			if [ "$#" -lt 2 ]; then usage; fi
+			reserved_file=$2
+			shift 2
+			;;
+		--handler)
+			if [ "$#" -lt 2 ]; then usage; fi
+			handler_url=$2
+			shift 2
+			;;
+		*) usage ;;
+		esac
+	done
+	if [ "$mode" = self-test ]; then
+		self_test
+		return 0
+	fi
+	session
+}
+
+# --- the self-test ------------------------------------------------------------
+#
+# What can be exercised without a terminal is exercised here: the question list's
+# parsing and every refusal it makes, each validation rule against a fixture, the
+# counter's branch totals against the shipped list, the summary, the token out of
+# a canned page, and two whole sessions run against a stub handler, one that files
+# and one that leaves. What stays on the ticket: the real sshd session over the
+# network, and the live handler.
+self_test() {
+	typeset work fails=0
+	work=$(mktemp -d "${TMPDIR:-/tmp}/kyriakon-tui-test.XXXXXX")
+	# Script scope, so the EXIT trap still has the name: a function's `typeset`
+	# names are gone by then, and `set -u` turns that into a non-zero exit on a run
+	# where every check passed.
+	self_test_work=$work
+	trap 'rm -rf "$self_test_work"' EXIT
+	check() {
+		if [ "$2" = "$3" ]; then
+			printf '  ok   %s\n' "$1"
+		else
+			printf '  FAIL %s: expected [%s], got [%s]\n' "$1" "$3" "$2"
+			fails=$((fails + 1))
+		fi
+	}
+	# requests_in <log>: how many requests the stub handler was handed. The stub
+	# logs the arguments curl was given, and one request's arguments carry the
+	# front end field on its own line, so the field counts requests rather than
+	# lines, which a pasted key would otherwise inflate.
+	requests_in() {
+		awk '/front_end=tui/ { n++ } END { print n + 0 }' "$1"
+	}
+	check_has() {
+		case $2 in
+		*"$3"*) printf '  ok   %s\n' "$1" ;;
+		*)
+			printf '  FAIL %s: [%s] does not carry [%s]\n' "$1" "$2" "$3"
+			fails=$((fails + 1))
+			;;
+		esac
+	}
+
+	# The list the parse is checked against: the repository's copy when this is
+	# run from the checkout, the installed one otherwise. They are the same file.
+	repo_root=$(cd "$script_dir/../../../.." && pwd)
+	if [ -r "$repo_root/openbsd/etc/onboard/questions.tsv" ]; then
+		real_list=$repo_root/openbsd/etc/onboard/questions.tsv
+	else
+		real_list=$questions_file
+	fi
+
+	printf 'the shipped question list\n'
+	questions_file=$real_list
+	load_questions
+	check "the list parses" "$([ "$q_count" -gt 0 ] && printf yes)" "yes"
+	check "the first question is the username" "${id_of[1]}" "username"
+	check "the second question is the branch question" "${id_of[2]}" "whose"
+	answers[whose]=person
+	answers[orders]=layman
+	branch_for_answers
+	derive
+	check "the individual path asks the individual count" "$shown_count" "13"
+	answers[orders]=monk
+	branch_for_answers
+	derive
+	check "the monastic answer opens the blessing" "$shown_count" "14"
+	answers[orders]=layman
+	answers[whose]=body
+	branch_for_answers
+	derive
+	check "the community block opens from the second question" "$shown_count" "21"
+	answers[orders]=nun
+	branch_for_answers
+	derive
+	check "a monastic body is asked the blessing too" "$shown_count" "22"
+	unset 'answers[whose]'
+	unset 'answers[orders]'
+	branch_for_answers
+	derive
+	check "the individual count shows until the branch is answered" "$shown_count" "13"
+
+	printf '\nthe parser refuses a broken list\n'
+	mk_bad() {
+		printf '%s\n' "$2" > "$work/bad.tsv"
+		if parse_list "$work/bad.tsv" >/dev/null 2>"$work/bad.err"; then
+			printf '  FAIL %s: accepted\n' "$1"
+			fails=$((fails + 1))
+		else
+			check_has "$1" "$(cat "$work/bad.err")" "$3"
+		fi
+	}
+	mk_bad "a wrong header is refused" \
+		"identifier	prompt	type	branch	required	validation" "the header is not"
+	mk_bad "a short line is refused" \
+		"id	prompt	type	branch	required	validation
+username	Username	text	all	yes" "expected 6"
+	mk_bad "an unknown type is refused" \
+		"id	prompt	type	branch	required	validation
+username	Username	widget	all	yes	none" "unknown answer type"
+	mk_bad "an unknown branch is refused" \
+		"id	prompt	type	branch	required	validation
+username	Username	text	everyone	yes	none" "unknown branch"
+	mk_bad "a required that is not yes or no is refused" \
+		"id	prompt	type	branch	required	validation
+username	Username	text	all	maybe	none" "required is"
+	mk_bad "an unknown rule is refused" \
+		"id	prompt	type	branch	required	validation
+username	Username	text	all	yes	exists" "unknown validation"
+	mk_bad "a choice option without a label is refused" \
+		"id	prompt	type	branch	required	validation
+rail	How you will pay	choice	all	yes	choice:card=Card|monero" "is not value=label"
+	mk_bad "a choice option with an empty value is refused" \
+		"id	prompt	type	branch	required	validation
+rail	How you will pay	choice	all	yes	choice:=Card" "empty value or label"
+	mk_bad "a maxlen that is not a number is refused" \
+		"id	prompt	type	branch	required	validation
+diocese	Diocese	text	all	no	maxlen:lots" "maxlen needs a number"
+
+	printf '\nevery validation rule\n'
+	cat > "$work/rules.tsv" <<'RULES'
+id	prompt	type	branch	required	validation
+username	Username	text	all	yes	username
+body_account_names	An account name for each mailbox	multiline	body	yes	usernames
+address_outside	An address outside this platform	text	all	no	address
+body_domain	The body's domain	text	body	yes	domain
+mail_key	Your public key	key	person	yes	mail-key
+upload_key	Your upload key	key	person	no	upload-key
+rail	How you will pay	choice	all	yes	choice:card=Card|monero=Monero
+diocese	Diocese	text	all	no	maxlen:3
+accept_terms	I accept the terms, the acceptable use policy and the privacy notice.	acceptance	all	yes	none
+RULES
+	questions_file=$work/rules.tsv
+	load_questions
+	printf '%s\n' 'www' 'mail' 'signup' > "$work/reserved.txt"
+	reserved_file=$work/reserved.txt
+	load_reserved
+	why() {
+		validate "$1" "$2"
+		printf '%s' "$validate_reason"
+	}
+	check "a good username is taken" "$(why 1 alice)" ""
+	check "an uppercase username is refused" "$(why 1 Alice)" "a username starts with a lowercase letter or a digit"
+	check "a username with a space is refused" "$(why 1 'al ice')" "a username is lowercase letters, digits, dot, underscore and hyphen"
+	check "a 33 character username is refused" "$(why 1 abcdefghijklmnopqrstuvwxyz0123456)" "a username is at most 32 characters"
+	check "a reserved username is refused" "$(why 1 www)" "that name is held back by the platform"
+	check "an empty required username says so" "$(why 1 '')" "a username is needed"
+	check "the account names accept one per line" "$(why 2 'alice
+bob')" ""
+	check "the account names name the bad line" "$(why 2 'alice
+Bob')" 'the name "Bob": a username starts with a lowercase letter or a digit'
+	check "a reserved account name is refused" "$(why 2 mail)" 'the name "mail": that name is held back by the platform'
+	check "an optional address may be empty" "$(why 3 '')" ""
+	check "an address is taken" "$(why 3 someone@example.invalid)" ""
+	check "an address without a domain dot is refused" "$(why 3 someone@example)" "an address outside this platform is one, like someone@example.invalid"
+	check "two at signs are refused" "$(why 3 a@b@example.invalid)" "an address outside this platform is one, like someone@example.invalid"
+	check "a domain is taken" "$(why 4 theirparish.example)" ""
+	check "a one label domain is refused" "$(why 4 theirparish)" "a domain has at least two labels, like theirparish.example"
+	check "an uppercase domain label is refused" "$(why 4 TheirParish.example)" 'the domain label "TheirParish" is not lowercase letters, digits and hyphen'
+	check "a hyphen edged label is refused" "$(why 4 their-parish.-example)" 'the domain label "-example" begins or ends with a hyphen'
+	check "an empty domain label is refused" "$(why 4 'theirparish..example')" "a domain has no empty labels"
+	check "a key block is taken" "$(why 5 '-----BEGIN PGP PUBLIC KEY BLOCK-----
+aaa
+-----END PGP PUBLIC KEY BLOCK-----')" ""
+	check "text that is not a key block is refused" "$(why 5 'hello')" "this is not an armoured PGP public key block"
+	check "an upload key is taken" "$(why 6 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample alice@example.invalid')" ""
+	check "an upload key with no material is refused" "$(why 6 'ssh-ed25519')" "the upload key has no key material"
+	check "an upload key that is not one is refused" "$(why 6 'PGP PUBLIC KEY')" "this is not an OpenSSH public key"
+	check "an optional upload key may be empty" "$(why 6 '')" ""
+	check "an offered choice is taken" "$(why 7 card)" ""
+	check "a choice that is not offered is refused" "$(why 7 bitcoin)" "choose one of the answers offered"
+	check "a short answer is taken" "$(why 8 Ave)" ""
+	check "a too long answer is refused" "$(why 8 Lausanne)" "at most 3 characters"
+	check "the acceptance takes yes" "$(why 9 yes)" ""
+	check "the acceptance refuses anything else" "$(why 9 no)" "type yes to accept this, or quit to leave without filing"
+
+	printf '\nthe number an option is shown as\n'
+	check "the first option's value" "$(option_value_by_number 'card=Card|monero=Monero' 1)" "card"
+	check "the second option's value" "$(option_value_by_number 'card=Card|monero=Monero' 2)" "monero"
+	check "the label for a value" "$(option_label 'card=Card, renews each year|monero=Monero' card)" "Card, renews each year"
+
+	printf "\nthe token out of the handler's answer\n"
+	filed_page='<h2>Thank you, that is with us</h2> <p class=mono>https://signup.kyriakon.net/status/0123456789abcdefghjkmnpqrs</p>'
+	check "the status link's token is read" "$(token_from "$filed_page")" "0123456789abcdefghjkmnpqrs"
+	check "a page without one yields nothing" \
+		"$(token_from '<h2>Something went wrong</h2>')" ""
+	check "a token with a letter outside the alphabet yields nothing" \
+		"$(token_from '<p>https://signup.kyriakon.net/status/0123456789abcdefghjklmnpq</p>')" ""
+	check "a token that is too short yields nothing" \
+		"$(token_from '<p>https://signup.kyriakon.net/status/0123456789abcdefghjkmnpq</p>')" ""
+
+	printf '\na scripted session that files one application\n'
+	mkdir -p "$work/bin"
+	cat > "$work/bin/curl" <<'STUB'
+#!/bin/sh
+# Stands in for curl in the self-test: records the request it was handed and
+# answers the page a real handler answers for a filed application.
+printf '%s\n' "$*" >> "$KYRIAKON_TEST_LOG"
+printf '%s\n' "$KYRIAKON_TEST_PAGE"
+exit 0
+STUB
+	chmod 0700 "$work/bin/curl"
+	KYRIAKON_TEST_LOG="$work/filed.log"
+	KYRIAKON_TEST_PAGE="$filed_page"
+	KYRIAKON_KEYCHECK="$work/no-such-checker"
+	export KYRIAKON_TEST_LOG KYRIAKON_TEST_PAGE KYRIAKON_KEYCHECK
+	: > "$work/filed.log"
+	rc=0
+	PATH="$work/bin:$PATH" ksh "$0" --questions "$real_list" \
+		--reserved "$work/reserved.txt" --handler "http://127.0.0.1:1" \
+		>"$work/filed.out" 2>&1 <<'ANSWERS' || rc=$?
+
+alice
+person
+someone@example.invalid
+yes
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+ZmFrZQ==
+-----END PGP PUBLIC KEY BLOCK-----
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample alice@example.invalid
+card
+
+layman
+.
+.
+.
+yes
+confirm
+ANSWERS
+	check "the session ends cleanly" "$rc" "0"
+	filed_out=$(cat "$work/filed.out")
+	check_has "the first question carries the individual total" "$filed_out" "question 1 of 13"
+	check_has "the last question carries the same total" "$filed_out" "question 13 of 13"
+	check_has "the key walkthrough is shown" "$filed_out" "Making your key"
+	check_has "the summary is shown" "$filed_out" "Check these over"
+	check_has "the summary names the username" "$filed_out" "Username: alice"
+	check_has "the summary says the fingerprint cannot be computed here" \
+		"$filed_out" "the fingerprint is not shown on this box"
+	check_has "the token and its address are handed back" \
+		"$filed_out" "https://signup.kyriakon.net/status/0123456789abcdefghjkmnpqrs"
+	check "exactly one request is made" "$(requests_in "$work/filed.log")" "1"
+	check_has "the front end is named" "$(cat "$work/filed.log")" "front_end=tui"
+	check_has "the answers are posted" "$(cat "$work/filed.log")" "username=alice"
+	check_has "the address is posted" "$(cat "$work/filed.log")" "address_outside=someone@example.invalid"
+	check_has "the key is posted to the handler's own field" "$(cat "$work/filed.log")" "mail_key=-----BEGIN"
+
+	printf '\na scripted session that leaves\n'
+	: > "$work/left.log"
+	KYRIAKON_TEST_LOG="$work/left.log"
+	rc=0
+	rc=0
+	PATH="$work/bin:$PATH" ksh "$0" --questions "$real_list" \
+		--reserved "$work/reserved.txt" --handler "http://127.0.0.1:1" \
+		>"$work/left.out" 2>&1 <<'ANSWERS' || rc=$?
+
+alice
+quit
+ANSWERS
+	left_out=$(cat "$work/left.out")
+	check "quitting exits zero" "$rc" "0"
+	check_has "quitting files nothing" "$left_out" "Left without filing anything"
+	check "quitting makes no request" "$(requests_in "$work/left.log")" "0"
+	case $left_out in
+	*"Your application is filed"*)
+		printf '  FAIL quitting files an application\n'
+		fails=$((fails + 1))
+		;;
+	*) printf '  ok   quitting files no application\n' ;;
+	esac
+
+	printf '\na scripted session whose connection drops\n'
+	: > "$work/dropped.log"
+	KYRIAKON_TEST_LOG="$work/dropped.log"
+	rc=0
+	rc=0
+	PATH="$work/bin:$PATH" ksh "$0" --questions "$real_list" \
+		--reserved "$work/reserved.txt" --handler "http://127.0.0.1:1" \
+		>"$work/dropped.out" 2>&1 <<'ANSWERS' || rc=$?
+
+alice
+ANSWERS
+	check "a dropped connection exits non-zero" "$rc" "1"
+	check "a dropped connection makes no request" "$(requests_in "$work/dropped.log")" "0"
+
+	printf '\nthe counter follows the branch, in a session\n'
+	: > "$work/branch.log"
+	KYRIAKON_TEST_LOG="$work/branch.log"
+	rc=0
+	PATH="$work/bin:$PATH" ksh "$0" --questions "$real_list" \
+		--reserved "$work/reserved.txt" --handler "http://127.0.0.1:1" \
+		>"$work/branch.out" 2>&1 <<'ANSWERS' || rc=$?
+
+alice
+body
+quit
+ANSWERS
+	branch_out=$(cat "$work/branch.out")
+	check_has "the community total follows the branch answer" "$branch_out" "question 3 of 21"
+
+	printf '\na key fingerprint arrives from the shared crate\n'
+	cat > "$work/bin/keycheck" <<'STUB'
+#!/bin/sh
+# Stands in for the native key check ticket #329 installs: one fingerprint per
+# line, one line per armoured block, in the order the blocks were pasted.
+printf 'AAAA BBBB CCCC DDDD EEEE\n'
+exit 0
+STUB
+	chmod 0700 "$work/bin/keycheck"
+	: > "$work/prints.log"
+	KYRIAKON_TEST_LOG="$work/prints.log"
+	KYRIAKON_KEYCHECK="$work/bin/keycheck"
+	export KYRIAKON_TEST_LOG KYRIAKON_KEYCHECK
+	rc=0
+	PATH="$work/bin:$PATH" ksh "$0" --questions "$real_list" \
+		--reserved "$work/reserved.txt" --handler "http://127.0.0.1:1" \
+		>"$work/prints.out" 2>&1 <<'ANSWERS' || rc=$?
+
+alice
+person
+someone@example.invalid
+yes
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+ZmFrZQ==
+-----END PGP PUBLIC KEY BLOCK-----
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample alice@example.invalid
+card
+
+monk
+blessed by my elder
+.
+.
+.
+.
+yes
+confirm
+ANSWERS
+	prints_out=$(cat "$work/prints.out")
+	check_has "the check's fingerprint is on the summary" "$prints_out" "AAAA BBBB CCCC DDDD EEEE"
+	check_has "the fingerprint goes beside the key" "$(cat "$work/prints.log")" \
+		"mail_key_fingerprint=AAAA BBBB CCCC DDDD EEEE"
+	check_has "the monastic blessing moves the total" "$prints_out" "question 10 of 14"
+
+	printf '\na wrong answer is re-asked with the reason\n'
+	: > "$work/reask.log"
+	KYRIAKON_TEST_LOG="$work/reask.log"
+	rc=0
+	PATH="$work/bin:$PATH" ksh "$0" --questions "$real_list" \
+		--reserved "$work/reserved.txt" --handler "http://127.0.0.1:1" \
+		>"$work/reask.out" 2>&1 <<'ANSWERS' || rc=$?
+
+Alice
+
+alice
+quit
+ANSWERS
+	reask_out=$(cat "$work/reask.out")
+	check_has "the refusal is the rule's own words" \
+		"$reask_out" "a username starts with a lowercase letter or a digit"
+	check_has "the same question is asked again" "$reask_out" "question 1 of 13"
+	check "the refusal is shown once" \
+		"$(printf '%s\n' "$reask_out" | awk '/a username starts/ { n++ } END { print n + 0 }')" "1"
+	check "no request is made" "$(requests_in "$work/reask.log")" "0"
+
+	printf '\na body pastes one key per mailbox, named for each\n'
+	: > "$work/body.log"
+	KYRIAKON_TEST_LOG="$work/body.log"
+	rc=0
+	PATH="$work/bin:$PATH" ksh "$0" --questions "$real_list" \
+		--reserved "$work/reserved.txt" --handler "http://127.0.0.1:1" \
+		>"$work/body.out" 2>&1 <<'ANSWERS' || rc=$?
+
+parish
+body
+St Someone
+parish
+
+theirparish.example
+yes
+secretary: own
+hall: alias secretary
+.
+secretary
+hall
+.
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+ZmFrZQ==
+-----END PGP PUBLIC KEY BLOCK-----
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+ZmFrZQ==
+-----END PGP PUBLIC KEY BLOCK-----
+quit
+ANSWERS
+	body_out=$(cat "$work/body.out")
+	check "the body session leaves cleanly" "$rc" "0"
+	check_has "the community block's total" "$body_out" "question 10 of 21"
+	check_has "the first block is named for its mailbox" "$body_out" "key 1 of 2, for secretary"
+	check_has "the second block is named for its mailbox" "$body_out" "key 2 of 2, for hall"
+	check "the body session makes no request" "$(requests_in "$work/body.log")" "0"
+
+	printf '\nback returns to the previous question with the answer kept\n'
+	: > "$work/back.log"
+	KYRIAKON_TEST_LOG="$work/back.log"
+	rc=0
+	PATH="$work/bin:$PATH" ksh "$0" --questions "$real_list" \
+		--reserved "$work/reserved.txt" --handler "http://127.0.0.1:1" \
+		>"$work/back.out" 2>&1 <<'ANSWERS' || rc=$?
+
+alice
+person
+back
+
+quit
+ANSWERS
+	back_out=$(cat "$work/back.out")
+	check "the back session leaves cleanly" "$rc" "0"
+	check "the previous question is asked again" \
+		"$(printf '%s\n' "$back_out" | awk '/question 2 of 13/ { n++ } END { print n + 0 }')" "2"
+	check_has "the walk moves on with the answer kept" "$back_out" "question 3 of 13"
+	case $back_out in
+	*"choose one of the answers offered"*)
+		printf '  FAIL the kept answer was refused\n'
+		fails=$((fails + 1))
+		;;
+	*) printf '  ok   the kept answer was not refused\n' ;;
+	esac
+	check "the back session makes no request" "$(requests_in "$work/back.log")" "0"
+
+	printf '\nthe handler address comes from its own config\n'
+	cat > "$work/onboard.toml" <<'TOML'
+store_root = "/var/db/onboard"
+listen = "127.0.0.1"
+port = 7080
+release = "REPLACE_ME"
+TOML
+	handler_config=$work/onboard.toml
+	handler_url=""
+	resolve_handler
+	check "the listen address and port are read" "$handler_url" "http://127.0.0.1:7080"
+	handler_config=$work/no-such-config.toml
+	handler_url="http://127.0.0.1:7081"
+	resolve_handler
+	check "a handler given by flag is used as given" "$handler_url" "http://127.0.0.1:7081"
+
+	if [ "$fails" -eq 0 ]; then
+		printf 'self-test: all checks passed\n'
+	else
+		printf 'self-test: %s failed\n' "$fails" >&2
+		exit 1
+	fi
+}
+
+main "$@"
