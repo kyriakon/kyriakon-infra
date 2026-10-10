@@ -111,9 +111,14 @@ fi
 # out as a file, so a path is the shape that works for both the drain and an
 # operator running this by hand. An operator then never retypes key material,
 # which matters because a mistyped key locks the member out of their own upload
-# path with an error only sshd sees, and nothing on the box reports it. The
-# default sits under /var/db/onboard, the onboarding service's own state tree,
-# which the service writes and root reads; this script only ever reads it.
+# path with an error only sshd sees, and nothing on the box reports it.
+# The default sits under /var/db/onboard, the onboarding service's own state tree,
+# which the service writes and root reads; this script only ever reads it. That
+# path is this script's convention rather than one any document fixes: the store
+# listing in the signup spec has no keys directory yet, so the drain that applies
+# an application intent has to write the upload key there, and the default here is
+# the contract it has to meet. Until it does, name the file with the second
+# argument.
 #
 # The second argument names the file explicitly, for a key collected by some
 # other route and for exercising this script before the service writes that tree.

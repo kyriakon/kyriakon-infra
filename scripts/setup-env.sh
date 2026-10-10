@@ -65,8 +65,10 @@ port_listening() {
 		netstat -na -f inet6 2>/dev/null | awk -v p="$1" '$4 ~ ("[.:]" p "$") { f = 1 } END { exit !f }'
 }
 
-# True when /etc/services names the port. sshd would refuse a named port anyway,
-# so skipping it here avoids choosing one the daemon then rejects.
+# True when /etc/services names the port. sshd takes any numeric port whether or
+# not /etc/services names it, so this is not about the daemon rejecting the
+# value: a name there marks a port a stock box already accounts for, and the
+# range is walked to stay clear of those.
 port_named_in_services() {
 	awk -v p="$1" '$2 ~ ("^" p "/(tcp|udp)$") { f = 1 } END { exit !f }' /etc/services
 }
@@ -322,7 +324,8 @@ if ! grep -q '^export TUI_PORT=' "$env_dst"; then
 		printf '\n'
 		printf '# The port the applicant-facing sshd listens on, chosen from the free\n'
 		printf '# ports in 2200-2299. The installed /etc/ssh/sshd_config.onboard carries\n'
-		printf '# it on its Port line, and scripts/pf-apply.sh reads it back.\n'
+		printf '# it on its Port line. The firewall rule that opens it is a later ticket and\n'
+		printf '# is not built here; it will read this value rather than carry its own.\n'
 		printf "export TUI_PORT='%s'\n" "$tui_port"
 	} >> "$env_dst"
 	printf 'chose %s for the onboarding TUI (TUI_PORT)\n' "$tui_port"

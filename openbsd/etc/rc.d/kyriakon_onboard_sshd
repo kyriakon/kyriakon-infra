@@ -29,11 +29,11 @@ rc_configtest() {
 	${daemon} ${daemon_flags} -t
 }
 
-# sshd refuses a session whose account home is missing or writable by anyone but
-# root, and the account's home is /var/empty. `install -d` creates it 0755
-# root:wheel when it is missing and leaves an existing directory alone, so a box
-# where it was removed still starts, and a half-built box fails here rather than
-# refusing every connection silently.
+# /var/empty is the account's home, and this keeps it 0755 root:wheel the way the
+# stock sshd unit does. `install -d` sets the mode and owner on the final path
+# whether or not it already existed, so this creates it on a box where it was
+# removed and corrects the permissions on a box where something else changed
+# them.
 rc_pre() {
 	install -d -o root -g wheel -m 755 /var/empty
 }

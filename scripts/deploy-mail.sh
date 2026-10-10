@@ -337,21 +337,25 @@ fi
 # because the drain that provisions a body appends to these same files and a
 # redeploy must not wipe what it wrote.
 #
-# Seeded before the syntax check below, not after: a file: table is opened at
-# parse time, so a missing one fails smtpd -n and takes the deploy down before
-# the tables are ever written.
+# Seeded before the reload below, not after: a file: table is opened when the LKA
+# process starts rather than when the configuration is parsed, so smtpd -n passes
+# on a config naming a table the box does not have and it is the running daemon
+# that fails.
 #
 # The drain hooks in here. Its group-provision step (#156, the onboarding
 # service's root cron) appends one line to /etc/mail/mail_domains per body
 # domain and a "full-address account" line to /etc/mail/virtuals per body
 # address, then reloads smtpd. That drain is a later ticket and is not built
 # here.
+# The platform's own domain. Every account under /home answers for it, and it is
+# the one line this deploy owns in mail_domains.
+platform_domain=kyriakon.net
 mail_domains_table=/etc/mail/mail_domains
 virtuals_table=/etc/mail/virtuals
 if [ -s "$mail_domains_table" ]; then
 	printf 'kept existing %s\n' "$mail_domains_table"
 else
-	printf 'kyriakon.net\n' > "$mail_domains_table"
+	printf '%s\n' "$platform_domain" > "$mail_domains_table"
 	chmod 0644 "$mail_domains_table"
 	printf 'seeded %s with the platform domain\n' "$mail_domains_table"
 fi
@@ -428,6 +432,35 @@ while IFS= read -r entry; do
 		|| { printf 'virtual entry did not land in %s: %s\n' "$virtuals_table" "$entry" >&2; exit 1; }
 done <<EOF
 $virtual_entries
+EOF
+
+# One entry per local account, because the virtual table is the whole answer for
+# this domain: a lookup that finds neither <user>@<domain> nor <user> has nothing
+# to expand to, so an account whose address is missing is an account mail cannot
+# reach, and the rejection happens at RCPT time where only the sender sees it.
+# Every account whose home is under /home is one of ours, since the service
+# accounts live in /var, and each entry is an identity mapping: the account
+# delivers its own mail.
+#
+# The aliases above and these lines are both written here, and the drain writes
+# the same file's body addresses, because a box deployed today has accounts that
+# predate any drain. Only an absent line is added: one that already maps the
+# address somewhere else is left alone, so an address deliberately aimed at
+# another mailbox survives a redeploy. Nothing is removed here either, since an
+# address can still be wanted after the account stops being used, and removing it
+# is the drain's act.
+while IFS= read -r acct; do
+	[ -n "$acct" ] || continue
+	account_line="$acct@$platform_domain: $acct"
+	if awk -F: -v k="$acct@$platform_domain" '$1 == k { found = 1 } END { exit !found }' "$virtuals_table"; then
+		continue
+	fi
+	printf '%s\n' "$account_line" >> "$virtuals_table"
+	awk -F: -v k="$acct@$platform_domain" '$1 == k { found = 1 } END { exit !found }' "$virtuals_table" \
+		|| { printf 'virtual entry did not land in %s: %s\n' "$virtuals_table" "$account_line" >&2; exit 1; }
+	printf 'virtual %s added\n' "$acct@$platform_domain"
+done <<EOF
+$(awk -F: '$6 ~ /^\/home\// { print $1 }' /etc/passwd)
 EOF
 
 # '|' delimits the s/// because base64 keys contain '/'. The deployed file
@@ -642,8 +675,8 @@ else
 fi
 
 # Where the operator's cron scripts live. The crontab lines in backup.sh,
-# abuse-monitor.sh, check-keyring-drift.sh, restore-standup.sh and renew-acme.sh all
-# call /root/bin/<script>,
+# abuse-monitor.sh, check-keyring-drift.sh, restore-standup.sh, renew-acme.sh and
+# acme-queue.sh all call /root/bin/<script>,
 # and nothing else creates the directory, so a fresh box fails on the first
 # install with "install: /root/bin/INS@...: No such file or directory".
 # 0755 inside /root, which is already 0700 root.
@@ -652,7 +685,7 @@ install -d -m 0755 /root/bin
 # copied by hand from the repo and each crontab line pasted by hand too, which is
 # how the monitor spent a week unscheduled. cron-apply.sh puts the lines in; it
 # can only do that if the files it names are deployed first.
-for s in lib.sh abuse-monitor.sh check-keyring-drift.sh backup.sh renew-acme.sh restore-standup.sh; do
+for s in lib.sh abuse-monitor.sh check-keyring-drift.sh backup.sh renew-acme.sh restore-standup.sh acme-queue.sh; do
 	install -m 0755 "$repo_dir/scripts/$s" "/root/bin/$s"
 done
 printf 'cron scripts installed into /root/bin\n'

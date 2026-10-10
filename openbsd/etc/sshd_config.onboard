@@ -26,9 +26,10 @@ PasswordAuthentication yes
 PermitRootLogin no
 LoginGraceTime 30
 
-# Pre-auth connection caps. PerSourceMaxStartups is the per-address one.
-# sshd drops the excess TCP connection and writes nothing; the TUI's own
-# counter answers the same condition with the screen in its own section.
+# Pre-auth connection caps. PerSourceMaxStartups is the per-address one. sshd
+# drops the excess connection, tells the client "Not allowed at this time" and
+# logs the drop at INFO under its own rate limit, so it is visible in authlog
+# without becoming a line per attempt.
 MaxStartups 4:50:10
 PerSourceMaxStartups 2
 PerSourceNetBlockSize 32:128
@@ -38,7 +39,10 @@ PerSourceNetBlockSize 32:128
 # platform wants.
 Banner none
 
-# Every connection lands in authlog, where the abuse monitor counts it.
+# Every connection lands in authlog with the account and the source address. The
+# abuse monitor's sshd tally counts the failed and invalid-user lines rather than
+# these admissions, so counting successful onboard sessions per source is a step
+# the TUI ticket owns.
 LogLevel VERBOSE
 SyslogFacility AUTH
 
