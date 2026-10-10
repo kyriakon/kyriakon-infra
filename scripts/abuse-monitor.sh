@@ -1,8 +1,8 @@
 #!/bin/ksh
 # abuse-monitor.sh: cron-driven abuse + health monitoring for the mail box.
 #
-# Watches nine signals (spec §30-33, plus the release additions in issue #173),
-# each tripping a content-rich alert:
+# Watches ten signals (spec §30-33, plus the release additions in issue #173 and
+# the certificate queue in issue #288), each tripping a content-rich alert:
 #   1. outbound mail-volume spike: relayed message count (MTA sessions)
 #   2. auth failures: smtpd + dovecot (maillog), sshd (authlog)
 #      mail-side any; ssh per source address
@@ -14,6 +14,7 @@
 #   7. onboarding drain: intents filed and left unapplied
 #   8. backup recency: a restic snapshot inside the last 26 hours
 #   9. root filesystem: / filling, and any filesystem with none left
+#  10. certificate queue: the age of the oldest pending certificate request
 #
 # The numbers all come from the dogfood logs, baselined in
 # docs/planning/research/alert-thresholds.md (PR #179, read 2026-10-01). Each
@@ -45,6 +46,12 @@
 #   ONBOARD_DIR            the onboarding store the drain applies intents from
 #                          (default /var/db/kyriakon-onboard)
 #   DRAIN_INTENT_MAX_MIN   minutes an intent may sit unapplied (default 240)
+#   ACME_QUEUE_DIR         the certificate queue store, whose pending/ directory
+#                          this reads for the oldest request (default
+#                          /var/db/kyriakon-acme-queue; scripts/acme-queue.sh
+#                          files the requests into it)
+#   ACME_PENDING_MAX_MIN   minutes the oldest certificate request may wait before
+#                          the alert (default 1440)
 #   SNAPSHOT_MAX_AGE_HOURS age at which the latest restic snapshot is stale (default 26)
 #   ROOT_FS_WARN_PCT       usage % on / that trips the alert (default 80)
 #   DAEMONLOG              spamd's verbose log, carrying greylist envelopes (default /var/log/daemon)
@@ -305,6 +312,8 @@ defer_min="${DEFER_MIN:-6}"
 daemon_log="${DAEMONLOG:-/var/log/daemon}"
 onboard_dir="${ONBOARD_DIR:-/var/db/kyriakon-onboard}"
 drain_intent_max_min="${DRAIN_INTENT_MAX_MIN:-240}"
+acme_queue_dir="${ACME_QUEUE_DIR:-/var/db/kyriakon-acme-queue}"
+acme_pending_max_min="${ACME_PENDING_MAX_MIN:-1440}"
 snapshot_max_age_hours="${SNAPSHOT_MAX_AGE_HOURS:-26}"
 root_fs_warn_pct="${ROOT_FS_WARN_PCT:-80}"
 
@@ -774,6 +783,38 @@ fi
 full_fs=$(df -P -k 2>/dev/null | awk 'NR > 1 && $2 > 0 && $4 == 0 { print $6 }' || true)
 if [ -n "$full_fs" ]; then
 	alert "filesystem full" "no free space on: $(printf '%s' "$full_fs" | tr '\n' ' '). A writable filesystem with nothing left will fail its next write, and this is separate from the percentage above because it is already broken rather than approaching it"
+fi
+
+# --- 10. certificate queue: the oldest pending request -------------------
+# A member's certificate is issued by HTTP-01 and is not immediate: it spends the
+# registered domain's budget of 50 new certificates per seven days, which refills
+# at one every 202 minutes (docs/planning/research/cert-issuance-ceiling.md,
+# section 2). scripts/acme-queue.sh holds one request per name, works them oldest
+# first, and attempts one every 202 minutes; this reads the age of the oldest
+# request straight from the queue's store, so the signal is real the day the first
+# request is filed.
+#
+# The alert carries the count and the age and never a name, so no member lands in
+# the check's event log, the same rule the drain signal above follows.
+#
+# Threshold 1440 minutes, a day, and it is the queue's own age rather than the
+# drain's 240: one name waits up to 202 minutes for its slot before anything is
+# wrong, so a value near the refill would alert on every second signup. A day is
+# where the queue is either not draining at all or deep enough that the oldest
+# member has waited a day; both are worth a person, and a backlog that shallow is
+# not. The value lives here as ACME_PENDING_MAX_MIN, and scripts/acme-queue.sh
+# states the same 1440 in its header as the age this watches.
+acme_queue_pending="$acme_queue_dir/pending"
+if [ -d "$acme_queue_pending" ]; then
+	oldest=$(find "$acme_queue_pending" -type f -exec stat -f '%m' {} + 2>/dev/null \
+		| awk 'NR == 1 || $1 < m { m = $1 } END { print m }' || true)
+	if [ -n "$oldest" ]; then
+		acme_pending=$(find "$acme_queue_pending" -type f 2>/dev/null | wc -l | tr -d ' ')
+		age_min=$(( ( $(date +%s) - oldest ) / 60 ))
+		if [ "$age_min" -gt "$acme_pending_max_min" ]; then
+			alert "certificate queue" "$acme_pending certificate request(s) pending, oldest $age_min minutes (max $acme_pending_max_min). The queue drains one name every 202 minutes against the registered domain refill, so an age past this means it is not draining or the backlog is this deep, and either way a member is waiting on a certificate the page says is coming"
+		fi
+	fi
 fi
 
 # --- dead-man's switch: Healthchecks ping on a clean run ------------------
