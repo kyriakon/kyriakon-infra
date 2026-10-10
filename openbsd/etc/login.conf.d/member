@@ -1,0 +1,51 @@
+# The member login class: the session shell git-shell runs on port 2222.
+#
+# On-box path: /etc/login.conf.d/member. login.conf.d/<class> takes precedence
+# over the same class in /etc/login.conf (login.conf(5), FILES), which is the
+# convention this box already runs: dovecot and rspamd each ship one there, and
+# so does the applicant-facing sshd's onboard class. The drop-in is the whole of
+# what this platform puts in the member class, so the base file is never edited
+# and a base update cannot conflict with this stanza.
+#
+# The account's password entry keeps /sbin/nologin. sshd takes the session shell
+# from the class instead: auth.c sets lc = login_getclass(pw->pw_class), and
+# session.c's do_child() takes shell = login_getcapstr(lc, "shell", pw_shell,
+# pw_shell) and execs the session's command through it. So a push over port 2222
+# arrives as `git-shell -c '<client command>'` while the account has no shell of
+# its own in /etc/master.passwd.
+#
+# The port 22 upload session is unaffected by this class. Its block carries
+# ForceCommand internal-sftp, and do_exec() sets is_subsystem =
+# SUBSYSTEM_INT_SFTP for that command, so do_child() runs sftp_server_main() in
+# process, before the shell is read. One account therefore has both sessions, on
+# one key, decided by the port: 22 is the sftp upload and 2222 is git-shell.
+#
+# cap_mkdb(1) has to run after this file is installed or edited whenever
+# /etc/login.conf.db exists, because that database is what login_getclass reads
+# when it is there (login.conf(5): cap_mkdb "must be run after each edit of
+# /etc/login.conf or the /etc/login.conf.d/${class} file to keep the database
+# version in sync with the plain file").
+#
+# scripts/provision-member.sh installs this file from the checkout, runs
+# cap_mkdb when the database exists, and then assigns the class:
+#
+#   doas usermod -L member <username>
+#
+# which is the step that makes the class reach the account. Without it the
+# account keeps the default class and port 2222 runs /sbin/nologin, which
+# ignores -c and exits. By hand, the same three steps are:
+#
+#   doas install -m 0644 openbsd/etc/login.conf.d/member /etc/login.conf.d/member
+#   doas cap_mkdb /etc/login.conf        # only when /etc/login.conf.db exists
+#   doas usermod -L member <username>
+#
+# The stanza is one line rather than the backslash-continued form the onboard
+# class uses: the two are the same to login.conf(5), and this one is short enough
+# to read in one. The spec writes the string the ticket prints, with a printf
+# escape in it, and reads the interpolation capability as c=default and the shell
+# as \shell; neither is a capability name login.conf(5) has. The capability that
+# interpolates another class is tc and the session shell is shell, so the drop-in
+# carries those two, with the interpolation last the way the onboard class and
+# the shipped /etc/login.conf both write it.
+
+member:shell=/usr/local/bin/git-shell:tc=default:

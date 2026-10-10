@@ -24,6 +24,13 @@
 #   /home/<username>/repos                      the member, 0700
 #   /home/<username>/.ssh                       the member, 0700
 #   /home/<username>/.ssh/authorized_keys       the member, 0600
+#   /etc/login.conf.d/member                    root:wheel 0644
+#
+# and then hands the last two lanes to scripts of their own, so that one command
+# still provisions a member and each lane can be read on its own:
+#
+#   /etc/httpd.d/<username>.kyriakon.net.conf           provision-member-web.sh
+#   /etc/gmid.d/<username>.kyriakon.net.conf            provision-member-capsule.sh
 #
 # The public root is the chroot sshd's port 22 block names, and the two
 # directories under it are the only things the member's sftp session can reach.
@@ -42,11 +49,25 @@
 # thing it always does is run scripts/quota-apply.sh, which rewrites the
 # account's record in place with the same limits.
 #
-# Not this script's job: creating the account or its Maildir, the member's shell
-# or login class, the vhost, capsule and acme-client files, certificate
-# generation, or adding and removing keys.
+# The two lane scripts are idempotent the same way. They are separate scripts
+# because one of them has to be run again later: the httpd vhost gains its port
+# 443 block when the member's certificate lands, which is a second run of
+# provision-member-web.sh rather than an edit by hand. A lane that fails stops
+# this run, because an account with a tree and no vhost is not a provisioned
+# member, and the drain that calls this applies the whole thing or reports it.
+#
+# Not this script's job: creating the account or its Maildir, the acme-client
+# block for the member's name and the certificate that comes from it (#289), the
+# generated indexes the daemons include and the reloads that follow them
+# (scripts/cron-apply.sh --web), or adding and removing keys.
 
 set -euo pipefail
+
+# doas and cron both hand over a minimal PATH, and this script now calls
+# cap_mkdb and usermod, which live in /usr/sbin. Set it rather than trusting the
+# caller, the same line the other box scripts carry.
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
+export PATH
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 
@@ -60,6 +81,11 @@ if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
 fi
 user="$1"
 key_arg="${2:-}"
+
+# Whether this run wrote anything, read by the report at the end. Set here rather
+# than beside the tree because the login class below is as much a part of a run as
+# the tree is.
+changed=no
 
 # Same charset rule as add-user.sh, and for the same reasons: the name is a
 # filesystem path component, a subdomain label (<username>.kyriakon.net) and here
@@ -100,6 +126,97 @@ if ! id -Gn "$user" | tr ' ' '\n' | grep -qx members; then
 	printf '%s is not in the members group, so it has no sftp or git session\n' "$user" >&2
 	printf 'and this tree would be unreachable:\n' >&2
 	printf '  doas usermod -G members %s\n' "$user" >&2
+	exit 1
+fi
+
+# --- the session shell, from the login class --------------------------------
+#
+# One account carries both sessions and the port decides which. Port 22's block
+# forces internal-sftp, which sshd runs in process before it reads any shell, and
+# 2222 has no forced command, so a push arrives there as
+# `git-shell -c '<client command>'`. That shell comes from the account's login
+# class rather than from the password entry: auth.c sets
+# lc = login_getclass(pw->pw_class), and session.c's do_child() takes
+# login_getcapstr(lc, "shell", pw_shell, pw_shell) before it execs anything. So
+# the entry keeps /sbin/nologin, which is the platform's core safety property,
+# and 2222 runs git-shell all the same.
+#
+# The class is the drop-in at /etc/login.conf.d/member, the directory this box
+# already runs its dovecot and rspamd classes from, and a class there takes
+# precedence over the same name in /etc/login.conf, so the base file is never
+# edited and a base update cannot conflict with it. The file is tracked in this
+# repository and installed here rather than left to a hand step, because
+# usermod -L names a class that has to exist first: that step has failed on this
+# box once already, with "No such login class 'onboard'", after the account was
+# made.
+#
+# cap_mkdb is what makes the class visible to sshd while /etc/login.conf.db
+# exists, because that database is what login_getclass reads when it is there
+# (login.conf(5), and cap_mkdb(1) says the same). The spec expected no database on
+# this box and no cap_mkdb run; the box has one now, built when the onboard class
+# was added, so this runs cap_mkdb whenever the database is the older of the two
+# files and says which of the two states it found rather than assuming either.
+class_src="$script_dir/../openbsd/etc/login.conf.d/member"
+login_conf_d=/etc/login.conf.d
+if [ ! -f "$class_src" ]; then
+	printf 'no %s, which is the member class this script installs\n' "$class_src" >&2
+	printf 'this script is run from the repository checkout:\n' >&2
+	printf '  doas ksh scripts/provision-member.sh %s\n' "$user" >&2
+	exit 1
+fi
+install -d -m 0755 "$login_conf_d"
+if [ -f "$login_conf_d/member" ] && cmp -s "$class_src" "$login_conf_d/member"; then
+	:
+else
+	install -m 0644 "$class_src" "$login_conf_d/member"
+	printf 'login class installed: %s\n' "$login_conf_d/member"
+	changed=yes
+fi
+
+# The mtimes are compared as numbers rather than with test's -nt, so the check
+# reads the same in every shell this runs under.
+if [ -f /etc/login.conf.db ]; then
+	if [ "$(stat -f '%m' /etc/login.conf.db)" -lt "$(stat -f '%m' "$login_conf_d/member")" ]; then
+		cap_mkdb /etc/login.conf
+		printf 'cap_mkdb: /etc/login.conf.db rebuilt, because that database is what\n'
+		printf '  sshd reads while it exists\n'
+		changed=yes
+	fi
+	[ "$(stat -f '%m' /etc/login.conf.db)" -ge "$(stat -f '%m' "$login_conf_d/member")" ] || {
+		printf '/etc/login.conf.db is older than %s, so the class is not in the\n' "$login_conf_d/member" >&2
+		printf 'database sshd reads and port 2222 would run /sbin/nologin\n' >&2
+		exit 1
+	}
+else
+	printf 'note: no /etc/login.conf.db, so the drop-in is read directly and no cap_mkdb run is needed\n'
+fi
+
+# The class on the account. Field 5 of /etc/master.passwd is the class and getent
+# passwd does not carry it (passwd(5), master.passwd(5)), so the class is read from
+# there; nothing else in that file is looked at. usermod -L is the only step that
+# puts an account in a class, so an account left in the default class is one whose
+# 2222 session is /sbin/nologin, which ignores -c and exits.
+class_now=$(awk -F: -v u="$user" '$1 == u { print $5 }' /etc/master.passwd)
+if [ "$class_now" != member ]; then
+	usermod -L member "$user" || {
+		printf 'usermod -L member %s failed\n' "$user" >&2
+		exit 1
+	}
+	printf 'login class: %s assigned to the member class\n' "$user"
+	changed=yes
+fi
+
+class_now=$(awk -F: -v u="$user" '$1 == u { print $5 }' /etc/master.passwd)
+if [ "$class_now" != member ]; then
+	printf '%s is in the %s login class, not member, so 2222 would run a shell that is not git-shell\n' \
+		"$user" "${class_now:-default}" >&2
+	exit 1
+fi
+shell_now=$(getent passwd "$user" | awk -F: 'NR == 1 { print $7 }')
+if [ "$shell_now" != /sbin/nologin ]; then
+	printf 'the password entry for %s runs %s, and it has to stay /sbin/nologin:\n' \
+		"$user" "$shell_now" >&2
+	printf 'the session shell comes from the login class, so the account keeps no shell of its own\n' >&2
 	exit 1
 fi
 
@@ -202,8 +319,6 @@ assert_shape() {
 		exit 1
 	fi
 }
-
-changed=no
 
 # The chroot root is root:wheel so sshd will chroot into it, and the two
 # directories that carry content belong to the member.
@@ -346,15 +461,37 @@ else
 	fi
 fi
 
+# --- the two daemon lanes ---------------------------------------------------
+#
+# Each lane is its own script, run from here so that one command still provisions
+# a member, and each is idempotent: a second run rewrites nothing and says so.
+# They are separate scripts because the web one has to be run again later, when
+# the member's certificate lands and the 443 block becomes due, and because a
+# lane read on its own is a lane reviewed on its own. A lane that fails stops
+# this run: an account with a tree and no vhost is not a provisioned member.
+for lane in provision-member-web.sh provision-member-capsule.sh; do
+	if [ ! -f "$script_dir/$lane" ]; then
+		printf 'no %s beside this script, so %s has no generated daemon file\n' "$lane" "$user" >&2
+		printf 'run this from the repository checkout:\n' >&2
+		printf '  doas ksh scripts/provision-member.sh %s\n' "$user" >&2
+		exit 1
+	fi
+	ksh "$script_dir/$lane" "$user"
+done
+
 # --- report -----------------------------------------------------------------
 
 if [ "$changed" = no ]; then
-	printf '%s is already provisioned; nothing changed\n' "$user"
+	printf '%s is already provisioned; the tree and the key are unchanged\n' "$user"
+	printf 'and the lanes above report any change to the generated daemon files\n'
 	exit 0
 fi
 
 printf 'provisioned %s\n' "$user"
 printf '  public:  %s (root:wheel 0755; www and gemini %s:members)\n' "$public" "$user"
 printf '  private: %s/repos 0700, %s/.ssh/authorized_keys 0600\n' "$home" "$home"
+printf '  session: sftp on 22 and git-shell on 2222 from the member login class, one key\n'
+printf '  files:   /etc/httpd.d/%s.kyriakon.net.conf, /etc/gmid.d/%s.kyriakon.net.conf\n' "$user" "$user"
 printf '  key from: %s\n' "$key_src"
-printf 'next: an sftp session on port 22 as %s uploads into %s/www\n' "$user" "$public"
+printf 'next: doas ksh scripts/cron-apply.sh --web   # index the member files, check, reload\n'
+printf 'then: an sftp session on port 22 as %s uploads into %s/www\n' "$user" "$public"
