@@ -1,0 +1,42 @@
+#!/bin/ksh
+#
+# rc.d unit for the applicant-facing sshd: a second stock sshd instance, started
+# from /etc/ssh/sshd_config.onboard, that serves the onboarding TUI on its own
+# port. Applied by hand. No deploy installs this unit: substitute the port in
+# the config from TUI_PORT in /root/.kyriakon-env, copy this to
+# /etc/rc.d/kyriakon_onboard_sshd, then `rcctl enable` and `rcctl start` it.
+#
+# It is a second instance, not a second daemon, and rc.subr tells the two apart
+# by the -f flag in the process title. That is why pexp below repeats the whole
+# flag set instead of matching "/usr/sbin/sshd" alone: a bare match would also
+# find the member instance on 22, and `rcctl stop kyriakon_onboard_sshd` would
+# then stop the wrong listener.
+
+# shellcheck disable=SC2034 # rc.subr reads daemon and daemon_flags at run time
+daemon="/usr/sbin/sshd"
+# shellcheck disable=SC2034 # rc.subr reads daemon_flags at run time
+daemon_flags="-f /etc/ssh/sshd_config.onboard"
+# shellcheck source=/dev/null # /etc/rc.d/rc.subr exists on the box, not in this repo
+. /etc/rc.d/rc.subr
+
+# shellcheck disable=SC2034 # rc.subr reads pexp at run time
+pexp="sshd: ${daemon}${daemon_flags:+ ${daemon_flags}} \[listener\].*"
+
+# What `rcctl configtest` and `rcctl reload` run before the signal, so a bad
+# config fails there instead of taking the listener down.
+rc_configtest() {
+	# shellcheck disable=SC2086 # daemon_flags is a deliberate multi-word flag list
+	${daemon} ${daemon_flags} -t
+}
+
+# /var/empty is the account's home, and this keeps it 0755 root:wheel the way the
+# stock sshd unit does. `install -d` sets the mode and owner on the final path
+# whether or not it already existed, so this creates it on a box where it was
+# removed and corrects the permissions on a box where something else changed
+# them.
+rc_pre() {
+	install -d -o root -g wheel -m 755 /var/empty
+}
+
+# shellcheck disable=SC2086 # stock shape: rc.subr's rc_cmd takes the action word, which is absent when rc.d sources the unit
+rc_cmd $1

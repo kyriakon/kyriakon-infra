@@ -43,7 +43,8 @@ PermitRootLogin no
 LoginGraceTime 30
 
 # Pre-auth connection caps. PerSourceMaxStartups is the per-address one.
-# sshd drops the excess TCP connection and writes nothing; the TUI's own
+# sshd drops the excess connection, tells the client "Not allowed at this
+# time" and logs the drop at INFO under its own rate limit; the TUI's own
 # counter answers the same condition with the screen in its own section.
 MaxStartups 4:50:10
 PerSourceMaxStartups 2
