@@ -15,8 +15,10 @@ axum = { version = "0.8", features = ["form"] }
 serde = { version = "1", features = ["derive"] }
 # The intent and the application record are JSON, the shape the drain reads.
 serde_json = "1"
-# filed_at, RFC 3339 in UTC. One function, so the formatting crate can move.
-time = { version = "0.3", features = ["std", "formatting"] }
+# filed_at, RFC 3339 in UTC, and reading back the decision time the drain
+# writes. One crate, so the formatting and parsing of a store timestamp move
+# together.
+time = { version = "0.3", features = ["std", "formatting", "parsing"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "fs", "io-util"] }
 # The config is TOML, the format the spec names for the service's own file.
 toml = "0.9"

@@ -11,6 +11,11 @@
     <tr><td>Stage</td><td>{{ stage }}</td></tr>
   </table>
   <p class="hint">The stage is one of received, with the reviewer, and decided. This page never repeats anything you wrote on the application. Anyone holding this link can read it, so keep it as you would a password. It works until the application is cleared away, a week after a decision.</p>
+  {% if let Some(link) = password_link %}
+  <h3>Setting your mail password</h3>
+  <p>You gave no address outside this platform, so there is nowhere else to send this. The link below sets the password for your mail account. It works once, and only you should open it.</p>
+  <p class="mono">{{ link }}</p>
+  {% endif %}
   {% endif %}
 </div>
 {% endblock %}

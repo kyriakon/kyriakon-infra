@@ -105,10 +105,24 @@ pub struct Record {
     pub username: String,
     pub status_token: String,
     pub filed_at: String,
+    /// Which front end filed this: web, tui or capsule. A label and not a
+    /// privilege, so nothing here reads it; the reviewer sees it.
     pub front_end: String,
     /// received | with the reviewer | decided. The handler writes `received`;
     /// only the drain moves it on.
     pub stage: String,
+    /// When the drain decided the application, RFC 3339. The drain sets it,
+    /// which is the half the status route's seven-day window is read from: the
+    /// handler writes nothing here and has no way to. A record without it has
+    /// not been decided yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<String>,
+    /// The one-time link that sets a mail password, written by the drain for an
+    /// applicant who gave no address outside the platform and so cannot be sent
+    /// one. The drain signs it; the handler neither signs nor verifies one and
+    /// only renders what it finds here, and renders nothing when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password_link: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

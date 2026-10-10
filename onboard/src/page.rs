@@ -38,6 +38,10 @@ pub struct StatusPage {
     pub stage: String,
     pub filed_at: String,
     pub notice: String,
+    /// The one-time password link the drain wrote onto the record, absent when
+    /// the record carries none. The handler never signs one: it renders what it
+    /// finds or nothing at all.
+    pub password_link: Option<String>,
 }
 
 #[derive(Template)]
