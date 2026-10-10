@@ -1,0 +1,24 @@
+# The applicant-facing sshd's session shell, as a login class drop-in.
+#
+# login.conf.d/<class> takes precedence over the same class in /etc/login.conf
+# (login.conf(5), FILES), which is the convention this box already uses: dovecot
+# and rspamd each ship one there. The drop-in is the whole of what this platform
+# adds, so the base database is never edited and a base update cannot conflict
+# with this stanza.
+#
+# The account's password entry keeps /sbin/nologin. sshd takes the session shell
+# from the class instead: auth.c sets lc = login_getclass(pw->pw_class), and
+# session.c's do_child() takes shell = login_getcapstr(lc, "shell", pw_shell,
+# pw_shell) and execs a forced command through it, which is what lets the
+# applicant's session be the TUI and nothing else.
+#
+# Applied by hand, never by a deploy:
+#
+#   doas install -m 0644 openbsd/etc/login.conf.d/onboard /etc/login.conf.d/onboard
+#   doas cap_mkdb /etc/login.conf
+#
+# cap_mkdb is required after an edit to this file or to /etc/login.conf whenever
+# /etc/login.conf.db exists.
+onboard:\
+	:shell=/usr/local/sbin/kyriakon-onboard-tui:\
+	:tc=default:
