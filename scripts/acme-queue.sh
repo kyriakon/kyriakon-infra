@@ -68,6 +68,10 @@
 #
 #   */15 * * * *  . /root/.kyriakon-env; /root/bin/acme-queue.sh --run
 #
+# --run prints nothing on a pass that attempts nothing, because cron mails a job's
+# output: read the queue with --status, and a request that has waited too long
+# arrives as an age alert rather than as a line every fifteen minutes.
+#
 # Depends on: /etc/acme-client.conf including /etc/acme-client.d/index.conf (the
 # generated index scripts/cron-apply.sh --web rewrites), the acme-client binary,
 # and a resolver command (host(1) from base).
@@ -273,25 +277,30 @@ run() {
 	if [ -f "$last_attempt_file" ]; then
 		last=$(cat "$last_attempt_file")
 	fi
+	# A pass with nothing to do prints nothing. cron mails the output of a job, so
+	# a line here is a line in the operator's inbox every fifteen minutes: this
+	# queue is empty or inside its refill window for almost every pass it makes.
+	# --status is the reading for a human, and a request that has waited too long
+	# is reported by its age through the monitor, which is a signal rather than a
+	# running commentary.
 	wait=$(minutes_until_slot "$now" "$last")
 	if [ "$wait" -gt 0 ]; then
-		printf 'nothing attempted: the refill allows the next attempt in %s minutes (%s-minute spacing)\n' \
-			"$wait" "$REFILL_MINUTES"
 		return 0
 	fi
 
 	list=$(pending_oldest_first)
 	if [ -z "$list" ]; then
-		printf 'no pending certificate requests\n'
 		return 0
 	fi
 
 	# The one attempt this pass makes: the oldest pending name that resolves. Two
 	# attempts in a pass are impossible by construction, and attempt() records the
 	# time so the next pass cannot come back before the refill.
+	# Silent for the same reason: a name that does not resolve yet is held, and that
+	# is a normal state for a name whose records were asked for minutes ago. The age
+	# alert is what reports one that stays that way.
 	candidate=$(next_attempt "$list")
 	if [ -z "$candidate" ]; then
-		printf 'nothing attempted: no pending name resolves yet\n' >&2
 		return 0
 	fi
 	attempt "$candidate"
