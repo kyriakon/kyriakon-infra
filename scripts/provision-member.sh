@@ -305,6 +305,47 @@ for d in /home /home/www "$public"; do
 	esac
 done
 
+# --- the member's own address -----------------------------------------------
+#
+# The virtual table is the whole answer for the local dispatcher: a lookup that
+# finds neither <user>@<domain> nor <user> has nothing to expand to, so a member
+# whose address is missing from it is a member mail cannot reach, and the
+# rejection happens at RCPT time where only the sender sees it. deploy-mail.sh
+# seeds one entry per account that exists when it runs, which is every account
+# except the one being provisioned now, so the entry is written here too. The
+# drain that provisions a member will grow this into the store-driven version of
+# the same table.
+#
+# The platform's own domain is the first line the deploy writes into
+# mail_domains. A box that has not run the mail deploy yet has no table to write
+# to, and that is a note rather than a failure: the account is usable for
+# everything but mail until then.
+virtuals=/etc/mail/virtuals
+if [ ! -f "$virtuals" ]; then
+	printf 'note: no %s yet, so %s has no address until the mail deploy runs\n' \
+		"$virtuals" "$user" >&2
+elif [ ! -s /etc/mail/mail_domains ]; then
+	printf 'note: %s has no domain line, so %s@ was not added anywhere\n' \
+		/etc/mail/mail_domains "$user" >&2
+else
+	domain=$(sed -n '1p' /etc/mail/mail_domains)
+	key="$user@$domain"
+	if awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals"; then
+		# An address aimed somewhere else on purpose is left where it is: this
+		# script provisions an account, it does not overrule a forward.
+		current=$(awk -F: -v k="$key" '$1 == k { sub(/^[^:]*:[ \t]*/, ""); print; exit }' "$virtuals")
+		if [ "$current" != "$user" ]; then
+			printf 'note: %s maps to %s, so mail for this member goes there\n' "$key" "$current" >&2
+		fi
+	else
+		printf '%s: %s\n' "$key" "$user" >> "$virtuals"
+		awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals" \
+			|| { printf 'could not add %s to %s\n' "$key" "$virtuals" >&2; exit 1; }
+		printf 'virtual %s added\n' "$key"
+		changed=yes
+	fi
+fi
+
 # --- report -----------------------------------------------------------------
 
 if [ "$changed" = no ]; then
