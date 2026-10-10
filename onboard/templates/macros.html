@@ -1,0 +1,18 @@
+{% macro field(q) %}
+<label for="{{ q.id }}">{{ q.prompt }}{% if q.note != "" %} <span class="opt">({{ q.note }})</span>{% endif %}</label>
+{% if q.kind == "text" %}
+<input type="text" id="{{ q.id }}" name="{{ q.id }}" value="{{ q.value }}">
+{% else if q.kind == "multiline" || q.kind == "addresses" %}
+<textarea id="{{ q.id }}" name="{{ q.id }}">{{ q.value }}</textarea>
+{% else if q.kind == "key" %}
+<textarea id="{{ q.id }}" name="{{ q.id }}" class="mono">{{ q.value }}</textarea>
+<input type="hidden" id="{{ q.fingerprint_id }}" name="{{ q.fingerprint_id }}" value="{{ q.fingerprint }}">
+{% else if q.kind == "choice" %}
+<select id="{{ q.id }}" name="{{ q.id }}">
+{% for o in q.options %}<option value="{{ o.value }}"{% if o.selected %} selected{% endif %}>{{ o.label }}</option>{% endfor %}
+</select>
+{% else if q.kind == "yesno" || q.kind == "acceptance" %}
+<input type="checkbox" id="{{ q.id }}" name="{{ q.id }}" value="yes"{% if q.checked %} checked{% endif %}>
+{% endif %}
+{% if q.hint != "" %}<p class="hint">{{ q.hint|safe }}</p>{% endif %}
+{% endmacro %}

@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% import "macros.html" as m %}
+{% block title %}Apply{% endblock %}
+{% block content %}
+<h2>Apply</h2>
+<p class="lede">A person reads every application. Nothing here is charged until it is approved.</p>
+
+{% if errors.len() > 0 %}
+<div class="warn"><ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div>
+{% endif %}
+
+<form method="post" action="/apply">
+
+  {#
+    One. The community block opens from the second question, so it sits
+    immediately after it, inside this section. Keeping it a block rather than a
+    section is what leaves the page at four sections on both paths.
+  #}
+  <section id="you">
+    <div class="card">
+      <h3>You</h3>
+      {% for q in you %}
+        {% if q.id == "whose" %}
+          {% call m::field(q) %}
+          {% if community.len() > 0 %}
+          <fieldset class="community">
+            <h4>The community block</h4>
+            {% for c in community %}{% call m::field(c) %}{% endfor %}
+          </fieldset>
+          {% endif %}
+        {% else %}
+          {% call m::field(q) %}
+        {% endif %}
+      {% endfor %}
+    </div>
+  </section>
+
+  {#
+    Two. The key is generated in the browser by the walkthrough; only the public
+    half is submitted. A body's per-mailbox keys are the same section.
+  #}
+  <section id="mail-key">
+    <div class="card">
+      <h3>Your mail key</h3>
+      {% for q in mailkey %}{% call m::field(q) %}{% endfor %}
+    </div>
+  </section>
+
+  {#
+    Three. One rail. This card has no separate heading: the question's own prompt
+    is the heading, so the shared list is the only place the string lives.
+  #}
+  <section id="pay">
+    <div class="card">
+      {% for q in pay %}{% call m::field(q) %}{% endfor %}
+    </div>
+  </section>
+
+  {#
+    Four. All optional except the elder's or confessor's blessing, which is
+    required on the monastic path.
+  #}
+  <section id="about">
+    <div class="card">
+      <h3>What to tell us about you</h3>
+      <p>These are the questions we would ask if you came to the door. <strong>All of this is optional.</strong> It goes to one person, it is not published, and it is deleted with your application. Answers here make approval quicker and more likely.</p>
+      {% for q in about %}{% call m::field(q) %}{% endfor %}
+    </div>
+  </section>
+
+  {#
+    Before you send. The acceptance is recorded with the version of each
+    document, which is what the confirmation email quotes.
+  #}
+  <div class="card">
+    <h3>Before you send</h3>
+    {% for q in acceptance %}{% call m::field(q) %}{% endfor %}<span class="tag">{{ doc_version }}</span>
+    <button class="btn" type="submit">Send application</button>
+  </div>
+
+</form>
+{% endblock %}

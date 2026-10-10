@@ -1,0 +1,25 @@
+id	prompt	type	branch	required	validation
+username	Username	text	all	yes	username
+whose	Is this for you, or for a body?	choice	all	yes	choice:person=Just me, one address at kyriakon.net|body=A body, with its own domain
+body_name	The body's name	text	body	yes	none
+body_kind	The body's kind	choice	body	yes	choice:parish=Parish|monastery=Monastery|school=School|business=Business|other=Other
+vat	VAT number	text	body	no	none
+body_domain	The body's domain	text	body	yes	domain
+body_records	I can add the DNS records you will ask me to create.	yesno	body	yes	choice:yes=Yes|no=No
+body_addresses	The addresses, one per line	addresses	body	yes	none
+body_account_names	An account name for each mailbox, one per line	multiline	body	yes	usernames
+body_mail_key	A public key for each mailbox	key	body	yes	mail-key
+body_upload_key	An upload key for the site	key	body	no	upload-key
+body_dns_contact	Who should we talk to about DNS?	text	body	no	none
+address_outside	An address outside this platform	text	all	no	address
+address_ack	I understand that we can only reach me inside this account.	yesno	all	no	choice:yes=Yes|no=No
+mail_key	Your public key	key	person	yes	mail-key
+upload_key	Your upload key	key	person	no	upload-key
+rail	How you will pay	choice	all	yes	choice:card=Card, renews each year|cash=Cash by post|monero=Monero|no_charge=No charge: clergy, monastics, or anyone who cannot pay
+diocese	Diocese	text	all	no	none
+orders	Are you a priest, deacon, monk, nun, or a layman?	choice	all	no	choice:priest=Priest|deacon=Deacon|monk=Monk|nun=Nun|layman=Layman
+blessing	If you are a monastic, do you have your elder's or confessor's blessing to have an account?	multiline	monastic	yes	none
+cannot_pay	If you are unable to pay, please tell us here.	multiline	all	no	none
+intended_use	What do you hope to use this for?	multiline	all	no	none
+anything_else	Anything else	multiline	all	no	none
+accept_terms	I accept the terms, the acceptable use policy and the privacy notice.	acceptance	all	yes	none

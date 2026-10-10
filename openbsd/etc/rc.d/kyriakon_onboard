@@ -1,0 +1,55 @@
+#!/bin/ksh
+#
+# rc.d unit for the onboarding handler: the Rust service that renders the
+# applicant page and writes one JSON intent per submission into the store,
+# reachable only on loopback with relayd terminating TLS for
+# signup.kyriakon.net in front of it.
+#
+# Installed by hand, with the config it names: no deploy installs this unit.
+# Copy it to /etc/rc.d/kyriakon_onboard, copy
+# openbsd/etc/onboard/onboard.toml to /etc/onboard/onboard.toml, then
+# `rcctl enable kyriakon_onboard` and `rcctl start kyriakon_onboard`.
+#
+# The name is the handler's own. The applicant-facing second sshd instance is
+# kyriakon_onboard_sshd, which took that name on purpose so the two are never
+# confused at an rcctl prompt.
+
+# The handler holds no privilege and no secret, so it runs as the unprivileged
+# _onboard account rather than root; rc.subr's rc_exec drops to daemon_user with
+# su(1). It writes intents/, drafts/, applications/ and webhooks/ and nothing
+# else. The store is created by scripts/onboard-store.sh, not here, so the store
+# tree has one author and its owners and modes are asserted in one place.
+# shellcheck disable=SC2034 # rc.subr reads daemon, daemon_flags and daemon_user at run time
+daemon="/usr/local/sbin/kyriakon-onboard"
+# shellcheck disable=SC2034 # rc.subr reads daemon_flags at run time
+daemon_flags="serve --config /etc/onboard/onboard.toml"
+# shellcheck disable=SC2034 # rc.subr reads daemon_user at run time
+daemon_user="_onboard"
+
+# shellcheck source=/dev/null # /etc/rc.d/rc.subr exists on the box, not in this repo
+. /etc/rc.d/rc.subr
+
+# serve() is a foreground accept loop and does not daemonize, so rc.subr has to
+# background it or the boot would block here. The same flag is required by
+# daemon_logger below.
+# shellcheck disable=SC2034 # rc.subr reads rc_bg at run time
+rc_bg=YES
+# shellcheck disable=SC2034 # rc.subr reads rc_reload at run time
+rc_reload=NO
+
+# The handler's only diagnostics go to stderr, which rc.subr would otherwise
+# discard. They land in /var/log/daemon, which newsyslog.conf already bounds, so
+# the handler needs no newsyslog entry of its own.
+# shellcheck disable=SC2034 # rc.subr reads daemon_logger at run time
+daemon_logger="daemon.info"
+
+# rc.subr runs the daemon under the login class named after this unit
+# (kyriakon_onboard) when /etc/login.conf defines one, and under the `daemon`
+# class otherwise. That class carries openfiles-cur=128, which is a connection
+# ceiling rather than a mistake, and it is ample for the counters' sixty requests
+# a minute, so the release keeps it: a `kyriakon_onboard` stanza in login.conf is
+# how it would be raised if the form ever needs more. The account's own class is
+# not what rc.subr uses, because rc_exec passes daemon_class to su(1).
+
+# shellcheck disable=SC2086 # stock shape: rc.subr's rc_cmd takes the action word, which is absent when rc.d sources the unit
+rc_cmd $1
