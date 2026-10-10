@@ -76,8 +76,11 @@ store_dir() {
 
 # The account is the one thing here this script will not create. Print the line
 # rather than a description of it: the account is a reserved-uid one in the same
-# shape `_gmid` has, and the number is reserved at build time beside `_gmid`'s
-# own, so the operator fills REPLACE_ME with it and runs the line.
+# shape `_gmid` has, with a number reserved at build time beside `_gmid`'s own.
+# 900 sits above the highest reserved account on the box, which is gmid's 878, and
+# below the range a person's account starts at, so the two families stay apart. It
+# is written down rather than chosen per box, because the same account has to come
+# back from a restored snapshot with the same number.
 if ! id "$onboard_user" >/dev/null 2>&1; then
 	cat >&2 <<EOF
 onboard-store: the $onboard_user user does not exist.
@@ -86,9 +89,7 @@ Create it by hand, once, as a reserved-uid account in the shape _gmid has
 (numeric uid and gid reserved for it, home /var/empty, shell /sbin/nologin, no
 group memberships beyond its own, no doas rule), then run this script again:
 
-useradd -d /var/empty -c "Kyriakon onboarding handler" -s /sbin/nologin -u REPLACE_ME -g =uid $onboard_user
-
-REPLACE_ME is the reserved uid the build assigns it.
+useradd -d /var/empty -c "Kyriakon onboarding handler" -s /sbin/nologin -u 900 -g =uid $onboard_user
 EOF
 	exit 1
 fi
