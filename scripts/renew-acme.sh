@@ -40,7 +40,10 @@
 # an outage. Only a first issue for a new name spends budget, and that belongs to
 # the queue (issue #166), along with ordering those requests oldest first, the
 # wait, and the alert when the oldest one passes a stated age. None of that is
-# duplicated here.
+# duplicated here, and the queue's store (/var/db/kyriakon-acme-queue,
+# scripts/acme-queue.sh) is never written from this lane: a renewal that queued
+# would spend the slot a waiting first issue needs, which is the opposite of the
+# exemption that keeps this lane running when the queue is backed up.
 #
 # The names come from /etc/acme-client.conf on every run, not from a list in this
 # file. A list is how oliver.kyriakon.net went unrenewed while its domain block
