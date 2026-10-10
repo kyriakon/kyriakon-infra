@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Where your application has got to{% endblock %}
+{% block content %}
+<h2>Where your application has got to</h2>
+<div class="card">
+  {% if notice != "" %}
+  <p>{{ notice }}</p>
+  {% else %}
+  <table>
+    <tr><td>Received</td><td>{{ filed_at }}. A person reads every application. Nothing is charged yet.</td></tr>
+    <tr><td>Stage</td><td>{{ stage }}</td></tr>
+  </table>
+  <p class="hint">The stage is one of received, with the reviewer, and decided. This page never repeats anything you wrote on the application. Anyone holding this link can read it, so keep it as you would a password. It works until the application is cleared away, a week after a decision.</p>
+  {% endif %}
+</div>
+{% endblock %}

@@ -66,6 +66,21 @@ helpdesk
 help
 info
 
+# Names the platform uses itself, added under the standing rule at the top of
+# this file. #187 fixes the rule: every hostname the platform uses is a username
+# someone could otherwise claim. ns0 is the zone's own nameserver name
+# (openbsd/etc/nsd/kyriakon.net.zone), and oliver is the operator's account and
+# carries its own vhost and certificate (openbsd/etc/httpd.conf,
+# acme-client.conf). apply, dmarc and hello are the platform's own role
+# addresses beside abuse and postmaster above: apply@ is the onboarding key
+# mailbox (docs/planning/specs/gemini-capsule.md), and dmarc@ and hello@ are in
+# the virtuals scripts/deploy-mail.sh delivers to the operator account.
+ns0
+oliver
+apply
+dmarc
+hello
+
 # --- Impersonation / authority-sounding names ---------------------------
 # Incomplete by design — see the note in the proposal §5.9. These are the
 # generic words most likely to be combined with a brand name for a

@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Application received{% endblock %}
+{% block content %}
+<h2>Thank you, that is with us</h2>
+<div class="card">
+  <p>Your application is with one person, who reads every one. If you gave an address outside this platform you will hear back there. Either way, this link shows where it has got to, and it is what carries the payment step if you are approved:</p>
+  <p class="mono" style="font-size:16px">{{ status_url }}</p>
+  <p class="hint">Keep it or print it. If you gave no other address, this is the only way we can tell you a decision, and it works until the application is cleared away, a week after a decision.</p>
+  <h3>What happens now</h3>
+  <ul>
+    <li><strong>Read.</strong> Usually within a few days, sometimes sooner.</li>
+    <li><strong>Approved.</strong> You get a link to pay, or a note that there is nothing to pay.</li>
+    <li><strong>Live.</strong> Your address starts accepting mail. Mail arriving before you have configured your client will sit there waiting, encrypted, and it will be readable once your client is set up.</li>
+    <li><strong>Site.</strong> Your site goes live when its certificate lands: it is requested when the account opens, and usually arrives within a day or three.</li>
+  </ul>
+  <p>If we cannot approve it, we will say so and tell you how to ask us to look again. Nothing is held for more than a week after we decide.</p>
+  <p class="hint">Your username is held for you while this is being read. If nothing is heard for a week, the application is deleted and the name is free again.</p>
+</div>
+{% endblock %}
