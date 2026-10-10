@@ -3,13 +3,12 @@
 //!
 //! The three conditions that decide whether mail can actually be delivered to a
 //! key (an encryption-capable subkey, no AEAD preference, not expired) are
-//! decided in the browser by the walkthrough (#176, #185), which posts its
-//! verdict and the key's fingerprint beside the material. This module only
-//! refuses something that is not a public key block at all, and reports whether
-//! the structure holds an encryption-capable packet so the recorded verdict is
-//! not blind trust. It never refuses a key merely because the browser would warn
-//! about it: the spec warns and proceeds, because a heuristic refusal turns a
-//! guarantee into a support queue.
+//! decided in the browser by the walkthrough (#176, #185), which posts the key's
+//! fingerprint beside the material. The verdict recorded here is this module's
+//! own structural reading, not a value the client sends. It refuses only
+//! something that is not a public key block at all, and never a key merely
+//! because the browser would warn about it: the spec warns and proceeds, because
+//! a heuristic refusal turns a guarantee into a support queue.
 
 const BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
 const END: &str = "-----END PGP PUBLIC KEY BLOCK-----";

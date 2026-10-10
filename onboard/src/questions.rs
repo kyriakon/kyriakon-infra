@@ -87,7 +87,9 @@ pub struct Choice {
 pub enum Rule {
     None,
     Username,
+    Usernames,
     Address,
+    Domain,
     MailKey,
     UploadKey,
     Choice(Vec<Choice>),
@@ -99,7 +101,9 @@ impl Rule {
         Ok(match s {
             "none" => Rule::None,
             "username" => Rule::Username,
+            "usernames" => Rule::Usernames,
             "address" => Rule::Address,
+            "domain" => Rule::Domain,
             "mail-key" => Rule::MailKey,
             "upload-key" => Rule::UploadKey,
             other => match other.strip_prefix("choice:") {

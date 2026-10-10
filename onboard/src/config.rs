@@ -9,9 +9,11 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// The store root. The handler writes `intents/`, `drafts/`, `applications/`
-    /// and `webhooks/` under it and reads the two shared files and the
-    /// application records it renders.
+    /// The store root. The handler reads the two shared files below it and the
+    /// application records it renders, and writes `intents/` and
+    /// `applications/`. `drafts/` and `webhooks/` are the capsule's draft store
+    /// and the payment webhooks, neither of which has a writer yet; both are
+    /// later tickets.
     pub store_root: String,
     /// The shared question list, 0644 at the top of the store.
     pub questions: String,

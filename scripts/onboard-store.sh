@@ -1,5 +1,5 @@
 #!/bin/ksh
-# onboard-store.sh — create the onboarding service's store and install the two
+# onboard-store.sh: create the onboarding service's store and install the two
 # files the three front-ends share.
 #
 # Usage: doas ksh scripts/onboard-store.sh
@@ -26,11 +26,11 @@
 # reserved-uid account in the shape `_gmid` has, and useradd is an operator step.
 # This script only checks for it, and names the exact line when it is missing.
 #
-# The modes on the four writable directories are tighter than a bare `install -d`
-# would leave them (0755), and they are the capsule spec's own: intents/ and
-# webhooks/ hold the privilege boundary's payloads, drafts/ and applications/
-# hold the applicant's own words, and no other local user, member or not, has any
-# reason to read any of them.
+# The four writable directories are 0700, owner `_onboard`: tighter than the
+# capsule spec's own rc_pre and much tighter than a bare `install -d` would leave
+# them (0755). They hold a stranger's own words, their public keys, their outside
+# address and the privilege boundary's payloads, and no other local user, member
+# or not, has any reason to read any of them.
 
 set -euo pipefail
 
@@ -52,13 +52,13 @@ onboard_user='_onboard'
 reserved_src="$repo_dir/reserved-usernames.txt"
 questions_src="$repo_dir/openbsd/etc/onboard/questions.tsv"
 
-# fail <message> — one place for the error shape, so every refusal reads the same.
+# fail <message>: one place for the error shape, so every refusal reads the same.
 fail() {
 	printf 'onboard-store: %s\n' "$1" >&2
 	exit 1
 }
 
-# assert_mode <path> <owner> <group> <octal-mode> — the post-condition check.
+# assert_mode <path> <owner> <group> <octal-mode>: the post-condition check.
 # %Lp prints the permission bits in octal without a leading zero, the same form
 # the mode arguments above are written in.
 assert_mode() {
@@ -67,7 +67,7 @@ assert_mode() {
 		fail "$1 is \"$got\", expected \"$2 $3 $4\""
 }
 
-# store_dir <name> <owner> <group> <mode> — create one directory under the store
+# store_dir <name> <owner> <group> <mode>: create one directory under the store
 # and assert it at once, so the assertion cannot be forgotten for a later entry.
 store_dir() {
 	install -d -m "$4" -o "$2" -g "$3" "$store/$1"
@@ -99,8 +99,8 @@ install -d -m 0755 -o root -g wheel "$store"
 assert_mode "$store" root wheel 755
 store_dir intents      "$onboard_user" "$onboard_user" 700
 store_dir webhooks     "$onboard_user" "$onboard_user" 700
-store_dir drafts       "$onboard_user" "$onboard_user" 750
-store_dir applications "$onboard_user" "$onboard_user" 750
+store_dir drafts       "$onboard_user" "$onboard_user" 700
+store_dir applications "$onboard_user" "$onboard_user" 700
 store_dir accounts     root wheel 750
 store_dir groups       root wheel 750
 store_dir tokens       root wheel 750

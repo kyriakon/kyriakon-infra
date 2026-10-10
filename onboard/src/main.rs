@@ -13,13 +13,14 @@ mod util;
 mod validate;
 
 use std::collections::{BTreeMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use askama::Template;
-use axum::extract::{ConnectInfo, Form, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Form, Path, Query, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -27,10 +28,29 @@ use serde::Deserialize;
 
 use crate::page::{NoticePage, ReceivedPage, StatusPage};
 use crate::questions::{Branch, Question, Rule};
+use crate::rate::Key;
 use crate::store::{Acceptance, KeyRecord, Record, Store};
 
 /// The fixed hostname for the form and the account page, used as itself.
 const HOST: &str = "signup.kyriakon.net";
+/// The only origin a submission may carry. The port-80 vhost redirects, so the
+/// form is served over TLS and nowhere else.
+const OWN_ORIGIN: &str = "https://signup.kyriakon.net";
+
+/// The largest body the handler reads. The largest legitimate field is a pasted
+/// public key: an armoured curve25519 key is about a kilobyte, and a body of ten
+/// mailboxes pastes ten of them, percent-encoded (up to three bytes on the wire
+/// for one byte of content) and beside the free-text answers. A quarter of a
+/// megabyte is comfortable for that and bounds a form post well under the two
+/// megabytes axum would otherwise accept.
+const MAX_BODY: usize = 256 * 1024;
+
+/// Served when a template could not be rendered. Static and interpolated with
+/// nothing, so the one place with no markup around it cannot become somewhere a
+/// field lands unescaped.
+const RENDER_FALLBACK: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<title>Kyriakon</title></head><body><main><h2>Something went wrong</h2>\
+<p>This is our fault, not yours. Try again in a moment.</p></main></body></html>";
 
 struct App {
     cfg: config::Config,
@@ -52,7 +72,11 @@ async fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("serve") => {}
-        Some(other) => return Err(format!("unknown command {other:?}; usage: kyriakon-onboard serve [--config PATH]")),
+        Some(other) => {
+            return Err(format!(
+                "unknown command {other:?}; usage: kyriakon-onboard serve [--config PATH]"
+            ))
+        }
         None => return Err("usage: kyriakon-onboard serve [--config PATH]".to_string()),
     }
     let mut cfg_path = PathBuf::from("/etc/onboard/onboard.toml");
@@ -66,11 +90,11 @@ async fn run() -> Result<(), String> {
     }
 
     let cfg = config::Config::load(&cfg_path)?;
-    let list = questions::parse(&Store::read_text(&cfg.questions)?)?;
+    let list = questions::parse(&Store::read_text(&cfg.questions).await?)?;
     if list.is_empty() {
         return Err("the question list has no questions".to_string());
     }
-    let reserved = validate::reserved(&Store::read_text(&cfg.reserved)?);
+    let reserved = validate::reserved(&Store::read_text(&cfg.reserved).await?);
     let addr = format!("{}:{}", cfg.listen, cfg.port);
     let app = Arc::new(App {
         store: Store::new(&cfg.store_root),
@@ -95,6 +119,11 @@ async fn run() -> Result<(), String> {
         .route("/", get(applicant))
         .route("/apply", post(apply))
         .route("/status/{token}", get(status))
+        // The counters are a layer rather than a check inside each handler, so a
+        // request an extractor rejects is still counted. The body limit is set
+        // here rather than inherited, because the default is two megabytes.
+        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app);
     axum::serve(
         listener,
@@ -104,43 +133,69 @@ async fn run() -> Result<(), String> {
     .map_err(|e| format!("server stopped: {e}"))
 }
 
+/// Count the request, refuse a cross-origin submission, and pass the key on.
+async fn guard(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Response {
+    let key = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| rate::key(c.0, req.headers()))
+        .unwrap_or(Key::UnknownForward);
+    if !app.counter.allow_request(key) {
+        return too_many(Which::Minute);
+    }
+    if req.method() == Method::POST && !own_origin(req.headers()) {
+        return (
+            StatusCode::FORBIDDEN,
+            html(&NoticePage {
+                title: "Refused".to_string(),
+                message: "A submission has to come from this form's own page.".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    req.extensions_mut().insert(key);
+    next.run(req).await
+}
+
+/// A submission's origin. `Origin` is sent on every browser POST; a value that
+/// is not this service's own is refused. When it is absent, `Sec-Fetch-Site` is
+/// the fallback, and a browser that sends neither is a client that is not a
+/// browser at all, which is not a cross-site request.
+fn own_origin(headers: &HeaderMap) -> bool {
+    if let Some(origin) = headers.get("origin") {
+        return origin.to_str().map(|o| o == OWN_ORIGIN).unwrap_or(false);
+    }
+    match headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        Some(site) => site == "same-origin" || site == "none",
+        None => true,
+    }
+}
+
 #[derive(Deserialize)]
 struct BranchQuery {
     branch: Option<String>,
 }
 
-async fn applicant(
-    State(app): State<Arc<App>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Query(q): Query<BranchQuery>,
-) -> Response {
-    if !app.counter.allow_request(client_ip(peer, &headers)) {
-        return too_many();
-    }
+async fn applicant(State(app): State<Arc<App>>, Query(q): Query<BranchQuery>) -> Response {
     let body = q.branch.as_deref() == Some("body");
     render_applicant(&app, body, &BTreeMap::new(), &[]).into_response()
 }
 
-async fn status(
-    State(app): State<Arc<App>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Path(token): Path<String>,
-) -> Response {
-    if !app.counter.allow_request(client_ip(peer, &headers)) {
-        return too_many();
-    }
+async fn status(State(app): State<Arc<App>>, Path(token): Path<String>) -> Response {
     // A token is a path component, so it is checked against the alphabet before
     // it is used as one: a probe cannot walk the directory with "..".
     let well_formed = token.len() == 26
         && token
             .bytes()
             .all(|b| b"0123456789abcdefghjkmnpqrstvwxyz".contains(&b));
-    let found = well_formed
-        .then(|| app.store.read_record("applications", &format!("{token}.json")))
-        .flatten()
-        .and_then(|s| serde_json::from_str::<Record>(&s).ok());
+    let found = if well_formed {
+        app.store
+            .read_record("applications", &format!("{token}.json"))
+            .await
+            .and_then(|s| serde_json::from_str::<Record>(&s).ok())
+    } else {
+        None
+    };
     let page = match found {
         Some(record) => StatusPage {
             stage: record.stage,
@@ -155,21 +210,15 @@ async fn status(
             notice: "This link is not in use. It may have been cleared away, or it may never have existed.".to_string(),
         },
     };
-    html(&page).into_response()
+    capability_page(&page)
 }
 
 async fn apply(
     State(app): State<Arc<App>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    Extension(key): Extension<Key>,
     // Every question id is one field, plus a `<id>_fingerprint` beside each key.
     Form(form): Form<BTreeMap<String, String>>,
 ) -> Response {
-    let ip = client_ip(peer, &headers);
-    if !app.counter.allow_request(ip) || !app.counter.allow_draft(ip) {
-        return too_many();
-    }
-
     let body = form.get("whose").map(String::as_str) == Some("body");
     let monastic = questions::is_monastic(form.get("orders").map(String::as_str));
     let applicable: Vec<&Question> = questions::shown(&app.questions, !body);
@@ -177,11 +226,11 @@ async fn apply(
     let mut errors = Vec::new();
     for q in &applicable {
         let value = form.get(&q.id).cloned().unwrap_or_default();
-        // A monastic-branch question is shown on both paths and is required only
-        // on the monastic path, which the orders answer selects. The file's own
-        // required flag cannot express that, so it is not read for one.
+        // A monastic-branch question belongs to the monastic path, so its
+        // requirement is read from the file's own column and applied only when
+        // the orders answer selects that path.
         let required = match q.branch {
-            Branch::Monastic => monastic,
+            Branch::Monastic => monastic && q.required,
             _ => q.required,
         };
         if q.rule == Rule::MailKey {
@@ -192,6 +241,9 @@ async fn apply(
             errors.push(format!("{}: {why}", q.prompt));
         }
     }
+    if body {
+        body_cross_checks(&form, &mut errors);
+    }
     if !errors.is_empty() {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -200,7 +252,14 @@ async fn apply(
             .into_response();
     }
 
-    let token = match store::status_token() {
+    // Charged here, once the submission is a draft and no longer merely an
+    // attempt: a refusal spends the request budget, not the day's drafts, and a
+    // third-party page cannot burn a visitor's day with junk posts.
+    if !app.counter.allow_draft(key) {
+        return too_many(Which::Day);
+    }
+
+    let token = match store::status_token().await {
         Ok(t) => t,
         Err(e) => return server_error(&e),
     };
@@ -219,6 +278,7 @@ async fn apply(
     if let Err(e) = app
         .store
         .write_record("applications", &format!("{token}.json"), &app_bytes)
+        .await
     {
         return server_error(&e);
     }
@@ -229,14 +289,35 @@ async fn apply(
     if let Err(e) = app
         .store
         .write_record("intents", &format!("{id}.json"), &intent_bytes)
+        .await
     {
         return server_error(&e);
     }
 
-    html(&ReceivedPage {
+    capability_page(&ReceivedPage {
         status_url: format!("https://{HOST}/status/{token}"),
     })
-    .into_response()
+}
+
+/// The body's addresses against its account names: the same number of lines, at
+/// most ten, and each address line `localpart: own` or `localpart: alias
+/// localpart`, which is the form the spec's community-block table gives.
+fn body_cross_checks(form: &BTreeMap<String, String>, errors: &mut Vec<String>) {
+    let addresses = form.get("body_addresses").map(String::as_str).unwrap_or("");
+    let names = form
+        .get("body_account_names")
+        .map(String::as_str)
+        .unwrap_or("");
+    let count = |v: &str| v.lines().filter(|l| !l.trim().is_empty()).count();
+    let (a, n) = (count(addresses), count(names));
+    if a != n {
+        errors.push(format!(
+            "The addresses, one per line: {a} addresses and {n} account names; there is one account name per address"
+        ));
+    }
+    if let Some(why) = validate::address_lines(addresses) {
+        errors.push(format!("The addresses, one per line: {why}"));
+    }
 }
 
 fn build_record(
@@ -259,7 +340,13 @@ fn build_record(
         .unwrap_or_default();
     let mailboxes: Vec<String> = if body {
         form.get("body_account_names")
-            .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+            .map(|s| {
+                s.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
         vec![String::new()]
@@ -279,7 +366,9 @@ fn build_record(
         key_record(
             String::new(),
             upload,
-            form.get(&format!("{upload_key_id}_fingerprint")).cloned().unwrap_or_default(),
+            form.get(&format!("{upload_key_id}_fingerprint"))
+                .cloned()
+                .unwrap_or_default(),
         )
     });
 
@@ -378,19 +467,6 @@ fn key_blocks(value: &str) -> Vec<String> {
     out
 }
 
-/// The client's address. `X-Forwarded-For` is trusted only because the listener
-/// is loopback and relayd is the only thing that can reach it: the front end
-/// sets the header the counters key on. A listener opened beyond loopback would
-/// let a caller forge it, which is why the address is loopback in the config.
-fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.trim().parse::<IpAddr>().ok())
-        .unwrap_or_else(|| peer.ip())
-}
-
 fn render_applicant(
     app: &App,
     body: bool,
@@ -402,12 +478,38 @@ fn render_applicant(
     html(&page)
 }
 
-fn too_many() -> Response {
+/// A page that carries a capability in its URL or is a capability itself is
+/// never stored and its URL is never sent as a referrer.
+fn capability_page<T: Template>(t: &T) -> Response {
+    let mut response = html(t).into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
+enum Which {
+    Minute,
+    Day,
+}
+
+fn too_many(which: Which) -> Response {
+    let message = match which {
+        Which::Minute => {
+            "Too many requests have come from this address in a short time. Wait a minute and try again."
+        }
+        Which::Day => {
+            "Too many applications have been started from this address today. Try again tomorrow."
+        }
+    };
     (
         StatusCode::TOO_MANY_REQUESTS,
         html(&NoticePage {
             title: "Too many requests".to_string(),
-            message: "Too many requests have come from this address in a short time. Wait a minute and try again.".to_string(),
+            message: message.to_string(),
         }),
     )
         .into_response()
@@ -428,7 +530,10 @@ fn server_error(why: &str) -> Response {
 fn html<T: Template>(t: &T) -> Html<String> {
     match t.render() {
         Ok(s) => Html(s),
-        Err(e) => Html(format!("<!doctype html><p>The page could not be rendered: {e}</p>")),
+        Err(e) => {
+            eprintln!("kyriakon-onboard: cannot render a page: {e}");
+            Html(RENDER_FALLBACK.to_string())
+        }
     }
 }
 
@@ -444,13 +549,32 @@ mod tests {
     }
 
     #[test]
-    fn the_forwarded_address_wins_only_when_it_parses() {
-        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+    fn a_submission_must_come_from_this_form() {
         let mut h = HeaderMap::new();
-        assert_eq!(client_ip(peer, &h), "127.0.0.1".parse::<IpAddr>().unwrap());
-        h.insert("x-forwarded-for", "203.0.113.10, 127.0.0.1".parse().unwrap());
-        assert_eq!(client_ip(peer, &h), "203.0.113.10".parse::<IpAddr>().unwrap());
-        h.insert("x-forwarded-for", "not an address".parse().unwrap());
-        assert_eq!(client_ip(peer, &h), "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert!(own_origin(&h), "a client that is not a browser is allowed");
+        h.insert("origin", OWN_ORIGIN.parse().unwrap());
+        assert!(own_origin(&h));
+        h.insert("origin", "https://elsewhere.example".parse().unwrap());
+        assert!(!own_origin(&h));
+        h.remove("origin");
+        h.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert!(!own_origin(&h));
+        h.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        assert!(own_origin(&h));
+    }
+
+    #[test]
+    fn the_body_addresses_are_counted_against_its_account_names() {
+        let mut errors = Vec::new();
+        let mut form = BTreeMap::new();
+        form.insert("body_addresses".into(), "secretary: own\nhall: alias secretary".into());
+        form.insert("body_account_names".into(), "secretary".into());
+        body_cross_checks(&form, &mut errors);
+        assert!(errors.iter().any(|e| e.contains("2 addresses and 1 account names")), "{errors:?}");
+
+        errors.clear();
+        form.insert("body_account_names".into(), "secretary\nhall".into());
+        body_cross_checks(&form, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }

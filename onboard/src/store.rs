@@ -7,10 +7,10 @@
 //! anything root-owned.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub struct Store {
     root: PathBuf,
@@ -23,30 +23,49 @@ impl Store {
         }
     }
 
-    pub fn read_text(path: &str) -> Result<String, String> {
-        std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))
+    pub async fn read_text(path: &str) -> Result<String, String> {
+        tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| format!("cannot read {path}: {e}"))
     }
 
     /// Read a record, `None` when it is not there. A missing record and an
     /// expired one are the same to the caller, which is what keeps the status
     /// path from being a token oracle.
-    pub fn read_record(&self, dir: &str, name: &str) -> Option<String> {
-        std::fs::read_to_string(self.root.join(dir).join(name)).ok()
+    pub async fn read_record(&self, dir: &str, name: &str) -> Option<String> {
+        tokio::fs::read_to_string(self.root.join(dir).join(name))
+            .await
+            .ok()
     }
 
     /// Write one record by rename: a temporary file in the same directory, then
     /// the rename, so a reader never sees half of one and a crash leaves the
-    /// temporary file rather than a truncated record.
-    pub fn write_record(&self, dir: &str, name: &str, bytes: &[u8]) -> Result<(), String> {
+    /// temporary file rather than a truncated record. The file is created 0600,
+    /// so the umask cannot widen the applicant's own words, keys and outside
+    /// address beyond the account that wrote them and root.
+    pub async fn write_record(&self, dir: &str, name: &str, bytes: &[u8]) -> Result<(), String> {
         let d = self.root.join(dir);
         let tmp = d.join(format!(".{name}.tmp"));
         let target = d.join(name);
-        let placed = std::fs::File::create(&tmp)
-            .and_then(|mut f| f.write_all(bytes).and_then(|_| f.sync_all()))
-            .and_then(|_| std::fs::rename(&tmp, &target));
+        let placed = async {
+            let mut f = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .await?;
+            f.write_all(bytes).await?;
+            f.sync_all().await?;
+            drop(f);
+            tokio::fs::rename(&tmp, &target).await
+        }
+        .await;
+        // The record's name is the status token, so the error names the
+        // directory rather than the path: the token must not reach the log.
         placed.map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
-            format!("cannot place {}: {e}", target.display())
+            format!("cannot place a record in {}: {e}", d.display())
         })
     }
 }
@@ -168,10 +187,13 @@ impl Record {
 /// kernel pool. It is a bearer capability, so it is 128 real bits of randomness
 /// and not a ULID: a ULID spends 48 of its bits on a timestamp, which a
 /// capability must not do.
-pub fn status_token() -> Result<String, String> {
+pub async fn status_token() -> Result<String, String> {
     let mut bytes = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
+    let mut f = tokio::fs::File::open("/dev/urandom")
+        .await
+        .map_err(|e| format!("cannot open /dev/urandom: {e}"))?;
+    f.read_exact(&mut bytes)
+        .await
         .map_err(|e| format!("cannot read /dev/urandom: {e}"))?;
     Ok(crockford128(bytes))
 }
@@ -192,16 +214,16 @@ fn crockford128(bytes: [u8; 16]) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_128_bit_token_is_26_crockford_characters() {
-        let t = status_token().unwrap();
+    #[tokio::test]
+    async fn a_128_bit_token_is_26_crockford_characters() {
+        let t = status_token().await.unwrap();
         assert_eq!(t.len(), 26, "{t}");
         assert!(t
             .bytes()
             .all(|b| b"0123456789abcdefghjkmnpqrstvwxyz".contains(&b)));
         // Crockford leaves out I, L, O and U, so no token can carry one.
         assert!(!t.contains(['i', 'l', 'o', 'u']));
-        assert_ne!(t, status_token().unwrap());
+        assert_ne!(t, status_token().await.unwrap());
     }
 
     #[test]
@@ -213,14 +235,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_record_is_written_by_rename_and_reads_back() {
+    #[tokio::test]
+    async fn a_record_is_written_by_rename_at_0600_and_reads_back() {
         let dir = std::env::temp_dir().join(format!("onboard-store-test-{}", std::process::id()));
         let apps = dir.join("applications");
         std::fs::create_dir_all(&apps).unwrap();
         let store = Store::new(dir.to_str().unwrap());
-        store.write_record("applications", "tok.json", b"{\"a\":1}").unwrap();
-        assert_eq!(store.read_record("applications", "tok.json").as_deref(), Some("{\"a\":1}"));
+        store
+            .write_record("applications", "tok.json", b"{\"a\":1}")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.read_record("applications", "tok.json").await.as_deref(),
+            Some("{\"a\":1}")
+        );
+        // The umask did not widen it.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(apps.join("tok.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "record mode is {mode:o}");
         // No temporary file is left behind.
         let leftovers: Vec<_> = std::fs::read_dir(&apps)
             .unwrap()
@@ -231,9 +267,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn a_missing_record_is_none_not_an_error() {
+    #[tokio::test]
+    async fn a_missing_record_is_none_not_an_error() {
         let store = Store::new("/tmp");
-        assert!(store.read_record("applications", "nope.json").is_none());
+        assert!(store.read_record("applications", "nope.json").await.is_none());
     }
 }
