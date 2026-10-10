@@ -1,0 +1,45 @@
+# /etc/onboard/onboard.toml
+#
+# The onboarding handler's configuration, installed from
+# openbsd/etc/onboard/onboard.toml. The handler holds no privilege and no
+# secret, so this file holds none either: unlike the drain's own home under
+# /etc/kyriakon/onboard/, which is 0700 root and holds Stripe's signing secret
+# and the keyring publish token, this file is neither root-only nor secret.
+#
+# No deploy installs it. The unit names it explicitly (openbsd/etc/rc.d/
+# kyriakon_onboard passes /etc/onboard/onboard.toml) rather than relying on a
+# compiled-in default, so the path is auditable at the rcctl prompt and a second
+# instance cannot silently pick up a different file.
+
+# The store root. The handler reads the two shared files below it and the
+# application and draft records it renders, and writes intents/, drafts/,
+# applications/ and webhooks/. It reads no secret and no other member's state.
+store_root = "/var/db/onboard"
+
+# The question list and the reserved set the three front-ends share, both 0644 at
+# the top of the store (scripts/onboard-store.sh installs them there). Named here
+# rather than derived from the store root, so the handler fails loudly if a later
+# layout moves them instead of reading an empty list and rendering nothing.
+questions = "/var/db/onboard/questions.tsv"
+reserved = "/var/db/onboard/reserved-usernames.txt"
+
+# The deployed commit and date, substituted at install, e.g.
+# "2026-10-10 1a2b3c4". The acceptance records carry it as the version of each
+# document accepted, and it is the version of the question list an application
+# was answered against. It is the release the box is running, not a hash of
+# either file: the handler holds no hash crate, and a commit is a version the
+# drain can look up.
+release = "REPLACE_ME"
+
+# Loopback only. relayd terminates TLS for signup.kyriakon.net on the box and
+# passes the request to this address, so the handler must never listen on a
+# public interface: its whole trust boundary is that nothing but relayd on this
+# host can reach it. 7080 is not in /etc/services and no other listener on the
+# box uses it.
+listen = "127.0.0.1"
+port = 7080
+
+# The rate limits (sixty requests a minute and five drafts a day per address, no
+# CAPTCHA) are the spec's numbers and live in the handler, not here: they are not
+# a per-box tuning knob, and a config file that could raise them is a config file
+# that could remove the gate the counters exist to be.

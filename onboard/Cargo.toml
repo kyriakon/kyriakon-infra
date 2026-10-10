@@ -1,0 +1,24 @@
+[package]
+name = "kyriakon-onboard"
+version = "0.1.0"
+edition = "2021"
+description = "Onboarding handler: renders the applicant page and writes one JSON intent per submission"
+publish = false
+
+[dependencies]
+# The framework the spec fixes for the service.
+askama = "0.14"
+# axum over tokio: the routes, the extractors, and the loopback listener.
+axum = { version = "0.8", features = ["form"] }
+# serde deserializes the form and serializes the record; axum's Form and
+# serde_json both build on it.
+serde = { version = "1", features = ["derive"] }
+# The intent and the application record are JSON, the shape the drain reads.
+serde_json = "1"
+# filed_at, RFC 3339 in UTC. One function, so the formatting crate can move.
+time = { version = "0.3", features = ["std", "formatting"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+# The config is TOML, the format the spec names for the service's own file.
+toml = "0.9"
+# The intent id and the status token are 128-bit Crockford ULIDs.
+ulid = "1"
