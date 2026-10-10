@@ -33,6 +33,12 @@
 # of them makes the others depend on running in a particular order. The deploys
 # call this when the file is absent instead of each carrying its own copy.
 #
+# One value is chosen here rather than passed in: TUI_PORT, the port the
+# applicant-facing sshd will listen on. The box walks 2200-2299 in order for the
+# first port that is neither listening nor named in /etc/services and records it
+# under that name, once. It is not an argument, and a later run keeps the value
+# it finds rather than choosing again.
+#
 # It never overwrites the file without arguments: the real one holds the TSIG
 # secret and the alert topic, and rewriting it from the repo template would
 # replace them with placeholders.
@@ -42,6 +48,43 @@ set -euo pipefail
 script_dir="$(dirname "$0")"
 template="${KYRIAKON_ENV_TEMPLATE:-$script_dir/../openbsd/etc/kyriakon.env}"
 env_dst="${KYRIAKON_ENV:-/root/.kyriakon-env}"
+
+# The onboarding TUI's port is a property of the box, not a value an operator
+# can be expected to know, so the box picks it here instead of taking it as an
+# argument. The reserved range is 2200-2299.
+tui_port_first=2200
+tui_port_last=2299
+
+# True when a port is already listening on either address family. netstat's
+# local-address column ends in the port, so a suffix match covers a wildcard
+# (0.0.0.0.2200, *.2200) as well as a bound address (127.0.0.1.2200). The match
+# runs in awk rather than `| grep -q` because grep -q exits at its first hit and
+# the resulting SIGPIPE to netstat would trip `set -o pipefail`.
+port_listening() {
+	netstat -na -f inet 2>/dev/null | awk -v p="$1" '$4 ~ ("[.:]" p "$") { f = 1 } END { exit !f }' ||
+		netstat -na -f inet6 2>/dev/null | awk -v p="$1" '$4 ~ ("[.:]" p "$") { f = 1 } END { exit !f }'
+}
+
+# True when /etc/services names the port. sshd would refuse a named port anyway,
+# so skipping it here avoids choosing one the daemon then rejects.
+port_named_in_services() {
+	awk -v p="$1" '$2 ~ ("^" p "/(tcp|udp)$") { f = 1 } END { exit !f }' /etc/services
+}
+
+# The first free port in the range. Returning nothing is a failure, not a
+# fallback: an unreviewed listener on an arbitrary port is worse than a build
+# that stops.
+choose_tui_port() {
+	p=$tui_port_first
+	while [ "$p" -le "$tui_port_last" ]; do
+		if ! port_listening "$p" && ! port_named_in_services "$p"; then
+			printf '%s\n' "$p"
+			return 0
+		fi
+		p=$((p + 1))
+	done
+	return 1
+}
 
 vars="KYRIAKON_IPV4 KYRIAKON_IPV6 KYRIAKON_TSIG_SECRET RESTIC_REPOSITORY RESTIC_PASSWORD_FILE ALERT_EMAIL HEALTHCHECKS_URL KEYRING_HEALTHCHECKS_URL REHEARSAL_HEALTHCHECKS_URL HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL"
 
@@ -261,6 +304,28 @@ elif [ ! -f "$env_dst" ]; then
 	}
 	install -m 0600 "$template" "$env_dst"
 	printf 'installed %s from %s\n' "$env_dst" "$template"
+fi
+
+# TUI_PORT is the one value here the box chooses rather than the operator, so it
+# is filled in whenever the line is absent: on the template install, on a fresh
+# write from arguments, and on a re-run against a file written before this
+# change. An existing value is kept untouched, which is what makes it recorded
+# once: a later run must not move a port the firewall has already been told
+# about.
+if ! grep -q '^export TUI_PORT=' "$env_dst"; then
+	if ! tui_port=$(choose_tui_port); then
+		printf 'setup-env: nothing in %s-%s is free for the onboarding TUI sshd; not choosing a port\n' \
+			"$tui_port_first" "$tui_port_last" >&2
+		exit 1
+	fi
+	{
+		printf '\n'
+		printf '# The port the applicant-facing sshd listens on, chosen from the free\n'
+		printf '# ports in 2200-2299. The installed /etc/ssh/sshd_config.onboard carries\n'
+		printf '# it on its Port line, and scripts/pf-apply.sh reads it back.\n'
+		printf "export TUI_PORT='%s'\n" "$tui_port"
+	} >> "$env_dst"
+	printf 'chose %s for the onboarding TUI (TUI_PORT)\n' "$tui_port"
 fi
 
 missing=""

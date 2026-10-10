@@ -1,0 +1,62 @@
+# /etc/ssh/sshd_config.onboard
+#
+# The applicant-facing sshd, run by /etc/rc.d/kyriakon_onboard_sshd. A separate
+# file, port, PidFile and account from the member sshd in /etc/ssh/sshd_config,
+# which this file leaves untouched.
+#
+# Applied by hand, like the member file. No deploy installs this one: copy it to
+# /etc/ssh/sshd_config.onboard with the REPLACE_ME on the Port line below
+# substituted from TUI_PORT in /root/.kyriakon-env, then
+#
+#   doas sshd -t -f /etc/ssh/sshd_config.onboard
+#   doas rcctl enable kyriakon_onboard_sshd
+#   doas rcctl start kyriakon_onboard_sshd
+#
+# No HostKey line, so sshd reads the same /etc/ssh/ssh_host_* keys the member
+# instance uses and the box keeps one SSH identity.
+Port REPLACE_ME
+PidFile /var/run/sshd.onboard.pid
+
+# Only the onboard account is reachable, before authentication. That is what
+# lets the instance carry PasswordAuthentication yes, which the none method
+# needs: userauth_none() calls mm_auth_password("") only when
+# permit_empty_passwd and password_authentication are both on (auth2-none.c).
+AllowUsers onboard
+PasswordAuthentication yes
+PermitRootLogin no
+LoginGraceTime 30
+
+# Pre-auth connection caps. PerSourceMaxStartups is the per-address one.
+# sshd drops the excess TCP connection and writes nothing; the TUI's own
+# counter answers the same condition with the screen in its own section.
+MaxStartups 4:50:10
+PerSourceMaxStartups 2
+PerSourceNetBlockSize 32:128
+
+# The documented default, written out so a future default change cannot quietly
+# reintroduce a banner: a banner is read by every scanner and by nobody the
+# platform wants.
+Banner none
+
+# Every connection lands in authlog, where the abuse monitor counts it.
+LogLevel VERBOSE
+SyslogFacility AUTH
+
+Match User onboard
+	# Nothing is asked of the applicant: no credential exists to leak, rotate
+	# or publish. The account is password-less, which is the condition the
+	# none method documents.
+	PermitEmptyPasswords yes
+	AuthenticationMethods none
+	KbdInteractiveAuthentication no
+
+	# A text pipe and nothing else: no pty, no forwarding, no ~/.ssh/rc, and
+	# one channel per connection.
+	MaxSessions 1
+	PermitTTY no
+	DisableForwarding yes
+	PermitOpen none
+	PermitUserRC no
+
+	# The one program the account can run, on every path.
+	ForceCommand /usr/local/sbin/kyriakon-onboard-tui
