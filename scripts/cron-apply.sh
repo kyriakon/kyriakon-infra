@@ -75,7 +75,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
-needed_scripts="abuse-monitor.sh check-keyring-drift.sh renew-acme.sh backup.sh restore-standup.sh"
+needed_scripts="abuse-monitor.sh check-keyring-drift.sh renew-acme.sh backup.sh restore-standup.sh acme-queue.sh"
 needed_vars="ALERT_EMAIL HEALTHCHECKS_URL KEYRING_HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL"
 
 # The crontab line for one script. Built per script rather than as one block: a
@@ -89,6 +89,7 @@ line_for() {
 	renew-acme.sh) printf '0 3 * * * . /root/.kyriakon-env; /root/bin/renew-acme.sh\n' ;;
 	backup.sh) printf '30 2 * * * . /root/.kyriakon-env; /root/bin/backup.sh\n' ;;
 	restore-standup.sh) printf '45 3 * * 0 . /root/.kyriakon-env; /root/bin/restore-standup.sh\n' ;;
+	acme-queue.sh) printf '*/15 * * * * . /root/.kyriakon-env; /root/bin/acme-queue.sh --run\n' ;;
 	*) return 1 ;;
 	esac
 }
