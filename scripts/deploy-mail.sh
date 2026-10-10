@@ -15,8 +15,8 @@
 #   1. installs the packages the build and the daemons need
 #   2. installs httpd.conf + acme-client.conf and issues the mail and site
 #      certificates
-#   3. installs smtpd.conf (with the queue key), dovecot.conf and the mail
-#      aliases the domain has to answer for
+#   3. installs smtpd.conf (with the queue key), dovecot.conf, and seeds the
+#      mail tables the domain has to answer for
 #   4. generates the DKIM key if absent, and checks the published DKIM and SPF
 #      records
 #   5. builds and installs the Dovecot plugin and the kyriakon-encrypt daemon
@@ -170,12 +170,10 @@ install -d -m 0755 -o root -g daemon /home/www/acme
 install -d -m 0700 /etc/acme
 # The generated vhost indexes the two daemons include. include is an fopen of one
 # path, so a missing index fails the whole configuration rather than being
-# skipped: the file has to exist before httpd -n, gmid -n or acme-client parses
-# the config, and an empty one is valid. acme-client.d is the third lane, added
-# when member certificates arrived: each member's name gets its own domain block
-# there, so the tracked config never gains a per-member line.
-install -d -m 0755 /etc/httpd.d /etc/gmid.d /etc/acme-client.d
-for i in /etc/httpd.d/index.conf /etc/gmid.d/index.conf /etc/acme-client.d/index.conf; do
+# skipped: the file has to exist before httpd -n or gmid -n runs, and an empty
+# one is valid.
+install -d -m 0755 /etc/httpd.d /etc/gmid.d
+for i in /etc/httpd.d/index.conf /etc/gmid.d/index.conf; do
 	[ -e "$i" ] || : >"$i"
 	chmod 0644 "$i"
 done
@@ -334,6 +332,137 @@ if [ "${#queue_key}" -ne "$queue_key_len" ]; then
 		"$queue_key_file" "$queue_key_len"
 fi
 
+# The two tables smtpd.conf reads. Both are generated on the box: this deploy
+# seeds only the platform's own entries and leaves the rest of each file alone,
+# because the drain that provisions a body appends to these same files and a
+# redeploy must not wipe what it wrote.
+#
+# Seeded before the reload below, not after: a file: table is opened when the LKA
+# process starts rather than when the configuration is parsed, so smtpd -n passes
+# on a config naming a table the box does not have and it is the running daemon
+# that fails.
+#
+# The drain hooks in here. Its group-provision step (#156, the onboarding
+# service's root cron) appends one line to /etc/mail/mail_domains per body
+# domain and a "full-address account" line to /etc/mail/virtuals per body
+# address, then reloads smtpd. That drain is a later ticket and is not built
+# here.
+# The platform's own domain. Every account under /home answers for it, and it is
+# the one line this deploy owns in mail_domains.
+platform_domain=kyriakon.net
+mail_domains_table=/etc/mail/mail_domains
+virtuals_table=/etc/mail/virtuals
+if [ -s "$mail_domains_table" ]; then
+	printf 'kept existing %s\n' "$mail_domains_table"
+else
+	printf '%s\n' "$platform_domain" > "$mail_domains_table"
+	chmod 0644 "$mail_domains_table"
+	printf 'seeded %s with the platform domain\n' "$mail_domains_table"
+fi
+[ -e "$virtuals_table" ] || : > "$virtuals_table"
+chmod 0644 "$virtuals_table"
+
+# Addresses the domain has to answer for. RFC 2142 requires every mail domain to
+# accept postmaster@ and abuse@; docs/aup.md sends abuse reports to
+# abuse@kyriakon.net; the DMARC record points aggregate reports at
+# dmarc@kyriakon.net. On a fresh box none of them land anywhere useful: abuse
+# and dmarc have no entry at all, and postmaster resolves to root, whose mailbox
+# nobody reads. Delivering them to the operator account means they arrive in a
+# mailbox that is read like any other delivery.
+#
+# These move into /etc/mail/virtuals as bare localparts rather than into
+# /etc/mail/aliases. The virtual lookup tries user@domain, then user, so a bare
+# localpart answers for every domain in mail_domains; the full-address entry the
+# drain writes for a body's own secretary@ is a different key and does not
+# collide with it. A body keeps no catch-all, because the ten-address cap counts
+# what the platform provisions and a catch-all would answer for any number of
+# them. security@ is absent on purpose, since the base aliases point it at root,
+# which resolves here to oliver. hello@ is here because the landing site
+# publishes it as the contact address, so mail to the platform bounces without
+# it.
+#
+# A table line is "name: value" (table(5) allows whitespace or an optional colon
+# between the columns; the colon is what the platform aliases have always used).
+# The write is matched on the leading localpart, so the platform's bare hello
+# does not touch a body's hello@parish.example, and every line the drain has
+# already added survives.
+#
+# admin@ uses Dovecot's recipient_delimiter (+ in dovecot.conf) so it lands in
+# the .Admin folder rather than the INBOX. It was previously an INBOX delivery
+# with a Thunderbird filter expected to move it, and that filter matches on the
+# sender being root@, so it filed machine mail and could never have caught
+# correspondence addressed to admin@. Filing it at delivery means it works on
+# every client, not only the one somebody configured, and the folder name here
+# has to match the existing .Admin exactly, since the detail part is used as
+# written.
+virtual_entries="root: oliver
+postmaster: oliver
+abuse: oliver
+dmarc: oliver
+admin: oliver+Admin
+hello: oliver"
+# Fed to each loop through a here-document rather than a here-string. OpenBSD's
+# /bin/ksh is pdksh-derived and has no `<<<`, which fails at parse time with
+# "syntax error: `< ' unexpected" and takes the whole deploy down with it. The
+# delimiter is unquoted so the variable expands, one entry per line. Read line
+# by line rather than split on whitespace: splitting would tear the "name: value"
+# pair apart and write an entry with an empty value, which stops delivering mail
+# to that address.
+virtuals_tmp=$(mktemp "$virtuals_table.XXXXXX")
+trap 'rm -f "$virtuals_tmp"' EXIT
+# make sure an append starts on a line of its own
+[ -n "$(tail -c 1 "$virtuals_table")" ] && printf '\n' >> "$virtuals_table"
+while IFS= read -r entry; do
+	virtual_name=${entry%%:*}
+	if grep -q "^${virtual_name}:" "$virtuals_table"; then
+		sed "s|^${virtual_name}:.*|${entry}|" "$virtuals_table" > "$virtuals_tmp"
+		# copied over the original rather than moved into place, so the file
+		# keeps the ownership and mode it already has
+		cat "$virtuals_tmp" > "$virtuals_table"
+		printf 'virtual %s set\n' "$virtual_name"
+	else
+		printf '%s\n' "$entry" >> "$virtuals_table"
+		printf 'virtual %s added\n' "$virtual_name"
+	fi
+done <<EOF
+$virtual_entries
+EOF
+while IFS= read -r entry; do
+	grep -qxF "$entry" "$virtuals_table" \
+		|| { printf 'virtual entry did not land in %s: %s\n' "$virtuals_table" "$entry" >&2; exit 1; }
+done <<EOF
+$virtual_entries
+EOF
+
+# One entry per local account, because the virtual table is the whole answer for
+# this domain: a lookup that finds neither <user>@<domain> nor <user> has nothing
+# to expand to, so an account whose address is missing is an account mail cannot
+# reach, and the rejection happens at RCPT time where only the sender sees it.
+# Every account whose home is under /home is one of ours, since the service
+# accounts live in /var, and each entry is an identity mapping: the account
+# delivers its own mail.
+#
+# The aliases above and these lines are both written here, and the drain writes
+# the same file's body addresses, because a box deployed today has accounts that
+# predate any drain. Only an absent line is added: one that already maps the
+# address somewhere else is left alone, so an address deliberately aimed at
+# another mailbox survives a redeploy. Nothing is removed here either, since an
+# address can still be wanted after the account stops being used, and removing it
+# is the drain's act.
+while IFS= read -r acct; do
+	[ -n "$acct" ] || continue
+	account_line="$acct@$platform_domain: $acct"
+	if awk -F: -v k="$acct@$platform_domain" '$1 == k { found = 1 } END { exit !found }' "$virtuals_table"; then
+		continue
+	fi
+	printf '%s\n' "$account_line" >> "$virtuals_table"
+	awk -F: -v k="$acct@$platform_domain" '$1 == k { found = 1 } END { exit !found }' "$virtuals_table" \
+		|| { printf 'virtual entry did not land in %s: %s\n' "$virtuals_table" "$account_line" >&2; exit 1; }
+	printf 'virtual %s added\n' "$acct@$platform_domain"
+done <<EOF
+$(awk -F: '$6 ~ /^\/home\// { print $1 }' /etc/passwd)
+EOF
+
 # '|' delimits the s/// because base64 keys contain '/'. The deployed file
 # holds the key, hence 0600.
 sed -e "s|REPLACE_ME_QUEUE_KEY|$queue_key|" "$repo_dir/openbsd/etc/smtpd.conf" > /etc/mail/smtpd.conf
@@ -359,75 +488,6 @@ install -m 0644 "$repo_dir/openbsd/etc/spamd.conf" /etc/mail/spamd.conf
 # kyriakon.net address must not be what teaches spamd that a new sender is a
 # spammer.
 install -m 0644 "$repo_dir/openbsd/etc/spamd.alloweddomains" /etc/mail/spamd.alloweddomains
-
-# Addresses the domain has to answer for. RFC 2142 requires every mail domain
-# to accept postmaster@ and abuse@; docs/aup.md sends abuse reports to
-# abuse@kyriakon.net; the DMARC record points aggregate reports at
-# dmarc@kyriakon.net. On a fresh box none of them land anywhere useful: abuse
-# and dmarc have no entry at all, and postmaster resolves to root, whose
-# mailbox nobody reads. Delivering them to the operator account means they
-# arrive in a mailbox that is read, encrypted at rest like any other delivery.
-#
-# OpenBSD has no alias database and no newaliases, so smtpd reads this file
-# directly and picks up the edit when the service step reloads it below.
-# Rewritten rather than edited in place with sed -i: that flag takes its suffix
-# differently on BSD and GNU sed, and this way the same code can be exercised
-# off the box.
-aliases=/etc/mail/aliases
-aliases_tmp=$(mktemp "$aliases.XXXXXX")
-trap 'rm -f "$aliases_tmp"' EXIT
-# make sure an append starts on a line of its own
-[ -n "$(tail -c 1 "$aliases")" ] && printf '\n' >> "$aliases"
-# Every address the domain promises to answer, all landing in the operator's
-# mailbox. One list drives the write and the check below, because they were two
-# separate copies and an address added to only one of them would pass its own
-# check. Read line by line rather than split on whitespace: each line is a
-# "name: value" pair, and word splitting would tear the pair apart and write an
-# alias with an empty right-hand side, which silently stops delivering mail to
-# that address. security@ is absent on purpose, since the base aliases already
-# point it at root, which resolves here to oliver. hello@ is here because the
-# landing site publishes it as the contact address, so mail to the platform
-# bounces without it.
-#
-# admin@ uses Dovecot's recipient_delimiter (+ in dovecot.conf) so it lands in the
-# .Admin folder rather than the INBOX. It was previously an INBOX delivery with a
-# Thunderbird filter expected to move it, and that filter matches on the sender
-# being root@, so it filed machine mail and could never have caught correspondence
-# addressed to admin@. Filing it at delivery means it works on every client, not
-# only the one somebody configured, and the folder name here has to match the
-# existing .Admin exactly, since the detail part is used as written.
-alias_entries="root: oliver
-postmaster: oliver
-abuse: oliver
-dmarc: oliver
-admin: oliver+Admin
-hello: oliver"
-# Fed to each loop through a here-document rather than a here-string. OpenBSD's
-# /bin/ksh is pdksh-derived and has no `<<<`, which fails at parse time with
-# "syntax error: `< ' unexpected" and takes the whole deploy down with it. The
-# delimiter is unquoted so the variable expands, one alias per line.
-while IFS= read -r entry; do
-	alias_name=${entry%%:*}
-	if grep -q "^${alias_name}:" "$aliases"; then
-		sed "s|^${alias_name}:.*|${entry}|" "$aliases" > "$aliases_tmp"
-		# copied over the original rather than moved into place, so the file
-		# keeps the ownership and mode the base system gave it
-		cat "$aliases_tmp" > "$aliases"
-		printf 'alias %s set\n' "$alias_name"
-	else
-		printf '%s\n' "$entry" >> "$aliases"
-		printf 'alias %s added\n' "$alias_name"
-	fi
-done <<EOF
-$alias_entries
-EOF
-while IFS= read -r entry; do
-	alias_name=${entry%%:*}
-	grep -q "^${alias_name}: oliver" "$aliases" \
-		|| { printf 'alias %s did not land in %s\n' "$alias_name" "$aliases" >&2; exit 1; }
-done <<EOF
-$alias_entries
-EOF
 
 # --- 4. DKIM -------------------------------------------------------------
 
