@@ -164,12 +164,22 @@ Subsystem	sftp	/usr/libexec/sftp-server
 # (safely_chroot in session.c), so the signup path leaves that directory
 # root:wheel 0755 and gives the two subdirectories to the member.
 #
-# There is deliberately no LocalPort 2222 block. 2222 is where the member's login
-# shell runs, and that shell is /usr/local/bin/git-shell, so a push arrives as
-# `git-shell -c '<client command>'`. A ForceCommand there would replace the
-# client's command and break the push, and a ChrootDirectory would put git-shell
-# outside the filesystem. An account still carrying /sbin/nologin uploads on 22
-# but cannot push, because nologin ignores -c and exits.
+# There is deliberately no LocalPort 2222 block. 2222 is where the member's
+# session shell runs, and that shell is /usr/local/bin/git-shell, so a push
+# arrives as `git-shell -c '<client command>'`. A ForceCommand there would
+# replace the client's command and break the push, and a ChrootDirectory would
+# put git-shell outside the filesystem.
+#
+# That shell is not in the password entry, which goes on carrying /sbin/nologin.
+# It comes from the member login class: /etc/login.conf.d/member carries
+# `shell=/usr/local/bin/git-shell`, and provisioning assigns it with
+# `usermod -L member <name>`. sshd takes the session shell from there, since
+# auth.c sets lc = login_getclass(pw->pw_class) and session.c's do_child() takes
+# shell = login_getcapstr(lc, "shell", pw_shell, pw_shell) before it execs
+# anything. So the account keeps no shell of its own and still pushes on 2222,
+# and an account whose class has not been assigned has nologin there instead,
+# because nologin ignores -c and exits. The port 22 upload is unaffected either
+# way: its forced internal-sftp is run in process, before the shell is read.
 Match Group members
 	AuthenticationMethods publickey
 	DisableForwarding yes
