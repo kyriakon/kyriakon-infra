@@ -25,6 +25,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
+use time::OffsetDateTime;
 
 use crate::page::{NoticePage, ReceivedPage, StatusPage};
 use crate::questions::{Branch, Question, Rule};
@@ -44,6 +45,13 @@ const OWN_ORIGIN: &str = "https://signup.kyriakon.net";
 /// megabyte is comfortable for that and bounds a form post well under the two
 /// megabytes axum would otherwise accept.
 const MAX_BODY: usize = 256 * 1024;
+
+/// What a token the store does not answer for reads as. One constant, because
+/// an unknown token, an expired one and a spent one are the same bytes: that is
+/// the no-oracle rule the spec fixes, and it is only true if they share one
+/// author.
+const UNKNOWN_TOKEN: &str =
+    "This link is not in use. It may have been cleared away, or it may never have existed.";
 
 /// Served when a template could not be rendered. Static and interpolated with
 /// nothing, so the one place with no markup around it cannot become somewhere a
@@ -144,14 +152,10 @@ async fn guard(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Res
         return too_many(Which::Minute);
     }
     if req.method() == Method::POST && !own_origin(req.headers()) {
-        return (
+        return refused(
             StatusCode::FORBIDDEN,
-            html(&NoticePage {
-                title: "Refused".to_string(),
-                message: "A submission has to come from this form's own page.".to_string(),
-            }),
-        )
-            .into_response();
+            "A submission has to come from this form's own page.",
+        );
     }
     req.extensions_mut().insert(key);
     next.run(req).await
@@ -196,21 +200,34 @@ async fn status(State(app): State<Arc<App>>, Path(token): Path<String>) -> Respo
     } else {
         None
     };
-    let page = match found {
+    capability_page(&status_page(found, OffsetDateTime::now_utc()))
+}
+
+/// The page one token's record renders, or the one notice that covers a token
+/// that is unknown, expired or spent alike. The window is read here and not in
+/// the store, because a record is still on disk after its link has stopped
+/// answering: nothing is deleted for it, the page simply stops.
+fn status_page(record: Option<Record>, now: OffsetDateTime) -> StatusPage {
+    let live = record.filter(|r| match r.decided_at.as_deref() {
+        // The drain sets `decided_at` when it decides. Until it does, the
+        // application has not been decided and the link answers.
+        Some(decided_at) => util::link_answers(decided_at, now),
+        None => true,
+    });
+    match live {
         Some(record) => StatusPage {
             stage: record.stage,
             filed_at: record.filed_at,
             notice: String::new(),
+            password_link: record.password_link,
         },
-        // An unknown token and an expired one read the same, so the path is not
-        // a token oracle.
         None => StatusPage {
             stage: String::new(),
             filed_at: String::new(),
-            notice: "This link is not in use. It may have been cleared away, or it may never have existed.".to_string(),
+            notice: UNKNOWN_TOKEN.to_string(),
+            password_link: None,
         },
-    };
-    capability_page(&page)
+    }
 }
 
 async fn apply(
@@ -222,6 +239,22 @@ async fn apply(
     let body = form.get("whose").map(String::as_str) == Some("body");
     let monastic = questions::is_monastic(form.get("orders").map(String::as_str));
     let applicable: Vec<&Question> = questions::shown(&app.questions, !body);
+
+    // Read before anything else is done with the submission, and before the
+    // request is charged as a draft: a front end that names itself wrongly gets
+    // its refusal rather than an application recorded under a name nothing
+    // recognises. The web form does not post this field at all, so its absence
+    // is the web form.
+    let front_end = match front_end(&form) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("kyriakon-onboard: {e}");
+            return refused(
+                StatusCode::BAD_REQUEST,
+                "A submission has to name its front end as web, tui or capsule.",
+            );
+        }
+    };
 
     let mut errors = Vec::new();
     for q in &applicable {
@@ -264,7 +297,7 @@ async fn apply(
         Err(e) => return server_error(&e),
     };
     let id = ulid::Ulid::new().to_string();
-    let record = match build_record(&app, &form, body, &token) {
+    let record = match build_record(&app, &form, body, &token, front_end) {
         Ok(r) => r,
         Err(e) => return server_error(&e),
     };
@@ -299,6 +332,21 @@ async fn apply(
     })
 }
 
+/// The front end that filed a submission: `web`, `tui` or `capsule`, and the
+/// web form when the field is not sent at all, since the browser form does not
+/// carry one. It is a label and nothing more, so nothing reads it but the
+/// reviewer and the intent: that is also why an unknown value is refused rather
+/// than recorded, because a value no reader recognises is a value that cannot
+/// be read at all.
+fn front_end(form: &BTreeMap<String, String>) -> Result<&'static str, String> {
+    match form.get("front_end").map(String::as_str) {
+        None | Some("web") => Ok("web"),
+        Some("tui") => Ok("tui"),
+        Some("capsule") => Ok("capsule"),
+        Some(other) => Err(format!("unknown front_end {other:?}")),
+    }
+}
+
 /// The body's addresses against its account names: the same number of lines, at
 /// most ten, and each address line `localpart: own` or `localpart: alias
 /// localpart`, which is the form the spec's community-block table gives.
@@ -325,6 +373,7 @@ fn build_record(
     form: &BTreeMap<String, String>,
     body: bool,
     token: &str,
+    front_end: &str,
 ) -> Result<Record, String> {
     let answers: BTreeMap<String, String> = questions::shown(&app.questions, !body)
         .iter()
@@ -376,8 +425,12 @@ fn build_record(
         username: form.get("username").cloned().unwrap_or_default(),
         status_token: token.to_string(),
         filed_at: util::filed_at(),
-        front_end: "web".to_string(),
+        front_end: front_end.to_string(),
         stage: "received".to_string(),
+        // Both are the drain's to write when it decides: the handler files an
+        // undecided application and has no decision to record.
+        decided_at: None,
+        password_link: None,
         domain: body
             .then(|| form.get("body_domain").cloned().unwrap_or_default())
             .filter(|d| !d.trim().is_empty()),
@@ -515,6 +568,19 @@ fn too_many(which: Which) -> Response {
         .into_response()
 }
 
+/// A refusal of a request that is well formed and simply asks for something the
+/// handler does not do. Not a field-level error: those go back into the form.
+fn refused(code: StatusCode, message: &str) -> Response {
+    (
+        code,
+        html(&NoticePage {
+            title: "Refused".to_string(),
+            message: message.to_string(),
+        }),
+    )
+        .into_response()
+}
+
 fn server_error(why: &str) -> Response {
     eprintln!("kyriakon-onboard: {why}");
     (
@@ -540,6 +606,93 @@ fn html<T: Template>(t: &T) -> Html<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use time::format_description::well_known::Rfc3339;
+
+    fn at(s: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(s, &Rfc3339).unwrap()
+    }
+
+    /// A record of the shape the store holds, as the drain leaves one when it
+    /// decides. The two fields the drain owns are the caller's.
+    fn decided(stage: &str, decided_at: Option<&str>, password_link: Option<&str>) -> Record {
+        let mut r: Record = serde_json::from_str(
+            r#"{"username": "secretary", "status_token": "00000000000000000000000000",
+                 "filed_at": "2026-10-01T09:00:00Z", "front_end": "tui", "stage": "received",
+                 "answers": {}, "mail_keys": [], "rail": "no_charge", "no_charge": true,
+                 "acceptances": [], "question_list": "2026-10-01 1a2b3c4"}"#,
+        )
+        .expect("a record the store could hold");
+        r.stage = stage.to_string();
+        r.decided_at = decided_at.map(str::to_string);
+        r.password_link = password_link.map(str::to_string);
+        r
+    }
+
+    #[test]
+    fn a_decided_application_answers_for_seven_days_and_then_reads_as_unknown() {
+        let now = at("2026-10-05T09:00:00Z");
+        // Filed and not yet decided: the link answers.
+        let filed = status_page(Some(decided("received", None, None)), now);
+        assert_eq!(filed.notice, "");
+        assert_eq!(filed.stage, "received");
+
+        // Decided inside the window: answers, with the drain's own word for the
+        // stage, and the link it wrote.
+        let inside = status_page(
+            Some(decided(
+                "decided: an account without charge",
+                Some("2026-10-01T09:00:00Z"),
+                Some("https://signup.kyriakon.net/password/abcdefghjkmnpqrstvwxyz"),
+            )),
+            now,
+        );
+        assert_eq!(inside.notice, "");
+        assert_eq!(inside.stage, "decided: an account without charge");
+        assert_eq!(
+            inside.password_link.as_deref(),
+            Some("https://signup.kyriakon.net/password/abcdefghjkmnpqrstvwxyz")
+        );
+
+        // A record without a password link renders none.
+        let without = status_page(Some(decided("received", None, None)), now);
+        assert_eq!(without.password_link, None);
+
+        // Past the window the record's page is the unknown-token page, byte for
+        // byte, so a live token cannot be told from a dead one.
+        let password_link = Some("https://signup.kyriakon.net/password/abcdefghjkmnpqrstvwxyz");
+        let expired = status_page(
+            Some(decided(
+                "decided: an account on the paid tier",
+                Some("2026-10-01T09:00:00Z"),
+                password_link,
+            )),
+            at("2026-10-08T09:00:01Z"),
+        );
+        let unknown = status_page(None, now);
+        assert_eq!(expired.notice, UNKNOWN_TOKEN);
+        assert_eq!(expired.stage, "");
+        assert_eq!(expired.filed_at, "");
+        assert_eq!(expired.password_link, None, "an expired link renders no password link either");
+        assert_eq!(
+            (expired.notice, expired.stage, expired.filed_at),
+            (unknown.notice, unknown.stage, unknown.filed_at)
+        );
+    }
+
+    #[test]
+    fn a_front_end_is_web_tui_or_capsule_and_nothing_else() {
+        let mut form = BTreeMap::new();
+        // The web form posts no such field, so its absence is the web form.
+        assert_eq!(front_end(&form).unwrap(), "web");
+        for v in ["web", "tui", "capsule"] {
+            form.insert("front_end".to_string(), v.to_string());
+            assert_eq!(front_end(&form).unwrap(), v);
+        }
+        for v in ["", "Capsule", "capsule ", "ssh", "http"] {
+            form.insert("front_end".to_string(), v.to_string());
+            assert!(front_end(&form).is_err(), "{v:?} should be refused");
+        }
+    }
 
     #[test]
     fn key_blocks_splits_one_per_mailbox() {
