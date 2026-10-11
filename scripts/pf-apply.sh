@@ -14,8 +14,11 @@
 # so a divert placed before the stock pass rule would never match.
 #
 # Safety properties:
-#   - it only appends. It never removes or rewrites a rule, and it skips a block
-#     whose rules are already present, so it is safe to run repeatedly;
+#   - it only appends, and it skips a block whose opening marker is already
+#     present, so it is safe to run repeatedly. It rewrites nothing outside its
+#     own marker pairs, except that it drops a byte-identical second copy of one
+#     of its own blocks: a check that keyed on a rule's text once appended finger
+#     twice, and the next run has to be able to repair that without a hand edit;
 #   - the candidate is built in a temp file and checked with pfctl -n before
 #     anything live is touched, and the installed file is checked again;
 #   - the file it replaces is kept beside the original, timestamped;
@@ -45,6 +48,13 @@ die() {
 	exit 1
 }
 
+# A fragment is present iff its opening marker is. Keying on the rule text is what
+# broke finger: that check looked for a line ending "port 79", the rule grew a
+# keep-state suffix, and from then on every run appended the block again. The
+# marker is the stable key, and every fragment is tested through this one helper,
+# including the onboarding block this script writes further down.
+has_block() { grep -q "^# --- kyriakon: $1" "$pf_conf"; }
+
 [ "$(id -u)" -eq 0 ] || die "run this with doas: it writes ${pf_conf}"
 [ -f "$pf_conf" ] || die "no ${pf_conf}"
 command -v pfctl >/dev/null 2>&1 || die "pfctl is not in PATH"
@@ -58,14 +68,51 @@ fi
 
 work=$(mktemp)
 bak=${pf_conf}.bak.$(date +%Y%m%d%H%M%S)
-cp -p "$pf_conf" "$work"
+
+# The candidate starts as the live file with an exact duplicate of one of our own
+# blocks removed. A block whose check keyed on its rule text could be appended
+# twice: the finger check looked for a line ending "port 79", the rule grew a
+# keep-state suffix, and every run since has added the block again. Collapsing
+# here is what repairs a box already carrying two copies, since the operator
+# edits this root-only file only through this script. A block is its two marker
+# lines and everything between them; a line outside them is copied through
+# untouched, and only a byte-identical repeat is dropped. Two copies that differ
+# (a block appended twice around a changed value) are both kept and left to the
+# diff, because guessing which one is wanted is not this script's call.
+dropped=$(mktemp)
+collapsed=0
+awk -v dropped="$dropped" '
+/^# --- kyriakon: / { inblk = 1; buf = $0 ORS; open = $0; next }
+inblk && /^# --- end kyriakon: / {
+	buf = buf $0 ORS
+	if (buf in seen) {
+		print open >> dropped
+	} else {
+		seen[buf] = 1
+		printf "%s", buf
+	}
+	inblk = 0
+	next
+}
+inblk { buf = buf $0 ORS; next }
+{ print }
+END { if (inblk) printf "%s", buf }
+' "$pf_conf" > "$work"
+if [ -s "$dropped" ]; then
+	collapsed=$(awk 'END { print NR + 0 }' "$dropped")
+	printf 'removing %s duplicate kyriakon block(s):\n' "$collapsed"
+	while read -r marker; do
+		printf '\t%s\n' "$marker"
+	done < "$dropped"
+fi
+rm -f "$dropped"
 added=0
 
 # --- greylisting ------------------------------------------------------------
 # The divert sends every inbound SMTP connection to spamd. The second rule is
 # what lets a whitelisted host through instead, and its log keyword is what
 # spamlogd reads to keep <spamd-white> current.
-if grep -q 'divert-to 127.0.0.1 port spamd' "$pf_conf"; then
+if has_block greylisting; then
 	printf 'greylisting:  already in %s\n' "$pf_conf"
 else
 	cat >>"$work" <<'EOF'
@@ -86,7 +133,7 @@ fi
 # its outbound addresses between retries is never promoted, so it is deferred
 # until it gives up. Exchange Online and Outlook.com do exactly that. This table
 # is the documented way to exempt them, and the list is in openbsd/etc/nospamd.
-if grep -q 'table <nospamd>' "$pf_conf"; then
+if has_block 'senders that skip greylisting'; then
 	printf 'nospamd:      already in %s\n' "$pf_conf"
 else
 	cat >>"$work" <<'EOF'
@@ -106,7 +153,7 @@ fi
 # rules, so that a scrape or a probe is attributable in pflog instead of
 # invisible. Note that this opens the port; gmid itself only serves hostnames
 # named in its config, and answers anything else with a 59.
-if grep -q 'port 1965' "$pf_conf"; then
+if has_block gemini; then
 	printf 'gemini:       already in %s\n' "$pf_conf"
 else
 	cat >>"$work" <<'EOF'
@@ -126,7 +173,7 @@ fi
 # needs its own rule. Logged, like the rest, so a probe is attributable in pflog
 # instead of invisible. No max-src-conn: sshd's own MaxStartups bounds what a
 # source can open before authentication.
-if grep -q 'to any port 2222$' "$pf_conf"; then
+if has_block 'git over ssh'; then
 	printf 'git:          already in %s\n' "$pf_conf"
 else
 	cat >>"$work" <<'EOF'
@@ -183,7 +230,7 @@ esac
 # block under the same heading.
 if [ -z "$tui_port" ]; then
 	printf 'onboard TUI:  skipped, no TUI_PORT in %s\n' "$env_file"
-elif grep -q 'kyriakon: onboarding TUI' "$pf_conf"; then
+elif has_block 'onboarding TUI'; then
 	printf 'onboard TUI:  already in %s\n' "$pf_conf"
 else
 	cat >>"$work" <<EOF
@@ -202,7 +249,7 @@ fi
 # like the rest, so that a probe is attributable in pflog. max-src-conn bounds a
 # single source: inetd forks per connection and the protocol is one line of
 # input, which would otherwise make this the cheapest port on the box to flood.
-if grep -q 'to any port 79$' "$pf_conf"; then
+if has_block finger; then
 	printf 'finger:       already in %s\n' "$pf_conf"
 else
 	cat >>"$work" <<'EOF'
@@ -215,7 +262,7 @@ EOF
 	printf 'finger:       to be added\n'
 fi
 
-if [ "$added" -eq 0 ]; then
+if [ "$added" -eq 0 ] && [ "$collapsed" -eq 0 ]; then
 	# A `persist file` table is read when the ruleset loads, so replacing the list
 	# file leaves the kernel holding the old one until something reloads. Compare
 	# them, ignoring order, and reload when they differ: that is what makes this
