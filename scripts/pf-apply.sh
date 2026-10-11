@@ -139,6 +139,63 @@ EOF
 	printf 'git:          to be added\n'
 fi
 
+# --- onboarding TUI ---------------------------------------------------------
+# The applicant sshd listens on a port the box chose when it was built, recorded
+# once as TUI_PORT in the values file rather than carried here, so this candidate
+# reads it at run time and expands it into the rule. On a box with no TUI yet the
+# file has no such line, and the block is skipped with a note instead of stopping
+# the run, so every other fragment still applies. A value that is not a port
+# number stops the run: the alternative is handing pfctl an unexpanded or
+# out-of-range port and reporting a parse failure that names nowhere near the bad
+# value, and nothing is written before this point anyway.
+#
+# No inet qualifier, deliberately: signup.kyriakon.net resolves through the zone
+# wildcard, which carries both an A and an AAAA, so a client that prefers IPv6
+# reaches this port too, and an inet-only rule would drop it.
+env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
+tui_port=""
+if [ -r "$env_file" ]; then
+	# Sourced, not parsed, which is how the cron lines and deploy-mail.sh read it,
+	# so the two cannot disagree about the format. A value file that errors ends
+	# the shell `.` runs in, which under errexit would end this run before the
+	# skip note below could say the file did not hold TUI_PORT: a silent exit is
+	# worse than a named skip, so errexit is off for the read only.
+	set +e
+	# shellcheck disable=SC1090 # root's own env file, whose path resolves at runtime
+	tui_port=$(. "$env_file" 2>/dev/null; printf '%s' "${TUI_PORT:-}")
+	set -e
+fi
+case "$tui_port" in
+"")
+	;;
+*[!0-9]*)
+	die "TUI_PORT in ${env_file} is not a port number: '${tui_port}'"
+	;;
+*)
+	if [ "$tui_port" -lt 1 ] || [ "$tui_port" -gt 65535 ]; then
+		die "TUI_PORT in ${env_file} is outside 1-65535: '${tui_port}'"
+	fi
+	;;
+esac
+
+# The port is a deploy value, so the rule text is not a stable key to test for:
+# check the block marker instead, which also stops a re-run appending a second
+# block under the same heading.
+if [ -z "$tui_port" ]; then
+	printf 'onboard TUI:  skipped, no TUI_PORT in %s\n' "$env_file"
+elif grep -q 'kyriakon: onboarding TUI' "$pf_conf"; then
+	printf 'onboard TUI:  already in %s\n' "$pf_conf"
+else
+	cat >>"$work" <<EOF
+
+# --- kyriakon: onboarding TUI (openbsd/etc/sshd_config.onboard) ---
+pass in log on egress proto tcp to any port ${tui_port} keep state (max-src-conn 4)
+# --- end kyriakon: onboarding TUI ---
+EOF
+	added=$((added + 1))
+	printf 'onboard TUI:  to be added on port %s\n' "$tui_port"
+fi
+
 # --- finger -----------------------------------------------------------------
 # fingerd is spawned by inetd rather than listening on its own, so the port has
 # to be opened here before the deploy's inetd line is reachable at all. Logged,
@@ -220,5 +277,5 @@ pfctl -f "$pf_conf"
 printf '\nbacked up as %s\n' "$bak"
 printf 'loaded %s\n\n' "$pf_conf"
 printf 'rules now loaded from these fragments:\n'
-pfctl -sr | grep -E 'divert-to 127\.0\.0\.1|spamd-white|nospamd|port = 1965|port = 2222|port = 79' | awk '{print "\t" $0}'
+pfctl -sr | grep -E 'divert-to 127\.0\.0\.1|spamd-white|nospamd|port = 1965|port = 2222|port = 79|max-src-conn 4' | awk '{print "\t" $0}'
 printf '\nrevert with: pfctl -f %s\n' "$bak"
