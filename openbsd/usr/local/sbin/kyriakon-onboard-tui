@@ -34,6 +34,19 @@
 # are worded as validate.rs words them, so the SSH applicant and the web applicant
 # are refused in the same words.
 #
+# It is written for the shell the box has: OpenBSD's /bin/ksh is pdksh (PD KSH
+# v5.2.14 on the box this was tested against), not ksh93. So there is no
+# associative array, no `typeset -a`, no `<<<`, no `$'...'`, no `+=` on an array
+# and no `${v//a/b}` here: the answers are an indexed array keyed by the question
+# file's line number, the reserved set is one space separated string tested with
+# `case`, and a line's CR and surrounding whitespace come off through tr and sed.
+# `scripts/deploy-mail.sh` carries the same warning for the same reason.
+#
+# The session has no pty (the instance sets PermitTTY no on purpose), so stdin and
+# stdout are pipes and nothing here may need a terminal: no /dev/tty, no cursor
+# control, no stty, no cursor arithmetic, only `read` from stdin and text on
+# stdout and stderr.
+#
 # Nothing here is written to disk: no temporary file, no draft, no counter. The
 # account has no home and this ticket's work allows it no writable directory of
 # its own, so the answers live in shell variables for the life of the connection
@@ -48,12 +61,12 @@
 #
 # --self-test exercises the question list's parsing and every refusal it makes,
 # each validation rule, the branch counters, the summary, the token out of a
-# canned reply, and six scripted sessions against a stub handler: one that files,
-# one that leaves, one whose connection drops, the body path with a key per
-# mailbox, one that shows the fingerprint the shared check returns, and one that
-# is refused and re-asked. All of it without a terminal, a network or root. What
-# it cannot exercise is on the ticket: the real sshd session over the network,
-# and the live handler.
+# canned reply, and eight scripted sessions against a stub handler: one that
+# files, one that leaves, one whose connection drops, the branch counter, the
+# fingerprint the shared check returns, a refusal re-asked, the body path with a
+# key per mailbox, and one that goes back. All of it without a terminal, a network
+# or root. What it cannot exercise is on the ticket: the real sshd session over
+# the network, and the live handler.
 #
 # Exit: 0 the session ended with quit or with an application filed; 1 the
 # connection dropped before the end, or the box is not ready to take one.
@@ -61,6 +74,9 @@
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
+
+# A tab, for the question file's separator. This shell has no `$'\t'`.
+tab=$(printf '\t')
 
 # The two shared lists, installed 0644 root:wheel by scripts/onboard-store.sh, and
 # read by all three front-ends. The handler's own config names its loopback
@@ -87,12 +103,26 @@ host=signup.kyriakon.net
 apply_path=/apply
 
 # One array per column of the question list, indexed by file order, so the file's
-# order is the order the applicant is asked and nothing here sorts or groups.
-typeset -a id_of prompt_of type_of branch_of required_of rule_of
-typeset -a shown_at
-typeset -A answers is_reserved
+# order is the order the applicant is asked and nothing here sorts or groups. The
+# answers are indexed the same way: `answers[7]` is the answer to the seventh
+# question in the file, which is what an indexed array can hold and an
+# associative one would have held by id.
+id_of[0]=""
+prompt_of[0]=""
+type_of[0]=""
+branch_of[0]=""
+required_of[0]=""
+rule_of[0]=""
+answers[0]=""
+shown_at[0]=0
 q_count=0
 shown_count=0
+# The three questions the walk itself has to find by name: the branch question,
+# the monastic one, and the body's mailbox names, which the per-mailbox key
+# question is paired against. Their line numbers are found once, at load.
+i_whose=0
+i_orders=0
+i_mailboxes=0
 is_body=0
 is_monastic=0
 walkthrough_shown=0
@@ -100,6 +130,13 @@ client_ip=""
 status_token=""
 validate_reason=""
 answer=""
+reserved_set=""
+
+# The curl argument list, built by add_arg: an indexed array with its own count,
+# because this shell has no `arr+=( )`. Nothing is put at index 0: this shell
+# expands `"${args[@]}"` over the indices that are set, and a set-but-empty index 0
+# would reach curl as an empty first argument.
+args_n=0
 
 usage() {
 	printf 'usage: %s [--questions PATH] [--reserved PATH] [--handler URL]\n       %s --self-test\n' \
@@ -133,19 +170,17 @@ leaving() {
 
 # clean <text>: the text as the applicant meant it. The session has no pty, so
 # what arrives is what the applicant's own console produced, and a Windows client
-# sends CR LF: the CR comes off. Whitespace at either end is not part of an
-# answer. Every rule is reasoned over the cleaned text and the cleaned text is
-# what is filed.
+# sends CR LF: the CR comes off. Whitespace at either end is not part of an answer.
+# Every rule is reasoned over the cleaned text and the cleaned text is what is
+# filed. This is a pipeline rather than `${s//pat/rep}` because this shell has no
+# replacement expansion.
 clean() {
-	typeset s=$1
-	s=${s//$'\r'/}
-	s=${s#"${s%%[![:space:]]*}"}
-	s=${s%"${s##*[![:space:]]}"}
-	printf '%s' "$s"
+	printf '%s' "$1" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
-# ask_line: read one line. Returns 1 at end of input, which is the dropped
-# connection the spec says costs the answers and nothing else.
+# ask_line: read one line with nothing split off and nothing stripped. Returns 1
+# at end of input, which is the dropped connection the spec says costs the answers
+# and nothing else.
 ask_line() {
 	if IFS= read -r answer; then
 		return 0
@@ -153,13 +188,15 @@ ask_line() {
 	return 1
 }
 
-# parse_list <file>: the question list, validated and echoed with its six columns
-# tab separated, one record per line, in file order. Every refusal names the line
+# parse_list <file>: the question list, checked and then discarded. This is a
+# validation pass, not the read the arrays are filled from: a loop that is fed by
+# a pipe runs in a subshell in this shell, so the file is read twice, once here to
+# refuse a malformed list and once into the arrays. Every refusal names the line
 # it came from: a question that disappears silently is a question no front-end
 # asks. The checks are onboard/src/questions.rs's, and the header and the tokens
 # are the ones the three front-ends share.
 parse_list() {
-	awk -F'\t' -v OFS='\t' '
+	awk -F'\t' '
 	function bad(msg) {
 		printf "kyriakon-onboard-tui: the question list: %s\n", msg > "/dev/stderr"
 		stop = 1
@@ -206,7 +243,6 @@ parse_list() {
 			   rule != "address" && rule != "domain" && rule != "mail-key" &&
 			   rule != "upload-key")
 			bad("line " FNR ": unknown validation " rule)
-		print $1, $2, $3, $4, $5, $6
 	}
 	END {
 		if (!stop && !seen) {
@@ -217,17 +253,33 @@ parse_list() {
 	' "$1"
 }
 
-# load_questions: read the installed list into the per-column arrays.
+# load_questions: check the installed list, then read it into the per-column
+# arrays, in one pass over the file itself so the loop is not a subshell.
 load_questions() {
-	typeset list
+	typeset id prompt kind branch required rule saw_header
 	if [ ! -r "$questions_file" ]; then
 		unavailable "the question list at $questions_file cannot be read"
 	fi
-	if ! list=$(parse_list "$questions_file"); then
+	if ! parse_list "$questions_file" > /dev/null; then
 		unavailable "the question list at $questions_file could not be read"
 	fi
 	q_count=0
-	while IFS=$'\t' read -r id prompt kind branch required rule; do
+	saw_header=0
+	while IFS=$tab read -r id prompt kind branch required rule; do
+		if [ "$saw_header" = 0 ]; then
+			# The header line, whose six columns the parse above has already
+			# checked in full, and blank lines before it, which the parse allows.
+			# It is recognised rather than skipped blindly so a file whose header
+			# moved cannot turn its first question into a lost one.
+			case $id in
+			"") continue ;;
+			id)
+				saw_header=1
+				continue
+				;;
+			*) unavailable "the question list at $questions_file has no header line" ;;
+			esac
+		fi
 		if [ -z "$id" ]; then
 			continue
 		fi
@@ -238,7 +290,12 @@ load_questions() {
 		branch_of[q_count]=$branch
 		required_of[q_count]=$required
 		rule_of[q_count]=$rule
-	done <<<"$list"
+		case $id in
+		whose) i_whose=$q_count ;;
+		orders) i_orders=$q_count ;;
+		body_account_names) i_mailboxes=$q_count ;;
+		esac
+	done < "$questions_file"
 	if [ "$q_count" -eq 0 ]; then
 		unavailable "the question list at $questions_file has no questions"
 	fi
@@ -247,28 +304,28 @@ load_questions() {
 # load_reserved: the reserved set, one name per line, `#` comments and blank lines
 # skipped, folded to lowercase, exactly as onboard/src/validate.rs reads it. The
 # set is checked live for format and reserved names, and existence is never
-# checked at all: that is the no-oracle rule.
+# checked at all: that is the no-oracle rule. It is held as one space separated
+# string, which is how a shell without associative arrays holds a set.
 load_reserved() {
-	typeset list name
 	if [ ! -r "$reserved_file" ]; then
 		unavailable "the reserved names file at $reserved_file cannot be read"
 	fi
-	if ! list=$(awk '
+	if ! reserved_set=$(awk '
 		/^[[:space:]]*#/ { next }
 		{
 			gsub(/^[[:space:]]+/, "")
 			gsub(/[[:space:]]+$/, "")
-			if ($0 != "") print tolower($0)
+			if ($0 != "") printf "%s ", tolower($0)
 		}
 	' "$reserved_file"); then
 		unavailable "the reserved names file at $reserved_file could not be read"
 	fi
-	while IFS= read -r name; do
-		if [ -z "$name" ]; then
-			continue
-		fi
-		is_reserved[$name]=1
-	done <<<"$list"
+}
+
+# add_arg <word>: one more word in the curl argument list.
+add_arg() {
+	args_n=$((args_n + 1))
+	args[args_n]=$1
 }
 
 # resolve_handler: the handler's address. Taken from its own config rather than
@@ -298,18 +355,18 @@ resolve_handler() {
 # monastic path, which is what makes the elder's or confessor's blessing required
 # (onboard/src/questions.rs is_monastic).
 branch_for_answers() {
-	case ${answers[whose]:-} in
+	case ${answers[i_whose]:-} in
 	body) is_body=1 ;;
 	*) is_body=0 ;;
 	esac
-	case ${answers[orders]:-} in
+	case ${answers[i_orders]:-} in
 	monk | nun) is_monastic=1 ;;
 	*) is_monastic=0 ;;
 	esac
 }
 
 # derive: the questions this applicant's path actually asks, in the file's order,
-# into shown_id. A monastic question is asked only on the monastic path, which is
+# into shown_at. A monastic question is asked only on the monastic path, which is
 # what makes the blessing move the counter; until the branch question is answered
 # the path is the individual one, so the individual count is what the counter
 # shows. The total is therefore the number of questions this applicant will be
@@ -319,7 +376,7 @@ derive() {
 	shown_count=0
 	i=1
 	while [ "$i" -le "$q_count" ]; do
-		case ${branch_of[$i]} in
+		case ${branch_of[i]} in
 		all) show=1 ;;
 		person)
 			if [ "$is_body" = 0 ]; then show=1; else show=0; fi
@@ -362,9 +419,37 @@ username_reason() {
 		return 0
 		;;
 	esac
-	if [ -n "${is_reserved[$v]:-}" ]; then
-		validate_reason='that name is held back by the platform'
+	if [ -n "$reserved_set" ]; then
+		case " $reserved_set " in
+		*" $v "*) validate_reason='that name is held back by the platform' ;;
+		esac
 	fi
+	return 0
+}
+
+# for_each_line <text>: walk the lines of a value without a pipe, a here-string or
+# a subshell, since a pipeline would run the caller's loop in a subshell and lose
+# what it set, and this shell has no `<<<`. Sets $line and returns 1 when there
+# are none left. The literal newline in the case patterns is the separator; it
+# has to be written out because this shell has no `$'\n'`.
+for_each_line() {
+	rest=$1
+	if [ -z "$rest" ]; then
+		return 1
+	fi
+	case $rest in
+	*'
+'*)
+		line=${rest%%'
+'*}
+		rest=${rest#*'
+'}
+		;;
+	*)
+		line=$rest
+		rest=""
+		;;
+	esac
 	return 0
 }
 
@@ -372,9 +457,10 @@ username_reason() {
 # username is, reserved set included, and the refusal names the offending line:
 # these lines become OS account names, created as root by the drain.
 usernames_reason() {
-	typeset line
+	typeset pending=$1
 	validate_reason=""
-	while IFS= read -r line; do
+	while for_each_line "$pending"; do
+		pending=$rest
 		line=$(clean "$line")
 		if [ -z "$line" ]; then
 			continue
@@ -384,7 +470,7 @@ usernames_reason() {
 			validate_reason="the name \"$line\": $validate_reason"
 			return 0
 		fi
-	done <<<"$1"
+	done
 	return 0
 }
 
@@ -495,7 +581,9 @@ mail_key_reason() {
 upload_key_reason() {
 	typeset kind rest blob
 	validate_reason=""
-	read -r kind rest <<<"$1"
+	read -r kind rest <<EOF
+$1
+EOF
 	if [ -z "$kind" ]; then
 		validate_reason='an upload key is needed'
 		return 0
@@ -549,7 +637,7 @@ choice_reason() {
 # are the ones onboard/src/validate.rs gives, so the two front-ends agree.
 validate() {
 	typeset which=$1 value=$2
-	typeset rule=${rule_of[$which]} id=${id_of[$which]} required=${required_of[$which]}
+	typeset rule=${rule_of[which]} required=${required_of[which]}
 	validate_reason=""
 	if [ -z "$value" ]; then
 		if [ "$required" = no ]; then
@@ -581,7 +669,7 @@ validate() {
 	# An `acceptance` question is the agreement itself, and the file's rule for it
 	# is `none`, so the one value that files an application is the one the web
 	# form's checkbox sends. The type is the file's, not this program's invention.
-	if [ "${type_of[$which]}" = acceptance ] && [ "$validate_reason" = "" ] &&
+	if [ "${type_of[which]}" = acceptance ] && [ "$validate_reason" = "" ] &&
 		[ "$value" != yes ]; then
 		validate_reason='type yes to accept this, or quit to leave without filing'
 	fi
@@ -694,14 +782,17 @@ mailbox_list() {
 # refuse it on the same screen with the reason. Returns 0 answered, 1 the
 # connection dropped, 2 quit, 3 back.
 ask_question() {
-	typeset pos=$1 which=${shown_at[$1]} id=${id_of[${shown_at[$1]}]}
-	typeset kind=${type_of[${shown_at[$1]}]} rule=${rule_of[${shown_at[$1]}]}
+	typeset pos=$1
+	typeset which=${shown_at[pos]}
+	typeset id=${id_of[which]}
+	typeset kind=${type_of[which]}
+	typeset rule=${rule_of[which]}
 	typeset first=1 line block blocks want=1 block_count n mailbox
 	answer=""
 	while :; do
 		if [ "$first" = 1 ]; then
 			printf '\nquestion %s of %s\n\n' "$pos" "$shown_count"
-			printf '%s\n' "${prompt_of[$which]}"
+			printf '%s\n' "${prompt_of[which]}"
 			case $kind in
 			choice | yesno)
 				printf '\n'
@@ -721,7 +812,7 @@ ask_question() {
 			first=0
 		else
 			printf '\n%s\n\n' "$validate_reason"
-			printf '%s\n\n' "${prompt_of[$which]}"
+			printf '%s\n\n' "${prompt_of[which]}"
 		fi
 		case $kind in
 		multiline | addresses)
@@ -752,7 +843,7 @@ $line"
 			# prompt.
 			want=1
 			if [ "$id" = body_mail_key ]; then
-				want=$(mailbox_list "${answers[body_account_names]:-}" |
+				want=$(mailbox_list "${answers[i_mailboxes]:-}" |
 					awk 'NF { n++ } END { print n + 0 }')
 				if [ "$want" -eq 0 ]; then
 					want=1
@@ -764,7 +855,7 @@ $line"
 			n=1
 			while [ "$n" -le "$want" ]; do
 				if [ "$want" -gt 1 ]; then
-					mailbox=$(mailbox_list "${answers[body_account_names]:-}" |
+					mailbox=$(mailbox_list "${answers[i_mailboxes]:-}" |
 						awk -v want="$n" 'NF { k++; if (k == want) print }')
 					printf 'key %s of %s, for %s\n' "$n" "$want" "$mailbox"
 				fi
@@ -800,8 +891,8 @@ $block"
 		# An empty line on a question that already has an answer keeps it: that is
 		# what going `back` is for, and re-typing an answer to change one word in
 		# it is not how anyone fixes a typo.
-		if [ -z "$answer" ] && [ -n "${answers[$id]:-}" ]; then
-			answer=${answers[$id]}
+		if [ -z "$answer" ] && [ -n "${answers[which]:-}" ]; then
+			answer=${answers[which]}
 		fi
 		if [ "$kind" = choice ] || [ "$kind" = yesno ]; then
 			# The number an option was printed as is accepted, and so is its value:
@@ -814,7 +905,7 @@ $block"
 		# A body's keys are counted here as the handler counts them, so a missing
 		# block is refused on this screen rather than by the handler at the end.
 		validate_reason=""
-		if [ "$kind" = key ] && [ "${want:-1}" -gt 1 ]; then
+		if [ "$kind" = key ] && [ "$want" -gt 1 ]; then
 			block_count=$(printf '%s\n' "$answer" |
 				awk '/^-----BEGIN PGP PUBLIC KEY BLOCK-----$/ { n++ } END { print n + 0 }')
 			if [ "$block_count" -ne "$want" ]; then
@@ -825,7 +916,7 @@ $block"
 			validate "$which" "$answer"
 		fi
 		if [ -z "$validate_reason" ]; then
-			answers[$id]=$answer
+			answers[which]=$answer
 			return 0
 		fi
 	done
@@ -837,19 +928,14 @@ $block"
 # there is no checker installed or it cannot read the key, because a fingerprint
 # this program cannot compute is one it must not invent.
 fingerprints() {
-	typeset out line
+	typeset out
 	if [ ! -x "$keycheck" ]; then
 		return 0
 	fi
 	if ! out=$(printf '%s\n' "$1" | "$keycheck" --fingerprints 2>/dev/null); then
 		return 0
 	fi
-	while IFS= read -r line; do
-		if [ -z "$line" ]; then
-			continue
-		fi
-		printf '%s\n' "$line"
-	done <<<"$out"
+	printf '%s\n' "$out" | awk 'NF { print }'
 	return 0
 }
 
@@ -857,13 +943,13 @@ fingerprints() {
 # material is not shown again: the applicant has just pasted it, and the
 # fingerprint is the part of it they need to compare against their own client.
 print_answer() {
-	typeset which=$1 value=$2 came=""
+	typeset which=$1 value=$2 came="" lines=1
 	if [ -z "$value" ]; then
 		value='(nothing)'
 	fi
-	case ${type_of[$which]} in
+	case ${type_of[which]} in
 	key)
-		printf '%s:\n' "${prompt_of[$which]}"
+		printf '%s:\n' "${prompt_of[which]}"
 		came=$(fingerprints "$value")
 		if [ -n "$came" ]; then
 			printf '%s\n' "$came" | awk '{ printf "  %s\n", $0 }'
@@ -873,19 +959,17 @@ print_answer() {
 		;;
 	choice | yesno)
 		# The words the option was offered as, not the token that is filed.
-		printf '%s: %s\n' "${prompt_of[$which]}" \
-			"$(option_label "${rule_of[$which]#choice:}" "$value")"
+		printf '%s: %s\n' "${prompt_of[which]}" \
+			"$(option_label "${rule_of[which]#choice:}" "$value")"
 		;;
 	*)
-		case $value in
-		*$'\n'*)
-			printf '%s:\n' "${prompt_of[$which]}"
+		lines=$(printf '%s\n' "$value" | wc -l | tr -d ' ')
+		if [ "$lines" -gt 1 ]; then
+			printf '%s:\n' "${prompt_of[which]}"
 			printf '%s\n' "$value" | awk '{ printf "  %s\n", $0 }'
-			;;
-		*)
-			printf '%s: %s\n' "${prompt_of[$which]}" "$value"
-			;;
-		esac
+		else
+			printf '%s: %s\n' "${prompt_of[which]}" "$value"
+		fi
 		;;
 	esac
 	return 0
@@ -970,7 +1054,7 @@ walk() {
 		if [ "$pos" -gt "$shown_count" ]; then
 			return 0
 		fi
-		kind=${type_of[${shown_at[$pos]}]}
+		kind=${type_of[${shown_at[pos]}]}
 		if [ "$kind" = key ] && [ "$walkthrough_shown" = 0 ]; then
 			walkthrough
 			walkthrough_shown=1
@@ -1000,12 +1084,11 @@ walk() {
 # confirm: the answers once, with the key fingerprints, and then one decision.
 # Returns 0 confirmed, 1 the connection dropped, 2 the applicant left.
 confirm() {
-	typeset pos=1 which id
+	typeset pos=1 which
 	printf '\n\nCheck these over. Nothing is filed until you confirm.\n\n'
 	while [ "$pos" -le "$shown_count" ]; do
-		which=${shown_at[$pos]}
-		id=${id_of[$which]}
-		print_answer "$which" "${answers[$id]:-}"
+		which=${shown_at[pos]}
+		print_answer "$which" "${answers[which]:-}"
 		pos=$((pos + 1))
 	done
 	printf '\nType confirm to file this application, or quit to leave without filing.\n'
@@ -1050,26 +1133,33 @@ token_from() {
 # header is sent: that guard is for browsers posting from elsewhere, and this is
 # not a browser. Returns 0 filed, 1 not filed.
 file_intent() {
-	typeset -a args
-	typeset pos=1 which id rc=0 reply prints
-	args+=(--silent --show-error --max-time 30 --fail-with-body)
-	args+=(--data-urlencode "front_end=tui")
+	typeset pos=1 which rc=0 reply prints
+	args_n=0
+	add_arg '--silent'
+	add_arg '--show-error'
+	add_arg '--max-time'
+	add_arg '30'
+	add_arg '--fail-with-body'
+	add_arg '--data-urlencode'
+	add_arg 'front_end=tui'
 	if [ -n "$client_ip" ]; then
-		args+=(-H "X-Forwarded-For: $client_ip")
+		add_arg '-H'
+		add_arg "X-Forwarded-For: $client_ip"
 	fi
 	while [ "$pos" -le "$shown_count" ]; do
-		which=${shown_at[$pos]}
-		id=${id_of[$which]}
-		args+=(--data-urlencode "$id=${answers[$id]:-}")
-		if [ "${type_of[$which]}" = key ]; then
-			prints=$(fingerprints "${answers[$id]:-}")
+		which=${shown_at[pos]}
+		add_arg '--data-urlencode'
+		add_arg "${id_of[which]}=${answers[which]:-}"
+		if [ "${type_of[which]}" = key ]; then
+			prints=$(fingerprints "${answers[which]:-}")
 			if [ -n "$prints" ]; then
-				args+=(--data-urlencode "${id}_fingerprint=$prints")
+				add_arg '--data-urlencode'
+				add_arg "${id_of[which]}_fingerprint=$prints"
 			fi
 		fi
 		pos=$((pos + 1))
 	done
-	args+=("$handler_url$apply_path")
+	add_arg "$handler_url$apply_path"
 	reply=$(curl "${args[@]}" 2>/dev/null) || rc=$?
 	case $rc in
 	0) ;;
@@ -1200,9 +1290,12 @@ main() {
 # What can be exercised without a terminal is exercised here: the question list's
 # parsing and every refusal it makes, each validation rule against a fixture, the
 # counter's branch totals against the shipped list, the summary, the token out of
-# a canned page, and two whole sessions run against a stub handler, one that files
-# and one that leaves. What stays on the ticket: the real sshd session over the
-# network, and the live handler.
+# a canned page, and eight whole sessions run against a stub handler: one that
+# files, one that leaves, one whose connection drops, one that proves the branch
+# total, one that shows the fingerprint the shared check returns, one refused and
+# re-asked, the body path with a key per mailbox, and one that goes back. What
+# stays on the ticket: the real sshd session over the network, and the live
+# handler.
 self_test() {
 	typeset work fails=0
 	work=$(mktemp -d "${TMPDIR:-/tmp}/kyriakon-tui-test.XXXXXX")
@@ -1251,26 +1344,26 @@ self_test() {
 	check "the list parses" "$([ "$q_count" -gt 0 ] && printf yes)" "yes"
 	check "the first question is the username" "${id_of[1]}" "username"
 	check "the second question is the branch question" "${id_of[2]}" "whose"
-	answers[whose]=person
-	answers[orders]=layman
+	answers[i_whose]=person
+	answers[i_orders]=layman
 	branch_for_answers
 	derive
 	check "the individual path asks the individual count" "$shown_count" "13"
-	answers[orders]=monk
+	answers[i_orders]=monk
 	branch_for_answers
 	derive
 	check "the monastic answer opens the blessing" "$shown_count" "14"
-	answers[orders]=layman
-	answers[whose]=body
+	answers[i_orders]=layman
+	answers[i_whose]=body
 	branch_for_answers
 	derive
 	check "the community block opens from the second question" "$shown_count" "21"
-	answers[orders]=nun
+	answers[i_orders]=nun
 	branch_for_answers
 	derive
 	check "a monastic body is asked the blessing too" "$shown_count" "22"
-	unset 'answers[whose]'
-	unset 'answers[orders]'
+	answers[i_whose]=""
+	answers[i_orders]=""
 	branch_for_answers
 	derive
 	check "the individual count shows until the branch is answered" "$shown_count" "13"
@@ -1443,7 +1536,6 @@ ANSWERS
 	: > "$work/left.log"
 	KYRIAKON_TEST_LOG="$work/left.log"
 	rc=0
-	rc=0
 	PATH="$work/bin:$PATH" ksh "$0" --questions "$real_list" \
 		--reserved "$work/reserved.txt" --handler "http://127.0.0.1:1" \
 		>"$work/left.out" 2>&1 <<'ANSWERS' || rc=$?
@@ -1466,7 +1558,6 @@ ANSWERS
 	printf '\na scripted session whose connection drops\n'
 	: > "$work/dropped.log"
 	KYRIAKON_TEST_LOG="$work/dropped.log"
-	rc=0
 	rc=0
 	PATH="$work/bin:$PATH" ksh "$0" --questions "$real_list" \
 		--reserved "$work/reserved.txt" --handler "http://127.0.0.1:1" \
