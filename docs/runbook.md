@@ -73,9 +73,24 @@ Provisioning is manual today. The service that will take it over is covered in t
 
    The message must be PGP ciphertext in the Maildir. Plaintext, or a quoted copy of one, is a fault in the delivery path and not something to work around.
 
+5. Provision their hosting: the public tree, the upload key, the site and the capsule.
+
+		doas ksh scripts/provision-member.sh <username> /path/to/their-upload-key.pub
+
+   It builds the public root at `/home/www/<username>.kyriakon.net`, hands `www/` and `gemini/` to the member, creates `/home/<username>/repos`, installs the login class that gives port 2222 `git-shell` while the password entry keeps `/sbin/nologin`, and writes `authorized_keys`. It then runs the two lanes: `scripts/provision-member-web.sh` writes the member's `httpd` file, and `scripts/provision-member-capsule.sh` writes the member's `gmid` file and generates the platform's self-signed capsule pair the first time it runs.
+
+   The upload key is the applicant's, so it is a file and only the public half goes in: pass it as the second argument. With none, the script reads `/var/db/onboard/keys/<username>.pub`, where the onboarding drain will put it, and stops before building anything when nothing is there.
+
+   The member files are not served until the indexes are rewritten and the daemons reloaded, which is the same command the deploy uses:
+
+		doas ksh scripts/cron-apply.sh --web --check
+		doas ksh scripts/cron-apply.sh --web
+
+   Then the checks that matter. `doas sshd -T -f /etc/ssh/sshd_config -C user=<username>,lport=22` reports the chroot and the forced sftp, and the same with `lport=2222` reports neither, which is what "the same key reaches both sessions" means. `httpd -n -f /etc/httpd.conf` and `gmid -n -c /etc/gmid.conf` are silent. An sftp session as the member on 22 puts a file into `www/`.
+
 Do not give the account a shell. `chsh -s /bin/ksh <username>` undoes the platform's central safety property. The operator account is the one exception, and `deploy-mail.sh` flips it back to `/bin/ksh` on every run.
 
-The per-member hosting design in #154 adds three things to this path: membership of the `members` group, the generated `httpd` and `gmid` include lines for the site, and the quota entry. Two of the three are scripted now, and `add-user.sh` does them. The third is the include line for a member's own vhost, which `scripts/cron-apply.sh --web` rewrites from `/etc/httpd.d` and `/etc/gmid.d` once member sites exist.
+The per-member hosting design in #154 adds three things to this path: membership of the `members` group, the generated `httpd` and `gmid` files for the site, and the quota entry. `add-user.sh` does the group and the quota, and `provision-member.sh` does the rest of the hosting: it writes the member's own `httpd` and `gmid` files through its two lanes, and `scripts/cron-apply.sh --web` rewrites the indexes that list them and reloads the daemons. Until the onboarding drain lands, this is the whole of provisioning a member.
 
 ## Provision through the onboarding service
 

@@ -68,11 +68,13 @@ on a provisioned member rewrites the same files and changes nothing else.
   `authorized_keys` line is written for a comment-key or a forced command: the port, not
   the key, decides which service the session reaches.
 - The session shell comes from the login class. `/etc/login.conf.d/member` carries
-  `member:\tc=default:\shell=/usr/local/bin/git-shell:`, and `usermod -L member <name>`
+  `member:shell=/usr/local/bin/git-shell:tc=default:`, and `usermod -L member <name>`
   assigns it, so `git-shell` runs on 2222 while `passwd` keeps `/sbin/nologin`. The
   drop-in directory is the convention already in use on the box (`dovecot`, `rspamd`), and
-  `login.conf.db` does not exist there, so no `cap_mkdb` run is required; the build
-  verifies that rather than assuming it.
+  `cap_mkdb /etc/login.conf` is required after an edit to either file while
+  `/etc/login.conf.db` exists, which it does on this box since the onboard
+  class was built. The provisioning script runs it only when the database is
+  older than the drop-in, and says which of the two states it found.
 - `sshd -T` is the check, run against the fragment as `#154` requires, and the stale
   comment in `openbsd/etc/sshd_config` that says an account "uploads on 22 but cannot
   push" is corrected in the same change, which `#154` asked for.
