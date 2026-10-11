@@ -15,8 +15,9 @@
 #   1. installs the packages the build and the daemons need
 #   2. installs httpd.conf + acme-client.conf and issues the mail and site
 #      certificates
-#   3. installs smtpd.conf (with the queue key), dovecot.conf, and seeds the
-#      mail tables the domain has to answer for
+#   3. installs smtpd.conf (with the queue key and the DKIM filter's domain
+#      list), dovecot.conf, and seeds the mail tables the domain has to answer
+#      for
 #   4. generates the DKIM key if absent, and checks the published DKIM and SPF
 #      records
 #   5. builds and installs the Dovecot plugin and the kyriakon-encrypt daemon
@@ -79,6 +80,40 @@ start_service() {
 	rcctl check "$1" >/dev/null 2>&1 \
 		|| { printf '%s did not start; check /var/log/messages\n' "$1" >&2; exit 1; }
 	printf 'running: %s\n' "$1"
+}
+
+# dkim_domains_add <file> <domain>: append <domain> to the DKIM filter's domain
+# list unless the file already holds it as a whole line, and print only when it
+# appends, so a redeploy that changes nothing says nothing. Whole-line matching,
+# not a substring: parish.example and sub.parish.example are different domains and
+# both belong in the list.
+dkim_domains_add() {
+	grep -qxF "$2" "$1" 2>/dev/null && return 0
+	# A hand edit may have left the last line unterminated, and appending to it
+	# would join two domains into one. The virtual table write below uses the same
+	# guard for the same reason.
+	[ -n "$(tail -c 1 "$1" 2>/dev/null)" ] && printf '\n' >> "$1"
+	printf '%s\n' "$2" >> "$1"
+	printf 'dkim domain %s added\n' "$2"
+}
+
+# dkim_domains_args <file>: print the "-d <domain>" arguments for the filter's
+# proc-exec line, in file order, because the filter signs with the domain that
+# matches the message's From header and falls back to the first one given. Each
+# line is validated here rather than left to smtpd: the list is spliced into a
+# command string, so a stray line would reach the configuration as part of that
+# string, and smtpd's complaint would name the config file rather than the list.
+dkim_domains_args() {
+	dk_args=
+	while IFS= read -r dk_domain; do
+		[ -n "$dk_domain" ] || continue
+		printf '%s\n' "$dk_domain" \
+			| grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$' \
+			|| { printf '%s holds a line that is not a domain: %s\n' "$1" "$dk_domain" >&2; return 1; }
+		dk_args="$dk_args -d $dk_domain"
+	done < "$1"
+	[ -n "$dk_args" ] || { printf '%s holds no domains\n' "$1" >&2; return 1; }
+	printf '%s\n' "${dk_args# }"
 }
 
 # --- 1. packages ---------------------------------------------------------
@@ -362,6 +397,37 @@ fi
 [ -e "$virtuals_table" ] || : > "$virtuals_table"
 chmod 0644 "$virtuals_table"
 
+# The DKIM filter's domain list, one domain per line, generated on the box the way
+# the two tables above are. The single filter process signs every domain in it
+# with the one key, choosing the domain that matches the message's From header and
+# falling back to the first domain given, so the platform's own domain is first: a
+# list whose first line was a body's domain would sign every name the filter does
+# not know with that body's domain, its d= would not match its From domain, and
+# DMARC alignment would fail. This deploy writes only that first line; the drain
+# that provisions a body appends the body's domain, and removing a body is
+# removing its line.
+#
+# The first domain is asserted rather than rewritten, because reordering a list
+# this deploy shares with the drain is how the fallback would move by accident.
+# The list is not a secret, only the domains the box sends as.
+#
+# The drain writes the file too, but a line here is not enough on its own: the -d
+# list is spliced into /etc/mail/smtpd.conf below, so whoever appends a domain
+# re-runs that splice and reloads smtpd, exactly as this deploy does. That drain
+# is a later ticket and is not built here.
+dkim_domains_table=/etc/mail/dkim_domains
+if [ -s "$dkim_domains_table" ]; then
+	dkim_first=$(awk 'NF { print; exit }' "$dkim_domains_table")
+	[ "$dkim_first" = "$platform_domain" ] || {
+		printf 'first line of %s is "%s", not "%s": the filter falls back to the first domain, which must be the platform domain\n' \
+			"$dkim_domains_table" "$dkim_first" "$platform_domain" >&2
+		exit 1
+	}
+else
+	dkim_domains_add "$dkim_domains_table" "$platform_domain"
+	chmod 0644 "$dkim_domains_table"
+fi
+
 # Addresses the domain has to answer for. RFC 2142 requires every mail domain to
 # accept postmaster@ and abuse@; docs/aup.md sends abuse reports to
 # abuse@kyriakon.net; the DMARC record points aggregate reports at
@@ -463,12 +529,24 @@ done <<EOF
 $(awk -F: '$6 ~ /^\/home\// { print $1 }' /etc/passwd)
 EOF
 
-# '|' delimits the s/// because base64 keys contain '/'. The deployed file
-# holds the key, hence 0600.
-sed -e "s|REPLACE_ME_QUEUE_KEY|$queue_key|" "$repo_dir/openbsd/etc/smtpd.conf" > /etc/mail/smtpd.conf
+# The filter's -d list, expanded from the domain list in file order. The first
+# domain is the one the filter falls back to, so the order is not cosmetic.
+# dkim_domains_args fails rather than printing a partial list, and the assignment
+# stops the deploy when it does.
+dkim_d_args=$(dkim_domains_args "$dkim_domains_table")
+
+# '|' delimits the s/// because base64 keys contain '/'. The deployed file holds
+# the key, hence 0600. Both placeholders are substituted in the one pass, so the
+# file is written once and never left with the key and not the list, or the
+# reverse.
+sed -e "s|REPLACE_ME_QUEUE_KEY|$queue_key|" \
+	-e "s|REPLACE_ME_DKIM_DOMAINS|$dkim_d_args|" \
+	"$repo_dir/openbsd/etc/smtpd.conf" > /etc/mail/smtpd.conf
 chmod 0600 /etc/mail/smtpd.conf
-grep -q 'REPLACE_ME_QUEUE_KEY' /etc/mail/smtpd.conf \
-	&& { printf 'queue key substitution failed\n' >&2; exit 1; }
+for placeholder in REPLACE_ME_QUEUE_KEY REPLACE_ME_DKIM_DOMAINS; do
+	grep -q "$placeholder" /etc/mail/smtpd.conf \
+		&& { printf '%s was not substituted in /etc/mail/smtpd.conf\n' "$placeholder" >&2; exit 1; }
+done
 smtpd -n -f /etc/mail/smtpd.conf
 
 install -m 0644 "$repo_dir/openbsd/dovecot/dovecot.conf" /etc/dovecot/dovecot.conf
