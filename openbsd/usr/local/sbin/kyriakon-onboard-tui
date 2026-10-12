@@ -52,21 +52,28 @@
 # its own, so the answers live in shell variables for the life of the connection
 # and a dropped connection costs them and nothing else.
 #
-# Used by sshd with no arguments, and no argument can come from a client:
-# sshd_config(5)'s ForceCommand "ignor[es] any command supplied by the client",
-# which is why the flags below are a testing seam rather than a lever. By hand:
+# sshd runs it the way a forced command is always run, as the login class's shell
+# with -c and the command word after it:
+#
+#   /usr/local/sbin/kyriakon-onboard-tui -c /usr/local/sbin/kyriakon-onboard-tui
+#
+# That shape is accepted and its word discarded (see main below). No other
+# argument can come from a client, because sshd_config(5)'s ForceCommand
+# "ignor[es] any command supplied by the client", which is why the flags below
+# are a testing seam rather than a lever. By hand, after the -c pair if one is
+# present:
 #
 #   ksh kyriakon-onboard-tui [--questions PATH] [--reserved PATH] [--handler URL]
 #   ksh kyriakon-onboard-tui --self-test
 #
 # --self-test exercises the question list's parsing and every refusal it makes,
 # each validation rule, the branch counters, the summary, the token out of a
-# canned reply, and eight scripted sessions against a stub handler: one that
+# canned reply, and nine scripted sessions against a stub handler: one that
 # files, one that leaves, one whose connection drops, the branch counter, the
 # fingerprint the shared check returns, a refusal re-asked, the body path with a
-# key per mailbox, and one that goes back. All of it without a terminal, a network
-# or root. What it cannot exercise is on the ticket: the real sshd session over
-# the network, and the live handler.
+# key per mailbox, one that goes back, and the sshd invocation shape. All of it
+# without a terminal, a network or root. What it cannot exercise is on the ticket:
+# the real sshd session over the network, and the live handler.
 #
 # Exit: 0 the session ended with quit or with an application filed; 1 the
 # connection dropped before the end, or the box is not ready to take one.
@@ -1256,6 +1263,19 @@ main() {
 	typeset mode=run
 	while [ "$#" -gt 0 ]; do
 		case $1 in
+		-c)
+			# sshd runs a forced command as `execve(shell, {shell, "-c",
+			# command})` (session.c's do_child), and the login class makes this
+			# program the session's shell, so a real session arrives as
+			# `kyriakon-onboard-tui -c /usr/local/sbin/kyriakon-onboard-tui`:
+			# sshd invoking the forced command through us. The word after -c is
+			# sshd's and is discarded, never run, because in the deployed shape it
+			# is this program's own path and running it would recurse.
+			# sshd_config(5)'s ForceCommand "ignor[es] any command supplied by the
+			# client", so nothing an applicant sends can arrive here.
+			if [ "$#" -lt 2 ]; then usage; fi
+			shift 2
+			;;
 		--self-test)
 			mode=self-test
 			shift
@@ -1290,12 +1310,12 @@ main() {
 # What can be exercised without a terminal is exercised here: the question list's
 # parsing and every refusal it makes, each validation rule against a fixture, the
 # counter's branch totals against the shipped list, the summary, the token out of
-# a canned page, and eight whole sessions run against a stub handler: one that
+# a canned page, and nine whole sessions run against a stub handler: one that
 # files, one that leaves, one whose connection drops, one that proves the branch
 # total, one that shows the fingerprint the shared check returns, one refused and
-# re-asked, the body path with a key per mailbox, and one that goes back. What
-# stays on the ticket: the real sshd session over the network, and the live
-# handler.
+# re-asked, the body path with a key per mailbox, one that goes back, and the sshd
+# invocation shape. What stays on the ticket: the real sshd session over the
+# network, and the live handler.
 self_test() {
 	typeset work fails=0
 	work=$(mktemp -d "${TMPDIR:-/tmp}/kyriakon-tui-test.XXXXXX")
@@ -1710,6 +1730,28 @@ ANSWERS
 	*) printf '  ok   the kept answer was not refused\n' ;;
 	esac
 	check "the back session makes no request" "$(requests_in "$work/back.log")" "0"
+
+	printf '\nthe sshd invocation shape starts the wizard\n'
+	: > "$work/sshdshape.log"
+	KYRIAKON_TEST_LOG="$work/sshdshape.log"
+	rc=0
+	PATH="$work/bin:$PATH" ksh "$0" -c "$0" --questions "$real_list" \
+		--reserved "$work/reserved.txt" --handler "http://127.0.0.1:1" \
+		>"$work/sshdshape.out" 2>&1 <<'ANSWERS' || rc=$?
+
+quit
+ANSWERS
+	shape_out=$(cat "$work/sshdshape.out")
+	check "the sshd shape leaves cleanly" "$rc" "0"
+	check_has "the sshd shape prints the first screen" "$shape_out" "Kyriakon onboarding"
+	check_has "the sshd shape starts the walk" "$shape_out" "question 1 of 13"
+	case $shape_out in
+	*"usage:"*)
+		printf '  FAIL the sshd shape printed usage\n'
+		fails=$((fails + 1))
+		;;
+	*) printf '  ok   the sshd shape did not print usage\n' ;;
+	esac
 
 	printf '\nthe handler address comes from its own config\n'
 	cat > "$work/onboard.toml" <<'TOML'
