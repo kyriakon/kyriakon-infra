@@ -37,3 +37,20 @@ because a gemini client pins what it first saw. One pair covers `kyriakon.net` a
 hostname, generated once with a ten-year life; an own-domain capsule gets its own. The
 key is held in the backup set because nothing reissues a self-signed pair.
 _Avoid_: gemini certificate, TOFU certificate
+
+## Conventions that have already bitten
+
+**The shell is pdksh.** Every script here runs under the box's `/bin/ksh`, which is
+pdksh-derived: no arrays, no `+=`, no `[[ ]]` pattern matching, no `<<<` here-strings,
+no process substitution. A script written against ksh93 passes its self-test on a
+developer's machine and fails on the box at the first `typeset -a`, which is what
+happened to the onboarding TUI: the session died on `typeset: -a: unknown option`
+before it drew anything. The other scripts in `scripts/` are the idiom reference, and
+a self-test only counts if it has been run under the box's own ksh.
+_Avoid_: ksh93, bash.
+
+**A scheduled script prints nothing when it has nothing to do.** cron mails a job's
+output, so a line on a quiet run is a line in the operator's inbox every time it runs,
+which is how the certificate queue mailed every fifteen minutes. What the operator
+must see is a health signal or a `--status` reading, not a running commentary.
+_Avoid_: verbose cron jobs, "just one line".
