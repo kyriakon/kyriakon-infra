@@ -16,9 +16,9 @@
 # Safety properties:
 #   - it only appends, and it skips a block whose opening marker is already
 #     present, so it is safe to run repeatedly. It rewrites nothing outside its
-#     own marker pairs, except that it drops a byte-identical second copy of one
-#     of its own blocks: a check that keyed on a rule's text once appended finger
-#     twice, and the next run has to be able to repair that without a hand edit;
+#     own marker pairs, with two exceptions it makes on purpose: it drops a
+#     byte-identical second copy of one of its own blocks, and it drops the
+#     greylisting block when the file already diverts SMTP to spamd without it;
 #   - the candidate is built in a temp file and checked with pfctl -n before
 #     anything live is touched, and the installed file is checked again;
 #   - the file it replaces is kept beside the original, timestamped;
@@ -51,8 +51,9 @@ die() {
 # A fragment is present iff its opening marker is. Keying on the rule text is what
 # broke finger: that check looked for a line ending "port 79", the rule grew a
 # keep-state suffix, and from then on every run appended the block again. The
-# marker is the stable key, and every fragment is tested through this one helper,
-# including the onboarding block this script writes further down.
+# marker is the stable key. The one fragment that cannot use this alone is
+# greylisting, whose rules a stock pf.conf already carries without our marker; its
+# test adds the effect as well, and says why there.
 has_block() { grep -q "^# --- kyriakon: $1" "$pf_conf"; }
 
 [ "$(id -u)" -eq 0 ] || die "run this with doas: it writes ${pf_conf}"
@@ -69,24 +70,39 @@ fi
 work=$(mktemp)
 bak=${pf_conf}.bak.$(date +%Y%m%d%H%M%S)
 
-# The candidate starts as the live file with an exact duplicate of one of our own
-# blocks removed. A block whose check keyed on its rule text could be appended
-# twice: the finger check looked for a line ending "port 79", the rule grew a
-# keep-state suffix, and every run since has added the block again. Collapsing
-# here is what repairs a box already carrying two copies, since the operator
-# edits this root-only file only through this script. A block is its two marker
-# lines and everything between them; a line outside them is copied through
-# untouched, and only a byte-identical repeat is dropped. Two copies that differ
-# (a block appended twice around a changed value) are both kept and left to the
-# diff, because guessing which one is wanted is not this script's call.
+# The candidate starts as the live file with the copies of our own blocks that are
+# no longer needed removed. Two things make a block redundant. One is a
+# byte-identical repeat: a check that keyed on a rule's text appended finger twice,
+# and only this script can repair a root-only file the operator will not hand-edit.
+# The other is our greylisting block when the file already diverts SMTP to spamd
+# outside it, because a stock pf.conf carries those same rules in its own words and
+# our copy is then dead weight. A block is its two marker lines and everything
+# between them; a line outside them is copied through untouched, and two copies
+# that differ (a block appended twice around a changed value) are both kept and
+# left to the diff, because guessing which is wanted is not this script's call.
 dropped=$(mktemp)
 collapsed=0
-awk -v dropped="$dropped" '
+# Whether the diverts are already there is decided with our own marker pairs
+# stripped out first. A scan that saw our block's own divert line would call a box
+# whose only divert is our block a box that does not need it, and drop it, sending
+# SMTP to smtpd instead of spamd: a mail change made by a firewall script for no
+# reason. So a box with the stock rules drops our block, and a box whose only
+# divert is our block keeps it.
+outdivert=$(awk '
+/^# --- kyriakon: / { inblk = 1; next }
+inblk && /^# --- end kyriakon: / { inblk = 0; next }
+inblk { next }
+/divert-to 127\.0\.0\.1 port spamd/ { found = 1 }
+END { print found + 0 }
+' "$pf_conf")
+awk -v dropped="$dropped" -v dropgrey="$outdivert" '
 /^# --- kyriakon: / { inblk = 1; buf = $0 ORS; open = $0; next }
 inblk && /^# --- end kyriakon: / {
 	buf = buf $0 ORS
-	if (buf in seen) {
-		print open >> dropped
+	if (dropgrey == 1 && open ~ /^# --- kyriakon: greylisting /) {
+		print "greylisting, superseded by the divert rules already in the file: " open >> dropped
+	} else if (buf in seen) {
+		print "byte-identical duplicate: " open >> dropped
 	} else {
 		seen[buf] = 1
 		printf "%s", buf
@@ -100,9 +116,9 @@ END { if (inblk) printf "%s", buf }
 ' "$pf_conf" > "$work"
 if [ -s "$dropped" ]; then
 	collapsed=$(awk 'END { print NR + 0 }' "$dropped")
-	printf 'removing %s duplicate kyriakon block(s):\n' "$collapsed"
-	while read -r marker; do
-		printf '\t%s\n' "$marker"
+	printf 'removing %s kyriakon block(s):\n' "$collapsed"
+	while read -r why; do
+		printf '\t%s\n' "$why"
 	done < "$dropped"
 fi
 rm -f "$dropped"
@@ -112,7 +128,14 @@ added=0
 # The divert sends every inbound SMTP connection to spamd. The second rule is
 # what lets a whitelisted host through instead, and its log keyword is what
 # spamlogd reads to keep <spamd-white> current.
-if has_block greylisting; then
+# The greylisting fragment tests differently from the other five, and it has to. A
+# stock OpenBSD pf.conf already carries these diverts in its own words, without our
+# marker, so a marker-only test would append a second copy of rules the box already
+# runs. The test is therefore for the effect, a divert to spamd, as well as for our
+# marker. The other five open services a stock file has nothing for, so there their
+# marker is the whole story. Removing our block once the stock rules are doing the
+# work is the candidate builder's job below, not this test's.
+if has_block greylisting || grep -q 'divert-to 127.0.0.1 port spamd' "$pf_conf"; then
 	printf 'greylisting:  already in %s\n' "$pf_conf"
 else
 	cat >>"$work" <<'EOF'
