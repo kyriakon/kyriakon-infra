@@ -147,15 +147,17 @@ The key walkthrough [#176](https://github.com/kyriakon/kyriakon-infra/issues/176
 
 The same walkthrough presents the upload key as a step for anyone who wants a website rather than an optional extra, because both paths are key-based and a member who skips it gets mail and nothing else ([#176](https://github.com/kyriakon/kyriakon-infra/issues/176), [#154](https://github.com/kyriakon/kyriakon-infra/issues/154)). It states the two ports plainly: sftp on 22 for uploads, and git on 2222 for `pass` repositories.
 
-The mail public key is the field that may not fit. An armored Curve25519 block plus the path and the token runs at or past the 1024 bytes the specification allows, and a client that enforces the limit refuses to send it. So the key page takes the paste where it fits and says before the prompt what to do when it does not:
+The mail public key is the field that may not fit. An armored Curve25519 block plus the path and the token runs at or past the 1024 bytes the specification allows, and a client that enforces the limit refuses to send it, which makes Titan the ordinary route rather than the exception and the paste the short case. So the key page takes the paste where it fits and says before the prompt what to do when it does not:
 
 ```
 10 (question 11 of 24) Paste the public key for secretary@theirparish.example. Paste the whole
-block. If your client refuses the paste because the address is too long, mail the block to
-apply@kyriakon.net with <token> as the subject instead, and name this mailbox in the message.
+block. If your client refuses the paste because the address is too long, upload it to
+titan://signup.kyriakon.net:REPLACE_ME/key with <token> as the upload token, or, if your client
+does not speak Titan, mail it to apply@kyriakon.net with <token> as the subject, and name this
+mailbox in the message.
 ```
 
-The warning is in META because META is the only text a client shows before the input; the specification forces that, and it means there is nowhere else for it to go. The prompt stays inside the 1024-byte reply header gmid allows.
+The warning is in META because META is the only text a client shows before the input; the specification forces that, and it means there is nowhere else for it to go. The prompt stays inside the 1024-byte reply header gmid allows. The Titan port is substituted at install, the same convention the terminal's own port and the postal address use, and the token in the link is the draft's, which the client supplies in its upload dialog because a link cannot carry it any other way.
 
 On the answer the handler extracts the armored block, runs the same three-condition check the web form runs, and records the fingerprint and the verdict. The conditions are the ones [#176](https://github.com/kyriakon/kyriakon-infra/issues/176) and the #185 prototype fix: no encryption-capable subkey, a preference that would make gpg emit a packet the member's client cannot read (the AEAD preference), and an expired or revoked key or subkey. The signup warns with the specific message and proceeds. It never refuses on the shape of a key, because the platform cannot verify what a client generated, and a heuristic refusal would turn a guarantee into a support queue.
 
