@@ -27,9 +27,10 @@
 # a separate ticket. Until that exists the handler answers the box and nothing
 # else, which is why the verification here is a loopback request.
 #
-# It does not install either secret. /etc/kyriakon/onboard/approval-signing-key
-# and its siblings are the operator's own, written once by hand, because they
-# must not come from this repository.
+# It generates the approval key when it is absent, and never rotates one that is
+# already there, so a first deploy signs and a later one leaves the links it
+# signed alone. Stripe's webhook secret is the one that stays a paste by hand,
+# because a real secret cannot live in this repository at all.
 
 set -euo pipefail
 
@@ -106,14 +107,32 @@ if awk '/REPLACE_ME/ { found = 1 } END { exit !found }' /etc/onboard/onboard.tom
 	die "/etc/onboard/onboard.toml still carries a REPLACE_ME placeholder"
 fi
 
+# The postal address the cash-by-post rail gives out, read from the box's own
+# values file rather than edited on the box: nothing host-specific is edited on
+# the box, and this is the file every other deploy already reads. A box that has
+# not set it is told where to, rather than left a config with a hole in it.
+env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
+[ -r "$env_file" ] || die "no $env_file; run scripts/setup-env.sh first, which installs it"
+# shellcheck source=/dev/null
+. "$env_file"
+case "${POSTAL_ADDRESS:-}" in
+"")
+	die "POSTAL_ADDRESS is not set in $env_file; set it with: scripts/setup-env.sh --postal-address '...'"
+	;;
+*REPLACE_ME*)
+	die "POSTAL_ADDRESS in $env_file is still a placeholder; set it with: scripts/setup-env.sh --postal-address '...'"
+	;;
+esac
+
 # The drain's own root-only config, into the drain's home that the store script
-# created. Only the release is substituted: the postal address is left as
-# REPLACE_ME because it is the operator's own and the deploy does not know it,
-# so unlike the handler's config this file is not required to be free of the
-# placeholder. The release line is, and is checked on its own.
+# created. The release and the postal address come from the tracked template,
+# substituted here; nothing is edited on the box.
 install -d -m 0700 -o root -g wheel /etc/kyriakon/onboard
-sed -e "s|^release = .*|release = \"$release\"|" \
-	"$repo_dir/openbsd/etc/onboard/drain.toml" > /etc/kyriakon/onboard/drain.toml
+RELEASE="$release" POSTAL="$POSTAL_ADDRESS" awk '
+	/^release[[:space:]]*=/ { print "release = \"" ENVIRON["RELEASE"] "\""; next }
+	/^postal_address[[:space:]]*=/ { print "postal_address = \"" ENVIRON["POSTAL"] "\""; next }
+	{ print }
+' "$repo_dir/openbsd/etc/onboard/drain.toml" > /etc/kyriakon/onboard/drain.toml
 chmod 0600 /etc/kyriakon/onboard/drain.toml
 awk -v want="release = \"$release\"" '$0 == want { found = 1 } END { exit !found }' \
 	/etc/kyriakon/onboard/drain.toml \
@@ -121,7 +140,25 @@ awk -v want="release = \"$release\"" '$0 == want { found = 1 } END { exit !found
 if grep -q '^release = "REPLACE_ME' /etc/kyriakon/onboard/drain.toml; then
 	die "/etc/kyriakon/onboard/drain.toml still carries a REPLACE_ME release"
 fi
+awk -v want="postal_address = \"$POSTAL_ADDRESS\"" '$0 == want { found = 1 } END { exit !found }' \
+	/etc/kyriakon/onboard/drain.toml \
+	|| die "/etc/kyriakon/onboard/drain.toml does not name the postal address; it should have been substituted, not left as a placeholder"
 printf 'release: %s\n' "$release"
+
+# The approval key, generated once and never by a later deploy: a second run must
+# not invalidate links a previous run has already signed. Replacing it is the
+# operator's own act, by hand, and the only rotation there is.
+approval_key=/etc/kyriakon/onboard/approval-signing-key
+if [ ! -e "$approval_key" ]; then
+	[ -x /usr/bin/openssl ] || die "no /usr/bin/openssl, which generates the approval key"
+	(umask 077 && /usr/bin/openssl rand -base64 32 > "$approval_key")
+	chown root:wheel "$approval_key"
+	printf 'generated %s\n' "$approval_key"
+else
+	printf 'kept the existing %s\n' "$approval_key"
+fi
+# Stripe's webhook secret is the exception: a real secret cannot live in this
+# repository, so the card rail's ticket leaves that file as a paste by hand.
 
 say "service"
 rcctl enable kyriakon_onboard
