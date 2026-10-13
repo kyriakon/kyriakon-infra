@@ -48,6 +48,17 @@ need_pkg() {
 	pkg_add "$1"
 }
 
+# The scripts the drain runs, by the paths its config names. It invokes
+# add-user.sh, provision-member.sh and delete-user.sh directly, and those invoke
+# quota-apply.sh, provision-member-web.sh, provision-member-capsule.sh and
+# cron-apply.sh, so the whole set has to be installed wherever the drain looks.
+# provision-member.sh also reads the tracked login class next to itself (its own
+# ../openbsd/etc/login.conf.d/member), so this deploy installs that file into the
+# layout the relative read resolves to rather than copying the scripts somewhere
+# the read would leave behind.
+drain_scripts="add-user.sh provision-member.sh delete-user.sh quota-apply.sh provision-member-web.sh provision-member-capsule.sh cron-apply.sh"
+drain_class="openbsd/etc/login.conf.d/member"
+
 # Every source this installs, checked before anything on the box is changed, so a
 # half-copied checkout fails here rather than after the store has been written.
 for f in onboard/Cargo.toml openbsd/etc/onboard/onboard.toml openbsd/etc/onboard/drain.toml \
@@ -55,6 +66,10 @@ for f in onboard/Cargo.toml openbsd/etc/onboard/onboard.toml openbsd/etc/onboard
 	openbsd/etc/rc.d/kyriakon_onboard scripts/onboard-store.sh reserved-usernames.txt; do
 	[ -e "$repo_dir/$f" ] || die "missing from $repo_dir: $f"
 done
+for s in $drain_scripts; do
+	[ -e "$repo_dir/scripts/$s" ] || die "missing from $repo_dir: scripts/$s"
+done
+[ -e "$repo_dir/$drain_class" ] || die "missing from $repo_dir: $drain_class"
 
 # The store, the four writable directories, the mail spool, the drain's root-only
 # home, and the two files the three front-ends share. One author for all of it:
@@ -159,6 +174,28 @@ else
 fi
 # Stripe's webhook secret is the exception: a real secret cannot live in this
 # repository, so the card rail's ticket leaves that file as a paste by hand.
+
+# The tree the drain looks in, taken back from its own installed config, so the
+# install and the drain cannot disagree about the path. The scripts run from
+# where they sit, which is why the login class provision-member.sh reads beside
+# them is installed into the same layout.
+say "drain scripts"
+scripts_dir=$(awk -F'"' '/^scripts[[:space:]]*=/ { print $2; exit }' /etc/kyriakon/onboard/drain.toml)
+[ -n "$scripts_dir" ] || die "/etc/kyriakon/onboard/drain.toml names no scripts directory"
+scripts_root=$(dirname "$scripts_dir")
+install -d -m 0755 "$scripts_dir"
+for s in $drain_scripts; do
+	install -m 0755 "$repo_dir/scripts/$s" "$scripts_dir/$s"
+done
+install -d -m 0755 "$scripts_root/openbsd/etc/login.conf.d"
+install -m 0644 "$repo_dir/$drain_class" "$scripts_root/openbsd/etc/login.conf.d/member"
+# Before the unit starts, every script the drain names must be executable. A
+# missing one is the drain's first intent failing at cron, which is how this gap
+# was found.
+for s in $drain_scripts; do
+	[ -x "$scripts_dir/$s" ] || die "$scripts_dir/$s is not executable"
+done
+printf 'drain scripts installed in %s\n' "$scripts_dir"
 
 say "service"
 rcctl enable kyriakon_onboard
