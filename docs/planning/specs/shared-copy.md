@@ -46,6 +46,7 @@ The values as they stand on 2026-10-13, which is a snapshot and not the source: 
 | capsule_signup | Applying over gemini | the whole application over gemini, with no browser | planned | signup.kyriakon.net | apply |
 | terminal | The terminal | apply, read your account and manage your keys from an ssh session | planned | ssh.kyriakon.net | read |
 | press | Kyriakon Press | the press, its books, and the state it is in | live | press.kyriakon.net | read |
+| shop | The bookshop | the Press's books, ordered from its own page once the shop is built | planned | press.kyriakon.net | read |
 | kleio | Kleio | the sibling project, and the state it is in | live | kleio.kyriakon.net | read |
 
 Two of those lines are projects rather than services, and they are in the catalogue because the site's own splash carries them and a member exploring the platform should find them the same way. Their pages state their own state, and their `state` word here says nothing more.
