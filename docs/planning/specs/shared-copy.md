@@ -220,7 +220,7 @@ ssh apply@ssh.kyriakon.net    ->  Mail                    live
 
 | The wording | Where it lives | Who reads it |
 | --- | --- | --- |
-| A service's name and its one clause | `openbsd/etc/onboard/catalogue.tsv` | all three |
+| A service's name and its one clause | `openbsd/etc/onboard/catalogue.toml` | all three |
 | A question's prompt, its type and its validation | `openbsd/etc/onboard/questions.tsv` | all three |
 | The word for each state and each action | one table in `onboard/src/catalogue.rs` | all three |
 | The hand-off sentence for each job a protocol cannot finish | the same table | per front-end |
@@ -243,7 +243,7 @@ The account page's table in `signup-and-account-page.md` is the whole list of wh
 
 One seam is worth tests, and it is the join between the catalogue and the three renderings, because a defect there tells a reader about a service that does not exist or hides one that does.
 
-- Every id in the tracked `catalogue.tsv` appears in all three renderings, compared as rows rather than as strings, since each renderer returns a list and the templates format it.
+- Every id in the tracked `catalogue.toml` appears in all three renderings, compared as rows rather than as strings, since each renderer returns a list and the templates format it.
 - Each renderer is rendered from a small fixture that differs from the shipped file, and the three outputs must follow the fixture. This is what catches a list that was hard-coded beside the file: a renderer that ignores its input passes the first check and fails this one.
 - Every `state` and every `action` value in the file has a word in every front-end's vocabulary, so a new value cannot arrive with a rendering for one front-end and none for the others.
 - The question list gets the same treatment where the three renderings of a question differ, and the existing checks in `onboard/src/questions.rs` stay.
@@ -252,7 +252,7 @@ Nothing else here is worth a test. The chrome is copy, and copy is checked by re
 
 ## Not verified
 
-Nothing in this document has been run. `openbsd/etc/onboard/catalogue.tsv` does not exist, `onboard/src/catalogue.rs` does not exist, the three renderings named here are not written, and the terminal front-end has no Rust home yet: [Amend the SSH onboarding TUI spec for the portal redesign](https://github.com/kyriakon/kyriakon-infra/issues/361) fixes that, and it should provide the crate as a library so the catalogue has one home and no copy. The catalogue's values are a snapshot of 2026-10-13 and the file is the source once it exists, which is the point of writing them down in one place.
+Nothing in this document has been run. `openbsd/etc/onboard/catalogue.toml` does not exist, `onboard/src/catalogue.rs` does not exist, the three renderings named here are not written, and the terminal front-end has no Rust home yet: [Amend the SSH onboarding TUI spec for the portal redesign](https://github.com/kyriakon/kyriakon-infra/issues/361) fixes that, and it should provide the crate as a library so the catalogue has one home and no copy. The catalogue's values are a snapshot of 2026-10-13 and the file is the source once it exists, which is the point of writing them down in one place.
 
 ## Sources
 
