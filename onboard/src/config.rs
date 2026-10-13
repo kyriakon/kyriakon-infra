@@ -47,7 +47,7 @@ mod tests {
     fn parses_the_shipped_shape() {
         let c: Config = toml::from_str(
             "store_root = \"/var/db/onboard\"\n\
-             questions = \"/var/db/onboard/questions.tsv\"\n\
+             questions = \"/var/db/onboard/questions.toml\"\n\
              reserved = \"/var/db/onboard/reserved-usernames.txt\"\n\
              listen = \"127.0.0.1\"\n\
              port = 7080\n\

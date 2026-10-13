@@ -39,7 +39,7 @@ need_pkg() {
 
 # Every source this installs, checked before anything on the box is changed, so a
 # half-copied checkout fails here rather than after the store has been written.
-for f in onboard/Cargo.toml openbsd/etc/onboard/onboard.toml openbsd/etc/onboard/questions.tsv \
+for f in onboard/Cargo.toml openbsd/etc/onboard/onboard.toml openbsd/etc/onboard/questions.toml \
 	openbsd/etc/rc.d/kyriakon_onboard scripts/onboard-store.sh reserved-usernames.txt; do
 	[ -e "$repo_dir/$f" ] || die "missing from $repo_dir: $f"
 done

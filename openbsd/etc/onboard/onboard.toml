@@ -22,7 +22,7 @@ store_root = "/var/db/onboard"
 # the top of the store (scripts/onboard-store.sh installs them there). Named here
 # rather than derived from the store root, so the handler fails loudly if a later
 # layout moves them instead of reading an empty list and rendering nothing.
-questions = "/var/db/onboard/questions.tsv"
+questions = "/var/db/onboard/questions.toml"
 reserved = "/var/db/onboard/reserved-usernames.txt"
 
 # The deployed commit and date, substituted at install, e.g.

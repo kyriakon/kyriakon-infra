@@ -1,0 +1,220 @@
+# /var/db/onboard/questions.toml
+#
+# The shared question list: what the three front-ends ask, in the order they ask
+# it. The file is the only place the list exists, so a prompt or an answer option
+# moves here rather than in three renderings. scripts/onboard-store.sh installs
+# it 0644 at the top of the store, and /etc/onboard/onboard.toml names the path
+# the handler reads it from.
+#
+# Hand-written, so it is TOML: the service already parses TOML for its own
+# config, the format takes comments, and an array of tables keeps display order,
+# which is the order the front-ends render and ask. A choice's answers are a list
+# of tables rather than one packed string, so a value cannot be read as a label.
+#
+# The columns, the vocabularies and the rules are in
+# docs/planning/specs/signup-and-account-page.md. In short: type is one of text,
+# choice, yesno, multiline, addresses, key or acceptance; branch is one of all,
+# person, body or monastic, the last being the path the orders answer selects;
+# choices belongs to a choice question, because Yes and No are the yesno type's
+# own rendering; validation names the check an answer must pass, and a choice
+# question's check is its choices list.
+
+[[question]]
+id = "username"
+prompt = "Username"
+type = "text"
+branch = "all"
+required = true
+validation = "username"
+
+[[question]]
+id = "whose"
+prompt = "Is this for you, or for a body?"
+type = "choice"
+branch = "all"
+required = true
+choices = [
+	{ value = "person", label = "Just me, one address at kyriakon.net" },
+	{ value = "body", label = "A body, with its own domain" },
+]
+
+[[question]]
+id = "body_name"
+prompt = "The body's name"
+type = "text"
+branch = "body"
+required = true
+
+[[question]]
+id = "body_kind"
+prompt = "The body's kind"
+type = "choice"
+branch = "body"
+required = true
+choices = [
+	{ value = "parish", label = "Parish" },
+	{ value = "monastery", label = "Monastery" },
+	{ value = "school", label = "School" },
+	{ value = "business", label = "Business" },
+	{ value = "other", label = "Other" },
+]
+
+[[question]]
+id = "vat"
+prompt = "VAT number"
+type = "text"
+branch = "body"
+required = false
+
+[[question]]
+id = "body_domain"
+prompt = "The body's domain"
+type = "text"
+branch = "body"
+required = true
+validation = "domain"
+
+[[question]]
+id = "body_records"
+prompt = "I can add the DNS records you will ask me to create."
+type = "yesno"
+branch = "body"
+required = true
+
+[[question]]
+id = "body_addresses"
+prompt = "The addresses, one per line"
+type = "addresses"
+branch = "body"
+required = true
+
+[[question]]
+id = "body_account_names"
+prompt = "An account name for each mailbox, one per line"
+type = "multiline"
+branch = "body"
+required = true
+validation = "usernames"
+
+[[question]]
+id = "body_mail_key"
+prompt = "A public key for each mailbox"
+type = "key"
+branch = "body"
+required = true
+validation = "mail-key"
+
+[[question]]
+id = "body_upload_key"
+prompt = "An upload key for the site"
+type = "key"
+branch = "body"
+required = false
+validation = "upload-key"
+
+[[question]]
+id = "body_dns_contact"
+prompt = "Who should we talk to about DNS?"
+type = "text"
+branch = "body"
+required = false
+
+[[question]]
+id = "address_outside"
+prompt = "An address outside this platform"
+type = "text"
+branch = "all"
+required = false
+validation = "address"
+
+[[question]]
+id = "address_ack"
+prompt = "I understand that we can only reach me inside this account."
+type = "yesno"
+branch = "all"
+required = false
+
+[[question]]
+id = "mail_key"
+prompt = "Your public key"
+type = "key"
+branch = "person"
+required = true
+validation = "mail-key"
+
+[[question]]
+id = "upload_key"
+prompt = "Your upload key"
+type = "key"
+branch = "person"
+required = false
+validation = "upload-key"
+
+[[question]]
+id = "rail"
+prompt = "How you will pay"
+type = "choice"
+branch = "all"
+required = true
+choices = [
+	{ value = "card", label = "Card, renews each year" },
+	{ value = "cash", label = "Cash by post" },
+	{ value = "monero", label = "Monero" },
+	{ value = "no_charge", label = "No charge: clergy, monastics, or anyone who cannot pay" },
+]
+
+[[question]]
+id = "diocese"
+prompt = "Diocese"
+type = "text"
+branch = "all"
+required = false
+
+[[question]]
+id = "orders"
+prompt = "Are you a priest, deacon, monk, nun, or a layman?"
+type = "choice"
+branch = "all"
+required = false
+choices = [
+	{ value = "priest", label = "Priest" },
+	{ value = "deacon", label = "Deacon" },
+	{ value = "monk", label = "Monk" },
+	{ value = "nun", label = "Nun" },
+	{ value = "layman", label = "Layman" },
+]
+
+[[question]]
+id = "blessing"
+prompt = "If you are a monastic, do you have your elder's or confessor's blessing to have an account?"
+type = "multiline"
+branch = "monastic"
+required = true
+
+[[question]]
+id = "cannot_pay"
+prompt = "If you are unable to pay, please tell us here."
+type = "multiline"
+branch = "all"
+required = false
+
+[[question]]
+id = "intended_use"
+prompt = "What do you hope to use this for?"
+type = "multiline"
+branch = "all"
+required = false
+
+[[question]]
+id = "anything_else"
+prompt = "Anything else"
+type = "multiline"
+branch = "all"
+required = false
+
+[[question]]
+id = "accept_terms"
+prompt = "I accept the terms, the acceptable use policy and the privacy notice."
+type = "acceptance"
+branch = "all"
+required = true
