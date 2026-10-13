@@ -125,6 +125,7 @@ mod tests {
             store_root: dir.join("store").to_str().unwrap().to_string(),
             scripts: dir.join("bin").to_str().unwrap().to_string(),
             sendmail: stub(dir),
+            passwd: dir.join("passwd").to_str().unwrap().to_string(),
             approval_key: dir.join("key").to_str().unwrap().to_string(),
             stripe_webhook_secret: String::new(),
             keyring_publish_token: String::new(),

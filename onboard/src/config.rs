@@ -61,6 +61,12 @@ pub struct DrainConfig {
     /// The local enqueuer, `/usr/sbin/sendmail`. Every notice leaves through it
     /// and is DKIM-signed by the smtpd that owns it.
     pub sendmail: String,
+    /// The box's own account list, `/etc/passwd`. The drain reads it, rather
+    /// than running `id(1)`, to decide whether a username is already in use:
+    /// an account made any other way, by the operator or by a script run by
+    /// hand, has no record under the store, and the drain must neither adopt it
+    /// nor release its name. A configuration value so a test can drive it.
+    pub passwd: String,
     /// The root-only HMAC key the review and password links are signed with.
     pub approval_key: String,
     /// Stripe's signing secret and the keyring publish token. This build reads
@@ -124,6 +130,7 @@ mod tests {
         let text = "store_root = \"/var/db/onboard\"\n\
              scripts = \"/root/bin\"\n\
              sendmail = \"/usr/sbin/sendmail\"\n\
+             passwd = \"/etc/passwd\"\n\
              approval_key = \"/etc/kyriakon/onboard/approval-signing-key\"\n\
              stripe_webhook_secret = \"/etc/kyriakon/onboard/stripe-webhook-secret\"\n\
              keyring_publish_token = \"/etc/kyriakon/onboard/keyring-publish-token\"\n\
@@ -148,6 +155,7 @@ mod tests {
         assert_eq!(c.store_root, "/var/db/onboard");
         assert_eq!(c.scripts, "/root/bin");
         assert_eq!(c.sendmail, "/usr/sbin/sendmail");
+        assert_eq!(c.passwd, "/etc/passwd");
         assert_eq!(c.approval_key, "/etc/kyriakon/onboard/approval-signing-key");
         assert_eq!(c.reviewer, "admin@kyriakon.net");
         assert_eq!(c.base_url, "https://signup.kyriakon.net");

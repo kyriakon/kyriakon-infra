@@ -26,6 +26,12 @@ scripts = "/root/bin"
 # smtpd that owns the queue, so nothing here signs or relays anything itself.
 sendmail = "/usr/sbin/sendmail"
 
+# The box's own account list. The drain reads it, rather than running id(1), to
+# decide whether a username is already in use: an account made any other way,
+# by the operator or by provision-member.sh run by hand, has no record under the
+# store, and the drain must neither adopt it nor release its name.
+passwd = "/etc/passwd"
+
 # The root-only HMAC-SHA256 key the review email's three links and the one-time
 # password link are signed with. The drain signs and verifies with it; the
 # handler never reads it, because it only passes a click through as an intent.

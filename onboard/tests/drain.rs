@@ -49,16 +49,21 @@ impl Fix {
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
+        // The box's account list, empty to start: the drain reads it to tell its
+        // own half-finished approval from somebody else's account.
+        std::fs::write(fix.path("passwd"), "").unwrap();
         let sent = fix.path("sent");
         fix.script("enqueuer.sh", &format!("#!/bin/sh\ncat >> '{sent}'\n"));
-        for s in ["add-user.sh", "provision-member.sh", "delete-user.sh"] {
+        for s in ["provision-member.sh", "delete-user.sh"] {
             let log = fix.path("scripts.log");
             fix.script(s, &format!("#!/bin/sh\necho \"{s} $*\" >> '{log}'\n"));
         }
+        fix.add_user_writes_passwd();
         let cfg = format!(
             "store_root = \"{}\"\n\
              scripts = \"{}\"\n\
              sendmail = \"{}\"\n\
+             passwd = \"{}\"\n\
              approval_key = \"{}\"\n\
              stripe_webhook_secret = \"{}/stripe\"\n\
              keyring_publish_token = \"{}/keyring\"\n\
@@ -70,6 +75,7 @@ impl Fix {
             fix.path("store"),
             fix.path("bin"),
             fix.path("bin/enqueuer.sh"),
+            fix.path("passwd"),
             fix.path("key"),
             fix.dir.display(),
             fix.dir.display(),
@@ -80,6 +86,29 @@ impl Fix {
 
     fn path(&self, rel: &str) -> String {
         self.dir.join(rel).to_str().unwrap().to_string()
+    }
+
+    fn passwd_file(&self) -> String {
+        std::fs::read_to_string(self.dir.join("passwd")).unwrap_or_default()
+    }
+
+    fn set_passwd(&self, text: &str) {
+        std::fs::write(self.dir.join("passwd"), text).unwrap();
+    }
+
+    /// An add-user.sh that makes the account in the passwd fixture and refuses a
+    /// name already there, the shape the real script has. The box is what the
+    /// drain reads to tell its own half-finished approval from somebody else's
+    /// account.
+    fn add_user_writes_passwd(&self) {
+        let p = self.path("passwd");
+        let log = self.path("scripts.log");
+        self.script(
+            "add-user.sh",
+            &format!(
+                "#!/bin/sh\nif grep -q \"^$1:\" '{p}'; then\n\techo \"user $1 already exists\" >&2\n\texit 1\nfi\nprintf '%s:x:1000:1000::/home/%s:/sbin/nologin\\n' \"$1\" \"$1\" >> '{p}'\necho \"add-user.sh $*\" >> '{log}'\n"
+            ),
+        );
     }
 
     fn script(&self, name: &str, body: &str) {
@@ -218,19 +247,6 @@ impl Fix {
         self.script(
             "provision-member.sh",
             "#!/bin/sh\necho 'builder refused' >&2\nexit 1\n",
-        );
-    }
-
-    /// An add-user.sh that succeeds once and then refuses the name as taken, the
-    /// shape the real script has, so a retry has to tolerate the refusal.
-    fn add_user_refuses_after_first(&self) {
-        let ran = self.path("add-user.ran");
-        let log = self.path("scripts.log");
-        self.script(
-            "add-user.sh",
-            &format!(
-                "#!/bin/sh\nif [ -f '{ran}' ]; then echo \"user $1 already exists\" >&2; exit 1; fi\ntouch '{ran}'\necho \"add-user.sh $*\" >> '{log}'\n"
-            ),
         );
     }
 
@@ -752,14 +768,37 @@ fn an_approval_writes_the_upload_key_the_builder_reads() {
     assert!(fix.dir.join("store/accounts/secretary/account.json").exists());
 }
 
-/// A retry completes after a run that died at the builder. add-user.sh is not
-/// idempotent, so the retry has to tolerate its already-exists exit and carry on.
+/// An application with no upload key is still built: mail is unconditional, and
+/// the builder is what writes the member's address and allowance. The key file
+/// is written only when the application carried one.
+#[test]
+fn an_approval_without_an_upload_key_still_builds_the_member() {
+    let fix = Fix::new("mail-only");
+    let record = fix.filed_with("secretary", "cash", &[("rail", "cash")], None, None);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    // The builder that writes the member's address and allowance ran, with no
+    // key to build hosting from.
+    assert!(
+        fix.scripts_log().contains("provision-member.sh secretary"),
+        "{}",
+        fix.scripts_log()
+    );
+    assert!(fix.dir.join("store/accounts/secretary/account.json").exists());
+    assert!(fix.names("keys").is_empty(), "no key, no key file: {:?}", fix.names("keys"));
+}
+
+/// A retry completes after a run that died at the builder. The box holds the
+/// account the first run made and the journal shows this application started it,
+/// so the retry skips add-user.sh, which is not idempotent, and finishes.
 #[test]
 fn a_retried_approval_completes() {
     let fix = Fix::new("retry");
-    fix.add_user_refuses_after_first();
     // The first run's builder fails, leaving the account half-made: add-user.sh
-    // ran, no account.json exists, and the intent stays.
+    // ran and made the box account, no account.json exists, and the intent stays.
     fix.provision_fails();
     let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
     fix.file_application(&record);
@@ -771,9 +810,14 @@ fn a_retried_approval_completes() {
         "the first run must fail at the builder"
     );
     assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
+    assert!(
+        fix.passwd_file().contains("secretary:"),
+        "the box should hold the name the first run made: {}",
+        fix.passwd_file()
+    );
 
-    // The builder works on the retry, and add-user.sh now refuses the name as
-    // taken; the retry tolerates that and finishes.
+    // The builder works on the retry; the box oracle and the journal say the
+    // account is this application's, so add-user.sh is not run again.
     fix.provision_requires_key();
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
@@ -783,6 +827,78 @@ fn a_retried_approval_completes() {
         body(&out)
     );
     assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert_eq!(
+        fix.scripts_log().matches("add-user.sh").count(),
+        1,
+        "add-user.sh ran once, not once per pass: {}",
+        fix.scripts_log()
+    );
+}
+
+/// An approval whose username is already on the box without this application
+/// having started it is refused rather than adopting somebody else's account,
+/// and the refusal names the name and leaves the intent in place.
+#[test]
+fn an_approval_for_a_name_the_box_already_has_is_refused() {
+    let fix = Fix::new("taken");
+    fix.set_passwd("secretary:x:1000:1000::/home/secretary:/sbin/nologin\n");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/secretary/account.json").exists(),
+        "an account the application did not make must not be adopted"
+    );
+    assert!(
+        body(&out).contains("secretary") && body(&out).contains("in use"),
+        "the refusal names the name: {}",
+        body(&out)
+    );
+    // Nothing was run against the box's account: no add-user, no builder, no
+    // release.
+    assert!(fix.scripts_log().is_empty(), "{}", fix.scripts_log());
+    assert!(fix.passwd_file().contains("secretary:"), "the box account is untouched");
+    assert_eq!(fix.intents().len(), 1, "the intent is left in place");
+}
+
+/// The purge leaves a name the box holds alone, whether or not this service
+/// wrote a record for it, and clears the declined application away.
+#[test]
+fn a_purge_leaves_a_name_the_box_holds_alone() {
+    let fix = Fix::new("purge-box");
+    fix.set_passwd("secretary:x:1000:1000::/home/secretary:/sbin/nologin\n");
+    let declined = json!({
+        "username": "secretary",
+        "status_token": TOKEN,
+        "filed_at": "2026-08-01T09:00:00Z",
+        "front_end": "web",
+        "stage": "declined: no reason given",
+        "decided_at": "2026-09-01T00:00:00Z",
+        "answers": {},
+        "mail_keys": [],
+        "rail": "cash",
+        "no_charge": false,
+        "acceptances": [],
+        "question_list": "2026-08-01 abc1234",
+    });
+    std::fs::write(
+        fix.dir.join(format!("store/applications/{TOKEN}.json")),
+        serde_json::to_vec_pretty(&declined).unwrap(),
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(!fix.dir.join(format!("store/applications/{TOKEN}.json")).exists());
+    assert!(
+        !fix.scripts_log().contains("delete-user.sh"),
+        "the box account's name was released: {}",
+        fix.scripts_log()
+    );
+    assert!(fix.passwd_file().contains("secretary:"), "the box account is untouched");
 }
 
 /// An address the applicant wrote cannot become a second recipient or a header

@@ -445,6 +445,22 @@ async fn approve(
     // half-applied.
     let to = recipient(&record, username)?;
 
+    // The box is the oracle and the record only a fast path. A name already on
+    // the box that this application did not create is somebody else's, and it is
+    // refused rather than adopted: the front end may not check existence at all,
+    // so the drain must not silently take the account. The check runs before the
+    // journal line, so a refusal records nothing and leaves the intent in place.
+    let existing = existing_account(store, username).await;
+    let mut on_box = false;
+    if existing.is_none() {
+        on_box = account_on_box(cfg, username)?;
+        if on_box && !approval_started(store, token).await {
+            return Err(format!(
+                "the username {username} is already in use on this box and this application did not create it; the intent is left in place"
+            ));
+        }
+    }
+
     journal(
         store,
         &cfg.release,
@@ -456,26 +472,23 @@ async fn approve(
     )
     .await?;
 
-    // The account's own record, before provisioning: a rerun after a crash
-    // reuses the token and the window it already holds rather than opening a
-    // second of either, and it is what tells a fresh approval from a retry.
-    let existing = existing_account(store, username).await;
-
-    // Provisioning, and only when there is no account yet, so a retry does not
-    // repeat it. add-user.sh is not idempotent: it exits non-zero on a name that
-    // already exists, which is exactly the state an earlier run that died after
-    // it leaves, so that one exit is tolerated and the run carries on.
+    // Provisioning, and only when there is no account record yet, so a retry
+    // does not repeat it. When the box already holds the name this application
+    // started, add-user.sh is skipped: it is not idempotent, and the account it
+    // would refuse is the one this application made.
     if existing.is_none() {
-        run_script_tolerating(cfg, "add-user.sh", &[username], "already exists").await?;
-        // provision-member.sh refuses to build anything without the member's
-        // public key at the path it reads, so the upload key the application
-        // carried is written there first. An application with no upload key has
-        // no site or repositories to build, and the mailbox add-user.sh made is
-        // the whole account.
+        if !on_box {
+            run_script_tolerating(cfg, "add-user.sh", &[username], "already exists").await?;
+        }
+        // The member is always built, because mail is unconditional: the builder
+        // writes the member's address and the allowance, and the key decides
+        // only what else. When the application carried one, it is written where
+        // that script reads it first, since the public tree and the upload
+        // session are built from it.
         if let Some(upload) = record.upload_key.as_ref() {
             write_public_key(store, username, &upload.material).await?;
-            run_script(cfg, "provision-member.sh", &[username]).await?;
         }
+        run_script(cfg, "provision-member.sh", &[username]).await?;
     }
 
     let now = util::filed_at();
@@ -740,12 +753,16 @@ pub async fn purge_declined(cfg: &DrainConfig, store: &Store) -> Result<(), Stri
                 )
                 .await?;
             }
-            // Release the name only when no account holds it. The front end
-            // never checks whether a name is taken, so an approved account and a
-            // declined application can share a username, and this must not
-            // delete the live member's account. A failed script leaves the
-            // record for the next pass rather than losing the release.
-            if existing_account(store, &record.username).await.is_none() {
+            // Release the name only when nothing holds it. The box is the oracle
+            // and the record only a fast path: an account made by the operator
+            // or by a script run by hand has no record, and the front end never
+            // checks whether a name is taken, so either form means the name is
+            // in use and the purge must not delete what holds it. A failed
+            // script leaves the record for the next pass rather than losing the
+            // release.
+            let taken = existing_account(store, &record.username).await.is_some()
+                || account_on_box(cfg, &record.username)?;
+            if !taken {
                 run_script(cfg, "delete-user.sh", &[&record.username]).await?;
             }
             journal(
@@ -775,12 +792,42 @@ async fn application_record(store: &Store, token: &str) -> Result<Record, String
     serde_json::from_str(&text).map_err(|e| format!("the application record does not parse: {e}"))
 }
 
-/// The account a username already has, when one is there.
+/// The account a username already has, when one is there. This is the fast path:
+/// the box itself, read below, is the oracle.
 async fn existing_account(store: &Store, username: &str) -> Option<Account> {
     let text = store
         .read_record(&format!("accounts/{username}"), "account.json")
         .await?;
     serde_json::from_str(&text).ok()
+}
+
+/// Whether the box itself holds an account for a username, read from the passwd
+/// file rather than by running `id(1)`. This is the oracle the account record is
+/// not: an account the operator made, or one `provision-member.sh` made by hand,
+/// has no `account.json`, and the drain must neither adopt it nor release its
+/// name. An unreadable file is an error rather than a "no", so the drain fails
+/// closed instead of acting on a box it cannot see.
+fn account_on_box(cfg: &DrainConfig, username: &str) -> Result<bool, String> {
+    let text = std::fs::read_to_string(&cfg.passwd)
+        .map_err(|e| format!("cannot read {}: {e}", cfg.passwd))?;
+    Ok(text
+        .lines()
+        .any(|line| line.split(':').next() == Some(username)))
+}
+
+/// Whether this application's approval already began. The journal records
+/// "applying" after the name check and before provisioning, so a name that is on
+/// the box and has that line is one this application made, and the retry
+/// continues with it rather than refusing it as taken.
+async fn approval_started(store: &Store, token: &str) -> bool {
+    for line in store.lines("journal.jsonl").await {
+        if let Ok(j) = serde_json::from_str::<JournalLine>(&line) {
+            if j.application.status_token == token && j.outcome == "applying" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Write the decision onto the application record. `password_link` is written
