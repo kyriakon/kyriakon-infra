@@ -189,8 +189,12 @@ The help page carries the fingerprint and the date it was last changed.
 
 ### Removing a member's hosting
 
-`scripts/del-user.sh <username>` is the reverse, run inside the deletion transition that
-[#241](https://github.com/kyriakon/kyriakon-infra/issues/241) owns rather than before it.
+`scripts/delete-user.sh <username>` is the reverse, run inside the deletion transition that
+[#241](https://github.com/kyriakon/kyriakon-infra/issues/241) owns rather than before it. It is
+the reverse of both scripts that make a member, `add-user.sh` and `provision-member.sh`, and
+it is what removes the account's own line in the mail virtual table as well as the tree, the
+configuration and the member's certificate material. The proposal's section 5.9.1 names a
+`del-user.sh`; this repository's script for that job is `delete-user.sh`.
 The order matters: remove `/etc/httpd.d/<name>.conf`, `/etc/gmid.d/<name>.kyriakon.net.conf`
 and `/etc/acme-client.d/<name>.kyriakon.net.conf`, regenerate the three indexes and reload
 the daemons, and only then remove the public tree and the account, so a daemon is never
@@ -236,5 +240,6 @@ written from the mechanics they rest on and the box's own state, not from a run.
   `userquota` with `/home/quota.user` present and the mount reporting "with quotas";
   `getent group members` answers; `openssl version` reports LibreSSL 4.3.0.
 - `openbsd/etc/httpd.conf`, `openbsd/etc/gmid.conf`, `openbsd/etc/sshd_config`,
-  `openbsd/etc/acme-client.conf`, `scripts/add-user.sh`, `scripts/quota-apply.sh`,
+  `openbsd/etc/acme-client.conf`, `scripts/add-user.sh`, `scripts/delete-user.sh`,
+  `scripts/quota-apply.sh`,
   `scripts/cron-apply.sh`, `scripts/deploy-mail.sh`, `scripts/backup.sh`. Read 2026-10-07.

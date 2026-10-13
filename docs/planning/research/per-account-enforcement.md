@@ -833,8 +833,8 @@ denies submission without touching IMAP, without a second store, and without a d
 The class file and the class name are part of the deploy, not per-account state, so
 `scripts/add-user.sh` or the provisioning service should own them.
 
-`scripts/del-user.sh`, which the proposal already names, has to become the ordered list in
-section 6. Two items in it are currently wrong in ways that matter: the keyring sync in
+`scripts/delete-user.sh` (the proposal names a `delete-user.sh`), built on 2026-10-13, is the
+ordered list in section 6. Two items in it are currently wrong in ways that matter: the keyring sync in
 `deploy-mail.sh` never removes entries, and the quota step is meaningless until `/home` carries
 a quota.
 
