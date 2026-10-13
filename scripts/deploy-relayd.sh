@@ -20,10 +20,14 @@
 #
 # Usage:
 #   doas ksh deploy-relayd.sh [src_dir]
-#   ksh scripts/deploy-relayd.sh --self-test
+#   ksh scripts/deploy-relayd.sh --self-test [src_dir]
 #
 #   src_dir   directory holding relayd.conf; defaults to this script's
-#             directory with ../openbsd/etc, which is the repo layout.
+#             directory with ../openbsd/etc, which is the repo layout. The
+#             self-test reads that file too, because the extraction that links
+#             the certificates has to work on the config being deployed and not
+#             only on its own fixture, and that is the check that would have
+#             caught the keypair shape that once stopped this deploy.
 #   --self-test  run the checks below against a temporary tree and exit. No
 #             daemon is touched and no file outside the temporary tree is
 #             written, so it runs as an ordinary user.
@@ -31,7 +35,15 @@
 set -euo pipefail
 
 script_dir=$(dirname -- "$0")
-src_dir="${1:-$script_dir/../openbsd/etc}"
+
+# src_dir: the argument when one is given, and this script's ../openbsd/etc
+# otherwise, which is the repo layout. --self-test takes its directory as a
+# second argument, because that check reads the config the deploy installs and
+# has to be able to find it wherever it is run from.
+case "${1:-}" in
+--self-test) src_dir="${2:-$script_dir/../openbsd/etc}" ;;
+*) src_dir="${1:-$script_dir/../openbsd/etc}" ;;
+esac
 
 conf_src="$src_dir/relayd.conf"
 conf_dst=/etc/relayd.conf
@@ -48,7 +60,7 @@ ssl_private=/etc/ssl/private
 
 usage() {
 	printf 'usage: doas ksh deploy-relayd.sh [src_dir]\n' >&2
-	printf '       ksh scripts/deploy-relayd.sh --self-test\n' >&2
+	printf '       ksh scripts/deploy-relayd.sh --self-test [src_dir]\n' >&2
 	exit 2
 }
 
@@ -59,13 +71,24 @@ die() {
 
 # The names the relay will present a certificate for, read out of the config
 # rather than listed again here, so a line added there is a certificate this
-# script also links. A commented keypair line is not one of them.
+# script also links. Both shapes the option is written in are read: one
+# `keypair "name"` per statement, which is what the file uses, and the
+# comma-separated list inside a `tls { }` block, which is the other form the same
+# man page shows. A commented line is not a name, and a shape this cannot read is
+# a deploy that stops on the box, so the self-test below runs it against the
+# shipped file rather than only against a fixture.
 keypair_names() {
-	awk '/^[[:space:]]*keypair[[:space:]]+"/ {
-		name = $2
-		gsub(/"/, "", name)
-		print name
-	}' "${1:--}"
+	awk '
+		/^[[:space:]]*#/ { next }
+		{
+			while (match($0, /keypair[[:space:]]+"[^"]+"/)) {
+				name = substr($0, RSTART, RLENGTH)
+				sub(/^keypair[[:space:]]+"/, "", name)
+				sub(/"$/, "", name)
+				print name
+				$0 = substr($0, RSTART + RLENGTH)
+			}
+		}' "${1:--}"
 }
 
 # How many sockets are listening on 443, from a netstat capture. Read from stdin
@@ -135,6 +158,22 @@ self_test() {
 		fi
 	}
 
+	# --- the shipped config, read the way the deploy reads it ---
+	# This is the check that matters: the extraction is what the deploy links
+	# certificates from, so a config shape it cannot read is a deploy that stops on
+	# the box, which is exactly what happened when the keypairs moved from a block
+	# to one statement each. It runs against the file that gets installed, not only
+	# against the fixture above, and the expected names come from grep rather than
+	# from the function itself, so a name it misses is a difference here instead of
+	# agreement with itself.
+	[ -r "$conf_src" ] \
+		|| die "no $conf_src to check: run this from the checkout, or pass its directory as the second argument"
+	shipped=$(keypair_names "$conf_src")
+	reference=$(grep -v '^[[:space:]]*#' "$conf_src" \
+		| grep -o 'keypair[[:space:]]*"[^"]*"' | sed 's/.*"\(.*\)"/\1/')
+	check "the shipped config names a certificate" "$([ -n "$shipped" ] && printf yes || printf no)" "yes"
+	check "every keypair in the shipped config is read" "$shipped" "$reference"
+
 	# --- the keypair names the config asks for ---
 	printf '%s\n' \
 		'http protocol "https" {' \
@@ -146,6 +185,15 @@ self_test() {
 		'# keypair "not.this.one"' > "$tree/relayd.conf"
 	names=$(keypair_names "$tree/relayd.conf")
 	check "a configured keypair is a name to link" "$names" "kyriakon.net"
+
+	# Both shapes the option is written in, since a change to which one the file
+	# uses is what stopped a deploy: a comma-separated list on one line, and one
+	# statement per keypair.
+	printf '%s\n' \
+		'tls { keypair "one.example", keypair "two.example" }' \
+		'tls keypair "three.example"' > "$tree/both.conf"
+	check "a comma-separated list on one line is read" \
+		"$(keypair_names "$tree/both.conf" | paste -s -d ' ' -)" "one.example two.example three.example"
 
 	# --- what still holds 443 ---
 	printf '%s\n' \
@@ -216,7 +264,7 @@ self_test() {
 
 case "${1:-}" in
 --self-test)
-	[ "$#" -eq 1 ] || usage
+	[ "$#" -le 2 ] || usage
 	self_test
 	;;
 -*)
