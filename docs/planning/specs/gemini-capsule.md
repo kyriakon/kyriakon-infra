@@ -2,6 +2,8 @@
 
 > Spec synthesised from [Spec the Gemini capsule front-end](https://github.com/kyriakon/kyriakon-infra/issues/243) and the decisions it points at: [Decide the Gemini onboarding front-end](https://github.com/kyriakon/kyriakon-infra/issues/182), whose resolution this spec implements rather than reopens, [Decide how a member's capsule survives certificate renewal](https://github.com/kyriakon/kyriakon-infra/issues/244), and the research note it rests on, [Research serving a dynamic Gemini capsule alongside gmid](https://github.com/kyriakon/kyriakon-infra/issues/181) (`docs/planning/research/gemini-dynamic-capsule.md`). It takes the application's questions from [Decide the organisation's application questions](https://github.com/kyriakon/kyriakon-infra/issues/233), the key's behaviour from [Decide the member key walkthrough and the browser generator](https://github.com/kyriakon/kyriakon-infra/issues/176), its promises from [Decide what the public release promises, and where](https://github.com/kyriakon/kyriakon-infra/issues/158), and its place in the service from [Decide the onboarding service's architecture and its trust boundary](https://github.com/kyriakon/kyriakon-infra/issues/156). The [gemini protocol specification 0.24.1](https://geminiprotocol.net/docs/protocol-specification.gmi) is the normative source for the flow.
 
+> Amended on 2026-10-13: the upload path per [Decide whether the capsule accepts uploads by Titan](https://github.com/kyriakon/kyriakon-infra/issues/358), the service catalogue per [Spec the shared copy across the three front-ends](https://github.com/kyriakon/kyriakon-infra/issues/362) and `docs/planning/specs/shared-copy.md`, and the member's identity per the map's standing decision that a member's credentials are one record rendered three ways.
+
 ## Problem statement
 
 The release ships the web form and nothing else, and the map requires onboarding to have three front-ends writing into one back end so that no single front-end is the only way in. The web form needs a browser, and a member who has a gemini client and no browser cannot reach it. The capsule is the second way in: the same application, the same questions, the same intents, served over the gemini protocol on the hostname the web form already uses.
@@ -16,7 +18,7 @@ One block is added to `gmid.conf` for `signup.kyriakon.net`, and the Rust servic
 
 State lives server-side in a draft keyed by a 128-bit random token carried in the path. Each page asks one question and shows "question N of M". Submitting an answer re-requests the same path with the answer as the query; the handler stores it and redirects to the next page. A draft untouched for seven days is purged by the drain, because a cancelled prompt sends nothing and the expiry is the only bound on an abandoned application.
 
-The mail public key is pasted where it fits, and each prompt that can overrun the 1024-byte limit warns before the input that a client enforcing it may refuse the answer; the same key can be mailed to `apply@kyriakon.net` with the draft's token in the subject, and the drain reads that mailbox and files the key against the draft. A status page at `/status/<token>` shows the stage and never echoes an answer. Counters keyed on `REMOTE_ADDR` answer 44 slow down rather than a failure. The terms, the acceptable use policy and the privacy notice are generated onto the capsule from the same source the site uses, and are mirrored rather than linked, because a gemini client cannot open an HTTPS page. The key walkthrough is mirrored the same way, so the way from a public key to a kept private key is readable on all three front-ends.
+The mail public key is pasted where it fits, and each prompt that can overrun the 1024-byte limit warns before the input that a client enforcing it may refuse the answer. A key that will not fit goes by Titan, which carries the payload in the request body rather than in the request line, and which this platform serves itself. Where a client has no Titan, the same key can be mailed to `apply@kyriakon.net` with the draft's token in the subject, and the drain reads that mailbox and files the key against the draft. A status page at `/status/<token>` shows the stage and never echoes an answer. Counters keyed on `REMOTE_ADDR` answer 44 slow down rather than a failure. The terms, the acceptable use policy and the privacy notice are generated onto the capsule from the same source the site uses, and are mirrored rather than linked, because a gemini client cannot open an HTTPS page. The key walkthrough is mirrored the same way, so the way from a public key to a kept private key is readable on all three front-ends.
 
 ## Where it lives
 
@@ -145,17 +147,27 @@ The key walkthrough [#176](https://github.com/kyriakon/kyriakon-infra/issues/176
 
 The same walkthrough presents the upload key as a step for anyone who wants a website rather than an optional extra, because both paths are key-based and a member who skips it gets mail and nothing else ([#176](https://github.com/kyriakon/kyriakon-infra/issues/176), [#154](https://github.com/kyriakon/kyriakon-infra/issues/154)). It states the two ports plainly: sftp on 22 for uploads, and git on 2222 for `pass` repositories.
 
-The mail public key is the field that may not fit. An armored Curve25519 block plus the path and the token runs at or past the 1024 bytes the specification allows, and a client that enforces the limit refuses to send it. So the key page takes the paste where it fits and says before the prompt what to do when it does not:
+The mail public key is the field that may not fit. An armored Curve25519 block plus the path and the token runs at or past the 1024 bytes the specification allows, and a client that enforces the limit refuses to send it, which makes Titan the ordinary route rather than the exception and the paste the short case. So the key page takes the paste where it fits and says before the prompt what to do when it does not:
 
 ```
 10 (question 11 of 24) Paste the public key for secretary@theirparish.example. Paste the whole
-block. If your client refuses the paste because the address is too long, mail the block to
-apply@kyriakon.net with <token> as the subject instead, and name this mailbox in the message.
+block. If your client refuses the paste because the address is too long, upload it to
+titan://signup.kyriakon.net:REPLACE_ME/key with <token> as the upload token, or, if your client
+does not speak Titan, mail it to apply@kyriakon.net with <token> as the subject, and name this
+mailbox in the message.
 ```
 
-The warning is in META because META is the only text a client shows before the input; the specification forces that, and it means there is nowhere else for it to go. The prompt stays inside the 1024-byte reply header gmid allows.
+The warning is in META because META is the only text a client shows before the input; the specification forces that, and it means there is nowhere else for it to go. The prompt stays inside the 1024-byte reply header gmid allows. The Titan port is substituted at install, the same convention the terminal's own port and the postal address use, and the token in the link is the draft's, which the client supplies in its upload dialog because a link cannot carry it any other way.
 
 On the answer the handler extracts the armored block, runs the same three-condition check the web form runs, and records the fingerprint and the verdict. The conditions are the ones [#176](https://github.com/kyriakon/kyriakon-infra/issues/176) and the #185 prototype fix: no encryption-capable subkey, a preference that would make gpg emit a packet the member's client cannot read (the AEAD preference), and an expired or revoked key or subkey. The signup warns with the specific message and proceeds. It never refuses on the shape of a key, because the platform cannot verify what a client generated, and a heuristic refusal would turn a guarantee into a support queue.
+
+### The Titan route
+
+Titan is gemini's write companion: the same protocol family on the same port, with the payload in the request body instead of the request line, which is what makes it the answer to a key that will not fit a 1024-byte answer. A request is the target URL followed by `;size=` in bytes, which is mandatory, and optionally `;mime=`, defaulting to `text/gemini`, and `;token=`; then exactly that many bytes of body. A bare `titan://` navigation is a zero-byte upload, so a link works even when the reader only meant to open a page.
+
+gmid cannot serve it. Its server reads the first line as an IRI and answers any scheme other than `gemini` with status 53 before the FastCGI dispatch, so no handler behind gmid sees a Titan request, and the `titan(1)` the package ships is a client. The endpoint is therefore this service itself, on a port of its own, behind a relayd relay that terminates TLS: `relayd.conf(5)` describes relays as "TLS acceleration, and general purpose TCP proxying on layer 7", which is the shape the packaged C server `vger` is deployed in, and the same relay forwards with `proxy-protocol v1` so the handler still sees the client's address and its counters keep meaning what they mean everywhere else. The port needs a rule in `scripts/pf-apply.sh`, which is propose-only and the operator's to apply, and the relay presents the capsule's own certificate, so a client that has pinned the capsule sees the pin it already holds.
+
+The token is the draft's own, the 128-bit capability the status link carries, so an applicant needs no identity to upload and losing the token costs exactly what losing the status link costs. What arrives is a key and nothing else, since the key is the one answer that overruns a request line. The handler checks three things before it reads a body: that the token names a live draft, that `size` is under the cap, and that the draft has no key yet, so a second upload against the same draft is refused rather than replacing the first.
 
 ### The mail route
 
@@ -172,11 +184,27 @@ The drain reads the Maildir on each run. It matches the draft's token in the sub
 
 A key whose subject carries a token that no longer resolves has arrived after the draft expired. The drain replies to the sender with one message carrying a fresh draft link, rather than leaving the applicant without an answer; it creates no draft from the mail alone, so the applicant starts again from the link. The reply is sent only when the message actually carries a public key block, and is rate-limited per sender, so ordinary mail to the address is not answered and the address is not a backscatter source.
 
+## A member over gemini
+
+The capsule is not only an applicant's front-end. When a client presents a certificate, gmid hands the handler `AUTH_TYPE`, which reads `CERTIFICATE` (the manual's spelling differs from the binary's, so read the source), `REMOTE_USER`, which is the certificate's subject, `TLS_CLIENT_ISSUER`, `TLS_CLIENT_HASH`, and the certificate's not-before and not-after dates. The hash is the one that matters, because it names the certificate the client holds the private key for rather than a name the client typed.
+
+**Validation is pinning, not a chain.** The account holds a set of certificate hashes, one per device, exactly as it holds upload keys, and a request whose `TLS_CLIENT_HASH` matches one of them is that member. Nothing signs these certificates and nothing needs to: a gemini client certificate is self-signed by design, and the platform is not trusting an issuer, it is recognising a key it has seen before. `REMOTE_USER` alone is worth nothing, since anyone can mint a self-signed certificate claiming any subject, and `TLS_CLIENT_ISSUER` is that same field again on a self-signed certificate. Both are recorded, and neither is trusted.
+
+**A reissued certificate is a new pin.** The hash is over the certificate rather than the key, so reissuing with the same key does not preserve it. That is tolerable because these certificates are made to last: Lagrange, which is what most of these readers use, lets an identity's validity be set in years and treats identity management as part of the client rather than an expert's errand. A member who makes a new one registers it again, which is the same action as adding a second device.
+
+**A certificate that matches nothing is an anonymous visit.** The capsule answers as it does for any stranger: no error, no refusal, and no page that says the certificate is unknown, because that would be an oracle for whether a hash is pinned. What the visit does carry is its own fingerprint, shown with the line that registering it happens from the account page or the terminal, so a member can pin the device in their hand without copying anything out of a client's settings.
+
+**Identity reads first and acts later.** A member's session over gemini reads the reading half of the account: its state, whether the site and the capsule are being served, the space used, and the notices sent. Nothing that changes anything is filed from the capsule until the drain exists, which is when the account half arrives. The record itself is the one in `docs/planning/specs/shared-copy.md`: a member's upload keys and pinned certificate hashes are entries of one account, and adding a device is a first-class action from every front-end that can identify a member.
+
 ## The status page
 
 `gemini://signup.kyriakon.net/status/<token>` is a `text/gemini` page keyed by the same 128-bit token the draft carries, which is also what the web form shows an applicant who gave no outside address. The page shows the stage: with us, waiting to be read (received); being read (with the reviewer); or decided, with the outcome being an account on the paid tier, an account without charge, or a decline, which offers the way back of [#159](https://github.com/kyriakon/kyriakon-infra/issues/159). The `KYR-` token the prototype's status link showed is the payment token drawn at approval, and is superseded here.
 
 The page never echoes an answer, the contact address or the key. A token that is unknown and a token that has expired return the same page, so the endpoint cannot be used to test whether a token exists. The page answers while the record exists: a draft until seven days after its last update, a filed application until seven days after the decision.
+
+## The services it lists
+
+The capsule renders the platform's service catalogue as one gemtext link list, read from `openbsd/etc/onboard/catalogue.toml`, with the same names and the same one-line clauses the web page and the terminal use, because that file is the only place the list exists. Each entry is one line, `=> <scheme>://<host>/ <name>: <summary>`, since the link label is the only place a gemtext link carries text. `docs/planning/specs/shared-copy.md` owns the file, its columns and the check that every entry appears in every rendering, and this document defers to it rather than restating a list that would then drift.
 
 ## Limits
 
@@ -208,6 +236,7 @@ Trust on first use. The specification recommends it, and it means the capsule re
 | `applications/<token>.json` | handler on file, drain on decision | answers, key fingerprints, verdicts, status | seven days after the decision, inside the 90-day window |
 | `intents/<id>.json` | handler | one filed application | consumed and deleted by the drain |
 | `mail/` | `smtpd` | the Maildir for `apply@kyriakon.net` | drained each run; a message is deleted once acted on |
+| `catalogue.toml` | `scripts/onboard-store.sh` | the shared service catalogue, read by the handler and by the terminal | with the service |
 | `journal.jsonl` | handler and drain | one line per transition | bounded with the service |
 
 The counters are process state and are not on disk.
@@ -220,9 +249,15 @@ The key mail is the other seam. A token in the subject files the block against t
 
 The limits and the counter are worth one case each. Exceeding either counter answers 44, and one shared address can still make the single draft a six-mailbox body needs. The counter's total matches the pages the path will actually ask, including after a branch answer. Multi-line normalisation is one table: `%0A`, `%0D%0A`, a literal newline and a bare CR, each landing as LF or as an ordinary character as the specification requires, with `+` staying a plus.
 
+The member's identity is worth two cases, because the join between a certificate and an account is where a defect answers someone as somebody else. A request whose certificate hash is pinned is that member, and one whose hash is unknown is anonymous, with the same pages answered either way; and no page asked for with an unmatched certificate ever says the certificate is unknown.
+
+The Titan route is worth three, because it is the one place a stranger with no session can write into an account. A token that names no live draft is refused before anything is read; a `size` over the cap is refused without reading the body; and a second upload against a draft that already holds a key is refused rather than replacing it.
+
+The catalogue rendering needs no test of its own beyond the check in `docs/planning/specs/shared-copy.md`, which renders this view along with the other two.
+
 ## Not verified
 
-The request-time FastCGI behaviour was read from gmid's source (`fcgi.c`, `server.c`) rather than observed, because no handler was run on the box. The first build should exercise one request end to end before the config is relied on. gmid's log lines and the `log off` server option are read from `gmid.conf(5)` and the source; the deploy confirms with `gmid -n` and one live request.
+The request-time FastCGI behaviour was read from gmid's source (`fcgi.c`, `server.c`) rather than observed, because no handler was run on the box. The first build should exercise one request end to end before the config is relied on. gmid's log lines and the `log off` server option are read from `gmid.conf(5)` and the source; the deploy confirms with `gmid -n` and one live request. The certificate variables named here are read from the same source rather than observed, and no member has yet been identified over gemini. The Titan route is entirely unbuilt: no relay, no port, no endpoint, no test, and the `proxy-protocol` behaviour and the `tls` keyword on a relay are read from `relayd.conf(5)` rather than observed.
 
 ## Out of scope
 
