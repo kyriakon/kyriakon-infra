@@ -23,6 +23,10 @@ Three paths appear throughout:
 
 Deploy the configuration with `doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-mail.sh`. It is idempotent, it installs the mail and web configuration, it rebuilds the Dovecot plugin and the encryptor, it installs every `keys/*.asc` into the keyring, and it restarts the daemons. It prints the firewall and `sshd_config` steps instead of taking them, because both are propose-only changes that a human applies.
 
+The web half of that configuration now ends behind `scripts/deploy-relayd.sh`, which owns 443 and terminates TLS for every web name. On a box that has not run it, run it after the mail deploy; after that, a change to `/etc/relayd.conf` is that script on its own.
+
+		doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-relayd.sh
+
 Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box without changing anything. It reports permission drift against mtree, the blocklist verdict for the box's address, whether a cron job can still reach the tools it needs, whether the finger service is intact, and whether the terraform guard and the restore snapshot are still in place. It exits non-zero when something is wrong.
 
 ## What is not built yet
@@ -330,7 +334,7 @@ Renewal runs daily from cron.
 
 	doas ksh /root/bin/renew-acme.sh
 
-The script renews `mail.kyriakon.net` for Dovecot and smtpd, `kyriakon.net` for httpd, and `kyriakon.com` for httpd. It restarts only the daemons whose certificate changed, and it prints `still current` for a certificate that is not near expiry. It exits non-zero when a renewal fails, and cron mails that to root.
+The script renews `mail.kyriakon.net` for Dovecot and smtpd, `kyriakon.net` and `oliver.kyriakon.net` for relayd and gmid, and `kyriakon.com` for relayd. relayd is the daemon that terminates TLS for every web name, and gmid serves the same certificates for the capsules. It restarts only the daemons whose certificate changed, and it prints `still current` for a certificate that is not near expiry. It exits non-zero when a renewal fails, and cron mails that to root.
 
 When it fails:
 
