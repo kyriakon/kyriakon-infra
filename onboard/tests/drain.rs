@@ -296,6 +296,25 @@ impl Fix {
         self.read("journal.jsonl")
     }
 
+    /// Move every failed attempt in the journal into the past, so a test can
+    /// reach the retry a backoff is holding back without waiting out the minute.
+    fn age_failures(&self) {
+        let path = self.dir.join("store/journal.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut out = String::new();
+        for line in text.lines() {
+            match serde_json::from_str::<Value>(line) {
+                Ok(mut v) if v.get("outcome").and_then(Value::as_str) == Some("failed") => {
+                    v["at"] = json!("2026-09-01T00:00:00Z");
+                    out.push_str(&serde_json::to_string(&v).unwrap());
+                }
+                _ => out.push_str(line),
+            }
+            out.push('\n');
+        }
+        std::fs::write(path, out).unwrap();
+    }
+
     fn account(&self, username: &str) -> Value {
         serde_json::from_str(&self.read(&format!("accounts/{username}/account.json"))).unwrap()
     }
@@ -817,7 +836,9 @@ fn a_retried_approval_completes() {
     );
 
     // The builder works on the retry; the box oracle and the journal say the
-    // account is this application's, so add-user.sh is not run again.
+    // account is this application's, so add-user.sh is not run again. The
+    // backoff is moved out of the way the way a real minute would.
+    fix.age_failures();
     fix.provision_requires_key();
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
@@ -833,6 +854,37 @@ fn a_retried_approval_completes() {
         "add-user.sh ran once, not once per pass: {}",
         fix.scripts_log()
     );
+}
+
+/// A failing intent is reported once rather than every pass, and is not retried
+/// again inside its backoff window. A stuck intent therefore costs the operator
+/// one mail, not one a minute.
+#[test]
+fn a_failing_intent_reports_once_and_backs_off() {
+    let fix = Fix::new("stuck");
+    // An approve intent for an application that is not on disk: a failure the
+    // drain cannot get past on its own.
+    fix.decide("approve", "secretary");
+
+    let first = fix.drain();
+    assert!(first.status.success(), "{}", body(&first));
+    assert_eq!(
+        body(&first).matches("there is no application").count(),
+        1,
+        "the first failure is reported once: {}",
+        body(&first)
+    );
+    assert_eq!(fix.intents().len(), 1, "the intent is left in place: {:?}", fix.intents());
+    assert!(fix.journal().contains("\"failed\""), "{}", fix.journal());
+
+    // Inside the backoff window the intent is not retried and nothing is printed.
+    let second = fix.drain();
+    assert!(second.status.success(), "{}", body(&second));
+    assert!(body(&second).is_empty(), "a backed-off failure is silent: {}", body(&second));
+    assert_eq!(fix.journal().matches("\"failed\"").count(), 1, "{}", fix.journal());
+
+    let third = fix.drain();
+    assert!(body(&third).is_empty(), "still inside the minute: {}", body(&third));
 }
 
 /// An approval whose username is already on the box without this application

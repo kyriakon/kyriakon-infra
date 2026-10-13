@@ -8,7 +8,8 @@
 //! nothing and the journal records only that the click was seen.
 
 use serde_json::{json, Value};
-use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use time::{Duration, OffsetDateTime};
 use tokio::process::Command;
 
 use crate::config::DrainConfig;
@@ -176,6 +177,82 @@ async fn intent_seen(store: &Store, id: &str) -> bool {
         }
     }
     false
+}
+
+/// How long to wait before retrying an id that has failed `failures` times, in
+/// minutes. A healthy intent is handled on the very next pass, which is the cron
+/// interval; a failing one backs off instead, so a permanent failure is retried
+/// after a minute, five, fifteen, then hourly rather than every minute. The
+/// schedule is a courtesy, not a limit: the retry never stops, so fixing the
+/// cause and waiting is enough.
+pub fn retry_after_minutes(failures: u32) -> i64 {
+    const SCHEDULE: [i64; 4] = [1, 5, 15, 60];
+    match failures {
+        0 => 0,
+        n => SCHEDULE[((n - 1) as usize).min(SCHEDULE.len() - 1)],
+    }
+}
+
+/// The failed passes recorded for an id: how many, when the last was, and what
+/// it said. Read back from the journal, so the count and the last message
+/// survive a restart, which is what makes both the backoff and the dedup hold
+/// across cron runs.
+pub async fn failures(store: &Store, id: &str) -> (u32, Option<OffsetDateTime>, Option<String>) {
+    let mut count = 0u32;
+    let mut last = None;
+    let mut message = None;
+    for line in store.lines("journal.jsonl").await {
+        if let Ok(j) = serde_json::from_str::<JournalLine>(&line) {
+            if j.intent == id && j.outcome == "failed" {
+                count += 1;
+                if let Ok(at) = OffsetDateTime::parse(&j.at, &Rfc3339) {
+                    last = Some(at);
+                }
+                if j.note.is_some() {
+                    message = j.note;
+                }
+            }
+        }
+    }
+    (count, last, message)
+}
+
+/// Record a failed pass and say whether it is a new one worth printing. The same
+/// message as the last failure is the same event, so the operator is not mailed
+/// it again; a different message is. This is the notices path's rule, applied to
+/// the drain's own output: record first, and let the record stop the duplicate.
+pub async fn note_failure(
+    store: &Store,
+    release: &str,
+    id: &str,
+    kind: &str,
+    message: &str,
+) -> Result<bool, String> {
+    let (_, _, previous) = failures(store, id).await;
+    journal(
+        store,
+        release,
+        id,
+        kind,
+        &ApplicationRef {
+            username: String::new(),
+            status_token: String::new(),
+        },
+        "failed",
+        Some(message),
+    )
+    .await?;
+    Ok(previous.as_deref() != Some(message))
+}
+
+/// Whether a failing id is due for another attempt, and whether it should be
+/// reported when it fails again. `true` means go ahead.
+pub async fn due(store: &Store, id: &str, now: OffsetDateTime) -> bool {
+    let (failures, last, _) = failures(store, id).await;
+    match last {
+        None => true,
+        Some(last) => now >= last + Duration::minutes(retry_after_minutes(failures)),
+    }
 }
 
 /// Whether the journal already holds a line of this kind for this application.
@@ -737,6 +814,11 @@ pub async fn purge_declined(cfg: &DrainConfig, store: &Store) -> Result<(), Stri
             status_token: record.status_token.clone(),
         };
         let purge_id = format!("purge-{}", record.status_token);
+        // A purge that keeps failing backs off, and its error is mailed once,
+        // through the same rule the intents use.
+        if !due(store, &purge_id, now).await {
+            continue;
+        }
         // The journal line goes before the transition, as it does for an intent,
         // and once: a pass that already released the name does not release it
         // again, and a crash after the line still clears the record away.
@@ -759,11 +841,19 @@ pub async fn purge_declined(cfg: &DrainConfig, store: &Store) -> Result<(), Stri
             // checks whether a name is taken, so either form means the name is
             // in use and the purge must not delete what holds it. A failed
             // script leaves the record for the next pass rather than losing the
-            // release.
+            // release, and its error is reported once rather than every minute.
             let taken = existing_account(store, &record.username).await.is_some()
                 || account_on_box(cfg, &record.username)?;
             if !taken {
-                run_script(cfg, "delete-user.sh", &[&record.username]).await?;
+                if let Err(e) = run_script(cfg, "delete-user.sh", &[&record.username]).await {
+                    let fresh = note_failure(store, &cfg.release, &purge_id, "decline", &e)
+                        .await
+                        .unwrap_or(true);
+                    if fresh {
+                        eprintln!("kyriakon-onboard-drain: {purge_id}: {e}");
+                    }
+                    continue;
+                }
             }
             journal(
                 store,
@@ -1012,5 +1102,16 @@ mod tests {
             decision_subject("approved", "secretary"),
             "Your application to kyriakon.net was approved (secretary)"
         );
+    }
+
+    #[test]
+    fn a_failing_id_backs_off_a_minute_then_five_then_fifteen_then_hourly() {
+        assert_eq!(retry_after_minutes(0), 0);
+        assert_eq!(retry_after_minutes(1), 1);
+        assert_eq!(retry_after_minutes(2), 5);
+        assert_eq!(retry_after_minutes(3), 15);
+        assert_eq!(retry_after_minutes(4), 60);
+        // The cap holds, so the drain keeps retrying rather than stopping.
+        assert_eq!(retry_after_minutes(40), 60);
     }
 }

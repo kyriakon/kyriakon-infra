@@ -153,7 +153,7 @@ mod tests {
         let c: DrainConfig =
             toml::from_str(include_str!("../../openbsd/etc/onboard/drain.toml")).unwrap();
         assert_eq!(c.store_root, "/var/db/onboard");
-        assert_eq!(c.scripts, "/root/bin");
+        assert_eq!(c.scripts, "/usr/local/libexec/kyriakon/scripts");
         assert_eq!(c.sendmail, "/usr/sbin/sendmail");
         assert_eq!(c.passwd, "/etc/passwd");
         assert_eq!(c.approval_key, "/etc/kyriakon/onboard/approval-signing-key");

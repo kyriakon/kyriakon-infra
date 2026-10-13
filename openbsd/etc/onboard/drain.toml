@@ -16,11 +16,15 @@
 # drain's, which is the privilege split the spec fixes.
 store_root = "/var/db/onboard"
 
-# The directory the privileged scripts are installed in. /root/bin is where
-# scripts/deploy-mail.sh puts them, and the drain calls
-# add-user.sh, provision-member.sh and delete-user.sh from here by their
-# configured paths so a test can point at stubs.
-scripts = "/root/bin"
+# The directory the drain's privileged scripts are installed in. It invokes
+# add-user.sh, provision-member.sh and delete-user.sh by their configured paths,
+# and those run quota-apply.sh, provision-member-web.sh,
+# provision-member-capsule.sh and cron-apply.sh in turn, so the whole set lives
+# here. scripts/deploy-onboard.sh installs them, and the tracked login class that
+# provision-member.sh reads beside them, and checks every script is executable
+# before the unit starts. A test points this at stubs under a temporary
+# directory.
+scripts = "/usr/local/libexec/kyriakon/scripts"
 
 # The local enqueuer. Every notice leaves through it and is DKIM-signed by the
 # smtpd that owns the queue, so nothing here signs or relays anything itself.

@@ -8,6 +8,7 @@
 //! until the ticket that understands it lands.
 
 use serde_json::Value;
+use time::OffsetDateTime;
 
 use crate::config::DrainConfig;
 use crate::sign;
@@ -19,21 +20,43 @@ use crate::transitions::{self, DecisionIntent};
 /// a minute later.
 pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     // Read once, before anything is done: the review email's links are signed
-    // with it, and a box whose key is missing should fail on the first minute
-    // rather than after it has half-carried a transition out.
-    let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
+    // with it. A missing or unreadable key is a misconfigured box, and it is
+    // reported once rather than on every pass.
+    let key = match sign::read_key(std::path::Path::new(&cfg.approval_key)) {
+        Ok(k) => k,
+        Err(e) => {
+            report(cfg, store, "config", "config", &e).await;
+            return Ok(());
+        }
+    };
     // The filenames are ULIDs, so a lexical sort is an age sort.
     for name in store.list("intents").await? {
         if !name.ends_with(".json") {
             continue;
         }
+        let id = name.trim_end_matches(".json");
+        // A failing intent backs off rather than being retried every minute, and
+        // its error is mailed once rather than on every pass.
+        if !transitions::due(store, id, OffsetDateTime::now_utc()).await {
+            continue;
+        }
         if let Err(e) = one(cfg, store, &key, &name).await {
-            // One bad intent must not stop the others, and the error names the
-            // intent file. The intent is left in place for the next pass.
-            eprintln!("kyriakon-onboard-drain: {name}: {e}");
+            report(cfg, store, id, "intent", &e).await;
         }
     }
     transitions::purge_declined(cfg, store).await
+}
+
+/// Report a failure once. The journal records every failed pass, so a message
+/// the last failure already carried is not printed again, and cron does not mail
+/// the same paragraph on every minute.
+async fn report(cfg: &DrainConfig, store: &Store, id: &str, kind: &str, message: &str) {
+    let fresh = transitions::note_failure(store, &cfg.release, id, kind, message)
+        .await
+        .unwrap_or(true);
+    if fresh {
+        eprintln!("kyriakon-onboard-drain: {id}: {message}");
+    }
 }
 
 /// One intent, dispatched by kind.
