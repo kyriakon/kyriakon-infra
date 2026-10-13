@@ -24,7 +24,7 @@
 # is an update, not a typo.
 #
 # With arguments and no file at all, it writes the whole file and insists on all
-# eleven, because there is nothing to merge into and a half-filled new file is
+# thirteen, because there is nothing to merge into and a half-filled new file is
 # more likely a mistake than an intention. Nothing is written until the values it
 # was given have been checked.
 #
@@ -88,7 +88,7 @@ choose_tui_port() {
 	return 1
 }
 
-vars="KYRIAKON_IPV4 KYRIAKON_IPV6 KYRIAKON_TSIG_SECRET RESTIC_REPOSITORY RESTIC_PASSWORD_FILE ALERT_EMAIL HEALTHCHECKS_URL KEYRING_HEALTHCHECKS_URL REHEARSAL_HEALTHCHECKS_URL HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL"
+vars="KYRIAKON_IPV4 KYRIAKON_IPV6 KYRIAKON_TSIG_SECRET RESTIC_REPOSITORY RESTIC_PASSWORD_FILE ALERT_EMAIL HEALTHCHECKS_URL KEYRING_HEALTHCHECKS_URL REHEARSAL_HEALTHCHECKS_URL HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL POSTAL_ADDRESS"
 
 usage() {
 	cat >&2 <<'EOF'
@@ -98,7 +98,8 @@ usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
                              --keyring-healthchecks-url H
                              --rehearsal-healthchecks-url I
                              --hcloud-token J --restore-test-repository K
-                             --restore-test-healthchecks-url L]
+                             --restore-test-healthchecks-url L
+                             --postal-address M]
 
   No arguments: install the template if /root/.kyriakon-env is absent, then
   report which values are still missing or placeholders.
@@ -107,7 +108,7 @@ usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
   what it had, comments and the PATH block included. This is how a box that is
   already deployed is given a value it did not have.
 
-  All twelve arguments, no file: write it from them, mode 0600. All or nothing
+  All thirteen arguments, no file: write it from them, mode 0600. All or nothing
   when creating one, and each value is checked before anything is written.
 
     doas ksh scripts/setup-env.sh \
@@ -120,7 +121,8 @@ usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
       --rehearsal-healthchecks-url https://hc-ping.com/<uuid> \
       --hcloud-token "$(pass kyriakon/hetzner-terraform-api-key)" \
       --restore-test-repository 'sftp://user-sub1@host:23/' \
-      --restore-test-healthchecks-url https://hc-ping.com/<uuid>
+      --restore-test-healthchecks-url https://hc-ping.com/<uuid> \
+      --postal-address '1 Example Street, Example'
 EOF
 	exit 2
 }
@@ -137,6 +139,7 @@ a_reh=
 a_hcloud=
 a_restrepo=
 a_resthc=
+a_postal=
 while [ "$#" -gt 0 ]; do
 	[ "$#" -ge 2 ] || usage
 	case "$1" in
@@ -152,13 +155,14 @@ while [ "$#" -gt 0 ]; do
 	--hcloud-token) a_hcloud="$2" ;;
 	--restore-test-repository) a_restrepo="$2" ;;
 	--restore-test-healthchecks-url) a_resthc="$2" ;;
+	--postal-address) a_postal="$2" ;;
 	*) usage ;;
 	esac
 	shift 2
 done
 
 given=0
-for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_keyring_hc" "$a_reh" "$a_hcloud" "$a_restrepo" "$a_resthc"; do
+for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_keyring_hc" "$a_reh" "$a_hcloud" "$a_restrepo" "$a_resthc" "$a_postal"; do
 	if [ -n "$v" ]; then
 		given=$((given + 1))
 	fi
@@ -181,8 +185,9 @@ if [ "$given" -gt 0 ]; then
 		if [ -z "$a_hcloud" ]; then missing="$missing HCLOUD_TOKEN"; fi
 		if [ -z "$a_restrepo" ]; then missing="$missing RESTORE_TEST_REPOSITORY"; fi
 		if [ -z "$a_resthc" ]; then missing="$missing RESTORE_TEST_HEALTHCHECKS_URL"; fi
+		if [ -z "$a_postal" ]; then missing="$missing POSTAL_ADDRESS"; fi
 		if [ -n "$missing" ]; then
-			printf 'setup-env: %s does not exist yet, so all twelve arguments are needed; missing:%s\n\n' "$env_dst" "$missing" >&2
+			printf 'setup-env: %s does not exist yet, so all thirteen arguments are needed; missing:%s\n\n' "$env_dst" "$missing" >&2
 			usage
 		fi
 	fi
@@ -223,7 +228,7 @@ if [ "$given" -gt 0 ]; then
 	esac
 	# The file expresses values as single-quoted shell words, so a value
 	# containing a quote cannot be represented in it.
-	for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_keyring_hc" "$a_reh" "$a_hcloud" "$a_restrepo" "$a_resthc"; do
+	for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_keyring_hc" "$a_reh" "$a_hcloud" "$a_restrepo" "$a_resthc" "$a_postal"; do
 		case "$v" in
 		*"'"*) printf 'setup-env: a value contains a single quote, which this file cannot express\n' >&2; exit 2 ;;
 		esac
@@ -238,7 +243,8 @@ if [ "$given" -gt 0 ]; then
 			"RESTIC_REPOSITORY=$a_repo" "RESTIC_PASSWORD_FILE=$a_pass" "ALERT_EMAIL=$a_email" \
 			"HEALTHCHECKS_URL=$a_hc" "KEYRING_HEALTHCHECKS_URL=$a_keyring_hc" \
 			"REHEARSAL_HEALTHCHECKS_URL=$a_reh" "HCLOUD_TOKEN=$a_hcloud" \
-			"RESTORE_TEST_REPOSITORY=$a_restrepo" "RESTORE_TEST_HEALTHCHECKS_URL=$a_resthc"; do
+			"RESTORE_TEST_REPOSITORY=$a_restrepo" "RESTORE_TEST_HEALTHCHECKS_URL=$a_resthc" \
+			"POSTAL_ADDRESS=$a_postal"; do
 			case "$kv" in
 			*=) continue ;;
 			esac
@@ -294,6 +300,7 @@ $kv"
 		printf "export HCLOUD_TOKEN='%s'\n" "$a_hcloud"
 		printf "export RESTORE_TEST_REPOSITORY='%s'\n" "$a_restrepo"
 		printf "export RESTORE_TEST_HEALTHCHECKS_URL='%s'\n" "$a_resthc"
+		printf "export POSTAL_ADDRESS='%s'\n" "$a_postal"
 	} > "$tmp"
 	install -m 0600 "$tmp" "$env_dst"
 	rm -f "$tmp"
@@ -357,6 +364,7 @@ if [ -n "$missing" ] || [ -n "$placeholder" ]; then
 	printf '  ALERT_EMAIL                   an address off this box, where alerts are mailed\n'
 	printf '  HEALTHCHECKS_URL              this box'"'"'s own check, not another box'"'"'s\n'
 	printf '  REHEARSAL_HEALTHCHECKS_URL    belongs on the rehearsal box, not this one\n'
+	printf '  POSTAL_ADDRESS                the address the cash-by-post rail gives out\n'
 	exit 1
 fi
 

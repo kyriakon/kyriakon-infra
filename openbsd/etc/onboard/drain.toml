@@ -59,10 +59,11 @@ base_url = "https://signup.kyriakon.net"
 # literal.
 price_gbp = "20.00"
 
-# The postal address a cash-by-post member is given, a deployment value and the
-# operator's own address: REPLACE_ME in the repository, as prepaid-rails.md
-# requires, and the terms page publishes the same address with the trader's
-# identity at deploy time.
+# The postal address a cash-by-post member is given. It is the operator's own, so
+# it lives in openbsd/etc/kyriakon.env with the other host-specific values and
+# scripts/deploy-onboard.sh substitutes it here from /root/.kyriakon-env. The
+# placeholder below is refused rather than installed, and the terms page
+# publishes the same address with the trader's identity at deploy time.
 postal_address = "REPLACE_ME"
 
 # The deployed commit and date, substituted at install, e.g. "2026-10-10 1a2b3c4".
