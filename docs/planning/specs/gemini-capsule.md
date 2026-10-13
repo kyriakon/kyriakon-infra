@@ -204,7 +204,7 @@ The page never echoes an answer, the contact address or the key. A token that is
 
 ## The services it lists
 
-The capsule renders the platform's service catalogue as one gemtext link list, read from `openbsd/etc/onboard/catalogue.tsv`, with the same names and the same one-line clauses the web page and the terminal use, because that file is the only place the list exists. Each entry is one line, `=> <scheme>://<host>/ <name>: <summary>`, since the link label is the only place a gemtext link carries text. `docs/planning/specs/shared-copy.md` owns the file, its columns and the check that every entry appears in every rendering, and this document defers to it rather than restating a list that would then drift.
+The capsule renders the platform's service catalogue as one gemtext link list, read from `openbsd/etc/onboard/catalogue.toml`, with the same names and the same one-line clauses the web page and the terminal use, because that file is the only place the list exists. Each entry is one line, `=> <scheme>://<host>/ <name>: <summary>`, since the link label is the only place a gemtext link carries text. `docs/planning/specs/shared-copy.md` owns the file, its columns and the check that every entry appears in every rendering, and this document defers to it rather than restating a list that would then drift.
 
 ## Limits
 
@@ -236,7 +236,7 @@ Trust on first use. The specification recommends it, and it means the capsule re
 | `applications/<token>.json` | handler on file, drain on decision | answers, key fingerprints, verdicts, status | seven days after the decision, inside the 90-day window |
 | `intents/<id>.json` | handler | one filed application | consumed and deleted by the drain |
 | `mail/` | `smtpd` | the Maildir for `apply@kyriakon.net` | drained each run; a message is deleted once acted on |
-| `catalogue.tsv` | `scripts/onboard-store.sh` | the shared service catalogue, read by the handler and by the terminal | with the service |
+| `catalogue.toml` | `scripts/onboard-store.sh` | the shared service catalogue, read by the handler and by the terminal | with the service |
 | `journal.jsonl` | handler and drain | one line per transition | bounded with the service |
 
 The counters are process state and are not on disk.
