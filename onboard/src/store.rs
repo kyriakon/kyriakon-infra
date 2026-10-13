@@ -44,25 +44,50 @@ impl Store {
     /// so the umask cannot widen the applicant's own words, keys and outside
     /// address beyond the account that wrote them and root.
     pub async fn write_record(&self, dir: &str, name: &str, bytes: &[u8]) -> Result<(), String> {
+        self.write_record_owned(dir, name, bytes, None).await
+    }
+
+    /// Like `write_record`, and additionally hands the placed file to `owner`
+    /// (uid, gid) before the rename. The drain uses this for the one file it
+    /// writes into a directory the unprivileged handler owns: `applications/`,
+    /// where a root-created file at 0600 would take the record away from the
+    /// process that renders the status page. Everywhere else the writer's own
+    /// identity is the right one.
+    ///
+    /// The temporary is opened with `create_new` (O_CREAT|O_EXCL), so a symlink
+    /// planted at its name by the unprivileged half is refused rather than
+    /// followed, and O_NOFOLLOW is set on top as belt and braces. A stale
+    /// temporary left by an interrupted run is removed first, which is safe
+    /// because it can only be one this code left.
+    pub async fn write_record_owned(
+        &self,
+        dir: &str,
+        name: &str,
+        bytes: &[u8],
+        owner: Option<(u32, u32)>,
+    ) -> Result<(), String> {
         let d = self.root.join(dir);
         let tmp = d.join(format!(".{name}.tmp"));
         let target = d.join(name);
+        let _ = tokio::fs::remove_file(&tmp).await;
         let placed = async {
-            let mut f = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)
-                .await?;
+            let mut opts = tokio::fs::OpenOptions::new();
+            opts.write(true).create_new(true).mode(0o600);
+            opts.custom_flags(libc::O_NOFOLLOW);
+            let mut f = opts.open(&tmp).await?;
             f.write_all(bytes).await?;
             f.sync_all().await?;
             drop(f);
+            // chown needs root, and only root ever needs to hand the file to
+            // another owner: a test runs as the directory's own owner already.
+            if let Some((uid, gid)) = owner {
+                if unsafe { libc::geteuid() } == 0 {
+                    std::os::unix::fs::chown(&tmp, Some(uid), Some(gid))?;
+                }
+            }
             tokio::fs::rename(&tmp, &target).await
         }
         .await;
-        // The record's name is the status token, so the error names the
-        // directory rather than the path: the token must not reach the log.
         placed.map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             format!("cannot place a record in {}: {e}", d.display())
@@ -125,12 +150,27 @@ impl Store {
         placed.map_err(|e| format!("cannot append to {}: {e}", p.display()))
     }
 
-    /// Create a directory under the root with its parents, 0700.
+    /// Create a directory under the root with its parents, 0700. The mode is
+    /// passed to `DirBuilder` rather than left to the umask, so the comment and
+    /// the code cannot disagree; an existing directory keeps the mode
+    /// `scripts/onboard-store.sh` gave it.
     pub async fn ensure_dir(&self, dir: &str) -> Result<(), String> {
         let d = self.root.join(dir);
-        tokio::fs::create_dir_all(&d)
+        let mut builder = tokio::fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.mode(0o700);
+        builder
+            .create(&d)
             .await
             .map_err(|e| format!("cannot create {}: {e}", d.display()))
+    }
+
+    /// The owner of a directory under the store. The drain uses this to write
+    /// into a directory the handler owns without taking the file away from it.
+    pub fn dir_owner(&self, dir: &str) -> Option<(u32, u32)> {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(self.root.join(dir)).ok()?;
+        Some((md.uid(), md.gid()))
     }
 
     /// Remove one record. A record that is not there reads as done, so a purge
@@ -445,6 +485,9 @@ pub struct JournalLine {
     /// The intent that caused this line, which is also the dedup key.
     pub intent: String,
     pub kind: String,
+    /// The deployed release the drain was running, so a transition can be
+    /// traced to the build that carried it out.
+    pub release: String,
     /// The application the line concerns, by username and status token.
     pub application: ApplicationRef,
     /// `applying`, `applied`, `already-decided`, `refused`, `review-sent` or

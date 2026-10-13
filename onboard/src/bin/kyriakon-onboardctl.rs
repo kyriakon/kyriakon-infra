@@ -21,6 +21,7 @@ use std::process::ExitCode;
 use serde_json::json;
 
 use kyriakon_onboard::config::DrainConfig;
+use kyriakon_onboard::sign;
 use kyriakon_onboard::store::{Record, Store};
 use kyriakon_onboard::util;
 use kyriakon_onboard::validate;
@@ -69,12 +70,20 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         return Err(format!("the username {username:?}: {why}"));
     }
     match verb {
-        "approve" => file_decision(&store, "approve", username).await,
-        // The free outcome is the `provision` kind: the account is provisioned
-        // and nothing about payment happens at all.
-        "approve-free" => file_decision(&store, "provision", username).await,
-        "decline" => file_decision(&store, "decline", username).await,
         "show" => show(&store, username).await,
+        // Each decision is signed with the same root-only key the review links
+        // are signed with, because the drain carries out a decision intent only
+        // when its signature verifies, and `intents/` belongs to the
+        // unprivileged half.
+        kind @ ("approve" | "approve-free" | "decline") => {
+            let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
+            let (intent_kind, action) = match kind {
+                "approve" => ("approve", "approve"),
+                "approve-free" => ("provision", "approve-free"),
+                _ => ("decline", "decline"),
+            };
+            file_decision(&store, &key, intent_kind, action, username).await
+        }
         _ => Err(usage()),
     }
 }
@@ -87,15 +96,26 @@ fn usage() -> String {
 
 /// File one decision as an intent. The application it names is looked up by
 /// username now, at the terminal, so the intent carries the token the drain
-/// keys on and not a name a second application could share.
-async fn file_decision(store: &Store, kind: &str, username: &str) -> Result<(), String> {
+/// keys on and not a name a second application could share. The action and its
+/// signature go with it, so the drain carries the decision out only if it was
+/// signed under the approval key.
+async fn file_decision(
+    store: &Store,
+    key: &[u8],
+    kind: &str,
+    action: &str,
+    username: &str,
+) -> Result<(), String> {
     let (token, _record) = find_application(store, username).await?;
     let id = ulid::Ulid::new().to_string();
+    let sig = sign::sign(key, &sign::decide_payload(&token, action))?;
     let intent = json!({
         "id": id,
         "kind": kind,
         "filed_at": util::filed_at(),
         "application": { "username": username, "status_token": token },
+        "action": action,
+        "sig": sig,
     });
     let bytes = serde_json::to_vec_pretty(&intent)
         .map_err(|e| format!("cannot encode the intent: {e}"))?;

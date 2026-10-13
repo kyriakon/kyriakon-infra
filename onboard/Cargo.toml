@@ -17,6 +17,11 @@ axum = { version = "0.8", features = ["form"] }
 # hashes, which is why the fingerprints stay the browser's own numbers.
 hmac = "0.12"
 sha2 = "0.10"
+# libc is for the two things std does not expose: geteuid, so the signing-key
+# check only demands a root-owned file when the drain is actually root, and
+# O_NOFOLLOW, so a temporary file the unprivileged half could plant a symlink at
+# is opened with the protections the store's mixed ownership needs.
+libc = "0.2"
 # serde deserializes the form and serializes the record; axum's Form and
 # serde_json both build on it.
 serde = { version = "1", features = ["derive"] }

@@ -13,6 +13,7 @@ use tokio::process::Command;
 
 use crate::config::DrainConfig;
 use crate::notice;
+use crate::questions;
 use crate::sign;
 use crate::store::{
     self, Account, ApplicationRef, Intent, JournalLine, Record, Store, TokenRecord, Window,
@@ -24,10 +25,11 @@ use crate::validate;
 /// rail rather than a flag because it is one of the four buttons on the form.
 const RAILS: [&str; 4] = ["card", "cash", "monero", "no_charge"];
 
-/// A reviewer's decision intent, from `onboardctl` or a signed link. The field
-/// shapes here are the whole of what a decision intent carries: which
-/// application, which decision, and, when it came from a link, the signed action
-/// the drain checks.
+/// A reviewer's decision intent, from `onboardctl` or a signed link. Every
+/// decision intent carries the action it performs and the signature over it: the
+/// directory it is read from belongs to the unprivileged half, so an unsigned
+/// decision would be root work driven by a file any writer of `intents/` could
+/// leave. `onboardctl` signs with the same root-only key the links use.
 #[derive(Debug, serde::Deserialize)]
 pub struct DecisionIntent {
     pub id: String,
@@ -35,39 +37,99 @@ pub struct DecisionIntent {
     #[serde(default)]
     pub filed_at: String,
     pub application: ApplicationRef,
-    /// `approve`, `approve-free` or `decline` on an intent that came from a
-    /// link. `None` from `onboardctl`, which is a local root action and carries
-    /// no signature.
-    #[serde(default)]
-    pub action: Option<String>,
-    #[serde(default)]
-    pub sig: Option<String>,
+    /// `approve`, `approve-free` or `decline`, and it must match the kind.
+    pub action: String,
+    /// The HMAC-SHA256 of `decide:<status_token>:<action>` under the approval
+    /// key.
+    pub sig: String,
 }
 
-/// The username release and the three privileged scripts, called by their
-/// configured paths so a test points the whole service at stubs.
-async fn run_script(cfg: &DrainConfig, name: &str, args: &[&str]) -> Result<(), String> {
+/// Run one of the repository's privileged scripts by its configured path and
+/// hand back what it wrote. It is called with argv only: there is no shell
+/// anywhere in the drain, and every value that reaches it was validated first.
+async fn spawn_script(
+    cfg: &DrainConfig,
+    name: &str,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
     let path = format!("{}/{}", cfg.scripts.trim_end_matches('/'), name);
-    let out = Command::new(&path)
+    Command::new(&path)
         .args(args)
         .output()
         .await
-        .map_err(|e| format!("cannot run {path}: {e}"))?;
+        .map_err(|e| format!("cannot run {path}: {e}"))
+}
+
+/// Run a script and refuse a non-zero exit, naming what it said.
+async fn run_script(cfg: &DrainConfig, name: &str, args: &[&str]) -> Result<(), String> {
+    let out = spawn_script(cfg, name, args).await?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!(
-            "{path} exited {}: {}",
-            out.status,
-            err.trim()
-        ));
+        return Err(script_error(cfg, name, &out));
     }
     Ok(())
 }
 
+/// Run a script and tolerate one known refusal, named by the message it prints.
+/// `add-user.sh` exits non-zero when the account already exists, which is the
+/// state a run that died after it leaves and the state a retry has to get past.
+async fn run_script_tolerating(
+    cfg: &DrainConfig,
+    name: &str,
+    args: &[&str],
+    tolerate: &str,
+) -> Result<(), String> {
+    let out = spawn_script(cfg, name, args).await?;
+    if out.status.success() || String::from_utf8_lossy(&out.stderr).contains(tolerate) {
+        return Ok(());
+    }
+    Err(script_error(cfg, name, &out))
+}
+
+fn script_error(cfg: &DrainConfig, name: &str, out: &std::process::Output) -> String {
+    let path = format!("{}/{}", cfg.scripts.trim_end_matches('/'), name);
+    format!(
+        "{path} exited {}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr).trim()
+    )
+}
+
+/// Write the member's upload key where `provision-member.sh` reads it, in the
+/// store's own `keys/` directory, root-owned like the rest of the drain's half.
+async fn write_public_key(store: &Store, username: &str, material: &str) -> Result<(), String> {
+    let body = material.trim();
+    if body.is_empty() {
+        return Err("the upload key material is empty".to_string());
+    }
+    store.ensure_dir("keys").await?;
+    let mut bytes = body.as_bytes().to_vec();
+    bytes.push(b'\n');
+    store
+        .write_record("keys", &format!("{username}.pub"), &bytes)
+        .await
+}
+
+/// The address an approval notice goes to: the applicant's own outside address,
+/// validated again here because it was written by the unprivileged half and is
+/// about to become a mail header, or the mailbox the approval just created.
+fn recipient(record: &Record, username: &str) -> Result<String, String> {
+    match record.outside_address.as_deref() {
+        Some(addr) => {
+            if let Some(why) = validate::address(addr) {
+                return Err(format!("the address outside the platform {addr:?}: {why}"));
+            }
+            Ok(addr.to_string())
+        }
+        None => Ok(format!("{username}@kyriakon.net")),
+    }
+}
+
 /// Append one journal line. The caller writes this before the transition, which
-/// is the whole point of the journal.
+/// is the whole point of the journal, and again on completion so an approval that
+/// finished and one that died midway do not read alike.
 async fn journal(
     store: &Store,
+    release: &str,
     intent: &str,
     kind: &str,
     application: &ApplicationRef,
@@ -79,6 +141,7 @@ async fn journal(
         at: util::filed_at(),
         intent: intent.to_string(),
         kind: kind.to_string(),
+        release: release.to_string(),
         application: application.clone(),
         outcome: outcome.to_string(),
         note: note.map(str::to_string),
@@ -88,8 +151,22 @@ async fn journal(
     store.append("journal.jsonl", encoded.as_bytes()).await
 }
 
+/// Whether the journal already holds a line for this intent id with this
+/// outcome. A refusal is recorded once, and a purge that already released the
+/// name is not released twice.
+async fn journal_has(store: &Store, id: &str, outcome: &str) -> bool {
+    for line in store.lines("journal.jsonl").await {
+        if let Ok(j) = serde_json::from_str::<JournalLine>(&line) {
+            if j.intent == id && j.outcome == outcome {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Whether the journal already holds a line for this intent id, whatever its
-/// outcome. A refusal is recorded once, so two runs do not append it twice.
+/// outcome.
 async fn intent_seen(store: &Store, id: &str) -> bool {
     for line in store.lines("journal.jsonl").await {
         if let Ok(j) = serde_json::from_str::<JournalLine>(&line) {
@@ -118,7 +195,12 @@ async fn application_seen(store: &Store, token: &str, kind: &str, outcome: &str)
 /// Refuse an intent of a kind this build does not implement, by name, and leave
 /// it in place. The journal records the refusal once, so two runs over the same
 /// directory do not append the same line twice.
-pub async fn refuse(store: &Store, file: &str, value: &Value) -> Result<(), String> {
+pub async fn refuse(
+    cfg: &DrainConfig,
+    store: &Store,
+    file: &str,
+    value: &Value,
+) -> Result<(), String> {
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -141,6 +223,7 @@ pub async fn refuse(store: &Store, file: &str, value: &Value) -> Result<(), Stri
     }
     journal(
         store,
+        &cfg.release,
         &id,
         &kind,
         &application,
@@ -185,6 +268,7 @@ pub async fn filed_application(
     }
     journal(
         store,
+        &cfg.release,
         &intent.id,
         "application",
         &intent.application,
@@ -278,8 +362,9 @@ fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String,
 }
 
 /// A decision intent: an approval with the charge, an approval without it, or a
-/// decline. Revalidates every field, checks a link's signature when one is
-/// present, and carries out the outcome.
+/// decline. Revalidates every field and requires a signature over the
+/// application and the action, so an intent is carried out only when the
+/// root-only key signed it, whether by the reviewer or by the reviewer's link.
 pub async fn decision(
     cfg: &DrainConfig,
     store: &Store,
@@ -293,35 +378,30 @@ pub async fn decision(
     if let Some(why) = validate::username_shape(&intent.application.username) {
         return Err(format!("the username: {why}"));
     }
-    // A link click carries the signed action; `onboardctl` is a local root
-    // action and carries neither. When a signature is present it must verify,
-    // and the action it names must be the one this kind carries out.
-    if let Some(action) = &intent.action {
-        let sig = intent
-            .sig
-            .as_deref()
-            .ok_or("a link click carries an action but no signature")?;
-        if !sign::verify(key, &sign::decide_payload(&intent.application.status_token, action), sig)
-        {
-            return Err("the link's signature does not verify".to_string());
-        }
-        let expected = match intent.kind.as_str() {
-            "approve" => "approve",
-            "provision" => "approve-free",
-            "decline" => "decline",
-            other => return Err(format!("kind {other:?} is not a decision")),
-        };
-        if action != expected {
-            return Err(format!(
-                "the link's action {action:?} does not match the intent's kind {:?}",
-                intent.kind
-            ));
-        }
+    let expected = match intent.kind.as_str() {
+        "approve" => "approve",
+        "provision" => "approve-free",
+        "decline" => "decline",
+        other => return Err(format!("kind {other:?} is not a decision")),
+    };
+    if intent.action != expected {
+        return Err(format!(
+            "the action {:?} does not match the kind {:?}",
+            intent.action, intent.kind
+        ));
+    }
+    if !sign::verify(
+        key,
+        &sign::decide_payload(&intent.application.status_token, &intent.action),
+        &intent.sig,
+    ) {
+        return Err("the decision intent's signature does not verify".to_string());
     }
     match intent.kind.as_str() {
         "approve" => approve(cfg, store, key, &intent, false, file).await,
         "provision" => approve(cfg, store, key, &intent, true, file).await,
         "decline" => decline(cfg, store, &intent, file).await,
+        // Unreachable after the kind match above, kept so the dispatch is total.
         other => Err(format!("kind {other:?} is not a decision")),
     }
 }
@@ -348,6 +428,7 @@ async fn approve(
     if record.decided_at.is_some() {
         journal(
             store,
+            &cfg.release,
             &intent.id,
             &intent.kind,
             &intent.application,
@@ -359,18 +440,45 @@ async fn approve(
         return Ok(());
     }
 
-    journal(store, &intent.id, &intent.kind, &intent.application, "applying", None).await?;
+    // The recipient is revalidated before anything is written or journaled, so a
+    // record whose address could inject a header is refused rather than
+    // half-applied.
+    let to = recipient(&record, username)?;
 
-    // Provisioning first, so a failure leaves the application undecided and the
-    // next run retries it. The two scripts are idempotent, and `add-user.sh`
-    // comes first because the mailbox is what everything after it needs.
-    run_script(cfg, "add-user.sh", &[username]).await?;
-    run_script(cfg, "provision-member.sh", &[username]).await?;
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &intent.application,
+        "applying",
+        None,
+    )
+    .await?;
+
+    // The account's own record, before provisioning: a rerun after a crash
+    // reuses the token and the window it already holds rather than opening a
+    // second of either, and it is what tells a fresh approval from a retry.
+    let existing = existing_account(store, username).await;
+
+    // Provisioning, and only when there is no account yet, so a retry does not
+    // repeat it. add-user.sh is not idempotent: it exits non-zero on a name that
+    // already exists, which is exactly the state an earlier run that died after
+    // it leaves, so that one exit is tolerated and the run carries on.
+    if existing.is_none() {
+        run_script_tolerating(cfg, "add-user.sh", &[username], "already exists").await?;
+        // provision-member.sh refuses to build anything without the member's
+        // public key at the path it reads, so the upload key the application
+        // carried is written there first. An application with no upload key has
+        // no site or repositories to build, and the mailbox add-user.sh made is
+        // the whole account.
+        if let Some(upload) = record.upload_key.as_ref() {
+            write_public_key(store, username, &upload.material).await?;
+            run_script(cfg, "provision-member.sh", &[username]).await?;
+        }
+    }
 
     let now = util::filed_at();
-    // A rerun after a crash must not draw a second token or open a second
-    // window: the account's own record is reused when it is already there.
-    let existing = existing_account(store, username).await;
     let token_ref = if no_charge {
         None
     } else {
@@ -461,10 +569,6 @@ async fn approve(
     // The decision email, recorded in the account's notices before it is
     // enqueued. The address outside the platform when one was given, and the
     // mailbox the approval just created otherwise.
-    let to = record
-        .outside_address
-        .clone()
-        .unwrap_or_else(|| format!("{username}@kyriakon.net"));
     let subject = decision_subject("approved", username);
     let body = decision_body(cfg, &record, no_charge, token_ref.as_deref(), &window)?;
     let notice_type = if no_charge {
@@ -489,6 +593,16 @@ async fn approve(
         )?),
     )
     .await?;
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &intent.application,
+        "applied",
+        None,
+    )
+    .await?;
     store.remove("intents", file).await?;
     Ok(())
 }
@@ -510,6 +624,7 @@ async fn decline(
     if record.decided_at.is_some() {
         journal(
             store,
+            &cfg.release,
             &intent.id,
             &intent.kind,
             &intent.application,
@@ -520,20 +635,51 @@ async fn decline(
         store.remove("intents", file).await?;
         return Ok(());
     }
-    journal(store, &intent.id, &intent.kind, &intent.application, "applying", None).await?;
+    // The address is validated before the journal line, so a record whose
+    // address could inject a header is refused before anything is carried out.
+    // A decline creates no mailbox, so the fallback an approval uses does not
+    // exist here: the message goes to the address outside the platform when the
+    // applicant gave one, and without one nothing is sent and the status link,
+    // which answers for the week, is the channel the spec makes durable.
+    let outside = match record.outside_address.as_deref() {
+        Some(addr) => {
+            if let Some(why) = validate::address(addr) {
+                return Err(format!("the address outside the platform {addr:?}: {why}"));
+            }
+            Some(addr.to_string())
+        }
+        None => None,
+    };
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &intent.application,
+        "applying",
+        None,
+    )
+    .await?;
 
     let now = util::filed_at();
-    let to = record
-        .outside_address
-        .clone()
-        .unwrap_or_else(|| format!("{username}@kyriakon.net"));
-    let subject = decision_subject("declined", username);
-    let body = decline_body(&record);
     // No account exists to hold a `notices.jsonl`, so the record that stops a
-    // second email is the application's own decision, written below and before
-    // the send in the ordinary case: mark it first, then mail.
+    // second email is the application's own decision: mark it before the send.
     mark_decided(store, token, "declined", &now, None).await?;
-    notice::enqueue(cfg, &to, &subject, &body).await?;
+    if let Some(addr) = &outside {
+        let subject = decision_subject("declined", username);
+        let body = decline_body(&record);
+        notice::enqueue(cfg, addr, &subject, &body).await?;
+    }
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &intent.application,
+        "applied",
+        None,
+    )
+    .await?;
     store.remove("intents", file).await?;
     Ok(())
 }
@@ -564,21 +710,55 @@ pub async fn purge_declined(cfg: &DrainConfig, store: &Store) -> Result<(), Stri
         if util::link_answers(decided_at, now) {
             continue;
         }
-        // Release the name first, so a script that is missing or fails leaves
-        // the record for the next pass rather than losing the release.
-        run_script(cfg, "delete-user.sh", &[&record.username]).await?;
-        journal(
-            store,
-            &format!("purge-{}", record.status_token),
-            "decline",
-            &ApplicationRef {
-                username: record.username.clone(),
-                status_token: record.status_token.clone(),
-            },
-            "purged",
-            Some("the week passed; the application was cleared away and the username released"),
-        )
-        .await?;
+        // The record was written by the unprivileged half, so the username is
+        // revalidated before it can reach a root script's argv; a record whose
+        // name does not fit is skipped rather than erroring the whole pass.
+        if validate::username_shape(&record.username).is_some() {
+            eprintln!(
+                "kyriakon-onboard-drain: declined record {name} has no usable username; skipped"
+            );
+            continue;
+        }
+        let app = ApplicationRef {
+            username: record.username.clone(),
+            status_token: record.status_token.clone(),
+        };
+        let purge_id = format!("purge-{}", record.status_token);
+        // The journal line goes before the transition, as it does for an intent,
+        // and once: a pass that already released the name does not release it
+        // again, and a crash after the line still clears the record away.
+        if !journal_has(store, &purge_id, "purged").await {
+            if !journal_has(store, &purge_id, "applying").await {
+                journal(
+                    store,
+                    &cfg.release,
+                    &purge_id,
+                    "decline",
+                    &app,
+                    "applying",
+                    Some("the week passed; the username is being released"),
+                )
+                .await?;
+            }
+            // Release the name only when no account holds it. The front end
+            // never checks whether a name is taken, so an approved account and a
+            // declined application can share a username, and this must not
+            // delete the live member's account. A failed script leaves the
+            // record for the next pass rather than losing the release.
+            if existing_account(store, &record.username).await.is_none() {
+                run_script(cfg, "delete-user.sh", &[&record.username]).await?;
+            }
+            journal(
+                store,
+                &cfg.release,
+                &purge_id,
+                "decline",
+                &app,
+                "purged",
+                Some("the application was cleared away"),
+            )
+            .await?;
+        }
         store.remove("applications", &name).await?;
     }
     Ok(())
@@ -623,8 +803,13 @@ async fn mark_decided(
     record.password_link = password_link;
     let bytes =
         serde_json::to_vec_pretty(&record).map_err(|e| format!("cannot encode the record: {e}"))?;
+    // `applications/` belongs to the handler, so the drain hands the rewritten
+    // record back to that directory's owner. A root-owned 0600 file would read
+    // as missing to the unprivileged process that renders the status page, and
+    // the link would answer as an unknown token for the week it should answer.
+    let owner = store.dir_owner("applications");
     store
-        .write_record("applications", &format!("{token}.json"), &bytes)
+        .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
         .await
 }
 
@@ -727,7 +912,7 @@ fn decision_body(
 /// is the one case that names what is missing, because what is missing is a
 /// conversation.
 fn decline_body(record: &Record) -> String {
-    let monastic = matches!(record.answers.get("orders").map(String::as_str), Some("monk") | Some("nun"));
+    let monastic = questions::is_monastic(record.answers.get("orders").map(String::as_str));
     let mut out = format!(
         "Your application for {} was not accepted this time.\n\n\
          We hold it for a week in case a word arrives, and then it is cleared away\n\

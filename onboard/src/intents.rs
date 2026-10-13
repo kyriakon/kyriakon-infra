@@ -56,6 +56,6 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
                 .map_err(|e| format!("the decision intent does not parse: {e}"))?;
             transitions::decision(cfg, store, key, intent, file).await
         }
-        _ => transitions::refuse(store, file, &value).await,
+        _ => transitions::refuse(cfg, store, file, &value).await,
     }
 }

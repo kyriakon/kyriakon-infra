@@ -7,9 +7,11 @@
 //! way cron and the reviewer drive them.
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+use kyriakon_onboard::sign;
 use serde_json::{json, Value};
 
 const DRAIN: &str = env!("CARGO_BIN_EXE_kyriakon-onboard-drain");
@@ -17,6 +19,17 @@ const CTL: &str = env!("CARGO_BIN_EXE_kyriakon-onboardctl");
 
 /// A status token: 26 lowercase Crockford characters, which is 128 bits.
 const TOKEN: &str = "0123456789abcdefghjkmnpqrs";
+
+/// A second status token, for a second application on the same username.
+const OTHER_TOKEN: &str = "fedcba98765432100123456789";
+
+/// The key file's body: `read_key` reads this and strips the trailing newline,
+/// and the fixtures must be 0600 for it to be accepted at all.
+const KEY: &[u8] = b"the approval key\n";
+
+/// A bare SSH public key line, the shape `provision-member.sh` accepts and what
+/// the upload key file it reads holds.
+const UPLOAD_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample secretary@example";
 
 struct Fix {
     dir: PathBuf,
@@ -30,7 +43,12 @@ impl Fix {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
         let fix = Fix { dir };
-        std::fs::write(fix.path("key"), "the approval key\n").unwrap();
+        std::fs::write(fix.path("key"), KEY).unwrap();
+        std::fs::set_permissions(
+            fix.path("key"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         let sent = fix.path("sent");
         fix.script("enqueuer.sh", &format!("#!/bin/sh\ncat >> '{sent}'\n"));
         for s in ["add-user.sh", "provision-member.sh", "delete-user.sh"] {
@@ -77,7 +95,7 @@ impl Fix {
 
     /// Write the application record the handler would have written.
     fn filed(&self, username: &str, rail: &str, answers: &[(&str, &str)]) -> Value {
-        self.filed_with(username, rail, answers, Some(("I want mail", "works")))
+        self.filed_with(username, rail, answers, None, Some((UPLOAD_KEY, "works")))
     }
 
     fn filed_with(
@@ -85,6 +103,7 @@ impl Fix {
         username: &str,
         rail: &str,
         answers: &[(&str, &str)],
+        outside_address: Option<&str>,
         upload: Option<(&str, &str)>,
     ) -> Value {
         let answers: BTreeMap<&str, &str> = answers.iter().cloned().collect();
@@ -103,6 +122,7 @@ impl Fix {
             "filed_at": "2026-10-01T09:00:00Z",
             "front_end": "web",
             "stage": "received",
+            "outside_address": outside_address,
             "answers": answers,
             "mail_keys": [{
                 "mailbox": "",
@@ -148,6 +168,14 @@ impl Fix {
     }
 
     fn decide(&self, kind: &str, username: &str) -> String {
+        let action = action_for(kind);
+        let sig = self.sign_action(action);
+        self.write_decision(kind, action, &sig, username)
+    }
+
+    /// A decision intent with whatever action and signature the caller gives, so
+    /// a test can try one the drain must refuse.
+    fn write_decision(&self, kind: &str, action: &str, sig: &str, username: &str) -> String {
         let id = ulid();
         self.write_intent(
             &id,
@@ -156,9 +184,54 @@ impl Fix {
                 "kind": kind,
                 "filed_at": "2026-10-02T09:00:00Z",
                 "application": {"username": username, "status_token": TOKEN},
+                "action": action,
+                "sig": sig,
             }),
         );
         id
+    }
+
+    /// The signature the drain will accept for an action, from the same key the
+    /// fixture's onboardctl reads.
+    fn sign_action(&self, action: &str) -> String {
+        sign::sign(b"the approval key", &sign::decide_payload(TOKEN, action)).unwrap()
+    }
+
+    /// A provision-member.sh that refuses when the upload key file is not there,
+    /// the shape the real script has, so an approval that fails to write it
+    /// fails the way it would on the box.
+    fn provision_requires_key(&self) {
+        let key = self.dir.join("store/keys/$1.pub");
+        let log = self.path("scripts.log");
+        self.script(
+            "provision-member.sh",
+            &format!(
+                "#!/bin/sh\nif [ ! -f \"{}\" ]; then echo \"no public key at {}\" >&2; exit 1; fi\necho \"provision-member.sh $*\" >> '{log}'\n",
+                key.display(),
+                key.display()
+            ),
+        );
+    }
+
+    /// A provision-member.sh that always fails, for a retry test's first run.
+    fn provision_fails(&self) {
+        self.script(
+            "provision-member.sh",
+            "#!/bin/sh\necho 'builder refused' >&2\nexit 1\n",
+        );
+    }
+
+    /// An add-user.sh that succeeds once and then refuses the name as taken, the
+    /// shape the real script has, so a retry has to tolerate the refusal.
+    fn add_user_refuses_after_first(&self) {
+        let ran = self.path("add-user.ran");
+        let log = self.path("scripts.log");
+        self.script(
+            "add-user.sh",
+            &format!(
+                "#!/bin/sh\nif [ -f '{ran}' ]; then echo \"user $1 already exists\" >&2; exit 1; fi\ntouch '{ran}'\necho \"add-user.sh $*\" >> '{log}'\n"
+            ),
+        );
     }
 
     fn drain(&self) -> Output {
@@ -250,6 +323,17 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
 
 fn ulid() -> String {
     ulid::Ulid::new().to_string()
+}
+
+/// The signed action each decision kind carries: the free outcome is the
+/// `provision` kind and the `approve-free` action.
+fn action_for(kind: &str) -> &'static str {
+    match kind {
+        "approve" => "approve",
+        "provision" => "approve-free",
+        "decline" => "decline",
+        other => panic!("no action for kind {other}"),
+    }
 }
 
 fn body(output: &Output) -> String {
@@ -418,6 +502,13 @@ fn onboardctl_files_a_decision_and_shows_the_application() {
     assert_eq!(intent["kind"], json!("approve"));
     assert_eq!(intent["application"]["username"], json!("secretary"));
     assert_eq!(intent["application"]["status_token"], json!(TOKEN));
+    // Every decision intent is signed: the drain refuses one that is not.
+    assert_eq!(intent["action"], json!("approve"));
+    let sig = intent["sig"].as_str().unwrap();
+    assert!(
+        sign::verify(b"the approval key", &sign::decide_payload(TOKEN, "approve"), sig),
+        "{intent}"
+    );
 
     // approve-free files the no-charge kind; decline files a decline.
     for (verb, kind) in [("approve-free", "provision"), ("decline", "decline")] {
@@ -450,7 +541,15 @@ fn onboardctl_files_a_decision_and_shows_the_application() {
 #[test]
 fn a_decline_purges_after_its_week_and_releases_the_username() {
     let fix = Fix::new("decline");
-    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    // The applicant gave an address outside the platform, so the decline is
+    // mailed. Without one nothing is sent, which the next test covers.
+    let record = fix.filed_with(
+        "secretary",
+        "cash",
+        &[("rail", "cash")],
+        Some("applicant@example.invalid"),
+        Some((UPLOAD_KEY, "works")),
+    );
     fix.file_application(&record);
     assert!(fix.drain().status.success());
     fix.decide("decline", "secretary");
@@ -494,23 +593,33 @@ fn a_decline_purges_after_its_week_and_releases_the_username() {
 }
 
 /// Running the drain twice over one `intents/` directory leaves the same store
-/// and sends no notice twice.
+/// and sends no notice twice. The second pass is made to re-read the same intent,
+/// the state a run that died before it deleted the file leaves, so the pass
+/// reaches the dedup rather than merely seeing an empty directory.
 #[test]
-fn two_runs_leave_the_same_store_and_send_nothing_twice() {
+fn two_runs_over_one_intent_directory_send_nothing_twice() {
     let fix = Fix::new("twice");
     let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
-    fix.file_application(&record);
+    let id = fix.file_application(&record);
+    let intent = fix.read(&format!("intents/{id}.json"));
 
     assert!(fix.drain().status.success());
     let after_first = fix.snapshot();
-    let sent_after_first = fix.sent().matches("Subject:").count();
+    assert_eq!(fix.sent().matches("Subject:").count(), 1, "one review email");
 
+    // The same intent again, as a crash before the delete leaves it: the second
+    // pass re-reads it and must find the application already reviewed.
+    std::fs::write(
+        fix.dir.join("store/intents").join(format!("{id}.json")),
+        &intent,
+    )
+    .unwrap();
     assert!(fix.drain().status.success());
     let after_second = fix.snapshot();
 
     assert_eq!(after_first, after_second, "the second run changed the store");
-    assert_eq!(fix.sent().matches("Subject:").count(), sent_after_first);
-    assert_eq!(sent_after_first, 1, "one review email, not two");
+    assert_eq!(fix.sent().matches("Subject:").count(), 1, "no second review email");
+    assert!(fix.intents().is_empty(), "the re-read intent is consumed: {:?}", fix.intents());
 }
 
 /// A kind this build does not implement is refused by name and left in place,
@@ -610,4 +719,239 @@ fn an_approval_provisions_with_add_user_first() {
     assert!(fix.dir.join("store/accounts/secretary/account.json").exists());
     assert!(fix.dir.join("store/accounts/secretary/application.json").exists());
     assert!(!fix.read("accounts/secretary/notices.jsonl").is_empty());
+    // The completion line is written, so a finished approval does not read like
+    // one that died midway.
+    assert!(fix.journal().contains("\"applied\""), "{}", fix.journal());
+}
+
+/// The upload key the application carried is written where `provision-member.sh`
+/// reads it before that script runs, so an approval completes against the real
+/// script's contract rather than only against a stub that ignores the key.
+#[test]
+fn an_approval_writes_the_upload_key_the_builder_reads() {
+    let fix = Fix::new("keyfile");
+    fix.provision_requires_key();
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "the approval reported an error: {}",
+        body(&out)
+    );
+    let key = fix.read("keys/secretary.pub");
+    assert!(key.contains(UPLOAD_KEY), "{key}");
+    assert!(
+        fix.scripts_log().contains("provision-member.sh secretary"),
+        "{}",
+        fix.scripts_log()
+    );
+    assert!(fix.dir.join("store/accounts/secretary/account.json").exists());
+}
+
+/// A retry completes after a run that died at the builder. add-user.sh is not
+/// idempotent, so the retry has to tolerate its already-exists exit and carry on.
+#[test]
+fn a_retried_approval_completes() {
+    let fix = Fix::new("retry");
+    fix.add_user_refuses_after_first();
+    // The first run's builder fails, leaving the account half-made: add-user.sh
+    // ran, no account.json exists, and the intent stays.
+    fix.provision_fails();
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    assert!(fix.drain().status.success());
+    assert!(
+        !fix.dir.join("store/accounts/secretary/account.json").exists(),
+        "the first run must fail at the builder"
+    );
+    assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
+
+    // The builder works on the retry, and add-user.sh now refuses the name as
+    // taken; the retry tolerates that and finishes.
+    fix.provision_requires_key();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.dir.join("store/accounts/secretary/account.json").exists(),
+        "the retry did not complete: {}",
+        body(&out)
+    );
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+}
+
+/// An address the applicant wrote cannot become a second recipient or a header
+/// line when the decision email is built.
+#[test]
+fn an_address_that_could_inject_a_header_is_refused() {
+    for (i, bad) in ["x,attacker@evil.example", "x\nBcc: attacker@evil.example"]
+        .iter()
+        .enumerate()
+    {
+        let fix = Fix::new(&format!("address-{i}"));
+        let record = fix.filed_with(
+            "secretary",
+            "cash",
+            &[("rail", "cash")],
+            Some(bad),
+            Some((UPLOAD_KEY, "works")),
+        );
+        fix.file_application(&record);
+        assert!(fix.drain().status.success());
+        fix.decide("approve", "secretary");
+        let out = fix.drain();
+        assert!(out.status.success(), "{}", body(&out));
+        assert!(
+            !fix.dir.join("store/accounts/secretary/account.json").exists(),
+            "{bad:?} must not decide the application"
+        );
+        assert!(
+            !fix
+                .sent()
+                .lines()
+                .any(|l| l.starts_with("To:") && l.contains("attacker")),
+            "an injected recipient became a header: {}",
+            fix.sent()
+        );
+        assert_eq!(fix.intents().len(), 1, "the intent is left for the reviewer");
+    }
+}
+
+/// A decision intent with no signature, and one whose signature is over another
+/// action, are both refused: `intents/` belongs to the unprivileged half, so an
+/// unsigned decision would be root provisioning driven by a file it wrote.
+#[test]
+fn a_decision_without_a_good_signature_is_refused() {
+    let fix = Fix::new("unsigned");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+
+    // No action and no signature at all.
+    let id = ulid();
+    fix.write_intent(
+        &id,
+        &json!({
+            "id": id, "kind": "approve", "filed_at": "2026-10-02T09:00:00Z",
+            "application": {"username": "secretary", "status_token": TOKEN},
+        }),
+    );
+    assert!(fix.drain().status.success());
+    assert!(
+        !fix.dir.join("store/accounts/secretary/account.json").exists(),
+        "an unsigned decision must not provision anything"
+    );
+
+    // A signature over a different action than the kind carries.
+    let id = ulid();
+    fix.write_intent(
+        &id,
+        &json!({
+            "id": id, "kind": "approve", "filed_at": "2026-10-02T09:00:00Z",
+            "application": {"username": "secretary", "status_token": TOKEN},
+            "action": "decline", "sig": fix.sign_action("decline"),
+        }),
+    );
+    assert!(fix.drain().status.success());
+    assert!(
+        !fix.dir.join("store/accounts/secretary/account.json").exists(),
+        "a signature over the wrong action must not decide the application"
+    );
+    // Both are left in place, not silently dropped.
+    assert_eq!(fix.intents().len(), 2, "{:?}", fix.intents());
+}
+
+/// The record the drain rewrites stays readable by the handler: it keeps the
+/// mode and the owner of the directory the handler owns, so the status link goes
+/// on answering for its seven days.
+#[test]
+fn a_decided_record_keeps_the_handler_directorys_owner_and_mode() {
+    let fix = Fix::new("owner");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    assert!(fix.drain().status.success());
+
+    let file =
+        std::fs::metadata(fix.dir.join(format!("store/applications/{TOKEN}.json"))).unwrap();
+    let dir = std::fs::metadata(fix.dir.join("store/applications")).unwrap();
+    assert_eq!(file.mode() & 0o777, 0o600, "the record stays 0600");
+    assert_eq!(file.uid(), dir.uid(), "and owned like the directory it lives in");
+    assert_eq!(file.gid(), dir.gid(), "and its group is the directory's group");
+}
+
+/// A decline with no address outside the platform sends nothing: no mailbox was
+/// created for it, so the status link is the channel, and the decision is still
+/// recorded on the application.
+#[test]
+fn a_decline_with_no_outside_address_sends_nothing() {
+    let fix = Fix::new("decline-silent");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    assert_eq!(fix.sent().matches("Subject:").count(), 1, "the review email");
+
+    fix.decide("decline", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.sent().matches("Subject:").count(), 1, "no decline email was sent");
+    assert!(!fix.sent().contains("declined"), "{}", fix.sent());
+    let app: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    assert!(app["decided_at"].is_string(), "{app}");
+    assert!(app["stage"].as_str().unwrap().starts_with("declined"), "{app}");
+}
+
+/// The purge clears a declined application away but never releases a username a
+/// live account holds: the front end does not check whether a name is taken, so
+/// an approved account and a declined application can share one.
+#[test]
+fn a_purge_never_releases_a_name_an_account_holds() {
+    let fix = Fix::new("collision");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    assert!(fix.drain().status.success());
+    assert!(fix.dir.join("store/accounts/secretary/account.json").exists());
+
+    // A second application for the same username, for another token, declined a
+    // week and more ago.
+    let declined = json!({
+        "username": "secretary",
+        "status_token": OTHER_TOKEN,
+        "filed_at": "2026-08-01T09:00:00Z",
+        "front_end": "web",
+        "stage": "declined: no reason given",
+        "decided_at": "2026-09-01T00:00:00Z",
+        "answers": {},
+        "mail_keys": [],
+        "rail": "cash",
+        "no_charge": false,
+        "acceptances": [],
+        "question_list": "2026-08-01 abc1234",
+    });
+    std::fs::write(
+        fix.dir.join(format!("store/applications/{OTHER_TOKEN}.json")),
+        serde_json::to_vec_pretty(&declined).unwrap(),
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    // The declined application is cleared away, the live account is untouched,
+    // and no release script ran for a name that is in use.
+    assert!(!fix.dir.join(format!("store/applications/{OTHER_TOKEN}.json")).exists());
+    assert!(fix.dir.join("store/accounts/secretary/account.json").exists());
+    assert!(
+        !fix.scripts_log().contains("delete-user.sh"),
+        "a live account's name was released: {}",
+        fix.scripts_log()
+    );
 }

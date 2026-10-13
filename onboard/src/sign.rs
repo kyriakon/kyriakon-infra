@@ -32,7 +32,24 @@ pub const ACTIONS: [&str; 3] = ["approve", "approve-free", "decline"];
 /// of the key: stripping it here is what lets the same secret be written either
 /// way. An empty file is an error rather than an empty key, because an empty
 /// key would sign every application with nothing.
+///
+/// The file must not be readable by group or others, and, when the drain is
+/// running as root, it must be owned by root. Both checks are the operator's
+/// own rule made enforceable: the config, the deploy script and the spec all
+/// describe this as a root-only file, and this is the one place that reads it.
 pub fn read_key(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if unsafe { libc::geteuid() } == 0 && meta.uid() != 0 {
+        return Err(format!("{} is not owned by root", path.display()));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} is readable by group or others; it must be 0600",
+            path.display()
+        ));
+    }
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let end = bytes
         .iter()
@@ -156,14 +173,23 @@ mod tests {
 
     #[test]
     fn a_key_file_is_read_without_its_trailing_newline() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("onboard-sign-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("key");
-        std::fs::write(&path, b"secret\n").unwrap();
+        let write = |bytes: &[u8]| {
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write(b"secret\n");
         assert_eq!(read_key(&path).unwrap(), b"secret");
-        std::fs::write(&path, b"secret").unwrap();
+        write(b"secret");
         assert_eq!(read_key(&path).unwrap(), b"secret");
-        std::fs::write(&path, b"\n").unwrap();
+        // A key the rest of the machine can read is refused: the file is the
+        // one secret the review and password links depend on.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_key(&path).is_err(), "a group/other-readable key is refused");
+        write(b"\n");
         assert!(read_key(&path).is_err(), "an empty key is refused");
         std::fs::remove_dir_all(&dir).unwrap();
     }
