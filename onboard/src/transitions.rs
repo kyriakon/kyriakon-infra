@@ -566,6 +566,13 @@ async fn approve(
             write_public_key(store, username, &upload.material).await?;
         }
         run_script(cfg, "provision-member.sh", &[username]).await?;
+        // The lanes wrote the member's httpd and gmid files, and regenerating the
+        // indexes and reloading those daemons is cron-apply.sh --web's job, as
+        // its own header says. Only a hosting member has new files, so a
+        // mail-only approval does not run it and prints nothing.
+        if record.upload_key.is_some() {
+            run_script(cfg, "cron-apply.sh", &["--web"]).await?;
+        }
     }
 
     let now = util::filed_at();
