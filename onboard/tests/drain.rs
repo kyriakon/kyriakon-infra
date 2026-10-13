@@ -806,10 +806,18 @@ fn an_approval_without_an_upload_key_still_builds_the_member() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     // The builder that writes the member's address and allowance ran, with no
-    // key to build hosting from.
+    // key to build hosting from. That is the address path, which every member
+    // takes, mail-only included, and it is where provision-member.sh restarts
+    // smtpd; only the web lanes and the public tree wait on a key.
     assert!(
         fix.scripts_log().contains("provision-member.sh secretary"),
         "{}",
+        fix.scripts_log()
+    );
+    assert_eq!(
+        fix.scripts_log().matches("provision-member.sh").count(),
+        1,
+        "the builder runs once, address path included: {}",
         fix.scripts_log()
     );
     assert!(fix.dir.join("store/accounts/secretary/account.json").exists());

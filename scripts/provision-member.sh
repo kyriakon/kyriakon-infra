@@ -207,10 +207,13 @@ else
 		changed=yes
 		# smtpd reads the table when it starts, so the line is not live until it
 		# is restarted: /etc/rc.d/smtpd defines no reload verb, and delete-user.sh
-		# restarts it for the same reason. The configuration is checked first, so
-		# a table smtpd would refuse leaves the running daemon alone, and this
-		# runs only in this branch, so a run that finds the address already
-		# present restarts nothing.
+		# restarts it for the same reason. This runs for every member, a mail-only
+		# member included, because the address is the account for both; what waits
+		# on hosting is the tree, the upload session and the daemon lanes below.
+		# The configuration is checked first, so a table smtpd would refuse leaves
+		# the running daemon alone, and the restart happens only when a line was
+		# actually added, so a run that finds the address already present
+		# restarts nothing.
 		if [ -f /etc/mail/smtpd.conf ] && smtpd -n -f /etc/mail/smtpd.conf; then
 			rcctl restart smtpd >/dev/null
 			printf 'restarted smtpd, which reads the table at start\n'
