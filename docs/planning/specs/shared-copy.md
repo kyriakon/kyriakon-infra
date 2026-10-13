@@ -18,7 +18,7 @@ This document names the file, its columns and the words that must read identical
 
 ## The catalogue
 
-The catalogue is `openbsd/etc/onboard/catalogue.tsv`, beside `questions.tsv` and shipped the same way, by `scripts/deploy-onboard.sh` into `/etc/onboard/` where the service reads it. It is tab-separated with a header line naming the columns, one record per line in display order, which is the shape the question file already set: a reader can open it in an editor, a diff of it is readable, and no front-end needs a parser beyond splitting on tabs.
+The catalogue is `openbsd/etc/onboard/catalogue.tsv` in the repository, seeded into the store as `/var/db/onboard/catalogue.tsv` by `scripts/onboard-store.sh` beside the question list and the reserved names, and read from the path `onboard.toml` gives it, beside the `questions` and `reserved` keys it already carries (`catalogue = "/var/db/onboard/catalogue.tsv"`), on the reason that file already gives for the other two: so that a layout moves them rather than the service reading an empty list and rendering nothing. It is tab-separated with a header line naming the columns, one record per line in display order, which is the shape the question file already set: a reader can open it in an editor, a diff of it is readable, and no front-end needs a parser beyond splitting on tabs.
 
 The columns are `id`, `name`, `summary`, `state`, `host` and `action`.
 
