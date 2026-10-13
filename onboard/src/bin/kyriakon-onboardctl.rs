@@ -1,0 +1,175 @@
+//! onboardctl: the reviewer's three decisions at a terminal, and a way to read
+//! one application's state.
+//!
+//! It is deliberately the smallest possible writer. Each decision is filed as an
+//! intent and nothing else: the drain applies it on its next minute, exactly as
+//! a click on a signed link would. That is what makes `onboardctl approve` the
+//! equivalent of the review email's first link, and it is also why there is no
+//! privileged work here at all. Root runs it, but it holds no key and touches no
+//! account.
+//!
+//! Usage:
+//!
+//!   kyriakon-onboardctl [--config PATH] approve <username>
+//!   kyriakon-onboardctl [--config PATH] approve-free <username>
+//!   kyriakon-onboardctl [--config PATH] decline <username>
+//!   kyriakon-onboardctl [--config PATH] show <username>
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use serde_json::json;
+
+use kyriakon_onboard::config::DrainConfig;
+use kyriakon_onboard::store::{Record, Store};
+use kyriakon_onboard::util;
+use kyriakon_onboard::validate;
+
+const DEFAULT_CONFIG: &str = "/etc/kyriakon/onboard/drain.toml";
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let mut cfg_path = std::env::var("KYRIAKON_DRAIN_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_CONFIG));
+    let mut rest = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--config" {
+            match args.next() {
+                Some(p) => cfg_path = PathBuf::from(p),
+                None => {
+                    eprintln!("kyriakon-onboardctl: --config needs a path");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else {
+            rest.push(arg);
+        }
+    }
+    match run(&cfg_path, &rest).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("kyriakon-onboardctl: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> {
+    let cfg = DrainConfig::load(cfg_path)?;
+    let store = Store::new(&cfg.store_root);
+    let verb = rest.first().map(String::as_str).unwrap_or("");
+    let username = rest.get(1).map(String::as_str);
+    let username = username.ok_or_else(usage)?;
+    if rest.len() > 2 {
+        return Err(usage());
+    }
+    if let Some(why) = validate::username_shape(username) {
+        return Err(format!("the username {username:?}: {why}"));
+    }
+    match verb {
+        "approve" => file_decision(&store, "approve", username).await,
+        // The free outcome is the `provision` kind: the account is provisioned
+        // and nothing about payment happens at all.
+        "approve-free" => file_decision(&store, "provision", username).await,
+        "decline" => file_decision(&store, "decline", username).await,
+        "show" => show(&store, username).await,
+        _ => Err(usage()),
+    }
+}
+
+fn usage() -> String {
+    "usage: kyriakon-onboardctl [--config PATH] \
+     approve|approve-free|decline|show <username>"
+        .to_string()
+}
+
+/// File one decision as an intent. The application it names is looked up by
+/// username now, at the terminal, so the intent carries the token the drain
+/// keys on and not a name a second application could share.
+async fn file_decision(store: &Store, kind: &str, username: &str) -> Result<(), String> {
+    let (token, _record) = find_application(store, username).await?;
+    let id = ulid::Ulid::new().to_string();
+    let intent = json!({
+        "id": id,
+        "kind": kind,
+        "filed_at": util::filed_at(),
+        "application": { "username": username, "status_token": token },
+    });
+    let bytes = serde_json::to_vec_pretty(&intent)
+        .map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    println!("filed {kind} for {username} as intent {id}");
+    Ok(())
+}
+
+/// Print what the store holds for a username: the application and, once an
+/// approval has made one, the account.
+async fn show(store: &Store, username: &str) -> Result<(), String> {
+    let (token, record) = find_application(store, username).await?;
+    println!("application {username} (token {token})");
+    println!("  filed    {}", record.filed_at);
+    println!("  stage    {}", record.stage);
+    println!("  rail     {}", record.rail);
+    println!(
+        "  decided  {}",
+        record.decided_at.as_deref().unwrap_or("not yet")
+    );
+    match store
+        .read_record(&format!("accounts/{username}"), "account.json")
+        .await
+    {
+        Some(text) => {
+            let account: kyriakon_onboard::store::Account = serde_json::from_str(&text)
+                .map_err(|e| format!("the account record does not parse: {e}"))?;
+            println!("account {username}");
+            println!("  state    {}", account.state);
+            println!("  decision {}", account.decision);
+            println!(
+                "  token    {}",
+                account.token_ref.as_deref().unwrap_or("none (no charge)")
+            );
+            println!(
+                "  paid     {}",
+                account.paid_until.as_deref().unwrap_or("null: the window is open")
+            );
+            if let Some(w) = &account.window {
+                println!("  window   {} to {}", w.opened_at, w.closes_at);
+            }
+        }
+        None => println!("account  none yet"),
+    }
+    Ok(())
+}
+
+/// The newest application filed for a username. The front-end never checks
+/// whether a name exists, so more than one can be on disk; the one the reviewer
+/// means is the one filed last.
+async fn find_application(store: &Store, username: &str) -> Result<(String, Record), String> {
+    let mut best: Option<(String, Record)> = None;
+    for name in store.list("applications").await? {
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let Some(text) = store.read_record("applications", &name).await else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<Record>(&text) else {
+            continue;
+        };
+        if record.username != username {
+            continue;
+        }
+        let better = best
+            .as_ref()
+            .map(|(_, b)| record.filed_at > b.filed_at)
+            .unwrap_or(true);
+        if better {
+            best = Some((record.status_token.clone(), record));
+        }
+    }
+    best.ok_or_else(|| format!("no application for {username}"))
+}

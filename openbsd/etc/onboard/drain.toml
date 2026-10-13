@@ -1,0 +1,66 @@
+# /etc/kyriakon/onboard/drain.toml
+#
+# The onboarding drain's configuration, installed from
+# openbsd/etc/onboard/drain.toml by scripts/deploy-onboard.sh. Unlike the
+# handler's own /etc/onboard/onboard.toml, this file is root-only and sits in
+# the drain's own home: it names the secret files and the privileged scripts the
+# drain runs as root, so nothing about it is for the unprivileged half.
+#
+# No deploy substitutes a path into it except the release below, and every path
+# in it is a value rather than a compiled-in default. That is what lets the
+# acceptance tests point the whole service at fixtures under a temporary
+# directory and run the real binaries with no root.
+
+# The store root the drain owns. The handler reads two files at the top of it
+# and writes intents/ and applications/; everything else under it is the
+# drain's, which is the privilege split the spec fixes.
+store_root = "/var/db/onboard"
+
+# The directory the privileged scripts are installed in. /root/bin is where
+# scripts/deploy-mail.sh puts them, and the drain calls
+# add-user.sh, provision-member.sh and delete-user.sh from here by their
+# configured paths so a test can point at stubs.
+scripts = "/root/bin"
+
+# The local enqueuer. Every notice leaves through it and is DKIM-signed by the
+# smtpd that owns the queue, so nothing here signs or relays anything itself.
+sendmail = "/usr/sbin/sendmail"
+
+# The root-only HMAC-SHA256 key the review email's three links and the one-time
+# password link are signed with. The drain signs and verifies with it; the
+# handler never reads it, because it only passes a click through as an intent.
+approval_key = "/etc/kyriakon/onboard/approval-signing-key"
+
+# Stripe's signing secret and the keyring publish token. This build reads
+# neither: the card rail and the keyring pull request are later tickets. They
+# are named here so the one root-only home for the service's secrets is fixed in
+# one place rather than invented per ticket.
+stripe_webhook_secret = "/etc/kyriakon/onboard/stripe-webhook-secret"
+keyring_publish_token = "/etc/kyriakon/onboard/keyring-publish-token"
+
+# The one reviewer the whole application is mailed to. Every answer, the
+# mail-key result, whether an upload key was supplied, the rail, the no-charge
+# flag and the three signed links arrive in one message so the decision can be
+# made from a phone.
+reviewer = "admin@kyriakon.net"
+
+# The base URL the signed links point at. relayd terminates TLS for this
+# hostname and passes the request to the handler on loopback.
+base_url = "https://signup.kyriakon.net"
+
+# The yearly price, as the ledger records it. A configuration value because the
+# Stripe Price and the prepaid price have to agree and neither belongs in a
+# literal.
+price_gbp = "20.00"
+
+# The postal address a cash-by-post member is given, a deployment value and the
+# operator's own address: REPLACE_ME in the repository, as prepaid-rails.md
+# requires, and the terms page publishes the same address with the trader's
+# identity at deploy time.
+postal_address = "REPLACE_ME"
+
+# The deployed commit and date, substituted at install, e.g. "2026-10-10 1a2b3c4".
+# The drain records it on a journal line so a transition can be traced to the
+# release that carried it out, and it is the document version the confirmation
+# email quotes. It is the release the box is running, not a hash of anything.
+release = "REPLACE_ME"

@@ -1,17 +1,23 @@
 #!/bin/ksh
-# deploy-onboard.sh: put the onboarding handler on the box and start it.
+# deploy-onboard.sh: put the onboarding service on the box and start its handler.
 #
 # The release's front door, installed from this repository: the store under
-# /var/db/onboard, the binary built from onboard/ and installed to
-# /usr/local/sbin, the config at /etc/onboard/onboard.toml with the deployed
-# release substituted into it, and the rc.d unit. Every step is idempotent, so a
-# rebuild, or a second run after a fix, is one command.
+# /var/db/onboard, the three binaries built from onboard/ and installed to
+# /usr/local/sbin (the handler, the root drain and onboardctl), the handler's
+# config at /etc/onboard/onboard.toml and the drain's own root-only config at
+# /etc/kyriakon/onboard/drain.toml, both with the deployed release substituted,
+# and the rc.d unit. Every step is idempotent, so a rebuild, or a second run
+# after a fix, is one command.
+#
+# Installing the drain's binary does not schedule it: its crontab line, the same
+# one every minute that the rest of the scheduled scripts get, is installed by
+# scripts/cron-apply.sh, which the operator runs afterwards.
 #
 # Runs ON the box as root:
 #
 #   doas ksh scripts/deploy-onboard.sh [repo_dir]
 #
-# Two things this deliberately does not do.
+# Three things this deliberately does not do.
 #
 # It does not create the _onboard account. That account is a reserved-uid one in
 # the shape _gmid has, so it is the operator's to create, once, and
@@ -20,6 +26,10 @@
 # loopback only, and the front end that terminates TLS for signup.kyriakon.net is
 # a separate ticket. Until that exists the handler answers the box and nothing
 # else, which is why the verification here is a loopback request.
+#
+# It does not install either secret. /etc/kyriakon/onboard/approval-signing-key
+# and its siblings are the operator's own, written once by hand, because they
+# must not come from this repository.
 
 set -euo pipefail
 
@@ -39,7 +49,8 @@ need_pkg() {
 
 # Every source this installs, checked before anything on the box is changed, so a
 # half-copied checkout fails here rather than after the store has been written.
-for f in onboard/Cargo.toml openbsd/etc/onboard/onboard.toml openbsd/etc/onboard/questions.toml \
+for f in onboard/Cargo.toml openbsd/etc/onboard/onboard.toml openbsd/etc/onboard/drain.toml \
+	openbsd/etc/onboard/questions.toml \
 	openbsd/etc/rc.d/kyriakon_onboard scripts/onboard-store.sh reserved-usernames.txt; do
 	[ -e "$repo_dir/$f" ] || die "missing from $repo_dir: $f"
 done
@@ -54,12 +65,18 @@ ksh "$repo_dir/scripts/onboard-store.sh"
 say "build"
 need_pkg rust
 cargo build --release --manifest-path "$repo_dir/onboard/Cargo.toml"
-[ -x "$repo_dir/onboard/target/release/kyriakon-onboard" ] \
-	|| die "the build produced no binary at onboard/target/release/kyriakon-onboard"
+# The handler, the root drain and onboardctl are one crate and three programs:
+# a build that produced one of them but not the others is half a service.
+for b in kyriakon-onboard kyriakon-onboard-drain kyriakon-onboardctl; do
+	[ -x "$repo_dir/onboard/target/release/$b" ] \
+		|| die "the build produced no binary at onboard/target/release/$b"
+done
 
 say "install"
 install -d -m 0755 -o root -g wheel /etc/onboard
 install -m 0755 "$repo_dir/onboard/target/release/kyriakon-onboard" /usr/local/sbin/kyriakon-onboard
+install -m 0755 "$repo_dir/onboard/target/release/kyriakon-onboard-drain" /usr/local/sbin/kyriakon-onboard-drain
+install -m 0755 "$repo_dir/onboard/target/release/kyriakon-onboardctl" /usr/local/sbin/kyriakon-onboardctl
 install -m 0755 "$repo_dir/openbsd/etc/rc.d/kyriakon_onboard" /etc/rc.d/kyriakon_onboard
 
 # The release this box is running, as the config's own comment describes it: the
@@ -87,6 +104,22 @@ awk -v want="release = \"$release\"" '$0 == want { found = 1 } END { exit !found
 	/etc/onboard/onboard.toml || die "/etc/onboard/onboard.toml does not name the release $release"
 if awk '/REPLACE_ME/ { found = 1 } END { exit !found }' /etc/onboard/onboard.toml; then
 	die "/etc/onboard/onboard.toml still carries a REPLACE_ME placeholder"
+fi
+
+# The drain's own root-only config, into the drain's home that the store script
+# created. Only the release is substituted: the postal address is left as
+# REPLACE_ME because it is the operator's own and the deploy does not know it,
+# so unlike the handler's config this file is not required to be free of the
+# placeholder. The release line is, and is checked on its own.
+install -d -m 0700 -o root -g wheel /etc/kyriakon/onboard
+sed -e "s|^release = .*|release = \"$release\"|" \
+	"$repo_dir/openbsd/etc/onboard/drain.toml" > /etc/kyriakon/onboard/drain.toml
+chmod 0600 /etc/kyriakon/onboard/drain.toml
+awk -v want="release = \"$release\"" '$0 == want { found = 1 } END { exit !found }' \
+	/etc/kyriakon/onboard/drain.toml \
+	|| die "/etc/kyriakon/onboard/drain.toml does not name the release $release"
+if grep -q '^release = "REPLACE_ME' /etc/kyriakon/onboard/drain.toml; then
+	die "/etc/kyriakon/onboard/drain.toml still carries a REPLACE_ME release"
 fi
 printf 'release: %s\n' "$release"
 
