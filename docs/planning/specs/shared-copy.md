@@ -18,7 +18,7 @@ This document names the file, its columns and the words that must read identical
 
 ## The catalogue
 
-The catalogue is `openbsd/etc/onboard/catalogue.toml` in the repository, seeded into the store as `/var/db/onboard/catalogue.toml` by `scripts/onboard-store.sh` beside the question list and the reserved names, and read from the path `onboard.toml` gives it, beside the `questions` and `reserved` keys it already carries (`catalogue = "/var/db/onboard/catalogue.toml"`), on the reason that file already gives for the other two: so that a layout moves them rather than the service reading an empty list and rendering nothing. It is TOML, an array of tables in display order, which is what the service already parses for its own configuration. The format takes comments, so a row that needs a reason carries it beside the value; the columns are typed rather than positional; and an array of tables keeps the order the front-ends render in. The question file's own serialisation is a separate question, not settled here.
+The catalogue is `openbsd/etc/onboard/catalogue.toml` in the repository, seeded into the store as `/var/db/onboard/catalogue.toml` by `scripts/onboard-store.sh` beside the question list and the reserved names, and read from the path `onboard.toml` gives it, beside the `questions` and `reserved` keys it already carries (`catalogue = "/var/db/onboard/catalogue.toml"`), on the reason that file already gives for the other two: so that a layout moves them rather than the service reading an empty list and rendering nothing. It is TOML, an array of tables in display order, which is what the service already parses for its own configuration. The format takes comments, so a row that needs a reason carries it beside the value; the columns are typed rather than positional; and an array of tables keeps the order the front-ends render in. The question file is TOML as well, for the same reasons, and its own conversion is the same change.
 
 The columns are `id`, `name`, `summary`, `state`, `host` and `action`.
 
@@ -221,7 +221,7 @@ ssh apply@ssh.kyriakon.net    ->  Mail                    live
 | The wording | Where it lives | Who reads it |
 | --- | --- | --- |
 | A service's name and its one clause | `openbsd/etc/onboard/catalogue.toml` | all three |
-| A question's prompt, its type and its validation | `openbsd/etc/onboard/questions.tsv` | all three |
+| A question's prompt, its type and its validation | `openbsd/etc/onboard/questions.toml` | all three |
 | The word for each state and each action | one table in `onboard/src/catalogue.rs` | all three |
 | The hand-off sentence for each job a protocol cannot finish | the same table | per front-end |
 | The account page's capability list and what each part rests on | `docs/planning/specs/signup-and-account-page.md` | the web page and the terminal |
@@ -256,7 +256,7 @@ Nothing in this document has been run. `openbsd/etc/onboard/catalogue.toml` does
 
 ## Sources
 
-- `openbsd/etc/onboard/questions.tsv`, the file shape this document copies: a header naming the columns, tab-separated, one record per line in display order.
+- `openbsd/etc/onboard/questions.toml`, the file shape this document copies: a header naming the columns, tab-separated, one record per line in display order.
 - `onboard/src/questions.rs`, `onboard/src/page.rs` and `onboard/templates/`, the service as built: the question list is read once and rendered by more than one front-end already.
 - `docs/planning/specs/signup-and-account-page.md`, read on 2026-10-13: the intent API and its record, the question file's six columns, the store root, the handler's write boundary, the account page's capability table, and the line that the signup copy's home is the site workstream.
 - `docs/planning/specs/gemini-capsule.md`, read on 2026-10-13: the counter and the pages, the status page, the `apply@` route, the pinned-certificate mechanism, and the sentence that the application's grouping is presentation and the capsule ignores it.
