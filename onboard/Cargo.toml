@@ -13,10 +13,17 @@ axum = { version = "0.8", features = ["form"] }
 # sha2 and hmac are the one pair the drain adds. The review email's three links
 # and the one-time password link are HMAC-SHA256 over their payload, keyed from
 # the root-only approval key file: the same process signs and verifies, so a
-# signature would buy a keypair nothing here needs. Nothing else in the crate
-# hashes, which is why the fingerprints stay the browser's own numbers.
+# signature would buy a keypair nothing here needs.
 hmac = "0.12"
 sha2 = "0.10"
+# sha1 is the handler's one hash of its own, and it is not a check: an OpenPGP
+# version 4 key's fingerprint is the SHA-1 of its framed public key packet, and
+# that is the number gpg prints and the reviewer compares with the key on the
+# box. The alternative was a fingerprint the client sends, which nothing on the
+# page could compute: the walkthrough is not built and the form carries no
+# script, so a submission carried a number that named material it was not
+# computed from (keycheck::pgp_fingerprint).
+sha1 = "0.10"
 # libc is for the two things std does not expose: geteuid, so the signing-key
 # check only demands a root-owned file when the drain is actually root, and
 # O_NOFOLLOW, so a temporary file the unprivileged half could plant a symlink at

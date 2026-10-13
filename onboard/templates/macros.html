@@ -6,7 +6,6 @@
 <textarea id="{{ q.id }}" name="{{ q.id }}">{{ q.value }}</textarea>
 {% else if q.kind == "key" %}
 <textarea id="{{ q.id }}" name="{{ q.id }}" class="mono">{{ q.value }}</textarea>
-<input type="hidden" id="{{ q.fingerprint_id }}" name="{{ q.fingerprint_id }}" value="{{ q.fingerprint }}">
 {% else if q.kind == "choice" %}
 <select id="{{ q.id }}" name="{{ q.id }}">
 {% for o in q.options %}<option value="{{ o.value }}"{% if o.selected %} selected{% endif %}>{{ o.label }}</option>{% endfor %}
