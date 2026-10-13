@@ -223,7 +223,7 @@ for path in "/" "/?branch=body"; do
 	printf '%s: %s sections\n' "$path" \
 		"$(printf '%s' "$body" | awk '/<section/ { n++ } END { print n + 0 }')"
 done
-printf 'the rail question appears %s time(s), the ticket asks for 1\n' \
+printf 'the rail question appears %s time(s) on the form (one is expected)\n' \
 	"$(curl -s --max-time 10 "$url/" | awk '/How you will pay/ { n++ } END { print n + 0 }')"
 
 printf '\ninstalled. the handler answers %s on this box only.\n' "$url"

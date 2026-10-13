@@ -54,7 +54,7 @@ impl Fix {
         std::fs::write(fix.path("passwd"), "").unwrap();
         let sent = fix.path("sent");
         fix.script("enqueuer.sh", &format!("#!/bin/sh\ncat >> '{sent}'\n"));
-        for s in ["provision-member.sh", "delete-user.sh"] {
+        for s in ["provision-member.sh", "delete-user.sh", "cron-apply.sh"] {
             let log = fix.path("scripts.log");
             fix.script(s, &format!("#!/bin/sh\necho \"{s} $*\" >> '{log}'\n"));
         }
@@ -750,6 +750,12 @@ fn an_approval_provisions_with_add_user_first() {
     let add = log.find("add-user.sh secretary").expect(&log);
     let member = log.find("provision-member.sh secretary").expect(&log);
     assert!(add < member, "add-user.sh comes first: {log}");
+    // The lanes wrote the member's daemon files, so the web index and reload
+    // pass runs for a hosting member.
+    assert!(
+        log.contains("cron-apply.sh --web"),
+        "the web index and reload should run: {log}"
+    );
     // The account holds its own copy of the application and its notices.
     assert!(fix.dir.join("store/accounts/secretary/account.json").exists());
     assert!(fix.dir.join("store/accounts/secretary/application.json").exists());
@@ -800,14 +806,29 @@ fn an_approval_without_an_upload_key_still_builds_the_member() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     // The builder that writes the member's address and allowance ran, with no
-    // key to build hosting from.
+    // key to build hosting from. That is the address path, which every member
+    // takes, mail-only included, and it is where provision-member.sh restarts
+    // smtpd; only the web lanes and the public tree wait on a key.
     assert!(
         fix.scripts_log().contains("provision-member.sh secretary"),
         "{}",
         fix.scripts_log()
     );
+    assert_eq!(
+        fix.scripts_log().matches("provision-member.sh").count(),
+        1,
+        "the builder runs once, address path included: {}",
+        fix.scripts_log()
+    );
     assert!(fix.dir.join("store/accounts/secretary/account.json").exists());
     assert!(fix.names("keys").is_empty(), "no key, no key file: {:?}", fix.names("keys"));
+    // No vhost files were written, so the web reload does not run and prints
+    // nothing.
+    assert!(
+        !fix.scripts_log().contains("cron-apply.sh"),
+        "a mail-only member has no web files to index: {}",
+        fix.scripts_log()
+    );
 }
 
 /// A retry completes after a run that died at the builder. The box holds the
