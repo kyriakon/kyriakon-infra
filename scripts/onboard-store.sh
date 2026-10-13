@@ -50,7 +50,7 @@ onboard_user='_onboard'
 # and the TUI can both read it. The question list is the service workstream's and
 # is installed beside it, 0644, for the same reason.
 reserved_src="$repo_dir/reserved-usernames.txt"
-questions_src="$repo_dir/openbsd/etc/onboard/questions.tsv"
+questions_src="$repo_dir/openbsd/etc/onboard/questions.toml"
 
 # fail <message>: one place for the error shape, so every refusal reads the same.
 fail() {
@@ -128,11 +128,19 @@ assert_mode "$drain_conf" root wheel 700
 for src in "$reserved_src" "$questions_src"; do
 	[ -r "$src" ] || fail "cannot read $src"
 done
+
+# The question list moved from TSV to TOML. install(1) leaves an existing path
+# alone, so a box that has run an earlier copy of this script keeps the list under
+# its old name beside the new file. Nothing reads it, and that is why it goes: an
+# unused copy of the list is one a person edits by mistake. Removed, not left.
+rm -f "$store/questions.tsv"
+[ ! -e "$store/questions.tsv" ] || fail "$store/questions.tsv is still there"
+
 install -m 0644 -o root -g wheel "$reserved_src" "$store/reserved-usernames.txt"
-install -m 0644 -o root -g wheel "$questions_src" "$store/questions.tsv"
+install -m 0644 -o root -g wheel "$questions_src" "$store/questions.toml"
 assert_mode "$store/reserved-usernames.txt" root wheel 644
-assert_mode "$store/questions.tsv" root wheel 644
-[ -s "$store/questions.tsv" ] || fail "$store/questions.tsv is empty"
+assert_mode "$store/questions.toml" root wheel 644
+[ -s "$store/questions.toml" ] || fail "$store/questions.toml is empty"
 
 printf 'store ready: %s (four dirs and mail/ writable by %s, the rest root), %s 0700 root\n' \
 	"$store" "$onboard_user" "$drain_conf"

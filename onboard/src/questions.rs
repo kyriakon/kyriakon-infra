@@ -1,12 +1,13 @@
-//! The shared question list: `openbsd/etc/onboard/questions.tsv`, installed to
-//! `/var/db/onboard/questions.tsv`. One tab-separated record per line, one
-//! question each, header `id prompt type branch required validation`.
+//! The shared question list: `openbsd/etc/onboard/questions.toml`, installed to
+//! `/var/db/onboard/questions.toml`. One `[[question]]` array per question, in
+//! display order, which is the order the three front-ends render and ask.
 //!
 //! The file is the only place the question list exists. This module parses it
 //! and says which questions a given branch shows; it does not restate a prompt
-//! and it does not hold the answer options, because the fixed format has no
-//! column for them (see `options` below for where the choices do live).
+//! and it does not hold an answer option, because the options are the question's
+//! own `choices` list, which is what a `choice` question's validation is.
 
+use serde::Deserialize;
 
 /// An answer type. The tokens are the file's, and the spelling is fixed by the
 /// three front-ends sharing the file.
@@ -72,8 +73,11 @@ impl Branch {
     }
 }
 
-/// One answer a `choice` question offers, with the label shown for it.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// One answer a `choice` question offers, with the label shown for it. Written
+/// in the file as `{ value = "person", label = "Just me" }`, so a value and the
+/// words shown for it cannot be read as each other.
+#[derive(Clone, PartialEq, Eq, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Choice {
     pub value: String,
     pub label: String,
@@ -81,8 +85,7 @@ pub struct Choice {
 
 /// A validation rule, named rather than expressed, so all three front-ends
 /// implement the same names. A `choice` question's answers are its validation,
-/// so the options live in the rule: `choice:<value>=<label>|<value>=<label>`,
-/// which keeps the file the only place the list exists.
+/// so its rule is the question's own `choices` list.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Rule {
     None,
@@ -106,37 +109,44 @@ impl Rule {
             "domain" => Rule::Domain,
             "mail-key" => Rule::MailKey,
             "upload-key" => Rule::UploadKey,
-            other => match other.strip_prefix("choice:") {
-                Some(list) => Rule::Choice(parse_choices(list)?),
-                None => match other.strip_prefix("maxlen:") {
-                    Some(n) => Rule::MaxLen(
-                        n.parse()
-                            .map_err(|_| format!("maxlen needs a number, got {n:?}"))?,
-                    ),
-                    None => return Err(format!("unknown validation {other:?}")),
-                },
+            other => match other.strip_prefix("maxlen:") {
+                Some(n) => Rule::MaxLen(
+                    n.parse()
+                        .map_err(|_| format!("maxlen needs a number, got {n:?}"))?,
+                ),
+                None => return Err(format!("unknown validation {other:?}")),
             },
         })
     }
 }
 
-/// The answers a `choice` question accepts. A question with none is refused
-/// here, as a build error, rather than becoming a control with nothing in it.
-fn parse_choices(list: &str) -> Result<Vec<Choice>, String> {
-    let mut out = Vec::new();
-    for pair in list.split('|') {
-        let (value, label) = pair
-            .split_once('=')
-            .ok_or_else(|| format!("choice option {pair:?} is not value=label"))?;
-        if value.is_empty() || label.is_empty() {
-            return Err(format!("choice option {pair:?} has an empty value or label"));
-        }
-        out.push(Choice {
-            value: value.to_string(),
-            label: label.to_string(),
-        });
-    }
-    Ok(out)
+/// The file, as serde reads it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct File {
+    /// The questions, in display order, which the array of tables preserves.
+    #[serde(default)]
+    question: Vec<Entry>,
+}
+
+/// One `[[question]]`, before its tokens are checked against their vocabularies.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Entry {
+    id: String,
+    prompt: String,
+    #[serde(rename = "type")]
+    kind: String,
+    branch: String,
+    required: bool,
+    /// A `choice` question's answers. Absent on every other question, and on a
+    /// `yesno` in particular, where Yes and No are the type's own rendering.
+    #[serde(default)]
+    choices: Vec<Choice>,
+    /// The named rule an answer must pass, absent when nothing but the answer
+    /// type's own shape is required.
+    #[serde(default)]
+    validation: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -149,49 +159,68 @@ pub struct Question {
     pub rule: Rule,
 }
 
-pub const HEADER: &str = "id\tprompt\ttype\tbranch\trequired\tvalidation";
-
-/// Parse the file. A malformed line names itself rather than being skipped: a
-/// question that disappears silently is a question no front-end asks.
+/// Parse the file. A question that is malformed, or that names a token outside
+/// its vocabulary, is refused by name rather than skipped: a question that
+/// disappears silently is a question no front-end asks.
 pub fn parse(text: &str) -> Result<Vec<Question>, String> {
-    let mut lines = text.lines();
-    let header = lines
-        .find(|l| !l.trim().is_empty())
-        .ok_or("the question list is empty")?;
-    if header.trim_end() != HEADER {
-        return Err(format!(
-            "the question list's header is {header:?}, expected {HEADER:?}"
-        ));
-    }
+    let file: File = toml::from_str(text).map_err(|e| format!("the question list: {e}"))?;
 
-    let mut out = Vec::new();
-    for (i, line) in lines.enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let f: Vec<&str> = line.split('\t').collect();
-        if f.len() != 6 {
-            return Err(format!(
-                "question line {} has {} fields, expected 6",
-                i + 2,
-                f.len()
-            ));
-        }
-        let required = match f[4] {
-            "yes" => true,
-            "no" => false,
-            other => return Err(format!("line {}: required is {other:?}", i + 2)),
-        };
+    let mut out = Vec::with_capacity(file.question.len());
+    for e in file.question {
+        let id = e.id;
+        let kind = Kind::parse(&e.kind).map_err(|why| format!("the question {id:?}: {why}"))?;
+        let branch =
+            Branch::parse(&e.branch).map_err(|why| format!("the question {id:?}: {why}"))?;
+        let rule = rule(&id, kind, e.choices, e.validation)?;
         out.push(Question {
-            id: f[0].to_string(),
-            prompt: f[1].to_string(),
-            kind: Kind::parse(f[2]).map_err(|e| format!("line {}: {e}", i + 2))?,
-            branch: Branch::parse(f[3]).map_err(|e| format!("line {}: {e}", i + 2))?,
-            required,
-            rule: Rule::parse(f[5]).map_err(|e| format!("line {}: {e}", i + 2))?,
+            id,
+            prompt: e.prompt,
+            kind,
+            branch,
+            required: e.required,
+            rule,
         });
     }
     Ok(out)
+}
+
+/// The rule a question's answer must pass. A `choice` question's is its choices,
+/// and a question with none is refused here, as a build error, rather than
+/// becoming a control with nothing in it.
+fn rule(
+    id: &str,
+    kind: Kind,
+    choices: Vec<Choice>,
+    validation: Option<String>,
+) -> Result<Rule, String> {
+    if kind == Kind::Choice {
+        if choices.is_empty() {
+            return Err(format!("the question {id:?} is a choice with no choices"));
+        }
+        if validation.is_some() {
+            return Err(format!(
+                "the question {id:?} is a choice, so its validation is its choices"
+            ));
+        }
+        for c in &choices {
+            if c.value.is_empty() || c.label.is_empty() {
+                return Err(format!(
+                    "the question {id:?} has a choice with an empty value or label"
+                ));
+            }
+        }
+        return Ok(Rule::Choice(choices));
+    }
+    if !choices.is_empty() {
+        return Err(format!(
+            "the question {id:?} is a {} carrying choices",
+            kind.token()
+        ));
+    }
+    match validation {
+        Some(v) => Rule::parse(&v).map_err(|why| format!("the question {id:?}: {why}")),
+        None => Ok(Rule::None),
+    }
 }
 
 /// The questions a branch shows, in file order. `person` and `body` are the
@@ -217,12 +246,48 @@ pub fn is_monastic(orders: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "id\tprompt\ttype\tbranch\trequired\tvalidation\n\
-username\tUsername\ttext\tall\tyes\tusername\n\
-whose\tIs this for you, or for a body?\tchoice\tall\tyes\tchoice:person=Just me|body=A body\n\
-body_name\tThe body's name\ttext\tbody\tyes\tnone\n\
-mail_key\tYour public key\tkey\tperson\tyes\tmail-key\n\
-blessing\tBlessing?\tmultiline\tmonastic\tyes\tnone\n";
+    const SAMPLE: &str = "\
+[[question]]
+id = \"username\"
+prompt = \"Username\"
+type = \"text\"
+branch = \"all\"
+required = true
+validation = \"username\"
+
+[[question]]
+id = \"whose\"
+prompt = \"Is this for you, or for a body?\"
+type = \"choice\"
+branch = \"all\"
+required = true
+choices = [
+\t{ value = \"person\", label = \"Just me\" },
+\t{ value = \"body\", label = \"A body\" },
+]
+
+[[question]]
+id = \"body_name\"
+prompt = \"The body's name\"
+type = \"text\"
+branch = \"body\"
+required = true
+
+[[question]]
+id = \"mail_key\"
+prompt = \"Your public key\"
+type = \"key\"
+branch = \"person\"
+required = true
+validation = \"mail-key\"
+
+[[question]]
+id = \"blessing\"
+prompt = \"Blessing?\"
+type = \"multiline\"
+branch = \"monastic\"
+required = true
+";
 
     #[test]
     fn parses_and_filters_by_branch() {
@@ -240,19 +305,32 @@ blessing\tBlessing?\tmultiline\tmonastic\tyes\tnone\n";
     }
 
     #[test]
-    fn a_malformed_line_is_named_not_skipped() {
-        let bad = "id\tprompt\ttype\tbranch\trequired\tvalidation\npassword\tPassword\ttext\tall\tyes\n";
-        let e = parse(bad).unwrap_err();
-        assert!(e.contains("line 2"), "{e}");
+    fn a_malformed_question_is_named_not_skipped() {
+        // A token outside its vocabulary names the question it came from.
+        let unknown_type = SAMPLE.replace("type = \"text\"", "type = \"widget\"");
+        let e = parse(&unknown_type).unwrap_err();
+        assert!(e.contains("username"), "{e}");
+        assert!(e.contains("unknown answer type"), "{e}");
 
-        let unknown = "id\tprompt\ttype\tbranch\trequired\tvalidation\nx\tX\ttext\tall\tyes\tnope\n";
-        assert!(parse(unknown).unwrap_err().contains("nope"));
-    }
+        let unknown_branch = SAMPLE.replace("branch = \"body\"", "branch = \"everyone\"");
+        let e = parse(&unknown_branch).unwrap_err();
+        assert!(e.contains("body_name"), "{e}");
+        assert!(e.contains("unknown branch"), "{e}");
 
-    #[test]
-    fn maxlen_carries_its_number() {
-        let t = "id\tprompt\ttype\tbranch\trequired\tvalidation\nx\tX\ttext\tall\tno\tmaxlen:12\n";
-        assert_eq!(parse(t).unwrap()[0].rule, Rule::MaxLen(12));
+        let unknown_rule = SAMPLE.replace("validation = \"mail-key\"", "validation = \"exists\"");
+        let e = parse(&unknown_rule).unwrap_err();
+        assert!(e.contains("mail_key"), "{e}");
+        assert!(e.contains("exists"), "{e}");
+
+        // A column of the wrong type is a build error rather than a skipped
+        // question: `required` is a real boolean, which is one of the reasons
+        // the file is TOML.
+        let not_a_boolean = SAMPLE.replace("required = true", "required = \"yes\"");
+        assert!(parse(&not_a_boolean).is_err());
+
+        // A key that is not a column is refused rather than ignored.
+        let typo = SAMPLE.replace("prompt = \"Username\"", "promtp = \"Username\"");
+        assert!(parse(&typo).is_err());
     }
 
     #[test]
@@ -280,7 +358,18 @@ blessing\tBlessing?\tmultiline\tmonastic\tyes\tnone\n";
 
     #[test]
     fn a_label_may_hold_a_comma_and_a_colon() {
-        let t = "id\tprompt\ttype\tbranch\trequired\tvalidation\nx\tX\tchoice\tall\tyes\tchoice:card=Card, £20 a year|none=No charge: anyone who cannot pay\n";
+        let t = "\
+[[question]]
+id = \"rail\"
+prompt = \"How you will pay\"
+type = \"choice\"
+branch = \"all\"
+required = true
+choices = [
+\t{ value = \"card\", label = \"Card, £20 a year\" },
+\t{ value = \"none\", label = \"No charge: anyone who cannot pay\" },
+]
+";
         match &parse(t).unwrap()[0].rule {
             Rule::Choice(opts) => {
                 assert_eq!(opts[0].label, "Card, £20 a year");
@@ -292,20 +381,108 @@ blessing\tBlessing?\tmultiline\tmonastic\tyes\tnone\n";
 
     #[test]
     fn a_choice_with_no_options_is_a_build_error() {
-        let bare = "id\tprompt\ttype\tbranch\trequired\tvalidation\nx\tX\tchoice\tall\tyes\tchoice\n";
-        let e = parse(bare).unwrap_err();
-        assert!(e.contains("unknown validation"), "{e}");
+        let bare = SAMPLE.replace(
+            "choices = [\n\t{ value = \"person\", label = \"Just me\" },\n\t{ value = \"body\", label = \"A body\" },\n]",
+            "",
+        );
+        let e = parse(&bare).unwrap_err();
+        assert!(e.contains("whose"), "{e}");
+        assert!(e.contains("no choices"), "{e}");
 
-        let empty = "id\tprompt\ttype\tbranch\trequired\tvalidation\nx\tX\tchoice\tall\tyes\tchoice:\n";
-        let e = parse(empty).unwrap_err();
-        assert!(e.contains("value=label"), "{e}");
+        let empty = SAMPLE.replace(
+            "{ value = \"person\", label = \"Just me\" },",
+            "{ value = \"\", label = \"Just me\" },",
+        );
+        let e = parse(&empty).unwrap_err();
+        assert!(e.contains("empty value or label"), "{e}");
     }
 
     #[test]
-    fn a_malformed_option_is_named() {
-        let t = "id\tprompt\ttype\tbranch\trequired\tvalidation\nx\tX\tchoice\tall\tyes\tchoice:noequals\n";
-        assert!(parse(t).unwrap_err().contains("value=label"));
-        let t = "id\tprompt\ttype\tbranch\trequired\tvalidation\nx\tX\tchoice\tall\tyes\tchoice:=nolabel\n";
-        assert!(parse(t).unwrap_err().contains("empty value or label"));
+    fn choices_belong_to_a_choice_and_everywhere_else_are_refused() {
+        let on_a_text = SAMPLE.replace(
+            "prompt = \"Username\"",
+            "prompt = \"Username\"\nchoices = [\n\t{ value = \"a\", label = \"A\" },\n]",
+        );
+        let e = parse(&on_a_text).unwrap_err();
+        assert!(e.contains("username"), "{e}");
+        assert!(e.contains("carrying choices"), "{e}");
+
+        // A choice's rule is its choices, so a validation string beside them is
+        // a question that says two things about the same answer.
+        let both = SAMPLE.replace(
+            "{ value = \"body\", label = \"A body\" },\n]",
+            "{ value = \"body\", label = \"A body\" },\n]\nvalidation = \"domain\"",
+        );
+        let e = parse(&both).unwrap_err();
+        assert!(e.contains("its choices"), "{e}");
+    }
+
+    #[test]
+    fn maxlen_carries_its_number() {
+        let t = SAMPLE.replace(
+            "validation = \"username\"",
+            "validation = \"maxlen:12\"",
+        );
+        assert_eq!(parse(&t).unwrap()[0].rule, Rule::MaxLen(12));
+    }
+
+    /// The tracked file, read at compile time, so a malformed commit of the data
+    /// file fails the build rather than a deployment.
+    #[test]
+    fn the_shipped_question_list_parses_in_display_order() {
+        let list = parse(include_str!("../../openbsd/etc/onboard/questions.toml")).unwrap();
+        assert_eq!(list.len(), 24);
+
+        let ids: Vec<&str> = list.iter().map(|q| q.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "username",
+                "whose",
+                "body_name",
+                "body_kind",
+                "vat",
+                "body_domain",
+                "body_records",
+                "body_addresses",
+                "body_account_names",
+                "body_mail_key",
+                "body_upload_key",
+                "body_dns_contact",
+                "address_outside",
+                "address_ack",
+                "mail_key",
+                "upload_key",
+                "rail",
+                "diocese",
+                "orders",
+                "blessing",
+                "cannot_pay",
+                "intended_use",
+                "anything_else",
+                "accept_terms",
+            ]
+        );
+
+        // The two yesno questions carry no choices: Yes and No are the type's own
+        // rendering, so they have no answers of their own to offer.
+        for q in list.iter().filter(|q| q.kind == Kind::YesNo) {
+            assert_eq!(q.rule, Rule::None, "{}", q.id);
+        }
+
+        let whose = list.iter().find(|q| q.id == "whose").unwrap();
+        match &whose.rule {
+            Rule::Choice(opts) => assert_eq!(opts.len(), 2),
+            other => panic!("whose is not a choice: {other:?}"),
+        }
+
+        // The person path and the body path both start at the shared questions
+        // and every question the branch rules exclude is a body or person one.
+        let person: Vec<&str> = shown(&list, true).iter().map(|q| q.id.as_str()).collect();
+        let body: Vec<&str> = shown(&list, false).iter().map(|q| q.id.as_str()).collect();
+        assert!(person.len() < list.len() && body.len() < list.len());
+        assert!(person.contains(&"mail_key") && !person.contains(&"body_mail_key"));
+        assert!(body.contains(&"body_mail_key") && !body.contains(&"mail_key"));
+        assert!(person.contains(&"blessing") && body.contains(&"blessing"));
     }
 }

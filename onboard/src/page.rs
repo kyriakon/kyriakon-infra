@@ -4,7 +4,7 @@
 //! The applicant page is one page of four sections, the prototype's order, with
 //! the community block open only for a body. It is inside the first section, so
 //! the section count is four on both paths. The labels are the shared list's
-//! prompts, rendered from `questions.tsv`; the hints below are page copy and the
+//! prompts, rendered from `questions.toml`; the hints below are page copy and the
 //! prototype is their source.
 
 use std::collections::BTreeMap;
