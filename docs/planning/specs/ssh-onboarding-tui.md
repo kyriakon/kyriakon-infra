@@ -26,9 +26,10 @@ The file is applied by hand, like the member one, with `doas sshd -t -f /etc/ssh
 
 ```ssh_config
 # /etc/ssh/sshd_config.onboard
-# The applicant-facing sshd, run by /etc/rc.d/kyriakon_onboard_sshd. Separate file,
-# port, PidFile and account from the member sshd in /etc/ssh/sshd_config, which
-# is not touched. Reviewed line by line and applied by hand.
+# The portal's sshd, run by /etc/rc.d/kyriakon_onboard_sshd. Separate file, ports,
+# PidFile and account from the member sshd in /etc/ssh/sshd_config, which this
+# change touches only to pin it to the primary address. Reviewed line by line
+# and applied by hand.
 
 # No HostKey line, so sshd reads the same /etc/ssh/ssh_host_* keys the member
 # instance uses and the box keeps one SSH identity.
@@ -107,7 +108,7 @@ Match LocalPort REPLACE_ME User apply
 	ForceCommand /usr/local/sbin/kyriakon-onboard-tui
 ```
 
-`PermitEmptyPasswords` and `PermitTTY` in the `Match` blocks are inside the subset of keywords `sshd_config(5)` allows after `Match`. `AuthorizedKeysCommand` and `AuthorizedKeysCommandUser` are written there too, and the operator's config test confirms they are accepted where they sit, which the identity research leaves as a check rather than an observation. `PasswordAuthentication` sits at the top level, as the resolution has it, and `PerSourceMaxStartups` sits there too because `sshd_config(5)` does not allow it after `Match`; both are harmless there because `AllowUsers onboard` makes the instance serve one account. `Banner none` is the documented default and is written out so a future default change cannot quietly reintroduce a banner; a banner is read by every scanner and by nobody the platform wants. The protocol identification string itself cannot be removed, and its version addendum already defaults to `none`, so it carries no local operating system suffix.
+`PermitEmptyPasswords` and `PermitTTY` in the `Match` blocks are inside the subset of keywords `sshd_config(5)` allows after `Match`. `AuthorizedKeysCommand` and `AuthorizedKeysCommandUser` are written there too, and the operator's config test confirms they are accepted where they sit, which the identity research leaves as a check rather than an observation. `PasswordAuthentication` sits at the top level, as the resolution has it, and `PerSourceMaxStartups` sits there too because `sshd_config(5)` does not allow it after `Match`; both are harmless there because `AllowUsers apply` makes the instance serve one account. `Banner none` is the documented default and is written out so a future default change cannot quietly reintroduce a banner; a banner is read by every scanner and by nobody the platform wants. The protocol identification string itself cannot be removed, and its version addendum already defaults to `none`, so it carries no local operating system suffix.
 
 ### The account
 
