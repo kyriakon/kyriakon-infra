@@ -69,6 +69,11 @@ pub struct DrainConfig {
     pub passwd: String,
     /// The root-only HMAC key the review and password links are signed with.
     pub approval_key: String,
+    /// The box keyring the encrypting LMTP reads: one `<localpart>.asc` per
+    /// account. `scripts/deploy-mail.sh` seeds it from the tracked `keys/`, and
+    /// the drain writes an approved member's mail key here before anything can
+    /// deliver to the account. A configuration value so a test can drive it.
+    pub keyring_dir: String,
     /// Stripe's signing secret and the keyring publish token. This build reads
     /// neither, because the card rail and the keyring pull request are later
     /// tickets, but the config names them now so their paths are fixed in one
@@ -132,6 +137,7 @@ mod tests {
              sendmail = \"/usr/sbin/sendmail\"\n\
              passwd = \"/etc/passwd\"\n\
              approval_key = \"/etc/kyriakon/onboard/approval-signing-key\"\n\
+             keyring_dir = \"/etc/kyriakon/keys\"\n\
              stripe_webhook_secret = \"/etc/kyriakon/onboard/stripe-webhook-secret\"\n\
              keyring_publish_token = \"/etc/kyriakon/onboard/keyring-publish-token\"\n\
              reviewer = \"admin@kyriakon.net\"\n\
@@ -157,6 +163,7 @@ mod tests {
         assert_eq!(c.sendmail, "/usr/sbin/sendmail");
         assert_eq!(c.passwd, "/etc/passwd");
         assert_eq!(c.approval_key, "/etc/kyriakon/onboard/approval-signing-key");
+        assert_eq!(c.keyring_dir, "/etc/kyriakon/keys");
         assert_eq!(c.reviewer, "admin@kyriakon.net");
         assert_eq!(c.base_url, "https://signup.kyriakon.net");
         assert_eq!(c.price_gbp, "20.00");
