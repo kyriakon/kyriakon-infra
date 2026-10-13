@@ -102,7 +102,7 @@ A single OpenBSD VPS on Hetzner, provisioned from a snapshot, running the zero-a
 **Seam.** The one place with authored logic is the `kyriakon-encrypt` daemon — its stdin→stdout interface (RFC 5322 message in, RFC 3156 PGP/MIME ciphertext out) plus its keyring directory is the single test seam. Shell scripts are tested at their CLI; config files are syntax-checked on an OpenBSD host only (not CI).
 
 - **What makes a good test here**: exercise observable behavior only — given a message and a keyring, the daemon emits RFC 3156 ciphertext; given a missing key, it fails closed; given a `+tag` recipient, it resolves the base localpart. Never test internal parse steps or gpg invocation flags.
-- **Modules tested**: the `kyriakon-encrypt` daemon (encryption, keyring resolution, tag stripping, fail-closed), and the shell scripts via their CLI (`provision`, `add-user`, `del-user`, `backup`, `abuse-monitor`).
+- **Modules tested**: the `kyriakon-encrypt` daemon (encryption, keyring resolution, tag stripping, fail-closed), and the shell scripts via their CLI (`provision`, `add-user`, `delete-user`, `backup`, `abuse-monitor`).
 - **Prior art**: none — this repo has no test suite yet; these are the first tests. OpenBSD config syntax checks (`httpd -n`, `smtpd -n`, `nsd-checkconf`, `doveconf -n`) are manual, run on a real OpenBSD host, not in CI.
 
 ## Out of Scope
