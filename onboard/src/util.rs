@@ -20,6 +20,23 @@ pub fn filed_at() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
+/// A timestamp `days` from now, RFC 3339 UTC to the second. The window's close,
+/// the status link's end and the one-time password link's expiry all come from
+/// here, so there is one arithmetic and one format for the three.
+pub fn after_days(days: i64) -> String {
+    let then = OffsetDateTime::now_utc() + Duration::days(days);
+    then.replace_nanosecond(0)
+        .unwrap_or(then)
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// A date `days` from now, `YYYY-MM-DD`. An RFC 3339 timestamp begins with the
+/// date, so the two cannot drift.
+pub fn date_after_days(days: i64) -> String {
+    after_days(days)[..10].to_string()
+}
+
 /// Whether the status link of a decided application still answers. `decided_at`
 /// is the field the drain sets when it decides; the handler writes nothing
 /// there and reads it only for this. Seven days after the decision the link
@@ -68,5 +85,16 @@ mod tests {
         assert_eq!(t.as_bytes()[10], b'T');
         assert_eq!(t.as_bytes()[13], b':');
         assert_eq!(t.as_bytes()[16], b':');
+    }
+
+    #[test]
+    fn after_days_moves_by_whole_days_and_date_is_its_first_ten() {
+        let week = super::after_days(7);
+        let date = super::date_after_days(7);
+        assert_eq!(date.len(), 10, "{date}");
+        assert!(week.starts_with(&date), "{week} {date}");
+        // Seven days after today is seven days after today, so the date differs
+        // from today's by the same span.
+        assert_ne!(date, super::date_after_days(0));
     }
 }

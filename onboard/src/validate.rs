@@ -169,14 +169,23 @@ fn address_line(line: &str) -> Option<String> {
     }
 }
 
-fn address(v: &str) -> Option<String> {
+/// The address outside the platform: exactly one `local@domain`, and nothing in
+/// it that could become a second recipient or a header line when the value is
+/// later written into a `To:` header. The drain revalidates the stored field for
+/// that reason, so the rule lives here once instead of twice: whitespace, a
+/// control character, a comma and the address-list punctuation are refused, in
+/// the local part as much as the domain.
+pub fn address(v: &str) -> Option<String> {
     let mut parts = v.split('@');
     let (local, domain) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    let punctuation = |c: char| {
+        c.is_whitespace() || c.is_control() || matches!(c, ',' | ';' | '<' | '>' | '"' | '(' | ')')
+    };
     let acceptable = !local.is_empty()
         && !domain.is_empty()
         && parts.next().is_none()
-        && !domain.contains(char::is_whitespace)
-        && domain.contains('.');
+        && domain.contains('.')
+        && !v.chars().any(punctuation);
     (!acceptable)
         .then(|| "an address outside this platform is one, like someone@example.invalid".to_string())
 }
@@ -282,6 +291,13 @@ mod tests {
         assert!(address("not an address").is_some());
         assert!(address("two@at@example.invalid").is_some());
         assert!(address("no@domain").is_some());
+        // The forms that would add a second recipient or a header line if the
+        // value were written into a `To:` header, which the drain guards against
+        // by revalidating this same rule.
+        assert!(address("x,attacker@evil.example").is_some());
+        assert!(address("x\nBcc: attacker@evil.example").is_some());
+        assert!(address("x y@example.invalid").is_some());
+        assert!(address("<x@example.invalid>").is_some());
     }
 
     #[test]

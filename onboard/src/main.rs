@@ -2,15 +2,10 @@
 //! no secret, validates what it is given, writes one JSON intent per submission
 //! by rename, and answers with the status link. Every privileged thing is the
 //! root drain's, on its next run.
-
-mod config;
-mod keycheck;
-mod page;
-mod questions;
-mod rate;
-mod store;
-mod util;
-mod validate;
+//!
+//! The modules it shares with the drain and `onboardctl` (the store, the config,
+//! the questions and the validation) live in the crate's library, so a second
+//! reader of the store cannot drift from the first.
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
@@ -27,10 +22,11 @@ use axum::Router;
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use crate::page::{NoticePage, ReceivedPage, StatusPage};
-use crate::questions::{Branch, Question, Rule};
-use crate::rate::Key;
-use crate::store::{Acceptance, KeyRecord, Record, Store};
+use kyriakon_onboard::page::{NoticePage, ReceivedPage, StatusPage};
+use kyriakon_onboard::questions::{Branch, Question, Rule};
+use kyriakon_onboard::rate::Key;
+use kyriakon_onboard::store::{Acceptance, KeyRecord, Record, Store};
+use kyriakon_onboard::{config, keycheck, page, questions, rate, store, util, validate};
 
 /// The fixed hostname for the form and the account page, used as itself.
 const HOST: &str = "signup.kyriakon.net";

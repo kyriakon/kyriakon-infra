@@ -78,6 +78,16 @@ env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
 needed_scripts="abuse-monitor.sh check-keyring-drift.sh renew-acme.sh backup.sh restore-standup.sh acme-queue.sh"
 needed_vars="ALERT_EMAIL HEALTHCHECKS_URL KEYRING_HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL"
 
+# The onboarding drain is a compiled binary, not one of the /root/bin shell
+# scripts above, so it is installed by scripts/deploy-onboard.sh into sbin and
+# its existence is checked there rather than in /root/bin. Its line still lives
+# here with the others, so the pull request that changes the schedule is the
+# review, and it is scheduled every minute because that is what makes a filed
+# application move: the handler holds no privilege and only writes an intent,
+# and the drain is the process that reads it, sends the review email and carries
+# the decision out.
+drain_bin=/usr/local/sbin/kyriakon-onboard-drain
+
 # The crontab line for one script. Built per script rather than as one block: a
 # block would duplicate the lines of scripts that are already
 # scheduled, which is what the first real run did, leaving the backup and the
@@ -90,6 +100,7 @@ line_for() {
 	backup.sh) printf '30 2 * * * . /root/.kyriakon-env; /root/bin/backup.sh\n' ;;
 	restore-standup.sh) printf '45 3 * * 0 . /root/.kyriakon-env; /root/bin/restore-standup.sh\n' ;;
 	acme-queue.sh) printf '*/15 * * * * . /root/.kyriakon-env; /root/bin/acme-queue.sh --run\n' ;;
+	kyriakon-onboard-drain) printf '* * * * * %s\n' "$drain_bin" ;;
 	*) return 1 ;;
 	esac
 }
@@ -239,8 +250,19 @@ for s in $needed_scripts; do
 	fi
 done
 
+# The drain, checked at its own installed path. A line whose binary the deploy
+# never installed is caught here rather than added for cron to fail on in
+# silence.
+if [ ! -x "$drain_bin" ]; then
+	missing_scripts="$missing_scripts kyriakon-onboard-drain"
+fi
+if ! printf '%s\n' "$current" | grep -qF "$drain_bin"; then
+	to_add="$to_add kyriakon-onboard-drain"
+	line_for kyriakon-onboard-drain >>"$pending"
+fi
+
 if [ -n "$missing_scripts" ]; then
-	printf 'not installed in /root/bin:%s\n' "$missing_scripts"
+	printf 'not installed:%s\n' "$missing_scripts"
 fi
 if [ -z "$to_add" ]; then
 	rm -f "$pending"
@@ -249,6 +271,7 @@ if [ -z "$to_add" ]; then
 	for s in $needed_scripts; do
 		line_for "$s"
 	done
+	line_for kyriakon-onboard-drain
 	exit 0
 fi
 printf 'to be added:%s\n' "$to_add"
@@ -265,7 +288,7 @@ block=$(mktemp)
 rm -f "$pending"
 
 if [ -n "$missing_scripts" ]; then
-	die "install the missing scripts first; the mail deploy does it"
+	die "install the missing scripts first: scripts/deploy-onboard.sh installs the drain and the mail deploy the rest"
 fi
 # A missing or half-filled env is the likely first run, so report which variables
 # are at fault and point at the one script that owns the file.
@@ -313,4 +336,6 @@ rm -f "$before" "$work"
 printf '\nbacked up as %s\n' "$bak"
 printf "installed. the lines now scheduled from /root/bin:\n"
 crontab -l | grep '/root/bin/' | awk '{ print "\t" $0 }'
+printf 'the drain:\n'
+crontab -l | grep -F "$drain_bin" | awk '{ print "\t" $0 }'
 printf '\nrevert with: crontab %s\n' "$bak"

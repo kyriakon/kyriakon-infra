@@ -1,5 +1,5 @@
 #!/bin/ksh
-# provision-member.sh: build a member's public tree, upload key and quota record.
+# provision-member.sh: build a member's address, allowance and public tree.
 #
 # Usage:
 #   doas ksh scripts/provision-member.sh <username> [public-key-file]
@@ -10,6 +10,12 @@
 #   doas ksh scripts/add-user.sh <username>
 #   doas passwd <username>
 #   doas ksh scripts/provision-member.sh <username>
+#
+# The key is optional. A member who only wants mail leaves it empty, and the run
+# then does the mail work and stops: the address and the allowance are the whole
+# account. A member with a key also gets the public tree, the upload session and
+# the two daemon lanes, which is everything the key is needed for. Mail is never
+# behind the key.
 #
 # add-user.sh creates the account, its Maildir and its quota record. This script
 # asserts the account is there rather than making one: a second creation path
@@ -110,6 +116,108 @@ if ! id "$user" >/dev/null 2>&1; then
 	printf '  doas ksh scripts/add-user.sh %s\n' "$user" >&2
 	printf '  doas passwd %s\n' "$user" >&2
 	exit 1
+fi
+
+# --- whether this member has hosting at all ---------------------------------
+#
+# A member with an upload key gets the public tree, the upload session and the
+# daemon lanes. A member without one gets mail and nothing else: the key is
+# optional in the spec and in the question list, and someone who only wants mail
+# leaves it empty. So the key decides hosting and nothing else, the address and
+# the allowance below are provisioned either way, and a missing default key is a
+# mail-only member rather than an error. A key named on the command line is
+# different: it was asked for explicitly, so a path that is not there is
+# refused, and the check is below.
+key_src="$key_arg"
+have_key=yes
+if [ -z "$key_src" ]; then
+	key_src="/var/db/onboard/keys/$user.pub"
+	if [ ! -f "$key_src" ]; then
+		have_key=no
+	fi
+fi
+
+# --- the quota --------------------------------------------------------------
+#
+# The 5 GB allowance the site promises for this account, across mail, web and
+# git. quota-apply.sh writes the record and reads it back from the file, so a
+# zero here means the allowance is in place rather than that a write was
+# attempted. Exit 3 means quotas are not on for the mount yet, which is a state
+# rather than a failure of provisioning: the account and its tree are usable, and
+# the allowance follows when quota-apply.sh --enable has been run. Any other
+# failure is reported and the member is still provisioned, because hosting does
+# not depend on the quota.
+#
+# The status is taken from $? directly rather than from an `if ! cmd` test: in
+# ksh a negated command leaves 0 behind in $?, so a case on $? inside that branch
+# could never tell exit 3 from any other failure.
+set +e
+quota_out=$(ksh "$script_dir/quota-apply.sh" "$user" 2>&1)
+rc=$?
+set -e
+case $rc in
+0)
+	printf 'quota: %s\n' "$quota_out"
+	;;
+3)
+	printf 'note: %s\n' "$quota_out" >&2
+	;;
+*)
+	printf 'warning: the allowance was not set: %s\n' "$quota_out" >&2
+	;;
+esac
+
+# --- the member's own address -----------------------------------------------
+#
+# The virtual table is the whole answer for the local dispatcher: a lookup that
+# finds neither <user>@<domain> nor <user> has nothing to expand to, so a member
+# whose address is missing from it is a member mail cannot reach, and the
+# rejection happens at RCPT time where only the sender sees it. deploy-mail.sh
+# seeds one entry per account that exists when it runs, which is every account
+# except the one being provisioned now, so the entry is written here too. The
+# drain that provisions a member will grow this into the store-driven version of
+# the same table.
+#
+# The platform's own domain is the first line the deploy writes into
+# mail_domains. A box that has not run the mail deploy yet has no table to write
+# to, and that is a note rather than a failure: the account is usable for
+# everything but mail until then.
+virtuals=/etc/mail/virtuals
+if [ ! -f "$virtuals" ]; then
+	printf 'note: no %s yet, so %s has no address until the mail deploy runs\n' \
+		"$virtuals" "$user" >&2
+elif [ ! -s /etc/mail/mail_domains ]; then
+	printf 'note: %s has no domain line, so %s@ was not added anywhere\n' \
+		/etc/mail/mail_domains "$user" >&2
+else
+	domain=$(sed -n '1p' /etc/mail/mail_domains)
+	key="$user@$domain"
+	if awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals"; then
+		# An address aimed somewhere else on purpose is left where it is: this
+		# script provisions an account, it does not overrule a forward.
+		current=$(awk -F: -v k="$key" '$1 == k { sub(/^[^:]*:[ \t]*/, ""); print; exit }' "$virtuals")
+		if [ "$current" != "$user" ]; then
+			printf 'note: %s maps to %s, so mail for this member goes there\n' "$key" "$current" >&2
+		fi
+	else
+		printf '%s: %s\n' "$key" "$user" >> "$virtuals"
+		awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals" \
+			|| { printf 'could not add %s to %s\n' "$key" "$virtuals" >&2; exit 1; }
+		printf 'virtual %s added\n' "$key"
+		changed=yes
+	fi
+fi
+
+# Mail is the account's whole job when there is no key, so a mail-only member
+# stops here: the address and the allowance are in place, and the tree, the
+# upload session and the daemon lanes are not built because there is no key to
+# reach them with.
+if [ "$have_key" = no ]; then
+	printf 'provisioned %s: mail only, no upload key\n' "$user"
+	printf '  the address and the allowance are in place; the public tree, the upload\n'
+	printf '  session and the daemon lanes are not built, because the member holds no key\n'
+	printf 'next: add a key from the member page, then run this script again\n'
+	exit 0
 fi
 
 # The members group is what sshd's Match blocks key on, and both the sftp upload
@@ -239,18 +347,12 @@ fi
 #
 # The second argument names the file explicitly, for a key collected by some
 # other route and for exercising this script before the service writes that tree.
-# With no argument and nothing at the default path the run stops before it builds
-# anything, naming the path it looked for.
-key_src="$key_arg"
-if [ -z "$key_src" ]; then
-	key_src="/var/db/onboard/keys/$user.pub"
-	if [ ! -f "$key_src" ]; then
-		printf 'no public key at %s\n' "$key_src" >&2
-		printf 'if the key was collected elsewhere, name the file:\n' >&2
-		printf '  doas ksh scripts/provision-member.sh %s <public-key-file>\n' "$user" >&2
-		exit 1
-	fi
-fi
+# Whether there is a key at all was settled at the top, and a member with none
+# stopped there on the mail-only path; this run has one, so what is left is to
+# check that the file it names can become an authorized_keys line. An explicitly
+# named file that is not there is a refusal, not a mail-only member: the caller
+# asked for it, and building the member without the tree they asked about would
+# silently ignore them.
 if [ ! -f "$key_src" ]; then
 	printf 'no such public key file: %s\n' "$key_src" >&2
 	exit 1
@@ -343,36 +445,6 @@ else
 	changed=yes
 fi
 
-# --- the quota --------------------------------------------------------------
-#
-# The 5 GB allowance the site promises for this account, across mail, web and
-# git. quota-apply.sh writes the record and reads it back from the file, so a
-# zero here means the allowance is in place rather than that a write was
-# attempted. Exit 3 means quotas are not on for the mount yet, which is a state
-# rather than a failure of provisioning: the account and its tree are usable, and
-# the allowance follows when quota-apply.sh --enable has been run. Any other
-# failure is reported and the member is still provisioned, because hosting does
-# not depend on the quota.
-#
-# The status is taken from $? directly rather than from an `if ! cmd` test: in
-# ksh a negated command leaves 0 behind in $?, so a case on $? inside that branch
-# could never tell exit 3 from any other failure.
-set +e
-quota_out=$(ksh "$script_dir/quota-apply.sh" "$user" 2>&1)
-rc=$?
-set -e
-case $rc in
-0)
-	printf 'quota: %s\n' "$quota_out"
-	;;
-3)
-	printf 'note: %s\n' "$quota_out" >&2
-	;;
-*)
-	printf 'warning: the allowance was not set: %s\n' "$quota_out" >&2
-	;;
-esac
-
 # --- the post-conditions ----------------------------------------------------
 
 assert_shape "$public" root:wheel 0755
@@ -419,47 +491,6 @@ for d in /home /home/www "$public"; do
 		;;
 	esac
 done
-
-# --- the member's own address -----------------------------------------------
-#
-# The virtual table is the whole answer for the local dispatcher: a lookup that
-# finds neither <user>@<domain> nor <user> has nothing to expand to, so a member
-# whose address is missing from it is a member mail cannot reach, and the
-# rejection happens at RCPT time where only the sender sees it. deploy-mail.sh
-# seeds one entry per account that exists when it runs, which is every account
-# except the one being provisioned now, so the entry is written here too. The
-# drain that provisions a member will grow this into the store-driven version of
-# the same table.
-#
-# The platform's own domain is the first line the deploy writes into
-# mail_domains. A box that has not run the mail deploy yet has no table to write
-# to, and that is a note rather than a failure: the account is usable for
-# everything but mail until then.
-virtuals=/etc/mail/virtuals
-if [ ! -f "$virtuals" ]; then
-	printf 'note: no %s yet, so %s has no address until the mail deploy runs\n' \
-		"$virtuals" "$user" >&2
-elif [ ! -s /etc/mail/mail_domains ]; then
-	printf 'note: %s has no domain line, so %s@ was not added anywhere\n' \
-		/etc/mail/mail_domains "$user" >&2
-else
-	domain=$(sed -n '1p' /etc/mail/mail_domains)
-	key="$user@$domain"
-	if awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals"; then
-		# An address aimed somewhere else on purpose is left where it is: this
-		# script provisions an account, it does not overrule a forward.
-		current=$(awk -F: -v k="$key" '$1 == k { sub(/^[^:]*:[ \t]*/, ""); print; exit }' "$virtuals")
-		if [ "$current" != "$user" ]; then
-			printf 'note: %s maps to %s, so mail for this member goes there\n' "$key" "$current" >&2
-		fi
-	else
-		printf '%s: %s\n' "$key" "$user" >> "$virtuals"
-		awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals" \
-			|| { printf 'could not add %s to %s\n' "$key" "$virtuals" >&2; exit 1; }
-		printf 'virtual %s added\n' "$key"
-		changed=yes
-	fi
-fi
 
 # --- the two daemon lanes ---------------------------------------------------
 #
