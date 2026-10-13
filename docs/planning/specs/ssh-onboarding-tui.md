@@ -2,7 +2,7 @@
 
 > Spec synthesised from [Spec the SSH onboarding TUI](https://github.com/kyriakon/kyriakon-infra/issues/245) and the decisions it takes as input: [#183](https://github.com/kyriakon/kyriakon-infra/issues/183) (the second sshd instance, the password-less session and the wizard), [#154](https://github.com/kyriakon/kyriakon-infra/issues/154) (the hosting port split and the mandatory upload key), [#182](https://github.com/kyriakon/kyriakon-infra/issues/182) (the shared question list, the status token and the counters), [#176](https://github.com/kyriakon/kyriakon-infra/issues/176) and [#185](https://github.com/kyriakon/kyriakon-infra/issues/185) (the key walkthrough and the shared check crate), [#156](https://github.com/kyriakon/kyriakon-infra/issues/156) (the service's trust boundary), [#233](https://github.com/kyriakon/kyriakon-infra/issues/233) (the community block) and [#150](https://github.com/kyriakon/kyriakon-infra/issues/150) (the OpenBSD mechanics, tested on the box). The proposal's section 5.9.2 is superseded on the transport by [#183](https://github.com/kyriakon/kyriakon-infra/issues/183) and is not decided again here.
 
-> Amended on 2026-10-13 for the portal redesign: the terminal front-end becomes a portal that mirrors the site over one shared service catalogue ([Decide the shared copy: one service catalogue and the check that keeps the three renderings in step](https://github.com/kyriakon/kyriakon-infra/issues/359) and `docs/planning/specs/shared-copy.md`), the session gains a pty and a plain mode, a member's path is added beside the applicant's ([Research what the onboard sshd tells the TUI about the key that connected](https://github.com/kyriakon/kyriakon-infra/issues/356)), the instruction becomes `ssh apply@ssh.kyriakon.net` ([Decide the SSH portal's entry address and port](https://github.com/kyriakon/kyriakon-infra/issues/360)), and the ksh program this spec first described is retired.
+> Amended on 2026-10-13 for the portal redesign: the terminal front-end becomes a portal that mirrors the site over one shared service catalogue ([Decide the shared copy: one service catalogue and the check that keeps the three renderings in step](https://github.com/kyriakon/kyriakon-infra/issues/359) and `docs/planning/specs/shared-copy.md`), the session gains a pty and a plain mode, a member's path is added beside the applicant's ([Research what the onboard sshd tells the TUI about the key that connected](https://github.com/kyriakon/kyriakon-infra/issues/356)), the instruction becomes `ssh hello@ssh.kyriakon.net` ([Decide the SSH portal's entry address and port](https://github.com/kyriakon/kyriakon-infra/issues/360)), and the ksh program this spec first described is retired.
 
 ## Problem statement
 
@@ -14,7 +14,7 @@ What remains is the shape of that program and its session: the config file, port
 
 ## Solution
 
-A second `sshd` instance runs from its own config file on a port chosen when the box is built, and the only account it can serve is a password-less system account named `apply`. The applicant reaches it as `ssh apply@ssh.kyriakon.net`, the instruction the site publishes on the signup page, on an address the portal has of its own, because the applicant path and the member path cannot share one `Match` block and one address therefore carries two ports. The username is part of both instructions, because `AllowUsers apply` refuses every other name before authentication, so the address on its own lands a connection as the caller's own local user and is refused. Nothing is asked once the connection is made: no password, no key, no published credential. The account has no shell and the instance forces one program, a line-oriented TUI, so the connection is a text pipe into an application form.
+A second `sshd` instance runs from its own config file on a port chosen when the box is built, and the only account it can serve is a password-less system account named `hello`. The applicant reaches it as `ssh hello@ssh.kyriakon.net`, the instruction the site publishes on the signup page, on an address the portal has of its own, because the applicant path and the member path cannot share one `Match` block and one address therefore carries two ports. The username is part of both instructions, because `AllowUsers hello` refuses every other name before authentication, so the address on its own lands a connection as the caller's own local user and is refused. Nothing is asked once the connection is made: no password, no key, no published credential. The account has no shell and the instance forces one program, a line-oriented TUI, so the connection is a text pipe into an application form.
 
 The program is a portal. It opens on a menu over the shared service catalogue, the same list the web page and the capsule render, and its rows say what the platform offers and what state each service is in. One row starts the application: a first screen that says what this is, the shared question list one question at a time with a counter, the key walkthrough, a pasted public key checked with the same crate the web form uses, a summary to confirm, one intent filed through the onboarding handler, and the status token handed back. Another row reads that status back by token, and the rest show a service's own page. The account section arrives when the drain does. A plain mode ships in the same binary for screen readers and bad links. Its per-address counters answer an over-eager source with a plain screen. It holds no privilege, no secrets and no shell, and the human approval stays the real gate.
 
@@ -45,11 +45,11 @@ Port 22
 Port REPLACE_ME
 PidFile /var/run/sshd.onboard.pid
 
-# Only the apply account is reachable, before authentication. That is what
+# Only the hello account is reachable, before authentication. That is what
 # lets the instance carry PasswordAuthentication yes, which the none method
 # needs: userauth_none() calls mm_auth_password("") only when
 # permit_empty_passwd and password_authentication are both on (auth2-none.c).
-AllowUsers apply
+AllowUsers hello
 PasswordAuthentication yes
 PermitRootLogin no
 LoginGraceTime 30
@@ -71,7 +71,7 @@ SyslogFacility AUTH
 # The applicant's path, on port 22 of the portal's own address. Nothing is
 # asked: no credential exists to leak, rotate or publish, and the account is
 # password-less, which is the condition the none method documents.
-Match LocalPort 22 User apply
+Match LocalPort 22 User hello
 	PermitEmptyPasswords yes
 	AuthenticationMethods none
 	KbdInteractiveAuthentication no
@@ -94,10 +94,10 @@ Match LocalPort 22 User apply
 # The member's path, on the same address's second port. Every key is admitted,
 # and the key itself is the identity: AuthorizedKeysCommand is never consulted
 # for the none method, which is why this cannot be the same block as above.
-Match LocalPort REPLACE_ME User apply
+Match LocalPort REPLACE_ME User hello
 	AuthenticationMethods publickey
 	AuthorizedKeysCommand /usr/local/sbin/kyriakon-onboard-keyecho %t %k
-	AuthorizedKeysCommandUser apply
+	AuthorizedKeysCommandUser hello
 	ExposeAuthInfo yes
 	PermitTTY yes
 	MaxSessions 1
@@ -108,34 +108,34 @@ Match LocalPort REPLACE_ME User apply
 	ForceCommand /usr/local/sbin/kyriakon-onboard-tui
 ```
 
-`PermitEmptyPasswords` and `PermitTTY` in the `Match` blocks are inside the subset of keywords `sshd_config(5)` allows after `Match`. `AuthorizedKeysCommand` and `AuthorizedKeysCommandUser` are written there too, and the operator's config test confirms they are accepted where they sit, which the identity research leaves as a check rather than an observation. `PasswordAuthentication` sits at the top level, as the resolution has it, and `PerSourceMaxStartups` sits there too because `sshd_config(5)` does not allow it after `Match`; both are harmless there because `AllowUsers apply` makes the instance serve one account. `Banner none` is the documented default and is written out so a future default change cannot quietly reintroduce a banner; a banner is read by every scanner and by nobody the platform wants. The protocol identification string itself cannot be removed, and its version addendum already defaults to `none`, so it carries no local operating system suffix.
+`PermitEmptyPasswords` and `PermitTTY` in the `Match` blocks are inside the subset of keywords `sshd_config(5)` allows after `Match`. `AuthorizedKeysCommand` and `AuthorizedKeysCommandUser` are written there too, and the operator's config test confirms they are accepted where they sit, which the identity research leaves as a check rather than an observation. `PasswordAuthentication` sits at the top level, as the resolution has it, and `PerSourceMaxStartups` sits there too because `sshd_config(5)` does not allow it after `Match`; both are harmless there because `AllowUsers hello` makes the instance serve one account. `Banner none` is the documented default and is written out so a future default change cannot quietly reintroduce a banner; a banner is read by every scanner and by nobody the platform wants. The protocol identification string itself cannot be removed, and its version addendum already defaults to `none`, so it carries no local operating system suffix.
 
 ### The account
 
-`apply` is a system account with an empty password field, a home of `/var/empty` and a `/sbin/nologin` shell. It is created once, at build time, after its login class exists:
+`hello` is a system account with an empty password field, a home of `/var/empty` and a `/sbin/nologin` shell. The name is the one the site already publishes for reaching the platform, and it is already in `reserved-usernames.txt`, so no member can hold it and the door reads the same whether someone is applying, browsing, tending an account, or one day ordering a book. `apply@kyriakon.net` keeps its own job as the onboarding key mailbox, which is a mail address and a different namespace. The account is created once, at build time, after its login class exists:
 
 ```
 useradd -d /var/empty -c "Kyriakon portal" \
-	-s /sbin/nologin -L apply -p '' apply
+	-s /sbin/nologin -L hello -p '' hello
 ```
 
 `useradd -p ''` stores the empty string in the password field (user(8) writes `up->u_password` verbatim), and provisioning verifies the result before the instance is enabled:
 
 ```
-awk -F: '$1 == "apply" { print length($2) }' /etc/master.passwd   # must print 0
+awk -F: '$1 == "hello" { print length($2) }' /etc/master.passwd   # must print 0
 ```
 
 A non-zero length fails the build, because a disabled account (`*`) would not authenticate with the `none` method and the instance would be a port that refuses everyone.
 
-The shell in the password file stays `/sbin/nologin`, which is the one [#183](https://github.com/kyriakon/kyriakon-infra/issues/183) asks for, and the session still runs the TUI because sshd takes its shell from the account's login class rather than from the password field. `do_child()` runs `shell = login_getcapstr(lc, "shell", pw_shell, pw_shell)` in `session.c`, and `auth.c` sets `lc = login_getclass(pw->pw_class)`, so the class's `shell` capability is the shell sshd execs the forced command through. The class is a new stanza in `/etc/login.conf`, kept in the repo as `openbsd/etc/login.conf.d/apply`:
+The shell in the password file stays `/sbin/nologin`, which is the one [#183](https://github.com/kyriakon/kyriakon-infra/issues/183) asks for, and the session still runs the TUI because sshd takes its shell from the account's login class rather than from the password field. `do_child()` runs `shell = login_getcapstr(lc, "shell", pw_shell, pw_shell)` in `session.c`, and `auth.c` sets `lc = login_getclass(pw->pw_class)`, so the class's `shell` capability is the shell sshd execs the forced command through. The class is a new stanza in `/etc/login.conf`, kept in the repo as `openbsd/etc/login.conf.d/hello`:
 
 ```
-apply:\
+hello:\
 	:shell=/usr/local/sbin/kyriakon-onboard-tui:\
 	:tc=default:
 ```
 
-It goes in `/etc/login.conf.d/apply`, the drop-in directory this box already uses for `dovecot` and `rspamd`, where a class takes precedence over the same name in `/etc/login.conf` and the base file is never edited. `cap_mkdb /etc/login.conf` then rebuilds the database, which is required after an edit to either file whenever `/etc/login.conf.db` exists. Without the class the account could not run the TUI at all: `sshd_config(5)` says a forced command "is invoked by using the user's login shell with the -c option" and `do_child()` runs `execve(shell, {shell, "-c", command})`, and `/sbin/nologin` ignores `-c` and exits, which is what the mechanics note already found for `authorized_keys` commands (section 4 of `docs/planning/research/openbsd-per-member-hosting.md`). The class is the standard OpenBSD way to give one account a different session shell without putting a program in its password entry, and it keeps the property [#183](https://github.com/kyriakon/kyriakon-infra/issues/183) wanted: there is no shell on the account, and a client that sends no command and one that sends its own both land in the same program, which ignores its arguments because `ForceCommand` replaces whatever the client asked for.
+It goes in `/etc/login.conf.d/hello`, the drop-in directory this box already uses for `dovecot` and `rspamd`, where a class takes precedence over the same name in `/etc/login.conf` and the base file is never edited. `cap_mkdb /etc/login.conf` then rebuilds the database, which is required after an edit to either file whenever `/etc/login.conf.db` exists. Without the class the account could not run the TUI at all: `sshd_config(5)` says a forced command "is invoked by using the user's login shell with the -c option" and `do_child()` runs `execve(shell, {shell, "-c", command})`, and `/sbin/nologin` ignores `-c` and exits, which is what the mechanics note already found for `authorized_keys` commands (section 4 of `docs/planning/research/openbsd-per-member-hosting.md`). The class is the standard OpenBSD way to give one account a different session shell without putting a program in its password entry, and it keeps the property [#183](https://github.com/kyriakon/kyriakon-infra/issues/183) wanted: there is no shell on the account, and a client that sends no command and one that sends its own both land in the same program, which ignores its arguments because `ForceCommand` replaces whatever the client asked for.
 
 ### The rc.d unit
 
@@ -294,27 +294,27 @@ https://signup.kyriakon.net works the same way and has no session limit.
 
 The TUI takes the source address from `SSH_CONNECTION`, the `client_ip client_port server_ip server_port` quartet sshd puts in the session environment, and keeps its counters under `/var/db/kyriakon-onboard-tui/`, which it owns. One lock file per live session is written at start and removed on exit, and a stale file whose session is gone is pruned on the next start, so an abandoned session cannot lock an address out for good. The caps are the ones [#182](https://github.com/kyriakon/kyriakon-infra/issues/182) fixed so the front-ends agree: sixty requests a minute and five drafts a day per address. The session layer below them starts at two concurrent sessions per address, matching `PerSourceMaxStartups 2`, with a small box-wide total; a bot that lands here finds a program that files one intent per completed application and a counter that stops it after a few, and the human approval is still the gate. The exact submission count is set when the port is live, from the baseline below rather than from a guess.
 
-Everything lands in `authlog`. sshd writes the admission line at `INFO` in the form `Accepted none for apply from <address> port <n> ssh2`, and on the member port `Accepted publickey for apply from <address> port <n> ssh2: <type> SHA256:<fingerprint>`. The abuse monitor gains a per-source count anchored on `for apply from`, which counts both lines and mixes in neither the members' own sshd traffic nor the operator's. The TUI's own stage events (a filed application, a status read, an abandoned session) go to `authlog` through `syslog` with facility `AUTH`, and carry no address and no answer, so the completion count cannot become a member list in the logs.
+Everything lands in `authlog`. sshd writes the admission line at `INFO` in the form `Accepted none for hello from <address> port <n> ssh2`, and on the member port `Accepted publickey for hello from <address> port <n> ssh2: <type> SHA256:<fingerprint>`. The abuse monitor gains a per-source count anchored on `for hello from`, which counts both lines and mixes in neither the members' own sshd traffic nor the operator's. The TUI's own stage events (a filed application, a status read, an abandoned session) go to `authlog` through `syslog` with facility `AUTH`, and carry no address and no answer, so the completion count cannot become a member list in the logs.
 
 The existing SSH-failure threshold in `docs/planning/research/alert-thresholds.md` (300 lines per source address per 15-minute interval) is re-measured once this port is live and the new number recorded there. A second public listener changes what `authlog` holds, and an unmeasured shift is how a real attack hides in the noise. That re-measurement is a build step, not this spec's number.
 
 ## What the session must never do
 
-- It is never a login to a member's account. The only account on the instance is `apply`, which holds no member state and no shell; a member's session is identified by the key it presented and reaches only what the handler renders for that account.
+- It is never a login to a member's account. The only account on the instance is `hello`, which holds no member state and no shell; a member's session is identified by the key it presented and reaches only what the handler renders for that account.
 - It never gives anyone a shell. The password-file shell is `/sbin/nologin`, the login class gives the session only the TUI, and `ForceCommand` pins the same program for a client-supplied command.
 - It never changes anything itself. It files intents: one for a completed application, and, once the drain exists, the account intents the account page also files. Provisioning, suspension, deletion, certificates, key rotation and payments stay the drain's, and no session performs them.
 - It never generates a key, and never sees a private key. It prints the walkthrough and the generator's address, accepts a pasted public key, and inspects it.
 - It is never the only way in. The web form at `signup.kyriakon.net` asks the same questions and needs no terminal, and nothing about applying requires a terminal.
 - It is never a username oracle. Format and reserved names are checked live; existence never is.
 - It never echoes an application's answers on the status path, and a token that does not exist reads as an expired one.
-- It never holds privilege or secrets. It runs as `apply`, reads no root-only file, and reaches the handler over loopback.
+- It never holds privilege or secrets. It runs as `hello`, reads no root-only file, and reaches the handler over loopback.
 - It never forwards anything. `DisableForwarding` and `PermitOpen none` leave no TCP, agent, X11 or streamlocal channel and no tunnel.
 - It never writes an address or an answer to a log of its own; sshd's admission line is the only place the address appears.
 - It never files twice. One confirm files one intent; an abandoned or dropped session files nothing.
 
 ## The trust boundary
 
-The TUI is a front-end and sits on the same side of the boundary as the web handler ([#156](https://github.com/kyriakon/kyriakon-infra/issues/156)). It runs as the unprivileged `apply` account and can do three things: read the shared question list and the catalogue, ask the handler to file an intent, read a status, or name the account a key belongs to, and run the shared key check. It holds no Stripe secret, no repository token and no signing key, and it cannot read the store, the account files or any member's mail.
+The TUI is a front-end and sits on the same side of the boundary as the web handler ([#156](https://github.com/kyriakon/kyriakon-infra/issues/156)). It runs as the unprivileged `hello` account and can do three things: read the shared question list and the catalogue, ask the handler to file an intent, read a status, or name the account a key belongs to, and run the shared key check. It holds no Stripe secret, no repository token and no signing key, and it cannot read the store, the account files or any member's mail.
 
 Its one network reach is the handler on the loopback address, the same process that answers the web form and the capsule behind `relayd` and `gmid`. That keeps one intent writer. The TUI passes the source address it took from `SSH_CONNECTION` so the handler's per-address counters apply to it the same way they apply to the capsule, but the handler validates every field again as it does for any front-end, so a bug in the TUI cannot become a privileged write. The drain still does every privileged thing, on its next run.
 
@@ -332,7 +332,7 @@ Three behaviours are worth a test each, and little else here is.
 
 A scripted session, answers fed on stdin and output read back, must produce exactly one intent for one completed application, and none when the session is abandoned or the connection drops before the confirm. That is the property a bug would break in either direction: a double file, or a file on an abandon.
 
-The config check is a test in the ordinary sense: `sshd -T -f /etc/ssh/sshd_config.onboard` must return both ports, `passwordauthentication yes` at the top level, `permitemptypasswords yes` and `authenticationmethods none` on the applicant port, `authenticationmethods publickey` with the `authorizedkeyscommand` on the member port, `permittty yes` and `exposeauthinfo yes` on both, and the forced command, and a connection attempt as any user other than `apply` must be refused before authentication. `docs/planning/research/onboard-sshd-identity.md` carries the operator's end-to-end version of this: a dry run on throwaway ports under an account whose shell is `/bin/sh`, whose forced command prints `TERM`, `SSH_TTY`, `SSH_USER_AUTH` and the file's contents, connected with and without `-t` and once with `-i` on the member port, and `authlog` then showing `Accepted none` for the anonymous sessions and `Accepted publickey` with a fingerprint for the keyed one.
+The config check is a test in the ordinary sense: `sshd -T -f /etc/ssh/sshd_config.onboard` must return both ports, `passwordauthentication yes` at the top level, `permitemptypasswords yes` and `authenticationmethods none` on the applicant port, `authenticationmethods publickey` with the `authorizedkeyscommand` on the member port, `permittty yes` and `exposeauthinfo yes` on both, and the forced command, and a connection attempt as any user other than `hello` must be refused before authentication. `docs/planning/research/onboard-sshd-identity.md` carries the operator's end-to-end version of this: a dry run on throwaway ports under an account whose shell is `/bin/sh`, whose forced command prints `TERM`, `SSH_TTY`, `SSH_USER_AUTH` and the file's contents, connected with and without `-t` and once with `-i` on the member port, and `authlog` then showing `Accepted none` for the anonymous sessions and `Accepted publickey` with a fingerprint for the keyed one.
 
 The two modes must say the same things: a session driven in the plain mode and one driven through the full-screen program's own harness must file the same intent for the same answers, and the menu must render every entry in the shared catalogue, which the check in `docs/planning/specs/shared-copy.md` covers for all three front-ends at once.
 
