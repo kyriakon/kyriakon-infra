@@ -6,8 +6,8 @@
 #        ksh scripts/provision-member-web.sh --self-test
 #
 # Runs ON the box as root, after scripts/provision-member.sh has built the
-# member's tree, and again later: the port 443 block appears the moment the
-# member's certificate file does, so a certificate that lands after signup is
+# member's tree, and again later: the block behind the relay appears the moment
+# the member's certificate file does, so a certificate that lands after signup is
 # applied by running this again rather than by editing anything by hand.
 #
 # What it writes, and why each shape:
@@ -17,20 +17,30 @@
 # The port 80 block comes first and holds the ACME challenge location before the
 # 301 to the same name over HTTPS. httpd uses the first location that matches and
 # ignores the rest, so the challenge has to come before any catch-all or a
-# renewal is answered with the redirect and fails. The port 443 block is written
-# only when the member's certificate file exists: serving a name over TLS with
-# another name's certificate is worse than not serving it, and a member whose
-# certificate is still in the queue has a resolving name and a working challenge
-# in the meantime. Which of the two blocks comes first in the file is the
-# ticket's order and does not matter to httpd, since each is a listener of its
-# own; port 80 is written first because that is the block a member's site has
-# before anything else works.
+# renewal is answered with the redirect and fails. The second block is the
+# member's site behind the relay, on 127.0.0.1 port 8080, plain HTTP: relayd
+# terminates TLS for every name on 443 and passes the Host header through, so the
+# vhost here is the same shape every other site on the box has. It is written only
+# when the member's certificate file exists, because the relay presents a
+# certificate it was told about, and a name answered with the relay's default
+# certificate is served under the wrong name, which is worse than not serving it.
+# A member whose certificate is still in the queue has a resolving name, a
+# working challenge and no site yet, in the meantime.
+#
+# The half that is still missing on that second run: the member's keypair line in
+# /etc/relayd.conf, which is what makes the relay present this member's
+# certificate. It is one line in the tls block there, named in a comment where it
+# goes, and this script is the one that has to write it and reload relayd, on the
+# same run that writes the block below. Until it does, a member name is answered
+# with the default certificate. The member certificate queue is #166's and is not
+# built, so no member is in that state yet.
 #
 # The paths inside the blocks are httpd's. httpd's chroot is /home/www, so
 # root "/<name>.kyriakon.net/www" is /home/www/<name>.kyriakon.net/www, which is
 # the member's own public tree, and root "/acme" is the challenge directory
-# deploy-mail.sh created. certificate, key and ocsp paths are not chroot-relative
-# and stay absolute, which is why the pair below is named in full.
+# deploy-mail.sh created. The certificate paths are not, which is why the
+# certificate check below names the one under /etc/ssl in full: relayd reads the
+# pair from there, out of the chroot, before it drops privileges.
 #
 # The index and the reload are not this script's job. /etc/httpd.d/index.conf is
 # regenerated and httpd is checked with httpd -n and then reloaded by
@@ -105,15 +115,14 @@ member_conf_body() {
 	printf '\t}\n'
 	printf '}\n'
 
-	# The 443 block, only once the certificate is there.
+	# The block behind the relay, only once the member's certificate is there: the
+	# relay presents what /etc/relayd.conf names, and a name it has no keypair for
+	# is answered with the default certificate.
 	[ -f "$(cert_file)" ] || return 0
 	printf '\n'
 	printf 'server "%s.kyriakon.net" {\n' "$user"
-	printf '\tlisten on * tls port 443\n'
-	printf '\ttls {\n'
-	printf '\t\tcertificate "%s"\n' "$(cert_file)"
-	printf '\t\tkey "%s"\n' "$(key_file)"
-	printf '\t}\n'
+	printf '\tlisten on 127.0.0.1 port 8080\n'
+	printf '\tlog { style forwarded }\n'
 	printf '\tlocation "/.git/*" {\n'
 	printf '\t\tblock\n'
 	printf '\t}\n'
@@ -132,11 +141,11 @@ write_member_conf() {
 	target=$(member_conf)
 
 	# A certificate without its key is a broken pair rather than a state to serve
-	# from: the vhost would name a key that is not there, httpd -n would fail, and
-	# the --web pass would then refuse to reload for every member at once. Refusing
-	# here leaves the previous file exactly as it was.
+	# from: relayd would name a key that is not there, its config check would fail,
+	# and the reload would then take every name on the box down rather than one.
+	# Refusing here leaves the previous file exactly as it was.
 	if [ -f "$(cert_file)" ] && [ ! -f "$(key_file)" ]; then
-		die "$(cert_file) is there and $(key_file) is not, so $target was left alone: a vhost needs both halves"
+		die "$(cert_file) is there and $(key_file) is not, so $target was left alone: the relay needs both halves of the pair"
 	fi
 
 	candidate="$target.new.$$"
@@ -152,7 +161,7 @@ write_member_conf() {
 		rm -f "$candidate"
 		conf_changed=no
 		if [ -f "$(cert_file)" ]; then
-			printf '%s: unchanged, the 443 block is in place\n' "$target"
+			printf '%s: unchanged, the block behind the relay is in place\n' "$target"
 		else
 			printf '%s: unchanged, port 80 only until %s exists\n' "$target" "$(cert_file)"
 		fi
@@ -164,9 +173,11 @@ write_member_conf() {
 	conf_changed=yes
 
 	if [ -f "$(cert_file)" ]; then
-		printf 'wrote %s: port 80 and port 443 for %s.kyriakon.net\n' "$target" "$user"
+		printf 'wrote %s: port 80 and the loopback block for %s.kyriakon.net\n' "$target" "$user"
+		printf '  next: add the keypair line for %s.kyriakon.net to /etc/relayd.conf and\n' "$user"
+		printf '  reload relayd, or the relay answers that name with its default certificate\n'
 	else
-		printf 'wrote %s: port 80 for %s.kyriakon.net; the 443 block lands when\n' \
+		printf 'wrote %s: port 80 for %s.kyriakon.net; the loopback block lands when\n' \
 			"$target" "$user"
 		printf '  %s exists, which is #289 running the queue\n' "$(cert_file)"
 	fi
@@ -242,7 +253,7 @@ self_test() {
 	check "the challenge is stripped" "$(grep -c 'request strip 2' "$conf")" 1
 	check "everything else is a 301 to https" \
 		"$(grep -cF "block return 301 \"https://alice.kyriakon.net\$REQUEST_URI\"" "$conf")" 1
-	check "and there is no 443 block yet" "$(grep -c '443' "$conf")" 0
+	check "and there is no block behind the relay yet" "$(grep -c '127.0.0.1 port 8080' "$conf")" 0
 	check "the file is mode 644 and the writer's" "$(stat -f '%Su:%Sg %Lp' "$conf")" "$conf_owner 644"
 	assert_member_conf
 	# Printed once, so this check's output carries the file it asserts about: the
@@ -257,16 +268,20 @@ self_test() {
 	check "a second run leaves the file alone" "$(stat -f '%i %m' "$conf")" "$before"
 	check "and says the file is unchanged" "$(grep -c 'unchanged, port 80 only until' "$tree/again.out")" 1
 
-	# 3. the certificate lands: the 443 block appears, port 80 stays first
+	# 3. the certificate lands: the block behind the relay appears, port 80 stays
+	# first, and the block names no certificate, because the relay presents it
 	: > "$(key_file)"
 	: > "$(cert_file)"
-	write_member_conf >/dev/null
+	write_member_conf > "$tree/certrun.out"
 	check "the port 80 block is still first" "$(awk 'NR == 1' "$conf")" 'server "alice.kyriakon.net" {'
-	check "the 443 block listens with tls" "$(grep -c 'listen on \* tls port 443' "$conf")" 1
-	check "it names the member's certificate" \
-		"$(grep -c "certificate \"$ssl_dir/alice.kyriakon.net.fullchain.pem\"" "$conf")" 1
-	check "and the member's key" \
-		"$(grep -c "key \"$ssl_private/alice.kyriakon.net.key\"" "$conf")" 1
+	check "and names the keypair line the relay still needs" \
+		"$(grep -c 'add the keypair line' "$tree/certrun.out")" 1
+	check "the second block listens on the relay's loopback port" \
+		"$(grep -c 'listen on 127.0.0.1 port 8080' "$conf")" 1
+	check "it names no certificate or key of its own" \
+		"$(grep -cE 'certificate|key "|tls' "$conf")" 0
+	check "it logs the forwarded address the relay sets" \
+		"$(grep -c 'log { style forwarded }' "$conf")" 1
 	check "it blocks .git" "$(grep -c 'location "/.git/\*"' "$conf")" 1
 	check "and roots the member's www directory" \
 		"$(grep -c 'root "/alice.kyriakon.net/www"' "$conf")" 1
@@ -275,7 +290,8 @@ self_test() {
 	before=$(stat -f '%i %m' "$conf")
 	write_member_conf > "$tree/cert.out"
 	check "a second run with a certificate leaves the file alone" "$(stat -f '%i %m' "$conf")" "$before"
-	check "and says the 443 block is in place" "$(grep -c 'unchanged, the 443 block is in place' "$tree/cert.out")" 1
+	check "and says the block behind the relay is in place" \
+		"$(grep -c 'unchanged, the block behind the relay is in place' "$tree/cert.out")" 1
 
 	# 5. a certificate whose key is missing is refused, and the file is untouched
 	before=$(stat -f '%i %m %z' "$conf")

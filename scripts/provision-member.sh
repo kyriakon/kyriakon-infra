@@ -50,8 +50,8 @@
 # account's record in place with the same limits.
 #
 # The two lane scripts are idempotent the same way. They are separate scripts
-# because one of them has to be run again later: the httpd vhost gains its port
-# 443 block when the member's certificate lands, which is a second run of
+# because one of them has to be run again later: the httpd vhost gains its block
+# behind the relay when the member's certificate lands, which is a second run of
 # provision-member-web.sh rather than an edit by hand. A lane that fails stops
 # this run, because an account with a tree and no vhost is not a provisioned
 # member, and the drain that calls this applies the whole thing or reports it.
@@ -466,9 +466,9 @@ fi
 # Each lane is its own script, run from here so that one command still provisions
 # a member, and each is idempotent: a second run rewrites nothing and says so.
 # They are separate scripts because the web one has to be run again later, when
-# the member's certificate lands and the 443 block becomes due, and because a
-# lane read on its own is a lane reviewed on its own. A lane that fails stops
-# this run: an account with a tree and no vhost is not a provisioned member.
+# the member's certificate lands and the block behind the relay becomes due, and
+# because a lane read on its own is a lane reviewed on its own. A lane that fails
+# stops this run: an account with a tree and no vhost is not a provisioned member.
 for lane in provision-member-web.sh provision-member-capsule.sh; do
 	if [ ! -f "$script_dir/$lane" ]; then
 		printf 'no %s beside this script, so %s has no generated daemon file\n' "$lane" "$user" >&2

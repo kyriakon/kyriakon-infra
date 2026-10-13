@@ -8,11 +8,14 @@
 #
 # The endpoint list is derived rather than maintained, so adding a vhost is the
 # only edit needed for it to appear, and the page cannot advertise something the
-# box does not serve. An httpd block counts as public when it terminates TLS on
-# 443 and is not a pure redirect: that excludes the www and kyriakon.com
-# redirectors, and it excludes every port 80 block, which exists only to answer
-# the ACME challenge. A gmid block is public by definition, since gmid has no
-# other reason to name a host.
+# box does not serve. An httpd block counts as public when it answers behind the
+# relay, which since 443 moved to relayd means the loopback listener, and is not a
+# pure redirect: that excludes the www and kyriakon.com redirectors, and it
+# excludes every port 80 block, which exists only to answer the ACME challenge and
+# is reached directly. The name's certificate is relayd's, so a block here is
+# public exactly when relayd will present a certificate for the name it names. A
+# gmid block is public by definition, since gmid has no other reason to name a
+# host.
 #
 # Output is plain LF, not CRLF. fingerd converts every newline to CRLF itself while
 # copying the provider's stdout out to the client, so writing CRLF here doubles the
@@ -46,14 +49,14 @@ printf '\n'
 			name = $2
 			gsub(/"/, "", name)
 			inblock = 1
-			tls = 0
+			behind_relay = 0
 			redirect = 0
 			next
 		}
-		inblock && /listen on .*tls port 443/ { tls = 1 }
+		inblock && /listen on 127\.0\.0\.1 port 8080/ { behind_relay = 1 }
 		inblock && /block return/ { redirect = 1 }
 		inblock && /^}/ {
-			if (tls && !redirect) { print "https://" name }
+			if (behind_relay && !redirect) { print "https://" name }
 			inblock = 0
 		}
 	' "$httpd_conf"

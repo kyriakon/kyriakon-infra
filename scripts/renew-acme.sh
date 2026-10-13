@@ -195,14 +195,18 @@ inside_warn_window() {
 # services_for <handle> : the daemons holding that certificate, in restart order.
 # Dovecot before smtpd on the mail host because smtpd delivers to Dovecot over
 # LMTP, so bringing smtpd back first leaves it a window with no delivery target
-# and bounces anything arriving inside it. gmid holds the apex and personal-site
-# certificates as well as httpd (openbsd/etc/gmid.conf), and neither rc.d defines
-# a reload action, so both are restarted rather than reloaded.
+# and bounces anything arriving inside it. relayd terminates TLS for the web
+# names and holds the certificates it presents (openbsd/etc/relayd.conf), and
+# gmid holds the apex and personal-site certificates for their capsules, so those
+# are the daemons a renewal has to reach. httpd is not one of them since the 443
+# vhosts moved to loopback behind the relay: it serves no certificate of its own.
+# Neither rc.d defines a reload action, so both are restarted rather than
+# reloaded.
 services_for() {
 	case "$1" in
 	mail.kyriakon.net) printf 'dovecot smtpd' ;;
-	kyriakon.net | oliver.kyriakon.net) printf 'httpd gmid' ;;
-	kyriakon.com) printf 'httpd' ;;
+	kyriakon.net | oliver.kyriakon.net) printf 'relayd gmid' ;;
+	kyriakon.com) printf 'relayd' ;;
 	*) return 1 ;;
 	esac
 }
