@@ -18,7 +18,7 @@ This document names the file, its columns and the words that must read identical
 
 ## The catalogue
 
-The catalogue is `openbsd/etc/onboard/catalogue.tsv` in the repository, seeded into the store as `/var/db/onboard/catalogue.tsv` by `scripts/onboard-store.sh` beside the question list and the reserved names, and read from the path `onboard.toml` gives it, beside the `questions` and `reserved` keys it already carries (`catalogue = "/var/db/onboard/catalogue.tsv"`), on the reason that file already gives for the other two: so that a layout moves them rather than the service reading an empty list and rendering nothing. It is tab-separated with a header line naming the columns, one record per line in display order, which is the shape the question file already set: a reader can open it in an editor, a diff of it is readable, and no front-end needs a parser beyond splitting on tabs.
+The catalogue is `openbsd/etc/onboard/catalogue.toml` in the repository, seeded into the store as `/var/db/onboard/catalogue.toml` by `scripts/onboard-store.sh` beside the question list and the reserved names, and read from the path `onboard.toml` gives it, beside the `questions` and `reserved` keys it already carries (`catalogue = "/var/db/onboard/catalogue.toml"`), on the reason that file already gives for the other two: so that a layout moves them rather than the service reading an empty list and rendering nothing. It is TOML, an array of tables in display order, which is what the service already parses for its own configuration. The format takes comments, so a row that needs a reason carries it beside the value; the columns are typed rather than positional; and an array of tables keeps the order the front-ends render in. The question file is TOML as well, for the same reasons, and its own conversion is the same change.
 
 The columns are `id`, `name`, `summary`, `state`, `host` and `action`.
 
@@ -29,24 +29,148 @@ The columns are `id`, `name`, `summary`, `state`, `host` and `action`.
 - **`host`** is the hostname the service lives at, with no scheme, because a hostname is protocol-agnostic: that is the reason the capsule already shares one name with the web page. A front-end adds the scheme its own protocol speaks. A host containing `<name>` is rendered from the session's member where there is one, and as the pattern itself where there is not.
 - **`action`** is one of `read`, `apply`, `account` or `pay`. `read` shows the service's own page, `apply` starts the application, `account` opens the member's account surface, and `pay` opens the payment window or the rail's instructions. A hand-off is how a front-end renders `pay` where the protocol cannot take a card, so it is a rule rather than a fifth value.
 
-The values as they stand on 2026-10-13, which is a snapshot and not the source: once the file exists, the file is the source and this table is history.
+The values as they stand on 2026-10-13, which is a snapshot and not the source: once the file exists, the file is the source and this block is history.
 
-| id | name | summary | state | host | action |
-| --- | --- | --- | --- | --- | --- |
-| mail | Mail | zero-access mail, 5 GB, IMAP and SMTP, readable only by you | live | mail.kyriakon.net | read |
-| web | A website | static pages at an address of your own, uploaded by sftp | live | `<name>`.kyriakon.net | read |
-| gemini | A gemini capsule | the same pages over the gemini protocol | live | `<name>`.kyriakon.net | read |
-| git | Repositories | `pass`-compatible git over ssh, on port 2222 | live | mail.kyriakon.net | read |
-| account | Your account | the password, the keys, the space used, the serving switches, the notices | live | signup.kyriakon.net | account |
-| pay | Paying | card, cash by post or Monero, and the window each one opens | live | signup.kyriakon.net | pay |
-| free | No charge | for clergy, monastics, and anyone who cannot pay | live | signup.kyriakon.net | read |
-| own_domain | A parish's own domain | your domain, up to ten addresses, with mail, a site and a capsule | live | signup.kyriakon.net | apply |
-| managed | A managed instance | your own server, run for you, by arrangement | by_request | signup.kyriakon.net | read |
-| key | Keys | making a mail key and an upload key, and the browser generator | live | signup.kyriakon.net | read |
-| capsule_signup | Applying over gemini | the whole application over gemini, with no browser | planned | signup.kyriakon.net | apply |
-| terminal | The terminal | apply, read your account and manage your keys from an ssh session | planned | ssh.kyriakon.net | read |
-| press | Kyriakon Press | the press, its books, and the state it is in | live | press.kyriakon.net | read |
-| kleio | Kleio | the sibling project, and the state it is in | live | kleio.kyriakon.net | read |
+```toml
+# /var/db/onboard/catalogue.toml
+#
+# The catalogue: what the platform offers, and what state each thing is in. It is
+# read by the three front-ends and copied by none, which is why it is data and
+# not a page. The check in docs/planning/specs/shared-copy.md renders the web
+# card, the gemini link list and the terminal menu from this file and fails if
+# one of them drops an entry or invents one.
+#
+# Hand-written, so it is TOML: the service already parses TOML for its own
+# config, the format takes comments, and a row that needs a reason can carry it
+# beside the value rather than in a commit message. An array of tables keeps
+# display order and types the columns.
+#
+# The columns, the vocabularies and the rules are in
+# docs/planning/specs/shared-copy.md. In short: state is one of live,
+# by_request or planned; host carries no scheme, because a hostname is
+# protocol-agnostic, and a host containing <name> is rendered from the session's
+# member where there is one; action is one of read, apply, account or pay.
+
+[[service]]
+id = "mail"
+name = "Mail"
+summary = "zero-access mail, 5 GB, IMAP and SMTP, readable only by you"
+state = "live"
+host = "mail.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "web"
+name = "A website"
+summary = "static pages at an address of your own, uploaded by sftp"
+state = "live"
+host = "<name>.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "gemini"
+name = "A gemini capsule"
+summary = "the same pages over the gemini protocol"
+state = "live"
+host = "<name>.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "git"
+name = "Repositories"
+summary = "pass-compatible git over ssh, on port 2222"
+state = "live"
+host = "mail.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "account"
+name = "Your account"
+summary = "the password, the keys, the space used, the serving switches, the notices"
+state = "live"
+host = "signup.kyriakon.net"
+action = "account"
+
+[[service]]
+id = "pay"
+name = "Paying"
+summary = "card, cash by post or Monero, and the window each one opens"
+state = "live"
+host = "signup.kyriakon.net"
+action = "pay"
+
+[[service]]
+id = "free"
+name = "No charge"
+summary = "for clergy, monastics, and anyone who cannot pay"
+state = "live"
+host = "signup.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "own_domain"
+name = "A parish's own domain"
+summary = "your domain, up to ten addresses, with mail, a site and a capsule"
+state = "live"
+host = "signup.kyriakon.net"
+action = "apply"
+
+[[service]]
+id = "managed"
+name = "A managed instance"
+summary = "your own server, run for you, by arrangement"
+state = "by_request"
+host = "signup.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "key"
+name = "Keys"
+summary = "making a mail key and an upload key, and the browser generator"
+state = "live"
+host = "signup.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "capsule_signup"
+name = "Applying over gemini"
+summary = "the whole application over gemini, with no browser"
+state = "planned"
+host = "signup.kyriakon.net"
+action = "apply"
+
+[[service]]
+id = "terminal"
+name = "The terminal"
+summary = "apply, read your account and manage your keys from an ssh session"
+state = "planned"
+host = "ssh.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "press"
+name = "Kyriakon Press"
+summary = "the press, its books, and the state it is in"
+state = "live"
+host = "press.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "shop"
+name = "The bookshop"
+summary = "the Press's books, ordered from its own page once the shop is built"
+state = "planned"
+host = "press.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "kleio"
+name = "Kleio"
+summary = "the sibling project, and the state it is in"
+state = "live"
+host = "kleio.kyriakon.net"
+action = "read"
+```
 
 Two of those lines are projects rather than services, and they are in the catalogue because the site's own splash carries them and a member exploring the platform should find them the same way. Their pages state their own state, and their `state` word here says nothing more.
 
@@ -96,8 +220,8 @@ ssh apply@ssh.kyriakon.net    ->  Mail                    live
 
 | The wording | Where it lives | Who reads it |
 | --- | --- | --- |
-| A service's name and its one clause | `openbsd/etc/onboard/catalogue.tsv` | all three |
-| A question's prompt, its type and its validation | `openbsd/etc/onboard/questions.tsv` | all three |
+| A service's name and its one clause | `openbsd/etc/onboard/catalogue.toml` | all three |
+| A question's prompt, its type and its validation | `openbsd/etc/onboard/questions.toml` | all three |
 | The word for each state and each action | one table in `onboard/src/catalogue.rs` | all three |
 | The hand-off sentence for each job a protocol cannot finish | the same table | per front-end |
 | The account page's capability list and what each part rests on | `docs/planning/specs/signup-and-account-page.md` | the web page and the terminal |
@@ -119,7 +243,7 @@ The account page's table in `signup-and-account-page.md` is the whole list of wh
 
 One seam is worth tests, and it is the join between the catalogue and the three renderings, because a defect there tells a reader about a service that does not exist or hides one that does.
 
-- Every id in the tracked `catalogue.tsv` appears in all three renderings, compared as rows rather than as strings, since each renderer returns a list and the templates format it.
+- Every id in the tracked `catalogue.toml` appears in all three renderings, compared as rows rather than as strings, since each renderer returns a list and the templates format it.
 - Each renderer is rendered from a small fixture that differs from the shipped file, and the three outputs must follow the fixture. This is what catches a list that was hard-coded beside the file: a renderer that ignores its input passes the first check and fails this one.
 - Every `state` and every `action` value in the file has a word in every front-end's vocabulary, so a new value cannot arrive with a rendering for one front-end and none for the others.
 - The question list gets the same treatment where the three renderings of a question differ, and the existing checks in `onboard/src/questions.rs` stay.
@@ -128,11 +252,11 @@ Nothing else here is worth a test. The chrome is copy, and copy is checked by re
 
 ## Not verified
 
-Nothing in this document has been run. `openbsd/etc/onboard/catalogue.tsv` does not exist, `onboard/src/catalogue.rs` does not exist, the three renderings named here are not written, and the terminal front-end has no Rust home yet: [Amend the SSH onboarding TUI spec for the portal redesign](https://github.com/kyriakon/kyriakon-infra/issues/361) fixes that, and it should provide the crate as a library so the catalogue has one home and no copy. The catalogue's values are a snapshot of 2026-10-13 and the file is the source once it exists, which is the point of writing them down in one place.
+Nothing in this document has been run. `openbsd/etc/onboard/catalogue.toml` does not exist, `onboard/src/catalogue.rs` does not exist, the three renderings named here are not written, and the terminal front-end has no Rust home yet: [Amend the SSH onboarding TUI spec for the portal redesign](https://github.com/kyriakon/kyriakon-infra/issues/361) fixes that, and it should provide the crate as a library so the catalogue has one home and no copy. The catalogue's values are a snapshot of 2026-10-13 and the file is the source once it exists, which is the point of writing them down in one place.
 
 ## Sources
 
-- `openbsd/etc/onboard/questions.tsv`, the file shape this document copies: a header naming the columns, tab-separated, one record per line in display order.
+- `openbsd/etc/onboard/questions.toml`, the file shape this document copies: a header naming the columns, tab-separated, one record per line in display order.
 - `onboard/src/questions.rs`, `onboard/src/page.rs` and `onboard/templates/`, the service as built: the question list is read once and rendered by more than one front-end already.
 - `docs/planning/specs/signup-and-account-page.md`, read on 2026-10-13: the intent API and its record, the question file's six columns, the store root, the handler's write boundary, the account page's capability table, and the line that the signup copy's home is the site workstream.
 - `docs/planning/specs/gemini-capsule.md`, read on 2026-10-13: the counter and the pages, the status page, the `apply@` route, the pinned-certificate mechanism, and the sentence that the application's grouping is presentation and the capsule ignores it.
