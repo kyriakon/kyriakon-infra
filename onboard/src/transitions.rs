@@ -264,7 +264,7 @@ pub async fn failures(store: &Store, id: &str) -> (u32, Option<OffsetDateTime>, 
     (count, last, message)
 }
 
-/// Record a failed pass and say whether it is a new one worth printing. The same
+/// Record a failed pass and say whether it is a new one worth mailing. The same
 /// message as the last failure is the same event, so the operator is not mailed
 /// it again; a different message is. This is the notices path's rule, applied to
 /// the drain's own output: record first, and let the record stop the duplicate.
@@ -290,6 +290,41 @@ pub async fn note_failure(
     )
     .await?;
     Ok(previous.as_deref() != Some(message))
+}
+
+/// Report a failed pass once, by mail. The journal records every failed pass, so
+/// a pass whose message the last failure already carried is not mailed again:
+/// the operator gets one mail per distinct failure rather than one a minute.
+///
+/// A failure that was mailed is not also printed. cron mails a job's output
+/// under a subject of its own, so printing would be the same news a second time,
+/// and the copy that names neither the component nor the event.
+pub async fn report_failure(cfg: &DrainConfig, store: &Store, id: &str, kind: &str, message: &str) {
+    let fresh = note_failure(store, &cfg.release, id, kind, message)
+        .await
+        .unwrap_or(true);
+    if fresh {
+        // The drain's own configuration is journalled under the id `config`,
+        // which is the one failure that is not about an intent: the id and the
+        // kind are the same word there.
+        let what = if id == kind {
+            "its own configuration".to_string()
+        } else {
+            format!("{kind} {id}")
+        };
+        notice::alert(
+            cfg,
+            "onboard",
+            "drain failed",
+            &format!("the drain failed on {what}: {message}"),
+            "nothing is lost: the work stays in place and the next pass tries it \
+             again, and this is sent once per distinct failure rather than once a \
+             minute, because the journal already carries the same message. \
+             docs/runbook.md, in the onboarding section, has the order to read when \
+             the drain is stuck.",
+        )
+        .await;
+    }
 }
 
 /// Whether a failing id is due for another attempt, and whether it should be
@@ -401,9 +436,16 @@ pub async fn filed_application(
     )
     .await?;
 
-    let subject = format!(
-        "Application {} ({})",
-        intent.application.username, intent.application.status_token
+    // The same subject shape as every other operator mail: the component, then
+    // the event, with the application named in it. The token stays because it is
+    // the one thing in this mail that is not written out anywhere in the body,
+    // and two applications from one username differ only by it.
+    let subject = notice::operator_subject(
+        "onboard",
+        &format!(
+            "application filed ({}, {})",
+            intent.application.username, intent.application.status_token
+        ),
     );
     let body = review_body(cfg, key, &intent)?;
     notice::enqueue(cfg, &cfg.reviewer, &subject, &body).await?;
@@ -904,12 +946,7 @@ pub async fn purge_declined(cfg: &DrainConfig, store: &Store) -> Result<(), Stri
                 || account_on_box(cfg, &record.username)?;
             if !taken {
                 if let Err(e) = run_script(cfg, "delete-user.sh", &[&record.username]).await {
-                    let fresh = note_failure(store, &cfg.release, &purge_id, "decline", &e)
-                        .await
-                        .unwrap_or(true);
-                    if fresh {
-                        eprintln!("kyriakon-onboard-drain: {purge_id}: {e}");
-                    }
+                    report_failure(cfg, store, &purge_id, "decline", &e).await;
                     continue;
                 }
             }

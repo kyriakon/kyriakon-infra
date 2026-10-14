@@ -61,8 +61,22 @@ fi
 # shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
 . "$script_dir/lib.sh"
 
-: "${RESTIC_REPOSITORY:?RESTIC_REPOSITORY is required (sftp:...)}"
-: "${RESTIC_PASSWORD_FILE:?RESTIC_PASSWORD_FILE is required}"
+# fail <found> <to do>: stop before restic runs at all, and mail it. The failure is
+# mailed like every other, so it is not printed as well: cron mails a job's output
+# under a subject of its own, which is the second copy this avoids.
+fail() {
+	notify_operator backup "snapshot failed" "$1" "$2"
+	exit 1
+}
+
+if [ -z "${RESTIC_REPOSITORY:-}" ]; then
+	fail "RESTIC_REPOSITORY is not set, so there is no repository to back up to." \
+		"set it in /root/.kyriakon-env, which the crontab line sources: the storage box's sftp url, port 23 included."
+fi
+if [ -z "${RESTIC_PASSWORD_FILE:-}" ]; then
+	fail "RESTIC_PASSWORD_FILE is not set, so there is no key to the repository." \
+		"set it in /root/.kyriakon-env, and keep an offline copy of that password: it is the only thing that can decrypt the snapshots."
+fi
 
 # restic caches repository metadata under $HOME, and cron hands these scripts
 # HOME=/var/log, so the cache would sit in the log directory instead. All three
@@ -71,14 +85,15 @@ fi
 export RESTIC_CACHE_DIR
 
 pw_file="$RESTIC_PASSWORD_FILE"
-[ -f "$pw_file" ] || { printf 'password file %s not found\n' "$pw_file" >&2; exit 1; }
+[ -f "$pw_file" ] || fail "the password file $pw_file is not there, so nothing can be decrypted or written." \
+	"check RESTIC_PASSWORD_FILE in /root/.kyriakon-env against the file on disk."
 
 # The password is the decryption key: enforce owner-only perms so it cannot leak
 # to another user on the box. 600 is the criterion; 400 (read-only) is accepted.
 perm=$(stat -f '%Lp' "$pw_file")
 if [ "$perm" != "600" ] && [ "$perm" != "400" ]; then
-	printf 'password file %s must be mode 0600 (owner-only), got %s\n' "$pw_file" "$perm" >&2
-	exit 1
+	fail "the password file $pw_file is mode $perm, so it is not owner-only." \
+		"run: chmod 600 $pw_file. The password is the only thing between a copy of the repository and every member's mail."
 fi
 
 # Canary path + content are single-sourced in lib.sh (cross-machine contract with
@@ -94,12 +109,28 @@ for f in /etc/ssl/capsule-*.crt /etc/ssl/private/capsule-*.key; do
 	[ -f "$f" ] || continue
 	set -- "$@" "$f"
 done
-restic backup "$@"
+
+# The two restic runs are the job's work, and their output is its report: it is
+# mailed under a subject naming the component and the event rather than printed for
+# cron to wrap in a subject of its own. restic's own words are the body either way,
+# so a failure needs no paraphrase.
+if ! snapshot=$(restic backup "$@" 2>&1); then
+	notify_operator backup "snapshot failed" "$snapshot" \
+		"nothing was backed up tonight. restic's own words are above: the repository and its password come from /root/.kyriakon-env, and whether last night's snapshot is there is what the monitor's stale-snapshot alert reads."
+	exit 1
+fi
 
 # Retention is the purge mechanism: a content-addressed repo cannot target-delete
 # a file, so the keep-* window bounds how long a deleted account's data survives
 # (proposal §5.5). Window from docs/planning/research/encrypted-backup-restore.md.
-restic forget --keep-daily 30 --keep-weekly 8 --keep-monthly 6 --prune
+if ! forget=$(restic forget --keep-daily 30 --keep-weekly 8 --keep-monthly 6 --prune 2>&1); then
+	notify_operator backup "retention failed" "$forget" \
+		"the snapshot above is taken and safe, so nothing is lost yet. Retention is what bounds how long a deleted account's data survives, so run this again before the next backup: tonight's window is still in place, and tomorrow's would leave it a night too long."
+	exit 1
+fi
+
+notify_operator backup "snapshot taken" "$(printf '%s\n%s' "$snapshot" "$forget")" \
+	"nothing: this is the nightly report. Its age is what the monitor's stale-snapshot alert reads, and the weekly restore test is what proves it can be restored."
 
 # crontab (root) — nightly after mail's quiet hours. Install it with
 # scripts/cron-apply.sh, which takes the values from /root/.kyriakon-env so

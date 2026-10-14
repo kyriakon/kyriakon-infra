@@ -252,6 +252,12 @@ impl Fix {
         );
     }
 
+    /// An enqueuer that refuses: the box's mail path is broken, which is when the
+    /// fallback a printed alert relies on is the only channel left.
+    fn enqueuer_fails(&self) {
+        self.script("enqueuer.sh", "#!/bin/sh\ncat >/dev/null\nexit 1\n");
+    }
+
     fn drain(&self) -> Output {
         std::process::Command::new(DRAIN)
             .arg("--config")
@@ -401,6 +407,12 @@ fn a_filed_application_produces_one_review_email() {
     // One message, to the reviewer.
     assert_eq!(sent.matches("Subject:").count(), 1, "{}", body(&out));
     assert!(sent.contains("To: reviewer@example.invalid"), "{sent}");
+    // The subject says what happened, in the shape every operator mail carries,
+    // so a crowded mailbox can be triaged from the list.
+    assert!(
+        sent.contains("Subject: kyriakon: onboard: application filed (secretary,"),
+        "{sent}"
+    );
     // Every answer, keyed by its question id.
     assert!(sent.contains("cannot_pay: I have no money"), "{sent}");
     assert!(sent.contains("intended_use: For parish mail"), "{sent}");
@@ -881,7 +893,7 @@ fn an_application_with_no_mail_key_is_refused() {
         !fix.dir.join("store/accounts/secretary/account.json").exists(),
         "an account with no mail key must not be made"
     );
-    assert!(body(&out).contains("no mail key"), "{}", body(&out));
+    assert!(fix.sent().contains("no mail key"), "{}", fix.sent());
     assert_eq!(fix.intents().len(), 1, "the intent is left in place");
     assert!(
         !fix.dir.join("keyring/secretary.asc").exists(),
@@ -973,9 +985,11 @@ fn a_retried_approval_completes() {
     );
 }
 
-/// A failing intent is reported once rather than every pass, and is not retried
+/// A failing intent is mailed once rather than every pass, and is not retried
 /// again inside its backoff window. A stuck intent therefore costs the operator
-/// one mail, not one a minute.
+/// one mail, not one a minute. The mail is the report, so the run prints nothing:
+/// cron mails a job's output under a subject of its own, and that copy would be
+/// the same news under a subject naming neither the component nor the event.
 #[test]
 fn a_failing_intent_reports_once_and_backs_off() {
     let fix = Fix::new("stuck");
@@ -985,23 +999,78 @@ fn a_failing_intent_reports_once_and_backs_off() {
 
     let first = fix.drain();
     assert!(first.status.success(), "{}", body(&first));
-    assert_eq!(
-        body(&first).matches("there is no application").count(),
-        1,
-        "the first failure is reported once: {}",
+    let sent = fix.sent();
+    assert!(
+        sent.contains("Subject: kyriakon: onboard: drain failed"),
+        "{sent}"
+    );
+    assert!(sent.contains("there is no application"), "{sent}");
+    // The subject names the intent and the body says what to do about it, so the
+    // mail is readable without the journal.
+    assert!(sent.contains("what to do:"), "{sent}");
+    assert!(sent.contains("run: kyriakon-onboard-drain"), "{sent}");
+    assert_eq!(sent.matches("Subject:").count(), 1, "{}", body(&first));
+    assert!(
+        body(&first).is_empty(),
+        "a mailed alert is not printed as well: {}",
         body(&first)
     );
     assert_eq!(fix.intents().len(), 1, "the intent is left in place: {:?}", fix.intents());
     assert!(fix.journal().contains("\"failed\""), "{}", fix.journal());
 
-    // Inside the backoff window the intent is not retried and nothing is printed.
+    // Inside the backoff window the intent is not retried and nothing is mailed.
     let second = fix.drain();
     assert!(second.status.success(), "{}", body(&second));
     assert!(body(&second).is_empty(), "a backed-off failure is silent: {}", body(&second));
+    assert_eq!(fix.sent().matches("Subject:").count(), 1, "one mail, not one a pass");
     assert_eq!(fix.journal().matches("\"failed\"").count(), 1, "{}", fix.journal());
 
     let third = fix.drain();
     assert!(body(&third).is_empty(), "still inside the minute: {}", body(&third));
+}
+
+/// A drain that cannot mail its alert prints it instead, subject and all. The
+/// fallback is what covers the day the mail path is the broken thing: cron still
+/// mails what a job prints, so the operator gets the subject even when the
+/// enqueuer is what failed.
+#[test]
+fn an_alert_the_box_cannot_mail_is_printed_instead() {
+    let fix = Fix::new("no-mail");
+    fix.enqueuer_fails();
+    fix.decide("approve", "secretary");
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let printed = String::from_utf8_lossy(&out.stderr);
+    assert!(printed.contains("kyriakon: onboard: drain failed"), "{printed}");
+    assert!(printed.contains("there is no application"), "{printed}");
+    assert!(printed.contains("could not be mailed"), "{printed}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).is_empty(),
+        "the alert is one message: {}",
+        body(&out)
+    );
+}
+
+/// A box whose approval key is missing is misconfigured rather than idle. It is
+/// mailed once under the same subject every drain failure carries, because a
+/// silence here reads exactly like a drain with nothing to do.
+#[test]
+fn a_missing_approval_key_is_mailed_as_the_drains_own_configuration() {
+    let fix = Fix::new("nokey");
+    fix.file_application(&fix.filed("secretary", "cash", &[("rail", "cash")]));
+    std::fs::remove_file(fix.path("key")).unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let sent = fix.sent();
+    assert!(
+        sent.contains("Subject: kyriakon: onboard: drain failed"),
+        "{sent}"
+    );
+    assert!(sent.contains("its own configuration"), "{sent}");
+    assert_eq!(sent.matches("Subject:").count(), 1, "{}", body(&out));
+    assert!(body(&out).is_empty(), "mailed, so not printed: {}", body(&out));
 }
 
 /// An approval whose username is already on the box without this application
@@ -1021,11 +1090,17 @@ fn an_approval_for_a_name_the_box_already_has_is_refused() {
         !fix.dir.join("store/accounts/secretary/account.json").exists(),
         "an account the application did not make must not be adopted"
     );
+    // The refusal is mailed, and it names the name: which account is which is the
+    // operator's decision, so the mail says which name is in use. Nothing is
+    // printed for a failure that was mailed.
+    let sent = fix.sent();
     assert!(
-        body(&out).contains("secretary") && body(&out).contains("in use"),
-        "the refusal names the name: {}",
-        body(&out)
+        sent.contains("Subject: kyriakon: onboard: drain failed")
+            && sent.contains("secretary")
+            && sent.contains("in use"),
+        "the refusal names what it found: {sent}"
     );
+    assert!(body(&out).is_empty(), "mailed, so not printed: {}", body(&out));
     // Nothing was run against the box's account: no add-user, no builder, no
     // release.
     assert!(fix.scripts_log().is_empty(), "{}", fix.scripts_log());

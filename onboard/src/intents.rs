@@ -21,11 +21,11 @@ use crate::transitions::{self, DecisionIntent};
 pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     // Read once, before anything is done: the review email's links are signed
     // with it. A missing or unreadable key is a misconfigured box, and it is
-    // reported once rather than on every pass.
+    // mailed once rather than on every pass.
     let key = match sign::read_key(std::path::Path::new(&cfg.approval_key)) {
         Ok(k) => k,
         Err(e) => {
-            report(cfg, store, "config", "config", &e).await;
+            transitions::report_failure(cfg, store, "config", "config", &e).await;
             return Ok(());
         }
     };
@@ -41,22 +41,10 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
             continue;
         }
         if let Err(e) = one(cfg, store, &key, &name).await {
-            report(cfg, store, id, "intent", &e).await;
+            transitions::report_failure(cfg, store, id, "intent", &e).await;
         }
     }
     transitions::purge_declined(cfg, store).await
-}
-
-/// Report a failure once. The journal records every failed pass, so a message
-/// the last failure already carried is not printed again, and cron does not mail
-/// the same paragraph on every minute.
-async fn report(cfg: &DrainConfig, store: &Store, id: &str, kind: &str, message: &str) {
-    let fresh = transitions::note_failure(store, &cfg.release, id, kind, message)
-        .await
-        .unwrap_or(true);
-    if fresh {
-        eprintln!("kyriakon-onboard-drain: {id}: {message}");
-    }
 }
 
 /// One intent, dispatched by kind.

@@ -280,6 +280,16 @@ STUB
 	check "a cold local resolver is retried, so the strongest list still answers" \
 		"$(dnsbl_verdict 203.0.113.9)" "clean zen.spamhaus.org"
 
+	# The operator mail's subject, which is the part an operator triages a mailbox
+	# by and the part nothing else here can see. With no address there is nothing
+	# to mail, so notify_operator prints instead of sending: the first line of
+	# that is the subject, and the print is also the fallback a broken mail path
+	# falls back to. Exported, so shellcheck sees the cross-file use in lib.sh.
+	export ALERT_EMAIL=''
+	check "an operator subject names the component and the event" \
+		"$(notify_operator mail "self test" "the subject check" 2>&1 | head -n 1)" \
+		"kyriakon: mail: self test"
+
 	if [ "$fails" -eq 0 ]; then
 		printf 'self-test: all checks passed\n'
 	else
@@ -326,27 +336,37 @@ root_fs_warn_pct="${ROOT_FS_WARN_PCT:-80}"
 # repeat it. And the check is what survives this box being the broken thing: mail
 # cannot report a broken mail path, and the check's silence covers that case.
 #
-# The cooldown is per signal, one file named from the title. It used to be one
-# file for all six checks, so the first to fire silenced the rest for the hour,
-# and the baseline note found that in the state directory: an address making
-# hundreds of ssh guesses trips every quarter hour, which held the channel shut
-# and is why the ssh threshold could not be lowered. The single file the old
-# code wrote, $state/alert.last, is left where it is and no longer read.
+# alert <component> <event> <body> [<what to do>]: the component and the event are
+# the two words the subject carries, from the vocabulary notify_operator in lib.sh
+# lists, so a list of subjects says what happened without any of them being
+# opened.
+#
+# Nothing is printed for an alert. The mail is the report, and cron mails what a
+# job prints, so a print would be the same finding a second time under a subject
+# of cron's own. The line that used to be printed here was that second copy;
+# notify_operator prints instead when it could not mail, so an alert raised while
+# the mail path is broken still reaches the operator, ugly and once.
+#
+# The cooldown is per signal, one file named from the component and the event. It
+# used to be one file for all six checks, so the first to fire silenced the rest
+# for the hour, and the baseline note found that in the state directory: an
+# address making hundreds of ssh guesses trips every quarter hour, which held the
+# channel shut and is why the ssh threshold could not be lowered. The single file
+# the old code wrote, $state/alert.last, is left where it is and no longer read,
+# and the file names changed when the subject did, so the first run after this
+# deploys may fire once on a signal that was inside its cooldown.
 alert() {
-	title="$1"; body="$2"
+	component="$1"; event="$2"; body="$3"; to_do="${4:-}"
 	now=$(date +%s)
-	last_file="$state/alert.last.$(printf '%s' "$title" | tr 'A-Z ' 'a-z-' | tr -cd 'a-z0-9-')"
+	last_file="$state/alert.last.$(printf '%s-%s' "$component" "$event" | tr 'A-Z ' 'a-z-' | tr -cd 'a-z0-9-')"
 	last=0
 	[ -f "$last_file" ] && last=$(cat "$last_file")
-	if [ "$(( now - last ))" -lt "$(( $(cooldown_for "$title") * 60 ))" ]; then
+	if [ "$(( now - last ))" -lt "$(( $(cooldown_for "$component $event") * 60 ))" ]; then
 		return 0
 	fi
 	printf '%s\n' "$now" > "$last_file"
 	when=$(date '+%F %T')
-	if [ -n "${ALERT_EMAIL:-}" ]; then
-		printf '%s\n\n%s on %s\n' "$body" "$title" "$(hostname)" \
-			| mail -s "kyriakon: $title" "$ALERT_EMAIL" >/dev/null 2>&1 || true
-	fi
+	notify_operator "$component" "$event" "$body" "$to_do"
 	# The body lands in the check's event log, which is what makes an alert
 	# raised while mail is broken still readable somewhere.
 	#
@@ -360,10 +380,9 @@ alert() {
 	# such a run dies before reaching any ping, leaving Healthchecks to alert on
 	# silence, which is what the switch is for.
 	if [ -n "${HEALTHCHECKS_URL:-}" ]; then
-		curl -fsS -m 10 --retry 3 --data "$when $title: $body" \
+		curl -fsS -m 10 --retry 3 --data "$when $component $event: $body" \
 			"$HEALTHCHECKS_URL" >/dev/null 2>&1 || true
 	fi
-	printf '%s %s: %s\n' "$when" "$title" "$body" >&2
 }
 
 # --- new_lines: emit log lines appended since last run -------------------
@@ -405,7 +424,7 @@ new_authlog=$(new_lines "$authlog" "$state/authlog.pos")
 outbound=$(printf '%s\n' "$new_maillog" \
 	| awk '/mta disconnected reason=quit/ { split($0, a, "messages="); s += a[2]+0 } END { print s+0 }')
 if [ "$outbound" -gt "$mail_spike_max" ]; then
-	alert "mail spike" "outbound: $outbound messages relayed since last run (max $mail_spike_max)"
+	alert mail "outbound spike" "outbound: $outbound messages relayed since last run (max $mail_spike_max)"
 fi
 
 # --- 2. auth failures ----------------------------------------------------
@@ -430,7 +449,7 @@ mail_auth=$(printf '%s\n' "$new_maillog" \
 		/auth failed, [0-9]+ attempts in/ { c++ }
 		END { print c+0 }')
 if [ "$mail_auth" -gt 0 ]; then
-	alert "mail auth failures" "$mail_auth failed SMTP/IMAP logins since last run. Each one is a client whose password is wrong, so check the address before assuming a stranger: a phone with a stale password looks exactly like this"
+	alert mail "auth failures" "$mail_auth failed SMTP/IMAP logins since last run. Each one is a client whose password is wrong, so check the address before assuming a stranger: a phone with a stale password looks exactly like this"
 fi
 
 # sshd, tallied by source address, reporting the worst one and the total.
@@ -480,7 +499,7 @@ ssh_ip=$(printf '%s\n' "$ssh_auth" | awk '{ print $1 }')
 ssh_high=$(printf '%s\n' "$ssh_auth" | awk '{ print $2+0 }')
 ssh_total=$(printf '%s\n' "$ssh_auth" | awk '{ print $3+0 }')
 if [ "$ssh_high" -gt "$auth_fail_max" ]; then
-	alert "ssh guesses" "$ssh_ip made $ssh_high failed ssh attempts since last run, out of $ssh_total from all addresses (max per address $auth_fail_max). Password auth is off everywhere, so none of this can succeed; it is worth a look only because one source is working through a list"
+	alert ssh "guesses" "$ssh_ip made $ssh_high failed ssh attempts since last run, out of $ssh_total from all addresses (max per address $auth_fail_max). Password auth is off everywhere, so none of this can succeed; it is worth a look only because one source is working through a list"
 fi
 
 # --- 3. quota approach ---------------------------------------------------
@@ -498,7 +517,7 @@ for dir in /home/*/; do
 			if (pct >= p) printf "%s at %d%% of soft limit (%d / %d blocks)", u, pct, $2, $3
 			exit
 		}')
-	[ -n "$msg" ] && alert "quota" "$msg"
+	[ -n "$msg" ] && alert mail "quota" "$msg"
 done
 
 # --- 4. spamd greylist / blocklist changes -------------------------------
@@ -515,7 +534,7 @@ spamdb_out=$(spamdb 2>/dev/null || true)
 grey=$(printf '%s\n' "$spamdb_out" | grep -c '^GREY|' || true)
 trapped=$(printf '%s\n' "$spamdb_out" | grep -c '^TRAPPED|' || true)
 if [ "$grey" -gt "$grey_max" ]; then
-	alert "spamd greylist" "$grey greylisted hosts (max $grey_max), possible mail flood"
+	alert spamd "greylist" "$grey greylisted hosts (max $grey_max), possible mail flood"
 fi
 # Thresholds 3 new and 20 total. Trap entries carry an expiry, so the count rises
 # and falls by one all day as hosts come and go, which is churn and not news: this
@@ -531,7 +550,7 @@ if [ -f "$state/spamd-trapped-list" ]; then
 	new_count=$(printf '%s\n' "$new_trapped" | grep -c . || true)
 	if [ "$new_count" -ge "$trapped_rise_min" ] || [ "$trapped" -ge "$trapped_max" ]; then
 		named=$(printf '%s\n' "$new_trapped" | head -5 | tr '\n' ' ')
-		alert "spamd blocklist" "$new_count new blacklisted host(s), total $trapped (burst at $trapped_rise_min, total at $trapped_max): $named"
+		alert spamd "blocklist" "$new_count new blacklisted host(s), total $trapped (burst at $trapped_rise_min, total at $trapped_max): $named"
 	fi
 fi
 rm -f "$work_trapped"
@@ -578,7 +597,7 @@ flagged=$(awk -v day="$today" -v min="$defer_min" '
 # prunes itself and a sender stuck for days is not news on every run.
 reported=$(cat "$state/deferred-senders" 2>/dev/null || true)
 if [ -n "$flagged" ] && [ "$flagged" != "$reported" ]; then
-	alert "greylisted senders" "deferred from several addresses today: $(printf '%s' "$flagged" | tr '\n' ';'). If one is a real correspondent, add its mail ranges to /etc/mail/nospamd (docs/planning/research/spamd-greylisting.md)"
+	alert spamd "deferred senders" "deferred from several addresses today: $(printf '%s' "$flagged" | tr '\n' ';'). If one is a real correspondent, add its mail ranges to /etc/mail/nospamd (docs/planning/research/spamd-greylisting.md)"
 fi
 printf '%s\n' "$flagged" > "$state/deferred-senders"
 
@@ -588,7 +607,7 @@ if [ -n "$ip" ]; then
 	verdict=$(dnsbl_verdict "$ip")
 	case "$verdict" in
 	listed*)
-		alert "blocklisted" "$ip is listed: ${verdict#listed }. That code names the list, which the verdict names too; look it up and request removal. Deliverability is at risk until it clears"
+		alert mail "blocklisted" "$ip is listed: ${verdict#listed }. That code names the list, which the verdict names too; look it up and request removal. Deliverability is at risk until it clears"
 		rm -f "$state/dnsbl.unchecked"
 		rm -f "$state/dnsbl.downgraded"
 		;;
@@ -644,13 +663,13 @@ if [ -n "$ip" ]; then
 					# its control answer, which is what the second query gets; the
 					# check asks 127.0.0.1 first, so a refusal means the box's own
 					# resolver did not answer and the fallback was refused.
-					alert "blocklist downgraded" "$ip is clean on $zone only: $strongest refused the query rather than giving a verdict, which is Spamhaus's answer to a resolver it will not serve. Nothing is listed on $strongest as far as this check can tell, and the runbook's blocklist section reads this one"
+					alert mail "blocklist downgraded" "$ip is clean on $zone only: $strongest refused the query rather than giving a verdict, which is Spamhaus's answer to a resolver it will not serve. Nothing is listed on $strongest as far as this check can tell, and the runbook's blocklist section reads this one"
 					;;
 				servfail)
 					# QNAME minimisation is already off in the tracked config, so a
 					# servfail is usually a lookup that timed out rather than a
 					# setting to change. The runbook's section says how to tell.
-					alert "blocklist downgraded" "$ip is clean on $zone only: $strongest gave servfail rather than a verdict. Nothing is listed on $strongest as far as this check can tell. The tracked config sets the QNAME minimisation line to no, so if that has been deployed the likely cause is a lookup that timed out, and the runbook's blocklist section says how to tell"
+					alert mail "blocklist downgraded" "$ip is clean on $zone only: $strongest gave servfail rather than a verdict. Nothing is listed on $strongest as far as this check can tell. The tracked config sets the QNAME minimisation line to no, so if that has been deployed the likely cause is a lookup that timed out, and the runbook's blocklist section says how to tell"
 					;;
 				*)
 					# Something said nothing at all, which has two causes and only one
@@ -661,7 +680,7 @@ if [ -n "$ip" ]; then
 					# only the second and blamed a reboot, which sent the operator to
 					# a healthy resolver on 2026-10-05 and told them the next run
 					# would be clean when it was not.
-					alert "blocklist downgraded" "$ip is clean on $zone only; $strongest did not answer for three runs in a row. The strongest list is the one that matters for deliverability, so a listing there would go unnoticed. The look-up timed out rather than being answered: the zone's answers live ten seconds, so this check is a cold walk nearly every time, and Spamhaus's servers are occasionally slower than the query's patience. A query that goes to the system resolver is refused rather than left silent, so silence here is a timeout and not the wrong resolver. Run check-hygiene.sh by hand if it repeats, and the runbook's blocklist section says what to look at"
+					alert mail "blocklist downgraded" "$ip is clean on $zone only; $strongest did not answer for three runs in a row. The strongest list is the one that matters for deliverability, so a listing there would go unnoticed. The look-up timed out rather than being answered: the zone's answers live ten seconds, so this check is a cold walk nearly every time, and Spamhaus's servers are occasionally slower than the query's patience. A query that goes to the system resolver is refused rather than left silent, so silence here is a timeout and not the wrong resolver. Run check-hygiene.sh by hand if it repeats, and the runbook's blocklist section says what to look at"
 					;;
 				esac
 			fi
@@ -676,7 +695,7 @@ if [ -n "$ip" ]; then
 		# existed, mailing an alert every cooldown. Report the transition, stay
 		# quiet while it persists, and speak again if it clears and returns.
 		if [ "$(cat "$state/dnsbl.unchecked" 2>/dev/null || true)" != "$verdict" ]; then
-			alert "blocklist check" "$verdict for $ip, so a listing would go unnoticed. refused above means the zone answered and will not serve this resolver; silent means it said nothing at all, which is DNS on this box"
+			alert mail "blocklist unchecked" "$verdict for $ip, so a listing would go unnoticed. refused above means the zone answered and will not serve this resolver; silent means it said nothing at all, which is DNS on this box"
 			printf '%s\n' "$verdict" > "$state/dnsbl.unchecked"
 		fi
 		;;
@@ -714,7 +733,7 @@ if [ -d "$intents_dir" ]; then
 		pending=$(find "$intents_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
 		age_min=$(( ( $(date +%s) - oldest ) / 60 ))
 		if [ "$age_min" -gt "$drain_intent_max_min" ]; then
-			alert "drain backlog" "$pending unapplied intent(s) in the onboarding store, oldest $age_min minutes (max $drain_intent_max_min). The drain is the service's privileged half; an intent this old is a member whose payment or approval was accepted and who still has no account"
+			alert onboard "drain backlog" "$pending unapplied intent(s) in the onboarding store, oldest $age_min minutes (max $drain_intent_max_min). The drain is the service's privileged half; an intent this old is a member whose payment or approval was accepted and who still has no account"
 		fi
 	fi
 fi
@@ -754,14 +773,14 @@ if [ -n "${RESTIC_REPOSITORY:-}" ] && [ -n "${RESTIC_PASSWORD_FILE:-}" ]; then
 		# old snapshot and must not be reported every hour as if it were. Report
 		# the transition, then stay quiet while it persists.
 		if [ "$(cat "$state/snapshot.unchecked" 2>/dev/null || true)" != "unreadable" ]; then
-			alert "snapshot check" "no snapshot time could be read from the backup repository, so last night's backup is unverified rather than missing. restic could not list the repository: check the credentials in /root/.kyriakon-env, the storage box, and the key file"
+			alert backup "snapshot check" "no snapshot time could be read from the backup repository, so last night's backup is unverified rather than missing. restic could not list the repository: check the credentials in /root/.kyriakon-env, the storage box, and the key file"
 			printf '%s\n' "unreadable" > "$state/snapshot.unchecked"
 		fi
 	else
 		rm -f "$state/snapshot.unchecked"
 		snap_age_h=$(( ( $(date +%s) - snap_epoch ) / 3600 ))
 		if [ "$snap_age_h" -gt "$snapshot_max_age_hours" ]; then
-			alert "snapshot stale" "the latest restic snapshot is $snap_age_h hours old (max $snapshot_max_age_hours). The weekly restore test would not run for another six days, so nothing else is going to tell you the nightly backup stopped"
+			alert backup "snapshot stale" "the latest restic snapshot is $snap_age_h hours old (max $snapshot_max_age_hours). The weekly restore test would not run for another six days, so nothing else is going to tell you the nightly backup stopped"
 		fi
 	fi
 fi
@@ -778,11 +797,11 @@ fi
 # percentage, because a filesystem with no blocks left is already failing.
 root_pct=$(df -P -k / 2>/dev/null | awk 'NR == 2 { print $5+0 }' || true)
 if [ -n "$root_pct" ] && [ "$root_pct" -ge "$root_fs_warn_pct" ]; then
-	alert "root filesystem" "/ is at ${root_pct}% (warn at ${root_fs_warn_pct}%). The biggest mover is /usr/local, so a package install or its logs is the place to look before a service fails to write"
+	alert host "root filesystem" "/ is at ${root_pct}% (warn at ${root_fs_warn_pct}%). The biggest mover is /usr/local, so a package install or its logs is the place to look before a service fails to write"
 fi
 full_fs=$(df -P -k 2>/dev/null | awk 'NR > 1 && $2 > 0 && $4 == 0 { print $6 }' || true)
 if [ -n "$full_fs" ]; then
-	alert "filesystem full" "no free space on: $(printf '%s' "$full_fs" | tr '\n' ' '). A writable filesystem with nothing left will fail its next write, and this is separate from the percentage above because it is already broken rather than approaching it"
+	alert host "filesystem full" "no free space on: $(printf '%s' "$full_fs" | tr '\n' ' '). A writable filesystem with nothing left will fail its next write, and this is separate from the percentage above because it is already broken rather than approaching it"
 fi
 
 # --- 10. certificate queue: the oldest pending request -------------------
@@ -812,7 +831,7 @@ if [ -d "$acme_queue_pending" ]; then
 		acme_pending=$(find "$acme_queue_pending" -type f 2>/dev/null | wc -l | tr -d ' ')
 		age_min=$(( ( $(date +%s) - oldest ) / 60 ))
 		if [ "$age_min" -gt "$acme_pending_max_min" ]; then
-			alert "certificate queue" "$acme_pending certificate request(s) pending, oldest $age_min minutes (max $acme_pending_max_min). The queue drains one name every 202 minutes against the registered domain refill, so an age past this means it is not draining or the backlog is this deep, and either way a member is waiting on a certificate the page says is coming"
+			alert acme "certificate queue" "$acme_pending certificate request(s) pending, oldest $age_min minutes (max $acme_pending_max_min). The queue drains one name every 202 minutes against the registered domain refill, so an age past this means it is not draining or the backlog is this deep, and either way a member is waiting on a certificate the page says is coming"
 		fi
 	fi
 fi
