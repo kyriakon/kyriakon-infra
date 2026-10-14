@@ -20,6 +20,15 @@
   h3:first-child, h4:first-child { margin-top:0; }
   .lede { color:var(--dim); margin:0 0 20px; }
   .card { border:1px solid var(--line); background:#fff; border-radius:6px; padding:16px 18px; margin:14px 0; }
+  /* A catalogue entry: a card on the application page's list of what the
+     platform offers, from the one file every front-end reads. The state word
+     rides beside the name as a tag. */
+  .service { border-top:1px solid var(--line); padding:12px 0; }
+  .service:first-of-type { border-top:0; padding-top:2px; }
+  .service:last-of-type { padding-bottom:0; }
+  .service h4 { margin:0; }
+  .service p { margin:4px 0 0; }
+  ul.services { list-style:none; padding:0; margin:0; }
   label { display:block; font-weight:600; font-size:14.5px; margin:16px 0 4px; }
   label .opt { font-weight:400; color:var(--dim); }
   input[type=text], textarea, select { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:4px; font:inherit; background:#fff; }

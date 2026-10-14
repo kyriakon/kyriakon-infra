@@ -5,6 +5,24 @@
 <h2>Apply</h2>
 <p class="lede">A person reads every application. Nothing here is charged until it is approved.</p>
 
+{#
+  What the platform offers, from the shared catalogue: one card per entry, and
+  the same file the account page's list and the capsule's page render, so a
+  service cannot exist here and nowhere else. The state and the action are the
+  crate's own words for the file's values. A host carrying <name> is shown as
+  the pattern itself, because an applicant is not a member yet.
+#}
+<div class="card">
+  <h3>What the platform offers</h3>
+  {% for s in services %}
+  <div class="service">
+    <h4>{{ s.name }} <span class="tag">{{ s.state }}</span></h4>
+    <p>{{ s.summary }}</p>
+    <p><a href="{{ s.href }}">{{ s.action }}</a></p>
+  </div>
+  {% endfor %}
+</div>
+
 {% if errors.len() > 0 %}
 <div class="warn"><ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div>
 {% endif %}

@@ -11,19 +11,21 @@
 # compiled-in default, so the path is auditable at the rcctl prompt and a second
 # instance cannot silently pick up a different file.
 
-# The store root. The handler reads the two shared files below it and the
+# The store root. The handler reads the three shared files below it and the
 # application records it renders, and writes intents/ and applications/. drafts/
 # and webhooks/ have no writer yet: they are the capsule's draft store and the
 # payment webhooks, and both are later tickets. It reads no secret and no other
 # member's state.
 store_root = "/var/db/onboard"
 
-# The question list and the reserved set the three front-ends share, both 0644 at
-# the top of the store (scripts/onboard-store.sh installs them there). Named here
-# rather than derived from the store root, so the handler fails loudly if a later
-# layout moves them instead of reading an empty list and rendering nothing.
+# The question list, the reserved set and the service catalogue the three
+# front-ends share, all 0644 at the top of the store (scripts/onboard-store.sh
+# installs them there). Named here rather than derived from the store root, so
+# the handler fails loudly if a later layout moves them instead of reading an
+# empty list and rendering nothing.
 questions = "/var/db/onboard/questions.toml"
 reserved = "/var/db/onboard/reserved-usernames.txt"
+catalogue = "/var/db/onboard/catalogue.toml"
 
 # The deployed commit and date, substituted at install, e.g.
 # "2026-10-10 1a2b3c4". The acceptance records carry it as the version of each

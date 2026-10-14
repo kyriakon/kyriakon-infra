@@ -252,7 +252,7 @@ Nothing else here is worth a test. The chrome is copy, and copy is checked by re
 
 ## Not verified
 
-Nothing in this document has been run. `openbsd/etc/onboard/catalogue.toml` does not exist, `onboard/src/catalogue.rs` does not exist, the three renderings named here are not written, and the terminal front-end has no Rust home yet: [Amend the SSH onboarding TUI spec for the portal redesign](https://github.com/kyriakon/kyriakon-infra/issues/361) fixes that, and it should provide the crate as a library so the catalogue has one home and no copy. The catalogue's values are a snapshot of 2026-10-13 and the file is the source once it exists, which is the point of writing them down in one place.
+The web card, the account page's list and the capsule's gemtext page are built, and the check in `onboard/src/catalogue.rs` covers all three: `cargo test` runs it against `openbsd/etc/onboard/catalogue.toml` and against a fixture that differs from it. Nothing here has been run on the box. No deploy has installed the catalogue, `scripts/check-hygiene.sh` has not compared a live `/var/db/onboard/catalogue.toml` against the tracked one, and no gemini client has fetched the capsule's page, because the service does not answer over FastCGI yet ([#394](https://github.com/kyriakon/kyriakon-infra/issues/394)). The terminal front-end has no Rust home yet: [Amend the SSH onboarding TUI spec for the portal redesign](https://github.com/kyriakon/kyriakon-infra/issues/361) fixes that, and it should provide the crate as a library so the catalogue has one home and no copy. The catalogue's values are a snapshot of 2026-10-13, and the file is the source from now on, which is the point of writing them down in one place.
 
 ## Sources
 

@@ -1,5 +1,5 @@
 //! The handler's own configuration, read once at startup from the TOML the unit
-//! names. It holds no secret: the store root, the two shared files, the loopback
+//! names. It holds no secret: the store root, the three shared files, the loopback
 //! address and the release the acceptances record.
 
 use std::path::Path;
@@ -9,7 +9,7 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// The store root. The handler reads the two shared files below it and the
+    /// The store root. The handler reads the three shared files below it and the
     /// application records it renders, and writes `intents/` and
     /// `applications/`. `drafts/` and `webhooks/` are the capsule's draft store
     /// and the payment webhooks, neither of which has a writer yet; both are
@@ -19,6 +19,10 @@ pub struct Config {
     pub questions: String,
     /// The shared reserved-names file, 0644 at the top of the store.
     pub reserved: String,
+    /// The shared service catalogue, 0644 at the top of the store. Named here
+    /// for the same reason as the two above: a later layout moves the file
+    /// rather than the handler reading an empty one and rendering no services.
+    pub catalogue: String,
     /// Loopback only, with relayd in front: the handler must never listen on a
     /// public interface.
     pub listen: String,
@@ -115,6 +119,7 @@ mod tests {
             "store_root = \"/var/db/onboard\"\n\
              questions = \"/var/db/onboard/questions.toml\"\n\
              reserved = \"/var/db/onboard/reserved-usernames.txt\"\n\
+             catalogue = \"/var/db/onboard/catalogue.toml\"\n\
              listen = \"127.0.0.1\"\n\
              port = 7080\n\
              release = \"REPLACE_ME\"\n",
@@ -126,7 +131,7 @@ mod tests {
 
     #[test]
     fn a_typo_is_refused_rather_than_ignored() {
-        let r: Result<Config, _> = toml::from_str("store_rooot = \"/x\"\nlisten=\"127.0.0.1\"\nport=1\nrelease=\"r\"\nquestions=\"q\"\nreserved=\"r\"\n");
+        let r: Result<Config, _> = toml::from_str("store_rooot = \"/x\"\nlisten=\"127.0.0.1\"\nport=1\nrelease=\"r\"\nquestions=\"q\"\nreserved=\"r\"\ncatalogue=\"c\"\n");
         assert!(r.is_err());
     }
 

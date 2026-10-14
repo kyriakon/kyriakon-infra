@@ -9,6 +9,8 @@
 //! reader of the store, a second signer or a second notice path cannot drift
 //! from the first.
 
+pub mod capsule;
+pub mod catalogue;
 pub mod config;
 pub mod intents;
 pub mod keycheck;

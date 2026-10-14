@@ -1,4 +1,4 @@
-//! The store: the two shared files read at the top, the records written under
+//! The store: the three shared files read at the top, the records written under
 //! the root, and the on-disk shapes the drain reads.
 //!
 //! Every record is written by rename, so a reader never sees half of one. The

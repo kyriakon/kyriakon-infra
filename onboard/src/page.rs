@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 use askama::Template;
 
+use crate::catalogue::{self, Protocol, Row, Service};
 use crate::questions::{self, Kind, Question, Rule};
 
 #[derive(Template)]
@@ -28,6 +29,18 @@ pub struct ApplicantPage {
     pub about: Vec<Rq>,
     pub acceptance: Vec<Rq>,
     pub doc_version: String,
+    /// What the platform offers, one row per catalogue entry. The applicant is
+    /// nobody yet, so no host is rendered from a member.
+    pub services: Vec<Row>,
+}
+
+/// The member's own page. Its list of what the platform offers is the same
+/// catalogue the application page's cards come from; the rest of the page, and
+/// the session that identifies a member, are the account page's own ticket.
+#[derive(Template)]
+#[template(path = "account.html")]
+pub struct AccountPage {
+    pub services: Vec<Row>,
 }
 
 #[derive(Template)]
@@ -99,10 +112,29 @@ fn section(id: &str) -> Section {
     }
 }
 
+/// The catalogue as the web page shows it, one row per entry. Both the
+/// application page's cards and the account page's list format these, and the
+/// rows are what the check compares: a list held in the template would not be
+/// these rows.
+pub fn services(list: &[Service], member: Option<&str>) -> Vec<Row> {
+    list.iter()
+        .map(|s| catalogue::row(s, Protocol::Web, member))
+        .collect()
+}
+
+/// The member's page. `member` is the session's member where there is one, which
+/// a host carrying `<name>` is rendered from.
+pub fn account(list: &[Service], member: Option<&str>) -> AccountPage {
+    AccountPage {
+        services: services(list, member),
+    }
+}
+
 /// Build the page for one branch. `answers` is the last submission when one was
 /// refused, so the applicant does not lose what they typed.
 pub fn applicant(
     list: &[Question],
+    catalogue: &[Service],
     body: bool,
     answers: &BTreeMap<String, String>,
     doc_version: &str,
@@ -117,6 +149,9 @@ pub fn applicant(
         about: Vec::new(),
         acceptance: Vec::new(),
         doc_version: doc_version.to_string(),
+        // An applicant is not a member, so a host carrying `<name>` is the
+        // pattern itself here.
+        services: services(catalogue, None),
     };
     for q in questions::shown(list, !body) {
         let rq = render(q, answers);
@@ -206,6 +241,22 @@ mod tests {
     use super::*;
     use crate::questions::{Branch, Choice};
 
+    /// A catalogue for the page tests. The services themselves are the
+    /// catalogue module's own subject; what these tests carry is that the page
+    /// renders the file it was given.
+    fn catalogue() -> Vec<Service> {
+        crate::catalogue::parse(
+            "[[service]]\n\
+             id = \"mail\"\n\
+             name = \"Mail\"\n\
+             summary = \"zero-access mail\"\n\
+             state = \"live\"\n\
+             host = \"mail.example.invalid\"\n\
+             action = \"read\"\n",
+        )
+        .expect("a catalogue the file could hold")
+    }
+
     fn q(id: &str, branch: Branch, kind: Kind, required: bool, rule: Rule) -> Question {
         Question {
             id: id.into(),
@@ -258,7 +309,7 @@ mod tests {
 
     #[test]
     fn a_person_has_four_sections_and_no_community_block() {
-        let p = applicant(&list(), false, &BTreeMap::new(), "r");
+        let p = applicant(&list(), &catalogue(), false, &BTreeMap::new(), "r");
         assert!(p.community.is_empty());
         let ids = |v: &[Rq]| v.iter().map(|q| q.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&p.you), ["username", "whose", "address_outside"]);
@@ -270,7 +321,7 @@ mod tests {
 
     #[test]
     fn a_body_has_the_community_block_and_its_own_keys() {
-        let p = applicant(&list(), true, &BTreeMap::new(), "r");
+        let p = applicant(&list(), &catalogue(), true, &BTreeMap::new(), "r");
         let ids = |v: &[Rq]| v.iter().map(|q| q.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&p.community), ["body_name"]);
         assert_eq!(ids(&p.you), ["username", "whose", "vat", "address_outside"]);
@@ -281,7 +332,7 @@ mod tests {
     fn a_selected_answer_is_still_selected_after_a_refusal() {
         let mut answers = BTreeMap::new();
         answers.insert("whose".to_string(), "body".to_string());
-        let p = applicant(&list(), true, &answers, "r");
+        let p = applicant(&list(), &catalogue(), true, &answers, "r");
         let whose = p.you.iter().find(|q| q.id == "whose").unwrap();
         assert!(whose.options.iter().any(|o| o.value == "body" && o.selected));
         assert!(whose.options.iter().any(|o| o.value == "person" && !o.selected));
@@ -300,7 +351,7 @@ mod tests {
             false,
             choices(&[("priest", "Priest"), ("nun", "Nun")]),
         ));
-        let untouched_page = applicant(&list, false, &BTreeMap::new(), "r");
+        let untouched_page = applicant(&list, &catalogue(), false, &BTreeMap::new(), "r");
         let untouched = &untouched_page
             .about
             .iter()
@@ -315,7 +366,7 @@ mod tests {
         // who changes their mind can go back to declaring nothing.
         let mut answers = BTreeMap::new();
         answers.insert("orders".to_string(), "nun".to_string());
-        let answered_page = applicant(&list, false, &answers, "r");
+        let answered_page = applicant(&list, &catalogue(), false, &answers, "r");
         let answered = &answered_page
             .about
             .iter()
@@ -327,8 +378,49 @@ mod tests {
 
         // A required choice has no blank answer: there would be nothing to
         // leave it on.
-        let p = applicant(&list, false, &BTreeMap::new(), "r");
+        let p = applicant(&list, &catalogue(), false, &BTreeMap::new(), "r");
         let rail = p.pay.iter().find(|q| q.id == "rail").unwrap();
         assert!(rail.options.iter().all(|o| !o.value.is_empty()));
+    }
+
+    /// The two web renderings format the catalogue they were handed: the cards
+    /// come from the rows, so the template cannot carry a list of its own, and
+    /// the account page's list is the same file.
+    #[test]
+    fn the_catalogue_is_a_card_per_entry_and_a_list_on_the_account_page() {
+        let p = applicant(&list(), &catalogue(), false, &BTreeMap::new(), "r");
+        assert_eq!(p.services.len(), 1);
+
+        let html = p.render().unwrap();
+        assert!(html.contains("<div class=\"service\">"), "{html}");
+        assert!(html.contains("Mail"), "{html}");
+        assert!(html.contains("zero-access mail"), "{html}");
+        assert!(html.contains("https://mail.example.invalid/"), "{html}");
+        assert!(html.contains("<span class=\"tag\">live</span>"), "{html}");
+
+        let listed = account(&catalogue(), None).render().unwrap();
+        assert!(listed.contains("zero-access mail"), "{listed}");
+        assert!(listed.contains("https://mail.example.invalid/"), "{listed}");
+
+        // No member to render a host from, so the pattern itself is what shows,
+        // HTML-escaped in the markup as `<name>.example.invalid`.
+        let pattern = crate::catalogue::parse(
+            "[[service]]\n\
+             id = \"web\"\n\
+             name = \"A website\"\n\
+             summary = \"static pages\"\n\
+             state = \"live\"\n\
+             host = \"<name>.example.invalid\"\n\
+             action = \"read\"\n",
+        )
+        .unwrap();
+        assert!(account(&pattern, None)
+            .render()
+            .unwrap()
+            .contains("&#60;name&#62;.example.invalid"));
+        assert!(account(&pattern, Some("theophilus"))
+            .render()
+            .unwrap()
+            .contains("https://theophilus.example.invalid/"));
     }
 }
