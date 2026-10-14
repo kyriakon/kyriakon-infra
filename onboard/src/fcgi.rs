@@ -339,12 +339,12 @@ impl Reply {
 pub fn reply_bytes(reply: &Reply, id: u16) -> Vec<u8> {
     let content = reply.head();
     let mut out = Vec::with_capacity(content.len() + 2 * HEADER + 8);
-    if content.is_empty() {
-        push_record(&mut out, STDOUT, id, &[]);
-    } else {
-        for chunk in content.chunks(MAX_CONTENT) {
-            push_record(&mut out, STDOUT, id, chunk);
-        }
+    // Every reply carries a header block, so the first record is never empty,
+    // which matters: httpd aborts a request whose first stdout record is empty
+    // ("empty stdout", server_fcgi.c), and gmid waits for a header it would then
+    // never see.
+    for chunk in content.chunks(MAX_CONTENT) {
+        push_record(&mut out, STDOUT, id, chunk);
     }
     // appStatus and protocolStatus, both zero: the application finished and the
     // protocol had no trouble. A protocol status is not an HTTP or gemini status
