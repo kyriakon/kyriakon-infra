@@ -113,12 +113,23 @@ async fn write_public_key(store: &Store, username: &str, material: &str) -> Resu
         .await
 }
 
+/// The localpart a mail key is published and served under: the mailbox when the
+/// application named one, and the account's own name otherwise. The keyring file,
+/// the published file and the branch the change is opened on all take it.
+fn mail_key_localpart<'a>(username: &'a str, key: &'a KeyRecord) -> &'a str {
+    if key.mailbox.is_empty() {
+        username
+    } else {
+        key.mailbox.as_str()
+    }
+}
+
 /// Publish the member's mail keys into the box keyring the encrypting LMTP reads,
 /// one `<localpart>.asc` each, before any path can deliver to the account. The
-/// file is created fresh, so the drift check's age for it is the moment this
-/// service wrote it. Delivery fails closed without the key, so an application
-/// that carries none is refused rather than made into an account whose mail
-/// bounces.
+/// file is created once and then left alone, so the drift check's age for it is
+/// the moment this service first wrote it. Delivery fails closed without the key,
+/// so an application that carries none is refused rather than made into an
+/// account whose mail bounces.
 async fn publish_mail_keys(
     cfg: &DrainConfig,
     username: &str,
@@ -133,11 +144,7 @@ async fn publish_mail_keys(
     let dir = std::path::Path::new(&cfg.keyring_dir);
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     for key in keys {
-        let localpart = if key.mailbox.is_empty() {
-            username
-        } else {
-            key.mailbox.as_str()
-        };
+        let localpart = mail_key_localpart(username, key);
         if let Some(why) = validate::username_shape(localpart) {
             return Err(format!("the mail key's mailbox {localpart:?}: {why}"));
         }
@@ -148,11 +155,49 @@ async fn publish_mail_keys(
         let path = dir.join(format!("{localpart}.asc"));
         let mut bytes = body.as_bytes().to_vec();
         bytes.push(b'\n');
-        std::fs::write(&path, &bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        // Written only when the bytes differ. The drift check's seven days for an
+        // unpublished key are the age of this file, and the publish runs after
+        // this in the same transition, so a retry whose publish failed must leave
+        // the file, and its mtime, exactly as they are. Rewriting an identical
+        // file would restart that window on every retry and it would never close.
+        let same = std::fs::read(&path).map(|have| have == bytes).unwrap_or(false);
+        if !same {
+            std::fs::write(&path, &bytes)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        }
         // deploy-mail installs the tracked keys 0644, and the drift check and the
         // encrypting daemon both read them as they find them.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .map_err(|e| format!("cannot set the mode on {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Offer the member's mail keys to the published set, one `keys/<localpart>.asc`
+/// each, by opening a change against the public repository through
+/// scripts/publish-mail-key.sh, which holds the mechanism and the token.
+///
+/// This runs after the keyring write and after the member is built, and before
+/// the account record and the notice. Nothing about the publish may stand between
+/// the member and their mail: the box keyring is what delivers, so a failed
+/// publish costs the member nothing, while its failure is loud and its retry
+/// leaves the keyring file, and the drift check's seven days, untouched. The
+/// window in check-keyring-drift.sh is the backstop for one that never succeeds.
+async fn publish_mail_keys_publicly(
+    cfg: &DrainConfig,
+    username: &str,
+    keys: &[KeyRecord],
+) -> Result<(), String> {
+    let dir = cfg.keyring_dir.trim_end_matches('/');
+    for key in keys {
+        let localpart = mail_key_localpart(username, key);
+        let path = format!("{dir}/{localpart}.asc");
+        run_script(
+            cfg,
+            "publish-mail-key.sh",
+            &[localpart, path.as_str(), cfg.keyring_publish_token.as_str()],
+        )
+        .await?;
     }
     Ok(())
 }
@@ -624,6 +669,13 @@ async fn approve(
         if record.upload_key.is_some() {
             run_script(cfg, "cron-apply.sh", &["--web"]).await?;
         }
+        // Last, with the member already built and mail already delivering: the
+        // published set is what the drift check compares the keyring against, and
+        // the forge is never on a path the key or the member waits on. A failure
+        // here is loud and leaves the intent in place, and the retry above leaves
+        // the keyring file alone, so the seven days the check allows an
+        // unpublished key are not restarted by it.
+        publish_mail_keys_publicly(cfg, username, &record.mail_keys).await?;
     }
 
     let now = util::filed_at();

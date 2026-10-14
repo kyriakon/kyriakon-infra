@@ -14,7 +14,13 @@
 #                  and a mistake after that. The age is the key file's modification
 #                  time in the keyring, which is when the signup service wrote it,
 #                  so the service must create the file rather than carry some older
-#                  timestamp onto it.
+#                  timestamp onto it. The service's publish is
+#                  scripts/publish-mail-key.sh, run from the approval, which opens
+#                  publish-key/<localpart> against the repository: that branch is
+#                  the change the operator merges. Because the age is that mtime,
+#                  a retried approval must leave an identical key file alone
+#                  rather than rewriting it, or the seven days would restart on
+#                  every pass and never elapse.
 #
 #   --publication  runs off the box, wherever the recorded copy in the second
 #                  repository (KEYRING_STORE) is readable. Compares the merged
@@ -212,7 +218,7 @@ check_box() {
 			mtime=$(stat -f %m "$k")
 			age=$(( (now - mtime) / 86400 ))
 			if [ "$age" -gt "$unpublished_days" ]; then
-				finding "$lp: on the box as $fpr, unpublished for $age days (limit $unpublished_days). An unmerged pull request or a mistake; delivery works either way, so nothing is broken yet."
+				finding "$lp: on the box as $fpr, unpublished for $age days (limit $unpublished_days). The approval opens publish-key/$lp against the repository and a human merges it: merge it, or find why it never opened. Delivery works either way, so nothing is broken yet."
 			fi
 			continue
 		fi
@@ -364,7 +370,7 @@ self_test() {
 	assert_has 'bob: the published fingerprint' "$bob" "$out"
 	assert_has 'carol: published, not served' 'carol' "$out"
 	assert_has 'dave: unpublished past the limit' 'dave' "$out"
-	assert_hasnt 'eve: unpublished and fresh, silent' 'eve' "$out"
+	assert_hasnt 'eve: unpublished and fresh, silent' 'eve:' "$out"
 	assert_hasnt 'alice: matching, silent' 'alice' "$out"
 
 	printf '%s\n' '--- a recorded copy that matches is silent, additions included'

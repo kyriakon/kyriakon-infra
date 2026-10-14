@@ -87,10 +87,11 @@ pub struct DrainConfig {
     /// the drain writes an approved member's mail key here before anything can
     /// deliver to the account. A configuration value so a test can drive it.
     pub keyring_dir: String,
-    /// Stripe's signing secret and the keyring publish token. This build reads
-    /// neither, because the card rail and the keyring pull request are later
-    /// tickets, but the config names them now so their paths are fixed in one
-    /// place rather than invented per ticket.
+    /// Stripe's signing secret and the keyring publish token. The drain reads
+    /// the token and hands its path to scripts/publish-mail-key.sh, which is
+    /// what opens an approved member's key against the public repository. The
+    /// card rail is a later ticket and still reads nothing from its own file,
+    /// so the two stay named together in the one root-only home.
     pub stripe_webhook_secret: String,
     pub keyring_publish_token: String,
     /// The one reviewer the whole application is mailed to.

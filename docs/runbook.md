@@ -33,7 +33,7 @@ Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box witho
 
 These procedures name the pieces that exist at this commit, and mark the ones that do not:
 
-- The onboarding service, its drain and the `onboardctl` command are decided in #156 and not built. Provisioning a member is manual until they land.
+- The onboarding service is decided in #156 and partly built: the handler is a FastCGI responder, and the drain and `onboardctl` are built and installed by `scripts/deploy-onboard.sh`. The account page and the rest of the handler are still to come, so provisioning a member is manual until they land.
 - The per-member hosting configuration is merged into the repository and not applied: the chroot under `/home/www`, the generated vhost indexes, the port split that separates git from the chrooted sftp server. Applying it is a sequence of propose-only steps rather than a script, so it is done once, by hand, and the order is in the pull request that added it (#160).
 - The quota is scripted and has been applied: `scripts/quota-apply.sh --enable` turns quotas on and `--all` applies the 5 GB allowance to the accounts that already exist. `scripts/add-user.sh` sets it at creation.
 
@@ -98,7 +98,7 @@ The per-member hosting design in #154 adds three things to this path: membership
 
 ## Provision through the onboarding service
 
-The service is decided in #156 and not built. This section records the shape an operator will work with, so that the decisions are findable beside the procedures they change.
+The service is decided in #156, and the drain it needs is built: `scripts/deploy-onboard.sh` installs it and `scripts/cron-apply.sh` schedules it. This section records the shape an operator will work with, so that the decisions are findable beside the procedures they change.
 
 Two halves run with different privilege. The handler is a FastCGI responder, reached by httpd's `signup.kyriakon.net` vhost for the web form and by gmid's signup block for the capsule, with `relayd` terminating TLS ahead of both. It holds no secrets, writes the raw Stripe body and its signature header, files applications, and writes account-page intents. The drain is a one-minute cron job, with a second hourly job for the sweeps, and it owns provisioning, manual payment credits, key publication pull requests, certificate requests, the lifecycle transitions and their notices, the 90-day application purge and the grace sweeps. Notices leave through the local `smtpd` enqueuer, so `filter-dkimsign` signs them the way it signs everything else.
 
@@ -109,6 +109,16 @@ Read a member's record by reading their `account.json`. The documents carry a ve
 When the drain is stuck, read in this order: the drain's log, the oldest file in `intents/`, then the last line of `journal.jsonl`. An intent that fails validation names its own file in the log, and a backlog of unapplied intents is what the monitoring signal in #173 alerts on. Rerunning the drain is safe. It verifies each event before acting, keys on the event id, and applies state through the repo-tracked scripts.
 
 Do not edit `account.json` by hand. A hand edit that fails validation stops the transition rather than being repaired, and the journal then disagrees with the file.
+
+### The publish an approval opens
+
+An approval writes the member's key into `/etc/kyriakon/keys/<localpart>.asc` so delivery works, and the same key has to reach the published set, which is `keys/` in this repository. The drain does that itself through `scripts/publish-mail-key.sh`, so no human copies a file and the box publishes without one.
+
+The script opens one branch, `publish-key/<localpart>`, with one commit adding `keys/<localpart>.asc`, and opens a pull request for it. It compares primary fingerprints, never file bytes, so the second run for a member writes nothing and opens no second pull request, and a key already on the default branch makes it exit 0 in silence. It refuses to replace a key that is already published, because that is a rotation, and rotation confirms with the member first (#155).
+
+The credential is a fine-grained token for this repository, scoped to contents and pull requests, at `/etc/kyriakon/onboard/keyring-publish-token`, root-owned and mode 0600. `scripts/deploy-onboard.sh` checks that shape and prints the install line when the file is missing. The script never writes the token to an argument or to its output: it goes into a mode-0600 curl config file.
+
+A failed publish is reported by the drain, which names the member and the fingerprint, and the next pass tries again. The seven days `scripts/check-keyring-drift.sh` allows an unpublished key are the backstop: if the pull request is never merged, or the publish never succeeds, the check alerts at the branch name, and the repair is to merge the pull request or fix the credential. Delivery is unaffected either way, because the box keyring is what encrypts.
 
 ## Replace a member's key
 
@@ -143,7 +153,7 @@ To replace a key by hand, before the service is built:
 
 Do not edit the keyring on the box by hand. The next deploy overwrites it from the repository, so the edit either disappears or leaves the published set disagreeing with what delivers, which is the drift the check in #171 exists to alert on.
 
-The drift check in #171 runs on the box at 04:00 daily and compares the fingerprints in `/etc/kyriakon/keys` against the merged published set in `keys/`. It alerts when a published key is missing from the box, when a fingerprint differs between the two, or when a key has sat unpublished for more than seven days. A second run, off the box, compares the published set against a recorded copy in a repository the box's publish token cannot write, held through `KEYRING_STORE`, so a rewrite of a key that already reached `main` is seen even if the box made the commit. Delivery does not change when this alerts, since the box keyring is what delivers, so the repair is a human's: merge the pending publication, or put back the key the member expects. Both cron lines belong in `scripts/cron-apply.sh`. The check and its cron lines are not on main at this commit.
+The drift check in #171 runs on the box at 04:00 daily and compares the fingerprints in `/etc/kyriakon/keys` against the merged published set in `keys/`. It alerts when a published key is missing from the box, when a fingerprint differs between the two, or when a key has sat unpublished for more than seven days. A second run, off the box, compares the published set against a recorded copy in a repository the box's publish token cannot write, held through `KEYRING_STORE`, so a rewrite of a key that already reached `main` is seen even if the box made the commit. Delivery does not change when this alerts, since the box keyring is what delivers, so the repair is a human's: merge the pending publication, or put back the key the member expects. Both cron lines belong in `scripts/cron-apply.sh`.
 
 ### A member who has lost their key
 

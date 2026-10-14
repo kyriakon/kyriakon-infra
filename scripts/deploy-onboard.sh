@@ -52,14 +52,15 @@ need_pkg() {
 }
 
 # The scripts the drain runs, by the paths its config names. It invokes
-# add-user.sh, provision-member.sh and delete-user.sh directly, and those invoke
-# quota-apply.sh, provision-member-web.sh, provision-member-capsule.sh and
-# cron-apply.sh, so the whole set has to be installed wherever the drain looks.
+# add-user.sh, provision-member.sh, delete-user.sh and publish-mail-key.sh
+# directly, and those invoke quota-apply.sh, provision-member-web.sh,
+# provision-member-capsule.sh and cron-apply.sh, so the whole set has to be
+# installed wherever the drain looks.
 # provision-member.sh also reads the tracked login class next to itself (its own
 # ../openbsd/etc/login.conf.d/member), so this deploy installs that file into the
 # layout the relative read resolves to rather than copying the scripts somewhere
 # the read would leave behind.
-drain_scripts="add-user.sh provision-member.sh delete-user.sh quota-apply.sh provision-member-web.sh provision-member-capsule.sh cron-apply.sh"
+drain_scripts="add-user.sh provision-member.sh delete-user.sh quota-apply.sh provision-member-web.sh provision-member-capsule.sh cron-apply.sh publish-mail-key.sh"
 drain_class="openbsd/etc/login.conf.d/member"
 
 # The service's own account, which scripts/onboard-store.sh refuses to create and
@@ -88,6 +89,12 @@ ksh "$repo_dir/scripts/onboard-store.sh"
 
 say "build"
 need_pkg rust
+# The publish path is a shell client rather than the binary: publish-mail-key.sh
+# opens the change with curl and encodes the key with jq, so the deploy that
+# installs the drain is what installs them. jq is not a convenience here, it is
+# the only base64 encoder on the box: OpenBSD ships no base64(1).
+need_pkg curl
+need_pkg jq
 cargo build --release --manifest-path "$repo_dir/onboard/Cargo.toml"
 # The handler, the root drain and onboardctl are one crate and three programs:
 # a build that produced one of them but not the others is half a service.
@@ -182,6 +189,27 @@ else
 fi
 # Stripe's webhook secret is the exception: a real secret cannot live in this
 # repository, so the card rail's ticket leaves that file as a paste by hand.
+
+# The keyring publish token, the other credential a deploy cannot generate: a
+# fine-grained token for the public repository with contents and pull requests
+# and nothing else, which publish-mail-key.sh opens an approved member's key
+# with. Like the webhook secret it is a paste by hand, so a box without it is
+# deployed rather than refused, and the publish path reports its own failure
+# until it is there. What is checked here is the shape the entry has to keep: a
+# token another local user could read is a token that can write the published
+# set, which is the repository the whole audit trail rests on.
+publish_token=/etc/kyriakon/onboard/keyring-publish-token
+if [ -e "$publish_token" ]; then
+	[ "$(stat -f '%Lp' "$publish_token")" = 600 ] \
+		|| die "$publish_token is not mode 600"
+	[ "$(stat -f '%Su' "$publish_token")" = root ] \
+		|| die "$publish_token is not owned by root"
+	printf 'kept the existing %s\n' "$publish_token"
+else
+	printf 'no %s yet, so an approval will report a failed publish until it is\n' "$publish_token"
+	printf 'there and the drift check will alert seven days later. Install one as root:\n'
+	printf '  doas install -m 600 -o root -g wheel <token-file> %s\n' "$publish_token"
+fi
 
 # The tree the drain looks in, taken back from its own installed config, so the
 # install and the drain cannot disagree about the path. The scripts run from
