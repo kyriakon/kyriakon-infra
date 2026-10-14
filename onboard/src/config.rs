@@ -1,6 +1,7 @@
 //! The handler's own configuration, read once at startup from the TOML the unit
-//! names. It holds no secret: the store root, the three shared files, the loopback
-//! address and the release the acceptances record.
+//! names. It holds no secret: the store root, the two files the front-ends share,
+//! the two sockets this responder answers on and the release the acceptances
+//! record.
 
 use std::path::Path;
 
@@ -9,24 +10,32 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// The store root. The handler reads the three shared files below it and the
+    /// The store root. The handler reads the shared files below it and the
     /// application records it renders, and writes `intents/` and
     /// `applications/`. `drafts/` and `webhooks/` are the capsule's draft store
     /// and the payment webhooks, neither of which has a writer yet; both are
     /// later tickets.
     pub store_root: String,
-    /// The shared question list, 0644 at the top of the store.
-    pub questions: String,
     /// The shared reserved-names file, 0644 at the top of the store.
     pub reserved: String,
     /// The shared service catalogue, 0644 at the top of the store. Named here
-    /// for the same reason as the two above: a later layout moves the file
-    /// rather than the handler reading an empty one and rendering no services.
+    /// because a later layout moves the file rather than the handler reading an
+    /// empty one and rendering no services. The question list has no key here:
+    /// the crate carries it, so the store holds no copy to move.
     pub catalogue: String,
-    /// Loopback only, with relayd in front: the handler must never listen on a
-    /// public interface.
-    pub listen: String,
-    pub port: u16,
+    /// The unix socket httpd's signup vhost reaches this responder on. Both
+    /// front-ends resolve a FastCGI socket path inside their own chroot, which is
+    /// the same directory for the two of them, so the path here is the one on
+    /// disk and the two configs name it relative to that chroot.
+    ///
+    /// One socket each rather than one shared: the connecting daemon is `www` for
+    /// httpd and `_gmid` for gmid, and a socket file may carry one group, so a
+    /// socket both may open would have to be one any local user may open. A local
+    /// user who can connect can forge the whole environment, `REMOTE_ADDR`
+    /// included, which is the key the limits and the audit rest on.
+    pub httpd_socket: String,
+    /// The unix socket gmid's signup block reaches it on. See `httpd_socket`.
+    pub gemini_socket: String,
     /// The deployed commit and date, e.g. "2026-10-10 1a2b3c4". The acceptance
     /// records carry it as the version of each document accepted, and it is the
     /// version of the question list an application was answered against. It is
@@ -117,22 +126,48 @@ mod tests {
     fn parses_the_shipped_shape() {
         let c: Config = toml::from_str(
             "store_root = \"/var/db/onboard\"\n\
-             questions = \"/var/db/onboard/questions.toml\"\n\
              reserved = \"/var/db/onboard/reserved-usernames.txt\"\n\
              catalogue = \"/var/db/onboard/catalogue.toml\"\n\
-             listen = \"127.0.0.1\"\n\
-             port = 7080\n\
+             httpd_socket = \"/home/www/run/onboard-httpd/httpd.sock\"\n\
+             gemini_socket = \"/home/www/run/onboard/onboard.sock\"\n\
              release = \"REPLACE_ME\"\n",
         )
         .unwrap();
-        assert_eq!(c.port, 7080);
-        assert_eq!(c.listen, "127.0.0.1");
+        assert_eq!(c.httpd_socket, "/home/www/run/onboard-httpd/httpd.sock");
+        assert_eq!(c.gemini_socket, "/home/www/run/onboard/onboard.sock");
     }
 
     #[test]
     fn a_typo_is_refused_rather_than_ignored() {
-        let r: Result<Config, _> = toml::from_str("store_rooot = \"/x\"\nlisten=\"127.0.0.1\"\nport=1\nrelease=\"r\"\nquestions=\"q\"\nreserved=\"r\"\ncatalogue=\"c\"\n");
+        let r: Result<Config, _> = toml::from_str(
+            "store_rooot = \"/x\"\n\
+             reserved=\"r\"\ncatalogue=\"c\"\n\
+             httpd_socket=\"/a\"\ngemini_socket=\"/b\"\nrelease=\"r\"\n",
+        );
         assert!(r.is_err());
+    }
+
+    /// The question list's key and the listener are gone rather than accepted and
+    /// ignored: a config that still names a store copy of the questions is a
+    /// config for a service that no longer reads one.
+    #[test]
+    fn the_question_key_and_the_loopback_listener_are_unknown() {
+        for extra in [
+            "questions = \"/var/db/onboard/questions.toml\"\n",
+            "listen = \"127.0.0.1\"\n",
+            "port = 7080\n",
+        ] {
+            let text = format!(
+                "store_root = \"/var/db/onboard\"\n\
+                 reserved = \"r\"\n\
+                 catalogue = \"c\"\n\
+                 httpd_socket = \"/a\"\n\
+                 gemini_socket = \"/b\"\n\
+                 release = \"r\"\n{extra}"
+            );
+            let r: Result<Config, _> = toml::from_str(&text);
+            assert!(r.is_err(), "{extra:?} should be refused");
+        }
     }
 
     #[test]

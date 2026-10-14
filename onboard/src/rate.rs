@@ -17,11 +17,9 @@
 //! down.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-use axum::http::HeaderMap;
 
 pub const REQUESTS_PER_MINUTE: usize = 60;
 pub const DRAFTS_PER_DAY: usize = 5;
@@ -51,27 +49,32 @@ pub enum Key {
     UnknownForward,
 }
 
-/// The client's key. The last element of `X-Forwarded-For` is the one the proxy
-/// appended and the only one it observed; a client can prepend anything, so the
-/// first element is worthless.
+/// The client's key, from what the front-end observed about the request.
 ///
-/// The listener is loopback, which by itself does not exclude a local process,
-/// and relayd sets this header only when its own configuration says to. Until
-/// that front end exists and sets it, every request falls back to the peer, so
-/// the limits as deployed are box-wide rather than per-applicant. The relayd
-/// rule that sets the header is recorded on the ticket.
-pub fn key(peer: SocketAddr, headers: &HeaderMap) -> Key {
-    match headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        Some(value) => match value
-            .rsplit(',')
-            .next()
-            .map(str::trim)
-            .and_then(|last| last.parse::<IpAddr>().ok())
-        {
-            Some(ip) => bucket(ip),
-            None => Key::UnknownForward,
-        },
-        None => bucket(peer.ip()),
+/// The web front-end arrives through relayd, which `match header set
+/// "X-Forwarded-For" value "$REMOTE_ADDR"`s the header rather than appending to
+/// it, so the last element is the address the terminator accepted the connection
+/// from and a value a client prepended is not there to be read. httpd passes the
+/// header on to a responder as `HTTP_X_FORWARDED_FOR`, and that is the only
+/// place in this service where a forwarded value is read.
+///
+/// The gemini front-end has no forwarded header of any kind: gmid sends none, so
+/// its `REMOTE_ADDR` is the socket peer as the kernel saw it and a header read
+/// there would be one the applicant wrote. `forwarded` is passed by the caller
+/// that knows which front-end it is answering, rather than by sniffing the
+/// environment here, because the two are different questions.
+///
+/// `peer` is that `REMOTE_ADDR`. It is arbitrary text from the environment, so an
+/// address that does not parse shares one key rather than falling back to
+/// something a caller could choose.
+pub fn key(forwarded: Option<&str>, peer: Option<&str>) -> Key {
+    let observed = match forwarded {
+        Some(value) => value.rsplit(',').next().map(str::trim),
+        None => peer,
+    };
+    match observed.and_then(|v| v.parse::<IpAddr>().ok()) {
+        Some(ip) => bucket(ip),
+        None => Key::UnknownForward,
     }
 }
 
@@ -211,16 +214,31 @@ mod tests {
 
     #[test]
     fn the_last_forwarded_address_is_the_key_and_a_garbled_one_has_its_own() {
-        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
-        let mut h = HeaderMap::new();
-        assert_eq!(key(peer, &h), v4(1));
+        // The web front-end: relayd's value is the whole header, so the peer is
+        // read only when the relay sent none.
+        assert_eq!(key(None, Some("127.0.0.1")), v4(1));
         // A client that prepends a lie cannot change the bucket: the proxy's
         // value is the last one.
-        h.insert("x-forwarded-for", "192.0.2.9, 203.0.113.10".parse().unwrap());
-        assert_eq!(key(peer, &h), bucket("203.0.113.10".parse().unwrap()));
-        assert_ne!(key(peer, &h), bucket("192.0.2.9".parse().unwrap()));
-        h.insert("x-forwarded-for", "not an address".parse().unwrap());
-        assert_eq!(key(peer, &h), Key::UnknownForward);
+        assert_eq!(
+            key(Some("192.0.2.9, 203.0.113.10"), Some("127.0.0.1")),
+            bucket("203.0.113.10".parse().unwrap())
+        );
+        assert_ne!(
+            key(Some("192.0.2.9, 203.0.113.10"), Some("127.0.0.1")),
+            bucket("192.0.2.9".parse().unwrap())
+        );
+        assert_eq!(
+            key(Some("not an address"), Some("127.0.0.1")),
+            Key::UnknownForward
+        );
+
+        // The gemini front-end: no forwarded header exists, and the peer is what
+        // it keys on.
+        assert_eq!(key(None, Some("2001:db8:1:2::9")), bucket("2001:db8:1:2::9".parse().unwrap()));
+        // Anything that is not an address shares one bucket rather than being
+        // read as whatever the environment put there.
+        assert_eq!(key(None, Some("UNKNOWN")), Key::UnknownForward);
+        assert_eq!(key(None, None), Key::UnknownForward);
     }
 
     #[test]

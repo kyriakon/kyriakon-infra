@@ -1,6 +1,6 @@
 #!/bin/ksh
-# onboard-store.sh: create the onboarding service's store and install the three
-# files the three front-ends share.
+# onboard-store.sh: create the onboarding service's store and install the two
+# files the front-ends share.
 #
 # Usage: doas ksh scripts/onboard-store.sh
 #
@@ -53,11 +53,12 @@ drain_conf='/etc/kyriakon/onboard'
 onboard_user='_onboard'
 
 # The reserved set is a repository file, read at the store's top so the handler
-# and the TUI can both read it. The question list and the service catalogue are
-# the service workstream's and are installed beside it, 0644, for the same
-# reason: one file read by every front-end, and no copy of it anywhere else.
+# and the TUI can both read it. The service catalogue is the service workstream's
+# and is installed beside it, 0644, for the same reason: one file read by every
+# front-end, and no copy of it anywhere else. The question list is not here: the
+# crate carries it, so there is nothing to install and nothing to keep in step
+# with a rebuild.
 reserved_src="$repo_dir/reserved-usernames.txt"
-questions_src="$repo_dir/openbsd/etc/onboard/questions.toml"
 catalogue_src="$repo_dir/openbsd/etc/onboard/catalogue.toml"
 
 # fail <message>: one place for the error shape, so every refusal reads the same.
@@ -163,21 +164,23 @@ store_dir mail/tmp     "$onboard_user" "$onboard_user" 700
 install -d -m 0700 -o root -g wheel "$drain_conf"
 assert_mode "$drain_conf" root wheel 700
 
-# The three shared files, at the top of the store, 0644, readable by the handler
-# and the TUI both. Each is checked for readability before any of them is
-# installed, so a missing sibling file fails here rather than at first request:
-# the handler refuses to start on a file it cannot read, and the deploy would
-# otherwise write the store before discovering it.
-for src in "$reserved_src" "$questions_src" "$catalogue_src"; do
+# The two shared files, at the top of the store, 0644, readable by the handler and
+# the TUI both. Each is checked for readability before any of them is installed,
+# so a missing sibling file fails here rather than at first request: the handler
+# refuses to start on a file it cannot read, and the deploy would otherwise write
+# the store before discovering it.
+for src in "$reserved_src" "$catalogue_src"; do
 	[ -r "$src" ] || fail "cannot read $src"
 done
 
-# The question list moved from TSV to TOML. install(1) leaves an existing path
-# alone, so a box that has run an earlier copy of this script keeps the list under
-# its old name beside the new file. Nothing reads it, and that is why it goes: an
-# unused copy of the list is one a person edits by mistake. Removed, not left.
+# The question list used to be seeded here, under two names as its format
+# changed. It is the crate's now, compiled into the handler, so neither name is
+# read by anything: an unused copy of the list is one a person edits by mistake
+# and expects to take effect. Removed, not left.
 remove_legacy "$store/questions.tsv"
 [ ! -e "$store/questions.tsv" ] || fail "$store/questions.tsv is still there"
+remove_legacy "$store/questions.toml"
+[ ! -e "$store/questions.toml" ] || fail "$store/questions.toml is still there"
 
 # The catalogue has no older name of its own: #370 settled TOML before the file
 # existed. The pre-TOML name goes the same way and for the same reason, so a
@@ -187,9 +190,7 @@ remove_legacy "$store/catalogue.tsv"
 [ ! -e "$store/catalogue.tsv" ] || fail "$store/catalogue.tsv is still there"
 
 install_file "$reserved_src" "$store/reserved-usernames.txt" root wheel 644
-install_file "$questions_src" "$store/questions.toml" root wheel 644
 install_file "$catalogue_src" "$store/catalogue.toml" root wheel 644
-[ -s "$store/questions.toml" ] || fail "$store/questions.toml is empty"
 [ -s "$store/catalogue.toml" ] || fail "$store/catalogue.toml is empty"
 
 if [ "$changed" -ne 0 ]; then

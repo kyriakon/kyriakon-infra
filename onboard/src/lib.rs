@@ -12,12 +12,14 @@
 pub mod capsule;
 pub mod catalogue;
 pub mod config;
+pub mod fcgi;
 pub mod intents;
 pub mod keycheck;
 pub mod notice;
 pub mod page;
 pub mod questions;
 pub mod rate;
+pub mod responder;
 pub mod sign;
 pub mod store;
 pub mod transitions;

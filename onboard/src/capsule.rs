@@ -5,6 +5,7 @@
 //! line per entry with the name and the clause in the link label.
 
 use crate::catalogue::{self, Protocol, Row, Service};
+use crate::page::StatusPage;
 
 /// The entries as rows, one per service. Here as well as in the gemtext page so
 /// the check can compare what this front-end shows before it is formatted, which
@@ -31,6 +32,36 @@ pub fn gemtext(list: &[Service], member: Option<&str>) -> String {
             out.push_str(sentence);
             out.push('\n');
         }
+    }
+    out
+}
+
+/// The status page as `text/gemini`, from the same record the web page renders:
+/// the stage a filed application has reached, or the one notice that covers a
+/// token that is unknown, expired or spent alike. The two reads are the web
+/// page's own words, in a page with no table to put them in and no hint below
+/// them, because a hint about links and referrers is chrome the web page carries
+/// and the capsule has no need of.
+///
+/// The stage is the whole of what this page says about a live application: it
+/// never repeats an answer, the contact address or a key, and a token that
+/// resolves to nothing reads exactly as one that has expired.
+pub fn status(page: &StatusPage) -> String {
+    let mut out = String::from("# Where your application has got to\n\n");
+    if !page.notice.is_empty() {
+        out.push_str(&page.notice);
+        out.push('\n');
+        return out;
+    }
+    out.push_str(&format!(
+        "Received: {}. A person reads every application. Nothing is charged yet.\n",
+        page.filed_at
+    ));
+    out.push_str(&format!("Stage: {}\n", page.stage));
+    if let Some(link) = &page.password_link {
+        out.push_str("\n## Setting your mail password\n\n");
+        out.push_str(link);
+        out.push('\n');
     }
     out
 }

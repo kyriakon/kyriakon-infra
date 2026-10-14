@@ -11,19 +11,20 @@
 # compiled-in default, so the path is auditable at the rcctl prompt and a second
 # instance cannot silently pick up a different file.
 
-# The store root. The handler reads the three shared files below it and the
+# The store root. The handler reads the two shared files below it and the
 # application records it renders, and writes intents/ and applications/. drafts/
 # and webhooks/ have no writer yet: they are the capsule's draft store and the
 # payment webhooks, and both are later tickets. It reads no secret and no other
 # member's state.
 store_root = "/var/db/onboard"
 
-# The question list, the reserved set and the service catalogue the three
-# front-ends share, all 0644 at the top of the store (scripts/onboard-store.sh
-# installs them there). Named here rather than derived from the store root, so
-# the handler fails loudly if a later layout moves them instead of reading an
-# empty list and rendering nothing.
-questions = "/var/db/onboard/questions.toml"
+# The reserved set and the service catalogue the front-ends share, both 0644 at
+# the top of the store (scripts/onboard-store.sh installs them there). Named here
+# rather than derived from the store root, so the handler fails loudly if a later
+# layout moves them instead of reading an empty list and rendering nothing.
+#
+# The question list has no key: the crate carries it, compiled in, so the store
+# holds no copy of it and there is no path for a layout to move.
 reserved = "/var/db/onboard/reserved-usernames.txt"
 catalogue = "/var/db/onboard/catalogue.toml"
 
@@ -35,13 +36,24 @@ catalogue = "/var/db/onboard/catalogue.toml"
 # compare, where a digest of two files is a number nothing acts on.
 release = "REPLACE_ME"
 
-# Loopback only. relayd terminates TLS for signup.kyriakon.net on the box and
-# passes the request to this address, so the handler must never listen on a
-# public interface: its whole trust boundary is that nothing but relayd on this
-# host can reach it. 7080 is not in /etc/services and no other listener on the
-# box uses it.
-listen = "127.0.0.1"
-port = 7080
+# The unix sockets the two front-ends reach the responder on. There is no
+# listener on a port: the service is a FastCGI responder, and both httpd and gmid
+# resolve a FastCGI socket path inside their own chroot, which is /home/www for
+# each of them. So these are the paths on disk, and the two configs name them
+# relative to that chroot.
+#
+# One socket each rather than one shared. The connecting daemon is www for httpd
+# and _gmid for gmid, and a socket file carries one group, so a socket both may
+# connect to would have to be one any local user may connect to. A local user who
+# can connect can forge the whole request environment, REMOTE_ADDR among it,
+# which is the address the counters and the audit rest on. Each socket is created
+# by this service at start-up, in a directory the deploy has made set-group-id
+# with the connecting daemon's group, so the socket belongs to it and to nobody
+# else. That is also why the two paths are in different directories: a directory's
+# set-group-id bit carries one group, and the two daemons that connect are not in
+# one group.
+httpd_socket = "/home/www/run/onboard-httpd/httpd.sock"
+gemini_socket = "/home/www/run/onboard/onboard.sock"
 
 # The rate limits (sixty requests a minute and five drafts a day per address, no
 # CAPTCHA) are the spec's numbers and live in the handler, not here: they are not

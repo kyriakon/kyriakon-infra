@@ -22,10 +22,13 @@
 # It does not create the _onboard account. That account is a reserved-uid one in
 # the shape _gmid has, so it is the operator's to create, once, and
 # scripts/onboard-store.sh (called below) stops with the exact useradd line when
-# it is missing. It also does not configure relayd: the handler listens on
-# loopback only, and the front end that terminates TLS for signup.kyriakon.net is
-# a separate ticket. Until that exists the handler answers the box and nothing
-# else, which is why the verification here is a loopback request.
+# it is missing. It also does not configure the front-ends: httpd's vhost and
+# gmid's block are installed by their own deploys, and relayd terminates TLS for
+# every name ahead of them. What this script does is create the socket
+# directories those two configs name, because the service binds the sockets and
+# cannot create the directory inside another daemon's chroot itself; the
+# verification at the end is then the sockets existing with the modes that keep
+# every other local user out.
 #
 # It generates the approval key when it is absent, and never rotates one that is
 # already there, so a first deploy signs and a later one leaves the links it
@@ -59,10 +62,15 @@ need_pkg() {
 drain_scripts="add-user.sh provision-member.sh delete-user.sh quota-apply.sh provision-member-web.sh provision-member-capsule.sh cron-apply.sh"
 drain_class="openbsd/etc/login.conf.d/member"
 
+# The service's own account, which scripts/onboard-store.sh refuses to create and
+# names the useradd line for: the socket directories below are owned by it,
+# because it is the account that binds the sockets inside them.
+onboard_user='_onboard'
+
 # Every source this installs, checked before anything on the box is changed, so a
 # half-copied checkout fails here rather than after the store has been written.
 for f in onboard/Cargo.toml openbsd/etc/onboard/onboard.toml openbsd/etc/onboard/drain.toml \
-	openbsd/etc/onboard/questions.toml \
+	onboard/questions.toml \
 	openbsd/etc/rc.d/kyriakon_onboard scripts/onboard-store.sh reserved-usernames.txt; do
 	[ -e "$repo_dir/$f" ] || die "missing from $repo_dir: $f"
 done
@@ -197,6 +205,41 @@ for s in $drain_scripts; do
 done
 printf 'drain scripts installed in %s\n' "$scripts_dir"
 
+# The two socket paths, read from the installed config rather than written here,
+# so the directories this script creates and the check at the end are the ones the
+# service itself uses: a box whose paths were changed is deployed to where it
+# answers.
+socket_path() {
+	awk -F'"' -v key="$1" '$1 ~ "^" key "[[:space:]]*=" { print $2; exit }' \
+		/etc/onboard/onboard.toml
+}
+httpd_socket_path=$(socket_path httpd_socket)
+gemini_socket_path=$(socket_path gemini_socket)
+[ -n "$httpd_socket_path" ] || die "/etc/onboard/onboard.toml names no httpd_socket"
+[ -n "$gemini_socket_path" ] || die "/etc/onboard/onboard.toml names no gemini_socket"
+
+# The two socket directories, inside the chroot the two front-ends share. Both the
+# paths and the chroot are the installed config's: this service borrows a
+# directory inside httpd's and gmid's chroot because a FastCGI socket path is
+# resolved inside it, and a layout that moves the chroot moves these with it.
+#
+# One directory per socket rather than one for both, because a socket file's group
+# is what decides which daemon may connect and a directory's set-group-id bit can
+# carry one group. Without the bit the socket would take _onboard's own group and
+# neither www nor _gmid could reach it. Nothing else may connect: a local user who
+# could would forge the request environment, REMOTE_ADDR among it.
+say "sockets"
+for pair in "www:$httpd_socket_path" "_gmid:$gemini_socket_path"; do
+	group=${pair%%:*}
+	dir=$(dirname "${pair#*:}")
+	install -d -o "$onboard_user" -g "$group" -m 2770 "$dir"
+	[ -g "$dir" ] || die "$dir is not set-group-id, so the socket in it would not carry $group"
+	[ "$(stat -f '%Su %Sg' "$dir")" = "$onboard_user $group" ] \
+		|| die "$dir is not $onboard_user:$group"
+	printf '%s (%s, 2770)
+' "$dir" "$group"
+done
+
 say "service"
 rcctl enable kyriakon_onboard
 if rcctl check kyriakon_onboard >/dev/null 2>&1; then
@@ -207,26 +250,23 @@ fi
 rcctl check kyriakon_onboard >/dev/null 2>&1 \
 	|| die "kyriakon_onboard did not come up; check /var/log/daemon"
 
-# The listener, taken from the installed config rather than assumed, so a box
-# whose port was changed is checked where it actually answers.
-port=$(awk -F= '/^port[[:space:]]*=/ { gsub(/[^0-9]/, "", $2); print $2; exit }' /etc/onboard/onboard.toml)
-[ -n "$port" ] || die "no port in /etc/onboard/onboard.toml"
-url="http://127.0.0.1:$port"
-
+# The sockets, taken from the installed config rather than assumed, so a box whose
+# paths were changed is checked where they are. A responder that came up but could
+# not bind is a service no front-end can reach, and this is what says so without a
+# front-end in the path: each file is a socket, and its mode is the one that keeps
+# every other local user out. The pages themselves are checked by the front-ends'
+# own deploys, which are the only things that can ask for one.
 say "verify"
-# The page must render, and the four sections must be there on both paths: the
-# community block is a fieldset inside the first, so a body page counts four as
-# well. A handler that is up but rendering nothing would pass a process check and
-# fail this.
-for path in "/" "/?branch=body"; do
-	body=$(curl -s --max-time 10 "$url$path") || die "no answer from $url$path"
-	printf '%s: %s sections\n' "$path" \
-		"$(printf '%s' "$body" | awk '/<section/ { n++ } END { print n + 0 }')"
+for pair in "httpd:$httpd_socket_path" "gemini:$gemini_socket_path"; do
+	front=${pair%%:*}
+	path=${pair#*:}
+	[ -S "$path" ] || die "$path is not a socket: is kyriakon_onboard running, and is its directory there?"
+	[ "$(stat -f '%Lp' "$path")" = "660" ] || die "$path is not mode 660"
+	printf '%s: %s\n' "$front" "$path"
 done
-printf 'the rail question appears %s time(s) on the form (one is expected)\n' \
-	"$(curl -s --max-time 10 "$url/" | awk '/How you will pay/ { n++ } END { print n + 0 }')"
 
-printf '\ninstalled. the handler answers %s on this box only.\n' "$url"
-printf 'relayd terminates TLS for signup.kyriakon.net and has to set the forwarded\n'
-printf 'address the counters key on; until that front end exists the limits are\n'
-printf 'box-wide. See the deployment notes on the service ticket.\n'
+printf '\ninstalled. the responder answers %s and %s, and no other local user may connect.\n' \
+	"$httpd_socket_path" "$gemini_socket_path"
+printf 'httpd and gmid reach it from their own configs, which their own deploys install.\n'
+printf 'relayd terminates TLS for signup.kyriakon.net and sets the forwarded address\n'
+printf 'the counters key on.\n'
