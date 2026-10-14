@@ -573,6 +573,44 @@ fn onboardctl_files_a_decision_and_shows_the_application() {
     let _ = record;
 }
 
+/// `show` names a window only where the account has one. A charged approval
+/// opens a window, so its output carries it and the date it closes; a no-charge
+/// approval has none and its output says so instead, rather than naming a window
+/// the member would watch for in vain.
+#[test]
+fn show_names_a_window_only_when_the_account_has_one() {
+    let charged = Fix::new("show-charged");
+    let record = charged.filed("secretary", "monero", &[("rail", "monero")]);
+    charged.file_application(&record);
+    assert!(charged.drain().status.success());
+    charged.decide("approve", "secretary");
+    let out = charged.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let account = charged.account("secretary");
+    let window = &account["window"];
+    let opened = window["opened_at"].as_str().expect("a charged approval opens a window");
+    let closes = window["closes_at"].as_str().unwrap();
+    let out = charged.ctl(&["show", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let text = body(&out);
+    assert!(text.contains(&format!("  window   {opened} to {closes}")), "{text}");
+
+    let free = Fix::new("show-free");
+    let record = free.filed("secretary", "no_charge", &[("rail", "no_charge")]);
+    free.file_application(&record);
+    assert!(free.drain().status.success());
+    free.decide("provision", "secretary");
+    let out = free.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let out = free.ctl(&["show", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let text = body(&out);
+    assert!(!text.contains("window"), "no window exists to name: {text}");
+    assert!(text.contains("no charge"), "the line should say what is true: {text}");
+}
+
 /// A decline purges nothing on the first run; the run after its week clears the
 /// application away and releases the username.
 #[test]
