@@ -1,10 +1,15 @@
-# /var/db/onboard/questions.toml
+# onboard/questions.toml
 #
-# The shared question list: what the three front-ends ask, in the order they ask
-# it. The file is the only place the list exists, so a prompt or an answer option
-# moves here rather than in three renderings. scripts/onboard-store.sh installs
-# it 0644 at the top of the store, and /etc/onboard/onboard.toml names the path
-# the handler reads it from.
+# The shared question list: what the front-ends ask, in the order they ask it. The
+# file is the only place the list exists, so a prompt or an answer option moves
+# here rather than in three renderings.
+#
+# The crate carries it, read at build time by onboard/src/questions.rs, which is
+# why it sits beside the crate rather than in the deployment tree: the structure
+# is the service's and ships with the service. The store holds no copy and
+# /etc/onboard/onboard.toml names no path for it, so a wording change is a rebuild
+# rather than a deploy, which is the price of the structure having one home. The
+# site workstream owns the wording and reaches the crate through this file.
 #
 # Hand-written, so it is TOML: the service already parses TOML for its own
 # config, the format takes comments, and an array of tables keeps display order,

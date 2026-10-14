@@ -2,6 +2,12 @@
 
 > Spec synthesised from [Spec the shared copy across the three front-ends](https://github.com/kyriakon/kyriakon-infra/issues/362) and the decisions it rests on: [Decide the shared copy: one service catalogue and the check that keeps the three renderings in step](https://github.com/kyriakon/kyriakon-infra/issues/359) (the container, the rules and the check), [Spec the release's web form and account page](https://github.com/kyriakon/kyriakon-infra/issues/274) (the intent API, the question file's schema and the account page's own table), [Decide the Gemini onboarding front-end](https://github.com/kyriakon/kyriakon-infra/issues/182) and [Spec the Gemini capsule front-end](https://github.com/kyriakon/kyriakon-infra/issues/243), [Decide the SSH onboarding front-end](https://github.com/kyriakon/kyriakon-infra/issues/183) and [Spec the SSH onboarding TUI](https://github.com/kyriakon/kyriakon-infra/issues/245), [Decide the SSH portal's entry address and port](https://github.com/kyriakon/kyriakon-infra/issues/360), [Decide whether the projects sit on their own hostnames](https://github.com/kyriakon/kyriakon-infra/issues/187), [Decide the organisation's application questions](https://github.com/kyriakon/kyriakon-infra/issues/233), and [Decide what the public release promises, and where](https://github.com/kyriakon/kyriakon-infra/issues/158).
 
+> Amended on 2026-10-14: the question list is the crate's own file,
+> `onboard/questions.toml`, read at build time, rather than a file seeded into the
+> store. The catalogue and the reserved names are unchanged, and the catalogue's
+> structure still lives in `onboard/src/catalogue.rs`
+> ([#394](https://github.com/kyriakon/kyriakon-infra/issues/394)).
+
 ## Problem statement
 
 One platform is reached three ways. The web form and the account page answer over HTTPS behind `relayd`, the capsule answers through gmid's FastCGI socket, and the terminal answers over ssh. The question list is already one file that all three read, and it is the only fact they share today.
@@ -18,7 +24,7 @@ This document names the file, its columns and the words that must read identical
 
 ## The catalogue
 
-The catalogue is `openbsd/etc/onboard/catalogue.toml` in the repository, seeded into the store as `/var/db/onboard/catalogue.toml` by `scripts/onboard-store.sh` beside the question list and the reserved names, and read from the path `onboard.toml` gives it, beside the `questions` and `reserved` keys it already carries (`catalogue = "/var/db/onboard/catalogue.toml"`), on the reason that file already gives for the other two: so that a layout moves them rather than the service reading an empty list and rendering nothing. It is TOML, an array of tables in display order, which is what the service already parses for its own configuration. The format takes comments, so a row that needs a reason carries it beside the value; the columns are typed rather than positional; and an array of tables keeps the order the front-ends render in. The question file is TOML as well, for the same reasons, and its own conversion is the same change.
+The catalogue is `openbsd/etc/onboard/catalogue.toml` in the repository, seeded into the store as `/var/db/onboard/catalogue.toml` by `scripts/onboard-store.sh` beside the reserved names, and read from the path `onboard.toml` gives it, beside the `questions` and `reserved` keys it already carries (`catalogue = "/var/db/onboard/catalogue.toml"`), on the reason that file already gives for the other two: so that a layout moves them rather than the service reading an empty list and rendering nothing. It is TOML, an array of tables in display order, which is what the service already parses for its own configuration. The format takes comments, so a row that needs a reason carries it beside the value; the columns are typed rather than positional; and an array of tables keeps the order the front-ends render in. The question file is TOML as well, for the same reasons, and its own conversion is the same change.
 
 The columns are `id`, `name`, `summary`, `state`, `host` and `action`.
 
@@ -199,7 +205,7 @@ ssh apply@ssh.kyriakon.net    ->  Mail                    live
 
 ## The rules that keep them in step
 
-**A fact lives in one file.** The catalogue, the question list and the reserved names are each one file read by three front-ends, and none of them is copied. The state words and the action words are one table in the crate rather than one per renderer, so a new state cannot arrive with a word for the web and none for the terminal.
+**A fact lives in one file.** The catalogue, the question list and the reserved names are each one file read by every front-end, and none of them is copied. The question list is the crate's, compiled into the library all of them link; the other two are data the deploy installs, which is what the difference between a structure and a fact comes to. The state words and the action words are one table in the crate rather than one per renderer, so a new state cannot arrive with a word for the web and none for the terminal.
 
 **The flow is data and the chrome is per protocol.** The order, the branches and the validation are the question file's; the catalogue's order is the catalogue's. What a front-end owns is its chrome: the titles, the hints, the confirmations and the shape of a screen. The capsule spec already says this of the application's grouping, that it is presentation and the capsule ignores it, and this document generalises it to everything the three render.
 
@@ -221,7 +227,7 @@ ssh apply@ssh.kyriakon.net    ->  Mail                    live
 | The wording | Where it lives | Who reads it |
 | --- | --- | --- |
 | A service's name and its one clause | `openbsd/etc/onboard/catalogue.toml` | all three |
-| A question's prompt, its type and its validation | `openbsd/etc/onboard/questions.toml` | all three |
+| A question's prompt, its type and its validation | `onboard/questions.toml`, read at build time | all three |
 | The word for each state and each action | one table in `onboard/src/catalogue.rs` | all three |
 | The hand-off sentence for each job a protocol cannot finish | the same table | per front-end |
 | The account page's capability list and what each part rests on | `docs/planning/specs/signup-and-account-page.md` | the web page and the terminal |
@@ -252,11 +258,11 @@ Nothing else here is worth a test. The chrome is copy, and copy is checked by re
 
 ## Not verified
 
-The web card, the account page's list and the capsule's gemtext page are built, and the check in `onboard/src/catalogue.rs` covers all three: `cargo test` runs it against `openbsd/etc/onboard/catalogue.toml` and against a fixture that differs from it. Nothing here has been run on the box. No deploy has installed the catalogue, `scripts/check-hygiene.sh` has not compared a live `/var/db/onboard/catalogue.toml` against the tracked one, and no gemini client has fetched the capsule's page, because the service does not answer over FastCGI yet ([#394](https://github.com/kyriakon/kyriakon-infra/issues/394)). The terminal front-end has no Rust home yet: [Amend the SSH onboarding TUI spec for the portal redesign](https://github.com/kyriakon/kyriakon-infra/issues/361) fixes that, and it should provide the crate as a library so the catalogue has one home and no copy. The catalogue's values are a snapshot of 2026-10-13, and the file is the source from now on, which is the point of writing them down in one place.
+The web card, the account page's list and the capsule's gemtext page are built, and the check in `onboard/src/catalogue.rs` covers all three: `cargo test` runs it against `openbsd/etc/onboard/catalogue.toml` and against a fixture that differs from it. Nothing here has been run on the box. No deploy has installed the catalogue, `scripts/check-hygiene.sh` has not compared a live `/var/db/onboard/catalogue.toml` against the tracked one, and no gemini client has fetched the capsule's page: the service answers over FastCGI now and its environment is checked by a fixture ([#394](https://github.com/kyriakon/kyriakon-infra/issues/394)), but neither front-end can be asked for a page without the box. The terminal front-end has no Rust home yet: [Amend the SSH onboarding TUI spec for the portal redesign](https://github.com/kyriakon/kyriakon-infra/issues/361) fixes that, and it should provide the crate as a library so the catalogue has one home and no copy. The catalogue's values are a snapshot of 2026-10-13, and the file is the source from now on, which is the point of writing them down in one place.
 
 ## Sources
 
-- `openbsd/etc/onboard/questions.toml`, the file shape this document copies: a header naming the columns, tab-separated, one record per line in display order.
+- `onboard/questions.toml`, the file shape this document copies: a header naming the columns, tab-separated, one record per line in display order. It was `openbsd/etc/onboard/questions.toml` when this document was written, and moved into the crate under #394.
 - `onboard/src/questions.rs`, `onboard/src/page.rs` and `onboard/templates/`, the service as built: the question list is read once and rendered by more than one front-end already.
 - `docs/planning/specs/signup-and-account-page.md`, read on 2026-10-13: the intent API and its record, the question file's six columns, the store root, the handler's write boundary, the account page's capability table, and the line that the signup copy's home is the site workstream.
 - `docs/planning/specs/gemini-capsule.md`, read on 2026-10-13: the counter and the pages, the status page, the `apply@` route, the pinned-certificate mechanism, and the sentence that the application's grouping is presentation and the capsule ignores it.

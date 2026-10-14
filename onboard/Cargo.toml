@@ -6,10 +6,11 @@ description = "Onboarding handler and root drain: the handler renders the applic
 publish = false
 
 [dependencies]
-# The framework the spec fixes for the service.
+# The pages the responder renders. The service itself is a FastCGI responder now
+# rather than an HTTP daemon, so there is no web framework here and no HTTP
+# parser: the front-ends on the box do that work and this reads the environment
+# they build.
 askama = "0.14"
-# axum over tokio: the routes, the extractors, and the loopback listener.
-axum = { version = "0.8", features = ["form"] }
 # sha2 and hmac are the one pair the drain adds. The review email's three links
 # and the one-time password link are HMAC-SHA256 over their payload, keyed from
 # the root-only approval key file: the same process signs and verifies, so a
@@ -29,8 +30,7 @@ sha1 = "0.10"
 # O_NOFOLLOW, so a temporary file the unprivileged half could plant a symlink at
 # is opened with the protections the store's mixed ownership needs.
 libc = "0.2"
-# serde deserializes the form and serializes the record; axum's Form and
-# serde_json both build on it.
+# serde deserializes the form and serializes the record.
 serde = { version = "1", features = ["derive"] }
 # The intent and the application record are JSON, the shape the drain reads.
 serde_json = "1"

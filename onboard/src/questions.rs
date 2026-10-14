@@ -1,13 +1,32 @@
-//! The shared question list: `openbsd/etc/onboard/questions.toml`, installed to
-//! `/var/db/onboard/questions.toml`. One `[[question]]` array per question, in
-//! display order, which is the order the three front-ends render and ask.
+//! The shared question list: `onboard/questions.toml`, which the crate reads at
+//! build time. One `[[question]]` array per question, in display order, which is
+//! the order the front-ends render and ask.
 //!
-//! The file is the only place the question list exists. This module parses it
-//! and says which questions a given branch shows; it does not restate a prompt
-//! and it does not hold an answer option, because the options are the question's
-//! own `choices` list, which is what a `choice` question's validation is.
+//! The file is the only place the list exists, and the crate is its only home: it
+//! is not installed into the store and no config key names it, so the store holds
+//! no copy to drift from. This module parses it and says which questions a given
+//! branch shows; it does not restate a prompt and it does not hold an answer
+//! option, because the options are the question's own `choices` list, which is
+//! what a `choice` question's validation is.
+//!
+//! The structure ships with the service and the wording does not have to: the site
+//! workstream owns the prompts and this file is how its text reaches the crate. A
+//! wording change is therefore a rebuild rather than a deploy, which is the
+//! accepted price of one home for the list.
 
 use serde::Deserialize;
+
+/// The tracked file this module parses, named in the refusals so a failure says
+/// which file to look at rather than which function returned.
+pub const TRACKED: &str = "onboard/questions.toml";
+
+/// The question list the crate carries, read at build time. The file is compiled
+/// into the binary, so no path is read at startup and no copy of it can differ
+/// from the one the service was built with. A list that does not parse is a
+/// service that will not start, and the check above is the build failing first.
+pub fn shipped() -> Result<Vec<Question>, String> {
+    parse(include_str!("../questions.toml"))
+}
 
 /// An answer type. The tokens are the file's, and the spelling is fixed by the
 /// three front-ends sharing the file.
@@ -430,7 +449,7 @@ choices = [
     /// file fails the build rather than a deployment.
     #[test]
     fn the_shipped_question_list_parses_in_display_order() {
-        let list = parse(include_str!("../../openbsd/etc/onboard/questions.toml")).unwrap();
+        let list = shipped().unwrap();
         assert_eq!(list.len(), 24);
 
         let ids: Vec<&str> = list.iter().map(|q| q.id.as_str()).collect();

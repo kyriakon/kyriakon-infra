@@ -4,6 +4,12 @@
 
 > Amended on 2026-10-13 for the portal redesign: the terminal front-end becomes a portal that mirrors the site over one shared service catalogue ([Decide the shared copy: one service catalogue and the check that keeps the three renderings in step](https://github.com/kyriakon/kyriakon-infra/issues/359) and `docs/planning/specs/shared-copy.md`), the session gains a pty and a plain mode, a member's path is added beside the applicant's ([Research what the onboard sshd tells the TUI about the key that connected](https://github.com/kyriakon/kyriakon-infra/issues/356)), the instruction becomes `ssh hello@ssh.kyriakon.net` ([Decide the SSH portal's entry address and port](https://github.com/kyriakon/kyriakon-infra/issues/360)), and the ksh program this spec first described is retired.
 
+> Amended on 2026-10-14: the handler no longer listens on loopback, so this
+> document's own route to it is a unix socket on the terms
+> [#394](https://github.com/kyriakon/kyriakon-infra/issues/394) settled: one socket
+> per front-end, its group deciding who may connect. The shared question list is
+> the crate's file rather than an installed one.
+
 ## Problem statement
 
 Kyriakon takes applications three ways and writes them into one back end: the web form at release, and a gemini capsule and an SSH TUI built once the platform is live. The SSH path is the one where the applicant already has a terminal, so it can do what the web form does and a little more, and the risk is that it grows into a second privileged way into the platform.
@@ -225,7 +231,7 @@ The wording obeys the rules [#158](https://github.com/kyriakon/kyriakon-infra/is
 
 ## The portal, the menu and the shared question list
 
-The questions are one data file owned by the service workstream and read by all three front-ends, not three copies of the list. The file is ordered and each entry carries an id, the prompt, its type (short text, choice, yes or no, multi-line, one address per line, a key paste, an acceptance), whether it is shown for a person, a body or a monastic, and its validation. The web form renders the list as one page with the community block conditional, and the capsule and the TUI render it one entry at a time. This spec does not restate a question, and neither does an implementation: the TUI reads the installed file, renders each entry, and validates it locally for the applicant's benefit while the handler validates again when the intent is filed, because a front-end cannot be trusted.
+The questions are one data file owned by the service workstream and read by all three front-ends, not three copies of the list. The file is ordered and each entry carries an id, the prompt, its type (short text, choice, yes or no, multi-line, one address per line, a key paste, an acceptance), whether it is shown for a person, a body or a monastic, and its validation. The web form renders the list as one page with the community block conditional, and the capsule and the TUI render it one entry at a time. This spec does not restate a question, and neither does an implementation: the TUI reads the list from the crate's library, which is where it lives now ([#394](https://github.com/kyriakon/kyriakon-infra/issues/394)), renders each entry, and validates it locally for the applicant's benefit while the handler validates again when the intent is filed, because a front-end cannot be trusted.
 
 The order and the branches are the web form's order and branches. The counter reads `question 4 of 12`, where the total is the count for the applicant's own branch rather than a fixed number: the second question (for yourself or for a body) opens the community block from [#233](https://github.com/kyriakon/kyriakon-infra/issues/233), and the monastic answer opens the elder's blessing, which is the one answer an application cannot be filed without. Until the branch question is answered the counter shows the individual count.
 
@@ -257,7 +263,7 @@ The upload key gets a shape check only, not the mail check: it must parse as an 
 
 ## The token and the status path
 
-The confirm screen shows the answers once, with the key fingerprints, and files nothing until the applicant confirms. On confirmation the TUI posts one intent to the onboarding handler over loopback, alongside the web form and the capsule, and receives the application token. It prints the token and the status address:
+The confirm screen shows the answers once, with the key fingerprints, and files nothing until the applicant confirms. On confirmation the TUI posts one intent to the onboarding handler, alongside the web form and the capsule, and receives the application token. It prints the token and the status address:
 
 ```
 Your application is filed.
@@ -307,7 +313,7 @@ The existing SSH-failure threshold in `docs/planning/research/alert-thresholds.m
 - It is never the only way in. The web form at `signup.kyriakon.net` asks the same questions and needs no terminal, and nothing about applying requires a terminal.
 - It is never a username oracle. Format and reserved names are checked live; existence never is.
 - It never echoes an application's answers on the status path, and a token that does not exist reads as an expired one.
-- It never holds privilege or secrets. It runs as `hello`, reads no root-only file, and reaches the handler over loopback.
+- It never holds privilege or secrets. It runs as `hello`, reads no root-only file, and reaches the handler over a socket of its own.
 - It never forwards anything. `DisableForwarding` and `PermitOpen none` leave no TCP, agent, X11 or streamlocal channel and no tunnel.
 - It never writes an address or an answer to a log of its own; sshd's admission line is the only place the address appears.
 - It never files twice. One confirm files one intent; an abandoned or dropped session files nothing.
@@ -316,7 +322,7 @@ The existing SSH-failure threshold in `docs/planning/research/alert-thresholds.m
 
 The TUI is a front-end and sits on the same side of the boundary as the web handler ([#156](https://github.com/kyriakon/kyriakon-infra/issues/156)). It runs as the unprivileged `hello` account and can do three things: read the shared question list and the catalogue, ask the handler to file an intent, read a status, or name the account a key belongs to, and run the shared key check. It holds no Stripe secret, no repository token and no signing key, and it cannot read the store, the account files or any member's mail.
 
-Its one network reach is the handler on the loopback address, the same process that answers the web form and the capsule behind `relayd` and `gmid`. That keeps one intent writer. The TUI passes the source address it took from `SSH_CONNECTION` so the handler's per-address counters apply to it the same way they apply to the capsule, but the handler validates every field again as it does for any front-end, so a bug in the TUI cannot become a privileged write. The drain still does every privileged thing, on its next run.
+Its one network reach is the handler, the same process that answers the web form and the capsule, over a unix socket whose group is what lets the `hello` account connect. The handler has no listener on a port since [#394](https://github.com/kyriakon/kyriakon-infra/issues/394), which also means the socket path and its group are this front-end's own decision to name, in the same shape the other two use. That keeps one intent writer. The TUI passes the source address it took from `SSH_CONNECTION` so the handler's per-address counters apply to it the same way they apply to the capsule, but the handler validates every field again as it does for any front-end, so a bug in the TUI cannot become a privileged write. The drain still does every privileged thing, on its next run.
 
 The handoff for the browser generator is one URL in the printed walkthrough. It is the site spec's page, linked rather than reimplemented, so the TUI carries no OpenPGP generator, no WASM, and no private key, ever.
 
