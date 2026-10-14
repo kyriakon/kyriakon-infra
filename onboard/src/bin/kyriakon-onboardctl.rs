@@ -152,10 +152,16 @@ async fn show(store: &Store, username: &str) -> Result<(), String> {
                 "  token    {}",
                 account.token_ref.as_deref().unwrap_or("none (no charge)")
             );
-            println!(
-                "  paid     {}",
-                account.paid_until.as_deref().unwrap_or("null: the window is open")
-            );
+            // `paid_until` is null while a window runs, so null alone says
+            // nothing about whether one exists: the window does. A no-charge
+            // approval has no window and never lapses, and saying it does would
+            // have a member watching for one to close.
+            let paid = match (&account.paid_until, &account.window) {
+                (Some(until), _) => until.as_str(),
+                (None, Some(_)) => "null: the window is open",
+                (None, None) => "none: no charge was made, so nothing expires",
+            };
+            println!("  paid     {paid}");
             if let Some(w) = &account.window {
                 println!("  window   {} to {}", w.opened_at, w.closes_at);
             }
