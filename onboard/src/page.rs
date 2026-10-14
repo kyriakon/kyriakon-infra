@@ -244,7 +244,7 @@ mod tests {
     /// A catalogue for the page tests. The services themselves are the
     /// catalogue module's own subject; what these tests carry is that the page
     /// renders the file it was given.
-    fn guide() -> Vec<Service> {
+    fn catalogue() -> Vec<Service> {
         crate::catalogue::parse(
             "[[service]]\n\
              id = \"mail\"\n\
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn a_person_has_four_sections_and_no_community_block() {
-        let p = applicant(&list(), &guide(), false, &BTreeMap::new(), "r");
+        let p = applicant(&list(), &catalogue(), false, &BTreeMap::new(), "r");
         assert!(p.community.is_empty());
         let ids = |v: &[Rq]| v.iter().map(|q| q.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&p.you), ["username", "whose", "address_outside"]);
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn a_body_has_the_community_block_and_its_own_keys() {
-        let p = applicant(&list(), &guide(), true, &BTreeMap::new(), "r");
+        let p = applicant(&list(), &catalogue(), true, &BTreeMap::new(), "r");
         let ids = |v: &[Rq]| v.iter().map(|q| q.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&p.community), ["body_name"]);
         assert_eq!(ids(&p.you), ["username", "whose", "vat", "address_outside"]);
@@ -332,7 +332,7 @@ mod tests {
     fn a_selected_answer_is_still_selected_after_a_refusal() {
         let mut answers = BTreeMap::new();
         answers.insert("whose".to_string(), "body".to_string());
-        let p = applicant(&list(), &guide(), true, &answers, "r");
+        let p = applicant(&list(), &catalogue(), true, &answers, "r");
         let whose = p.you.iter().find(|q| q.id == "whose").unwrap();
         assert!(whose.options.iter().any(|o| o.value == "body" && o.selected));
         assert!(whose.options.iter().any(|o| o.value == "person" && !o.selected));
@@ -351,7 +351,7 @@ mod tests {
             false,
             choices(&[("priest", "Priest"), ("nun", "Nun")]),
         ));
-        let untouched_page = applicant(&list, &guide(), false, &BTreeMap::new(), "r");
+        let untouched_page = applicant(&list, &catalogue(), false, &BTreeMap::new(), "r");
         let untouched = &untouched_page
             .about
             .iter()
@@ -366,7 +366,7 @@ mod tests {
         // who changes their mind can go back to declaring nothing.
         let mut answers = BTreeMap::new();
         answers.insert("orders".to_string(), "nun".to_string());
-        let answered_page = applicant(&list, &guide(), false, &answers, "r");
+        let answered_page = applicant(&list, &catalogue(), false, &answers, "r");
         let answered = &answered_page
             .about
             .iter()
@@ -378,7 +378,7 @@ mod tests {
 
         // A required choice has no blank answer: there would be nothing to
         // leave it on.
-        let p = applicant(&list, &guide(), false, &BTreeMap::new(), "r");
+        let p = applicant(&list, &catalogue(), false, &BTreeMap::new(), "r");
         let rail = p.pay.iter().find(|q| q.id == "rail").unwrap();
         assert!(rail.options.iter().all(|o| !o.value.is_empty()));
     }
@@ -388,7 +388,7 @@ mod tests {
     /// the account page's list is the same file.
     #[test]
     fn the_catalogue_is_a_card_per_entry_and_a_list_on_the_account_page() {
-        let p = applicant(&list(), &guide(), false, &BTreeMap::new(), "r");
+        let p = applicant(&list(), &catalogue(), false, &BTreeMap::new(), "r");
         assert_eq!(p.services.len(), 1);
 
         let html = p.render().unwrap();
@@ -398,7 +398,7 @@ mod tests {
         assert!(html.contains("https://mail.example.invalid/"), "{html}");
         assert!(html.contains("<span class=\"tag\">live</span>"), "{html}");
 
-        let listed = account(&guide(), None).render().unwrap();
+        let listed = account(&catalogue(), None).render().unwrap();
         assert!(listed.contains("zero-access mail"), "{listed}");
         assert!(listed.contains("https://mail.example.invalid/"), "{listed}");
 
