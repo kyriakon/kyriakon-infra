@@ -594,6 +594,7 @@ fn show_names_a_window_only_when_the_account_has_one() {
     let out = charged.ctl(&["show", "secretary"]);
     assert!(out.status.success(), "{}", body(&out));
     let text = body(&out);
+    assert!(text.contains("  paid     null: the window is open"), "{text}");
     assert!(text.contains(&format!("  window   {opened} to {closes}")), "{text}");
 
     let free = Fix::new("show-free");
@@ -608,7 +609,10 @@ fn show_names_a_window_only_when_the_account_has_one() {
     assert!(out.status.success(), "{}", body(&out));
     let text = body(&out);
     assert!(!text.contains("window"), "no window exists to name: {text}");
-    assert!(text.contains("no charge"), "the line should say what is true: {text}");
+    assert!(
+        text.contains("  paid     none: no charge was made, so nothing expires"),
+        "the line should say what is true: {text}"
+    );
 }
 
 /// A decline purges nothing on the first run; the run after its week clears the
