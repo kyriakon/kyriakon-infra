@@ -17,6 +17,10 @@ use crate::questions::{self, Kind, Question, Rule};
 #[template(path = "applicant.html")]
 pub struct ApplicantPage {
     pub errors: Vec<String>,
+    /// The branch the page was rendered for, `person` or `body`. The form posts
+    /// it back in a hidden field, so a submission is read against the page the
+    /// applicant was shown rather than against whatever the select says now.
+    pub branch: &'static str,
     pub community: Vec<Rq>,
     pub you: Vec<Rq>,
     pub mailkey: Vec<Rq>,
@@ -62,10 +66,6 @@ pub struct Rq {
     pub value: String,
     pub checked: bool,
     pub options: Vec<Opt>,
-    /// The hidden field the browser walkthrough fills with the fingerprint it
-    /// computed, carried beside the material and never recomputed here.
-    pub fingerprint_id: String,
-    pub fingerprint: String,
     pub hint: String,
 }
 
@@ -109,6 +109,7 @@ pub fn applicant(
 ) -> ApplicantPage {
     let mut page = ApplicantPage {
         errors: Vec::new(),
+        branch: if body { "body" } else { "person" },
         community: Vec::new(),
         you: Vec::new(),
         mailkey: Vec::new(),
@@ -133,17 +134,28 @@ pub fn applicant(
 
 fn render(q: &Question, answers: &BTreeMap<String, String>) -> Rq {
     let value = answers.get(&q.id).cloned().unwrap_or_default();
-    let fingerprint_id = format!("{}_fingerprint", q.id);
-    let fingerprint = answers.get(&fingerprint_id).cloned().unwrap_or_default();
     let options = match &q.rule {
-        Rule::Choice(choices) => choices
-            .iter()
-            .map(|c| Opt {
+        Rule::Choice(choices) => {
+            // An optional choice opens on a blank answer rather than on its
+            // first one: the orders question is optional, so an applicant who
+            // ignores it must declare nothing rather than be recorded as a
+            // priest. A required choice has no blank, because there is no
+            // answer to leave it on.
+            let mut opts: Vec<Opt> = Vec::new();
+            if !q.required {
+                opts.push(Opt {
+                    value: String::new(),
+                    label: String::new(),
+                    selected: value.is_empty(),
+                });
+            }
+            opts.extend(choices.iter().map(|c| Opt {
                 value: c.value.clone(),
                 label: c.label.clone(),
                 selected: value == c.value,
-            })
-            .collect(),
+            }));
+            opts
+        }
         _ => Vec::new(),
     };
     Rq {
@@ -163,8 +175,6 @@ fn render(q: &Question, answers: &BTreeMap<String, String>) -> Rq {
         checked: q.kind == Kind::YesNo && !value.is_empty() && value != "no",
         value,
         options,
-        fingerprint_id,
-        fingerprint,
         hint: hint(&q.id).to_string(),
     }
 }
@@ -178,7 +188,7 @@ fn hint(id: &str) -> &'static str {
         "whose" => "A body is a parish, a monastery, a school or a small Orthodox business. Answering for one opens the community block: the body's name and kind, its domain, its addresses and a mail key for each mailbox, and it pays £40 a year rather than £20. Whoever applies stays one person either way, and is who we reach, who accepts the terms and who pays.",
         "vat" => "Optional. A body in business in the Union supplies a reverse-charge supply, which is why the number is asked for.",
         "address_outside" => "We write here as well as to your new address, including if the account is ever in trouble, and if this address bounces we hold on longer before doing anything final. It is used for notices only, it is never shared, and we never use it to look you up anywhere else. <strong>If you leave it empty,</strong> we can only reach you inside this account: if you lose your key or your mail client you will not hear from us, and an unpaid account will still lapse and in time be deleted, with the mail. Nothing else changes.",
-        "mail_key" => "The walkthrough makes a key in your browser and gives you a recovery phrase to write down: <a href=\"/keys\">the key walkthrough</a>. Paste the public block here; only the public half is ever sent.",
+        "mail_key" => "The walkthrough makes a key in your browser and gives you a recovery phrase to write down: the key walkthrough. Paste the public block here; only the public half is ever sent.",
         "upload_key" => "Needed for a website or repositories. An OpenSSH public key, the line starting <span class=\"mono\">ssh-ed25519</span> or <span class=\"mono\">ssh-rsa</span>.",
         "rail" => "Clergy, monastics, and anyone without the means to pay are not charged. There is nothing to prove and no means test: say so below and the same person who reviews the application decides it.",
         "body_records" => "The platform asks for the domain's A and AAAA, MX, SPF, DKIM and DMARC records.",
@@ -275,5 +285,50 @@ mod tests {
         let whose = p.you.iter().find(|q| q.id == "whose").unwrap();
         assert!(whose.options.iter().any(|o| o.value == "body" && o.selected));
         assert!(whose.options.iter().any(|o| o.value == "person" && !o.selected));
+    }
+
+    #[test]
+    fn an_optional_choice_declares_nothing_until_it_is_answered() {
+        // The orders question is optional and its first answer is Priest, so a
+        // select that opens on the first answer records priesthood for an
+        // applicant who ignores the question.
+        let mut list = list();
+        list.push(q(
+            "orders",
+            Branch::All,
+            Kind::Choice,
+            false,
+            choices(&[("priest", "Priest"), ("nun", "Nun")]),
+        ));
+        let untouched_page = applicant(&list, false, &BTreeMap::new(), "r");
+        let untouched = &untouched_page
+            .about
+            .iter()
+            .find(|q| q.id == "orders")
+            .unwrap()
+            .options;
+        assert_eq!(untouched.first().map(|o| o.value.as_str()), Some(""));
+        assert!(untouched[0].selected, "the blank answer is the one declared");
+        assert!(untouched[1..].iter().all(|o| !o.selected));
+
+        // Answered, it opens on the answer, blank answer included: an applicant
+        // who changes their mind can go back to declaring nothing.
+        let mut answers = BTreeMap::new();
+        answers.insert("orders".to_string(), "nun".to_string());
+        let answered_page = applicant(&list, false, &answers, "r");
+        let answered = &answered_page
+            .about
+            .iter()
+            .find(|q| q.id == "orders")
+            .unwrap()
+            .options;
+        assert!(!answered[0].selected && answered[0].value.is_empty());
+        assert!(answered.iter().any(|o| o.value == "nun" && o.selected));
+
+        // A required choice has no blank answer: there would be nothing to
+        // leave it on.
+        let p = applicant(&list, false, &BTreeMap::new(), "r");
+        let rail = p.pay.iter().find(|q| q.id == "rail").unwrap();
+        assert!(rail.options.iter().all(|o| !o.value.is_empty()));
     }
 }

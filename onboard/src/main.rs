@@ -120,7 +120,10 @@ async fn run() -> Result<(), String> {
     );
 
     let router = Router::new()
-        .route("/", get(applicant))
+        // The branch question is answered by using the form: this route renders
+        // the page again with the answer, and gets its submission from the
+        // form's own continuation button.
+        .route("/", get(applicant).post(branch_step))
         .route("/apply", post(apply))
         .route("/status/{token}", get(status))
         // The counters are a layer rather than a check inside each handler, so a
@@ -181,6 +184,49 @@ async fn applicant(State(app): State<Arc<App>>, Query(q): Query<BranchQuery>) ->
     render_applicant(&app, body, &BTreeMap::new(), &[]).into_response()
 }
 
+/// The branch question's own step. The continuation button posts the whole form
+/// here, so the answer comes back as a submission, the page is rendered again
+/// with the community block open or closed to match, and everything already
+/// typed comes back with it. This is the whole of the branch mechanism: no
+/// script, and the same question is settled the same way when the application is
+/// submitted, which is what the terminal and the capsule inherit.
+async fn branch_step(
+    State(app): State<Arc<App>>,
+    Form(form): Form<BTreeMap<String, String>>,
+) -> Response {
+    let body = form.get("whose").map(String::as_str) == Some("body");
+    render_applicant(&app, body, &form, &[]).into_response()
+}
+
+/// What a submission is read against.
+struct Reading {
+    /// Whether it is read as a body's, which decides which questions exist.
+    body: bool,
+    /// Whether the applicant has already been shown that branch's questions.
+    /// False when the answer names a branch the page did not carry, which is a
+    /// question the page had not opened and therefore answers it never showed.
+    shown: bool,
+}
+
+/// The branch a submission is read against, and whether its own answers are the
+/// page it was shown. The branch question's answer settles this, from the same
+/// field whichever front-end filed the submission: the web form posts its
+/// select, and the terminal and the capsule post the same answer.
+fn reading(form: &BTreeMap<String, String>) -> Reading {
+    let body = form.get("whose").map(String::as_str) == Some("body");
+    let shown = match form.get("branch") {
+        // The web form posts the branch its page was rendered for. An answer
+        // naming the other one means the applicant changed the select without
+        // opening the block it asks for, so the page they were shown is not the
+        // page their answer asks for.
+        Some(page) => (page == "body") == body,
+        // No page: a front-end that renders its own has already shown whatever
+        // its answer asks for, so its answer is the page.
+        None => true,
+    };
+    Reading { body, shown }
+}
+
 async fn status(State(app): State<Arc<App>>, Path(token): Path<String>) -> Response {
     // A token is a path component, so it is checked against the alphabet before
     // it is used as one: a probe cannot walk the directory with "..".
@@ -229,10 +275,11 @@ fn status_page(record: Option<Record>, now: OffsetDateTime) -> StatusPage {
 async fn apply(
     State(app): State<Arc<App>>,
     Extension(key): Extension<Key>,
-    // Every question id is one field, plus a `<id>_fingerprint` beside each key.
+    // Every question id is one field, and `branch` beside them is the branch the
+    // page that posted them was rendered for.
     Form(form): Form<BTreeMap<String, String>>,
 ) -> Response {
-    let body = form.get("whose").map(String::as_str) == Some("body");
+    let Reading { body, shown } = reading(&form);
     let monastic = questions::is_monastic(form.get("orders").map(String::as_str));
     let applicable: Vec<&Question> = questions::shown(&app.questions, !body);
 
@@ -253,6 +300,14 @@ async fn apply(
     };
 
     let mut errors = Vec::new();
+    // The answer names a branch the page did not carry, so its questions are
+    // ones the applicant has not been shown and answers they have not been given
+    // the chance to give. Refusing would list exactly those, which is the
+    // refusal the ticket is about: the page is rendered again with the block
+    // open instead, and the answers so far come back with it.
+    if !shown {
+        return render_applicant(&app, body, &form, &[]).into_response();
+    }
     for q in &applicable {
         let value = form.get(&q.id).cloned().unwrap_or_default();
         // A monastic-branch question belongs to the monastic path, so its
@@ -379,10 +434,6 @@ fn build_record(
 
     let mail_key_id = if body { "body_mail_key" } else { "mail_key" };
     let blocks = key_blocks(form.get(mail_key_id).map(String::as_str).unwrap_or(""));
-    let fingerprints = form
-        .get(&format!("{mail_key_id}_fingerprint"))
-        .map(|s| s.lines().map(str::trim).map(str::to_string).collect::<Vec<_>>())
-        .unwrap_or_default();
     let mailboxes: Vec<String> = if body {
         form.get("body_account_names")
             .map(|s| {
@@ -401,21 +452,14 @@ fn build_record(
         mail_keys.push(key_record(
             mailboxes.get(i).cloned().unwrap_or_default(),
             block,
-            fingerprints.get(i).cloned().unwrap_or_default(),
+            KeyKind::Mail,
         ));
     }
 
     let upload_key_id = if body { "body_upload_key" } else { "upload_key" };
     let upload = form.get(upload_key_id).map(String::as_str).unwrap_or("").trim();
-    let upload_key = (!upload.is_empty()).then(|| {
-        key_record(
-            String::new(),
-            upload,
-            form.get(&format!("{upload_key_id}_fingerprint"))
-                .cloned()
-                .unwrap_or_default(),
-        )
-    });
+    let upload_key =
+        (!upload.is_empty()).then(|| key_record(String::new(), upload, KeyKind::Upload));
 
     Ok(Record {
         username: form.get("username").cloned().unwrap_or_default(),
@@ -450,10 +494,30 @@ fn build_record(
     })
 }
 
-fn key_record(mailbox: String, material: &str, fingerprint: String) -> KeyRecord {
+/// Which of the two fingerprints a key's material carries: an OpenPGP
+/// certificate has the one gpg prints, and an OpenSSH public key the one
+/// ssh-keygen prints. They are different numbers over different things.
+#[derive(Clone, Copy)]
+enum KeyKind {
+    Mail,
+    Upload,
+}
+
+/// A key as the record carries it. The fingerprint is computed here, over the
+/// material stored beside it, because the handler is the only place that holds
+/// both: the web form has no script and cannot compute one, and the walkthrough
+/// that would have computed it in the browser never posts to a field nothing
+/// fills. A number that names material it was not computed from is worse than
+/// none, and the reviewer compares this one with the key they will be sent.
+fn key_record(mailbox: String, material: &str, kind: KeyKind) -> KeyRecord {
     let verdict = keycheck::pgp_public_key(material)
         .map(|c| c.verdict)
         .unwrap_or_else(|_| "unchecked".to_string());
+    let fingerprint = match kind {
+        KeyKind::Mail => keycheck::pgp_fingerprint(material),
+        KeyKind::Upload => keycheck::openssh_fingerprint(material),
+    }
+    .unwrap_or_default();
     KeyRecord {
         mailbox,
         fingerprint,
@@ -725,5 +789,205 @@ mod tests {
         form.insert("body_account_names".into(), "secretary\nhall".into());
         body_cross_checks(&form, &mut errors);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A public key block with the structure of a key that can be encrypted to.
+    const GOOD_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
+mAYEAAAAABK4BgQAAAAAEg==\n-----END PGP PUBLIC KEY BLOCK-----\n";
+
+    /// A handler over a store under a temporary directory, reading the shipped
+    /// question list: the page these tests answer is the page an applicant is
+    /// served, and the answers are the ones it asks for.
+    fn handler(name: &str) -> (Arc<App>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("onboard-apply-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["applications", "intents"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let cfg = config::Config {
+            store_root: dir.to_str().unwrap().to_string(),
+            // Both are read once at startup, by `run`, which is not what these
+            // tests exercise: the list is parsed here and the reserved set is
+            // empty.
+            questions: String::new(),
+            reserved: String::new(),
+            listen: "127.0.0.1".to_string(),
+            port: 0,
+            release: "2026-10-13 test".to_string(),
+        };
+        let app = Arc::new(App {
+            store: Store::new(&cfg.store_root),
+            cfg,
+            questions: questions::parse(include_str!(
+                "../../openbsd/etc/onboard/questions.toml"
+            ))
+            .expect("the shipped question list"),
+            reserved: HashSet::new(),
+            counter: rate::Counter::new(),
+        });
+        (app, dir)
+    }
+
+    /// The HTML a response carries.
+    async fn page_of(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// The answers the body's page asks for, and nothing a body's page does not
+    /// carry: no mail_key, no upload_key, no monastic blessing.
+    fn body_answers() -> BTreeMap<String, String> {
+        [
+            ("branch", "body"),
+            ("whose", "body"),
+            ("username", "theophilus"),
+            ("body_name", "The Parish of Example"),
+            ("body_kind", "parish"),
+            ("vat", ""),
+            ("body_domain", "example.invalid"),
+            ("body_records", "yes"),
+            ("body_addresses", "secretary: own"),
+            ("body_account_names", "secretary"),
+            ("body_mail_key", GOOD_KEY),
+            ("body_upload_key", ""),
+            ("body_dns_contact", ""),
+            ("address_outside", ""),
+            ("address_ack", ""),
+            ("rail", "no_charge"),
+            ("diocese", ""),
+            ("orders", ""),
+            ("blessing", ""),
+            ("cannot_pay", ""),
+            ("intended_use", ""),
+            ("anything_else", ""),
+            ("accept_terms", "yes"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    fn form(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_branch_question_opens_the_block_by_being_answered() {
+        let (app, _dir) = handler("branch");
+        let no_branch = || BranchQuery { branch: None };
+
+        // The page as it opens: a person's, with no community block on it and
+        // the branch its own form carries recorded as a person's.
+        let fresh = page_of(applicant(State(app.clone()), Query(no_branch())).await).await;
+        assert!(fresh.contains("name=\"branch\" value=\"person\""));
+        assert!(!fresh.contains("id=\"body_name\""));
+
+        // Answering for a body: the form's own continuation posts the answers
+        // back and the page comes back with the block open, holding them.
+        let answered = page_of(
+            branch_step(
+                State(app.clone()),
+                Form(form(&[("username", "theophilus"), ("whose", "body")])),
+            )
+            .await,
+        )
+        .await;
+        assert!(answered.contains("id=\"body_name\""), "the block is open");
+        assert!(answered.contains("name=\"branch\" value=\"body\""));
+        assert!(
+            answered.contains("value=\"theophilus\""),
+            "what was already typed comes back"
+        );
+
+        // Answering for a person closes it again.
+        let closed = page_of(
+            branch_step(State(app.clone()), Form(form(&[("whose", "person")]))).await,
+        )
+        .await;
+        assert!(!closed.contains("id=\"body_name\""));
+        assert!(closed.contains("name=\"branch\" value=\"person\""));
+    }
+
+    #[tokio::test]
+    async fn a_body_submission_that_was_shown_the_block_is_filed() {
+        let (app, dir) = handler("body-filed");
+
+        // The block is opened the way an applicant opens it, by answering the
+        // branch question, and the page that comes back is the one submitted to.
+        let page = page_of(
+            branch_step(State(app.clone()), Form(form(&[("whose", "body")]))).await,
+        )
+        .await;
+        let answers = body_answers();
+        assert!(page.contains("id=\"body_name\""), "the block is open");
+        assert!(
+            !page.contains("name=\"mail_key\""),
+            "a body is not shown the person's key"
+        );
+        for id in answers.keys() {
+            assert!(page.contains(&format!("name=\"{id}\"")), "{id} is on the page");
+        }
+        for q in questions::shown(&app.questions, false).iter().filter(|q| q.required) {
+            assert!(
+                page.contains(&format!("name=\"{}\"", q.id)),
+                "the required question {} is on the page",
+                q.id
+            );
+        }
+
+        // Submitting it is not a refusal for a question the page did not show,
+        // and it files the application.
+        let response = apply(
+            State(app.clone()),
+            Extension(Key::UnknownForward),
+            Form(answers),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a body applicant who filled in the block is not refused"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.join("applications")).unwrap().count(),
+            1,
+            "one application, filed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_the_page_did_not_carry_is_shown_rather_than_refused() {
+        let (app, dir) = handler("body-unshown");
+
+        // The select was changed to a body without opening the block, so the
+        // page the applicant was shown was the person's: the body's questions
+        // are ones they have never seen. The handler renders that page for them
+        // instead of refusing for answers they were not asked for.
+        let response = apply(
+            State(app.clone()),
+            Extension(Key::UnknownForward),
+            Form(form(&[
+                ("branch", "person"),
+                ("whose", "body"),
+                ("username", "theophilus"),
+                ("rail", "no_charge"),
+                ("accept_terms", "yes"),
+            ])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = page_of(response).await;
+        assert!(page.contains("id=\"body_name\""), "the block is open");
+        assert!(page.contains("name=\"branch\" value=\"body\""));
+        assert_eq!(
+            std::fs::read_dir(dir.join("applications")).unwrap().count(),
+            0,
+            "nothing is filed from a submission that was refused the page"
+        );
     }
 }

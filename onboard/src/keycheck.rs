@@ -1,14 +1,23 @@
 //! Structural checks on a submitted key: armour framing, base64, and the packet
-//! structure. No cryptography.
+//! structure, and the fingerprint of the material either way.
 //!
 //! The three conditions that decide whether mail can actually be delivered to a
 //! key (an encryption-capable subkey, no AEAD preference, not expired) are
-//! decided in the browser by the walkthrough (#176, #185), which posts the key's
-//! fingerprint beside the material. The verdict recorded here is this module's
-//! own structural reading, not a value the client sends. It refuses only
-//! something that is not a public key block at all, and never a key merely
-//! because the browser would warn about it: the spec warns and proceeds, because
-//! a heuristic refusal turns a guarantee into a support queue.
+//! decided in the browser by the walkthrough (#176, #185). The verdict recorded
+//! here is this module's own structural reading, not a value the client sends.
+//! It refuses only something that is not a public key block at all, and never a
+//! key merely because the browser would warn about it: the spec warns and
+//! proceeds, because a heuristic refusal turns a guarantee into a support queue.
+//!
+//! The fingerprints are the exception to that division of labour, and they are
+//! hashes rather than checks: the walkthrough is not built, the web form has no
+//! script, and a number that names material it was not computed from reads as a
+//! number that disagrees with the key on the box. So the fingerprint is computed
+//! here, over the material the record carries, in the two shapes the two keys
+//! have. They decide nothing.
+
+use sha1::{Digest, Sha1};
+use sha2::Sha256;
 
 const BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
 const END: &str = "-----END PGP PUBLIC KEY BLOCK-----";
@@ -71,6 +80,70 @@ pub fn openssh_public_key(value: &str) -> Result<(), String> {
         return Err("the upload key's material does not decode".to_string());
     }
     Ok(())
+}
+
+/// The OpenPGP fingerprint of the first public key packet in an armoured block,
+/// in the upper-case hex gpg prints: the SHA-1 of the version 4 packet's framing
+/// (`0x99`, the packet's length, the packet) or the SHA-256 of a version 6 one
+/// (`0x9b`, a four-byte length, the packet), which is RFC 9580's own definition.
+/// `None` when the block carries no key packet or one of a version with no
+/// fingerprint defined here, which is not a number to guess at.
+pub fn pgp_fingerprint(value: &str) -> Option<String> {
+    let body = armour_body(value).ok()?;
+    let raw = base64_decode(&body)?;
+    let key = packets(&raw)?.into_iter().find(|p| p.tag == 6)?;
+    let version = key.body.first().copied()?;
+    let len = key.body.len();
+    let mut framed = Vec::with_capacity(len + 5);
+    let digest = match version {
+        4 => {
+            framed.push(0x99);
+            framed.extend_from_slice(&u16::try_from(len).ok()?.to_be_bytes());
+            framed.extend_from_slice(&key.body);
+            Sha1::digest(&framed).to_vec()
+        }
+        6 => {
+            framed.push(0x9b);
+            framed.extend_from_slice(&u32::try_from(len).ok()?.to_be_bytes());
+            framed.extend_from_slice(&key.body);
+            Sha256::digest(&framed).to_vec()
+        }
+        _ => return None,
+    };
+    Some(digest.iter().map(|b| format!("{b:02X}")).collect())
+}
+
+/// The OpenSSH fingerprint `ssh-keygen -l` prints: `SHA256:` and the unpadded
+/// base64 of the key blob's SHA-256. `None` when the line has no key material to
+/// hash.
+pub fn openssh_fingerprint(value: &str) -> Option<String> {
+    let blob = value.split_whitespace().nth(1)?;
+    let raw = base64_decode(blob)?;
+    Some(format!("SHA256:{}", base64_encode(&Sha256::digest(&raw))))
+}
+
+/// Standard base64 without padding, which is the form OpenSSH prints a
+/// fingerprint in.
+fn base64_encode(bytes: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(A[(n >> 6) as usize & 63] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(A[n as usize & 63] as char);
+        }
+    }
+    out
 }
 
 /// The base64 body of an armoured block: everything between the armour headers
@@ -277,6 +350,32 @@ mod tests {
         assert_eq!(base64_decode("aGVsbG8").unwrap(), b"hello");
         assert_eq!(base64_decode("mAYEAAAAABK4BgQAAAAAEg==").unwrap().len(), 16);
         assert!(base64_decode("!!!!").is_none());
+    }
+
+    #[test]
+    fn a_v4_fingerprint_is_the_hash_of_the_framed_key_packet() {
+        // GOOD's key packet is six bytes: version 4, four bytes of creation time,
+        // algorithm 18. Its fingerprint is the SHA-1 of 0x99, that length in two
+        // bytes, and those six bytes, which is the number gpg prints for the same
+        // packet.
+        assert_eq!(
+            pgp_fingerprint(&armoured(GOOD)).as_deref(),
+            Some("E6EC346E2ADF3273FC2427550A3E4823302ED1D3")
+        );
+        // Not a key at all, and a packet of no version: no number to give.
+        assert_eq!(pgp_fingerprint("hello"), None);
+        assert_eq!(pgp_fingerprint(&armoured(NO_KEY)), None);
+    }
+
+    #[test]
+    fn an_ssh_fingerprint_is_the_one_ssh_keygen_prints() {
+        let line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEneyKlmR58gWNLesodiRodRAss6LnzTWOXQZDDTwgqE test@example";
+        assert_eq!(
+            openssh_fingerprint(line).as_deref(),
+            Some("SHA256:AKJY00Q0wyarJib298vyVjNrGBFRYqsPeWcBluZNRQU"),
+            "ssh-keygen -lf prints this for the same key"
+        );
+        assert_eq!(openssh_fingerprint("ssh-ed25519"), None);
     }
 
     fn base64_of(bytes: &[u8]) -> String {

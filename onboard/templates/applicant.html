@@ -12,6 +12,17 @@
 <form method="post" action="/apply">
 
   {#
+    The branch this page was rendered for, as the page's own record of itself. A
+    submission is read against it, so the questions the handler validates are the
+    questions the applicant was shown. The branch question's Continue sends the
+    same form to the handler's own route, which renders this page again with the
+    answer; a browser that ignores formaction posts to /apply, which finds the
+    answer and this field disagreeing and renders the page again rather than
+    refusing for fields that were never on it.
+  #}
+  <input type="hidden" name="branch" value="{{ branch }}">
+
+  {#
     One. The community block opens from the second question, so it sits
     immediately after it, inside this section. Keeping it a block rather than a
     section is what leaves the page at four sections on both paths.
@@ -22,6 +33,13 @@
       {% for q in you %}
         {% if q.id == "whose" %}
           {% call m::field(q) %}
+          {#
+            The branch, answered by using it: the continuation posts every answer
+            to the handler, which renders the page again with the community block
+            open or closed to match. No script, and the block is open before the
+            applicant is asked for anything inside it.
+          #}
+          <button class="btn" type="submit" formaction="/" formmethod="post">Continue</button>
           {% if community.len() > 0 %}
           <fieldset class="community">
             <h4>The community block</h4>

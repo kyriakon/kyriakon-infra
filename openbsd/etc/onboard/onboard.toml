@@ -29,8 +29,8 @@ reserved = "/var/db/onboard/reserved-usernames.txt"
 # "2026-10-10 1a2b3c4". The acceptance records carry it as the version of each
 # document accepted, and it is the version of the question list an application
 # was answered against. It is the release the box is running, not a hash of
-# either file: the handler holds no hash crate, and a commit is a version the
-# drain can look up.
+# either file: a commit is a version the drain can look up and a reader can
+# compare, where a digest of two files is a number nothing acts on.
 release = "REPLACE_ME"
 
 # Loopback only. relayd terminates TLS for signup.kyriakon.net on the box and
