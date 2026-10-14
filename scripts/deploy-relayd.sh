@@ -364,7 +364,7 @@ case "${1:-}" in
 	printf 'relayd is terminating TLS on 443; relayd.conf names the certificates it presents.\n' >&2
 	printf 'next (manual): from a second machine, curl -sI https://signup.kyriakon.net/ | head -1\n' >&2
 	printf 'should be 200. The Titan listener stays commented in /etc/relayd.conf until a\n' >&2
-	printf 'capsule certificate pair and a handler listener exist; that port needs a pf\n' >&2
-	printf 'fragment when it opens, and none is filed while it is dark.\n' >&2
+	printf 'handler listener exists for it; that port needs a pf fragment when it opens,\n' >&2
+	printf 'and none is filed while it is dark.\n' >&2
 	;;
 esac
