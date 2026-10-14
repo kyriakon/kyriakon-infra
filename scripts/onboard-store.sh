@@ -91,10 +91,13 @@ store_dir() {
 }
 
 # install_file <source> <installed> <owner> <group> <mode>: install one shared
-# file and assert it, recording whether its contents or its mode changed. The
-# comparison is the file's bytes: these are data files read by every front-end,
-# so a byte that differs is a rendering that differs.
+# file and assert it, recording whether its contents, its owner or its mode
+# changed. The comparison is the file's bytes, because these are data files read
+# by every front-end and a byte that differs is a rendering that differs, and the
+# mode beside it for the same reason the directories are compared: a run that
+# repaired one has changed something and should say so.
 install_file() {
+	[ "$(stat -f '%Su %Sg %Lp' "$2" 2>/dev/null)" = "$3 $4 $5" ] || changed=1
 	cmp -s "$1" "$2" 2>/dev/null || changed=1
 	install -m "$5" -o "$3" -g "$4" "$1" "$2"
 	assert_mode "$2" "$3" "$4" "$5"
