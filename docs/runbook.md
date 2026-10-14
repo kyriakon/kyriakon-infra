@@ -317,16 +317,22 @@ Do not restore over a live box's `/home` while the daemons are running, and do n
 
 ### Regenerate the capsule certificate pair
 
-A capsule serves a long-lived self-signed certificate, generated once with a ten-year life and never renewed, so nothing mints its key again and the file is the only copy. Losing it changes every capsule's certificate at once and every reader's client trusts once more, because a gemini client pins the certificate on first use. The pair sits in the snapshot and a restore brings it back. When it is lost everywhere, generate it again, reload `gmid`, and update the fingerprint the help page publishes.
+A capsule serves a long-lived self-signed certificate, generated once with a ten-year life and never renewed, so nothing mints its key again and the file is the only copy. Losing it changes every capsule's certificate at once and every reader's client trusts once more, because a gemini client pins the certificate on first use. The pair sits in the snapshot and a restore brings it back.
 
-1. Generate the pair with `openssl req -x509`, driven from a configuration file that sets `subjectAltName = DNS:kyriakon.net, DNS:*.kyriakon.net` and `basicConstraints = critical, CA:FALSE`. The platform pair is `/etc/ssl/capsule-kyriakon.net.crt` and `/etc/ssl/private/capsule-kyriakon.net.key`; an own-domain pair is `/etc/ssl/capsule-<domain>.crt` with its key under `/etc/ssl/private`. The LibreSSL on this box carries a configuration file rather than command-line extension flags.
+`scripts/deploy-mail.sh` looks after the pair rather than a person remembering it. It runs `ksh scripts/provision-member-capsule.sh --pair` before installing `/etc/gmid.conf`, which is the file that names the pair, and refuses to install a config whose certificate is missing. That step generates both halves when either is missing and leaves a complete pair alone, so a lost pair is repaired by the ordinary deploy and a pair that is still there is never rotated by accident. The same command is the repair on its own.
 
-2. Check the result and reload `gmid`.
+1. Remove both halves and run the deploy.
+
+		doas rm /etc/ssl/capsule-kyriakon.net.crt /etc/ssl/private/capsule-kyriakon.net.key
+		doas ksh scripts/deploy-mail.sh
+
+2. Check the result. The deploy restarts gmid, and this is the check that the new pair is readable.
 
 		doas gmid -n -c /etc/gmid.conf
-		doas rcctl reload gmid
 
-3. Update the fingerprint the help page publishes. Nothing regenerates the pair on a schedule, because the fingerprint only changes when a human runs this step.
+3. Update the fingerprint the help page publishes. The deploy prints it from the certificate it generated.
+
+An own-domain capsule has a pair of its own at `/etc/ssl/capsule-<domain>.crt` with its key under `/etc/ssl/private`, and the own-domain tier's provisioning owns that one. Nothing regenerates a pair on a schedule, because the fingerprint only changes when a human decides to change it.
 
 ## A failed certificate renewal
 
@@ -334,7 +340,7 @@ Renewal runs daily from cron.
 
 	doas ksh /root/bin/renew-acme.sh
 
-The script renews `mail.kyriakon.net` for Dovecot and smtpd, `kyriakon.net` and `oliver.kyriakon.net` for relayd and gmid, and `kyriakon.com` for relayd. relayd is the daemon that terminates TLS for every web name, and gmid serves the same certificates for the capsules. It restarts only the daemons whose certificate changed, and it prints `still current` for a certificate that is not near expiry. It exits non-zero when a renewal fails, and cron mails that to root.
+The script renews `mail.kyriakon.net` for Dovecot and smtpd, `kyriakon.net` and `oliver.kyriakon.net` for relayd, and `kyriakon.com` for relayd. relayd terminates TLS for every web name. The capsules are not in this lane: gmid presents the capsule pair, which is self-signed, lasts ten years and is never renewed, so a renewal cannot change what a reader's client has pinned. It restarts only the daemons whose certificate changed, and it prints `still current` for a certificate that is not near expiry. It exits non-zero when a renewal fails, and cron mails that to root.
 
 When it fails:
 

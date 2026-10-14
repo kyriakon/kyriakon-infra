@@ -47,9 +47,10 @@
 #
 # The names come from /etc/acme-client.conf on every run, not from a list in this
 # file. A list is how oliver.kyriakon.net went unrenewed while its domain block
-# sat in the config and httpd and gmid both served it. A handle with no entry in
-# services_for below stops the run instead of being renewed into no daemon, so a
-# name cannot be added to the config without this script being told what holds it.
+# sat in the config and nothing presented its certificate over TLS. A handle with
+# no entry in services_for below stops the run instead of being renewed into no
+# daemon, so a name cannot be added to the config without this script being told
+# what holds it.
 # Per-member certificates belong in a file the config includes (acme-client.conf(5)
 # documents `include`), so that neither lane inherits the other's domain list.
 #
@@ -196,16 +197,18 @@ inside_warn_window() {
 # Dovecot before smtpd on the mail host because smtpd delivers to Dovecot over
 # LMTP, so bringing smtpd back first leaves it a window with no delivery target
 # and bounces anything arriving inside it. relayd terminates TLS for the web
-# names and holds the certificates it presents (openbsd/etc/relayd.conf), and
-# gmid holds the apex and personal-site certificates for their capsules, so those
-# are the daemons a renewal has to reach. httpd is not one of them since the 443
-# vhosts moved to loopback behind the relay: it serves no certificate of its own.
-# Neither rc.d defines a reload action, so both are restarted rather than
-# reloaded.
+# names and holds the certificates it presents (openbsd/etc/relayd.conf), so those
+# are the daemons a renewal has to reach. gmid is deliberately not among them: the
+# capsules present the long-lived capsule pair rather than any certificate this
+# lane renews, because a reader's client pins what it was shown and a ninety-day
+# rotation would break every pin on the box at once. httpd is not one of them
+# either, since the 443 vhosts moved to loopback behind the relay: it serves no
+# certificate of its own. Neither rc.d defines a reload action, so both are
+# restarted rather than reloaded.
 services_for() {
 	case "$1" in
 	mail.kyriakon.net) printf 'dovecot smtpd' ;;
-	kyriakon.net | oliver.kyriakon.net) printf 'relayd gmid' ;;
+	kyriakon.net | oliver.kyriakon.net) printf 'relayd' ;;
 	kyriakon.com) printf 'relayd' ;;
 	*) return 1 ;;
 	esac

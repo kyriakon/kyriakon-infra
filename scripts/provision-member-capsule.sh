@@ -3,6 +3,7 @@
 #
 # Usage:
 #   doas ksh scripts/provision-member-capsule.sh <username>
+#   doas ksh scripts/provision-member-capsule.sh --pair
 #        ksh scripts/provision-member-capsule.sh --self-test
 #
 # Runs ON the box as root, after scripts/provision-member.sh has built the
@@ -28,9 +29,12 @@
 # command line has are not there. The configuration file is written by this
 # script rather than checked in, so the invocation and the extensions it asks for
 # cannot drift apart, and the runbook's regeneration step is the same invocation.
-# A pair that is lost is generated again by running this script: the step is never
-# automated, because the fingerprint the help page publishes only changes when a
-# human runs it.
+# A pair that is lost is repaired rather than remembered: the --pair step below
+# is what scripts/deploy-mail.sh runs before it installs the gmid config that
+# names the pair, so the ordinary deploy generates a missing pair and leaves a
+# complete one alone. Nothing regenerates a pair that is already there, because
+# the fingerprint the help page publishes only changes when a human decides to
+# change it.
 #
 # It is generated once. A run that finds both halves does not touch them, because
 # a regeneration is not free: every reader's gemini client pins the certificate on
@@ -81,6 +85,7 @@ conf_owner="root:wheel"
 usage() {
 	cat >&2 <<'USAGE'
 usage: doas ksh provision-member-capsule.sh <username>
+       doas ksh provision-member-capsule.sh --pair
        ksh scripts/provision-member-capsule.sh --self-test
 USAGE
 	exit 2
@@ -397,6 +402,15 @@ case "${1:-}" in
 --self-test)
 	[ "$#" -eq 1 ] || usage
 	self_test
+	;;
+--pair)
+	# The pair alone, which is all scripts/deploy-mail.sh needs before it
+	# installs a gmid config naming it. No member and no member tree: the
+	# deploy has to be able to repair a lost pair on a box with no members yet.
+	[ "$#" -eq 1 ] || usage
+	[ "$(id -u)" -eq 0 ] || die "run this with doas: it writes the pair under $ssl_dir"
+	[ -x "$openssl" ] || die "no $openssl"
+	ensure_capsule_pair
 	;;
 "")
 	usage

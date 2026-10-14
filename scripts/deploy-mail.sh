@@ -278,23 +278,39 @@ case "$acme_rc" in
 	   printf '  kyriakon.net and www.kyriakon.net vhosts serve the challenge.\n' >&2 ;;
 esac
 
-# The capsule's hostname, which httpd.conf also has a vhost for. It was not in
-# this list, so its certificate was issued by hand and nothing renewed it: left
-# that way it expires silently and takes HTTPS and Gemini down together for that
-# hostname, since both present the same file.
+# oliver.kyriakon.net, which httpd.conf has a vhost for and relayd presents for
+# it. It was not in this list, so its certificate was issued by hand and nothing
+# renewed it: left that way it expires silently and takes the https side down for
+# that hostname. The capsules are served from the capsule pair generated below,
+# not from this one.
 acme_rc=0
 acme-client -v oliver.kyriakon.net || acme_rc=$?
 case "$acme_rc" in
-	0) printf 'capsule certificate issued or renewed\n' ;;
-	2) printf 'capsule certificate already current\n' ;;
-	*) printf 'warning: acme-client failed for oliver.kyriakon.net (exit %s); the\n' "$acme_rc" >&2
-	   printf '  capsule has no certificate and gmid will not start without one.\n' >&2 ;;
+	0) printf 'oliver.kyriakon.net certificate issued or renewed\n' ;;
+	2) printf 'oliver.kyriakon.net certificate already current\n' ;;
+	*) printf 'warning: acme-client failed for oliver.kyriakon.net (exit %s); its\n' "$acme_rc" >&2
+	   printf '  https vhost has no certificate until that succeeds.\n' >&2 ;;
 esac
 
 # --- Gemini --------------------------------------------------------------
 
 # The same content tree httpd serves, to a second protocol (issue #95). gmid -n
 # validates the config the way httpd -n does, before anything restarts.
+#
+# The capsule pair first, because the config below names it and gmid refuses to
+# start on a certificate it cannot read. The pair step generates both halves when
+# either is missing and leaves a complete pair alone: a rotated pair is a
+# certificate every reader's client has to trust again, so this repairs a lost
+# pair and never renews a live one. Refusing here rather than at gmid -n is what
+# keeps an unstartable config off the disk, since that check runs after the
+# install and a box that reboots in between would come up with no capsules at all.
+if ! ksh "$repo_dir/scripts/provision-member-capsule.sh" --pair; then
+	printf 'refusing to install %s: the capsules present the pair this step looks after,\n' \
+		"/etc/gmid.conf" >&2
+	printf '  and it is not there, so gmid would not start.\n' >&2
+	exit 1
+fi
+
 install -m 0644 "$repo_dir/openbsd/etc/gmid.conf" /etc/gmid.conf
 gmid -n -c /etc/gmid.conf
 start_service gmid
