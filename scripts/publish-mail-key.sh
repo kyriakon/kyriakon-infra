@@ -138,9 +138,14 @@ unexpected() {
 # or empty when gpg cannot read it. The same call check-keyring-drift.sh makes,
 # so the two agree about what "the same key" means, from a scratch keyring that
 # keeps this out of root's own.
+#
+# The `|| true` is load-bearing under `set -o pipefail`: gpg exits non-zero on a
+# file that is not a key, and without it the assignment would abort this script
+# silently, which is the one thing a failed publish must not do. Empty is what
+# every caller tests for.
 fpr_of() {
 	gpg --with-colons --show-keys "$1" 2>/dev/null |
-		awk -F: '$1 == "fpr" { print $10; exit }'
+		awk -F: '$1 == "fpr" { print $10; exit }' || true
 }
 
 # already_there: whether the last 422 is the forge saying the thing is already
@@ -228,7 +233,7 @@ publish() {
 	if [ "$(id -u)" -eq 0 ] && [ "$(stat -f '%Su' "$token_file")" != root ]; then
 		die "$token_file is not owned by root"
 	fi
-	token=$(cat "$token_file")
+	token=$(cat "$token_file") || die "cannot read $token_file"
 	printf '%s' "$token" | grep -Eq '^[A-Za-z0-9_.-]{20,255}$' ||
 		die "$token_file does not hold one token; a pasted newline, a trailing comment or a Bearer prefix would all go into the request"
 
@@ -290,8 +295,8 @@ publish() {
 	# and one explicit call is cheaper than depending on it.
 	api GET "$accept_json" "$api_base/repos/$repo/git/ref/heads/$base_branch"
 	[ "$code" = 200 ] || unexpected "refs/heads/$base_branch"
-	head=$(jq -r '.object.sha // empty' "$resp")
-	[ -n "$head" ] || die "$repo named no commit for $base_branch"
+	head=$(jq -r '.object.sha // empty' "$resp" 2>/dev/null) || head=""
+	[ -n "$head" ] || refuse "$localpart" "$want" "$repo answered $base_branch with no commit; nothing was published"
 
 	# The branch. 422 is the forge saying it is already there, which a previous
 	# run that died between this and the write leaves behind, so it is not an
@@ -563,6 +568,14 @@ EOF
 	assert_eq 'branch collision exit' 1 "$rc"
 	assert_has 'the refusal names the branch' 'publish-key/alice' "$out"
 	assert_no_log 'the branch was not written' 'PUT'
+
+	printf '%s\n' '--- a key file gpg cannot read is refused, and names the member'
+	rm -f "$fix/state/main" "$fix/state/branch"
+	printf '%s\n' 'not a public key' >"$fix/broken.asc"
+	run alice "$fix/broken.asc" "$fix/token"
+	assert_eq 'unreadable key exit' 1 "$rc"
+	assert_has 'the refusal names the member' 'alice' "$out"
+	assert_eq 'nothing was sent' '' "$(cat "$fix/stub.log")"
 
 	printf '%s\n' '--- the token is never an argument'
 	rm -f "$fix/state/main" "$fix/state/branch"
