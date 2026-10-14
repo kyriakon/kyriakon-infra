@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Your account{% endblock %}
+{% block content %}
+{#
+  The account page's own ticket brings the login, the keys, the space used and
+  the rest of the capability table. What is here is the catalogue: one line per
+  entry, from the same file the application page's cards and the capsule's list
+  come from, so what a member is offered cannot drift from what an applicant was.
+#}
+<h2>Your account</h2>
+
+<h3>What the platform offers</h3>
+<ul class="services">
+{% for s in services %}
+  <li><a href="{{ s.href }}">{{ s.name }}</a> <span class="tag">{{ s.state }}</span> {{ s.summary }}</li>
+{% endfor %}
+</ul>
+{% endblock %}

@@ -1,0 +1,147 @@
+# /var/db/onboard/catalogue.toml
+#
+# The catalogue: what the platform offers, and what state each thing is in. It is
+# read by the three front-ends and copied by none, which is why it is data and
+# not a page: three drafts of a list drift in a way that is invisible until a
+# member is told about a service the capsule never mentioned. scripts/
+# onboard-store.sh installs it 0644 at the top of the store, and
+# /etc/onboard/onboard.toml names the path the handler reads it from.
+#
+# Hand-written, so it is TOML: the service already parses TOML for its own
+# config, the format takes comments, and an array of tables keeps display order
+# and types the columns. A row that needs a reason carries it beside the value
+# rather than in a commit message.
+#
+# The columns, the vocabularies and the rules are in
+# docs/planning/specs/shared-copy.md. In short: state is one of live, by_request
+# or planned, and action is one of read, apply, account or pay. host carries no
+# scheme, because a hostname is protocol-agnostic and each front-end adds the
+# scheme its own protocol speaks; a host containing <name> is rendered from the
+# session's member where there is one, and as the pattern itself where there is
+# not. onboard/src/catalogue.rs holds the word for each state and each action,
+# so this file names a value and the crate names what a reader sees for it.
+
+[[service]]
+id = "mail"
+name = "Mail"
+summary = "zero-access mail, 5 GB, IMAP and SMTP, readable only by you"
+state = "live"
+host = "mail.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "web"
+name = "A website"
+summary = "static pages at an address of your own, uploaded by sftp"
+state = "live"
+host = "<name>.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "gemini"
+name = "A gemini capsule"
+summary = "the same pages over the gemini protocol"
+state = "live"
+host = "<name>.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "git"
+name = "Repositories"
+summary = "pass-compatible git over ssh, on port 2222"
+state = "live"
+host = "mail.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "account"
+name = "Your account"
+summary = "the password, the keys, the space used, the serving switches, the notices"
+state = "live"
+host = "signup.kyriakon.net"
+action = "account"
+
+[[service]]
+id = "pay"
+name = "Paying"
+summary = "card, cash by post or Monero, and the window each one opens"
+state = "live"
+host = "signup.kyriakon.net"
+action = "pay"
+
+[[service]]
+id = "free"
+name = "No charge"
+summary = "for clergy, monastics, and anyone who cannot pay"
+state = "live"
+host = "signup.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "own_domain"
+name = "A parish's own domain"
+summary = "your domain, up to ten addresses, with mail, a site and a capsule"
+state = "live"
+host = "signup.kyriakon.net"
+action = "apply"
+
+[[service]]
+id = "managed"
+name = "A managed instance"
+summary = "your own server, run for you, by arrangement"
+state = "by_request"
+host = "signup.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "key"
+name = "Keys"
+summary = "making a mail key and an upload key, and the browser generator"
+state = "live"
+host = "signup.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "capsule_signup"
+name = "Applying over gemini"
+summary = "the whole application over gemini, with no browser"
+state = "planned"
+host = "signup.kyriakon.net"
+action = "apply"
+
+[[service]]
+id = "terminal"
+name = "The terminal"
+summary = "apply, read your account and manage your keys from an ssh session"
+state = "planned"
+host = "ssh.kyriakon.net"
+action = "read"
+
+# The last three are projects rather than services of this platform, and they are
+# in the catalogue because the site's own splash carries them and a member
+# exploring the platform should find them the same way. Their own pages state
+# their own state, and the state word here says nothing more than that.
+
+[[service]]
+id = "press"
+name = "Kyriakon Press"
+summary = "the press, its books, and the state it is in"
+state = "live"
+host = "press.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "shop"
+name = "The bookshop"
+summary = "the Press's books, ordered from its own page once the shop is built"
+state = "planned"
+host = "press.kyriakon.net"
+action = "read"
+
+[[service]]
+id = "kleio"
+name = "Kleio"
+summary = "the sibling project, and the state it is in"
+state = "live"
+host = "kleio.kyriakon.net"
+action = "read"

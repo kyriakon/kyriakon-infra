@@ -22,11 +22,11 @@ use axum::Router;
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use kyriakon_onboard::page::{NoticePage, ReceivedPage, StatusPage};
+use kyriakon_onboard::page::{AccountPage, NoticePage, ReceivedPage, StatusPage};
 use kyriakon_onboard::questions::{Branch, Question, Rule};
 use kyriakon_onboard::rate::Key;
 use kyriakon_onboard::store::{Acceptance, KeyRecord, Record, Store};
-use kyriakon_onboard::{config, keycheck, page, questions, rate, store, util, validate};
+use kyriakon_onboard::{catalogue, config, keycheck, page, questions, rate, store, util, validate};
 
 /// The fixed hostname for the form and the account page, used as itself.
 const HOST: &str = "signup.kyriakon.net";
@@ -59,6 +59,10 @@ const RENDER_FALLBACK: &str = "<!doctype html><html lang=\"en\"><head><meta char
 struct App {
     cfg: config::Config,
     questions: Vec<Question>,
+    /// The shared service catalogue, parsed once at startup. Read from the path
+    /// the config names, and empty only if that file held no `[[service]]` at
+    /// all, which `run` refuses.
+    catalogue: Vec<catalogue::Service>,
     reserved: HashSet<String>,
     counter: rate::Counter,
     store: Store,
@@ -98,12 +102,20 @@ async fn run() -> Result<(), String> {
     if list.is_empty() {
         return Err("the question list has no questions".to_string());
     }
+    // The catalogue is read the same way and refused the same way: a handler
+    // that came up with no services would render an application page that
+    // promises nothing, which is the failure the config path exists to prevent.
+    let services = catalogue::parse(&Store::read_text(&cfg.catalogue).await?)?;
+    if services.is_empty() {
+        return Err(format!("{} has no services", catalogue::TRACKED));
+    }
     let reserved = validate::reserved(&Store::read_text(&cfg.reserved).await?);
     let addr = format!("{}:{}", cfg.listen, cfg.port);
     let app = Arc::new(App {
         store: Store::new(&cfg.store_root),
         cfg,
         questions: list,
+        catalogue: services,
         reserved,
         counter: rate::Counter::new(),
     });
@@ -125,6 +137,7 @@ async fn run() -> Result<(), String> {
         // form's own continuation button.
         .route("/", get(applicant).post(branch_step))
         .route("/apply", post(apply))
+        .route("/account", get(account))
         .route("/status/{token}", get(status))
         // The counters are a layer rather than a check inside each handler, so a
         // request an extractor rejects is still counted. The body limit is set
@@ -182,6 +195,14 @@ struct BranchQuery {
 async fn applicant(State(app): State<Arc<App>>, Query(q): Query<BranchQuery>) -> Response {
     let body = q.branch.as_deref() == Some("body");
     render_applicant(&app, body, &BTreeMap::new(), &[]).into_response()
+}
+
+/// The account page. Its login and its capability list are its own ticket's; what
+/// it renders today is the catalogue, from the one file, with no member to
+/// render a `<name>` host from until a session identifies one.
+async fn account(State(app): State<Arc<App>>) -> Response {
+    let page: AccountPage = page::account(&app.catalogue, None);
+    html(&page).into_response()
 }
 
 /// The branch question's own step. The continuation button posts the whole form
@@ -586,7 +607,8 @@ fn render_applicant(
     answers: &BTreeMap<String, String>,
     errors: &[String],
 ) -> Html<String> {
-    let mut page = page::applicant(&app.questions, body, answers, &app.cfg.release);
+    let mut page =
+        page::applicant(&app.questions, &app.catalogue, body, answers, &app.cfg.release);
     page.errors = errors.to_vec();
     html(&page)
 }
@@ -806,11 +828,12 @@ mAYEAAAAABK4BgQAAAAAEg==\n-----END PGP PUBLIC KEY BLOCK-----\n";
         }
         let cfg = config::Config {
             store_root: dir.to_str().unwrap().to_string(),
-            // Both are read once at startup, by `run`, which is not what these
-            // tests exercise: the list is parsed here and the reserved set is
-            // empty.
+            // All three are read once at startup, by `run`, which is not what
+            // these tests exercise: the two lists are parsed here and the
+            // reserved set is empty.
             questions: String::new(),
             reserved: String::new(),
+            catalogue: String::new(),
             listen: "127.0.0.1".to_string(),
             port: 0,
             release: "2026-10-13 test".to_string(),
@@ -822,6 +845,10 @@ mAYEAAAAABK4BgQAAAAAEg==\n-----END PGP PUBLIC KEY BLOCK-----\n";
                 "../../openbsd/etc/onboard/questions.toml"
             ))
             .expect("the shipped question list"),
+            catalogue: catalogue::parse(include_str!(
+                "../../openbsd/etc/onboard/catalogue.toml"
+            ))
+            .expect("the shipped catalogue"),
             reserved: HashSet::new(),
             counter: rate::Counter::new(),
         });

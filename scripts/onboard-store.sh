@@ -1,5 +1,5 @@
 #!/bin/ksh
-# onboard-store.sh: create the onboarding service's store and install the two
+# onboard-store.sh: create the onboarding service's store and install the three
 # files the three front-ends share.
 #
 # Usage: doas ksh scripts/onboard-store.sh
@@ -11,6 +11,11 @@
 # owner, group and mode: a store from an earlier run with the wrong mode would
 # pass the installs silently, and this script exists so that a half-built state
 # cannot report success.
+#
+# A run that changes nothing prints nothing: every step records whether it had
+# to do anything, and only a run that did prints the summary. The deploy calls
+# this on every run, and a store already in place should not report work it did
+# not do.
 #
 # The split is the spec's. The unprivileged `_onboard` user writes exactly four
 # directories, intents/ (one JSON per submission, written by rename), drafts/
@@ -48,16 +53,23 @@ drain_conf='/etc/kyriakon/onboard'
 onboard_user='_onboard'
 
 # The reserved set is a repository file, read at the store's top so the handler
-# and the TUI can both read it. The question list is the service workstream's and
-# is installed beside it, 0644, for the same reason.
+# and the TUI can both read it. The question list and the service catalogue are
+# the service workstream's and are installed beside it, 0644, for the same
+# reason: one file read by every front-end, and no copy of it anywhere else.
 reserved_src="$repo_dir/reserved-usernames.txt"
 questions_src="$repo_dir/openbsd/etc/onboard/questions.toml"
+catalogue_src="$repo_dir/openbsd/etc/onboard/catalogue.toml"
 
 # fail <message>: one place for the error shape, so every refusal reads the same.
 fail() {
 	printf 'onboard-store: %s\n' "$1" >&2
 	exit 1
 }
+
+# Whether this run has changed anything on the box. Every step that installs,
+# creates or removes records it, and the summary is printed only when one did:
+# the deploy runs this every time, and a run with nothing to do says nothing.
+changed=0
 
 # assert_mode <path> <owner> <group> <octal-mode>: the post-condition check.
 # %Lp prints the permission bits in octal without a leading zero, the same form
@@ -71,8 +83,30 @@ assert_mode() {
 # store_dir <name> <owner> <group> <mode>: create one directory under the store
 # and assert it at once, so the assertion cannot be forgotten for a later entry.
 store_dir() {
+	# A missing directory, or one with the wrong owner, group or mode, is what
+	# this run is for; one already right changes nothing.
+	[ "$(stat -f '%Su %Sg %Lp' "$store/$1" 2>/dev/null)" = "$2 $3 $4" ] || changed=1
 	install -d -m "$4" -o "$2" -g "$3" "$store/$1"
 	assert_mode "$store/$1" "$2" "$3" "$4"
+}
+
+# install_file <source> <installed> <owner> <group> <mode>: install one shared
+# file and assert it, recording whether its contents or its mode changed. The
+# comparison is the file's bytes: these are data files read by every front-end,
+# so a byte that differs is a rendering that differs.
+install_file() {
+	cmp -s "$1" "$2" 2>/dev/null || changed=1
+	install -m "$5" -o "$3" -g "$4" "$1" "$2"
+	assert_mode "$2" "$3" "$4" "$5"
+}
+
+# remove_legacy <path>: a copy an older layout leaves behind is removed rather
+# than left. An unused copy of a shared file is one a person edits by mistake,
+# and nothing reads it.
+remove_legacy() {
+	[ -e "$1" ] || return 0
+	rm -f "$1"
+	changed=1
 }
 
 # The account is the one thing here this script will not create. Print the line
@@ -97,6 +131,7 @@ fi
 
 # The store root, then the four the handler writes, the mail spool, and the
 # root-owned rest.
+[ "$(stat -f '%Su %Sg %Lp' "$store" 2>/dev/null)" = "root wheel 755" ] || changed=1
 install -d -m 0755 -o root -g wheel "$store"
 assert_mode "$store" root wheel 755
 store_dir intents      "$onboard_user" "$onboard_user" 700
@@ -121,13 +156,16 @@ store_dir mail/new     "$onboard_user" "$onboard_user" 700
 store_dir mail/tmp     "$onboard_user" "$onboard_user" 700
 
 # The drain's own configuration, outside the store and root-only.
+[ "$(stat -f '%Su %Sg %Lp' "$drain_conf" 2>/dev/null)" = "root wheel 700" ] || changed=1
 install -d -m 0700 -o root -g wheel "$drain_conf"
 assert_mode "$drain_conf" root wheel 700
 
-# The two shared files, at the top of the store, 0644, readable by the handler
-# and the TUI both. The question list is checked for readability before it is
-# installed, so a missing sibling file fails here rather than at first request.
-for src in "$reserved_src" "$questions_src"; do
+# The three shared files, at the top of the store, 0644, readable by the handler
+# and the TUI both. Each is checked for readability before any of them is
+# installed, so a missing sibling file fails here rather than at first request:
+# the handler refuses to start on a file it cannot read, and the deploy would
+# otherwise write the store before discovering it.
+for src in "$reserved_src" "$questions_src" "$catalogue_src"; do
 	[ -r "$src" ] || fail "cannot read $src"
 done
 
@@ -135,14 +173,23 @@ done
 # alone, so a box that has run an earlier copy of this script keeps the list under
 # its old name beside the new file. Nothing reads it, and that is why it goes: an
 # unused copy of the list is one a person edits by mistake. Removed, not left.
-rm -f "$store/questions.tsv"
+remove_legacy "$store/questions.tsv"
 [ ! -e "$store/questions.tsv" ] || fail "$store/questions.tsv is still there"
 
-install -m 0644 -o root -g wheel "$reserved_src" "$store/reserved-usernames.txt"
-install -m 0644 -o root -g wheel "$questions_src" "$store/questions.toml"
-assert_mode "$store/reserved-usernames.txt" root wheel 644
-assert_mode "$store/questions.toml" root wheel 644
-[ -s "$store/questions.toml" ] || fail "$store/questions.toml is empty"
+# The catalogue has no older name of its own: #370 settled TOML before the file
+# existed. The pre-TOML name goes the same way and for the same reason, so a
+# copy of the list sitting beside the real one, unread, is not something a
+# person edits by mistake on a box that has one.
+remove_legacy "$store/catalogue.tsv"
+[ ! -e "$store/catalogue.tsv" ] || fail "$store/catalogue.tsv is still there"
 
-printf 'store ready: %s (four dirs and mail/ writable by %s, the rest root), %s 0700 root\n' \
-	"$store" "$onboard_user" "$drain_conf"
+install_file "$reserved_src" "$store/reserved-usernames.txt" root wheel 644
+install_file "$questions_src" "$store/questions.toml" root wheel 644
+install_file "$catalogue_src" "$store/catalogue.toml" root wheel 644
+[ -s "$store/questions.toml" ] || fail "$store/questions.toml is empty"
+[ -s "$store/catalogue.toml" ] || fail "$store/catalogue.toml is empty"
+
+if [ "$changed" -ne 0 ]; then
+	printf 'store ready: %s (four dirs and mail/ writable by %s, the rest root), %s 0700 root\n' \
+		"$store" "$onboard_user" "$drain_conf"
+fi
