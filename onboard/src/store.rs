@@ -207,12 +207,12 @@ pub struct KeyRecord {
     /// The mailbox an upload key belongs to, or the mailbox a mail key serves.
     /// Empty for a person's single address.
     pub mailbox: String,
-    /// The fingerprint the walkthrough computed in the browser. It is stored and
-    /// never recomputed here, and the next reader will want to know why: the
-    /// handler holds no crypto and no hash, so recomputing an OpenPGP
-    /// fingerprint would mean a second, divergent implementation of the check
-    /// #185 already runs. The reviewer sees both the browser's number and the
-    /// material it names, and the drain rechecks before anything is carried out.
+    /// The fingerprint of the material beside it, computed by the handler from
+    /// that material rather than taken as a number the client sends: the OpenPGP
+    /// fingerprint for a mail key, the SSH one for an upload key. Storing what
+    /// was hashed is what keeps a number from naming a key it was not computed
+    /// from, and the reviewer sees it beside the material it names while the
+    /// drain rechecks before anything is carried out.
     pub fingerprint: String,
     /// The armoured key as submitted.
     pub material: String,

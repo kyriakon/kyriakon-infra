@@ -7,6 +7,8 @@
 //! application's own state, so a click on an already-decided application changes
 //! nothing and the journal records only that the click was seen.
 
+use std::os::unix::fs::PermissionsExt;
+
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -17,7 +19,8 @@ use crate::notice;
 use crate::questions;
 use crate::sign;
 use crate::store::{
-    self, Account, ApplicationRef, Intent, JournalLine, Record, Store, TokenRecord, Window,
+    self, Account, ApplicationRef, Intent, JournalLine, KeyRecord, Record, Store, TokenRecord,
+    Window,
 };
 use crate::util;
 use crate::validate;
@@ -108,6 +111,50 @@ async fn write_public_key(store: &Store, username: &str, material: &str) -> Resu
     store
         .write_record("keys", &format!("{username}.pub"), &bytes)
         .await
+}
+
+/// Publish the member's mail keys into the box keyring the encrypting LMTP reads,
+/// one `<localpart>.asc` each, before any path can deliver to the account. The
+/// file is created fresh, so the drift check's age for it is the moment this
+/// service wrote it. Delivery fails closed without the key, so an application
+/// that carries none is refused rather than made into an account whose mail
+/// bounces.
+async fn publish_mail_keys(
+    cfg: &DrainConfig,
+    username: &str,
+    keys: &[KeyRecord],
+) -> Result<(), String> {
+    if keys.is_empty() {
+        return Err(
+            "the application carries no mail key, so the account could not receive mail"
+                .to_string(),
+        );
+    }
+    let dir = std::path::Path::new(&cfg.keyring_dir);
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    for key in keys {
+        let localpart = if key.mailbox.is_empty() {
+            username
+        } else {
+            key.mailbox.as_str()
+        };
+        if let Some(why) = validate::username_shape(localpart) {
+            return Err(format!("the mail key's mailbox {localpart:?}: {why}"));
+        }
+        let body = key.material.trim();
+        if body.is_empty() {
+            return Err(format!("the mail key for {localpart} is empty"));
+        }
+        let path = dir.join(format!("{localpart}.asc"));
+        let mut bytes = body.as_bytes().to_vec();
+        bytes.push(b'\n');
+        std::fs::write(&path, &bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        // deploy-mail installs the tracked keys 0644, and the drift check and the
+        // encrypting daemon both read them as they find them.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| format!("cannot set the mode on {}: {e}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// The address an approval notice goes to: the applicant's own outside address,
@@ -554,6 +601,10 @@ async fn approve(
     // started, add-user.sh is skipped: it is not idempotent, and the account it
     // would refuse is the one this application made.
     if existing.is_none() {
+        // The keyring first, before the builder makes the address live: the
+        // encrypting LMTP fails closed without the member's key, so mail offered
+        // between the two would bounce at the door.
+        publish_mail_keys(cfg, username, &record.mail_keys).await?;
         if !on_box {
             run_script_tolerating(cfg, "add-user.sh", &[username], "already exists").await?;
         }

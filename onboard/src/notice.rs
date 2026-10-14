@@ -127,6 +127,7 @@ mod tests {
             sendmail: stub(dir),
             passwd: dir.join("passwd").to_str().unwrap().to_string(),
             approval_key: dir.join("key").to_str().unwrap().to_string(),
+            keyring_dir: dir.join("keyring").to_str().unwrap().to_string(),
             stripe_webhook_secret: String::new(),
             keyring_publish_token: String::new(),
             reviewer: "reviewer@example.invalid".to_string(),

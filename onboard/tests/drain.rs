@@ -65,6 +65,7 @@ impl Fix {
              sendmail = \"{}\"\n\
              passwd = \"{}\"\n\
              approval_key = \"{}\"\n\
+             keyring_dir = \"{}\"\n\
              stripe_webhook_secret = \"{}/stripe\"\n\
              keyring_publish_token = \"{}/keyring\"\n\
              reviewer = \"reviewer@example.invalid\"\n\
@@ -77,6 +78,7 @@ impl Fix {
             fix.path("bin/enqueuer.sh"),
             fix.path("passwd"),
             fix.path("key"),
+            fix.path("keyring"),
             fix.dir.display(),
             fix.dir.display(),
         );
@@ -791,6 +793,58 @@ fn an_approval_writes_the_upload_key_the_builder_reads() {
         fix.scripts_log()
     );
     assert!(fix.dir.join("store/accounts/secretary/account.json").exists());
+}
+
+/// An approval publishes the member's mail key into the box keyring the
+/// encrypting LMTP reads, named for the localpart and at the mode deploy-mail
+/// installs the tracked keys with, before anything can deliver.
+#[test]
+fn an_approval_publishes_the_mail_key_to_the_keyring() {
+    let fix = Fix::new("keyring");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let path = fix.dir.join("keyring/secretary.asc");
+    let published = std::fs::read_to_string(&path).expect("the key is in the keyring");
+    assert!(published.contains("BEGIN PGP PUBLIC KEY BLOCK"), "{published}");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o644,
+        "the keyring file carries the mode deploy-mail installs"
+    );
+}
+
+/// An application with no mail key is refused rather than approved into an
+/// account whose mail bounces: delivery fails closed without a key.
+#[test]
+fn an_application_with_no_mail_key_is_refused() {
+    let fix = Fix::new("no-mail-key");
+    let mut record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    record["mail_keys"] = json!([]);
+    std::fs::write(
+        fix.dir.join(format!("store/applications/{TOKEN}.json")),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/secretary/account.json").exists(),
+        "an account with no mail key must not be made"
+    );
+    assert!(body(&out).contains("no mail key"), "{}", body(&out));
+    assert_eq!(fix.intents().len(), 1, "the intent is left in place");
+    assert!(
+        !fix.dir.join("keyring/secretary.asc").exists(),
+        "nothing was published for a keyless application"
+    );
 }
 
 /// An application with no upload key is still built: mail is unconditional, and

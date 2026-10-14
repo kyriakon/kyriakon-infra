@@ -41,6 +41,12 @@ passwd = "/etc/passwd"
 # handler never reads it, because it only passes a click through as an intent.
 approval_key = "/etc/kyriakon/onboard/approval-signing-key"
 
+# The box keyring the encrypting LMTP reads: one `<localpart>.asc` per account,
+# which scripts/deploy-mail.sh seeds from the tracked keys/ at deploy time. An
+# approved member's mail key is written here by the drain before anything can
+# deliver to the account, because the encryptor fails closed without it.
+keyring_dir = "/etc/kyriakon/keys"
+
 # Stripe's signing secret and the keyring publish token. This build reads
 # neither: the card rail and the keyring pull request are later tickets. They
 # are named here so the one root-only home for the service's secrets is fixed in
