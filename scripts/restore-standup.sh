@@ -146,8 +146,11 @@ report=$(mktemp)
 exec 3>&1 4>&2
 exec >> "$report" 2>&1
 
-# The EXIT trap below invokes this, which shellcheck cannot follow.
-# shellcheck disable=SC2329
+# The EXIT trap below invokes this, which shellcheck cannot follow. Two codes name
+# the same thing: SC2329 where shellcheck calls it unused, SC2317 where it calls
+# the body unreachable. The runner image's shellcheck is older than a
+# workstation's, and it emits the second, so both are named here.
+# shellcheck disable=SC2317,SC2329
 cleanup() {
 	cleanup_status=$?
 	# The report goes back out on the streams cron reads before the mail is sent, so
