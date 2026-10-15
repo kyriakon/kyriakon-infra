@@ -382,18 +382,38 @@ pub async fn due(store: &Store, id: &str, now: OffsetDateTime) -> bool {
     }
 }
 
-/// Whether the journal already holds a line of this kind for this application.
+/// Whether the journal already holds a line of this kind for this application,
+/// written by an intent whose pass has not failed since.
+///
 /// Used for the review email, whose dedup key is the application and not the
 /// intent: a re-filed application must not be mailed twice either.
+///
+/// The line is written before the send on purpose, so that a crash loses an
+/// email rather than sending two. A returned error is not a crash: the pass that
+/// gets one knows the send did not happen, and it leaves a `failed` line for its
+/// own intent, so a marker counted there would have the next pass drop the
+/// intent and lose the review email for good. A crash writes no failed line, so
+/// the direction the marker is written in is unchanged.
+///
+/// A failure counts only when it comes after the marker, so an intent that
+/// failed once and then sent successfully keeps its marker standing. Order is
+/// the file's own: several lines of one pass share a timestamp.
 async fn application_seen(store: &Store, token: &str, kind: &str, outcome: &str) -> bool {
-    for line in store.lines("journal.jsonl").await {
-        if let Ok(j) = serde_json::from_str::<JournalLine>(&line) {
+    let mut marks: Vec<(usize, String)> = Vec::new();
+    let mut failed: Vec<(usize, String)> = Vec::new();
+    for (at, line) in store.lines("journal.jsonl").await.iter().enumerate() {
+        if let Ok(j) = serde_json::from_str::<JournalLine>(line) {
+            if j.outcome == "failed" {
+                failed.push((at, j.intent.clone()));
+            }
             if j.application.status_token == token && j.kind == kind && j.outcome == outcome {
-                return true;
+                marks.push((at, j.intent));
             }
         }
     }
-    false
+    marks
+        .iter()
+        .any(|(at, id)| !failed.iter().any(|(f, fid)| fid == id && f > at))
 }
 
 /// Refuse an intent of a kind this build does not implement, by name, and leave
@@ -904,14 +924,20 @@ async fn decline(
     .await?;
 
     let now = util::filed_at();
-    // No account exists to hold a `notices.jsonl`, so the record that stops a
-    // second email is the application's own decision: mark it before the send.
-    mark_decided(store, token, "declined", &now, None).await?;
     if let Some(addr) = &outside {
         let subject = decision_subject("declined", username);
         let body = decline_body(&record);
         notice::enqueue(cfg, addr, &subject, &body).await?;
     }
+    // The decision is recorded after the send, which is what the approval does
+    // and for the same reason: a decline marked before a send that then returned
+    // an error left a record saying the applicant had been told, so the next pass
+    // took the already-decided branch above and dropped the intent without ever
+    // sending anything. No account exists to hold a `notices.jsonl`, so this
+    // record is the only thing that stops a second email. Recording it after the
+    // send leaves one window in which a crash could send twice, between sendmail
+    // returning and this write, against the certain loss of the notice before.
+    mark_decided(store, token, "declined", &now, None).await?;
     journal(
         store,
         &cfg.release,

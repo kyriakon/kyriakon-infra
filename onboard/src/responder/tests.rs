@@ -400,6 +400,34 @@ async fn the_branch_question_opens_the_block_by_being_answered() {
     assert!(closed.contains("name=\"branch\" value=\"person\""));
 }
 
+/// An acceptance answer is carried by its checkbox and nothing else, so a page
+/// rebuilt from a submission has to put the tick back. Without that, an
+/// applicant who ticked the terms and pressed continue was handed back an
+/// unticked box and then refused for an answer they had given.
+#[tokio::test]
+async fn an_accepted_terms_tick_comes_back_on_the_next_render() {
+    let (app, _dir) = handler("acceptance").await;
+    let ticked = "id=\"accept_terms\" name=\"accept_terms\" value=\"yes\" checked";
+
+    let body = encoded(&[
+        ("username", "theophilus"),
+        ("accept_terms", "yes"),
+        ("whose", "body"),
+    ]);
+    let (_, answered) = answer(&app, &httpd_post("/", &body)).await;
+    assert!(
+        answered.contains(ticked),
+        "the tick the applicant gave comes back: {answered}"
+    );
+
+    // A page nobody gave the answer to does not invent one.
+    let (_, fresh) = answer(&app, &httpd_get("/", "")).await;
+    assert!(
+        !fresh.contains(ticked),
+        "an unticked box stays unticked: {fresh}"
+    );
+}
+
 #[tokio::test]
 async fn a_body_submission_that_was_shown_the_block_is_filed() {
     let (app, dir) = handler("body-filed").await;

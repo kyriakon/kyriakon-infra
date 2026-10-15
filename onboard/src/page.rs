@@ -207,7 +207,14 @@ fn render(q: &Question, answers: &BTreeMap<String, String>) -> Rq {
         } else {
             String::new()
         },
-        checked: q.kind == Kind::YesNo && !value.is_empty() && value != "no",
+        // Both kinds are drawn as a checkbox by the field macro, and for both the
+        // box is the only place the answer is carried. An acceptance answer is
+        // "yes" or nothing, so it is restored the same way a yes/no answer is: a
+        // page rebuilt from a submission that dropped this came back with the
+        // terms unticked and refused the applicant for an answer they had given.
+        checked: matches!(q.kind, Kind::YesNo | Kind::Acceptance)
+            && !value.is_empty()
+            && value != "no",
         value,
         options,
         hint: hint(&q.id).to_string(),

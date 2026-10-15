@@ -263,6 +263,13 @@ impl Fix {
         self.script("enqueuer.sh", "#!/bin/sh\ncat >/dev/null\nexit 1\n");
     }
 
+    /// The working enqueuer back, for a test that broke the mail path and then
+    /// wants the retry to go through.
+    fn enqueuer_works(&self) {
+        let sent = self.path("sent");
+        self.script("enqueuer.sh", &format!("#!/bin/sh\ncat >> '{sent}'\n"));
+    }
+
     /// A publish-mail-key.sh that refuses, in the shape the real one has when the
     /// forge will not take the change: the member and the key named on stderr,
     /// and a non-zero exit.
@@ -1435,5 +1442,111 @@ fn a_purge_never_releases_a_name_an_account_holds() {
         !fix.scripts_log().contains("delete-user.sh"),
         "a live account's name was released: {}",
         fix.scripts_log()
+    );
+}
+
+/// The review email is the only copy of the answers and of the links, and the
+/// marker that stops a second one is written before the send. A send that
+/// returns an error is not a crash, so the next pass must send it, and must not
+/// send a second copy once one has gone.
+#[test]
+fn a_review_email_that_could_not_be_sent_goes_on_the_next_pass() {
+    let fix = Fix::new("review-retry");
+    fix.enqueuer_fails();
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    fix.drain();
+
+    assert!(fix.journal().contains("review-sent"), "{}", fix.journal());
+    assert!(
+        fix.sent().is_empty(),
+        "the box could not mail, so nothing was sent: {}",
+        fix.sent()
+    );
+    assert_eq!(
+        fix.intents().len(),
+        1,
+        "the intent is left in place: {:?}",
+        fix.intents()
+    );
+
+    // The mail path works again, and the backoff is what holds the retry back.
+    fix.enqueuer_works();
+    fix.age_failures();
+    fix.drain();
+    assert!(
+        fix.sent().contains("secretary"),
+        "the review email went out on the retry: {}",
+        fix.sent()
+    );
+    assert_eq!(
+        fix.intents().len(),
+        0,
+        "and the intent is cleared: {:?}",
+        fix.intents()
+    );
+
+    // A re-filed application is not mailed a second time.
+    fix.file_application(&record);
+    fix.drain();
+    assert_eq!(
+        fix.sent().matches("Subject:").count(),
+        1,
+        "one review email per application: {}",
+        fix.sent()
+    );
+}
+
+/// A decline's own record is what stops a second mail, and it is written after
+/// the send, so a send that failed cannot leave a decision saying the applicant
+/// had been told when nothing reached them.
+#[test]
+fn a_decline_that_could_not_be_sent_goes_on_the_next_pass() {
+    let fix = Fix::new("decline-retry");
+    let record = fix.filed_with(
+        "secretary",
+        "cash",
+        &[("rail", "cash")],
+        Some("applicant@example.invalid"),
+        Some((UPLOAD_KEY, "works")),
+    );
+    fix.file_application(&record);
+    fix.drain();
+    fix.decide("decline", "secretary");
+    fix.enqueuer_fails();
+    fix.drain();
+
+    let app: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    assert!(
+        app["decided_at"].is_null(),
+        "nothing claims the applicant was told: {app}"
+    );
+    assert_eq!(
+        fix.intents().len(),
+        1,
+        "the intent is left in place: {:?}",
+        fix.intents()
+    );
+
+    fix.enqueuer_works();
+    fix.age_failures();
+    fix.drain();
+    assert!(
+        fix.sent().contains("was declined"),
+        "the notice went out on the retry: {}",
+        fix.sent()
+    );
+    let app: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    assert!(
+        !app["decided_at"].is_null(),
+        "and the decision is recorded after it: {app}"
+    );
+    assert_eq!(
+        fix.intents().len(),
+        0,
+        "the intent is cleared: {:?}",
+        fix.intents()
     );
 }
