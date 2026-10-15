@@ -51,8 +51,12 @@ use crate::rate::Key;
 use crate::store::{Acceptance, KeyRecord, Record, Store};
 use crate::{capsule, catalogue, config, keycheck, page, questions, rate, store, util, validate};
 
-/// The fixed hostname for the form and the account page, used as itself.
-const HOST: &str = "signup.kyriakon.net";
+/// The fixed hostname for the form and the account page, used as itself. It is
+/// public because the terminal front-end hands a reader the same host's status
+/// route, so the address a session gives out cannot name a different service than
+/// the one that answers it.
+pub const HOST: &str = "signup.kyriakon.net";
+
 /// The only origin a submission may carry. The port-80 vhost redirects, so the
 /// form is served over TLS and nowhere else.
 const OWN_ORIGIN: &str = "https://signup.kyriakon.net";

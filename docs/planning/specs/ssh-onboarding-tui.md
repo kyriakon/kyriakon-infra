@@ -10,6 +10,19 @@
 > per front-end, its group deciding who may connect. The shared question list is
 > the crate's file rather than an installed one.
 
+> Amended on 2026-10-15: the portal's frame exists, as
+> [#379](https://github.com/kyriakon/kyriakon-infra/issues/379) built it:
+> `onboard/src/bin/kyriakon-onboard-tui.rs` holds the program and both modes, and
+> `onboard/src/portal.rs` holds the rows, the screens and the dispatch, so the menu
+> is the catalogue's third rendering and the check in `catalogue.rs` covers it. The
+> two modes are chosen from the terminal the session arrived on, since no client can
+> supply an argument to a forced command. What each of the four actions ends at is
+> the address the catalogue names, which is what the web card and the gemtext link
+> render for the same entry: the application flow and the member's account are
+> [#380](https://github.com/kyriakon/kyriakon-infra/issues/380) and
+> [#381](https://github.com/kyriakon/kyriakon-infra/issues/381), and the session's
+> counters under `/var/db/kyriakon-onboard-tui/` are not built yet either.
+
 ## Problem statement
 
 Kyriakon takes applications three ways and writes them into one back end: the web form at release, and a gemini capsule and an SSH TUI built once the platform is live. The SSH path is the one where the applicant already has a terminal, so it can do what the web form does and a little more, and the risk is that it grows into a second privileged way into the platform.
@@ -360,4 +373,4 @@ The web form and the capsule, which have their own specs. The onboarding service
 
 `docs/planning/specs/shared-copy.md`, read on 2026-10-13: the service catalogue, its columns, the wording that must read identically, and the check that every entry appears in every rendering.
 
-What this spec still could not settle from the record: the re-measured SSH failure threshold, which can only be taken once the port is live; the two-port split, `ExposeAuthInfo` and `AuthorizedKeysCommand` in a `Match` block, which the identity research reads from the manual pages and the source with its operator checklist unrun; and the portal itself, which does not exist in Rust yet.
+What this spec still could not settle from the record: the re-measured SSH failure threshold, which can only be taken once the port is live; the two-port split, `ExposeAuthInfo` and `AuthorizedKeysCommand` in a `Match` block, which the identity research reads from the manual pages and the source with its operator checklist unrun; and the portal's own screens, whose frame exists since [#379](https://github.com/kyriakon/kyriakon-infra/issues/379) and whose flow, member path and counters are still to come.
