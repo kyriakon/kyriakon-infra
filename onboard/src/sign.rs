@@ -20,13 +20,6 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// The three decisions a review link can carry, and the three the drain's
-/// dispatch table names. `approve` is a charged approval and `approve-free` the
-/// same decision without charge, which is why they are two actions rather than
-/// an action with a flag: the link's whole payload is what is signed, and an
-/// action that is one string is one thing to read.
-pub const ACTIONS: [&str; 3] = ["approve", "approve-free", "decline"];
-
 /// The key file, as the operator installed it. A trailing newline is the shape
 /// a `printf` or an `install` of a generated secret leaves, and it is not part
 /// of the key: stripping it here is what lets the same secret be written either

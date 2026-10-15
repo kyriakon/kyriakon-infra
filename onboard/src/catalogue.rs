@@ -547,29 +547,19 @@ action = \"pay\"
         assert_eq!(terminal.handoff, Some(Job::CardPayment.handoff()));
     }
 
-    /// The terminal's menu is one of the renderings the check compares, so a menu
-    /// that dropped an entry, or carried a list of its own, fails here rather than
-    /// at a reader.
+    /// The terminal's menu is one of the renderings the check compares. That the
+    /// comparison catches a menu which dropped an entry is
+    /// `a_renderer_that_drops_an_entry_is_caught`'s, on the same code path; what
+    /// is worth asserting here is that the menu is in the list at all, because a
+    /// rendering the check does not carry is one nothing compares.
     #[test]
     fn the_check_covers_the_terminals_menu() {
         let list = parse(SHIPPED).unwrap();
-        let rendered = renderings(&list, None);
-        let menu = rendered
+        let names: Vec<&str> = renderings(&list, None)
             .iter()
-            .find(|(front_end, _)| *front_end == "the terminal menu")
-            .expect("the check compares the terminal's menu");
-        assert_eq!(menu.1, portal::entries(&list, None));
-
-        // And a menu that dropped an entry is caught by name, like any other.
-        let mut rows = rendered;
-        let at = rows
-            .iter()
-            .position(|(front_end, _)| *front_end == "the terminal menu")
-            .unwrap();
-        rows[at].1.retain(|r| r.id != "shop");
-        let e = compare(&list, &rows).unwrap_err();
-        assert!(e.contains("the terminal menu"), "{e}");
-        assert!(e.contains("shop"), "{e}");
+            .map(|(front_end, _)| *front_end)
+            .collect();
+        assert!(names.contains(&"the terminal menu"), "{names:?}");
     }
 
     /// The capsule's own page: one line per entry, the name and the clause in
