@@ -122,6 +122,18 @@ impl Fix {
         std::fs::write(&p, text).unwrap();
     }
 
+    /// The note on the last failed journal line. It is what the operator's mail
+    /// carries, and the only place a refused name can be read: a failure is
+    /// journalled against an empty application, so a name that is not in the note
+    /// is a name the operator cannot see.
+    fn failed_note(&self) -> String {
+        self.journal()
+            .lines()
+            .rfind(|l| l.contains("\"outcome\":\"failed\""))
+            .unwrap_or_default()
+            .to_string()
+    }
+
     /// An add-user.sh that makes the account in the passwd fixture and refuses a
     /// name already there, the shape the real script has. The box is what the
     /// drain reads to tell its own half-finished approval from somebody else's
@@ -1581,6 +1593,11 @@ fn an_application_for_a_held_back_name_is_refused() {
     fix.drain();
 
     assert!(fix.journal().contains("held back"), "{}", fix.journal());
+    assert!(
+        fix.failed_note().contains("signup"),
+        "the failure names the name that was held back: {}",
+        fix.failed_note()
+    );
     assert_eq!(
         fix.intents().len(),
         1,
@@ -1609,6 +1626,11 @@ fn an_approval_for_a_name_held_back_since_filing_is_refused() {
     fix.drain();
 
     assert!(fix.journal().contains("held back"), "{}", fix.journal());
+    assert!(
+        fix.failed_note().contains("theophilus"),
+        "the failure names the name that was held back: {}",
+        fix.failed_note()
+    );
     assert!(
         !fix.dir.join("store/accounts/theophilus").exists(),
         "no account was made"

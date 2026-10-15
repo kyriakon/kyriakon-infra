@@ -518,10 +518,7 @@ pub async fn filed_application(
     if intent.kind != "application" {
         return Err(format!("kind {:?} is not an application", intent.kind));
     }
-    let reserved = reserved_names(cfg).await?;
-    if let Some(why) = validate::username(&intent.application.username, &reserved) {
-        return Err(format!("the username: {why}"));
-    }
+    name_allowed(cfg, &intent.application.username).await?;
     if !store::is_status_token(&intent.application.status_token) {
         return Err("the status token is not 128 bits of Crockford".to_string());
     }
@@ -755,10 +752,7 @@ async fn approve(
     // does not turn the retry of a half-made account into an intent that can
     // never finish.
     if !begun {
-        let reserved = reserved_names(cfg).await?;
-        if let Some(why) = validate::username(username, &reserved) {
-            return Err(format!("the username: {why}"));
-        }
+        name_allowed(cfg, username).await?;
     }
 
     // The box is the oracle and the record only a fast path. A name already on
@@ -1169,6 +1163,20 @@ fn account_on_box(cfg: &DrainConfig, username: &str) -> Result<bool, String> {
 /// work rather than let it through on an empty list.
 async fn reserved_names(cfg: &DrainConfig) -> Result<HashSet<String>, String> {
     Ok(validate::reserved(&Store::read_text(&cfg.reserved).await?))
+}
+
+/// Refuse a username the platform holds back, naming it. Both gates that can
+/// create an account go through this: the filing, and the approval.
+///
+/// The name is in the message because a failed pass is journalled against an
+/// empty application and mailed to the operator, so the message is the only
+/// place either of them can read which name was refused.
+async fn name_allowed(cfg: &DrainConfig, username: &str) -> Result<(), String> {
+    let reserved = reserved_names(cfg).await?;
+    match validate::username(username, &reserved) {
+        None => Ok(()),
+        Some(why) => Err(format!("the username {username}: {why}")),
+    }
 }
 
 /// Whether this application's approval already began. The journal records
