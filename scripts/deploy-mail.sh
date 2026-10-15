@@ -315,6 +315,114 @@ install -m 0644 "$repo_dir/openbsd/etc/gmid.conf" /etc/gmid.conf
 gmid -n -c /etc/gmid.conf
 start_service gmid
 
+# The capsule block needs one live request, because gmid accepts a mistyped
+# FastCGI socket path at config time and fails only when a request arrives: the
+# gmid -n above cannot tell the socket in the block from one that is not there.
+#
+# Both halves of the answer are checked, and both are read back from
+# /var/log/daemon. Its line count is taken first, so an older deploy's line
+# cannot be read as this request's. The reply has to be the handler's, and gmid
+# can answer by itself: a connect it cannot make is answered by gmid with a
+# status of its own, and gmid has no 20 to send, so a 20 is the capsule
+# rendering and the handler's own line carries the same route and code. And
+# gmid's log must hold no access line for the request, because that line carries
+# the request URI, and a URI on this hostname carries a draft token and an
+# applicant's answer, which is what `log off` in the block is for. The handler's
+# line carries the route, the reply code and the client address, and never the
+# query or the body.
+#
+# The responder is another script's, and the order is stated rather than assumed:
+# scripts/deploy-onboard.sh creates the socket directory inside gmid's chroot,
+# installs the unit and starts kyriakon_onboard, and this script does none of
+# that. With no responder behind the block there is nothing to ask, so this stops
+# here and names the script to run first. A version of this that skipped a
+# missing responder would pass on the one box the check exists for.
+if ! rcctl check kyriakon_onboard >/dev/null 2>&1; then
+	printf 'the capsule: kyriakon_onboard is not running, so the block just installed\n' >&2
+	printf '  answers nothing. Run scripts/deploy-onboard.sh first, which creates the\n' >&2
+	printf '  socket directory and starts the responder.\n' >&2
+	exit 1
+fi
+
+gemini_url='gemini://signup.kyriakon.net/'
+log_before=$(wc -l < /var/log/daemon)
+
+# 1965 is gmid's port, spelled in the block above and in the pf fragment that
+# opens it. -quiet takes the handshake off the answer; it implies -ign_eof, and
+# this ends where the handler closes the connection. timeout is the bound on a
+# gmid that accepts and then waits on a socket that never answers.
+#
+# The retry is for gmid's own start rather than for the socket: gmid creates its
+# listeners in the server processes, which start after the parent has written its
+# pidfile, so rcctl check can pass a moment before the port is open. A socket
+# nothing ever answers on is what is left after the retries, with no reply at all.
+gemini_reply=
+gemini_try=0
+while [ "$gemini_try" -lt 5 ] && [ -z "$gemini_reply" ]; do
+	gemini_reply=$(printf '%s\r\n' "$gemini_url" \
+		| timeout 10 openssl s_client -quiet -connect 127.0.0.1:1965 \
+			-servername signup.kyriakon.net 2>/dev/null \
+		| tr -d '\r' | awk 'NR == 1 { first = $0 } END { print first }') || true
+	[ -n "$gemini_reply" ] || sleep 1
+	gemini_try=$((gemini_try + 1))
+done
+gemini_code=${gemini_reply%% *}
+
+if [ "$gemini_code" != 20 ]; then
+	printf 'the capsule: %s answered %s, wanted a 20 from the handler.\n' \
+		"$gemini_url" "${gemini_reply:-nothing at all}" >&2
+	printf '  A 4x here is gmid answering for a socket it could not reach, and gmid logs\n' >&2
+	printf '  the path it tried. Check that the block in /etc/gmid.conf and gemini_socket\n' >&2
+	printf '  in /etc/onboard/onboard.toml name the same socket.\n' >&2
+	tail -n "+$((log_before + 1))" /var/log/daemon | grep -F gmid >&2 || true
+	exit 1
+fi
+
+# The handler's line, waited for rather than assumed present, because rc.subr's
+# daemon_logger is a second process and the line reaches syslog a moment after
+# the reply does. The address is the one gmid saw, which for this request is
+# loopback, and gmid sends the numeric address with no port on it.
+gemini_line="kyriakon-onboard: gemini / $gemini_code 127.0.0.1"
+gemini_log=
+gemini_try=0
+while [ "$gemini_try" -lt 5 ]; do
+	gemini_log=$(tail -n "+$((log_before + 1))" /var/log/daemon)
+	case "$gemini_log" in
+	*"$gemini_line"*) break ;;
+	esac
+	sleep 1
+	gemini_try=$((gemini_try + 1))
+done
+
+case "$gemini_log" in
+*"$gemini_line"*) ;;
+*)
+	printf 'the capsule: %s answered %s and the handler wrote no line for it.\n' \
+		"$gemini_url" "$gemini_reply" >&2
+	gemini_seen=$(printf '%s\n' "$gemini_log" | grep -F kyriakon-onboard | tail -1)
+	printf '  wanted %s, where this run holds: %s\n' \
+		"$gemini_line" "${gemini_seen:-nothing from the handler}" >&2
+	exit 1
+	;;
+esac
+
+# The other half: no access line of gmid's for the request. The URI is what is
+# looked for rather than the shape of the line, because the URI is what `log off`
+# exists to keep out of the log and what gmid writes verbatim when the block logs.
+case "$gemini_log" in
+*"$gemini_url"*)
+	printf 'the capsule: gmid logged a line carrying %s, so the block is not\n' \
+		"$gemini_url" >&2
+	printf '  keeping the request URI out of /var/log/daemon. See log off in the block.\n' >&2
+	printf '%s\n' "$gemini_log" | grep -F "$gemini_url" >&2
+	exit 1
+	;;
+esac
+
+printf 'gemini: %s answered %s, so the block reaches the handler\n' "$gemini_url" "$gemini_reply"
+printf '  handler log: %s\n' "$(printf '%s\n' "$gemini_log" | grep -F "$gemini_line" | tail -1)"
+printf '  gmid log: no access line for the request, so its URI is not in the log\n'
+
 # --- Finger --------------------------------------------------------------
 
 # A static page on port 79, spawned per connection by inetd rather than run as a
