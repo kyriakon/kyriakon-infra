@@ -74,7 +74,8 @@
 #
 # Depends on: /etc/acme-client.conf including /etc/acme-client.d/index.conf (the
 # generated index scripts/cron-apply.sh --web rewrites), the acme-client binary,
-# and a resolver command (host(1) from base).
+# a resolver command (host(1) from base), and lib.sh installed beside this file,
+# which is where notify_operator comes from.
 
 set -euo pipefail
 
@@ -83,6 +84,15 @@ set -euo pipefail
 # needed here is written in one shape.
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
 export PATH
+
+script_dir="$(dirname "$0")"
+if [ ! -f "$script_dir/lib.sh" ]; then
+	printf '%s: lib.sh is not in %s. Install the two files together, as lib.sh describes.\n' \
+		"$0" "$script_dir" >&2
+	exit 1
+fi
+# shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
+. "$script_dir/lib.sh"
 
 queue_dir="${ACME_QUEUE_DIR:-/var/db/kyriakon-acme-queue}"
 pending_dir="$queue_dir/pending"
@@ -102,7 +112,16 @@ usage() {
 }
 
 die() {
-	printf 'acme-queue: %s\n' "$*" >&2
+	# A run that stops before it can ask for a certificate has no report of its
+	# own, so it is mailed like any other failure. --add and --status are runs by
+	# hand, where the message on the terminal is the report, and cron is not
+	# involved.
+	if [ "${mode:-}" = run ]; then
+		notify_operator acme "queue failed" "$*" \
+			"nothing is attempted until this is fixed, and the queue's age alert is what says so after 24 hours. --status reads it by hand."
+	else
+		printf 'acme-queue: %s\n' "$*" >&2
+	fi
 	exit 1
 }
 
@@ -153,10 +172,11 @@ resolve_ok() {
 }
 
 # next_attempt <list> : the oldest name in the "<mtime> <path>" list whose records
-# resolve, or nothing when none resolve. A name that does not resolve is announced
-# on stderr and skipped, so the queue moves past one member's missing record rather
-# than stopping on it (see the header). Returns 0 either way; the caller reads the
-# printed name.
+# resolve, or nothing when none resolve. A name that does not resolve is skipped
+# and the queue moves past one member's missing record rather than stopping on it
+# (see the header). Skipped silently, not announced: a pass that attempts nothing
+# prints nothing, and a name that never resolves is reported by its age through
+# the monitor. Returns 0 either way; the caller reads the printed name.
 next_attempt() {
 	while read -r mtime path; do
 		[ -n "$path" ] || continue
@@ -165,7 +185,6 @@ next_attempt() {
 			printf '%s' "$name"
 			return 0
 		fi
-		printf 'held: %s does not resolve yet, so it is left pending and not attempted\n' "$name" >&2
 	done <<EOF
 $1
 EOF
@@ -173,9 +192,10 @@ EOF
 }
 
 # attempt <name> : the one attempt of a pass. Records the attempt whatever happens,
-# closes the request on success, and on any other outcome leaves it pending and
-# exits 1 so cron mails root, because a swallowed refusal is a member who waits for
-# nothing.
+# closes the request on success, and mails the outcome on every path: cron mails a
+# job's output under a subject of its own, so the report is the mail and nothing is
+# printed. On any outcome but success the request is left pending and the run exits
+# 1, because a swallowed refusal is a member who waits for nothing.
 attempt() {
 	name="$1"
 	cert="/etc/ssl/$name.fullchain.pem"
@@ -188,23 +208,28 @@ attempt() {
 		[ -f "$cert" ] || die "$name: acme-client exited $rc but $cert is not there"
 		rm -f "$pending_dir/$name"
 		[ ! -e "$pending_dir/$name" ] || die "$name: the request file is still there"
+		# The two outcomes get different events, so a list of subjects says which
+		# one happened: a first issue spends one of the five per registered
+		# domain, and a renewal that was already current spends none.
 		if [ "$rc" -eq 0 ]; then
-			printf 'issued: %s (%s)\n' "$name" "$cert"
+			notify_operator acme issued "$(printf '%s: issued, and %s is in place, so the request is closed.\nThe next attempt can be %s minutes from now at the earliest, and this one spent a slot of the registered domain refill.' \
+				"$name" "$cert" "$REFILL_MINUTES")"
 		else
-			printf 'current: %s already had a valid certificate, so the request is closed (%s)\n' \
-				"$name" "$cert"
+			notify_operator acme current "$(printf '%s: already had a valid certificate, so the request is closed (%s).\nThe next attempt can be %s minutes from now at the earliest.' \
+				"$name" "$cert" "$REFILL_MINUTES")"
 		fi
-		printf 'the next attempt can be %s minutes from now at the earliest\n' "$REFILL_MINUTES"
 		;;
 	*)
-		printf 'failed: %s: acme-client exited %s\n%s\n' "$name" "$rc" "$log" >&2
+		# The client's own words are the finding, and they are what has to arrive.
+		found=$(printf '%s: acme-client exited %s\n%s' "$name" "$rc" "$log")
 		case "$log" in
 		*"bad HTTP: 429"*)
-			printf '%s: the CA rate limited this order. A refusal spends no budget, but\n  acme-client 7.9 prints no Retry-After, so the %s-minute spacing stands as the retry.\n  Repeat occurrences: docs/planning/research/cert-issuance-ceiling.md\n' \
-				"$name" "$REFILL_MINUTES" >&2
+			found="$found$(printf '\n%s: the CA rate limited this order. A refusal spends no budget, but\n  acme-client 7.9 prints no Retry-After, so the %s-minute spacing stands as the retry.\n  Repeat occurrences: docs/planning/research/cert-issuance-ceiling.md' \
+				"$name" "$REFILL_MINUTES")"
 			;;
 		esac
-		printf 'held: %s, left pending so its age stays visible in --status\n' "$name" >&2
+		notify_operator acme "attempt failed" "$found" \
+			"$name is left pending, so its age keeps saying how long the wait is, and the next pass tries it in $REFILL_MINUTES minutes at the earliest. --status reads the queue by hand."
 		exit 1
 		;;
 	esac
@@ -260,7 +285,9 @@ run() {
 	if ! mkdir -m 0700 "$lock" 2>/dev/null; then
 		holder=$(cat "$lock/pid" 2>/dev/null || true)
 		if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-			printf 'another pass is running (pid %s); nothing attempted\n' "$holder"
+			# A pass that attempts nothing prints nothing, like every other such
+			# pass: the run holding the lock reports its own outcome, and the age
+			# alert is what covers one that never finishes.
 			return 0
 		fi
 		rm -f "$lock/pid"

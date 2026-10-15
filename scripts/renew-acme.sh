@@ -22,13 +22,15 @@
 # formats contained '%s', so every night handed /bin/sh a command cut in the
 # middle of a quote. No '%' appears in this file.
 #
-# Exit codes carry the outcome. 0 means every certificate was renewed or was
-# current; 1 means at least one was not, or was renewed into a daemon that did not
-# come back. Output goes to stdout and stderr, which cron mails to root, and root
-# is aliased to the operator. A clean run prints one line per certificate carrying
-# its expiry date, so mail from this job means the schedule ran and the dates say
-# how much margin is left; a failure prints a line beginning with the certificate
-# name, the client's own words, and ends the run with a count.
+# Exit codes carry the outcome, and the status also decides what the run's one
+# mail is called. 0 means every certificate was renewed or was current; 1 means at
+# least one was not, or was renewed into a daemon that did not come back. The
+# report is mailed rather than printed, because cron mails what a job prints under
+# a subject of its own and this job has something more specific to say: a clean
+# run's body is one line per certificate carrying its expiry date, so this mail
+# means the schedule ran and the dates say how much margin is left, and a failed
+# run's body begins each failing line with the certificate name and carries the
+# client's own words.
 #
 # The issuance ceiling, and why renewals do not touch it. Let's Encrypt allows 50
 # new certificates per registered domain per seven days, refilling one every 202
@@ -114,7 +116,43 @@ if ! mkdir -m 0700 "$lock" 2>/dev/null; then
 	fi
 fi
 printf '%s\n' "$$" > "$lock/pid"
-trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true' EXIT
+
+# --- the report, which is also the operator mail ----------------------------
+# Everything this run writes goes to a file rather than to cron, and the trap
+# below mails it under a subject naming the component and the event. cron mails
+# what a job prints under a subject of its own, which would be the same report
+# twice and the cron copy filed under nothing an operator can filter on. The
+# lines below carry on being written exactly as they were: only their
+# destination changes.
+#
+# The exit status decides the event, so a run that could not renew one name and a
+# run that never got as far as asking are both mailed, with the client's own
+# words and the certificate names in the body.
+report=$(mktemp)
+exec 3>&1 4>&2
+exec >> "$report" 2>&1
+
+# cleanup runs on every exit path. The report goes back out on the streams cron
+# reads before the mail is sent, so an alert that could not be mailed is printed
+# rather than written into the file this is about to delete: cron's copy is ugly
+# and a silent failure is worse.
+cleanup() {
+	status=$?
+	exec 1>&3 2>&4
+	rm -f "$lock/pid"
+	rmdir "$lock" 2>/dev/null || true
+	if [ -s "$report" ]; then
+		if [ "$status" -eq 0 ]; then
+			notify_operator acme renewed "$(cat "$report")"
+		else
+			notify_operator acme "renewal failed" "$(cat "$report")" \
+				"read the lines above in order. A certificate inside its warning window needs attention today; the rest can wait for the next daily run, which is the retry, and a refusal spends none of the issuance ceiling because a renewal carries the identifier set it was issued with."
+		fi
+	fi
+	rm -f "$report"
+	exit "$status"
+}
+trap cleanup EXIT
 
 # --- what needs renewing ----------------------------------------------------
 [ -r "$acme_conf" ] || {
@@ -220,7 +258,7 @@ failed=0
 # renew <handle> <fullchain> <service>...
 # The counter carries the outcome, not the return status: a failure on one
 # certificate must not stop the others being attempted, and the run still exits
-# non-zero so cron mails the result.
+# non-zero so its report is mailed as a failure.
 renew() {
 	handle="$1"
 	cert="$2"

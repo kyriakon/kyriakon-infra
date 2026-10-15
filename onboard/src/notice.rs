@@ -18,6 +18,7 @@ use tokio::process::Command;
 
 use crate::config::DrainConfig;
 use crate::store::{Notice, Store};
+use crate::util;
 
 /// The RFC 5322 message: the two headers the enqueuer reads and a plain-text
 /// body. Deliberately no From or Message-ID: the local smtpd owns those, and a
@@ -57,6 +58,40 @@ pub async fn enqueue(cfg: &DrainConfig, to: &str, subject: &str, body: &str) -> 
         return Err(format!("{} exited {status}", cfg.sendmail));
     }
     Ok(())
+}
+
+/// The shape every subject a human operator reads takes: the component, then the
+/// event. Two stable words, so a crowded mailbox can be filtered on the
+/// component and triaged from the event without opening anything, and so the
+/// same thing is called the same thing in every mail about it. The shell half
+/// builds the identical shape in `scripts/lib.sh`, and both halves use its
+/// component words: onboard, mail, spamd, ssh, acme, backup, keyring, host.
+pub fn operator_subject(component: &str, event: &str) -> String {
+    format!("kyriakon: {component}: {event}")
+}
+
+/// One operator alert, the only way this half sends one, so the shape cannot
+/// drift per call site: the subject names the component and the event, and the
+/// body says what ran, when, what it found and what to do about it. It goes to
+/// the reviewer, which is the one address the service reaches its operator at.
+///
+/// An alert that cannot be sent is printed rather than swallowed. A box whose
+/// mail path is broken is exactly when this matters, and cron mails what a job
+/// prints: under a subject of cron's own, which hides the component, and still
+/// better than the operator hearing nothing at all.
+pub async fn alert(cfg: &DrainConfig, component: &str, event: &str, found: &str, todo: &str) {
+    let subject = operator_subject(component, event);
+    // The same RFC 3339 UTC the journal lines carry, so the time in the mail and
+    // the time in the record it is about are one format.
+    let body = format!(
+        "what it found: {found}\n\nwhat to do: {todo}\n\n\
+         run: kyriakon-onboard-drain, release {}, at {}\n",
+        cfg.release,
+        util::filed_at(),
+    );
+    if let Err(e) = enqueue(cfg, &cfg.reviewer, &subject, &body).await {
+        eprintln!("{subject}\n\n{body}\nthis alert could not be mailed: {e}");
+    }
 }
 
 /// Whether the account already records a notice of this type and subject.

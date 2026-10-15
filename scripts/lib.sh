@@ -1,7 +1,8 @@
 #!/bin/ksh
 # lib.sh: shared helpers for the scripts that run on the box (backup.sh,
 # restore-test.sh, rehearsal.sh, abuse-monitor.sh, check-hygiene.sh,
-# check-keyring-drift.sh). Source it
+# check-keyring-drift.sh, renew-acme.sh, restore-standup.sh, acme-queue.sh).
+# Source it
 # from the script's own directory:
 #
 #   . "$(dirname "$0")/lib.sh"
@@ -151,5 +152,57 @@ dnsbl_verdict() {
 		esac
 	done
 	printf 'unchecked no zone answered%s\n' "${dnsbl_skipped:+ [skipped:$dnsbl_skipped]}"
+	return 0
+}
+
+# --- operator mail ---------------------------------------------------------
+#
+# notify_operator <component> <event> <found> [<what to do>]
+#
+# The one way a scheduled script tells the operator something, so the shape
+# cannot drift per script. The subject names the component and the event, both
+# drawn from the vocabulary below, and the body says what ran, when, what it
+# found and what to do about it. The subject is the part that has to hold: an
+# operator triaging a crowded mailbox sorts and filters on it, and a mail whose
+# subject says nothing is read last, if at all.
+#
+# The components, one word per thing the box runs, the same word in every mail
+# about it. onboard/src/notice.rs builds the identical shape for the drain:
+#
+#   onboard  the signup service: the handler, the drain and the store
+#   mail     smtpd, dovecot, and the accounts and allowances behind them
+#   spamd    the greylisting and blocking layer in front of smtpd
+#   ssh      sshd, and the keys and accounts it admits
+#   acme     certificate issuance, renewal and the queue
+#   backup   the nightly restic snapshot and the weekly restore test
+#   keyring  the published mail keys the encrypting LMTP reads
+#   host     the box itself: filesystems, snapshots and the hygiene checks
+#
+# Never fails the caller, for the reason ping_url gives: an alert that cannot be
+# sent must not become a second failure stacked on the one being reported, and a
+# script that dies on its own alert is silent about the failure it was
+# reporting. Mail that could not be sent is printed instead, so cron's own mail
+# still carries it, under cron's subject, which hides the component and is
+# still better than silence.
+notify_operator() {
+	# Locals, so a caller's own variables of any name survive the call. The
+	# scripts that source this one run under `set -u`, and a helper that left a
+	# stray variable behind would be a bug in a script nowhere near it.
+	typeset component="$1" event="$2" found="$3" todo="${4:-}" subject body
+	subject="kyriakon: $component: $event"
+	body="$found"
+	if [ -n "$todo" ]; then
+		body="$body
+
+what to do: $todo"
+	fi
+	body="$body
+
+run: $0 on $(hostname) at $(date '+%F %T')"
+	if [ -n "${ALERT_EMAIL:-}" ] &&
+		printf '%s\n' "$body" | mail -s "$subject" "$ALERT_EMAIL" >/dev/null 2>&1; then
+		return 0
+	fi
+	printf '%s\n\n%s\n' "$subject" "$body" >&2
 	return 0
 }

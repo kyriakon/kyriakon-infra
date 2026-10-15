@@ -76,20 +76,20 @@ fi
 # shellcheck disable=SC1090 # the path is the box's, not this repo's
 . "$env_file"
 
+# lib.sh holds notify_operator, the one way a scheduled script mails the operator.
+# Installed beside this script, as its header says.
+script_dir="$(dirname "$0")"
+if [ ! -f "$script_dir/lib.sh" ]; then
+	printf '%s: lib.sh is not in %s. Install the two files together, as lib.sh describes.\n' \
+		"$0" "$script_dir" >&2
+	exit 1
+fi
+# shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
+. "$script_dir/lib.sh"
+
 die() {
 	printf 'restore-standup: %s\n' "$*" >&2
 	exit 1
-}
-
-# Alert off-box. cron mails root once and then silence looks exactly like health, which
-# this job has already been bitten by. The healthcheck is the real dead-man's switch: a
-# run that never reaches the test leaves its weekly check unpinned, and the check alerts
-# on its own.
-# Called from the trap path rather than inline, which shellcheck cannot follow.
-# shellcheck disable=SC2329
-alert() {
-	[ -n "${ALERT_EMAIL:-}" ] || return 0
-	printf '%s\n' "$*" | mail -s "restore standup failed" "$ALERT_EMAIL" 2>/dev/null || true
 }
 
 : "${HCLOUD_TOKEN:?HCLOUD_TOKEN is required, in $env_file}"
@@ -118,25 +118,9 @@ esac
 [ -f "$ro_key" ] || die "no read-only storage key at $ro_key"
 [ -f "$ro_password" ] || die "no restic password file at $ro_password"
 
-# The EXIT trap below invokes this, which shellcheck cannot follow.
-# shellcheck disable=SC2329
-cleanup() {
-	cleanup_status=$?
-	if [ -n "$server_id" ]; then
-		printf 'deleting server %s\n' "$server_id"
-		if ! hcloud server delete "$server_id"; then
-			printf 'restore-standup: the box is still there. It bills until it is gone.\n' >&2
-			alert "hcloud server delete failed for id $server_id, and the box bills until it is gone"$'\n'"run: hcloud server delete $server_id"
-		fi
-	fi
-	if [ "$cleanup_status" -ne 0 ]; then
-		alert "the restore standup failed with status $cleanup_status"
-	fi
-	exit "$cleanup_status"
-}
-trap cleanup EXIT
-trap 'exit 1' INT TERM HUP
-
+# Nothing is mailed, cleaned up or redirected before this point: the checks above
+# are the ones that stop a hand run before it touches anything, and they say so on
+# the terminal. Everything after it is the run's report.
 if [ "$dry_run" = yes ]; then
 	printf 'dry-run: hcloud image list -t snapshot -l %s -o noheader -o columns=id\n' "$image_label"
 	printf 'dry-run: hcloud server create --name %s --type %s --image <id> --location %s -o json\n' "$server_name" "$server_type" "$location"
@@ -150,6 +134,46 @@ if [ "$dry_run" = yes ]; then
 	printf 'dry-run: nothing was created, nothing was destroyed\n'
 	exit 0
 fi
+
+# --- the report, which is also the operator mail ----------------------------
+# From here every line the run produces goes to a file, and the trap below mails it
+# under a subject naming the component and the event. cron mails what a job prints
+# under a subject of its own, so printing the same words would send the operator the
+# good mail and the guff. Nothing is mailed for a run that succeeded: the weekly
+# healthcheck is the signal for that, as the header says. The lines below carry on
+# being written exactly as they were, and only their destination changes.
+report=$(mktemp)
+exec 3>&1 4>&2
+exec >> "$report" 2>&1
+
+# The EXIT trap below invokes this, which shellcheck cannot follow.
+# shellcheck disable=SC2329
+cleanup() {
+	cleanup_status=$?
+	# The report goes back out on the streams cron reads before the mail is sent, so
+	# an alert that could not be mailed is printed rather than written into the file
+	# this is about to delete: cron's copy is ugly and a silent failure is worse.
+	exec 1>&3 2>&4
+	if [ -n "$server_id" ]; then
+		printf 'deleting server %s\n' "$server_id"
+		if ! hcloud server delete "$server_id"; then
+			printf 'restore-standup: the box is still there. It bills until it is gone.\n' >&2
+			notify_operator backup "restore server left behind" \
+				"the throwaway box $server_id was created and could not be deleted, and it bills until it is gone." \
+				"delete it: hcloud server delete $server_id"
+		fi
+	fi
+	if [ "$cleanup_status" -ne 0 ]; then
+		# Every line the run produced, which is what cron used to mail under its own
+		# subject, and what the operator needs to see beside the failure.
+		notify_operator backup "restore test failed" "$(cat "$report")" \
+			"read the lines above: the test's own output is there, and the box it ran on has been destroyed. The weekly healthcheck stays unpinned for a run that never got this far, so it is the channel that covers a failure of this one."
+	fi
+	rm -f "$report"
+	exit "$cleanup_status"
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM HUP
 
 command -v hcloud >/dev/null 2>&1 || die "no hcloud on this box, run: doas pkg_add hcloud"
 command -v jq >/dev/null 2>&1 || die "no jq on this box, run: doas pkg_add jq"
