@@ -174,6 +174,16 @@ self_test() {
 	check "the shipped config names a certificate" "$([ -n "$shipped" ] && printf yes || printf no)" "yes"
 	check "every keypair in the shipped config is read" "$shipped" "$reference"
 
+	# --- which keypair is the default ---
+	# The first keypair in the file is what a client that sends no SNI is served,
+	# and it has to be the one carrying the name the box is best known by: the
+	# apex certificate is the only one that names kyriakon.net and the hosts
+	# beside it. A pair placed above the apex takes that fallback away, and the
+	# fault is invisible from outside, because the handshake still succeeds with
+	# the wrong name in it. Nothing else in this file reads the order.
+	check "the first keypair is the one carrying the apex name" \
+		"$(printf '%s\n' "$shipped" | sed -n 1p)" "kyriakon.net"
+
 	# --- the keypair names the config asks for ---
 	printf '%s\n' \
 		'http protocol "https" {' \
