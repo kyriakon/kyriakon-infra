@@ -16,6 +16,16 @@
 # drain's, which is the privilege split the spec fixes.
 store_root = "/var/db/onboard"
 
+# The names the platform holds back, 0644 at the top of the store, installed
+# there by scripts/onboard-store.sh. The handler refuses them when an
+# application is filed; the drain checks the same file, because it is the half
+# that creates the account, the address and the subdomain, and it must not take
+# the filing half's answer for a rule this one enforces as root. Named here
+# rather than derived from the store root, for the reason the handler's own
+# config gives: a later layout moves the file rather than the service reading an
+# empty list and holding nothing back.
+reserved = "/var/db/onboard/reserved-usernames.txt"
+
 # The directory the drain's privileged scripts are installed in. It invokes
 # add-user.sh, provision-member.sh and delete-user.sh by their configured paths,
 # and those run quota-apply.sh, provision-member-web.sh,

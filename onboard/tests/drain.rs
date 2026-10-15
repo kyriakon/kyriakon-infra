@@ -52,6 +52,14 @@ impl Fix {
         // The box's account list, empty to start: the drain reads it to tell its
         // own half-finished approval from somebody else's account.
         std::fs::write(fix.path("passwd"), "").unwrap();
+        // The held-back names, copied from the tracked list so that a test can add
+        // one to the fixture's without touching the repository's.
+        let tracked = std::fs::read_to_string(format!(
+            "{}/../reserved-usernames.txt",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_default();
+        std::fs::write(fix.path("reserved"), tracked).unwrap();
         let sent = fix.path("sent");
         fix.script("enqueuer.sh", &format!("#!/bin/sh\ncat >> '{sent}'\n"));
         for s in [
@@ -66,6 +74,7 @@ impl Fix {
         fix.add_user_writes_passwd();
         let cfg = format!(
             "store_root = \"{}\"\n\
+             reserved = \"{}\"\n\
              scripts = \"{}\"\n\
              sendmail = \"{}\"\n\
              passwd = \"{}\"\n\
@@ -79,6 +88,7 @@ impl Fix {
              postal_address = \"1 Example Street, Example\"\n\
              release = \"2026-10-10 abc1234\"\n",
             fix.path("store"),
+            fix.path("reserved"),
             fix.path("bin"),
             fix.path("bin/enqueuer.sh"),
             fix.path("passwd"),
@@ -101,6 +111,15 @@ impl Fix {
 
     fn set_passwd(&self, text: &str) {
         std::fs::write(self.dir.join("passwd"), text).unwrap();
+    }
+
+    /// Hold one more name back, as adding a hostname to the tracked list does.
+    fn reserve(&self, name: &str) {
+        let p = self.dir.join("reserved");
+        let mut text = std::fs::read_to_string(&p).unwrap_or_default();
+        text.push_str(name);
+        text.push('\n');
+        std::fs::write(&p, text).unwrap();
     }
 
     /// An add-user.sh that makes the account in the passwd fixture and refuses a
@@ -1548,5 +1567,156 @@ fn a_decline_that_could_not_be_sent_goes_on_the_next_pass() {
         0,
         "the intent is cleared: {:?}",
         fix.intents()
+    );
+}
+
+/// The drain is the second gate for the names the platform holds back. The
+/// handler refuses one when an application is filed, and the half that creates
+/// the account as root cannot take the other half's word for it.
+#[test]
+fn an_application_for_a_held_back_name_is_refused() {
+    let fix = Fix::new("reserved-filed");
+    let record = fix.filed("signup", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    fix.drain();
+
+    assert!(fix.journal().contains("held back"), "{}", fix.journal());
+    assert_eq!(
+        fix.intents().len(),
+        1,
+        "the intent is left in place: {:?}",
+        fix.intents()
+    );
+    assert!(
+        fix.passwd_file().is_empty(),
+        "no account was made: {}",
+        fix.passwd_file()
+    );
+    assert!(!fix.dir.join("store/accounts/signup").exists());
+}
+
+/// A name held back after the application was filed stops the approval, because
+/// that is where an account would be made. The list's own header tells a
+/// maintainer to add a new platform hostname to it, which is exactly this.
+#[test]
+fn an_approval_for_a_name_held_back_since_filing_is_refused() {
+    let fix = Fix::new("reserved-approve");
+    let record = fix.filed("theophilus", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    fix.drain();
+    fix.reserve("theophilus");
+    fix.decide("approve", "theophilus");
+    fix.drain();
+
+    assert!(fix.journal().contains("held back"), "{}", fix.journal());
+    assert!(
+        !fix.dir.join("store/accounts/theophilus").exists(),
+        "no account was made"
+    );
+    assert!(fix.passwd_file().is_empty(), "{}", fix.passwd_file());
+}
+
+/// The same check must not sit where the intent is read, or a decline of a
+/// held-back name could never be carried out and the application would sit
+/// undecided for ever.
+#[test]
+fn a_decline_of_a_held_back_name_is_still_carried_out() {
+    let fix = Fix::new("reserved-decline");
+    let record = fix.filed_with(
+        "theophilus",
+        "cash",
+        &[("rail", "cash")],
+        Some("applicant@example.invalid"),
+        Some((UPLOAD_KEY, "works")),
+    );
+    fix.file_application(&record);
+    fix.drain();
+    fix.reserve("theophilus");
+    fix.decide("decline", "theophilus");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert!(
+        fix.sent().contains("was declined"),
+        "the applicant is told: {}",
+        fix.sent()
+    );
+    assert!(
+        !fix.journal().contains("held back"),
+        "a decline is not an admission: {}",
+        fix.journal()
+    );
+}
+
+/// A second application for a username that already has an account is not the
+/// first application's to inherit. The first approval drew a payment token,
+/// opened a window and wrote a ledger row, and approving the second must not
+/// rewrite the account from that state, which would leave the account and the
+/// ledger disagreeing about what is owed.
+#[test]
+fn a_second_application_does_not_reuse_the_first_approvals_payment() {
+    let fix = Fix::new("second-application");
+    let first = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&first);
+    fix.drain();
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let token = fix.account("secretary")["token_ref"].clone();
+    let ledger = fix.read("ledger/payments.jsonl");
+    assert!(!ledger.is_empty(), "the first approval opened a window: {ledger}");
+
+    // The same person applies again, later, and that application is approved.
+    let second = json!({
+        "username": "secretary",
+        "status_token": OTHER_TOKEN,
+        "filed_at": "2026-10-05T09:00:00Z",
+        "front_end": "web",
+        "stage": "received",
+        "outside_address": null,
+        "answers": {"rail": "cash"},
+        "mail_keys": [{
+            "mailbox": "",
+            "fingerprint": "1111 2222 3333 4444",
+            "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n-----END PGP PUBLIC KEY BLOCK-----",
+            "verdict": "works",
+        }],
+        "upload_key": null,
+        "rail": "cash",
+        "no_charge": false,
+        "acceptances": [{"document": "terms", "version": "2026-10-01 abc1234"}],
+        "question_list": "2026-10-01 abc1234",
+    });
+    std::fs::write(
+        fix.dir.join(format!("store/applications/{OTHER_TOKEN}.json")),
+        serde_json::to_vec_pretty(&second).unwrap(),
+    )
+    .unwrap();
+    fix.file_application(&second);
+    fix.drain();
+    // The console looks the application up by username and takes the newest, which
+    // is how the operator reaches a second application for one person.
+    let out = fix.ctl(&["approve", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert!(fix.journal().contains("already-member"), "{}", fix.journal());
+    assert_eq!(
+        fix.intents().len(),
+        0,
+        "the second intent is cleared: {:?}",
+        fix.intents()
+    );
+    assert_eq!(
+        fix.account("secretary")["token_ref"], token,
+        "the first approval's token is untouched"
+    );
+    assert_eq!(
+        fix.read("ledger/payments.jsonl"),
+        ledger,
+        "and no second window was opened and no second row written"
     );
 }

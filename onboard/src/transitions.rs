@@ -7,6 +7,7 @@
 //! application's own state, so a click on an already-decided application changes
 //! nothing and the journal records only that the click was seen.
 
+use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 
 use serde_json::{json, Value};
@@ -517,7 +518,8 @@ pub async fn filed_application(
     if intent.kind != "application" {
         return Err(format!("kind {:?} is not an application", intent.kind));
     }
-    if let Some(why) = validate::username_shape(&intent.application.username) {
+    let reserved = reserved_names(cfg).await?;
+    if let Some(why) = validate::username(&intent.application.username, &reserved) {
         return Err(format!("the username: {why}"));
     }
     if !store::is_status_token(&intent.application.status_token) {
@@ -716,16 +718,58 @@ async fn approve(
     // half-applied.
     let to = recipient(&record, username)?;
 
+    // Whether this application's own approval already began. A genuine retry has
+    // its own "applying" line; anything else holding this name is not this
+    // application's.
+    let begun = approval_started(store, token).await;
+    let existing = existing_account(store, username).await;
+
+    // An account record that this application never began is a second
+    // application for a username that already has one. Nothing here is this
+    // application's to reuse: not the payment token, not its window, and not its
+    // ledger row, and an approval reached this way would rewrite the first
+    // application's payment state, leaving the account and the ledger
+    // disagreeing about what is owed. This is the replay rule for a different
+    // reason: the click is recorded and the intent is dropped.
+    if existing.is_some() && !begun {
+        journal(
+            store,
+            &cfg.release,
+            &intent.id,
+            &intent.kind,
+            &intent.application,
+            "already-member",
+            Some(
+                "this username already has an account that this application did not make; nothing was carried out",
+            ),
+        )
+        .await?;
+        store.remove("intents", file).await?;
+        return Ok(());
+    }
+
+    // The held-back names are checked here, where the account would be made,
+    // rather than where the intent is read: only an approval creates an account,
+    // and a decline of a held-back name must still be carried out. Only when the
+    // approval is starting, so a name added to the list after an approval began
+    // does not turn the retry of a half-made account into an intent that can
+    // never finish.
+    if !begun {
+        let reserved = reserved_names(cfg).await?;
+        if let Some(why) = validate::username(username, &reserved) {
+            return Err(format!("the username: {why}"));
+        }
+    }
+
     // The box is the oracle and the record only a fast path. A name already on
     // the box that this application did not create is somebody else's, and it is
     // refused rather than adopted: the front end may not check existence at all,
     // so the drain must not silently take the account. The check runs before the
     // journal line, so a refusal records nothing and leaves the intent in place.
-    let existing = existing_account(store, username).await;
     let mut on_box = false;
     if existing.is_none() {
         on_box = account_on_box(cfg, username)?;
-        if on_box && !approval_started(store, token).await {
+        if on_box && !begun {
             return Err(format!(
                 "the username {username} is already in use on this box and this application did not create it; the intent is left in place"
             ));
@@ -1118,14 +1162,32 @@ fn account_on_box(cfg: &DrainConfig, username: &str) -> Result<bool, String> {
         .any(|line| line.split(':').next() == Some(username)))
 }
 
+/// The names the platform holds back, read from the path the config names.
+///
+/// Read where it is used rather than held for the pass: it is a short file, read
+/// at most twice a minute by a cron job, and a read that fails must refuse the
+/// work rather than let it through on an empty list.
+async fn reserved_names(cfg: &DrainConfig) -> Result<HashSet<String>, String> {
+    Ok(validate::reserved(&Store::read_text(&cfg.reserved).await?))
+}
+
 /// Whether this application's approval already began. The journal records
 /// "applying" after the name check and before provisioning, so a name that is on
 /// the box and has that line is one this application made, and the retry
 /// continues with it rather than refusing it as taken.
+///
+/// The kind is matched as well. Three transitions write that word for a token:
+/// the approval, the decline and the purge. Without the kind, a decline that
+/// could not finish would make a later approval of the same application believe
+/// the account on the box was its own, and it would adopt a name this
+/// application never made.
 async fn approval_started(store: &Store, token: &str) -> bool {
     for line in store.lines("journal.jsonl").await {
         if let Ok(j) = serde_json::from_str::<JournalLine>(&line) {
-            if j.application.status_token == token && j.outcome == "applying" {
+            if j.application.status_token == token
+                && j.outcome == "applying"
+                && (j.kind == "approve" || j.kind == "provision")
+            {
                 return true;
             }
         }

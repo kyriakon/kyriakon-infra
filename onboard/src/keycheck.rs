@@ -62,6 +62,13 @@ pub fn pgp_public_key(value: &str) -> Result<Checked, String> {
 
 /// Inspect an OpenSSH public key: the shape sftp and git will accept. A shape
 /// check only; the mail check does not apply to an upload key.
+///
+/// The four forms are the ones `scripts/provision-member.sh` writes into
+/// `authorized_keys`, named here in the same shape so the two lists can be read
+/// against each other. They were two different rules: this one took any kind
+/// beginning `ssh-`, so a line the box refuses at provisioning time passed the
+/// form, and the approval was half applied, leaving an account with no sftp and
+/// no git.
 pub fn openssh_public_key(value: &str) -> Result<(), String> {
     let value = value.trim();
     if value.is_empty() {
@@ -69,9 +76,20 @@ pub fn openssh_public_key(value: &str) -> Result<(), String> {
     }
     let mut parts = value.split_whitespace();
     let kind = parts.next().unwrap_or("");
-    let known = kind.starts_with("ssh-")
-        || kind.starts_with("ecdsa-sha2-")
-        || kind.starts_with("sk-");
+    let known = kind == "ssh-ed25519"
+        || kind == "ssh-rsa"
+        || kind
+            .strip_prefix("ecdsa-sha2-nistp")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        || kind
+            .strip_prefix("sk-")
+            .and_then(|rest| rest.strip_suffix("@openssh.com"))
+            .is_some_and(|middle| {
+                !middle.is_empty()
+                    && middle
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            });
     if !known {
         return Err("this is not an OpenSSH public key".to_string());
     }
@@ -342,6 +360,34 @@ mod tests {
         assert!(openssh_public_key("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAA user@host").is_ok());
         assert!(openssh_public_key("-----BEGIN PGP PUBLIC KEY BLOCK-----").is_err());
         assert!(openssh_public_key("ssh-ed25519 notbase64!!!").is_err());
+    }
+
+    /// The four forms are the ones `scripts/provision-member.sh` writes into
+    /// `authorized_keys`, and this list and that one are meant to be read against
+    /// each other. The crate used to take any kind beginning `ssh-`, so a line the
+    /// box refuses at provisioning time passed the form, and the approval was half
+    /// applied: an account with no sftp and no git.
+    #[test]
+    fn the_upload_key_forms_are_the_four_the_box_accepts() {
+        for good in [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAA user@host",
+            "ssh-rsa AAAAC3NzaC1yc2EAAAA user@host",
+            "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAA user@host",
+            "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAA user@host",
+        ] {
+            assert!(openssh_public_key(good).is_ok(), "{good} should be accepted");
+        }
+        for bad in [
+            // A certificate line begins `ssh-` exactly as the first form does.
+            "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQAAA user@host",
+            "ssh-dss AAAAB3NzaC1kc3MAAA user@host",
+            "ecdsa-sha2-nistp256-cert-v01@openssh.com AAAAKGVjZHNhLXNoYTItbmlzdHAyNTYAAA user@host",
+            "ecdsa-sha2-nistp256x AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAA user@host",
+            // A resident key without the suffix the box wants.
+            "sk-ssh-ed25519 AAAAGnNrLXNzaCAAA user@host",
+        ] {
+            assert!(openssh_public_key(bad).is_err(), "{bad} should be refused");
+        }
     }
 
     #[test]

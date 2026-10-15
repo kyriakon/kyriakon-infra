@@ -67,6 +67,10 @@ pub struct DrainConfig {
     /// The store root the drain owns: everything but the four directories the
     /// handler writes.
     pub store_root: String,
+    /// The names the platform holds back, 0644 at the top of the store. The
+    /// handler refuses them when an application is filed and this half checks
+    /// the same file, because it is the half that creates the account as root.
+    pub reserved: String,
     /// The directory the privileged scripts are installed in. `/root/bin` on the
     /// box, where `scripts/deploy-mail.sh` puts them; a fixtures directory in a
     /// test, which is why it is a value and not a literal.
@@ -174,6 +178,7 @@ mod tests {
     #[test]
     fn the_drain_config_reads_the_shipped_shape_and_refuses_a_typo() {
         let text = "store_root = \"/var/db/onboard\"\n\
+             reserved = \"/var/db/onboard/reserved-usernames.txt\"\n\
              scripts = \"/root/bin\"\n\
              sendmail = \"/usr/sbin/sendmail\"\n\
              passwd = \"/etc/passwd\"\n\
@@ -200,6 +205,7 @@ mod tests {
         let c: DrainConfig =
             toml::from_str(include_str!("../../openbsd/etc/onboard/drain.toml")).unwrap();
         assert_eq!(c.store_root, "/var/db/onboard");
+        assert_eq!(c.reserved, "/var/db/onboard/reserved-usernames.txt");
         assert_eq!(c.scripts, "/usr/local/libexec/kyriakon/scripts");
         assert_eq!(c.sendmail, "/usr/sbin/sendmail");
         assert_eq!(c.passwd, "/etc/passwd");
