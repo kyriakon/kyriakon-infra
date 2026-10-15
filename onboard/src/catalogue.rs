@@ -16,7 +16,7 @@
 
 use serde::Deserialize;
 
-use crate::{capsule, page};
+use crate::{capsule, page, portal};
 
 /// The tracked file, named in the refusals so a failing check says which file to
 /// look at rather than which function returned.
@@ -130,6 +130,9 @@ impl Job {
 pub enum Protocol {
     Web,
     Gemini,
+    /// The terminal. It opens nothing itself, so an entry's address is one the
+    /// reader's own client opens, over the scheme a client of theirs reaches.
+    Terminal,
 }
 
 impl Protocol {
@@ -137,15 +140,16 @@ impl Protocol {
         match self {
             Protocol::Web => "https",
             Protocol::Gemini => "gemini",
+            Protocol::Terminal => "https",
         }
     }
 
     /// Whether this front-end can finish the job an action starts. The web form
-    /// finishes all four in place; the capsule cannot take a card, so `pay` is
-    /// the one it hands to a browser. That is the spec's rule, not a fifth
-    /// action value.
+    /// finishes all four in place; the capsule cannot take a card and the terminal
+    /// has no browser in the session to take one in, so `pay` is the one both hand
+    /// off. That is the spec's rule, not a fifth action value.
     pub fn can_finish(self, action: Action) -> bool {
-        !(self == Protocol::Gemini && action == Action::Pay)
+        !(matches!(self, Protocol::Gemini | Protocol::Terminal) && action == Action::Pay)
     }
 }
 
@@ -261,14 +265,15 @@ pub fn row(s: &Service, protocol: Protocol, member: Option<&str>) -> Row {
 }
 
 /// Every rendering that exists, as the rows it shows: the application page's
-/// cards, the account page's list, and the capsule's gemtext lines. The
-/// terminal's menu joins this list with the portal, and the check covers it from
-/// then on.
+/// cards, the account page's list, the capsule's gemtext lines and the terminal's
+/// menu. The check covers all four, which is what keeps a front-end that drops an
+/// entry, or invents one, from reaching a reader.
 pub fn renderings(list: &[Service], member: Option<&str>) -> Vec<(&'static str, Vec<Row>)> {
     vec![
         ("the application page", page::services(list, member)),
         ("the account page", page::services(list, member)),
         ("the capsule", capsule::entries(list, member)),
+        ("the terminal menu", portal::entries(list, member)),
     ]
 }
 
@@ -525,6 +530,46 @@ action = \"pay\"
         let capsule = row(paying, Protocol::Gemini, None);
         assert_eq!(capsule.href, "https://signup.kyriakon.net/");
         assert_eq!(capsule.handoff, Some(Job::CardPayment.handoff()));
+
+        // The terminal opens nothing itself, so its rows carry the address a
+        // client of the reader's opens, and it has no browser to take a card in
+        // either.
+        let terminal = row(mail, Protocol::Terminal, None);
+        assert_eq!(terminal.href, "https://mail.kyriakon.net/");
+        assert_eq!(terminal.handoff, None);
+        let named = list.iter().find(|s| s.id == "gemini").unwrap();
+        assert_eq!(
+            row(named, Protocol::Terminal, Some("theophilus")).href,
+            "https://theophilus.kyriakon.net/"
+        );
+        let terminal = row(paying, Protocol::Terminal, None);
+        assert_eq!(terminal.href, "https://signup.kyriakon.net/");
+        assert_eq!(terminal.handoff, Some(Job::CardPayment.handoff()));
+    }
+
+    /// The terminal's menu is one of the renderings the check compares, so a menu
+    /// that dropped an entry, or carried a list of its own, fails here rather than
+    /// at a reader.
+    #[test]
+    fn the_check_covers_the_terminals_menu() {
+        let list = parse(SHIPPED).unwrap();
+        let rendered = renderings(&list, None);
+        let menu = rendered
+            .iter()
+            .find(|(front_end, _)| *front_end == "the terminal menu")
+            .expect("the check compares the terminal's menu");
+        assert_eq!(menu.1, portal::entries(&list, None));
+
+        // And a menu that dropped an entry is caught by name, like any other.
+        let mut rows = rendered;
+        let at = rows
+            .iter()
+            .position(|(front_end, _)| *front_end == "the terminal menu")
+            .unwrap();
+        rows[at].1.retain(|r| r.id != "shop");
+        let e = compare(&list, &rows).unwrap_err();
+        assert!(e.contains("the terminal menu"), "{e}");
+        assert!(e.contains("shop"), "{e}");
     }
 
     /// The capsule's own page: one line per entry, the name and the clause in

@@ -2,12 +2,12 @@
 # deploy-onboard.sh: put the onboarding service on the box and start its handler.
 #
 # The release's front door, installed from this repository: the store under
-# /var/db/onboard, the three binaries built from onboard/ and installed to
-# /usr/local/sbin (the handler, the root drain and onboardctl), the handler's
-# config at /etc/onboard/onboard.toml and the drain's own root-only config at
-# /etc/kyriakon/onboard/drain.toml, both with the deployed release substituted,
-# and the rc.d unit. Every step is idempotent, so a rebuild, or a second run
-# after a fix, is one command.
+# /var/db/onboard, the four binaries built from onboard/ and installed to
+# /usr/local/sbin (the handler, the root drain, onboardctl and the portal), the
+# handler's config at /etc/onboard/onboard.toml and the drain's own root-only
+# config at /etc/kyriakon/onboard/drain.toml, both with the deployed release
+# substituted, and the rc.d unit. Every step is idempotent, so a rebuild, or a
+# second run after a fix, is one command.
 #
 # Installing the drain's binary does not schedule it: its crontab line, the same
 # one every minute that the rest of the scheduled scripts get, is installed by
@@ -96,9 +96,12 @@ need_pkg rust
 need_pkg curl
 need_pkg jq
 cargo build --release --manifest-path "$repo_dir/onboard/Cargo.toml"
-# The handler, the root drain and onboardctl are one crate and three programs:
-# a build that produced one of them but not the others is half a service.
-for b in kyriakon-onboard kyriakon-onboard-drain kyriakon-onboardctl; do
+# The handler, the root drain, onboardctl and the portal are one crate and four
+# programs: a build that produced some of them but not the others is half a
+# service. The portal is the one the applicant's ssh session runs, so a build
+# without it would install nothing the login class names and every connection
+# would land on a file that is not there.
+for b in kyriakon-onboard kyriakon-onboard-drain kyriakon-onboardctl kyriakon-onboard-tui; do
 	[ -x "$repo_dir/onboard/target/release/$b" ] \
 		|| die "the build produced no binary at onboard/target/release/$b"
 done
@@ -108,6 +111,12 @@ install -d -m 0755 -o root -g wheel /etc/onboard
 install -m 0755 "$repo_dir/onboard/target/release/kyriakon-onboard" /usr/local/sbin/kyriakon-onboard
 install -m 0755 "$repo_dir/onboard/target/release/kyriakon-onboard-drain" /usr/local/sbin/kyriakon-onboard-drain
 install -m 0755 "$repo_dir/onboard/target/release/kyriakon-onboardctl" /usr/local/sbin/kyriakon-onboardctl
+# The portal, at the path openbsd/etc/login.conf.d/onboard names as the session's
+# shell and openbsd/etc/sshd_config.onboard pins with ForceCommand. It also
+# replaces the ksh program that path held, which left the repository in #373: the
+# same path and one file, so no session can reach the retired program and no
+# fallback runs it.
+install -m 0755 "$repo_dir/onboard/target/release/kyriakon-onboard-tui" /usr/local/sbin/kyriakon-onboard-tui
 install -m 0755 "$repo_dir/openbsd/etc/rc.d/kyriakon_onboard" /etc/rc.d/kyriakon_onboard
 
 # The release this box is running, as the config's own comment describes it: the
