@@ -54,7 +54,12 @@ impl Fix {
         std::fs::write(fix.path("passwd"), "").unwrap();
         let sent = fix.path("sent");
         fix.script("enqueuer.sh", &format!("#!/bin/sh\ncat >> '{sent}'\n"));
-        for s in ["provision-member.sh", "delete-user.sh", "cron-apply.sh"] {
+        for s in [
+            "provision-member.sh",
+            "delete-user.sh",
+            "cron-apply.sh",
+            "publish-mail-key.sh",
+        ] {
             let log = fix.path("scripts.log");
             fix.script(s, &format!("#!/bin/sh\necho \"{s} $*\" >> '{log}'\n"));
         }
@@ -67,7 +72,7 @@ impl Fix {
              approval_key = \"{}\"\n\
              keyring_dir = \"{}\"\n\
              stripe_webhook_secret = \"{}/stripe\"\n\
-             keyring_publish_token = \"{}/keyring\"\n\
+             keyring_publish_token = \"{}/keyring-token\"\n\
              reviewer = \"reviewer@example.invalid\"\n\
              base_url = \"https://signup.kyriakon.net\"\n\
              price_gbp = \"20.00\"\n\
@@ -249,6 +254,21 @@ impl Fix {
         self.script(
             "provision-member.sh",
             "#!/bin/sh\necho 'builder refused' >&2\nexit 1\n",
+        );
+    }
+
+    /// A publish-mail-key.sh that refuses, in the shape the real one has when the
+    /// forge will not take the change: the member and the key named on stderr,
+    /// and a non-zero exit.
+    fn publish_fails(&self) {
+        let log = self.path("scripts.log");
+        self.script(
+            "publish-mail-key.sh",
+            &format!(
+                "#!/bin/sh\necho \"publish-mail-key.sh $*\" >> '{log}'\n\
+                 printf 'publish-mail-key.sh: %s (1111 2222 3333 4444): the token cannot read the repository\\n' \"$1\" >&2\n\
+                 exit 2\n"
+            ),
         );
     }
 
@@ -857,6 +877,104 @@ fn an_approval_publishes_the_mail_key_to_the_keyring() {
         std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o644,
         "the keyring file carries the mode deploy-mail installs"
+    );
+}
+
+/// An approval offers the member's mail key to the published set through the
+/// script the box owns, after the keyring entry and after the member is built:
+/// the keyring is what delivers, so nothing about the publish comes before
+/// either, and the forge is never on a path the member waits on.
+#[test]
+fn an_approval_offers_the_mail_key_for_publication() {
+    let fix = Fix::new("publish");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let log = fix.scripts_log();
+    let offered = log
+        .lines()
+        .find(|l| l.starts_with("publish-mail-key.sh "))
+        .unwrap_or_else(|| panic!("the mail key was not offered to the published set: {log}"));
+    assert_eq!(
+        offered,
+        format!(
+            "publish-mail-key.sh secretary {} {}",
+            fix.path("keyring/secretary.asc"),
+            fix.path("keyring-token"),
+        ),
+        "the member, the key file and the token are what the script is handed"
+    );
+    let member = log.find("provision-member.sh secretary").expect(&log);
+    let published = log.find("publish-mail-key.sh").expect(&log);
+    assert!(
+        member < published,
+        "the member is built before the publish: {log}"
+    );
+}
+
+/// A publish that fails is reported with the member and the key, holds the
+/// approval back from its record and its notice rather than from mail, and is
+/// retried without touching the keyring file: the seven days the drift check
+/// allows an unpublished key are the age of that file, so a retry that rewrote
+/// it would restart the window forever.
+#[test]
+fn a_failed_publish_is_reported_and_retried_without_touching_the_key() {
+    let fix = Fix::new("publish-fails");
+    fix.publish_fails();
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("publish-mail-key.sh"), "{err}");
+    assert!(
+        err.contains("secretary"),
+        "the failure names the member: {err}"
+    );
+    assert!(
+        err.contains("1111 2222 3333 4444"),
+        "the failure names the key: {err}"
+    );
+
+    // The member is live: the key is in the keyring and delivery works. What is
+    // held back is the account record and the notice.
+    let key = fix.dir.join("keyring/secretary.asc");
+    let written = std::fs::metadata(&key)
+        .expect("an approval that fails to publish still serves the key")
+        .modified()
+        .unwrap();
+    assert!(
+        !fix.dir.join("store/accounts/secretary/account.json").exists(),
+        "an approval whose publish failed is not finished"
+    );
+    assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
+
+    // The retry moves the backoff out of the way the way a real minute would. It
+    // tries the publish again, reports nothing new, and leaves the key alone.
+    fix.age_failures();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.scripts_log().matches("publish-mail-key.sh").count(),
+        2,
+        "the publish is retried: {}",
+        fix.scripts_log()
+    );
+    assert_eq!(
+        std::fs::metadata(&key).unwrap().modified().unwrap(),
+        written,
+        "the keyring file was rewritten, which restarts the drift check's seven days"
+    );
+    assert_eq!(
+        fix.intents().len(),
+        1,
+        "the intent stays until the publish succeeds"
     );
 }
 

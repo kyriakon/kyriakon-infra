@@ -14,7 +14,13 @@
 #                  and a mistake after that. The age is the key file's modification
 #                  time in the keyring, which is when the signup service wrote it,
 #                  so the service must create the file rather than carry some older
-#                  timestamp onto it.
+#                  timestamp onto it. The service's publish is
+#                  scripts/publish-mail-key.sh, run from the approval, which opens
+#                  publish-key/<localpart> against the repository: that branch is
+#                  the change the operator merges. Because the age is that mtime,
+#                  a retried approval must leave an identical key file alone
+#                  rather than rewriting it, or the seven days would restart on
+#                  every pass and never elapse.
 #
 #   --publication  runs off the box, wherever the recorded copy in the second
 #                  repository (KEYRING_STORE) is readable. Compares the merged
@@ -161,9 +167,14 @@ alert() {
 # fpr_of <file>: the primary fingerprint of the first key in a public key file, or
 # empty if gpg cannot read it. --show-keys is the call rekey-mail-key.sh already
 # uses, and it reads the file without importing anything.
+#
+# The `|| true` is load-bearing under `set -o pipefail`: gpg exits non-zero on a
+# file that is not a key, which would otherwise abort the whole run at the
+# assignment, and the empty answer every caller tests for is what should come
+# back instead.
 fpr_of() {
 	gpg --with-colons --show-keys "$1" 2>/dev/null |
-		awk -F: '$1 == "fpr" { print $10; exit }'
+		awk -F: '$1 == "fpr" { print $10; exit }' || true
 }
 
 # A finding names the localpart and the fingerprints involved, never the key body.
@@ -212,7 +223,7 @@ check_box() {
 			mtime=$(stat -f %m "$k")
 			age=$(( (now - mtime) / 86400 ))
 			if [ "$age" -gt "$unpublished_days" ]; then
-				finding "$lp: on the box as $fpr, unpublished for $age days (limit $unpublished_days). An unmerged pull request or a mistake; delivery works either way, so nothing is broken yet."
+				finding "$lp: on the box as $fpr, unpublished for $age days (limit $unpublished_days). The approval opens publish-key/$lp against the repository and a human merges it: merge it, or find why it never opened. Delivery works either way, so nothing is broken yet."
 			fi
 			continue
 		fi
@@ -302,6 +313,10 @@ self_test() {
 	cp "$fixture/carol.asc" "$box_drift/bob.asc"
 	cp "$fixture/carol.asc" "$box_drift/dave.asc"
 	cp "$fixture/carol.asc" "$box_drift/eve.asc"
+	# A file in the keyring that gpg cannot read at all. Delivery fails closed on
+	# it, so it is a finding and never a failure to run: a check that aborted at
+	# the assignment instead would alert about nothing.
+	printf '%s\n' 'not a public key' >"$box_drift/frank.asc"
 	touch -t 202001010000 "$box_drift/dave.asc"
 
 	fail=0
@@ -364,7 +379,8 @@ self_test() {
 	assert_has 'bob: the published fingerprint' "$bob" "$out"
 	assert_has 'carol: published, not served' 'carol' "$out"
 	assert_has 'dave: unpublished past the limit' 'dave' "$out"
-	assert_hasnt 'eve: unpublished and fresh, silent' 'eve' "$out"
+	assert_has 'frank: a key file gpg cannot read' 'frank' "$out"
+	assert_hasnt 'eve: unpublished and fresh, silent' 'eve:' "$out"
 	assert_hasnt 'alice: matching, silent' 'alice' "$out"
 
 	printf '%s\n' '--- a recorded copy that matches is silent, additions included'
