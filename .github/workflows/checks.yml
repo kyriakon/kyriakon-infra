@@ -1,0 +1,75 @@
+# The checks this repository already has, run on every pull request.
+#
+# Only what a Linux runner can run honestly is here, and two things stay manual
+# without that being an oversight:
+#
+#   * The OpenBSD config syntax checks (httpd -n, smtpd -n, gmid -n, relayd -n)
+#     need a real host, which the repository's own conventions already say.
+#   * The `--self-test`s in scripts/ rebind their paths and shell out to BSD
+#     userland that a Linux runner does not carry, so they remain the box's
+#     check. A self-test only counts once it has run under the box's own ksh.
+#
+# There is deliberately no Rust formatter here: the crate is hand formatted and
+# rustfmt would rewrite seventeen files, which is a separate decision.
+#
+# What these catch, all of them found by hand in the 2026-10-15 audit: a status
+# read inside the wrong branch, a loop variable read after its loop, a checkbox
+# flag computed for one kind while the template draws two, and a route table
+# drifting from the links the code emits.
+
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  onboard:
+    name: onboard crate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The runner's own stable Rust rather than a toolchain action: the bar is
+      # that the crate builds and its tests pass, and the versions are printed
+      # so a failure is diagnosable without a second run.
+      - name: toolchain
+        run: rustc --version && cargo --version
+      - name: test
+        run: cargo test --manifest-path onboard/Cargo.toml
+      # Warnings are errors: the crate is clean at this bar today, so a new one
+      # fails the check rather than scrolling past.
+      - name: clippy
+        run: cargo clippy --manifest-path onboard/Cargo.toml --all-targets -- -D warnings
+
+  shell:
+    name: shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Every script in the tree, not only scripts/: the restore template's
+      # prepare-disk.sh runs on the box too.
+      - name: shellcheck
+        run: shellcheck $(git ls-files '*.sh')
+
+  terraform:
+    name: terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: format
+        run: terraform fmt -check -recursive
+        working-directory: terraform
+      # validate needs the provider schemas, so this initializes without a
+      # backend. It reads no state and reaches nothing at Hetzner, and the
+      # committed lock file now carries the checksums for this platform as well
+      # as the one it was first written on.
+      - name: init
+        run: terraform init -backend=false -input=false
+        working-directory: terraform
+      - name: validate
+        run: terraform validate
+        working-directory: terraform

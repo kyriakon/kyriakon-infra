@@ -39,13 +39,13 @@ pub fn reason(
     }
     match &q.rule {
         Rule::None => None,
-        Rule::Username => username(&v, reserved),
-        Rule::Usernames => usernames(&v, reserved),
-        Rule::Address => address(&v),
-        Rule::Domain => domain(&v),
-        Rule::MailKey => keycheck::pgp_public_key(&v).err(),
-        Rule::UploadKey => keycheck::openssh_public_key(&v).err(),
-        Rule::Choice(opts) => choice(opts, &v),
+        Rule::Username => username(v, reserved),
+        Rule::Usernames => usernames(v, reserved),
+        Rule::Address => address(v),
+        Rule::Domain => domain(v),
+        Rule::MailKey => keycheck::pgp_public_key(v).err(),
+        Rule::UploadKey => keycheck::openssh_public_key(v).err(),
+        Rule::Choice(opts) => choice(opts, v),
         Rule::MaxLen(n) => (v.chars().count() > *n).then(|| format!("at most {n} characters")),
     }
 }
@@ -161,10 +161,8 @@ fn address_line(line: &str) -> Option<String> {
     let mut words = rest.split_whitespace();
     match (words.next(), words.next(), words.next()) {
         (Some("own"), None, None) => None,
-        (Some("alias"), Some(target), None) => match username_shape(target) {
-            None => None,
-            Some(why) => Some(format!("the address line {line:?}: the alias target {target:?} {why}")),
-        },
+        (Some("alias"), Some(target), None) => username_shape(target)
+            .map(|why| format!("the address line {line:?}: the alias target {target:?} {why}")),
         _ => Some(malformed()),
     }
 }
