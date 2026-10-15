@@ -27,7 +27,7 @@ The web half of that configuration now ends behind `scripts/deploy-relayd.sh`, w
 
 		doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-relayd.sh
 
-Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box without changing anything. It reports permission drift against mtree, the blocklist verdict for the box's address, whether a cron job can still reach the tools it needs, whether the finger service is intact, and whether the terraform guard and the restore snapshot are still in place. It exits non-zero when something is wrong.
+Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box without changing anything. It reports permission drift against mtree, the blocklist verdict for the box's address, whether a cron job can still reach the tools it needs, whether the finger service is intact, whether the deployed catalogue matches the tracked one, whether the terraform guard and the restore snapshot are still in place, and whether the two files naming the mail domains agree. It exits non-zero when something is wrong.
 
 ## What is not built yet
 

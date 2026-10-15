@@ -44,8 +44,20 @@
 #    the box's copy. The catalogue is one file the three front-ends read, so a
 #    box running a different one is three renderings nobody reviewed.
 #
+# 6. Whether the terraform root still refuses to remove the mail box, and whether
+#    the weekly restore test still has an image to create from.
+#
+# 7. Whether the two files that name the mail domains agree. smtpd accepts mail
+#    for every domain in /etc/mail/mail_domains, and spamd traps any destination
+#    whose domain is not in /etc/mail/spamd.alloweddomains: trapping is not
+#    greylisting, it puts the sending host on the blocklist. The two files are
+#    written by different steps, and only the first is generated, so this is the
+#    pair that goes out of step when a body's own domain is added.
+#
 # Read-only. Exits non-zero when something is wrong, so cron could run it, though
 # the daily mail already covers the permissions half.
+#
+#   ksh scripts/check-hygiene.sh --self-test   section 7's comparison, and nothing else
 
 set -euo pipefail
 
@@ -66,6 +78,91 @@ fi
 . "$script_dir/lib.sh"
 
 status=0
+
+# domains_missing_from <mail-domains-file> <allowed-file>
+#
+# Print, one per line, every domain the first file names that the second has no
+# bare `@domain` line for. The first file's comments and blank lines are skipped,
+# because it explains itself; the allow list is matched whole-line, because that
+# is how spamd reads it, so a line carrying anything else does not count and a
+# domain on one is reported. The comparison runs in this direction only: a line
+# for a domain smtpd does not accept passes mail that never arrives, and traps
+# nothing, so it is not a finding.
+domains_missing_from() {
+	typeset list="$1" allowed="$2" line
+	# The `|| [ -n "$line" ]` is not decoration: `read` returns false at end of
+	# input, so a final line with no trailing newline never reaches the body, and
+	# the domain a hand edit appended last is the one most likely to be the one
+	# missing from the allow list.
+	while read -r line || [ -n "$line" ]; do
+		line=$(printf '%s' "$line" | sed -e 's/#.*//' -e 's/[[:space:]]//g')
+		[ -n "$line" ] || continue
+		grep -qxF "@$line" "$allowed" || printf '%s\n' "$line"
+	done < "$list"
+}
+
+# The comparison above, against fixtures, so a change to it is not a claim. It
+# drives the function and not the box, which is why it can run anywhere.
+self_test() {
+	typeset dir out want
+	dir=$(mktemp -d "${TMPDIR:-/tmp}/check-hygiene-test.XXXXXX") || exit 1
+	# The value is interpolated rather than referenced, so the trap does not read
+	# a name this function scoped and set -u would then refuse.
+	# shellcheck disable=SC2064
+	trap "rm -rf '$dir'" EXIT
+
+	printf 'kyriakon.net\nparish.example\nschool.example\n' > "$dir/mail_domains"
+	printf '# the platform domain, and nothing else yet\n@kyriakon.net\n' > "$dir/allowed"
+	want=$(printf 'parish.example\nschool.example')
+	out=$(domains_missing_from "$dir/mail_domains" "$dir/allowed")
+	[ "$out" = "$want" ] || {
+		printf 'FAIL: a domain smtpd accepts and spamd does not; expected [%s], got [%s]\n' \
+			"$want" "$out" >&2
+		exit 1
+	}
+
+	printf '@kyriakon.net\n@parish.example\n@school.example\n' > "$dir/allowed"
+	out=$(domains_missing_from "$dir/mail_domains" "$dir/allowed")
+	[ -z "$out" ] || {
+		printf 'FAIL: expected nothing, got [%s]\n' "$out" >&2
+		exit 1
+	}
+
+	# An extra line in the allow list is not a finding, and a comment is not a
+	# domain.
+	printf 'kyriakon.net\n# parish.example, added by hand\n' > "$dir/mail_domains"
+	out=$(domains_missing_from "$dir/mail_domains" "$dir/allowed")
+	[ -z "$out" ] || {
+		printf 'FAIL: an extra line and a comment are not findings; got [%s]\n' "$out" >&2
+		exit 1
+	}
+
+	# A last line with no trailing newline still counts. `read` does not run its
+	# body for one, and a hand edit that appends a domain without ending the line
+	# is the likeliest way for the pair to go out of step.
+	printf '@kyriakon.net\n' > "$dir/allowed"
+	printf 'kyriakon.net\nschool.example' > "$dir/mail_domains"
+	out=$(domains_missing_from "$dir/mail_domains" "$dir/allowed")
+	[ "$out" = "school.example" ] || {
+		printf 'FAIL: a last line with no trailing newline; expected [school.example], got [%s]\n' \
+			"$out" >&2
+		exit 1
+	}
+
+	printf 'check-hygiene: self-test passed\n'
+}
+
+case "${1:-}" in
+--self-test)
+	self_test
+	exit 0
+	;;
+"") ;;
+*)
+	printf 'usage: check-hygiene.sh [--self-test]\n' >&2
+	exit 2
+	;;
+esac
 
 # The box's checkout of this repository, which two sections read: the deployed
 # catalogue is compared against it, and the live terraform root is read from it.
@@ -245,6 +342,41 @@ if [ "$(id -u)" -eq 0 ] && [ -f /root/.kyriakon-env ]; then
 else
 	printf 'terraform: hcloud and the env file are both needed to check the restore image\n'
 	status=1
+fi
+
+# --- 7. the two files that name the mail domains --------------------------
+# smtpd accepts mail for every domain in mail_domains, and spamd's greylist
+# pass-through list is what decides which destinations it lets through. The two
+# are written by different steps and only the first is generated: deploy-mail.sh
+# seeds the platform's own domain into it, and the drain appends a body's domain
+# as it provisions one, while spamd.alloweddomains is installed once from the
+# tracked file and nothing rewrites it. A domain in the first and not the second
+# is not mail that is delayed: spamd(8) traps it and puts the sending host on the
+# blocklist, wherever the greylist diverts are in place, so the failure is seen
+# by whoever writes to that parish and not by anything here. The allow list's own
+# header says the same, which is what made the pair worth checking rather than
+# trusting.
+mail_domains_table=/etc/mail/mail_domains
+spamd_allowed=/etc/mail/spamd.alloweddomains
+if [ ! -f "$mail_domains_table" ]; then
+	printf 'mail domains: %s is missing; scripts/deploy-mail.sh seeds it with the platform domain\n' \
+		"$mail_domains_table"
+	status=1
+elif [ ! -f "$spamd_allowed" ]; then
+	printf 'mail domains: %s is missing; it is installed from openbsd/etc/spamd.alloweddomains\n' \
+		"$spamd_allowed"
+	status=1
+else
+	unwelcome=$(domains_missing_from "$mail_domains_table" "$spamd_allowed")
+	if [ -n "$unwelcome" ]; then
+		printf 'mail domains: %s names these and %s has no line for them, so spamd traps them and blocklists the sender:\n' \
+			"$mail_domains_table" "$spamd_allowed"
+		printf '%s\n' "$unwelcome" | sed -e 's/^/  /'
+		printf '  the line it wants is @<domain>; add it and reload spamd\n'
+		status=1
+	else
+		printf 'mail domains: every domain smtpd accepts is in the greylist pass-through list\n'
+	fi
 fi
 
 exit "$status"
