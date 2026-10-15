@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Confirm{% endblock %}
+{% block content %}
+<h2>{{ label }}</h2>
+<div class="card">
+  <p>Application: <span class="mono">{{ username }}</span></p>
+  <p>This is a decision on one application. Confirming files it, and the platform
+     carries it out on its next pass, within a minute.</p>
+</div>
+<form method="post" action="/decide/{{ token }}">
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="sig" value="{{ sig }}">
+  <button class="btn" type="submit">Confirm</button>
+</form>
+<p class="hint">
+  The link opened this page rather than deciding on its own: anything that
+  fetches a URL it is sent, from a link scanner to a mail client's preview, would
+  otherwise be able to decide an application.
+  <a href="/status/{{ token }}">Read the application instead.</a>
+</p>
+{% endblock %}

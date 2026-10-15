@@ -29,6 +29,51 @@ use crate::validate;
 /// rail rather than a flag because it is one of the four buttons on the form.
 const RAILS: [&str; 4] = ["card", "cash", "monero", "no_charge"];
 
+/// One of the three decisions a reviewer can make.
+pub struct Decision {
+    /// The word the console takes and a decision link carries, and the action
+    /// the signature covers.
+    pub action: &'static str,
+    /// The intent kind the drain dispatches on.
+    pub kind: &'static str,
+    /// The words the operator reads, in the review email and on the confirm page
+    /// a link opens.
+    pub label: &'static str,
+}
+
+/// The three decisions, as one list. Everything that names one takes its words
+/// from here: the console's verb, the intent's kind, the action the signature
+/// covers and the label the operator reads. They were four tables in four
+/// places, which is how a decision comes to be added in one of them and refused
+/// by another after the reviewer has already made it.
+pub const DECISIONS: [Decision; 3] = [
+    Decision {
+        action: "approve",
+        kind: "approve",
+        label: "approve, with the charge",
+    },
+    Decision {
+        action: "approve-free",
+        kind: "provision",
+        label: "approve, without charge",
+    },
+    Decision {
+        action: "decline",
+        kind: "decline",
+        label: "decline",
+    },
+];
+
+/// The decision a console verb or a link named, by the word it carries.
+pub fn decision_for(action: &str) -> Option<&'static Decision> {
+    DECISIONS.iter().find(|d| d.action == action)
+}
+
+/// The decision an intent carries, by its kind.
+pub fn decision_for_kind(kind: &str) -> Option<&'static Decision> {
+    DECISIONS.iter().find(|d| d.kind == kind)
+}
+
 /// A reviewer's decision intent, from `onboardctl` or a signed link. Every
 /// decision intent carries the action it performs and the signature over it: the
 /// directory it is read from belongs to the unprivileged half, so an unsigned
@@ -554,14 +599,11 @@ fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String,
     }
 
     out.push_str("\nDecide\n");
-    for (label, action) in [
-        ("approve, with the charge", "approve"),
-        ("approve, without charge", "approve-free"),
-        ("decline", "decline"),
-    ] {
+    for d in DECISIONS.iter() {
         out.push_str(&format!(
-            "  {label}: {}\n",
-            sign::decide_link(&cfg.base_url, key, token, action)?
+            "  {}: {}\n",
+            d.label,
+            sign::decide_link(&cfg.base_url, key, token, d.action)?
         ));
     }
     let username = &intent.application.username;
@@ -589,11 +631,9 @@ pub async fn decision(
     if let Some(why) = validate::username_shape(&intent.application.username) {
         return Err(format!("the username: {why}"));
     }
-    let expected = match intent.kind.as_str() {
-        "approve" => "approve",
-        "provision" => "approve-free",
-        "decline" => "decline",
-        other => return Err(format!("kind {other:?} is not a decision")),
+    let expected = match decision_for_kind(&intent.kind) {
+        Some(d) => d.action,
+        None => return Err(format!("kind {:?} is not a decision", intent.kind)),
     };
     if intent.action != expected {
         return Err(format!(
