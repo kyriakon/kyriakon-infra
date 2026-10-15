@@ -70,3 +70,34 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
         _ => transitions::refuse(cfg, store, file, &value).await,
     }
 }
+
+/// File one decision, as a link's click or the console does.
+///
+/// The handler holds no key and signs nothing: the signature travels in the link
+/// the operator was sent, and the drain is the half that verifies it. The console
+/// signs with the root-only key and passes its own. Both build the file here, so
+/// the two callers cannot disagree about the shape the drain parses.
+pub async fn file_decision(
+    store: &Store,
+    kind: &str,
+    action: &str,
+    username: &str,
+    token: &str,
+    sig: &str,
+) -> Result<String, String> {
+    let id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({
+        "id": id,
+        "kind": kind,
+        "filed_at": crate::util::filed_at(),
+        "application": { "username": username, "status_token": token },
+        "action": action,
+        "sig": sig,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    Ok(id)
+}

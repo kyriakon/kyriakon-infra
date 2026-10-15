@@ -68,6 +68,20 @@ pub struct NoticePage {
     pub message: String,
 }
 
+/// The page a decision link opens. It names what the link would do and carries
+/// the signature in the form, because the link itself acts on nothing: a GET
+/// that decided would let anything that fetches a URL decide for the operator.
+#[derive(Template)]
+#[template(path = "decide.html")]
+pub struct DecidePage {
+    /// The decision in words, as the review email lists it.
+    pub label: String,
+    pub username: String,
+    pub token: String,
+    pub action: String,
+    pub sig: String,
+}
+
 /// A question as the template renders it.
 pub struct Rq {
     pub id: String,

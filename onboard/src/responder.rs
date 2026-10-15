@@ -45,11 +45,14 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::fcgi::{self, Reply, Request};
-use crate::page::{AccountPage, NoticePage, ReceivedPage, StatusPage};
+use crate::page::{AccountPage, DecidePage, NoticePage, ReceivedPage, StatusPage};
 use crate::questions::{Branch, Question, Rule};
 use crate::rate::Key;
 use crate::store::{Acceptance, KeyRecord, Record, Store};
-use crate::{capsule, catalogue, config, keycheck, page, questions, rate, store, util, validate};
+use crate::{
+    capsule, catalogue, config, intents, keycheck, page, questions, rate, store, transitions, util,
+    validate,
+};
 
 /// The fixed hostname for the form and the account page, used as itself. It is
 /// public because the terminal front-end hands a reader the same host's status
@@ -421,6 +424,19 @@ async fn http(app: &App, request: &Request, incoming: &Incoming) -> Reply {
             method_not_allowed()
         };
     }
+    // A decision link opens a page that says what it would do, and the button on
+    // that page is what files it. See `decide_confirm`.
+    if let Some(token) = incoming.path.strip_prefix("decide/") {
+        if get {
+            let query = fields(request.value("QUERY_STRING"));
+            return decide_confirm(app, token, &query).await;
+        }
+        if method == "POST" {
+            let form = fields(&String::from_utf8_lossy(&request.body));
+            return decide_file(app, token, &form).await;
+        }
+        return method_not_allowed();
+    }
     if incoming.path == "apply" {
         if method != "POST" {
             return method_not_allowed();
@@ -661,6 +677,81 @@ async fn apply(app: &App, request: &Request, incoming: &Incoming) -> Reply {
 async fn status(app: &App, token: &str) -> Reply {
     let record = record_for(app, token).await;
     capability(&status_page(record, OffsetDateTime::now_utc()))
+}
+
+/// The decision a link names, with the signature it carries. A link with no
+/// signature, or with one naming an action this build has no decision for, names
+/// no decision.
+fn decision_from(f: &BTreeMap<String, String>) -> Option<&'static transitions::Decision> {
+    let sig = f.get("sig").map(String::as_str).unwrap_or("");
+    if sig.is_empty() {
+        return None;
+    }
+    transitions::decision_for(f.get("action").map(String::as_str).unwrap_or(""))
+}
+
+/// The confirm step in front of a decision link.
+///
+/// The links in the review email do not act when they are fetched. Email is
+/// fetched by things that are not the operator: a link scanner, a mail client's
+/// preview, a corporate rewriter that follows every URL before the human sees it.
+/// A GET that filed a decision would let any of them approve or decline an
+/// application, and the operator would never know, because a decision they did
+/// not make leaves nothing they can see. So the link opens this page, which names
+/// what it would do, and the button posts.
+///
+/// The signature is carried through untouched and is not checked here: the
+/// handler holds no key and holds no privilege, and the drain is the half that
+/// verifies the signature before carrying anything out.
+async fn decide_confirm(app: &App, token: &str, query: &BTreeMap<String, String>) -> Reply {
+    let Some(record) = record_for(app, token).await else {
+        // The page an unknown, an expired and a spent token all read as.
+        return capability(&status_page(None, OffsetDateTime::now_utc()));
+    };
+    let Some(decision) = decision_from(query) else {
+        return refused("This link does not name a decision the platform knows.");
+    };
+    capability(&DecidePage {
+        label: decision.label.to_string(),
+        username: record.username,
+        token: token.to_string(),
+        action: decision.action.to_string(),
+        sig: query.get("sig").cloned().unwrap_or_default(),
+    })
+}
+
+/// The click itself: the decision the confirm page named, filed as an intent the
+/// drain verifies and carries out.
+///
+/// An application that has already been decided is not refused here. Nothing in
+/// this handler reads the decision's state, because a click files an intent and
+/// that is the whole of its job: the drain is the half with the key, and it is
+/// the half that decides whether the click was already seen, so a replay is
+/// answered where the rule already lives and is already tested.
+async fn decide_file(app: &App, token: &str, form: &BTreeMap<String, String>) -> Reply {
+    let Some(record) = record_for(app, token).await else {
+        return capability(&status_page(None, OffsetDateTime::now_utc()));
+    };
+    let Some(decision) = decision_from(form) else {
+        return refused("This link does not name a decision the platform knows.");
+    };
+    let sig = form.get("sig").cloned().unwrap_or_default();
+    match intents::file_decision(
+        &app.store,
+        decision.kind,
+        decision.action,
+        &record.username,
+        token,
+        &sig,
+    )
+    .await
+    {
+        Ok(_) => capability(&notice(
+            "Filed",
+            "The decision is filed. The platform carries it out on its next pass, within a minute.",
+        )),
+        Err(e) => server_error(&format!("the decision could not be filed: {e}")),
+    }
 }
 
 /// The page one token's record renders, or the one notice that covers a token

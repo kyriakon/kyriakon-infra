@@ -18,12 +18,11 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use serde_json::json;
-
 use kyriakon_onboard::config::DrainConfig;
+use kyriakon_onboard::intents;
 use kyriakon_onboard::sign;
 use kyriakon_onboard::store::{Record, Store};
-use kyriakon_onboard::util;
+use kyriakon_onboard::transitions::{self, Decision};
 use kyriakon_onboard::validate;
 
 const DEFAULT_CONFIG: &str = "/etc/kyriakon/onboard/drain.toml";
@@ -74,17 +73,16 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         // Each decision is signed with the same root-only key the review links
         // are signed with, because the drain carries out a decision intent only
         // when its signature verifies, and `intents/` belongs to the
-        // unprivileged half.
-        kind @ ("approve" | "approve-free" | "decline") => {
-            let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
-            let (intent_kind, action) = match kind {
-                "approve" => ("approve", "approve"),
-                "approve-free" => ("provision", "approve-free"),
-                _ => ("decline", "decline"),
+        // unprivileged half. The verb, the kind and the action come from the
+        // crate's one decision list, so a verb this console takes is a decision
+        // the drain knows.
+        verb => {
+            let Some(decision) = transitions::decision_for(verb) else {
+                return Err(usage());
             };
-            file_decision(&store, &key, intent_kind, action, username).await
+            let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
+            sign_and_file(&store, &key, decision, username).await
         }
-        _ => Err(usage()),
     }
 }
 
@@ -94,35 +92,29 @@ fn usage() -> String {
         .to_string()
 }
 
-/// File one decision as an intent. The application it names is looked up by
-/// username now, at the terminal, so the intent carries the token the drain
-/// keys on and not a name a second application could share. The action and its
-/// signature go with it, so the drain carries the decision out only if it was
-/// signed under the approval key.
-async fn file_decision(
+/// Sign one decision and file it as an intent. The application it names is
+/// looked up by username now, at the terminal, so the intent carries the token
+/// the drain keys on and not a name a second application could share. The action
+/// and its signature go with it, so the drain carries the decision out only if it
+/// was signed under the approval key.
+async fn sign_and_file(
     store: &Store,
     key: &[u8],
-    kind: &str,
-    action: &str,
+    decision: &Decision,
     username: &str,
 ) -> Result<(), String> {
     let (token, _record) = find_application(store, username).await?;
-    let id = ulid::Ulid::new().to_string();
-    let sig = sign::sign(key, &sign::decide_payload(&token, action))?;
-    let intent = json!({
-        "id": id,
-        "kind": kind,
-        "filed_at": util::filed_at(),
-        "application": { "username": username, "status_token": token },
-        "action": action,
-        "sig": sig,
-    });
-    let bytes = serde_json::to_vec_pretty(&intent)
-        .map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store
-        .write_record("intents", &format!("{id}.json"), &bytes)
-        .await?;
-    println!("filed {kind} for {username} as intent {id}");
+    let sig = sign::sign(key, &sign::decide_payload(&token, decision.action))?;
+    let id = intents::file_decision(
+        store,
+        decision.kind,
+        decision.action,
+        username,
+        &token,
+        &sig,
+    )
+    .await?;
+    println!("filed {} for {username} as intent {id}", decision.kind);
     Ok(())
 }
 
