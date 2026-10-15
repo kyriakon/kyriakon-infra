@@ -10,6 +10,10 @@
 #
 #   repo_dir   checkout to install from; defaults to /usr/local/src/kyriakon-infra
 #
+# The two writes it makes into files the box reads are checked without a box:
+#
+#   ksh deploy-mail.sh --self-test [repo_root]
+#
 # Idempotent. Re-running reinstalls the configs, rebuilds the two components,
 # and restarts what is already running. It:
 #   1. installs the packages the build and the daemons need
@@ -43,18 +47,6 @@ queue_key_len=32
 dkim_key=/etc/mail/dkim/private.rsa.key
 keyring_dir=/etc/kyriakon/keys
 encrypt_bin=/usr/local/sbin/kyriakon-encrypt
-
-[ "$(id -u)" -eq 0 ] || { printf 'run as root (doas ksh %s)\n' "$0" >&2; exit 1; }
-[ -d "$repo_dir" ] || { printf 'repo_dir not found: %s\n' "$repo_dir" >&2; exit 1; }
-
-for f in openbsd/etc/smtpd.conf openbsd/etc/httpd.conf openbsd/etc/gmid.conf \
-	openbsd/etc/acme-client.conf \
-	openbsd/etc/rc.d/kyriakon_encrypt openbsd/dovecot/dovecot.conf \
-	openbsd/etc/spamd.alloweddomains openbsd/etc/spamd.conf openbsd/etc/nospamd \
-	openbsd/etc/kyriakon.env openbsd/etc/newsyslog.conf \
-	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml keys scripts/setup-env.sh; do
-	[ -e "$repo_dir/$f" ] || { printf 'missing from repo_dir: %s\n' "$f" >&2; exit 1; }
-done
 
 say() { printf '== %s\n' "$*"; }
 
@@ -115,6 +107,197 @@ dkim_domains_args() {
 	[ -n "$dk_args" ] || { printf '%s holds no domains\n' "$1" >&2; return 1; }
 	printf '%s\n' "${dk_args# }"
 }
+
+# set_virtual <table> <candidate> <name> <entry>
+#
+# Replace the line whose leading localpart is <name> with <entry>, or append it
+# when there is none, and print which happened. The replacement is written to
+# <candidate> and moved into place. It used to be `cat "$candidate" > "$table"`,
+# whose redirect empties the live table before filling it: this file is the whole
+# answer for local delivery, so a run interrupted in between leaves every address
+# under it unreachable. The mode is set on the candidate because a move brings
+# its own, and mktemp's is 0600 where the table is 0644.
+set_virtual() {
+	typeset table="$1" candidate="$2" name="$3" entry="$4"
+	if grep -q "^${name}:" "$table"; then
+		sed "s|^${name}:.*|${entry}|" "$table" > "$candidate"
+		chmod 0644 "$candidate"
+		mv "$candidate" "$table"
+		printf 'virtual %s set\n' "$name"
+	else
+		printf '%s\n' "$entry" >> "$table"
+		printf 'virtual %s added\n' "$name"
+	fi
+}
+
+# install_smtpd_conf <destination> <candidate>
+#
+# The shipped config with the queue key and the filter's domain list substituted,
+# written through <candidate> and moved onto <destination>. Both placeholders are
+# substituted in the one pass, so the file is never left with the key and not the
+# list, or the reverse. The redirect used to go straight onto the live file,
+# which empties the MTA's only configuration before filling it, and the chmod
+# landed two lines later: for that window the file carrying the substituted queue
+# key existed under this script's umask.
+install_smtpd_conf() {
+	typeset dst="$1" candidate="$2"
+	sed -e "s|REPLACE_ME_QUEUE_KEY|$queue_key|" \
+		-e "s|REPLACE_ME_DKIM_DOMAINS|$dkim_d_args|" \
+		"$repo_dir/openbsd/etc/smtpd.conf" > "$candidate"
+	chmod 0600 "$candidate"
+	mv "$candidate" "$dst"
+}
+
+# self_test — the two writes this deploy makes into files the box reads, against
+# fixtures and the shipped smtpd.conf, and not the box. Both install by moving a
+# candidate onto the live file, and that is what the checks are about: a write
+# that is interrupted, or that cannot be made at all, leaves the file with what it
+# had, never with half of a new one.
+self_test() {
+	typeset tree fails code before after candidate
+	tree=$(mktemp -d "${TMPDIR:-/tmp}/deploy-mail-test.XXXXXX") || exit 1
+	# Script scope, so the EXIT trap still sees it: a function's typeset name is
+	# gone by then, and set -u turns that into a line on stderr and a non-zero exit
+	# on a run where every check passed.
+	self_test_work="$tree"
+	trap 'rm -rf "$self_test_work"' EXIT
+	fails=0
+	check() {
+		if [ "$2" = "$3" ]; then
+			printf '  ok   %s\n' "$1"
+		else
+			printf '  FAIL %s: expected [%s], got [%s]\n' "$1" "$3" "$2"
+			fails=$((fails + 1))
+		fi
+	}
+
+	# --- the virtual table ---
+	# As a previous run and the drain leave it: two platform entries, and one the
+	# drain wrote for a body's own address. All three have to survive a redeploy.
+	printf 'admin: oliver+Admin\nhello: oliver\nsecretary@parish.example: parish\n' \
+		> "$tree/virtuals"
+	before=$(stat -f %i "$tree/virtuals")
+	set_virtual "$tree/virtuals" "$(mktemp "$tree/virtuals.XXXXXX")" hello \
+		"hello: hello@kyriakon.net" > "$tree/set.out" 2>&1
+	after=$(stat -f %i "$tree/virtuals")
+	check "an existing entry is replaced" \
+		"$(grep -c '^hello: hello@kyriakon.net$' "$tree/virtuals")" 1
+	check "and the lines around it are left alone" \
+		"$(grep -c -e '^admin: oliver+Admin$' -e '^secretary@parish.example: parish$' "$tree/virtuals")" 2
+	check "and the run says which happened" "$(grep -c '^virtual hello set$' "$tree/set.out")" 1
+	# What the move buys: the table is replaced rather than rewritten in place, so
+	# there is no moment at which it holds half an entry, with every address under
+	# it unreachable until someone notices.
+	check "the table is replaced, not rewritten" \
+		"$([ "$before" != "$after" ] && printf yes || printf no)" yes
+	check "at the mode the table had" "$(stat -f %Lp "$tree/virtuals")" 644
+
+	set_virtual "$tree/virtuals" "$(mktemp "$tree/virtuals.XXXXXX")" dmarc "dmarc: oliver" \
+		> "$tree/add.out" 2>&1
+	check "an entry with no line of its own is appended" \
+		"$(grep -c '^dmarc: oliver$' "$tree/virtuals")" 1
+
+	# A write that cannot be made leaves the table exactly as it was. The candidate
+	# is a directory here, which the redirect refuses, so the failure lands where
+	# the old shape had already emptied the table.
+	#
+	# `set +e` around the subshell rather than `( ... ) || code=$?`: a command on
+	# the left of || has its own errexit suppressed, so the function carried on past
+	# the failing write, moved an empty candidate over the table and reported
+	# success.
+	cp "$tree/virtuals" "$tree/expected"
+	mkdir "$tree/adirectory"
+	set +e
+	( set -e; set_virtual "$tree/virtuals" "$tree/adirectory" hello "hello: x" ) \
+		>/dev/null 2>&1
+	code=$?
+	set -e
+	check "a write that fails leaves the table as it was" \
+		"$(cmp -s "$tree/virtuals" "$tree/expected" && printf same || printf changed)" same
+	check "and says that it failed" "$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+
+	# --- the MTA configuration ---
+	# Against the file that gets installed rather than a fixture: the substitution
+	# below is what puts the queue key and the filter's domain list in place.
+	if [ ! -r "$repo_dir/openbsd/etc/smtpd.conf" ]; then
+		printf 'self-test: no %s/openbsd/etc/smtpd.conf to read: run this from the checkout, or pass its root as the second argument\n' \
+			"$repo_dir" >&2
+		exit 1
+	fi
+	queue_key=0123456789abcdef0123456789abcdef
+	dkim_d_args="-d kyriakon.net"
+	# The umask an operator's shell is likely to have. The file holds the queue
+	# key, so the mode it lands with must not depend on this.
+	umask 022
+	install_smtpd_conf "$tree/smtpd.conf" "$(mktemp "$tree/smtpd.conf.XXXXXX")"
+	check "no placeholder is left in the installed configuration" \
+		"$(grep -c REPLACE_ME "$tree/smtpd.conf")" 0
+	# One substituted line for each placeholder in the shipped file, whatever shape
+	# that file's filter declaration has. The key is checked by the line above.
+	check "every placeholder line is given the domain list" \
+		"$(grep -c -- '-d kyriakon.net' "$tree/smtpd.conf")" \
+		"$(grep -c REPLACE_ME_DKIM_DOMAINS "$repo_dir/openbsd/etc/smtpd.conf")"
+	check "the installed configuration is 0600 under a 022 umask" \
+		"$(stat -f %Lp "$tree/smtpd.conf")" 600
+
+	before=$(stat -f %i "$tree/smtpd.conf")
+	install_smtpd_conf "$tree/smtpd.conf" "$(mktemp "$tree/smtpd.conf.XXXXXX")"
+	after=$(stat -f %i "$tree/smtpd.conf")
+	check "an installed configuration is replaced, not rewritten" \
+		"$([ "$before" != "$after" ] && printf yes || printf no)" yes
+
+	# A substitution that cannot be read leaves the installed file as it was. This
+	# is the failure the redirect used to turn into an empty smtpd.conf, which is
+	# every mail path on the box, and the candidate it leaves is not readable.
+	cp "$tree/smtpd.conf" "$tree/expected"
+	candidate=$(mktemp "$tree/smtpd.conf.XXXXXX")
+	repo_dir="$tree/no-such-checkout"
+	set +e
+	( set -e; install_smtpd_conf "$tree/smtpd.conf" "$candidate" ) >/dev/null 2>&1
+	code=$?
+	set -e
+	check "a substitution that fails leaves the configuration as it was" \
+		"$(cmp -s "$tree/smtpd.conf" "$tree/expected" && printf same || printf changed)" same
+	check "and says that it failed" "$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and what it left behind is not readable" "$(stat -f %Lp "$candidate")" 600
+
+	if [ "$fails" -eq 0 ]; then
+		printf 'self-test: all checks passed\n'
+	else
+		printf 'self-test: %s failed\n' "$fails" >&2
+		exit 1
+	fi
+}
+
+# --- how this run was asked for ------------------------------------------
+# The live run defaults to the box's checkout. --self-test takes the repo root from
+# this script's own location instead, and with no second argument, so a run from a
+# checkout of either shape reads the tree it is being run from.
+case "${1:-}" in
+--self-test)
+	[ "$#" -le 2 ] || { printf 'usage: ksh %s [repo_dir] | ksh %s --self-test [repo_root]\n' "$0" "$0" >&2; exit 2; }
+	repo_dir="${2:-$(cd "$(dirname "$0")/.." && pwd)}"
+	self_test
+	exit 0
+	;;
+-*)
+	printf 'usage: ksh %s [repo_dir] | ksh %s --self-test [repo_root]\n' "$0" "$0" >&2
+	exit 2
+	;;
+esac
+
+# --- the preconditions, for a live run -----------------------------------
+[ "$(id -u)" -eq 0 ] || { printf 'run as root (doas ksh %s)\n' "$0" >&2; exit 1; }
+[ -d "$repo_dir" ] || { printf 'repo_dir not found: %s\n' "$repo_dir" >&2; exit 1; }
+
+for f in openbsd/etc/smtpd.conf openbsd/etc/httpd.conf openbsd/etc/gmid.conf \
+	openbsd/etc/acme-client.conf \
+	openbsd/etc/rc.d/kyriakon_encrypt openbsd/dovecot/dovecot.conf \
+	openbsd/etc/spamd.alloweddomains openbsd/etc/spamd.conf openbsd/etc/nospamd \
+	openbsd/etc/kyriakon.env openbsd/etc/newsyslog.conf \
+	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml keys scripts/setup-env.sh; do
+	[ -e "$repo_dir/$f" ] || { printf 'missing from repo_dir: %s\n' "$f" >&2; exit 1; }
+done
 
 # --- 1. packages ---------------------------------------------------------
 
@@ -599,21 +782,15 @@ hello: oliver"
 # pair apart and write an entry with an empty value, which stops delivering mail
 # to that address.
 virtuals_tmp=$(mktemp "$virtuals_table.XXXXXX")
-trap 'rm -f "$virtuals_tmp"' EXIT
+# One trap for both candidates in this section: a second `trap ... EXIT` would
+# replace this one rather than add to it, and the virtuals candidate would be
+# left behind. smtpd_tmp is set below; `:-` covers this trap running first.
+smtpd_tmp=''
+trap 'rm -f "$virtuals_tmp" "${smtpd_tmp:-}"' EXIT
 # make sure an append starts on a line of its own
 [ -n "$(tail -c 1 "$virtuals_table")" ] && printf '\n' >> "$virtuals_table"
 while IFS= read -r entry; do
-	virtual_name=${entry%%:*}
-	if grep -q "^${virtual_name}:" "$virtuals_table"; then
-		sed "s|^${virtual_name}:.*|${entry}|" "$virtuals_table" > "$virtuals_tmp"
-		# copied over the original rather than moved into place, so the file
-		# keeps the ownership and mode it already has
-		cat "$virtuals_tmp" > "$virtuals_table"
-		printf 'virtual %s set\n' "$virtual_name"
-	else
-		printf '%s\n' "$entry" >> "$virtuals_table"
-		printf 'virtual %s added\n' "$virtual_name"
-	fi
+	set_virtual "$virtuals_table" "$virtuals_tmp" "${entry%%:*}" "$entry"
 done <<EOF
 $virtual_entries
 EOF
@@ -660,13 +837,9 @@ EOF
 dkim_d_args=$(dkim_domains_args "$dkim_domains_table")
 
 # '|' delimits the s/// because base64 keys contain '/'. The deployed file holds
-# the key, hence 0600. Both placeholders are substituted in the one pass, so the
-# file is written once and never left with the key and not the list, or the
-# reverse.
-sed -e "s|REPLACE_ME_QUEUE_KEY|$queue_key|" \
-	-e "s|REPLACE_ME_DKIM_DOMAINS|$dkim_d_args|" \
-	"$repo_dir/openbsd/etc/smtpd.conf" > /etc/mail/smtpd.conf
-chmod 0600 /etc/mail/smtpd.conf
+# the key, hence 0600.
+smtpd_tmp=$(mktemp /etc/mail/smtpd.conf.XXXXXX)
+install_smtpd_conf /etc/mail/smtpd.conf "$smtpd_tmp"
 for placeholder in REPLACE_ME_QUEUE_KEY REPLACE_ME_DKIM_DOMAINS; do
 	grep -q "$placeholder" /etc/mail/smtpd.conf \
 		&& { printf '%s was not substituted in /etc/mail/smtpd.conf\n' "$placeholder" >&2; exit 1; }

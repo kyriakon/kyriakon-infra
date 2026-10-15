@@ -59,6 +59,16 @@ die() {
 	hc_fail "${HEALTHCHECKS_URL:-}"
 }
 
+# Before anything is restored or removed. `${target_root:?}` refuses unset and
+# empty, not `/`: with RESTORE_TARGET_ROOT=/ the line that clears the target
+# expands into `rm -rf //*`, which is the filesystem. A trailing slash is the
+# same value, so it is stripped before the comparison.
+case "${target_root%/}" in
+"" | /)
+	die "RESTORE_TARGET_ROOT=$target_root is the root of the filesystem, and this script clears its target before restoring into it. Set it to a scratch directory (default /var/restore-test)."
+	;;
+esac
+
 # --- 1. snapshot recency ------------------------------------------------
 # If the nightly backup silently stopped, snapshots/check/restore still pass on
 # whatever is there; only freshness proves the backup is actually still running.
@@ -77,7 +87,9 @@ restic check --no-lock
 
 # --- 3. full restore ----------------------------------------------------
 mkdir -p "$target_root"
-rm -rf "${target_root:?}"/* 2>/dev/null || true   # stop weekly restores accumulating; :? guards RESTORE_TARGET_ROOT=/
+# Stop weekly restores accumulating. RESTORE_TARGET_ROOT=/ is refused above:
+# `${var:?}` guards unset and empty, not the root directory.
+rm -rf "${target_root:?}"/* 2>/dev/null || true
 mkdir -p "$target"
 restic restore latest --target "$target" --no-lock
 

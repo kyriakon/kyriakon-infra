@@ -16,6 +16,11 @@
 #   doas ksh scripts/cron-apply.sh --web --check           # show the index diff
 #   doas ksh scripts/cron-apply.sh --web                  # rewrite the indexes, reload
 #
+# The index and reload behaviour is checked without a box, against a tree of its
+# own with the daemons stubbed:
+#
+#   ksh scripts/cron-apply.sh --self-test
+#
 # The crontab half runs once, when a scheduled script or its line changes. The
 # web half runs whenever member files may have appeared, which is the drain's
 # pass, and it is batched: see the note above regen_index.
@@ -62,12 +67,14 @@ umask 077
 
 check_only=no
 web_only=no
+self_test_mode=no
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 	--check) check_only=yes ;;
 	--web) web_only=yes ;;
+	--self-test) self_test_mode=yes ;;
 	*)
-		printf 'usage: doas ksh %s [--web] [--check]\n' "$0" >&2
+		printf 'usage: doas ksh %s [--web] [--check]\n       ksh %s --self-test\n' "$0" "$0" >&2
 		exit 2
 		;;
 	esac
@@ -110,7 +117,11 @@ die() {
 	exit 1
 }
 
-[ "$(id -u)" -eq 0 ] || die "run this with doas: it writes root's crontab and the generated vhost indexes"
+# The self-test runs against a tree of its own, with the daemons and rcctl stubbed,
+# so it is the one mode that needs no root: every other one here writes root's
+# crontab or the box's generated indexes.
+[ "$self_test_mode" = yes ] || [ "$(id -u)" -eq 0 ] \
+	|| die "run this with doas: it writes root's crontab and the generated vhost indexes"
 
 # --- the generated vhost indexes (--web) ------------------------------------
 #
@@ -215,10 +226,15 @@ apply_web() {
 		restore_indexes
 		die "${gmid_conf} does not check, so the running configuration was left alone"
 	fi
+	# A failed reload restores the index it was reloading, as the two configtest
+	# arms above do. The daemon is still serving the old configuration, so leaving
+	# the new index on disk makes the next pass find it byte-identical and report
+	# "nothing to change, nothing reloaded" while exiting 0: the member's vhost
+	# then never loads, and nothing says so.
 	for d in $changed; do
 		case "$d" in
-		httpd) rcctl reload httpd || die "rcctl reload httpd failed" ;;
-		gmid) rcctl reload gmid || die "rcctl reload gmid failed" ;;
+		httpd) rcctl reload httpd || { restore_indexes; die "rcctl reload httpd failed"; } ;;
+		gmid) rcctl reload gmid || { restore_indexes; die "rcctl reload gmid failed"; } ;;
 		esac
 	done
 	rm -f "$httpd_d/index.conf.saved.$$" "$gmid_d/index.conf.saved.$$" \
@@ -230,6 +246,99 @@ apply_web() {
 		printf 'acme-client index rewritten; it reads the file at its next run, so nothing was reloaded\n'
 	fi
 }
+
+# self_test — apply_web against a tree of its own, with the two daemons and rcctl
+# stubbed. It runs the real function, because what is being checked is what the
+# function does with the indexes when a reload fails, and that is not something a
+# fixture can be asked about separately.
+self_test() {
+	typeset tree stub fails code index_before
+	tree=$(mktemp -d "${TMPDIR:-/tmp}/cron-apply-test.XXXXXX") || exit 1
+	# Script scope, so the EXIT trap still sees it: a function's typeset name is
+	# gone by then, and set -u turns that into a line on stderr and a non-zero exit
+	# on a run where every check passed.
+	self_test_work="$tree"
+	trap 'rm -rf "$self_test_work"' EXIT
+	fails=0
+	check() {
+		if [ "$2" = "$3" ]; then
+			printf '  ok   %s\n' "$1"
+		else
+			printf '  FAIL %s: expected [%s], got [%s]\n' "$1" "$3" "$2"
+			fails=$((fails + 1))
+		fi
+	}
+
+	# The daemons pass their configtest and rcctl fails only when told to, so the
+	# box's own configuration is never parsed and its daemons are never signalled.
+	stub="$tree/bin"
+	mkdir "$stub"
+	printf '#!/bin/sh\nexit 0\n' > "$stub/httpd"
+	printf '#!/bin/sh\nexit 0\n' > "$stub/gmid"
+	# The stub expands this at its own run time, which is the point; shellcheck
+	# reads the single quotes as an expansion that cannot happen.
+	# shellcheck disable=SC2016
+	printf '#!/bin/sh\n[ "${STUB_RCCTL_FAIL:-no}" = yes ] && exit 1\nexit 0\n' > "$stub/rcctl"
+	chmod 0755 "$stub/httpd" "$stub/gmid" "$stub/rcctl"
+	PATH="$stub:$PATH"
+	export PATH
+
+	httpd_d="$tree/httpd.d"
+	gmid_d="$tree/gmid.d"
+	acme_d="$tree/acme.d"
+	httpd_conf="$tree/httpd.conf"
+	gmid_conf="$tree/gmid.conf"
+	mkdir -p "$httpd_d" "$gmid_d" "$acme_d"
+	printf 'server "parish.example" {}\n' > "$httpd_d/parish.conf"
+
+	# The first pass writes the indexes and reloads, which is the state everything
+	# below is about.
+	STUB_RCCTL_FAIL=no
+	export STUB_RCCTL_FAIL
+	apply_web > "$tree/first.out" 2>&1
+	check "the first pass reloads the daemon whose index changed" \
+		"$(grep -c '^reloaded: httpd' "$tree/first.out")" 1
+	index_before=$(cat "$httpd_d/index.conf")
+
+	# A member file appears, and the reload of it fails.
+	printf 'server "school.example" {}\n' > "$httpd_d/school.conf"
+	STUB_RCCTL_FAIL=yes
+	export STUB_RCCTL_FAIL
+	set +e
+	( set -e; apply_web ) > "$tree/failed.out" 2>&1
+	code=$?
+	set -e
+	check "a failed reload is a failure" "$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and names the daemon" "$(grep -c 'rcctl reload httpd failed' "$tree/failed.out")" 1
+	# The point of the restored index: the daemon is still serving what the index
+	# said before, so the next pass has to see a diff and try again. Left as it was,
+	# every later pass would find the index byte-identical and report nothing to
+	# change, and the member's site would never load.
+	check "the index is back to what the running daemon was told" \
+		"$(cat "$httpd_d/index.conf")" "$index_before"
+	set -- "$httpd_d"/*.saved.*
+	check "and no saved copy is left behind" "$([ -e "$1" ] && printf yes || printf no)" no
+
+	# And so the next pass does the work rather than reporting nothing to change.
+	STUB_RCCTL_FAIL=no
+	export STUB_RCCTL_FAIL
+	apply_web > "$tree/second.out" 2>&1
+	check "the next pass sees the diff" "$(grep -c '^reloaded: httpd' "$tree/second.out")" 1
+	check "and the index now lists the member" \
+		"$(grep -c 'school.conf' "$httpd_d/index.conf")" 1
+
+	if [ "$fails" -eq 0 ]; then
+		printf 'self-test: all checks passed\n'
+	else
+		printf 'self-test: %s failed\n' "$fails" >&2
+		exit 1
+	fi
+}
+
+if [ "$self_test_mode" = yes ]; then
+	self_test
+	exit 0
+fi
 
 if [ "$web_only" = yes ]; then
 	apply_web

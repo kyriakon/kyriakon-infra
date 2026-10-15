@@ -57,7 +57,8 @@
 # Read-only. Exits non-zero when something is wrong, so cron could run it, though
 # the daily mail already covers the permissions half.
 #
-#   ksh scripts/check-hygiene.sh --self-test   section 7's comparison, and nothing else
+#   ksh scripts/check-hygiene.sh --self-test   section 7's comparison and section
+#                                              3's remedy lines, and nothing else
 
 set -euo pipefail
 
@@ -101,8 +102,25 @@ domains_missing_from() {
 	done < "$list"
 }
 
-# The comparison above, against fixtures, so a change to it is not a claim. It
-# drives the function and not the box, which is why it can run anywhere.
+# tool_remedy <tool>... — one line of remedy per tool cron could not find.
+#
+# Takes the absent list rather than reading a loop variable: a caller's `tool`
+# after its own loop is whichever tool it looked at last, which is how a box
+# missing only hcloud was told to install jq, while a box missing only curl was
+# told nothing at all.
+tool_remedy() {
+	typeset tool
+	for tool in "$@"; do
+		case "$tool" in
+		hcloud|jq) printf '  %s is a package: doas pkg_add %s\n' "$tool" "$tool" ;;
+		*) printf '  %s ships in base: the PATH line above is what it needs\n' "$tool" ;;
+		esac
+	done
+}
+
+# The comparison above and the remedy lines below, against fixtures, so a change
+# to either is not a claim. Both drive a function and not the box, which is why
+# this can run anywhere.
 self_test() {
 	typeset dir out want
 	dir=$(mktemp -d "${TMPDIR:-/tmp}/check-hygiene-test.XXXXXX") || exit 1
@@ -146,6 +164,29 @@ self_test() {
 	[ "$out" = "school.example" ] || {
 		printf 'FAIL: a last line with no trailing newline; expected [school.example], got [%s]\n' \
 			"$out" >&2
+		exit 1
+	}
+
+	# The remedy is per tool, from the absent list. The caller used to print one
+	# line using `$tool`, which after its loop is jq whatever is missing.
+	out=$(tool_remedy hcloud)
+	[ "$out" = '  hcloud is a package: doas pkg_add hcloud' ] || {
+		printf 'FAIL: the remedy for hcloud names hcloud; got [%s]\n' "$out" >&2
+		exit 1
+	}
+	out=$(tool_remedy curl ifconfig)
+	case "$out" in
+	*pkg_add*)
+		printf 'FAIL: neither curl nor ifconfig is a package; got [%s]\n' "$out" >&2
+		exit 1
+		;;
+	esac
+	# Both packages get a line: the old shape printed one, for the last tool. The
+	# tools are separate words here because that is how the caller passes the list
+	# the loop built.
+	out=$(tool_remedy curl hcloud jq)
+	[ "$(printf '%s\n' "$out" | grep -c pkg_add)" -eq 2 ] || {
+		printf 'FAIL: two absent packages are two remedies; got [%s]\n' "$out" >&2
 		exit 1
 	}
 
@@ -233,9 +274,8 @@ if [ "$(id -u)" -eq 0 ] && [ -f /root/.kyriakon-env ]; then
 	if [ -n "$absent" ]; then
 		printf 'cron environment: a cron job would not find:%s\n' "$absent"
 		printf '  the fix is the PATH line in /root/.kyriakon-env, which every cron line sources\n'
-		case "$absent" in
-		*hcloud*|*jq*) printf '  %s is a package: doas pkg_add %s\n' "$tool" "$tool" ;;
-		esac
+		# shellcheck disable=SC2086 # the word list the loop above just built
+		tool_remedy $absent
 		status=1
 	else
 		printf 'cron environment: %s all reachable as a cron job sees them\n' "$tools"

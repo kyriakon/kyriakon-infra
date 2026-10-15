@@ -77,13 +77,18 @@ owner=$(stat -f '%Su' "$home/Maildir")
 # failure of provisioning: the account is usable, and its allowance follows when
 # scripts/quota-apply.sh --enable has been run. Any other failure is reported and
 # the account is still left usable, because delivery does not depend on the quota.
-if ! quota_out=$(ksh "$script_dir/quota-apply.sh" "$user" 2>&1); then
-	rc=$?
-	case $rc in
-	3) printf 'note: %s\n' "$quota_out" >&2 ;;
-	*) printf 'warning: the allowance was not set: %s\n' "$quota_out" >&2 ;;
-	esac
-fi
+# The status is read from the assignment, not from inside a negated command:
+# `if ! out=$(...); then rc=$?; fi` reads the status of the `!`, which is always
+# 0, so the 3) arm never ran and the state the comment above calls "not a
+# failure" was reported as one, in words identical to a real failed write.
+# provision-member.sh reads it the same way.
+rc=0
+quota_out=$(ksh "$script_dir/quota-apply.sh" "$user" 2>&1) || rc=$?
+case $rc in
+0) ;;
+3) printf 'note: %s\n' "$quota_out" >&2 ;;
+*) printf 'warning: the allowance was not set: %s\n' "$quota_out" >&2 ;;
+esac
 
 printf 'created %s (shell /sbin/nologin, Maildir %s/Maildir)\n' "$user" "$home"
 printf 'next: set password (doas passwd %s) and sync %s.asc into the keyring\n' \
