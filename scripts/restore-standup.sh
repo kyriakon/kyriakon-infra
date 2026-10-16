@@ -33,13 +33,13 @@
 # /root/.restic-pass, and the READ-ONLY storage sub-account's private key.
 #
 # The template is a plain box, and that is forced rather than chosen. A softraid crypto
-# root stops at the passphrase prompt, and nobody is at the console at 03:45 on a Sunday,
-# so a template built from an encrypted box never reaches ssh and the run dies on its own
-# timeout every week without testing anything. The template therefore carries no softraid
-# at all, and the credentials it needs arrive after every boot: this script copies the
-# restic password and the read-only key over ssh before the test runs. Nothing secret is
-# baked into the image, which is also the better arrangement, since an image outlives the
-# box it was made from.
+# root stops at the passphrase prompt, and nobody is at the console at 03:45 on the
+# morning the test runs, so a template built from an encrypted box never reaches ssh and
+# the run dies on its own timeout every week without testing anything. The template
+# therefore carries no softraid at all, and the credentials it needs arrive after every
+# boot: this script copies the restic password and the read-only key over ssh before the
+# test runs. Nothing secret is baked into the image, which is also the better
+# arrangement, since an image outlives the box it was made from.
 #
 # The cost of that is the throwaway's disk, which is plaintext for the minutes the run
 # takes and is not wiped when Hetzner frees it. The restored mail is PGP ciphertext and
@@ -63,10 +63,23 @@
 set -euo pipefail
 umask 077
 
+die() {
+	printf 'restore-standup: %s\n' "$*" >&2
+	exit 1
+}
+
+# Only --dry-run is recognised, and anything else stops the run before it reads
+# the env file. The test was a single exact match, so every other word fell
+# through to the live path: a hand run of `restore-standup.sh --dryrun` created a
+# cx23 and pushed the restic password and the read-only key to it, which is the
+# one thing the flag is there to prevent.
+[ "$#" -le 1 ] || die "one argument at most: --dry-run (got: $*)"
 dry_run=no
-if [ "${1:-}" = "--dry-run" ]; then
-	dry_run=yes
-fi
+case "${1:-}" in
+'') ;;
+--dry-run) dry_run=yes ;;
+*) die "unknown argument: $1 (known: --dry-run, or nothing for a live run)" ;;
+esac
 
 env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
 if [ ! -f "$env_file" ]; then
@@ -86,11 +99,6 @@ if [ ! -f "$script_dir/lib.sh" ]; then
 fi
 # shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
 . "$script_dir/lib.sh"
-
-die() {
-	printf 'restore-standup: %s\n' "$*" >&2
-	exit 1
-}
 
 : "${HCLOUD_TOKEN:?HCLOUD_TOKEN is required, in $env_file}"
 : "${RESTORE_TEST_REPOSITORY:?RESTORE_TEST_REPOSITORY is required, in $env_file}"
@@ -167,10 +175,19 @@ cleanup() {
 		fi
 	fi
 	if [ "$cleanup_status" -ne 0 ]; then
+		# The box is only known to be gone when there was an id to delete. A create
+		# whose reply never arrived leaves none, and this line asserted the box had
+		# been destroyed either way, which is the one thing a stranded box must not
+		# be told.
+		if [ -n "$server_id" ]; then
+			gone="and the box it ran on has been destroyed"
+		else
+			gone="and no box was created by this run, or one was created and this run cannot name it: check for one that bills with hcloud server list -o noheader -o columns=id,name"
+		fi
 		# Every line the run produced, which is what cron used to mail under its own
 		# subject, and what the operator needs to see beside the failure.
 		notify_operator backup "restore test failed" "$(cat "$report")" \
-			"read the lines above: the test's own output is there, and the box it ran on has been destroyed. The weekly healthcheck stays unpinned for a run that never got this far, so it is the channel that covers a failure of this one."
+			"read the lines above: the test's own output is there, $gone. The weekly healthcheck stays unpinned for a run that never got this far, so it is the channel that covers a failure of this one."
 	fi
 	rm -f "$report"
 	exit "$cleanup_status"
@@ -199,8 +216,19 @@ image_id=$image_ids
 # The id is captured here and used for every later reference. That is the whole safety
 # argument: no name lookup, no list, nothing that could resolve to another server.
 printf 'creating %s from image %s\n' "$server_name" "$image_id"
+# The status is caught rather than left to set -e, because the API can accept a
+# create and the reply be lost: a dropped connection or a timeout aborted here
+# with no id captured, so the exit path had nothing to delete and the failure
+# mail said the box had been destroyed. The id is what the whole safety argument
+# rests on, so a create that did not report one is the case that has to be loud.
+create_rc=0
 create_out=$(hcloud server create --name "$server_name" --type "$server_type" \
-	--image "$image_id" --location "$location" -o json)
+	--image "$image_id" --location "$location" -o json) || create_rc=$?
+[ "$create_rc" -eq 0 ] \
+	|| die "hcloud server create exited $create_rc, so a server named $server_name \
+may have been created with no id this run can delete. Check for it and remove it by hand: \
+hcloud server list -o noheader -o columns=id,name, then hcloud server delete <id>. \
+hcloud said: ${create_out:-<nothing>}"
 # This reply has come back wrapped as {"server": {...}, "root_password": "..."}, and
 # older hcloud reported a bare object or a one-element array. Accept all three, and keep
 # the expression total: anything else yields an empty id rather than a jq error under

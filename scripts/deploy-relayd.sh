@@ -140,8 +140,34 @@ install_conf() {
 	printf 'installed %s\n' "$2"
 }
 
+# install_checked_conf — the shipped configuration, checked as a candidate and
+# installed only if the check passes.
+#
+# The candidate is a file in $conf_dst's own directory, removed on both paths:
+# leaving one in /etc is a file the next run has to explain. Not by an EXIT trap,
+# which would replace whatever trap the caller already had, and --self-test has
+# one.
+#
+# The check used to run on $conf_dst after the install, which is the other way
+# round, so a typo left the live file failing its own configtest: "nothing was
+# restarted" was true of that run and only that run, and the next
+# `rcctl start relayd` or a reboot then came up with no listener on 443. The shape
+# is pf-apply.sh's: prepare, check the candidate, install it.
+#
+# Root is required for the check, which is one reason this script runs under doas.
+install_checked_conf() {
+	conf_candidate=$(mktemp "$conf_dst.XXXXXX")
+	install -m 0644 "$conf_src" "$conf_candidate"
+	if ! relayd -n -f "$conf_candidate"; then
+		rm -f "$conf_candidate"
+		die "$conf_src does not check, so $conf_dst was left as it was and nothing was restarted"
+	fi
+	install_conf "$conf_candidate" "$conf_dst"
+	rm -f "$conf_candidate"
+}
+
 self_test() {
-	typeset tree fails names link code
+	typeset tree fails names link code stub
 	tree=$(mktemp -d "${TMPDIR:-/tmp}/deploy-relayd.XXXXXX")
 	# Script scope, so the EXIT trap still sees it: a function's typeset name is
 	# gone by then, and set -u turns that into a line on stderr and a non-zero
@@ -264,6 +290,43 @@ self_test() {
 	check "the first install is reported" "$(grep -c '^installed ' "$tree/first.out")" 1
 	check "and the second run says unchanged" "$(grep -c 'unchanged' "$tree/second.out")" 1
 
+	# --- checking the configuration before installing it ---
+	# `relayd -n` needs root and a configuration it can parse, so it is stubbed
+	# here: what is being checked is the order the deploy does things in, not
+	# relayd's parser.
+	stub="$tree/bin"
+	mkdir "$stub"
+	# shellcheck disable=SC2016 # the stub expands this at its own run time
+	printf '#!/bin/sh\n[ "${STUB_RELAYD_CHECK:-ok}" = fail ] && exit 1\nexit 0\n' > "$stub/relayd"
+	chmod 0755 "$stub/relayd"
+	PATH="$stub:$PATH"
+	export PATH
+	conf_src="$tree/shipped.conf"
+	conf_dst="$tree/etc/relayd-checked.conf"
+	printf 'tls keypair "kyriakon.net"\n' > "$conf_src"
+	printf 'the configuration the relay is running\n' > "$conf_dst"
+
+	STUB_RELAYD_CHECK=fail
+	export STUB_RELAYD_CHECK
+	code=0
+	( install_checked_conf ) > "$tree/refused.out" 2>&1 || code=$?
+	check "a configuration that does not check is a failure" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and it is not installed" "$(cat "$conf_dst")" \
+		"the configuration the relay is running"
+	check "and the refusal says the installed file was left alone" \
+		"$(grep -c 'was left as it was' "$tree/refused.out")" 1
+
+	STUB_RELAYD_CHECK=ok
+	export STUB_RELAYD_CHECK
+	( install_checked_conf ) > "$tree/checked.out" 2>&1
+	check "a configuration that checks is installed" "$(cat "$conf_dst")" "$(cat "$conf_src")"
+	check "and reported as installed" "$(grep -c '^installed ' "$tree/checked.out")" 1
+
+	# Neither path leaves its candidate in /etc.
+	set -- "$tree/etc"/relayd-checked.conf.*
+	check "and no candidate is left behind" "$([ -e "$1" ] && printf yes || printf no)" no
+
 	if [ "$fails" -eq 0 ]; then
 		printf 'self-test: all checks passed\n'
 	else
@@ -294,19 +357,17 @@ case "${1:-}" in
 	grep -q "listen on 127.0.0.1 port $httpd_port" "$httpd_conf" \
 		|| die "$httpd_conf has no 'listen on 127.0.0.1 port $httpd_port': scripts/deploy-mail.sh installs the httpd.conf that puts httpd behind this relay, and it must run first"
 
-	install_conf "$conf_src" "$conf_dst"
-
+	# Certificates first: relayd's check loads the keypairs the configuration
+	# names, so a candidate checked before the links exist would fail a first
+	# deploy. Linking writes only under /etc/ssl, which the running relay reads
+	# when it starts and not before.
 	# shellcheck disable=SC2086 # names is a deliberate word list
 	for name in $names; do
 		ensure_cert_link "$name"
 	done
 
-	# Check what was just written, before anything restarts: a relay started on a
-	# config it cannot parse leaves 443 with no listener at all, which looks
-	# exactly like the box being down. Root is required for the check, which is
-	# one reason this script runs under doas.
-	relayd -n -f "$conf_dst" \
-		|| die "$conf_dst does not check, so nothing was restarted"
+	# The candidate is checked before it is installed: see install_checked_conf.
+	install_checked_conf
 
 	# Any relayd from an earlier run goes first, and we wait for the process to
 	# actually exit: the guard below is only meaningful once the port is free of
