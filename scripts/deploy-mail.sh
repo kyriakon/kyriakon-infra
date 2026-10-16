@@ -1067,7 +1067,7 @@ printf 'cron scripts installed into /root/bin\n'
 
 # restore-standup.sh creates the weekly test box with the hcloud CLI and reads its answer
 # with jq. Both are packages and the weekly job cannot install its own, so they are
-# installed here rather than left to fail at 03:45 on a Sunday.
+# installed here rather than left to fail at 03:45 on the morning it runs.
 need_pkg hcloud
 need_pkg jq
 

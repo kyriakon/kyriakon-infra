@@ -33,13 +33,13 @@
 # /root/.restic-pass, and the READ-ONLY storage sub-account's private key.
 #
 # The template is a plain box, and that is forced rather than chosen. A softraid crypto
-# root stops at the passphrase prompt, and nobody is at the console at 03:45 on a Sunday,
-# so a template built from an encrypted box never reaches ssh and the run dies on its own
-# timeout every week without testing anything. The template therefore carries no softraid
-# at all, and the credentials it needs arrive after every boot: this script copies the
-# restic password and the read-only key over ssh before the test runs. Nothing secret is
-# baked into the image, which is also the better arrangement, since an image outlives the
-# box it was made from.
+# root stops at the passphrase prompt, and nobody is at the console at 03:45 on the
+# morning the test runs, so a template built from an encrypted box never reaches ssh and
+# the run dies on its own timeout every week without testing anything. The template
+# therefore carries no softraid at all, and the credentials it needs arrive after every
+# boot: this script copies the restic password and the read-only key over ssh before the
+# test runs. Nothing secret is baked into the image, which is also the better
+# arrangement, since an image outlives the box it was made from.
 #
 # The cost of that is the throwaway's disk, which is plaintext for the minutes the run
 # takes and is not wiped when Hetzner frees it. The restored mail is PGP ciphertext and

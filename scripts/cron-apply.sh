@@ -105,7 +105,11 @@ line_for() {
 	check-keyring-drift.sh) printf '0 4 * * * . /root/.kyriakon-env; /root/bin/check-keyring-drift.sh --box\n' ;;
 	renew-acme.sh) printf '0 3 * * * . /root/.kyriakon-env; /root/bin/renew-acme.sh\n' ;;
 	backup.sh) printf '30 2 * * * . /root/.kyriakon-env; /root/bin/backup.sh\n' ;;
-	restore-standup.sh) printf '45 3 * * 0 . /root/.kyriakon-env; /root/bin/restore-standup.sh\n' ;;
+	# Monday, not Sunday. The run creates a box, restores the snapshot into it and
+	# mails the operator when it fails, and a failure mailed at 03:45 on a Sunday
+	# is one nobody can act on until Monday anyway: the day is chosen for the
+	# morning the mail is read, not for the test.
+	restore-standup.sh) printf '45 3 * * 1 . /root/.kyriakon-env; /root/bin/restore-standup.sh\n' ;;
 	acme-queue.sh) printf '*/15 * * * * . /root/.kyriakon-env; /root/bin/acme-queue.sh --run\n' ;;
 	kyriakon-onboard-drain) printf '* * * * * %s\n' "$drain_bin" ;;
 	*) return 1 ;;
