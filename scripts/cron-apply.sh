@@ -230,16 +230,22 @@ apply_web() {
 		restore_indexes
 		die "${gmid_conf} does not check, so the running configuration was left alone"
 	fi
-	# A failed reload restores the index it was reloading, as the two configtest
+	# A failed reload restores the indexes this pass wrote, as the two configtest
 	# arms above do. The daemon is still serving the old configuration, so leaving
 	# the new index on disk makes the next pass find it byte-identical and report
 	# "nothing to change, nothing reloaded" while exiting 0: the member's vhost
 	# then never loads, and nothing says so.
+	#
+	# A daemon that did reload drops its saved copy as it goes, so a later failure
+	# in this loop cannot put the old index back under a daemon that has already
+	# read the new one.
 	for d in $changed; do
 		case "$d" in
-		httpd) rcctl reload httpd || { restore_indexes; die "rcctl reload httpd failed"; } ;;
-		gmid) rcctl reload gmid || { restore_indexes; die "rcctl reload gmid failed"; } ;;
+		httpd) idx="$httpd_d/index.conf" ;;
+		gmid) idx="$gmid_d/index.conf" ;;
 		esac
+		rcctl reload "$d" || { restore_indexes; die "rcctl reload $d failed"; }
+		rm -f "$idx.saved.$$"
 	done
 	rm -f "$httpd_d/index.conf.saved.$$" "$gmid_d/index.conf.saved.$$" \
 		"$acme_d/index.conf.saved.$$"
@@ -256,7 +262,7 @@ apply_web() {
 # function does with the indexes when a reload fails, and that is not something a
 # fixture can be asked about separately.
 self_test() {
-	typeset tree stub fails code index_before
+	typeset tree stub fails code index_before gmid_before
 	tree=$(mktemp -d "${TMPDIR:-/tmp}/cron-apply-test.XXXXXX") || exit 1
 	# Script scope, so the EXIT trap still sees it: a function's typeset name is
 	# gone by then, and set -u turns that into a line on stderr and a non-zero exit
@@ -279,10 +285,16 @@ self_test() {
 	mkdir "$stub"
 	printf '#!/bin/sh\nexit 0\n' > "$stub/httpd"
 	printf '#!/bin/sh\nexit 0\n' > "$stub/gmid"
-	# The stub expands this at its own run time, which is the point; shellcheck
-	# reads the single quotes as an expansion that cannot happen.
-	# shellcheck disable=SC2016
-	printf '#!/bin/sh\n[ "${STUB_RCCTL_FAIL:-no}" = yes ] && exit 1\nexit 0\n' > "$stub/rcctl"
+	# The stub expands the variable at its own run time, which is the point, and it
+	# fails one daemon when named, or all of them when told yes.
+	cat > "$stub/rcctl" <<'STUB'
+#!/bin/sh
+case "${STUB_RCCTL_FAIL:-no}" in
+no) exit 0 ;;
+yes) exit 1 ;;
+*) [ "$2" = "$STUB_RCCTL_FAIL" ] && exit 1; exit 0 ;;
+esac
+STUB
 	chmod 0755 "$stub/httpd" "$stub/gmid" "$stub/rcctl"
 	PATH="$stub:$PATH"
 	export PATH
@@ -330,6 +342,25 @@ self_test() {
 	check "the next pass sees the diff" "$(grep -c '^reloaded: httpd' "$tree/second.out")" 1
 	check "and the index now lists the member" \
 		"$(grep -c 'school.conf' "$httpd_d/index.conf")" 1
+
+	# A reload that succeeds followed by one that fails: the daemon that reloaded
+	# keeps this pass's index, so a reboot does not bring it up without the vhosts
+	# the pass added, and the one that failed is back on the index it is serving.
+	printf 'server "third.example" {}\n' > "$httpd_d/third.conf"
+	printf 'server "another.example" {}\n' > "$gmid_d/another.conf"
+	gmid_before=$(cat "$gmid_d/index.conf")
+	STUB_RCCTL_FAIL=gmid
+	export STUB_RCCTL_FAIL
+	set +e
+	( set -e; apply_web ) > "$tree/half.out" 2>&1
+	code=$?
+	set -e
+	check "a reload that fails after one that succeeded is a failure" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "the daemon that reloaded keeps the index it read" \
+		"$(grep -c 'third.conf' "$httpd_d/index.conf")" 1
+	check "the daemon that failed keeps the old index" \
+		"$(cat "$gmid_d/index.conf")" "$gmid_before"
 
 	if [ "$fails" -eq 0 ]; then
 		printf 'self-test: all checks passed\n'

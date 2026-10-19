@@ -111,23 +111,27 @@ dkim_domains_args() {
 # set_virtual <table> <candidate> <name> <entry>
 #
 # Replace the line whose leading localpart is <name> with <entry>, or append it
-# when there is none, and print which happened. The replacement is written to
-# <candidate> and moved into place. It used to be `cat "$candidate" > "$table"`,
-# whose redirect empties the live table before filling it: this file is the whole
-# answer for local delivery, so a run interrupted in between leaves every address
-# under it unreachable. The mode is set on the candidate because a move brings
-# its own, and mktemp's is 0600 where the table is 0644.
+# when there is none, and print which happened. Both paths write <candidate> and
+# move it into place. The replacement used to be `cat "$candidate" > "$table"`,
+# and the append went straight at the live file: the first empties the table
+# before filling it, and an append interrupted mid-line leaves a fragment that
+# the next run's match does not recognise, so it writes a second line beside it.
+# This file is the whole answer for local delivery, so either failure leaves
+# addresses under it unreachable. The mode is set on the candidate because a move
+# brings its own, and mktemp's is 0600 where the table is 0644.
 set_virtual() {
-	typeset table="$1" candidate="$2" name="$3" entry="$4"
+	typeset table="$1" candidate="$2" name="$3" entry="$4" how
 	if grep -q "^${name}:" "$table"; then
 		sed "s|^${name}:.*|${entry}|" "$table" > "$candidate"
-		chmod 0644 "$candidate"
-		mv "$candidate" "$table"
-		printf 'virtual %s set\n' "$name"
+		how='set'
 	else
-		printf '%s\n' "$entry" >> "$table"
-		printf 'virtual %s added\n' "$name"
+		cat "$table" > "$candidate"
+		printf '%s\n' "$entry" >> "$candidate"
+		how='added'
 	fi
+	chmod 0644 "$candidate"
+	mv "$candidate" "$table"
+	printf 'virtual %s %s\n' "$name" "$how"
 }
 
 # install_smtpd_conf <destination> <candidate>
@@ -192,10 +196,17 @@ self_test() {
 		"$([ "$before" != "$after" ] && printf yes || printf no)" yes
 	check "at the mode the table had" "$(stat -f %Lp "$tree/virtuals")" 644
 
+	before=$(stat -f %i "$tree/virtuals")
 	set_virtual "$tree/virtuals" "$(mktemp "$tree/virtuals.XXXXXX")" dmarc "dmarc: oliver" \
 		> "$tree/add.out" 2>&1
+	after=$(stat -f %i "$tree/virtuals")
 	check "an entry with no line of its own is appended" \
 		"$(grep -c '^dmarc: oliver$' "$tree/virtuals")" 1
+	# The append path replaces the table too: an append interrupted mid-line would
+	# leave a fragment the next run does not match, so it would write a second line
+	# beside it.
+	check "and the table is replaced by that as well" \
+		"$([ "$before" != "$after" ] && printf yes || printf no)" yes
 
 	# A write that cannot be made leaves the table exactly as it was. The candidate
 	# is a directory here, which the redirect refuses, so the failure lands where
@@ -1161,8 +1172,9 @@ if pfctl -sr 2>/dev/null | grep -q 'from <nospamd>'; then
 	printf 'greylist exemption: on (%s network(s) loaded)\n' "$kernel_n"
 	if [ "$kernel_n" != "$file_n" ]; then
 		printf '                    but /etc/mail/nospamd holds %s: the table is stale.\n' "$file_n"
-		# Not pf-apply.sh: it returns early when no fragment is missing, and a
-		# `persist file` table is read only when the ruleset is loaded.
+		# A `persist file` table is read only when the ruleset is loaded, so the
+		# file and the kernel can disagree. This replaces just the table;
+		# pf-apply.sh would also do it, by reloading /etc/pf.conf.
 		printf '                    Run: doas pfctl -t nospamd -T replace -f /etc/mail/nospamd\n'
 	fi
 else

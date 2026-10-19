@@ -112,8 +112,11 @@ tool_remedy() {
 	typeset tool
 	for tool in "$@"; do
 		case "$tool" in
-		hcloud|jq) printf '  %s is a package: doas pkg_add %s\n' "$tool" "$tool" ;;
-		*) printf '  %s ships in base: the PATH line above is what it needs\n' "$tool" ;;
+		# curl is a package here: base has ftp(1), and setup-env.sh lists curl
+		# among the tools cron cannot find without the PATH line.
+		hcloud|jq|curl) printf '  %s is a package: doas pkg_add %s\n' "$tool" "$tool" ;;
+		ifconfig) printf '  %s ships in base: the PATH line above is what it needs\n' "$tool" ;;
+		*) printf '  %s: check the PATH line above, then whether it is installed\n' "$tool" ;;
 		esac
 	done
 }
@@ -174,17 +177,21 @@ self_test() {
 		printf 'FAIL: the remedy for hcloud names hcloud; got [%s]\n' "$out" >&2
 		exit 1
 	}
-	out=$(tool_remedy curl ifconfig)
+	out=$(tool_remedy curl)
+	[ "$out" = '  curl is a package: doas pkg_add curl' ] || {
+		printf 'FAIL: curl is a package, and the remedy must say so; got [%s]\n' "$out" >&2
+		exit 1
+	}
+	out=$(tool_remedy ifconfig)
 	case "$out" in
 	*pkg_add*)
-		printf 'FAIL: neither curl nor ifconfig is a package; got [%s]\n' "$out" >&2
+		printf 'FAIL: ifconfig ships in base; got [%s]\n' "$out" >&2
 		exit 1
 		;;
 	esac
-	# Both packages get a line: the old shape printed one, for the last tool. The
-	# tools are separate words here because that is how the caller passes the list
-	# the loop built.
-	out=$(tool_remedy curl hcloud jq)
+	# Both packages get a line, the base tool gets none. The tools are separate
+	# words here because that is how the caller passes the list the loop built.
+	out=$(tool_remedy ifconfig hcloud jq)
 	[ "$(printf '%s\n' "$out" | grep -c pkg_add)" -eq 2 ] || {
 		printf 'FAIL: two absent packages are two remedies; got [%s]\n' "$out" >&2
 		exit 1
