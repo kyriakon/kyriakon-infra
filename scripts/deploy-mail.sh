@@ -1005,9 +1005,11 @@ start_service spamlogd
 # The list of senders that skip greylisting, read by pf as a table file. spamd
 # promotes an address only when a retry arrives for the same tuple, and a tuple is
 # keyed on the source IP, so a sender that rotates its outbound address between
-# retries is never promoted and is deferred until it gives up. Outlook.com and
-# Exchange Online do that; the pf rules that read this file are added by
-# scripts/pf-apply.sh, and openbsd/etc/nospamd records where the ranges come from.
+# retries is never promoted and is deferred until it gives up. Outlook.com,
+# Exchange Online and GitHub's own out-N.smtp.github.com pool do that; the pf
+# rules that read this file are added by scripts/pf-apply.sh, and
+# docs/planning/research/spamd-greylisting.md records each range and the SPF
+# record it came from.
 say "nospamd"
 nospamd_src="$repo_dir/openbsd/etc/nospamd"
 # A pf table file holds addresses only. A stray line here would fail the later
@@ -1159,7 +1161,9 @@ if pfctl -sr 2>/dev/null | grep -q 'from <nospamd>'; then
 	printf 'greylist exemption: on (%s network(s) loaded)\n' "$kernel_n"
 	if [ "$kernel_n" != "$file_n" ]; then
 		printf '                    but /etc/mail/nospamd holds %s: the table is stale.\n' "$file_n"
-		printf '                    Run: doas ksh scripts/pf-apply.sh\n'
+		# Not pf-apply.sh: it returns early when no fragment is missing, and a
+		# `persist file` table is read only when the ruleset is loaded.
+		printf '                    Run: doas pfctl -t nospamd -T replace -f /etc/mail/nospamd\n'
 	fi
 else
 	printf 'greylist exemption: OFF - senders that rotate their IP will be deferred until they give up.\n'
