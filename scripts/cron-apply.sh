@@ -111,6 +111,14 @@ line_for() {
 	# morning the mail is read, not for the test.
 	restore-standup.sh) printf '45 3 * * 1 . /root/.kyriakon-env; /root/bin/restore-standup.sh\n' ;;
 	acme-queue.sh) printf '*/15 * * * * . /root/.kyriakon-env; /root/bin/acme-queue.sh --run\n' ;;
+	# The two checks that watch the box rather than run it. They live in the
+	# checkout and are read from there, because self-test-all.sh runs the scripts
+	# beside it and the drain's copies are not all there. Both are weekly and an
+	# hour apart, so a failure is one mail and not a pile.
+	# A clean run prints nothing, so cron mails nothing; a failing one prints the
+	# line that says where the detail is.
+	check-hygiene.sh) printf '30 4 * * 1 . /root/.kyriakon-env; ksh /usr/local/src/kyriakon-infra/scripts/check-hygiene.sh >/dev/null || printf "check-hygiene found something; run it as root for the detail\\n"\n' ;;
+	self-test-all.sh) printf '0 5 * * 1 . /root/.kyriakon-env; ksh /usr/local/src/kyriakon-infra/scripts/self-test-all.sh >/dev/null || printf "a self-test failed; run scripts/self-test-all.sh for the detail\\n"\n' ;;
 	kyriakon-onboard-drain) printf '* * * * * %s\n' "$drain_bin" ;;
 	*) return 1 ;;
 	esac
@@ -352,6 +360,13 @@ STUB
 	check "the daemon that failed keeps the old index" \
 		"$(cat "$gmid_d/index.conf")" "$gmid_before"
 
+	check "the checkout-run checks have lines of their own" \
+		"$(line_for check-hygiene.sh | grep -c 'scripts/check-hygiene.sh')" 1
+	check "and the self-test runner has one" \
+		"$(line_for self-test-all.sh | grep -c 'scripts/self-test-all.sh')" 1
+	check "a clean weekly run prints nothing to cron" \
+		"$(line_for check-hygiene.sh | grep -c '>/dev/null')" 1
+
 	self_test_end
 }
 
@@ -388,6 +403,19 @@ if ! printf '%s\n' "$current" | grep -qF "$drain_bin"; then
 	to_add="$to_add kyriakon-onboard-drain"
 	line_for kyriakon-onboard-drain >>"$pending"
 fi
+
+# The two checks that run from the checkout rather than /root/bin:
+# self-test-all.sh runs the scripts beside it, and check-hygiene reports on the
+# checkout it is in. Their lines name that path on purpose, so the install check
+# above does not apply to them; the dedupe does.
+repo_dir=/usr/local/src/kyriakon-infra
+for s in check-hygiene.sh self-test-all.sh; do
+	[ -f "$repo_dir/scripts/$s" ] || missing_scripts="$missing_scripts $s"
+	if ! printf '%s\n' "$current" | grep -qF "scripts/$s"; then
+		to_add="$to_add $s"
+		line_for "$s" >>"$pending"
+	fi
+done
 
 if [ -n "$missing_scripts" ]; then
 	printf 'not installed:%s\n' "$missing_scripts"

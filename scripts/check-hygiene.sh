@@ -57,9 +57,9 @@
 # Read-only. Exits non-zero when something is wrong, so cron could run it, though
 # the daily mail already covers the permissions half.
 #
-#   ksh scripts/check-hygiene.sh --self-test   section 7's comparison, section 3's
-#                                              remedy lines and section 8's address
-#                                              check, and nothing else
+#   ksh scripts/check-hygiene.sh --self-test   the checks that run on fixtures:
+#                                              sections 7, 8, 9 and 10, and
+#                                              section 3's remedy lines
 
 set -euo pipefail
 
@@ -158,6 +158,46 @@ alert_address_problem() {
 		printf 'ALERT_EMAIL is %s, and this box accepts mail for %s: a mail box cannot report its own mail being broken\n' \
 			"$value" "$domain"
 	fi
+}
+
+# deployed_drift <checkout-scripts> <dir>...
+#
+# One line per installed file whose copy is not the checkout's, and per directory
+# that is gone. A script the checkout has and the box does not install is not a
+# finding: the deploys name what they install, and this compares the copies that
+# exist.
+deployed_drift() {
+	typeset checkout="$1" dir file name
+	shift
+	for dir in "$@"; do
+		if [ ! -d "$dir" ]; then
+			printf '%s: the directory is gone\n' "$dir"
+			continue
+		fi
+		for file in "$dir"/*.sh; do
+			[ -f "$file" ] || continue
+			name=$(basename "$file")
+			if [ ! -f "$checkout/$name" ]; then
+				printf '%s: not in the checkout\n' "$file"
+				continue
+			fi
+			cmp -s "$file" "$checkout/$name" \
+				|| printf '%s differs from %s\n' "$file" "$checkout/$name"
+		done
+	done
+}
+
+# store_drift <store-dir> <owner>
+#
+# Every file under the store directory that the owner does not own. The handler
+# renders the status pages from these files and runs unprivileged, so a record it
+# cannot read is a page that answers as an unknown token.
+store_drift() {
+	if [ ! -d "$1" ]; then
+		printf '%s: the directory is gone\n' "$1"
+		return
+	fi
+	find "$1" -type f ! -user "$2" -print
 }
 
 # The comparison above, the remedy lines and the address check below, against
@@ -277,6 +317,39 @@ self_test() {
 		printf 'FAIL: an unset address is a finding; got [%s]\n' "$out" >&2
 		exit 1
 		;;
+	esac
+
+	# Sections 9 and 10, against fixtures rather than the box.
+	mkdir -p "$dir/checkout" "$dir/deployed" "$dir/store"
+	printf 'same\n' > "$dir/checkout/one.sh"
+	printf 'same\n' > "$dir/deployed/one.sh"
+	printf 'old\n' > "$dir/deployed/two.sh"
+	printf 'new\n' > "$dir/checkout/two.sh"
+	out=$(deployed_drift "$dir/checkout" "$dir/deployed")
+	case "$out" in
+	*two.sh*) ;;
+	*) printf 'FAIL: a copy older than the checkout is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
+	case "$out" in
+	*one.sh*) printf 'FAIL: a matching copy is not a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
+	out=$(deployed_drift "$dir/checkout" "$dir/gone")
+	case "$out" in
+	*gone*) ;;
+	*) printf 'FAIL: a missing directory is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
+
+	printf 'mine\n' > "$dir/store/record.json"
+	[ -z "$(store_drift "$dir/store" "$(id -un)")" ] || {
+		printf 'FAIL: a record owned by the running user is not a finding\n' >&2
+		exit 1
+	}
+	other=nobody
+	if [ "$(id -un)" = nobody ]; then other=root; fi
+	out=$(store_drift "$dir/store" "$other")
+	case "$out" in
+	*record.json*) ;;
+	*) printf 'FAIL: a record the owner cannot be is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
 	esac
 
 	printf 'check-hygiene: self-test passed\n'
@@ -529,6 +602,53 @@ else
 	else
 		printf 'alert address: set, and off this box\n'
 	fi
+fi
+
+# --- 9. the scripts the box runs are the scripts the checkout has ---------
+# The deploys copy scripts into /root/bin and the drain's directory, and nothing
+# reads them again afterwards. A box running copies older than its checkout gives
+# no sign at all: operator mail went out without the subject fix for months, and
+# it surfaced because someone happened to look at a subject line.
+repo_dir="${KYRIAKON_REPO:-/usr/local/src/kyriakon-infra}"
+# The drain's directory comes from the config that decides it, not from the
+# constant it happens to have today: a changed setting would otherwise leave this
+# comparing a directory nothing installs into.
+drain_scripts_dir=$(awk -F'"' '/^scripts[[:space:]]*=/ { print $2; exit }' \
+	/etc/kyriakon/onboard/drain.toml 2>/dev/null || true)
+if [ -n "$drain_scripts_dir" ]; then :; else drain_scripts_dir=/usr/local/libexec/kyriakon/scripts; fi
+if [ -d "$repo_dir/scripts" ]; then
+	drift=$(deployed_drift "$repo_dir/scripts" /root/bin "$drain_scripts_dir")
+	if [ -n "$drift" ]; then
+		printf 'installed scripts: these are not the checkout at %s/scripts:\n' "$repo_dir"
+		printf '%s\n' "$drift" | sed -e 's/^/  /'
+		printf '  the fix is the deploy that installs them: deploy-mail.sh for /root/bin, deploy-onboard.sh for the drain\n'
+		status=1
+	else
+		printf 'installed scripts: every copy matches the checkout\n'
+	fi
+else
+	printf 'installed scripts: no checkout at %s/scripts, so the copies were not checked\n' "$repo_dir"
+	status=1
+fi
+
+# --- 10. the store's records belong to the handler ------------------------
+# The handler renders the status page from applications/ and runs as _onboard. A
+# record left root-owned reads as missing to it, which is why the drain hands each
+# one back to the directory's owner after it writes.
+applications_dir=/var/db/onboard/applications
+if [ -d "$applications_dir" ]; then
+	owner_drift=$(store_drift "$applications_dir" _onboard)
+	if [ -n "$owner_drift" ]; then
+		printf 'store records: these are not owned by _onboard, so the handler cannot read them:\n'
+		printf '%s\n' "$owner_drift" | sed -e 's/^/  /'
+		printf '  the fix is chown _onboard, and the writer that made them: the drain must use write_record_owned\n'
+		status=1
+	else
+		printf "store records: every application record belongs to the handler\n"
+	fi
+else
+	printf 'store records: %s is gone\n' "$applications_dir"
+	status=1
 fi
 
 exit "$status"

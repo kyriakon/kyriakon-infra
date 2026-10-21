@@ -40,7 +40,14 @@ repo's own root. Two terms most likely to matter while working in this repo:
 - Terraform: `terraform fmt -check -recursive` / `terraform validate` — run from
   `terraform/`. **`terraform plan` is fine to run; `terraform apply` and
   `terraform destroy` are never run by an agent** (see "Never" below).
-- Shell scripts (`scripts/`): `shellcheck scripts/*.sh`
+- Rust: `cargo test --manifest-path onboard/Cargo.toml` and
+  `cargo clippy --manifest-path onboard/Cargo.toml --all-targets -- -D warnings`; the
+  same for `kyriakon-encrypt/`. There is no workspace root, so a command without
+  `--manifest-path`, run from the repository root, does not find `Cargo.toml` at all.
+  `cargo fmt --check` runs in CI.
+- Shell scripts (`scripts/`): `shellcheck scripts/*.sh`, and
+  `ksh scripts/self-test-all.sh` runs every script's `--self-test` with the arguments
+  each one needs. On the box, `ksh scripts/check-hygiene.sh` reports its live state.
 - OpenBSD config syntax checks require an actual OpenBSD host and are not run in CI —
   e.g. `httpd -n -f openbsd/etc/httpd.conf`, `smtpd -n -f openbsd/etc/smtpd.conf`. If
   you don't have access to a test OpenBSD instance, say so rather than claiming a
@@ -49,6 +56,8 @@ repo's own root. Two terms most likely to matter while working in this repo:
 
 ## Code style
 
+- `CODING_STANDARDS.md` is what a reviewer enforces beyond the tooling: tests that
+  assert behaviour, the drain's transitions, and the shell-script failure shapes.
 - Terraform: `terraform fmt` is the source of truth for formatting. Resource and
   variable names in `snake_case`. Every variable needs a `description`.
 - Shell scripts: `set -euo pipefail` at the top of every script; `shellcheck`-clean is
@@ -81,10 +90,17 @@ issue body alone is a summary, not the full context.
 
 ## Git
 
-- Conventional commits, with scope: `type(scope): description` — e.g.
-  `feat(mail): add DKIM key rotation script`, `fix(terraform): correct hcloud image
-  reference`. Types: `feat`, `fix`, `chore`, `docs`, `test`. Scope is the area touched
-  (`terraform`, `mail`, `static`, `gemini`, `git-hosting`, `ci`, `docs`).
+- Conventional commits, with scope: `type(scope): description`, for example
+  `feat(mail): add DKIM key rotation script` or `fix(terraform): correct hcloud image
+  reference`. Types: `feat`, `fix`, `chore`, `docs`, `test`. The scope is the area
+  touched; in use are `onboard`, `web`, `scripts`, `mail`, `ssh`, `pf`, `relayd`,
+  `hosting`, `gemini`, `terraform`, `ci`, `docs`, `specs`, `research`. The shape is
+  enforced by `.githooks/commit-msg`; the scope is a judgement call.
+- Enable the repository's hooks once per clone: `git config core.hooksPath .githooks`.
+  They check the commit shape, run `shellcheck` and `ksh -n` on staged scripts and
+  `cargo fmt --check` when Rust is staged, and refuse a push from a branch that is
+  behind `main`, because a branch cut before a merge squashes to a commit that silently
+  reverts it.
 - Never force-push to `main`. Never rewrite shared history without explicit human
   sign-off.
 - Squash merge only.
