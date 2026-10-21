@@ -32,18 +32,30 @@ jobs:
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -eu
+          # Same repository only. workflow_run fires for a fork's pull request
+          # too, with write permissions, and headRefName is only a branch name:
+          # `publish-key/evil` in someone else's fork would otherwise match.
           pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
-            --json number,headRefName,headRefOid \
+            --json number,headRefName,headRefOid,isCrossRepository \
             --jq --arg sha "$HEAD_SHA" \
-              '[.[] | select(.headRefOid == $sha and (.headRefName | startswith("publish-key/")))] | .[0].number // empty')
+              '[.[] | select(.headRefOid == $sha and .isCrossRepository == false and (.headRefName | startswith("publish-key/")))] | .[0].number // empty')
           if [ -z "$pr" ]; then
-            printf 'nothing to do: no open publish-key pull request at %s\n' "$HEAD_SHA"
+            printf 'nothing to do: no open publish-key pull request of this repository at %s\n' "$HEAD_SHA"
             exit 0
           fi
-          outside=$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json files \
-            --jq '[.files[].path | select(startswith("keys/") | not)] | join(" ")')
-          if [ -n "$outside" ]; then
-            printf 'leaving #%s alone: it touches %s, which is not a key\n' "$pr" "$outside"
+          # Every changed file must be an *added* key. A modified or deleted one
+          # would be a substitution: swapping a published key for another sends
+          # that member's mail to whoever holds the new one, which is the one
+          # thing the published set exists to prevent.
+          files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr/files" --paginate \
+            --jq '.[] | "\(.status) \(.filename)"')
+          bad=$(printf '%s\n' "$files" | grep -vE '^added keys/[^/]+\.asc$' || true)
+          if [ -n "$bad" ]; then
+            printf 'leaving #%s alone: these are not new key files:\n%s\n' "$pr" "$bad"
+            exit 0
+          fi
+          if [ -z "$files" ]; then
+            printf 'leaving #%s alone: it changes no file\n' "$pr"
             exit 0
           fi
           gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --squash --delete-branch
