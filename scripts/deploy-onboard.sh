@@ -232,6 +232,11 @@ install -d -m 0755 "$scripts_dir"
 for s in $drain_scripts; do
 	install -m 0755 "$repo_dir/scripts/$s" "$scripts_dir/$s"
 done
+# The drain's scripts source lib.sh only from inside --self-test, so the live path
+# keeps no dependency on it. It is installed here for the same reason the scripts
+# are: so one of them can answer --self-test on the box, where the checkout may
+# be older than this deploy.
+install -m 0755 "$repo_dir/scripts/lib.sh" "$scripts_dir/lib.sh"
 install -d -m 0755 "$scripts_root/openbsd/etc/login.conf.d"
 install -m 0644 "$repo_dir/$drain_class" "$scripts_root/openbsd/etc/login.conf.d/member"
 # Before the unit starts, every script the drain names must be executable. A

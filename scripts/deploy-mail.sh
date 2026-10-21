@@ -158,22 +158,12 @@ install_smtpd_conf() {
 # that is interrupted, or that cannot be made at all, leaves the file with what it
 # had, never with half of a new one.
 self_test() {
-	typeset tree fails code before after candidate
-	tree=$(mktemp -d "${TMPDIR:-/tmp}/deploy-mail-test.XXXXXX") || exit 1
-	# Script scope, so the EXIT trap still sees it: a function's typeset name is
-	# gone by then, and set -u turns that into a line on stderr and a non-zero exit
-	# on a run where every check passed.
-	self_test_work="$tree"
-	trap 'rm -rf "$self_test_work"' EXIT
-	fails=0
-	check() {
-		if [ "$2" = "$3" ]; then
-			printf '  ok   %s\n' "$1"
-		else
-			printf '  FAIL %s: expected [%s], got [%s]\n' "$1" "$3" "$2"
-			fails=$((fails + 1))
-		fi
-	}
+	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+	. "$(dirname "$0")/lib.sh"
+	typeset tree code before after candidate
+	self_test_begin
+	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
+	tree=$self_test_work
 
 	# --- the virtual table ---
 	# As a previous run and the drain leave it: two platform entries, and one the
@@ -272,12 +262,7 @@ self_test() {
 	check "and says that it failed" "$([ "$code" -ne 0 ] && printf yes || printf no)" yes
 	check "and what it left behind is not readable" "$(stat -f %Lp "$candidate")" 600
 
-	if [ "$fails" -eq 0 ]; then
-		printf 'self-test: all checks passed\n'
-	else
-		printf 'self-test: %s failed\n' "$fails" >&2
-		exit 1
-	fi
+	self_test_end
 }
 
 # --- how this run was asked for ------------------------------------------
@@ -289,7 +274,6 @@ case "${1:-}" in
 	[ "$#" -le 2 ] || { printf 'usage: ksh %s [repo_dir] | ksh %s --self-test [repo_root]\n' "$0" "$0" >&2; exit 2; }
 	repo_dir="${2:-$(cd "$(dirname "$0")/.." && pwd)}"
 	self_test
-	exit 0
 	;;
 -*)
 	printf 'usage: ksh %s [repo_dir] | ksh %s --self-test [repo_root]\n' "$0" "$0" >&2

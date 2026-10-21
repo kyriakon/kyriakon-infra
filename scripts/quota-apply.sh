@@ -361,23 +361,12 @@ cmd_all() {
 }
 
 self_test() {
-	typeset work fails rc out member_offset
-	work=$(mktemp -d "${TMPDIR:-/tmp}/kyriakon-quota-test.XXXXXX")
-	# Script scope, for the reason set_limits gives: a function's `typeset` names are
-	# gone by the time an EXIT trap runs, and `set -u` turns that into a line on stderr
-	# and a non-zero exit on a run where every check passed. Seen on the box on
-	# 2026-10-05, where the self-test printed "all checks passed" and exited 1.
-	self_test_work="$work"
-	trap 'rm -rf "$self_test_work"' EXIT
-	fails=0
-	check() {
-		if [ "$2" = "$3" ]; then
-			printf '  ok   %s\n' "$1"
-		else
-			printf '  FAIL %s: expected [%s], got [%s]\n' "$1" "$3" "$2"
-			fails=$((fails + 1))
-		fi
-	}
+	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+	. "$(dirname "$0")/lib.sh"
+	typeset work rc out member_offset
+	self_test_begin
+	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
+	work=$self_test_work
 	test_mount="$work/home"
 	mkdir -p "$test_mount"
 	: > "$test_mount/quota.user"
@@ -476,12 +465,7 @@ EOF
 	unset STUB_NONE
 	check "quota listing the mount reads as on" "$(quotas_state)" "on"
 
-	if [ "$fails" -eq 0 ]; then
-		printf 'self-test: all checks passed\n'
-	else
-		printf 'self-test: %s failed\n' "$fails" >&2
-		exit 1
-	fi
+	self_test_end
 }
 
 case "${1:-}" in
