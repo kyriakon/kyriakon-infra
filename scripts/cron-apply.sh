@@ -111,6 +111,12 @@ line_for() {
 	# morning the mail is read, not for the test.
 	restore-standup.sh) printf '45 3 * * 1 . /root/.kyriakon-env; /root/bin/restore-standup.sh\n' ;;
 	acme-queue.sh) printf '*/15 * * * * . /root/.kyriakon-env; /root/bin/acme-queue.sh --run\n' ;;
+	# The two checks that watch the box rather than run it. They live in the
+	# checkout and are read from there, because self-test-all.sh runs the scripts
+	# beside it and the drain's copies are not all there. Both are weekly and an
+	# hour apart, so a failure is one mail and not a pile.
+	check-hygiene.sh) printf '30 4 * * 1 . /root/.kyriakon-env; ksh /usr/local/src/kyriakon-infra/scripts/check-hygiene.sh\n' ;;
+	self-test-all.sh) printf '0 5 * * 1 . /root/.kyriakon-env; ksh /usr/local/src/kyriakon-infra/scripts/self-test-all.sh\n' ;;
 	kyriakon-onboard-drain) printf '* * * * * %s\n' "$drain_bin" ;;
 	*) return 1 ;;
 	esac

@@ -1,0 +1,13 @@
+#!/bin/sh
+# type(scope): description. The shape is mechanical, so it is enforced here
+# rather than reviewed; the scope is the area touched and stays a judgement.
+set -e
+subject=$(head -n 1 "$1")
+case "$subject" in
+'Merge '* | 'Revert '*) exit 0 ;;
+esac
+if ! printf '%s' "$subject" | grep -Eq '^(feat|fix|chore|docs|test)\([a-z0-9._-]+\): .+'; then
+	printf 'commit-msg: %s\n' "$subject" >&2
+	printf '  the subject must be "type(scope): description", types: feat fix chore docs test\n' >&2
+	exit 1
+fi
