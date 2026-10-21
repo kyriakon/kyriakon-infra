@@ -90,23 +90,13 @@ pub fn password_payload(token: &str, until: &str) -> String {
 }
 
 /// One decision link, pointing at the handler's click-through path.
-pub fn decide_link(
-    base: &str,
-    key: &[u8],
-    token: &str,
-    action: &str,
-) -> Result<String, String> {
+pub fn decide_link(base: &str, key: &[u8], token: &str, action: &str) -> Result<String, String> {
     let sig = sign(key, &decide_payload(token, action))?;
     Ok(format!("{base}/decide/{token}?action={action}&sig={sig}"))
 }
 
 /// The one-time password link, the same mechanism as the review links.
-pub fn password_link(
-    base: &str,
-    key: &[u8],
-    token: &str,
-    until: &str,
-) -> Result<String, String> {
+pub fn password_link(base: &str, key: &[u8], token: &str, until: &str) -> Result<String, String> {
     let sig = sign(key, &password_payload(token, until))?;
     Ok(format!("{base}/password/{token}?until={until}&sig={sig}"))
 }
@@ -142,7 +132,9 @@ mod tests {
         let b = sign(b"k", "decide:tok:approve").unwrap();
         assert_eq!(a, b);
         assert_eq!(a.len(), 64, "{a}");
-        assert!(a.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         // A different key and a different payload each give a different one.
         assert_ne!(a, sign(b"k2", "decide:tok:approve").unwrap());
         assert_ne!(a, sign(b"k", "decide:tok:decline").unwrap());
@@ -181,7 +173,10 @@ mod tests {
         // A key the rest of the machine can read is refused: the file is the
         // one secret the review and password links depend on.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_key(&path).is_err(), "a group/other-readable key is refused");
+        assert!(
+            read_key(&path).is_err(),
+            "a group/other-readable key is refused"
+        );
         write(b"\n");
         assert!(read_key(&path).is_err(), "an empty key is refused");
         std::fs::remove_dir_all(&dir).unwrap();

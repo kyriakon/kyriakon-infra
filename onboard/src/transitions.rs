@@ -223,7 +223,9 @@ async fn publish_mail_keys(
         // this in the same transition, so a retry whose publish failed must leave
         // the file, and its mtime, exactly as they are. Rewriting an identical
         // file would restart that window on every retry and it would never close.
-        let same = std::fs::read(&path).map(|have| have == bytes).unwrap_or(false);
+        let same = std::fs::read(&path)
+            .map(|have| have == bytes)
+            .unwrap_or(false);
         if !same {
             std::fs::write(&path, &bytes)
                 .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
@@ -693,7 +695,10 @@ fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String,
     let token = &intent.application.status_token;
     let mut out = String::new();
     out.push_str(&format!("Application {}\n", intent.application.username));
-    out.push_str(&format!("Filed {} by the {} front end\n", intent.filed_at, intent.front_end));
+    out.push_str(&format!(
+        "Filed {} by the {} front end\n",
+        intent.filed_at, intent.front_end
+    ));
     out.push_str(&format!("Question list {}\n", intent.question_list));
     out.push_str(&format!("Rail: {}\n", intent.rail));
     out.push_str(&format!(
@@ -722,7 +727,11 @@ fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String,
     } else {
         out.push_str("Mail keys:\n");
         for k in &intent.mail_keys {
-            let mailbox = if k.mailbox.is_empty() { "address" } else { &k.mailbox };
+            let mailbox = if k.mailbox.is_empty() {
+                "address"
+            } else {
+                &k.mailbox
+            };
             out.push_str(&format!(
                 "  {mailbox}: {} (fingerprint {})\n",
                 k.verdict, k.fingerprint
@@ -742,19 +751,28 @@ fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String,
         }
     }
 
-    out.push_str("\nDecide\n");
-    for d in DECISIONS.iter() {
-        out.push_str(&format!(
-            "  {}: {}\n",
-            d.label,
-            sign::decide_link(&cfg.base_url, key, token, d.action)?
-        ));
-    }
+    // The terminal form comes first. A decision URL is about 140 characters and
+    // the signature is at the end of it, so a mail client that hard-wraps at 72
+    // cuts it before the signature whatever the label does: the fix is to lead
+    // with the form that cannot be wrapped, and say so rather than let the link
+    // look like the reliable one.
     let username = &intent.application.username;
     out.push_str("\nFrom a terminal\n");
     out.push_str(&format!("  onboardctl approve {username}\n"));
     out.push_str(&format!("  onboardctl approve-free {username}\n"));
     out.push_str(&format!("  onboardctl decline {username}\n"));
+    out.push_str(
+        "\nOr by link, which works once. Each is 140 characters and the signature\n\
+         is at the end, so a mail client that wraps a long line cuts it at the\n\
+         wrap: open it as one unbroken line, or use the terminal form above.\n",
+    );
+    for d in DECISIONS.iter() {
+        out.push_str(&format!(
+            "\n  {}\n  {}\n",
+            d.label,
+            sign::decide_link(&cfg.base_url, key, token, d.action)?
+        ));
+    }
     Ok(out)
 }
 
@@ -988,10 +1006,14 @@ async fn approve(
         outside_address: record.outside_address.clone(),
     };
     store.ensure_dir(&format!("accounts/{username}")).await?;
-    let account_bytes =
-        serde_json::to_vec_pretty(&account).map_err(|e| format!("cannot encode the account: {e}"))?;
+    let account_bytes = serde_json::to_vec_pretty(&account)
+        .map_err(|e| format!("cannot encode the account: {e}"))?;
     store
-        .write_record(&format!("accounts/{username}"), "account.json", &account_bytes)
+        .write_record(
+            &format!("accounts/{username}"),
+            "account.json",
+            &account_bytes,
+        )
         .await?;
 
     if let (Some(token), Some(window)) = (&token_ref, &window) {
@@ -1341,8 +1363,8 @@ async fn mark_decided(
         .read_record("applications", &format!("{token}.json"))
         .await
         .ok_or("the application record vanished before it could be decided")?;
-    let mut record: Record =
-        serde_json::from_str(&text).map_err(|e| format!("the application record does not parse: {e}"))?;
+    let mut record: Record = serde_json::from_str(&text)
+        .map_err(|e| format!("the application record does not parse: {e}"))?;
     record.stage = stage.to_string();
     record.decided_at = Some(decided_at.to_string());
     record.password_link = password_link;
@@ -1400,8 +1422,11 @@ async fn append_ledger(
         "intent": intent,
         "note": "the window opened at approval; no money has arrived yet",
     });
-    let encoded = serde_json::to_string(&line).map_err(|e| format!("cannot encode the ledger: {e}"))?;
-    store.append("ledger/payments.jsonl", encoded.as_bytes()).await
+    let encoded =
+        serde_json::to_string(&line).map_err(|e| format!("cannot encode the ledger: {e}"))?;
+    store
+        .append("ledger/payments.jsonl", encoded.as_bytes())
+        .await
 }
 
 fn decision_subject(what: &str, username: &str) -> String {

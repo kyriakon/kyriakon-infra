@@ -28,7 +28,11 @@ async fn handler(name: &str) -> (App, PathBuf) {
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let cfg = config::Config {
         store_root: dir.to_str().unwrap().to_string(),
-        reserved: crate_dir.join("../reserved-usernames.txt").to_str().unwrap().to_string(),
+        reserved: crate_dir
+            .join("../reserved-usernames.txt")
+            .to_str()
+            .unwrap()
+            .to_string(),
         catalogue: crate_dir
             .join("../openbsd/etc/onboard/catalogue.toml")
             .to_str()
@@ -50,7 +54,11 @@ async fn answer(app: &App, bytes: &[u8]) -> (u16, String) {
         .expect("the fixture is one request");
     let outcome = respond(app, &request).await;
     let (body, last) = fixture::reply(&fcgi::reply_bytes(&outcome.reply, request.id()));
-    assert_eq!(last, fixture::END, "the reply is finished rather than truncated");
+    assert_eq!(
+        last,
+        fixture::END,
+        "the reply is finished rather than truncated"
+    );
     (
         outcome.reply.code(),
         String::from_utf8_lossy(&body).into_owned(),
@@ -141,7 +149,9 @@ fn at(s: &str) -> OffsetDateTime {
 
 /// A filed application in the store the fixtures read.
 fn file_application(dir: &Path, record: &Record) {
-    let path = dir.join("applications").join(format!("{}.json", record.status_token));
+    let path = dir
+        .join("applications")
+        .join(format!("{}.json", record.status_token));
     std::fs::write(path, serde_json::to_vec_pretty(record).unwrap()).unwrap();
 }
 
@@ -217,9 +227,15 @@ async fn a_page_httpd_asks_for_comes_back_as_http() {
         body.contains("Content-Type: text/html; charset=utf-8\r\n"),
         "the page is served as what it is: {body}"
     );
-    assert!(body.contains("action=\"/apply\""), "the form is on the page");
+    assert!(
+        body.contains("action=\"/apply\""),
+        "the form is on the page"
+    );
     assert!(body.contains("name=\"branch\" value=\"person\""), "{body}");
-    assert!(body.contains("How you will pay"), "the shared question list is rendered");
+    assert!(
+        body.contains("How you will pay"),
+        "the shared question list is rendered"
+    );
     assert!(
         !body.contains("Cache-Control"),
         "the form is not a capability in a URL"
@@ -240,7 +256,10 @@ async fn a_page_gmid_asks_for_comes_back_as_gemini() {
         "{body}"
     );
     assert!(body.contains("Stage: received"), "{body}");
-    assert!(!body.contains("<!doctype html>"), "a gemini client reads gemtext");
+    assert!(
+        !body.contains("<!doctype html>"),
+        "a gemini client reads gemtext"
+    );
 }
 
 #[tokio::test]
@@ -443,9 +462,15 @@ async fn a_body_submission_that_was_shown_the_block_is_filed() {
         "a body is not shown the person's key"
     );
     for (id, _) in &answers {
-        assert!(page.contains(&format!("name=\"{id}\"")), "{id} is on the page");
+        assert!(
+            page.contains(&format!("name=\"{id}\"")),
+            "{id} is on the page"
+        );
     }
-    for q in questions::shown(&app.questions, false).iter().filter(|q| q.required) {
+    for q in questions::shown(&app.questions, false)
+        .iter()
+        .filter(|q| q.required)
+    {
         assert!(
             page.contains(&format!("name=\"{}\"", q.id)),
             "the required question {} is on the page",
@@ -456,7 +481,10 @@ async fn a_body_submission_that_was_shown_the_block_is_filed() {
     // Submitting it is not a refusal for a question the page did not show, and it
     // files the application.
     let (code, _) = answer(&app, &httpd_post("/apply", &encoded(&answers))).await;
-    assert_eq!(code, 200, "a body applicant who filled in the block is not refused");
+    assert_eq!(
+        code, 200,
+        "a body applicant who filled in the block is not refused"
+    );
     assert_eq!(
         std::fs::read_dir(dir.join("applications")).unwrap().count(),
         1,
@@ -511,8 +539,10 @@ async fn a_submission_that_is_not_from_this_form_is_refused_whatever_it_names() 
         assert_eq!(code, 403, "{path}");
         assert!(page.contains("A submission has to come from this form"));
     }
-    assert_eq!(std::fs::read_dir(dir.join("applications")).unwrap().count(), 0);
-
+    assert_eq!(
+        std::fs::read_dir(dir.join("applications")).unwrap().count(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -521,7 +551,10 @@ async fn a_submission_whose_body_overruns_the_cap_is_refused() {
     let long = format!("anything_else={}", "x".repeat(MAX_BODY + 1));
     let (code, _) = answer(&app, &httpd_post("/apply", &long)).await;
     assert_eq!(code, 413);
-    assert_eq!(std::fs::read_dir(dir.join("applications")).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::read_dir(dir.join("applications")).unwrap().count(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -574,7 +607,10 @@ async fn the_status_page_answers_for_seven_days_after_a_decision() {
     assert!(page.contains("Stage</td><td>received"), "{page}");
 
     let (code, _) = answer(&app, &httpd_get("/status/not-a-token", "")).await;
-    assert_eq!(code, 200, "a token that is not one reads as unknown, not as an error");
+    assert_eq!(
+        code, 200,
+        "a token that is not one reads as unknown, not as an error"
+    );
 }
 
 #[test]
@@ -621,7 +657,10 @@ fn a_decided_application_answers_for_seven_days_and_then_reads_as_unknown() {
     assert_eq!(expired.notice, UNKNOWN_TOKEN);
     assert_eq!(expired.stage, "");
     assert_eq!(expired.filed_at, "");
-    assert_eq!(expired.password_link, None, "an expired link renders no password link either");
+    assert_eq!(
+        expired.password_link, None,
+        "an expired link renders no password link either"
+    );
     assert_eq!(
         (expired.notice, expired.stage, expired.filed_at),
         (unknown.notice, unknown.stage, unknown.filed_at)
@@ -657,26 +696,48 @@ fn a_submission_must_come_from_this_form() {
         tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(async { fcgi::read_request(&mut &bytes[..], MAX_BODY).await.unwrap().unwrap() })
+            .block_on(async {
+                fcgi::read_request(&mut &bytes[..], MAX_BODY)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            })
     };
     assert!(
         own_origin(&request(&[("REQUEST_METHOD", "POST")])),
         "a client that is not a browser is allowed"
     );
     assert!(own_origin(&request(&[("HTTP_ORIGIN", OWN_ORIGIN)])));
-    assert!(!own_origin(&request(&[("HTTP_ORIGIN", "https://elsewhere.example")])));
-    assert!(!own_origin(&request(&[("HTTP_SEC_FETCH_SITE", "cross-site")])));
-    assert!(own_origin(&request(&[("HTTP_SEC_FETCH_SITE", "same-origin")])));
+    assert!(!own_origin(&request(&[(
+        "HTTP_ORIGIN",
+        "https://elsewhere.example"
+    )])));
+    assert!(!own_origin(&request(&[(
+        "HTTP_SEC_FETCH_SITE",
+        "cross-site"
+    )])));
+    assert!(own_origin(&request(&[(
+        "HTTP_SEC_FETCH_SITE",
+        "same-origin"
+    )])));
 }
 
 #[test]
 fn the_body_addresses_are_counted_against_its_account_names() {
     let mut errors = Vec::new();
     let mut form = BTreeMap::new();
-    form.insert("body_addresses".into(), "secretary: own\nhall: alias secretary".into());
+    form.insert(
+        "body_addresses".into(),
+        "secretary: own\nhall: alias secretary".into(),
+    );
     form.insert("body_account_names".into(), "secretary".into());
     body_cross_checks(&form, &mut errors);
-    assert!(errors.iter().any(|e| e.contains("2 addresses and 1 account names")), "{errors:?}");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("2 addresses and 1 account names")),
+        "{errors:?}"
+    );
 
     errors.clear();
     form.insert("body_account_names".into(), "secretary\nhall".into());
@@ -708,7 +769,10 @@ async fn a_decision_link_opens_a_page_instead_of_deciding() {
     .await;
     assert_eq!(code, 200);
     assert!(page.contains("approve, with the charge"), "{page}");
-    assert!(page.contains("secretary"), "the application is named: {page}");
+    assert!(
+        page.contains("secretary"),
+        "the application is named: {page}"
+    );
     assert!(
         page.contains("name=\"sig\" value=\"deadbeef\""),
         "the signature is carried into the form: {page}"
@@ -740,7 +804,10 @@ async fn the_click_files_one_decision_the_drain_can_parse() {
         "without the charge is the kind the drain dispatches"
     );
     assert_eq!(v["action"], "approve-free");
-    assert_eq!(v["sig"], "abc123", "the signature is passed through untouched");
+    assert_eq!(
+        v["sig"], "abc123",
+        "the signature is passed through untouched"
+    );
     assert_eq!(v["application"]["username"], "secretary");
     assert_eq!(v["application"]["status_token"], TOKEN);
 }
@@ -767,8 +834,16 @@ async fn a_decision_link_that_names_nothing_is_refused() {
     .await;
     assert_eq!(code, 403, "an action the platform has no decision for");
 
-    let (code, _) = answer(&app, &httpd_get(&format!("/decide/{TOKEN}"), "action=approve")).await;
+    let (code, _) = answer(
+        &app,
+        &httpd_get(&format!("/decide/{TOKEN}"), "action=approve"),
+    )
+    .await;
     assert_eq!(code, 403, "a link with no signature");
 
-    assert_eq!(intent_files(&dir).len(), 0, "a link that names nothing files nothing");
+    assert_eq!(
+        intent_files(&dir).len(),
+        0,
+        "a link that names nothing files nothing"
+    );
 }

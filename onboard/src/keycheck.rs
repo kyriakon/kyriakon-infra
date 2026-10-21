@@ -212,7 +212,12 @@ fn packets(raw: &[u8]) -> Option<Vec<Packet>> {
                 let l2 = *raw.get(i + 2)? as usize;
                 (tag, ((l1 - 192) << 8) + l2 + 192, 3usize)
             } else if l1 == 255 {
-                let l = u32::from_be_bytes([*raw.get(i + 2)?, *raw.get(i + 3)?, *raw.get(i + 4)?, *raw.get(i + 5)?]);
+                let l = u32::from_be_bytes([
+                    *raw.get(i + 2)?,
+                    *raw.get(i + 3)?,
+                    *raw.get(i + 4)?,
+                    *raw.get(i + 5)?,
+                ]);
                 (tag, l as usize, 6usize)
             } else {
                 return None; // partial body length
@@ -229,7 +234,12 @@ fn packets(raw: &[u8]) -> Option<Vec<Packet>> {
                     3usize,
                 ),
                 2 => {
-                    let l = u32::from_be_bytes([*raw.get(i + 1)?, *raw.get(i + 2)?, *raw.get(i + 3)?, *raw.get(i + 4)?]);
+                    let l = u32::from_be_bytes([
+                        *raw.get(i + 1)?,
+                        *raw.get(i + 2)?,
+                        *raw.get(i + 3)?,
+                        *raw.get(i + 4)?,
+                    ]);
                     (tag, l as usize, 5usize)
                 }
                 _ => return None, // indeterminate length
@@ -289,11 +299,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         buf = (buf << 6) | u32::from(val(c)?);
         n += 1;
         if n == 4 {
-            out.extend_from_slice(&[
-                (buf >> 16) as u8,
-                (buf >> 8) as u8,
-                buf as u8,
-            ]);
+            out.extend_from_slice(&[(buf >> 16) as u8, (buf >> 8) as u8, buf as u8]);
             buf = 0;
             n = 0;
         }
@@ -375,7 +381,10 @@ mod tests {
             "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAA user@host",
             "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAA user@host",
         ] {
-            assert!(openssh_public_key(good).is_ok(), "{good} should be accepted");
+            assert!(
+                openssh_public_key(good).is_ok(),
+                "{good} should be accepted"
+            );
         }
         for bad in [
             // A certificate line begins `ssh-` exactly as the first form does.
@@ -428,12 +437,24 @@ mod tests {
         const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         for chunk in bytes.chunks(3) {
-            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
             let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
             out.push(A[(n >> 18) as usize & 63] as char);
             out.push(A[(n >> 12) as usize & 63] as char);
-            out.push(if chunk.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
-            out.push(if chunk.len() > 2 { A[n as usize & 63] as char } else { '=' });
+            out.push(if chunk.len() > 1 {
+                A[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                A[n as usize & 63] as char
+            } else {
+                '='
+            });
         }
         out
     }

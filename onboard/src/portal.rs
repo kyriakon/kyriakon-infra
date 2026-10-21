@@ -186,7 +186,11 @@ pub fn run(
         match made {
             Answer::Next => selected = (selected + 1) % rows.len(),
             Answer::Previous => {
-                selected = if selected == 0 { rows.len() - 1 } else { selected - 1 };
+                selected = if selected == 0 {
+                    rows.len() - 1
+                } else {
+                    selected - 1
+                };
             }
             // Following a row shows where its action happens, and the reader
             // comes back to the menu: the flow [#380] and the account read
@@ -296,7 +300,11 @@ fn screen(mode: Mode, rows: &[Row], selected: usize) -> String {
 /// `summary` fits one terminal row, so there is no width to read and no resize to
 /// handle.
 fn drawing(rows: &[Row], selected: usize) -> String {
-    let width = rows.iter().map(|r| r.name.chars().count()).max().unwrap_or(0);
+    let width = rows
+        .iter()
+        .map(|r| r.name.chars().count())
+        .max()
+        .unwrap_or(0);
     let mut out = String::from(" Kyriakon\n\n");
     for (at, row) in rows.iter().enumerate() {
         let mark = if at == selected { '>' } else { ' ' };
@@ -333,7 +341,10 @@ fn listing(rows: &[Row]) -> String {
 /// gemtext link give the same entry. Two of those addresses are #380's and #381's
 /// to replace with a screen of their own.
 fn page(row: &Row) -> String {
-    let mut out = format!("\n{}\n\n{} ({})\n\n{}\n", row.name, row.state, row.summary, row.href);
+    let mut out = format!(
+        "\n{}\n\n{} ({})\n\n{}\n",
+        row.name, row.state, row.summary, row.href
+    );
     if let Some(sentence) = row.handoff {
         out.push_str(&format!("\n{sentence}\n"));
     }
@@ -454,8 +465,16 @@ mod tests {
         let rows = rows(None);
         for (at, row) in rows.iter().enumerate() {
             let drawn = drawing(&rows, at);
-            assert!(drawn.contains(&format!("> {}", row.name)), "{} is not the row it marks", row.id);
-            assert!(drawn.contains(&row.summary), "{} shows no clause of its own", row.id);
+            assert!(
+                drawn.contains(&format!("> {}", row.name)),
+                "{} is not the row it marks",
+                row.id
+            );
+            assert!(
+                drawn.contains(&row.summary),
+                "{} shows no clause of its own",
+                row.id
+            );
             for other in rows.iter().filter(|o| o.id != row.id) {
                 assert!(
                     !drawn.contains(&other.summary),
@@ -475,9 +494,18 @@ mod tests {
         let mut script = Script::full(&[Key::Down, Key::Enter, Key::Enter, Key::Quit]);
         let (left, seen) = session(&rows, Mode::Full, &mut script);
         assert_eq!(left, Departure::Quit);
-        assert!(seen.contains(&page(&rows[1])), "Enter did not open the row it was on");
-        assert!(!seen.contains(&page(&rows[0])), "Enter opened the row the reader moved off");
-        assert!(script.spent(), "the session did not read every key the page asked for");
+        assert!(
+            seen.contains(&page(&rows[1])),
+            "Enter did not open the row it was on"
+        );
+        assert!(
+            !seen.contains(&page(&rows[0])),
+            "Enter opened the row the reader moved off"
+        );
+        assert!(
+            script.spent(),
+            "the session did not read every key the page asked for"
+        );
     }
 
     /// A page waits for the reader: it is on the screen until Enter comes back,
@@ -494,7 +522,10 @@ mod tests {
             1,
             "the page was painted over rather than left for the reader"
         );
-        assert!(script.spent(), "the session did not read every key the page asked for");
+        assert!(
+            script.spent(),
+            "the session did not read every key the page asked for"
+        );
 
         // And the menu's own key leaves from the page rather than going back to
         // the menu first.
@@ -512,7 +543,10 @@ mod tests {
         for mode in [Mode::Full, Mode::Plain] {
             let (left, seen) = session(&rows, mode, &mut Script::default());
             assert_eq!(left, Departure::Gone, "{mode:?}");
-            assert!(seen.starts_with(OPENING), "{mode:?} closed before the first screen");
+            assert!(
+                seen.starts_with(OPENING),
+                "{mode:?} closed before the first screen"
+            );
         }
     }
 
@@ -532,11 +566,22 @@ mod tests {
         assert_eq!(left, Departure::Quit);
 
         for (mode, seen) in [("the drawing", &drawn), ("the line input", &listed)] {
-            assert!(seen.starts_with(OPENING), "{mode} does not open with the first screen");
+            assert!(
+                seen.starts_with(OPENING),
+                "{mode} does not open with the first screen"
+            );
             for row in &rows {
                 assert!(seen.contains(&row.name), "{mode} has no row for {}", row.id);
-                assert!(seen.contains(&row.summary), "{mode} has no clause for {}", row.id);
-                assert!(seen.contains(row.state), "{mode} has no state for {}", row.id);
+                assert!(
+                    seen.contains(&row.summary),
+                    "{mode} has no clause for {}",
+                    row.id
+                );
+                assert!(
+                    seen.contains(row.state),
+                    "{mode} has no state for {}",
+                    row.id
+                );
             }
         }
     }
@@ -552,17 +597,33 @@ mod tests {
         let mut script = Script::lines(&["", "2", "", "quit"]);
         let (left, seen) = session(&rows, Mode::Plain, &mut script);
         assert_eq!(left, Departure::Quit);
-        assert!(seen.contains(&page(&rows[1])), "row 2 opened row 1 or nothing");
-        assert!(!seen.contains(&page(&rows[0])), "row 2 opened the first row");
+        assert!(
+            seen.contains(&page(&rows[1])),
+            "row 2 opened row 1 or nothing"
+        );
+        assert!(
+            !seen.contains(&page(&rows[0])),
+            "row 2 opened the first row"
+        );
         assert!(!seen.contains('\x1b'), "the line mode drew something");
-        assert!(script.spent(), "the session did not read every line the page asked for");
+        assert!(
+            script.spent(),
+            "the session did not read every line the page asked for"
+        );
 
         let mut script = Script::lines(&["", "0", "99", "-1", "two", "", "quit"]);
         let (left, seen) = session(&rows, Mode::Plain, &mut script);
         assert_eq!(left, Departure::Quit);
-        assert!(script.spent(), "the session stopped reading before the script ran out");
+        assert!(
+            script.spent(),
+            "the session stopped reading before the script ran out"
+        );
         for row in &rows {
-            assert!(!seen.contains(&page(row)), "{} opened for an answer naming no row", row.id);
+            assert!(
+                !seen.contains(&page(row)),
+                "{} opened for an answer naming no row",
+                row.id
+            );
         }
 
         // The drawing mode is the one that draws.
@@ -579,8 +640,14 @@ mod tests {
         let mut script = Script::lines(&["status", "", "quit"]);
         let (left, seen) = session(&rows, Mode::Plain, &mut script);
         assert_eq!(left, Departure::Quit);
-        assert!(seen.contains(&format!("https://{HOST}/status/")), "the status screen names no route");
-        assert!(script.spent(), "the session stopped reading at the status word");
+        assert!(
+            seen.contains(&format!("https://{HOST}/status/")),
+            "the status screen names no route"
+        );
+        assert!(
+            script.spent(),
+            "the session stopped reading at the status word"
+        );
     }
 
     /// A member's session carries their own addresses, and an anonymous one shows

@@ -330,9 +330,21 @@ mod tests {
             ),
             q("vat", Branch::Body, Kind::Text, false, Rule::None),
             q("body_name", Branch::Body, Kind::Text, true, Rule::None),
-            q("address_outside", Branch::All, Kind::Text, false, Rule::Address),
+            q(
+                "address_outside",
+                Branch::All,
+                Kind::Text,
+                false,
+                Rule::Address,
+            ),
             q("mail_key", Branch::Person, Kind::Key, true, Rule::MailKey),
-            q("body_mail_key", Branch::Body, Kind::Key, true, Rule::MailKey),
+            q(
+                "body_mail_key",
+                Branch::Body,
+                Kind::Key,
+                true,
+                Rule::MailKey,
+            ),
             q(
                 "rail",
                 Branch::All,
@@ -340,8 +352,20 @@ mod tests {
                 true,
                 choices(&[("card", "Card"), ("no_charge", "No charge")]),
             ),
-            q("blessing", Branch::Monastic, Kind::Multiline, true, Rule::None),
-            q("accept_terms", Branch::All, Kind::Acceptance, true, Rule::None),
+            q(
+                "blessing",
+                Branch::Monastic,
+                Kind::Multiline,
+                true,
+                Rule::None,
+            ),
+            q(
+                "accept_terms",
+                Branch::All,
+                Kind::Acceptance,
+                true,
+                Rule::None,
+            ),
         ]
     }
 
@@ -372,8 +396,14 @@ mod tests {
         answers.insert("whose".to_string(), "body".to_string());
         let p = applicant(&list(), &catalogue(), true, &answers, "r");
         let whose = p.you.iter().find(|q| q.id == "whose").unwrap();
-        assert!(whose.options.iter().any(|o| o.value == "body" && o.selected));
-        assert!(whose.options.iter().any(|o| o.value == "person" && !o.selected));
+        assert!(whose
+            .options
+            .iter()
+            .any(|o| o.value == "body" && o.selected));
+        assert!(whose
+            .options
+            .iter()
+            .any(|o| o.value == "person" && !o.selected));
     }
 
     #[test]
@@ -397,7 +427,10 @@ mod tests {
             .unwrap()
             .options;
         assert_eq!(untouched.first().map(|o| o.value.as_str()), Some(""));
-        assert!(untouched[0].selected, "the blank answer is the one declared");
+        assert!(
+            untouched[0].selected,
+            "the blank answer is the one declared"
+        );
         assert!(untouched[1..].iter().all(|o| !o.selected));
 
         // Answered, it opens on the answer, blank answer included: an applicant
