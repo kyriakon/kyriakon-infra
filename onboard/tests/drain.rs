@@ -579,6 +579,9 @@ fn a_password_link_applies_once_and_only_when_signed() {
     )
     .unwrap();
     assert!(after["password_link"].is_null(), "{after}");
+    // And the intent is removed once it is applied, as every transition does:
+    // leaving it makes every later pass re-read it.
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
     // And the fields this build does not model survive the write: the record
     // carries the answers and the rest, and losing them would be silent.
     assert!(after["answers"].is_object(), "{after}");
@@ -618,6 +621,75 @@ fn a_password_link_applies_once_and_only_when_signed() {
 
 /// A click on an already-decided application changes nothing in the store and
 /// sends nothing, and the journal records that it was seen.
+/// The decision email carries the one-time password link, not only the status
+/// page: the spec asks for both, and the member whose mailbox has no password
+/// yet cannot read the mail that was sent to it.
+#[test]
+fn an_approval_email_carries_the_password_link() {
+    let fix = Fix::new("password-in-mail");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
+    let sig = sign::sign(&key, &sign::decide_payload(TOKEN, "approve-free")).unwrap();
+    fix.write_decision("provision", "approve-free", &sig, "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let sent = fix.sent();
+    assert!(sent.contains("/password/"), "{sent}");
+    assert!(sent.contains("works once"), "{sent}");
+}
+
+/// After a failed pass and its backoff, the next pass applies the intent: a
+/// failed journal line is the reason to retry, not a settlement.
+#[test]
+fn a_failed_password_pass_is_retried_after_the_backoff() {
+    let fix = Fix::new("password-retry");
+    let log = fix.path("password.log");
+    fix.script(
+        "set-mail-password.sh",
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n"),
+    );
+    let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
+    let until = kyriakon_onboard::util::date_after_days(7);
+    let hash = kyriakon_onboard::password::make("correct horse battery").unwrap();
+    let mut record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    record["password_link"] = json!("https://signup.example.invalid/password/x");
+    std::fs::write(
+        fix.path(&format!("store/applications/{TOKEN}.json")),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    let sig = sign::sign(&key, &sign::password_payload(TOKEN, &until)).unwrap();
+    fix.write_intent(
+        "01J00000000000000000RETRY",
+        &json!({
+            "id": "01J00000000000000000RETRY",
+            "kind": "set-password",
+            "filed_at": "2026-10-21T09:00:00Z",
+            "application": { "username": "secretary", "status_token": TOKEN },
+            "until": until,
+            "sig": sig,
+            "hash": hash,
+        }),
+    );
+    std::fs::write(
+        fix.path("store/journal.jsonl"),
+        format!(
+            "{{\"version\":1,\"at\":\"2020-01-01T00:00:00Z\",\"intent\":\"01J00000000000000000RETRY\",\"kind\":\"intent\",\"release\":\"test\",\"application\":{{\"username\":\"secretary\",\"status_token\":\"{TOKEN}\"}},\"outcome\":\"failed\",\"note\":\"an earlier pass\"}}\n"
+        ),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("secretary"),
+        "the script should have run"
+    );
+}
+
 #[test]
 fn a_replayed_approval_changes_nothing() {
     let fix = Fix::new("replay");

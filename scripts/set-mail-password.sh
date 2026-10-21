@@ -26,6 +26,14 @@ die() {
 	exit 1
 }
 
+# is_member <home>: whether this home is a member's. A Maildir is what
+# add-user.sh creates and what Dovecot reads; root, _onboard and every daemon
+# account have none, and the name is not the test because a localpart need not
+# contain a dot.
+is_member() {
+	[ -d "$1/Maildir" ]
+}
+
 # is_bcrypt <hash>: the shape bcrypt writes, and the one BSD auth reads.
 is_bcrypt() {
 	case "$1" in
@@ -60,10 +68,10 @@ user="$1"
 hash="$2"
 
 is_bcrypt "$hash" || die "the second argument is not a bcrypt hash, so it is not written to $user"
-case "$user" in
-*.*) ;;
-*) die "$user is not a member account name (no dot), so nothing was written" ;;
-esac
 id -u "$user" >/dev/null 2>&1 || die "there is no account named $user"
+home=$(getent passwd "$user" | cut -d: -f6)
+if [ -z "$home" ] || ! is_member "$home"; then
+	die "$user has no Maildir, so it is not a member account name; nothing was written"
+fi
 usermod -p "$hash" "$user"
 printf 'set-mail-password: wrote the stored hash for %s\n' "$user"
