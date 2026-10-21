@@ -397,7 +397,14 @@ async fn http(app: &App, request: &Request, incoming: &Incoming) -> Reply {
     // of the old HTTP daemon's router did: a POST from somewhere that is not this
     // form is refused for being that, whatever path it names.
     if method == "POST" && !own_origin(request) {
-        return refused("A submission has to come from this form's own page.");
+        // The two values, in the refusal: neither is a secret and the pair is
+        // the only way to tell which kind of client was refused.
+        return refused(&format!(
+            "A submission has to come from this form's own page. This one sent origin {:?} \
+             and sec-fetch-site {:?}.",
+            request.get("HTTP_ORIGIN").unwrap_or("<none>"),
+            request.get("HTTP_SEC_FETCH_SITE").unwrap_or("<none>"),
+        ));
     }
     // The front-end is mid-request, so a body over the cap is answered rather than
     // the connection dropped. It is the same refusal a body over the old HTTP
@@ -576,11 +583,24 @@ fn reading(form: &BTreeMap<String, String>) -> Reading {
 /// fallback, and a browser that sends neither is a client that is not a browser at
 /// all, which is not a cross-site request.
 fn own_origin(request: &Request) -> bool {
-    if let Some(origin) = request.get("HTTP_ORIGIN") {
-        return origin == OWN_ORIGIN;
+    // A browser that posts a form sends Origin, and an ordinary tab sends this
+    // site as it. An in-app browser, which is what a link tapped in a mail or
+    // chat client opens, sends `Origin: null` instead, and `Sec-Fetch-Site:
+    // same-origin` beside it. The null origin used to refuse that submission
+    // without ever reading the header that would have answered the question, so
+    // null falls through to Sec-Fetch-Site now, as an absent Origin already did.
+    let origin = request.get("HTTP_ORIGIN");
+    let site = request.get("HTTP_SEC_FETCH_SITE");
+    if let Some(origin) = origin {
+        if origin != "null" {
+            return origin == OWN_ORIGIN;
+        }
     }
-    match request.get("HTTP_SEC_FETCH_SITE") {
-        Some(site) => site == "same-origin" || site == "none",
+    match site {
+        // same-site is the same registrable site as this page, which is what a
+        // browser reports when it reads the post as this site's but not this
+        // origin's: it is not a cross-site submission and does not need to be.
+        Some(site) => site == "same-origin" || site == "same-site" || site == "none",
         None => true,
     }
 }
