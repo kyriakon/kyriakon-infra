@@ -35,10 +35,17 @@ jobs:
           # Same repository only. workflow_run fires for a fork's pull request
           # too, with write permissions, and headRefName is only a branch name:
           # `publish-key/evil` in someone else's fork would otherwise match.
+          # gh's --jq does not take jq's --arg, so the commit is checked as hex
+          # and interpolated into the expression.
+          case "$HEAD_SHA" in
+          *[!0-9a-f]* | "")
+            printf 'the commit is not a sha: %s\n' "$HEAD_SHA" >&2
+            exit 1
+            ;;
+          esac
           pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
             --json number,headRefName,headRefOid,isCrossRepository \
-            --jq --arg sha "$HEAD_SHA" \
-              '[.[] | select(.headRefOid == $sha and .isCrossRepository == false and (.headRefName | startswith("publish-key/")))] | .[0].number // empty')
+            --jq "[.[] | select(.headRefOid == \"$HEAD_SHA\" and .isCrossRepository == false and (.headRefName | startswith(\"publish-key/\")))] | .[0].number // empty")
           if [ -z "$pr" ]; then
             printf 'nothing to do: no open publish-key pull request of this repository at %s\n' "$HEAD_SHA"
             exit 0
