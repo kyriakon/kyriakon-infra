@@ -1,6 +1,11 @@
 #!/bin/ksh
 # publish-mail-key.sh: open a change that publishes an approved member's mail key.
 #
+# The pull request does not wait for an operator: .github/workflows/auto-merge-key.yml
+# merges it once the checks pass, because a key is not code and the approval has
+# already made the decision. The branch is squashed and deleted, so the published
+# set's history is one commit per key.
+#
 # Usage:
 #   doas ksh scripts/publish-mail-key.sh <localpart> <key-file> <token-file>
 #   ksh scripts/publish-mail-key.sh --self-test

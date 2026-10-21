@@ -1,0 +1,50 @@
+# Merge a member's published key without an operator click.
+#
+# scripts/publish-mail-key.sh opens `publish-key/<localpart>` with the box's
+# token when an approval publishes a key, and the operator merges it by hand
+# today. A key is not code: the checks run on it like any PR and pass, and the
+# only decision is whether the published set should carry the key, which the
+# approval already made. So the merge waits for the checks and then happens.
+#
+# It runs on the checks workflow's completion, not on the pull request, because a
+# pull_request trigger would start beside the checks rather than after them.
+# Two guards keep it narrow: the head branch must be a publish-key branch, and
+# the diff must touch nothing outside keys/.
+name: auto-merge key publications
+
+on:
+  workflow_run:
+    workflows: [checks]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: merge the green publish-key pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -eu
+          pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json number,headRefName,headRefOid \
+            --jq --arg sha "$HEAD_SHA" \
+              '[.[] | select(.headRefOid == $sha and (.headRefName | startswith("publish-key/")))] | .[0].number // empty')
+          if [ -z "$pr" ]; then
+            printf 'nothing to do: no open publish-key pull request at %s\n' "$HEAD_SHA"
+            exit 0
+          fi
+          outside=$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json files \
+            --jq '[.files[].path | select(startswith("keys/") | not)] | join(" ")')
+          if [ -n "$outside" ]; then
+            printf 'leaving #%s alone: it touches %s, which is not a key\n' "$pr" "$outside"
+            exit 0
+          fi
+          gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --squash --delete-branch
+          printf 'merged #%s, a green key publication\n' "$pr"
