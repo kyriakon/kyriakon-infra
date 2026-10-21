@@ -1120,9 +1120,10 @@ fi
 # This is the deploy that installs the cron scripts, so it is the one that says
 # so; check-hygiene.sh reports the live value afterwards.
 if grep -q 'REPLACE_ME' "$env_dst"; then
-	die "$env_dst still carries a placeholder:
-$(grep -n 'REPLACE_ME' "$env_dst" | sed -e 's/^/  /')
-set it with scripts/setup-env.sh before deploying, or every alert falls back to cron's own subject"
+	printf '%s still carries a placeholder:\n' "$env_dst" >&2
+	grep -n 'REPLACE_ME' "$env_dst" | sed -e 's/^/  /' >&2
+	printf 'set it with scripts/setup-env.sh before deploying, or every alert goes out under cron own subject\n' >&2
+	exit 1
 fi
 
 home=$(awk -F: '$1 == "oliver" { print $6 }' /etc/passwd)
