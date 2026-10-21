@@ -15,8 +15,6 @@
 #     records that trap already, from a script that passed its self-test on a
 #     workstation and died on the box's `typeset -a`.
 #
-# There is deliberately no Rust formatter here: the crate is hand formatted and
-# rustfmt would rewrite seventeen files, which is a separate decision.
 #
 # What these catch, all of them found by hand in the 2026-10-15 audit: a status
 # read inside the wrong branch, a loop variable read after its loop, a checkbox
@@ -83,7 +81,9 @@ jobs:
       # half of this repository's conventions, but it is still a script nobody
       # reads before it is run.
       - name: shellcheck
-        run: shellcheck $(git ls-files '*.sh')
+        # The hooks have no .sh suffix, so git ls-files misses them, and nothing else
+        # lints them: a quoting mistake there fires on every commit in every clone.
+        run: shellcheck $(git ls-files '*.sh') .githooks/commit-msg .githooks/pre-commit .githooks/pre-push
 
   terraform:
     name: terraform

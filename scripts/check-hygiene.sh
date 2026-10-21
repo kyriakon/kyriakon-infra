@@ -610,8 +610,14 @@ fi
 # no sign at all: operator mail went out without the subject fix for months, and
 # it surfaced because someone happened to look at a subject line.
 repo_dir="${KYRIAKON_REPO:-/usr/local/src/kyriakon-infra}"
+# The drain's directory comes from the config that decides it, not from the
+# constant it happens to have today: a changed setting would otherwise leave this
+# comparing a directory nothing installs into.
+drain_scripts_dir=$(awk -F'"' '/^scripts[[:space:]]*=/ { print $2; exit }' \
+	/etc/kyriakon/onboard/drain.toml 2>/dev/null || true)
+if [ -n "$drain_scripts_dir" ]; then :; else drain_scripts_dir=/usr/local/libexec/kyriakon/scripts; fi
 if [ -d "$repo_dir/scripts" ]; then
-	drift=$(deployed_drift "$repo_dir/scripts" /root/bin /usr/local/libexec/kyriakon/scripts)
+	drift=$(deployed_drift "$repo_dir/scripts" /root/bin "$drain_scripts_dir")
 	if [ -n "$drift" ]; then
 		printf 'installed scripts: these are not the checkout at %s/scripts:\n' "$repo_dir"
 		printf '%s\n' "$drift" | sed -e 's/^/  /'
@@ -621,7 +627,8 @@ if [ -d "$repo_dir/scripts" ]; then
 		printf 'installed scripts: every copy matches the checkout\n'
 	fi
 else
-	printf 'installed scripts: no checkout at %s/scripts, so this was skipped\n' "$repo_dir"
+	printf 'installed scripts: no checkout at %s/scripts, so the copies were not checked\n' "$repo_dir"
+	status=1
 fi
 
 # --- 10. the store's records belong to the handler ------------------------
