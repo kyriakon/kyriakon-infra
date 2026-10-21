@@ -220,7 +220,7 @@ the old one has to go, or the label has to be taken off it.
 
 What terraform was there for was that a destroy could not reach the mail box, since destroy only removes what is in the state it runs against. The CLI version keeps that property by a narrower route: the script creates the server once, captures its id, and uses only that id for every later reference. The delete cannot resolve to anything but the box that run made. The mail box keeps its own protection besides, the live root's `prevent_destroy` and Hetzner's `delete_protection`.
 
-The box comes from a snapshot labelled `kind=restore`, a third label beside `kind=gold` for provisioning images and `kind=dr` for point-in-time copies, so neither of those can be picked up by a test run. The template is a plain box without softraid, because a crypto root stops at a passphrase prompt and nobody is at the console when cron runs. It holds the test scripts and the standup's public key; the repository password and the read-only storage sub-account key are copied in after each boot.
+The box comes from a snapshot labelled `kind=restore`, a third label beside `kind=gold` for provisioning images and `kind=dr` for point-in-time copies, so neither of those can be picked up by a test run. The template is a plain box without softraid, because a crypto root stops at a passphrase prompt and nobody is at the console when cron runs. It holds the standup's public key. The two test scripts, the repository password and the read-only storage sub-account key are copied in after each boot, the scripts from the mail box's checkout.
 
 ## Discipline
 

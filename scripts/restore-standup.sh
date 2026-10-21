@@ -117,6 +117,7 @@ ssh_key="${RESTORE_TEST_SSH_KEY:-/root/.ssh/kyriakon-standup}"
 known_hosts="${RESTORE_TEST_KNOWN_HOSTS:-/root/.ssh/known_hosts.standup}"
 ro_key="${RESTORE_TEST_RO_KEY:-/root/.ssh/kyriakon-restore-readonly}"
 ro_password="${RESTORE_TEST_PASSWORD_FILE:-/root/.restic-pass}"
+test_script_dir="${RESTORE_TEST_SCRIPT_DIR:-/usr/local/src/kyriakon-infra/scripts}"
 healthchecks="${RESTORE_TEST_HEALTHCHECKS_URL:-}"
 server_ip=''
 
@@ -130,6 +131,10 @@ esac
 [ -f "$ssh_key" ] || die "no ssh key at $ssh_key"
 [ -f "$ro_key" ] || die "no read-only storage key at $ro_key"
 [ -f "$ro_password" ] || die "no restic password file at $ro_password"
+for s in restore-test.sh lib.sh; do
+	[ -f "$test_script_dir/$s" ] \
+		|| die "no $test_script_dir/$s: the weekly test runs the checkout's script, and the checkout is what this box deploys from"
+done
 
 # Nothing is mailed, cleaned up or redirected before this point: the checks above
 # are the ones that stop a hand run before it touches anything, and they say so on
@@ -142,6 +147,7 @@ if [ "$dry_run" = yes ]; then
 	printf 'dry-run: ssh -i %s root@<address> mkdir -p /root/.ssh\n' "$ssh_key"
 	printf 'dry-run: scp-equivalent: %s -> root@<address>:/root/.ssh/id_ed25519\n' "$ro_key"
 	printf 'dry-run: scp-equivalent: %s -> root@<address>:/root/scratch/restic-pass\n' "$ro_password"
+	printf 'dry-run: copy %s/restore-test.sh and %s/lib.sh to root@<address>:/root/bin\n' "$test_script_dir" "$test_script_dir"
 	printf 'dry-run: ssh -i %s root@<address> RESTIC_REPOSITORY=... /root/bin/restore-test.sh\n' "$ssh_key"
 	printf 'dry-run: hcloud server delete <id>       # the id this run created, never a name\n'
 	printf 'dry-run: nothing was created, nothing was destroyed\n'
@@ -279,7 +285,7 @@ remote() {
 # as a redirect rather than scp so it travels down the same ssh invocation as everything
 # else, with the same key and the same host-key pin.
 push() {
-	remote "cat > $1 && chmod 600 $1" <"$2"
+	remote "cat > $1 && chmod ${3:-600} $1" <"$2"
 }
 
 # hcloud server create returns once the API has the server, which is before it has
@@ -341,14 +347,9 @@ printf 'credentials in place\n'
 # drifts: the weekly run would test whatever the template was built from, which is
 # how a fix to the test reaches nobody until someone rebuilds a snapshot. The
 # checkout is the deploy's own source, so this is the file the deploy names.
-test_script_dir="${RESTORE_TEST_SCRIPT_DIR:-/usr/local/src/kyriakon-infra/scripts}"
-for s in restore-test.sh lib.sh; do
-	[ -f "$test_script_dir/$s" ] \
-		|| die "no $test_script_dir/$s: the weekly test runs the checkout's script, and the checkout is what this box deploys from"
-done
 remote 'mkdir -p /root/bin'
-remote 'cat > /root/bin/restore-test.sh && chmod 755 /root/bin/restore-test.sh' < "$test_script_dir/restore-test.sh"
-remote 'cat > /root/bin/lib.sh && chmod 755 /root/bin/lib.sh' < "$test_script_dir/lib.sh"
+push /root/bin/restore-test.sh "$test_script_dir/restore-test.sh" 755
+push /root/bin/lib.sh "$test_script_dir/lib.sh" 755
 printf 'test scripts in place, from %s\n' "$test_script_dir"
 
 set +e
