@@ -74,6 +74,7 @@ acme_d=${ACME_D:-/etc/acme-client.d}
 ssl_dir=${SSL_DIR:-/etc/ssl}
 ssl_private=${SSL_PRIVATE:-/etc/ssl/private}
 virtuals=${VIRTUALS:-/etc/mail/virtuals}
+onboard_store=${ONBOARD_STORE:-/var/db/onboard}
 
 # --- the steps, as functions, so the self-test can replace them -------------
 #
@@ -84,8 +85,10 @@ virtuals=${VIRTUALS:-/etc/mail/virtuals}
 # there is not, which is what makes a second run silent, and a predicate rather
 # than a bare id(1) call because the self-test has to answer it too.
 account_exists() { id "$user" >/dev/null 2>&1; }
+group_exists() { getent group "$user" >/dev/null 2>&1; }
 
 remove_account() { userdel -r "$user"; }
+remove_group() { groupdel "$user" 2>/dev/null; }
 clear_quota() { ksh "$script_dir/quota-apply.sh" --clear "$user"; }
 regen_indexes() { ksh "$script_dir/cron-apply.sh" --web; }
 restart_smtpd() { rcctl restart smtpd >/dev/null; }
@@ -195,6 +198,20 @@ remove_member() {
 			remove_account
 			printf 'removed the account %s, its home and its Maildir\n' "$user"
 		fi
+		# The member's own group, after the account. add-user.sh gives each account
+		# a group of its name; a group left behind makes the next account with that
+		# name take a numbered gid, and the provision's ownership check then
+		# refuses the tree it built. Inside the account's guard, so a second run
+		# is silent like the rest.
+		if group_exists; then
+			if [ "$show" = yes ]; then
+				printf 'would remove the group %s\n' "$user"
+			else
+				remove_group \
+					&& printf 'removed the group %s\n' "$user" \
+					|| printf 'warning: the group %s was not removed (groupdel failed)\n' "$user" >&2
+			fi
+		fi
 	fi
 
 	# 7. The member's own line in the mail virtual table, which provisioning
@@ -224,10 +241,25 @@ remove_member() {
 		fi
 	fi
 
+	# The onboarding service's record of the account, last. The note below says the
+	# rest of the store is the drain's and it is right: those are records of money,
+	# publication and retention. This one is not, because the drain reads it to
+	# decide whether a name is taken, so leaving it behind makes the next approval
+	# refuse the name as an account that still exists.
+	if [ -d "$onboard_store/accounts/$user" ]; then
+		if [ "$show" = yes ]; then
+			printf 'would remove the store record %s/accounts/%s\n' "$onboard_store" "$user"
+		else
+			rm -rf "$onboard_store/accounts/$user"
+			printf 'removed the store record %s/accounts/%s\n' "$onboard_store" "$user"
+			did=yes
+		fi
+	fi
+
 	# The last line, and the reason a run that did something is not silent.
 	if [ "$did" = yes ] && [ "$show" = no ]; then
-		printf 'not this script'"'"'s: the store record, the ledger line, the keyring'"'"'s published\n'
-		printf '  set, the backup window and the 90-day username hold. All the drain'"'"'s.\n'
+		printf 'not this script'"'"'s: the ledger line, the keyring'"'"'s published set, the\n'
+		printf '  backup window and the 90-day username hold. All the drain'"'"'s.\n'
 	fi
 	return 0
 }
@@ -277,15 +309,19 @@ self_test() {
 	HTTPD_D="$tree/etc/httpd.d"; GMID_D="$tree/etc/gmid.d"; ACME_D="$tree/etc/acme-client.d"
 	SSL_DIR="$tree/etc/ssl"; SSL_PRIVATE="$tree/etc/ssl/private"
 	VIRTUALS="$tree/etc/mail/virtuals"
+	ONBOARD_STORE="$tree/store"
 	www_root="$WWW_ROOT"; httpd_d="$HTTPD_D"
 	gmid_d="$GMID_D"; acme_d="$ACME_D"; ssl_dir="$SSL_DIR"
 	ssl_private="$SSL_PRIVATE"; virtuals="$VIRTUALS"
+	onboard_store="$ONBOARD_STORE"
 
 	mkdir -p "$httpd_d" "$gmid_d" "$acme_d" "$ssl_private" "$www_root" "$(dirname "$virtuals")"
 
 	# The predicate and the steps, recorded rather than run.
 	account_exists() { return 0; }
+	group_exists() { return 0; }
 	remove_account() { printf 'userdel -r %s\n' "$user" >>"$case_dir/calls"; }
+	remove_group() { printf 'groupdel %s\n' "$user" >>"$case_dir/calls"; }
 	clear_quota() { printf 'quota-apply --clear %s\n' "$user" >>"$case_dir/calls"; }
 	regen_indexes() { printf 'cron-apply --web\n' >>"$case_dir/calls"; }
 	restart_smtpd() { printf 'rcctl restart smtpd\n' >>"$case_dir/calls"; }
@@ -297,7 +333,7 @@ self_test() {
 	user=alice
 	show=no
 	public="$www_root/$user.kyriakon.net"
-	mkdir -p "$public/www"
+	mkdir -p "$public/www" "$onboard_store/accounts/$user"
 	: >"$httpd_d/$user.kyriakon.net.conf"
 	: >"$gmid_d/$user.kyriakon.net.conf"
 	: >"$acme_d/$user.kyriakon.net.conf"
@@ -323,9 +359,18 @@ self_test() {
 	check "the order starts with the indexes" "$(awk 'NR == 1' "$case_dir/calls")" 'cron-apply --web'
 	check "and the account goes last of the tools" "$(awk 'NR == 3' "$case_dir/calls")" 'userdel -r alice'
 	check "smtpd restarted once" "$(grep -c 'rcctl restart smtpd' "$case_dir/calls")" 1
+	check "the member's group goes after the account" "$(awk 'NR == 4' "$case_dir/calls")" 'groupdel alice'
+	# The store's record goes too: the drain reads it to decide whether a name is
+	# taken, and an account deleted without it makes the next approval refuse the
+	# name as one that exists.
+	check "the store record goes with the account" \
+		"$([ -d "$onboard_store/accounts/alice" ] && printf no || printf yes)" yes
+	check "and the note no longer lists it" \
+		"$(grep -c "not this script's: the ledger line" "$tree/first.out" || true)" 1
 
 	# A second run against the same tree must do nothing and say nothing.
 	account_exists() { return 1; }
+	group_exists() { return 1; }
 	: >"$case_dir/calls"
 	remove_member >"$tree/second.out" 2>"$tree/second.err"
 	check "a second run is silent on stdout" "$(wc -c <"$tree/second.out" | tr -d ' ')" 0

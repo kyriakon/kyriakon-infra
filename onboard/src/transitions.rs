@@ -121,8 +121,15 @@ async fn spawn_script(
     args: &[&str],
 ) -> Result<std::process::Output, String> {
     let path = format!("{}/{}", cfg.scripts.trim_end_matches('/'), name);
+    // The drain runs from root cron, whose PATH is /usr/bin:/bin, and the scripts
+    // it runs reach the packages in /usr/local: without this, a provision's
+    // reload call cannot find gmid, refuses, and fails the whole approval.
     Command::new(&path)
         .args(args)
+        .env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin",
+        )
         .output()
         .await
         .map_err(|e| format!("cannot run {path}: {e}"))
