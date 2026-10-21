@@ -57,8 +57,9 @@
 # Read-only. Exits non-zero when something is wrong, so cron could run it, though
 # the daily mail already covers the permissions half.
 #
-#   ksh scripts/check-hygiene.sh --self-test   section 7's comparison and section
-#                                              3's remedy lines, and nothing else
+#   ksh scripts/check-hygiene.sh --self-test   section 7's comparison, section 3's
+#                                              remedy lines and section 8's address
+#                                              check, and nothing else
 
 set -euo pipefail
 
@@ -121,9 +122,47 @@ tool_remedy() {
 	done
 }
 
-# The comparison above and the remedy lines below, against fixtures, so a change
-# to either is not a claim. Both drive a function and not the box, which is why
-# this can run anywhere.
+# alert_address_problem <env-file> <mail-domains-file>
+#
+# Why the address notify_operator mails is not usable, one line, or nothing. It
+# matters more than it reads: an address that cannot receive does not fail the
+# alert, it demotes it. notify_operator prints instead, cron mails the print, and
+# the mail arrives under cron's own subject with the component and the event gone
+# from the one field an operator triages on.
+#
+# The file is sourced rather than parsed, because that is how the cron lines and
+# lib.sh read it, and a value this cannot see is a value they cannot see either.
+alert_address_problem() {
+	typeset env_file="$1" domains="$2" value domain
+	value=$(env -i PATH=/usr/bin:/bin:/usr/local/bin sh -c \
+		". '$env_file'; printf '%s' \"\${ALERT_EMAIL:-}\"" 2>/dev/null) || value=''
+	case "$value" in
+	"")
+		printf 'ALERT_EMAIL is not set in %s, so every alert falls back to printing and cron mails it under its own subject\n' \
+			"$env_file"
+		return 0
+		;;
+	*REPLACE_ME*)
+		printf 'ALERT_EMAIL in %s is still the template placeholder (%s), so nothing can be mailed to it\n' \
+			"$env_file" "$value"
+		return 0
+		;;
+	*@*) ;;
+	*)
+		printf 'ALERT_EMAIL in %s is not an address: %s\n' "$env_file" "$value"
+		return 0
+		;;
+	esac
+	domain=${value##*@}
+	if [ -f "$domains" ] && grep -qxF "$domain" "$domains"; then
+		printf 'ALERT_EMAIL is %s, and this box accepts mail for %s: a mail box cannot report its own mail being broken\n' \
+			"$value" "$domain"
+	fi
+}
+
+# The comparison above, the remedy lines and the address check below, against
+# fixtures, so a change to any of them is not a claim. All three drive a function
+# and not the box, which is why this can run anywhere.
 self_test() {
 	typeset dir out want
 	dir=$(mktemp -d "${TMPDIR:-/tmp}/check-hygiene-test.XXXXXX") || exit 1
@@ -197,6 +236,49 @@ self_test() {
 		exit 1
 	}
 
+	# Section 8: an address that cannot receive is a silent demotion rather than
+	# an error, so each way it goes wrong has to be named.
+	printf 'kyriakon.net\nparish.example\n' > "$dir/domains"
+	printf "export ALERT_EMAIL='REPLACE_ME_OFF_BOX_ADDRESS'\n" > "$dir/env"
+	out=$(alert_address_problem "$dir/env" "$dir/domains")
+	case "$out" in
+	*placeholder*)
+		;;
+	*)
+		printf 'FAIL: the template placeholder is a finding; got [%s]\n' "$out" >&2
+		exit 1
+		;;
+	esac
+
+	printf "export ALERT_EMAIL='ops@kyriakon.net'\n" > "$dir/env"
+	out=$(alert_address_problem "$dir/env" "$dir/domains")
+	case "$out" in
+	*'this box accepts mail for kyriakon.net'*)
+		;;
+	*)
+		printf 'FAIL: an address this box hosts is a finding; got [%s]\n' "$out" >&2
+		exit 1
+		;;
+	esac
+
+	printf "export ALERT_EMAIL='ops@example.org'\n" > "$dir/env"
+	out=$(alert_address_problem "$dir/env" "$dir/domains")
+	[ -z "$out" ] || {
+		printf 'FAIL: an off-box address is not a finding; got [%s]\n' "$out" >&2
+		exit 1
+	}
+
+	printf 'export HEALTHCHECKS_URL=example\n' > "$dir/env"
+	out=$(alert_address_problem "$dir/env" "$dir/domains")
+	case "$out" in
+	*'not set'*)
+		;;
+	*)
+		printf 'FAIL: an unset address is a finding; got [%s]\n' "$out" >&2
+		exit 1
+		;;
+	esac
+
 	printf 'check-hygiene: self-test passed\n'
 }
 
@@ -237,6 +319,8 @@ fi
 ip="${PUBLIC_IP:-$(ifconfig egress inet 2>/dev/null | awk '/inet / { print $2; exit }')}"
 if [ -z "$ip" ]; then
 	printf 'blocklist: cannot determine this box address\n'
+	# Not a clean run: an address that could not be determined was not checked.
+	status=1
 	exit "$status"
 fi
 verdict=$(dnsbl_verdict "$ip")
@@ -423,6 +507,27 @@ else
 		status=1
 	else
 		printf 'mail domains: every domain smtpd accepts is in the greylist pass-through list\n'
+	fi
+fi
+
+# --- 8. the address every alert is mailed to ------------------------------
+# notify_operator in lib.sh mails this address and prints when it cannot. The
+# print is the fallback, not the plan: cron mails it under its own subject, where
+# the component and the event are gone. The file is root's, so this half runs on
+# the box as root or not at all.
+env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
+if [ ! -r "$env_file" ]; then
+	printf 'alert address: %s is unreadable, so whether an alert can leave the box is unchecked (needs root)\n' \
+		"$env_file"
+	status=1
+else
+	address_problem=$(alert_address_problem "$env_file" "$mail_domains_table")
+	if [ -n "$address_problem" ]; then
+		printf 'alert address: %s\n' "$address_problem"
+		printf '  set it with scripts/setup-env.sh --alert-email <address>, at an address off this box\n'
+		status=1
+	else
+		printf 'alert address: set, and off this box\n'
 	fi
 fi
 

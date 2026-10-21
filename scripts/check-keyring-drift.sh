@@ -45,12 +45,13 @@
 # merged state at the moment it runs. A stale checkout would show the old
 # fingerprint for a rewritten key and miss the substitution entirely.
 #
-# Alerts go off the box by the route scripts/abuse-monitor.sh uses: mail to
-# ALERT_EMAIL, and this check's own Healthchecks URL carrying the finding in its
-# event log. A clean run pings that URL too, so silence means the check stopped
-# running. The monitor's HEALTHCHECKS_URL is deliberately not reused: its period
-# belongs to a fifteen-minute job, and a second, daily pinger would make its
-# liveness say nothing.
+# Alerts go off the box through notify_operator in lib.sh, the route every
+# scheduled script uses: the subject names the component and the event, and the
+# body carries the finding. This check's own Healthchecks URL carries the finding
+# into its event log as well. A clean run pings that URL too, so silence means the
+# check stopped running. The monitor's HEALTHCHECKS_URL is deliberately not reused:
+# its period belongs to a fifteen-minute job, and a second, daily pinger would make
+# its liveness say nothing.
 #
 # Nothing here changes delivery. The box keyring is what encrypts, a publication
 # lag must never bounce a member's mail, and an alert is for a human to look at.
@@ -136,32 +137,30 @@ export GNUPGHOME="$tmp/gnupg"
 mkdir -m 700 "$GNUPGHOME"
 
 # die <message>: the check could not do its job. An unattended run that cannot see
-# the keyring is not the same as a clean one, so say so on the same off-box channel
-# and leave a status that cron and a human can tell apart from drift.
+# the keyring is not the same as a clean one, so it goes out the way a finding does,
+# with a subject that says this was not a finding, and leaves a status that cron and
+# a human can tell apart from drift.
 die() {
-	printf '%s: %s\n' "$0" "$1" >&2
+	notify_operator keyring "could not run" "$1" \
+		"the check did not run, so its silence says nothing either way; the next daily run is the retry"
 	if [ -n "${KEYRING_HEALTHCHECKS_URL:-}" ]; then
 		ping_url "$KEYRING_HEALTHCHECKS_URL/fail"
 	fi
 	exit 2
 }
 
-# alert <title> <body>: mail off the box, and carry the body into the check's
-# event log. Never fails the caller: an alert that cannot be sent must not become a
-# second failure stacked on the one being reported.
+# alert <event> <body>: mail off the box, and carry the body into the check's
+# event log. The subject and the print-when-mail-fails fallback are notify_operator's,
+# so this check's mail has the same shape as every other script's: the component is
+# keyring and the event is the one word the caller names.
 alert() {
-	title="$1"
-	body="$2"
+	typeset event="$1" body="$2" when
 	when=$(date '+%F %T')
-	if [ -n "${ALERT_EMAIL:-}" ]; then
-		printf '%s\n\n%s on %s\n' "$body" "$title" "$(hostname)" |
-			mail -s "kyriakon: $title" "$ALERT_EMAIL" >/dev/null 2>&1 || true
-	fi
+	notify_operator keyring "$event" "$body"
 	if [ -n "${KEYRING_HEALTHCHECKS_URL:-}" ]; then
-		curl -fsS -m 10 --retry 3 --data "$when $title: $body" "$KEYRING_HEALTHCHECKS_URL" \
+		curl -fsS -m 10 --retry 3 --data "$when keyring $event: $body" "$KEYRING_HEALTHCHECKS_URL" \
 			>/dev/null 2>&1 || true
 	fi
-	printf '%s %s: %s\n%s\n' "$when" "$title" "$(hostname)" "$body" >&2
 }
 
 # fpr_of <file>: the primary fingerprint of the first key in a public key file, or
@@ -450,7 +449,7 @@ case "$mode" in
 esac
 
 if [ -s "$findings" ]; then
-	alert "keyring drift" "$(cat "$findings")"
+	alert drift "$(cat "$findings")"
 	exit 1
 fi
 

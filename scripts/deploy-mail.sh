@@ -1112,6 +1112,19 @@ else
 		|| printf 'WARNING: fill in %s before deploy-nsd or cron-apply\n' "$env_dst"
 fi
 
+# A placeholder is not a value, and the failure it causes is silent by design:
+# mail to REPLACE_ME_OFF_BOX_ADDRESS fails, notify_operator falls back to
+# printing, and cron sends it under its own subject, so every alert loses the
+# component and the event in the field an operator triages on. The same applies
+# to a healthcheck URL this box reads as a dead-man's switch it is not pinging.
+# This is the deploy that installs the cron scripts, so it is the one that says
+# so; check-hygiene.sh reports the live value afterwards.
+if grep -q 'REPLACE_ME' "$env_dst"; then
+	die "$env_dst still carries a placeholder:
+$(grep -n 'REPLACE_ME' "$env_dst" | sed -e 's/^/  /')
+set it with scripts/setup-env.sh before deploying, or every alert falls back to cron's own subject"
+fi
+
 home=$(awk -F: '$1 == "oliver" { print $6 }' /etc/passwd)
 [ -n "$home" ] || { printf 'cannot read the home directory for oliver from /etc/passwd\n' >&2; exit 1; }
 shell=$(awk -F: '$1 == "oliver" { print $7 }' /etc/passwd)
