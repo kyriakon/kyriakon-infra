@@ -17,6 +17,7 @@ pub mod intents;
 pub mod keycheck;
 pub mod notice;
 pub mod page;
+pub mod password;
 pub mod portal;
 pub mod questions;
 pub mod rate;

@@ -45,7 +45,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::fcgi::{self, Reply, Request};
-use crate::page::{AccountPage, DecidePage, NoticePage, ReceivedPage, StatusPage};
+use crate::page::{AccountPage, DecidePage, NoticePage, PasswordPage, ReceivedPage, StatusPage};
 use crate::questions::{Branch, Question, Rule};
 use crate::rate::Key;
 use crate::store::{Acceptance, KeyRecord, Record, Store};
@@ -437,6 +437,19 @@ async fn http(app: &App, request: &Request, incoming: &Incoming) -> Reply {
         }
         return method_not_allowed();
     }
+    // The one-time password link. The page is a form and the submission files an
+    // intent; the link's signature is checked by the drain, which holds the key.
+    if let Some(token) = incoming.path.strip_prefix("password/") {
+        if get {
+            let query = fields(request.value("QUERY_STRING"));
+            return password_page(app, token, &query).await;
+        }
+        if method == "POST" {
+            let form = fields(&String::from_utf8_lossy(&request.body));
+            return password_file(app, token, &form).await;
+        }
+        return method_not_allowed();
+    }
     if incoming.path == "apply" {
         if method != "POST" {
             return method_not_allowed();
@@ -751,6 +764,93 @@ async fn decide_file(app: &App, token: &str, form: &BTreeMap<String, String>) ->
             "The decision is filed. The platform carries it out on its next pass, within a minute.",
         )),
         Err(e) => server_error(&format!("the decision could not be filed: {e}")),
+    }
+}
+
+/// Whether the date a password link carries is still ahead of today. The drain
+/// checks the same value under the signature; this is the page's copy of the
+/// rule, not the rule itself.
+fn password_window_open(until: &str) -> bool {
+    until >= crate::util::date_after_days(0).as_str()
+}
+
+#[cfg(test)]
+mod password_window_tests {
+    use super::password_window_open;
+
+    #[test]
+    fn a_past_date_is_closed_and_today_is_open() {
+        // The link's date is signed with its token, so the drain checks the same
+        // value; this only decides whether the form is shown.
+        assert!(!password_window_open("2000-01-01"));
+        assert!(password_window_open(&crate::util::date_after_days(0)));
+        assert!(password_window_open(&crate::util::date_after_days(1)));
+    }
+}
+
+/// The form behind a one-time password link.
+///
+/// Past its window, or once the record no longer holds a link, this is the
+/// unknown-token page byte for byte: that page is a function of nothing, so the
+/// two cannot drift apart.
+async fn password_page(app: &App, token: &str, query: &BTreeMap<String, String>) -> Reply {
+    let Some(record) = record_for(app, token).await else {
+        return capability(&status_page(None, OffsetDateTime::now_utc()));
+    };
+    let (Some(until), Some(sig)) = (query.get("until"), query.get("sig")) else {
+        return capability(&status_page(None, OffsetDateTime::now_utc()));
+    };
+    if record.password_link.is_none() || !password_window_open(until) {
+        return capability(&status_page(None, OffsetDateTime::now_utc()));
+    }
+    capability(&PasswordPage {
+        username: record.username,
+        token: token.to_string(),
+        until: until.clone(),
+        sig: sig.clone(),
+        error: None,
+    })
+}
+
+/// The submission: check the password, hash it, and file the intent the drain
+/// verifies and applies. The signature travels with it, because the handler
+/// holds no key and proves nothing on its own.
+async fn password_file(app: &App, token: &str, form: &BTreeMap<String, String>) -> Reply {
+    let Some(record) = record_for(app, token).await else {
+        return capability(&status_page(None, OffsetDateTime::now_utc()));
+    };
+    let (Some(until), Some(sig)) = (form.get("until"), form.get("sig")) else {
+        return capability(&status_page(None, OffsetDateTime::now_utc()));
+    };
+    if record.password_link.is_none() || !password_window_open(until) {
+        return capability(&status_page(None, OffsetDateTime::now_utc()));
+    }
+    let password = form.get("password").map(String::as_str).unwrap_or("");
+    let confirm = form.get("confirm").map(String::as_str).unwrap_or("");
+    let problem = if password != confirm {
+        Some("The two passwords do not match.".to_string())
+    } else {
+        crate::password::validate(password).err()
+    };
+    if let Some(problem) = problem {
+        return capability(&PasswordPage {
+            username: record.username,
+            token: token.to_string(),
+            until: until.clone(),
+            sig: sig.clone(),
+            error: Some(problem),
+        });
+    }
+    let hash = match crate::password::make(password) {
+        Ok(hash) => hash,
+        Err(e) => return server_error(&e),
+    };
+    match intents::file_password(&app.store, &record.username, token, until, sig, &hash).await {
+        Ok(_) => capability(&notice(
+            "Password set",
+            "The platform sets it on its next pass, within a minute. This link will not work again.",
+        )),
+        Err(e) => server_error(&format!("the password could not be filed: {e}")),
     }
 }
 

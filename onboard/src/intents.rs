@@ -67,6 +67,11 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
                 .map_err(|e| format!("the decision intent does not parse: {e}"))?;
             transitions::decision(cfg, store, key, intent, file).await
         }
+        "set-password" => {
+            let intent: transitions::PasswordIntent = serde_json::from_value(value.clone())
+                .map_err(|e| format!("the password intent does not parse: {e}"))?;
+            transitions::set_password(cfg, store, key, intent, file, &value).await
+        }
         _ => transitions::refuse(cfg, store, file, &value).await,
     }
 }
@@ -93,6 +98,37 @@ pub async fn file_decision(
         "application": { "username": username, "status_token": token },
         "action": action,
         "sig": sig,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    Ok(id)
+}
+
+/// File a password set through the member's one-time link.
+///
+/// The hash is the handler's and the signature is the link's. The drain checks
+/// the signature before it applies anything, so a forged submission files an
+/// intent that is refused, never a password.
+pub async fn file_password(
+    store: &Store,
+    username: &str,
+    token: &str,
+    until: &str,
+    sig: &str,
+    hash: &str,
+) -> Result<String, String> {
+    let id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({
+        "id": id,
+        "kind": "set-password",
+        "filed_at": crate::util::filed_at(),
+        "application": { "username": username, "status_token": token },
+        "until": until,
+        "sig": sig,
+        "hash": hash,
     });
     let bytes =
         serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;

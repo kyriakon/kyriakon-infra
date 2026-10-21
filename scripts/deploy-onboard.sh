@@ -66,7 +66,7 @@ need_pkg() {
 # ../openbsd/etc/login.conf.d/member), so this deploy installs that file into the
 # layout the relative read resolves to rather than copying the scripts somewhere
 # the read would leave behind.
-drain_scripts="add-user.sh provision-member.sh delete-user.sh quota-apply.sh provision-member-web.sh provision-member-capsule.sh cron-apply.sh publish-mail-key.sh"
+drain_scripts="add-user.sh provision-member.sh delete-user.sh quota-apply.sh provision-member-web.sh provision-member-capsule.sh cron-apply.sh publish-mail-key.sh set-mail-password.sh"
 drain_class="openbsd/etc/login.conf.d/member"
 
 # The service's own account, which scripts/onboard-store.sh refuses to create and
