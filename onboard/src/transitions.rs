@@ -336,7 +336,9 @@ async fn journal_has(store: &Store, id: &str, outcome: &str) -> bool {
 async fn intent_seen(store: &Store, id: &str) -> bool {
     for line in store.lines("journal.jsonl").await {
         if let Ok(j) = serde_json::from_str::<JournalLine>(&line) {
-            if j.intent == id {
+            // A failed line is the reason the next pass retries, not a
+            // settlement: counting it would drop the intent after one failure.
+            if j.intent == id && j.outcome != "failed" {
                 return true;
             }
         }
@@ -549,7 +551,12 @@ pub async fn set_password(
     record["password_link"] = Value::Null;
     let bytes = serde_json::to_vec_pretty(&record)
         .map_err(|e| format!("cannot encode the application record: {e}"))?;
-    store.write_record("applications", &name, &bytes).await?;
+    // `applications/` belongs to the handler, which renders the status page as
+    // _onboard: a root-owned record reads as missing to it.
+    let owner = store.dir_owner("applications");
+    store
+        .write_record_owned("applications", &name, &bytes, owner)
+        .await?;
     journal(
         store,
         &cfg.release,
@@ -559,7 +566,9 @@ pub async fn set_password(
         "applied",
         None,
     )
-    .await
+    .await?;
+    // Done: the file goes, as every other applied transition removes its own.
+    store.remove("intents", file).await
 }
 
 /// Journal a refusal with its reason. The intent is left in place, as `refuse`
@@ -1065,7 +1074,15 @@ async fn approve(
     // enqueued. The address outside the platform when one was given, and the
     // mailbox the approval just created otherwise.
     let subject = decision_subject("approved", username);
-    let body = decision_body(cfg, &record, no_charge, token_ref.as_deref(), &window)?;
+    // Built before the body, so the mail that says the account exists also says
+    // how to set the password. The spec asks for the link in the email and on
+    // the status page both.
+    let password_until = util::date_after_days(7);
+    let password_link = sign::password_link(&cfg.base_url, key, token, &password_until)?;
+    let body = format!(
+        "{}\n\nSet your mail password from this one-time link, which works until {password_until}:\n\n{password_link}\n\nIt works once. The same link is on your status page.\n",
+        decision_body(cfg, &record, no_charge, token_ref.as_deref(), &window)?
+    );
     let notice_type = if no_charge {
         "approval.free"
     } else {
@@ -1080,12 +1097,7 @@ async fn approve(
         token,
         "approved: an account was made",
         &now,
-        Some(sign::password_link(
-            &cfg.base_url,
-            key,
-            token,
-            &util::date_after_days(7),
-        )?),
+        Some(password_link),
     )
     .await?;
     journal(
