@@ -214,9 +214,9 @@ run: $0 on $(hostname) at $(date '+%F %T')"
 # copied into each: the scratch directory and its cleanup, the assertion, and the
 # summary that makes the exit status mean something.
 #
-# Source lib.sh from inside self_test, not at the top of the script: the live path
-# takes no new dependency, and the drain's copies of these scripts run without
-# lib.sh beside them.
+# A script that does not already source lib.sh for its live path sources it from
+# inside self_test, so the live path takes no new dependency. The drain's copies do
+# get lib.sh installed beside them, but only so one can answer --self-test there.
 #
 #   self_test_begin                     # sets $self_test_work, clears the count
 #   check "what it proves" "$got" "$want"

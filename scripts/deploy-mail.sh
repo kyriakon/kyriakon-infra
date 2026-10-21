@@ -274,7 +274,6 @@ case "${1:-}" in
 	[ "$#" -le 2 ] || { printf 'usage: ksh %s [repo_dir] | ksh %s --self-test [repo_root]\n' "$0" "$0" >&2; exit 2; }
 	repo_dir="${2:-$(cd "$(dirname "$0")/.." && pwd)}"
 	self_test
-	exit 0
 	;;
 -*)
 	printf 'usage: ksh %s [repo_dir] | ksh %s --self-test [repo_root]\n' "$0" "$0" >&2

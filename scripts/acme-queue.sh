@@ -338,8 +338,6 @@ run() {
 # before any mode reads the live store or runs as root, so it is safe unprivileged
 # on any machine (the same shape as scripts/abuse-monitor.sh --self-test).
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	work=$self_test_work
@@ -418,7 +416,6 @@ done
 
 if [ "$mode" = self-test ]; then
 	self_test
-	exit 0
 fi
 
 if [ "$mode" = add ] || [ "$mode" = run ]; then

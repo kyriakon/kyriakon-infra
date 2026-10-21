@@ -359,7 +359,6 @@ esac
 
 if [ "$self_test_mode" = yes ]; then
 	self_test
-	exit $?
 fi
 
 if [ "$#" -ne 1 ]; then

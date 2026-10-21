@@ -357,7 +357,6 @@ STUB
 
 if [ "$self_test_mode" = yes ]; then
 	self_test
-	exit 0
 fi
 
 if [ "$web_only" = yes ]; then

@@ -156,8 +156,6 @@ newest_snapshot_epoch() {
 }
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	work=$self_test_work
@@ -267,7 +265,6 @@ STUB
 # writes state, so it is safe to run as an unprivileged user on any machine.
 if [ "${1:-}" = "--self-test" ]; then
 	self_test
-	exit 0
 fi
 
 # --- one run at a time ------------------------------------------------------
