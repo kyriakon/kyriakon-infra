@@ -174,12 +174,14 @@ with a pool, since each retry arrives on a different one.
 
 ### What is in the list, and where each entry came from
 
-Two providers, each taken from its own mailing SPF rather than from memory:
+Three providers, each taken from its own mailing SPF rather than from memory:
 
 	Microsoft (Outlook.com, Exchange Online)
 	  dig +short TXT spf.protection.outlook.com
 	Google (Gmail, Workspace)
 	  dig +short TXT _spf.google.com
+	GitHub (noreply@github.com, out-N.smtp.github.com)
+	  dig +short TXT github.com
 
 Microsoft's entries are its mail relays. Google's `74.125.0.0/16` and
 `209.85.128.0/17` are its mail range and not its cloud, which is the distinction
@@ -196,6 +198,16 @@ comparing against are the ones spamd has been tarpitting, which the verbose log
 names:
 
 	grep connected /var/log/daemon | awk '{ print $6 }' | sort | uniq -c | sort -rn
+
+GitHub was added on 2026-10-19. A verification email to `oliver@kyriakon.net` was
+deferred from `192.30.252.129`, which is `out-30.smtp.github.com` sending as
+`noreply@github.com`, and the tuple was still in the table when it was looked at.
+That pool is one range in GitHub's SPF, `ip4:192.30.252.0/22`. The record's other
+includes are Microsoft's mail and Google's mail, which are already listed, and
+four bulk-mail platforms, SendGrid, Mailchimp, Salesforce and Zendesk, which are
+not listed on purpose. Those carry marketing mail, and this domain has no reason
+to pass marketing ranges straight through. The tuple table held no other address
+inside the range before it was added.
 
 
 ## Verifying

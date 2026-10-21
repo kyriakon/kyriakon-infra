@@ -60,12 +60,13 @@ die() {
 }
 
 # Before anything is restored or removed. `${target_root:?}` refuses unset and
-# empty, not `/`: with RESTORE_TARGET_ROOT=/ the line that clears the target
-# expands into `rm -rf //*`, which is the filesystem. A trailing slash is the
-# same value, so it is stripped before the comparison.
+# empty, not `/`, so the root is refused here by name. The removal below is
+# bounded to the dated directories this script writes, which makes this guard a
+# second line rather than the only one. A trailing slash is the same value, so it
+# is stripped before the comparison.
 case "${target_root%/}" in
 "" | /)
-	die "RESTORE_TARGET_ROOT=$target_root is the root of the filesystem, and this script clears its target before restoring into it. Set it to a scratch directory (default /var/restore-test)."
+	die "RESTORE_TARGET_ROOT=$target_root is the root of the filesystem, and this script restores into its target. Set it to a scratch directory (default /var/restore-test)."
 	;;
 esac
 
@@ -87,9 +88,16 @@ restic check --no-lock
 
 # --- 3. full restore ----------------------------------------------------
 mkdir -p "$target_root"
-# Stop weekly restores accumulating. RESTORE_TARGET_ROOT=/ is refused above:
-# `${var:?}` guards unset and empty, not the root directory.
-rm -rf "${target_root:?}"/* 2>/dev/null || true
+# Stop weekly restores accumulating. Only the dated directories this script
+# creates are removed, so a RESTORE_TARGET_ROOT that is a mistyped system path
+# costs a restore run rather than the contents of whatever it points at. A check
+# of the value alone cannot promise that, because `/home` is a plausible typo and
+# a perfectly valid directory. The root itself is refused above.
+for d in "$target_root"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]; do
+	if [ -d "$d" ]; then
+		rm -rf "$d"
+	fi
+done
 mkdir -p "$target"
 restic restore latest --target "$target" --no-lock
 

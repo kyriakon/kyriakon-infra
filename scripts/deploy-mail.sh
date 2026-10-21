@@ -111,23 +111,27 @@ dkim_domains_args() {
 # set_virtual <table> <candidate> <name> <entry>
 #
 # Replace the line whose leading localpart is <name> with <entry>, or append it
-# when there is none, and print which happened. The replacement is written to
-# <candidate> and moved into place. It used to be `cat "$candidate" > "$table"`,
-# whose redirect empties the live table before filling it: this file is the whole
-# answer for local delivery, so a run interrupted in between leaves every address
-# under it unreachable. The mode is set on the candidate because a move brings
-# its own, and mktemp's is 0600 where the table is 0644.
+# when there is none, and print which happened. Both paths write <candidate> and
+# move it into place. The replacement used to be `cat "$candidate" > "$table"`,
+# and the append went straight at the live file: the first empties the table
+# before filling it, and an append interrupted mid-line leaves a fragment that
+# the next run's match does not recognise, so it writes a second line beside it.
+# This file is the whole answer for local delivery, so either failure leaves
+# addresses under it unreachable. The mode is set on the candidate because a move
+# brings its own, and mktemp's is 0600 where the table is 0644.
 set_virtual() {
-	typeset table="$1" candidate="$2" name="$3" entry="$4"
+	typeset table="$1" candidate="$2" name="$3" entry="$4" how
 	if grep -q "^${name}:" "$table"; then
 		sed "s|^${name}:.*|${entry}|" "$table" > "$candidate"
-		chmod 0644 "$candidate"
-		mv "$candidate" "$table"
-		printf 'virtual %s set\n' "$name"
+		how='set'
 	else
-		printf '%s\n' "$entry" >> "$table"
-		printf 'virtual %s added\n' "$name"
+		cat "$table" > "$candidate"
+		printf '%s\n' "$entry" >> "$candidate"
+		how='added'
 	fi
+	chmod 0644 "$candidate"
+	mv "$candidate" "$table"
+	printf 'virtual %s %s\n' "$name" "$how"
 }
 
 # install_smtpd_conf <destination> <candidate>
@@ -192,10 +196,17 @@ self_test() {
 		"$([ "$before" != "$after" ] && printf yes || printf no)" yes
 	check "at the mode the table had" "$(stat -f %Lp "$tree/virtuals")" 644
 
+	before=$(stat -f %i "$tree/virtuals")
 	set_virtual "$tree/virtuals" "$(mktemp "$tree/virtuals.XXXXXX")" dmarc "dmarc: oliver" \
 		> "$tree/add.out" 2>&1
+	after=$(stat -f %i "$tree/virtuals")
 	check "an entry with no line of its own is appended" \
 		"$(grep -c '^dmarc: oliver$' "$tree/virtuals")" 1
+	# The append path replaces the table too: an append interrupted mid-line would
+	# leave a fragment the next run does not match, so it would write a second line
+	# beside it.
+	check "and the table is replaced by that as well" \
+		"$([ "$before" != "$after" ] && printf yes || printf no)" yes
 
 	# A write that cannot be made leaves the table exactly as it was. The candidate
 	# is a directory here, which the redirect refuses, so the failure lands where
@@ -1005,9 +1016,11 @@ start_service spamlogd
 # The list of senders that skip greylisting, read by pf as a table file. spamd
 # promotes an address only when a retry arrives for the same tuple, and a tuple is
 # keyed on the source IP, so a sender that rotates its outbound address between
-# retries is never promoted and is deferred until it gives up. Outlook.com and
-# Exchange Online do that; the pf rules that read this file are added by
-# scripts/pf-apply.sh, and openbsd/etc/nospamd records where the ranges come from.
+# retries is never promoted and is deferred until it gives up. Outlook.com,
+# Exchange Online and GitHub's own out-N.smtp.github.com pool do that; the pf
+# rules that read this file are added by scripts/pf-apply.sh, and
+# docs/planning/research/spamd-greylisting.md records each range and the SPF
+# record it came from.
 say "nospamd"
 nospamd_src="$repo_dir/openbsd/etc/nospamd"
 # A pf table file holds addresses only. A stray line here would fail the later
@@ -1159,7 +1172,10 @@ if pfctl -sr 2>/dev/null | grep -q 'from <nospamd>'; then
 	printf 'greylist exemption: on (%s network(s) loaded)\n' "$kernel_n"
 	if [ "$kernel_n" != "$file_n" ]; then
 		printf '                    but /etc/mail/nospamd holds %s: the table is stale.\n' "$file_n"
-		printf '                    Run: doas ksh scripts/pf-apply.sh\n'
+		# A `persist file` table is read only when the ruleset is loaded, so the
+		# file and the kernel can disagree. This replaces just the table;
+		# pf-apply.sh would also do it, by reloading /etc/pf.conf.
+		printf '                    Run: doas pfctl -t nospamd -T replace -f /etc/mail/nospamd\n'
 	fi
 else
 	printf 'greylist exemption: OFF - senders that rotate their IP will be deferred until they give up.\n'
