@@ -489,9 +489,18 @@ fn a_filed_application_produces_one_review_email() {
     assert!(sent.contains("action=approve&"), "{sent}");
     assert!(sent.contains("action=approve-free&"), "{sent}");
     assert!(sent.contains("action=decline&"), "{sent}");
-    assert!(sent.contains("onboardctl approve secretary"), "{sent}");
-    assert!(sent.contains("onboardctl approve-free secretary"), "{sent}");
-    assert!(sent.contains("onboardctl decline secretary"), "{sent}");
+    assert!(
+        sent.contains("\n  kyriakon-onboardctl approve secretary\n"),
+        "{sent}"
+    );
+    assert!(
+        sent.contains("\n  kyriakon-onboardctl approve-free secretary\n"),
+        "{sent}"
+    );
+    assert!(
+        sent.contains("\n  kyriakon-onboardctl decline secretary\n"),
+        "{sent}"
+    );
     // Each decision link is on a line of its own, so a client that wraps at a
     // fixed width has a chance of keeping the URL whole; and the terminal form
     // is printed before them, because it cannot be wrapped at all.
