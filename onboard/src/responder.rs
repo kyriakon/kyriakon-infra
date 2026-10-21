@@ -212,8 +212,8 @@ fn bind(path: &str) -> Result<UnixListener, String> {
                 .map_err(|e| format!("cannot remove the socket {}: {e}", path.display()))?;
         }
     }
-    let listener =
-        UnixListener::bind(path).map_err(|e| format!("cannot listen on {}: {e}", path.display()))?;
+    let listener = UnixListener::bind(path)
+        .map_err(|e| format!("cannot listen on {}: {e}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
         .map_err(|e| format!("cannot set the mode on {}: {e}", path.display()))?;
     Ok(listener)
@@ -457,7 +457,11 @@ async fn http(app: &App, request: &Request, incoming: &Incoming) -> Reply {
         return apply(app, request, incoming).await;
     }
     if incoming.path == "account" {
-        return if get { account(app) } else { method_not_allowed() };
+        return if get {
+            account(app)
+        } else {
+            method_not_allowed()
+        };
     }
     if incoming.path.is_empty() {
         if get {
@@ -630,8 +634,13 @@ async fn apply(app: &App, request: &Request, incoming: &Incoming) -> Reply {
         body_cross_checks(&form, &mut errors);
     }
     if !errors.is_empty() {
-        let mut page =
-            page::applicant(&app.questions, &app.catalogue, body, &form, &app.cfg.release);
+        let mut page = page::applicant(
+            &app.questions,
+            &app.catalogue,
+            body,
+            &form,
+            &app.cfg.release,
+        );
         page.errors = errors;
         return Reply::html(422, page_html(&page));
     }
@@ -722,6 +731,18 @@ async fn decide_confirm(app: &App, token: &str, query: &BTreeMap<String, String>
         return capability(&status_page(None, OffsetDateTime::now_utc()));
     };
     let Some(decision) = decision_from(query) else {
+        // Two ways to get here, and they are not the same problem. A mail client
+        // that wraps the line cuts the URL at the wrap, which drops the
+        // signature: the link itself is fine and the address the browser got is
+        // not. Saying so is the difference between "try the next link" and "use
+        // the terminal form".
+        if query.get("sig").is_none_or(|s| s.is_empty()) {
+            return refused(
+                "This address is missing the signature, which a mail client that \
+                 wrapped the line will cause. Open the link exactly as it appears \
+                 in the message, or use the onboardctl line below it.",
+            );
+        }
         return refused("This link does not name a decision the platform knows.");
     };
     capability(&DecidePage {
@@ -970,8 +991,16 @@ fn build_record(
         ));
     }
 
-    let upload_key_id = if body { "body_upload_key" } else { "upload_key" };
-    let upload = form.get(upload_key_id).map(String::as_str).unwrap_or("").trim();
+    let upload_key_id = if body {
+        "body_upload_key"
+    } else {
+        "upload_key"
+    };
+    let upload = form
+        .get(upload_key_id)
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim();
     let upload_key =
         (!upload.is_empty()).then(|| key_record(String::new(), upload, KeyKind::Upload));
 
@@ -1065,7 +1094,10 @@ fn mail_key_errors(q: &Question, value: &str, form: &BTreeMap<String, String>) -
     } else if blocks.len() > 1 {
         vec!["one key for one address".to_string()]
     } else {
-        keycheck::pgp_public_key(&blocks[0]).err().into_iter().collect()
+        keycheck::pgp_public_key(&blocks[0])
+            .err()
+            .into_iter()
+            .collect()
     }
 }
 
@@ -1100,7 +1132,13 @@ fn render_applicant(
     answers: &BTreeMap<String, String>,
     errors: &[String],
 ) -> Reply {
-    let mut page = page::applicant(&app.questions, &app.catalogue, body, answers, &app.cfg.release);
+    let mut page = page::applicant(
+        &app.questions,
+        &app.catalogue,
+        body,
+        answers,
+        &app.cfg.release,
+    );
     page.errors = errors.to_vec();
     Reply::html(200, page_html(&page))
 }

@@ -113,7 +113,8 @@ fn run() -> Result<Departure, String> {
 /// without one of the three, and the plain mode is the mode for them.
 fn chosen() -> Mode {
     let term = std::env::var("TERM").unwrap_or_default();
-    let ttys = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 && libc::isatty(libc::STDOUT_FILENO) == 1 };
+    let ttys =
+        unsafe { libc::isatty(libc::STDIN_FILENO) == 1 && libc::isatty(libc::STDOUT_FILENO) == 1 };
     let drawable = ttys && !term.is_empty() && term != "dumb";
     if drawable {
         Mode::Full

@@ -44,11 +44,7 @@ impl Fix {
         }
         let fix = Fix { dir };
         std::fs::write(fix.path("key"), KEY).unwrap();
-        std::fs::set_permissions(
-            fix.path("key"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
+        std::fs::set_permissions(fix.path("key"), std::fs::Permissions::from_mode(0o600)).unwrap();
         // The box's account list, empty to start: the drain reads it to tell its
         // own half-finished approval from somebody else's account.
         std::fs::write(fix.path("passwd"), "").unwrap();
@@ -204,7 +200,9 @@ impl Fix {
             "question_list": "2026-10-01 abc1234",
         });
         std::fs::write(
-            self.dir.join("store/applications").join(format!("{TOKEN}.json")),
+            self.dir
+                .join("store/applications")
+                .join(format!("{TOKEN}.json")),
             serde_json::to_vec_pretty(&record).unwrap(),
         )
         .unwrap();
@@ -454,7 +452,11 @@ fn a_filed_application_produces_one_review_email() {
     let record = fix.filed(
         "secretary",
         "cash",
-        &[("rail", "cash"), ("cannot_pay", "I have no money"), ("intended_use", "For parish mail")],
+        &[
+            ("rail", "cash"),
+            ("cannot_pay", "I have no money"),
+            ("intended_use", "For parish mail"),
+        ],
     );
     fix.file_application(&record);
 
@@ -583,8 +585,14 @@ fn a_password_link_applies_once_and_only_when_signed() {
     let written = std::fs::read_to_string(&log).unwrap_or_default();
     assert_eq!(written.lines().count(), 1, "{written}");
     let journal = std::fs::read_to_string(fix.path("store/journal.jsonl")).unwrap_or_default();
-    assert!(journal.contains("the link has already been used"), "{journal}");
-    assert!(journal.contains("the link's signature does not verify"), "{journal}");
+    assert!(
+        journal.contains("the link has already been used"),
+        "{journal}"
+    );
+    assert!(
+        journal.contains("the link's signature does not verify"),
+        "{journal}"
+    );
 }
 
 /// A click on an already-decided application changes nothing in the store and
@@ -617,7 +625,11 @@ fn a_replayed_approval_changes_nothing() {
     // No second decision email.
     assert_eq!(fix.sent().matches("Subject:").count(), sent_after_first);
     // The journal records that the replay was seen.
-    assert!(fix.journal().contains("already-decided"), "{}", fix.journal());
+    assert!(
+        fix.journal().contains("already-decided"),
+        "{}",
+        fix.journal()
+    );
     assert!(fix.intents().is_empty(), "{:?}", fix.intents());
 }
 
@@ -635,21 +647,35 @@ fn a_paid_approval_writes_a_token_and_a_no_charge_approval_does_not() {
     assert!(out.status.success(), "{}", body(&out));
 
     let account = paid.account("secretary");
-    let token = account["token_ref"].as_str().expect("a paid approval writes a token");
+    let token = account["token_ref"]
+        .as_str()
+        .expect("a paid approval writes a token");
     assert!(token.starts_with("KYR-"), "{token}");
     assert_eq!(token.len(), 18, "{token}");
     assert!(account["paid_until"].is_null(), "{}", account);
-    assert!(!account["window"].is_null(), "a paid approval opens a window");
+    assert!(
+        !account["window"].is_null(),
+        "a paid approval opens a window"
+    );
     // The join and the ledger line, keyed by the token and holding no username.
     assert!(paid.read(&format!("tokens/{token}.json")).contains(token));
     let ledger = paid.read("ledger/payments.jsonl");
     assert_eq!(ledger.lines().count(), 1, "{ledger}");
     assert!(ledger.contains(token), "{ledger}");
-    assert!(!ledger.contains("secretary"), "the ledger holds no username: {ledger}");
+    assert!(
+        !ledger.contains("secretary"),
+        "the ledger holds no username: {ledger}"
+    );
     // The password link is written for the account that has no password.
     let app: Value =
         serde_json::from_str(&paid.read(&format!("applications/{TOKEN}.json"))).unwrap();
-    assert!(app["password_link"].as_str().unwrap().contains("/password/"), "{app}");
+    assert!(
+        app["password_link"]
+            .as_str()
+            .unwrap()
+            .contains("/password/"),
+        "{app}"
+    );
 
     // The free path: no token, no window, no ledger line.
     let free = Fix::new("free");
@@ -664,7 +690,10 @@ fn a_paid_approval_writes_a_token_and_a_no_charge_approval_does_not() {
     assert!(account["paid_until"].is_null(), "{account}");
     assert!(account["window"].is_null(), "{account}");
     assert_eq!(account["no_charge"], json!(true));
-    assert!(free.read("ledger/payments.jsonl").is_empty(), "no ledger line without money");
+    assert!(
+        free.read("ledger/payments.jsonl").is_empty(),
+        "no ledger line without money"
+    );
     assert!(free.names("tokens").is_empty(), "no token without a charge");
 }
 
@@ -683,7 +712,10 @@ fn an_application_that_asked_for_no_charge_is_never_charged() {
     let account = fix.account("secretary");
     assert!(account["token_ref"].is_null(), "{account}");
     assert!(account["window"].is_null(), "{account}");
-    assert!(fix.read("ledger/payments.jsonl").is_empty(), "nothing owed, no ledger line");
+    assert!(
+        fix.read("ledger/payments.jsonl").is_empty(),
+        "nothing owed, no ledger line"
+    );
 }
 
 /// The three decision verbs write the intent the drain reads, and `show` reads
@@ -705,7 +737,11 @@ fn onboardctl_files_a_decision_and_shows_the_application() {
     assert_eq!(intent["action"], json!("approve"));
     let sig = intent["sig"].as_str().unwrap();
     assert!(
-        sign::verify(b"the approval key", &sign::decide_payload(TOKEN, "approve"), sig),
+        sign::verify(
+            b"the approval key",
+            &sign::decide_payload(TOKEN, "approve"),
+            sig
+        ),
         "{intent}"
     );
 
@@ -751,13 +787,21 @@ fn show_names_a_window_only_when_the_account_has_one() {
 
     let account = charged.account("secretary");
     let window = &account["window"];
-    let opened = window["opened_at"].as_str().expect("a charged approval opens a window");
+    let opened = window["opened_at"]
+        .as_str()
+        .expect("a charged approval opens a window");
     let closes = window["closes_at"].as_str().unwrap();
     let out = charged.ctl(&["show", "secretary"]);
     assert!(out.status.success(), "{}", body(&out));
     let text = body(&out);
-    assert!(text.contains("  paid     null: the window is open"), "{text}");
-    assert!(text.contains(&format!("  window   {opened} to {closes}")), "{text}");
+    assert!(
+        text.contains("  paid     null: the window is open"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("  window   {opened} to {closes}")),
+        "{text}"
+    );
 
     let free = Fix::new("show-free");
     let record = free.filed("secretary", "no_charge", &[("rail", "no_charge")]);
@@ -799,7 +843,9 @@ fn a_decline_purges_after_its_week_and_releases_the_username() {
 
     // The first run decides and holds; nothing is purged.
     assert!(
-        fix.dir.join(format!("store/applications/{TOKEN}.json")).exists(),
+        fix.dir
+            .join(format!("store/applications/{TOKEN}.json"))
+            .exists(),
         "a fresh decline is held for its week"
     );
     assert!(fix.sent().contains("was declined"), "{}", fix.sent());
@@ -822,7 +868,9 @@ fn a_decline_purges_after_its_week_and_releases_the_username() {
     assert!(out.status.success(), "{}", body(&out));
 
     assert!(
-        !fix.dir.join(format!("store/applications/{TOKEN}.json")).exists(),
+        !fix.dir
+            .join(format!("store/applications/{TOKEN}.json"))
+            .exists(),
         "the week past, the application is cleared away"
     );
     assert!(
@@ -846,7 +894,11 @@ fn two_runs_over_one_intent_directory_send_nothing_twice() {
 
     assert!(fix.drain().status.success());
     let after_first = fix.snapshot();
-    assert_eq!(fix.sent().matches("Subject:").count(), 1, "one review email");
+    assert_eq!(
+        fix.sent().matches("Subject:").count(),
+        1,
+        "one review email"
+    );
 
     // The same intent again, as a crash before the delete leaves it: the second
     // pass re-reads it and must find the application already reviewed.
@@ -858,9 +910,20 @@ fn two_runs_over_one_intent_directory_send_nothing_twice() {
     assert!(fix.drain().status.success());
     let after_second = fix.snapshot();
 
-    assert_eq!(after_first, after_second, "the second run changed the store");
-    assert_eq!(fix.sent().matches("Subject:").count(), 1, "no second review email");
-    assert!(fix.intents().is_empty(), "the re-read intent is consumed: {:?}", fix.intents());
+    assert_eq!(
+        after_first, after_second,
+        "the second run changed the store"
+    );
+    assert_eq!(
+        fix.sent().matches("Subject:").count(),
+        1,
+        "no second review email"
+    );
+    assert!(
+        fix.intents().is_empty(),
+        "the re-read intent is consumed: {:?}",
+        fix.intents()
+    );
 }
 
 /// A kind this build does not implement is refused by name and left in place,
@@ -888,7 +951,12 @@ fn an_unimplemented_kind_is_left_in_place_and_refused_once() {
     assert!(fix.drain().status.success());
     assert_eq!(fix.intents(), vec![format!("{id}.json")]);
     // The refusal is recorded once, not once per run.
-    assert_eq!(fix.journal().matches("refused").count(), 1, "{}", fix.journal());
+    assert_eq!(
+        fix.journal().matches("refused").count(),
+        1,
+        "{}",
+        fix.journal()
+    );
 }
 
 /// A link the review email carried is the one the drain accepts, and a tampered
@@ -905,7 +973,10 @@ fn a_signed_link_decides_and_a_tampered_one_does_not() {
     let sent = fix.sent();
     let marker = format!("/decide/{TOKEN}?action=approve&sig=");
     let start = sent.find(&marker).expect(&sent) + marker.len();
-    let sig: String = sent[start..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+    let sig: String = sent[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
     assert_eq!(sig.len(), 64, "{sig}");
 
     // A tampered signature is refused and the application is untouched.
@@ -922,7 +993,9 @@ fn a_signed_link_decides_and_a_tampered_one_does_not() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     assert!(
-        !fix.dir.join("store/accounts/secretary/account.json").exists(),
+        !fix.dir
+            .join("store/accounts/secretary/account.json")
+            .exists(),
         "a tampered signature must not decide the application"
     );
     std::fs::remove_file(fix.dir.join("store/intents").join(format!("{id}.json"))).unwrap();
@@ -939,7 +1012,10 @@ fn a_signed_link_decides_and_a_tampered_one_does_not() {
     );
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
-    assert!(fix.dir.join("store/accounts/secretary/account.json").exists());
+    assert!(fix
+        .dir
+        .join("store/accounts/secretary/account.json")
+        .exists());
 }
 
 /// The approval runs the two provisioning scripts in the order the spec fixes.
@@ -963,8 +1039,14 @@ fn an_approval_provisions_with_add_user_first() {
         "the web index and reload should run: {log}"
     );
     // The account holds its own copy of the application and its notices.
-    assert!(fix.dir.join("store/accounts/secretary/account.json").exists());
-    assert!(fix.dir.join("store/accounts/secretary/application.json").exists());
+    assert!(fix
+        .dir
+        .join("store/accounts/secretary/account.json")
+        .exists());
+    assert!(fix
+        .dir
+        .join("store/accounts/secretary/application.json")
+        .exists());
     assert!(!fix.read("accounts/secretary/notices.jsonl").is_empty());
     // The completion line is written, so a finished approval does not read like
     // one that died midway.
@@ -996,7 +1078,10 @@ fn an_approval_writes_the_upload_key_the_builder_reads() {
         "{}",
         fix.scripts_log()
     );
-    assert!(fix.dir.join("store/accounts/secretary/account.json").exists());
+    assert!(fix
+        .dir
+        .join("store/accounts/secretary/account.json")
+        .exists());
 }
 
 /// An approval publishes the member's mail key into the box keyring the
@@ -1014,7 +1099,10 @@ fn an_approval_publishes_the_mail_key_to_the_keyring() {
 
     let path = fix.dir.join("keyring/secretary.asc");
     let published = std::fs::read_to_string(&path).expect("the key is in the keyring");
-    assert!(published.contains("BEGIN PGP PUBLIC KEY BLOCK"), "{published}");
+    assert!(
+        published.contains("BEGIN PGP PUBLIC KEY BLOCK"),
+        "{published}"
+    );
     assert_eq!(
         std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o644,
@@ -1077,7 +1165,10 @@ fn a_failed_publish_is_reported_and_retried_without_touching_the_key() {
     // key: the drain's alert is where a failure report goes now.
     let sent = fix.sent();
     assert!(sent.contains("publish-mail-key.sh"), "{sent}");
-    assert!(sent.contains("secretary"), "the failure names the member: {sent}");
+    assert!(
+        sent.contains("secretary"),
+        "the failure names the member: {sent}"
+    );
     assert!(
         sent.contains("1111 2222 3333 4444"),
         "the failure names the key: {sent}"
@@ -1096,7 +1187,9 @@ fn a_failed_publish_is_reported_and_retried_without_touching_the_key() {
         .modified()
         .unwrap();
     assert!(
-        !fix.dir.join("store/accounts/secretary/account.json").exists(),
+        !fix.dir
+            .join("store/accounts/secretary/account.json")
+            .exists(),
         "an approval whose publish failed is not finished"
     );
     assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
@@ -1142,7 +1235,9 @@ fn an_application_with_no_mail_key_is_refused() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     assert!(
-        !fix.dir.join("store/accounts/secretary/account.json").exists(),
+        !fix.dir
+            .join("store/accounts/secretary/account.json")
+            .exists(),
         "an account with no mail key must not be made"
     );
     assert!(fix.sent().contains("no mail key"), "{}", fix.sent());
@@ -1180,8 +1275,15 @@ fn an_approval_without_an_upload_key_still_builds_the_member() {
         "the builder runs once, address path included: {}",
         fix.scripts_log()
     );
-    assert!(fix.dir.join("store/accounts/secretary/account.json").exists());
-    assert!(fix.names("keys").is_empty(), "no key, no key file: {:?}", fix.names("keys"));
+    assert!(fix
+        .dir
+        .join("store/accounts/secretary/account.json")
+        .exists());
+    assert!(
+        fix.names("keys").is_empty(),
+        "no key, no key file: {:?}",
+        fix.names("keys")
+    );
     // No vhost files were written, so the web reload does not run and prints
     // nothing.
     assert!(
@@ -1206,7 +1308,9 @@ fn a_retried_approval_completes() {
     fix.decide("approve", "secretary");
     assert!(fix.drain().status.success());
     assert!(
-        !fix.dir.join("store/accounts/secretary/account.json").exists(),
+        !fix.dir
+            .join("store/accounts/secretary/account.json")
+            .exists(),
         "the first run must fail at the builder"
     );
     assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
@@ -1224,7 +1328,9 @@ fn a_retried_approval_completes() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     assert!(
-        fix.dir.join("store/accounts/secretary/account.json").exists(),
+        fix.dir
+            .join("store/accounts/secretary/account.json")
+            .exists(),
         "the retry did not complete: {}",
         body(&out)
     );
@@ -1267,18 +1373,40 @@ fn a_failing_intent_reports_once_and_backs_off() {
         "a mailed alert is not printed as well: {}",
         body(&first)
     );
-    assert_eq!(fix.intents().len(), 1, "the intent is left in place: {:?}", fix.intents());
+    assert_eq!(
+        fix.intents().len(),
+        1,
+        "the intent is left in place: {:?}",
+        fix.intents()
+    );
     assert!(fix.journal().contains("\"failed\""), "{}", fix.journal());
 
     // Inside the backoff window the intent is not retried and nothing is mailed.
     let second = fix.drain();
     assert!(second.status.success(), "{}", body(&second));
-    assert!(body(&second).is_empty(), "a backed-off failure is silent: {}", body(&second));
-    assert_eq!(fix.sent().matches("Subject:").count(), 1, "one mail, not one a pass");
-    assert_eq!(fix.journal().matches("\"failed\"").count(), 1, "{}", fix.journal());
+    assert!(
+        body(&second).is_empty(),
+        "a backed-off failure is silent: {}",
+        body(&second)
+    );
+    assert_eq!(
+        fix.sent().matches("Subject:").count(),
+        1,
+        "one mail, not one a pass"
+    );
+    assert_eq!(
+        fix.journal().matches("\"failed\"").count(),
+        1,
+        "{}",
+        fix.journal()
+    );
 
     let third = fix.drain();
-    assert!(body(&third).is_empty(), "still inside the minute: {}", body(&third));
+    assert!(
+        body(&third).is_empty(),
+        "still inside the minute: {}",
+        body(&third)
+    );
 }
 
 /// A drain that cannot mail its alert prints it instead, subject and all. The
@@ -1294,7 +1422,10 @@ fn an_alert_the_box_cannot_mail_is_printed_instead() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     let printed = String::from_utf8_lossy(&out.stderr);
-    assert!(printed.contains("kyriakon: onboard: drain failed"), "{printed}");
+    assert!(
+        printed.contains("kyriakon: onboard: drain failed"),
+        "{printed}"
+    );
     assert!(printed.contains("there is no application"), "{printed}");
     assert!(printed.contains("could not be mailed"), "{printed}");
     assert!(
@@ -1322,7 +1453,11 @@ fn a_missing_approval_key_is_mailed_as_the_drains_own_configuration() {
     );
     assert!(sent.contains("its own configuration"), "{sent}");
     assert_eq!(sent.matches("Subject:").count(), 1, "{}", body(&out));
-    assert!(body(&out).is_empty(), "mailed, so not printed: {}", body(&out));
+    assert!(
+        body(&out).is_empty(),
+        "mailed, so not printed: {}",
+        body(&out)
+    );
 }
 
 /// An approval whose username is already on the box without this application
@@ -1339,7 +1474,9 @@ fn an_approval_for_a_name_the_box_already_has_is_refused() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     assert!(
-        !fix.dir.join("store/accounts/secretary/account.json").exists(),
+        !fix.dir
+            .join("store/accounts/secretary/account.json")
+            .exists(),
         "an account the application did not make must not be adopted"
     );
     // The refusal is mailed, and it names the name: which account is which is the
@@ -1352,11 +1489,18 @@ fn an_approval_for_a_name_the_box_already_has_is_refused() {
             && sent.contains("in use"),
         "the refusal names what it found: {sent}"
     );
-    assert!(body(&out).is_empty(), "mailed, so not printed: {}", body(&out));
+    assert!(
+        body(&out).is_empty(),
+        "mailed, so not printed: {}",
+        body(&out)
+    );
     // Nothing was run against the box's account: no add-user, no builder, no
     // release.
     assert!(fix.scripts_log().is_empty(), "{}", fix.scripts_log());
-    assert!(fix.passwd_file().contains("secretary:"), "the box account is untouched");
+    assert!(
+        fix.passwd_file().contains("secretary:"),
+        "the box account is untouched"
+    );
     assert_eq!(fix.intents().len(), 1, "the intent is left in place");
 }
 
@@ -1388,13 +1532,19 @@ fn a_purge_leaves_a_name_the_box_holds_alone() {
 
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
-    assert!(!fix.dir.join(format!("store/applications/{TOKEN}.json")).exists());
+    assert!(!fix
+        .dir
+        .join(format!("store/applications/{TOKEN}.json"))
+        .exists());
     assert!(
         !fix.scripts_log().contains("delete-user.sh"),
         "the box account's name was released: {}",
         fix.scripts_log()
     );
-    assert!(fix.passwd_file().contains("secretary:"), "the box account is untouched");
+    assert!(
+        fix.passwd_file().contains("secretary:"),
+        "the box account is untouched"
+    );
 }
 
 /// An address the applicant wrote cannot become a second recipient or a header
@@ -1419,18 +1569,23 @@ fn an_address_that_could_inject_a_header_is_refused() {
         let out = fix.drain();
         assert!(out.status.success(), "{}", body(&out));
         assert!(
-            !fix.dir.join("store/accounts/secretary/account.json").exists(),
+            !fix.dir
+                .join("store/accounts/secretary/account.json")
+                .exists(),
             "{bad:?} must not decide the application"
         );
         assert!(
-            !fix
-                .sent()
+            !fix.sent()
                 .lines()
                 .any(|l| l.starts_with("To:") && l.contains("attacker")),
             "an injected recipient became a header: {}",
             fix.sent()
         );
-        assert_eq!(fix.intents().len(), 1, "the intent is left for the reviewer");
+        assert_eq!(
+            fix.intents().len(),
+            1,
+            "the intent is left for the reviewer"
+        );
     }
 }
 
@@ -1455,7 +1610,9 @@ fn a_decision_without_a_good_signature_is_refused() {
     );
     assert!(fix.drain().status.success());
     assert!(
-        !fix.dir.join("store/accounts/secretary/account.json").exists(),
+        !fix.dir
+            .join("store/accounts/secretary/account.json")
+            .exists(),
         "an unsigned decision must not provision anything"
     );
 
@@ -1471,7 +1628,9 @@ fn a_decision_without_a_good_signature_is_refused() {
     );
     assert!(fix.drain().status.success());
     assert!(
-        !fix.dir.join("store/accounts/secretary/account.json").exists(),
+        !fix.dir
+            .join("store/accounts/secretary/account.json")
+            .exists(),
         "a signature over the wrong action must not decide the application"
     );
     // Both are left in place, not silently dropped.
@@ -1490,12 +1649,19 @@ fn a_decided_record_keeps_the_handler_directorys_owner_and_mode() {
     fix.decide("approve", "secretary");
     assert!(fix.drain().status.success());
 
-    let file =
-        std::fs::metadata(fix.dir.join(format!("store/applications/{TOKEN}.json"))).unwrap();
+    let file = std::fs::metadata(fix.dir.join(format!("store/applications/{TOKEN}.json"))).unwrap();
     let dir = std::fs::metadata(fix.dir.join("store/applications")).unwrap();
     assert_eq!(file.mode() & 0o777, 0o600, "the record stays 0600");
-    assert_eq!(file.uid(), dir.uid(), "and owned like the directory it lives in");
-    assert_eq!(file.gid(), dir.gid(), "and its group is the directory's group");
+    assert_eq!(
+        file.uid(),
+        dir.uid(),
+        "and owned like the directory it lives in"
+    );
+    assert_eq!(
+        file.gid(),
+        dir.gid(),
+        "and its group is the directory's group"
+    );
 }
 
 /// A decline with no address outside the platform sends nothing: no mailbox was
@@ -1507,17 +1673,28 @@ fn a_decline_with_no_outside_address_sends_nothing() {
     let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
     fix.file_application(&record);
     assert!(fix.drain().status.success());
-    assert_eq!(fix.sent().matches("Subject:").count(), 1, "the review email");
+    assert_eq!(
+        fix.sent().matches("Subject:").count(),
+        1,
+        "the review email"
+    );
 
     fix.decide("decline", "secretary");
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
-    assert_eq!(fix.sent().matches("Subject:").count(), 1, "no decline email was sent");
+    assert_eq!(
+        fix.sent().matches("Subject:").count(),
+        1,
+        "no decline email was sent"
+    );
     assert!(!fix.sent().contains("declined"), "{}", fix.sent());
     let app: Value =
         serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
     assert!(app["decided_at"].is_string(), "{app}");
-    assert!(app["stage"].as_str().unwrap().starts_with("declined"), "{app}");
+    assert!(
+        app["stage"].as_str().unwrap().starts_with("declined"),
+        "{app}"
+    );
 }
 
 /// The purge clears a declined application away but never releases a username a
@@ -1531,7 +1708,10 @@ fn a_purge_never_releases_a_name_an_account_holds() {
     assert!(fix.drain().status.success());
     fix.decide("approve", "secretary");
     assert!(fix.drain().status.success());
-    assert!(fix.dir.join("store/accounts/secretary/account.json").exists());
+    assert!(fix
+        .dir
+        .join("store/accounts/secretary/account.json")
+        .exists());
 
     // A second application for the same username, for another token, declined a
     // week and more ago.
@@ -1550,7 +1730,8 @@ fn a_purge_never_releases_a_name_an_account_holds() {
         "question_list": "2026-08-01 abc1234",
     });
     std::fs::write(
-        fix.dir.join(format!("store/applications/{OTHER_TOKEN}.json")),
+        fix.dir
+            .join(format!("store/applications/{OTHER_TOKEN}.json")),
         serde_json::to_vec_pretty(&declined).unwrap(),
     )
     .unwrap();
@@ -1559,8 +1740,14 @@ fn a_purge_never_releases_a_name_an_account_holds() {
     assert!(out.status.success(), "{}", body(&out));
     // The declined application is cleared away, the live account is untouched,
     // and no release script ran for a name that is in use.
-    assert!(!fix.dir.join(format!("store/applications/{OTHER_TOKEN}.json")).exists());
-    assert!(fix.dir.join("store/accounts/secretary/account.json").exists());
+    assert!(!fix
+        .dir
+        .join(format!("store/applications/{OTHER_TOKEN}.json"))
+        .exists());
+    assert!(fix
+        .dir
+        .join("store/accounts/secretary/account.json")
+        .exists());
     assert!(
         !fix.scripts_log().contains("delete-user.sh"),
         "a live account's name was released: {}",
@@ -1779,7 +1966,10 @@ fn a_second_application_does_not_reuse_the_first_approvals_payment() {
 
     let token = fix.account("secretary")["token_ref"].clone();
     let ledger = fix.read("ledger/payments.jsonl");
-    assert!(!ledger.is_empty(), "the first approval opened a window: {ledger}");
+    assert!(
+        !ledger.is_empty(),
+        "the first approval opened a window: {ledger}"
+    );
 
     // The same person applies again, later, and that application is approved.
     let second = json!({
@@ -1803,7 +1993,8 @@ fn a_second_application_does_not_reuse_the_first_approvals_payment() {
         "question_list": "2026-10-01 abc1234",
     });
     std::fs::write(
-        fix.dir.join(format!("store/applications/{OTHER_TOKEN}.json")),
+        fix.dir
+            .join(format!("store/applications/{OTHER_TOKEN}.json")),
         serde_json::to_vec_pretty(&second).unwrap(),
     )
     .unwrap();
@@ -1817,7 +2008,11 @@ fn a_second_application_does_not_reuse_the_first_approvals_payment() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
 
-    assert!(fix.journal().contains("already-member"), "{}", fix.journal());
+    assert!(
+        fix.journal().contains("already-member"),
+        "{}",
+        fix.journal()
+    );
     assert_eq!(
         fix.intents().len(),
         0,
@@ -1825,7 +2020,8 @@ fn a_second_application_does_not_reuse_the_first_approvals_payment() {
         fix.intents()
     );
     assert_eq!(
-        fix.account("secretary")["token_ref"], token,
+        fix.account("secretary")["token_ref"],
+        token,
         "the first approval's token is untouched"
     );
     assert_eq!(

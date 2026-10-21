@@ -79,7 +79,9 @@ pub fn username_shape(value: &str) -> Option<String> {
         .bytes()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
     {
-        return Some("a username is lowercase letters, digits, dot, underscore and hyphen".to_string());
+        return Some(
+            "a username is lowercase letters, digits, dot, underscore and hyphen".to_string(),
+        );
     }
     None
 }
@@ -184,8 +186,9 @@ pub fn address(v: &str) -> Option<String> {
         && parts.next().is_none()
         && domain.contains('.')
         && !v.chars().any(punctuation);
-    (!acceptable)
-        .then(|| "an address outside this platform is one, like someone@example.invalid".to_string())
+    (!acceptable).then(|| {
+        "an address outside this platform is one, like someone@example.invalid".to_string()
+    })
 }
 
 fn choice(opts: &[questions::Choice], v: &str) -> Option<String> {
@@ -217,7 +220,9 @@ mod tests {
     fn a_username_outside_the_charset_is_refused_with_its_reason() {
         let r = name();
         assert!(username("Upper", &r).unwrap().contains("starts with"));
-        assert!(username("bad_name!", &r).unwrap().contains("dot, underscore and hyphen"));
+        assert!(username("bad_name!", &r)
+            .unwrap()
+            .contains("dot, underscore and hyphen"));
     }
 
     #[test]
@@ -328,12 +333,22 @@ mod tests {
     fn the_body_addresses_are_checked_line_by_line() {
         assert!(address_lines("secretary: own\nhall: alias secretary").is_none());
         assert!(address_lines("secretary: own").is_none());
-        assert!(address_lines("secretary").unwrap().contains("not localpart: own"));
+        assert!(address_lines("secretary")
+            .unwrap()
+            .contains("not localpart: own"));
         assert!(address_lines("Bad_Name: own").unwrap().contains("Bad_Name"));
-        assert!(address_lines("hall: alias Bad Target").unwrap().contains("Bad Target"));
-        assert!(address_lines("hall: alias").unwrap().contains("not localpart: own"));
-        assert!(address_lines("hall: shared secretary").unwrap().contains("not localpart: own"));
+        assert!(address_lines("hall: alias Bad Target")
+            .unwrap()
+            .contains("Bad Target"));
+        assert!(address_lines("hall: alias")
+            .unwrap()
+            .contains("not localpart: own"));
+        assert!(address_lines("hall: shared secretary")
+            .unwrap()
+            .contains("not localpart: own"));
         let eleven: Vec<String> = (0..11).map(|i| format!("a{i}: own")).collect();
-        assert!(address_lines(&eleven.join("\n")).unwrap().contains("up to ten"));
+        assert!(address_lines(&eleven.join("\n"))
+            .unwrap()
+            .contains("up to ten"));
     }
 }

@@ -134,7 +134,10 @@ pub async fn send_account_notice(
     let encoded =
         serde_json::to_string(&line).map_err(|e| format!("cannot encode a notice: {e}"))?;
     store
-        .append(&format!("accounts/{username}/notices.jsonl"), encoded.as_bytes())
+        .append(
+            &format!("accounts/{username}/notices.jsonl"),
+            encoded.as_bytes(),
+        )
         .await?;
     enqueue(cfg, to, subject, body).await?;
     Ok(true)
@@ -183,19 +186,44 @@ mod tests {
         let store = Store::new(&cfg.store_root);
         store.ensure_dir("accounts/secretary").await.unwrap();
 
-        assert!(send_account_notice(&cfg, &store, "secretary", "approval.decision", "Your application", "a@b.c", "hello")
-            .await
-            .unwrap());
+        assert!(send_account_notice(
+            &cfg,
+            &store,
+            "secretary",
+            "approval.decision",
+            "Your application",
+            "a@b.c",
+            "hello"
+        )
+        .await
+        .unwrap());
         // The record exists before the send is observable, and the message left.
         let sent = std::fs::read_to_string(dir.join("sent")).unwrap();
         assert!(sent.contains("To: a@b.c"), "{sent}");
         assert!(sent.contains("Subject: Your application"), "{sent}");
         // The second attempt does nothing: no second message, no second line.
-        assert!(!send_account_notice(&cfg, &store, "secretary", "approval.decision", "Your application", "a@b.c", "hello")
-            .await
-            .unwrap());
-        assert_eq!(store.lines("accounts/secretary/notices.jsonl").await.len(), 1);
-        assert_eq!(std::fs::read_to_string(dir.join("sent")).unwrap().matches("Subject:").count(), 1);
+        assert!(!send_account_notice(
+            &cfg,
+            &store,
+            "secretary",
+            "approval.decision",
+            "Your application",
+            "a@b.c",
+            "hello"
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            store.lines("accounts/secretary/notices.jsonl").await.len(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sent"))
+                .unwrap()
+                .matches("Subject:")
+                .count(),
+            1
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

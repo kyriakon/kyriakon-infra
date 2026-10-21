@@ -71,7 +71,10 @@ mod tests {
         assert!(!super::link_answers(decided, at("2026-10-08T09:00:00Z")));
         assert!(!super::link_answers(decided, at("2026-10-09T09:00:00Z")));
         // A decision that cannot be dated is closed, not open.
-        assert!(!super::link_answers("last Tuesday", at("2026-10-01T09:00:00Z")));
+        assert!(!super::link_answers(
+            "last Tuesday",
+            at("2026-10-01T09:00:00Z")
+        ));
     }
 
     #[test]

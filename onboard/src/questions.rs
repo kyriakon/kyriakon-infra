@@ -438,10 +438,7 @@ choices = [
 
     #[test]
     fn maxlen_carries_its_number() {
-        let t = SAMPLE.replace(
-            "validation = \"username\"",
-            "validation = \"maxlen:12\"",
-        );
+        let t = SAMPLE.replace("validation = \"username\"", "validation = \"maxlen:12\"");
         assert_eq!(parse(&t).unwrap()[0].rule, Rule::MaxLen(12));
     }
 

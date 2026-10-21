@@ -498,12 +498,19 @@ mod tests {
     #[tokio::test]
     async fn a_request_reads_its_parameters_in_either_length_form() {
         // gmid's four-byte form and the keep-connection flag.
-        let request = read_request(&mut &fixture::gmid(&[("GEMINI_URL_PATH", "status/x")])[..], 1024)
-            .await
-            .unwrap()
-            .unwrap();
+        let request = read_request(
+            &mut &fixture::gmid(&[("GEMINI_URL_PATH", "status/x")])[..],
+            1024,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(request.value("GEMINI_URL_PATH"), "status/x");
-        assert_eq!(request.value("SERVER_NAME"), "", "an absent parameter is empty");
+        assert_eq!(
+            request.value("SERVER_NAME"),
+            "",
+            "an absent parameter is empty"
+        );
         assert!(request.get("SERVER_NAME").is_none());
         assert!(request.keep_conn);
         assert_eq!(request.id(), 1);
@@ -581,7 +588,10 @@ mod tests {
         let (body, last) = fixture::reply(&bytes);
         assert_eq!(last, END);
         let text = String::from_utf8(body).unwrap();
-        assert!(text.starts_with("Status: 422 Unprocessable Content\r\n"), "{text}");
+        assert!(
+            text.starts_with("Status: 422 Unprocessable Content\r\n"),
+            "{text}"
+        );
         assert!(text.contains("Cache-Control: no-store\r\n"), "{text}");
         assert!(text.ends_with("\r\n\r\n<p>no</p>"), "{text}");
     }
@@ -597,7 +607,10 @@ mod tests {
             let len = u16::from_be_bytes([bytes[at + 4], bytes[at + 5]]) as usize;
             if kind == STDOUT {
                 stdout += 1;
-                assert!(len <= MAX_CONTENT, "no record is longer than the field allows");
+                assert!(
+                    len <= MAX_CONTENT,
+                    "no record is longer than the field allows"
+                );
             } else {
                 assert_eq!(kind, END_REQUEST);
                 assert_eq!(len, 8);

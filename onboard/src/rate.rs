@@ -234,7 +234,10 @@ mod tests {
 
         // The gemini front-end: no forwarded header exists, and the peer is what
         // it keys on.
-        assert_eq!(key(None, Some("2001:db8:1:2::9")), bucket("2001:db8:1:2::9".parse().unwrap()));
+        assert_eq!(
+            key(None, Some("2001:db8:1:2::9")),
+            bucket("2001:db8:1:2::9".parse().unwrap())
+        );
         // Anything that is not an address shares one bucket rather than being
         // read as whatever the environment put there.
         assert_eq!(key(None, Some("UNKNOWN")), Key::UnknownForward);

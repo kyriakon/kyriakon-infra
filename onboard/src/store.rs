@@ -181,7 +181,10 @@ impl Store {
         match tokio::fs::remove_file(&p).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("cannot remove a record in {}: {e}", self.root.join(dir).display())),
+            Err(e) => Err(format!(
+                "cannot remove a record in {}: {e}",
+                self.root.join(dir).display()
+            )),
         }
     }
 
@@ -531,10 +534,7 @@ mod tests {
     #[test]
     fn crockford_pads_at_the_high_end_like_a_ulid() {
         assert_eq!(crockford128([0u8; 16]), "0".repeat(26));
-        assert_eq!(
-            crockford128([0xffu8; 16]),
-            format!("7{}", "z".repeat(25))
-        );
+        assert_eq!(crockford128([0xffu8; 16]), format!("7{}", "z".repeat(25)));
     }
 
     #[tokio::test]
@@ -548,7 +548,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.read_record("applications", "tok.json").await.as_deref(),
+            store
+                .read_record("applications", "tok.json")
+                .await
+                .as_deref(),
             Some("{\"a\":1}")
         );
         // The umask did not widen it.
@@ -572,7 +575,10 @@ mod tests {
     #[tokio::test]
     async fn a_missing_record_is_none_not_an_error() {
         let store = Store::new("/tmp");
-        assert!(store.read_record("applications", "nope.json").await.is_none());
+        assert!(store
+            .read_record("applications", "nope.json")
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -583,7 +589,9 @@ mod tests {
         assert!(is_payment_token(&t), "{t}");
         assert!(!t.contains(['I', 'L', 'O', 'U']), "{t}");
         assert!(
-            t[4..].chars().all(|c| c == '-' || c.is_ascii_uppercase() || c.is_ascii_digit()),
+            t[4..]
+                .chars()
+                .all(|c| c == '-' || c.is_ascii_uppercase() || c.is_ascii_digit()),
             "{t}"
         );
         assert_ne!(t, payment_token().await.unwrap());
@@ -616,10 +624,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("onboard-append-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::new(dir.to_str().unwrap());
-        assert!(store.lines("journal.jsonl").await.is_empty(), "missing reads as empty");
+        assert!(
+            store.lines("journal.jsonl").await.is_empty(),
+            "missing reads as empty"
+        );
         store.append("journal.jsonl", b"{\"a\":1}").await.unwrap();
         store.append("journal.jsonl", b"{\"a\":2}\n").await.unwrap();
-        assert_eq!(store.lines("journal.jsonl").await, vec!["{\"a\":1}", "{\"a\":2}"]);
+        assert_eq!(
+            store.lines("journal.jsonl").await,
+            vec!["{\"a\":1}", "{\"a\":2}"]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
