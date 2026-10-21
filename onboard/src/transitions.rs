@@ -94,6 +94,23 @@ pub struct DecisionIntent {
     pub sig: String,
 }
 
+/// A password set through the member's one-time link. Everything the drain needs
+/// to check it is here, including the signature: the handler holds no key, so
+/// the link's signature is the proof and the drain is the half that checks it.
+#[derive(serde::Deserialize)]
+pub struct PasswordIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub application: ApplicationRef,
+    /// The date the link carried. In the signed payload, never beside it.
+    pub until: String,
+    pub sig: String,
+    /// The bcrypt hash the handler computed. The password itself never travels.
+    pub hash: String,
+}
+
 /// Run one of the repository's privileged scripts by its configured path and
 /// hand back what it wrote. It is called with argv only: there is no shell
 /// anywhere in the drain, and every value that reaches it was validated first.
@@ -465,6 +482,114 @@ async fn application_seen(store: &Store, token: &str, kind: &str, outcome: &str)
 /// Refuse an intent of a kind this build does not implement, by name, and leave
 /// it in place. The journal records the refusal once, so two runs over the same
 /// directory do not append the same line twice.
+/// Apply a password set through a one-time link.
+///
+/// Four checks before anything runs, and each is the half the handler cannot do:
+/// the signature over the token and its date (the key is root-only), the date
+/// still being ahead, the hash being one this build made, and the record still
+/// holding the link. The last is what makes the link one-time: applying it clears
+/// the link, so a replay finds nothing to apply and is refused like any other
+/// spent link.
+pub async fn set_password(
+    cfg: &DrainConfig,
+    store: &Store,
+    key: &[u8],
+    intent: PasswordIntent,
+    file: &str,
+    value: &Value,
+) -> Result<(), String> {
+    if intent_seen(store, &intent.id).await {
+        return Ok(());
+    }
+    let token = intent.application.status_token.as_str();
+    let username = intent.application.username.as_str();
+    let problem = if !sign::verify(
+        key,
+        &sign::password_payload(token, &intent.until),
+        &intent.sig,
+    ) {
+        Some("the link's signature does not verify")
+    } else if intent.until.as_str() < util::date_after_days(0).as_str() {
+        Some("the link's date has passed")
+    } else if !crate::password::is_hash(&intent.hash) {
+        Some("the intent does not carry a bcrypt hash")
+    } else {
+        None
+    };
+    if let Some(problem) = problem {
+        return refuse_with(cfg, store, file, value, problem).await;
+    }
+    let name = format!("{token}.json");
+    let Some(text) = store.read_record("applications", &name).await else {
+        return refuse_with(cfg, store, file, value, "the application record is gone").await;
+    };
+    // Read as a Value and edit one key: the record carries fields this build
+    // does not model, and writing it back through the typed struct would drop
+    // them.
+    let mut record: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("the application record does not parse: {e}"))?;
+    if record.get("username").and_then(Value::as_str) != Some(username) {
+        return refuse_with(cfg, store, file, value, "the intent names another account").await;
+    }
+    if record.get("password_link").is_none_or(Value::is_null) {
+        return refuse_with(cfg, store, file, value, "the link has already been used").await;
+    }
+    run_script(cfg, "set-mail-password.sh", &[username, &intent.hash]).await?;
+    // One use: the record keeps no link, so the page stops answering.
+    record["password_link"] = Value::Null;
+    let bytes = serde_json::to_vec_pretty(&record)
+        .map_err(|e| format!("cannot encode the application record: {e}"))?;
+    store.write_record("applications", &name, &bytes).await?;
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &intent.application,
+        "applied",
+        None,
+    )
+    .await
+}
+
+/// Journal a refusal with its reason. The intent is left in place, as `refuse`
+/// leaves an unknown kind, and the journal's own line stops it being retried.
+async fn refuse_with(
+    cfg: &DrainConfig,
+    store: &Store,
+    file: &str,
+    value: &Value,
+    reason: &str,
+) -> Result<(), String> {
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| file.trim_end_matches(".json").to_string());
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let application = value
+        .get("application")
+        .and_then(|a| serde_json::from_value::<ApplicationRef>(a.clone()).ok())
+        .unwrap_or_else(|| ApplicationRef {
+            username: String::new(),
+            status_token: String::new(),
+        });
+    journal(
+        store,
+        &cfg.release,
+        &id,
+        &kind,
+        &application,
+        "refused",
+        Some(reason),
+    )
+    .await
+}
+
 pub async fn refuse(
     cfg: &DrainConfig,
     store: &Store,

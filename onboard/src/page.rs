@@ -82,6 +82,23 @@ pub struct DecidePage {
     pub sig: String,
 }
 
+/// The page a one-time password link opens. It shows the form; the hash it
+/// submits is checked against the link's signature by the drain, which holds the
+/// key, so this page proves nothing and cannot know the link is spent.
+#[derive(Template)]
+#[template(path = "password.html")]
+pub struct PasswordPage {
+    pub username: String,
+    pub token: String,
+    /// The signed expiry, passed through so the drain checks the same value the
+    /// link carried.
+    pub until: String,
+    pub sig: String,
+    /// Set when the submission was refused, so the form comes back with the
+    /// reason on it rather than a bare page.
+    pub error: Option<String>,
+}
+
 /// A question as the template renders it.
 pub struct Rq {
     pub id: String,

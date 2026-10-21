@@ -17,6 +17,10 @@ askama = "0.14"
 # signature would buy a keypair nothing here needs.
 hmac = "0.12"
 sha2 = "0.10"
+# The member's mail password: bcrypt, because the login is BSD auth against the
+# system account and that reads a $2b$ hash. The handler hashes and the drain
+# sets it, so no plaintext is written anywhere.
+bcrypt = "0.15"
 # sha1 is the handler's one hash of its own, and it is not a check: an OpenPGP
 # version 4 key's fingerprint is the SHA-1 of its framed public key packet, and
 # that is the number gpg prints and the reviewer compares with the key on the

@@ -495,6 +495,98 @@ fn a_filed_application_produces_one_review_email() {
     assert!(fix.intents().is_empty(), "{:?}", fix.intents());
 }
 
+/// A password set through the one-time link is applied once, and only with a
+/// signature over the link's own token and date. The hash reaches the script,
+/// the record stops holding the link, and a replay or a forged signature is
+/// refused without the script being run.
+#[test]
+fn a_password_link_applies_once_and_only_when_signed() {
+    let fix = Fix::new("password");
+    let log = fix.path("password.log");
+    fix.script(
+        "set-mail-password.sh",
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n"),
+    );
+    let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
+    let until = kyriakon_onboard::util::date_after_days(7);
+    let hash = kyriakon_onboard::password::make("correct horse battery").unwrap();
+
+    let mut record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    record["password_link"] = json!(format!(
+        "https://signup.example.invalid/password/{TOKEN}?until={until}&sig=x"
+    ));
+    std::fs::write(
+        fix.path(&format!("store/applications/{TOKEN}.json")),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+
+    let sig = sign::sign(&key, &sign::password_payload(TOKEN, &until)).unwrap();
+    let intent = json!({
+        "id": "01J00000000000000000PASSWORD",
+        "kind": "set-password",
+        "filed_at": "2026-10-21T09:00:00Z",
+        "application": { "username": "secretary", "status_token": TOKEN },
+        "until": until,
+        "sig": sig,
+        "hash": hash,
+    });
+    fix.write_intent("01J00000000000000000PASSWORD", &intent);
+    let out = fix.drain();
+    assert!(
+        out.status.success(),
+        "status {:?}\nstdout: {}\nstderr: {}",
+        out.status,
+        body(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The script ran once, with the account and the hash and never a plaintext.
+    let written = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        written.contains(&format!("secretary {hash}")),
+        "journal: {}",
+        std::fs::read_to_string(fix.path("store/journal.jsonl")).unwrap_or_default()
+    );
+    assert!(!written.contains("correct horse"), "{written}");
+
+    // The link is spent: the record no longer carries it.
+    let after: Value = serde_json::from_str(
+        &std::fs::read_to_string(fix.path(&format!("store/applications/{TOKEN}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert!(after["password_link"].is_null(), "{after}");
+    // And the fields this build does not model survive the write: the record
+    // carries the answers and the rest, and losing them would be silent.
+    assert!(after["answers"].is_object(), "{after}");
+    assert_eq!(after["status_token"], json!(TOKEN), "{after}");
+    assert!(
+        std::fs::read_to_string(fix.path("store/journal.jsonl"))
+            .unwrap_or_default()
+            .contains("\"outcome\":\"applied\""),
+        "the journal should record the apply"
+    );
+
+    // A replay of the same intent is caught by the journal's own dedup, a fresh
+    // click on a spent link by the record, and a forged signature by the key.
+    // None of the three runs the script again.
+    fix.write_intent("01J00000000000000000PASSWORD", &intent);
+    let mut fresh = intent.clone();
+    fresh["id"] = json!("01J00000000000000000SPENT");
+    fix.write_intent("01J00000000000000000SPENT", &fresh);
+    let mut forged = intent.clone();
+    forged["id"] = json!("01J00000000000000000FORGED");
+    forged["sig"] = json!("00".repeat(32));
+    fix.write_intent("01J00000000000000000FORGED", &forged);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let written = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(written.lines().count(), 1, "{written}");
+    let journal = std::fs::read_to_string(fix.path("store/journal.jsonl")).unwrap_or_default();
+    assert!(journal.contains("the link has already been used"), "{journal}");
+    assert!(journal.contains("the link's signature does not verify"), "{journal}");
+}
+
 /// A click on an already-decided application changes nothing in the store and
 /// sends nothing, and the journal records that it was seen.
 #[test]
