@@ -119,7 +119,10 @@ line_for() {
 	# line that says where the detail is.
 	check-hygiene.sh) printf '30 4 * * 1 . /root/.kyriakon-env; ksh /usr/local/src/kyriakon-infra/scripts/check-hygiene.sh >/dev/null || printf "check-hygiene found something; run it as root for the detail\\n"\n' ;;
 	self-test-all.sh) printf '0 5 * * 1 . /root/.kyriakon-env; ksh /usr/local/src/kyriakon-infra/scripts/self-test-all.sh >/dev/null || printf "a self-test failed; run scripts/self-test-all.sh for the detail\\n"\n' ;;
-	kyriakon-onboard-drain) printf '* * * * * %s\n' "$drain_bin" ;;
+	# The env file sets PATH, and the drain's scripts need the packages in
+	# /usr/local: without it, cron-apply.sh inside a provision cannot find gmid,
+	# refuses to reload, and fails the whole approval.
+	kyriakon-onboard-drain) printf '* * * * * . /root/.kyriakon-env; %s\n' "$drain_bin" ;;
 	*) return 1 ;;
 	esac
 }

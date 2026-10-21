@@ -85,8 +85,10 @@ onboard_store=${ONBOARD_STORE:-/var/db/onboard}
 # there is not, which is what makes a second run silent, and a predicate rather
 # than a bare id(1) call because the self-test has to answer it too.
 account_exists() { id "$user" >/dev/null 2>&1; }
+group_exists() { getent group "$user" >/dev/null 2>&1; }
 
 remove_account() { userdel -r "$user"; }
+remove_group() { groupdel "$user" 2>/dev/null; }
 clear_quota() { ksh "$script_dir/quota-apply.sh" --clear "$user"; }
 regen_indexes() { ksh "$script_dir/cron-apply.sh" --web; }
 restart_smtpd() { rcctl restart smtpd >/dev/null; }
@@ -196,6 +198,20 @@ remove_member() {
 			remove_account
 			printf 'removed the account %s, its home and its Maildir\n' "$user"
 		fi
+		# The member's own group, after the account. add-user.sh gives each account
+		# a group of its name; a group left behind makes the next account with that
+		# name take a numbered gid, and the provision's ownership check then
+		# refuses the tree it built. Inside the account's guard, so a second run
+		# is silent like the rest.
+		if group_exists; then
+			if [ "$show" = yes ]; then
+				printf 'would remove the group %s\n' "$user"
+			else
+				remove_group \
+					&& printf 'removed the group %s\n' "$user" \
+					|| printf 'warning: the group %s was not removed (groupdel failed)\n' "$user" >&2
+			fi
+		fi
 	fi
 
 	# 7. The member's own line in the mail virtual table, which provisioning
@@ -303,7 +319,9 @@ self_test() {
 
 	# The predicate and the steps, recorded rather than run.
 	account_exists() { return 0; }
+	group_exists() { return 0; }
 	remove_account() { printf 'userdel -r %s\n' "$user" >>"$case_dir/calls"; }
+	remove_group() { printf 'groupdel %s\n' "$user" >>"$case_dir/calls"; }
 	clear_quota() { printf 'quota-apply --clear %s\n' "$user" >>"$case_dir/calls"; }
 	regen_indexes() { printf 'cron-apply --web\n' >>"$case_dir/calls"; }
 	restart_smtpd() { printf 'rcctl restart smtpd\n' >>"$case_dir/calls"; }
@@ -341,6 +359,7 @@ self_test() {
 	check "the order starts with the indexes" "$(awk 'NR == 1' "$case_dir/calls")" 'cron-apply --web'
 	check "and the account goes last of the tools" "$(awk 'NR == 3' "$case_dir/calls")" 'userdel -r alice'
 	check "smtpd restarted once" "$(grep -c 'rcctl restart smtpd' "$case_dir/calls")" 1
+	check "the member's group goes after the account" "$(awk 'NR == 4' "$case_dir/calls")" 'groupdel alice'
 	# The store's record goes too: the drain reads it to decide whether a name is
 	# taken, and an account deleted without it makes the next approval refuse the
 	# name as one that exists.
@@ -351,6 +370,7 @@ self_test() {
 
 	# A second run against the same tree must do nothing and say nothing.
 	account_exists() { return 1; }
+	group_exists() { return 1; }
 	: >"$case_dir/calls"
 	remove_member >"$tree/second.out" 2>"$tree/second.err"
 	check "a second run is silent on stdout" "$(wc -c <"$tree/second.out" | tr -d ' ')" 0

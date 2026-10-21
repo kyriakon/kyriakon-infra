@@ -417,8 +417,8 @@ ensure_dir() {
 	typeset path mode want
 	path="$1"
 	mode="$2"
-	want="$3:$4 $(strip_mode "$2")"
-	if [ -d "$path" ] && [ "$(stat -f '%Su:%Sg %Lp' "$path")" = "$want" ]; then
+	want="$(id -u "$3"):$4 $(strip_mode "$2")"
+	if [ -d "$path" ] && [ "$(stat -f '%u:%g %Lp' "$path")" = "$want" ]; then
 		return 1
 	fi
 	install -d -m "$mode" -o "$3" -g "$4" "$path"
@@ -429,7 +429,7 @@ ensure_dir() {
 # was just built. This is the last line of defence for the whole script.
 assert_shape() {
 	typeset got want
-	got=$(stat -f '%Su:%Sg %Lp' "$1" 2>/dev/null) || got=missing
+	got=$(stat -f '%u:%g %Lp' "$1" 2>/dev/null) || got=missing
 	want="$2 $(strip_mode "$3")"
 	if [ "$got" != "$want" ]; then
 		printf '%s is %s, wanted %s\n' "$1" "$got" "$want" >&2
@@ -453,7 +453,7 @@ ensure_dir "$home/.ssh" 0700 "$user" "$group" || changed=yes
 # from the account on the next run. Writing only when the bytes, the owner or the
 # mode differ is what lets a second run leave the file's mtime and inode alone.
 if [ -f "$authorized_keys" ] &&
-	[ "$(stat -f '%Su:%Sg %Lp' "$authorized_keys")" = "$user:$group $(strip_mode 0600)" ] &&
+	[ "$(stat -f '%u:%g %Lp' "$authorized_keys")" = "$(id -u "$user"):$group $(strip_mode 0600)" ] &&
 	cmp -s "$key_src" "$authorized_keys"; then
 	:
 else
