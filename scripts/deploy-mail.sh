@@ -1016,6 +1016,12 @@ bad=$(grep -v -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$|^[0-9A-Fa-f:]+(/[0
 }
 install -m 0644 -o root -g wheel "$nospamd_src" /etc/mail/nospamd
 printf 'installed /etc/mail/nospamd (%s networks)\n' "$(grep -c . /etc/mail/nospamd)"
+# A persist file table is read only when the ruleset loads, so a fresh file
+# changes nothing until the table is replaced. Done on every deploy rather than
+# on a diff: a matching count is not a matching set, and a replace is cheap and
+# idempotent. The check near the end still reports a table that disagrees.
+/sbin/pfctl -t nospamd -T replace -f /etc/mail/nospamd \
+	|| printf 'could not replace the nospamd table; the greylist exemption check at the end reports it\n' >&2
 
 # --- 7. account ---------------------------------------------------------
 
