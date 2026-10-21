@@ -105,8 +105,8 @@ gold image in section 1 therefore produces a box that boots, waits, and is delet
 by the standup's own timeout, every week, without ever testing a restore.
 
 Declining encryption costs nothing here, because the template holds nothing worth
-protecting: a base install, `restic jq git`, the two test scripts, and a public key. It
-carries no user data, no repository password, and no storage key. Those two secrets are
+protecting: a base install, `restic jq git` and a public key. It carries no user data, no
+repository password, and no storage key. Those two secrets are
 copied to the throwaway after each boot by `scripts/restore-standup.sh`. What the
 throwaway does hold, in plaintext for the minutes it runs, is the restored data, and that
 residue is the open follow-up recorded in #111 rather than a property of this image.
@@ -127,8 +127,11 @@ So the template is section 1 with these differences:
 
 - Answer **no** to disk encryption at the installer's prompt.
 - Install `restic jq git` rather than `dovecot rspamd restic`.
-- `mkdir -p /root/bin`, and put `lib.sh` and `restore-test.sh` in it, mode 0755. They are
-  in this repo at `scripts/`, and the box can fetch them from the public repository.
+- Nothing needs to be put in `/root/bin`. The standup copies `lib.sh` and
+  `restore-test.sh` from the mail box's checkout after every boot, so the weekly run
+  tests the script the deploy named rather than whatever an older snapshot carried.
+  A box tested by hand still wants the two files there; the standup creates the
+  directory.
 - Append the mail box's `/root/.ssh/kyriakon-standup.pub` to `/root/.ssh/authorized_keys`.
   The standup reaches the throwaway with it after every boot, since the template carries
   it into the snapshot.

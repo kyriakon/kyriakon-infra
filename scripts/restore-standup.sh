@@ -32,6 +32,11 @@
 # /root/.ssh/authorized_keys, and two files this box already has: the restic password at
 # /root/.restic-pass, and the READ-ONLY storage sub-account's private key.
 #
+# The test script is not taken from the image as the source of truth: this copies the
+# checkout's scripts/restore-test.sh and scripts/lib.sh over after every boot, so a fix
+# to the test takes effect on the next weekly run without rebuilding a snapshot.
+# RESTORE_TEST_SCRIPT_DIR overrides where that checkout is.
+#
 # The template is a plain box, and that is forced rather than chosen. A softraid crypto
 # root stops at the passphrase prompt, and nobody is at the console at 03:45 on the
 # morning the test runs, so a template built from an encrypted box never reaches ssh and
@@ -330,6 +335,21 @@ push /root/.ssh/known_hosts /root/.ssh/known_hosts
 # somewhere the box does not keep.
 push /root/scratch/restic-pass "$ro_password"
 printf 'credentials in place\n'
+
+# The test script itself comes from this box's checkout, not from the image. The
+# template carries a copy so a box can be tested by hand, but a copy in an image
+# drifts: the weekly run would test whatever the template was built from, which is
+# how a fix to the test reaches nobody until someone rebuilds a snapshot. The
+# checkout is the deploy's own source, so this is the file the deploy names.
+test_script_dir="${RESTORE_TEST_SCRIPT_DIR:-/usr/local/src/kyriakon-infra/scripts}"
+for s in restore-test.sh lib.sh; do
+	[ -f "$test_script_dir/$s" ] \
+		|| die "no $test_script_dir/$s: the weekly test runs the checkout's script, and the checkout is what this box deploys from"
+done
+remote 'mkdir -p /root/bin'
+remote 'cat > /root/bin/restore-test.sh && chmod 755 /root/bin/restore-test.sh' < "$test_script_dir/restore-test.sh"
+remote 'cat > /root/bin/lib.sh && chmod 755 /root/bin/lib.sh' < "$test_script_dir/lib.sh"
+printf 'test scripts in place, from %s\n' "$test_script_dir"
 
 set +e
 remote "RESTIC_REPOSITORY='$RESTORE_TEST_REPOSITORY' \
