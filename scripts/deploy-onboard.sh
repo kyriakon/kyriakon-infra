@@ -40,6 +40,12 @@ set -euo pipefail
 script_dir=$(cd "$(dirname -- "$0")" && pwd)
 repo_dir="${1:-$(cd "$script_dir/.." && pwd)}"
 
+# The two configs below are written to a candidate and renamed. A write that
+# fails part way leaves a truncated config, and a partial onboard.toml is a
+# handler that refuses to start, which is the fault #423 fixed at the other
+# write sites.
+trap 'rm -f "${onboard_candidate:-}" "${drain_candidate:-}"' EXIT
+
 [ "$(id -u)" -eq 0 ] || { printf 'run as root (doas ksh %s)\n' "$0" >&2; exit 1; }
 
 say() { printf '== %s\n' "$*"; }
@@ -132,19 +138,21 @@ release=$(git -C "$repo_dir" -c "safe.directory=$repo_dir" rev-parse --short HEA
 	|| die "cannot read the commit from $repo_dir, so the release cannot be named"
 release="$release $(date -u +%F)"
 
+onboard_candidate=$(mktemp /etc/onboard/.onboard.toml.XXXXXX)
 sed -e "s|^release = .*|release = \"$release\"|" \
-	"$repo_dir/openbsd/etc/onboard/onboard.toml" > /etc/onboard/onboard.toml
-chmod 0644 /etc/onboard/onboard.toml
+	"$repo_dir/openbsd/etc/onboard/onboard.toml" > "$onboard_candidate"
+chmod 0644 "$onboard_candidate"
 
-# The two ways this substitution goes wrong, both checked: a config that still
-# carries the placeholder (the handler refuses to start, which is deliberate and
-# is why this is caught here first), and one where the line did not match and the
-# file went out with no release at all.
+# The two ways this substitution goes wrong, both checked on the candidate: a
+# config that still carries the placeholder (the handler refuses to start, which
+# is deliberate and is why this is caught here first), and one where the line did
+# not match and the file went out with no release at all.
 awk -v want="release = \"$release\"" '$0 == want { found = 1 } END { exit !found }' \
-	/etc/onboard/onboard.toml || die "/etc/onboard/onboard.toml does not name the release $release"
-if awk '/REPLACE_ME/ { found = 1 } END { exit !found }' /etc/onboard/onboard.toml; then
+	"$onboard_candidate" || die "/etc/onboard/onboard.toml does not name the release $release"
+if awk '/REPLACE_ME/ { found = 1 } END { exit !found }' "$onboard_candidate"; then
 	die "/etc/onboard/onboard.toml still carries a REPLACE_ME placeholder"
 fi
+mv "$onboard_candidate" /etc/onboard/onboard.toml
 
 # The postal address the cash-by-post rail gives out, read from the box's own
 # values file rather than edited on the box: nothing host-specific is edited on
@@ -167,21 +175,23 @@ esac
 # created. The release and the postal address come from the tracked template,
 # substituted here; nothing is edited on the box.
 install -d -m 0700 -o root -g wheel /etc/kyriakon/onboard
+drain_candidate=$(mktemp /etc/kyriakon/onboard/.drain.toml.XXXXXX)
 RELEASE="$release" POSTAL="$POSTAL_ADDRESS" awk '
 	/^release[[:space:]]*=/ { print "release = \"" ENVIRON["RELEASE"] "\""; next }
 	/^postal_address[[:space:]]*=/ { print "postal_address = \"" ENVIRON["POSTAL"] "\""; next }
 	{ print }
-' "$repo_dir/openbsd/etc/onboard/drain.toml" > /etc/kyriakon/onboard/drain.toml
-chmod 0600 /etc/kyriakon/onboard/drain.toml
+' "$repo_dir/openbsd/etc/onboard/drain.toml" > "$drain_candidate"
+chmod 0600 "$drain_candidate"
 awk -v want="release = \"$release\"" '$0 == want { found = 1 } END { exit !found }' \
-	/etc/kyriakon/onboard/drain.toml \
+	"$drain_candidate" \
 	|| die "/etc/kyriakon/onboard/drain.toml does not name the release $release"
-if grep -q '^release = "REPLACE_ME' /etc/kyriakon/onboard/drain.toml; then
+if grep -q '^release = "REPLACE_ME' "$drain_candidate"; then
 	die "/etc/kyriakon/onboard/drain.toml still carries a REPLACE_ME release"
 fi
 awk -v want="postal_address = \"$POSTAL_ADDRESS\"" '$0 == want { found = 1 } END { exit !found }' \
-	/etc/kyriakon/onboard/drain.toml \
+	"$drain_candidate" \
 	|| die "/etc/kyriakon/onboard/drain.toml does not name the postal address; it should have been substituted, not left as a placeholder"
+mv "$drain_candidate" /etc/kyriakon/onboard/drain.toml
 printf 'release: %s\n' "$release"
 
 # The approval key, generated once and never by a later deploy: a second run must
