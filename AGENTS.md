@@ -41,7 +41,9 @@ repo's own root. Two terms most likely to matter while working in this repo:
   `terraform/`. **`terraform plan` is fine to run; `terraform apply` and
   `terraform destroy` are never run by an agent** (see "Never" below).
 - Rust: `cargo test --manifest-path onboard/Cargo.toml` and
-  `cargo clippy --all-targets -- -D warnings`; the same for `kyriakon-encrypt/`.
+  `cargo clippy --manifest-path onboard/Cargo.toml --all-targets -- -D warnings`; the
+  same for `kyriakon-encrypt/`. There is no workspace root, so a command without
+  `--manifest-path`, run from the repository root, does not find `Cargo.toml` at all.
   `cargo fmt --check` runs in CI.
 - Shell scripts (`scripts/`): `shellcheck scripts/*.sh`, and
   `ksh scripts/self-test-all.sh` runs every script's `--self-test` with the arguments
