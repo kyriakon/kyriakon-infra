@@ -262,22 +262,12 @@ apply_web() {
 # function does with the indexes when a reload fails, and that is not something a
 # fixture can be asked about separately.
 self_test() {
-	typeset tree stub fails code index_before gmid_before
-	tree=$(mktemp -d "${TMPDIR:-/tmp}/cron-apply-test.XXXXXX") || exit 1
-	# Script scope, so the EXIT trap still sees it: a function's typeset name is
-	# gone by then, and set -u turns that into a line on stderr and a non-zero exit
-	# on a run where every check passed.
-	self_test_work="$tree"
-	trap 'rm -rf "$self_test_work"' EXIT
-	fails=0
-	check() {
-		if [ "$2" = "$3" ]; then
-			printf '  ok   %s\n' "$1"
-		else
-			printf '  FAIL %s: expected [%s], got [%s]\n' "$1" "$3" "$2"
-			fails=$((fails + 1))
-		fi
-	}
+	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+	. "$(dirname "$0")/lib.sh"
+	typeset tree stub code index_before gmid_before
+	self_test_begin
+	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
+	tree=$self_test_work
 
 	# The daemons pass their configtest and rcctl fails only when told to, so the
 	# box's own configuration is never parsed and its daemons are never signalled.
@@ -362,12 +352,7 @@ STUB
 	check "the daemon that failed keeps the old index" \
 		"$(cat "$gmid_d/index.conf")" "$gmid_before"
 
-	if [ "$fails" -eq 0 ]; then
-		printf 'self-test: all checks passed\n'
-	else
-		printf 'self-test: %s failed\n' "$fails" >&2
-		exit 1
-	fi
+	self_test_end
 }
 
 if [ "$self_test_mode" = yes ]; then

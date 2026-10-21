@@ -281,22 +281,12 @@ assert_member_tree() {
 # TMPDIR.
 
 self_test() {
-	typeset tree fails conf before out
-	tree=$(mktemp -d "${TMPDIR:-/tmp}/provision-member-capsule.XXXXXX")
-	# Script scope, so the EXIT trap still sees it: a function's typeset name is
-	# gone by then, and set -u turns that into a line on stderr and a non-zero exit
-	# on a run where every check passed.
-	self_test_work="$tree"
-	trap 'rm -rf "$self_test_work"' EXIT
-	fails=0
-	check() {
-		if [ "$2" = "$3" ]; then
-			printf '  ok   %s\n' "$1"
-		else
-			printf '  FAIL %s: expected [%s], got [%s]\n' "$1" "$3" "$2"
-			fails=$((fails + 1))
-		fi
-	}
+	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+	. "$(dirname "$0")/lib.sh"
+	typeset tree conf before out
+	self_test_begin
+	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
+	tree=$self_test_work
 
 	gmid_d="$tree/etc/gmid.d"
 	ssl_dir="$tree/etc/ssl"
@@ -348,9 +338,9 @@ self_test() {
 	check "and it says CA:FALSE" \
 		"$("$openssl" x509 -in "$(capsule_cert)" -noout -text | grep -cF 'CA:FALSE')" 1
 	check "it is still valid in ten years less three days" \
-		"$("$openssl" x509 -in "$(capsule_cert)" -noout -checkend $((3650 * 86400 - 3 * 86400)) && echo yes || echo no)" yes
+		"$("$openssl" x509 -in "$(capsule_cert)" -noout -checkend $((3650 * 86400 - 3 * 86400)) >/dev/null 2>&1 && echo yes || echo no)" yes
 	check "and not in ten years plus three days" \
-		"$("$openssl" x509 -in "$(capsule_cert)" -noout -checkend $((3650 * 86400 + 3 * 86400)) && echo yes || echo no)" no
+		"$("$openssl" x509 -in "$(capsule_cert)" -noout -checkend $((3650 * 86400 + 3 * 86400)) >/dev/null 2>&1 && echo yes || echo no)" no
 	check "and the run prints the fingerprint for the help page" \
 		"$(printf '%s\n' "$out" | grep -c '^capsule fingerprint (help page): [0-9A-F][0-9A-F]:')" 1
 
@@ -388,12 +378,7 @@ self_test() {
 	check "and the refusal names provision-member.sh" \
 		"$(grep -c 'scripts/provision-member.sh nobody' "$tree/notree.out")" 1
 
-	if [ "$fails" -eq 0 ]; then
-		printf 'self-test: all checks passed\n'
-	else
-		printf 'self-test: %s failed\n' "$fails" >&2
-		exit 1
-	fi
+	self_test_end
 }
 
 conf_changed=no

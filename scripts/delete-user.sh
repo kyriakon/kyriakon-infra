@@ -265,8 +265,11 @@ remove_own_addresses() {
 # so the logic runs anywhere: no root, no account, no daemon, nothing outside
 # TMPDIR. What it checks is this script's own decisions, not the tools'.
 self_test() {
-	tree=$(mktemp -d "${TMPDIR:-/tmp}/delete-user.XXXXXX") || exit 1
-	trap 'rm -rf "$tree"' EXIT
+	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+	. "$(dirname "$0")/lib.sh"
+	self_test_begin
+	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
+	tree=$self_test_work
 
 	case_dir="$tree/calls"
 	mkdir -p "$case_dir"
@@ -280,15 +283,6 @@ self_test() {
 
 	mkdir -p "$httpd_d" "$gmid_d" "$acme_d" "$ssl_private" "$www_root" "$(dirname "$virtuals")"
 
-	failures=0
-	check() {
-		if [ "$2" = "$3" ]; then
-			printf 'ok   %s\n' "$1"
-		else
-			printf 'FAIL %s (got %s, wanted %s)\n' "$1" "$2" "$3" >&2
-			failures=$((failures + 1))
-		fi
-	}
 	# The predicate and the steps, recorded rather than run.
 	account_exists() { return 0; }
 	remove_account() { printf 'userdel -r %s\n' "$user" >>"$case_dir/calls"; }
@@ -350,10 +344,7 @@ self_test() {
 	check "and names the account" "$(grep -c 'would remove the account alice' "$tree/third.out")" 1
 	check "--show calls no tools" "$(wc -c <"$case_dir/calls" | tr -d ' ')" 0
 
-	printf '\n%s\n' "$([ "$failures" -eq 0 ] && echo 'self-test passed' || echo "self-test FAILED: $failures")"
-	rm -rf "$tree"
-	trap - EXIT
-	[ "$failures" -eq 0 ]
+	self_test_end
 }
 
 # --- the entry --------------------------------------------------------------

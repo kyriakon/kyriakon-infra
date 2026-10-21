@@ -167,22 +167,12 @@ install_checked_conf() {
 }
 
 self_test() {
-	typeset tree fails names link code stub
-	tree=$(mktemp -d "${TMPDIR:-/tmp}/deploy-relayd.XXXXXX")
-	# Script scope, so the EXIT trap still sees it: a function's typeset name is
-	# gone by then, and set -u turns that into a line on stderr and a non-zero
-	# exit on a run where every check passed.
-	self_test_work="$tree"
-	trap 'rm -rf "$self_test_work"' EXIT
-	fails=0
-	check() {
-		if [ "$2" = "$3" ]; then
-			printf '  ok   %s\n' "$1"
-		else
-			printf '  FAIL %s: expected [%s], got [%s]\n' "$1" "$3" "$2"
-			fails=$((fails + 1))
-		fi
-	}
+	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+	. "$(dirname "$0")/lib.sh"
+	typeset tree names link code stub
+	self_test_begin
+	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
+	tree=$self_test_work
 
 	# --- the shipped config, read the way the deploy reads it ---
 	# This is the check that matters: the extraction is what the deploy links
@@ -327,12 +317,7 @@ self_test() {
 	set -- "$tree/etc"/relayd-checked.conf.*
 	check "and no candidate is left behind" "$([ -e "$1" ] && printf yes || printf no)" no
 
-	if [ "$fails" -eq 0 ]; then
-		printf 'self-test: all checks passed\n'
-	else
-		printf 'self-test: %s failed\n' "$fails" >&2
-		exit 1
-	fi
+	self_test_end
 }
 
 case "${1:-}" in

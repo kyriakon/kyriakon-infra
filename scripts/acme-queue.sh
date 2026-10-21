@@ -338,17 +338,11 @@ run() {
 # before any mode reads the live store or runs as root, so it is safe unprivileged
 # on any machine (the same shape as scripts/abuse-monitor.sh --self-test).
 self_test() {
-	typeset fails=0
-	work=$(mktemp -d "${TMPDIR:-/tmp}/kyriakon-acme-queue-test.XXXXXX")
-	trap 'rm -rf "$work"' EXIT
-	check() {
-		if [ "$2" = "$3" ]; then
-			printf '  ok   %s\n' "$1"
-		else
-			printf '  FAIL %s: expected [%s], got [%s]\n' "$1" "$3" "$2"
-			fails=$(( fails + 1 ))
-		fi
-	}
+	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+	. "$(dirname "$0")/lib.sh"
+	self_test_begin
+	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
+	work=$self_test_work
 
 	check "a member name is accepted" "$(name_ok foo.kyriakon.net && printf yes)" "yes"
 	check "a name with a bad character is refused" "$(name_ok Foo.kyriakon.net && printf yes || printf no)" "no"
@@ -401,12 +395,7 @@ STUB
 		"$(next_attempt "10 $pending_dir/c.kyriakon.net
 20 $pending_dir/b.kyriakon.net" 2>/dev/null)" ""
 
-	if [ "$fails" -eq 0 ]; then
-		printf 'self-test: all checks passed\n'
-	else
-		printf 'self-test: %s failed\n' "$fails" >&2
-		exit 1
-	fi
+	self_test_end
 }
 
 mode=""

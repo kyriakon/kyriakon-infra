@@ -75,30 +75,6 @@ fi
 # shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
 . "$script_dir/lib.sh"
 
-# --- one run at a time ------------------------------------------------------
-# mkdir is the atomic test-and-set available in base: this box has no shlock(1)
-# and no flock(1), only the flock(2) syscall, which has no shell wrapper. The
-# blocklist walk is patient by design, ten seconds and three tries per query over
-# four zones, so a run can take minutes, and two overlapping runs would race on
-# every file under $state. A lock left by a killed run is taken over once its pid
-# is gone, so a reboot cannot wedge the monitor, and --self-test does not release
-# it, which the next real run absorbs for the same reason.
-lock=/var/run/abuse-monitor.lock
-if ! mkdir -m 0700 "$lock" 2>/dev/null; then
-	holder=$(cat "$lock/pid" 2>/dev/null || true)
-	if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-		exit 0
-	fi
-	rm -f "$lock/pid"
-	rmdir "$lock" 2>/dev/null || true
-	if ! mkdir -m 0700 "$lock" 2>/dev/null; then
-		printf '%s: could not take %s, and no live process holds it\n' "$0" "$lock" >&2
-		exit 1
-	fi
-fi
-printf '%s\n' "$$" > "$lock/pid"
-trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true' EXIT
-
 # A storm keeps a signal true for hours, and telling the operator the same thing
 # every hour is how an alert channel stops being read. These two are the ones a
 # stranger can hold true indefinitely: a source working through a list of
@@ -180,17 +156,11 @@ newest_snapshot_epoch() {
 }
 
 self_test() {
-	typeset fails=0
-	work=$(mktemp -d "${TMPDIR:-/tmp}/kyriakon-monitor-test.XXXXXX")
-	trap 'rm -rf "$work"' EXIT
-	check() {
-		if [ "$2" = "$3" ]; then
-			printf '  ok   %s\n' "$1"
-		else
-			printf '  FAIL %s: expected [%s], got [%s]\n' "$1" "$3" "$2"
-			fails=$((fails + 1))
-		fi
-	}
+	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+	. "$(dirname "$0")/lib.sh"
+	self_test_begin
+	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
+	work=$self_test_work
 	# Two groups, the newer one with the larger time, and the older listed first:
 	# the shape that produced the false "364 hours old". Written the way restic
 	# 0.19 actually prints it, on one line, because the multi-line form is what let
@@ -290,12 +260,7 @@ STUB
 		"$(notify_operator mail "self test" "the subject check" 2>&1 | head -n 1)" \
 		"kyriakon: mail: self test"
 
-	if [ "$fails" -eq 0 ]; then
-		printf 'self-test: all checks passed\n'
-	else
-		printf 'self-test: %s failed\n' "$fails" >&2
-		exit 1
-	fi
+	self_test_end
 }
 
 # --self-test runs the parse checks and leaves, before any signal reads a log or
@@ -305,6 +270,29 @@ if [ "${1:-}" = "--self-test" ]; then
 	exit 0
 fi
 
+# --- one run at a time ------------------------------------------------------
+# mkdir is the atomic test-and-set available in base: this box has no shlock(1)
+# and no flock(1), only the flock(2) syscall, which has no shell wrapper. The
+# blocklist walk is patient by design, ten seconds and three tries per query over
+# four zones, so a run can take minutes, and two overlapping runs would race on
+# every file under $state. A lock left by a killed run is taken over once its pid
+# is gone, so a reboot cannot wedge the monitor. --self-test never reaches this
+# point: its dispatch is above, so an unprivileged run does not touch /var/run.
+lock=/var/run/abuse-monitor.lock
+if ! mkdir -m 0700 "$lock" 2>/dev/null; then
+	holder=$(cat "$lock/pid" 2>/dev/null || true)
+	if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+		exit 0
+	fi
+	rm -f "$lock/pid"
+	rmdir "$lock" 2>/dev/null || true
+	if ! mkdir -m 0700 "$lock" 2>/dev/null; then
+		printf '%s: could not take %s, and no live process holds it\n' "$0" "$lock" >&2
+		exit 1
+	fi
+fi
+printf '%s\n' "$$" > "$lock/pid"
+trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true' EXIT
 
 maillog="${MAILLOG:-/var/log/maillog}"
 authlog="${AUTHLOG:-/var/log/authlog}"

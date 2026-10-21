@@ -206,3 +206,44 @@ run: $0 on $(hostname) at $(date '+%F %T')"
 	printf '%s\n\n%s\n' "$subject" "$body" >&2
 	return 0
 }
+
+# --- self-tests ------------------------------------------------------------
+#
+# A --self-test is the one check a script can run without the box's own state, so
+# most scripts carry one. These three pieces are the shape, kept here rather than
+# copied into each: the scratch directory and its cleanup, the assertion, and the
+# summary that makes the exit status mean something.
+#
+# Source lib.sh from inside self_test, not at the top of the script: the live path
+# takes no new dependency, and the drain's copies of these scripts run without
+# lib.sh beside them.
+#
+#   self_test_begin                     # sets $self_test_work, clears the count
+#   check "what it proves" "$got" "$want"
+#   self_test_end                       # prints the summary, exits 0 or 1
+
+self_test_begin() {
+	self_test_fails=0
+	self_test_work=$(mktemp -d "${TMPDIR:-/tmp}/kyriakon-self-test.XXXXXX") || exit 1
+	# Expanded now rather than at exit: the function's locals are gone by then.
+	# shellcheck disable=SC2064
+	trap "rm -rf '$self_test_work'" EXIT
+}
+
+check() {
+	if [ "$2" = "$3" ]; then
+		printf 'ok: %s\n' "$1"
+	else
+		printf 'FAIL: %s: expected [%s], got [%s]\n' "$1" "$3" "$2"
+		self_test_fails=$((self_test_fails + 1))
+	fi
+}
+
+self_test_end() {
+	if [ "${self_test_fails:-0}" -ne 0 ]; then
+		printf '\nself-test: %s check(s) failed\n' "$self_test_fails" >&2
+		exit 1
+	fi
+	printf '\nself-test: every check passed\n'
+	exit 0
+}
