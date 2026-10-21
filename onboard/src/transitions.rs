@@ -751,9 +751,20 @@ fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String,
         }
     }
 
+    // The terminal form comes first. A decision URL is about 140 characters and
+    // the signature is at the end of it, so a mail client that hard-wraps at 72
+    // cuts it before the signature whatever the label does: the fix is to lead
+    // with the form that cannot be wrapped, and say so rather than let the link
+    // look like the reliable one.
+    let username = &intent.application.username;
+    out.push_str("\nFrom a terminal\n");
+    out.push_str(&format!("  onboardctl approve {username}\n"));
+    out.push_str(&format!("  onboardctl approve-free {username}\n"));
+    out.push_str(&format!("  onboardctl decline {username}\n"));
     out.push_str(
-        "\nDecide\nEach link is one line by itself: a mail client that wraps a long\
-         \nline breaks it at the wrap, and the signature is at the end.\n",
+        "\nOr by link, which works once. Each is 140 characters and the signature\n\
+         is at the end, so a mail client that wraps a long line cuts it at the\n\
+         wrap: open it as one unbroken line, or use the terminal form above.\n",
     );
     for d in DECISIONS.iter() {
         out.push_str(&format!(
@@ -762,11 +773,6 @@ fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String,
             sign::decide_link(&cfg.base_url, key, token, d.action)?
         ));
     }
-    let username = &intent.application.username;
-    out.push_str("\nFrom a terminal\n");
-    out.push_str(&format!("  onboardctl approve {username}\n"));
-    out.push_str(&format!("  onboardctl approve-free {username}\n"));
-    out.push_str(&format!("  onboardctl decline {username}\n"));
     Ok(out)
 }
 

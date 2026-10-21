@@ -712,6 +712,21 @@ fn decision_from(f: &BTreeMap<String, String>) -> Option<&'static transitions::D
     transitions::decision_for(f.get("action").map(String::as_str).unwrap_or(""))
 }
 
+/// Why a confirm page cannot name a decision, in the words the reader needs.
+///
+/// Two ways to get here, and they are not the same problem. A mail client that
+/// wraps the line cuts the URL at the wrap, which drops the signature: the link
+/// itself is fine and the address the browser got is not. Saying so is the
+/// difference between "try the next link" and "use the terminal form".
+fn decision_refusal(query: &BTreeMap<String, String>) -> &'static str {
+    if query.get("sig").is_none_or(|s| s.is_empty()) {
+        return "This address is missing the signature, which a mail client that \
+                wrapped the line will cause. Open the link exactly as it appears in \
+                the message, or use the onboardctl line in it.";
+    }
+    "This link does not name a decision the platform knows."
+}
+
 /// The confirm step in front of a decision link.
 ///
 /// The links in the review email do not act when they are fetched. Email is
@@ -731,19 +746,7 @@ async fn decide_confirm(app: &App, token: &str, query: &BTreeMap<String, String>
         return capability(&status_page(None, OffsetDateTime::now_utc()));
     };
     let Some(decision) = decision_from(query) else {
-        // Two ways to get here, and they are not the same problem. A mail client
-        // that wraps the line cuts the URL at the wrap, which drops the
-        // signature: the link itself is fine and the address the browser got is
-        // not. Saying so is the difference between "try the next link" and "use
-        // the terminal form".
-        if query.get("sig").is_none_or(|s| s.is_empty()) {
-            return refused(
-                "This address is missing the signature, which a mail client that \
-                 wrapped the line will cause. Open the link exactly as it appears \
-                 in the message, or use the onboardctl line below it.",
-            );
-        }
-        return refused("This link does not name a decision the platform knows.");
+        return refused(decision_refusal(query));
     };
     capability(&DecidePage {
         label: decision.label.to_string(),
@@ -793,6 +796,34 @@ async fn decide_file(app: &App, token: &str, form: &BTreeMap<String, String>) ->
 /// rule, not the rule itself.
 fn password_window_open(until: &str) -> bool {
     until >= crate::util::date_after_days(0).as_str()
+}
+
+#[cfg(test)]
+mod decision_refusal_tests {
+    use super::decision_refusal;
+    use std::collections::BTreeMap;
+
+    fn query(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_missing_signature_names_the_wrap_not_the_link() {
+        // The wrap is what happened to the first real approval: the URL arrived
+        // without its &sig= and the page said the link named nothing.
+        let text = decision_refusal(&query(&[("action", "approve-free")]));
+        assert!(text.contains("missing the signature"), "{text}");
+        assert!(text.contains("onboardctl"), "{text}");
+    }
+
+    #[test]
+    fn an_unknown_action_keeps_the_link_message() {
+        let text = decision_refusal(&query(&[("action", "nonsense"), ("sig", "ab")]));
+        assert!(text.contains("does not name a decision"), "{text}");
+    }
 }
 
 #[cfg(test)]

@@ -492,6 +492,18 @@ fn a_filed_application_produces_one_review_email() {
     assert!(sent.contains("onboardctl approve secretary"), "{sent}");
     assert!(sent.contains("onboardctl approve-free secretary"), "{sent}");
     assert!(sent.contains("onboardctl decline secretary"), "{sent}");
+    // Each decision link is on a line of its own, so a client that wraps at a
+    // fixed width has a chance of keeping the URL whole; and the terminal form
+    // is printed before them, because it cannot be wrapped at all.
+    let lines: Vec<&str> = sent.lines().collect();
+    let link_lines = lines
+        .iter()
+        .filter(|l| l.trim_start().starts_with("https://") && l.contains("/decide/"))
+        .count();
+    assert_eq!(link_lines, 3, "{sent}");
+    let terminal = sent.find("onboardctl approve-free").unwrap();
+    let first_link = sent.find("/decide/").unwrap();
+    assert!(terminal < first_link, "the terminal form comes first");
 
     // The intent is consumed.
     assert!(fix.intents().is_empty(), "{:?}", fix.intents());
