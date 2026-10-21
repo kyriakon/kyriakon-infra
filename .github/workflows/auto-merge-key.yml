@@ -30,6 +30,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          KEY_PUBLISHER_LOGIN: ${{ vars.KEY_PUBLISHER_LOGIN }}
         run: |
           set -eu
           # Same repository only. workflow_run fires for a fork's pull request
@@ -43,9 +44,18 @@ jobs:
             exit 1
             ;;
           esac
+          # Only the box's own publications. The token that publish-mail-key.sh
+          # pushes with belongs to one account; a branch someone else pushed is a
+          # key a person has to look at, or a collaborator with write access has
+          # found a way around the review it would otherwise get. Unset means
+          # nothing auto-merges, which is the safe way to be wrong.
+          if [ -z "${KEY_PUBLISHER_LOGIN:-}" ]; then
+            printf 'no KEY_PUBLISHER_LOGIN variable is set, so nothing is merged automatically\n'
+            exit 0
+          fi
           pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
-            --json number,headRefName,headRefOid,isCrossRepository \
-            --jq "[.[] | select(.headRefOid == \"$HEAD_SHA\" and .isCrossRepository == false and (.headRefName | startswith(\"publish-key/\")))] | .[0].number // empty")
+            --json number,headRefName,headRefOid,isCrossRepository,author \
+            --jq "[.[] | select(.headRefOid == \"$HEAD_SHA\" and .isCrossRepository == false and .author.login == \"$KEY_PUBLISHER_LOGIN\" and (.headRefName | startswith(\"publish-key/\")))] | .[0].number // empty")
           if [ -z "$pr" ]; then
             printf 'nothing to do: no open publish-key pull request of this repository at %s\n' "$HEAD_SHA"
             exit 0
