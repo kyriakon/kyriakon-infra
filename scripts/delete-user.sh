@@ -74,6 +74,7 @@ acme_d=${ACME_D:-/etc/acme-client.d}
 ssl_dir=${SSL_DIR:-/etc/ssl}
 ssl_private=${SSL_PRIVATE:-/etc/ssl/private}
 virtuals=${VIRTUALS:-/etc/mail/virtuals}
+onboard_store=${ONBOARD_STORE:-/var/db/onboard}
 
 # --- the steps, as functions, so the self-test can replace them -------------
 #
@@ -224,10 +225,25 @@ remove_member() {
 		fi
 	fi
 
+	# The onboarding service's record of the account, last. The note below says the
+	# rest of the store is the drain's and it is right: those are records of money,
+	# publication and retention. This one is not, because the drain reads it to
+	# decide whether a name is taken, so leaving it behind makes the next approval
+	# refuse the name as an account that still exists.
+	if [ -d "$onboard_store/accounts/$user" ]; then
+		if [ "$show" = yes ]; then
+			printf 'would remove the store record %s/accounts/%s\n' "$onboard_store" "$user"
+		else
+			rm -rf "$onboard_store/accounts/$user"
+			printf 'removed the store record %s/accounts/%s\n' "$onboard_store" "$user"
+			did=yes
+		fi
+	fi
+
 	# The last line, and the reason a run that did something is not silent.
 	if [ "$did" = yes ] && [ "$show" = no ]; then
-		printf 'not this script'"'"'s: the store record, the ledger line, the keyring'"'"'s published\n'
-		printf '  set, the backup window and the 90-day username hold. All the drain'"'"'s.\n'
+		printf 'not this script'"'"'s: the ledger line, the keyring'"'"'s published set, the\n'
+		printf '  backup window and the 90-day username hold. All the drain'"'"'s.\n'
 	fi
 	return 0
 }
@@ -277,9 +293,11 @@ self_test() {
 	HTTPD_D="$tree/etc/httpd.d"; GMID_D="$tree/etc/gmid.d"; ACME_D="$tree/etc/acme-client.d"
 	SSL_DIR="$tree/etc/ssl"; SSL_PRIVATE="$tree/etc/ssl/private"
 	VIRTUALS="$tree/etc/mail/virtuals"
+	ONBOARD_STORE="$tree/store"
 	www_root="$WWW_ROOT"; httpd_d="$HTTPD_D"
 	gmid_d="$GMID_D"; acme_d="$ACME_D"; ssl_dir="$SSL_DIR"
 	ssl_private="$SSL_PRIVATE"; virtuals="$VIRTUALS"
+	onboard_store="$ONBOARD_STORE"
 
 	mkdir -p "$httpd_d" "$gmid_d" "$acme_d" "$ssl_private" "$www_root" "$(dirname "$virtuals")"
 
@@ -297,7 +315,7 @@ self_test() {
 	user=alice
 	show=no
 	public="$www_root/$user.kyriakon.net"
-	mkdir -p "$public/www"
+	mkdir -p "$public/www" "$onboard_store/accounts/$user"
 	: >"$httpd_d/$user.kyriakon.net.conf"
 	: >"$gmid_d/$user.kyriakon.net.conf"
 	: >"$acme_d/$user.kyriakon.net.conf"
@@ -323,6 +341,13 @@ self_test() {
 	check "the order starts with the indexes" "$(awk 'NR == 1' "$case_dir/calls")" 'cron-apply --web'
 	check "and the account goes last of the tools" "$(awk 'NR == 3' "$case_dir/calls")" 'userdel -r alice'
 	check "smtpd restarted once" "$(grep -c 'rcctl restart smtpd' "$case_dir/calls")" 1
+	# The store's record goes too: the drain reads it to decide whether a name is
+	# taken, and an account deleted without it makes the next approval refuse the
+	# name as one that exists.
+	check "the store record goes with the account" \
+		"$([ -d "$onboard_store/accounts/alice" ] && printf no || printf yes)" yes
+	check "and the note no longer lists it" \
+		"$(grep -c "not this script's: the ledger line" "$tree/first.out" || true)" 1
 
 	# A second run against the same tree must do nothing and say nothing.
 	account_exists() { return 1; }
