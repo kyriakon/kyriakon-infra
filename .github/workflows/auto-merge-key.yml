@@ -6,6 +6,11 @@
 # only decision is whether the published set should carry the key, which the
 # approval already made. So the merge waits for the checks and then happens.
 #
+# The merge runs as the machine account (the KEY_PUBLISHER_TOKEN secret), which is
+# the only actor besides the owner that main's ruleset lets merge without a
+# review. It is the same account the publishing token belongs to, so the
+# unattended path covers exactly what that credential could already do.
+#
 # It runs on the checks workflow's completion, not on the pull request, because a
 # pull_request trigger would start beside the checks rather than after them.
 # Two guards keep it narrow: the head branch must be a publish-key branch, and
@@ -28,11 +33,21 @@ jobs:
     steps:
       - name: merge the green publish-key pull request
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A token of the machine account, not GITHUB_TOKEN. main's ruleset
+          # requires an approving review and lists only that account as a bypass
+          # actor, so the merge has to be attributable to it; the bot cannot.
+          GH_TOKEN: ${{ secrets.KEY_PUBLISHER_TOKEN }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           KEY_PUBLISHER_LOGIN: ${{ vars.KEY_PUBLISHER_LOGIN }}
         run: |
           set -eu
+          # Fail closed if the credential is missing: without it the merge would
+          # be attempted as the bot and refused by the review rule, which reads
+          # as a broken workflow rather than an unconfigured one.
+          if [ -z "${GH_TOKEN:-}" ]; then
+            printf 'no KEY_PUBLISHER_TOKEN secret is set, so nothing is merged automatically\n'
+            exit 0
+          fi
           # Same repository only. workflow_run fires for a fork's pull request
           # too, with write permissions, and headRefName is only a branch name:
           # `publish-key/evil` in someone else's fork would otherwise match.
