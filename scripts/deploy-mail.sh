@@ -1066,6 +1066,18 @@ install -d -m 0755 /root/bin
 for s in lib.sh abuse-monitor.sh check-keyring-drift.sh backup.sh renew-acme.sh restore-standup.sh acme-queue.sh; do
 	install -m 0755 "$repo_dir/scripts/$s" "/root/bin/$s"
 done
+# This list used to be longer: before the onboarding service split out of this
+# deploy, the drain's own scripts were installed here too, and a box from that
+# time keeps them. They are stale copies of scripts that now run from the drain's
+# directory, and check-hygiene's section 9 reports every one of them for ever
+# otherwise, which is noise that hides a real drift.
+for s in add-user.sh check-hygiene.sh cron-apply.sh delete-user.sh deploy-mail.sh \
+	deploy-onboard.sh deploy-relayd.sh onboard-store.sh provision-member.sh \
+	provision-member-capsule.sh provision-member-web.sh quota-apply.sh restore-test.sh; do
+	[ -e "/root/bin/$s" ] || continue
+	rm -f "/root/bin/$s"
+	printf 'removed the stale copy /root/bin/%s\n' "$s"
+done
 printf 'cron scripts installed into /root/bin\n'
 
 # restore-standup.sh creates the weekly test box with the hcloud CLI and reads its answer

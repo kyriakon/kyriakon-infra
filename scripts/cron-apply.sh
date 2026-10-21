@@ -428,6 +428,9 @@ if [ -z "$to_add" ]; then
 		line_for "$s"
 	done
 	line_for kyriakon-onboard-drain
+	for s in check-hygiene.sh self-test-all.sh; do
+		line_for "$s"
+	done
 	exit 0
 fi
 printf 'to be added:%s\n' "$to_add"
@@ -494,4 +497,8 @@ printf "installed. the lines now scheduled from /root/bin:\n"
 crontab -l | grep '/root/bin/' | awk '{ print "\t" $0 }'
 printf 'the drain:\n'
 crontab -l | grep -F "$drain_bin" | awk '{ print "\t" $0 }'
+# The two that run from the checkout are on cron too, and a summary that left
+# them out read as if a clean run had scheduled nothing new.
+printf 'the checkout-run checks:\n'
+crontab -l | grep -E 'scripts/(check-hygiene|self-test-all)\.sh' | awk '{ print "\t" $0 }'
 printf '\nrevert with: crontab %s\n' "$bak"
