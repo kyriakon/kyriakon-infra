@@ -75,11 +75,12 @@ pub fn decision_for_kind(kind: &str) -> Option<&'static Decision> {
     DECISIONS.iter().find(|d| d.kind == kind)
 }
 
-/// A reviewer's decision intent, from `onboardctl` or a signed link. Every
+/// A reviewer's decision intent, from `kyriakon-onboardctl` or a signed link.
+/// Every
 /// decision intent carries the action it performs and the signature over it: the
 /// directory it is read from belongs to the unprivileged half, so an unsigned
 /// decision would be root work driven by a file any writer of `intents/` could
-/// leave. `onboardctl` signs with the same root-only key the links use.
+/// leave. `kyriakon-onboardctl` signs with the same root-only key the links use.
 #[derive(Debug, serde::Deserialize)]
 pub struct DecisionIntent {
     pub id: String,
@@ -690,7 +691,7 @@ pub async fn filed_application(
 }
 
 /// The review email's body. Every field the ticket lists, and the three links
-/// beside their `onboardctl` equivalents.
+/// beside their `kyriakon-onboardctl` equivalents.
 fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String, String> {
     let token = &intent.application.status_token;
     let mut out = String::new();
@@ -758,9 +759,9 @@ fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String,
     // look like the reliable one.
     let username = &intent.application.username;
     out.push_str("\nFrom a terminal\n");
-    out.push_str(&format!("  onboardctl approve {username}\n"));
-    out.push_str(&format!("  onboardctl approve-free {username}\n"));
-    out.push_str(&format!("  onboardctl decline {username}\n"));
+    out.push_str(&format!("  kyriakon-onboardctl approve {username}\n"));
+    out.push_str(&format!("  kyriakon-onboardctl approve-free {username}\n"));
+    out.push_str(&format!("  kyriakon-onboardctl decline {username}\n"));
     out.push_str(
         "\nOr by link, which works once. Each is 140 characters and the signature\n\
          is at the end, so a mail client that wraps a long line cuts it at the\n\
