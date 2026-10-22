@@ -371,8 +371,12 @@ SETPREF
 	# leaving the exit status in $rc and the combined output in $out.
 	export KEYRING_DIR KEYRING_STORE
 	run() {
-		if out=$(ALERT_EMAIL='' KEYRING_HEALTHCHECKS_URL='' KYRIAKON_PUBLISHED_DIR="$run_pub" \
-			"$0" "$@" 2>&1); then
+		# KYRIAKON_ENV=/dev/null because lib.sh sources that file at load time, and
+		# as root it is readable: it would set ALERT_EMAIL again after this empty
+		# one, notify_operator would mail the operator instead of printing, and
+		# every case that asserts on output would fail with nothing to read.
+		if out=$(ALERT_EMAIL='' KEYRING_HEALTHCHECKS_URL='' KYRIAKON_ENV=/dev/null \
+			KYRIAKON_PUBLISHED_DIR="$run_pub" "$0" "$@" 2>&1); then
 			rc=0
 		else
 			rc=$?
