@@ -285,7 +285,10 @@ self_test() {
 	stub_mail="$dir/sendmail"
 	printf '#!/bin/sh\ncat > "%s"\n' "$dir/sent.mail" > "$stub_mail"
 	chmod 0755 "$stub_mail"
-	ALERT_EMAIL='ops@example.invalid' SENDMAIL="$stub_mail" \
+	# ALERT_FROM is pinned: a caller who sourced the env file has the operator's
+	# value set, and this asserts the default the file ships.
+	ALERT_EMAIL='ops@example.invalid' ALERT_FROM='kyriakon <hello@kyriakon.net>' \
+		SENDMAIL="$stub_mail" \
 		notify_operator mail test "something to report" >/dev/null 2>&1
 	check "an alert names the platform as its sender" \
 		"$(grep -c '^From: kyriakon <hello@kyriakon.net>$' "$dir/sent.mail")" 1
