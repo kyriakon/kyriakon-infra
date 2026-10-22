@@ -120,6 +120,31 @@ The credential is a fine-grained token for this repository, scoped to contents a
 
 A failed publish is reported by the drain, which names the member and the fingerprint, and the next pass tries again. The seven days `scripts/check-keyring-drift.sh` allows an unpublished key are the backstop: if the pull request is never merged, or the publish never succeeds, the check alerts at the branch name, and the repair is to merge the pull request or fix the credential. Delivery is unaffected either way, because the box keyring is what encrypts.
 
+`scripts/publish-mail-key.sh` refuses a key that advertises AEAD or that expires, which is stricter than the application form: the form is specified to warn and proceed (`docs/planning/specs/gemini-capsule.md`, `docs/planning/specs/ssh-onboarding-tui.md`), and that warning is not built yet (#176). The refusal keeps the published set from claiming a key the box cannot deliver with. It does not change delivery in either direction, because the box keyring is what encrypts, and a key that needs it is repaired where the secret lives (`scripts/rekey-mail-key.sh`). A key already installed on the box with either fault is reported by `scripts/check-keyring-drift.sh` on every run until it is replaced, which is louder than the seven-day unpublished-key alert beside it.
+
+### The repository settings the publish depends on
+
+None of these is visible from the repository, and each one has cost an hour to find
+once. They belong to the forge, not the box, so they are listed here rather than
+checked by any script.
+
+- **Ruleset `Main`** on this repository: one approving review, no force-push, no
+  deletion. Its bypass list names the owner with `always` and `kyriakon-publisher`
+  with `pull_request`. In practice the machine account's entry did not let its merge
+  through, which is why the workflow records the review itself; do not remove that
+  step on the assumption that the bypass list is enough.
+- **"Allow GitHub Actions to create and approve pull requests"**: an organization
+  setting first, then a repository one. Off by default. With it off, the auto-merge
+  workflow's approval is refused, the workflow says so and merges nothing.
+- **Variable `KEY_PUBLISHER_LOGIN`** = the machine account's login. Unset, the
+  workflow merges nothing.
+- **Secret `KEY_PUBLISHER_TOKEN`** = the same fine-grained token the box holds in
+  `/etc/kyriakon/onboard/keyring-publish-token`, scoped to contents and pull requests.
+  The workflow merges as that account, so a rotated token has to be replaced in both
+  places.
+- **"Allow auto-merge"** was needed while the workflow queued its merge; the workflow
+  now merges directly, so it is no longer a dependency.
+
 ## Replace a member's key
 
 Rotation is self-service and never needs a signing key. The account page starts it; the new key applies after a confirmation from every address on the account and a 72-hour window in which any of them can cancel it, and a request signed by the current key skips the delay. Where the member gave no address outside the platform, the delay stands and the warning goes out encrypted to the old key, which only the holder can read. Decided in #155.
