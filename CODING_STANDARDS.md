@@ -18,6 +18,10 @@ A file under the store that the drain writes is handed back to the directory's o
 
 The handler holds no key. Anything it cannot prove is proved by the drain: a link's signature travels through the form, and the drain is the half that verifies it.
 
+## Records
+
+A store file ending `.jsonl` is a record and stays append-only. The one exception is a line that has to be completed later, as `request close` does: that verb takes an exclusive lock across the read and the write, and the code says why. A rewrite without the lock can drop a line another process appended.
+
 ## Shell scripts
 
 A failure that matters prints the message it exists to print. A `die` whose function is not defined exits 127 and says nothing, so a new failure path is checked against the script's own error idiom, not copied from another script's.
