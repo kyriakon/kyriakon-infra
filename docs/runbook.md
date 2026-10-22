@@ -39,7 +39,7 @@ run after a fix is safe.
 
 From the workstation, one command updates the checkout and prints the plan:
 
-	ssh kyriakon 'cd /usr/local/src/kyriakon-infra && doas git pull --ff-only && doas ksh scripts/deploy.sh --check'
+	ssh -t kyriakon 'cd /usr/local/src/kyriakon-infra && doas git pull --ff-only && doas ksh scripts/deploy.sh --check'
 
 Run the same command without `--check` to apply the plan. The first run on a box
 with no marker plans every deploy script; a later run can be narrowed with
