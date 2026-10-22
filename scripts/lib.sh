@@ -199,8 +199,16 @@ what to do: $todo"
 	body="$body
 
 run: $0 on $(hostname) at $(date '+%F %T')"
+	# The enqueuer directly rather than mail(1): mail(1) supplies a From from the
+	# account running it, which for every one of these scripts is root, so an
+	# operator alert read "Charlie Root <root@mail.kyriakon.net>". Naming the
+	# sender is the only way to keep the platform's own address on it.
 	if [ -n "${ALERT_EMAIL:-}" ] &&
-		printf '%s\n' "$body" | mail -s "$subject" "$ALERT_EMAIL" >/dev/null 2>&1; then
+		{
+			printf 'From: %s\n' "${ALERT_FROM:-kyriakon <hello@kyriakon.net>}"
+			printf 'To: %s\nSubject: %s\n\n' "$ALERT_EMAIL" "$subject"
+			printf '%s\n' "$body"
+		} | ${SENDMAIL:-/usr/sbin/sendmail} -i -t >/dev/null 2>&1; then
 		return 0
 	fi
 	printf '%s\n\n%s\n' "$subject" "$body" >&2

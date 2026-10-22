@@ -79,6 +79,7 @@ impl Fix {
              stripe_webhook_secret = \"{}/stripe\"\n\
              keyring_publish_token = \"{}/keyring-token\"\n\
              reviewer = \"reviewer@example.invalid\"\n\
+             from = \"kyriakon <hello@example.invalid>\"\n\
              base_url = \"https://signup.kyriakon.net\"\n\
              price_gbp = \"20.00\"\n\
              postal_address = \"1 Example Street, Example\"\n\
