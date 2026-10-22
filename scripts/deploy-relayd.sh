@@ -136,7 +136,9 @@ install_conf() {
 		printf '%s: unchanged, the relay configuration is in place\n' "$2"
 		return 0
 	fi
-	install -m 0644 "$1" "$2"
+	# /etc/mtree/special carries relayd.conf at 0600, and security(8) reports the
+	# difference daily until it matches.
+	install -m 0600 "$1" "$2"
 	printf 'installed %s\n' "$2"
 }
 
@@ -157,7 +159,7 @@ install_conf() {
 # Root is required for the check, which is one reason this script runs under doas.
 install_checked_conf() {
 	conf_candidate=$(mktemp "$conf_dst.XXXXXX")
-	install -m 0644 "$conf_src" "$conf_candidate"
+	install -m 0600 "$conf_src" "$conf_candidate"
 	if ! relayd -n -f "$conf_candidate"; then
 		rm -f "$conf_candidate"
 		die "$conf_src does not check, so $conf_dst was left as it was and nothing was restarted"
@@ -278,6 +280,8 @@ self_test() {
 	install_conf "$tree/relayd.conf" "$tree/etc/relayd.conf" > "$tree/first.out" 2>&1
 	install_conf "$tree/relayd.conf" "$tree/etc/relayd.conf" > "$tree/second.out" 2>&1
 	check "the first install is reported" "$(grep -c '^installed ' "$tree/first.out")" 1
+	check "and installed at the mode mtree special expects" \
+		"$(stat -f %Lp "$tree/etc/relayd.conf")" 600
 	check "and the second run says unchanged" "$(grep -c 'unchanged' "$tree/second.out")" 1
 
 	# --- checking the configuration before installing it ---
