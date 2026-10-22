@@ -14,12 +14,23 @@
 //!   kyriakon-onboardctl [--config PATH] approve-free <username>
 //!   kyriakon-onboardctl [--config PATH] decline <username>
 //!   kyriakon-onboardctl [--config PATH] show <username>
+//!   kyriakon-onboardctl request list
+//!   kyriakon-onboardctl request record --username <u> --kind <k> \
+//!     --received <date> --evidence <text> [--note <text>] [--identity-at <date>] \
+//!     [--fee-at <date>]
+//!   kyriakon-onboardctl request close <id> --done <date> --note <text>
+//!
+//! The `request` verbs write the data-subject request record straight into the
+//! account's store directory. They are root's, like the decisions: the record is
+//! the member's data and the account directory is not the handler's to write.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use kyriakon_onboard::config::DrainConfig;
 use kyriakon_onboard::intents;
+use kyriakon_onboard::requests;
 use kyriakon_onboard::sign;
 use kyriakon_onboard::store::{Record, Store};
 use kyriakon_onboard::transitions::{self, Decision};
@@ -59,17 +70,12 @@ async fn main() -> ExitCode {
 async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> {
     let cfg = DrainConfig::load(cfg_path)?;
     let store = Store::new(&cfg.store_root);
-    let verb = rest.first().map(String::as_str).unwrap_or("");
-    let username = rest.get(1).map(String::as_str);
-    let username = username.ok_or_else(usage)?;
-    if rest.len() > 2 {
+    let Some(verb) = rest.first().map(String::as_str) else {
         return Err(usage());
-    }
-    if let Some(why) = validate::username_shape(username) {
-        return Err(format!("the username {username:?}: {why}"));
-    }
+    };
     match verb {
-        "show" => show(&store, username).await,
+        "request" => request(&store, &rest[1..]).await,
+        "show" => show(&store, one_username(rest)?).await,
         // Each decision is signed with the same root-only key the review links
         // are signed with, because the drain carries out a decision intent only
         // when its signature verifies, and `intents/` belongs to the
@@ -77,6 +83,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         // crate's one decision list, so a verb this console takes is a decision
         // the drain knows.
         verb => {
+            let username = one_username(rest)?;
             let Some(decision) = transitions::decision_for(verb) else {
                 return Err(usage());
             };
@@ -88,8 +95,146 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
 
 fn usage() -> String {
     "usage: kyriakon-onboardctl [--config PATH] \
-     approve|approve-free|decline|show <username>"
+     approve|approve-free|decline|show <username>
+       kyriakon-onboardctl request list
+       kyriakon-onboardctl request record --username <u> --kind <access|erasure|rectification> \
+     --received <YYYY-MM-DD> --evidence <text> [--note <text>] \
+     [--identity-at <YYYY-MM-DD>] [--fee-at <YYYY-MM-DD>]
+       kyriakon-onboardctl request close <id> --done <YYYY-MM-DD> --note <text>"
         .to_string()
+}
+
+/// The one username a verb other than `request` takes.
+fn one_username(rest: &[String]) -> Result<&str, String> {
+    let username = match rest {
+        [_, username] => username.as_str(),
+        _ => return Err(usage()),
+    };
+    if let Some(why) = validate::username_shape(username) {
+        return Err(format!("the username {username:?}: {why}"));
+    }
+    Ok(username)
+}
+
+/// `--flag value` pairs for one subcommand. A repeated flag is refused rather
+/// than letting the last one win: this record is evidence, and a typo that
+/// silently replaced a date would be a wrong clock.
+fn flags(args: &[String], known: &[&str]) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    let mut i = 0;
+    while i < args.len() {
+        let flag = &args[i];
+        let Some(name) = flag.strip_prefix("--") else {
+            return Err(format!("unexpected argument {flag:?}\n{}", usage()));
+        };
+        if !known.contains(&name) {
+            return Err(format!("unknown flag {flag:?}\n{}", usage()));
+        }
+        let Some(value) = args.get(i + 1) else {
+            return Err(format!("{flag} needs a value"));
+        };
+        if out.insert(name.to_string(), value.clone()).is_some() {
+            return Err(format!("{flag} is given twice"));
+        }
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn need<'a>(flags: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str, String> {
+    flags
+        .get(name)
+        .map(String::as_str)
+        .ok_or_else(|| format!("--{name} is needed"))
+}
+
+async fn request(store: &Store, args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("record") => request_record(store, &args[1..]).await,
+        Some("close") => request_close(store, &args[1..]).await,
+        Some("list") => request_list(store).await,
+        _ => Err(usage()),
+    }
+}
+
+async fn request_record(store: &Store, args: &[String]) -> Result<(), String> {
+    let flags = flags(
+        args,
+        &[
+            "username",
+            "kind",
+            "received",
+            "evidence",
+            "note",
+            "identity-at",
+            "fee-at",
+        ],
+    )?;
+    let line = requests::record(
+        store,
+        requests::NewRequest {
+            username: need(&flags, "username")?,
+            kind: need(&flags, "kind")?,
+            received: need(&flags, "received")?,
+            evidence: need(&flags, "evidence")?,
+            note: flags.get("note").map(String::as_str),
+            identity_at: flags.get("identity-at").map(String::as_str),
+            fee_at: flags.get("fee-at").map(String::as_str),
+        },
+    )
+    .await?;
+    println!("recorded {}; answer due {}", line.id, line.due);
+    Ok(())
+}
+
+async fn request_close(store: &Store, args: &[String]) -> Result<(), String> {
+    let (id, rest) = match args {
+        [id, rest @ ..] if !id.starts_with("--") => (id.as_str(), rest),
+        _ => return Err(usage()),
+    };
+    let flags = flags(rest, &["done", "note"])?;
+    let line = requests::close(store, id, need(&flags, "done")?, need(&flags, "note")?).await?;
+    println!(
+        "closed {} (done {})",
+        line.id,
+        line.done_at.as_deref().unwrap_or("")
+    );
+    Ok(())
+}
+
+async fn request_list(store: &Store) -> Result<(), String> {
+    let open = requests::open(store).await?;
+    if open.is_empty() {
+        println!("no open requests");
+        return Ok(());
+    }
+    let today = requests::today();
+    let mut nearly = 0;
+    let mut rows = Vec::new();
+    for line in open {
+        let due =
+            requests::parse_date(&line.due).map_err(|e| format!("request {}: {e}", line.id))?;
+        let days = requests::days_until(due, today);
+        if requests::nearly_due(due, today) {
+            nearly += 1;
+        }
+        let state = if days < 0 {
+            "OVERDUE"
+        } else if requests::nearly_due(due, today) {
+            "nearly due"
+        } else {
+            "open"
+        };
+        rows.push((line, state));
+    }
+    println!("{} open request(s), {nearly} nearly due", rows.len());
+    for (line, state) in rows {
+        println!(
+            "{}  {}  {}  received {}  due {}  {state}",
+            line.id, line.username, line.kind, line.received, line.due
+        );
+    }
+    Ok(())
 }
 
 /// Sign one decision and file it as an intent. The application it names is

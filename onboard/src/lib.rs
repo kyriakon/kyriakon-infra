@@ -21,6 +21,7 @@ pub mod password;
 pub mod portal;
 pub mod questions;
 pub mod rate;
+pub mod requests;
 pub mod responder;
 pub mod sign;
 pub mod store;
