@@ -16,6 +16,12 @@
 
 set -euo pipefail
 
+# A self-test is offline by design, and lib.sh sources /root/.kyriakon-env when it
+# can read it. Under cron that file exists, so a test would pick up the operator's
+# address and mail the fixtures it was given instead of printing them. Both the
+# drift check's children and every other test get a path that does not exist.
+export KYRIAKON_ENV=/dev/null
+
 here=$(cd "$(dirname "$0")" && pwd)
 repo="${1:-$(cd "$here/.." && pwd)}"
 failed=0
