@@ -100,6 +100,13 @@ pub struct DrainConfig {
     pub keyring_publish_token: String,
     /// The one reviewer the whole application is mailed to.
     pub reviewer: String,
+
+    /// The address every notice leaves as, display name included. The local
+    /// enqueuer fills a From header from the account that ran it, and the drain
+    /// runs as root, so without this a member's approval mail arrived from
+    /// "Charlie Root <root@mail.kyriakon.net>". The drain owns these messages, so
+    /// this is the one place the sender can be decided.
+    pub from: String,
     /// The service's own base URL, which the signed links point at.
     pub base_url: String,
     /// The yearly price, as the ledger records it. A configuration value because
@@ -187,6 +194,7 @@ mod tests {
              stripe_webhook_secret = \"/etc/kyriakon/onboard/stripe-webhook-secret\"\n\
              keyring_publish_token = \"/etc/kyriakon/onboard/keyring-publish-token\"\n\
              reviewer = \"admin@kyriakon.net\"\n\
+             from = \"kyriakon <hello@kyriakon.net>\"\n\
              base_url = \"https://signup.kyriakon.net\"\n\
              price_gbp = \"20.00\"\n\
              postal_address = \"REPLACE_ME\"\n\

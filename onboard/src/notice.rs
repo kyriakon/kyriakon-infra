@@ -20,13 +20,17 @@ use crate::config::DrainConfig;
 use crate::store::{Notice, Store};
 use crate::util;
 
-/// The RFC 5322 message: the two headers the enqueuer reads and a plain-text
-/// body. Deliberately no From or Message-ID: the local smtpd owns those, and a
-/// header the platform invents here is a header the DKIM signer then has to
-/// account for.
-fn message(to: &str, subject: &str, body: &str) -> String {
+/// The RFC 5322 message: the headers the enqueuer reads and a plain-text body.
+///
+/// From is written here because the enqueuer would otherwise supply one from the
+/// account that ran the drain, which is root: a member's first mail from the
+/// platform read "Charlie Root <root@mail.kyriakon.net>". The DKIM signer covers
+/// whatever From is present (`h=subject:to:date:from` in the signature the smtpd
+/// adds), so naming it here is signed like any other header. Message-ID stays the
+/// enqueuer's, which is the one header it is better at.
+fn message(from: &str, to: &str, subject: &str, body: &str) -> String {
     format!(
-        "To: {to}\nSubject: {subject}\nMIME-Version: 1.0\nContent-Type: text/plain; charset=utf-8\n\n{body}\n"
+        "From: {from}\nTo: {to}\nSubject: {subject}\nMIME-Version: 1.0\nContent-Type: text/plain; charset=utf-8\n\n{body}\n"
     )
 }
 
@@ -42,7 +46,7 @@ pub async fn enqueue(cfg: &DrainConfig, to: &str, subject: &str, body: &str) -> 
         .map_err(|e| format!("cannot start {}: {e}", cfg.sendmail))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
-            .write_all(message(to, subject, body).as_bytes())
+            .write_all(message(&cfg.from, to, subject, body).as_bytes())
             .await
             .map_err(|e| format!("cannot write to {}: {e}", cfg.sendmail))?;
         stdin
@@ -170,6 +174,7 @@ mod tests {
             stripe_webhook_secret: String::new(),
             keyring_publish_token: String::new(),
             reviewer: "reviewer@example.invalid".to_string(),
+            from: "kyriakon <hello@example.invalid>".to_string(),
             base_url: "https://signup.kyriakon.net".to_string(),
             price_gbp: "20.00".to_string(),
             postal_address: "REPLACE_ME".to_string(),
@@ -200,6 +205,11 @@ mod tests {
         // The record exists before the send is observable, and the message left.
         let sent = std::fs::read_to_string(dir.join("sent")).unwrap();
         assert!(sent.contains("To: a@b.c"), "{sent}");
+        // The sender is the platform's, not the account that ran the drain.
+        assert!(
+            sent.contains("From: kyriakon <hello@example.invalid>\n"),
+            "{sent}"
+        );
         assert!(sent.contains("Subject: Your application"), "{sent}");
         // The second attempt does nothing: no second message, no second line.
         assert!(!send_account_notice(

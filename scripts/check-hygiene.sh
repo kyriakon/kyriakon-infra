@@ -279,6 +279,20 @@ self_test() {
 	# Section 8: an address that cannot receive is a silent demotion rather than
 	# an error, so each way it goes wrong has to be named.
 	printf 'kyriakon.net\nparish.example\n' > "$dir/domains"
+	# The sender is written by notify_operator, not by the enqueuer: mail(1) and
+	# the raw enqueuer both fill a From from the account running them, which is
+	# root, and a member's approval mail arrived from "Charlie Root".
+	stub_mail="$dir/sendmail"
+	printf '#!/bin/sh\ncat > "%s"\n' "$dir/sent.mail" > "$stub_mail"
+	chmod 0755 "$stub_mail"
+	# ALERT_FROM is pinned: a caller who sourced the env file has the operator's
+	# value set, and this asserts the default the file ships.
+	ALERT_EMAIL='ops@example.invalid' ALERT_FROM='kyriakon <hello@kyriakon.net>' \
+		SENDMAIL="$stub_mail" \
+		notify_operator mail test "something to report" >/dev/null 2>&1
+	check "an alert names the platform as its sender" \
+		"$(grep -c '^From: kyriakon <hello@kyriakon.net>$' "$dir/sent.mail")" 1
+
 	printf "export ALERT_EMAIL='REPLACE_ME_OFF_BOX_ADDRESS'\n" > "$dir/env"
 	out=$(alert_address_problem "$dir/env" "$dir/domains")
 	case "$out" in

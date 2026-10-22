@@ -72,6 +72,12 @@ keyring_publish_token = "/etc/kyriakon/onboard/keyring-publish-token"
 # made from a phone.
 reviewer = "admin@kyriakon.net"
 
+# The sender every notice leaves as. The enqueuer fills a From header from the
+# account that ran it, and the drain runs as root, so a member's approval mail
+# read "Charlie Root <root@mail.kyriakon.net>" until this was named. hello@ is the
+# address the platform already publishes for people to write to.
+from = "kyriakon <hello@kyriakon.net>"
+
 # The base URL the signed links point at. relayd terminates TLS for this
 # hostname and passes the request to the handler on loopback.
 base_url = "https://signup.kyriakon.net"
