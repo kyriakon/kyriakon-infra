@@ -295,6 +295,28 @@ mod tests {
         .expect("a catalogue the file could hold")
     }
 
+    #[test]
+    fn the_status_page_links_the_password_page() {
+        // The link is what a member clicks to set the only password they will
+        // ever have. Rendered as text it cannot be clicked, which is how it
+        // reached the first real member.
+        let page = StatusPage {
+            stage: "approved: an account was made".into(),
+            filed_at: "2026-10-22T10:53:46Z".into(),
+            notice: String::new(),
+            password_link: Some(
+                "https://signup.kyriakon.net/password/x?until=2026-10-29&sig=abc".into(),
+            ),
+        };
+        let html = page.render().expect("the page renders");
+        assert!(
+            html.contains(
+                "<a href=\"https://signup.kyriakon.net/password/x?until=2026-10-29&#38;sig=abc\">Set your mail password</a>"
+            ),
+            "{html}"
+        );
+    }
+
     fn q(id: &str, branch: Branch, kind: Kind, required: bool, rule: Rule) -> Question {
         Question {
             id: id.into(),

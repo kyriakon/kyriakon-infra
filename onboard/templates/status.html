@@ -13,8 +13,9 @@
   <p class="hint">The stage is one of received, with the reviewer, and decided. This page never repeats anything you wrote on the application. Anyone holding this link can read it, so keep it as you would a password. It works until the application is cleared away, a week after a decision.</p>
   {% if let Some(link) = password_link %}
   <h3>Setting your mail password</h3>
-  <p>You gave no address outside this platform, so there is nowhere else to send this. The link below sets the password for your mail account. It works once, and only you should open it.</p>
-  <p class="mono">{{ link }}</p>
+  <p>You gave no address outside this platform, so there is nowhere else to send this. The link below sets the password for your mail account. It works once, and only you should open it. Opening it sets nothing by itself: you choose the password there.</p>
+  <p><a href="{{ link }}">Set your mail password</a></p>
+  <p class="hint mono">{{ link }}</p>
   {% endif %}
   {% endif %}
 </div>
