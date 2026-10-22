@@ -60,8 +60,34 @@ pub fn status(page: &StatusPage) -> String {
     out.push_str(&format!("Stage: {}\n", page.stage));
     if let Some(link) = &page.password_link {
         out.push_str("\n## Setting your mail password\n\n");
-        out.push_str(link);
-        out.push('\n');
+        // A gemtext link is a `=>` line; a bare URL is text to every client, the
+        // same defect the web page had on its other front end.
+        out.push_str(&format!("=> {link} Set your mail password\n"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::page::StatusPage;
+
+    #[test]
+    fn the_capsule_status_page_links_the_password_page() {
+        let page = StatusPage {
+            stage: "approved: an account was made".into(),
+            filed_at: "2026-10-22T10:53:46Z".into(),
+            notice: String::new(),
+            password_link: Some(
+                "https://signup.kyriakon.net/password/x?until=2026-10-29&sig=abc".into(),
+            ),
+        };
+        let text = status(&page);
+        assert!(
+            text.contains(
+                "=> https://signup.kyriakon.net/password/x?until=2026-10-29&sig=abc Set your mail password\n"
+            ),
+            "{text}"
+        );
+    }
 }
