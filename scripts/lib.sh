@@ -215,6 +215,39 @@ run: $0 on $(hostname) at $(date '+%F %T')"
 	return 0
 }
 
+# --- keys -------------------------------------------------------------------
+#
+# key_problems <file> — why a public key cannot serve this platform's mail, one
+# line each, and nothing at all when it can. Two faults, both silent at delivery
+# time: gpg encrypts with packet tag 20 whenever the key advertises AEAD, and a
+# client that implements MDC alone cannot open that; an expired key makes the
+# encryptor fail closed, and the drift check compares fingerprints only, so
+# nothing reports it. deploy-mail.sh warns about the first at install and
+# rekey-mail-key.sh fixes it, both on the side of the box; this is the gate the
+# key has to pass before it is published at all.
+key_problems() {
+	typeset key_file="$1" packets feat expires
+	packets=$(gpg --list-packets "$key_file" 2>/dev/null)
+	if printf '%s\n' "$packets" | grep -q 'pref-aead-algos'; then
+		printf 'it advertises AEAD, so delivery would use a packet a client with MDC alone cannot read (fix on the workstation holding it: scripts/rekey-mail-key.sh)\n'
+	fi
+	# One line per self-signature: a key re-signed beside an older signature
+	# advertises both sets, and the feature bit is what a client reads.
+	printf '%s\n' "$packets" |
+		sed -n 's/.*(features: \([0-9a-fA-F]*\)).*/\1/p' |
+		while read -r feat; do
+			if [ $((0x$feat & 2)) -ne 0 ]; then
+				printf 'its self-signature sets the AEAD feature bit (features: %s)\n' "$feat"
+			fi
+		done
+	expires=$(gpg --batch --with-colons --show-keys "$key_file" 2>/dev/null |
+		awk -F: '$1 == "pub" { print $7; exit }')
+	if [ -n "$expires" ]; then
+		printf 'it expires on %s, and delivery stops then without a word (a mail key must not expire)\n' \
+			"$(date -r "$expires" +%Y-%m-%d)"
+	fi
+}
+
 # --- self-tests ------------------------------------------------------------
 #
 # A --self-test is the one check a script can run without the box's own state, so

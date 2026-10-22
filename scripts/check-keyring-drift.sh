@@ -217,6 +217,14 @@ check_box() {
 			finding "$lp: unreadable key file $k. Delivery to $lp fails closed until a key gpg can read is back in place."
 			continue
 		fi
+		# Drift is not the only way a key stops working: one that advertises
+		# AEAD, or one with an expiry, delivers a packet the member's client may
+		# not open, or stops delivering on a day nobody is watching. The publish
+		# path refuses both, so this catches what reached the box another way.
+		problems=$(key_problems "$k" | tr '\n' ' ')
+		if [ -n "${problems% }" ]; then
+			finding "$lp: the key the box serves cannot deliver to it. $problems"
+		fi
 		pf=$(pub_fpr "$lp")
 		if [ -z "$pf" ]; then
 			mtime=$(stat -f %m "$k")
@@ -282,6 +290,15 @@ self_test() {
 	make_key() {
 		gpg --batch --pinentry-mode loopback --passphrase '' \
 			--quick-generate-key "$1" ed25519 sign 0 >/dev/null 2>&1
+		# gpg 2.4+ writes the AEAD preference into every self-signature, and the
+		# file is otherwise reported by the usability check below; a fixture has
+		# to look like a key the publish path would have accepted.
+		gpg --batch --yes --pinentry-mode loopback --passphrase '' --command-fd 0 \
+			--edit-key "$1" >/dev/null 2>&1 <<'SETPREF'
+setpref AES256 AES192 AES SHA512 SHA384 SHA256 ZLIB BZIP2 ZIP Uncompressed
+y
+save
+SETPREF
 		gpg --batch --armor --export "$1" >"$2" 2>/dev/null
 	}
 	make_key 'Alice Drift <alice@example.invalid>' "$fixture/alice.asc"
@@ -381,6 +398,23 @@ self_test() {
 	assert_has 'frank: a key file gpg cannot read' 'frank' "$out"
 	assert_hasnt 'eve: unpublished and fresh, silent' 'eve:' "$out"
 	assert_hasnt 'alice: matching, silent' 'alice' "$out"
+
+	# A key the publish path would now refuse, already installed: the finding is
+	# the only thing that says the member's mail is being stored as a packet their
+	# client may not open.
+	gpg --batch --pinentry-mode loopback --passphrase '' \
+		--quick-generate-key 'Aead Drift <aead@example.invalid>' ed25519 sign 0 >/dev/null 2>&1
+	gpg --batch --armor --export 'aead@example.invalid' >"$fixture/aead.asc" 2>/dev/null
+	box_aead="$fixture/box-aead"
+	mkdir -p "$box_aead"
+	cp "$fixture/aead.asc" "$box_aead/aead.asc"
+
+	printf '%s\n' '--- a key the box cannot deliver with is named'
+	KEYRING_DIR="$box_aead"
+	run --box
+	assert_eq 'usability exit' 1 "$rc"
+	assert_has 'the finding names the localpart' 'aead:' "$out"
+	assert_has 'and says the key cannot deliver' 'cannot deliver to it' "$out"
 
 	printf '%s\n' '--- a recorded copy that matches is silent, additions included'
 	printf '%s %s\n%s %s\n' alice "$alice" bob "$bob" >"$store"

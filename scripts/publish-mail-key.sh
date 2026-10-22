@@ -88,6 +88,18 @@ set -euo pipefail
 # so the mask is set once and never relaxed.
 umask 077
 
+# lib.sh holds key_problems, which is what decides whether a key can serve this
+# platform's mail. deploy-onboard.sh installs the two files together, and the
+# repo has them beside each other, so a missing one is a broken install rather
+# than a key to publish.
+script_dir=$(cd "$(dirname "$0")" && pwd)
+if [ ! -f "$script_dir/lib.sh" ]; then
+	printf '%s: lib.sh is not in %s. Install the two files together.\n' "$0" "$script_dir" >&2
+	exit 2
+fi
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
+
 repo="${KYRIAKON_REPO:-kyriakon/kyriakon-infra}"
 api_base="${KYRIAKON_API:-https://api.github.com}"
 api_version=2022-11-28
@@ -256,6 +268,14 @@ publish() {
 	want=$(fpr_of "$key_file")
 	[ -n "$want" ] ||
 		refuse "$localpart" "" "the key file $key_file is not a public key gpg can read, so nothing was published"
+
+	# The key's shape, before anything is opened: a key the platform cannot
+	# deliver to is a refusal with the fix on the workstation that holds it, not
+	# a published set entry that fails one member's mail quietly.
+	problems=$(key_problems "$key_file")
+	[ -z "$problems" ] ||
+		refuse "$localpart" "$want" "the key cannot serve this platform's mail:
+$problems"
 
 	path="$key_dir/$localpart.asc"
 	branch="publish-key/$localpart"
@@ -445,6 +465,15 @@ EOF
 	make_key() {
 		gpg --batch --pinentry-mode loopback --passphrase '' \
 			--quick-generate-key "$1" ed25519 sign 0 >/dev/null 2>&1
+		# gpg 2.4+ writes the AEAD preference into every self-signature, and the
+		# publish gate refuses that: a fixture has to look like a key the platform
+		# would publish, or every case below would test the refusal instead.
+		gpg --batch --yes --pinentry-mode loopback --passphrase '' --command-fd 0 \
+			--edit-key "$1" >/dev/null 2>&1 <<'SETPREF'
+setpref AES256 AES192 AES SHA512 SHA384 SHA256 ZLIB BZIP2 ZIP Uncompressed
+y
+save
+SETPREF
 		gpg --batch --armor --export "$1" >"$2" 2>/dev/null
 	}
 	make_key 'Alice Publish <alice@example.invalid>' "$fix/alice.asc"
@@ -565,6 +594,33 @@ EOF
 	assert_has 'the refusal names the published key' "$bob" "$out"
 	assert_has 'the refusal names the key on the box' "$alice" "$out"
 	assert_no_log 'the published file was not written' 'PUT'
+
+	printf '%s\n' '--- a key that advertises AEAD is refused before anything is opened'
+	aead_key="$fix/carol.asc"
+	gpg --batch --pinentry-mode loopback --passphrase '' \
+		--quick-generate-key 'Carol Aead <carol@example.invalid>' ed25519 sign 0 >/dev/null 2>&1
+	gpg --batch --armor --export 'carol@example.invalid' >"$aead_key" 2>/dev/null
+	# gpg before 2.4 writes no AEAD advert, so there would be nothing to refuse.
+	# Skipped by name rather than asserted, because the case would then fail for a
+	# property of the tool rather than of this script.
+	if gpg --list-packets "$aead_key" 2>/dev/null | grep -q 'pref-aead-algos'; then
+		run carol "$aead_key" "$fix/token"
+		assert_eq 'aead exit' 1 "$rc"
+		assert_has 'the refusal names the fix' 'rekey-mail-key.sh' "$out"
+		assert_no_log 'nothing was opened for an AEAD key' 'PUT'
+	else
+		printf 'skip: this gpg writes no AEAD advert, so %s has nothing to refuse\n' "$0"
+	fi
+
+	printf '%s\n' '--- a key that expires is refused'
+	expiring_key="$fix/exp.asc"
+	gpg --batch --pinentry-mode loopback --passphrase '' \
+		--quick-generate-key 'Exp Soon <exp@example.invalid>' rsa2048 encr 1d >/dev/null 2>&1
+	gpg --batch --armor --export 'exp@example.invalid' >"$expiring_key" 2>/dev/null
+	run exp "$expiring_key" "$fix/token"
+	assert_eq 'expiry exit' 1 "$rc"
+	assert_has 'the refusal says when it expires' 'expires on' "$out"
+	assert_no_log 'nothing was opened for an expiring key' 'PUT'
 
 	printf '%s\n' '--- a different key on the branch is refused'
 	rm -f "$fix/state/main"
