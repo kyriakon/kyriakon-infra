@@ -29,6 +29,32 @@ The web half of that configuration now ends behind `scripts/deploy-relayd.sh`, w
 
 Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box without changing anything. It reports permission drift against mtree, the blocklist verdict for the box's address, whether a cron job can still reach the tools it needs, whether the finger service is intact, whether the deployed catalogue matches the tracked one, whether the terraform guard and the restore snapshot are still in place, and whether the two files naming the mail domains agree. It exits non-zero when something is wrong.
 
+## Deploy a merged change
+
+`scripts/deploy.sh` is the normal deploy. It reads the last deployed commit from
+`/var/db/kyriakon/deployed`, diffs it to the checkout's `HEAD`, and runs only the
+deploy scripts that diff needs, in this order: `deploy-nsd.sh`, `deploy-mail.sh`,
+`deploy-relayd.sh`, `deploy-onboard.sh`. Each script is idempotent, so a second
+run after a fix is safe.
+
+From the workstation, one command updates the checkout and prints the plan:
+
+	ssh kyriakon 'cd /usr/local/src/kyriakon-infra && doas git pull --ff-only && doas ksh scripts/deploy.sh --check'
+
+Run the same command without `--check` to apply the plan. The first run on a box
+with no marker plans every deploy script; a later run can be narrowed with
+`--since <commit>`, and `--all` plans every script again.
+
+The script never applies `pf.conf`, `sshd_config` or a login class. It prints
+the commands for each, and it does not advance the marker while one of them
+remains in the range. Apply that diff by hand, then run the deploy again. A
+`kyriakon.env` change also needs `doas ksh scripts/setup-env.sh` to merge the new
+value, and a `cron-apply.sh` change needs `doas ksh scripts/cron-apply.sh`.
+
+The marker is `/var/db/kyriakon/deployed`, one line holding the commit and the
+UTC time it was recorded. It is written only after every planned script
+succeeded.
+
 ## What is not built yet
 
 These procedures name the pieces that exist at this commit, and mark the ones that do not:
