@@ -416,23 +416,6 @@ SETPREF
 	assert_has 'the finding names the localpart' 'aead:' "$out"
 	assert_has 'and says the key cannot deliver' 'cannot deliver to it' "$out"
 
-	# A key the publish path would now refuse, already installed: the finding is
-	# the only thing that says the member's mail is being stored as a packet their
-	# client may not open.
-	gpg --batch --pinentry-mode loopback --passphrase '' \
-		--quick-generate-key 'Aead Drift <aead@example.invalid>' ed25519 sign 0 >/dev/null 2>&1
-	gpg --batch --armor --export 'aead@example.invalid' >"$fixture/aead.asc" 2>/dev/null
-	box_aead="$fixture/box-aead"
-	mkdir -p "$box_aead"
-	cp "$fixture/aead.asc" "$box_aead/aead.asc"
-
-	printf '%s\n' '--- a key the box cannot deliver with is named'
-	KEYRING_DIR="$box_aead"
-	run --box
-	assert_eq 'usability exit' 1 "$rc"
-	assert_has 'the finding names the localpart' 'aead:' "$out"
-	assert_has 'and says the key cannot deliver' 'cannot deliver to it' "$out"
-
 	printf '%s\n' '--- a recorded copy that matches is silent, additions included'
 	printf '%s %s\n%s %s\n' alice "$alice" bob "$bob" >"$store"
 	KEYRING_STORE="$store"

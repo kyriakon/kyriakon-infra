@@ -226,13 +226,14 @@ run: $0 on $(hostname) at $(date '+%F %T')"
 # rekey-mail-key.sh fixes it, both on the side of the box; this is the gate the
 # key has to pass before it is published at all.
 key_problems() {
-	typeset key_file="$1" feat expires
-	if gpg --list-packets "$key_file" 2>/dev/null | grep -q 'pref-aead-algos'; then
+	typeset key_file="$1" packets feat expires
+	packets=$(gpg --list-packets "$key_file" 2>/dev/null)
+	if printf '%s\n' "$packets" | grep -q 'pref-aead-algos'; then
 		printf 'it advertises AEAD, so delivery would use a packet a client with MDC alone cannot read (fix on the workstation holding it: scripts/rekey-mail-key.sh)\n'
 	fi
 	# One line per self-signature: a key re-signed beside an older signature
 	# advertises both sets, and the feature bit is what a client reads.
-	gpg --list-packets "$key_file" 2>/dev/null |
+	printf '%s\n' "$packets" |
 		sed -n 's/.*(features: \([0-9a-fA-F]*\)).*/\1/p' |
 		while read -r feat; do
 			if [ $((0x$feat & 2)) -ne 0 ]; then

@@ -272,10 +272,10 @@ publish() {
 	# The key's shape, before anything is opened: a key the platform cannot
 	# deliver to is a refusal with the fix on the workstation that holds it, not
 	# a published set entry that fails one member's mail quietly.
-	key_problems=$(key_problems "$key_file")
-	[ -z "$key_problems" ] ||
+	problems=$(key_problems "$key_file")
+	[ -z "$problems" ] ||
 		refuse "$localpart" "$want" "the key cannot serve this platform's mail:
-$key_problems"
+$problems"
 
 	path="$key_dir/$localpart.asc"
 	branch="publish-key/$localpart"
@@ -600,10 +600,17 @@ SETPREF
 	gpg --batch --pinentry-mode loopback --passphrase '' \
 		--quick-generate-key 'Carol Aead <carol@example.invalid>' ed25519 sign 0 >/dev/null 2>&1
 	gpg --batch --armor --export 'carol@example.invalid' >"$aead_key" 2>/dev/null
-	run carol "$aead_key" "$fix/token"
-	assert_eq 'aead exit' 1 "$rc"
-	assert_has 'the refusal names the fix' 'rekey-mail-key.sh' "$out"
-	assert_no_log 'nothing was opened for an AEAD key' 'PUT'
+	# gpg before 2.4 writes no AEAD advert, so there would be nothing to refuse.
+	# Skipped by name rather than asserted, because the case would then fail for a
+	# property of the tool rather than of this script.
+	if gpg --list-packets "$aead_key" 2>/dev/null | grep -q 'pref-aead-algos'; then
+		run carol "$aead_key" "$fix/token"
+		assert_eq 'aead exit' 1 "$rc"
+		assert_has 'the refusal names the fix' 'rekey-mail-key.sh' "$out"
+		assert_no_log 'nothing was opened for an AEAD key' 'PUT'
+	else
+		printf 'skip: this gpg writes no AEAD advert, so %s has nothing to refuse\n' "$0"
+	fi
 
 	printf '%s\n' '--- a key that expires is refused'
 	expiring_key="$fix/exp.asc"
