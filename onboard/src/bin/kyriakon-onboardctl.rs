@@ -15,10 +15,11 @@
 //!   kyriakon-onboardctl [--config PATH] decline <username>
 //!   kyriakon-onboardctl [--config PATH] show <username>
 //!   kyriakon-onboardctl request list
-//!   kyriakon-onboardctl request record --username <u> --kind <k> \
-//!     --received <date> --evidence <text> [--note <text>] [--identity-at <date>] \
-//!     [--fee-at <date>]
-//!   kyriakon-onboardctl request close <id> --done <date> --note <text>
+//!   kyriakon-onboardctl request record
+//!   kyriakon-onboardctl request close <id>
+//!
+//! The flags the two writing verbs take are in `usage`, which is the one copy
+//! of the text.
 //!
 //! The `request` verbs write the data-subject request record straight into the
 //! account's store directory. They are root's, like the decisions: the record is
@@ -99,7 +100,7 @@ fn usage() -> String {
        kyriakon-onboardctl request list
        kyriakon-onboardctl request record --username <u> --kind <access|erasure|rectification> \
      --received <YYYY-MM-DD> --evidence <text> [--note <text>] \
-     [--identity-at <YYYY-MM-DD>] [--fee-at <YYYY-MM-DD>]
+     [--identity-at <YYYY-MM-DD>] [--fee-at <YYYY-MM-DD>] [--id <ulid>] \
        kyriakon-onboardctl request close <id> --done <YYYY-MM-DD> --note <text>"
         .to_string()
 }
@@ -168,6 +169,7 @@ async fn request_record(store: &Store, args: &[String]) -> Result<(), String> {
             "note",
             "identity-at",
             "fee-at",
+            "id",
         ],
     )?;
     let line = requests::record(
@@ -180,6 +182,7 @@ async fn request_record(store: &Store, args: &[String]) -> Result<(), String> {
             note: flags.get("note").map(String::as_str),
             identity_at: flags.get("identity-at").map(String::as_str),
             fee_at: flags.get("fee-at").map(String::as_str),
+            id: flags.get("id").map(String::as_str),
         },
     )
     .await?;
@@ -210,24 +213,28 @@ async fn request_list(store: &Store) -> Result<(), String> {
     }
     let today = requests::today();
     let mut nearly = 0;
+    let mut overdue = 0;
     let mut rows = Vec::new();
     for line in open {
         let due =
             requests::parse_date(&line.due).map_err(|e| format!("request {}: {e}", line.id))?;
-        let days = requests::days_until(due, today);
-        if requests::nearly_due(due, today) {
-            nearly += 1;
-        }
-        let state = if days < 0 {
-            "OVERDUE"
-        } else if requests::nearly_due(due, today) {
-            "nearly due"
-        } else {
-            "open"
+        let state = match requests::due_state(due, today) {
+            requests::DueState::Overdue => {
+                overdue += 1;
+                "OVERDUE"
+            }
+            requests::DueState::NearlyDue => {
+                nearly += 1;
+                "nearly due"
+            }
+            requests::DueState::Open => "open",
         };
         rows.push((line, state));
     }
-    println!("{} open request(s), {nearly} nearly due", rows.len());
+    println!(
+        "{} open request(s), {nearly} nearly due, {overdue} overdue",
+        rows.len()
+    );
     for (line, state) in rows {
         println!(
             "{}  {}  {}  received {}  due {}  {state}",
@@ -335,4 +342,51 @@ async fn find_application(store: &Store, username: &str) -> Result<(String, Reco
         }
     }
     best.ok_or_else(|| format!("no application for {username}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flags_read_pairs_and_refuse_a_bad_shape() {
+        let map = flags(
+            &args(&["--username", "alice", "--kind", "access"]),
+            &["username", "kind"],
+        )
+        .unwrap();
+        assert_eq!(map["username"], "alice");
+        assert_eq!(map["kind"], "access");
+
+        assert!(flags(&args(&["--nope", "x"]), &["username"])
+            .unwrap_err()
+            .contains("unknown flag"));
+        assert!(flags(
+            &args(&["--username", "a", "--username", "b"]),
+            &["username"]
+        )
+        .unwrap_err()
+        .contains("given twice"));
+        assert!(flags(&args(&["--username"]), &["username"])
+            .unwrap_err()
+            .contains("needs a value"));
+        assert!(flags(&args(&["alice"]), &["username"])
+            .unwrap_err()
+            .contains("unexpected argument"));
+    }
+
+    #[test]
+    fn one_username_takes_exactly_one_valid_name() {
+        let show = args(&["show", "alice"]);
+        assert_eq!(one_username(&show).unwrap(), "alice");
+        assert!(one_username(&args(&["show"])).is_err());
+        assert!(one_username(&args(&["show", "alice", "extra"])).is_err());
+        assert!(one_username(&args(&["show", "Alice"]))
+            .unwrap_err()
+            .contains("starts with"));
+    }
 }

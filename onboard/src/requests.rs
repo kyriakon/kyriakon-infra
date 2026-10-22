@@ -6,6 +6,9 @@
 //! intents write through the same functions when the drain carries them, so a
 //! page-filed request and a scripted one cannot produce different lines.
 
+use std::io::ErrorKind;
+use std::os::unix::io::AsRawFd;
+
 use serde::{Deserialize, Serialize};
 use time::{Date, Month, OffsetDateTime};
 
@@ -14,11 +17,11 @@ use crate::validate;
 
 /// The kinds the spec names. A portability request is recorded as `access`,
 /// which is the pair the spec treats as one answer; the other two are separate.
-pub const KINDS: [&str; 3] = ["access", "erasure", "rectification"];
+const KINDS: [&str; 3] = ["access", "erasure", "rectification"];
 
 /// What "nearly due" means in `request list`: the deletion path's own seven-day
 /// wait, the only window the spec gives a number for.
-pub const NEARLY_DUE_DAYS: i64 = 7;
+const NEARLY_DUE_DAYS: i64 = 7;
 
 /// One line of `accounts/<username>/requests.jsonl`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -65,6 +68,10 @@ pub struct NewRequest<'a> {
     pub note: Option<&'a str>,
     pub identity_at: Option<&'a str>,
     pub fee_at: Option<&'a str>,
+    /// The id a retry reuses. Absent on a first record, where the module draws
+    /// a ULID; present, an id already in the account's file is refused rather
+    /// than appended a second time.
+    pub id: Option<&'a str>,
 }
 
 /// Today in UTC. One function so `list` and its tests read the same clock.
@@ -85,7 +92,7 @@ pub fn parse_date(value: &str) -> Result<Date, String> {
     Date::from_calendar_date(year, month, day).map_err(|_| bad())
 }
 
-pub fn format_date(date: Date) -> String {
+fn format_date(date: Date) -> String {
     format!(
         "{:04}-{:02}-{:02}",
         date.year(),
@@ -97,7 +104,7 @@ pub fn format_date(date: Date) -> String {
 /// One calendar month later, clamping the day to the shorter month: the 31st of
 /// January answers by the 28th of February, and by the 29th in a leap year.
 /// Article 12's month is a calendar month, not thirty days.
-pub fn one_month_after(date: Date) -> Date {
+fn one_month_after(date: Date) -> Date {
     let (year, month) = if date.month() == Month::December {
         (date.year() + 1, Month::January)
     } else {
@@ -110,7 +117,7 @@ pub fn one_month_after(date: Date) -> Date {
 
 /// The day the clock starts: the latest of receipt, the identity information
 /// asked for, and any fee. Article 12A's "relevant time".
-pub fn relevant_time(received: Date, identity_at: Option<Date>, fee_at: Option<Date>) -> Date {
+fn relevant_time(received: Date, identity_at: Option<Date>, fee_at: Option<Date>) -> Date {
     [Some(received), identity_at, fee_at]
         .into_iter()
         .flatten()
@@ -118,21 +125,60 @@ pub fn relevant_time(received: Date, identity_at: Option<Date>, fee_at: Option<D
         .expect("receipt is always present")
 }
 
-/// Whole days from `today` to `due`, negative once it has passed.
-pub fn days_until(due: Date, today: Date) -> i64 {
-    (due - today).whole_days()
+/// How a request stands against its answer day.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DueState {
+    Open,
+    NearlyDue,
+    Overdue,
 }
 
-pub fn nearly_due(due: Date, today: Date) -> bool {
-    days_until(due, today) <= NEARLY_DUE_DAYS
-}
-
-fn record_path(username: &str) -> String {
-    format!("accounts/{username}/requests.jsonl")
+/// The state `request list` prints. Overdue is separate from nearly due, so the
+/// summary cannot call a lapsed request merely close.
+pub fn due_state(due: Date, today: Date) -> DueState {
+    let days = (due - today).whole_days();
+    if days < 0 {
+        DueState::Overdue
+    } else if days <= NEARLY_DUE_DAYS {
+        DueState::NearlyDue
+    } else {
+        DueState::Open
+    }
 }
 
 fn account_dir(username: &str) -> String {
     format!("accounts/{username}")
+}
+
+fn record_path(username: &str) -> String {
+    format!("{}/requests.jsonl", account_dir(username))
+}
+
+/// The request record's exclusive lock. The console and the drain are different
+/// processes, and a close reads every line and writes them back, so a record
+/// appended between the read and the write would be lost without this. The lock
+/// is held for one small read or write, so blocking a runtime thread that long
+/// is fine.
+///
+/// The lock lives in a file of its own rather than on `requests.jsonl`: the
+/// close replaces that file by rename, and a lock on the replaced inode would
+/// stop guarding the path the moment the rename landed.
+async fn lock(store: &Store, username: &str) -> Result<tokio::fs::File, String> {
+    let path = store.path(&format!("{}/.requests.lock", account_dir(username)));
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).mode(0o600);
+    let file = opts
+        .open(&path)
+        .await
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!(
+            "cannot lock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(file)
 }
 
 /// Append one request line and return it, so the caller can print the due date.
@@ -161,6 +207,12 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
         return Err(format!("no account for {}", request.username));
     }
 
+    let id = match request.id {
+        Some(raw) => ulid::Ulid::from_string(raw)
+            .map_err(|e| format!("the id {raw:?}: {e}"))?
+            .to_string(),
+        None => ulid::Ulid::new().to_string(),
+    };
     let received = parse_date(request.received)?;
     let identity_at = request.identity_at.map(parse_date).transpose()?;
     let fee_at = request.fee_at.map(parse_date).transpose()?;
@@ -169,7 +221,7 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
 
     let line = RequestLine {
         version: 1,
-        id: ulid::Ulid::new().to_string(),
+        id,
         username: request.username.to_string(),
         kind: request.kind.to_string(),
         received: format_date(received),
@@ -187,37 +239,59 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
         done_at: None,
         bundle: None,
     };
+    let _guard = lock(store, request.username).await?;
+    // A retry that carries an id must not write the same request twice. The
+    // read is under the lock, so it sees a record that another process lands
+    // first.
+    if request.id.is_some() {
+        let existing = read_all(store, request.username).await?;
+        if existing.iter().any(|l| l.id == line.id) {
+            return Err(format!("request {} is already recorded", line.id));
+        }
+    }
     let bytes = serde_json::to_vec(&line).map_err(|e| format!("cannot write the request: {e}"))?;
     store.append(&record_path(&line.username), &bytes).await?;
     Ok(line)
 }
 
-/// Read one account's request lines. A line that does not parse is an error:
-/// a record that cannot be read must be reported, not skipped.
+/// Read one account's request lines. A missing file is an empty record; any
+/// other read error is an error, because a record the command cannot see must
+/// not read as a clear docket.
 async fn read_all(store: &Store, username: &str) -> Result<Vec<RequestLine>, String> {
     let path = record_path(username);
+    let abs = store.path(&path);
+    let text = match tokio::fs::read_to_string(&abs).await {
+        Ok(text) => text,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot read {}: {e}", abs.display())),
+    };
     let mut out = Vec::new();
-    for (i, text) in store.lines(&path).await.iter().enumerate() {
-        let line = serde_json::from_str(text)
-            .map_err(|e| format!("{path}: line {} does not parse: {e}", i + 1))?;
-        out.push(line);
+    for (i, line) in text
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .enumerate()
+    {
+        out.push(
+            serde_json::from_str(line)
+                .map_err(|e| format!("{path}: line {} does not parse: {e}", i + 1))?,
+        );
     }
     Ok(out)
 }
 
-/// Find one request by id across the account directories. Returns the account
-/// name, the file's lines, and the index of the request in them.
-async fn find(store: &Store, id: &str) -> Result<(String, Vec<RequestLine>, usize), String> {
-    let mut found: Option<(String, Vec<RequestLine>, usize)> = None;
+/// The account whose record holds one request id. The read happens before the
+/// lock, and again under it in `close`.
+async fn find_account(store: &Store, id: &str) -> Result<String, String> {
+    let mut found: Option<String> = None;
     for username in store.list("accounts").await? {
-        let lines = read_all(store, &username).await?;
-        let Some(at) = lines.iter().position(|l| l.id == id) else {
+        if !read_all(store, &username).await?.iter().any(|l| l.id == id) {
             continue;
-        };
+        }
         if found.is_some() {
             return Err(format!("request {id} appears in more than one account"));
         }
-        found = Some((username.clone(), lines, at));
+        found = Some(username);
     }
     found.ok_or_else(|| format!("no request with id {id}"))
 }
@@ -226,7 +300,9 @@ async fn find(store: &Store, id: &str) -> Result<(String, Vec<RequestLine>, usiz
 ///
 /// The file is one line per request, not one line per event, so closing rewrites
 /// that request's line and leaves the others as they were. The rewrite goes by
-/// rename (the store's own write), so a reader never sees a half file.
+/// rename (the store's own write), so a reader never sees a half file, and the
+/// whole read and write happen under the record's lock, so a concurrent record
+/// is not dropped.
 pub async fn close(
     store: &Store,
     id: &str,
@@ -238,7 +314,13 @@ pub async fn close(
         return Err("what was done is needed".to_string());
     }
     let done_at = parse_date(done_at)?;
-    let (username, mut lines, at) = find(store, id).await?;
+    let username = find_account(store, id).await?;
+    let _guard = lock(store, &username).await?;
+    let mut lines = read_all(store, &username).await?;
+    let at = lines
+        .iter()
+        .position(|l| l.id == id)
+        .ok_or_else(|| format!("no request with id {id}"))?;
     if lines[at].done.is_some() {
         return Err(format!("request {id} is already closed"));
     }
@@ -302,6 +384,7 @@ mod tests {
             note: None,
             identity_at: None,
             fee_at: None,
+            id: None,
         }
     }
 
@@ -481,15 +564,39 @@ mod tests {
     }
 
     #[test]
-    fn nearly_due_includes_the_day_it_passes() {
+    fn the_list_separates_overdue_from_nearly_due() {
         let today = d("2026-10-22");
-        assert!(
-            !nearly_due(d("2026-10-30"), today),
-            "eight days is not near"
-        );
-        assert!(nearly_due(d("2026-10-29"), today), "seven days is near");
-        assert!(nearly_due(d("2026-10-22"), today), "today is near");
-        assert!(nearly_due(d("2026-10-01"), today), "overdue is still owed");
-        assert_eq!(days_until(d("2026-10-29"), today), 7);
+        assert_eq!(due_state(d("2026-10-21"), today), DueState::Overdue);
+        assert_eq!(due_state(d("2026-10-22"), today), DueState::NearlyDue);
+        assert_eq!(due_state(d("2026-10-29"), today), DueState::NearlyDue);
+        assert_eq!(due_state(d("2026-10-30"), today), DueState::Open);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_record_is_an_error_not_an_empty_docket() {
+        let (store, dir) = temp_store("unreadable");
+        // A directory where the file belongs. The read fails for every user,
+        // including root, so the test does not depend on file permissions.
+        std::fs::create_dir_all(dir.join("accounts/alice/requests.jsonl")).unwrap();
+        let err = open(&store).await.unwrap_err();
+        assert!(err.contains("cannot read"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_retry_with_the_same_id_does_not_write_a_second_line() {
+        let (store, dir) = temp_store("record-retry");
+        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let mut first = new_request("access", "2026-10-22");
+        first.id = Some(id);
+        let line = record(&store, first).await.unwrap();
+        assert_eq!(line.id, id);
+
+        let mut again = new_request("access", "2026-10-22");
+        again.id = Some(id);
+        let err = record(&store, again).await.unwrap_err();
+        assert!(err.contains("already recorded"), "{err}");
+        assert_eq!(read_all(&store, "alice").await.unwrap().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

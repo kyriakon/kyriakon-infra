@@ -23,6 +23,12 @@ impl Store {
         }
     }
 
+    /// The absolute path of one store path, for a caller that has to open the
+    /// file itself. The request record takes its lock on a path, not on a handle.
+    pub fn path(&self, rel: &str) -> PathBuf {
+        self.root.join(rel)
+    }
+
     pub async fn read_text(path: &str) -> Result<String, String> {
         tokio::fs::read_to_string(path)
             .await
