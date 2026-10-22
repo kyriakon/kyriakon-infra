@@ -371,15 +371,17 @@ fn protected_payload(msg: &[u8]) -> Vec<u8> {
         None => {
             // No Content-Type at all, so the RFC 2045 default applies. Naming it
             // changes nothing about how the body reads and gives the parameter a
-            // home.
-            out.extend_from_slice(block);
-            if !block.is_empty() {
-                out.extend_from_slice(nl_style(block));
-            }
+            // home. It goes first, and directly: `block` already ends with its
+            // last line's newline, so appending a second one after it ends the
+            // header block, which puts this line in the body for every parser
+            // that is strict about where headers stop. Cron's mail, which is
+            // composed without a Content-Type, arrived that way: the client
+            // showed the real Subject and then the Content-Type line as text.
             out.extend_from_slice(
                 b"Content-Type: text/plain; charset=us-ascii; protected-headers=\"v1\"",
             );
             out.extend_from_slice(nl_style(block));
+            out.extend_from_slice(block);
         }
     }
 
@@ -539,6 +541,17 @@ mod tests {
     #[test]
     fn payload_adds_a_content_type_when_there_is_none() {
         let p = payload(b"From: a@b\nSubject: x\n\nbody\n");
+        // The whole header block, in order and unbroken: the synthesized line is
+        // a header the client can see, not the first line of the body.
+        assert_eq!(
+            p,
+            "Content-Type: text/plain; charset=us-ascii; protected-headers=\"v1\"\n\
+             From: a@b\n\
+             Subject: x\n\
+             \n\
+             body\n",
+            "{p}"
+        );
         assert!(
             p.contains("Content-Type: text/plain; charset=us-ascii; protected-headers=\"v1\"\n"),
             "{p}"
@@ -561,8 +574,18 @@ mod tests {
 
     #[test]
     fn payload_terminates_headers_when_the_message_has_no_blank_line() {
+        // The message ends inside its header block, so the blank line that ends
+        // it has to be added: without one, the synthesized Content-Type would be
+        // indistinguishable from the body. It must come after both headers, not
+        // after the first.
         let p = payload(b"Subject: x\n");
-        assert!(p.contains("protected-headers=\"v1\"\n\n"), "{p}");
+        assert_eq!(
+            p,
+            "Content-Type: text/plain; charset=us-ascii; protected-headers=\"v1\"\n\
+             Subject: x\n\
+             \n",
+            "{p}"
+        );
     }
 
     #[test]
