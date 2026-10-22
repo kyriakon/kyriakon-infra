@@ -118,6 +118,10 @@ The script opens one branch, `publish-key/<localpart>`, with one commit adding `
 
 The credential is a fine-grained token for this repository, scoped to contents and pull requests, at `/etc/kyriakon/onboard/keyring-publish-token`, root-owned and mode 0600. `scripts/deploy-onboard.sh` checks that shape and prints the install line when the file is missing. The script never writes the token to an argument or to its output: it goes into a mode-0600 curl config file.
 
+A failed publish is reported by the drain, which names the member and the fingerprint, and the next pass tries again. The seven days `scripts/check-keyring-drift.sh` allows an unpublished key are the backstop: if the pull request is never merged, or the publish never succeeds, the check alerts at the branch name, and the repair is to merge the pull request or fix the credential. Delivery is unaffected either way, because the box keyring is what encrypts.
+
+`scripts/publish-mail-key.sh` refuses a key that advertises AEAD or that expires, which is stricter than the application form: the form is specified to warn and proceed (`docs/planning/specs/gemini-capsule.md`, `docs/planning/specs/ssh-onboarding-tui.md`), and that warning is not built yet (#176). The refusal keeps the published set from claiming a key the box cannot deliver with. It does not change delivery in either direction, because the box keyring is what encrypts, and a key that needs it is repaired where the secret lives (`scripts/rekey-mail-key.sh`). A key already installed on the box with either fault is reported by `scripts/check-keyring-drift.sh` on every run until it is replaced, which is louder than the seven-day unpublished-key alert beside it.
+
 ### The repository settings the publish depends on
 
 None of these is visible from the repository, and each one has cost an hour to find
@@ -140,8 +144,6 @@ checked by any script.
   places.
 - **"Allow auto-merge"** was needed while the workflow queued its merge; the workflow
   now merges directly, so it is no longer a dependency.
-
-A failed publish is reported by the drain, which names the member and the fingerprint, and the next pass tries again. The seven days `scripts/check-keyring-drift.sh` allows an unpublished key are the backstop: if the pull request is never merged, or the publish never succeeds, the check alerts at the branch name, and the repair is to merge the pull request or fix the credential. Delivery is unaffected either way, because the box keyring is what encrypts.
 
 ## Replace a member's key
 

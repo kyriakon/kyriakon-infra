@@ -26,7 +26,8 @@ A candidate file is staged in its destination's directory and renamed, never red
 
 ## Review findings
 
-A finding that changes behaviour lands with its test on the branch that will merge. A
+A finding that changes behaviour lands with its test on the branch that will merge.
+A reviewer who says the tooling fails runs it and quotes the exit status: a `shellcheck` or `clippy` finding the repository's own command does not reproduce is a finding about the review, and it costs a round trip with the implementation agent. A
 fix moved between branches by checking out whole directories from another branch
 carries whatever that branch held: five verified fixes were lost that way, and the
 squash merged code that had never been tested.
@@ -35,4 +36,3 @@ squash merged code that had never been tested.
 
 The tooling wins. If a rule here can be checked mechanically, move it into `.githooks/` or the CI workflow and delete it from this file.
 
-A reviewer who says the tooling fails runs it and quotes the exit status. A claimed `shellcheck` or `clippy` finding that the repository's own command does not reproduce is a finding about the review, and it costs a round trip with the implementation agent.

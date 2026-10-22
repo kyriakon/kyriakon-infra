@@ -1,3 +1,6 @@
+<!-- A proposal: move this over the current file to adopt it. Until then the current
+     file is the authoritative copy. -->
+
 # AGENTS.md
 
 kyriakon-infra is the public infrastructure repo for kyriakon.net — a low-extraction,
@@ -16,40 +19,40 @@ without that context — don't guess at proposal content from memory.
 Any research/spec working docs specific to this repo live under `docs/planning/`. Read
 `docs/planning/README.md` for infra-repo-local planning context.
 
-Finalized decisions specific to this repo (not cross-cutting ones — those are ADRs in
-the meta repo) live under `docs/decisions/` — check there before assuming you're
-missing context; it may already be written down.
+Finalized decisions live in the meta repo, `../kyriakon/docs/decisions/`, beside the
+project proposal. Check there before assuming you're missing context; it may already be
+written down. This repo has no decisions directory of its own.
 
 ## Where things are
 
 Pointers, so a search starts where the thing is.
 
-- `onboard/` — the Rust service. `src/responder.rs` serves the web form and its pages;
+- `onboard/`: the Rust service. `src/responder.rs` serves the web form and its pages;
   `src/capsule.rs` renders the same pages as gemtext, so a page has two renderers and a
   change to one is a change to both; `templates/*.html` are the web renderings;
   `src/transitions.rs` holds the drain's decisions; `src/bin/` holds the three
   binaries (`kyriakon-onboard-drain`, `kyriakon-onboard-tui`, `kyriakon-onboardctl`);
   `questions.toml` is the application's question list; `tests/drain.rs` is the drain's
   acceptance suite.
-- `kyriakon-encrypt/` — the daemon that encrypts every saved message to the recipient's
+- `kyriakon-encrypt/`: the daemon that encrypts every saved message to the recipient's
   key; `src/lib.rs` builds the PGP/MIME wrapper.
-- `dovecot-plugin/` — the C plugin that calls the encryptor on the save path.
-- `keys/` — the published public keys, one `<localpart>.asc` per member: the audit
+- `dovecot-plugin/`: the C plugin that calls the encryptor on the save path.
+- `keys/`: the published public keys, one `<localpart>.asc` per member: the audit
   surface. `scripts/publish-mail-key.sh` writes one, `scripts/rekey-mail-key.sh`
   rewrites one without the AEAD advert.
-- `scripts/` — every deploy and operator script, each with a `--self-test`; `lib.sh`
+- `scripts/`: every deploy and operator script, each with a `--self-test`; `lib.sh`
   holds the shared helpers and the self-test harness.
-- `openbsd/` — what the box runs: `etc/` (smtpd, httpd, relayd, gmid, unbound, nsd,
-  spamd, sshd, `login.conf.d/`, `rc.d/`, `kyriakon.env`, and the two onboarding configs
-  under `etc/onboard/`), `dovecot/`, and `restore-template/` for the throwaway box.
-- `terraform/` — the box itself, and the throwaway's stack.
-- `docs/` — `runbook.md` (every operator procedure, including the repository settings
+- `openbsd/`: what the box runs: `etc/` (smtpd, httpd, relayd, gmid, unbound, nsd,
+  spamd, sshd, `login.conf.d/`, `rc.d/`, `kyriakon.env`, and the three onboarding
+  configs (`catalogue.toml`, `drain.toml`, `onboard.toml`) under `etc/onboard/`), `dovecot/`, and `restore-template/` for the throwaway box.
+- `terraform/`: the box itself, and the throwaway's stack.
+- `docs/`: `runbook.md` (every operator procedure, including the repository settings
   the automation depends on), `operations/`, `threat-model.md`, `terms.md`,
   `privacy.md`, `aup.md`, `transparency.md`, `refusals.md`, `planning/` (specs,
   research, prototypes), `agents/` (issue tracker, triage labels, domain docs).
-- `.github/workflows/` — `checks.yml` (the four CI jobs) and `auto-merge-key.yml` (a
+- `.github/workflows/`: `checks.yml` (the four CI jobs) and `auto-merge-key.yml` (a
   green key publication merges itself, as the machine account).
-- `.githooks/` — commit shape, pre-commit, pre-push.
+- `.githooks/`: commit shape, pre-commit, pre-push.
 - Root: `reserved-usernames.txt` (the held-back names), `CONTEXT.md` (repo vocabulary),
   `CODING_STANDARDS.md` (what a review enforces), `README.md`.
 
@@ -152,9 +155,9 @@ issue body alone is a summary, not the full context.
   that's working as intended, not a bug to route around.
 - **Never `scp`, `rsync`, or otherwise push a config file to the live box.** All
   deployment to the live host is a manual, human-run step.
-- Never edit `docs/decisions/*.md` (ADRs) as a side effect of an unrelated task —
-  these record decisions, not implementation notes, and changes need explicit human
-  review.
+- Never edit the meta repo's ADRs (`../kyriakon/docs/decisions/*.md`) as a side effect
+  of an unrelated task. They record decisions, not implementation notes, and changes
+  need explicit human review.
 
 ## Agent skills
 
@@ -168,4 +171,4 @@ Five canonical triage labels, strings equal to their names: `needs-triage`, `nee
 
 ### Domain docs
 
-Single-context. ADRs live in `docs/decisions/`, shared vocabulary in `CONTEXT.md`. See `docs/agents/domain.md`.
+Single-context. ADRs live in the meta repo at `../kyriakon/docs/decisions/`, shared vocabulary in `CONTEXT.md`. See `docs/agents/domain.md`.
