@@ -43,9 +43,13 @@ Hetzner has no native OpenBSD image, so install once by hand and snapshot it:
 6. Post-install, before snapshotting:
    ```sh
    syspatch
-   pkg_add dovecot rspamd restic
+   pkg_add dovecot restic
    pkg_add -u
    ```
+   Not `rspamd`: the spam and blocklist work is OpenBSD's `spamd` plus
+   `filter-dkimsign`, and a box built from this list with `rspamd` on it boots a
+   daemon nothing starts and nothing configures. The restore template's note below
+   says the same, and the two disagreed until a test box was found carrying it.
 7. Shut down cleanly (`shutdown -h now`), then snapshot with a label:
    ```sh
    hcloud server create-image --type snapshot \
