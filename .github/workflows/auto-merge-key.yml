@@ -6,13 +6,11 @@
 # only decision is whether the published set should carry the key, which the
 # approval already made. So the merge waits for the checks and then happens.
 #
-# Two repository settings this depends on, both off in a new repository:
-#   allow_auto_merge                    -- "Allow auto-merge"
-#   can_approve_pull_request_reviews    -- "Allow GitHub Actions to create and
-#                                          approve pull requests"
-# The first lets the merge be queued; the second is what lets the workflow's own
-# token record the review the ruleset wants. A run with the second off says so
-# and merges nothing, rather than going red.
+# One repository setting this depends on, off in a new repository:
+#   can_approve_pull_request_reviews  -- "Allow GitHub Actions to create and
+#                                        approve pull requests"
+# It is what lets the workflow's own token record the review the ruleset wants. A
+# run with it off says so and merges nothing, rather than going red.
 #
 # main's ruleset requires one approving review. Listing the machine account in its
 # bypass list did not make the merge pass (`the base branch policy prohibits the
@@ -122,9 +120,19 @@ jobs:
             printf 'GitHub Actions to approve pull requests; nothing was merged\n'
             exit 0
           fi
-          # --auto, because the approval takes a moment to count and the merge
-          # would otherwise race it. It exits 0 once the merge is queued, so the
-          # message says queued, not merged: the merge itself is the workflow run
-          # on the pull request and the commit on main.
-          gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --squash --auto --delete-branch
-          printf 'queued #%s to merge when the review registers\n' "$pr"
+          # A direct merge, not --auto. GitHub re-evaluates auto-merge when a check
+          # suite completes, and this runs *after* the checks have completed, so
+          # #443 sat mergeable and approved until the checks were re-run by hand;
+          # the same gap left its branch undeleted. The approval above is
+          # registered by the time this returns, and the retries cover the second
+          # it can take to settle. A merge that still fails is loud.
+          attempt=0
+          until gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --squash --delete-branch; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 3 ]; then
+              printf 'could not merge #%s; it is left open\n' "$pr"
+              exit 1
+            fi
+            sleep 5
+          done
+          printf 'merged #%s, a green key publication\n' "$pr"
