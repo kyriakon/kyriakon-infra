@@ -13,6 +13,15 @@ Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all o
 
 Infer the repo from `git remote -v` — `gh` does this automatically when run inside a clone.
 
+## Gotchas
+
+- `gh pr list --json ... --jq ...` takes jq's *expression* but not its flags: `--arg`
+  is rejected with "unknown arguments". Interpolate the value into the expression, and
+  check it first when it comes from an event payload.
+- A PR or issue body with backticks or `$` in it: write the body to a file and pass
+  `--body-file`. An inline heredoc inside a command substitution expands them, which
+  is how a PR body has been published as a list of shell errors.
+
 ## Pull requests as a triage surface
 
 **PRs as a request surface: no.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_

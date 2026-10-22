@@ -24,6 +24,13 @@ A failure that matters prints the message it exists to print. A `die` whose func
 
 A candidate file is staged in its destination's directory and renamed, never redirected over the installed file. A partial config is a service that will not start.
 
+## Review findings
+
+A finding that changes behaviour lands with its test on the branch that will merge. A
+fix moved between branches by checking out whole directories from another branch
+carries whatever that branch held: five verified fixes were lost that way, and the
+squash merged code that had never been tested.
+
 ## When the tooling and this file disagree
 
 The tooling wins. If a rule here can be checked mechanically, move it into `.githooks/` or the CI workflow and delete it from this file.

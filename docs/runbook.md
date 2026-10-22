@@ -118,6 +118,29 @@ The script opens one branch, `publish-key/<localpart>`, with one commit adding `
 
 The credential is a fine-grained token for this repository, scoped to contents and pull requests, at `/etc/kyriakon/onboard/keyring-publish-token`, root-owned and mode 0600. `scripts/deploy-onboard.sh` checks that shape and prints the install line when the file is missing. The script never writes the token to an argument or to its output: it goes into a mode-0600 curl config file.
 
+### The repository settings the publish depends on
+
+None of these is visible from the repository, and each one has cost an hour to find
+once. They belong to the forge, not the box, so they are listed here rather than
+checked by any script.
+
+- **Ruleset `Main`** on this repository: one approving review, no force-push, no
+  deletion. Its bypass list names the owner with `always` and `kyriakon-publisher`
+  with `pull_request`. In practice the machine account's entry did not let its merge
+  through, which is why the workflow records the review itself; do not remove that
+  step on the assumption that the bypass list is enough.
+- **"Allow GitHub Actions to create and approve pull requests"**: an organization
+  setting first, then a repository one. Off by default. With it off, the auto-merge
+  workflow's approval is refused, the workflow says so and merges nothing.
+- **Variable `KEY_PUBLISHER_LOGIN`** = the machine account's login. Unset, the
+  workflow merges nothing.
+- **Secret `KEY_PUBLISHER_TOKEN`** = the same fine-grained token the box holds in
+  `/etc/kyriakon/onboard/keyring-publish-token`, scoped to contents and pull requests.
+  The workflow merges as that account, so a rotated token has to be replaced in both
+  places.
+- **"Allow auto-merge"** was needed while the workflow queued its merge; the workflow
+  now merges directly, so it is no longer a dependency.
+
 A failed publish is reported by the drain, which names the member and the fingerprint, and the next pass tries again. The seven days `scripts/check-keyring-drift.sh` allows an unpublished key are the backstop: if the pull request is never merged, or the publish never succeeds, the check alerts at the branch name, and the repair is to merge the pull request or fix the credential. Delivery is unaffected either way, because the box keyring is what encrypts.
 
 ## Replace a member's key
