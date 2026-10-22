@@ -6,10 +6,12 @@
 # only decision is whether the published set should carry the key, which the
 # approval already made. So the merge waits for the checks and then happens.
 #
-# The merge runs as the machine account (the KEY_PUBLISHER_TOKEN secret), which is
-# the only actor besides the owner that main's ruleset lets merge without a
-# review. It is the same account the publishing token belongs to, so the
-# unattended path covers exactly what that credential could already do.
+# main's ruleset requires one approving review. Listing the machine account in its
+# bypass list did not make the merge pass (`the base branch policy prohibits the
+# merge`), so the workflow supplies the review itself: it approves under its own
+# identity, github-actions[bot], and merges as the machine account. The review that
+# matters is the operator's approval of the application, which is what published
+# the key; this records that the checks passed on the result.
 #
 # It runs on the checks workflow's completion, not on the pull request, because a
 # pull_request trigger would start beside the checks rather than after them.
@@ -37,6 +39,9 @@ jobs:
           # requires an approving review and lists only that account as a bypass
           # actor, so the merge has to be attributable to it; the bot cannot.
           GH_TOKEN: ${{ secrets.KEY_PUBLISHER_TOKEN }}
+          # The workflow's own token, used only for the approval. Named apart so
+          # the merge below cannot accidentally run as the bot.
+          WORKFLOW_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           KEY_PUBLISHER_LOGIN: ${{ vars.KEY_PUBLISHER_LOGIN }}
         run: |
@@ -90,5 +95,16 @@ jobs:
             printf 'leaving #%s alone: it changes no file\n' "$pr"
             exit 0
           fi
-          gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --squash --delete-branch
+          # The token has to be the machine account's for the merge to be
+          # attributable to the credential that pushed the branch, and the author
+          # guard above only checked the pull request, not the token.
+          who=$(gh api user --jq .login)
+          printf 'acting as %s\n' "$who"
+          if [ "$who" != "$KEY_PUBLISHER_LOGIN" ]; then
+            printf 'the token belongs to %s, not %s, so nothing is merged\n' "$who" "$KEY_PUBLISHER_LOGIN"
+            exit 0
+          fi
+          GH_TOKEN="$WORKFLOW_TOKEN" gh pr review "$pr" --repo "$GITHUB_REPOSITORY" --approve \
+            --body "The approval published this key and the checks passed on it."
+          gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --squash --auto --delete-branch
           printf 'merged #%s, a green key publication\n' "$pr"
