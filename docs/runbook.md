@@ -18,7 +18,7 @@ Three paths appear throughout:
 		doas mv /root/src/kyriakon-infra /usr/local/src/kyriakon-infra
 		doas chown -R root:wheel /usr/local/src/kyriakon-infra
 		ls /usr/local/src/kyriakon-infra   # as the operator, this should list
-- `/root/bin` holds the copies that cron runs. `scripts/deploy-mail.sh` installs `lib.sh`, `abuse-monitor.sh`, `backup.sh`, `renew-acme.sh` and `restore-standup.sh` there, and `scripts/cron-apply.sh` writes the crontab lines that call them.
+- `/root/bin` holds the copies that cron runs. `scripts/deploy-mail.sh` installs `lib.sh`, `abuse-monitor.sh`, `check-keyring-drift.sh`, `backup.sh`, `renew-acme.sh`, `restore-standup.sh` and `acme-queue.sh` there, and `scripts/cron-apply.sh` writes the crontab lines that call them.
 - `/root/.kyriakon-env` holds the box's values, mode 0600, one `export VAR=value` per line. `scripts/setup-env.sh` installs and merges it, and every cron line sources it, so no value is typed twice.
 
 Deploy the configuration with `doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-mail.sh`. It is idempotent, it installs the mail and web configuration, it rebuilds the Dovecot plugin and the encryptor, it installs every `keys/*.asc` into the keyring, and it restarts the daemons. It prints the firewall and `sshd_config` steps instead of taking them, because both are propose-only changes that a human applies.
@@ -28,6 +28,37 @@ The web half of that configuration now ends behind `scripts/deploy-relayd.sh`, w
 		doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-relayd.sh
 
 Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box without changing anything. It reports permission drift against mtree, the blocklist verdict for the box's address, whether a cron job can still reach the tools it needs, whether the finger service is intact, whether the deployed catalogue matches the tracked one, whether the terraform guard and the restore snapshot are still in place, and whether the two files naming the mail domains agree. It exits non-zero when something is wrong.
+
+## Deploy a merged change
+
+`scripts/deploy.sh` is the normal deploy. It reads the last deployed commit from
+`/var/db/kyriakon/deployed`, diffs it to the checkout's `HEAD`, and runs only the
+deploy scripts that diff needs, in this order: `deploy-nsd.sh`, `deploy-mail.sh`,
+`deploy-relayd.sh`, `deploy-onboard.sh`. Each script is idempotent, so a second
+run after a fix is safe.
+
+From the workstation, one command updates the checkout and prints the plan:
+
+	ssh -t kyriakon 'cd /usr/local/src/kyriakon-infra && doas git pull --ff-only && doas ksh scripts/deploy.sh --check'
+
+Run the same command without `--check` to apply the plan. A later run can be
+narrowed with `--since <commit>`. The first run on a box with no marker is
+`--all`, which runs every script and does not record, because with no diff it
+cannot see a `pf.conf` or `sshd_config` change. After the manual checks, record
+it:
+
+	ssh -t kyriakon 'cd /usr/local/src/kyriakon-infra && doas ksh scripts/deploy.sh --record'
+
+The script never applies `pf.conf`, `sshd_config` or a login class. It prints
+the commands for each, and it does not advance the marker while one of them
+remains in the range. Apply the diff by hand, then run `--record`. A
+`kyriakon.env` change also needs `doas ksh scripts/setup-env.sh` to merge the new
+value, a `cron-apply.sh` change needs `doas ksh scripts/cron-apply.sh`, and a
+terraform change needs the plan and apply you already run from the workstation.
+
+The marker is `/var/db/kyriakon/deployed`, one line holding the commit and the
+UTC time it was recorded. It is written by `--record`, or by a run whose range
+had no manual step.
 
 ## What is not built yet
 
