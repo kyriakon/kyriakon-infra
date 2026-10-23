@@ -22,6 +22,12 @@ The handler holds no key. Anything it cannot prove is proved by the drain: a lin
 
 A store file ending `.jsonl` is a record and stays append-only. The one exception is a line that has to be completed later, as `request close` does: that verb takes an exclusive lock across the read and the write, and the code says why. A rewrite without the lock can drop a line another process appended.
 
+## Docs
+
+Cite the command, path or symbol that makes a claim checkable. A line number is
+a timestamp: the next edit above it moves it, and the review cannot tell a stale
+one from a correct one.
+
 ## Shell scripts
 
 A failure that matters prints the message it exists to print. A `die` whose function is not defined exits 127 and says nothing, so a new failure path is checked against the script's own error idiom, not copied from another script's.
