@@ -161,7 +161,8 @@ mod tests {
         let r: Result<Config, _> = toml::from_str(
             "store_rooot = \"/x\"\n\
              reserved=\"r\"\ncatalogue=\"c\"\n\
-             httpd_socket=\"/a\"\ngemini_socket=\"/b\"\nrelease=\"r\"\n",
+             httpd_socket=\"/a\"\ngemini_socket=\"/b\"\n\
+             portal_socket=\"/c\"\nrelease=\"r\"\n",
         );
         assert!(r.is_err());
     }

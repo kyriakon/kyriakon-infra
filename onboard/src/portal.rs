@@ -29,7 +29,7 @@
 //! [#380]: https://github.com/kyriakon/kyriakon-infra/issues/380
 //! [#381]: https://github.com/kyriakon/kyriakon-infra/issues/381
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::IpAddr;
 use std::os::fd::AsRawFd;
@@ -37,21 +37,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::catalogue::{self, Protocol, Row, Service};
+use crate::portal_ipc::Answer as StatusAnswer;
 use crate::store;
-
-/// What the handler answered a status read with: the stage alone, or the one
-/// notice that covers an unknown token, an expired one and a rate-limited read.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Lookup {
-    Stage(String),
-    Notice(String),
-}
 
 /// Where a session reads an application's stage. The portal cannot read the
 /// store, so the answer comes from the handler over its own socket; a test drives
 /// the same trait with an answer instead.
 pub trait StatusSource {
-    fn read(&mut self, token: &str) -> Result<Lookup, String>;
+    fn read(&mut self, token: &str) -> Result<StatusAnswer, String>;
 }
 
 /// The screen an address sees when it already holds the session cap. It names
@@ -64,18 +57,23 @@ Wait a few minutes and try again. The web form at
 https://signup.kyriakon.net works the same way and has no session limit.
 ";
 
-/// Where the portal keeps its session locks, and how many one address may hold.
-/// The cap matches sshd's `PerSourceMaxStartups 2`; the spec leaves the box-wide
-/// total unset until the port is measured, so only the per-address cap is here.
+/// Where the portal keeps its session locks, how many one address may hold, and
+/// the small box-wide total the spec asks for. The per-address cap matches sshd's
+/// `PerSourceMaxStartups 2`; the box-wide number is a starting point, like the
+/// spec's other limits, and the live port's baseline sets the final one.
 pub const SESSION_DIR: &str = "/var/db/kyriakon-onboard-tui";
 pub const SESSIONS_PER_ADDRESS: usize = 2;
+pub const SESSIONS_TOTAL: usize = 16;
 
-/// A session's lock file. One file per live session, named for the address and
-/// the process that holds it, and removed on exit. A file whose process is gone is
-/// pruned by the next session, so an abandoned session cannot lock an address out
-/// for good.
+/// One session's lock file, held open for the session's life. The kernel releases
+/// the lock when the process ends, so a file left behind by a crash can be told
+/// from a live one without trusting a pid. The path is removed on a clean exit;
+/// the next start prunes any it finds unlocked.
 pub struct Sessions {
-    file: Option<PathBuf>,
+    path: Option<PathBuf>,
+    /// The open file carries the lock; dropping it releases the lock. It is not
+    /// read, so the field is here for its lifetime rather than its value.
+    _lock: Option<File>,
 }
 
 /// Whether a session may start.
@@ -93,98 +91,110 @@ impl Sessions {
             .map_err(|e| format!("cannot open the session directory {}: {e}", dir.display()))?;
         prune(dir)?;
         let Some(address) = address else {
-            return Ok(Admission::Open(Sessions { file: None }));
+            return Ok(Admission::Open(Sessions {
+                path: None,
+                _lock: None,
+            }));
         };
 
-        // The count and the create are one critical section: two sessions starting
-        // together must not both read a count of one and make three. The lock file
-        // is per address and outlives the session, so its inode is stable.
-        let lock_path = dir.join(format!("{address}.lock"));
-        let lock = OpenOptions::new()
+        // One directory-wide lock, so the counts and the create are one critical
+        // section across every address. It is the only permanent file here; the
+        // session files are removed on exit or pruned.
+        let count_path = dir.join("sessions.lock");
+        let count_lock = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(&lock_path)
-            .map_err(|e| format!("cannot open {}: {e}", lock_path.display()))?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(format!(
-                "cannot lock {}: {}",
-                lock_path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
+            .open(&count_path)
+            .map_err(|e| format!("cannot open {}: {e}", count_path.display()))?;
+        lock_exclusive(count_lock.as_raw_fd(), &count_path)?;
 
         let prefix = format!("{address}@");
         let mut held = 0;
+        let mut total = 0;
         for entry in fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))? {
             let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.contains('@') {
+                continue;
+            }
+            total += 1;
+            if name.starts_with(&prefix) {
                 held += 1;
             }
         }
-        if held >= SESSIONS_PER_ADDRESS {
+        if held >= SESSIONS_PER_ADDRESS || total >= SESSIONS_TOTAL {
             return Ok(Admission::Busy);
         }
 
-        // A pid is unique among live processes; the start time and the counter
-        // keep a later process that reused the pid from colliding with a lock the
-        // dead one left behind.
+        // The pid and start time are for reading a file, not for deciding whether
+        // its session is alive: the lock does that.
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let started = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let file = dir.join(format!(
+        let path = dir.join(format!(
             "{prefix}{}-{started}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(&file)
-            .map_err(|e| format!("cannot write {}: {e}", file.display()))?;
-        Ok(Admission::Open(Sessions { file: Some(file) }))
+            .open(&path)
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        lock_exclusive(file.as_raw_fd(), &path)?;
+        Ok(Admission::Open(Sessions {
+            path: Some(path),
+            _lock: Some(file),
+        }))
     }
 }
 
 impl Drop for Sessions {
     fn drop(&mut self) {
-        if let Some(file) = &self.file {
-            let _ = fs::remove_file(file);
+        if let Some(path) = &self.path {
+            let _ = fs::remove_file(path);
         }
     }
 }
 
-/// Remove the locks whose process has gone. A file that cannot be parsed is not
-/// this program's and is left alone: the directory is the portal's, but a name
-/// this code did not write is not evidence of a session.
+/// Lock one file, or say which one could not be locked.
+fn lock_exclusive(fd: i32, path: &Path) -> Result<(), String> {
+    if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "cannot lock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+/// Remove the session files no live process holds. A live session keeps an
+/// exclusive lock on its own file; this tries the same lock without waiting, and
+/// a grant means nobody holds it, so the session is gone. A file this code cannot
+/// open is left alone: the directory is the portal's, but a name it did not write
+/// is not evidence of a session.
 fn prune(dir: &Path) -> Result<(), String> {
     for entry in fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))? {
         let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
         let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Some((_, rest)) = name.split_once('@') else {
+        if !name.to_string_lossy().contains('@') {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
             continue;
         };
-        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<i32>().ok()) else {
-            continue;
-        };
-        if pid > 0 && !running(pid) {
-            let _ = fs::remove_file(entry.path());
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            let _ = fs::remove_file(&path);
         }
     }
     Ok(())
-}
-
-/// Whether a process is still there. `kill(pid, 0)` checks for existence and
-/// permission rather than sending anything; a process this account may not signal
-/// is alive, so only `ESRCH` means gone.
-fn running(pid: i32) -> bool {
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// The first screen, in the words the spec fixes: what this is, that the web form
@@ -536,8 +546,8 @@ fn show_status(
     // reader can still use the menu, and a restart is the operator's repair. The
     // read is the only thing here that can fail for a reason outside this process.
     let text = match status.read(token) {
-        Ok(Lookup::Stage(stage)) => format!("Stage: {stage}"),
-        Ok(Lookup::Notice(notice)) => notice,
+        Ok(StatusAnswer::Stage(stage)) => format!("Stage: {stage}"),
+        Ok(StatusAnswer::Notice(notice)) => notice,
         Err(e) => format!("The status service is not answering. Try again in a moment.\n\n{e}"),
     };
     put(out, &format!("\n{text}\n\nPress Enter to go back.\n"))
@@ -624,11 +634,11 @@ mod tests {
     /// than a default, so a screen that asks when it should not is caught.
     #[derive(Default)]
     struct Statuses {
-        answers: VecDeque<Result<Lookup, String>>,
+        answers: VecDeque<Result<StatusAnswer, String>>,
     }
 
     impl Statuses {
-        fn new(answers: Vec<Lookup>) -> Statuses {
+        fn new(answers: Vec<StatusAnswer>) -> Statuses {
             Statuses {
                 answers: answers.into_iter().map(Ok).collect(),
             }
@@ -636,7 +646,7 @@ mod tests {
     }
 
     impl StatusSource for Statuses {
-        fn read(&mut self, _token: &str) -> Result<Lookup, String> {
+        fn read(&mut self, _token: &str) -> Result<StatusAnswer, String> {
             self.answers
                 .pop_front()
                 .unwrap_or_else(|| Err("no status was scripted".into()))
@@ -647,7 +657,7 @@ mod tests {
     struct NoStatus;
 
     impl StatusSource for NoStatus {
-        fn read(&mut self, _token: &str) -> Result<Lookup, String> {
+        fn read(&mut self, _token: &str) -> Result<StatusAnswer, String> {
             Err("this session asks no status".into())
         }
     }
@@ -855,7 +865,7 @@ mod tests {
     #[test]
     fn the_status_word_reads_the_stage_and_nothing_else() {
         let rows = rows(None);
-        let mut statuses = Statuses::new(vec![Lookup::Stage("with the reviewer".into())]);
+        let mut statuses = Statuses::new(vec![StatusAnswer::Stage("with the reviewer".into())]);
         let mut script = Script::lines(&["status", "abcdefghjkmnpqrstvwxyz0123", "", "quit"]);
         let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut statuses);
         assert_eq!(left, Departure::Quit);
@@ -872,7 +882,9 @@ mod tests {
     #[test]
     fn a_pasted_token_is_read_and_an_unknown_one_is_the_notice() {
         let rows = rows(None);
-        let mut statuses = Statuses::new(vec![Lookup::Notice("This link is not in use.".into())]);
+        let mut statuses = Statuses::new(vec![StatusAnswer::Notice(
+            "This link is not in use.".into(),
+        )]);
         let mut script = Script::lines(&["abcdefghjkmnpqrstvwxyz0123", "", "quit"]);
         let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut statuses);
         assert_eq!(left, Departure::Quit);
@@ -932,7 +944,7 @@ mod tests {
     }
 
     /// Two concurrent sessions per address, a third refused in the screen the
-    /// spec words, and a lock whose process is gone pruned by the next start.
+    /// spec words, and a session file no process holds pruned by the next start.
     #[test]
     fn a_third_session_from_one_address_is_refused() {
         let dir =
@@ -940,12 +952,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let address: IpAddr = "203.0.113.9".parse().unwrap();
-        // A process that has just been waited for: its pid is gone, and a stale
-        // lock naming it is exactly what the next start must prune.
-        let mut gone = std::process::Command::new("true").spawn().unwrap();
-        let dead = gone.id();
-        gone.wait().unwrap();
-        let stale = dir.join(format!("203.0.113.9@{dead}-0"));
+        // A file with no lock held is what a killed session leaves behind.
+        let stale = dir.join("203.0.113.9@999999-0");
         std::fs::write(&stale, "").unwrap();
 
         let Admission::Open(first) = Sessions::open(&dir, Some(address)).unwrap() else {
@@ -979,5 +987,25 @@ mod tests {
             })
             .count();
         assert_eq!(held, 0, "a finished session left its lock");
+    }
+
+    /// The box-wide total bounds the whole portal, not one address's share of
+    /// it: the last slot is refused to a new address.
+    #[test]
+    fn the_box_wide_total_is_enforced() {
+        let dir = std::env::temp_dir().join(format!("onboard-portal-total-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut open = Vec::new();
+        for i in 0..SESSIONS_TOTAL {
+            let address: IpAddr = format!("198.51.100.{}", i + 1).parse().unwrap();
+            let Admission::Open(session) = Sessions::open(&dir, Some(address)).unwrap() else {
+                panic!("session {i} was refused before the total");
+            };
+            open.push(session);
+        }
+        assert!(matches!(
+            Sessions::open(&dir, Some("203.0.113.10".parse().unwrap())).unwrap(),
+            Admission::Busy
+        ));
     }
 }

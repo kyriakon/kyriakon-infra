@@ -130,8 +130,10 @@ fn run() -> Result<Departure, String> {
     let mode = forced.unwrap_or_else(chosen);
     let mut term = Term::new(mode);
     let left = portal::run(&rows, mode, &mut term, &mut status, &mut std::io::stdout())?;
-    if left == Departure::Gone {
-        authlog("session abandoned");
+    // Both endings abandon the session today: nothing files yet. #380 adds the
+    // filed outcome, which is the one this must stop logging.
+    match left {
+        Departure::Quit | Departure::Gone => authlog("session abandoned"),
     }
     Ok(left)
 }
@@ -157,15 +159,15 @@ struct HandlerStatus {
 }
 
 impl portal::StatusSource for HandlerStatus {
-    fn read(&mut self, token: &str) -> Result<portal::Lookup, String> {
+    fn read(&mut self, token: &str) -> Result<portal_ipc::Answer, String> {
         match portal_ipc::ask(Path::new(&self.socket), self.address.as_deref(), token)? {
             portal_ipc::Answer::Stage(stage) => {
                 authlog(&format!("status read: {stage}"));
-                Ok(portal::Lookup::Stage(stage))
+                Ok(portal_ipc::Answer::Stage(stage))
             }
             portal_ipc::Answer::Notice(notice) => {
                 authlog("status read: no stage");
-                Ok(portal::Lookup::Notice(notice))
+                Ok(portal_ipc::Answer::Notice(notice))
             }
         }
     }

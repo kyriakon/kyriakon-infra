@@ -96,16 +96,20 @@ ksh "$repo_dir/scripts/onboard-store.sh"
 # The portal's own state: one lock file per live session, created and removed by
 # the program as `hello`. It is not under the store because `_onboard` owns that
 # and the portal must not be able to read it. The account is the operator's to
-# create, like `_onboard`, and the deploy stops without it: the handler binds a
-# socket in a directory owned by it, and a box that cannot start the portal has no
-# portal.
+# create, like `_onboard`. A box whose account is still named `onboard` gets the
+# socket directory under `_onboard`'s group and a warning rather than a deploy that
+# stops: the handler must still start for every other part of the service, and the
+# rename plus a rerun moves the socket to the portal's group.
 say "portal state"
-id hello >/dev/null 2>&1 \
-	|| die "the hello account is missing; the portal's socket and session directory are owned by it (see docs/runbook.md)"
-# The group is the account's own, not the word "hello": the live box reaches it by
-# renaming the old account, and a rename leaves the group's name behind.
-portal_group=$(id -gn hello)
-install -d -o hello -g "$portal_group" -m 0700 /var/db/kyriakon-onboard-tui
+if id hello >/dev/null 2>&1; then
+	# The group is the account's own, not the word "hello": the live box reaches
+	# it by renaming the old account, and a rename leaves the group's name behind.
+	portal_group=$(id -gn hello)
+	install -d -o hello -g "$portal_group" -m 0700 /var/db/kyriakon-onboard-tui
+else
+	portal_group=$onboard_user
+	printf 'hello account missing; the portal cannot start until it exists, and this deploy must be rerun after the rename\n' >&2
+fi
 
 say "build"
 need_pkg rust
