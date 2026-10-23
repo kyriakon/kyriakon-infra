@@ -28,7 +28,8 @@
 #
 # The mapping follows the repository layout, plus the two install lists each
 # deploy script keeps: deploy-mail's /root/bin set and deploy-onboard's drain
-# scripts. A path in either needs that deploy.
+# scripts. A path in either needs that deploy. A deploy script's own path needs
+# the deploy it runs, so pulling a fix to deploy-mail.sh schedules deploy-mail.sh.
 
 set -euo pipefail
 
@@ -101,6 +102,15 @@ classify() {
 		needs_mail=yes
 		needs_onboard=yes
 		;;
+	# A deploy script's own code changed, so run it. `deploy.sh` itself is the
+	# dispatcher and deliberately plans nothing.
+	scripts/deploy-mail.sh) needs_mail=yes ;;
+	scripts/deploy-relayd.sh) needs_relayd=yes ;;
+	scripts/deploy-onboard.sh) needs_onboard=yes ;;
+	scripts/deploy-nsd.sh) needs_nsd=yes ;;
+	# The pf fragments live in the script; a change to it is still the propose-only
+	# step, not a deploy this dispatcher runs.
+	scripts/pf-apply.sh) manual_pf=yes ;;
 	scripts/*) : ;;
 	keys/*) needs_mail=yes ;;
 	terraform/*) manual_terraform=yes ;;
@@ -161,7 +171,7 @@ manual_any() {
 
 print_manual() {
 	if [ "$manual_pf" = yes ]; then
-		printf 'propose-only: pf.conf changed. Review the diff, then apply it by hand:\n'
+		printf 'propose-only: pf.conf or scripts/pf-apply.sh changed. Review the diff, then apply it by hand:\n'
 		printf '  doas ksh scripts/pf-apply.sh --check\n'
 		printf '  doas ksh scripts/pf-apply.sh\n'
 	fi
@@ -403,6 +413,21 @@ self_test() {
 	reset_plan
 	classify 'scripts/deploy.sh'
 	check 'the deploy script plans nothing' "$(plan_order)" ''
+	reset_plan
+	classify 'scripts/deploy-mail.sh'
+	check 'the mail deploy plans itself' "$needs_mail" yes
+	reset_plan
+	classify 'scripts/deploy-relayd.sh'
+	check 'the relay deploy plans itself' "$needs_relayd" yes
+	reset_plan
+	classify 'scripts/deploy-onboard.sh'
+	check 'the onboard deploy plans itself' "$needs_onboard" yes
+	reset_plan
+	classify 'scripts/deploy-nsd.sh'
+	check 'the nsd deploy plans itself' "$needs_nsd" yes
+	reset_plan
+	classify 'scripts/pf-apply.sh'
+	check 'a pf script change is a manual step' "$manual_pf" yes
 
 	plan "$repo" ''
 	check 'no base plans every script' "$(plan_order | paste -sd ' ' -)" \

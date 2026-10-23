@@ -152,6 +152,19 @@ install_smtpd_conf() {
 	mv "$candidate" "$dst"
 }
 
+# install_indexes <root> — create the three generated index files and leave them
+# 0644. `root` is /etc on the box and a fixture in the self-test, which is what
+# lets the third lane's creation be checked without a box.
+install_indexes() {
+	typeset root="$1" i
+	install -d -m 0755 "$root/httpd.d" "$root/gmid.d" "$root/acme-client.d"
+	for i in "$root/httpd.d/index.conf" "$root/gmid.d/index.conf" \
+		"$root/acme-client.d/index.conf"; do
+		[ -e "$i" ] || : >"$i"
+		chmod 0644 "$i"
+	done
+}
+
 # self_test — the two writes this deploy makes into files the box reads, against
 # fixtures and the shipped smtpd.conf, and not the box. Both install by moving a
 # candidate onto the live file, and that is what the checks are about: a write
@@ -160,7 +173,7 @@ install_smtpd_conf() {
 self_test() {
 	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
 	. "$(dirname "$0")/lib.sh"
-	typeset tree code before after candidate
+	typeset tree code before after candidate i
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work
@@ -261,6 +274,17 @@ self_test() {
 		"$(cmp -s "$tree/smtpd.conf" "$tree/expected" && printf same || printf changed)" same
 	check "and says that it failed" "$([ "$code" -ne 0 ] && printf yes || printf no)" yes
 	check "and what it left behind is not readable" "$(stat -f %Lp "$candidate")" 600
+
+	# --- the generated indexes ---
+	# The three include targets are created here, not by the config they are
+	# included from. Dropping one again is what #339 did, and the deployed
+	# acme-client then fails to parse a config whose include target is missing.
+	install_indexes "$tree/etc"
+	for i in httpd gmid acme-client; do
+		check "the $i index is installed" \
+			"$([ -f "$tree/etc/$i.d/index.conf" ] && printf yes || printf no)" yes
+	done
+	check "the index is 0644" "$(stat -f %Lp "$tree/etc/httpd.d/index.conf")" 644
 
 	self_test_end
 }
@@ -381,15 +405,13 @@ install -d -m 0755 -o root -g daemon /home/www/logs
 # this directory rather than relying on the default.
 install -d -m 0755 -o root -g daemon /home/www/acme
 install -d -m 0700 /etc/acme
-# The generated vhost indexes the two daemons include. include is an fopen of one
-# path, so a missing index fails the whole configuration rather than being
-# skipped: the file has to exist before httpd -n or gmid -n runs, and an empty
-# one is valid.
-install -d -m 0755 /etc/httpd.d /etc/gmid.d
-for i in /etc/httpd.d/index.conf /etc/gmid.d/index.conf; do
-	[ -e "$i" ] || : >"$i"
-	chmod 0644 "$i"
-done
+# The generated indexes the front-ends and acme-client include. include is an
+# fopen of one path, so a missing index fails the whole configuration rather than
+# being skipped: the file has to exist before httpd -n, gmid -n or acme-client
+# parses the config, and an empty one is valid. acme-client.d is the third lane,
+# added when member certificates arrived: each member's name gets its own domain
+# block there, so the tracked config never gains a per-member line.
+install_indexes /etc
 # One root per hostname the box serves, each with the www and gemini halves, so
 # httpd's root "/<host>/www" and gmid's root "/<host>/gemini" are relative to the
 # same chroot and the whole public surface is one tree that the backup covers.
