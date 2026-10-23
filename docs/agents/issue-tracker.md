@@ -33,19 +33,39 @@ gh api graphql -f query='
 {
   repository(owner: "kyriakon", name: "kyriakon-infra") {
     issues(first: 100, states: OPEN, labels: ["ready-for-agent"]) {
-      nodes { number title issueDependenciesSummary { blockedBy } }
+      nodes {
+        number
+        title
+        assignees(first: 1) { nodes { login } }
+        issueDependenciesSummary { blockedBy }
+        timelineItems(first: 50, itemTypes: [CROSS_REFERENCED_EVENT]) {
+          nodes {
+            ... on CrossReferencedEvent {
+              source { ... on PullRequest { number state merged } }
+            }
+          }
+        }
+      }
     }
   }
-}' --jq '.data.repository.issues.nodes[] | select(.issueDependenciesSummary.blockedBy == 0) | "\(.number)\t\(.title)"'
+}' --jq '
+  .data.repository.issues.nodes[]
+  | select(.issueDependenciesSummary.blockedBy == 0)
+  | select((.assignees.nodes | length) == 0)
+  | select([.timelineItems.nodes[]?.source? | select(.merged == true)] | length == 0)
+  | "\(.number)\t\(.title)"
+'
 ```
 
 `blockedBy` is the GraphQL count of open blockers; `totalBlockedBy` also counts
 the closed ones. The Wayfinding section below uses the REST spelling,
-`issue_dependencies_summary.blocked_by`.
+`issue_dependencies_summary.blocked_by`. `assignees` is non-empty when the issue
+is claimed; `timelineItems` carries the cross-referenced pull requests. The queue
+drops claimed issues and issues with a merged pull request: the first is being
+worked, and the second is waiting for a deploy, not work. Check that pull
+request's deploy step before closing the issue.
 
-The queue has no priority order of its own, so read the titles and choose. A
-merged PR that says `Refs #N` leaves the issue open until its deploy step, so an
-open issue with a merged PR is not work. Check the merged PRs before starting.
+The queue has no priority order of its own, so read the titles and choose.
 
 ## Pull requests as a triage surface
 
