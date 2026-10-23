@@ -53,8 +53,9 @@ storage box, also in Germany. The provider holds the disk image, the hypervisor,
 take a memory snapshot of the running machine. Those are the provider's to produce, on their own
 legal process, and the platform cannot prevent it or detect it.
 
-This is the reason for the named hypervisor ceiling in `threat-model.md`, and the reason the offline
-copy of the backup repository exists with a key the machine never holds.
+This is the reason for the named hypervisor ceiling in `threat-model.md`, and the reason the platform
+plans an offline copy of the backup repository, on media the machine cannot reach, with a key it
+never holds. That copy is decided (ADR 0007) and not yet made.
 
 ## Payments
 
