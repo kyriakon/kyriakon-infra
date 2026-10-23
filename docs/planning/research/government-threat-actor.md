@@ -236,9 +236,11 @@ learning anything.
 
 The delegation is unsigned. The registry's own record reports `"secureDNS": {"delegationSigned":
 false}` (Verisign RDAP for `kyriakon.net`, read 2026-10-01), and a `+dnssec` query returns no RRSIG.
-Without DNSSEC a resolver cannot tell a genuine answer from a forged one, and DANE would rest on a
-record that proves nothing, so signing the zone is the prerequisite for authenticating mail transport
-by TLSA rather than an alternative to it.
+Rechecked at the secondaries on 2026-10-23: `ns1`–`ns5.he.net` answer `A kyriakon.net` with no
+`RRSIG`, `DNSKEY` returns no records and the parent holds no `DS`; the commands are in
+`dns-nsd-he-mail-records.md`. Without DNSSEC a resolver cannot tell a genuine answer from a forged
+one, and DANE would rest on a record that proves nothing, so signing the zone is the prerequisite for
+authenticating mail transport by TLSA rather than an alternative to it.
 
 The sites send no HSTS header, because `openbsd/etc/httpd.conf` has no `hsts` block and the live file
 has none either (`grep -c hsts /etc/httpd.conf` returns 0 on the box, read 2026-10-01). `httpd.conf(5)`
@@ -281,7 +283,7 @@ marked proposed are recommendations from this note, and the last row is decided 
 | The server holds no key that opens mail, and nothing that derives one. | `grep -rIl "BEGIN PGP PRIVATE KEY" .` is empty; `keys/` holds public keys; the encryptor resolves `<localpart>.asc` | No server-side search or threading, a PGP client on every device, and permanent loss when a member loses both key and recovery phrase | Built, ADRs 0002, 0003 and 0008 |
 | The keys the platform does hold are the DKIM signing key, the queue key at `/etc/mail/queue.key`, and the restic password, and each is named with what it opens. | `docs/transparency.md`; `openbsd/etc/smtpd.conf`; `scripts/backup.sh` states that the password is the key | None. This is a statement, and it is what makes the negative claims precise | Built, ADR 0007 |
 | A powered-off disk or a stored image is ciphertext. | The root volume is `softraid` CRYPTO and needs a passphrase at boot; `sysctl hw.sensors.softraid0.drive0` reports the volume on the box, and `bioctl` on the volume shows the discipline, which needs root | A passphrase typed at the console on every boot, so an unattended reboot is an outage until someone is present | Built, `softraid(4)`, ADR 0007 |
-| The raw per-user log record expires about a week after it is written. | `openbsd/etc/newsyslog.conf` sets seven copies on `maillog`, `authlog` and `nsd.log` | A slow-burn relay or a credential-stuffing ramp is caught inside the window or not at all | Built, but the box runs a different file, see below |
+| The raw per-user log record expires about a week after it is written. | `openbsd/etc/newsyslog.conf` sets seven copies on `maillog`, `authlog` and `nsd.log` | A slow-burn relay or a credential-stuffing ramp is caught inside the window or not at all | Built; installed by `deploy-mail.sh` on the next deploy |
 | A durable substitution of a member's public key is a commit in this repository. | `git log -- keys/`, and the member compares the fingerprint recorded at signup | The check only works for a member who recorded the fingerprint, and it does not see a change made in memory and reverted | Built, `threat-model.md` |
 | Inbound mail declares a policy that senders must use TLS, and delivery to a host without a valid certificate should fail. | `dig +short TXT _mta-sts.kyriakon.net` returns a policy, and `https://mta-sts.kyriakon.net/.well-known/mta-sts.txt` matches it | A TXT record, a file served by httpd, and the discipline to keep both current, since a stale or wrong policy makes well-behaved senders bounce mail. It does not cover the sending direction | Proposed, RFC 8461 |
 | The sites are HTTPS-only after the first visit. | `curl -sI https://kyriakon.net` carries a `Strict-Transport-Security` header | One `hsts` block in `httpd.conf`, and a commitment that every host under the name keeps a valid certificate. Preload is refused for now because the list is public and slow to leave | Proposed, `httpd.conf(5)` |
@@ -326,28 +328,18 @@ as worded, or made true only by a limit that the same sentence would hide.
 - "A re-home would put the platform beyond reach". The operator is a UK sole trader, so moving the
   machine leaves the operator route intact. ADR 0006 says a re-home is all three parts or none.
 
-## Where the published documents and the box disagree
+## Where the published documents and the box disagreed
 
-The check in every row above that reads a published file tests the intended state. On this box, two
-places already differ, and both are worth recording because they weaken claims the threat model makes.
+The check in every row above that reads a published file tests the intended state. The two
+disagreements this note first recorded are now closed.
 
-`scripts/deploy-mail.sh` installs the mail stack, the keyring and the queue key, and no script in
-`scripts/` installs `openbsd/etc/newsyslog.conf` (`grep -rn newsyslog scripts/` returns one comment in
-`scripts/abuse-monitor.sh` and no install step). The box therefore runs the stock OpenBSD file: it is
-838 bytes, dated 2026-05-06, and contains no `nsd` entry, so `/var/log/nsd.log` is not rotated by
-newsyslog, and `maillog` and `authlog` are mode 640 rather than the published 600. The retention claim
-holds in effect for the two logs that carry per-user data, because the stock file also keeps seven
-copies, and does not hold for `nsd.log`. HostConfig recorded the human step as
-`install -m 0644 openbsd/etc/newsyslog.conf /etc/newsyslog.conf` followed by `rcctl restart syslogd`,
-and put the fix in its own ticket rather than folding it into an unrelated change.
+`scripts/deploy-mail.sh` installs `openbsd/etc/newsyslog.conf` (`install -m 0644`, line 426), and the
+file carries the base system's entries as well as the platform's, because newsyslog has no include.
+After a deploy, the box's `nsd.log` entry and the 600 modes on `authlog` and `maillog` are the
+published ones.
 
-`docs/transparency.md` says the offline copy of the backup repository "exists with a key the machine
-never holds". It does not exist at this commit. `scripts/rehearsal.sh` and `scripts/restore-test.sh`
-both read `RESTIC_REPOSITORY`, which is the storage box, and `scripts/` contains no offline-copy path
-(`grep -rn -i "offline" scripts/` returns two comments about keeping a copy of the restic password).
-ADR 0007 decides the copy, the ticket lists building it as an open action, and one sentence in
-`transparency.md` states it in the present tense. The sentence should change, or the copy should be
-built.
+`docs/transparency.md` now says the offline copy is decided and not yet made, rather than saying it
+exists. Building it remains #109.
 
 The wider version of this point is the one to state plainly in the product: a check that reads the
 published repository verifies what the platform intends to run, and the running machine is a separate
@@ -391,16 +383,17 @@ All read on 2026-10-01 unless stated.
 ## Not verified
 
 - The reading of IPA 2016 s. 261(10) to (12) that puts a mail hosting service inside
-  "telecommunications operator" is mine, not a decided case, and no lawyer has reviewed it.
+  "telecommunications operator" is mine, not a decided case, and no lawyer has reviewed it. A
+  lawyer's review of that reading would close it.
 - Whether an email hosting platform is a "Telekommunikationsdienst" under the German
   Telecommunications Act, which decides how far § 100a(4) StPO reaches it.
 - The text of the e-evidence Regulation and the directive on legal representatives. EUR-Lex refused
   automated fetches, so the account above comes from the Council's own explanation of the two
   instruments. Whether the directive obliges this platform to appoint a representative was not
   settled.
-- Whether Hurricane Electric's secondary service can serve a signed `kyriakon.net` zone. Its
-  secondary configuration panel was not read, and DNSSEC at the secondaries is the prerequisite for
-  TLSA records to mean anything.
+- Whether Hurricane Electric's secondary service can serve a signed `kyriakon.net` zone. The zone
+  is unsigned today, so this check cannot show it, and its secondary configuration panel was not
+  read.
 - Whether a Hetzner snapshot of a running server captures memory. The FAQ describes snapshots as a
   copy of the disk, and the hypervisor is not the platform's to inspect, so the memory question is
   recorded as unknown rather than asserted either way.

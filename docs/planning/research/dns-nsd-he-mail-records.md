@@ -216,6 +216,24 @@ This ordering is what §5.7/§6.13 mean by "DNS redundancy from day one": HE is 
 
 ---
 
+## 6. DNSSEC at the public secondaries
+
+Checked on 2026-10-23. `kyriakon.net` is unsigned as served:
+
+```sh
+dig +dnssec +noall +answer +comments A kyriakon.net @ns1.he.net
+dig +dnssec +noall +answer +comments A kyriakon.net @ns3.he.net
+dig +dnssec +noall +answer +comments A kyriakon.net @ns5.he.net
+dig +short DNSKEY kyriakon.net @ns1.he.net
+dig +noall +answer DS kyriakon.net
+```
+
+Each A query answers with `flags: qr aa rd` and no `RRSIG`; `DNSKEY` returns no records; the parent
+returns no `DS`. The zone file carries no DNSSEC records and `nsd.conf` has no signing configuration.
+A `TLSA` record can be published, but nothing validates it until the zone is signed and the registry
+holds the matching `DS`. Whether HE's secondary service can serve a signed zone is still unread at its
+panel; the unsigned state means this check cannot show it.
+
 ## Sources
 
 - [OpenBSD `nsd.conf(5)`](https://man.openbsd.org/nsd.conf.5) — file format, hidden-primary EXAMPLE, `notify`/`provide-xfr`/`allow-notify`/`request-xfr`/`outgoing-interface`/`notify-retry` semantics, `_nsd` user + `/var/nsd` chroot paths, `kill -HUP` reload.
