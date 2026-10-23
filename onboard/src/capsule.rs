@@ -67,10 +67,29 @@ pub fn status(page: &StatusPage) -> String {
     out
 }
 
+/// The page a completed draft answers with: the status link, so the applicant
+/// leaves the flow with the one capability the application is identified by.
+pub fn filed(link: &str) -> String {
+    format!(
+        "# Application filed\n\nKeep this link. It is the only thing that identifies your application:\n\n=> {link} Application status\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::page::StatusPage;
+
+    #[test]
+    fn the_capsule_filed_page_links_the_status() {
+        let link = "gemini://signup.kyriakon.net/status/abcdefghjkmnpqrstvwxyz0123";
+        let text = filed(link);
+        assert!(text.contains("# Application filed"), "{text}");
+        assert!(
+            text.contains(&format!("=> {link} Application status")),
+            "{text}"
+        );
+    }
 
     #[test]
     fn the_capsule_status_page_links_the_password_page() {

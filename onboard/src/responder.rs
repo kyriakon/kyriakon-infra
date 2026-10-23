@@ -46,12 +46,12 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::fcgi::{self, Reply, Request};
 use crate::page::{AccountPage, DecidePage, NoticePage, PasswordPage, ReceivedPage, StatusPage};
-use crate::questions::{Branch, Question, Rule};
+use crate::questions::{Branch, Kind, Question, Rule};
 use crate::rate::Key;
 use crate::store::{Acceptance, KeyRecord, Record, Store};
 use crate::{
-    capsule, catalogue, config, intents, keycheck, page, questions, rate, store, transitions, util,
-    validate,
+    capsule, catalogue, config, draft, intents, keycheck, page, questions, rate, store,
+    transitions, util, validate,
 };
 
 /// The fixed hostname for the form and the account page, used as itself. It is
@@ -162,6 +162,9 @@ struct Incoming {
     /// The path with every leading slash stripped, which is the form gmid sends
     /// and therefore the form the route table is written against.
     path: String,
+    /// gmid's `QUERY_STRING`, still percent-encoded. A capsule answer lives here;
+    /// the web front-end's fields come in the body instead.
+    query: String,
     /// The address the counters key on.
     key: Key,
     /// The address as the front-end observed it, for the log line.
@@ -328,7 +331,16 @@ fn read(front_end: FrontEnd, request: &Request) -> Incoming {
         Some(value) => value.rsplit(',').next().unwrap_or("").trim().to_string(),
         None => remote.to_string(),
     };
-    Incoming { path, key, addr }
+    let query = match front_end {
+        FrontEnd::Gemini => request.value("QUERY_STRING").to_string(),
+        FrontEnd::Httpd => String::new(),
+    };
+    Incoming {
+        path,
+        query,
+        key,
+        addr,
+    }
 }
 
 /// Percent-decode one value. A plus is a space in a form, which is what a browser
@@ -499,18 +511,19 @@ fn form_post(request: &Request) -> bool {
         .is_some_and(|t| t.eq_ignore_ascii_case("application/x-www-form-urlencoded"))
 }
 
-/// The gemini front-end, which serves the capsule's pages: the catalogue the
-/// capsule lists, and the status page for a filed application. Nothing else is
-/// here yet, because the rest of the capsule is its own front-end's ticket: the
-/// applicant flow over gemini asks one question per page and keeps a draft, which
-/// is a page shape the web form does not have.
-///
-/// No route on this face reads a query yet. When one does it is `QUERY_STRING`,
-/// which gmid sends still percent-encoded and decodes by the responder rather
-/// than read from `GEMINI_SEARCH_STRING`: that copy is sent only for a query with
-/// no `=` in it, and its decoder maps `+` to a space, which is not the reading the
+/// The gemini front-end: the catalogue, the status page, and the applicant's
+/// draft flow. The apply route reads an answer from `QUERY_STRING`, which gmid
+/// sends still percent-encoded and the responder decodes itself rather than read
+/// from `GEMINI_SEARCH_STRING`: that copy is sent only for a query with no `=`
+/// in it, and its decoder maps `+` to a space, which is not the reading the
 /// specification gives a URI query.
 async fn gemini(app: &App, incoming: &Incoming) -> Reply {
+    if incoming.path == "apply" {
+        return capsule_new(app, incoming).await;
+    }
+    if let Some(rest) = incoming.path.strip_prefix("apply/") {
+        return capsule_apply(app, incoming, rest).await;
+    }
     if let Some(token) = incoming.path.strip_prefix("status/") {
         let record = record_for(app, token).await;
         let page = status_page(record, OffsetDateTime::now_utc());
@@ -520,6 +533,284 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
         return Reply::gemini(20, "text/gemini", capsule::gemtext(&app.catalogue, None));
     }
     Reply::gemini(51, "Not found", String::new())
+}
+
+/// Open a draft and send the client to its first page. The draft token is the
+/// status token the application will carry, drawn here and never from anything
+/// about the applicant. The 30 is the only way the token reaches the path: a
+/// gemini prompt cannot carry one.
+async fn capsule_new(app: &App, incoming: &Incoming) -> Reply {
+    if !app.counter.allow_draft(incoming.key) {
+        return too_many(FrontEnd::Gemini, Which::Day);
+    }
+    let token = match store::status_token().await {
+        Ok(token) => token,
+        Err(e) => {
+            eprintln!("kyriakon-onboard: {e}");
+            return Reply::gemini(40, "Temporary failure", String::new());
+        }
+    };
+    let mut record = draft::Draft::new(token.clone());
+    if let Err(e) = draft::save(&app.store, &mut record).await {
+        eprintln!("kyriakon-onboard: {e}");
+        return Reply::gemini(40, "Temporary failure", String::new());
+    }
+    capsule_redirect(&token, 1)
+}
+
+/// One answer, one page, one redirect. The page number in the path must be the
+/// draft's cursor; a replayed page redirects to the cursor rather than applying
+/// the answer again, which is what makes a second tap advance nothing.
+async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) -> Reply {
+    let mut parts = rest.split('/');
+    let token = parts.next().unwrap_or("");
+    let page = parts.next();
+    if parts.next().is_some() || !draft::valid_token(token) {
+        return capsule_not_found();
+    }
+    let page = match page {
+        Some(p) => match p.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => return capsule_not_found(),
+        },
+        // The token alone names the draft; the page is the cursor's.
+        None => return capsule_redirect(token, 1),
+    };
+    let mut record = match draft::load(&app.store, token).await {
+        Ok(Some(d)) => d,
+        Ok(None) => return capsule_not_found(),
+        Err(e) => {
+            eprintln!("kyriakon-onboard: {e}");
+            return Reply::gemini(40, "Temporary failure", String::new());
+        }
+    };
+    let path = capsule_path(&app.questions, &record.answers);
+    if record.cursor >= path.len() {
+        return capsule_file(app, &record).await;
+    }
+    let index = record.cursor;
+    let expected = index + 1;
+    if page != expected {
+        return capsule_redirect(token, expected);
+    }
+    if incoming.query.is_empty() {
+        return Reply::gemini(
+            10,
+            &capsule_meta(path[index], index, path.len(), None),
+            String::new(),
+        );
+    }
+
+    let q = path[index];
+    let value = capsule_value(&incoming.query);
+    let value = match q.kind {
+        Kind::YesNo | Kind::Acceptance => value.to_ascii_lowercase(),
+        _ => value,
+    };
+    if let Some(why) = capsule_problem(q, &value, &app.reserved, q.required, &record.answers) {
+        return Reply::gemini(
+            10,
+            &capsule_meta(q, index, path.len(), Some(&why)),
+            String::new(),
+        );
+    }
+    record.answers.insert(q.id.clone(), value);
+    record.cursor = index + 1;
+
+    // The body's two line lists are checked together, because the fault is the
+    // count rather than either list. Re-ask the page just answered, so the
+    // applicant can correct it; nothing is saved until the pair agrees.
+    if record.answers.get("whose").map(String::as_str) == Some("body")
+        && record.answers.contains_key("body_addresses")
+        && record.answers.contains_key("body_account_names")
+    {
+        let mut errors = Vec::new();
+        body_cross_checks(&record.answers, &mut errors);
+        if !errors.is_empty() {
+            record.cursor = index;
+            return Reply::gemini(
+                10,
+                &capsule_meta(q, index, path.len(), Some(&errors.join(" "))),
+                String::new(),
+            );
+        }
+    }
+
+    let next = capsule_path(&app.questions, &record.answers);
+    if record.cursor >= next.len() {
+        return capsule_file(app, &record).await;
+    }
+    if let Err(e) = draft::save(&app.store, &mut record).await {
+        eprintln!("kyriakon-onboard: {e}");
+        return Reply::gemini(40, "Temporary failure", String::new());
+    }
+    capsule_redirect(token, record.cursor + 1)
+}
+
+/// The pages this applicant's path will ask, in file order: the branch the
+/// `whose` answer selects, and the blessing only once `orders` says monastic.
+fn capsule_path<'a>(list: &'a [Question], answers: &BTreeMap<String, String>) -> Vec<&'a Question> {
+    let body = answers.get("whose").map(String::as_str) == Some("body");
+    let monastic = questions::is_monastic(answers.get("orders").map(String::as_str));
+    questions::shown(list, !body)
+        .into_iter()
+        .filter(|q| q.branch != Branch::Monastic || monastic)
+        .collect()
+}
+
+/// The query as the draft stores it. gmid leaves the query percent-encoded, and
+/// the handler decodes it itself so a `+` stays a plus and only `%0D%0A` becomes
+/// a line break; a bare CR stays an ordinary character. A single full stop is the
+/// clients' empty answer.
+fn capsule_value(raw: &str) -> String {
+    let decoded = decode(raw, false).replace("\r\n", "\n");
+    // Only the answer's own padding is removed. `str::trim` also removes `\r`,
+    // and the specification says a bare CR is an ordinary character.
+    let trimmed = decoded.trim_matches(|c: char| matches!(c, ' ' | '\n' | '\t'));
+    if trimmed == "." {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Why one page's answer cannot advance the flow, or `None`. The shared rules are
+/// the web form's; the type's own shape is added where the shared rules are
+/// silent, because a yes/no page that accepted "maybe" would store a value the
+/// form never offers.
+fn capsule_problem(
+    q: &Question,
+    value: &str,
+    reserved: &HashSet<String>,
+    required: bool,
+    answers: &BTreeMap<String, String>,
+) -> Option<String> {
+    if let Some(why) = validate::reason(q, value, reserved, required) {
+        return Some(why);
+    }
+    // The shared key check is the web form's, because `validate::reason` only
+    // proves the first block parses; it does not count blocks or compare them
+    // with the body's account names.
+    if q.rule == Rule::MailKey && !value.is_empty() {
+        if let Some(why) = mail_key_errors(q, value, answers).into_iter().next() {
+            return Some(why);
+        }
+    }
+    match q.kind {
+        Kind::YesNo => (!value.is_empty() && !matches!(value, "yes" | "no"))
+            .then(|| "answer yes or no".to_string()),
+        Kind::Acceptance => {
+            (!value.is_empty() && value != "yes").then(|| "this has to be accepted".to_string())
+        }
+        Kind::Addresses => validate::address_lines(value),
+        _ => None,
+    }
+}
+
+/// A status 10 META: one line, because a newline would end the header. The
+/// counter is the applicant's own path length; the hints are the input the prompt
+/// alone does not give, and the 1024-byte warning is here because META is the last
+/// text a client shows before it reads an answer.
+fn capsule_meta(q: &Question, index: usize, total: usize, reason: Option<&str>) -> String {
+    let mut out = format!("question {} of {}. {}", index + 1, total, q.prompt);
+    match q.kind {
+        Kind::Choice => {
+            if let Rule::Choice(options) = &q.rule {
+                out.push_str(" Answer one of: ");
+                for (i, option) in options.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&format!("{} ({})", option.value, option.label));
+                }
+                out.push('.');
+            }
+        }
+        Kind::YesNo => out.push_str(" Answer yes or no."),
+        Kind::Acceptance => out.push_str(" Answer yes to accept."),
+        Kind::Addresses => {
+            out.push_str(" One per line, as localpart: own or localpart: alias localpart.")
+        }
+        Kind::Key => {
+            if q.id == "body_mail_key" {
+                out.push_str(" Paste one block per mailbox, in the order of the account names.");
+            } else {
+                out.push_str(" Paste the whole public key block.");
+            }
+        }
+        _ => {}
+    }
+    if !q.required {
+        out.push_str(" Leave a single full stop to skip.");
+    }
+    if matches!(
+        q.kind,
+        Kind::Text | Kind::Multiline | Kind::Addresses | Kind::Key
+    ) {
+        out.push_str(" Keep the answer under 1024 bytes.");
+    }
+    if let Some(reason) = reason {
+        out.push(' ');
+        out.push_str(reason);
+    }
+    out
+}
+
+fn capsule_redirect(token: &str, page: usize) -> Reply {
+    Reply::gemini(
+        30,
+        &format!("gemini://{HOST}/apply/{token}/{page}"),
+        String::new(),
+    )
+}
+
+fn capsule_not_found() -> Reply {
+    Reply::gemini(51, "Not found", String::new())
+}
+
+/// Draw the intent id and write the application then the intent. The application
+/// goes first, so the drain never sees an intent whose application is not on
+/// disk. One writer for the web form and the capsule, so the order cannot drift
+/// between them.
+async fn file_application(app: &App, record: &Record) -> Result<(), String> {
+    let id = ulid::Ulid::new().to_string();
+    let bytes = serde_json::to_vec_pretty(record)
+        .map_err(|e| format!("cannot encode the application: {e}"))?;
+    app.store
+        .write_record(
+            "applications",
+            &format!("{}.json", record.status_token),
+            &bytes,
+        )
+        .await?;
+    let intent = serde_json::to_vec_pretty(&record.intent(&id))
+        .map_err(|e| format!("cannot encode the intent: {e}"))?;
+    app.store
+        .write_record("intents", &format!("{id}.json"), &intent)
+        .await
+}
+
+/// Every answer is in hand: file the application and the one intent through the
+/// same builder the web form uses, then remove the draft. The token stays the
+/// one the draft carried, which is the capability the status link already holds.
+async fn capsule_file(app: &App, record: &draft::Draft) -> Reply {
+    let body = record.answers.get("whose").map(String::as_str) == Some("body");
+    let application = match build_record(app, &record.answers, body, &record.token, "capsule") {
+        Ok(application) => application,
+        Err(e) => {
+            eprintln!("kyriakon-onboard: {e}");
+            return Reply::gemini(40, "Temporary failure", String::new());
+        }
+    };
+    if let Err(e) = file_application(app, &application).await {
+        eprintln!("kyriakon-onboard: {e}");
+        return Reply::gemini(40, "Temporary failure", String::new());
+    }
+    if let Err(e) = draft::remove(&app.store, &record.token).await {
+        eprintln!("kyriakon-onboard: {e}");
+    }
+    let link = format!("gemini://{HOST}/status/{}", record.token);
+    Reply::gemini(20, "text/gemini", capsule::filed(&link))
 }
 
 /// The applicant page, with the community block open for a body. `branch` is the
@@ -678,34 +969,11 @@ async fn apply(app: &App, request: &Request, incoming: &Incoming) -> Reply {
         Ok(t) => t,
         Err(e) => return server_error(&e),
     };
-    let id = ulid::Ulid::new().to_string();
     let record = match build_record(app, &form, body, &token, label) {
         Ok(r) => r,
         Err(e) => return server_error(&e),
     };
-
-    // The application record first, so the drain never sees an intent whose
-    // application is not on disk yet, then the one intent.
-    let app_bytes = match serde_json::to_vec_pretty(&record) {
-        Ok(b) => b,
-        Err(e) => return server_error(&format!("cannot encode the application: {e}")),
-    };
-    if let Err(e) = app
-        .store
-        .write_record("applications", &format!("{token}.json"), &app_bytes)
-        .await
-    {
-        return server_error(&e);
-    }
-    let intent_bytes = match serde_json::to_vec_pretty(&record.intent(&id)) {
-        Ok(b) => b,
-        Err(e) => return server_error(&format!("cannot encode the intent: {e}")),
-    };
-    if let Err(e) = app
-        .store
-        .write_record("intents", &format!("{id}.json"), &intent_bytes)
-        .await
-    {
+    if let Err(e) = file_application(app, &record).await {
         return server_error(&e);
     }
 

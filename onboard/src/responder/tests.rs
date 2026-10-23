@@ -847,3 +847,217 @@ async fn a_decision_link_that_names_nothing_is_refused() {
         "a link that names nothing files nothing"
     );
 }
+
+/// The token from the 30 that opens a draft.
+fn draft_token(redirect: &str) -> String {
+    let url = redirect
+        .lines()
+        .next()
+        .expect("a reply line")
+        .strip_prefix("30 ")
+        .expect("a redirect");
+    url.split('/')
+        .nth(4)
+        .expect(".../apply/<token>/1")
+        .to_string()
+}
+
+fn read_draft(dir: &Path, token: &str) -> crate::draft::Draft {
+    serde_json::from_str(
+        &std::fs::read_to_string(dir.join("drafts").join(format!("{token}.json")))
+            .expect("the draft is on disk"),
+    )
+    .expect("the draft parses")
+}
+
+#[tokio::test]
+async fn a_capsule_draft_asks_the_first_question() {
+    let (app, _dir) = handler("capsule-first").await;
+    let (code, redirect) = answer(&app, &gmid_get("apply", "")).await;
+    assert_eq!(code, 30, "{redirect}");
+    let token = draft_token(&redirect);
+
+    let (code, page) = answer(&app, &gmid_get(&format!("apply/{token}/1"), "")).await;
+    assert_eq!(code, 10, "{page}");
+    assert!(page.starts_with("10 question 1 of "), "{page}");
+    assert!(page.contains("Username"), "{page}");
+    assert!(page.contains("under 1024 bytes"), "{page}");
+}
+
+#[tokio::test]
+async fn a_capsule_answer_advances_the_cursor_once() {
+    let (app, dir) = handler("capsule-answer").await;
+    let (_, redirect) = answer(&app, &gmid_get("apply", "")).await;
+    let token = draft_token(&redirect);
+
+    let (code, redirect) = answer(&app, &gmid_get(&format!("apply/{token}/1"), "secretary")).await;
+    assert_eq!(code, 30, "{redirect}");
+    assert!(
+        redirect.contains(&format!("/apply/{token}/2")),
+        "{redirect}"
+    );
+    let draft = read_draft(&dir, &token);
+    assert_eq!(draft.answers["username"], "secretary");
+    assert_eq!(draft.cursor, 1);
+
+    // The same page and answer again: a redirect to the cursor, and no second
+    // advance.
+    let (code, redirect) = answer(&app, &gmid_get(&format!("apply/{token}/1"), "secretary")).await;
+    assert_eq!(code, 30, "{redirect}");
+    assert!(
+        redirect.contains(&format!("/apply/{token}/2")),
+        "{redirect}"
+    );
+    assert_eq!(read_draft(&dir, &token).cursor, 1);
+}
+
+#[tokio::test]
+async fn a_capsule_branch_answer_changes_the_counter() {
+    let (app, dir) = handler("capsule-branch").await;
+    let (_, redirect) = answer(&app, &gmid_get("apply", "")).await;
+    let token = draft_token(&redirect);
+    answer(&app, &gmid_get(&format!("apply/{token}/1"), "secretary")).await;
+    answer(&app, &gmid_get(&format!("apply/{token}/2"), "body")).await;
+
+    let total = capsule_path(&app.questions, &read_draft(&dir, &token).answers).len();
+    let (code, page) = answer(&app, &gmid_get(&format!("apply/{token}/3"), "")).await;
+    assert_eq!(code, 10, "{page}");
+    assert!(page.contains(&format!("question 3 of {total}.")), "{page}");
+    assert!(page.contains("The body's name"), "{page}");
+}
+
+#[tokio::test]
+async fn a_required_capsule_answer_is_reasked_with_the_reason() {
+    let (app, dir) = handler("capsule-required").await;
+    let (_, redirect) = answer(&app, &gmid_get("apply", "")).await;
+    let token = draft_token(&redirect);
+
+    let (code, page) = answer(&app, &gmid_get(&format!("apply/{token}/1"), ".")).await;
+    assert_eq!(code, 10, "{page}");
+    assert!(page.contains("a username is needed"), "{page}");
+    assert_eq!(read_draft(&dir, &token).cursor, 0);
+    assert!(!read_draft(&dir, &token).answers.contains_key("username"));
+}
+
+#[tokio::test]
+async fn an_optional_capsule_answer_of_a_full_stop_is_empty() {
+    let (app, dir) = handler("capsule-skip").await;
+    let (_, redirect) = answer(&app, &gmid_get("apply", "")).await;
+    let token = draft_token(&redirect);
+    answer(&app, &gmid_get(&format!("apply/{token}/1"), "secretary")).await;
+    answer(&app, &gmid_get(&format!("apply/{token}/2"), "person")).await;
+
+    let (code, _) = answer(&app, &gmid_get(&format!("apply/{token}/3"), ".")).await;
+    assert_eq!(code, 30);
+    let draft = read_draft(&dir, &token);
+    assert_eq!(draft.answers["address_outside"], "");
+    assert_eq!(draft.cursor, 3);
+}
+
+#[test]
+fn the_capsule_query_decoding_is_the_gemini_one() {
+    assert_eq!(capsule_value("line1%0D%0Aline2"), "line1\nline2");
+    assert_eq!(capsule_value("line1%0Aline2"), "line1\nline2");
+    assert_eq!(capsule_value("line1\r\nline2"), "line1\nline2");
+    assert_eq!(capsule_value("a+b"), "a+b");
+    assert_eq!(capsule_value("a\rb"), "a\rb");
+    assert_eq!(capsule_value("line%0D"), "line\r");
+    assert_eq!(capsule_value("."), "");
+}
+
+#[test]
+fn the_capsule_adds_the_blessing_only_on_the_monastic_path() {
+    let list = questions::shipped().unwrap();
+    let mut answers = BTreeMap::new();
+    answers.insert("whose".to_string(), "person".to_string());
+    answers.insert("orders".to_string(), "layman".to_string());
+    assert!(!capsule_path(&list, &answers)
+        .iter()
+        .any(|q| q.id == "blessing"));
+    answers.insert("orders".to_string(), "monk".to_string());
+    assert!(capsule_path(&list, &answers)
+        .iter()
+        .any(|q| q.id == "blessing"));
+}
+
+#[tokio::test]
+async fn a_capsule_body_with_mismatched_address_and_name_lists_is_reasked() {
+    let (app, dir) = handler("capsule-body-mismatch").await;
+    let mut record = crate::draft::Draft::new(TOKEN.to_string());
+    record
+        .answers
+        .insert("whose".to_string(), "body".to_string());
+    record
+        .answers
+        .insert("body_addresses".to_string(), "a: own\nb: own".to_string());
+    record.cursor = 8;
+    crate::draft::save(&app.store, &mut record).await.unwrap();
+
+    let (code, page) = answer(&app, &gmid_get(&format!("apply/{TOKEN}/9"), "a")).await;
+    assert_eq!(code, 10, "{page}");
+    assert!(page.contains("2 addresses and 1 account names"), "{page}");
+    let draft = read_draft(&dir, TOKEN);
+    assert_eq!(draft.cursor, 8);
+    assert!(!draft.answers.contains_key("body_account_names"));
+}
+
+#[tokio::test]
+async fn a_capsule_body_with_the_wrong_number_of_keys_is_reasked() {
+    let (app, _dir) = handler("capsule-key-mismatch").await;
+    let mut record = crate::draft::Draft::new(TOKEN.to_string());
+    record
+        .answers
+        .insert("whose".to_string(), "body".to_string());
+    record
+        .answers
+        .insert("body_addresses".to_string(), "secretary: own".to_string());
+    record
+        .answers
+        .insert("body_account_names".to_string(), "secretary".to_string());
+    record.cursor = 9;
+    crate::draft::save(&app.store, &mut record).await.unwrap();
+
+    let query = format!("{GOOD_KEY}\n\n{GOOD_KEY}");
+    let (code, page) = answer(&app, &gmid_get(&format!("apply/{TOKEN}/10"), &query)).await;
+    assert_eq!(code, 10, "{page}");
+    assert!(
+        page.contains("one key per mailbox: 1 mailboxes and 2 keys"),
+        "{page}"
+    );
+}
+
+#[tokio::test]
+async fn two_capsule_drafts_do_not_write_to_each_other() {
+    let (app, dir) = handler("capsule-isolation").await;
+    let (_, first) = answer(&app, &gmid_get("apply", "")).await;
+    let (_, second) = answer(&app, &gmid_get("apply", "")).await;
+    let first = draft_token(&first);
+    let second = draft_token(&second);
+
+    answer(&app, &gmid_get(&format!("apply/{first}/1"), "alice")).await;
+    assert_eq!(read_draft(&dir, &first).answers["username"], "alice");
+    assert!(!read_draft(&dir, &second).answers.contains_key("username"));
+}
+
+#[tokio::test]
+async fn a_complete_capsule_draft_files_the_application() {
+    let (app, dir) = handler("capsule-file").await;
+    let answers: BTreeMap<String, String> = body_answers()
+        .into_iter()
+        .map(|(id, value)| (id.to_string(), value.to_string()))
+        .collect();
+    let mut record = crate::draft::Draft::new(TOKEN.to_string());
+    record.answers = answers;
+    record.cursor = capsule_path(&app.questions, &record.answers).len();
+    crate::draft::save(&app.store, &mut record).await.unwrap();
+
+    let (code, page) = answer(&app, &gmid_get(&format!("apply/{TOKEN}/1"), "")).await;
+    assert_eq!(code, 20, "{page}");
+    assert!(page.contains("# Application filed"), "{page}");
+    assert!(dir
+        .join("applications")
+        .join(format!("{TOKEN}.json"))
+        .exists());
+    assert_eq!(intent_files(&dir).len(), 1);
+    assert!(!dir.join("drafts").join(format!("{TOKEN}.json")).exists());
+}
