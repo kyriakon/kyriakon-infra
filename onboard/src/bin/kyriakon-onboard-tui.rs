@@ -3,7 +3,7 @@
 //! `kyriakon-onboard-tui [-c COMMAND] [--config PATH] [--plain | --full]`
 //!
 //! Installed to `/usr/local/sbin/kyriakon-onboard-tui`, which is the path
-//! `openbsd/etc/login.conf.d/onboard` gives the `hello` account as its session
+//! `openbsd/etc/login.conf.d/hello` gives the `hello` account as its session
 //! shell and the path `openbsd/etc/sshd_config.onboard` pins with `ForceCommand`,
 //! so a connection to the portal lands here and nowhere else.
 //! `scripts/deploy-onboard.sh` installs it from the same build as the handler, so

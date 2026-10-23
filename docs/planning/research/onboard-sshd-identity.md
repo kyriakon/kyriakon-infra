@@ -1,5 +1,8 @@
 # What the onboard sshd tells the TUI about the key that connected (public release, §5.9.2)
 
+> The tracked portal account is `hello`; the probes below used `onboard`, the name at the time.
+> The evidence is otherwise unchanged.
+
 **Question:** the portal redesign gives one connection two jobs. An applicant authenticates with
 `none`, and a member is whoever the public key sshd saw belongs to. The TUI has no other source
 for who is connected, so four things need settling against the daemon itself: whether
