@@ -236,9 +236,11 @@ learning anything.
 
 The delegation is unsigned. The registry's own record reports `"secureDNS": {"delegationSigned":
 false}` (Verisign RDAP for `kyriakon.net`, read 2026-10-01), and a `+dnssec` query returns no RRSIG.
-Without DNSSEC a resolver cannot tell a genuine answer from a forged one, and DANE would rest on a
-record that proves nothing, so signing the zone is the prerequisite for authenticating mail transport
-by TLSA rather than an alternative to it.
+Rechecked at the secondaries on 2026-10-23: `ns1`–`ns5.he.net` answer `A kyriakon.net` with no
+`RRSIG`, `DNSKEY` returns no records and the parent holds no `DS`; the commands are in
+`dns-nsd-he-mail-records.md`. Without DNSSEC a resolver cannot tell a genuine answer from a forged
+one, and DANE would rest on a record that proves nothing, so signing the zone is the prerequisite for
+authenticating mail transport by TLSA rather than an alternative to it.
 
 The sites send no HSTS header, because `openbsd/etc/httpd.conf` has no `hsts` block and the live file
 has none either (`grep -c hsts /etc/httpd.conf` returns 0 on the box, read 2026-10-01). `httpd.conf(5)`
@@ -270,15 +272,6 @@ grounds that the adversary these would answer is not the one the platform can af
 - The secondaries: `dig +short NS kyriakon.net` lists the five nameservers, all of which are Hurricane
   Electric.
 
-## DNSSEC at the public secondaries
-
-Checked on 2026-10-23: `kyriakon.net` is unsigned as served. All five public nameservers
-(`ns1`–`ns5.he.net`) are Hurricane Electric; each answered `A kyriakon.net` with the authoritative
-flag and no `RRSIG`, `DNSKEY kyriakon.net` returned no records, and the parent returned no `DS`. The
-zone file carries no DNSSEC records and the hidden primary has no signing configured. A `TLSA` record
-can be published today, but nothing validates it until the zone is signed and the registry holds the
-matching `DS`.
-
 ## Properties worth stating
 
 Each row is a sentence the platform could publish, the check that makes it verifiable, the cost of
@@ -290,7 +283,7 @@ marked proposed are recommendations from this note, and the last row is decided 
 | The server holds no key that opens mail, and nothing that derives one. | `grep -rIl "BEGIN PGP PRIVATE KEY" .` is empty; `keys/` holds public keys; the encryptor resolves `<localpart>.asc` | No server-side search or threading, a PGP client on every device, and permanent loss when a member loses both key and recovery phrase | Built, ADRs 0002, 0003 and 0008 |
 | The keys the platform does hold are the DKIM signing key, the queue key at `/etc/mail/queue.key`, and the restic password, and each is named with what it opens. | `docs/transparency.md`; `openbsd/etc/smtpd.conf`; `scripts/backup.sh` states that the password is the key | None. This is a statement, and it is what makes the negative claims precise | Built, ADR 0007 |
 | A powered-off disk or a stored image is ciphertext. | The root volume is `softraid` CRYPTO and needs a passphrase at boot; `sysctl hw.sensors.softraid0.drive0` reports the volume on the box, and `bioctl` on the volume shows the discipline, which needs root | A passphrase typed at the console on every boot, so an unattended reboot is an outage until someone is present | Built, `softraid(4)`, ADR 0007 |
-| The raw per-user log record expires about a week after it is written. | `openbsd/etc/newsyslog.conf` sets seven copies on `maillog`, `authlog` and `nsd.log` | A slow-burn relay or a credential-stuffing ramp is caught inside the window or not at all | Built, and installed by `deploy-mail.sh` |
+| The raw per-user log record expires about a week after it is written. | `openbsd/etc/newsyslog.conf` sets seven copies on `maillog`, `authlog` and `nsd.log` | A slow-burn relay or a credential-stuffing ramp is caught inside the window or not at all | Built; installed by `deploy-mail.sh` on the next deploy |
 | A durable substitution of a member's public key is a commit in this repository. | `git log -- keys/`, and the member compares the fingerprint recorded at signup | The check only works for a member who recorded the fingerprint, and it does not see a change made in memory and reverted | Built, `threat-model.md` |
 | Inbound mail declares a policy that senders must use TLS, and delivery to a host without a valid certificate should fail. | `dig +short TXT _mta-sts.kyriakon.net` returns a policy, and `https://mta-sts.kyriakon.net/.well-known/mta-sts.txt` matches it | A TXT record, a file served by httpd, and the discipline to keep both current, since a stale or wrong policy makes well-behaved senders bounce mail. It does not cover the sending direction | Proposed, RFC 8461 |
 | The sites are HTTPS-only after the first visit. | `curl -sI https://kyriakon.net` carries a `Strict-Transport-Security` header | One `hsts` block in `httpd.conf`, and a commitment that every host under the name keeps a valid certificate. Preload is refused for now because the list is public and slow to leave | Proposed, `httpd.conf(5)` |
@@ -340,7 +333,7 @@ as worded, or made true only by a limit that the same sentence would hide.
 The check in every row above that reads a published file tests the intended state. The two
 disagreements this note first recorded are now closed.
 
-`scripts/deploy-mail.sh` installs `openbsd/etc/newsyslog.conf` (`install -m 0644`, line 428), and the
+`scripts/deploy-mail.sh` installs `openbsd/etc/newsyslog.conf` (`install -m 0644`, line 426), and the
 file carries the base system's entries as well as the platform's, because newsyslog has no include.
 After a deploy, the box's `nsd.log` entry and the 600 modes on `authlog` and `maillog` are the
 published ones.
@@ -398,6 +391,9 @@ All read on 2026-10-01 unless stated.
   automated fetches, so the account above comes from the Council's own explanation of the two
   instruments. Whether the directive obliges this platform to appoint a representative was not
   settled.
+- Whether Hurricane Electric's secondary service can serve a signed `kyriakon.net` zone. The zone
+  is unsigned today, so this check cannot show it, and its secondary configuration panel was not
+  read.
 - Whether a Hetzner snapshot of a running server captures memory. The FAQ describes snapshots as a
   copy of the disk, and the hypervisor is not the platform's to inspect, so the memory question is
   recorded as unknown rather than asserted either way.
