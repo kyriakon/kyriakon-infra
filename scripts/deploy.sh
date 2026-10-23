@@ -6,25 +6,29 @@
 #   doas ksh scripts/deploy.sh --check           # print the plan, run nothing
 #   doas ksh scripts/deploy.sh                   # run the plan
 #   doas ksh scripts/deploy.sh --since <commit>  # plan from a chosen commit
-#   doas ksh scripts/deploy.sh --all             # every deploy script
+#   doas ksh scripts/deploy.sh --all             # every deploy script, no record
+#   doas ksh scripts/deploy.sh --record          # record HEAD, run nothing
 #
 # The base is /var/db/kyriakon/deployed, written as `<commit><tab><date>` after
-# a run whose scripts all succeeded. The first run has no marker and plans every
-# script; a later run diffs the marker's commit to HEAD and runs only what the
-# changed paths need. `--check` prints the same plan and writes nothing.
+# a run whose scripts all succeeded and whose propose-only steps were applied.
+# The first run has no marker: `--all` runs every script and does not record,
+# because with no diff it cannot see a pf.conf or sshd_config change. After the
+# manual checks, `--record` records HEAD. A later run diffs the marker's commit
+# to HEAD and runs only what the changed paths need. `--check` prints the same
+# plan and writes nothing.
 #
 # Two changes are never applied here. pf.conf is the operator's propose-only
 # step, and sshd_config and its login class are installed by hand; the script
 # prints the commands for both and does not advance the marker while one of
-# them remains in the range. Apply the diff by hand, then run this again.
+# them remains in the range. Apply the diff by hand, then run `--record`.
 #
 # A path this script does not recognise is an error, not a silent skip: a new
 # directory has to choose its deploy, which is how a config file added under
 # openbsd/etc/ cannot land without a rule.
 #
-# The mapping is read from the repository layout, not from a list per script:
-# onboard/ goes with deploy-onboard, the mail and web configs with deploy-mail,
-# relayd.conf with deploy-relayd, the nsd tree with deploy-nsd.
+# The mapping follows the repository layout, plus the two install lists each
+# deploy script keeps: deploy-mail's /root/bin set and deploy-onboard's drain
+# scripts. A path in either needs that deploy.
 
 set -euo pipefail
 
@@ -36,7 +40,7 @@ say() { printf '== %s\n' "$*"; }
 die() { printf '%s: %s\n' "$0" "$*" >&2; exit 1; }
 
 usage() {
-	printf 'usage: doas ksh %s [--check] [--since <commit> | --all]\n' "$0" >&2
+	printf 'usage: doas ksh %s [--check | --record] [--since <commit> | --all]\n' "$0" >&2
 	exit 2
 }
 
@@ -69,10 +73,7 @@ classify() {
 		openbsd/etc/smtpd.conf | openbsd/etc/unbound.conf | openbsd/etc/newsyslog.conf | \
 		openbsd/etc/spamd.conf | openbsd/etc/spamd.alloweddomains | openbsd/etc/nospamd | \
 		openbsd/etc/kyriakon-finger | openbsd/etc/finger.txt) needs_mail=yes ;;
-	openbsd/etc/kyriakon.env)
-		needs_mail=yes
-		manual_env=yes
-		;;
+	openbsd/etc/kyriakon.env) manual_env=yes ;;
 	openbsd/etc/relayd.conf) needs_relayd=yes ;;
 	openbsd/etc/nsd/* | openbsd/etc/hostname.vio0) needs_nsd=yes ;;
 	openbsd/etc/pf.conf) manual_pf=yes ;;
@@ -83,9 +84,23 @@ classify() {
 		manual_member_class=yes
 		;;
 	reserved-usernames.txt | scripts/onboard-store.sh) needs_onboard=yes ;;
-	scripts/lib.sh | scripts/abuse-monitor.sh | scripts/backup.sh | \
-		scripts/renew-acme.sh | scripts/restore-standup.sh) needs_mail=yes ;;
-	scripts/cron-apply.sh) manual_cron=yes ;;
+	# deploy-mail.sh installs these into /root/bin (its install loop).
+	scripts/abuse-monitor.sh | scripts/check-keyring-drift.sh | scripts/backup.sh | \
+		scripts/renew-acme.sh | scripts/restore-standup.sh | scripts/acme-queue.sh) needs_mail=yes ;;
+	# deploy-onboard.sh installs its drain_scripts list, and lib.sh, into the
+	# drain's script directory.
+	scripts/add-user.sh | scripts/provision-member.sh | scripts/delete-user.sh | \
+		scripts/quota-apply.sh | scripts/provision-member-web.sh | \
+		scripts/provision-member-capsule.sh | scripts/publish-mail-key.sh | \
+		scripts/set-mail-password.sh) needs_onboard=yes ;;
+	scripts/cron-apply.sh)
+		needs_onboard=yes
+		manual_cron=yes
+		;;
+	scripts/lib.sh)
+		needs_mail=yes
+		needs_onboard=yes
+		;;
 	scripts/*) : ;;
 	keys/*) needs_mail=yes ;;
 	terraform/*) manual_terraform=yes ;;
@@ -152,18 +167,21 @@ print_manual() {
 	fi
 	if [ "$manual_sshd" = yes ]; then
 		printf 'propose-only: sshd_config changed. Install it by hand, then:\n'
+		printf '  doas install -m 0644 %s/openbsd/etc/sshd_config /etc/ssh/sshd_config\n' "$repo_dir"
 		printf '  doas sshd -t -f /etc/ssh/sshd_config\n'
 		printf '  doas rcctl restart sshd\n'
 	fi
 	if [ "$manual_sshd_onboard" = yes ]; then
-		printf 'propose-only: the portal sshd config or its login class changed:\n'
+		printf 'propose-only: the portal sshd config or its login class changed. Install by hand:\n'
+		printf '  doas install -m 0644 %s/openbsd/etc/sshd_config.onboard /etc/ssh/sshd_config.onboard\n' "$repo_dir"
+		printf '  doas install -m 0644 %s/openbsd/etc/login.conf.d/onboard /etc/login.conf.d/onboard\n' "$repo_dir"
+		printf '  doas cap_mkdb /etc/login.conf   # when the class changed\n'
 		printf '  doas sshd -t -f /etc/ssh/sshd_config.onboard\n'
 		printf '  doas rcctl restart kyriakon_onboard_sshd\n'
-		printf '  doas cap_mkdb /etc/login.conf   # when the class changed\n'
 	fi
 	if [ "$manual_member_class" = yes ]; then
 		printf 'the member login class changed; existing accounts keep the old one until:\n'
-		printf '  doas install -m 0644 openbsd/etc/login.conf.d/member /etc/login.conf.d/member\n'
+		printf '  doas install -m 0644 %s/openbsd/etc/login.conf.d/member /etc/login.conf.d/member\n' "$repo_dir"
 		printf '  doas cap_mkdb /etc/login.conf   # only when /etc/login.conf.db exists\n'
 		printf '  doas usermod -L member <username>\n'
 	fi
@@ -175,22 +193,23 @@ print_manual() {
 		printf '  doas ksh scripts/setup-env.sh\n'
 	fi
 	if [ "$manual_terraform" = yes ]; then
-		printf 'terraform changed; review the plan, then apply it by hand:\n'
+		printf 'terraform changed; review the plan from the workstation, then apply it by hand:\n'
 		printf '  terraform -chdir=terraform plan\n'
 	fi
 	return 0
 }
 
 print_plan() {
-	if [ "$all" = yes ]; then
+	if [ "$all_scripts" = yes ]; then
 		say 'the plan: every deploy script'
 	else
 		say 'the plan:'
 	fi
-	if [ -z "$(plan_order)" ]; then
+	plan_scripts=$(plan_order)
+	if [ -z "$plan_scripts" ]; then
 		say 'no deploy script is needed'
 	else
-		plan_order | while IFS= read -r s; do
+		printf '%s\n' "$plan_scripts" | while IFS= read -r s; do
 			printf '  ksh scripts/%s\n' "$s"
 		done
 	fi
@@ -198,11 +217,18 @@ print_plan() {
 }
 
 run_scripts() {
-	# shellcheck disable=SC2046 # plan_order writes one script name per line
-	for s in $(plan_order); do
+	# shellcheck disable=SC2086 # plan_scripts is one script name per line
+	for s in $plan_scripts; do
 		say "running scripts/$s"
 		ksh "$1/scripts/$s" || die "scripts/$s failed; the marker was not written"
 	done
+}
+
+# The marker is written when the range was checked (not --all) and held no
+# manual step. `--record` is the operator's explicit confirmation after applying
+# one, and is the only other writer.
+gate() {
+	[ "${all_scripts:-no}" = no ] && ! manual_any
 }
 
 marker_base() {
@@ -216,28 +242,39 @@ write_marker() {
 	mv "$1.tmp" "$1"
 }
 
+record_now() {
+	head=$(git -C "$1" rev-parse HEAD)
+	write_marker "$2" "$head"
+	say "recorded $head in $2"
+}
+
 main() {
 	if [ "${1:-}" = --self-test ]; then
 		self_test
 	fi
 	check_only=no
-	all=no
-	since=''
+	record_only=no
+	all_scripts=no
+	since_commit=''
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--check) check_only=yes ;;
-		--all) all=yes ;;
+		--record) record_only=yes ;;
+		--all) all_scripts=yes ;;
 		--since)
 			[ $# -ge 2 ] || usage
-			since=$2
+			since_commit=$2
 			shift
 			;;
 		*) usage ;;
 		esac
 		shift
 	done
-	if [ "$all" = yes ] && [ -n "$since" ]; then
+	if [ "$all_scripts" = yes ] && [ -n "$since_commit" ]; then
 		die '--all and --since cannot be combined'
+	fi
+	if [ "$record_only" = yes ] && { [ "$check_only" = yes ] || [ "$all_scripts" = yes ] || [ -n "$since_commit" ]; }; then
+		die '--record stands alone'
 	fi
 	[ "$(id -u)" -eq 0 ] || die "run as root (doas ksh $0)"
 	[ -d "$repo_dir/.git" ] || die "$repo_dir is not a git checkout"
@@ -245,15 +282,20 @@ main() {
 		die "$repo_dir has uncommitted changes; commit or discard them first"
 	fi
 
-	base=$since
-	if [ "$all" = no ] && [ -z "$base" ]; then
+	if [ "$record_only" = yes ]; then
+		record_now "$repo_dir" "$marker"
+		return 0
+	fi
+
+	base=$since_commit
+	if [ "$all_scripts" = no ] && [ -z "$base" ]; then
 		base=$(marker_base "$marker")
 		if [ -z "$base" ]; then
-			all=yes
+			all_scripts=yes
 			say "no deploy marker at $marker: planning every deploy script"
 		fi
 	fi
-	[ "$all" = no ] || base=''
+	[ "$all_scripts" = no ] || base=''
 
 	plan "$repo_dir" "$base"
 	head=$(git -C "$repo_dir" rev-parse HEAD)
@@ -269,8 +311,14 @@ main() {
 		return 0
 	fi
 	run_scripts "$repo_dir"
-	if manual_any; then
-		say 'not recorded: the manual steps above are still to run'
+	if ! gate; then
+		if [ "$all_scripts" = yes ]; then
+			say 'not recorded: --all has no diff, so pf.conf and sshd_config were not checked'
+			say 'apply the propose-only steps, then: doas ksh scripts/deploy.sh --record'
+		else
+			say 'not recorded: the manual steps above are still to run'
+			say 'apply them, then: doas ksh scripts/deploy.sh --record'
+		fi
 		return 0
 	fi
 	write_marker "$marker" "$head"
@@ -337,6 +385,22 @@ self_test() {
 	classify 'scripts/backup.sh'
 	check 'an installed cron script plans deploy-mail' "$needs_mail" yes
 	reset_plan
+	classify 'scripts/check-keyring-drift.sh'
+	check 'the drift check plans deploy-mail' "$needs_mail" yes
+	reset_plan
+	classify 'scripts/provision-member.sh'
+	check 'a drain script plans deploy-onboard' "$needs_onboard" yes
+	reset_plan
+	classify 'scripts/lib.sh'
+	check 'lib.sh plans both deploys' "$needs_mail $needs_onboard" 'yes yes'
+	reset_plan
+	classify 'scripts/cron-apply.sh'
+	check 'cron-apply plans onboard and a manual run' "$needs_onboard $manual_cron" 'yes yes'
+	reset_plan
+	classify 'openbsd/etc/kyriakon.env'
+	check 'the env template does not plan a mail deploy' "$needs_mail" no
+	check 'the env template is a manual step' "$manual_env" yes
+	reset_plan
 	classify 'scripts/deploy.sh'
 	check 'the deploy script plans nothing' "$(plan_order)" ''
 
@@ -344,10 +408,23 @@ self_test() {
 	check 'no base plans every script' "$(plan_order | paste -sd ' ' -)" \
 		'deploy-nsd.sh deploy-mail.sh deploy-relayd.sh deploy-onboard.sh'
 
+	all_scripts=no
+	reset_plan
+	check 'a clean range records' "$(if gate; then printf yes; else printf no; fi)" yes
+	manual_pf=yes
+	check 'a manual step blocks recording' "$(if gate; then printf yes; else printf no; fi)" no
+	all_scripts=yes
+	manual_pf=no
+	check '--all does not record' "$(if gate; then printf yes; else printf no; fi)" no
+	all_scripts=no
+
 	printf 'abc123\t2026-10-22T00:00:00Z\n' >"$self_test_work/old-marker"
 	check "the marker's commit is read" "$(marker_base "$self_test_work/old-marker")" abc123
 	write_marker "$self_test_work/new-marker" deadbeef
 	check 'the marker is written' "$(marker_base "$self_test_work/new-marker")" deadbeef
+	head=$(git -C "$repo" rev-parse HEAD)
+	record_now "$repo" "$self_test_work/recorded"
+	check 'record_now writes HEAD' "$(marker_base "$self_test_work/recorded")" "$head"
 
 	self_test_end
 }
