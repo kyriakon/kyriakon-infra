@@ -14,11 +14,11 @@
 #
 # Applied by hand, never by a deploy:
 #
-#   doas install -m 0644 openbsd/etc/login.conf.d/onboard /etc/login.conf.d/onboard
+#   doas install -m 0644 openbsd/etc/login.conf.d/hello /etc/login.conf.d/hello
 #   doas cap_mkdb /etc/login.conf
 #
 # cap_mkdb is required after an edit to this file or to /etc/login.conf whenever
 # /etc/login.conf.db exists.
-onboard:\
+hello:\
 	:shell=/usr/local/sbin/kyriakon-onboard-tui:\
 	:tc=default:

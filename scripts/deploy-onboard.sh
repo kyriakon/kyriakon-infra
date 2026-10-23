@@ -117,7 +117,7 @@ install -d -m 0755 -o root -g wheel /etc/onboard
 install -m 0755 "$repo_dir/onboard/target/release/kyriakon-onboard" /usr/local/sbin/kyriakon-onboard
 install -m 0755 "$repo_dir/onboard/target/release/kyriakon-onboard-drain" /usr/local/sbin/kyriakon-onboard-drain
 install -m 0755 "$repo_dir/onboard/target/release/kyriakon-onboardctl" /usr/local/sbin/kyriakon-onboardctl
-# The portal, at the path openbsd/etc/login.conf.d/onboard names as the session's
+# The portal, at the path openbsd/etc/login.conf.d/hello names as the session's
 # shell and openbsd/etc/sshd_config.onboard pins with ForceCommand. It also
 # replaces the ksh program that path held, which left the repository in #373: the
 # same path and one file, so no session can reach the retired program and no

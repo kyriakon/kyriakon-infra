@@ -79,7 +79,7 @@ classify() {
 	openbsd/etc/nsd/* | openbsd/etc/hostname.vio0) needs_nsd=yes ;;
 	openbsd/etc/pf.conf) manual_pf=yes ;;
 	openbsd/etc/sshd_config) manual_sshd=yes ;;
-	openbsd/etc/sshd_config.onboard | openbsd/etc/login.conf.d/onboard) manual_sshd_onboard=yes ;;
+	openbsd/etc/sshd_config.onboard | openbsd/etc/login.conf.d/hello) manual_sshd_onboard=yes ;;
 	openbsd/etc/login.conf.d/member)
 		needs_onboard=yes
 		manual_member_class=yes
@@ -184,7 +184,7 @@ print_manual() {
 	if [ "$manual_sshd_onboard" = yes ]; then
 		printf 'propose-only: the portal sshd config or its login class changed. Install by hand:\n'
 		printf '  doas install -m 0644 %s/openbsd/etc/sshd_config.onboard /etc/ssh/sshd_config.onboard\n' "$repo_dir"
-		printf '  doas install -m 0644 %s/openbsd/etc/login.conf.d/onboard /etc/login.conf.d/onboard\n' "$repo_dir"
+		printf '  doas install -m 0644 %s/openbsd/etc/login.conf.d/hello /etc/login.conf.d/hello\n' "$repo_dir"
 		printf '  doas cap_mkdb /etc/login.conf   # when the class changed\n'
 		printf '  doas sshd -t -f /etc/ssh/sshd_config.onboard\n'
 		printf '  doas rcctl restart kyriakon_onboard_sshd\n'
@@ -410,6 +410,9 @@ self_test() {
 	classify 'openbsd/etc/kyriakon.env'
 	check 'the env template does not plan a mail deploy' "$needs_mail" no
 	check 'the env template is a manual step' "$manual_env" yes
+	reset_plan
+	classify 'openbsd/etc/login.conf.d/hello'
+	check 'the portal login class is a manual step' "$manual_sshd_onboard" yes
 	reset_plan
 	classify 'scripts/deploy.sh'
 	check 'the deploy script plans nothing' "$(plan_order)" ''

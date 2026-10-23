@@ -17,11 +17,11 @@
 Port REPLACE_ME
 PidFile /var/run/sshd.onboard.pid
 
-# Only the onboard account is reachable, before authentication. That is what
+# Only the hello account is reachable, before authentication. That is what
 # lets the instance carry PasswordAuthentication yes, which the none method
 # needs: userauth_none() calls mm_auth_password("") only when
 # permit_empty_passwd and password_authentication are both on (auth2-none.c).
-AllowUsers onboard
+AllowUsers hello
 PasswordAuthentication yes
 PermitRootLogin no
 LoginGraceTime 30
@@ -46,7 +46,7 @@ Banner none
 LogLevel VERBOSE
 SyslogFacility AUTH
 
-Match User onboard
+Match User hello
 	# Nothing is asked of the applicant: no credential exists to leak, rotate
 	# or publish. The account is password-less, which is the condition the
 	# none method documents.
