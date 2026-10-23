@@ -108,6 +108,8 @@ classify() {
 	scripts/deploy-relayd.sh) needs_relayd=yes ;;
 	scripts/deploy-onboard.sh) needs_onboard=yes ;;
 	scripts/deploy-nsd.sh) needs_nsd=yes ;;
+	# The pf fragments live in the script; a change to it is still the propose-only
+	# step, not a deploy this dispatcher runs.
 	scripts/pf-apply.sh) manual_pf=yes ;;
 	scripts/*) : ;;
 	keys/*) needs_mail=yes ;;
@@ -169,7 +171,7 @@ manual_any() {
 
 print_manual() {
 	if [ "$manual_pf" = yes ]; then
-		printf 'propose-only: pf.conf changed. Review the diff, then apply it by hand:\n'
+		printf 'propose-only: pf.conf or scripts/pf-apply.sh changed. Review the diff, then apply it by hand:\n'
 		printf '  doas ksh scripts/pf-apply.sh --check\n'
 		printf '  doas ksh scripts/pf-apply.sh\n'
 	fi
