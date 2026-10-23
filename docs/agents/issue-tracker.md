@@ -22,6 +22,31 @@ Infer the repo from `git remote -v` — `gh` does this automatically when run in
   `--body-file`. An inline heredoc inside a command substitution expands them, which
   is how a PR body has been published as a list of shell errors.
 
+## Ready queue
+
+When the user asks you to pick the next task, this query returns the unblocked
+`ready-for-agent` queue. Without that request, work only on the issue you were
+given.
+
+```sh
+gh api graphql -f query='
+{
+  repository(owner: "kyriakon", name: "kyriakon-infra") {
+    issues(first: 100, states: OPEN, labels: ["ready-for-agent"]) {
+      nodes { number title issueDependenciesSummary { blockedBy } }
+    }
+  }
+}' --jq '.data.repository.issues.nodes[] | select(.issueDependenciesSummary.blockedBy == 0) | "\(.number)\t\(.title)"'
+```
+
+`blockedBy` is the GraphQL count of open blockers; `totalBlockedBy` also counts
+the closed ones. The Wayfinding section below uses the REST spelling,
+`issue_dependencies_summary.blocked_by`.
+
+The queue has no priority order of its own, so read the titles and choose. A
+merged PR that says `Refs #N` leaves the issue open until its deploy step, so an
+open issue with a merged PR is not work. Check the merged PRs before starting.
+
 ## Pull requests as a triage surface
 
 **PRs as a request surface: no.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_
