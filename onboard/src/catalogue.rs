@@ -250,12 +250,20 @@ pub fn row(s: &Service, protocol: Protocol, member: Option<&str>) -> Row {
     } else {
         Some(Job::CardPayment.handoff())
     };
+    // The web form is the site root, and the capsule's root is its catalogue.
+    // An apply row on the capsule therefore has to name the route the draft
+    // flow lives at; without it the row loops back to the catalogue.
+    let path = if protocol == Protocol::Gemini && s.action == Action::Apply {
+        "/apply"
+    } else {
+        "/"
+    };
     Row {
         id: s.id.clone(),
         name: s.name.clone(),
         summary: s.summary.clone(),
         href: format!(
-            "{}://{host}/",
+            "{}://{host}{path}",
             if finished { protocol.scheme() } else { "https" }
         ),
         state: s.state.word(),
@@ -508,6 +516,14 @@ action = \"pay\"
 
         let web = row(mail, Protocol::Gemini, None);
         assert_eq!(web.href, "gemini://mail.kyriakon.net/");
+
+        // The capsule's root is its catalogue, so an apply row names the route
+        // the draft flow lives at rather than looping back to the front page.
+        let applying = list.iter().find(|s| s.action == Action::Apply).unwrap();
+        assert_eq!(
+            row(applying, Protocol::Gemini, None).href,
+            "gemini://signup.kyriakon.net/apply"
+        );
 
         // A host carrying <name> is the pattern where there is no member, and
         // the member's own where there is.
