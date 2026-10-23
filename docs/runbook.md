@@ -65,6 +65,7 @@ had no manual step.
 These procedures name the pieces that exist at this commit, and mark the ones that do not:
 
 - The onboarding service is decided in #156 and partly built: the handler is a FastCGI responder, and the drain, `kyriakon-onboardctl` and the portal's frame (`kyriakon-onboard-tui`, the program an applicant's ssh session runs) are built and installed by `scripts/deploy-onboard.sh`. The account page, the portal's application flow and its member path are still to come, so provisioning a member is manual until they land.
+- The portal's account is `onboard`, not the `hello` the TUI spec names, and it is locked with `usermod -p '*'` while the portal is unreleased. `none` auth therefore refuses everyone. At release, restore the empty field with `usermod -p '' onboard`, enable `kyriakon_onboard_sshd`, and settle which name the published `ssh ...` instruction uses; the tracked `sshd_config.onboard` and the login class both say `onboard`.
 - The per-member hosting configuration is merged into the repository and not applied: the chroot under `/home/www`, the generated vhost indexes, the port split that separates git from the chrooted sftp server. Applying it is a sequence of propose-only steps rather than a script, so it is done once, by hand, and the order is in the pull request that added it (#160).
 - The quota is scripted and has been applied: `scripts/quota-apply.sh --enable` turns quotas on and `--all` applies the 5 GB allowance to the accounts that already exist. `scripts/add-user.sh` sets it at creation.
 
