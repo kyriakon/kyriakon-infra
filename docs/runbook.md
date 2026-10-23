@@ -235,6 +235,37 @@ The generated include files, the `members` group and the account page all arrive
 
 Do not refuse inbound mail as the default, and do not edit `pf.conf` or `sshd_config` on the box to enforce any of this. Both are propose-only changes; a pull request carries the diff and a human applies it.
 
+## Record a data-subject request
+
+Every request is recorded before it is answered. The identity rule is the one in
+`docs/planning/specs/data-subject-requests.md`: a request from the account page
+is checked against the system account, and a request sent by mail is confirmed
+by a signed message from the account's own address.
+
+Record the request once the relevant time is known. `--received` is the day it
+arrived, and `--identity-at` or `--fee-at` is the day the identity information
+or a fee arrived. The answer is due one calendar month after the latest of the
+three.
+
+	doas onboardctl request record --username <username> --kind access \
+	  --received <YYYY-MM-DD> --evidence "signed message from the account address" \
+	  --identity-at <YYYY-MM-DD> --note "export filed"
+
+`--kind` is `access`, `erasure` or `rectification`. A portability request is
+recorded as `access`. The command prints the request id and the due date. If the
+connection drops before it prints, run `request list` before recording again:
+the line is there if the write landed.
+
+	doas onboardctl request list
+
+The list prints every open request, earliest due first, and counts the ones
+inside seven days and the overdue ones separately.
+
+	doas onboardctl request close <id> --done <YYYY-MM-DD> --note "collected over sftp"
+
+Closing writes what was done onto that request's own line. The record is the
+member's data: it goes out with a later export and is removed with the account.
+
 ## When a member has died
 
 Nothing is released, and the ordinary paths apply. The rule in `docs/planning/specs/data-subject-requests.md` stands: a request from outside the account page is confirmed by the password or by a message from the account's own address signed with the member's key, and where neither can be produced the operator says so and does not answer as though identity were established. A bereaved family holds neither, so nothing can be handed over on their request.
