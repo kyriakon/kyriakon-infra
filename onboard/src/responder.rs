@@ -511,16 +511,11 @@ fn form_post(request: &Request) -> bool {
         .is_some_and(|t| t.eq_ignore_ascii_case("application/x-www-form-urlencoded"))
 }
 
-/// The gemini front-end, which serves the capsule's pages: the catalogue the
-/// capsule lists, and the status page for a filed application. Nothing else is
-/// here yet, because the rest of the capsule is its own front-end's ticket: the
-/// applicant flow over gemini asks one question per page and keeps a draft, which
-/// is a page shape the web form does not have.
-///
-/// No route on this face reads a query yet. When one does it is `QUERY_STRING`,
-/// which gmid sends still percent-encoded and decodes by the responder rather
-/// than read from `GEMINI_SEARCH_STRING`: that copy is sent only for a query with
-/// no `=` in it, and its decoder maps `+` to a space, which is not the reading the
+/// The gemini front-end: the catalogue, the status page, and the applicant's
+/// draft flow. The apply route reads an answer from `QUERY_STRING`, which gmid
+/// sends still percent-encoded and the responder decodes itself rather than read
+/// from `GEMINI_SEARCH_STRING`: that copy is sent only for a query with no `=`
+/// in it, and its decoder maps `+` to a space, which is not the reading the
 /// specification gives a URI query.
 async fn gemini(app: &App, incoming: &Incoming) -> Reply {
     if incoming.path == "apply" {
@@ -612,7 +607,7 @@ async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) -> Reply {
         Kind::YesNo | Kind::Acceptance => value.to_ascii_lowercase(),
         _ => value,
     };
-    if let Some(why) = capsule_problem(q, &value, &app.reserved, q.required) {
+    if let Some(why) = capsule_problem(q, &value, &app.reserved, q.required, &record.answers) {
         return Reply::gemini(
             10,
             &capsule_meta(q, index, path.len(), Some(&why)),
@@ -669,7 +664,9 @@ fn capsule_path<'a>(list: &'a [Question], answers: &BTreeMap<String, String>) ->
 /// clients' empty answer.
 fn capsule_value(raw: &str) -> String {
     let decoded = decode(raw, false).replace("\r\n", "\n");
-    let trimmed = decoded.trim();
+    // Only the answer's own padding is removed. `str::trim` also removes `\r`,
+    // and the specification says a bare CR is an ordinary character.
+    let trimmed = decoded.trim_matches(|c: char| matches!(c, ' ' | '\n' | '\t'));
     if trimmed == "." {
         String::new()
     } else {
@@ -686,9 +683,18 @@ fn capsule_problem(
     value: &str,
     reserved: &HashSet<String>,
     required: bool,
+    answers: &BTreeMap<String, String>,
 ) -> Option<String> {
     if let Some(why) = validate::reason(q, value, reserved, required) {
         return Some(why);
+    }
+    // The shared key check is the web form's, because `validate::reason` only
+    // proves the first block parses; it does not count blocks or compare them
+    // with the body's account names.
+    if q.rule == Rule::MailKey && !value.is_empty() {
+        if let Some(why) = mail_key_errors(q, value, answers).into_iter().next() {
+            return Some(why);
+        }
     }
     match q.kind {
         Kind::YesNo => (!value.is_empty() && !matches!(value, "yes" | "no"))
@@ -725,7 +731,13 @@ fn capsule_meta(q: &Question, index: usize, total: usize, reason: Option<&str>) 
         Kind::Addresses => {
             out.push_str(" One per line, as localpart: own or localpart: alias localpart.")
         }
-        Kind::Key => out.push_str(" Paste the whole public key block."),
+        Kind::Key => {
+            if q.id == "body_mail_key" {
+                out.push_str(" Paste one block per mailbox, in the order of the account names.");
+            } else {
+                out.push_str(" Paste the whole public key block.");
+            }
+        }
         _ => {}
     }
     if !q.required {
@@ -756,12 +768,33 @@ fn capsule_not_found() -> Reply {
     Reply::gemini(51, "Not found", String::new())
 }
 
+/// Draw the intent id and write the application then the intent. The application
+/// goes first, so the drain never sees an intent whose application is not on
+/// disk. One writer for the web form and the capsule, so the order cannot drift
+/// between them.
+async fn file_application(app: &App, record: &Record) -> Result<(), String> {
+    let id = ulid::Ulid::new().to_string();
+    let bytes = serde_json::to_vec_pretty(record)
+        .map_err(|e| format!("cannot encode the application: {e}"))?;
+    app.store
+        .write_record(
+            "applications",
+            &format!("{}.json", record.status_token),
+            &bytes,
+        )
+        .await?;
+    let intent = serde_json::to_vec_pretty(&record.intent(&id))
+        .map_err(|e| format!("cannot encode the intent: {e}"))?;
+    app.store
+        .write_record("intents", &format!("{id}.json"), &intent)
+        .await
+}
+
 /// Every answer is in hand: file the application and the one intent through the
 /// same builder the web form uses, then remove the draft. The token stays the
 /// one the draft carried, which is the capability the status link already holds.
 async fn capsule_file(app: &App, record: &draft::Draft) -> Reply {
     let body = record.answers.get("whose").map(String::as_str) == Some("body");
-    let id = ulid::Ulid::new().to_string();
     let application = match build_record(app, &record.answers, body, &record.token, "capsule") {
         Ok(application) => application,
         Err(e) => {
@@ -769,33 +802,7 @@ async fn capsule_file(app: &App, record: &draft::Draft) -> Reply {
             return Reply::gemini(40, "Temporary failure", String::new());
         }
     };
-    let bytes = match serde_json::to_vec_pretty(&application) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!("kyriakon-onboard: cannot encode the application: {e}");
-            return Reply::gemini(40, "Temporary failure", String::new());
-        }
-    };
-    if let Err(e) = app
-        .store
-        .write_record("applications", &format!("{}.json", record.token), &bytes)
-        .await
-    {
-        eprintln!("kyriakon-onboard: {e}");
-        return Reply::gemini(40, "Temporary failure", String::new());
-    }
-    let intent = match serde_json::to_vec_pretty(&application.intent(&id)) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!("kyriakon-onboard: cannot encode the intent: {e}");
-            return Reply::gemini(40, "Temporary failure", String::new());
-        }
-    };
-    if let Err(e) = app
-        .store
-        .write_record("intents", &format!("{id}.json"), &intent)
-        .await
-    {
+    if let Err(e) = file_application(app, &application).await {
         eprintln!("kyriakon-onboard: {e}");
         return Reply::gemini(40, "Temporary failure", String::new());
     }
@@ -803,13 +810,7 @@ async fn capsule_file(app: &App, record: &draft::Draft) -> Reply {
         eprintln!("kyriakon-onboard: {e}");
     }
     let link = format!("gemini://{HOST}/status/{}", record.token);
-    Reply::gemini(
-        20,
-        "text/gemini",
-        format!(
-            "# Application filed\n\nKeep this link. It is the only thing that identifies your application:\n\n=> {link} Application status\n"
-        ),
-    )
+    Reply::gemini(20, "text/gemini", capsule::filed(&link))
 }
 
 /// The applicant page, with the community block open for a body. `branch` is the
@@ -968,34 +969,11 @@ async fn apply(app: &App, request: &Request, incoming: &Incoming) -> Reply {
         Ok(t) => t,
         Err(e) => return server_error(&e),
     };
-    let id = ulid::Ulid::new().to_string();
     let record = match build_record(app, &form, body, &token, label) {
         Ok(r) => r,
         Err(e) => return server_error(&e),
     };
-
-    // The application record first, so the drain never sees an intent whose
-    // application is not on disk yet, then the one intent.
-    let app_bytes = match serde_json::to_vec_pretty(&record) {
-        Ok(b) => b,
-        Err(e) => return server_error(&format!("cannot encode the application: {e}")),
-    };
-    if let Err(e) = app
-        .store
-        .write_record("applications", &format!("{token}.json"), &app_bytes)
-        .await
-    {
-        return server_error(&e);
-    }
-    let intent_bytes = match serde_json::to_vec_pretty(&record.intent(&id)) {
-        Ok(b) => b,
-        Err(e) => return server_error(&format!("cannot encode the intent: {e}")),
-    };
-    if let Err(e) = app
-        .store
-        .write_record("intents", &format!("{id}.json"), &intent_bytes)
-        .await
-    {
+    if let Err(e) = file_application(app, &record).await {
         return server_error(&e);
     }
 

@@ -12,10 +12,9 @@
 # instance cannot silently pick up a different file.
 
 # The store root. The handler reads the two shared files below it and the
-# application records it renders, and writes intents/ and applications/. drafts/
-# and webhooks/ have no writer yet: they are the capsule's draft store and the
-# payment webhooks, and both are later tickets. It reads no secret and no other
-# member's state.
+# application records it renders, and writes intents/, applications/ and the
+# capsule's drafts/. webhooks/ has no writer yet: it is the payment webhook
+# store, a later ticket. It reads no secret and no other member's state.
 store_root = "/var/db/onboard"
 
 # The reserved set and the service catalogue the front-ends share, both 0644 at
