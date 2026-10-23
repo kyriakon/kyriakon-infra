@@ -24,8 +24,9 @@ Infer the repo from `git remote -v` — `gh` does this automatically when run in
 
 ## Ready queue
 
-The next agent task is the first unblocked `ready-for-agent` issue. One call
-returns the queue, with the open blocker count:
+When the user asks you to pick the next task, this query returns the unblocked
+`ready-for-agent` queue. Without that request, work only on the issue you were
+given.
 
 ```sh
 gh api graphql -f query='
@@ -38,10 +39,13 @@ gh api graphql -f query='
 }' --jq '.data.repository.issues.nodes[] | select(.issueDependenciesSummary.blockedBy == 0) | "\(.number)\t\(.title)"'
 ```
 
-`blockedBy` counts open blockers; `totalBlockedBy` also counts the closed ones.
+`blockedBy` is the GraphQL count of open blockers; `totalBlockedBy` also counts
+the closed ones. The Wayfinding section below uses the REST spelling,
+`issue_dependencies_summary.blocked_by`.
 
-A merged PR that says `Refs #N` leaves the issue open until its deploy step, so
-an open issue with a merged PR is not work. Check the merged PRs before starting.
+The queue has no priority order of its own, so read the titles and choose. A
+merged PR that says `Refs #N` leaves the issue open until its deploy step, so an
+open issue with a merged PR is not work. Check the merged PRs before starting.
 
 ## Pull requests as a triage surface
 
