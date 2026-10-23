@@ -40,6 +40,7 @@ async fn handler(name: &str) -> (App, PathBuf) {
             .to_string(),
         httpd_socket: String::new(),
         gemini_socket: String::new(),
+        portal_socket: String::new(),
         release: "2026-10-13 test".to_string(),
     };
     (App::load(cfg).await.unwrap(), dir)
@@ -310,6 +311,66 @@ async fn a_gemini_request_for_an_unknown_token_reads_as_one_that_expired() {
     let (_, expired_body) = answer(&app, &gmid_get(&format!("status/{TOKEN}"), "")).await;
     assert!(expired_body.contains(UNKNOWN_TOKEN), "{expired_body}");
     assert_eq!(expired_body, unknown_body, "the two reads are one page");
+}
+
+// The portal's one read: the stage, or the same notice for every token that
+// names nothing.
+
+#[tokio::test]
+async fn a_portal_status_read_answers_with_the_stage_and_never_an_answer() {
+    let (app, dir) = handler("portal-stage").await;
+    file_application(
+        &dir,
+        &decided(
+            "received",
+            None,
+            Some("https://signup.kyriakon.net/password/secret"),
+        ),
+    );
+
+    let answer = portal_answer(&app, "203.0.113.10", TOKEN).await;
+    assert_eq!(answer, portal_ipc::Answer::Stage("received".to_string()));
+    let line = answer.line();
+    // The status path's one promise: no answer, contact address or key.
+    assert!(!line.contains("secretary"), "{line}");
+    assert!(!line.contains("password"), "{line}");
+    assert!(!line.contains("signup.kyriakon.net"), "{line}");
+}
+
+#[tokio::test]
+async fn a_portal_read_of_an_unknown_token_reads_as_one_that_expired() {
+    let (app, dir) = handler("portal-expired").await;
+    let unknown = portal_answer(&app, "203.0.113.10", TOKEN).await;
+    assert!(
+        matches!(unknown, portal_ipc::Answer::Notice(_)),
+        "{unknown:?}"
+    );
+
+    file_application(
+        &dir,
+        &decided("decided: declined", Some("2026-10-01T09:00:00Z"), None),
+    );
+    let expired = portal_answer(&app, "203.0.113.10", TOKEN).await;
+    assert_eq!(
+        unknown.line(),
+        expired.line(),
+        "the two reads are one reply"
+    );
+}
+
+#[tokio::test]
+async fn a_portal_status_read_is_rate_limited_by_address() {
+    let (app, _dir) = handler("portal-rate").await;
+    for _ in 0..crate::rate::REQUESTS_PER_MINUTE {
+        let _ = portal_answer(&app, "203.0.113.10", TOKEN).await;
+    }
+    let refused = portal_answer(&app, "203.0.113.10", TOKEN).await;
+    assert_eq!(refused, portal_ipc::Answer::Notice(SLOW_STATUS.to_string()));
+    // Another address still reads.
+    assert!(matches!(
+        portal_answer(&app, "203.0.113.11", TOKEN).await,
+        portal_ipc::Answer::Notice(_)
+    ));
 }
 
 // The environment traps: what each front-end sends, and what is read from it.

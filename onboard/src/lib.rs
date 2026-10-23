@@ -20,6 +20,7 @@ pub mod notice;
 pub mod page;
 pub mod password;
 pub mod portal;
+pub mod portal_ipc;
 pub mod questions;
 pub mod rate;
 pub mod requests;

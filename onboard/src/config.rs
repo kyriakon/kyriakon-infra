@@ -1,6 +1,6 @@
 //! The handler's own configuration, read once at startup from the TOML the unit
-//! names. It holds no secret: the store root, the two files the front-ends share,
-//! the two sockets this responder answers on and the release the acceptances
+//! names. It holds no secret: the store root, the files the front-ends share, the
+//! three sockets this responder answers on and the release the acceptances
 //! record.
 
 use std::path::Path;
@@ -36,6 +36,11 @@ pub struct Config {
     pub httpd_socket: String,
     /// The unix socket gmid's signup block reaches it on. See `httpd_socket`.
     pub gemini_socket: String,
+    /// The unix socket the ssh portal reaches it on. The portal runs as `hello`,
+    /// not chrooted, and asks one thing here: the stage of a filed application.
+    /// Its directory is set-group-id to that account's group for the same reason
+    /// the other two carry their daemon's group.
+    pub portal_socket: String,
     /// The deployed commit and date, e.g. "2026-10-10 1a2b3c4". The acceptance
     /// records carry it as the version of each document accepted, and it is the
     /// version of the question list an application was answered against. It is
@@ -142,11 +147,13 @@ mod tests {
              catalogue = \"/var/db/onboard/catalogue.toml\"\n\
              httpd_socket = \"/home/www/run/onboard-httpd/httpd.sock\"\n\
              gemini_socket = \"/home/www/run/onboard/onboard.sock\"\n\
+             portal_socket = \"/home/www/run/onboard-portal/portal.sock\"\n\
              release = \"REPLACE_ME\"\n",
         )
         .unwrap();
         assert_eq!(c.httpd_socket, "/home/www/run/onboard-httpd/httpd.sock");
         assert_eq!(c.gemini_socket, "/home/www/run/onboard/onboard.sock");
+        assert_eq!(c.portal_socket, "/home/www/run/onboard-portal/portal.sock");
     }
 
     #[test]
@@ -175,6 +182,7 @@ mod tests {
                  catalogue = \"c\"\n\
                  httpd_socket = \"/a\"\n\
                  gemini_socket = \"/b\"\n\
+                 portal_socket = \"/c\"\n\
                  release = \"r\"\n{extra}"
             );
             let r: Result<Config, _> = toml::from_str(&text);

@@ -35,11 +35,12 @@ catalogue = "/var/db/onboard/catalogue.toml"
 # compare, where a digest of two files is a number nothing acts on.
 release = "REPLACE_ME"
 
-# The unix sockets the two front-ends reach the responder on. There is no
-# listener on a port: the service is a FastCGI responder, and both httpd and gmid
-# resolve a FastCGI socket path inside their own chroot, which is /home/www for
-# each of them. So these are the paths on disk, and the two configs name them
-# relative to that chroot.
+# The unix sockets the front-ends reach the responder on. There is no listener on
+# a port: the service is a FastCGI responder, and both httpd and gmid resolve a
+# FastCGI socket path inside their own chroot, which is /home/www for each of
+# them. So these are the paths on disk, and the two configs name them relative to
+# that chroot. The portal's socket is the third and is not FastCGI: its program is
+# not chrooted, and it sends one line.
 #
 # One socket each rather than one shared. The connecting daemon is www for httpd
 # and _gmid for gmid, and a socket file carries one group, so a socket both may
@@ -53,6 +54,13 @@ release = "REPLACE_ME"
 # one group.
 httpd_socket = "/home/www/run/onboard-httpd/httpd.sock"
 gemini_socket = "/home/www/run/onboard/onboard.sock"
+
+# The unix socket the ssh portal reaches this service on. The portal runs as
+# `hello`, outside the store and outside the front-ends' chroot, and asks one
+# question here: the stage of a filed application. Its directory is set-group-id
+# to the portal account's own group for the reason above, and the path is the
+# on-disk one because the portal is not chrooted.
+portal_socket = "/home/www/run/onboard-portal/portal.sock"
 
 # The rate limits (sixty requests a minute and five drafts a day per address, no
 # CAPTCHA) are the spec's numbers and live in the handler, not here: they are not
