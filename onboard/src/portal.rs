@@ -16,19 +16,22 @@
 //! answers it. A screen reader and a bad link get the same program as everyone
 //! else, which is the point rather than a convenience.
 //!
-//! Two tickets come after this one, and this module is where they attach. [#380]
-//! starts the application from a row's `apply` action and [#381] opens the
-//! member's own account from its `account` action; today `follow` hands the reader
-//! the address the catalogue names for the row, which is what the web card and
-//! the gemtext link render for the same entry, so no row is a dead end. Those two
-//! tickets replace that address with their own screens and move nothing else here.
+//! Following a row whose action is `apply` starts the applicant's flow: the
+//! shared question list one question per screen, the counter for the branch the
+//! reader's answers select, the key pages, a confirm screen, and one intent filed
+//! through the handler. The answers live in memory for the connection's life and
+//! nothing is filed until the confirm, so an abandoned or dropped session leaves
+//! no record. Every other row still hands the reader the address the catalogue
+//! names for it. [#381] replaces that address with the member's own account
+//! screen and moves nothing else here.
+//!
 //! The member is the other half of the same seam: `entries` renders a host
 //! carrying `<name>` from the session's member, so a member's session shows their
 //! own addresses the moment something identifies them.
 //!
-//! [#380]: https://github.com/kyriakon/kyriakon-infra/issues/380
 //! [#381]: https://github.com/kyriakon/kyriakon-infra/issues/381
 
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::IpAddr;
@@ -36,15 +39,34 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::catalogue::{self, Protocol, Row, Service};
+use crate::catalogue::{self, Action, Protocol, Row, Service};
 use crate::portal_ipc::Answer as StatusAnswer;
+use crate::questions::{Kind, Question, Rule};
+use crate::responder::{flow_answers, flow_path, flow_problem, Page};
 use crate::store;
+use crate::{draft, keycheck};
 
 /// Where a session reads an application's stage. The portal cannot read the
 /// store, so the answer comes from the handler over its own socket; a test drives
 /// the same trait with an answer instead.
 pub trait StatusSource {
     fn read(&mut self, token: &str) -> Result<StatusAnswer, String>;
+}
+
+/// Where a completed application goes. The handler is the only writer and
+/// validates every field again; the portal's job is the answers and the confirm.
+/// A test drives the same trait with a form instead of a socket.
+pub trait Filing {
+    fn file(&mut self, form: &BTreeMap<String, String>) -> Result<String, String>;
+}
+
+/// The shared facts the applicant's flow reads: the crate's question list and
+/// the platform's reserved names. Grouped rather than passed one by one, because
+/// a front-end that carried its own copy of either would ask a different
+/// application.
+pub struct Flow<'a> {
+    pub questions: &'a [Question],
+    pub reserved: &'a HashSet<String>,
 }
 
 /// The screen an address sees when it already holds the session cap. It names
@@ -258,8 +280,8 @@ pub enum Key {
 
 /// How a session ended, which is the program's exit status. A reader who left
 /// with their own word has finished; a connection that closed under the program
-/// has not. Neither files anything, and #380 is the ticket that must keep that
-/// true when there is an intent to file.
+/// has not. Only the confirm screen files anything, so these two say how the
+/// connection ended rather than what was filed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Departure {
     Quit,
@@ -304,9 +326,11 @@ pub fn entries(list: &[Service], member: Option<&str>) -> Vec<Row> {
 /// no rows has no answer.
 pub fn run(
     rows: &[Row],
+    flow: &Flow,
     mode: Mode,
     input: &mut dyn Input,
     status: &mut dyn StatusSource,
+    filing: &mut dyn Filing,
     out: &mut dyn Write,
 ) -> Result<Departure, String> {
     if rows.is_empty() {
@@ -360,9 +384,12 @@ pub fn run(
                     selected - 1
                 };
             }
-            // Following a row shows where its action happens, and the reader
-            // comes back to the menu: the flow [#380] and the account read
-            // [#381] are what take over from the address.
+            // An `apply` row starts the application; every other row shows where
+            // its action happens and the reader comes back to the menu. The
+            // account read is [#381]'s.
+            Answer::Follow(at) if rows[at].action_kind == Action::Apply => {
+                return application(flow, mode, input, filing, out);
+            }
             Answer::Follow(at) => {
                 paint(mode, out, &page(&rows[at]))?;
                 selected = at;
@@ -520,6 +547,299 @@ fn page(row: &Row) -> String {
     out
 }
 
+/// The application's own opening, after the row is followed. It says the same
+/// things the first screen says, in the words that matter once answering starts.
+const APPLY_INTRO: &str = "\
+Applying for a Kyriakon account.
+
+One question at a time. Type back to return to the previous question, or quit
+to leave. Nothing is filed until you confirm at the end, and a dropped
+connection files nothing either.
+
+";
+
+/// The applicant's flow: the shared question list one page at a time, the
+/// counter for the answers given so far, a confirm screen, and one intent filed
+/// through the handler. The answers live in this process for the connection's
+/// life; there is no draft on disk because one connection is the whole session.
+fn application(
+    flow: &Flow,
+    mode: Mode,
+    input: &mut dyn Input,
+    filing: &mut dyn Filing,
+    out: &mut dyn Write,
+) -> Result<Departure, String> {
+    let mut draft = draft::Draft::new(String::new());
+    let mut index = 0;
+    paint(mode, out, APPLY_INTRO)?;
+    loop {
+        let path = flow_path(flow.questions, &draft.answers);
+        if index >= path.len() {
+            paint(mode, out, &confirmation(flow.questions, &draft))?;
+            let Some(word) = input.word()? else {
+                return Ok(Departure::Gone);
+            };
+            match word.trim().to_ascii_lowercase().as_str() {
+                "yes" | "y" => {
+                    let form = application_form(&draft);
+                    return match filing.file(&form) {
+                        Ok(token) => {
+                            put(out, &filed(&token))?;
+                            Ok(Departure::Quit)
+                        }
+                        Err(e) => {
+                            put(
+                                out,
+                                &format!("\nThe application could not be filed. Nothing was sent.\n\n{e}\n"),
+                            )?;
+                            Ok(Departure::Quit)
+                        }
+                    };
+                }
+                "back" => {
+                    index = path.len().saturating_sub(1);
+                    continue;
+                }
+                "quit" | "q" => return Ok(Departure::Quit),
+                _ => continue,
+            }
+        }
+
+        // `flow_path` already leaves the monastic pages out unless the orders
+        // answer selects that path, so the question's own column is the rule here.
+        let page = &path[index];
+        let required = page.q.required;
+        paint(mode, out, &prompt(page, index, path.len()))?;
+        match read_answer(page, input)? {
+            Entered::Gone => return Ok(Departure::Gone),
+            Entered::Quit => return Ok(Departure::Quit),
+            Entered::Back => {
+                index = index.saturating_sub(1);
+                continue;
+            }
+            Entered::Value(value) => {
+                if let Some(why) =
+                    flow_problem(page, &value, flow.reserved, required, &draft.answers)
+                {
+                    put(out, &format!("\n{why}. Press Enter to try again.\n"))?;
+                    input.word()?;
+                    continue;
+                }
+                store_answer(page, &mut draft, value);
+                index += 1;
+                // The body's two line lists are checked together, because the
+                // fault is the count rather than either list; the page just
+                // answered is the one that gets corrected.
+                if page.q.id == "body_account_names"
+                    && draft.answers.get("whose").map(String::as_str) == Some("body")
+                    && draft.answers.contains_key("body_addresses")
+                {
+                    let mut errors = Vec::new();
+                    crate::responder::body_cross_checks(&draft.answers, &mut errors);
+                    if !errors.is_empty() {
+                        index -= 1;
+                        put(
+                            out,
+                            &format!("\n{}. Press Enter to try again.\n", errors.join("; ")),
+                        )?;
+                        input.word()?;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One line of the reader's answer, or the word that leaves the page.
+enum Entered {
+    Value(String),
+    Back,
+    Quit,
+    Gone,
+}
+
+/// Read one answer. A multi-line answer, and an address list, end with a full
+/// stop on its own line; a mail key ends at the armour's own end line; the upload
+/// key is one line, because that is the shape OpenSSH writes. `back` and `quit`
+/// are read before a free-text answer starts, and on any line of a key, because
+/// neither word can appear in an armoured block and a mistaken paste otherwise
+/// has no way out.
+fn read_answer(page: &Page, input: &mut dyn Input) -> Result<Entered, String> {
+    let key = page.q.kind == Kind::Key;
+    let multiline = matches!(page.q.kind, Kind::Multiline | Kind::Addresses);
+    let mut lines = Vec::new();
+    loop {
+        let Some(word) = input.word()? else {
+            return Ok(Entered::Gone);
+        };
+        let line = word.trim_end_matches(['\r', '\n']);
+        if lines.is_empty() && matches!(line, "\x1b[D" | "\x1bOD") {
+            return Ok(Entered::Back);
+        }
+        if (lines.is_empty() || key) && !multiline {
+            match line.trim() {
+                "back" => return Ok(Entered::Back),
+                "quit" | "q" => return Ok(Entered::Quit),
+                _ => {}
+            }
+        }
+        // A blank answer is one line and done; a blank line inside a pasted key
+        // block is part of the armour, so only the first one ends a page.
+        if line.trim().is_empty() && lines.is_empty() {
+            break;
+        }
+        lines.push(line.to_string());
+        if multiline {
+            if line.trim() == "." {
+                lines.pop();
+                break;
+            }
+            continue;
+        }
+        if key {
+            // A public key block ends at its own last line; the upload key is a
+            // single line and needs no terminator.
+            let ended = line.starts_with("-----END PGP PUBLIC KEY BLOCK-----");
+            let ssh = page.q.rule == Rule::UploadKey;
+            if ended || ssh {
+                break;
+            }
+            // A pasted block that never ends is a malformed key rather than an
+            // invitation to read forever; the bound is far past a real block.
+            if lines.len() > 200 {
+                break;
+            }
+            continue;
+        }
+        break;
+    }
+    // Validation trims, so the value the branch and rail logic compares must be
+    // trimmed too: `monk ` must open the blessing and `no_charge ` must not be
+    // read as a paid rail.
+    Ok(Entered::Value(lines.join("\n").trim().to_string()))
+}
+
+/// One question, its counter, and the shape of the answer it wants. The counter
+/// is the applicant's own branch: a body's path is longer by the community block,
+/// and the blessing appears only after a monastic answer.
+fn prompt(page: &Page, index: usize, total: usize) -> String {
+    let q = page.q;
+    let mut out = format!("\nquestion {} of {}.\n\n", index + 1, total);
+    match &page.mailbox {
+        Some(mailbox) => out.push_str(&format!("Paste the public key for {}.\n", mailbox.address)),
+        None => {
+            out.push_str(&q.prompt);
+            out.push('\n');
+        }
+    }
+    match q.kind {
+        Kind::Choice => {
+            out.push_str("Answer one of: ");
+            if let Rule::Choice(options) = &q.rule {
+                for (i, option) in options.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&format!("{} ({})", option.value, option.label));
+                }
+            }
+            out.push_str(".\n");
+        }
+        Kind::YesNo => out.push_str("Answer yes or no.\n"),
+        Kind::Acceptance => out.push_str("Answer yes to accept.\n"),
+        Kind::Addresses => out.push_str(
+            "One per line, as localpart: own or localpart: alias localpart. \
+             Finish with a single full stop on its own line.\n",
+        ),
+        Kind::Key if page.mailbox.is_some() => {
+            out.push_str("Paste the whole block, ending with -----END PGP PUBLIC KEY BLOCK-----.\n")
+        }
+        Kind::Key => out.push_str("Paste the whole key on one line.\n"),
+        Kind::Multiline => out.push_str("Finish with a single full stop on its own line.\n"),
+        Kind::Text => {}
+    }
+    if !q.required {
+        out.push_str("Press Enter to skip.\n");
+    }
+    out.push_str("Type back to go to the previous question, or quit to leave.\n");
+    out
+}
+
+/// Keep one answer. A mail-key page is stored against its mailbox rather than
+/// under the question's id, because one question asks once per mailbox.
+fn store_answer(page: &Page, draft: &mut draft::Draft, value: String) {
+    match &page.mailbox {
+        Some(mailbox) => {
+            draft.mail_keys.retain(|k| k.mailbox != mailbox.name);
+            draft
+                .mail_keys
+                .push(keycheck::mail_key(mailbox.name.clone(), &value));
+        }
+        None => {
+            draft.answers.insert(page.q.id.clone(), value);
+        }
+    }
+}
+
+/// The confirm screen: each answer once, with a key shown by fingerprint rather
+/// than by its material. Nothing has been written at this point.
+fn confirmation(questions: &[Question], draft: &draft::Draft) -> String {
+    let mut out = String::from("Check your answers.\n\n");
+    for page in flow_path(questions, &draft.answers) {
+        let q = page.q;
+        match &page.mailbox {
+            Some(mailbox) => {
+                let shown = draft
+                    .mail_keys
+                    .iter()
+                    .find(|k| k.mailbox == mailbox.name)
+                    .map(|k| k.fingerprint.clone())
+                    .unwrap_or_else(|| "no key".to_string());
+                out.push_str(&format!("{}: {shown}\n", mailbox.address));
+            }
+            None => {
+                let value = draft.answers.get(&q.id).cloned().unwrap_or_default();
+                if value.is_empty() {
+                    continue;
+                }
+                let shown = if q.kind == Kind::Key {
+                    keycheck::openssh_fingerprint(&value)
+                        .or_else(|| keycheck::pgp_fingerprint(&value))
+                        .unwrap_or_else(|| "a key".to_string())
+                } else {
+                    value
+                };
+                out.push_str(&format!("{}: {shown}\n", q.prompt));
+            }
+        }
+    }
+    out.push_str("\nType yes to file it, back to change the last answer, or quit to leave.\n");
+    out
+}
+
+/// The form the handler validates and files: the answers, the keys rebuilt from
+/// the pages in mailbox order, and the same field names the web form posts.
+fn application_form(draft: &draft::Draft) -> BTreeMap<String, String> {
+    let body = draft.answers.get("whose").map(String::as_str) == Some("body");
+    flow_answers(draft, body)
+}
+
+/// The token and the status address, in the words the spec fixes.
+fn filed(token: &str) -> String {
+    format!(
+        "\nYour application is filed.\n\n\
+Keep this link. It is the only thing that identifies your application:\n\
+https://{}/status/{token}\n\n\
+The link shows the stage and never your answers. A person reads every\n\
+application; approval is not automatic. If you gave an address, everything\n\
+after this arrives there. Payment follows approval by email.\n\n\
+Your account page, once there is an account, is on the web at\n\
+https://{}.\n",
+        crate::responder::HOST,
+        crate::responder::HOST,
+    )
+}
+
 /// The token the reader pasted, or `None` when they left the prompt empty and
 /// want the first screen back.
 fn token_word(input: &mut dyn Input, out: &mut dyn Write) -> Result<Option<String>, String> {
@@ -662,9 +982,42 @@ mod tests {
         }
     }
 
+    /// Scripted applications. Every form the session filed is kept, so a test can
+    /// see that one confirm files one intent and an abandon files none.
+    #[derive(Default)]
+    struct Files {
+        forms: Vec<BTreeMap<String, String>>,
+    }
+
+    impl Filing for Files {
+        fn file(&mut self, form: &BTreeMap<String, String>) -> Result<String, String> {
+            self.forms.push(form.clone());
+            Ok("abcdefghjkmnpqrstvwxyz0123".to_string())
+        }
+    }
+
+    /// The source for a session that never files.
+    struct NoFiles;
+
+    impl Filing for NoFiles {
+        fn file(&mut self, _form: &BTreeMap<String, String>) -> Result<String, String> {
+            Err("this session files nothing".into())
+        }
+    }
+
+    /// The crate's own question list and the tracked reserved names, so a scripted
+    /// application walks what a deployment asks.
+    fn question_list() -> Vec<Question> {
+        crate::questions::shipped().unwrap()
+    }
+
+    fn reserved_names() -> HashSet<String> {
+        crate::validate::reserved(include_str!("../../reserved-usernames.txt"))
+    }
+
     /// One scripted session: how it ended, and everything the reader saw.
     fn session(rows: &[Row], mode: Mode, input: &mut Script) -> (Departure, String) {
-        session_with(rows, mode, input, &mut NoStatus)
+        session_with(rows, mode, input, &mut NoStatus, &mut NoFiles)
     }
 
     fn session_with(
@@ -672,9 +1025,16 @@ mod tests {
         mode: Mode,
         input: &mut Script,
         status: &mut dyn StatusSource,
+        filing: &mut dyn Filing,
     ) -> (Departure, String) {
+        let questions = question_list();
+        let reserved = reserved_names();
+        let flow = Flow {
+            questions: &questions,
+            reserved: &reserved,
+        };
         let mut out = Vec::new();
-        let left = run(rows, mode, input, status, &mut out).unwrap();
+        let left = run(rows, &flow, mode, input, status, filing, &mut out).unwrap();
         (left, String::from_utf8(out).unwrap())
     }
 
@@ -867,7 +1227,8 @@ mod tests {
         let rows = rows(None);
         let mut statuses = Statuses::new(vec![StatusAnswer::Stage("with the reviewer".into())]);
         let mut script = Script::lines(&["status", "abcdefghjkmnpqrstvwxyz0123", "", "quit"]);
-        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut statuses);
+        let (left, seen) =
+            session_with(&rows, Mode::Plain, &mut script, &mut statuses, &mut NoFiles);
         assert_eq!(left, Departure::Quit);
         assert!(seen.contains("Stage: with the reviewer"), "{seen}");
         assert!(
@@ -886,7 +1247,8 @@ mod tests {
             "This link is not in use.".into(),
         )]);
         let mut script = Script::lines(&["abcdefghjkmnpqrstvwxyz0123", "", "quit"]);
-        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut statuses);
+        let (left, seen) =
+            session_with(&rows, Mode::Plain, &mut script, &mut statuses, &mut NoFiles);
         assert_eq!(left, Departure::Quit);
         assert!(seen.contains("This link is not in use."), "{seen}");
         assert!(
@@ -904,10 +1266,493 @@ mod tests {
             answers: VecDeque::from([Err("connection refused".to_string())]),
         };
         let mut script = Script::lines(&["status", "abcdefghjkmnpqrstvwxyz0123", "", "quit"]);
-        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut statuses);
+        let (left, seen) =
+            session_with(&rows, Mode::Plain, &mut script, &mut statuses, &mut NoFiles);
         assert_eq!(left, Departure::Quit);
         assert!(seen.contains("not answering"), "{seen}");
         assert!(script.spent(), "the session ended on the failed read");
+    }
+
+    const KEY_BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
+    const KEY_END: &str = "-----END PGP PUBLIC KEY BLOCK-----";
+    const KEY_BODY: &str = "mAYEAAAAABK4BgQAAAAAEg==";
+
+    /// The first row the catalogue marks `apply`, which is the row a reader
+    /// follows to start an application.
+    fn apply_row() -> usize {
+        rows(None)
+            .iter()
+            .position(|r| r.action == Action::Apply.word())
+            .expect("the catalogue has an apply row")
+    }
+
+    /// The answers to the individual path, as lines: the opening screen, the
+    /// apply row's number in the plain mode, every question, and the confirm.
+    fn person_lines(at: usize) -> Vec<String> {
+        let row = (at + 1).to_string();
+        [
+            "",
+            &row,
+            "theophilus",
+            "person",
+            "",
+            "",
+            KEY_BEGIN,
+            "",
+            KEY_BODY,
+            KEY_END,
+            "",
+            "no_charge",
+            "",
+            "layman",
+            "",
+            "",
+            "",
+            "yes",
+            "yes",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// One completed application in the line mode.
+    fn scripts(lines: &[String]) -> Script {
+        Script {
+            words: lines.iter().map(|l| Some(l.clone())).collect(),
+            keys: VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn a_completed_application_files_exactly_one_intent() {
+        let rows = rows(None);
+        let at = apply_row();
+        let mut script = scripts(&person_lines(at));
+        let mut files = Files::default();
+
+        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
+        assert_eq!(left, Departure::Quit);
+        assert!(script.spent(), "the session stopped before the confirm");
+        assert_eq!(
+            files.forms.len(),
+            1,
+            "one confirm filed {} intents",
+            files.forms.len()
+        );
+        let form = &files.forms[0];
+        assert_eq!(form.get("username").unwrap(), "theophilus");
+        assert_eq!(form.get("whose").unwrap(), "person");
+        assert!(
+            form.get("mail_key")
+                .unwrap()
+                .contains("BEGIN PGP PUBLIC KEY BLOCK"),
+            "the key did not reach the form"
+        );
+        assert!(
+            !form.contains_key("front_end"),
+            "the handler names the front end"
+        );
+        assert!(seen.contains("Your application is filed"), "{seen}");
+        assert!(
+            seen.contains("https://signup.kyriakon.net/status/abcdefghjkmnpqrstvwxyz0123"),
+            "{seen}"
+        );
+    }
+
+    /// The answers to a body's path with two mailboxes, as lines. The address
+    /// list and the account names are multi-line, so both end with a full stop.
+    fn body_lines(at: usize) -> Vec<String> {
+        let row = (at + 1).to_string();
+        [
+            "",
+            &row,
+            "theophilus",
+            "body",
+            "The Parish of Example",
+            "parish",
+            "",
+            "example.invalid",
+            "yes",
+            "secretary: own",
+            "hall: alias secretary",
+            ".",
+            "secretary",
+            "hall",
+            ".",
+            KEY_BEGIN,
+            "",
+            KEY_BODY,
+            KEY_END,
+            KEY_BEGIN,
+            "",
+            KEY_BODY,
+            KEY_END,
+            "",
+            "",
+            "",
+            "",
+            "no_charge",
+            "",
+            "layman",
+            "",
+            "",
+            "",
+            "yes",
+            "yes",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// A body with more than one mailbox can finish: the address list and the
+    /// account names are one per line, and each mailbox gets its own key page.
+    #[test]
+    fn a_body_with_two_mailboxes_files() {
+        let rows = rows(None);
+        let at = apply_row();
+        let mut script = scripts(&body_lines(at));
+        let mut files = Files::default();
+        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
+        assert_eq!(left, Departure::Quit);
+        assert!(
+            script.spent(),
+            "the session stopped before the confirm: {seen}"
+        );
+        assert_eq!(files.forms.len(), 1);
+        let form = &files.forms[0];
+        assert_eq!(
+            form.get("body_addresses").unwrap(),
+            "secretary: own\nhall: alias secretary"
+        );
+        assert_eq!(form.get("body_account_names").unwrap(), "secretary\nhall");
+        assert_eq!(
+            form.get("body_mail_key")
+                .unwrap()
+                .matches("BEGIN PGP")
+                .count(),
+            2,
+            "one key page per mailbox"
+        );
+        assert!(seen.contains("secretary@example.invalid"), "{seen}");
+        assert!(seen.contains("hall@example.invalid"), "{seen}");
+    }
+
+    /// The value stored is the trimmed value, so a stray space cannot change the
+    /// branch, the blessing or the rail.
+    #[test]
+    fn a_trailing_space_does_not_change_the_branch() {
+        let rows = rows(None);
+        let at = apply_row();
+        let row = (at + 1).to_string();
+        let mut script = scripts(
+            &[
+                "",
+                &row,
+                "theophilus",
+                "person",
+                "",
+                "",
+                KEY_BEGIN,
+                "",
+                KEY_BODY,
+                KEY_END,
+                "",
+                "no_charge",
+                "",
+                "monk ",
+                "with my elder's blessing",
+                ".",
+                "",
+                "",
+                "",
+                "yes",
+                "yes",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        );
+        let mut files = Files::default();
+        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
+        assert_eq!(left, Departure::Quit);
+        assert!(seen.contains("question 10 of 14"), "{seen}");
+        assert_eq!(files.forms.len(), 1);
+        assert_eq!(files.forms[0].get("orders").unwrap(), "monk");
+        assert_eq!(
+            files.forms[0].get("blessing").unwrap(),
+            "with my elder's blessing"
+        );
+    }
+
+    /// A mistaken paste on a key page can be left with `back`, and the session
+    /// files nothing when the reader then quits.
+    #[test]
+    fn a_key_page_can_leave_a_mistaken_paste() {
+        let rows = rows(None);
+        let at = apply_row();
+        let row = (at + 1).to_string();
+        let mut script = scripts(&[
+            "".to_string(),
+            row,
+            "theophilus".to_string(),
+            "person".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample".to_string(),
+            "back".to_string(),
+            "quit".to_string(),
+        ]);
+        let mut files = Files::default();
+        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
+        assert_eq!(left, Departure::Quit);
+        assert!(files.forms.is_empty(), "an escaped session filed");
+        assert!(script.spent());
+        assert!(
+            seen.matches("I understand that we can only reach me inside this account.")
+                .count()
+                >= 2,
+            "back did not return to the previous question: {seen}"
+        );
+    }
+
+    /// Every answer kind in the shipped list is read and accepted. A kind that
+    /// reads one line where the question asks for several is how a two-mailbox
+    /// body dead-ended, so the table is what makes a new kind obvious.
+    #[test]
+    fn every_answer_kind_is_read_and_accepted() {
+        let list = question_list();
+        let reserved = reserved_names();
+        let page = |id: &str| Page {
+            q: list.iter().find(|q| q.id == id).expect(id),
+            mailbox: None,
+        };
+        let mut person = BTreeMap::new();
+        person.insert("username".to_string(), "theophilus".to_string());
+        person.insert("whose".to_string(), "person".to_string());
+        let mail_page = flow_path(&list, &person)
+            .into_iter()
+            .find(|p| p.q.id == "mail_key")
+            .expect("the mail key page");
+        let key_block = format!("{KEY_BEGIN}\n\n{KEY_BODY}\n{KEY_END}");
+        let upload = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAA user@host";
+
+        let cases = vec![
+            (
+                "username",
+                page("username"),
+                vec!["theophilus"],
+                "theophilus".to_string(),
+            ),
+            ("whose", page("whose"), vec!["person"], "person".to_string()),
+            (
+                "body_records",
+                page("body_records"),
+                vec!["yes"],
+                "yes".to_string(),
+            ),
+            (
+                "cannot_pay",
+                page("cannot_pay"),
+                vec!["line one", "line two", "."],
+                "line one\nline two".to_string(),
+            ),
+            (
+                "body_addresses",
+                page("body_addresses"),
+                vec!["a: own", "b: alias a", "."],
+                "a: own\nb: alias a".to_string(),
+            ),
+            (
+                "mail_key",
+                mail_page,
+                vec![KEY_BEGIN, "", KEY_BODY, KEY_END],
+                key_block,
+            ),
+            (
+                "upload_key",
+                page("upload_key"),
+                vec![upload],
+                upload.to_string(),
+            ),
+            (
+                "accept_terms",
+                page("accept_terms"),
+                vec!["yes"],
+                "yes".to_string(),
+            ),
+        ];
+
+        for (id, page, lines, expected) in cases {
+            let mut script = Script::lines(&lines);
+            match read_answer(&page, &mut script).unwrap() {
+                Entered::Value(value) => assert_eq!(value, expected, "{id}"),
+                _ => panic!("{id} did not read a value"),
+            }
+            assert!(script.spent(), "{id} left input unread");
+            assert!(
+                flow_problem(
+                    &page,
+                    &expected,
+                    &reserved,
+                    page.q.required,
+                    &BTreeMap::new()
+                )
+                .is_none(),
+                "{id} was read but refused"
+            );
+        }
+    }
+
+    /// The full mode's left arrow returns to the previous question as the spec
+    /// says, even though the answer itself is read as a line.
+    #[test]
+    fn the_left_arrow_returns_to_the_previous_question() {
+        let list = question_list();
+        let page = Page {
+            q: &list[0],
+            mailbox: None,
+        };
+        let mut script = Script::lines(&["\u{1b}[D"]);
+        assert!(matches!(
+            read_answer(&page, &mut script).unwrap(),
+            Entered::Back
+        ));
+    }
+
+    #[test]
+    fn an_abandoned_application_files_nothing() {
+        let rows = rows(None);
+        let at = apply_row();
+        let mut script = scripts(&[
+            "".to_string(),
+            (at + 1).to_string(),
+            "theophilus".into(),
+            "quit".into(),
+        ]);
+        let mut files = Files::default();
+        let (left, _) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
+        assert_eq!(left, Departure::Quit);
+        assert!(files.forms.is_empty(), "an abandoned session filed");
+        assert!(script.spent());
+    }
+
+    #[test]
+    fn a_connection_dropped_before_the_confirm_files_nothing() {
+        let rows = rows(None);
+        let at = apply_row();
+        let mut script = scripts(&["".to_string(), (at + 1).to_string(), "theophilus".into()]);
+        let mut files = Files::default();
+        let (left, _) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
+        assert_eq!(left, Departure::Gone);
+        assert!(files.forms.is_empty(), "a dropped session filed");
+    }
+
+    /// The counter follows the answers: a body's path is longer than the
+    /// individual one, and a monastic answer adds the blessing the flow will not
+    /// let past empty.
+    #[test]
+    fn the_counter_is_the_applicants_branch_and_the_blessing_is_required() {
+        let list = question_list();
+        let individual = flow_path(&list, &BTreeMap::new()).len();
+
+        let mut person = BTreeMap::new();
+        person.insert("orders".to_string(), "monk".to_string());
+        assert_eq!(flow_path(&list, &person).len(), individual + 1);
+
+        let mut body = BTreeMap::new();
+        body.insert("whose".to_string(), "body".to_string());
+        body.insert("body_addresses".to_string(), "secretary: own".to_string());
+        body.insert("body_account_names".to_string(), "secretary".to_string());
+        assert!(
+            flow_path(&list, &body).len() > individual,
+            "the body's path is not longer than the individual one"
+        );
+
+        let rows = rows(None);
+        let at = apply_row();
+        let row = (at + 1).to_string();
+        let lines: Vec<String> = [
+            "",
+            &row,
+            "theophilus",
+            "person",
+            "",
+            "",
+            KEY_BEGIN,
+            "",
+            KEY_BODY,
+            KEY_END,
+            "",
+            "no_charge",
+            "",
+            "monk",
+            "",
+            "",
+            "with my elder's blessing",
+            ".",
+            "",
+            "",
+            "",
+            "yes",
+            "yes",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let mut script = scripts(&lines);
+        let mut files = Files::default();
+        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
+        assert_eq!(left, Departure::Quit);
+        assert!(
+            seen.contains("question 10 of 14"),
+            "the monastic counter is not the branch's: {seen}"
+        );
+        assert!(
+            seen.contains("this is needed"),
+            "the empty blessing was accepted"
+        );
+        assert_eq!(files.forms.len(), 1);
+        assert_eq!(
+            files.forms[0].get("blessing").unwrap(),
+            "with my elder's blessing"
+        );
+    }
+
+    /// The two modes file the same answers: the drawing moves to the apply row
+    /// with the arrows, and every answer after it is a line in both.
+    #[test]
+    fn the_two_modes_file_the_same_application() {
+        let rows = rows(None);
+        let at = apply_row();
+
+        let mut plain = scripts(&person_lines(at));
+        let mut plain_files = Files::default();
+        let (left, _) = session_with(
+            &rows,
+            Mode::Plain,
+            &mut plain,
+            &mut NoStatus,
+            &mut plain_files,
+        );
+        assert_eq!(left, Departure::Quit);
+
+        // The same answers without the opening line and the menu's row number,
+        // and with the arrows that reach the same row.
+        let answers = &person_lines(at)[2..];
+        let mut words: VecDeque<Option<String>> = VecDeque::from([Some(String::new())]);
+        words.extend(answers.iter().cloned().map(Some));
+        let mut keys: VecDeque<Option<Key>> = vec![Some(Key::Down); at].into();
+        keys.push_back(Some(Key::Enter));
+        let mut full = Script { words, keys };
+
+        let mut full_files = Files::default();
+        let (left, _) = session_with(&rows, Mode::Full, &mut full, &mut NoStatus, &mut full_files);
+        assert_eq!(left, Departure::Quit);
+        assert!(full.spent(), "the drawing session stopped early");
+        assert_eq!(plain_files.forms.len(), 1);
+        assert_eq!(full_files.forms, plain_files.forms);
     }
 
     /// A member's session carries their own addresses, and an anonymous one shows
@@ -930,12 +1775,20 @@ mod tests {
     /// rows is a screen that promises nothing.
     #[test]
     fn a_catalogue_with_no_services_is_refused_rather_than_drawn() {
+        let questions = question_list();
+        let reserved = reserved_names();
+        let flow = Flow {
+            questions: &questions,
+            reserved: &reserved,
+        };
         let mut out = Vec::new();
         let why = run(
             &[],
+            &flow,
             Mode::Full,
             &mut Script::default(),
             &mut NoStatus,
+            &mut NoFiles,
             &mut out,
         )
         .unwrap_err();

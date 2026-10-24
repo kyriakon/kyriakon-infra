@@ -181,6 +181,9 @@ pub struct Row {
     /// The state's word and the action's word, from the one table.
     pub state: &'static str,
     pub action: &'static str,
+    /// The action itself, for a front-end that dispatches on it. The word above
+    /// is display text and may change without changing what a row does.
+    pub action_kind: Action,
     /// The sentence that hands this entry's job to a protocol that can finish
     /// it, where this front-end's own cannot. Only the capsule's `pay` entry
     /// reaches one today.
@@ -268,6 +271,7 @@ pub fn row(s: &Service, protocol: Protocol, member: Option<&str>) -> Row {
         ),
         state: s.state.word(),
         action: s.action.word(),
+        action_kind: s.action,
         handoff,
     }
 }

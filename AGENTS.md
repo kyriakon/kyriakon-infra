@@ -24,13 +24,14 @@ written down. This repo has no decisions directory of its own.
 
 Pointers, so a search starts where the thing is.
 
-- `onboard/`: the Rust service. `src/responder.rs` serves the web form and its pages;
-  `src/capsule.rs` renders the same pages as gemtext, so a page has two renderers and a
-  change to one is a change to both; `templates/*.html` are the web renderings;
-  `src/transitions.rs` holds the drain's decisions; `src/bin/` holds the three
-  binaries (`kyriakon-onboard-drain`, `kyriakon-onboard-tui`, `kyriakon-onboardctl`);
-  `questions.toml` is the application's question list; `tests/drain.rs` is the drain's
-  acceptance suite.
+- `onboard/`: the Rust service. `src/responder.rs` serves the web form and holds the
+  shared applicant flow (`flow_path`, `flow_problem`, `flow_answers`); `src/capsule.rs`
+  renders the pages as gemtext; `src/portal.rs` is the terminal library (menu, sessions,
+  the applicant flow); `src/portal_ipc.rs` is the terminal's one request to the handler;
+  `templates/*.html` are the web renderings; `src/transitions.rs` holds the drain's
+  decisions; `src/bin/` holds the three binaries (`kyriakon-onboard-drain`,
+  `kyriakon-onboard-tui`, `kyriakon-onboardctl`); `questions.toml` is the application's
+  question list; `tests/drain.rs` is the drain's acceptance suite.
 - `kyriakon-encrypt/`: the daemon that encrypts every saved message to the recipient's
   key; `src/lib.rs` builds the PGP/MIME wrapper.
 - `dovecot-plugin/`: the C plugin that calls the encryptor on the save path.

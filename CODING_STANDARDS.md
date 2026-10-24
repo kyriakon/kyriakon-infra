@@ -8,6 +8,8 @@ An assertion tests a behaviour or a value. Never the text of the code. A `grep` 
 
 A new branch, a parser, money, a security decision or a bug fix carries a test that fails when it breaks. One is enough, and it should fail on the plausible mistake rather than restate the implementation.
 
+A front-end flow test covers every answer kind in `questions.toml` and at least one branch with more than one generated page, such as a body with two mailboxes.
+
 A check that cannot see what it is checking is a finding, not a pass. A health check that reads a missing file, a mail that was not sent, a stale table: each must say so rather than exit 0.
 
 ## The drain's transitions
@@ -45,4 +47,3 @@ squash merged code that had never been tested.
 ## When the tooling and this file disagree
 
 The tooling wins. If a rule here can be checked mechanically, move it into `.githooks/` or the CI workflow and delete it from this file.
-

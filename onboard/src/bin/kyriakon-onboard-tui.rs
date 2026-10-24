@@ -31,18 +31,19 @@
 //! gets the plain mode. `--plain` and `--full` force one, which is a testing seam
 //! rather than a lever, in the shape the ksh program this replaces had.
 //!
-//! The session files nothing and holds no privilege. It is unprivileged `hello`,
-//! it reads the catalogue the handler reads and nothing else on the box, and it
-//! never sees a member's state: what a reader does with an answer is the flow the
-//! next ticket builds, and that is what files an intent.
+//! The session holds no privilege. It is unprivileged `hello`, it reads the
+//! catalogue, the reserved names and the question list the handler reads, and it
+//! never sees a member's state: the completed application is handed to the
+//! handler, which validates it again and is the only writer of the intent.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, Read};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use kyriakon_onboard::portal::{Departure, Input, Key, Mode};
-use kyriakon_onboard::{catalogue, config, portal, portal_ipc};
+use kyriakon_onboard::portal::{Departure, Filing, Input, Key, Mode};
+use kyriakon_onboard::{catalogue, config, portal, portal_ipc, questions, validate};
 
 /// The handler's own configuration, read for the one value the portal needs from
 /// it: the path the catalogue is installed at. Named here rather than derived, the
@@ -101,6 +102,11 @@ fn run() -> Result<Departure, String> {
     let text = std::fs::read_to_string(&cfg.catalogue)
         .map_err(|e| format!("cannot read {}: {e}", cfg.catalogue))?;
     let list = catalogue::parse(&text)?;
+    let questions = questions::shipped()?;
+    let reserved = validate::reserved(
+        &std::fs::read_to_string(&cfg.reserved)
+            .map_err(|e| format!("cannot read {}: {e}", cfg.reserved))?,
+    );
 
     // The session's member, where the key it presented names one: [#381] asks the
     // handler which account a key fingerprint belongs to and passes the answer
@@ -127,13 +133,30 @@ fn run() -> Result<Departure, String> {
         socket: cfg.portal_socket.clone(),
         address: address.map(|a| a.to_string()),
     };
+    let mut filing = HandlerFile {
+        socket: cfg.portal_socket.clone(),
+        address: address.map(|a| a.to_string()),
+        filed: false,
+    };
     let mode = forced.unwrap_or_else(chosen);
     let mut term = Term::new(mode);
-    let left = portal::run(&rows, mode, &mut term, &mut status, &mut std::io::stdout())?;
-    // Both endings abandon the session today: nothing files yet. #380 adds the
-    // filed outcome, which is the one this must stop logging.
-    match left {
-        Departure::Quit | Departure::Gone => authlog("session abandoned"),
+    let flow = portal::Flow {
+        questions: &questions,
+        reserved: &reserved,
+    };
+    let left = portal::run(
+        &rows,
+        &flow,
+        mode,
+        &mut term,
+        &mut status,
+        &mut filing,
+        &mut std::io::stdout(),
+    )?;
+    // A filed application logged itself in `file`; every other ending abandons
+    // the session and files nothing.
+    if !filing.filed {
+        authlog("session abandoned");
     }
     Ok(left)
 }
@@ -170,6 +193,23 @@ impl portal::StatusSource for HandlerStatus {
                 Ok(portal_ipc::Answer::Notice(notice))
             }
         }
+    }
+}
+
+/// The handler's answer to a completed application. It logs the one event the
+/// spec names, with no address, token or answer.
+struct HandlerFile {
+    socket: String,
+    address: Option<String>,
+    filed: bool,
+}
+
+impl Filing for HandlerFile {
+    fn file(&mut self, form: &BTreeMap<String, String>) -> Result<String, String> {
+        let token = portal_ipc::file(Path::new(&self.socket), self.address.as_deref(), form)?;
+        self.filed = true;
+        authlog("application filed");
+        Ok(token)
     }
 }
 
