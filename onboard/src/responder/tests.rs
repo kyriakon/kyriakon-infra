@@ -1179,6 +1179,55 @@ async fn a_mailed_key_answers_the_capsule_key_page() {
     assert_eq!(read_draft(&dir, TOKEN).cursor, first + 1);
 }
 
+/// A mailed key reaches the application the way the spec describes: the body's
+/// two mailboxes keep their order, and the material is the block that arrived by
+/// mail rather than an empty answer.
+#[tokio::test]
+async fn a_mailed_key_is_in_the_filed_application_in_mailbox_order() {
+    let (app, dir) = handler("capsule-mail-files").await;
+    let mut record = crate::draft::Draft::new(TOKEN.to_string());
+    record.answers = body_answers()
+        .into_iter()
+        .map(|(id, value)| (id.to_string(), value.to_string()))
+        .collect();
+    record
+        .answers
+        .insert("body_domain".into(), "parish.example".into());
+    record.answers.insert(
+        "body_addresses".into(),
+        "secretary: own\nhall: alias secretary".into(),
+    );
+    record
+        .answers
+        .insert("body_account_names".into(), "secretary\nhall".into());
+    record.answers.remove("body_mail_key");
+    record
+        .mail_keys
+        .push(crate::keycheck::mail_key("secretary".into(), GOOD_KEY));
+    record
+        .mail_keys
+        .push(crate::keycheck::mail_key("hall".into(), GOOD_KEY));
+    record.cursor = capsule_path(&app.questions, &record.answers).len();
+    crate::draft::save(&app.store, &mut record).await.unwrap();
+
+    let (code, page) = answer(&app, &gmid_get(&format!("apply/{TOKEN}/1"), "")).await;
+    assert_eq!(code, 20, "{page}");
+    let filed: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("applications").join(format!("{TOKEN}.json"))).unwrap(),
+    )
+    .unwrap();
+    let keys = filed["mail_keys"].as_array().expect("the filed keys");
+    assert_eq!(keys.len(), 2, "{filed}");
+    assert_eq!(keys[0]["mailbox"], "secretary", "{filed}");
+    assert_eq!(keys[1]["mailbox"], "hall", "{filed}");
+    assert!(
+        keys[0]["material"]
+            .as_str()
+            .is_some_and(|m| m.contains("BEGIN PGP PUBLIC KEY BLOCK")),
+        "{filed}"
+    );
+}
+
 #[tokio::test]
 async fn two_capsule_drafts_do_not_write_to_each_other() {
     let (app, dir) = handler("capsule-isolation").await;

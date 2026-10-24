@@ -11,6 +11,7 @@
 //! the same draft the applicant is walking.
 
 use std::collections::BTreeMap;
+use std::os::unix::io::AsRawFd;
 
 use crate::store::{self, KeyRecord, Store};
 use crate::util;
@@ -76,11 +77,46 @@ pub async fn load(store: &Store, token: &str) -> Result<Option<Draft>, String> {
     Ok(Some(draft))
 }
 
+/// Hold the drafts directory's lock for one read-modify-write. The handler and
+/// the root drain both write a draft: the applicant advances the cursor while
+/// the drain files a mailed key. Without one lock around the read and the write,
+/// one of the two saves overwrites the other's answer.
+///
+/// The lock file is never removed. Removing it while another process holds it
+/// would let a third create a new file and lock that instead, which is no lock
+/// at all.
+pub async fn lock(store: &Store) -> Result<tokio::fs::File, String> {
+    let dir = store.path("drafts");
+    if tokio::fs::metadata(&dir).await.is_err() {
+        // scripts/onboard-store.sh lays this directory out on the box. A store
+        // that has not been laid out yet still needs a lock file, and the
+        // process that opens the first draft is the one that owns it.
+        store.ensure_dir("drafts").await?;
+    }
+    let path = store.path("drafts/.lock");
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).mode(0o600);
+    let file = opts
+        .open(&path)
+        .await
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!(
+            "cannot lock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(file)
+}
+
 /// Write the draft by rename, stamping `updated_at`. The directory is created
 /// here so a first draft does not depend on the store script having run. The
 /// file is handed to the directory's owner because the drain writes this record
 /// too, as root: a root-owned 0600 draft would read as missing to the
 /// unprivileged handler that is walking it.
+///
+/// A caller that reads and then writes must hold `lock` across both.
 pub async fn save(store: &Store, draft: &mut Draft) -> Result<(), String> {
     draft.updated_at = util::filed_at();
     store.ensure_dir("drafts").await?;

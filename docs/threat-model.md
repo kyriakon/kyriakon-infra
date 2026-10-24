@@ -60,7 +60,10 @@ sits in `/var/spool/smtpd/` in plaintext for seconds to minutes. Queue encryptio
 with AES-256-GCM, and its key is persisted at `/etc/mail/queue.key` rather than derived at boot,
 because `rc.d` has no terminal for `getpass(3)` to prompt on. The key therefore sits on the disk it
 protects against being pulled, so queue encryption closes the walked-away-disk window and not the
-compelled-operator one. This is the one residual plaintext-at-rest point in the mail path.
+compelled-operator one. This is one of two residual plaintext-at-rest points in the mail path. The
+other is the `apply@` key mailbox, which smtpd delivers to a plaintext Maildir under
+`/var/db/onboard/mail` because the onboarding drain must read the key to file it against the
+application. `docs/planning/specs/gemini-capsule.md`, "The mail route", states that exception.
 
 The forward secrecy of the archive. Holding ciphertext and no key is a claim about the present.
 Ciphertext archived today plus a key obtained later reads history, and so does a broken KEM. Nothing

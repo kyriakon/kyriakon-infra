@@ -60,49 +60,80 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
         let text = match tokio::fs::read(&path).await {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(e) => {
-                return Err(format!("cannot read {}: {e}", path.display()));
+                crate::transitions::report_failure(
+                    cfg,
+                    store,
+                    name.as_ref(),
+                    "mail",
+                    &format!("cannot read {}: {e}", path.display()),
+                )
+                .await;
+                continue;
             }
         };
         if let Err(e) = one(cfg, store, &text).await {
-            crate::transitions::report_failure(cfg, store, "mail", "mail", &format!("{name}: {e}"))
-                .await;
+            crate::transitions::report_failure(cfg, store, name.as_ref(), "mail", &e).await;
             continue;
         }
-        tokio::fs::remove_file(&path)
-            .await
-            .map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            crate::transitions::report_failure(
+                cfg,
+                store,
+                name.as_ref(),
+                "mail",
+                &format!("cannot remove {}: {e}", path.display()),
+            )
+            .await;
+        }
     }
     Ok(())
 }
 
 /// Act on one message. `Ok` means it has been dealt with and may be deleted,
-/// whether that was files, refuse or ignore.
+/// whether that was files, refuse or ignore. The reply address is read only on
+/// the paths that answer: a live token files the key even when From is empty.
 async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), String> {
     let message = Message::parse(raw);
-    let Some(from) = message.reply_address() else {
-        return Ok(());
-    };
     let blocks = labelled_blocks(&message.body);
     if blocks.is_empty() {
         return Ok(());
     }
     let Some(token) = token_in_subject(&message.subject) else {
-        return reply(cfg, store, &from, &restart_body()).await;
+        return reply_or_drop(cfg, store, &message, &restart_body()).await;
     };
+    let lock = draft::lock(store).await?;
     let Some(mut draft) = draft::load(store, &token).await? else {
-        return reply(cfg, store, &from, &restart_body()).await;
+        drop(lock);
+        return reply_or_drop(cfg, store, &message, &restart_body()).await;
     };
     let keys = match assign(&blocks, &draft) {
         Ok(keys) => keys,
         Err(missing) => {
-            return reply(cfg, store, &from, &missing_body(&missing)).await;
+            drop(lock);
+            return reply_or_drop(cfg, store, &message, &missing_body(&missing)).await;
         }
     };
     for (mailbox, material) in keys {
         draft.mail_keys.retain(|k| k.mailbox != mailbox);
         draft.mail_keys.push(keycheck::mail_key(mailbox, &material));
     }
-    draft::save(store, &mut draft).await
+    let saved = draft::save(store, &mut draft).await;
+    drop(lock);
+    saved
+}
+
+/// Answer the sender when there is one to answer. A message with no usable From
+/// still gets its key filed, but there is nowhere to send a refusal.
+async fn reply_or_drop(
+    cfg: &DrainConfig,
+    store: &Store,
+    message: &Message,
+    body: &str,
+) -> Result<(), String> {
+    match message.reply_address() {
+        Some(from) => reply(cfg, store, &from, body).await,
+        None => Ok(()),
+    }
 }
 
 /// One message: the headers it needs, and the decoded body.
@@ -232,7 +263,7 @@ fn assign(
         .cloned()
         .unwrap_or_default();
     let names: Vec<String> = if body {
-        account_names(&draft.answers)
+        crate::questions::account_names(&draft.answers)
     } else {
         draft
             .answers
@@ -245,7 +276,10 @@ fn assign(
     if names.is_empty() {
         return Ok(Vec::new());
     }
-    if blocks.len() == 1 && names.len() == 1 {
+    // One mailbox takes the first block, labelled or not. The spec says the
+    // drain takes the first block from the message body; a second block is not
+    // something a single-mailbox applicant needs to label.
+    if names.len() == 1 {
         return Ok(vec![(names[0].clone(), blocks[0].1.clone())]);
     }
 
@@ -285,19 +319,6 @@ fn name_in_label(label: &str, name: &str, domain: &str) -> bool {
     lower
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'))
         .any(|token| token == name)
-}
-
-fn account_names(answers: &BTreeMap<String, String>) -> Vec<String> {
-    answers
-        .get("body_account_names")
-        .map(|s| {
-            s.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Send one reply unless this sender already had one today. The timestamp is
@@ -353,10 +374,23 @@ fn missing_body(missing: &[String]) -> String {
     )
 }
 
+/// How deep a MIME tree may nest before it is treated as carrying no text. A
+/// message is unauthenticated input from a stranger; without a bound, a message
+/// built from a few hundred bytes of boundaries recurses until the worker's
+/// stack overflows and takes the drain down with it.
+const MAX_MIME_DEPTH: usize = 8;
+
 /// The message body with its transfer encoding undone and the text part chosen
 /// from a multipart. Unknown encodings are read as they are, which loses no key
 /// block that was sent as text.
 fn decode_body(headers: &str, body: &str) -> String {
+    decode_body_at(headers, body, 0)
+}
+
+fn decode_body_at(headers: &str, body: &str, depth: usize) -> String {
+    if depth > MAX_MIME_DEPTH {
+        return String::new();
+    }
     let content_type = header(headers, "content-type").unwrap_or_default();
     let lower = content_type.to_ascii_lowercase();
     if lower.starts_with("multipart/") {
@@ -376,11 +410,16 @@ fn decode_body(headers: &str, body: &str) -> String {
             let part_type = header(part_headers, "content-type")
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            let decoded = decode_body(part_headers, part_body);
+            let decoded = decode_body_at(part_headers, part_body, depth + 1);
             if part_type.starts_with("text/plain") {
                 return decoded;
             }
-            if fallback.is_none() && part_type.starts_with("text/") {
+            // A nested multipart can hold the text/plain; keep what it found
+            // rather than discarding it because its own type is not text/*.
+            if fallback.is_none()
+                && !decoded.is_empty()
+                && (part_type.starts_with("text/") || part_type.starts_with("multipart/"))
+            {
                 fallback = Some(decoded);
             }
         }
@@ -578,5 +617,46 @@ aGVsbG8=\n--line--\n";
         let blocks = labelled_blocks(KEY);
         let assigned = assign(&blocks, &draft).unwrap();
         assert_eq!(assigned[0].0, "secretary");
+    }
+
+    #[test]
+    fn a_single_mailbox_takes_the_first_block_when_two_arrive() {
+        let mut draft = Draft::new("0123456789abcdefghjkmnpqrs".to_string());
+        draft.answers.insert("username".into(), "secretary".into());
+        let blocks = labelled_blocks(&format!("{KEY}\n{KEY}"));
+        let assigned = assign(&blocks, &draft).unwrap();
+        assert_eq!(assigned.len(), 1, "one mailbox, one key");
+        assert_eq!(assigned[0].0, "secretary");
+    }
+
+    #[test]
+    fn a_nested_multipart_keeps_the_text_plain_it_finds() {
+        let raw = format!(
+            "From: a@example.invalid\nSubject: x\nMIME-Version: 1.0\n\
+             Content-Type: multipart/mixed; boundary=\"outer\"\n\n\
+             --outer\nContent-Type: multipart/alternative; boundary=\"inner\"\n\n\
+             --inner\nContent-Type: text/plain\n\n{KEY}\n--inner--\n--outer--\n"
+        );
+        let message = Message::parse(&raw);
+        assert!(message.body.contains(BEGIN), "{}", message.body);
+    }
+
+    #[test]
+    fn a_message_nested_past_the_limit_has_no_body() {
+        let mut part = format!("Content-Type: text/plain\n\n{KEY}\n");
+        for i in 0..20 {
+            let boundary = format!("b{i}");
+            part = format!(
+                "Content-Type: multipart/mixed; boundary=\"{boundary}\"\n\n\
+                 --{boundary}\n{part}\n--{boundary}--\n"
+            );
+        }
+        let raw = format!("From: a@example.invalid\nSubject: x\n{part}");
+        let message = Message::parse(&raw);
+        assert!(
+            !message.body.contains(BEGIN),
+            "the depth limit stops the recursion: {}",
+            message.body
+        );
     }
 }

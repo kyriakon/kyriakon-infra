@@ -2259,11 +2259,12 @@ fn a_key_for_a_dead_token_gets_one_reply_and_files_no_draft() {
 
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
-    assert!(
-        fix.names("drafts").is_empty(),
-        "a mail creates no draft: {:?}",
-        fix.names("drafts")
-    );
+    let drafts: Vec<String> = fix
+        .names("drafts")
+        .into_iter()
+        .filter(|n| n.ends_with(".json"))
+        .collect();
+    assert!(drafts.is_empty(), "a mail creates no draft: {drafts:?}");
     assert_eq!(
         fix.sent()
             .matches("Subject: Your Kyriakon application key")
@@ -2274,6 +2275,21 @@ fn a_key_for_a_dead_token_gets_one_reply_and_files_no_draft() {
     );
     assert!(fix.sent().contains("gemini://signup.kyriakon.net/apply"));
     assert!(fix.names("mail/new").is_empty());
+}
+
+/// A live token files its key even when the message has no usable From. The
+/// reply address is only needed on the paths that answer.
+#[test]
+fn a_key_with_no_reply_address_is_still_filed() {
+    let fix = Fix::new("mail-no-from");
+    fix.write_draft(TOKEN, &[("username", "secretary"), ("whose", "person")]);
+    fix.mail("one", "", TOKEN, GOOD_KEY);
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.sent().is_empty(), "nothing to answer: {}", fix.sent());
+    let draft: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
+    assert_eq!(draft["mail_keys"][0]["mailbox"], "secretary", "{draft}");
 }
 
 /// A message with no key block is not answered at all.

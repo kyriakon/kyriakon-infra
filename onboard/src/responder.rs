@@ -649,6 +649,16 @@ async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) -> Reply {
         // The token alone names the draft; the page is the cursor's.
         None => return capsule_redirect(token, 1),
     };
+    // One lock around the read and every write: the drain files a mailed key
+    // into this same record as root, and two unsynchronised read-modify-writes
+    // would lose one of them.
+    let _lock = match draft::lock(&app.store).await {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("kyriakon-onboard: {e}");
+            return Reply::gemini(40, "Temporary failure", String::new());
+        }
+    };
     let mut record = match draft::load(&app.store, token).await {
         Ok(Some(d)) => d,
         Ok(None) => return capsule_not_found(),
@@ -785,7 +795,7 @@ fn capsule_path<'a>(list: &'a [Question], answers: &BTreeMap<String, String>) ->
             });
         } else if q.id == "body_mail_key" && body {
             let domain = answers.get("body_domain").cloned().unwrap_or_default();
-            for name in account_names(answers) {
+            for name in questions::account_names(answers) {
                 let address = if domain.is_empty() {
                     name.clone()
                 } else {
@@ -801,20 +811,6 @@ fn capsule_path<'a>(list: &'a [Question], answers: &BTreeMap<String, String>) ->
         }
     }
     out
-}
-
-/// The body's account names, one per mailbox, in the order the answers gave.
-fn account_names(answers: &BTreeMap<String, String>) -> Vec<String> {
-    answers
-        .get("body_account_names")
-        .map(|s| {
-            s.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Advance the cursor past key pages whose mailbox already holds a key, which
@@ -908,6 +904,9 @@ fn capsule_meta(
     let mut out = format!("question {} of {}. ", index + 1, total);
     match &page.mailbox {
         Some(mailbox) => {
+            // shortcut: only the apply@ fallback is offered; add the titan://
+            // line when #378 creates the listener, because a URL now would name
+            // a port nothing serves.
             out.push_str(&format!(
                 "Paste the public key for {}. Paste the whole block. If your client refuses the \
                  paste because the address is too long, mail it to apply@kyriakon.net with {token} \
@@ -1021,7 +1020,7 @@ async fn capsule_file(app: &App, record: &draft::Draft) -> Reply {
 fn capsule_answers(record: &draft::Draft, body: bool) -> BTreeMap<String, String> {
     let mut answers = record.answers.clone();
     let (id, mailboxes) = if body {
-        ("body_mail_key", account_names(&record.answers))
+        ("body_mail_key", questions::account_names(&record.answers))
     } else {
         (
             "mail_key",
@@ -1485,12 +1484,8 @@ fn label(form: &BTreeMap<String, String>) -> Result<&'static str, String> {
 /// localpart`, which is the form the spec's community-block table gives.
 fn body_cross_checks(form: &BTreeMap<String, String>, errors: &mut Vec<String>) {
     let addresses = form.get("body_addresses").map(String::as_str).unwrap_or("");
-    let names = form
-        .get("body_account_names")
-        .map(String::as_str)
-        .unwrap_or("");
-    let count = |v: &str| v.lines().filter(|l| !l.trim().is_empty()).count();
-    let (a, n) = (count(addresses), count(names));
+    let a = addresses.lines().filter(|l| !l.trim().is_empty()).count();
+    let n = questions::account_names(form).len();
     if a != n {
         errors.push(format!(
             "The addresses, one per line: {a} addresses and {n} account names; there is one account name per address"
@@ -1517,15 +1512,7 @@ fn build_record(
     let mail_key_id = if body { "body_mail_key" } else { "mail_key" };
     let blocks = keycheck::blocks(form.get(mail_key_id).map(String::as_str).unwrap_or(""));
     let mailboxes: Vec<String> = if body {
-        form.get("body_account_names")
-            .map(|s| {
-                s.lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
+        questions::account_names(form)
     } else {
         vec![String::new()]
     };
@@ -1590,10 +1577,7 @@ fn mail_key_errors(q: &Question, value: &str, form: &BTreeMap<String, String>) -
         return vec!["a public key is needed".to_string()];
     }
     if q.id == "body_mail_key" {
-        let mailboxes = form
-            .get("body_account_names")
-            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
-            .unwrap_or(0);
+        let mailboxes = questions::account_names(form).len();
         if blocks.len() != mailboxes {
             return vec![format!(
                 "one key per mailbox: {mailboxes} mailboxes and {} keys",
