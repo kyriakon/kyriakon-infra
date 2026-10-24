@@ -1,6 +1,3 @@
-<!-- A proposal: move this over the current file to adopt it. Until then the current
-     file is the authoritative copy. -->
-
 # AGENTS.md
 
 kyriakon-infra is the public infrastructure repo for kyriakon.net — a low-extraction,
@@ -110,10 +107,16 @@ repo's own root. Two terms most likely to matter while working in this repo:
 
 ## Tickets
 
-Tickets live in GitHub Issues. **Work only on the ticket explicitly given to you for
-the current session — do not browse the issue tracker, list open issues, or self-select
-work.** If a task doesn't map to an existing ticket, ask before creating one; don't
-create tickets speculatively.
+Tickets live in GitHub Issues. Work only on the ticket you were given for the
+current session. **When the user asks you to pick the next task, use the Ready
+queue query in `docs/agents/issue-tracker.md` and take one unblocked ticket;
+otherwise do not browse the issue tracker, list open issues, or self-select
+work.** If a task doesn't map to an existing ticket, ask before creating one;
+don't create tickets speculatively.
+
+When a PR is the last code change a ticket needs, its body says `Closes #<n>` so
+the merge closes the issue. If the ticket also has a manual deploy, name that
+step in the PR body; it is the operator's, and the merge still closes the issue.
 
 ```
 gh issue view <number>
