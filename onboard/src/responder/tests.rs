@@ -746,8 +746,8 @@ fn a_front_end_is_web_tui_or_capsule_and_nothing_else() {
 #[test]
 fn key_blocks_splits_one_per_mailbox() {
     let two = "-----BEGIN PGP PUBLIC KEY BLOCK-----\nAAA\n-----END PGP PUBLIC KEY BLOCK-----\n\n-----BEGIN PGP PUBLIC KEY BLOCK-----\nBBB\n-----END PGP PUBLIC KEY BLOCK-----\n";
-    assert_eq!(key_blocks(two).len(), 2);
-    assert!(key_blocks("nothing here").is_empty());
+    assert_eq!(crate::keycheck::blocks(two).len(), 2);
+    assert!(crate::keycheck::blocks("nothing here").is_empty());
 }
 
 #[test]
@@ -1034,11 +1034,11 @@ fn the_capsule_adds_the_blessing_only_on_the_monastic_path() {
     answers.insert("orders".to_string(), "layman".to_string());
     assert!(!capsule_path(&list, &answers)
         .iter()
-        .any(|q| q.id == "blessing"));
+        .any(|p| p.q.id == "blessing"));
     answers.insert("orders".to_string(), "monk".to_string());
     assert!(capsule_path(&list, &answers)
         .iter()
-        .any(|q| q.id == "blessing"));
+        .any(|p| p.q.id == "blessing"));
 }
 
 #[tokio::test]
@@ -1063,28 +1063,120 @@ async fn a_capsule_body_with_mismatched_address_and_name_lists_is_reasked() {
 }
 
 #[tokio::test]
-async fn a_capsule_body_with_the_wrong_number_of_keys_is_reasked() {
-    let (app, _dir) = handler("capsule-key-mismatch").await;
+async fn a_capsule_body_key_page_names_one_mailbox_and_the_mail_route() {
+    let (app, dir) = handler("capsule-key-pages").await;
     let mut record = crate::draft::Draft::new(TOKEN.to_string());
     record
         .answers
         .insert("whose".to_string(), "body".to_string());
     record
         .answers
-        .insert("body_addresses".to_string(), "secretary: own".to_string());
-    record
-        .answers
-        .insert("body_account_names".to_string(), "secretary".to_string());
-    record.cursor = 9;
+        .insert("body_domain".to_string(), "parish.example".to_string());
+    record.answers.insert(
+        "body_addresses".to_string(),
+        "secretary: own\nhall: alias secretary".to_string(),
+    );
+    record.answers.insert(
+        "body_account_names".to_string(),
+        "secretary\nhall".to_string(),
+    );
+    let path = capsule_path(&app.questions, &record.answers);
+    let first = path
+        .iter()
+        .position(|p| p.mailbox.is_some())
+        .expect("the first key page");
+    record.cursor = first;
     crate::draft::save(&app.store, &mut record).await.unwrap();
 
-    let query = format!("{GOOD_KEY}\n\n{GOOD_KEY}");
-    let (code, page) = answer(&app, &gmid_get(&format!("apply/{TOKEN}/10"), &query)).await;
+    let (code, page) = answer(&app, &gmid_get(&format!("apply/{TOKEN}/{}", first + 1), "")).await;
     assert_eq!(code, 10, "{page}");
+    assert!(page.contains("secretary@parish.example"), "{page}");
+    assert!(page.contains("apply@kyriakon.net"), "{page}");
     assert!(
-        page.contains("one key per mailbox: 1 mailboxes and 2 keys"),
-        "{page}"
+        page.contains(TOKEN),
+        "the subject carries the draft's token: {page}"
     );
+    assert!(
+        page.lines().next().unwrap().len() < 1024,
+        "the reply header stays inside gmid's limit: {page}"
+    );
+
+    let (code, redirect) = answer(
+        &app,
+        &gmid_get(&format!("apply/{TOKEN}/{}", first + 1), GOOD_KEY),
+    )
+    .await;
+    assert_eq!(code, 30, "{redirect}");
+    let draft = read_draft(&dir, TOKEN);
+    assert_eq!(draft.mail_keys.len(), 1);
+    assert_eq!(draft.mail_keys[0].mailbox, "secretary");
+    assert!(!draft.mail_keys[0].fingerprint.is_empty());
+
+    let (code, page) = answer(&app, &gmid_get(&format!("apply/{TOKEN}/{}", first + 2), "")).await;
+    assert_eq!(code, 10, "{page}");
+    assert!(page.contains("hall@parish.example"), "{page}");
+}
+
+#[tokio::test]
+async fn a_capsule_person_key_page_names_their_address() {
+    let (app, _dir) = handler("capsule-person-key").await;
+    let mut record = crate::draft::Draft::new(TOKEN.to_string());
+    record
+        .answers
+        .insert("whose".to_string(), "person".to_string());
+    record
+        .answers
+        .insert("username".to_string(), "secretary".to_string());
+    let path = capsule_path(&app.questions, &record.answers);
+    let index = path
+        .iter()
+        .position(|p| p.q.id == "mail_key")
+        .expect("the key page");
+    record.cursor = index;
+    crate::draft::save(&app.store, &mut record).await.unwrap();
+
+    let (code, page) = answer(&app, &gmid_get(&format!("apply/{TOKEN}/{}", index + 1), "")).await;
+    assert_eq!(code, 10, "{page}");
+    assert!(page.contains("secretary@kyriakon.net"), "{page}");
+    assert!(page.contains("apply@kyriakon.net"), "{page}");
+}
+
+#[tokio::test]
+async fn a_mailed_key_answers_the_capsule_key_page() {
+    let (app, dir) = handler("capsule-key-mailed").await;
+    let mut record = crate::draft::Draft::new(TOKEN.to_string());
+    record
+        .answers
+        .insert("whose".to_string(), "body".to_string());
+    record
+        .answers
+        .insert("body_domain".to_string(), "parish.example".to_string());
+    record.answers.insert(
+        "body_account_names".to_string(),
+        "secretary\nhall".to_string(),
+    );
+    record
+        .mail_keys
+        .push(crate::keycheck::mail_key("secretary".to_string(), GOOD_KEY));
+    let path = capsule_path(&app.questions, &record.answers);
+    let first = path
+        .iter()
+        .position(|p| p.mailbox.is_some())
+        .expect("the first key page");
+    record.cursor = first;
+    crate::draft::save(&app.store, &mut record).await.unwrap();
+
+    let (code, redirect) =
+        answer(&app, &gmid_get(&format!("apply/{TOKEN}/{}", first + 1), "")).await;
+    assert_eq!(
+        code, 30,
+        "the mailed key advances past its page: {redirect}"
+    );
+    assert!(
+        redirect.contains(&format!("/apply/{TOKEN}/{}", first + 2)),
+        "{redirect}"
+    );
+    assert_eq!(read_draft(&dir, TOKEN).cursor, first + 1);
 }
 
 #[tokio::test]

@@ -19,6 +19,8 @@
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
+use crate::store::KeyRecord;
+
 const BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
 const END: &str = "-----END PGP PUBLIC KEY BLOCK-----";
 
@@ -129,6 +131,66 @@ pub fn pgp_fingerprint(value: &str) -> Option<String> {
         _ => return None,
     };
     Some(digest.iter().map(|b| format!("{b:02X}")).collect())
+}
+
+/// Split a key answer into armoured blocks, one per mailbox. The handler's two
+/// front-ends and the drain's mail route all take a paste that may carry more
+/// than one block, so the split is one function rather than three copies.
+pub fn blocks(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_block = false;
+    for line in value.lines() {
+        let t = line.trim();
+        if t.starts_with(BEGIN) {
+            in_block = true;
+            cur.clear();
+        }
+        if in_block {
+            cur.push_str(line);
+            cur.push('\n');
+        }
+        if t.starts_with(END) && in_block {
+            in_block = false;
+            out.push(cur.trim().to_string());
+        }
+    }
+    out
+}
+
+/// The record for one mail key, with the fingerprint and the verdict computed
+/// over the material rather than taken from the client. A block that does not
+/// parse is still recorded: the spec warns and proceeds, and the verdict says
+/// what the check found.
+pub fn mail_key(mailbox: String, material: &str) -> KeyRecord {
+    record(mailbox, material, Kind::Mail)
+}
+
+/// The record for one upload key. The mail check does not apply to it.
+pub fn upload_key(material: &str) -> KeyRecord {
+    record(String::new(), material, Kind::Upload)
+}
+
+enum Kind {
+    Mail,
+    Upload,
+}
+
+fn record(mailbox: String, material: &str, kind: Kind) -> KeyRecord {
+    let verdict = pgp_public_key(material)
+        .map(|c| c.verdict)
+        .unwrap_or_else(|_| "unchecked".to_string());
+    let fingerprint = match kind {
+        Kind::Mail => pgp_fingerprint(material),
+        Kind::Upload => openssh_fingerprint(material),
+    }
+    .unwrap_or_default();
+    KeyRecord {
+        mailbox,
+        fingerprint,
+        material: material.trim().to_string(),
+        verdict,
+    }
 }
 
 /// The OpenSSH fingerprint `ssh-keygen -l` prints: `SHA256:` and the unpadded
@@ -275,7 +337,7 @@ fn encryption_algorithm(p: &Packet) -> bool {
 
 /// Standard base64, padding optional at the end, whitespace ignored. `None` on
 /// any character outside the alphabet or a length that cannot decode.
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u8> {
         Some(match c {
             b'A'..=b'Z' => c - b'A',

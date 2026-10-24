@@ -6,12 +6,13 @@
 //! only place an answer is kept: the URL the client follows holds none.
 //!
 //! The record is deliberately open to fields later tickets add, as the account
-//! record is. The key fingerprints and verdicts arrive with the key page; this
-//! module stores what the flow has and leaves the rest to it.
+//! record is. The key fingerprints and verdicts arrive with the key page; the
+//! mail route writes them here too, because a key mailed to `apply@` must reach
+//! the same draft the applicant is walking.
 
 use std::collections::BTreeMap;
 
-use crate::store::{self, Store};
+use crate::store::{self, KeyRecord, Store};
 use crate::util;
 
 /// `drafts/<token>.json`.
@@ -22,6 +23,11 @@ pub struct Draft {
     pub token: String,
     /// Every answer given so far, keyed by the question list's ids.
     pub answers: BTreeMap<String, String>,
+    /// The mail keys filed against this draft, pasted or mailed, one per
+    /// mailbox. Empty for a person until their key page is answered; a body's
+    /// holds one entry per account name.
+    #[serde(default)]
+    pub mail_keys: Vec<KeyRecord>,
     /// The next page to ask, as an index into the applicant's own path. Zero is
     /// the first question; a value equal to the path's length means every page
     /// has been answered.
@@ -38,6 +44,7 @@ impl Draft {
             version: 1,
             token,
             answers: BTreeMap::new(),
+            mail_keys: Vec::new(),
             cursor: 0,
             created_at: now.clone(),
             updated_at: now,
@@ -70,14 +77,18 @@ pub async fn load(store: &Store, token: &str) -> Result<Option<Draft>, String> {
 }
 
 /// Write the draft by rename, stamping `updated_at`. The directory is created
-/// here so a first draft does not depend on the store script having run.
+/// here so a first draft does not depend on the store script having run. The
+/// file is handed to the directory's owner because the drain writes this record
+/// too, as root: a root-owned 0600 draft would read as missing to the
+/// unprivileged handler that is walking it.
 pub async fn save(store: &Store, draft: &mut Draft) -> Result<(), String> {
     draft.updated_at = util::filed_at();
     store.ensure_dir("drafts").await?;
     let bytes =
         serde_json::to_vec_pretty(draft).map_err(|e| format!("cannot encode the draft: {e}"))?;
+    let owner = store.dir_owner("drafts");
     store
-        .write_record("drafts", &format!("{}.json", draft.token), &bytes)
+        .write_record_owned("drafts", &format!("{}.json", draft.token), &bytes, owner)
         .await
 }
 
