@@ -1517,6 +1517,94 @@ mod tests {
         );
     }
 
+    /// Every answer kind in the shipped list is read and accepted. A kind that
+    /// reads one line where the question asks for several is how a two-mailbox
+    /// body dead-ended, so the table is what makes a new kind obvious.
+    #[test]
+    fn every_answer_kind_is_read_and_accepted() {
+        let list = question_list();
+        let reserved = reserved_names();
+        let page = |id: &str| Page {
+            q: list.iter().find(|q| q.id == id).expect(id),
+            mailbox: None,
+        };
+        let mut person = BTreeMap::new();
+        person.insert("username".to_string(), "theophilus".to_string());
+        person.insert("whose".to_string(), "person".to_string());
+        let mail_page = flow_path(&list, &person)
+            .into_iter()
+            .find(|p| p.q.id == "mail_key")
+            .expect("the mail key page");
+        let key_block = format!("{KEY_BEGIN}\n\n{KEY_BODY}\n{KEY_END}");
+        let upload = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAA user@host";
+
+        let cases = vec![
+            (
+                "username",
+                page("username"),
+                vec!["theophilus"],
+                "theophilus".to_string(),
+            ),
+            ("whose", page("whose"), vec!["person"], "person".to_string()),
+            (
+                "body_records",
+                page("body_records"),
+                vec!["yes"],
+                "yes".to_string(),
+            ),
+            (
+                "cannot_pay",
+                page("cannot_pay"),
+                vec!["line one", "line two", "."],
+                "line one\nline two".to_string(),
+            ),
+            (
+                "body_addresses",
+                page("body_addresses"),
+                vec!["a: own", "b: alias a", "."],
+                "a: own\nb: alias a".to_string(),
+            ),
+            (
+                "mail_key",
+                mail_page,
+                vec![KEY_BEGIN, "", KEY_BODY, KEY_END],
+                key_block,
+            ),
+            (
+                "upload_key",
+                page("upload_key"),
+                vec![upload],
+                upload.to_string(),
+            ),
+            (
+                "accept_terms",
+                page("accept_terms"),
+                vec!["yes"],
+                "yes".to_string(),
+            ),
+        ];
+
+        for (id, page, lines, expected) in cases {
+            let mut script = Script::lines(&lines);
+            match read_answer(&page, &mut script).unwrap() {
+                Entered::Value(value) => assert_eq!(value, expected, "{id}"),
+                _ => panic!("{id} did not read a value"),
+            }
+            assert!(script.spent(), "{id} left input unread");
+            assert!(
+                flow_problem(
+                    &page,
+                    &expected,
+                    &reserved,
+                    page.q.required,
+                    &BTreeMap::new()
+                )
+                .is_none(),
+                "{id} was read but refused"
+            );
+        }
+    }
+
     /// The full mode's left arrow returns to the previous question as the spec
     /// says, even though the answer itself is read as a line.
     #[test]
