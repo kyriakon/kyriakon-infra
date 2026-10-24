@@ -373,6 +373,63 @@ async fn a_portal_status_read_is_rate_limited_by_address() {
     ));
 }
 
+/// The portal's completed application: the handler validates it with the web
+/// form's rules, files one application and one intent, and the token it returns
+/// reads back the stage.
+#[tokio::test]
+async fn the_portal_files_one_application_and_its_token_reads_the_stage() {
+    let (app, dir) = handler("portal-file").await;
+    let form: BTreeMap<String, String> = body_answers()
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let body = serde_json::to_string(&form).unwrap();
+
+    let reply = portal_file(&app, "203.0.113.10", &body).await;
+    let token = portal_ipc::parse_file_answer(&reply).unwrap();
+    assert!(store::is_status_token(&token), "{token}");
+
+    let text =
+        std::fs::read_to_string(dir.join("applications").join(format!("{token}.json"))).unwrap();
+    let record: Record = serde_json::from_str(&text).unwrap();
+    assert_eq!(record.front_end, "tui");
+    assert_eq!(record.username, "theophilus");
+    assert_eq!(
+        record.mail_keys.len(),
+        1,
+        "the mailbox's key did not reach the record"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.join("intents")).unwrap().count(),
+        1,
+        "one application is one intent"
+    );
+    assert_eq!(
+        portal_answer(&app, "203.0.113.10", &token).await,
+        portal_ipc::Answer::Stage("received".to_string())
+    );
+}
+
+/// A bug in the portal cannot become a filed record the web form would have
+/// refused: the handler runs the same checks again and files nothing.
+#[tokio::test]
+async fn the_portal_refuses_an_application_the_web_form_would_refuse() {
+    let (app, dir) = handler("portal-file-refused").await;
+    let mut form: BTreeMap<String, String> = body_answers()
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    form.insert("username".to_string(), "Not A Username".to_string());
+
+    let reply = portal_file(&app, "203.0.113.10", &serde_json::to_string(&form).unwrap()).await;
+    assert!(reply.starts_with("ERR "), "{reply}");
+    assert_eq!(
+        std::fs::read_dir(dir.join("applications")).unwrap().count(),
+        0
+    );
+    assert_eq!(std::fs::read_dir(dir.join("intents")).unwrap().count(), 0);
+}
+
 // The environment traps: what each front-end sends, and what is read from it.
 
 #[tokio::test]

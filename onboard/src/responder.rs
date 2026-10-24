@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use askama::Template;
 use time::OffsetDateTime;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::fcgi::{self, Reply, Request};
@@ -297,21 +297,58 @@ async fn connection(stream: UnixStream, app: &App) -> Result<(), String> {
     }
 }
 
-/// Answer one portal request: one line in, one line out. The portal is not a web
-/// front-end, and the one question it asks is answered in a line.
+/// One line from the portal, capped before the buffer grows. `None` is a
+/// connection that closed before the line was finished.
+async fn portal_line<R>(reader: &mut R, limit: usize) -> Result<Option<String>, String>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    loop {
+        let mut b = [0u8; 1];
+        match reader.read(&mut b).await {
+            Ok(0) => return Ok(None),
+            Ok(_) => bytes.push(b[0]),
+            Err(e) => return Err(format!("cannot read the portal request: {e}")),
+        }
+        if b[0] == b'\n' {
+            break;
+        }
+        if bytes.len() > limit {
+            return Err(format!("the portal request is longer than {limit} bytes"));
+        }
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|e| format!("the portal request is not text: {e}"))
+}
+
+/// Answer one portal request: a status read is one line in, one line out, and a
+/// filed application adds one line of JSON. The portal is not a web front-end,
+/// and the one question it asks is answered in a line.
 async fn portal_connection(stream: UnixStream, app: &App) -> Result<(), String> {
     let (reader, mut writer) = stream.into_split();
-    let mut reader = tokio::io::BufReader::new(reader.take(portal_ipc::MAX_LINE as u64));
-    let mut line = String::new();
-    let read = reader
-        .read_line(&mut line)
-        .await
-        .map_err(|e| format!("cannot read the portal request: {e}"))?;
-    if read == 0 {
+    let mut reader = tokio::io::BufReader::new(reader);
+    let Some(line) = portal_line(&mut reader, portal_ipc::MAX_LINE).await? else {
         return Ok(());
-    }
-    if !line.ends_with('\n') {
-        return Err("the portal request is not one line".to_string());
+    };
+    if let Some(address) = portal_ipc::parse_file_request(&line) {
+        let address = address.to_string();
+        let body = portal_line(&mut reader, portal_ipc::MAX_BODY)
+            .await?
+            .ok_or("the portal closed before sending the application")?;
+        let reply = portal_file(app, &address, &body).await;
+        // The route and the address are the log line every front-end gets; the
+        // answers and the token never are.
+        eprintln!("kyriakon-onboard: portal /apply 200 {address}");
+        writer
+            .write_all(reply.as_bytes())
+            .await
+            .map_err(|e| format!("cannot write the portal answer: {e}"))?;
+        return writer
+            .flush()
+            .await
+            .map_err(|e| format!("cannot flush the portal answer: {e}"));
     }
     let Some((address, token)) = portal_ipc::parse_request(&line) else {
         return Err("the portal sent no status request".to_string());
@@ -328,6 +365,51 @@ async fn portal_connection(stream: UnixStream, app: &App) -> Result<(), String> 
         .flush()
         .await
         .map_err(|e| format!("cannot flush the portal answer: {e}"))
+}
+
+/// File one completed application the portal checked, through the same builder
+/// and writer the web form and the capsule use. The handler validates every
+/// field again, so a bug in the portal cannot become a filed record the web form
+/// would have refused.
+async fn portal_file(app: &App, address: &str, body: &str) -> String {
+    let key = rate::key(None, Some(address));
+    if !app.counter.allow_request(key) {
+        return portal_ipc::file_answer(None, SLOW_STATUS);
+    }
+    let form: BTreeMap<String, String> = match serde_json::from_str(body) {
+        Ok(form) => form,
+        Err(e) => return portal_ipc::file_answer(None, &format!("the application: {e}")),
+    };
+    let errors = application_problems(app, &form);
+    if !errors.is_empty() {
+        return portal_ipc::file_answer(None, &errors.join(" "));
+    }
+    if !app.counter.allow_draft(key) {
+        return portal_ipc::file_answer(
+            None,
+            "Too many applications have been started from this address today. Try again tomorrow.",
+        );
+    }
+    let token = match store::status_token().await {
+        Ok(token) => token,
+        Err(e) => {
+            eprintln!("kyriakon-onboard: {e}");
+            return portal_ipc::file_answer(None, "Temporary failure. Try again in a moment.");
+        }
+    };
+    let body_branch = form.get("whose").map(String::as_str) == Some("body");
+    let record = match build_record(app, &form, body_branch, &token, "tui") {
+        Ok(record) => record,
+        Err(e) => {
+            eprintln!("kyriakon-onboard: {e}");
+            return portal_ipc::file_answer(None, "Temporary failure. Try again in a moment.");
+        }
+    };
+    if let Err(e) = file_application(app, &record).await {
+        eprintln!("kyriakon-onboard: {e}");
+        return portal_ipc::file_answer(None, "Temporary failure. Try again in a moment.");
+    }
+    portal_ipc::file_answer(Some(&token), "")
 }
 
 /// The stage a token names, or the one notice an unknown, expired or
@@ -757,24 +839,28 @@ async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) -> Reply {
 /// One page of the applicant's path. A mail key is one page per mailbox, with
 /// the mailbox in the prompt: a body's key page would otherwise ask for every
 /// key at once, and a status 10 answer cannot say which block is whose.
-struct Page<'a> {
-    q: &'a Question,
+pub(crate) struct Page<'a> {
+    pub(crate) q: &'a Question,
     /// Set on a key page, which is generated per mailbox rather than read from
     /// the question list.
-    mailbox: Option<Mailbox>,
+    pub(crate) mailbox: Option<Mailbox>,
 }
 
-struct Mailbox {
+pub(crate) struct Mailbox {
     /// The account name the key is filed under, empty for a person.
-    name: String,
+    pub(crate) name: String,
     /// The address the page names.
-    address: String,
+    pub(crate) address: String,
 }
 
 /// The pages this applicant's path will ask, in file order: the branch the
 /// `whose` answer selects, the blessing only once `orders` says monastic, and
-/// one mail-key page per mailbox.
-fn capsule_path<'a>(list: &'a [Question], answers: &BTreeMap<String, String>) -> Vec<Page<'a>> {
+/// one mail-key page per mailbox. The capsule and the terminal both walk it, so
+/// the counter and the branches cannot disagree between the two.
+pub(crate) fn capsule_path<'a>(
+    list: &'a [Question],
+    answers: &BTreeMap<String, String>,
+) -> Vec<Page<'a>> {
     let body = answers.get("whose").map(String::as_str) == Some("body");
     let monastic = questions::is_monastic(answers.get("orders").map(String::as_str));
     let mut out = Vec::new();
@@ -849,7 +935,7 @@ fn capsule_value(raw: &str) -> String {
 /// the web form's; the type's own shape is added where the shared rules are
 /// silent, because a yes/no page that accepted "maybe" would store a value the
 /// form never offers.
-fn capsule_problem(
+pub(crate) fn capsule_problem(
     page: &Page,
     value: &str,
     reserved: &HashSet<String>,
@@ -1017,7 +1103,7 @@ async fn capsule_file(app: &App, record: &draft::Draft) -> Reply {
 /// holds, pasted and mailed alike. `build_record` pairs one block per mailbox in
 /// account order, so a key the mail route filed and one pasted on the next page
 /// cannot disagree about which mailbox they serve.
-fn capsule_answers(record: &draft::Draft, body: bool) -> BTreeMap<String, String> {
+pub(crate) fn capsule_answers(record: &draft::Draft, body: bool) -> BTreeMap<String, String> {
     let mut answers = record.answers.clone();
     let (id, mailboxes) = if body {
         ("body_mail_key", questions::account_names(&record.answers))
@@ -1126,8 +1212,6 @@ fn own_origin(request: &Request) -> bool {
 async fn apply(app: &App, request: &Request, incoming: &Incoming) -> Reply {
     let form = fields(&String::from_utf8_lossy(&request.body));
     let Reading { body, shown } = reading(&form);
-    let monastic = questions::is_monastic(form.get("orders").map(String::as_str));
-    let applicable: Vec<&Question> = questions::shown(&app.questions, !body);
 
     // Read before anything else is done with the submission, and before the
     // request is charged as a draft: a front end that names itself wrongly gets
@@ -1142,7 +1226,6 @@ async fn apply(app: &App, request: &Request, incoming: &Incoming) -> Reply {
         }
     };
 
-    let mut errors = Vec::new();
     // The answer names a branch the page did not carry, so its questions are ones
     // the applicant has not been shown and answers they have not been given the
     // chance to give. Refusing would list exactly those, which is the refusal the
@@ -1151,26 +1234,7 @@ async fn apply(app: &App, request: &Request, incoming: &Incoming) -> Reply {
     if !shown {
         return render_applicant(app, body, &form, &[]);
     }
-    for q in &applicable {
-        let value = form.get(&q.id).cloned().unwrap_or_default();
-        // A monastic-branch question belongs to the monastic path, so its
-        // requirement is read from the file's own column and applied only when the
-        // orders answer selects that path.
-        let required = match q.branch {
-            Branch::Monastic => monastic && q.required,
-            _ => q.required,
-        };
-        if q.rule == Rule::MailKey {
-            for why in mail_key_errors(q, &value, &form) {
-                errors.push(format!("{}: {why}", q.prompt));
-            }
-        } else if let Some(why) = validate::reason(q, &value, &app.reserved, required) {
-            errors.push(format!("{}: {why}", q.prompt));
-        }
-    }
-    if body {
-        body_cross_checks(&form, &mut errors);
-    }
+    let errors = application_problems(app, &form);
     if !errors.is_empty() {
         let mut page = page::applicant(
             &app.questions,
@@ -1479,10 +1543,41 @@ fn label(form: &BTreeMap<String, String>) -> Result<&'static str, String> {
     }
 }
 
+/// Every refusal a submission has earned, in the form's own order. The web form
+/// posts it, and the terminal's completed application is checked with it before
+/// the handler files anything, so the two cannot disagree about what is
+/// acceptable.
+fn application_problems(app: &App, form: &BTreeMap<String, String>) -> Vec<String> {
+    let body = form.get("whose").map(String::as_str) == Some("body");
+    let monastic = questions::is_monastic(form.get("orders").map(String::as_str));
+    let mut errors = Vec::new();
+    for q in questions::shown(&app.questions, !body) {
+        let value = form.get(&q.id).cloned().unwrap_or_default();
+        // A monastic-branch question belongs to the monastic path, so its
+        // requirement is read from the file's own column and applied only when the
+        // orders answer selects that path.
+        let required = match q.branch {
+            Branch::Monastic => monastic && q.required,
+            _ => q.required,
+        };
+        if q.rule == Rule::MailKey {
+            for why in mail_key_errors(q, &value, form) {
+                errors.push(format!("{}: {why}", q.prompt));
+            }
+        } else if let Some(why) = validate::reason(q, &value, &app.reserved, required) {
+            errors.push(format!("{}: {why}", q.prompt));
+        }
+    }
+    if body {
+        body_cross_checks(form, &mut errors);
+    }
+    errors
+}
+
 /// The body's addresses against its account names: the same number of lines, at
 /// most ten, and each address line `localpart: own` or `localpart: alias
 /// localpart`, which is the form the spec's community-block table gives.
-fn body_cross_checks(form: &BTreeMap<String, String>, errors: &mut Vec<String>) {
+pub(crate) fn body_cross_checks(form: &BTreeMap<String, String>, errors: &mut Vec<String>) {
     let addresses = form.get("body_addresses").map(String::as_str).unwrap_or("");
     let a = addresses.lines().filter(|l| !l.trim().is_empty()).count();
     let n = questions::account_names(form).len();
