@@ -31,6 +31,10 @@ const KEY: &[u8] = b"the approval key\n";
 /// the upload key file it reads holds.
 const UPLOAD_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample secretary@example";
 
+/// A public key block with the structure of a key the check can read.
+const GOOD_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
+mAYEAAAAABK4BgQAAAAAEg==\n-----END PGP PUBLIC KEY BLOCK-----\n";
+
 struct Fix {
     dir: PathBuf,
 }
@@ -39,7 +43,12 @@ impl Fix {
     fn new(name: &str) -> Fix {
         let dir = std::env::temp_dir().join(format!("onboard-it-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        for sub in ["store/intents", "store/applications", "bin"] {
+        for sub in [
+            "store/intents",
+            "store/applications",
+            "store/mail/new",
+            "bin",
+        ] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
         let fix = Fix { dir };
@@ -83,6 +92,7 @@ impl Fix {
              base_url = \"https://signup.kyriakon.net\"\n\
              price_gbp = \"20.00\"\n\
              postal_address = \"1 Example Street, Example\"\n\
+             mail_dir = \"{}/store/mail/new\"\n\
              release = \"2026-10-10 abc1234\"\n",
             fix.path("store"),
             fix.path("reserved"),
@@ -91,6 +101,7 @@ impl Fix {
             fix.path("passwd"),
             fix.path("key"),
             fix.path("keyring"),
+            fix.dir.display(),
             fix.dir.display(),
             fix.dir.display(),
         );
@@ -351,6 +362,37 @@ impl Fix {
 
     fn sent(&self) -> String {
         std::fs::read_to_string(self.dir.join("sent")).unwrap_or_default()
+    }
+
+    /// A draft on disk, as the capsule leaves it before a key page.
+    fn write_draft(&self, token: &str, answers: &[(&str, &str)]) {
+        let answers: BTreeMap<String, String> = answers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let draft = json!({
+            "version": 1,
+            "token": token,
+            "answers": answers,
+            "cursor": 0,
+            "created_at": "2026-10-10T00:00:00Z",
+            "updated_at": "2026-10-10T00:00:00Z",
+        });
+        std::fs::create_dir_all(self.dir.join("store/drafts")).unwrap();
+        std::fs::write(
+            self.dir.join("store/drafts").join(format!("{token}.json")),
+            serde_json::to_vec_pretty(&draft).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// One raw message in the apply@ spool, the way smtpd delivers it.
+    fn mail(&self, name: &str, from: &str, subject: &str, body: &str) {
+        std::fs::write(
+            self.dir.join("store/mail/new").join(name),
+            format!("From: {from}\nSubject: {subject}\n\n{body}\n"),
+        )
+        .unwrap();
     }
 
     fn scripts_log(&self) -> String {
@@ -2123,4 +2165,141 @@ fn a_second_application_does_not_reuse_the_first_approvals_payment() {
         ledger,
         "and no second window was opened and no second row written"
     );
+}
+
+// --- the apply@ key spool ------------------------------------------------
+
+/// A key mailed to apply@ is filed against the draft its subject names, with
+/// the fingerprint and verdict the handler would have recorded, and the spool
+/// is empty afterwards.
+#[test]
+fn a_mailed_key_is_filed_against_the_draft_and_the_spool_empties() {
+    let fix = Fix::new("mail-key");
+    fix.write_draft(TOKEN, &[("username", "secretary"), ("whose", "person")]);
+    fix.mail("one", "applicant@example.invalid", TOKEN, GOOD_KEY);
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.names("mail/new").is_empty(), "the spool is drained");
+
+    let draft: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
+    let key = &draft["mail_keys"][0];
+    assert_eq!(key["mailbox"], "secretary");
+    assert!(
+        !key["fingerprint"].as_str().unwrap_or_default().is_empty(),
+        "the fingerprint is computed over the mailed material: {draft}"
+    );
+    assert!(
+        !key["verdict"].as_str().unwrap_or_default().is_empty(),
+        "the verdict is recorded: {draft}"
+    );
+}
+
+/// A body's key page is one page per mailbox, so the message has to say which
+/// mailbox each block belongs to. Two labelled blocks file both.
+#[test]
+fn two_labelled_keys_for_a_body_are_both_filed() {
+    let fix = Fix::new("mail-body-keys");
+    fix.write_draft(
+        TOKEN,
+        &[
+            ("whose", "body"),
+            ("body_domain", "parish.example"),
+            ("body_account_names", "secretary\nhall"),
+        ],
+    );
+    let message = format!("secretary@parish.example\n{GOOD_KEY}\nhall@parish.example\n{GOOD_KEY}");
+    fix.mail("one", "applicant@example.invalid", TOKEN, &message);
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.names("mail/new").is_empty());
+
+    let draft: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
+    let keys = draft["mail_keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 2, "{draft}");
+    assert_eq!(keys[0]["mailbox"], "secretary");
+    assert_eq!(keys[1]["mailbox"], "hall");
+}
+
+/// A body with more than one mailbox and an unlabelled block is refused, and
+/// the reply names the mailboxes the message failed to label.
+#[test]
+fn an_unlabelled_key_for_two_mailboxes_is_refused_by_name() {
+    let fix = Fix::new("mail-unlabelled");
+    fix.write_draft(
+        TOKEN,
+        &[
+            ("whose", "body"),
+            ("body_domain", "parish.example"),
+            ("body_account_names", "secretary\nhall"),
+        ],
+    );
+    fix.mail("one", "applicant@example.invalid", TOKEN, GOOD_KEY);
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let sent = fix.sent();
+    assert!(sent.contains("secretary"), "{sent}");
+    assert!(sent.contains("hall"), "{sent}");
+    let draft: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
+    assert!(
+        draft["mail_keys"].as_array().is_none_or(|k| k.is_empty()),
+        "nothing was filed: {draft}"
+    );
+}
+
+/// A token that no longer resolves gets one reply with a fresh link and creates
+/// no draft. The second message from the same sender is not answered again.
+#[test]
+fn a_key_for_a_dead_token_gets_one_reply_and_files_no_draft() {
+    let fix = Fix::new("mail-dead-token");
+    fix.mail("one", "applicant@example.invalid", OTHER_TOKEN, GOOD_KEY);
+    fix.mail("two", "applicant@example.invalid", OTHER_TOKEN, GOOD_KEY);
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let drafts: Vec<String> = fix
+        .names("drafts")
+        .into_iter()
+        .filter(|n| n.ends_with(".json"))
+        .collect();
+    assert!(drafts.is_empty(), "a mail creates no draft: {drafts:?}");
+    assert_eq!(
+        fix.sent()
+            .matches("Subject: Your Kyriakon application key")
+            .count(),
+        1,
+        "one reply per sender:\n{}",
+        fix.sent()
+    );
+    assert!(fix.sent().contains("gemini://signup.kyriakon.net/apply"));
+    assert!(fix.names("mail/new").is_empty());
+}
+
+/// A live token files its key even when the message has no usable From. The
+/// reply address is only needed on the paths that answer.
+#[test]
+fn a_key_with_no_reply_address_is_still_filed() {
+    let fix = Fix::new("mail-no-from");
+    fix.write_draft(TOKEN, &[("username", "secretary"), ("whose", "person")]);
+    fix.mail("one", "", TOKEN, GOOD_KEY);
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.sent().is_empty(), "nothing to answer: {}", fix.sent());
+    let draft: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
+    assert_eq!(draft["mail_keys"][0]["mailbox"], "secretary", "{draft}");
+}
+
+/// A message with no key block is not answered at all.
+#[test]
+fn mail_without_a_key_block_is_not_answered() {
+    let fix = Fix::new("mail-no-key");
+    fix.mail("one", "applicant@example.invalid", TOKEN, "hello");
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.sent().is_empty(), "{}", fix.sent());
+    assert!(fix.names("mail/new").is_empty());
 }

@@ -44,7 +44,11 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
             transitions::report_failure(cfg, store, id, "intent", &e).await;
         }
     }
-    transitions::purge_declined(cfg, store).await
+    transitions::purge_declined(cfg, store).await?;
+    // The key spool is read after the intents so a filed application is not
+    // waiting behind a mailbox pass. The pass handles each message on its own:
+    // one that cannot be dealt with is reported and left for the next run.
+    crate::mailbox::run(cfg, store).await
 }
 
 /// One intent, dispatched by kind.

@@ -254,6 +254,19 @@ self_test() {
 	check "the installed configuration is 0600 under a 022 umask" \
 		"$(stat -f %Lp "$tree/smtpd.conf")" 600
 
+	# The apply@ route: a plaintext Maildir for _onboard, matched before the
+	# general local delivery. The order is the whole property: a match after it
+	# would deliver the key through the encrypting LMTP path, where the drain
+	# cannot read it.
+	apply_match=$(awk '/^match from any for domain <mail_domains> rcpt-to apply@kyriakon.net action "onboard_mail"$/ { print NR; exit }' \
+		"$tree/smtpd.conf")
+	local_match=$(awk '/^match from any for domain <mail_domains> action "local_mail"$/ { print NR; exit }' \
+		"$tree/smtpd.conf")
+	check "apply@ is delivered to the plaintext _onboard Maildir" \
+		"$(grep -c '^action "onboard_mail" maildir "/var/db/onboard/mail" user _onboard$' "$tree/smtpd.conf")" 1
+	check "apply@ is matched before local delivery" \
+		"$([ -n "$apply_match" ] && [ -n "$local_match" ] && [ "$apply_match" -lt "$local_match" ] && printf yes || printf no)" yes
+
 	before=$(stat -f %i "$tree/smtpd.conf")
 	install_smtpd_conf "$tree/smtpd.conf" "$(mktemp "$tree/smtpd.conf.XXXXXX")"
 	after=$(stat -f %i "$tree/smtpd.conf")

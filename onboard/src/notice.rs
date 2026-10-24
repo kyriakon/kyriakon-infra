@@ -178,6 +178,7 @@ mod tests {
             base_url: "https://signup.kyriakon.net".to_string(),
             price_gbp: "20.00".to_string(),
             postal_address: "REPLACE_ME".to_string(),
+            mail_dir: dir.join("mail").to_str().unwrap().to_string(),
             release: "2026-10-10 abc1234".to_string(),
         }
     }

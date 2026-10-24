@@ -14,6 +14,8 @@
 //! wording change is therefore a rebuild rather than a deploy, which is the
 //! accepted price of one home for the list.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 
 /// The tracked file this module parses, named in the refusals so a failure says
@@ -259,6 +261,22 @@ pub fn shown(list: &[Question], person: bool) -> Vec<&Question> {
 /// makes the elder's or confessor's blessing required.
 pub fn is_monastic(orders: Option<&str>) -> bool {
     matches!(orders, Some("monk") | Some("nun"))
+}
+
+/// The body's account names, one per mailbox, in the order the answers gave.
+/// The form, the capsule and the mail route all pair a key with one of these
+/// names, so the parsing lives here rather than in three places.
+pub fn account_names(answers: &BTreeMap<String, String>) -> Vec<String> {
+    answers
+        .get("body_account_names")
+        .map(|s| {
+            s.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

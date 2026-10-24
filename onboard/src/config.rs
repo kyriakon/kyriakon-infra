@@ -121,6 +121,11 @@ pub struct DrainConfig {
     /// repository, because it is the operator's own address. `prepaid-rails.md`
     /// leaves it to the deployment.
     pub postal_address: String,
+    /// The `mail/new` directory `smtpd` delivers `apply@kyriakon.net` to. It is
+    /// a plaintext Maildir, deliberately outside the encrypting LMTP path: the
+    /// drain reads the key to file it. `scripts/onboard-store.sh` owns the
+    /// directory and its `_onboard` ownership.
+    pub mail_dir: String,
     /// The deployed commit and date, e.g. "2026-10-10 1a2b3c4". The drain records
     /// it on a journal line so a transition can be traced to the release that
     /// carried it out, and it is the confirmation email's document version.
@@ -222,6 +227,7 @@ mod tests {
              base_url = \"https://signup.kyriakon.net\"\n\
              price_gbp = \"20.00\"\n\
              postal_address = \"REPLACE_ME\"\n\
+             mail_dir = \"/var/db/onboard/mail/new\"\n\
              release = \"REPLACE_ME\"\n";
         let c: DrainConfig = toml::from_str(text).unwrap();
         assert_eq!(c.price_gbp, "20.00");

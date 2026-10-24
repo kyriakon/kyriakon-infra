@@ -50,7 +50,7 @@ use crate::fcgi::{self, Reply, Request};
 use crate::page::{AccountPage, DecidePage, NoticePage, PasswordPage, ReceivedPage, StatusPage};
 use crate::questions::{Branch, Kind, Question, Rule};
 use crate::rate::Key;
-use crate::store::{Acceptance, KeyRecord, Record, Store};
+use crate::store::{Acceptance, Record, Store};
 use crate::{
     capsule, catalogue, config, draft, intents, keycheck, page, portal_ipc, questions, rate, store,
     transitions, util, validate,
@@ -649,6 +649,16 @@ async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) -> Reply {
         // The token alone names the draft; the page is the cursor's.
         None => return capsule_redirect(token, 1),
     };
+    // One lock around the read and every write: the drain files a mailed key
+    // into this same record as root, and two unsynchronised read-modify-writes
+    // would lose one of them.
+    let _lock = match draft::lock(&app.store).await {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("kyriakon-onboard: {e}");
+            return Reply::gemini(40, "Temporary failure", String::new());
+        }
+    };
     let mut record = match draft::load(&app.store, token).await {
         Ok(Some(d)) => d,
         Ok(None) => return capsule_not_found(),
@@ -661,41 +671,65 @@ async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) -> Reply {
     if record.cursor >= path.len() {
         return capsule_file(app, &record).await;
     }
-    let index = record.cursor;
-    let expected = index + 1;
-    if page != expected {
-        return capsule_redirect(token, expected);
+    if page != record.cursor + 1 {
+        return capsule_redirect(token, record.cursor + 1);
     }
+    // A key mailed to apply@ is filed against this draft by the drain. When the
+    // flow reaches that page, it is already answered: advance past every such
+    // page rather than asking for a key the applicant has sent.
+    if capsule_skip_mailed(&path, &mut record) {
+        if let Err(e) = draft::save(&app.store, &mut record).await {
+            eprintln!("kyriakon-onboard: {e}");
+            return Reply::gemini(40, "Temporary failure", String::new());
+        }
+        if record.cursor >= path.len() {
+            return capsule_file(app, &record).await;
+        }
+        return capsule_redirect(token, record.cursor + 1);
+    }
+
+    let index = record.cursor;
+    let page = &path[index];
+    let q = page.q;
     if incoming.query.is_empty() {
         return Reply::gemini(
             10,
-            &capsule_meta(path[index], index, path.len(), None),
+            &capsule_meta(page, index, path.len(), token, None),
             String::new(),
         );
     }
 
-    let q = path[index];
     let value = capsule_value(&incoming.query);
     let value = match q.kind {
         Kind::YesNo | Kind::Acceptance => value.to_ascii_lowercase(),
         _ => value,
     };
-    if let Some(why) = capsule_problem(q, &value, &app.reserved, q.required, &record.answers) {
+    if let Some(why) = capsule_problem(page, &value, &app.reserved, q.required, &record.answers) {
         return Reply::gemini(
             10,
-            &capsule_meta(q, index, path.len(), Some(&why)),
+            &capsule_meta(page, index, path.len(), token, Some(&why)),
             String::new(),
         );
     }
-    record.answers.insert(q.id.clone(), value);
+    match &page.mailbox {
+        Some(mailbox) => {
+            record.mail_keys.retain(|k| k.mailbox != mailbox.name);
+            record
+                .mail_keys
+                .push(keycheck::mail_key(mailbox.name.clone(), &value));
+        }
+        None => {
+            record.answers.insert(q.id.clone(), value);
+        }
+    }
     record.cursor = index + 1;
 
     // The body's two line lists are checked together, because the fault is the
     // count rather than either list. Re-ask the page just answered, so the
     // applicant can correct it; nothing is saved until the pair agrees.
-    if record.answers.get("whose").map(String::as_str) == Some("body")
+    if q.id == "body_account_names"
+        && record.answers.get("whose").map(String::as_str) == Some("body")
         && record.answers.contains_key("body_addresses")
-        && record.answers.contains_key("body_account_names")
     {
         let mut errors = Vec::new();
         body_cross_checks(&record.answers, &mut errors);
@@ -703,7 +737,7 @@ async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) -> Reply {
             record.cursor = index;
             return Reply::gemini(
                 10,
-                &capsule_meta(q, index, path.len(), Some(&errors.join(" "))),
+                &capsule_meta(page, index, path.len(), token, Some(&errors.join(" "))),
                 String::new(),
             );
         }
@@ -720,15 +754,79 @@ async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) -> Reply {
     capsule_redirect(token, record.cursor + 1)
 }
 
+/// One page of the applicant's path. A mail key is one page per mailbox, with
+/// the mailbox in the prompt: a body's key page would otherwise ask for every
+/// key at once, and a status 10 answer cannot say which block is whose.
+struct Page<'a> {
+    q: &'a Question,
+    /// Set on a key page, which is generated per mailbox rather than read from
+    /// the question list.
+    mailbox: Option<Mailbox>,
+}
+
+struct Mailbox {
+    /// The account name the key is filed under, empty for a person.
+    name: String,
+    /// The address the page names.
+    address: String,
+}
+
 /// The pages this applicant's path will ask, in file order: the branch the
-/// `whose` answer selects, and the blessing only once `orders` says monastic.
-fn capsule_path<'a>(list: &'a [Question], answers: &BTreeMap<String, String>) -> Vec<&'a Question> {
+/// `whose` answer selects, the blessing only once `orders` says monastic, and
+/// one mail-key page per mailbox.
+fn capsule_path<'a>(list: &'a [Question], answers: &BTreeMap<String, String>) -> Vec<Page<'a>> {
     let body = answers.get("whose").map(String::as_str) == Some("body");
     let monastic = questions::is_monastic(answers.get("orders").map(String::as_str));
-    questions::shown(list, !body)
-        .into_iter()
-        .filter(|q| q.branch != Branch::Monastic || monastic)
-        .collect()
+    let mut out = Vec::new();
+    for q in questions::shown(list, !body) {
+        if q.branch == Branch::Monastic && !monastic {
+            continue;
+        }
+        if q.id == "mail_key" && !body {
+            let name = answers.get("username").cloned().unwrap_or_default();
+            let address = if name.is_empty() {
+                "your address".to_string()
+            } else {
+                format!("{name}@kyriakon.net")
+            };
+            out.push(Page {
+                q,
+                mailbox: Some(Mailbox { name, address }),
+            });
+        } else if q.id == "body_mail_key" && body {
+            let domain = answers.get("body_domain").cloned().unwrap_or_default();
+            for name in questions::account_names(answers) {
+                let address = if domain.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{name}@{domain}")
+                };
+                out.push(Page {
+                    q,
+                    mailbox: Some(Mailbox { name, address }),
+                });
+            }
+        } else {
+            out.push(Page { q, mailbox: None });
+        }
+    }
+    out
+}
+
+/// Advance the cursor past key pages whose mailbox already holds a key, which
+/// is how a key mailed to apply@ answers the page for the applicant.
+fn capsule_skip_mailed(path: &[Page], record: &mut draft::Draft) -> bool {
+    let mut moved = false;
+    while let Some(page) = path.get(record.cursor) {
+        match &page.mailbox {
+            Some(mailbox) if record.mail_keys.iter().any(|k| k.mailbox == mailbox.name) => {
+                record.cursor += 1;
+                moved = true;
+            }
+            _ => break,
+        }
+    }
+    moved
 }
 
 /// The query as the draft stores it. gmid leaves the query percent-encoded, and
@@ -752,12 +850,23 @@ fn capsule_value(raw: &str) -> String {
 /// silent, because a yes/no page that accepted "maybe" would store a value the
 /// form never offers.
 fn capsule_problem(
-    q: &Question,
+    page: &Page,
     value: &str,
     reserved: &HashSet<String>,
     required: bool,
     answers: &BTreeMap<String, String>,
 ) -> Option<String> {
+    let q = page.q;
+    if page.mailbox.is_some() {
+        if value.trim().is_empty() {
+            return Some("a public key is needed".to_string());
+        }
+        let blocks = keycheck::blocks(value);
+        if blocks.len() != 1 {
+            return Some("one key for one mailbox".to_string());
+        }
+        return keycheck::pgp_public_key(&blocks[0]).err();
+    }
     if let Some(why) = validate::reason(q, value, reserved, required) {
         return Some(why);
     }
@@ -782,39 +891,56 @@ fn capsule_problem(
 
 /// A status 10 META: one line, because a newline would end the header. The
 /// counter is the applicant's own path length; the hints are the input the prompt
-/// alone does not give, and the 1024-byte warning is here because META is the last
-/// text a client shows before it reads an answer.
-fn capsule_meta(q: &Question, index: usize, total: usize, reason: Option<&str>) -> String {
-    let mut out = format!("question {} of {}. {}", index + 1, total, q.prompt);
-    match q.kind {
-        Kind::Choice => {
-            if let Rule::Choice(options) = &q.rule {
-                out.push_str(" Answer one of: ");
-                for (i, option) in options.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
+/// alone does not give, and the mail route is here because META is the last text
+/// a client shows before it reads an answer.
+fn capsule_meta(
+    page: &Page,
+    index: usize,
+    total: usize,
+    token: &str,
+    reason: Option<&str>,
+) -> String {
+    let q = page.q;
+    let mut out = format!("question {} of {}. ", index + 1, total);
+    match &page.mailbox {
+        Some(mailbox) => {
+            // shortcut: only the apply@ fallback is offered; add the titan://
+            // line when #378 creates the listener, because a URL now would name
+            // a port nothing serves.
+            out.push_str(&format!(
+                "Paste the public key for {}. Paste the whole block. If your client refuses the \
+                 paste because the address is too long, mail it to apply@kyriakon.net with {token} \
+                 as the subject, and name this mailbox in the message.",
+                mailbox.address,
+            ));
+        }
+        None => {
+            out.push_str(&q.prompt);
+            match q.kind {
+                Kind::Choice => {
+                    if let Rule::Choice(options) = &q.rule {
+                        out.push_str(" Answer one of: ");
+                        for (i, option) in options.iter().enumerate() {
+                            if i > 0 {
+                                out.push_str(", ");
+                            }
+                            out.push_str(&format!("{} ({})", option.value, option.label));
+                        }
+                        out.push('.');
                     }
-                    out.push_str(&format!("{} ({})", option.value, option.label));
                 }
-                out.push('.');
+                Kind::YesNo => out.push_str(" Answer yes or no."),
+                Kind::Acceptance => out.push_str(" Answer yes to accept."),
+                Kind::Addresses => {
+                    out.push_str(" One per line, as localpart: own or localpart: alias localpart.")
+                }
+                Kind::Key => out.push_str(" Paste the whole public key block."),
+                _ => {}
+            }
+            if !q.required {
+                out.push_str(" Leave a single full stop to skip.");
             }
         }
-        Kind::YesNo => out.push_str(" Answer yes or no."),
-        Kind::Acceptance => out.push_str(" Answer yes to accept."),
-        Kind::Addresses => {
-            out.push_str(" One per line, as localpart: own or localpart: alias localpart.")
-        }
-        Kind::Key => {
-            if q.id == "body_mail_key" {
-                out.push_str(" Paste one block per mailbox, in the order of the account names.");
-            } else {
-                out.push_str(" Paste the whole public key block.");
-            }
-        }
-        _ => {}
-    }
-    if !q.required {
-        out.push_str(" Leave a single full stop to skip.");
     }
     if matches!(
         q.kind,
@@ -868,7 +994,8 @@ async fn file_application(app: &App, record: &Record) -> Result<(), String> {
 /// one the draft carried, which is the capability the status link already holds.
 async fn capsule_file(app: &App, record: &draft::Draft) -> Reply {
     let body = record.answers.get("whose").map(String::as_str) == Some("body");
-    let application = match build_record(app, &record.answers, body, &record.token, "capsule") {
+    let answers = capsule_answers(record, body);
+    let application = match build_record(app, &answers, body, &record.token, "capsule") {
         Ok(application) => application,
         Err(e) => {
             eprintln!("kyriakon-onboard: {e}");
@@ -884,6 +1011,33 @@ async fn capsule_file(app: &App, record: &draft::Draft) -> Reply {
     }
     let link = format!("gemini://{HOST}/status/{}", record.token);
     Reply::gemini(20, "text/gemini", capsule::filed(&link))
+}
+
+/// The draft's answers with the key answer rebuilt from the keys the draft
+/// holds, pasted and mailed alike. `build_record` pairs one block per mailbox in
+/// account order, so a key the mail route filed and one pasted on the next page
+/// cannot disagree about which mailbox they serve.
+fn capsule_answers(record: &draft::Draft, body: bool) -> BTreeMap<String, String> {
+    let mut answers = record.answers.clone();
+    let (id, mailboxes) = if body {
+        ("body_mail_key", questions::account_names(&record.answers))
+    } else {
+        (
+            "mail_key",
+            vec![record.answers.get("username").cloned().unwrap_or_default()],
+        )
+    };
+    let mut materials = Vec::new();
+    for mailbox in &mailboxes {
+        match record.mail_keys.iter().find(|k| k.mailbox == *mailbox) {
+            Some(key) => materials.push(key.material.clone()),
+            None => return answers,
+        }
+    }
+    if !materials.is_empty() {
+        answers.insert(id.to_string(), materials.join("\n\n"));
+    }
+    answers
 }
 
 /// The applicant page, with the community block open for a body. `branch` is the
@@ -1330,12 +1484,8 @@ fn label(form: &BTreeMap<String, String>) -> Result<&'static str, String> {
 /// localpart`, which is the form the spec's community-block table gives.
 fn body_cross_checks(form: &BTreeMap<String, String>, errors: &mut Vec<String>) {
     let addresses = form.get("body_addresses").map(String::as_str).unwrap_or("");
-    let names = form
-        .get("body_account_names")
-        .map(String::as_str)
-        .unwrap_or("");
-    let count = |v: &str| v.lines().filter(|l| !l.trim().is_empty()).count();
-    let (a, n) = (count(addresses), count(names));
+    let a = addresses.lines().filter(|l| !l.trim().is_empty()).count();
+    let n = questions::account_names(form).len();
     if a != n {
         errors.push(format!(
             "The addresses, one per line: {a} addresses and {n} account names; there is one account name per address"
@@ -1360,26 +1510,17 @@ fn build_record(
     let rail = form.get("rail").cloned().unwrap_or_default();
 
     let mail_key_id = if body { "body_mail_key" } else { "mail_key" };
-    let blocks = key_blocks(form.get(mail_key_id).map(String::as_str).unwrap_or(""));
+    let blocks = keycheck::blocks(form.get(mail_key_id).map(String::as_str).unwrap_or(""));
     let mailboxes: Vec<String> = if body {
-        form.get("body_account_names")
-            .map(|s| {
-                s.lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
+        questions::account_names(form)
     } else {
         vec![String::new()]
     };
     let mut mail_keys = Vec::new();
     for (i, block) in blocks.iter().enumerate() {
-        mail_keys.push(key_record(
+        mail_keys.push(keycheck::mail_key(
             mailboxes.get(i).cloned().unwrap_or_default(),
             block,
-            KeyKind::Mail,
         ));
     }
 
@@ -1393,8 +1534,7 @@ fn build_record(
         .map(String::as_str)
         .unwrap_or("")
         .trim();
-    let upload_key =
-        (!upload.is_empty()).then(|| key_record(String::new(), upload, KeyKind::Upload));
+    let upload_key = (!upload.is_empty()).then(|| keycheck::upload_key(upload));
 
     Ok(Record {
         username: form.get("username").cloned().unwrap_or_default(),
@@ -1429,50 +1569,15 @@ fn build_record(
     })
 }
 
-/// Which of the two fingerprints a key's material carries: an OpenPGP certificate
-/// has the one gpg prints, and an OpenSSH public key the one ssh-keygen prints.
-/// They are different numbers over different things.
-#[derive(Clone, Copy)]
-enum KeyKind {
-    Mail,
-    Upload,
-}
-
-/// A key as the record carries it. The fingerprint is computed here, over the
-/// material stored beside it, because the handler is the only place that holds
-/// both: the web form has no script and cannot compute one, and the walkthrough
-/// that would have computed it in the browser never posts to a field nothing
-/// fills. A number that names material it was not computed from is worse than
-/// none, and the reviewer compares this one with the key they will be sent.
-fn key_record(mailbox: String, material: &str, kind: KeyKind) -> KeyRecord {
-    let verdict = keycheck::pgp_public_key(material)
-        .map(|c| c.verdict)
-        .unwrap_or_else(|_| "unchecked".to_string());
-    let fingerprint = match kind {
-        KeyKind::Mail => keycheck::pgp_fingerprint(material),
-        KeyKind::Upload => keycheck::openssh_fingerprint(material),
-    }
-    .unwrap_or_default();
-    KeyRecord {
-        mailbox,
-        fingerprint,
-        material: material.trim().to_string(),
-        verdict,
-    }
-}
-
 /// The refusals for a mail-key answer. A person's key is one block; a body's is
 /// one block per mailbox, paired with the account names in the order given.
 fn mail_key_errors(q: &Question, value: &str, form: &BTreeMap<String, String>) -> Vec<String> {
-    let blocks = key_blocks(value);
+    let blocks = keycheck::blocks(value);
     if blocks.is_empty() {
         return vec!["a public key is needed".to_string()];
     }
     if q.id == "body_mail_key" {
-        let mailboxes = form
-            .get("body_account_names")
-            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
-            .unwrap_or(0);
+        let mailboxes = questions::account_names(form).len();
         if blocks.len() != mailboxes {
             return vec![format!(
                 "one key per mailbox: {mailboxes} mailboxes and {} keys",
@@ -1491,31 +1596,6 @@ fn mail_key_errors(q: &Question, value: &str, form: &BTreeMap<String, String>) -
             .into_iter()
             .collect()
     }
-}
-
-/// Split a key answer into armoured blocks, one per mailbox.
-fn key_blocks(value: &str) -> Vec<String> {
-    const BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
-    const END: &str = "-----END PGP PUBLIC KEY BLOCK-----";
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_block = false;
-    for line in value.lines() {
-        let t = line.trim();
-        if t.starts_with(BEGIN) {
-            in_block = true;
-            cur.clear();
-        }
-        if in_block {
-            cur.push_str(line);
-            cur.push('\n');
-        }
-        if t.starts_with(END) && in_block {
-            in_block = false;
-            out.push(cur.trim().to_string());
-        }
-    }
-    out
 }
 
 fn render_applicant(

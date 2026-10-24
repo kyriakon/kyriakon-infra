@@ -16,6 +16,7 @@ pub mod draft;
 pub mod fcgi;
 pub mod intents;
 pub mod keycheck;
+pub mod mailbox;
 pub mod notice;
 pub mod page;
 pub mod password;

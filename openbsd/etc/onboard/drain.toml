@@ -94,6 +94,12 @@ price_gbp = "20.00"
 # publishes the same address with the trader's identity at deploy time.
 postal_address = "REPLACE_ME"
 
+# The Maildir smtpd delivers apply@kyriakon.net to. Plaintext on purpose: the
+# drain reads the key to file it, which is why this address is not on the
+# encrypting LMTP path. scripts/onboard-store.sh makes the directory and its
+# _onboard ownership.
+mail_dir = "/var/db/onboard/mail/new"
+
 # The deployed commit and date, substituted at install, e.g. "2026-10-10 1a2b3c4".
 # The drain records it on a journal line so a transition can be traced to the
 # release that carried it out, and it is the document version the confirmation
