@@ -123,6 +123,13 @@ render_all() {
 	fi
 
 	mkdir -p "$out" || die "cannot create $out"
+	# A mistaken --out pointing at the source would put the operator's address into
+	# the tracked files. The directory itself is fine to create; the files are not
+	# written until this check has passed.
+	out_abs=$(cd "$out" && pwd)
+	docs_abs=$(cd "$docs" && pwd)
+	[ "$out_abs" != "$docs_abs" ] \
+		|| die "refusing to write into the tracked source directory $docs; name the site build's output directory"
 	render_one "$terms" "$out/terms.md"
 	render_one "$privacy" "$out/privacy.md"
 	render_one "$aup" "$out/aup.md"
@@ -193,6 +200,19 @@ self_test() {
 		got=no
 	fi
 	check 'a missing ICO reference is refused' "$got" no
+
+	# A mistaken --out at the source would put the address into the tracked files.
+	# The test uses a copy, so a broken refusal cannot rewrite the repository.
+	mkdir -p "$work/source"
+	cp "$repo_dir/docs/terms.md" "$repo_dir/docs/privacy.md" "$repo_dir/docs/aup.md" "$work/source/"
+	if ( render_all "$work/source" "$work/source" ) >/dev/null 2>&1; then
+		got=yes
+	else
+		got=no
+	fi
+	check 'writing into the source directory is refused' "$got" no
+	check 'the source copy is unchanged' \
+		"$(grep -c -F 'REPLACE_ME_TRADING_ADDRESS' "$work/source/terms.md")" 2
 
 	self_test_end
 }
