@@ -156,6 +156,21 @@ mod tests {
         assert_eq!(c.portal_socket, "/home/www/run/onboard-portal/portal.sock");
     }
 
+    /// The handler config the deploy installs, not a fixture that can agree with a
+    /// broken struct: a required field missing from the tracked file is a handler
+    /// that will not start. The drain's own file is checked by
+    /// `the_shipped_drain_config_parses`.
+    #[test]
+    fn the_tracked_handler_config_loads() {
+        let handler: Config =
+            toml::from_str(include_str!("../../openbsd/etc/onboard/onboard.toml"))
+                .expect("the tracked handler config parses");
+        assert_eq!(
+            handler.portal_socket,
+            "/home/www/run/onboard-portal/portal.sock"
+        );
+    }
+
     #[test]
     fn a_typo_is_refused_rather_than_ignored() {
         let r: Result<Config, _> = toml::from_str(
