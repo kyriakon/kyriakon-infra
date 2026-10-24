@@ -1,9 +1,11 @@
 //! The responder: the face that answers both front-ends.
 //!
 //! httpd's vhost for `signup.kyriakon.net` and gmid's signup block both reach this
-//! over a unix socket, and it serves the same routes to both: the applicant page,
+//! over their own unix sockets, and it serves the same routes to both: the applicant page,
 //! the branch step, the submission, the account page and the status page. The
-//! routes, the pages and the wording are what the service served when it was an
+//! portal has a socket of its own and one request on it: the stage a filed
+//! application has reached, answered without repeating an answer.
+//! The routes, the pages and the wording are what the service served when it was an
 //! HTTP daemon on a loopback port with relayd in front of it; what changed is the
 //! last hop. A request arrives as a CGI environment rather than as an HTTP
 //! request, and the reply is framed for whichever front-end asked.
@@ -41,7 +43,7 @@ use std::sync::Arc;
 
 use askama::Template;
 use time::OffsetDateTime;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::fcgi::{self, Reply, Request};
@@ -50,7 +52,7 @@ use crate::questions::{Branch, Kind, Question, Rule};
 use crate::rate::Key;
 use crate::store::{Acceptance, KeyRecord, Record, Store};
 use crate::{
-    capsule, catalogue, config, draft, intents, keycheck, page, questions, rate, store,
+    capsule, catalogue, config, draft, intents, keycheck, page, portal_ipc, questions, rate, store,
     transitions, util, validate,
 };
 
@@ -77,6 +79,10 @@ const MAX_BODY: usize = 256 * 1024;
 /// no-oracle rule the spec fixes, and it is only true if they share one author.
 const UNKNOWN_TOKEN: &str =
     "This link is not in use. It may have been cleared away, or it may never have existed.";
+
+/// Answer to a portal status read past the per-address counter. It is the
+/// portal's screen that shows it, so the words are the screen's.
+const SLOW_STATUS: &str = "Too many status reads from this address. Wait a minute and try again.";
 
 /// Served when a template could not be rendered. Static and interpolated with
 /// nothing, so the one place with no markup around it cannot become somewhere a
@@ -180,20 +186,35 @@ struct Outcome {
     addr: String,
 }
 
-/// Run the responder on the two sockets the config names, until one of them stops
-/// accepting.
+/// Run the responder on the three sockets the config names, until one of them
+/// stops accepting.
 pub async fn serve(cfg: config::Config) -> Result<(), String> {
     let app = Arc::new(App::load(cfg).await?);
     let httpd = bind(&app.cfg.httpd_socket)?;
     let gemini = bind(&app.cfg.gemini_socket)?;
+    let portal = bind(&app.cfg.portal_socket)?;
     eprintln!(
-        "kyriakon-onboard: httpd {}, gemini {}, store {}, {} questions",
+        "kyriakon-onboard: httpd {}, gemini {}, portal {}, store {}, {} questions",
         app.cfg.httpd_socket,
         app.cfg.gemini_socket,
+        app.cfg.portal_socket,
         app.cfg.store_root,
         app.questions.len()
     );
-    tokio::try_join!(accept(httpd, app.clone()), accept(gemini, app)).map(|_| ())
+    tokio::try_join!(
+        accept(httpd, app.clone(), Channel::FrontEnd),
+        accept(gemini, app.clone(), Channel::FrontEnd),
+        accept(portal, app, Channel::Portal),
+    )
+    .map(|_| ())
+}
+
+/// What a listener speaks. The two FastCGI sockets share a loop; the portal's
+/// line protocol is the one difference in the task each connection spawns.
+#[derive(Clone, Copy)]
+enum Channel {
+    FrontEnd,
+    Portal,
 }
 
 /// Bind one socket, replacing the file a previous run left behind. A socket file
@@ -225,7 +246,7 @@ fn bind(path: &str) -> Result<UnixListener, String> {
 /// Accept connections for as long as the listener holds, which is until it fails:
 /// a socket that has stopped accepting is not something this process can repair,
 /// and rc.d's own check is where a human reads that the daemon is gone.
-async fn accept(listener: UnixListener, app: Arc<App>) -> Result<(), String> {
+async fn accept(listener: UnixListener, app: Arc<App>, channel: Channel) -> Result<(), String> {
     loop {
         let (stream, _) = listener
             .accept()
@@ -233,7 +254,11 @@ async fn accept(listener: UnixListener, app: Arc<App>) -> Result<(), String> {
             .map_err(|e| format!("cannot accept: {e}"))?;
         let app = app.clone();
         tokio::spawn(async move {
-            if let Err(e) = connection(stream, &app).await {
+            let outcome = match channel {
+                Channel::FrontEnd => connection(stream, &app).await,
+                Channel::Portal => portal_connection(stream, &app).await,
+            };
+            if let Err(e) = outcome {
                 eprintln!("kyriakon-onboard: {e}");
             }
         });
@@ -269,6 +294,54 @@ async fn connection(stream: UnixStream, app: &App) -> Result<(), String> {
         if !request.keep_conn {
             return Ok(());
         }
+    }
+}
+
+/// Answer one portal request: one line in, one line out. The portal is not a web
+/// front-end, and the one question it asks is answered in a line.
+async fn portal_connection(stream: UnixStream, app: &App) -> Result<(), String> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(reader.take(portal_ipc::MAX_LINE as u64));
+    let mut line = String::new();
+    let read = reader
+        .read_line(&mut line)
+        .await
+        .map_err(|e| format!("cannot read the portal request: {e}"))?;
+    if read == 0 {
+        return Ok(());
+    }
+    if !line.ends_with('\n') {
+        return Err("the portal request is not one line".to_string());
+    }
+    let Some((address, token)) = portal_ipc::parse_request(&line) else {
+        return Err("the portal sent no status request".to_string());
+    };
+    let answer = portal_answer(app, address, token).await;
+    // The route carries the token and the address, which is the log line every
+    // other front-end gets; the answer never does.
+    eprintln!("kyriakon-onboard: portal /status/{token} 200 {address}");
+    writer
+        .write_all(answer.line().as_bytes())
+        .await
+        .map_err(|e| format!("cannot write the portal answer: {e}"))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| format!("cannot flush the portal answer: {e}"))
+}
+
+/// The stage a token names, or the one notice an unknown, expired or
+/// rate-limited read gets. The same counter and the same record read as the two
+/// front-ends, so the portal cannot learn more than the status page says.
+async fn portal_answer(app: &App, address: &str, token: &str) -> portal_ipc::Answer {
+    if !app.counter.allow_request(rate::key(None, Some(address))) {
+        return portal_ipc::Answer::Notice(SLOW_STATUS.to_string());
+    }
+    let page = status_page(record_for(app, token).await, OffsetDateTime::now_utc());
+    if page.notice.is_empty() {
+        portal_ipc::Answer::Stage(page.stage)
+    } else {
+        portal_ipc::Answer::Notice(page.notice)
     }
 }
 

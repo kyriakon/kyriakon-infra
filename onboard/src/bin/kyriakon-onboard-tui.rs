@@ -37,11 +37,12 @@
 //! next ticket builds, and that is what files an intent.
 
 use std::io::{BufRead, Read};
-use std::path::PathBuf;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use kyriakon_onboard::portal::{Departure, Input, Key, Mode};
-use kyriakon_onboard::{catalogue, config, portal};
+use kyriakon_onboard::{catalogue, config, portal, portal_ipc};
 
 /// The handler's own configuration, read for the one value the portal needs from
 /// it: the path the catalogue is installed at. Named here rather than derived, the
@@ -65,6 +66,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<Departure, String> {
     let mut cfg_path = PathBuf::from(DEFAULT_CONFIG);
+    let mut state = PathBuf::from(portal::SESSION_DIR);
     let mut forced: Option<Mode> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -78,12 +80,18 @@ fn run() -> Result<Departure, String> {
             "--config" => {
                 cfg_path = PathBuf::from(args.next().ok_or("--config needs a path")?);
             }
+            // The session-lock directory, the same testing seam as --plain: the
+            // live path is the fixed one, and sshd sets no AcceptEnv, so no client
+            // can reach either.
+            "--state" => {
+                state = PathBuf::from(args.next().ok_or("--state needs a path")?);
+            }
             "--plain" => forced = Some(Mode::Plain),
             "--full" => forced = Some(Mode::Full),
             other => {
                 return Err(format!(
                     "unknown argument {other:?}; usage: kyriakon-onboard-tui \
-                     [-c COMMAND] [--config PATH] [--plain | --full]"
+                     [-c COMMAND] [--config PATH] [--state PATH] [--plain | --full]"
                 ))
             }
         }
@@ -103,9 +111,82 @@ fn run() -> Result<Departure, String> {
     // [#381]: https://github.com/kyriakon/kyriakon-infra/issues/381
     let rows = portal::entries(&list, None);
 
+    // The address is the session's own, and the lock it takes is what bounds an
+    // address to the two sessions `PerSourceMaxStartups 2` would let sshd start.
+    // A session over the cap gets a screen rather than a dropped connection.
+    let address = source_address();
+    let _session = match portal::Sessions::open(&state, address)? {
+        portal::Admission::Busy => {
+            print!("{}", portal::TOO_MANY);
+            return Ok(Departure::Quit);
+        }
+        portal::Admission::Open(session) => session,
+    };
+
+    let mut status = HandlerStatus {
+        socket: cfg.portal_socket.clone(),
+        address: address.map(|a| a.to_string()),
+    };
     let mode = forced.unwrap_or_else(chosen);
     let mut term = Term::new(mode);
-    portal::run(&rows, mode, &mut term, &mut std::io::stdout())
+    let left = portal::run(&rows, mode, &mut term, &mut status, &mut std::io::stdout())?;
+    // Both endings abandon the session today: nothing files yet. #380 adds the
+    // filed outcome, which is the one this must stop logging.
+    match left {
+        Departure::Quit | Departure::Gone => authlog("session abandoned"),
+    }
+    Ok(left)
+}
+
+/// The client's address from `SSH_CONNECTION`, the quartet sshd puts in the
+/// session environment. No address is a manual run rather than a session, so it
+/// takes no lock.
+fn source_address() -> Option<IpAddr> {
+    std::env::var("SSH_CONNECTION")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The handler's answer to a status read. It logs the stage to `authlog` and
+/// nothing else: no address, no token and no answer. The handler's own log
+/// carries the route and the address, which is where those belong.
+struct HandlerStatus {
+    socket: String,
+    address: Option<String>,
+}
+
+impl portal::StatusSource for HandlerStatus {
+    fn read(&mut self, token: &str) -> Result<portal_ipc::Answer, String> {
+        match portal_ipc::ask(Path::new(&self.socket), self.address.as_deref(), token)? {
+            portal_ipc::Answer::Stage(stage) => {
+                authlog(&format!("status read: {stage}"));
+                Ok(portal_ipc::Answer::Stage(stage))
+            }
+            portal_ipc::Answer::Notice(notice) => {
+                authlog("status read: no stage");
+                Ok(portal_ipc::Answer::Notice(notice))
+            }
+        }
+    }
+}
+
+/// One line at facility `AUTH`, which is where the front-ends' own stage events
+/// go. `%s` is the format because a stage is a string this program did not
+/// write, and a format string it cannot control.
+fn authlog(message: &str) {
+    let clean = message.replace('\0', " ");
+    if let Ok(text) = std::ffi::CString::new(format!("kyriakon-onboard-tui: {clean}")) {
+        unsafe {
+            libc::syslog(
+                libc::LOG_AUTH | libc::LOG_INFO,
+                c"%s".as_ptr(),
+                text.as_ptr(),
+            );
+        }
+    }
 }
 
 /// Whether this session can be drawn on: both ends a terminal and `TERM` naming

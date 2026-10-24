@@ -2,10 +2,11 @@
 #
 # rc.d unit for the onboarding handler: the Rust service that renders the
 # applicant page and writes one JSON intent per submission into the store, and
-# answers the two front-ends over the FastCGI sockets the config names. httpd
-# reaches it for the signup hostname's form and gmid for the capsule, both over a
-# unix socket inside the chroot the two of them share, so the service has no
-# listener on a port at all.
+# answers the two front-ends over the FastCGI sockets the config names, and the
+# ssh portal over a third socket of its own. httpd reaches it for the signup
+# hostname's form and gmid for the capsule, both over a unix socket inside the
+# chroot the two of them share; the portal is unchrooted and asks only for a filed
+# application's stage. So the service has no listener on a port at all.
 #
 # Installed by hand, with the config it names: no deploy installs this unit.
 # Copy it to /etc/rc.d/kyriakon_onboard, copy
@@ -18,9 +19,9 @@
 #
 # Two things have to exist before it starts, and neither is created here: the
 # _onboard account, which is an operator's useradd, and the socket directory
-# inside the front-ends' chroot, which their deploy creates. The service binds
-# its two sockets there at start-up and exits with the path in its message if it
-# cannot.
+# inside the front-ends' chroot and the portal's beside them, all created by the
+# deploy. The service binds its three sockets there at start-up and exits with the
+# path in its message if it cannot.
 
 # The handler holds no privilege and no secret, so it runs as the unprivileged
 # _onboard account rather than root; rc.subr's rc_exec drops to daemon_user with

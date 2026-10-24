@@ -93,6 +93,24 @@ done
 say "store"
 ksh "$repo_dir/scripts/onboard-store.sh"
 
+# The portal's own state: one lock file per live session, created and removed by
+# the program as `hello`. It is not under the store because `_onboard` owns that
+# and the portal must not be able to read it. The account is the operator's to
+# create, like `_onboard`. A box whose account is still named `onboard` gets the
+# socket directory under `_onboard`'s group and a warning rather than a deploy that
+# stops: the handler must still start for every other part of the service, and the
+# rename plus a rerun moves the socket to the portal's group.
+say "portal state"
+if id hello >/dev/null 2>&1; then
+	# The group is the account's own, not the word "hello": the live box reaches
+	# it by renaming the old account, and a rename leaves the group's name behind.
+	portal_group=$(id -gn hello)
+	install -d -o hello -g "$portal_group" -m 0700 /var/db/kyriakon-onboard-tui
+else
+	portal_group=$onboard_user
+	printf 'hello account missing; the portal cannot start until it exists, and this deploy must be rerun after the rename\n' >&2
+fi
+
 say "build"
 need_pkg rust
 # The publish path is a shell client rather than the binary: publish-mail-key.sh
@@ -267,11 +285,15 @@ socket_path() {
 }
 httpd_socket_path=$(socket_path httpd_socket)
 gemini_socket_path=$(socket_path gemini_socket)
+portal_socket_path=$(socket_path portal_socket)
 [ -n "$httpd_socket_path" ] || die "/etc/onboard/onboard.toml names no httpd_socket"
 [ -n "$gemini_socket_path" ] || die "/etc/onboard/onboard.toml names no gemini_socket"
+[ -n "$portal_socket_path" ] || die "/etc/onboard/onboard.toml names no portal_socket"
 
-# The two socket directories, inside the chroot the two front-ends share. Both the
-# paths and the chroot are the installed config's: this service borrows a
+# The three socket directories. httpd's and gmid's are inside the chroot the two
+# front-ends share; the portal's is the on-disk path its unchrooted program
+# connects to. All three paths and the chroot are the installed config's: this
+# service borrows a
 # directory inside httpd's and gmid's chroot because a FastCGI socket path is
 # resolved inside it, and a layout that moves the chroot moves these with it.
 #
@@ -281,7 +303,7 @@ gemini_socket_path=$(socket_path gemini_socket)
 # neither www nor _gmid could reach it. Nothing else may connect: a local user who
 # could would forge the request environment, REMOTE_ADDR among it.
 say "sockets"
-for pair in "www:$httpd_socket_path" "_gmid:$gemini_socket_path"; do
+for pair in "www:$httpd_socket_path" "_gmid:$gemini_socket_path" "$portal_group:$portal_socket_path"; do
 	group=${pair%%:*}
 	dir=$(dirname "${pair#*:}")
 	install -d -o "$onboard_user" -g "$group" -m 2770 "$dir"
@@ -309,7 +331,7 @@ rcctl check kyriakon_onboard >/dev/null 2>&1 \
 # every other local user out. The pages themselves are checked by the front-ends'
 # own deploys, which are the only things that can ask for one.
 say "verify"
-for pair in "httpd:$httpd_socket_path" "gemini:$gemini_socket_path"; do
+for pair in "httpd:$httpd_socket_path" "gemini:$gemini_socket_path" "portal:$portal_socket_path"; do
 	front=${pair%%:*}
 	path=${pair#*:}
 	[ -S "$path" ] || die "$path is not a socket: is kyriakon_onboard running, and is its directory there?"
@@ -317,8 +339,8 @@ for pair in "httpd:$httpd_socket_path" "gemini:$gemini_socket_path"; do
 	printf '%s: %s\n' "$front" "$path"
 done
 
-printf '\ninstalled. the responder answers %s and %s, and no other local user may connect.\n' \
-	"$httpd_socket_path" "$gemini_socket_path"
+printf '\ninstalled. the responder answers %s, %s and %s, and no other local user may connect.\n' \
+	"$httpd_socket_path" "$gemini_socket_path" "$portal_socket_path"
 printf 'httpd and gmid reach it from their own configs, which their own deploys install.\n'
 printf 'relayd terminates TLS for signup.kyriakon.net and sets the forwarded address\n'
 printf 'the counters key on.\n'
