@@ -65,6 +65,12 @@ drops claimed issues and issues with a merged pull request: the first is being
 worked, and the second is waiting for a deploy, not work. Check that pull
 request's deploy step before closing the issue.
 
+The query drops an issue with a merged cross-referenced PR, but a change that
+merged without a cross-reference leaves its issue in the queue. Before starting,
+check the issue's acceptance criteria against the current tree. If every
+criterion is already met, close the issue with the evidence in a comment rather
+than reimplementing it.
+
 The queue has no priority order of its own, so read the titles and choose.
 
 ## Pull requests as a triage surface
@@ -86,6 +92,10 @@ Create a GitHub issue.
 ## When a skill says "fetch the relevant ticket"
 
 Run `gh issue view <number> --comments`.
+
+A ticket carrying a `Spec:` line reads the spec and `../kyriakon/docs/CONTEXT.md`
+before coding. That line is the concrete trigger; without one, `AGENTS.md` leaves
+the meta-repo read to judgement.
 
 ## Wayfinding operations
 
