@@ -373,6 +373,24 @@ async fn a_portal_status_read_is_rate_limited_by_address() {
     ));
 }
 
+/// The portal line is bounded on the wire: a request past the bound is refused
+/// before it becomes an unbounded allocation.
+#[tokio::test]
+async fn portal_lines_are_bounded_and_a_close_is_not_an_error() {
+    let mut reader = tokio::io::BufReader::new(&b"abcdef\n"[..]);
+    assert_eq!(
+        portal_line(&mut reader, 6).await.unwrap(),
+        Some("abcdef\n".to_string())
+    );
+
+    let mut reader = tokio::io::BufReader::new(&b"abcdefg\n"[..]);
+    let why = portal_line(&mut reader, 6).await.unwrap_err();
+    assert!(why.contains("longer than 6"), "{why}");
+
+    let mut reader = tokio::io::BufReader::new(&b"abc"[..]);
+    assert_eq!(portal_line(&mut reader, 6).await.unwrap(), None);
+}
+
 /// The portal's completed application: the handler validates it with the web
 /// form's rules, files one application and one intent, and the token it returns
 /// reads back the stage.
@@ -1037,7 +1055,7 @@ async fn a_capsule_branch_answer_changes_the_counter() {
     answer(&app, &gmid_get(&format!("apply/{token}/1"), "secretary")).await;
     answer(&app, &gmid_get(&format!("apply/{token}/2"), "body")).await;
 
-    let total = capsule_path(&app.questions, &read_draft(&dir, &token).answers).len();
+    let total = flow_path(&app.questions, &read_draft(&dir, &token).answers).len();
     let (code, page) = answer(&app, &gmid_get(&format!("apply/{token}/3"), "")).await;
     assert_eq!(code, 10, "{page}");
     assert!(page.contains(&format!("question 3 of {total}.")), "{page}");
@@ -1089,11 +1107,11 @@ fn the_capsule_adds_the_blessing_only_on_the_monastic_path() {
     let mut answers = BTreeMap::new();
     answers.insert("whose".to_string(), "person".to_string());
     answers.insert("orders".to_string(), "layman".to_string());
-    assert!(!capsule_path(&list, &answers)
+    assert!(!flow_path(&list, &answers)
         .iter()
         .any(|p| p.q.id == "blessing"));
     answers.insert("orders".to_string(), "monk".to_string());
-    assert!(capsule_path(&list, &answers)
+    assert!(flow_path(&list, &answers)
         .iter()
         .any(|p| p.q.id == "blessing"));
 }
@@ -1137,7 +1155,7 @@ async fn a_capsule_body_key_page_names_one_mailbox_and_the_mail_route() {
         "body_account_names".to_string(),
         "secretary\nhall".to_string(),
     );
-    let path = capsule_path(&app.questions, &record.answers);
+    let path = flow_path(&app.questions, &record.answers);
     let first = path
         .iter()
         .position(|p| p.mailbox.is_some())
@@ -1184,7 +1202,7 @@ async fn a_capsule_person_key_page_names_their_address() {
     record
         .answers
         .insert("username".to_string(), "secretary".to_string());
-    let path = capsule_path(&app.questions, &record.answers);
+    let path = flow_path(&app.questions, &record.answers);
     let index = path
         .iter()
         .position(|p| p.q.id == "mail_key")
@@ -1215,7 +1233,7 @@ async fn a_mailed_key_answers_the_capsule_key_page() {
     record
         .mail_keys
         .push(crate::keycheck::mail_key("secretary".to_string(), GOOD_KEY));
-    let path = capsule_path(&app.questions, &record.answers);
+    let path = flow_path(&app.questions, &record.answers);
     let first = path
         .iter()
         .position(|p| p.mailbox.is_some())
@@ -1264,7 +1282,7 @@ async fn a_mailed_key_is_in_the_filed_application_in_mailbox_order() {
     record
         .mail_keys
         .push(crate::keycheck::mail_key("hall".into(), GOOD_KEY));
-    record.cursor = capsule_path(&app.questions, &record.answers).len();
+    record.cursor = flow_path(&app.questions, &record.answers).len();
     crate::draft::save(&app.store, &mut record).await.unwrap();
 
     let (code, page) = answer(&app, &gmid_get(&format!("apply/{TOKEN}/1"), "")).await;
@@ -1307,7 +1325,7 @@ async fn a_complete_capsule_draft_files_the_application() {
         .collect();
     let mut record = crate::draft::Draft::new(TOKEN.to_string());
     record.answers = answers;
-    record.cursor = capsule_path(&app.questions, &record.answers).len();
+    record.cursor = flow_path(&app.questions, &record.answers).len();
     crate::draft::save(&app.store, &mut record).await.unwrap();
 
     let (code, page) = answer(&app, &gmid_get(&format!("apply/{TOKEN}/1"), "")).await;

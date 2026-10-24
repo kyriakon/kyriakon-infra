@@ -6,11 +6,12 @@
 //! therefore lines over its own socket, because the portal has no network reach
 //! but this one and the socket's group is what lets the account connect at all.
 //!
-//! The protocol is a request line and a reply line, both bounded, and a filed
-//! application adds one line of JSON between them because a key does not fit a
-//! line the token and a stage fit. It carries no answer and no address but the
-//! one the portal took from `SSH_CONNECTION`, which the handler uses as the
-//! counter key and logs as the front-ends' own log line already does.
+//! The protocol is a request line and a reply line, both bounded. A status read
+//! carries no answer. A filed application adds one line of JSON between them,
+//! because a key does not fit a line the way a token and a stage do, and that
+//! line is the answers. Either request carries no address but the one the portal
+//! took from `SSH_CONNECTION`, which the handler uses as the counter key and logs
+//! as the front-ends' own log line already does.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -160,6 +161,14 @@ pub fn file(
 ) -> Result<String, String> {
     let body =
         serde_json::to_string(form).map_err(|e| format!("cannot encode the application: {e}"))?;
+    // The handler reads one line and rejects it past this bound, so refuse here
+    // where the reader can be told, rather than after a whole session's answers.
+    if body.len() >= MAX_BODY {
+        return Err(format!(
+            "the application is too large to send ({} bytes, the limit is {MAX_BODY}); shorten an answer",
+            body.len()
+        ));
+    }
     let stream = connect(socket, "file service")?;
     let mut request = file_request(address);
     request.push_str(&body);
@@ -208,6 +217,13 @@ mod tests {
             "ERR one two\n",
             "a reply is one line"
         );
+    }
+
+    #[test]
+    fn an_application_over_the_body_bound_is_refused_before_it_is_sent() {
+        let form = BTreeMap::from([("anything_else".to_string(), "x".repeat(MAX_BODY))]);
+        let why = file(Path::new("/nonexistent/portal.sock"), None, &form).unwrap_err();
+        assert!(why.contains("too large"), "{why}");
     }
 
     #[test]

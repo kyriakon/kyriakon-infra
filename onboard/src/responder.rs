@@ -72,7 +72,7 @@ const OWN_ORIGIN: &str = "https://signup.kyriakon.net";
 /// for one byte of content) and beside the free-text answers. A quarter of a
 /// megabyte is comfortable for that and bounds a form post well under what the
 /// front-ends will carry.
-const MAX_BODY: usize = 256 * 1024;
+const MAX_BODY: usize = portal_ipc::MAX_BODY;
 
 /// What a token the store does not answer for reads as. One constant, because an
 /// unknown token, an expired one and a spent one are the same bytes: that is the
@@ -334,13 +334,29 @@ async fn portal_connection(stream: UnixStream, app: &App) -> Result<(), String> 
     };
     if let Some(address) = portal_ipc::parse_file_request(&line) {
         let address = address.to_string();
-        let body = portal_line(&mut reader, portal_ipc::MAX_BODY)
-            .await?
-            .ok_or("the portal closed before sending the application")?;
+        let body = match portal_line(&mut reader, portal_ipc::MAX_BODY).await {
+            Ok(Some(body)) => body,
+            Ok(None) => return Err("the portal closed before sending the application".to_string()),
+            // Answer rather than just closing: the portal can tell the reader
+            // what happened at the end of a long session.
+            Err(e) => {
+                let reply = portal_ipc::file_answer(None, &e);
+                writer
+                    .write_all(reply.as_bytes())
+                    .await
+                    .map_err(|e| format!("cannot write the portal answer: {e}"))?;
+                return writer
+                    .flush()
+                    .await
+                    .map_err(|e| format!("cannot flush the portal answer: {e}"));
+            }
+        };
         let reply = portal_file(app, &address, &body).await;
         // The route and the address are the log line every front-end gets; the
-        // answers and the token never are.
-        eprintln!("kyriakon-onboard: portal /apply 200 {address}");
+        // answers and the token never are. The code a refusal gets is not 200,
+        // because a count of filed applications reads this line.
+        let code = if reply.starts_with("OK ") { 200 } else { 422 };
+        eprintln!("kyriakon-onboard: portal /apply {code} {address}");
         writer
             .write_all(reply.as_bytes())
             .await
@@ -749,7 +765,7 @@ async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) -> Reply {
             return Reply::gemini(40, "Temporary failure", String::new());
         }
     };
-    let path = capsule_path(&app.questions, &record.answers);
+    let path = flow_path(&app.questions, &record.answers);
     if record.cursor >= path.len() {
         return capsule_file(app, &record).await;
     }
@@ -786,7 +802,7 @@ async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) -> Reply {
         Kind::YesNo | Kind::Acceptance => value.to_ascii_lowercase(),
         _ => value,
     };
-    if let Some(why) = capsule_problem(page, &value, &app.reserved, q.required, &record.answers) {
+    if let Some(why) = flow_problem(page, &value, &app.reserved, q.required, &record.answers) {
         return Reply::gemini(
             10,
             &capsule_meta(page, index, path.len(), token, Some(&why)),
@@ -825,7 +841,7 @@ async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) -> Reply {
         }
     }
 
-    let next = capsule_path(&app.questions, &record.answers);
+    let next = flow_path(&app.questions, &record.answers);
     if record.cursor >= next.len() {
         return capsule_file(app, &record).await;
     }
@@ -857,7 +873,7 @@ pub(crate) struct Mailbox {
 /// `whose` answer selects, the blessing only once `orders` says monastic, and
 /// one mail-key page per mailbox. The capsule and the terminal both walk it, so
 /// the counter and the branches cannot disagree between the two.
-pub(crate) fn capsule_path<'a>(
+pub(crate) fn flow_path<'a>(
     list: &'a [Question],
     answers: &BTreeMap<String, String>,
 ) -> Vec<Page<'a>> {
@@ -935,7 +951,7 @@ fn capsule_value(raw: &str) -> String {
 /// the web form's; the type's own shape is added where the shared rules are
 /// silent, because a yes/no page that accepted "maybe" would store a value the
 /// form never offers.
-pub(crate) fn capsule_problem(
+pub(crate) fn flow_problem(
     page: &Page,
     value: &str,
     reserved: &HashSet<String>,
@@ -1080,7 +1096,7 @@ async fn file_application(app: &App, record: &Record) -> Result<(), String> {
 /// one the draft carried, which is the capability the status link already holds.
 async fn capsule_file(app: &App, record: &draft::Draft) -> Reply {
     let body = record.answers.get("whose").map(String::as_str) == Some("body");
-    let answers = capsule_answers(record, body);
+    let answers = flow_answers(record, body);
     let application = match build_record(app, &answers, body, &record.token, "capsule") {
         Ok(application) => application,
         Err(e) => {
@@ -1103,7 +1119,7 @@ async fn capsule_file(app: &App, record: &draft::Draft) -> Reply {
 /// holds, pasted and mailed alike. `build_record` pairs one block per mailbox in
 /// account order, so a key the mail route filed and one pasted on the next page
 /// cannot disagree about which mailbox they serve.
-pub(crate) fn capsule_answers(record: &draft::Draft, body: bool) -> BTreeMap<String, String> {
+pub(crate) fn flow_answers(record: &draft::Draft, body: bool) -> BTreeMap<String, String> {
     let mut answers = record.answers.clone();
     let (id, mailboxes) = if body {
         ("body_mail_key", questions::account_names(&record.answers))

@@ -41,8 +41,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::catalogue::{self, Action, Protocol, Row, Service};
 use crate::portal_ipc::Answer as StatusAnswer;
-use crate::questions::{self, Branch, Kind, Question, Rule};
-use crate::responder::{capsule_answers, capsule_path, capsule_problem, Page};
+use crate::questions::{Kind, Question, Rule};
+use crate::responder::{flow_answers, flow_path, flow_problem, Page};
 use crate::store;
 use crate::{draft, keycheck};
 
@@ -387,7 +387,7 @@ pub fn run(
             // An `apply` row starts the application; every other row shows where
             // its action happens and the reader comes back to the menu. The
             // account read is [#381]'s.
-            Answer::Follow(at) if rows[at].action == Action::Apply.word() => {
+            Answer::Follow(at) if rows[at].action_kind == Action::Apply => {
                 return application(flow, mode, input, filing, out);
             }
             Answer::Follow(at) => {
@@ -573,7 +573,7 @@ fn application(
     let mut index = 0;
     paint(mode, out, APPLY_INTRO)?;
     loop {
-        let path = capsule_path(flow.questions, &draft.answers);
+        let path = flow_path(flow.questions, &draft.answers);
         if index >= path.len() {
             paint(mode, out, &confirmation(flow.questions, &draft))?;
             let Some(word) = input.word()? else {
@@ -605,14 +605,10 @@ fn application(
             }
         }
 
+        // `flow_path` already leaves the monastic pages out unless the orders
+        // answer selects that path, so the question's own column is the rule here.
         let page = &path[index];
-        let required = match page.q.branch {
-            Branch::Monastic => {
-                questions::is_monastic(draft.answers.get("orders").map(String::as_str))
-                    && page.q.required
-            }
-            _ => page.q.required,
-        };
+        let required = page.q.required;
         paint(mode, out, &prompt(page, index, path.len()))?;
         match read_answer(page, input)? {
             Entered::Gone => return Ok(Departure::Gone),
@@ -623,7 +619,7 @@ fn application(
             }
             Entered::Value(value) => {
                 if let Some(why) =
-                    capsule_problem(page, &value, flow.reserved, required, &draft.answers)
+                    flow_problem(page, &value, flow.reserved, required, &draft.answers)
                 {
                     put(out, &format!("\n{why}. Press Enter to try again.\n"))?;
                     input.word()?;
@@ -662,20 +658,25 @@ enum Entered {
     Gone,
 }
 
-/// Read one answer. A multi-line answer ends with a full stop on its own line,
-/// and a mail key ends at the armour's own end line; the upload key is one line,
-/// because that is the shape OpenSSH writes. `back` and `quit` are read only
-/// before the answer has started, so they stay typeable in a free-text answer.
+/// Read one answer. A multi-line answer, and an address list, end with a full
+/// stop on its own line; a mail key ends at the armour's own end line; the upload
+/// key is one line, because that is the shape OpenSSH writes. `back` and `quit`
+/// are read before a free-text answer starts, and on any line of a key, because
+/// neither word can appear in an armoured block and a mistaken paste otherwise
+/// has no way out.
 fn read_answer(page: &Page, input: &mut dyn Input) -> Result<Entered, String> {
     let key = page.q.kind == Kind::Key;
-    let multiline = page.q.kind == Kind::Multiline;
+    let multiline = matches!(page.q.kind, Kind::Multiline | Kind::Addresses);
     let mut lines = Vec::new();
     loop {
         let Some(word) = input.word()? else {
             return Ok(Entered::Gone);
         };
         let line = word.trim_end_matches(['\r', '\n']);
-        if lines.is_empty() {
+        if lines.is_empty() && matches!(line, "\x1b[D" | "\x1bOD") {
+            return Ok(Entered::Back);
+        }
+        if (lines.is_empty() || key) && !multiline {
             match line.trim() {
                 "back" => return Ok(Entered::Back),
                 "quit" | "q" => return Ok(Entered::Quit),
@@ -712,7 +713,10 @@ fn read_answer(page: &Page, input: &mut dyn Input) -> Result<Entered, String> {
         }
         break;
     }
-    Ok(Entered::Value(lines.join("\n")))
+    // Validation trims, so the value the branch and rail logic compares must be
+    // trimmed too: `monk ` must open the blessing and `no_charge ` must not be
+    // read as a paid rail.
+    Ok(Entered::Value(lines.join("\n").trim().to_string()))
 }
 
 /// One question, its counter, and the shape of the answer it wants. The counter
@@ -743,9 +747,10 @@ fn prompt(page: &Page, index: usize, total: usize) -> String {
         }
         Kind::YesNo => out.push_str("Answer yes or no.\n"),
         Kind::Acceptance => out.push_str("Answer yes to accept.\n"),
-        Kind::Addresses => {
-            out.push_str("One per line, as localpart: own or localpart: alias localpart.\n")
-        }
+        Kind::Addresses => out.push_str(
+            "One per line, as localpart: own or localpart: alias localpart. \
+             Finish with a single full stop on its own line.\n",
+        ),
         Kind::Key if page.mailbox.is_some() => {
             out.push_str("Paste the whole block, ending with -----END PGP PUBLIC KEY BLOCK-----.\n")
         }
@@ -774,14 +779,13 @@ fn store_answer(page: &Page, draft: &mut draft::Draft, value: String) {
             draft.answers.insert(page.q.id.clone(), value);
         }
     }
-    draft.cursor += 1;
 }
 
 /// The confirm screen: each answer once, with a key shown by fingerprint rather
 /// than by its material. Nothing has been written at this point.
 fn confirmation(questions: &[Question], draft: &draft::Draft) -> String {
     let mut out = String::from("Check your answers.\n\n");
-    for page in capsule_path(questions, &draft.answers) {
+    for page in flow_path(questions, &draft.answers) {
         let q = page.q;
         match &page.mailbox {
             Some(mailbox) => {
@@ -817,7 +821,7 @@ fn confirmation(questions: &[Question], draft: &draft::Draft) -> String {
 /// the pages in mailbox order, and the same field names the web form posts.
 fn application_form(draft: &draft::Draft) -> BTreeMap<String, String> {
     let body = draft.answers.get("whose").map(String::as_str) == Some("body");
-    capsule_answers(draft, body)
+    flow_answers(draft, body)
 }
 
 /// The token and the status address, in the words the spec fixes.
@@ -1004,7 +1008,7 @@ mod tests {
     /// The crate's own question list and the tracked reserved names, so a scripted
     /// application walks what a deployment asks.
     fn question_list() -> Vec<Question> {
-        questions::shipped().unwrap()
+        crate::questions::shipped().unwrap()
     }
 
     fn reserved_names() -> HashSet<String> {
@@ -1356,6 +1360,179 @@ mod tests {
         );
     }
 
+    /// The answers to a body's path with two mailboxes, as lines. The address
+    /// list and the account names are multi-line, so both end with a full stop.
+    fn body_lines(at: usize) -> Vec<String> {
+        let row = (at + 1).to_string();
+        [
+            "",
+            &row,
+            "theophilus",
+            "body",
+            "The Parish of Example",
+            "parish",
+            "",
+            "example.invalid",
+            "yes",
+            "secretary: own",
+            "hall: alias secretary",
+            ".",
+            "secretary",
+            "hall",
+            ".",
+            KEY_BEGIN,
+            "",
+            KEY_BODY,
+            KEY_END,
+            KEY_BEGIN,
+            "",
+            KEY_BODY,
+            KEY_END,
+            "",
+            "",
+            "",
+            "",
+            "no_charge",
+            "",
+            "layman",
+            "",
+            "",
+            "",
+            "yes",
+            "yes",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// A body with more than one mailbox can finish: the address list and the
+    /// account names are one per line, and each mailbox gets its own key page.
+    #[test]
+    fn a_body_with_two_mailboxes_files() {
+        let rows = rows(None);
+        let at = apply_row();
+        let mut script = scripts(&body_lines(at));
+        let mut files = Files::default();
+        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
+        assert_eq!(left, Departure::Quit);
+        assert!(
+            script.spent(),
+            "the session stopped before the confirm: {seen}"
+        );
+        assert_eq!(files.forms.len(), 1);
+        let form = &files.forms[0];
+        assert_eq!(
+            form.get("body_addresses").unwrap(),
+            "secretary: own\nhall: alias secretary"
+        );
+        assert_eq!(form.get("body_account_names").unwrap(), "secretary\nhall");
+        assert_eq!(
+            form.get("body_mail_key")
+                .unwrap()
+                .matches("BEGIN PGP")
+                .count(),
+            2,
+            "one key page per mailbox"
+        );
+        assert!(seen.contains("secretary@example.invalid"), "{seen}");
+        assert!(seen.contains("hall@example.invalid"), "{seen}");
+    }
+
+    /// The value stored is the trimmed value, so a stray space cannot change the
+    /// branch, the blessing or the rail.
+    #[test]
+    fn a_trailing_space_does_not_change_the_branch() {
+        let rows = rows(None);
+        let at = apply_row();
+        let row = (at + 1).to_string();
+        let mut script = scripts(
+            &[
+                "",
+                &row,
+                "theophilus",
+                "person",
+                "",
+                "",
+                KEY_BEGIN,
+                "",
+                KEY_BODY,
+                KEY_END,
+                "",
+                "no_charge",
+                "",
+                "monk ",
+                "with my elder's blessing",
+                ".",
+                "",
+                "",
+                "",
+                "yes",
+                "yes",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        );
+        let mut files = Files::default();
+        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
+        assert_eq!(left, Departure::Quit);
+        assert!(seen.contains("question 10 of 14"), "{seen}");
+        assert_eq!(files.forms.len(), 1);
+        assert_eq!(files.forms[0].get("orders").unwrap(), "monk");
+        assert_eq!(
+            files.forms[0].get("blessing").unwrap(),
+            "with my elder's blessing"
+        );
+    }
+
+    /// A mistaken paste on a key page can be left with `back`, and the session
+    /// files nothing when the reader then quits.
+    #[test]
+    fn a_key_page_can_leave_a_mistaken_paste() {
+        let rows = rows(None);
+        let at = apply_row();
+        let row = (at + 1).to_string();
+        let mut script = scripts(&[
+            "".to_string(),
+            row,
+            "theophilus".to_string(),
+            "person".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample".to_string(),
+            "back".to_string(),
+            "quit".to_string(),
+        ]);
+        let mut files = Files::default();
+        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
+        assert_eq!(left, Departure::Quit);
+        assert!(files.forms.is_empty(), "an escaped session filed");
+        assert!(script.spent());
+        assert!(
+            seen.matches("I understand that we can only reach me inside this account.")
+                .count()
+                >= 2,
+            "back did not return to the previous question: {seen}"
+        );
+    }
+
+    /// The full mode's left arrow returns to the previous question as the spec
+    /// says, even though the answer itself is read as a line.
+    #[test]
+    fn the_left_arrow_returns_to_the_previous_question() {
+        let list = question_list();
+        let page = Page {
+            q: &list[0],
+            mailbox: None,
+        };
+        let mut script = Script::lines(&["\u{1b}[D"]);
+        assert!(matches!(
+            read_answer(&page, &mut script).unwrap(),
+            Entered::Back
+        ));
+    }
+
     #[test]
     fn an_abandoned_application_files_nothing() {
         let rows = rows(None);
@@ -1390,18 +1567,18 @@ mod tests {
     #[test]
     fn the_counter_is_the_applicants_branch_and_the_blessing_is_required() {
         let list = question_list();
-        let individual = capsule_path(&list, &BTreeMap::new()).len();
+        let individual = flow_path(&list, &BTreeMap::new()).len();
 
         let mut person = BTreeMap::new();
         person.insert("orders".to_string(), "monk".to_string());
-        assert_eq!(capsule_path(&list, &person).len(), individual + 1);
+        assert_eq!(flow_path(&list, &person).len(), individual + 1);
 
         let mut body = BTreeMap::new();
         body.insert("whose".to_string(), "body".to_string());
         body.insert("body_addresses".to_string(), "secretary: own".to_string());
         body.insert("body_account_names".to_string(), "secretary".to_string());
         assert!(
-            capsule_path(&list, &body).len() > individual,
+            flow_path(&list, &body).len() > individual,
             "the body's path is not longer than the individual one"
         );
 
