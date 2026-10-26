@@ -99,10 +99,16 @@ usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
                              --rehearsal-healthchecks-url I
                              --hcloud-token J --restore-test-repository K
                              --restore-test-healthchecks-url L
-                             --postal-address M]
+                             --postal-address M
+                             [--ico-reference N --eu-representative O
+                              --eu-representative-contact P]]
 
   No arguments: install the template if /root/.kyriakon-env is absent, then
   report which values are still missing or placeholders.
+
+  The last three are optional. The site build's privacy notice needs them, and
+  refuses to render until they are set. Set them here when those decisions are
+  made.
 
   Some arguments, file present: update just those values. Everything else keeps
   what it had, comments and the PATH block included. This is how a box that is
@@ -140,6 +146,9 @@ a_hcloud=
 a_restrepo=
 a_resthc=
 a_postal=
+a_ico=
+a_rep=
+a_rep_contact=
 while [ "$#" -gt 0 ]; do
 	[ "$#" -ge 2 ] || usage
 	case "$1" in
@@ -156,13 +165,16 @@ while [ "$#" -gt 0 ]; do
 	--restore-test-repository) a_restrepo="$2" ;;
 	--restore-test-healthchecks-url) a_resthc="$2" ;;
 	--postal-address) a_postal="$2" ;;
+	--ico-reference) a_ico="$2" ;;
+	--eu-representative) a_rep="$2" ;;
+	--eu-representative-contact) a_rep_contact="$2" ;;
 	*) usage ;;
 	esac
 	shift 2
 done
 
 given=0
-for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_keyring_hc" "$a_reh" "$a_hcloud" "$a_restrepo" "$a_resthc" "$a_postal"; do
+for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_keyring_hc" "$a_reh" "$a_hcloud" "$a_restrepo" "$a_resthc" "$a_postal" "$a_ico" "$a_rep" "$a_rep_contact"; do
 	if [ -n "$v" ]; then
 		given=$((given + 1))
 	fi
@@ -228,9 +240,15 @@ if [ "$given" -gt 0 ]; then
 	esac
 	# The file expresses values as single-quoted shell words, so a value
 	# containing a quote cannot be represented in it.
-	for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_keyring_hc" "$a_reh" "$a_hcloud" "$a_restrepo" "$a_resthc" "$a_postal"; do
+	for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_keyring_hc" "$a_reh" "$a_hcloud" "$a_restrepo" "$a_resthc" "$a_postal" "$a_ico" "$a_rep" "$a_rep_contact"; do
 		case "$v" in
 		*"'"*) printf 'setup-env: a value contains a single quote, which this file cannot express\n' >&2; exit 2 ;;
+		esac
+	done
+	for v in "$a_ico" "$a_rep" "$a_rep_contact"; do
+		[ -n "$v" ] || continue
+		case "$v" in
+		REPLACE_ME*) printf 'setup-env: %s is a placeholder\n' "$v" >&2; exit 2 ;;
 		esac
 	done
 
@@ -244,7 +262,8 @@ if [ "$given" -gt 0 ]; then
 			"HEALTHCHECKS_URL=$a_hc" "KEYRING_HEALTHCHECKS_URL=$a_keyring_hc" \
 			"REHEARSAL_HEALTHCHECKS_URL=$a_reh" "HCLOUD_TOKEN=$a_hcloud" \
 			"RESTORE_TEST_REPOSITORY=$a_restrepo" "RESTORE_TEST_HEALTHCHECKS_URL=$a_resthc" \
-			"POSTAL_ADDRESS=$a_postal"; do
+			"POSTAL_ADDRESS=$a_postal" "ICO_REFERENCE=$a_ico" \
+			"EU_REPRESENTATIVE=$a_rep" "EU_REPRESENTATIVE_CONTACT=$a_rep_contact"; do
 			case "$kv" in
 			*=) continue ;;
 			esac
@@ -301,6 +320,9 @@ $kv"
 		printf "export RESTORE_TEST_REPOSITORY='%s'\n" "$a_restrepo"
 		printf "export RESTORE_TEST_HEALTHCHECKS_URL='%s'\n" "$a_resthc"
 		printf "export POSTAL_ADDRESS='%s'\n" "$a_postal"
+		if [ -n "$a_ico" ]; then printf "export ICO_REFERENCE='%s'\n" "$a_ico"; fi
+		if [ -n "$a_rep" ]; then printf "export EU_REPRESENTATIVE='%s'\n" "$a_rep"; fi
+		if [ -n "$a_rep_contact" ]; then printf "export EU_REPRESENTATIVE_CONTACT='%s'\n" "$a_rep_contact"; fi
 	} > "$tmp"
 	install -m 0600 "$tmp" "$env_dst"
 	rm -f "$tmp"
