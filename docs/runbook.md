@@ -69,13 +69,20 @@ command over them and renders the output:
 
 	ksh scripts/render-docs.sh --out <the site build's docs directory>
 
-It reads `/root/.kyriakon-env` (override with `--env <file>`), the same file the
-drain reads. `POSTAL_ADDRESS` is both the cash-by-post address and the published
-trading address, by decision (#397), so the two cannot disagree. `ICO_REFERENCE`,
-`EU_REPRESENTATIVE` and `EU_REPRESENTATIVE_CONTACT` belong to separate decisions;
-the script refuses when a document names one and the value is absent. It also
-refuses when any `REPLACE_ME` remains in an output, so a placeholder cannot reach
-the public web.
+It reads `/root/.kyriakon-env` (override with `--env <file>`). `POSTAL_ADDRESS`
+is both the cash-by-post address and the published trading address, by decision
+(#397), so the two cannot disagree: `scripts/deploy-onboard.sh` writes the same
+value into the drain's `postal_address`.
+
+`ICO_REFERENCE`, `EU_REPRESENTATIVE` and `EU_REPRESENTATIVE_CONTACT` belong to
+separate decisions. Set them with the same script when those decisions are made:
+
+	doas ksh scripts/setup-env.sh --ico-reference '...' \
+	  --eu-representative '...' --eu-representative-contact '...'
+
+The render step refuses when a document names one and the value is absent. It
+also refuses when any `REPLACE_ME` remains in an output, so a placeholder cannot
+reach the public web.
 
 Run the script from the site build rather than by hand, so a change to a document
 or to a value cannot leave the served pages stale.
