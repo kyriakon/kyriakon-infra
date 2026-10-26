@@ -1,0 +1,18 @@
+{
+  "servers": {
+    "rust-analyzer": {
+      "rootMarkers": [".git"],
+      "settings": {
+        "rust-analyzer": {
+          "linkedProjects": [
+            "onboard/Cargo.toml",
+            "kyriakon-encrypt/Cargo.toml"
+          ]
+        }
+      }
+    },
+    "terraformls": {
+      "rootMarkers": [".git"]
+    }
+  }
+}
