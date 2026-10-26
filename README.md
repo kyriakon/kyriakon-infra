@@ -42,12 +42,25 @@ CONTEXT.md            the words this project uses, and what they mean here
 ## Checking a change
 
 ```sh
-cd onboard && cargo test && cargo clippy --all-targets -- -D warnings
+# Both crates, because there is no workspace root.
+cargo fmt --manifest-path onboard/Cargo.toml --check
+cargo test --manifest-path onboard/Cargo.toml
+cargo clippy --manifest-path onboard/Cargo.toml --all-targets -- -D warnings
+
+cargo fmt --manifest-path kyriakon-encrypt/Cargo.toml --check
+cargo test --manifest-path kyriakon-encrypt/Cargo.toml
+cargo clippy --manifest-path kyriakon-encrypt/Cargo.toml --all-targets -- -D warnings
+
+# The lock file is committed, so init reads no state.
+terraform -chdir=terraform init -backend=false -input=false
+terraform -chdir=terraform fmt -check -recursive
+terraform -chdir=terraform validate
+
 ksh scripts/self-test-all.sh          # every script's --self-test, one line each
-shellcheck scripts/*.sh
+shellcheck scripts/*.sh .githooks/commit-msg .githooks/pre-commit .githooks/pre-push
 ```
 
-CI runs the same checks on the crates, the scripts and the terraform, plus `cargo fmt --check`. `scripts/check-hygiene.sh` runs on the box and reports its live state: permissions, the installed scripts against the checkout, the store's ownership, the greylist pair, and the address alerts go to.
+CI runs these checks on every pull request. `scripts/check-hygiene.sh` runs on the box and reports its live state: permissions, the installed scripts against the checkout, the store's ownership, the greylist pair, and the address alerts go to.
 
 ## Deploying
 
