@@ -41,6 +41,7 @@ async fn handler(name: &str) -> (App, PathBuf) {
         httpd_socket: String::new(),
         gemini_socket: String::new(),
         portal_socket: String::new(),
+        titan_listener: "127.0.0.1:0".to_string(),
         release: "2026-10-13 test".to_string(),
     };
     (App::load(cfg).await.unwrap(), dir)
@@ -1337,4 +1338,165 @@ async fn a_complete_capsule_draft_files_the_application() {
         .exists());
     assert_eq!(intent_files(&dir).len(), 1);
     assert!(!dir.join("drafts").join(format!("{TOKEN}.json")).exists());
+}
+
+/// One Titan exchange: the request line (and any PROXY line) and a body, put in
+/// front of the handler together. The leftover count is what the handler did not
+/// read, which is how a refusal proves it left the body alone.
+async fn titan_exchange(app: &App, head: &str, body: &[u8]) -> (u16, String, usize) {
+    let mut request = head.as_bytes().to_vec();
+    request.extend_from_slice(body);
+    let mut reader = &request[..];
+    let (reply, _address) = titan_answer(&mut reader, app, Some("203.0.113.10"))
+        .await
+        .expect("the request is readable");
+    (
+        reply.code(),
+        String::from_utf8_lossy(&reply.head()).into_owned(),
+        reader.len(),
+    )
+}
+
+#[tokio::test]
+async fn a_titan_upload_naming_no_live_draft_is_refused_before_the_body() {
+    let (app, _dir) = handler("titan-unknown-token").await;
+    let body = b"-----BEGIN PGP PUBLIC KEY BLOCK-----\nnot read\n";
+    let head = format!(
+        "titan://signup.kyriakon.net:1966/key;size={};token={TOKEN}\r\n",
+        body.len()
+    );
+    let (code, reply, leftover) = titan_exchange(&app, &head, body).await;
+    assert_eq!(code, 51, "{reply}");
+    assert_eq!(
+        leftover,
+        body.len(),
+        "the body is left on the stream: {reply}"
+    );
+}
+
+#[tokio::test]
+async fn a_titan_upload_over_the_cap_is_refused_before_the_body() {
+    let (app, _dir) = handler("titan-over-cap").await;
+    let mut record = crate::draft::Draft::new(TOKEN.to_string());
+    record
+        .answers
+        .insert("whose".to_string(), "person".to_string());
+    record
+        .answers
+        .insert("username".to_string(), "secretary".to_string());
+    crate::draft::save(&app.store, &mut record).await.unwrap();
+
+    let body = b"not read";
+    let head = format!(
+        "titan://signup.kyriakon.net:1966/key;size={};token={TOKEN}\r\n",
+        MAX_TITAN_BODY + 1
+    );
+    let (code, reply, leftover) = titan_exchange(&app, &head, body).await;
+    assert_eq!(code, 59, "{reply}");
+    assert_eq!(
+        leftover,
+        body.len(),
+        "the body is left on the stream: {reply}"
+    );
+}
+
+#[tokio::test]
+async fn a_titan_upload_files_the_key_and_the_mail_verdict() {
+    let (app, dir) = handler("titan-files").await;
+    let mut record = crate::draft::Draft::new(TOKEN.to_string());
+    record
+        .answers
+        .insert("whose".to_string(), "person".to_string());
+    record
+        .answers
+        .insert("username".to_string(), "secretary".to_string());
+    crate::draft::save(&app.store, &mut record).await.unwrap();
+
+    let body = GOOD_KEY.as_bytes();
+    let head = format!(
+        "titan://signup.kyriakon.net:1966/key;size={};mime=application/pgp-keys;token={TOKEN}\r\n",
+        body.len()
+    );
+    let (code, reply, leftover) = titan_exchange(&app, &head, body).await;
+    assert_eq!(code, 20, "{reply}");
+    assert_eq!(leftover, 0, "the whole body is read: {reply}");
+
+    let draft = read_draft(&dir, TOKEN);
+    assert_eq!(draft.mail_keys.len(), 1);
+    let filed = &draft.mail_keys[0];
+    let expected = crate::keycheck::mail_key("secretary".to_string(), GOOD_KEY);
+    assert_eq!(filed.mailbox, "secretary");
+    assert_eq!(filed.material, expected.material);
+    assert_eq!(filed.fingerprint, expected.fingerprint);
+    assert_eq!(
+        filed.verdict, expected.verdict,
+        "the Titan route records the verdict the mail route records"
+    );
+}
+
+#[tokio::test]
+async fn a_second_titan_upload_is_refused_and_the_first_key_stays() {
+    let (app, dir) = handler("titan-second").await;
+    let mut record = crate::draft::Draft::new(TOKEN.to_string());
+    record
+        .answers
+        .insert("whose".to_string(), "person".to_string());
+    record
+        .answers
+        .insert("username".to_string(), "secretary".to_string());
+    crate::draft::save(&app.store, &mut record).await.unwrap();
+
+    let body = GOOD_KEY.as_bytes();
+    let head = format!(
+        "titan://signup.kyriakon.net:1966/key;size={};token={TOKEN}\r\n",
+        body.len()
+    );
+    let (code, reply, _) = titan_exchange(&app, &head, body).await;
+    assert_eq!(code, 20, "{reply}");
+    let first = read_draft(&dir, TOKEN);
+    assert_eq!(first.mail_keys.len(), 1);
+    let fingerprint = first.mail_keys[0].fingerprint.clone();
+
+    let (code, reply, leftover) = titan_exchange(&app, &head, body).await;
+    assert_eq!(code, 59, "{reply}");
+    assert_eq!(
+        leftover,
+        body.len(),
+        "the second body is left on the stream: {reply}"
+    );
+    let after = read_draft(&dir, TOKEN);
+    assert_eq!(
+        after.mail_keys.len(),
+        1,
+        "the second upload does not add a key"
+    );
+    assert_eq!(after.mail_keys[0].fingerprint, fingerprint);
+}
+
+#[tokio::test]
+async fn a_titan_request_reads_the_proxy_line_and_the_request_line() {
+    let (app, _dir) = handler("titan-proxy").await;
+    let mut record = crate::draft::Draft::new(TOKEN.to_string());
+    record
+        .answers
+        .insert("whose".to_string(), "person".to_string());
+    record
+        .answers
+        .insert("username".to_string(), "secretary".to_string());
+    crate::draft::save(&app.store, &mut record).await.unwrap();
+
+    let body = GOOD_KEY.as_bytes();
+    let head = format!(
+        "PROXY TCP4 198.51.100.7 192.0.2.1 34567 7081\r\n\
+         titan://signup.kyriakon.net:1966/key;size={};token={TOKEN}\r\n",
+        body.len()
+    );
+    let (code, reply, leftover) = titan_exchange(&app, &head, body).await;
+    assert_eq!(code, 20, "{reply}");
+    assert_eq!(leftover, 0);
+    assert_eq!(
+        proxy_address("PROXY TCP4 198.51.100.7 192.0.2.1 34567 7081"),
+        Some("198.51.100.7".to_string())
+    );
+    assert_eq!(proxy_address("PROXY UNKNOWN\r"), None);
 }

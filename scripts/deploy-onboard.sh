@@ -286,9 +286,11 @@ socket_path() {
 httpd_socket_path=$(socket_path httpd_socket)
 gemini_socket_path=$(socket_path gemini_socket)
 portal_socket_path=$(socket_path portal_socket)
+titan_listener=$(socket_path titan_listener)
 [ -n "$httpd_socket_path" ] || die "/etc/onboard/onboard.toml names no httpd_socket"
 [ -n "$gemini_socket_path" ] || die "/etc/onboard/onboard.toml names no gemini_socket"
 [ -n "$portal_socket_path" ] || die "/etc/onboard/onboard.toml names no portal_socket"
+[ -n "$titan_listener" ] || die "/etc/onboard/onboard.toml names no titan_listener"
 
 # The three socket directories. httpd's and gmid's are inside the chroot the two
 # front-ends share; the portal's is the on-disk path its unchrooted program
@@ -339,8 +341,23 @@ for pair in "httpd:$httpd_socket_path" "gemini:$gemini_socket_path" "portal:$por
 	printf '%s: %s\n' "$front" "$path"
 done
 
+# The Titan listener is a TCP socket on loopback, so it has no file to stat. Its
+# address is the commented relayd forward target, and relayd is the only thing
+# that reaches it from off the box. A process that came up without binding it is
+# a service whose upload route is missing, and this is the check that says so.
+titan_port=${titan_listener##*:}
+case "$titan_port" in
+"" | *[!0-9]*)
+	die "/etc/onboard/onboard.toml has no port in titan_listener: '$titan_listener'"
+	;;
+esac
+netstat -na -f inet | awk -v p=".$titan_port" '$4 ~ (p "$") { found = 1 } END { exit !found }' \
+	|| die "nothing is listening on titan_listener $titan_listener: is kyriakon_onboard running?"
+printf 'titan: %s\n' "$titan_listener"
+
 printf '\ninstalled. the responder answers %s, %s and %s, and no other local user may connect.\n' \
 	"$httpd_socket_path" "$gemini_socket_path" "$portal_socket_path"
+printf 'the Titan upload listener is on %s behind the commented relayd block.\n' "$titan_listener"
 printf 'httpd and gmid reach it from their own configs, which their own deploys install.\n'
 printf 'relayd terminates TLS for signup.kyriakon.net and sets the forwarded address\n'
 printf 'the counters key on.\n'

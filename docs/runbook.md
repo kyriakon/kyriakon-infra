@@ -27,6 +27,12 @@ The web half of that configuration now ends behind `scripts/deploy-relayd.sh`, w
 
 		doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-relayd.sh
 
+### The Titan upload port
+
+The Titan upload listener has a public port of its own because gmid holds 1965 and cannot pass a Titan request to the handler. `scripts/pf-apply.sh` proposes the inbound rule for it when `TITAN_PORT` is set in `/root/.kyriakon-env`; `scripts/setup-env.sh` records that value, and the tracked template carries 1966. The handler's own listener is loopback only and is the forward target in `openbsd/etc/relayd.conf`.
+
+Both changes are propose-only. The relayd listener block stays commented in the tracked file, and `pf-apply.sh` only prints the candidate diff until an operator runs it without `--check`. No agent runs the firewall step or turns the relay on. A run with no `TITAN_PORT`, or with the matching rule already present, changes nothing.
+
 Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box without changing anything. It reports permission drift against mtree, the blocklist verdict for the box's address, whether a cron job can still reach the tools it needs, whether the finger service is intact, whether the deployed catalogue matches the tracked one, whether the terraform guard and the restore snapshot are still in place, and whether the two files naming the mail domains agree. It exits non-zero when something is wrong.
 
 ## Deploy a merged change

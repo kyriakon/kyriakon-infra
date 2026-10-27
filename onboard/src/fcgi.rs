@@ -305,7 +305,11 @@ impl Reply {
     /// line is not optional for either front-end: httpd reads headers until it,
     /// and gmid reads its reply header as the first CRLF-terminated line, so
     /// without it a gemini client would be shown the rest of the headers.
-    fn head(&self) -> Vec<u8> {
+    ///
+    /// The Titan listener writes this straight to its socket: there is no front-end
+    /// between the handler and the client there, so gemini's framing is the wire
+    /// format.
+    pub(crate) fn head(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
             Reply::Http {

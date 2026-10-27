@@ -39,8 +39,9 @@ check_only=no
 
 case "${1:-}" in
 --check) check_only=yes ;;
+--self-test) self_test_mode=yes ;;
 "") ;;
-*) printf 'usage: doas ksh %s [--check]\n' "$0" >&2; exit 2 ;;
+*) printf 'usage: doas ksh %s [--check | --self-test]\n' "$0" >&2; exit 2 ;;
 esac
 
 die() {
@@ -54,7 +55,89 @@ die() {
 # marker is the stable key. The one fragment that cannot use this alone is
 # greylisting, whose rules a stock pf.conf already carries without our marker; its
 # test adds the effect as well, and says why there.
-has_block() { grep -q "^# --- kyriakon: $1" "$pf_conf"; }
+has_block_in() { grep -q "^# --- kyriakon: $2" "$1"; }
+has_block() { has_block_in "$pf_conf" "$1"; }
+
+# The port a fragment already carries, read from its rule line. A marker-only
+# test cannot tell a block for this port from one for the port it was proposed
+# with last month, and a firewall rule on the wrong port is not a no-op.
+block_port() {
+	awk -v marker="# --- kyriakon: $2" '
+		index($0, marker) == 1 { inside = 1; next }
+		inside && /^# --- end kyriakon: / { exit }
+		inside && match($0, /port [0-9]+/) {
+			print substr($0, RSTART + 5, RLENGTH - 5)
+			exit
+		}' "$1"
+}
+
+# One value from the box's values file, or the empty string. Sourced in a
+# subshell so a file that errors cannot end this run, which is the same reason
+# the onboarding TUI's read below disables errexit for its own read.
+env_value() {
+	if [ -r "$env_file" ]; then
+		# shellcheck disable=SC1090 # root's own env file, whose path resolves at runtime
+		( set +e; . "$env_file" 2>/dev/null; eval "printf '%s' \"\${$1:-}\"" )
+	fi
+}
+
+# The Titan fragment's rule. The public port is the relay's, not the handler's:
+# relayd terminates TLS on it and forwards to the loopback listener with PROXY
+# protocol v1, so the handler keeps seeing the client's address.
+append_titan() {
+	# $1 candidate file, $2 public port. Returns 1 when the marker is already
+	# there, so the caller can leave the file byte-identical.
+	if has_block_in "$1" "titan upload"; then
+		return 1
+	fi
+	cat >>"$1" <<EOF
+
+# --- kyriakon: titan upload (openbsd/etc/relayd.conf) ---
+pass in log on egress proto tcp to any port $2
+# --- end kyriakon: titan upload ---
+EOF
+}
+
+self_test() {
+	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+	. "$(dirname "$0")/lib.sh"
+	typeset tree first second env
+	self_test_begin
+	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
+	tree=$self_test_work
+	first="$tree/pf.conf"
+	: > "$first"
+
+	# The fragment reads its port from the values file, beside the onboarding
+	# TUI's, and a box with no TITAN_PORT is skipped rather than guessed at.
+	env="$tree/kyriakon.env"
+	printf "export TITAN_PORT='1966'\n" > "$env"
+	env_file=$env
+	check "the values file is read" "$(env_value TITAN_PORT)" "1966"
+	env_file="$tree/missing"
+	check "a missing values file is empty" "$(env_value TITAN_PORT)" ""
+
+	# The quiet path: the first run writes the block, and the second finds its
+	# own marker and leaves the file byte-identical.
+	append_titan "$first" 1966
+	check "the fragment carries the port" "$(grep -c 'to any port 1966' "$first")" "1"
+	check "the marker is present" "$(has_block_in "$first" 'titan upload' && printf yes)" "yes"
+	before=$(cksum "$first")
+	if append_titan "$first" 1966; then
+		second=added
+	else
+		second=quiet
+	fi
+	check "a second run changes nothing" "$second" "quiet"
+	check "and the file is byte-identical" "$(cksum "$first")" "$before"
+	check "the block's port is readable" "$(block_port "$first" 'titan upload')" "1966"
+
+	self_test_end
+}
+
+if [ "${self_test_mode:-no}" = yes ]; then
+	self_test
+fi
 
 [ "$(id -u)" -eq 0 ] || die "run this with doas: it writes ${pf_conf}"
 [ -f "$pf_conf" ] || die "no ${pf_conf}"
@@ -264,6 +347,46 @@ pass in log on egress proto tcp to any port ${tui_port} keep state (max-src-conn
 EOF
 	added=$((added + 1))
 	printf 'onboard TUI:  to be added on port %s\n' "$tui_port"
+fi
+
+# --- titan upload -----------------------------------------------------------
+# The Titan listener is the one public port the handler needs of its own. gmid
+# holds 1965 and a Titan request cannot reach a FastCGI front-end, so relayd
+# terminates TLS for it and forwards to the handler on loopback. This opens the
+# public port only; the relayd block stays commented in the repository until the
+# operator turns it on, and no agent applies either change. The port is read from
+# TITAN_PORT in the values file, the way the onboarding TUI's is, and a box with
+# none is skipped with a note rather than stopping every other fragment.
+titan_port=$(env_value TITAN_PORT)
+case "$titan_port" in
+"")
+	;;
+*[!0-9]*)
+	die "TITAN_PORT in ${env_file} is not a port number: '${titan_port}'"
+	;;
+*)
+	if [ "$titan_port" -lt 1 ] || [ "$titan_port" -gt 65535 ]; then
+		die "TITAN_PORT in ${env_file} is outside 1-65535: '${titan_port}'"
+	fi
+	;;
+esac
+
+if [ -z "$titan_port" ]; then
+	printf 'titan upload: skipped, no TITAN_PORT in %s\n' "$env_file"
+elif has_block 'titan upload'; then
+	existing=$(block_port "$pf_conf" 'titan upload')
+	if [ "$existing" = "$titan_port" ]; then
+		# Nothing changes, so say nothing: a quiet run is one the operator can
+		# ignore, and the port is already the one the values file names.
+		:
+	else
+		printf 'titan upload: %s already opens port %s, not TITAN_PORT %s; leaving it and the rest of the run alone\n' \
+			"$pf_conf" "${existing:-unknown}" "$titan_port" >&2
+	fi
+else
+	append_titan "$work" "$titan_port"
+	added=$((added + 1))
+	printf 'titan upload: to be added on port %s\n' "$titan_port"
 fi
 
 # --- finger -----------------------------------------------------------------
