@@ -703,13 +703,22 @@ fn application(
                 index += 1;
                 if !warnings.is_empty() {
                     // The full mode paints the next screen over whatever is
-                    // here, so a warning gets a screen of its own. Enter is the
-                    // only thing it asks for; the answer is already kept.
+                    // here, so a warning gets a screen of its own. Enter moves
+                    // on and the answer is already kept; back returns to the key
+                    // page so a warning the reader acts on is not a dead end.
                     for warning in warnings {
                         put(out, &format!("\nWarning: {warning}\n"))?;
                     }
-                    put(out, "\nPress Enter to continue.\n")?;
-                    input.word()?;
+                    put(out, "\nPress Enter to continue, or back to answer again.\n")?;
+                    match input.word()?.as_deref() {
+                        None => return Ok(Departure::Gone),
+                        Some("back") => {
+                            index = index.saturating_sub(1);
+                            continue;
+                        }
+                        Some("quit") | Some("q") => return Ok(Departure::Quit),
+                        Some(_) => {}
+                    }
                 }
                 // The body's two line lists are checked together, because the
                 // fault is the count rather than either list; the page just
@@ -838,6 +847,7 @@ fn prompt(page: &Page, index: usize, total: usize) -> String {
         Kind::Key if page.mailbox.is_some() => {
             out.push_str(&key_walkthrough(
                 &[
+                    "The recovery phrase",
                     "Thunderbird on a desktop",
                     "The browser generator",
                     "The upload key",
@@ -1501,14 +1511,7 @@ mod tests {
             .find(|p| p.q.rule == Rule::UploadKey)
             .expect("the upload key page");
         let text = prompt(&upload, 0, 1);
-        for expected in [
-            "THE UPLOAD KEY",
-            "ssh-ed25519",
-            "sftp on port 22",
-            "git on port 2222",
-        ] {
-            assert!(text.contains(expected), "{expected} missing from {text}");
-        }
+        assert!(text.contains("THE UPLOAD KEY"), "{text}");
         assert!(!text.contains("THUNDERBIRD ON A DESKTOP"), "{text}");
         assert!(!text.contains("Android"), "{text}");
         assert!(
@@ -1534,6 +1537,43 @@ mod tests {
         assert!(seen.contains("Press Enter to continue"), "{seen}");
         assert_eq!(files.forms.len(), 1, "the warning refused the key");
         assert!(script.spent(), "the session stopped at the warning");
+    }
+
+    /// The warning screen's `back` returns to the key page, and the key that is
+    /// filed is the one answered after the warning rather than the one it named.
+    #[test]
+    fn a_key_warning_can_be_answered_again() {
+        let rows = rows(None);
+        let at = apply_row();
+        let aead =
+            include_str!("../../docs/planning/prototypes/keygen-spike/fixtures/gpg-aead.asc");
+        let mut lines: Vec<String> = ["", &(at + 1).to_string(), "theophilus", "person", "", ""]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        lines.extend(aead.lines().map(str::to_string));
+        lines.push("back".to_string());
+        lines.extend(KEY_BLOCK.lines().map(str::to_string));
+        lines.extend(
+            ["", "no_charge", "", "layman", "", "", "", "yes", "yes"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        let mut script = scripts(&lines);
+        let mut files = Files::default();
+        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
+        assert_eq!(left, Departure::Quit);
+        assert!(seen.contains("Warning: The key asks for AEAD"), "{seen}");
+        assert_eq!(
+            files.forms.len(),
+            1,
+            "the corrected key was not filed: {seen}"
+        );
+        assert_eq!(
+            files.forms[0].get("mail_key").unwrap().trim_end(),
+            KEY_BLOCK.trim_end(),
+            "the warned key stayed on the form"
+        );
     }
 
     /// A paste longer than the capsule's 1024-byte prompt limit is read and

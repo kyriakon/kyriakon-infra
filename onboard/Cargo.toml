@@ -55,4 +55,4 @@ ulid = "1"
 # terminal and the browser return the same verdict by construction rather than
 # from two copies of the rules. A path dependency because the crate is still
 # the prototype the release takes over.
-keygen-spike = { path = "../docs/planning/prototypes/keygen-spike" }
+keygen-spike = { path = "../docs/planning/prototypes/keygen-spike", default-features = false }

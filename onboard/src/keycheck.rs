@@ -29,7 +29,8 @@ const END: &str = "-----END PGP PUBLIC KEY BLOCK-----";
 
 #[derive(Debug)]
 pub struct Checked {
-    /// "works", or the one structural warning worth recording.
+    /// "works" when the shared check finds nothing, or its findings joined with
+    /// "; " when one or more trips.
     pub verdict: String,
 }
 

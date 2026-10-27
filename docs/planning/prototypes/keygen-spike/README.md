@@ -18,7 +18,7 @@ the private key is written by the page itself.
 ## Building it
 
 ```
-cargo build --target wasm32-unknown-unknown --release --lib
+cargo build --target wasm32-unknown-unknown --release --lib --features wasm
 wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/keygen_spike.wasm
 python3 -m http.server 8899 --bind 127.0.0.1
 ```

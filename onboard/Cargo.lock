@@ -894,9 +894,6 @@ name = "keygen-spike"
 version = "0.1.0"
 dependencies = [
  "pgp",
- "rand 0.8.8",
- "smallvec",
- "wasm-bindgen",
 ]
 
 [[package]]

@@ -13,26 +13,37 @@
 //
 // Still a spike. No error types worth the name, no tests beyond the self-check below.
 
+use pgp::composed::{Deserializable, SignedPublicKey};
+#[cfg(feature = "generate")]
 use pgp::composed::{
-    Deserializable, EncryptionCaps, KeyType, SecretKeyParamsBuilder, SignedPublicKey,
-    SignedSecretKey, SubkeyParamsBuilder,
+    EncryptionCaps, KeyType, SecretKeyParamsBuilder, SignedSecretKey, SubkeyParamsBuilder,
 };
+#[cfg(feature = "generate")]
 use pgp::crypto::ecc_curve::ECCCurve;
+#[cfg(feature = "generate")]
 use pgp::crypto::hash::HashAlgorithm;
+#[cfg(feature = "generate")]
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::SubpacketData;
-use pgp::types::{CompressionAlgorithm, KeyDetails, KeyVersion};
+use pgp::types::KeyDetails;
+#[cfg(feature = "generate")]
+use pgp::types::{CompressionAlgorithm, KeyVersion};
+#[cfg(feature = "generate")]
 use rand::thread_rng;
+#[cfg(feature = "generate")]
 use smallvec::smallvec;
 
+#[cfg(feature = "generate")]
 pub const DEFAULT_USER_ID: &str = "Spike Member <spike@example.invalid>";
 
+#[cfg(feature = "generate")]
 pub struct Generated {
     pub fingerprint: String,
     pub public_armor: String,
     pub secret_armor: String,
 }
 
+#[cfg(feature = "generate")]
 pub fn generate_key(
     variant: &str,
     user_id: &str,
@@ -257,6 +268,7 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
 }
 
 /// Minimal JSON string escaping, so the browser exports need no serializer dependency.
+#[cfg(feature = "generate")]
 fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 16);
     for c in s.chars() {
@@ -273,6 +285,7 @@ fn esc(s: &str) -> String {
     out
 }
 
+#[cfg(feature = "generate")]
 fn findings_json(findings: &[String]) -> String {
     let items: Vec<String> = findings.iter().map(|f| format!("\"{}\"", esc(f))).collect();
     format!(
@@ -284,7 +297,7 @@ fn findings_json(findings: &[String]) -> String {
 
 /// Exports for the page. wasm-bindgen returns a string rather than a class so the JavaScript
 /// side is one `JSON.parse` and the module stays free of serializer dependencies.
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 mod wasm {
     use super::*;
     use wasm_bindgen::prelude::*;
@@ -319,6 +332,7 @@ mod wasm {
 /// One runnable check, so a broken preference list or a dropped condition fails loudly
 /// rather than shipping a key no client can read. `cargo test` on this crate runs it, and
 /// `--self-check` runs it without a test harness.
+#[cfg(feature = "generate")]
 pub fn self_check() -> Result<(), String> {
     let g = generate_key("ed25519", DEFAULT_USER_ID, Some("not-a-secret"))?;
     if g.fingerprint.len() != 40 {
@@ -344,7 +358,7 @@ pub fn self_check() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "generate"))]
 mod tests {
     #[test]
     fn self_check_passes() {

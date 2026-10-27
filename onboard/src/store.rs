@@ -227,7 +227,8 @@ pub struct KeyRecord {
     pub material: String,
     /// What the check found: "works" when the shared inspection returns
     /// nothing, its findings joined when one or more trips, and "unchecked"
-    /// when the block does not parse. Never a value the client sends.
+    /// when there is no PGP block to inspect: an upload key, or a mail key the
+    /// check cannot frame. Never a value the client sends.
     pub verdict: String,
 }
 
