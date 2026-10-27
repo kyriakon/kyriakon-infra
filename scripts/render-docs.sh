@@ -16,12 +16,24 @@
 # scripts/setup-env.sh --ico-reference and --eu-representative, and the script
 # reads them from the same file. It refuses rather than publish a placeholder.
 #
+# The key walkthrough is the fourth source, docs/key-walkthrough.md. It is not a
+# governance document, so the site build's --out does not receive it; the gemtext
+# mode does, because the capsule has to serve the walkthrough as a page rather
+# than link a browser page a gemini client cannot open.
+#
 # Usage:
 #   ksh scripts/render-docs.sh --out DIR [--env FILE]
+#   ksh scripts/render-docs.sh --gemini DIR [--env FILE]
 #        ksh scripts/render-docs.sh --self-test
 #
 # --out receives terms.md, privacy.md and aup.md. It is the site build's input,
 # not HTML: presentation belongs to the site build, which is kyriakon-site #3.
+#
+# --gemini receives terms.gmi, privacy.gmi, aup.gmi and key-walkthrough.gmi, the
+# four pages the capsule mirrors. The converter handles what these documents
+# use, and refuses the constructs it does not, so a sentence added with a table
+# image or a fenced block fails the deploy rather than reaching a reader as
+# half-converted text.
 #
 # Refuses, and writes nothing, when a value the documents need is absent or still
 # a placeholder, or when any REPLACE_ME remains in an output. A placeholder must
@@ -33,8 +45,8 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 repo_dir=$(cd "$script_dir/.." && pwd)
 
 usage() {
-	printf 'usage: ksh %s --out DIR [--env FILE]\n       ksh %s --self-test\n' \
-		"$0" "$0" >&2
+	printf 'usage: ksh %s --out DIR [--env FILE]\n       ksh %s --gemini DIR [--env FILE]\n       ksh %s --self-test\n' \
+		"$0" "$0" "$0" >&2
 	exit 2
 }
 
@@ -78,19 +90,13 @@ render_one() {
 	[ -z "$remaining" ] || die "$dst still carries a placeholder:$remaining"
 }
 
-# render_all <docs dir> <out dir> — the live path and the self-test's entry point.
-# Values are required only when the documents name them, so a page without a
-# placeholder does not demand a value it never uses.
-render_all() {
-	docs=$1
-	out=$2
-	terms="$docs/terms.md"
-	privacy="$docs/privacy.md"
-	aup="$docs/aup.md"
-	for f in "$terms" "$privacy" "$aup"; do
-		[ -r "$f" ] || die "cannot read $f"
-	done
-
+# require_values <terms> <privacy> — the values the pages name, required only when
+# they name them, so a page without a placeholder does not demand a value it
+# never uses. Shared by the web and gemtext modes so the two cannot publish the
+# same document under different refusal rules.
+require_values() {
+	terms=$1
+	privacy=$2
 	if grep -q REPLACE_ME_TRADING_ADDRESS "$terms" "$privacy"; then
 		case "${POSTAL_ADDRESS:-}" in
 		'')
@@ -122,6 +128,20 @@ render_all() {
 			;;
 		esac
 	fi
+}
+
+# render_all <docs dir> <out dir> — the live path and the self-test's entry point.
+render_all() {
+	docs=$1
+	out=$2
+	terms="$docs/terms.md"
+	privacy="$docs/privacy.md"
+	aup="$docs/aup.md"
+	for f in "$terms" "$privacy" "$aup"; do
+		[ -r "$f" ] || die "cannot read $f"
+	done
+
+	require_values "$terms" "$privacy"
 
 	mkdir -p "$out" || die "cannot create $out"
 	# A mistaken --out pointing at the source would put the operator's address into
@@ -150,6 +170,141 @@ render_all() {
 		mv "$stage/aup.md" "$out/aup.md" || exit 1
 	) || exit 1
 	printf 'rendered terms.md, privacy.md and aup.md to %s\n' "$out"
+}
+
+# gemini_one <src.md> <dst.gmi> — the conservative markdown to gemtext converter.
+#
+# It handles the constructs these documents use: headings of one to three
+# levels, paragraphs, unordered lists, ordered lists as plain text, block quotes,
+# pipe tables and inline code or emphasis. Everything else is refused, because
+# half-converted markdown reaches a reader as literal asterisks, and a page that
+# fails stops the deploy instead.
+gemini_one() {
+	src=$1
+	dst=$2
+	awk '
+		function refuse(why) {
+			printf "%s:%d: %s\n", FILENAME, FNR, why > "/dev/stderr"
+			exit 1
+		}
+		function inline(s) {
+			gsub(/`/, "", s)
+			gsub(/\*\*/, "", s)
+			gsub(/\*/, "", s)
+			return s
+		}
+		{
+			if ($0 ~ /\]\(/ || $0 ~ /!\[/) refuse("a markdown link or image")
+			if ($0 ~ /^[ \t]*(```|~~~)/) refuse("a fenced code block")
+			if ($0 ~ /^ {4,}/ || $0 ~ /^\t/) refuse("an indented block")
+			if ($0 ~ /^[ \t]+[-*+][ \t]+/) refuse("a nested list")
+			if ($0 ~ /^[ \t]+[0-9]+[.)][ \t]+/) refuse("a nested ordered list")
+			if ($0 ~ /^[ \t]*\[[^]]+\]:/) refuse("a link definition")
+			if ($0 ~ /^[ \t]*([-*_][ \t]*){3,}$/) refuse("a horizontal rule")
+			if ($0 ~ /^[ \t]*=+[ \t]*$/) refuse("a setext heading")
+			if ($0 ~ /^[ \t]*[-*+] \[[ xX]\]/) refuse("a task list")
+			if ($0 ~ /^[ \t]*<[a-zA-Z\/!]/) refuse("raw html")
+		}
+		/^[ \t]*$/ { print ""; next }
+		/^#+[ \t]/ {
+			line = $0
+			match(line, /^#+/)
+			level = RLENGTH
+			rest = substr(line, RLENGTH + 1)
+			sub(/^[ \t]+/, "", rest)
+			sub(/[ \t]+#+[ \t]*$/, "", rest)
+			if (level > 3) level = 3
+			print substr("###", 1, level) " " inline(rest)
+			next
+		}
+		/^[ \t]*\|/ {
+			line = $0
+			sub(/^[ \t]*\|/, "", line)
+			sub(/[ \t]*\|[ \t]*$/, "", line)
+			n = split(line, cells, "[|]")
+			separator = 1
+			for (i = 1; i <= n; i++) {
+				c = cells[i]
+				gsub(/^[ \t]+|[ \t]+$/, "", c)
+				if (c !~ /^:?-+:?$/) separator = 0
+			}
+			if (separator) next
+			out = ""
+			for (i = 1; i <= n; i++) {
+				c = cells[i]
+				gsub(/^[ \t]+|[ \t]+$/, "", c)
+				if (i > 1) out = out " | "
+				out = out inline(c)
+			}
+			print out
+			next
+		}
+		/^>[ \t]?/ {
+			line = $0
+			sub(/^>[ \t]?/, "", line)
+			line = inline(line)
+			sub(/[ \t]+$/, "", line)
+			if (line == "") print ">"
+			else print "> " line
+			next
+		}
+		/^[-*+][ \t]+/ {
+			line = $0
+			sub(/^[-*+][ \t]+/, "", line)
+			print "* " inline(line)
+			next
+		}
+		/^[0-9]+[.)][ \t]+/ {
+			print inline($0)
+			next
+		}
+		{ print inline($0) }
+	' "$src" > "$dst" || die "cannot convert $src to gemtext: a construct it does not handle"
+}
+
+# gemini_all <docs dir> <out dir> — the capsule's four mirrored pages. It uses
+# the same substitution and the same refusals as the web mode, then converts,
+# so the two published forms cannot disagree about a value or a placeholder.
+gemini_all() {
+	docs=$1
+	out=$2
+	terms="$docs/terms.md"
+	privacy="$docs/privacy.md"
+	aup="$docs/aup.md"
+	walkthrough="$docs/key-walkthrough.md"
+	for f in "$terms" "$privacy" "$aup" "$walkthrough"; do
+		[ -r "$f" ] || die "cannot read $f"
+	done
+
+	require_values "$terms" "$privacy"
+
+	mkdir -p "$out" || die "cannot create $out"
+	out_abs=$(cd -P "$out" && pwd)
+	docs_abs=$(cd -P "$docs" && pwd)
+	[ "$out_abs" != "$docs_abs" ] \
+		|| die "refusing to write into the tracked source directory $docs; name the capsule's page directory"
+
+	(
+		stage=$(mktemp -d "$out/.render.XXXXXX") || exit 1
+		trap 'rm -rf "$stage"' EXIT
+		for pair in "terms.md:$terms" "privacy.md:$privacy" "aup.md:$aup" \
+			"key-walkthrough.md:$walkthrough"; do
+			name=${pair%%:*}
+			src=${pair#*:}
+			render_one "$src" "$stage/$name" || exit 1
+		done
+		gemini_one "$stage/terms.md" "$stage/terms.gmi" || exit 1
+		gemini_one "$stage/privacy.md" "$stage/privacy.gmi" || exit 1
+		gemini_one "$stage/aup.md" "$stage/aup.gmi" || exit 1
+		gemini_one "$stage/key-walkthrough.md" "$stage/key-walkthrough.gmi" || exit 1
+		chmod 0644 "$stage/terms.gmi" "$stage/privacy.gmi" "$stage/aup.gmi" \
+			"$stage/key-walkthrough.gmi" || exit 1
+		mv "$stage/terms.gmi" "$out/terms.gmi" || exit 1
+		mv "$stage/privacy.gmi" "$out/privacy.gmi" || exit 1
+		mv "$stage/aup.gmi" "$out/aup.gmi" || exit 1
+		mv "$stage/key-walkthrough.gmi" "$out/key-walkthrough.gmi" || exit 1
+	) || exit 1
+	printf 'rendered terms.gmi, privacy.gmi, aup.gmi and key-walkthrough.gmi to %s\n' "$out"
 }
 
 self_test() {
@@ -192,8 +347,59 @@ self_test() {
 		"$(cmp -s "$repo_dir/docs/aup.md" "$work/out/aup.md" && printf yes)" yes
 	check 'the tracked terms still carry the placeholder' \
 		"$(grep -q -F 'REPLACE_ME_TRADING_ADDRESS' "$repo_dir/docs/terms.md" && printf yes)" yes
-	check 'the tracked privacy still carries the placeholder' \
+	check 'the tracked privacy still carry the placeholder' \
 		"$(grep -q -F 'REPLACE_ME_TRADING_ADDRESS' "$repo_dir/docs/privacy.md" && printf yes)" yes
+
+	# The capsule's four gemtext pages, from the same sources and values.
+	gemini_all "$repo_dir/docs" "$work/gemini" >/dev/null
+
+	for page in terms.gmi privacy.gmi aup.gmi key-walkthrough.gmi; do
+		check "the gemtext mode writes $page" \
+			"$(test -s "$work/gemini/$page" && printf yes || printf no)" yes
+	done
+	check 'the gemtext terms page keeps its first heading' \
+		"$(grep -q -F '# Terms of service' "$work/gemini/terms.gmi" && printf yes)" yes
+	check 'the gemtext terms page keeps its second heading' \
+		"$(grep -q -F '## Who you are dealing with' "$work/gemini/terms.gmi" && printf yes)" yes
+	check 'a table becomes text rows' \
+		"$(grep -q -F 'Individual | £20 a year |' "$work/gemini/terms.gmi" && printf yes)" yes
+	check 'an unordered list becomes a gemtext list' \
+		"$(grep -q -F '* your express request' "$work/gemini/terms.gmi" && printf yes)" yes
+	check 'an ordered list stays readable text' \
+		"$(grep -q -F '1. Detect.' "$work/gemini/aup.gmi" && printf yes)" yes
+	check 'a block quote becomes a gemtext quote' \
+		"$(grep -q -F '> To Oliver Brotchie' "$work/gemini/terms.gmi" && printf yes)" yes
+	check 'inline emphasis and code are stripped' \
+		"$(if grep -q -e '\*\*' -e '`' "$work/gemini/terms.gmi" "$work/gemini/aup.gmi"; then printf yes; else printf no; fi)" no
+	check 'no placeholder survives in the gemtext pages' \
+		"$(if grep -q 'REPLACE_ME' "$work/gemini/terms.gmi" "$work/gemini/privacy.gmi"; then printf yes; else printf no; fi)" no
+	check 'the walkthrough names Thunderbird on a desktop' \
+		"$(grep -q -F 'Thunderbird on a desktop' "$work/gemini/key-walkthrough.gmi" && printf yes)" yes
+	check 'the walkthrough names sftp on 22' \
+		"$(grep -q -F 'sftp on port 22' "$work/gemini/key-walkthrough.gmi" && printf yes)" yes
+	check 'the walkthrough names git on 2222' \
+		"$(grep -q -F 'git on port 2222' "$work/gemini/key-walkthrough.gmi" && printf yes)" yes
+	check 'no mirrored page claims encryption at rest or end-to-end' \
+		"$(if grep -E -qi 'encrypted at rest|end-to-end' "$work/gemini"/*.gmi; then printf yes; else printf no; fi)" no
+	check 'the terms page states the zero-access metadata limit' \
+		"$(grep -q -F 'addressing information' "$work/gemini/terms.gmi" && printf yes)" yes
+	check 'the privacy page states the zero-access metadata limit' \
+		"$(grep -E -q 'metadata|addressing information' "$work/gemini/privacy.gmi" && printf yes)" yes
+
+	# A construct the converter does not handle stops the render rather than
+	# reaching a reader as literal markdown.
+	mkdir -p "$work/bad-docs"
+	cp "$repo_dir/docs/terms.md" "$repo_dir/docs/privacy.md" "$repo_dir/docs/aup.md" \
+		"$repo_dir/docs/key-walkthrough.md" "$work/bad-docs/"
+	printf '\n![a diagram](https://example.invalid/diagram.png)\n' >>"$work/bad-docs/terms.md"
+	if ( gemini_all "$work/bad-docs" "$work/bad-out" ) >/dev/null 2>&1; then
+		got=yes
+	else
+		got=no
+	fi
+	check 'an unsupported markdown construct is refused' "$got" no
+	check 'a refused conversion writes no page' \
+		"$(find "$work/bad-out" -type f 2>/dev/null | wc -l | tr -d ' ')" 0
 
 	# No address: fail, and do not leave a partial output directory behind.
 	if ( POSTAL_ADDRESS=; render_all "$repo_dir/docs" "$work/no-address" ) >/dev/null 2>&1; then
@@ -293,6 +499,14 @@ EOF
 	check 'the CLI renders with --env' "$got" yes
 	check 'the CLI wrote the terms page' \
 		"$(grep -q -F "$cli_address" "$work/cli/terms.md" && printf yes)" yes
+	if ksh "$0" --gemini "$work/cli-gemini" --env "$work/cli-env" >/dev/null 2>&1; then
+		got=yes
+	else
+		got=no
+	fi
+	check 'the CLI renders gemtext with --gemini' "$got" yes
+	check 'the gemtext CLI wrote the walkthrough page' \
+		"$(test -s "$work/cli-gemini/key-walkthrough.gmi" && printf yes || printf no)" yes
 	if ksh "$0" >/dev/null 2>&1; then got=yes; else got=no; fi
 	check 'a missing --out is refused' "$got" no
 	if ksh "$0" --bogus >/dev/null 2>&1; then got=yes; else got=no; fi
@@ -314,6 +528,7 @@ EOF
 }
 
 out=''
+gemini_out=''
 env_override=''
 env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
 while [ "$#" -gt 0 ]; do
@@ -321,6 +536,11 @@ while [ "$#" -gt 0 ]; do
 	--out)
 		[ "$#" -ge 2 ] || usage
 		out=$2
+		shift 2
+		;;
+	--gemini)
+		[ "$#" -ge 2 ] || usage
+		gemini_out=$2
 		shift 2
 		;;
 	--env)
@@ -337,7 +557,10 @@ while [ "$#" -gt 0 ]; do
 	esac
 done
 
-[ -n "$out" ] || usage
+[ -n "$out" ] || [ -n "$gemini_out" ] || usage
+if [ -n "$out" ] && [ -n "$gemini_out" ]; then
+	usage
+fi
 
 if [ -n "$env_override" ]; then
 	[ -r "$env_override" ] || die "cannot read $env_override"
@@ -348,4 +571,8 @@ fi
 # shellcheck disable=SC1090 # the operator's own file, whose path resolves at runtime
 . "$env_file"
 
-render_all "$repo_dir/docs" "$out"
+if [ -n "$out" ]; then
+	render_all "$repo_dir/docs" "$out"
+else
+	gemini_all "$repo_dir/docs" "$gemini_out"
+fi

@@ -78,7 +78,8 @@ onboard_user='_onboard'
 # half-copied checkout fails here rather than after the store has been written.
 for f in onboard/Cargo.toml openbsd/etc/onboard/onboard.toml openbsd/etc/onboard/drain.toml \
 	onboard/questions.toml \
-	openbsd/etc/rc.d/kyriakon_onboard scripts/onboard-store.sh reserved-usernames.txt; do
+	openbsd/etc/rc.d/kyriakon_onboard scripts/onboard-store.sh scripts/render-docs.sh \
+	docs/key-walkthrough.md reserved-usernames.txt; do
 	[ -e "$repo_dir/$f" ] || die "missing from $repo_dir: $f"
 done
 for s in $drain_scripts; do
@@ -211,6 +212,22 @@ awk -v want="postal_address = \"$POSTAL_ADDRESS\"" '$0 == want { found = 1 } END
 	|| die "/etc/kyriakon/onboard/drain.toml does not name the postal address; it should have been substituted, not left as a placeholder"
 mv "$drain_candidate" /etc/kyriakon/onboard/drain.toml
 printf 'release: %s\n' "$release"
+
+# The capsule's mirrored pages: the terms, the acceptable use policy, the privacy
+# notice and the key walkthrough, rendered to gemtext from the same tracked
+# sources the site publishes and staged where the installed config says the
+# handler reads them. The renderer refuses a placeholder and an unsupported
+# markdown construct, so a page that would reach a reader half-converted stops
+# this deploy instead. The path comes from the config rather than being repeated
+# here, for the reason that file gives for naming it at all.
+say "pages"
+pages_dir=$(awk -F'"' '/^pages[[:space:]]*=/ { print $2; exit }' /etc/onboard/onboard.toml)
+[ -n "$pages_dir" ] || die "/etc/onboard/onboard.toml names no pages directory"
+install -d -m 0755 -o root -g wheel "$pages_dir"
+ksh "$repo_dir/scripts/render-docs.sh" --gemini "$pages_dir" --env "$env_file"
+for page in terms.gmi aup.gmi privacy.gmi key-walkthrough.gmi; do
+	[ -s "$pages_dir/$page" ] || die "$pages_dir/$page was not rendered"
+done
 
 # The approval key, generated once and never by a later deploy: a second run must
 # not invalidate links a previous run has already signed. Replacing it is the

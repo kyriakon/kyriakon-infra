@@ -99,6 +99,10 @@ struct App {
     /// the config names, and empty only if that file held no `[[service]]` at all,
     /// which `App::load` refuses.
     catalogue: Vec<catalogue::Service>,
+    /// The mirrored gemtext pages, keyed by the route that serves them. Read once
+    /// at startup from the directory the config names, so a page change is a
+    /// deploy and a restart rather than a request that reads a file.
+    pages: BTreeMap<String, String>,
     reserved: HashSet<String>,
     counter: rate::Counter,
     store: Store,
@@ -121,12 +125,26 @@ impl App {
         if services.is_empty() {
             return Err(format!("{} has no services", catalogue::TRACKED));
         }
+        // The mirrored pages are read the same way and refused the same way: a
+        // handler that came up without them would answer 51 for the pages the
+        // ticket says it serves, which is the failure the named directory exists
+        // to prevent.
+        let mut pages = BTreeMap::new();
+        for (route, file) in capsule::PAGES {
+            let path = format!("{}/{}", cfg.pages.trim_end_matches('/'), file);
+            let text = Store::read_text(&path).await?;
+            if text.trim().is_empty() {
+                return Err(format!("{path} is empty"));
+            }
+            pages.insert((*route).to_string(), text);
+        }
         let reserved = validate::reserved(&Store::read_text(&cfg.reserved).await?);
         Ok(App {
             store: Store::new(&cfg.store_root),
             cfg,
             questions: list,
             catalogue: services,
+            pages,
             reserved,
             counter: rate::Counter::new(),
         })
@@ -701,7 +719,19 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
         return Reply::gemini(20, "text/gemini", capsule::status(&page));
     }
     if incoming.path.is_empty() {
-        return Reply::gemini(20, "text/gemini", capsule::gemtext(&app.catalogue, None));
+        return Reply::gemini(20, "text/gemini", capsule::front_page(&app.catalogue, None));
+    }
+    // The mirrored pages are literals, not paths: the route is a key in the map
+    // the handler read at startup, so no request can name a file to read.
+    if let Some(text) = app.pages.get(&incoming.path) {
+        return Reply::gemini(20, "text/gemini", text.clone());
+    }
+    if incoming.path == capsule::ACCEPTANCES {
+        return Reply::gemini(
+            20,
+            "text/gemini",
+            capsule::acceptances(&app.questions, &app.cfg.release),
+        );
     }
     Reply::gemini(51, "Not found", String::new())
 }
@@ -1043,6 +1073,12 @@ fn capsule_meta(
                 out.push_str(" Leave a single full stop to skip.");
             }
         }
+    }
+    // A gemini prompt has no body, so META is the only place a key page can name
+    // the walkthrough. The upload key is a key page here as much as the mail key
+    // is: the hosting is key-based, so it is a step rather than an extra.
+    if q.kind == Kind::Key {
+        out.push_str(&format!(" How to make one: gemini://{HOST}/keys"));
     }
     if matches!(
         q.kind,
@@ -1669,10 +1705,10 @@ fn build_record(
         upload_key,
         rail: rail.clone(),
         no_charge: rail == "no_charge",
-        acceptances: ["terms", "aup", "privacy"]
+        acceptances: capsule::ACCEPTED
             .iter()
-            .map(|d| Acceptance {
-                document: (*d).to_string(),
+            .map(|(document, _)| Acceptance {
+                document: (*document).to_string(),
                 version: app.cfg.release.clone(),
             })
             .collect(),

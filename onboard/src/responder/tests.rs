@@ -22,8 +22,17 @@ const TOKEN: &str = "abcdefghjkmnpqrstvwxyz0123";
 async fn handler(name: &str) -> (App, PathBuf) {
     let dir = std::env::temp_dir().join(format!("onboard-responder-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    for sub in ["applications", "intents"] {
+    for sub in ["applications", "intents", "pages"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    // The deploy stages these from `scripts/render-docs.sh --gemini`; the
+    // fixture writes one file per route so the startup read sees the same shape.
+    for (_, file) in capsule::PAGES {
+        std::fs::write(
+            dir.join("pages").join(file),
+            format!("# {file}\n\nA mirrored page.\n"),
+        )
+        .unwrap();
     }
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let cfg = config::Config {
@@ -38,6 +47,7 @@ async fn handler(name: &str) -> (App, PathBuf) {
             .to_str()
             .unwrap()
             .to_string(),
+        pages: dir.join("pages").to_str().unwrap().to_string(),
         httpd_socket: String::new(),
         gemini_socket: String::new(),
         portal_socket: String::new(),
@@ -274,6 +284,63 @@ async fn gmid_asks_for_the_capsule_and_gets_the_catalogue() {
     assert!(
         body.contains("=> gemini://mail.kyriakon.net/ Mail: zero-access mail"),
         "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_capsule_serves_each_mirrored_page_as_gemtext() {
+    let (app, _dir) = handler("gmid-pages").await;
+    for (route, file) in capsule::PAGES {
+        let (code, body) = answer(&app, &gmid_get(route, "")).await;
+        assert_eq!(code, 20, "{route} answers with a page: {body}");
+        assert!(body.starts_with("20 text/gemini\r\n"), "{body}");
+        assert!(
+            body.contains(&format!("# {file}")),
+            "{route} serves the staged file: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_acceptances_page_carries_three_acceptances_and_the_release() {
+    let (app, _dir) = handler("gmid-acceptances").await;
+    let (code, body) = answer(&app, &gmid_get(capsule::ACCEPTANCES, "")).await;
+    assert_eq!(code, 20, "{body}");
+    assert!(body.starts_with("20 text/gemini\r\n"), "{body}");
+    for document in [
+        "I accept the terms of service.",
+        "I accept the acceptable use policy.",
+        "I accept the privacy notice.",
+    ] {
+        assert!(body.contains(document), "{document} is on the page: {body}");
+    }
+    assert_eq!(
+        body.matches("* I accept ").count(),
+        3,
+        "one acceptance per document: {body}"
+    );
+    assert!(
+        body.contains("2026-10-13 test"),
+        "the release the page was generated from: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_front_page_names_the_web_form_and_the_pages_that_stay_over_https() {
+    let (app, _dir) = handler("gmid-front").await;
+    let (code, body) = answer(&app, &gmid_get("", "")).await;
+    assert_eq!(code, 20, "{body}");
+    assert!(
+        body.contains("The web form at https://signup.kyriakon.net/ is the other way in"),
+        "the browser is named as the other way in: {body}"
+    );
+    assert!(
+        body.contains("The refusal list and the threat model stay published over HTTPS"),
+        "the two pages that are not mirrored are named: {body}"
+    );
+    assert!(
+        body.contains(&format!("=> gemini://{HOST}/keys Making a key")),
+        "the walkthrough is linked from the front page: {body}"
     );
 }
 
@@ -1168,6 +1235,10 @@ async fn a_capsule_body_key_page_names_one_mailbox_and_the_mail_route() {
     assert!(page.contains("secretary@parish.example"), "{page}");
     assert!(page.contains("apply@kyriakon.net"), "{page}");
     assert!(
+        page.contains("gemini://signup.kyriakon.net/keys"),
+        "the walkthrough is named on every key page: {page}"
+    );
+    assert!(
         page.contains(TOKEN),
         "the subject carries the draft's token: {page}"
     );
@@ -1214,6 +1285,33 @@ async fn a_capsule_person_key_page_names_their_address() {
     assert_eq!(code, 10, "{page}");
     assert!(page.contains("secretary@kyriakon.net"), "{page}");
     assert!(page.contains("apply@kyriakon.net"), "{page}");
+    assert!(
+        page.contains("gemini://signup.kyriakon.net/keys"),
+        "the walkthrough is named on every key page: {page}"
+    );
+}
+
+#[tokio::test]
+async fn a_capsule_upload_key_page_names_the_walkthrough() {
+    let (app, _dir) = handler("capsule-upload-key").await;
+    let mut record = crate::draft::Draft::new(TOKEN.to_string());
+    record
+        .answers
+        .insert("whose".to_string(), "person".to_string());
+    record
+        .answers
+        .insert("username".to_string(), "secretary".to_string());
+    let path = flow_path(&app.questions, &record.answers);
+    let index = path
+        .iter()
+        .position(|p| p.q.id == "upload_key")
+        .expect("the upload key page");
+    record.cursor = index;
+    crate::draft::save(&app.store, &mut record).await.unwrap();
+
+    let (code, page) = answer(&app, &gmid_get(&format!("apply/{TOKEN}/{}", index + 1), "")).await;
+    assert_eq!(code, 10, "{page}");
+    assert!(page.contains("gemini://signup.kyriakon.net/keys"), "{page}");
 }
 
 #[tokio::test]
