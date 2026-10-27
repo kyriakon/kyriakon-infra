@@ -87,6 +87,12 @@ reach the public web.
 Run the script from the site build rather than by hand, so a change to a document
 or to a value cannot leave the served pages stale.
 
+`scripts/deploy-onboard.sh` runs the same script with `--gemini` to stage the
+capsule's copies under the directory `/etc/onboard/onboard.toml` names, so the
+same values are required for an onboarding deploy. The deploy refuses when a
+page would carry a placeholder, and the handler refuses to start when a staged
+page is missing.
+
 ## What is not built yet
 
 These procedures name the pieces that exist at this commit, and mark the ones that do not:
