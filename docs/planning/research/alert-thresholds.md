@@ -287,7 +287,7 @@ The onboarding sshd writes a line per admitted connection on each of its ports, 
 	Accepted none for hello from <address> port <n> ssh2
 	Accepted publickey for hello from <address> port <n> ssh2: <type> SHA256:<fingerprint>
 
-`scripts/abuse-monitor.sh` counts those per source address beside the failure tally, anchored on `for hello from`. A member's own login on 22 and the operator's login name their own accounts, so neither enters this count. The count is compared against the same per-address window value as the failure tally, `AUTH_FAIL_MAX`, because this measurement is what will set that value.
+`scripts/abuse-monitor.sh` counts those per source address beside the failure tally, anchored on the `Accepted … for hello from` line. The member port also writes `Postponed publickey for hello from` for a key it tests and `Failed publickey for hello from` for one it refuses, and neither admits anyone, so the anchor is the Accepted form rather than the account. A member's own login on 22 and the operator's login name their own accounts, so neither enters this count. The count is compared against the same per-address window value as the failure tally, `AUTH_FAIL_MAX`, because this measurement is what will set that value.
 
 The number is not measured in this note. The port was not live when it was written, so 300 stays in the table above and in the monitor's default. A number recorded without the live reading would be a guess in the place the note keeps for measurements.
 
@@ -297,15 +297,17 @@ Once the port is serving, read the retained authlog on the box. Nothing here wri
 
 ```ksh
 gzip -dc /var/log/authlog.[0-6].gz | cat - /var/log/authlog |
-	awk '/for hello from/ { for (i = NF; i >= 2; i--) if ($i == "port") { print $(i-1); break } }' |
+	awk '/Accepted (none|publickey) for hello from/ { for (i = NF; i >= 2; i--) if ($i == "port") { print $(i-1); break } }' |
 	sort | uniq -c | sort -rn
 ```
 
-This is the ticket's command with the anchor the 2026-10-13 account rename requires. The line read `for onboard from` before the rename. The output gives the busiest source address and its line count over the retained window.
+This is the ticket's command with the two corrections the box requires. The 2026-10-13 account rename (`60757e0`) made `for onboard from` into `for hello from`, and the anchor is the Accepted form so a key test or a failed password against `hello` is not counted as a session. The output gives the busiest source address and its line count over the retained window.
 
 The value this note records is the busiest source's count inside one 15-minute interval, because that is the window `new_lines()` measures between runs. Take the same match and bucket it by the timestamp in the way the command in section 2b does.
 
 The number goes in three places, which must agree: the proposed value in section 2b, the ssh row of the table above, and `AUTH_FAIL_MAX` in `/root/.kyriakon-env` on the box, which the cron line sources. That value also governs the admission count's alert. The script default stays 300 until then, so a box without the override keeps the baselined value.
+
+The other figure #331 asks for is the submission count the session caps use, `DRAFTS_PER_DAY` in `onboard/src/rate.rs`. It is five today by choice, and the criterion asks that it come from the same measured baseline rather than from a guess. The command above counts admitted sessions rather than filed drafts, so record the drafts per address over the same window beside it when the measurement is taken.
 
 ## 3. Quota approach
 

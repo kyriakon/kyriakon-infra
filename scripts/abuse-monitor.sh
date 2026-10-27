@@ -79,13 +79,16 @@ fi
 . "$script_dir/lib.sh"
 
 # A storm keeps a signal true for hours, and telling the operator the same thing
-# every hour is how an alert channel stops being read. These two are the ones a
+# every hour is how an alert channel stops being read. These are the ones a
 # stranger can hold true indefinitely: a source working through a list of
-# usernames, and a spamtrap campaign. Everything else fires on a condition that
-# has to be dealt with, so the shorter default suits it.
+# usernames, one opening onboarding sessions in a loop, and a spamtrap campaign.
+# Everything else fires on a condition that has to be dealt with, so the shorter
+# default suits it.
 cooldown_for() {
 	case "$1" in
-	"ssh guesses" | "spamd blocklist") printf '%s' "${STORM_COOLDOWN_MINUTES:-360}" ;;
+	"ssh guesses" | "ssh onboard admissions" | "spamd blocklist")
+		printf '%s' "${STORM_COOLDOWN_MINUTES:-360}"
+		;;
 	*) printf '%s' "${alert_cooldown:-60}" ;;
 	esac
 }
@@ -105,11 +108,17 @@ cooldown_for() {
 # it does not also name an invalid user, which is the attempt against a real
 # account.
 #
-# admissions anchors on "for hello from", which is the account the onboarding
-# instance serves: it takes both the applicant's "Accepted none for hello from
+# admissions anchors on the "Accepted" line naming hello, which is the account
+# the onboarding instance serves: the applicant's "Accepted none for hello from
 # <address> port <n> ssh2" and the member port's "Accepted publickey for hello
-# from <address> port <n> ssh2: <type> SHA256:<fingerprint>", and neither a
-# member's own login on 22 nor the operator's, which name their own accounts.
+# from <address> port <n> ssh2: <type> SHA256:<fingerprint>". It takes neither a
+# member's own login on 22 nor the operator's, which name their own accounts,
+# and not the "Postponed publickey" or "Failed publickey" lines the member port
+# writes at VERBOSE for a key it tests or refuses: those name hello without a
+# connection being admitted, and the failure tally already counts them.
+#
+# A failed password against hello is written "Failed password for hello from"
+# and is the failure tally's line, never an admission.
 source_tally() {
 	awk -v mode="$1" '
 		{
@@ -117,7 +126,7 @@ source_tally() {
 			if (mode == "failures") {
 				keep = ($0 ~ /Invalid user/ || ($0 ~ /Failed password/ && $0 !~ /invalid user/))
 			} else if (mode == "admissions") {
-				keep = ($0 ~ /for hello from/)
+				keep = ($0 ~ /Accepted (none|publickey) for hello from/)
 			}
 			if (keep) {
 				ip = ""
@@ -251,13 +260,15 @@ self_test() {
 
 	# The cooldown two signals get for being holdable by a stranger.
 	check "a storm signal waits six hours" "$(cooldown_for "ssh guesses")" "360"
+	check "an admission flood gets the storm cooldown" "$(cooldown_for "ssh onboard admissions")" "360"
 	check "an ordinary signal waits the default hour" "$(cooldown_for "quota")" "60"
 
 	# The authlog split: the onboarding instance's two admission forms, a
-	# member's own login on 22 and the operator's, and an unknown username's
-	# usual pair of failure lines. The admission count takes the two hello
-	# admissions and nothing else; the failure tally is the pair folded to one
-	# attempt, which is what it did before the admission count existed.
+	# member's own login on 22 and the operator's, an unknown username's usual
+	# pair of failure lines, and the hello lines that are not admissions (the
+	# member port's Postponed and Failed publickey, and a failed password). The
+	# admission count takes the two Accepted hello lines and nothing else; the
+	# failure tally is the pair folded to one attempt, plus the failed password.
 	cat > "$work/authlog" <<'AUTHLOG'
 Oct 27 09:00:01 mail sshd-session[1]: Accepted none for hello from 203.0.113.9 port 40000 ssh2
 Oct 27 09:00:02 mail sshd-session[2]: Accepted publickey for hello from 203.0.113.9 port 40001 ssh2: ED25519 SHA256:aaaa
@@ -265,11 +276,14 @@ Oct 27 09:00:03 mail sshd-session[3]: Accepted publickey for oliver from 198.51.
 Oct 27 09:00:04 mail sshd-session[4]: Accepted publickey for root from 198.51.100.8 port 22 ssh2: ED25519 SHA256:cccc
 Oct 27 09:00:05 mail sshd-session[5]: Invalid user admin from 192.0.2.5 port 55555
 Oct 27 09:00:05 mail sshd-session[5]: Failed password for invalid user admin from 192.0.2.5 port 55555 ssh2
+Oct 27 09:00:06 mail sshd-session[6]: Postponed publickey for hello from 203.0.113.9 port 40002 ssh2: ED25519 SHA256:dddd
+Oct 27 09:00:07 mail sshd-session[6]: Failed publickey for hello from 203.0.113.9 port 40002 ssh2: ED25519 SHA256:eeee
+Oct 27 09:00:08 mail sshd-session[7]: Failed password for hello from 192.0.2.5 port 40003 ssh2
 AUTHLOG
-	check "the admission count takes only the hello lines" \
+	check "the admission count takes only the Accepted hello lines" \
 		"$(source_tally admissions < "$work/authlog")" "203.0.113.9 2 2"
 	check "the failure tally still counts the pair as one attempt" \
-		"$(source_tally failures < "$work/authlog")" "192.0.2.5 1 1"
+		"$(source_tally failures < "$work/authlog")" "192.0.2.5 2 2"
 
 	# A cold resolver must be retried rather than skipped past, which is the
 	# 2026-10-05 alert: the box had just rebooted, the probe gave up, the query fell
@@ -502,16 +516,8 @@ fi
 
 # sshd, tallied by source address, reporting the worst one and the total.
 #
-# One count per attempt. An attempt against an unknown username writes two lines
-# for the one event, "Invalid user X from IP port N" and "Failed password for
-# invalid user X from IP port N", and the old pattern matched both, so it
-# reported about 1.5 times the attempts: over the retained authlogs it counts
-# 217,320 lines where one line per attempt counts 142,298. The rule below takes
-# the "Invalid user" line for an unknown username, and the "Failed password"
-# line only when it does not also name an invalid user, which is the attempt
-# against a real account.
-#
-# The address is the token before the last "port", as source_tally takes it.
+# The counting rules, including one line per attempt and the address taken from
+# before the last "port", are in source_tally above.
 #
 # A failed attempt against a real account leaves no line at all now: with
 # PasswordAuthentication no, sshd writes "Connection closed by authenticating
@@ -527,30 +533,31 @@ fi
 # it is kept at the baselined value rather than re-derived from eight quiet
 # days. An address threshold cannot see a swarm, which is why the total is
 # printed beside it and why the note leaves the total as the swarm signal.
-ssh_auth=$(printf '%s\n' "$new_authlog" | source_tally failures)
-ssh_ip=$(printf '%s\n' "$ssh_auth" | awk '{ print $1 }')
-ssh_high=$(printf '%s\n' "$ssh_auth" | awk '{ print $2+0 }')
-ssh_total=$(printf '%s\n' "$ssh_auth" | awk '{ print $3+0 }')
+# shellcheck disable=SC2046 # the tally is three space-separated fields by contract
+set -- $(printf '%s\n' "$new_authlog" | source_tally failures)
+ssh_ip=$1 ssh_high=${2:-0} ssh_total=${3:-0}
 if [ "$ssh_high" -gt "$auth_fail_max" ]; then
 	alert ssh "guesses" "$ssh_ip made $ssh_high failed ssh attempts since last run, out of $ssh_total from all addresses (max per address $auth_fail_max). Password auth is off everywhere, so none of this can succeed; it is worth a look only because one source is working through a list"
 fi
 
 # The onboarding listener's admissions, counted beside the failures and from the
-# same window. Both of its lines name the account hello, which is what keeps a
+# same window. Both admitted forms name the account hello, which is what keeps a
 # member's own login on 22 and the operator's out of the count; the applicant's
 # is "Accepted none for hello from", the member port's "Accepted publickey for
-# hello from". It counts connections rather than applications, and the TUI's own
-# session caps are what bound what a source can do with them.
+# hello from". The member port's "Postponed publickey" and "Failed publickey"
+# lines also name hello and are not admissions, which is why the anchor is the
+# Accepted line rather than the account. It counts connections rather than
+# applications, and the TUI's own session caps are what bound what a source can
+# do with them.
 #
 # It is compared against the same per-address value as the failures because that
 # is the number the note re-measures from these very lines once the second
 # listener is live (docs/planning/research/alert-thresholds.md). Until that
 # reading exists the value is the 300 the note records as pending, and no
 # separate admission threshold is invented.
-onboard_adm=$(printf '%s\n' "$new_authlog" | source_tally admissions)
-onboard_ip=$(printf '%s\n' "$onboard_adm" | awk '{ print $1 }')
-onboard_high=$(printf '%s\n' "$onboard_adm" | awk '{ print $2+0 }')
-onboard_total=$(printf '%s\n' "$onboard_adm" | awk '{ print $3+0 }')
+# shellcheck disable=SC2046 # the tally is three space-separated fields by contract
+set -- $(printf '%s\n' "$new_authlog" | source_tally admissions)
+onboard_ip=$1 onboard_high=${2:-0} onboard_total=${3:-0}
 if [ "$onboard_high" -gt "$auth_fail_max" ]; then
 	alert ssh "onboard admissions" "$onboard_ip opened $onboard_high onboarding sessions since last run, out of $onboard_total from all addresses (max per address $auth_fail_max). The applicant port asks for no credential, so a source this busy is a script rather than a person; the TUI's session caps are what stop it filing, and this count is what says they are being reached"
 fi
