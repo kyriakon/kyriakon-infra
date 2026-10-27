@@ -1,14 +1,43 @@
-//! The capsule's rendering: the shared catalogue, the status page, and the
+//! The capsule's pages as gemtext: the catalogue and its links, the mirrored
+//! documents the deploy stages, the acceptances page, the status page, and the
 //! member's reading half.
 //!
-//! The catalogue is one line per entry with the name and the clause in the link
-//! label, because that is the only place a gemtext link carries text. The
-//! account page is a read and nothing else; a certificate that matched no pin
-//! gets the same page as a stranger, carrying only its own fingerprint.
+//! A page is plain text and link lines. A claim that needs its limit stated
+//! carries that sentence in the body, because a link label has no room for it.
+//! The account page is a read and nothing else; a certificate that matched no
+//! pin gets the same page as a stranger, carrying only its own fingerprint.
 
 use crate::catalogue::{self, Protocol, Row, Service};
 use crate::page::StatusPage;
+use crate::questions::{Kind, Question};
+use crate::responder::HOST;
 use crate::store::{Account, Certificate, Notice};
+
+/// The mirrored pages the deploy stages as gemtext, as the route name, the file
+/// `scripts/render-docs.sh --gemini` writes, and the link label the front page
+/// gives it. One table because the route, the file and the label must name the
+/// same page: adding one here is what makes the renderer stage it and the front
+/// page link it.
+pub const PAGES: &[(&str, &str, &str)] = &[
+    ("terms", "terms.gmi", "Terms of service"),
+    ("aup", "aup.gmi", "Acceptable use policy"),
+    ("privacy", "privacy.gmi", "Privacy notice"),
+    ("keys", "key-walkthrough.gmi", "Making a key"),
+];
+
+/// The route the acceptances page answers on. It is not a staged file: the page
+/// is generated from the question list and the release the handler carries.
+pub const ACCEPTANCES: &str = "acceptances";
+
+/// The three documents the one acceptance question covers, in the order the
+/// record stores them. One checkbox, three acceptances: each document is
+/// accepted in its own name, and the page says so rather than carrying one
+/// sentence that names all three and no separate acceptance of each.
+pub const ACCEPTED: [(&str, &str); 3] = [
+    ("terms", "the terms of service"),
+    ("aup", "the acceptable use policy"),
+    ("privacy", "the privacy notice"),
+];
 
 /// The entries as rows, one per service. Here as well as in the gemtext page so
 /// the check can compare what this front-end shows before it is formatted, which
@@ -35,6 +64,75 @@ pub fn gemtext(list: &[Service], member: Option<&str>) -> String {
             out.push_str(sentence);
             out.push('\n');
         }
+    }
+    out
+}
+
+/// The capsule's front page: what this is, the catalogue it lists, and the
+/// documents and keys it carries. It names the web form as the other way in,
+/// because a gemini client cannot open the form, and says where the two pages
+/// the capsule does not mirror stay, so a reader is not left thinking the
+/// refusal list and the threat model are missing rather than published
+/// elsewhere.
+pub fn front_page(list: &[Service], member: Option<&str>) -> String {
+    let mut out = String::from(
+        "# Kyriakon\n\n\
+         This capsule is one of the ways in. The web form at https://signup.kyriakon.net/ \
+         is the other way in today if you would rather use a browser, and an ssh terminal \
+         follows.\n\n\
+         The refusal list and the threat model stay published over HTTPS, because they are \
+         pages for a browser:\n\n",
+    );
+    out.push_str(
+        "=> https://signup.kyriakon.net/ The web form\n\
+         => https://kyriakon.net/ The main site, where both are published\n\n\
+         ## What the platform offers\n\n",
+    );
+    out.push_str(&gemtext(list, member));
+    // The catalogue summary claims zero-access, so the limit travels with it
+    // here, the way the terms and privacy notice state it: a reader who takes
+    // only this page must not read the claim without it.
+    out.push_str(
+        "\nThat zero-access covers the content of your mail, not the addressing \
+         information it needs to move: sender, recipient, timestamp and size \
+         appear in the server's logs and in the outer message wrapper.\n",
+    );
+    out.push_str("\n## The documents and the keys\n\n");
+    for (route, _, label) in PAGES {
+        out.push_str(&format!("=> gemini://{HOST}/{route} {label}\n"));
+    }
+    out.push_str(&format!(
+        "=> gemini://{HOST}/{ACCEPTANCES} What you accept\n"
+    ));
+    out
+}
+
+/// The acceptances page: the three documents and the release they were
+/// generated from. The acceptance wording comes from the question list, so the
+/// page and the form ask the same question, and the three documents are listed
+/// in the order the application record stores them.
+pub fn acceptances(list: &[Question], release: &str) -> String {
+    let mut out = String::from("# What you accept\n\n");
+    out.push_str(
+        "When you apply, you accept three documents on one checkbox. A person reads every \
+         application, and the version of each document you accepted is recorded by date and \
+         short commit.\n\n",
+    );
+    for q in list.iter().filter(|q| q.kind == Kind::Acceptance) {
+        out.push_str(&q.prompt);
+        out.push('\n');
+    }
+    out.push('\n');
+    for (_, label) in ACCEPTED {
+        out.push_str(&format!("* I accept {label}.\n"));
+    }
+    out.push_str(&format!("\nVersion: {release}\n\n"));
+    for (route, _) in ACCEPTED {
+        let (_, _, label) = PAGES
+            .iter()
+            .find(|(r, _, _)| *r == route)
+            .unwrap_or_else(|| panic!("{route} is accepted but not a staged page"));
+        out.push_str(&format!("=> gemini://{HOST}/{route} {label}\n"));
     }
     out
 }
@@ -181,6 +279,134 @@ fn date(at: &str) -> &str {
 mod tests {
     use super::*;
     use crate::page::StatusPage;
+
+    #[test]
+    fn the_front_page_names_the_web_form_and_the_pages_that_stay_https() {
+        let list = catalogue::parse(include_str!("../../openbsd/etc/onboard/catalogue.toml"))
+            .expect("the tracked catalogue parses");
+        let text = front_page(&list, None);
+        assert!(
+            text.contains("The web form at https://signup.kyriakon.net/ is the other way in"),
+            "{text}"
+        );
+        assert!(
+            text.contains("The refusal list and the threat model stay published over HTTPS"),
+            "{text}"
+        );
+        assert!(
+            text.contains("not the addressing information it needs to move"),
+            "the front page states the zero-access limit beside the catalogue's claim: {text}"
+        );
+        for route in ["terms", "aup", "privacy", "keys", ACCEPTANCES] {
+            assert!(
+                text.contains(&format!("=> gemini://{HOST}/{route} ")),
+                "{route} is linked from the front page: {text}"
+            );
+        }
+        assert!(
+            text.contains("=> gemini://mail.kyriakon.net/ Mail:"),
+            "{text}"
+        );
+    }
+
+    /// The one table links every staged page and stages every accepted
+    /// document, so a page added there cannot ship without a link, and an
+    /// acceptance cannot name a page that is not served.
+    #[test]
+    fn every_staged_page_is_linked_and_every_accepted_document_is_staged() {
+        let list = catalogue::parse(include_str!("../../openbsd/etc/onboard/catalogue.toml"))
+            .expect("the tracked catalogue parses");
+        let front = front_page(&list, None);
+        for (route, _, label) in PAGES {
+            assert!(
+                front.contains(&format!("=> gemini://{HOST}/{route} {label}")),
+                "{route} is linked from the front page as {label}: {front}"
+            );
+        }
+        let mine = crate::questions::shipped().expect("the shipped question list parses");
+        let accepted = acceptances(&mine, "2026-10-13 test");
+        for (route, _) in ACCEPTED {
+            assert!(
+                PAGES.iter().any(|(r, _, _)| *r == route),
+                "{route} is accepted but not a staged page"
+            );
+            assert!(
+                accepted.contains(&format!("=> gemini://{HOST}/{route} ")),
+                "{route} is linked from the acceptances page"
+            );
+        }
+    }
+
+    #[test]
+    fn the_acceptances_page_carries_three_documents_and_the_release() {
+        let list = crate::questions::shipped().expect("the shipped question list parses");
+        let text = acceptances(&list, "2026-10-13 test");
+        for label in [
+            "the terms of service",
+            "the acceptable use policy",
+            "the privacy notice",
+        ] {
+            assert!(
+                text.contains(&format!("* I accept {label}.")),
+                "{label} is accepted in its own name: {text}"
+            );
+        }
+        assert_eq!(text.matches("* I accept ").count(), 3, "{text}");
+        assert!(text.contains("Version: 2026-10-13 test"), "{text}");
+    }
+
+    /// The mirror may not carry a claim the resistance decision refuses. The
+    /// sources are read from the tracked files, so a sentence added to one of
+    /// them is caught here rather than only by a reader.
+    #[test]
+    fn the_mirrored_sources_make_no_refused_claim() {
+        let sources = [
+            ("terms", include_str!("../../docs/terms.md")),
+            ("aup", include_str!("../../docs/aup.md")),
+            ("privacy", include_str!("../../docs/privacy.md")),
+            (
+                "key walkthrough",
+                include_str!("../../docs/key-walkthrough.md"),
+            ),
+        ];
+        for (name, text) in sources {
+            let lower = text.to_lowercase();
+            for claim in [
+                "encrypted at rest",
+                "end-to-end",
+                "forward secrecy",
+                "no logs",
+                "warrant canary",
+            ] {
+                assert!(!lower.contains(claim), "{name} claims {claim}");
+            }
+        }
+    }
+
+    /// Where a source claims zero-access mail, it states the metadata limit in
+    /// the same document. Every mirrored document is in this list, so the one
+    /// mirror CI runs cannot carry the claim alone.
+    #[test]
+    fn every_zero_access_claim_states_the_metadata_limit() {
+        let sources = [
+            ("terms", include_str!("../../docs/terms.md")),
+            ("aup", include_str!("../../docs/aup.md")),
+            ("privacy", include_str!("../../docs/privacy.md")),
+            (
+                "key walkthrough",
+                include_str!("../../docs/key-walkthrough.md"),
+            ),
+        ];
+        for (name, text) in sources {
+            let lower = text.to_lowercase();
+            if lower.contains("zero-access") {
+                assert!(
+                    lower.contains("metadata") || lower.contains("addressing information"),
+                    "{name} claims zero-access without the metadata limit"
+                );
+            }
+        }
+    }
 
     #[test]
     fn the_capsule_filed_page_links_the_status() {

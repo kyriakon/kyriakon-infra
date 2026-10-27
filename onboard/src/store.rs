@@ -238,9 +238,9 @@ impl Store {
     }
 }
 
-/// A key as the store carries it: the fingerprint the walkthrough computed in
-/// the browser beside the material it was computed over, and the structural
-/// verdict this handler reached without hashing anything.
+/// A key as the store carries it: the fingerprint computed here over the
+/// material it names, and the verdict the shared key check reached from that
+/// material rather than from anything the client sends.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KeyRecord {
     /// The mailbox an upload key belongs to, or the mailbox a mail key serves.
@@ -255,7 +255,10 @@ pub struct KeyRecord {
     pub fingerprint: String,
     /// The armoured key as submitted.
     pub material: String,
-    /// What the structural check here found: "works" or "no encryption subkey".
+    /// What the check found: "works" when the shared inspection returns
+    /// nothing, its findings joined when one or more trips, and "unchecked"
+    /// when there is no PGP block to inspect: an upload key, or a mail key the
+    /// check cannot frame. Never a value the client sends.
     pub verdict: String,
 }
 

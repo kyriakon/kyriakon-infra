@@ -49,6 +49,14 @@ jobs:
       # fails the check rather than scrolling past.
       - name: clippy
         run: cargo clippy --manifest-path onboard/Cargo.toml --all-targets -- -D warnings
+      # The handler links the prototype crate's check, so its fixtures, format
+      # and lint run here; no other job in this file sees that crate.
+      - name: key check fixtures
+        run: cargo test --manifest-path docs/planning/prototypes/keygen-spike/Cargo.toml
+      - name: key check fmt
+        run: cargo fmt --manifest-path docs/planning/prototypes/keygen-spike/Cargo.toml --check
+      - name: key check clippy
+        run: cargo clippy --manifest-path docs/planning/prototypes/keygen-spike/Cargo.toml --all-targets -- -D warnings
 
   # The other crate in the tree, and the one the mail path depends on: the
   # encrypting LMTP the keyring is published for. It had tests before this file

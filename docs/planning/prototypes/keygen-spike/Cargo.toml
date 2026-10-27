@@ -6,8 +6,21 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# `generate` is the CLI's and the page's half; the handler links this crate with
+# `default-features = false` and gets only the check, so no generator, no rand
+# and no wasm-bindgen reach a binary that files an application.
+[[bin]]
+name = "keygen-spike"
+path = "src/main.rs"
+required-features = ["generate"]
+
+[features]
+default = ["generate"]
+generate = ["dep:rand", "dep:smallvec"]
+wasm = ["generate", "dep:wasm-bindgen"]
+
 [dependencies]
 pgp = { version = "0.20.0", features = ["wasm"] }
-rand = "0.8"
-smallvec = "1"
-wasm-bindgen = "0.2"
+rand = { version = "0.8", optional = true }
+smallvec = { version = "1", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
