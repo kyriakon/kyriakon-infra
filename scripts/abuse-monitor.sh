@@ -4,7 +4,9 @@
 # Watches ten signals (spec §30-33, plus the release additions in issue #173 and
 # the certificate queue in issue #288), each tripping a content-rich alert:
 #   1. outbound mail-volume spike: relayed message count (MTA sessions)
-#   2. auth failures: smtpd + dovecot (maillog), sshd (authlog)
+#   2. auth failures: smtpd + dovecot (maillog), sshd (authlog), and the
+#      onboarding instance's admissions per source, which are what the second
+#      public listener adds to authlog
 #      mail-side any; ssh per source address
 #   3. quota approach: per-user edquota usage vs soft limit
 #   4. spamd greylist/blocklist: greylist churn + new TRAPPED (blacklisted) hosts
@@ -39,7 +41,8 @@
 #   DNSBL_ZONES            blocklists to query, strongest first (default in lib.sh:
 #                          zen.spamhaus.org bl.spamcop.net all.s5h.net dnsbl.dronebl.org)
 #   MAIL_SPIKE_MAX         outbound msgs per run that counts as a spike (default 50)
-#   AUTH_FAIL_MAX          failed ssh logins from one address before alert (default 300)
+#   AUTH_FAIL_MAX          failed ssh logins, or onboarding admissions, from one
+#                          address before alert (default 300)
 #   QUOTA_WARN_PCT         quota usage % of soft limit that trips the alert (default 80)
 #   GREY_MAX               spamd greylist entries before "flood" alert (default 100)
 #   DEFER_MIN              distinct addresses one sender may be deferred from before it alerts (default 6)
@@ -85,6 +88,48 @@ cooldown_for() {
 	"ssh guesses" | "spamd blocklist") printf '%s' "${STORM_COOLDOWN_MINUTES:-360}" ;;
 	*) printf '%s' "${alert_cooldown:-60}" ;;
 	esac
+}
+
+# source_tally <failures|admissions> — read authlog lines on stdin and print
+# "<worst> <high> <total>": the source address with the most matching lines, its
+# count, and the count from every address.
+#
+# The address is the token before the last "port", rather than the token after
+# the first "from": scanners do try usernames like "from" and "port", and either
+# one would otherwise be read as the address.
+#
+# failures counts one line per attempt. An attempt against an unknown username
+# writes two lines for the one event, "Invalid user X from IP port N" and
+# "Failed password for invalid user X from IP port N", so the "Invalid user"
+# line is taken for an unknown username and the "Failed password" line only when
+# it does not also name an invalid user, which is the attempt against a real
+# account.
+#
+# admissions anchors on "for hello from", which is the account the onboarding
+# instance serves: it takes both the applicant's "Accepted none for hello from
+# <address> port <n> ssh2" and the member port's "Accepted publickey for hello
+# from <address> port <n> ssh2: <type> SHA256:<fingerprint>", and neither a
+# member's own login on 22 nor the operator's, which name their own accounts.
+source_tally() {
+	awk -v mode="$1" '
+		{
+			keep = 0
+			if (mode == "failures") {
+				keep = ($0 ~ /Invalid user/ || ($0 ~ /Failed password/ && $0 !~ /invalid user/))
+			} else if (mode == "admissions") {
+				keep = ($0 ~ /for hello from/)
+			}
+			if (keep) {
+				ip = ""
+				for (i = NF; i >= 2; i--) if ($i == "port") { ip = $(i-1); break }
+				if (ip != "") { n[ip]++; t++ }
+			}
+		}
+		END {
+			worst = ""; high = 0
+			for (ip in n) if (n[ip] > high) { high = n[ip]; worst = ip }
+			printf "%s %d %d\n", worst, high, t+0
+		}'
 }
 
 # Entries in the first list that are not in the second. Files rather than strings,
@@ -207,6 +252,24 @@ self_test() {
 	# The cooldown two signals get for being holdable by a stranger.
 	check "a storm signal waits six hours" "$(cooldown_for "ssh guesses")" "360"
 	check "an ordinary signal waits the default hour" "$(cooldown_for "quota")" "60"
+
+	# The authlog split: the onboarding instance's two admission forms, a
+	# member's own login on 22 and the operator's, and an unknown username's
+	# usual pair of failure lines. The admission count takes the two hello
+	# admissions and nothing else; the failure tally is the pair folded to one
+	# attempt, which is what it did before the admission count existed.
+	cat > "$work/authlog" <<'AUTHLOG'
+Oct 27 09:00:01 mail sshd-session[1]: Accepted none for hello from 203.0.113.9 port 40000 ssh2
+Oct 27 09:00:02 mail sshd-session[2]: Accepted publickey for hello from 203.0.113.9 port 40001 ssh2: ED25519 SHA256:aaaa
+Oct 27 09:00:03 mail sshd-session[3]: Accepted publickey for oliver from 198.51.100.7 port 22 ssh2: ED25519 SHA256:bbbb
+Oct 27 09:00:04 mail sshd-session[4]: Accepted publickey for root from 198.51.100.8 port 22 ssh2: ED25519 SHA256:cccc
+Oct 27 09:00:05 mail sshd-session[5]: Invalid user admin from 192.0.2.5 port 55555
+Oct 27 09:00:05 mail sshd-session[5]: Failed password for invalid user admin from 192.0.2.5 port 55555 ssh2
+AUTHLOG
+	check "the admission count takes only the hello lines" \
+		"$(source_tally admissions < "$work/authlog")" "203.0.113.9 2 2"
+	check "the failure tally still counts the pair as one attempt" \
+		"$(source_tally failures < "$work/authlog")" "192.0.2.5 1 1"
 
 	# A cold resolver must be retried rather than skipped past, which is the
 	# 2026-10-05 alert: the box had just rebooted, the probe gave up, the query fell
@@ -448,9 +511,7 @@ fi
 # line only when it does not also name an invalid user, which is the attempt
 # against a real account.
 #
-# The address is the token before the last "port", rather than the token after
-# the first "from": scanners do try usernames like "from" and "port", and either
-# one would otherwise be read as the address.
+# The address is the token before the last "port", as source_tally takes it.
 #
 # A failed attempt against a real account leaves no line at all now: with
 # PasswordAuthentication no, sshd writes "Connection closed by authenticating
@@ -466,25 +527,32 @@ fi
 # it is kept at the baselined value rather than re-derived from eight quiet
 # days. An address threshold cannot see a swarm, which is why the total is
 # printed beside it and why the note leaves the total as the swarm signal.
-ssh_auth=$(printf '%s\n' "$new_authlog" \
-	| awk '
-		{
-			if ($0 ~ /Invalid user/ || ($0 ~ /Failed password/ && $0 !~ /invalid user/)) {
-				ip = ""
-				for (i = NF; i >= 2; i--) if ($i == "port") { ip = $(i-1); break }
-				if (ip != "") { n[ip]++; t++ }
-			}
-		}
-		END {
-			worst = ""; high = 0
-			for (ip in n) if (n[ip] > high) { high = n[ip]; worst = ip }
-			printf "%s %d %d\n", worst, high, t+0
-		}')
+ssh_auth=$(printf '%s\n' "$new_authlog" | source_tally failures)
 ssh_ip=$(printf '%s\n' "$ssh_auth" | awk '{ print $1 }')
 ssh_high=$(printf '%s\n' "$ssh_auth" | awk '{ print $2+0 }')
 ssh_total=$(printf '%s\n' "$ssh_auth" | awk '{ print $3+0 }')
 if [ "$ssh_high" -gt "$auth_fail_max" ]; then
 	alert ssh "guesses" "$ssh_ip made $ssh_high failed ssh attempts since last run, out of $ssh_total from all addresses (max per address $auth_fail_max). Password auth is off everywhere, so none of this can succeed; it is worth a look only because one source is working through a list"
+fi
+
+# The onboarding listener's admissions, counted beside the failures and from the
+# same window. Both of its lines name the account hello, which is what keeps a
+# member's own login on 22 and the operator's out of the count; the applicant's
+# is "Accepted none for hello from", the member port's "Accepted publickey for
+# hello from". It counts connections rather than applications, and the TUI's own
+# session caps are what bound what a source can do with them.
+#
+# It is compared against the same per-address value as the failures because that
+# is the number the note re-measures from these very lines once the second
+# listener is live (docs/planning/research/alert-thresholds.md). Until that
+# reading exists the value is the 300 the note records as pending, and no
+# separate admission threshold is invented.
+onboard_adm=$(printf '%s\n' "$new_authlog" | source_tally admissions)
+onboard_ip=$(printf '%s\n' "$onboard_adm" | awk '{ print $1 }')
+onboard_high=$(printf '%s\n' "$onboard_adm" | awk '{ print $2+0 }')
+onboard_total=$(printf '%s\n' "$onboard_adm" | awk '{ print $3+0 }')
+if [ "$onboard_high" -gt "$auth_fail_max" ]; then
+	alert ssh "onboard admissions" "$onboard_ip opened $onboard_high onboarding sessions since last run, out of $onboard_total from all addresses (max per address $auth_fail_max). The applicant port asks for no credential, so a source this busy is a script rather than a person; the TUI's session caps are what stop it filing, and this count is what says they are being reached"
 fi
 
 # --- 3. quota approach ---------------------------------------------------
