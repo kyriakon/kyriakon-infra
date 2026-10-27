@@ -89,6 +89,14 @@ pub struct DrainConfig {
     /// hand, has no record under the store, and the drain must neither adopt it
     /// nor release its name. A configuration value so a test can drive it.
     pub passwd: String,
+    /// The virtual table's two files, which smtpd reads at start:
+    /// `/etc/mail/mail_domains` holds one body domain per line and
+    /// `/etc/mail/virtuals` the full-address entries that point at an account.
+    /// scripts/deploy-mail.sh seeds both and owns the platform's own lines; the
+    /// drain adds a body's on approval. Configuration values for the reason
+    /// `passwd` is one.
+    pub mail_domains: String,
+    pub virtuals: String,
     /// The root-only HMAC key the review and password links are signed with.
     pub approval_key: String,
     /// The box keyring the encrypting LMTP reads: one `<localpart>.asc` per
@@ -218,6 +226,8 @@ mod tests {
              scripts = \"/root/bin\"\n\
              sendmail = \"/usr/sbin/sendmail\"\n\
              passwd = \"/etc/passwd\"\n\
+             mail_domains = \"/etc/mail/mail_domains\"\n\
+             virtuals = \"/etc/mail/virtuals\"\n\
              approval_key = \"/etc/kyriakon/onboard/approval-signing-key\"\n\
              keyring_dir = \"/etc/kyriakon/keys\"\n\
              stripe_webhook_secret = \"/etc/kyriakon/onboard/stripe-webhook-secret\"\n\
@@ -247,6 +257,8 @@ mod tests {
         assert_eq!(c.scripts, "/usr/local/libexec/kyriakon/scripts");
         assert_eq!(c.sendmail, "/usr/sbin/sendmail");
         assert_eq!(c.passwd, "/etc/passwd");
+        assert_eq!(c.mail_domains, "/etc/mail/mail_domains");
+        assert_eq!(c.virtuals, "/etc/mail/virtuals");
         assert_eq!(c.approval_key, "/etc/kyriakon/onboard/approval-signing-key");
         assert_eq!(c.keyring_dir, "/etc/kyriakon/keys");
         assert_eq!(c.reviewer, "admin@kyriakon.net");

@@ -46,6 +46,14 @@ sendmail = "/usr/sbin/sendmail"
 # store, and the drain must neither adopt it nor release its name.
 passwd = "/etc/passwd"
 
+# The virtual table's two files. deploy-mail.sh seeds /etc/mail/mail_domains
+# with the platform's own domain and /etc/mail/virtuals with the platform
+# aliases; the drain adds a body's domain and one full-address entry per
+# address on approval. Both are values rather than compiled-in paths for the
+# reason passwd is: a test points them at fixtures.
+mail_domains = "/etc/mail/mail_domains"
+virtuals = "/etc/mail/virtuals"
+
 # The root-only HMAC-SHA256 key the review email's three links and the one-time
 # password link are signed with. The drain signs and verifies with it; the
 # handler never reads it, because it only passes a click through as an intent.

@@ -76,6 +76,7 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
                 .map_err(|e| format!("the password intent does not parse: {e}"))?;
             transitions::set_password(cfg, store, key, intent, file, &value).await
         }
+        "provision-group" => transitions::provision_group(cfg, store, &value, file).await,
         _ => transitions::refuse(cfg, store, file, &value).await,
     }
 }

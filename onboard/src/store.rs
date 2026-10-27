@@ -459,6 +459,75 @@ pub struct Account {
     pub window: Option<Window>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outside_address: Option<String>,
+    /// The domain of the group this account belongs to, for a mailbox the
+    /// own-domain tier made. The group holds the payment state, so an account
+    /// with this set carries no `paid_until` of its own. `None` for a person's
+    /// account, and absent from the file, so a record written before this field
+    /// existed reads the same.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+/// One address in a group's table: the localpart on the body's domain, and the
+/// account its virtual entry points at.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GroupAddress {
+    pub address: String,
+    pub mailbox: String,
+}
+
+/// The payment block `groups/<domain>/group.json` carries. The card rail's
+/// subscription and the prepaid rail's window are #315's; what this record holds
+/// now is the rail the application chose and whether it was approved without
+/// charge, and a paid-until date the group's single renewal will set.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GroupPayment {
+    pub rail: String,
+    pub no_charge: bool,
+    pub paid_until: Option<String>,
+}
+
+/// `groups/<domain>/group.json`: one body's record. The name and kind are the
+/// body's own words, used to address it in notices; the accounts are the
+/// mailboxes, and the site owner is the account whose public tree holds the
+/// site.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GroupRecord {
+    pub version: u32,
+    pub domain: String,
+    pub name: String,
+    pub kind: String,
+    pub payment: GroupPayment,
+    pub accounts: Vec<String>,
+    pub site_owner: String,
+}
+
+/// The `provision-group` intent: everything the drain needs to make one body's
+/// domain live, filed by the approval and applied in one idempotent pass.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GroupIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub application: ApplicationRef,
+    pub domain: String,
+    /// The body's name and kind, as the community block answered them.
+    pub name: String,
+    pub body_kind: String,
+    pub payment: GroupPayment,
+    pub addresses: Vec<GroupAddress>,
+    /// The mailbox accounts, one system account each.
+    pub mailboxes: Vec<String>,
+    pub site_owner: String,
+    /// The block's upload key, installed into the site owner's
+    /// `authorized_keys`. Empty when the body gave none, which leaves the site
+    /// there to be filled only once a key is supplied.
+    #[serde(default)]
+    pub upload_key: String,
+    /// One mail key per mailbox, keyed by the mailbox it serves.
+    #[serde(default)]
+    pub mail_keys: Vec<KeyRecord>,
 }
 
 /// The 14-day payment window a paid approval opens.
