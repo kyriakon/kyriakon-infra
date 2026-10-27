@@ -1,8 +1,8 @@
-//! The capsule's rendering of the shared catalogue.
+//! The capsule's pages as gemtext: the catalogue and its links, the mirrored
+//! documents the deploy stages, the acceptances page, and the status page.
 //!
-//! The capsule front-end itself is a later ticket: this is the one page it
-//! renders from the catalogue file today, which is the page its spec fixes, one
-//! line per entry with the name and the clause in the link label.
+//! A page is plain text and link lines. A claim that needs its limit stated
+//! carries that sentence in the body, because a link label has no room for it.
 
 use crate::catalogue::{self, Protocol, Row, Service};
 use crate::page::StatusPage;
@@ -79,10 +79,18 @@ pub fn front_page(list: &[Service], member: Option<&str>) -> String {
          pages for a browser:\n\n",
     );
     out.push_str(
-        "=> https://signup.kyriakon.net/ The site, where both are published\n\n\
+        "=> https://kyriakon.net/ The main site, where both are published\n\n\
          ## What the platform offers\n\n",
     );
     out.push_str(&gemtext(list, member));
+    // The catalogue summary claims zero-access, so the limit travels with it
+    // here, the way the terms and privacy notice state it: a reader who takes
+    // only this page must not read the claim without it.
+    out.push_str(
+        "\nThat zero-access covers the content of your mail, not the addressing \
+         information it needs to move: sender, recipient, timestamp and size \
+         appear in the server's logs and in the outer message wrapper.\n",
+    );
     out.push_str("\n## The documents and the keys\n\n");
     for (route, label) in [
         ("terms", "Terms of service"),
@@ -182,6 +190,10 @@ mod tests {
         assert!(
             text.contains("The refusal list and the threat model stay published over HTTPS"),
             "{text}"
+        );
+        assert!(
+            text.contains("not the addressing information it needs to move"),
+            "the front page states the zero-access limit beside the catalogue's claim: {text}"
         );
         for route in ["terms", "aup", "privacy", "keys", ACCEPTANCES] {
             assert!(

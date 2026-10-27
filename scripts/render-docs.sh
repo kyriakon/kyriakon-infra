@@ -385,6 +385,8 @@ self_test() {
 		"$(grep -q -F 'addressing information' "$work/gemini/terms.gmi" && printf yes)" yes
 	check 'the privacy page states the zero-access metadata limit' \
 		"$(grep -E -q 'metadata|addressing information' "$work/gemini/privacy.gmi" && printf yes)" yes
+	check 'the acceptable use policy states the zero-access metadata limit' \
+		"$(grep -q -F 'addressing information' "$work/gemini/aup.gmi" && printf yes)" yes
 
 	# A construct the converter does not handle stops the render rather than
 	# reaching a reader as literal markdown.
