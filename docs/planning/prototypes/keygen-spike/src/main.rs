@@ -4,7 +4,7 @@
 //
 // Not the deliverable. No error handling worth the name, no CLI worth the name.
 
-use keygen_spike::{check_public_key, generate_key, self_check, DEFAULT_USER_ID};
+use keygen_spike::{DEFAULT_USER_ID, check_public_key, generate_key, self_check};
 use pgp::composed::{Deserializable, SignedPublicKey, SignedSecretKey};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};

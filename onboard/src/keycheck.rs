@@ -2,19 +2,22 @@
 //! structure, and the fingerprint of the material either way.
 //!
 //! The three conditions that decide whether mail can actually be delivered to a
-//! key (an encryption-capable subkey, no AEAD preference, not expired) are
-//! decided in the browser by the walkthrough (#176, #185). The verdict recorded
-//! here is this module's own structural reading, not a value the client sends.
-//! It refuses only something that is not a public key block at all, and never a
-//! key merely because the browser would warn about it: the spec warns and
-//! proceeds, because a heuristic refusal turns a guarantee into a support queue.
+//! key (an encryption-capable subkey, no AEAD preference, not expired) are the
+//! `keygen-spike` crate's, called here so the terminal and the page's WASM build
+//! return the same verdict from one implementation rather than from two copies
+//! of the rules. The verdict recorded is the crate's, not a value the client
+//! sends. This module refuses only something that is not a public key block at
+//! all, and never a key merely because the crate would warn about it: the spec
+//! warns and proceeds, because a heuristic refusal turns a guarantee into a
+//! support queue.
 //!
 //! The fingerprints are the exception to that division of labour, and they are
-//! hashes rather than checks: the walkthrough is not built, the web form has no
-//! script, and a number that names material it was not computed from reads as a
-//! number that disagrees with the key on the box. So the fingerprint is computed
-//! here, over the material the record carries, in the two shapes the two keys
-//! have. They decide nothing.
+//! hashes rather than checks: a number that names material it was not computed
+//! from reads as a number that disagrees with the key on the box. So the
+//! fingerprint is computed here, over the material the record carries, in the
+//! two shapes the two keys have. They decide nothing.
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
@@ -26,7 +29,8 @@ const END: &str = "-----END PGP PUBLIC KEY BLOCK-----";
 
 #[derive(Debug)]
 pub struct Checked {
-    /// "works", or the one structural warning worth recording.
+    /// "works" when the shared check finds nothing, or its findings joined with
+    /// "; " when one or more trips.
     pub verdict: String,
 }
 
@@ -35,8 +39,24 @@ struct Packet {
     body: Vec<u8>,
 }
 
-/// Inspect an armoured PGP public key block. `Err` is the refusal reason.
+/// Inspect an armoured PGP public key block. `Err` is the refusal reason; the
+/// verdict is the shared crate's reading of the three conditions, joined when
+/// more than one trips.
 pub fn pgp_public_key(value: &str) -> Result<Checked, String> {
+    let findings = pgp_findings(value)?;
+    Ok(Checked {
+        verdict: if findings.is_empty() {
+            "works".to_string()
+        } else {
+            findings.join("; ")
+        },
+    })
+}
+
+/// The three-condition inspection, from the crate the page builds to WASM, with
+/// the framing check that decides whether the material is a public key block at
+/// all. The conditions themselves are not repeated here.
+pub fn pgp_findings(value: &str) -> Result<Vec<String>, String> {
     let value = value.trim();
     if value.is_empty() {
         return Err("a public key is needed".to_string());
@@ -50,16 +70,28 @@ pub fn pgp_public_key(value: &str) -> Result<Checked, String> {
     if !packets.iter().any(|p| p.tag == 6) {
         return Err("the block carries no public key packet".to_string());
     }
-    let encrypts = packets
-        .iter()
-        .any(|p| matches!(p.tag, 6 | 14) && encryption_algorithm(p));
-    Ok(Checked {
-        verdict: if encrypts {
-            "works".to_string()
-        } else {
-            "no encryption subkey".to_string()
-        },
-    })
+    // The framing above is the only thing that may refuse a key. A parser that
+    // cannot read a well-framed block is a gap in this check, not a verdict on
+    // the key, and the spec says a shape the platform cannot verify warns and
+    // proceeds, because a refusal would turn a support question into a lost
+    // application. The warning says what happened so the reviewer reads it.
+    match keygen_spike::check_public_key(value, now_secs()) {
+        Ok(findings) => Ok(findings),
+        Err(_) => Ok(vec![
+            "The key could not be inspected automatically, so a person will check it \
+             against the key on the box. The application can still be filed."
+                .to_string(),
+        ]),
+    }
+}
+
+/// The clock the crate asks its caller for, because `SystemTime::now()` panics
+/// on wasm32 and the browser supplies its own.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Inspect an OpenSSH public key: the shape sftp and git will accept. A shape
@@ -321,20 +353,6 @@ fn packets(raw: &[u8]) -> Option<Vec<Packet>> {
     Some(out)
 }
 
-/// A public-key or public-subkey packet whose algorithm can encrypt to it. RSA
-/// (1, 2, 3), ElGamal (16) and ECDH (18) can; DSA, ECDSA and EdDSA are signing
-/// algorithms.
-fn encryption_algorithm(p: &Packet) -> bool {
-    let algo = match p.body.first().copied() {
-        // Version 4 and 5: version, four bytes of creation time, then algorithm.
-        Some(4) | Some(5) => p.body.get(5).copied(),
-        // Version 2 and 3: version, time, two bytes of validity, then algorithm.
-        Some(2) | Some(3) => p.body.get(7).copied(),
-        _ => None,
-    };
-    matches!(algo, Some(1..=3) | Some(16) | Some(18))
-}
-
 /// Standard base64, padding optional at the end, whitespace ignored. `None` on
 /// any character outside the alphabet or a length that cannot decode.
 pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
@@ -386,19 +404,56 @@ mod tests {
 
     // A public key packet (tag 6, algo 18 ECDH) and a public subkey packet
     // (tag 14, algo 18): 16 bytes, the smallest thing with the structure of a
-    // key that can be encrypted to.
+    // key. The fingerprint test below reads it; the three-condition checks use
+    // the fixtures the prototype tested, because those rules live in its crate.
     const GOOD: &str = "mAYEAAAAABK4BgQAAAAAEg==";
     // One signature packet (tag 2, algo 18), no key packet at all.
     const NO_KEY: &str = "iAYEAAAAABI=";
+
+    // The prototype's four fixtures, which its CLI and the page's WASM build both
+    // check. The expired-subkey fixture is made by gpg 2.5.24 with a faked 2020
+    // clock and a one-day subkey; gpg's export includes it.
+    const CLEAN: &str =
+        include_str!("../../docs/planning/prototypes/keygen-spike/fixtures/generated-clean.asc");
+    const AEAD: &str =
+        include_str!("../../docs/planning/prototypes/keygen-spike/fixtures/gpg-aead.asc");
+    const NO_ENCRYPTION: &str = include_str!(
+        "../../docs/planning/prototypes/keygen-spike/fixtures/gpg-no-encryption-subkey.asc"
+    );
+    const EXPIRED_SUBKEY: &str =
+        include_str!("../../docs/planning/prototypes/keygen-spike/fixtures/gpg-expired-subkey.asc");
 
     fn armoured(b64: &str) -> String {
         format!("{BEGIN}\n\n{b64}\n={END}\n")
     }
 
     #[test]
-    fn a_key_with_an_encryption_packet_passes() {
-        let c = pgp_public_key(&armoured(GOOD)).unwrap();
+    fn the_generators_own_key_checks_clean() {
+        let c = pgp_public_key(CLEAN).unwrap();
         assert_eq!(c.verdict, "works");
+    }
+
+    #[test]
+    fn each_condition_carries_its_own_message_and_never_refuses() {
+        let aead = pgp_public_key(AEAD).expect("a warning is not a refusal");
+        assert!(aead.verdict.contains("AEAD"), "{}", aead.verdict);
+        assert!(aead.verdict.contains("Remove AEAD"), "{}", aead.verdict);
+
+        let no_encryption = pgp_public_key(NO_ENCRYPTION).expect("a warning is not a refusal");
+        assert!(
+            no_encryption
+                .verdict
+                .contains("no encryption-capable subkey"),
+            "{}",
+            no_encryption.verdict
+        );
+
+        let expired = pgp_public_key(EXPIRED_SUBKEY).expect("a warning is not a refusal");
+        assert!(
+            expired.verdict.contains("encryption subkey expired"),
+            "{}",
+            expired.verdict
+        );
     }
 
     #[test]
@@ -415,12 +470,16 @@ mod tests {
     }
 
     #[test]
-    fn a_key_without_an_encryption_packet_is_a_warning_not_a_refusal() {
-        // Tag 6, algorithm 17 (DSA), the one signing algorithm the old format
-        // could carry beside RSA.
-        let sign_only = base64_of(&[0x98, 0x06, 0x04, 0, 0, 0, 0, 17]);
-        let c = pgp_public_key(&armoured(&sign_only)).unwrap();
-        assert_eq!(c.verdict, "no encryption subkey");
+    fn a_framed_block_the_parser_cannot_read_warns_and_proceeds() {
+        // `GOOD` has the framing and a public key packet, and nothing the
+        // parser can understand. A refusal here would lose an application over
+        // a gap in the check, so it is a warning with a reader named.
+        let c = pgp_public_key(&armoured(GOOD)).expect("a warning is not a refusal");
+        assert!(
+            c.verdict.contains("could not be inspected"),
+            "{}",
+            c.verdict
+        );
     }
 
     #[test]
@@ -493,31 +552,5 @@ mod tests {
             "ssh-keygen -lf prints this for the same key"
         );
         assert_eq!(openssh_fingerprint("ssh-ed25519"), None);
-    }
-
-    fn base64_of(bytes: &[u8]) -> String {
-        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::new();
-        for chunk in bytes.chunks(3) {
-            let b = [
-                chunk[0],
-                *chunk.get(1).unwrap_or(&0),
-                *chunk.get(2).unwrap_or(&0),
-            ];
-            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-            out.push(A[(n >> 18) as usize & 63] as char);
-            out.push(A[(n >> 12) as usize & 63] as char);
-            out.push(if chunk.len() > 1 {
-                A[(n >> 6) as usize & 63] as char
-            } else {
-                '='
-            });
-            out.push(if chunk.len() > 2 {
-                A[n as usize & 63] as char
-            } else {
-                '='
-            });
-        }
-        out
     }
 }
