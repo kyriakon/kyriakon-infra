@@ -565,24 +565,21 @@ connection files nothing either.
 /// something untested.
 const KEY_WALKTHROUGH: &str = include_str!("../../docs/key-walkthrough.md");
 
-/// The walkthrough cut to its three applicable sections and stripped to plain
+/// The walkthrough cut to the sections a key page needs, stripped to plain
 /// terminal text. This is not a Markdown renderer: the selected prose carries no
 /// links, and the only markup it uses is the heading, emphasis and code ticks
-/// removed below.
-fn key_walkthrough() -> String {
-    const SECTIONS: [&str; 3] = [
-        "Thunderbird on a desktop",
-        "The browser generator",
-        "The upload key",
-    ];
+/// removed below. The mail-key page wants the two ways to make a key and the
+/// upload-key paragraph; the upload-key page wants only its own section, so the
+/// step reads as a step rather than as a page of unrelated advice.
+fn key_walkthrough(sections: &[&str], preamble: bool) -> String {
     let mut out = String::new();
-    let mut preamble = true;
-    let mut wanted = true;
+    let mut in_preamble = true;
+    let mut wanted = false;
     let mut skipping = false;
     for line in KEY_WALKTHROUGH.lines() {
         if let Some(title) = line.strip_prefix("## ") {
-            preamble = false;
-            wanted = SECTIONS.contains(&title.trim());
+            in_preamble = false;
+            wanted = sections.contains(&title.trim());
             if wanted {
                 out.push('\n');
                 out.push_str(&title.trim().to_uppercase());
@@ -590,7 +587,10 @@ fn key_walkthrough() -> String {
             }
             continue;
         }
-        if preamble {
+        if in_preamble {
+            if !preamble {
+                continue;
+            }
             if let Some(title) = line.strip_prefix("# ") {
                 out.push('\n');
                 out.push_str(&title.trim().to_uppercase());
@@ -836,10 +836,20 @@ fn prompt(page: &Page, index: usize, total: usize) -> String {
              Finish with a single full stop on its own line.\n",
         ),
         Kind::Key if page.mailbox.is_some() => {
-            out.push_str(&key_walkthrough());
+            out.push_str(&key_walkthrough(
+                &[
+                    "Thunderbird on a desktop",
+                    "The browser generator",
+                    "The upload key",
+                ],
+                true,
+            ));
             out.push_str("Paste the whole block, ending with -----END PGP PUBLIC KEY BLOCK-----.\n")
         }
-        Kind::Key => out.push_str("Paste the whole key on one line.\n"),
+        Kind::Key => {
+            out.push_str(&key_walkthrough(&["The upload key"], false));
+            out.push_str("Paste the whole key on one line.\n")
+        }
         Kind::Multiline => out.push_str("Finish with a single full stop on its own line.\n"),
         Kind::Text => {}
     }
@@ -1475,6 +1485,35 @@ mod tests {
         assert!(
             !text.contains("##"),
             "markdown heading reached the terminal"
+        );
+    }
+
+    /// The upload-key page prints its own section, because the walkthrough
+    /// presents the upload key as a step for anyone who wants a website.
+    #[test]
+    fn the_upload_key_page_prints_its_own_step() {
+        let list = question_list();
+        let mut person = BTreeMap::new();
+        person.insert("username".to_string(), "theophilus".to_string());
+        person.insert("whose".to_string(), "person".to_string());
+        let upload = flow_path(&list, &person)
+            .into_iter()
+            .find(|p| p.q.rule == Rule::UploadKey)
+            .expect("the upload key page");
+        let text = prompt(&upload, 0, 1);
+        for expected in [
+            "THE UPLOAD KEY",
+            "ssh-ed25519",
+            "sftp on port 22",
+            "git on port 2222",
+        ] {
+            assert!(text.contains(expected), "{expected} missing from {text}");
+        }
+        assert!(!text.contains("THUNDERBIRD ON A DESKTOP"), "{text}");
+        assert!(!text.contains("Android"), "{text}");
+        assert!(
+            !text.contains("# Making a key") && !text.contains("Your account has two keys"),
+            "the upload page carries only its own section: {text}"
         );
     }
 

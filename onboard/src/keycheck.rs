@@ -69,7 +69,19 @@ pub fn pgp_findings(value: &str) -> Result<Vec<String>, String> {
     if !packets.iter().any(|p| p.tag == 6) {
         return Err("the block carries no public key packet".to_string());
     }
-    keygen_spike::check_public_key(value, now_secs())
+    // The framing above is the only thing that may refuse a key. A parser that
+    // cannot read a well-framed block is a gap in this check, not a verdict on
+    // the key, and the spec says a shape the platform cannot verify warns and
+    // proceeds, because a refusal would turn a support question into a lost
+    // application. The warning says what happened so the reviewer reads it.
+    match keygen_spike::check_public_key(value, now_secs()) {
+        Ok(findings) => Ok(findings),
+        Err(_) => Ok(vec![
+            "The key could not be inspected automatically, so a person will check it \
+             against the key on the box. The application can still be filed."
+                .to_string(),
+        ]),
+    }
 }
 
 /// The clock the crate asks its caller for, because `SystemTime::now()` panics
@@ -454,6 +466,19 @@ mod tests {
     fn a_block_with_no_public_key_packet_is_refused() {
         let e = pgp_public_key(&armoured(NO_KEY)).unwrap_err();
         assert!(e.contains("public key packet"), "{e}");
+    }
+
+    #[test]
+    fn a_framed_block_the_parser_cannot_read_warns_and_proceeds() {
+        // `GOOD` has the framing and a public key packet, and nothing the
+        // parser can understand. A refusal here would lose an application over
+        // a gap in the check, so it is a warning with a reader named.
+        let c = pgp_public_key(&armoured(GOOD)).expect("a warning is not a refusal");
+        assert!(
+            c.verdict.contains("could not be inspected"),
+            "{}",
+            c.verdict
+        );
     }
 
     #[test]
