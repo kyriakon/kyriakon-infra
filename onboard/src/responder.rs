@@ -17,9 +17,10 @@
 //!
 //! * The path is `GEMINI_URL_PATH` for gmid, which decodes and cleans it before it
 //!   sends it and strips every leading slash, and `REQUEST_URI` for httpd, which
-//!   passes the client's own spelling. It is used for one comparison against three
-//!   literals and one 26-character token check, and never as a path, a file name
-//!   or a lookup key.
+//!   passes the client's own spelling. It matches the route names, indexes the
+//!   page map the handler read at startup, or carries a status token that is
+//!   checked against the 26-character alphabet. It never names a file on disk and
+//!   never builds a path.
 //! * `QUERY_STRING` and the body are the form's fields, and both arrive still
 //!   percent-encoded. The responder decodes them itself.
 //! * `REMOTE_ADDR` is the socket peer, which is the address the counters key on
@@ -130,7 +131,7 @@ impl App {
         // ticket says it serves, which is the failure the named directory exists
         // to prevent.
         let mut pages = BTreeMap::new();
-        for (route, file) in capsule::PAGES {
+        for (route, file, _) in capsule::PAGES {
             let path = format!("{}/{}", cfg.pages.trim_end_matches('/'), file);
             let text = Store::read_text(&path).await?;
             if text.trim().is_empty() {

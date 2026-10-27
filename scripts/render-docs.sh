@@ -16,18 +16,19 @@
 # scripts/setup-env.sh --ico-reference and --eu-representative, and the script
 # reads them from the same file. It refuses rather than publish a placeholder.
 #
-# The key walkthrough is the fourth source, docs/key-walkthrough.md. It is not a
-# governance document, so the site build's --out does not receive it; the gemtext
-# mode does, because the capsule has to serve the walkthrough as a page rather
-# than link a browser page a gemini client cannot open.
+# The key walkthrough is the fourth source, docs/key-walkthrough.md. Both modes
+# receive it: the site publishes it, and the capsule mirrors it as a page rather
+# than link a browser page a gemini client cannot open. It carries none of the
+# governance placeholders, so it renders without an env value of its own.
 #
 # Usage:
 #   ksh scripts/render-docs.sh --out DIR [--env FILE]
 #   ksh scripts/render-docs.sh --gemini DIR [--env FILE]
 #        ksh scripts/render-docs.sh --self-test
 #
-# --out receives terms.md, privacy.md and aup.md. It is the site build's input,
-# not HTML: presentation belongs to the site build, which is kyriakon-site #3.
+# --out receives terms.md, privacy.md, aup.md and key-walkthrough.md. It is the
+# site build's input, not HTML: presentation belongs to the site build, which is
+# kyriakon-site #3.
 #
 # --gemini receives terms.gmi, privacy.gmi, aup.gmi and key-walkthrough.gmi, the
 # four pages the capsule mirrors. The converter handles what these documents
@@ -134,14 +135,15 @@ require_values() {
 render_all() {
 	docs=$1
 	out=$2
-	terms="$docs/terms.md"
-	privacy="$docs/privacy.md"
-	aup="$docs/aup.md"
-	for f in "$terms" "$privacy" "$aup"; do
-		[ -r "$f" ] || die "cannot read $f"
+	# The same four sources both modes publish, named once. A page added to the
+	# site and not to the capsule, or the reverse, is what the shared list and
+	# the deploy's staged-page check exist to stop.
+	set -- terms privacy aup key-walkthrough
+	for name in "$@"; do
+		[ -r "$docs/$name.md" ] || die "cannot read $docs/$name.md"
 	done
 
-	require_values "$terms" "$privacy"
+	require_values "$docs/terms.md" "$docs/privacy.md"
 
 	mkdir -p "$out" || die "cannot create $out"
 	# A mistaken --out pointing at the source would put the operator's address into
@@ -161,15 +163,13 @@ render_all() {
 	(
 		stage=$(mktemp -d "$out/.render.XXXXXX") || exit 1
 		trap 'rm -rf "$stage"' EXIT
-		render_one "$terms" "$stage/terms.md"
-		render_one "$privacy" "$stage/privacy.md"
-		render_one "$aup" "$stage/aup.md"
-		chmod 0644 "$stage/terms.md" "$stage/privacy.md" "$stage/aup.md" || exit 1
-		mv "$stage/terms.md" "$out/terms.md" || exit 1
-		mv "$stage/privacy.md" "$out/privacy.md" || exit 1
-		mv "$stage/aup.md" "$out/aup.md" || exit 1
+		for name in "$@"; do
+			render_one "$docs/$name.md" "$stage/$name.md" || exit 1
+			chmod 0644 "$stage/$name.md" || exit 1
+			mv "$stage/$name.md" "$out/$name.md" || exit 1
+		done
 	) || exit 1
-	printf 'rendered terms.md, privacy.md and aup.md to %s\n' "$out"
+	printf 'rendered the four documents to %s\n' "$out"
 }
 
 # gemini_one <src.md> <dst.gmi> — the conservative markdown to gemtext converter.
@@ -268,15 +268,16 @@ gemini_one() {
 gemini_all() {
 	docs=$1
 	out=$2
-	terms="$docs/terms.md"
-	privacy="$docs/privacy.md"
-	aup="$docs/aup.md"
-	walkthrough="$docs/key-walkthrough.md"
-	for f in "$terms" "$privacy" "$aup" "$walkthrough"; do
-		[ -r "$f" ] || die "cannot read $f"
+	# One list for the pages themselves: the check, the render and the install
+	# all read it, so a page added here cannot be staged by one and missed by
+	# another. The handler's own table is `capsule::PAGES`, and the deploy
+	# checks its output by file name.
+	set -- terms privacy aup key-walkthrough
+	for name in "$@"; do
+		[ -r "$docs/$name.md" ] || die "cannot read $docs/$name.md"
 	done
 
-	require_values "$terms" "$privacy"
+	require_values "$docs/terms.md" "$docs/privacy.md"
 
 	mkdir -p "$out" || die "cannot create $out"
 	out_abs=$(cd -P "$out" && pwd)
@@ -287,22 +288,12 @@ gemini_all() {
 	(
 		stage=$(mktemp -d "$out/.render.XXXXXX") || exit 1
 		trap 'rm -rf "$stage"' EXIT
-		for pair in "terms.md:$terms" "privacy.md:$privacy" "aup.md:$aup" \
-			"key-walkthrough.md:$walkthrough"; do
-			name=${pair%%:*}
-			src=${pair#*:}
-			render_one "$src" "$stage/$name" || exit 1
+		for name in "$@"; do
+			render_one "$docs/$name.md" "$stage/$name.md" || exit 1
+			gemini_one "$stage/$name.md" "$stage/$name.gmi" || exit 1
+			chmod 0644 "$stage/$name.gmi" || exit 1
+			mv "$stage/$name.gmi" "$out/$name.gmi" || exit 1
 		done
-		gemini_one "$stage/terms.md" "$stage/terms.gmi" || exit 1
-		gemini_one "$stage/privacy.md" "$stage/privacy.gmi" || exit 1
-		gemini_one "$stage/aup.md" "$stage/aup.gmi" || exit 1
-		gemini_one "$stage/key-walkthrough.md" "$stage/key-walkthrough.gmi" || exit 1
-		chmod 0644 "$stage/terms.gmi" "$stage/privacy.gmi" "$stage/aup.gmi" \
-			"$stage/key-walkthrough.gmi" || exit 1
-		mv "$stage/terms.gmi" "$out/terms.gmi" || exit 1
-		mv "$stage/privacy.gmi" "$out/privacy.gmi" || exit 1
-		mv "$stage/aup.gmi" "$out/aup.gmi" || exit 1
-		mv "$stage/key-walkthrough.gmi" "$out/key-walkthrough.gmi" || exit 1
 	) || exit 1
 	printf 'rendered terms.gmi, privacy.gmi, aup.gmi and key-walkthrough.gmi to %s\n' "$out"
 }
@@ -345,6 +336,8 @@ self_test() {
 		"$(grep -q -F "$EU_REPRESENTATIVE_CONTACT" "$work/out/privacy.md" && printf yes)" yes
 	check 'the aup is copied unchanged' \
 		"$(cmp -s "$repo_dir/docs/aup.md" "$work/out/aup.md" && printf yes)" yes
+	check 'the site output carries the key walkthrough' \
+		"$(test -s "$work/out/key-walkthrough.md" && printf yes)" yes
 	check 'the tracked terms still carry the placeholder' \
 		"$(grep -q -F 'REPLACE_ME_TRADING_ADDRESS' "$repo_dir/docs/terms.md" && printf yes)" yes
 	check 'the tracked privacy still carry the placeholder' \
@@ -373,12 +366,37 @@ self_test() {
 		"$(if grep -q -e '\*\*' -e '`' "$work/gemini/terms.gmi" "$work/gemini/aup.gmi"; then printf yes; else printf no; fi)" no
 	check 'no placeholder survives in the gemtext pages' \
 		"$(if grep -q 'REPLACE_ME' "$work/gemini/terms.gmi" "$work/gemini/privacy.gmi"; then printf yes; else printf no; fi)" no
-	check 'the walkthrough names Thunderbird on a desktop' \
-		"$(grep -q -F 'Thunderbird on a desktop' "$work/gemini/key-walkthrough.gmi" && printf yes)" yes
-	check 'the walkthrough names sftp on 22' \
-		"$(grep -q -F 'sftp on port 22' "$work/gemini/key-walkthrough.gmi" && printf yes)" yes
-	check 'the walkthrough names git on 2222' \
-		"$(grep -q -F 'git on port 2222' "$work/gemini/key-walkthrough.gmi" && printf yes)" yes
+	# The converter's constructs on a fixture of its own: a copy edit to a
+	# tracked document must not fail this suite, and a broken converter must.
+	cat > "$work/constructs.md" <<'MD'
+# Heading one
+## Heading two
+
+A paragraph with **bold** and `code`.
+
+| a | b |
+|---|---|
+| 1 | 2 |
+
+- item one
+
+1. first
+
+> quoted
+MD
+	gemini_one "$work/constructs.md" "$work/constructs.gmi"
+	check 'a heading keeps its level' \
+		"$(grep -c -E '^#{1,3} ' "$work/constructs.gmi")" 2
+	check 'emphasis and code are stripped' \
+		"$(if grep -q -e '\*\*' -e '`' "$work/constructs.gmi"; then printf yes; else printf no; fi)" no
+	check 'a table becomes a text row' \
+		"$(grep -q -F '1 | 2' "$work/constructs.gmi" && printf yes)" yes
+	check 'an unordered list becomes a gemtext list' \
+		"$(grep -q -F '* item one' "$work/constructs.gmi" && printf yes)" yes
+	check 'an ordered list stays readable text' \
+		"$(grep -q -F '1. first' "$work/constructs.gmi" && printf yes)" yes
+	check 'a block quote becomes a gemtext quote' \
+		"$(grep -q -F '> quoted' "$work/constructs.gmi" && printf yes)" yes
 	check 'no mirrored page claims encryption at rest or end-to-end' \
 		"$(if grep -E -qi 'encrypted at rest|end-to-end' "$work/gemini"/*.gmi; then printf yes; else printf no; fi)" no
 	check 'the terms page states the zero-access metadata limit' \
@@ -456,6 +474,18 @@ self_test() {
 	check 'writing through a symlink to the source is refused' "$got" no
 	check 'the symlinked source copy is unchanged' \
 		"$(grep -q -F 'REPLACE_ME_TRADING_ADDRESS' "$work/source/terms.md" && printf yes)" yes
+
+	# The gemtext mode has the same guard, which the cases above do not reach
+	# because they call the web mode.
+	mkdir -p "$work/gemini-source"
+	cp "$repo_dir/docs/terms.md" "$repo_dir/docs/privacy.md" "$repo_dir/docs/aup.md" \
+		"$repo_dir/docs/key-walkthrough.md" "$work/gemini-source/"
+	if ( gemini_all "$work/gemini-source" "$work/gemini-source" ) >/dev/null 2>&1; then
+		got=yes
+	else
+		got=no
+	fi
+	check 'writing gemtext into the source directory is refused' "$got" no
 
 	# A page that fails its placeholder check must not replace the good page
 	# already in --out.
