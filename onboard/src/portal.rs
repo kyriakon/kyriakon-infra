@@ -558,6 +558,72 @@ connection files nothing either.
 
 ";
 
+/// The page the site publishes, read at build time so the terminal cannot drift
+/// from the walkthrough the web form links. The terminal shows the sections that
+/// apply before the paste; Android is left out until the prototype has tested it,
+/// which is why the paragraph naming it is dropped rather than promising
+/// something untested.
+const KEY_WALKTHROUGH: &str = include_str!("../../docs/key-walkthrough.md");
+
+/// The walkthrough cut to its three applicable sections and stripped to plain
+/// terminal text. This is not a Markdown renderer: the selected prose carries no
+/// links, and the only markup it uses is the heading, emphasis and code ticks
+/// removed below.
+fn key_walkthrough() -> String {
+    const SECTIONS: [&str; 3] = [
+        "Thunderbird on a desktop",
+        "The browser generator",
+        "The upload key",
+    ];
+    let mut out = String::new();
+    let mut preamble = true;
+    let mut wanted = true;
+    let mut skipping = false;
+    for line in KEY_WALKTHROUGH.lines() {
+        if let Some(title) = line.strip_prefix("## ") {
+            preamble = false;
+            wanted = SECTIONS.contains(&title.trim());
+            if wanted {
+                out.push('\n');
+                out.push_str(&title.trim().to_uppercase());
+                out.push('\n');
+            }
+            continue;
+        }
+        if preamble {
+            if let Some(title) = line.strip_prefix("# ") {
+                out.push('\n');
+                out.push_str(&title.trim().to_uppercase());
+                out.push('\n');
+            } else if line.starts_with("You can make both in a browser") {
+                // Its next sentence points at the recovery phrase section, which
+                // this cut does not carry; the generator section gives the
+                // instruction that matters here.
+                continue;
+            } else {
+                out.push_str(&line.replace("**", "").replace('`', ""));
+                out.push('\n');
+            }
+            continue;
+        }
+        if !wanted {
+            continue;
+        }
+        if line.starts_with("Thunderbird for Android") {
+            skipping = true;
+        }
+        if line.trim().is_empty() {
+            skipping = false;
+        }
+        if skipping {
+            continue;
+        }
+        out.push_str(&line.replace("**", "").replace('`', ""));
+        out.push('\n');
+    }
+    out
+}
+
 /// The applicant's flow: the shared question list one page at a time, the
 /// counter for the answers given so far, a confirm screen, and one intent filed
 /// through the handler. The answers live in this process for the connection's
@@ -625,8 +691,26 @@ fn application(
                     input.word()?;
                     continue;
                 }
+                // A mail key that trips one of the three conditions is a warning
+                // at its own page and the flow carries on; a refusal here would
+                // turn a heuristic into a support queue.
+                let warnings = if page.mailbox.is_some() {
+                    keycheck::pgp_findings(&value).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 store_answer(page, &mut draft, value);
                 index += 1;
+                if !warnings.is_empty() {
+                    // The full mode paints the next screen over whatever is
+                    // here, so a warning gets a screen of its own. Enter is the
+                    // only thing it asks for; the answer is already kept.
+                    for warning in warnings {
+                        put(out, &format!("\nWarning: {warning}\n"))?;
+                    }
+                    put(out, "\nPress Enter to continue.\n")?;
+                    input.word()?;
+                }
                 // The body's two line lists are checked together, because the
                 // fault is the count rather than either list; the page just
                 // answered is the one that gets corrected.
@@ -752,6 +836,7 @@ fn prompt(page: &Page, index: usize, total: usize) -> String {
              Finish with a single full stop on its own line.\n",
         ),
         Kind::Key if page.mailbox.is_some() => {
+            out.push_str(&key_walkthrough());
             out.push_str("Paste the whole block, ending with -----END PGP PUBLIC KEY BLOCK-----.\n")
         }
         Kind::Key => out.push_str("Paste the whole key on one line.\n"),
@@ -1273,9 +1358,16 @@ mod tests {
         assert!(script.spent(), "the session ended on the failed read");
     }
 
-    const KEY_BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
-    const KEY_END: &str = "-----END PGP PUBLIC KEY BLOCK-----";
-    const KEY_BODY: &str = "mAYEAAAAABK4BgQAAAAAEg==";
+    // A clean key from the generator, so the portal's flow is tested with a key
+    // the shared check actually parses. The old two-packet stub passed this
+    // module's structural check only, which is exactly the duplication the
+    // shared crate removed.
+    const KEY_BLOCK: &str =
+        include_str!("../../docs/planning/prototypes/keygen-spike/fixtures/generated-clean.asc");
+
+    fn key_lines() -> Vec<String> {
+        KEY_BLOCK.lines().map(str::to_string).collect()
+    }
 
     /// The first row the catalogue marks `apply`, which is the row a reader
     /// follows to start an application.
@@ -1289,31 +1381,25 @@ mod tests {
     /// The answers to the individual path, as lines: the opening screen, the
     /// apply row's number in the plain mode, every question, and the confirm.
     fn person_lines(at: usize) -> Vec<String> {
+        person_lines_with(at, KEY_BLOCK, &[])
+    }
+
+    /// The same path with another mail key, and any lines its warning screen
+    /// asks for between the key and the next question.
+    fn person_lines_with(at: usize, key: &str, after_key: &[&str]) -> Vec<String> {
         let row = (at + 1).to_string();
-        [
-            "",
-            &row,
-            "theophilus",
-            "person",
-            "",
-            "",
-            KEY_BEGIN,
-            "",
-            KEY_BODY,
-            KEY_END,
-            "",
-            "no_charge",
-            "",
-            "layman",
-            "",
-            "",
-            "",
-            "yes",
-            "yes",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+        let mut lines: Vec<String> = ["", row.as_str(), "theophilus", "person", "", ""]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        lines.extend(key.lines().map(str::to_string));
+        lines.extend(after_key.iter().map(|line| (*line).to_string()));
+        lines.extend(
+            ["", "no_charge", "", "layman", "", "", "", "yes", "yes"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        lines
     }
 
     /// One completed application in the line mode.
@@ -1360,13 +1446,109 @@ mod tests {
         );
     }
 
+    /// The key page carries the site's walkthrough before the paste, from the
+    /// file the web form publishes, and leaves Android out until it is tested.
+    #[test]
+    fn the_key_page_prints_the_walkthrough_before_the_paste() {
+        let list = question_list();
+        let mut person = BTreeMap::new();
+        person.insert("username".to_string(), "theophilus".to_string());
+        person.insert("whose".to_string(), "person".to_string());
+        let mail = flow_path(&list, &person)
+            .into_iter()
+            .find(|p| p.q.id == "mail_key")
+            .expect("the mail key page");
+        let text = prompt(&mail, 0, 1);
+        for expected in [
+            "MAKING A KEY",
+            "a step for anyone who wants a website",
+            "THUNDERBIRD ON A DESKTOP",
+            "https://signup.kyriakon.net/",
+            "sftp on port 22",
+            "git on port 2222",
+            "THE UPLOAD KEY",
+            "ssh-keygen -t ed25519",
+        ] {
+            assert!(text.contains(expected), "{expected} missing from {text}");
+        }
+        assert!(!text.contains("Android"), "the untested path is printed");
+        assert!(
+            !text.contains("##"),
+            "markdown heading reached the terminal"
+        );
+    }
+
+    /// A key that advertises AEAD is a warning screen and then the flow carries
+    /// on, files the key and asks the next question.
+    #[test]
+    fn a_key_warning_is_shown_and_the_session_proceeds() {
+        let rows = rows(None);
+        let at = apply_row();
+        let aead =
+            include_str!("../../docs/planning/prototypes/keygen-spike/fixtures/gpg-aead.asc");
+        // The warning screen asks for Enter before the next question.
+        let mut script = scripts(&person_lines_with(at, aead, &[""]));
+        let mut files = Files::default();
+        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
+        assert_eq!(left, Departure::Quit);
+        assert!(seen.contains("Warning: The key asks for AEAD"), "{seen}");
+        assert!(seen.contains("Press Enter to continue"), "{seen}");
+        assert_eq!(files.forms.len(), 1, "the warning refused the key");
+        assert!(script.spent(), "the session stopped at the warning");
+    }
+
+    /// A paste longer than the capsule's 1024-byte prompt limit is read and
+    /// filed here, because SSH has no such request limit.
+    #[test]
+    fn a_key_longer_than_the_capsule_limit_is_accepted() {
+        let rows = rows(None);
+        let at = apply_row();
+        let long =
+            include_str!("../../docs/planning/prototypes/keygen-spike/fixtures/gpg-rsa-long.asc");
+        assert!(long.len() > 1024, "the fixture is not a long paste");
+        let mut script = scripts(&person_lines_with(at, long, &[]));
+        let mut files = Files::default();
+        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
+        assert_eq!(left, Departure::Quit);
+        assert_eq!(files.forms.len(), 1);
+        assert!(
+            files.forms[0].get("mail_key").unwrap().len() > 1024,
+            "the long key was truncated"
+        );
+        assert!(script.spent());
+        assert!(seen.contains("Your application is filed"), "{seen}");
+    }
+
+    /// An upload key is an OpenSSH line and nothing else, and a line that is not
+    /// one is refused with the reason rather than reaching the handler.
+    #[test]
+    fn an_upload_key_that_is_not_openssh_is_refused_with_the_reason() {
+        let list = question_list();
+        let page = Page {
+            q: list
+                .iter()
+                .find(|q| q.id == "upload_key")
+                .expect("the upload key question"),
+            mailbox: None,
+        };
+        let why = flow_problem(
+            &page,
+            "-----BEGIN PGP PUBLIC KEY BLOCK-----",
+            &reserved_names(),
+            true,
+            &BTreeMap::new(),
+        )
+        .expect("a PGP block is not an upload key");
+        assert!(why.contains("OpenSSH"), "{why}");
+    }
+
     /// The answers to a body's path with two mailboxes, as lines. The address
     /// list and the account names are multi-line, so both end with a full stop.
     fn body_lines(at: usize) -> Vec<String> {
         let row = (at + 1).to_string();
-        [
+        let mut lines: Vec<String> = [
             "",
-            &row,
+            row.as_str(),
             "theophilus",
             "body",
             "The Parish of Example",
@@ -1380,30 +1562,31 @@ mod tests {
             "secretary",
             "hall",
             ".",
-            KEY_BEGIN,
-            "",
-            KEY_BODY,
-            KEY_END,
-            KEY_BEGIN,
-            "",
-            KEY_BODY,
-            KEY_END,
-            "",
-            "",
-            "",
-            "",
-            "no_charge",
-            "",
-            "layman",
-            "",
-            "",
-            "",
-            "yes",
-            "yes",
         ]
         .into_iter()
         .map(str::to_string)
-        .collect()
+        .collect();
+        lines.extend(key_lines());
+        lines.extend(key_lines());
+        lines.extend(
+            [
+                "",
+                "",
+                "",
+                "",
+                "no_charge",
+                "",
+                "layman",
+                "",
+                "",
+                "",
+                "yes",
+                "yes",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        lines
     }
 
     /// A body with more than one mailbox can finish: the address list and the
@@ -1446,34 +1629,31 @@ mod tests {
         let rows = rows(None);
         let at = apply_row();
         let row = (at + 1).to_string();
-        let mut script = scripts(
-            &[
-                "",
-                &row,
-                "theophilus",
-                "person",
-                "",
-                "",
-                KEY_BEGIN,
-                "",
-                KEY_BODY,
-                KEY_END,
-                "",
-                "no_charge",
-                "",
-                "monk ",
-                "with my elder's blessing",
-                ".",
-                "",
-                "",
-                "",
-                "yes",
-                "yes",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>(),
-        );
+        let mut script = scripts(&{
+            let mut lines: Vec<String> = ["", row.as_str(), "theophilus", "person", "", ""]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            lines.extend(key_lines());
+            lines.extend(
+                [
+                    "",
+                    "no_charge",
+                    "",
+                    "monk ",
+                    "with my elder's blessing",
+                    ".",
+                    "",
+                    "",
+                    "",
+                    "yes",
+                    "yes",
+                ]
+                .into_iter()
+                .map(str::to_string),
+            );
+            lines
+        });
         let mut files = Files::default();
         let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
         assert_eq!(left, Departure::Quit);
@@ -1535,57 +1715,68 @@ mod tests {
             .into_iter()
             .find(|p| p.q.id == "mail_key")
             .expect("the mail key page");
-        let key_block = format!("{KEY_BEGIN}\n\n{KEY_BODY}\n{KEY_END}");
+        let key_block = KEY_BLOCK.trim().to_string();
         let upload = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAA user@host";
 
-        let cases = vec![
+        let cases: Vec<(&str, Page, Vec<String>, String)> = vec![
             (
                 "username",
                 page("username"),
-                vec!["theophilus"],
+                vec!["theophilus".to_string()],
                 "theophilus".to_string(),
             ),
-            ("whose", page("whose"), vec!["person"], "person".to_string()),
+            (
+                "whose",
+                page("whose"),
+                vec!["person".to_string()],
+                "person".to_string(),
+            ),
             (
                 "body_records",
                 page("body_records"),
-                vec!["yes"],
+                vec!["yes".to_string()],
                 "yes".to_string(),
             ),
             (
                 "cannot_pay",
                 page("cannot_pay"),
-                vec!["line one", "line two", "."],
+                vec![
+                    "line one".to_string(),
+                    "line two".to_string(),
+                    ".".to_string(),
+                ],
                 "line one\nline two".to_string(),
             ),
             (
                 "body_addresses",
                 page("body_addresses"),
-                vec!["a: own", "b: alias a", "."],
+                vec![
+                    "a: own".to_string(),
+                    "b: alias a".to_string(),
+                    ".".to_string(),
+                ],
                 "a: own\nb: alias a".to_string(),
             ),
-            (
-                "mail_key",
-                mail_page,
-                vec![KEY_BEGIN, "", KEY_BODY, KEY_END],
-                key_block,
-            ),
+            ("mail_key", mail_page, key_lines(), key_block),
             (
                 "upload_key",
                 page("upload_key"),
-                vec![upload],
+                vec![upload.to_string()],
                 upload.to_string(),
             ),
             (
                 "accept_terms",
                 page("accept_terms"),
-                vec!["yes"],
+                vec!["yes".to_string()],
                 "yes".to_string(),
             ),
         ];
 
         for (id, page, lines, expected) in cases {
-            let mut script = Script::lines(&lines);
+            let mut script = Script {
+                words: lines.into_iter().map(Some).collect(),
+                keys: VecDeque::new(),
+            };
             match read_answer(&page, &mut script).unwrap() {
                 Entered::Value(value) => assert_eq!(value, expected, "{id}"),
                 _ => panic!("{id} did not read a value"),
@@ -1673,34 +1864,30 @@ mod tests {
         let rows = rows(None);
         let at = apply_row();
         let row = (at + 1).to_string();
-        let lines: Vec<String> = [
-            "",
-            &row,
-            "theophilus",
-            "person",
-            "",
-            "",
-            KEY_BEGIN,
-            "",
-            KEY_BODY,
-            KEY_END,
-            "",
-            "no_charge",
-            "",
-            "monk",
-            "",
-            "",
-            "with my elder's blessing",
-            ".",
-            "",
-            "",
-            "",
-            "yes",
-            "yes",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+        let mut lines: Vec<String> = ["", row.as_str(), "theophilus", "person", "", ""]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        lines.extend(key_lines());
+        lines.extend(
+            [
+                "",
+                "no_charge",
+                "",
+                "monk",
+                "",
+                "",
+                "with my elder's blessing",
+                ".",
+                "",
+                "",
+                "",
+                "yes",
+                "yes",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
         let mut script = scripts(&lines);
         let mut files = Files::default();
         let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);

@@ -198,9 +198,10 @@ fn body_answers() -> Vec<(&'static str, &'static str)> {
     .collect()
 }
 
-/// A public key block with the structure of a key that can be encrypted to.
-const GOOD_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
-mAYEAAAAABK4BgQAAAAAEg==\n-----END PGP PUBLIC KEY BLOCK-----\n";
+/// A real clean key from the generator, because the shared check parses the
+/// block in full: the old two-packet stub passed only the structural reading.
+const GOOD_KEY: &str =
+    include_str!("../../../docs/planning/prototypes/keygen-spike/fixtures/generated-clean.asc");
 
 /// The body of a form post, percent-encoded the way a browser sends one.
 fn encoded(pairs: &[(&str, &str)]) -> String {

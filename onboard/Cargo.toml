@@ -51,3 +51,8 @@ toml = "0.9"
 # ULID: it is 128 bits of Crockford encoded by hand in store.rs, because a ULID
 # spends 48 of its bits on a timestamp and a bearer capability must not.
 ulid = "1"
+# The key inspection is the crate the web page builds to WASM (#185), so the
+# terminal and the browser return the same verdict by construction rather than
+# from two copies of the rules. A path dependency because the crate is still
+# the prototype the release takes over.
+keygen-spike = { path = "../docs/planning/prototypes/keygen-spike" }

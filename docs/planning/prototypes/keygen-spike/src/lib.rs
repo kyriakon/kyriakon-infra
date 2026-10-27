@@ -102,7 +102,8 @@ pub fn generate_key(
 /// The three conditions, as the check page would state them. `now_secs` is the caller's
 /// clock, so the same code runs in a binary and in a browser.
 pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, String> {
-    let (key, _) = SignedPublicKey::from_armor_single(armor.as_bytes()).map_err(|e| e.to_string())?;
+    let (key, _) =
+        SignedPublicKey::from_armor_single(armor.as_bytes()).map_err(|e| e.to_string())?;
     let mut findings = Vec::new();
 
     // Expiry and revocation come from the certificate's own signatures. The preferences
@@ -170,7 +171,11 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
     }
 
     if !key.details.revocation_signatures.is_empty() {
-        findings.push("The key has been revoked.".into());
+        findings.push(
+            "The key has been revoked. Make a new key with the generator; a revoked key \
+             cannot receive mail."
+                .into(),
+        );
     }
 
     if !aead.is_empty() {
@@ -187,7 +192,9 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
         let expires_at = created.saturating_add(lifetime);
         if u64::from(expires_at) <= now_secs {
             findings.push(format!(
-                "The key expired at {expires_at} seconds since the epoch and cannot be used."
+                "The key expired at {expires_at} seconds since the epoch and cannot be used. \
+                 Make a new key with the generator, or extend the expiry in your mail client \
+                 before it lapses."
             ));
         }
     }
@@ -214,7 +221,8 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
         let encrypts = sub.key.algorithm().can_encrypt();
         if sub_revoked && encrypts {
             findings.push(format!(
-                "The encryption subkey {:?} has been revoked, so mail cannot be encrypted to it.",
+                "The encryption subkey {:?} has been revoked, so mail cannot be encrypted to \
+                 it. Make a new key with the generator; a revoked subkey cannot receive mail.",
                 sub.key.fingerprint()
             ));
         }
@@ -223,7 +231,8 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
             if u64::from(expires_at) <= now_secs {
                 findings.push(format!(
                     "The encryption subkey expired at {expires_at} seconds since the epoch, \
-                     so mail encrypted to this key may not open."
+                     so mail encrypted to this key may not open. Extend the subkey's expiry in \
+                     your mail client, or make a new key with the generator."
                 ));
             }
         }
@@ -238,7 +247,8 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
     if encrypting.is_empty() {
         findings.push(
             "There is no encryption-capable subkey, so mail to this member would be \
-             refused rather than delivered."
+             refused rather than delivered. Make a new key with the generator, which makes \
+             an encryption subkey beside the signing one."
                 .into(),
         );
     }
@@ -265,7 +275,11 @@ fn esc(s: &str) -> String {
 
 fn findings_json(findings: &[String]) -> String {
     let items: Vec<String> = findings.iter().map(|f| format!("\"{}\"", esc(f))).collect();
-    format!("{{\"ok\":{},\"findings\":[{}]}}", findings.is_empty(), items.join(","))
+    format!(
+        "{{\"ok\":{},\"findings\":[{}]}}",
+        findings.is_empty(),
+        items.join(",")
+    )
 }
 
 /// Exports for the page. wasm-bindgen returns a string rather than a class so the JavaScript
@@ -277,7 +291,11 @@ mod wasm {
 
     #[wasm_bindgen]
     pub fn generate(variant: &str, user_id: &str, passphrase: &str) -> String {
-        let pass = if passphrase.is_empty() { None } else { Some(passphrase) };
+        let pass = if passphrase.is_empty() {
+            None
+        } else {
+            Some(passphrase)
+        };
         match generate_key(variant, user_id, pass) {
             Ok(g) => format!(
                 "{{\"ok\":true,\"fingerprint\":\"{}\",\"publicArmor\":\"{}\",\"secretArmor\":\"{}\"}}",
@@ -313,7 +331,8 @@ pub fn self_check() -> Result<(), String> {
     if !findings.is_empty() {
         return Err(format!("a generated key did not check clean: {findings:?}"));
     }
-    let not_a_key = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nnot a key\n-----END PGP PUBLIC KEY BLOCK-----\n";
+    let not_a_key =
+        "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nnot a key\n-----END PGP PUBLIC KEY BLOCK-----\n";
     if check_public_key(not_a_key, 1_700_000_000).is_ok() {
         return Err("a malformed key was accepted".into());
     }
