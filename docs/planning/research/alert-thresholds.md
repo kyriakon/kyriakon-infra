@@ -98,7 +98,7 @@ Commands are abbreviated here and written out in the matching section.
 | signal | extraction | observed in the window | proposed | false positive cost |
 |---|---|---|---|---|
 | outbound volume | `mta disconnected reason=quit messages=N` in maillog, summed per 15 min | 0 to 4 per interval; 3 to 10 messages a day; 57 total over 8 days; all of it cron mail | 50 per interval | An operator alert only. It could fire on one send to more than 50 recipients, and the AUP ladder's first rung is a warning mail, so the member's cost is that warning, not a bounce |
-| ssh authentication failures | `Failed password` or `Invalid user` lines in authlog, counted per source address per 15 min | 217,300 lines, 1,797 addresses, 35 days; worst single address 358 in one interval; 1,826 of 3,111 intervals above 10 | 300 per interval | Nothing lands on the member. The cost is that ssh alerts hold the one-hour cooldown and keep the other five checks silent |
+| ssh authentication failures | `Failed password` or `Invalid user` lines in authlog, counted per source address per 15 min, plus the onboarding instance's `for hello from` admissions per source (section 2c) | 217,300 lines, 1,797 addresses, 35 days; worst single address 358 in one interval; 1,826 of 3,111 intervals above 10 | 300 per interval, pending the second listener's first reading | Nothing lands on the member. The cost is that ssh alerts hold the one-hour cooldown and keep the other five checks silent |
 | mail authentication failures | failed `smtp authentication` lines, and the dovecot pattern in section 2 | No SMTP failures; one IMAP failure on 2026-09-24, which the pattern does not match; 1,049 pre-auth scanner disconnects | keep the alert at any failure, and fix the pattern | A false alert here is one operator read. A missed one is a member's client failing to log in with nobody told |
 | quota approach | `quota -u <user>` for each `/home/*/` | No quota exists on `/home`; the only reading is 1.2 MB used of 8.2 GB | keep 80, no data | None today. Once quotas exist, a member parked above the line re-alerts every hour forever; the member's mail is not refused until the soft limit plus grace |
 | spamd greylist churn | `spamdb`, counting the lines that start with `GREY` | 3 live now; 3 to 37 new tuples a day, 90 tuples over 12 days; nothing samples the live count | 100 | Greylisting defers and then delivers, so the member sees nothing. The cost is an ignored "possible mail flood" |
@@ -280,6 +280,35 @@ permanent lockout during an attack. The cost of a value that is too high is that
 grinding through a list goes unmentioned, which is a log-volume and CPU matter and not a
 member-visible one.
 
+### 2c. The second listener and the re-measurement
+
+The onboarding sshd writes a line per admitted connection on each of its ports, and both lines name the account `hello`:
+
+	Accepted none for hello from <address> port <n> ssh2
+	Accepted publickey for hello from <address> port <n> ssh2: <type> SHA256:<fingerprint>
+
+`scripts/abuse-monitor.sh` counts those per source address beside the failure tally, anchored on the `Accepted … for hello from` line. The member port also writes `Postponed publickey for hello from` for a key it tests and `Failed publickey for hello from` for one it refuses, and neither admits anyone, so the anchor is the Accepted form rather than the account. A member's own login on 22 and the operator's login name their own accounts, so neither enters this count. The count is compared against the same per-address window value as the failure tally, `AUTH_FAIL_MAX`, because this measurement is what will set that value.
+
+The number is not measured in this note. The port was not live when it was written, so 300 stays in the table above and in the monitor's default. A number recorded without the live reading would be a guess in the place the note keeps for measurements.
+
+#### The manual deploy step
+
+Once the port is serving, read the retained authlog on the box. Nothing here writes:
+
+```ksh
+gzip -dc /var/log/authlog.[0-6].gz | cat - /var/log/authlog |
+	awk '/Accepted (none|publickey) for hello from/ { for (i = NF; i >= 2; i--) if ($i == "port") { print $(i-1); break } }' |
+	sort | uniq -c | sort -rn
+```
+
+This is the ticket's command with the two corrections the box requires. The 2026-10-13 account rename (`60757e0`) made `for onboard from` into `for hello from`, and the anchor is the Accepted form so a key test or a failed password against `hello` is not counted as a session. The output gives the busiest source address and its line count over the retained window.
+
+The value this note records is the busiest source's count inside one 15-minute interval, because that is the window `new_lines()` measures between runs. Take the same match and bucket it by the timestamp in the way the command in section 2b does.
+
+The number goes in three places, which must agree: the proposed value in section 2b, the ssh row of the table above, and `AUTH_FAIL_MAX` in `/root/.kyriakon-env` on the box, which the cron line sources. That value also governs the admission count's alert. The script default stays 300 until then, so a box without the override keeps the baselined value.
+
+The other figure #331 asks for is the submission count the session caps use, `DRAFTS_PER_DAY` in `onboard/src/rate.rs`. It is five today by choice, and the criterion asks that it come from the same measured baseline rather than from a guess. The command above counts admitted sessions rather than filed drafts, so record the drafts per address over the same window beside it when the measurement is taken.
+
 ## 3. Quota approach
 
 **Where it lives.** `quota -u <user>` for each directory under `/home/`.
@@ -446,6 +475,8 @@ refused at Gmail and Outlook while everything on this box looks healthy.
 - **The effect of starting from the shipped values.** The monitor's first run baselines without
   alerting, and no historical replay exists, so none of these thresholds has ever been evaluated
   against the traffic in this note.
+
+The second listener's value is the one this window cannot give at all. It did not exist for the period, so both the admission count and the re-measured SSH threshold wait for the first live reading. Section 2c carries the command and the three places the number goes.
 
 ## Tested versus documentary
 

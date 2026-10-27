@@ -20,13 +20,34 @@ const TOKEN: &str = "abcdefghjkmnpqrstvwxyz0123";
 /// catalogue and the tracked reserved names. The question list is the crate's own,
 /// so it comes with the build rather than from a path.
 async fn handler(name: &str) -> (App, PathBuf) {
+    let dir = fixture_dir(name);
+    // The deploy stages these from `scripts/render-docs.sh --gemini`; the
+    // fixture writes one file per route so the startup read sees the same shape.
+    for (_, file, _) in capsule::PAGES {
+        std::fs::write(
+            dir.join("pages").join(file),
+            format!("# {file}\n\nA mirrored page.\n"),
+        )
+        .unwrap();
+    }
+    (App::load(handler_config(&dir)).await.unwrap(), dir)
+}
+
+/// The store and page directories, empty, for a test that stages its own pages.
+fn fixture_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("onboard-responder-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    for sub in ["applications", "intents"] {
+    for sub in ["applications", "intents", "pages"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
+    dir
+}
+
+/// The configuration every fixture handler loads: the tracked catalogue and
+/// reserved names, the crate's question list, and the pages under `dir`.
+fn handler_config(dir: &Path) -> config::Config {
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let cfg = config::Config {
+    config::Config {
         store_root: dir.to_str().unwrap().to_string(),
         reserved: crate_dir
             .join("../reserved-usernames.txt")
@@ -38,12 +59,48 @@ async fn handler(name: &str) -> (App, PathBuf) {
             .to_str()
             .unwrap()
             .to_string(),
+        pages: dir.join("pages").to_str().unwrap().to_string(),
         httpd_socket: String::new(),
         gemini_socket: String::new(),
         portal_socket: String::new(),
         release: "2026-10-13 test".to_string(),
+    }
+}
+
+/// A staging run that missed a page stops the handler rather than leaving a
+/// route that answers 51 for a document the capsule promises.
+#[tokio::test]
+async fn the_handler_refuses_to_start_without_a_staged_page() {
+    let dir = fixture_dir("missing-page");
+    for (route, file, _) in capsule::PAGES {
+        if *route == "aup" {
+            continue;
+        }
+        std::fs::write(dir.join("pages").join(file), "# ok\n").unwrap();
+    }
+    let Err(err) = App::load(handler_config(&dir)).await else {
+        panic!("the handler started without a page");
     };
-    (App::load(cfg).await.unwrap(), dir)
+    assert!(err.contains("aup.gmi"), "{err}");
+}
+
+/// An empty staged file is the same failure as a missing one: the page exists
+/// and says nothing, which a reader would take for the document.
+#[tokio::test]
+async fn the_handler_refuses_an_empty_staged_page() {
+    let dir = fixture_dir("empty-page");
+    for (route, file, _) in capsule::PAGES {
+        let body = if *route == "privacy" {
+            String::new()
+        } else {
+            "# ok\n".to_string()
+        };
+        std::fs::write(dir.join("pages").join(file), body).unwrap();
+    }
+    let Err(err) = App::load(handler_config(&dir)).await else {
+        panic!("the handler started on an empty page");
+    };
+    assert!(err.contains("privacy.gmi"), "{err}");
 }
 
 /// One request through the responder: the fixture in, the code and the bytes a
@@ -188,9 +245,10 @@ fn body_answers() -> Vec<(&'static str, &'static str)> {
     .collect()
 }
 
-/// A public key block with the structure of a key that can be encrypted to.
-const GOOD_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
-mAYEAAAAABK4BgQAAAAAEg==\n-----END PGP PUBLIC KEY BLOCK-----\n";
+/// A real clean key from the generator, because the shared check parses the
+/// block in full: the old two-packet stub passed only the structural reading.
+const GOOD_KEY: &str =
+    include_str!("../../../docs/planning/prototypes/keygen-spike/fixtures/generated-clean.asc");
 
 /// The body of a form post, percent-encoded the way a browser sends one.
 fn encoded(pairs: &[(&str, &str)]) -> String {
@@ -274,6 +332,63 @@ async fn gmid_asks_for_the_capsule_and_gets_the_catalogue() {
     assert!(
         body.contains("=> gemini://mail.kyriakon.net/ Mail: zero-access mail"),
         "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_capsule_serves_each_mirrored_page_as_gemtext() {
+    let (app, _dir) = handler("gmid-pages").await;
+    for (route, file, _) in capsule::PAGES {
+        let (code, body) = answer(&app, &gmid_get(route, "")).await;
+        assert_eq!(code, 20, "{route} answers with a page: {body}");
+        assert!(body.starts_with("20 text/gemini\r\n"), "{body}");
+        assert!(
+            body.contains(&format!("# {file}")),
+            "{route} serves the staged file: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_acceptances_page_carries_three_acceptances_and_the_release() {
+    let (app, _dir) = handler("gmid-acceptances").await;
+    let (code, body) = answer(&app, &gmid_get(capsule::ACCEPTANCES, "")).await;
+    assert_eq!(code, 20, "{body}");
+    assert!(body.starts_with("20 text/gemini\r\n"), "{body}");
+    for document in [
+        "I accept the terms of service.",
+        "I accept the acceptable use policy.",
+        "I accept the privacy notice.",
+    ] {
+        assert!(body.contains(document), "{document} is on the page: {body}");
+    }
+    assert_eq!(
+        body.matches("* I accept ").count(),
+        3,
+        "one acceptance per document: {body}"
+    );
+    assert!(
+        body.contains("2026-10-13 test"),
+        "the release the page was generated from: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_front_page_names_the_web_form_and_the_pages_that_stay_over_https() {
+    let (app, _dir) = handler("gmid-front").await;
+    let (code, body) = answer(&app, &gmid_get("", "")).await;
+    assert_eq!(code, 20, "{body}");
+    assert!(
+        body.contains("The web form at https://signup.kyriakon.net/ is the other way in"),
+        "the browser is named as the other way in: {body}"
+    );
+    assert!(
+        body.contains("The refusal list and the threat model stay published over HTTPS"),
+        "the two pages that are not mirrored are named: {body}"
+    );
+    assert!(
+        body.contains(&format!("=> gemini://{HOST}/keys Making a key")),
+        "the walkthrough is linked from the front page: {body}"
     );
 }
 
@@ -1168,6 +1283,10 @@ async fn a_capsule_body_key_page_names_one_mailbox_and_the_mail_route() {
     assert!(page.contains("secretary@parish.example"), "{page}");
     assert!(page.contains("apply@kyriakon.net"), "{page}");
     assert!(
+        page.contains("gemini://signup.kyriakon.net/keys"),
+        "the walkthrough is named on every key page: {page}"
+    );
+    assert!(
         page.contains(TOKEN),
         "the subject carries the draft's token: {page}"
     );
@@ -1214,6 +1333,33 @@ async fn a_capsule_person_key_page_names_their_address() {
     assert_eq!(code, 10, "{page}");
     assert!(page.contains("secretary@kyriakon.net"), "{page}");
     assert!(page.contains("apply@kyriakon.net"), "{page}");
+    assert!(
+        page.contains("gemini://signup.kyriakon.net/keys"),
+        "the walkthrough is named on every key page: {page}"
+    );
+}
+
+#[tokio::test]
+async fn a_capsule_upload_key_page_names_the_walkthrough() {
+    let (app, _dir) = handler("capsule-upload-key").await;
+    let mut record = crate::draft::Draft::new(TOKEN.to_string());
+    record
+        .answers
+        .insert("whose".to_string(), "person".to_string());
+    record
+        .answers
+        .insert("username".to_string(), "secretary".to_string());
+    let path = flow_path(&app.questions, &record.answers);
+    let index = path
+        .iter()
+        .position(|p| p.q.id == "upload_key")
+        .expect("the upload key page");
+    record.cursor = index;
+    crate::draft::save(&app.store, &mut record).await.unwrap();
+
+    let (code, page) = answer(&app, &gmid_get(&format!("apply/{TOKEN}/{}", index + 1), "")).await;
+    assert_eq!(code, 10, "{page}");
+    assert!(page.contains("gemini://signup.kyriakon.net/keys"), "{page}");
 }
 
 #[tokio::test]
