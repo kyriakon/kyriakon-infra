@@ -20,22 +20,34 @@ const TOKEN: &str = "abcdefghjkmnpqrstvwxyz0123";
 /// catalogue and the tracked reserved names. The question list is the crate's own,
 /// so it comes with the build rather than from a path.
 async fn handler(name: &str) -> (App, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("onboard-responder-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    for sub in ["applications", "intents", "pages"] {
-        std::fs::create_dir_all(dir.join(sub)).unwrap();
-    }
+    let dir = fixture_dir(name);
     // The deploy stages these from `scripts/render-docs.sh --gemini`; the
     // fixture writes one file per route so the startup read sees the same shape.
-    for (_, file) in capsule::PAGES {
+    for (_, file, _) in capsule::PAGES {
         std::fs::write(
             dir.join("pages").join(file),
             format!("# {file}\n\nA mirrored page.\n"),
         )
         .unwrap();
     }
+    (App::load(handler_config(&dir)).await.unwrap(), dir)
+}
+
+/// The store and page directories, empty, for a test that stages its own pages.
+fn fixture_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("onboard-responder-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for sub in ["applications", "intents", "pages"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    dir
+}
+
+/// The configuration every fixture handler loads: the tracked catalogue and
+/// reserved names, the crate's question list, and the pages under `dir`.
+fn handler_config(dir: &Path) -> config::Config {
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let cfg = config::Config {
+    config::Config {
         store_root: dir.to_str().unwrap().to_string(),
         reserved: crate_dir
             .join("../reserved-usernames.txt")
@@ -52,8 +64,43 @@ async fn handler(name: &str) -> (App, PathBuf) {
         gemini_socket: String::new(),
         portal_socket: String::new(),
         release: "2026-10-13 test".to_string(),
+    }
+}
+
+/// A staging run that missed a page stops the handler rather than leaving a
+/// route that answers 51 for a document the capsule promises.
+#[tokio::test]
+async fn the_handler_refuses_to_start_without_a_staged_page() {
+    let dir = fixture_dir("missing-page");
+    for (route, file, _) in capsule::PAGES {
+        if *route == "aup" {
+            continue;
+        }
+        std::fs::write(dir.join("pages").join(file), "# ok\n").unwrap();
+    }
+    let Err(err) = App::load(handler_config(&dir)).await else {
+        panic!("the handler started without a page");
     };
-    (App::load(cfg).await.unwrap(), dir)
+    assert!(err.contains("aup.gmi"), "{err}");
+}
+
+/// An empty staged file is the same failure as a missing one: the page exists
+/// and says nothing, which a reader would take for the document.
+#[tokio::test]
+async fn the_handler_refuses_an_empty_staged_page() {
+    let dir = fixture_dir("empty-page");
+    for (route, file, _) in capsule::PAGES {
+        let body = if *route == "privacy" {
+            String::new()
+        } else {
+            "# ok\n".to_string()
+        };
+        std::fs::write(dir.join("pages").join(file), body).unwrap();
+    }
+    let Err(err) = App::load(handler_config(&dir)).await else {
+        panic!("the handler started on an empty page");
+    };
+    assert!(err.contains("privacy.gmi"), "{err}");
 }
 
 /// One request through the responder: the fixture in, the code and the bytes a
@@ -291,7 +338,7 @@ async fn gmid_asks_for_the_capsule_and_gets_the_catalogue() {
 #[tokio::test]
 async fn the_capsule_serves_each_mirrored_page_as_gemtext() {
     let (app, _dir) = handler("gmid-pages").await;
-    for (route, file) in capsule::PAGES {
+    for (route, file, _) in capsule::PAGES {
         let (code, body) = answer(&app, &gmid_get(route, "")).await;
         assert_eq!(code, 20, "{route} answers with a page: {body}");
         assert!(body.starts_with("20 text/gemini\r\n"), "{body}");

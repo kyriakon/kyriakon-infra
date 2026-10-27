@@ -33,7 +33,7 @@ Thunderbird for Android is not covered by this page. The prototype has not teste
 
 ## The browser generator
 
-The generator is at https://signup.kyriakon.net/ and runs in your browser. The page's own code makes the key on your machine. Nothing is uploaded while it runs, and the private key file is written by the page for you to keep.
+The generator is at https://signup.kyriakon.net/ and runs in your browser. The page's own code makes the key on your machine, and the private key file is written by the page for you to keep.
 
 It makes the mail key and the upload key together, and it shows the recovery phrase once. Write the phrase down before you close the tab.
 
@@ -53,12 +53,6 @@ The two ports are these, and they are the only two you need:
 - git on port 2222, for your `pass` repositories.
 
 There is no interactive shell on the account. The sftp session is confined to your own website directory, and the git session can only reach the repositories you own. If a client asks for a shell, that is a client setting to change, not a missing permission to request.
-
-## Checking a key
-
-The same site has a key check page. Paste a public key and it reports whether a client could use it: whether a subkey can encrypt, whether the key advertises a packet your mail client cannot read, and whether it has expired or been revoked.
-
-The check runs in the browser and uploads nothing. A warning is not a refusal. The platform records the verdict with your application and lets a person read it, because it cannot verify what any client generated and a refusal would send a working setup to a support queue.
 
 ## Where the key goes
 

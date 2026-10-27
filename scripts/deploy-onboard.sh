@@ -79,7 +79,8 @@ onboard_user='_onboard'
 for f in onboard/Cargo.toml openbsd/etc/onboard/onboard.toml openbsd/etc/onboard/drain.toml \
 	onboard/questions.toml \
 	openbsd/etc/rc.d/kyriakon_onboard scripts/onboard-store.sh scripts/render-docs.sh \
-	docs/key-walkthrough.md reserved-usernames.txt; do
+	docs/terms.md docs/privacy.md docs/aup.md docs/key-walkthrough.md \
+	reserved-usernames.txt; do
 	[ -e "$repo_dir/$f" ] || die "missing from $repo_dir: $f"
 done
 for s in $drain_scripts; do

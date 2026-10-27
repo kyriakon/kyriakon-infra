@@ -9,15 +9,16 @@ use crate::page::StatusPage;
 use crate::questions::{Kind, Question};
 use crate::responder::HOST;
 
-/// The mirrored pages the deploy stages as gemtext, as the route name and the
-/// file `scripts/render-docs.sh --gemini` writes. The route is a literal the
-/// handler serves and the file name is the one the renderer writes, so the two
-/// ends cannot disagree about a page.
-pub const PAGES: &[(&str, &str)] = &[
-    ("terms", "terms.gmi"),
-    ("aup", "aup.gmi"),
-    ("privacy", "privacy.gmi"),
-    ("keys", "key-walkthrough.gmi"),
+/// The mirrored pages the deploy stages as gemtext, as the route name, the file
+/// `scripts/render-docs.sh --gemini` writes, and the link label the front page
+/// gives it. One table because the route, the file and the label must name the
+/// same page: adding one here is what makes the renderer stage it and the front
+/// page link it.
+pub const PAGES: &[(&str, &str, &str)] = &[
+    ("terms", "terms.gmi", "Terms of service"),
+    ("aup", "aup.gmi", "Acceptable use policy"),
+    ("privacy", "privacy.gmi", "Privacy notice"),
+    ("keys", "key-walkthrough.gmi", "Making a key"),
 ];
 
 /// The route the acceptances page answers on. It is not a staged file: the page
@@ -79,7 +80,8 @@ pub fn front_page(list: &[Service], member: Option<&str>) -> String {
          pages for a browser:\n\n",
     );
     out.push_str(
-        "=> https://kyriakon.net/ The main site, where both are published\n\n\
+        "=> https://signup.kyriakon.net/ The web form\n\
+         => https://kyriakon.net/ The main site, where both are published\n\n\
          ## What the platform offers\n\n",
     );
     out.push_str(&gemtext(list, member));
@@ -92,12 +94,7 @@ pub fn front_page(list: &[Service], member: Option<&str>) -> String {
          appear in the server's logs and in the outer message wrapper.\n",
     );
     out.push_str("\n## The documents and the keys\n\n");
-    for (route, label) in [
-        ("terms", "Terms of service"),
-        ("aup", "Acceptable use policy"),
-        ("privacy", "Privacy notice"),
-        ("keys", "Making a key"),
-    ] {
+    for (route, _, label) in PAGES {
         out.push_str(&format!("=> gemini://{HOST}/{route} {label}\n"));
     }
     out.push_str(&format!(
@@ -125,12 +122,14 @@ pub fn acceptances(list: &[Question], release: &str) -> String {
     for (_, label) in ACCEPTED {
         out.push_str(&format!("* I accept {label}.\n"));
     }
-    out.push_str(&format!(
-        "\nVersion: {release}\n\n\
-         => gemini://{HOST}/terms Terms of service\n\
-         => gemini://{HOST}/aup Acceptable use policy\n\
-         => gemini://{HOST}/privacy Privacy notice\n"
-    ));
+    out.push_str(&format!("\nVersion: {release}\n\n"));
+    for (route, _) in ACCEPTED {
+        let (_, _, label) = PAGES
+            .iter()
+            .find(|(r, _, _)| *r == route)
+            .unwrap_or_else(|| panic!("{route} is accepted but not a staged page"));
+        out.push_str(&format!("=> gemini://{HOST}/{route} {label}\n"));
+    }
     out
 }
 
@@ -207,6 +206,34 @@ mod tests {
         );
     }
 
+    /// The one table links every staged page and stages every accepted
+    /// document, so a page added there cannot ship without a link, and an
+    /// acceptance cannot name a page that is not served.
+    #[test]
+    fn every_staged_page_is_linked_and_every_accepted_document_is_staged() {
+        let list = catalogue::parse(include_str!("../../openbsd/etc/onboard/catalogue.toml"))
+            .expect("the tracked catalogue parses");
+        let front = front_page(&list, None);
+        for (route, _, label) in PAGES {
+            assert!(
+                front.contains(&format!("=> gemini://{HOST}/{route} {label}")),
+                "{route} is linked from the front page as {label}: {front}"
+            );
+        }
+        let mine = crate::questions::shipped().expect("the shipped question list parses");
+        let accepted = acceptances(&mine, "2026-10-13 test");
+        for (route, _) in ACCEPTED {
+            assert!(
+                PAGES.iter().any(|(r, _, _)| *r == route),
+                "{route} is accepted but not a staged page"
+            );
+            assert!(
+                accepted.contains(&format!("=> gemini://{HOST}/{route} ")),
+                "{route} is linked from the acceptances page"
+            );
+        }
+    }
+
     #[test]
     fn the_acceptances_page_carries_three_documents_and_the_release() {
         let list = crate::questions::shipped().expect("the shipped question list parses");
@@ -254,13 +281,13 @@ mod tests {
     }
 
     /// Where a source claims zero-access mail, it states the metadata limit in
-    /// the same document. The AUP is not in this list: its zero-access paragraph
-    /// is a tracked site document this ticket may not edit, and it was reported
-    /// rather than changed.
+    /// the same document. Every mirrored document is in this list, so the one
+    /// mirror CI runs cannot carry the claim alone.
     #[test]
     fn every_zero_access_claim_states_the_metadata_limit() {
         let sources = [
             ("terms", include_str!("../../docs/terms.md")),
+            ("aup", include_str!("../../docs/aup.md")),
             ("privacy", include_str!("../../docs/privacy.md")),
             (
                 "key walkthrough",
