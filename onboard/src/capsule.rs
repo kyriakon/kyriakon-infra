@@ -1,11 +1,14 @@
-//! The capsule's rendering of the shared catalogue.
+//! The capsule's rendering: the shared catalogue, the status page, and the
+//! member's reading half.
 //!
-//! The capsule front-end itself is a later ticket: this is the one page it
-//! renders from the catalogue file today, which is the page its spec fixes, one
-//! line per entry with the name and the clause in the link label.
+//! The catalogue is one line per entry with the name and the clause in the link
+//! label, because that is the only place a gemtext link carries text. The
+//! account page is a read and nothing else; a certificate that matched no pin
+//! gets the same page as a stranger, carrying only its own fingerprint.
 
 use crate::catalogue::{self, Protocol, Row, Service};
 use crate::page::StatusPage;
+use crate::store::{Account, Certificate, Notice};
 
 /// The entries as rows, one per service. Here as well as in the gemtext page so
 /// the check can compare what this front-end shows before it is formatted, which
@@ -75,6 +78,105 @@ pub fn filed(link: &str) -> String {
     )
 }
 
+/// The member's reading half: the account's state, whether the site and the
+/// capsule are served, the space used and the notices sent. It is a read and
+/// nothing else, so the page carries no prompt, no form and no link that files
+/// anything; changing an account is handed off to the two front-ends that can.
+///
+/// The words for the serving facts are the capsule's own chrome. A fact the
+/// drain has not recorded yet reads as that rather than as a false "no".
+pub fn account(account: &Account, notices: &[Notice]) -> String {
+    let mut out = String::from("# Your account\n\n");
+    out.push_str(&format!("State: {}\n", account.state));
+    out.push_str(&format!("Site: {}\n", served(account.site_served)));
+    out.push_str(&format!("Capsule: {}\n", served(account.capsule_served)));
+    out.push_str(&format!("Space used: {}\n", space(account.space_used)));
+    out.push_str(
+        "\nNothing here changes anything. Change it from \
+         https://signup.kyriakon.net/account or from the terminal.\n",
+    );
+    out.push_str("\n## Notices\n\n");
+    if notices.is_empty() {
+        out.push_str("Nothing has been sent yet.\n");
+    }
+    for notice in notices {
+        out.push_str(&format!(
+            "{}: {} (to {})\n",
+            date(&notice.at),
+            notice.subject,
+            notice.to
+        ));
+    }
+    out
+}
+
+/// The account page for a visit no pin matched. It says what the page is for
+/// and, when the client presented a certificate, how to register it. It never
+/// says whether the certificate is known, because a page that said "unknown"
+/// would answer the question a stranger is asking one hash at a time.
+pub fn account_stranger(certificate: Option<&Certificate>) -> String {
+    let mut out = String::from(
+        "# Your account\n\n\
+         Your account is read here when a client presents a certificate the\n\
+         account has pinned, one per device. Nothing is changed from the capsule.\n",
+    );
+    if let Some(certificate) = certificate.filter(|c| !c.hash.is_empty()) {
+        out.push('\n');
+        out.push_str(&registration(certificate));
+    }
+    out
+}
+
+/// The line a presented certificate earns: its own fingerprint, so a member can
+/// pin the device in their hand without copying anything out of a client's
+/// settings, and where registering it happens.
+pub fn registration(certificate: &Certificate) -> String {
+    format!(
+        "To add this device, register the certificate this client presented,\n\
+         from https://signup.kyriakon.net/account or from the terminal:\n\n\
+         {}\n",
+        short_hash(&certificate.hash)
+    )
+}
+
+/// The first bytes of a certificate's fingerprint: the algorithm gmid names and
+/// the first eight hexadecimal characters of the digest, which is enough to
+/// tell two devices apart by eye.
+fn short_hash(hash: &str) -> String {
+    match hash.split_once(':') {
+        Some((algorithm, digest)) => {
+            format!("{algorithm}:{}", digest.chars().take(8).collect::<String>())
+        }
+        None => hash.chars().take(8).collect(),
+    }
+}
+
+/// Whether a protocol is being served, as the drain recorded it.
+fn served(flag: Option<bool>) -> &'static str {
+    match flag {
+        Some(true) => "serving",
+        Some(false) => "not serving",
+        None => "not recorded yet",
+    }
+}
+
+/// The space used under the quota, in the units the platform publishes. Binary
+/// multiples, because the quota itself is five gibibytes.
+fn space(bytes: Option<u64>) -> String {
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    match bytes {
+        Some(bytes) if bytes >= GIB => format!("{:.1} GB", bytes as f64 / GIB as f64),
+        Some(bytes) => format!("{} MB", bytes / MIB),
+        None => "not recorded yet".to_string(),
+    }
+}
+
+/// A notice's date, which is the RFC 3339 timestamp's own date part.
+fn date(at: &str) -> &str {
+    at.get(..10).unwrap_or(at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +191,81 @@ mod tests {
             text.contains(&format!("=> {link} Application status")),
             "{text}"
         );
+    }
+
+    fn member() -> Account {
+        serde_json::from_str(
+            r#"{"version": 1, "username": "alice", "state": "active",
+                "decision": "approve", "decided_at": "2026-09-30T09:00:00Z",
+                "rail": "no_charge", "no_charge": true,
+                "created_at": "2026-09-30T09:00:00Z", "paid_until": null,
+                "site_served": true, "capsule_served": false,
+                "space_used": 432013312}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_capsule_account_reads_the_four_facts_and_the_notices() {
+        let notices: Vec<Notice> = vec![Notice {
+            version: 1,
+            at: "2026-09-30T09:00:00Z".into(),
+            notice_type: "approval.free".into(),
+            subject: "Application approved, account opened.".into(),
+            to: "alice@kyriakon.net".into(),
+        }];
+        let text = account(&member(), &notices);
+        assert!(text.contains("State: active"), "{text}");
+        assert!(text.contains("Site: serving"), "{text}");
+        assert!(text.contains("Capsule: not serving"), "{text}");
+        assert!(text.contains("Space used: 412 MB"), "{text}");
+        assert!(
+            text.contains(
+                "2026-09-30: Application approved, account opened. (to alice@kyriakon.net)"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Nothing here changes anything"), "{text}");
+    }
+
+    #[test]
+    fn an_unrecorded_fact_is_not_a_false_no() {
+        let mut record = member();
+        record.site_served = None;
+        record.space_used = None;
+        let text = account(&record, &[]);
+        assert!(text.contains("Site: not recorded yet"), "{text}");
+        assert!(text.contains("Space used: not recorded yet"), "{text}");
+        assert!(text.contains("Nothing has been sent yet."), "{text}");
+    }
+
+    #[test]
+    fn a_stranger_sees_the_fingerprint_and_never_the_word_unknown() {
+        let certificate = Certificate {
+            hash: "SHA256:0123456789abcdef".into(),
+            ..Certificate::default()
+        };
+        let text = account_stranger(Some(&certificate));
+        assert!(text.contains("SHA256:01234567"), "{text}");
+        assert!(
+            text.contains("https://signup.kyriakon.net/account"),
+            "{text}"
+        );
+        assert!(text.contains("terminal"), "{text}");
+        assert!(!text.to_lowercase().contains("unknown"), "{text}");
+
+        // No certificate is no fingerprint, and the page is still a page.
+        let text = account_stranger(None);
+        assert!(!text.contains("SHA256:"), "{text}");
+    }
+
+    #[test]
+    fn the_space_and_the_hash_shorten_for_the_page() {
+        assert_eq!(space(Some(1 << 30)), "1.0 GB");
+        assert_eq!(space(Some(432013312)), "412 MB");
+        assert_eq!(space(None), "not recorded yet");
+        assert_eq!(short_hash("SHA256:0123456789abcdef"), "SHA256:01234567");
+        assert_eq!(short_hash("0123456789"), "01234567");
     }
 
     #[test]

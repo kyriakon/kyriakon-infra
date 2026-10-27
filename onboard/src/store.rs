@@ -100,6 +100,36 @@ impl Store {
         })
     }
 
+    /// The account a pinned client certificate belongs to, or `None` when no
+    /// account carries the hash.
+    ///
+    /// The scan reads each `account.json` rather than an index beside the pins:
+    /// an index would be a second list that can disagree with the account, and
+    /// the account directory is small enough that one read answers it. An
+    /// account that cannot be read is skipped rather than failing the lookup,
+    /// so a damaged record answers anonymously instead of breaking the page
+    /// for everyone.
+    pub async fn account_for_certificate(&self, hash: &str) -> Option<Account> {
+        if hash.is_empty() {
+            return None;
+        }
+        for username in self.list("accounts").await.ok()? {
+            let Some(text) = self
+                .read_record(&format!("accounts/{username}"), "account.json")
+                .await
+            else {
+                continue;
+            };
+            let Ok(account) = serde_json::from_str::<Account>(&text) else {
+                continue;
+            };
+            if account.certificates.iter().any(|c| c.hash == hash) {
+                return Some(account);
+            }
+        }
+        None
+    }
+
     /// The names in one directory, sorted. A missing directory reads as empty,
     /// which is what a first run against a fresh store is: no intents, no
     /// journal, no notices, and none of those is an error to a reader.
@@ -459,6 +489,41 @@ pub struct Account {
     pub window: Option<Window>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outside_address: Option<String>,
+    /// The gemini client certificates pinned to this account, one per device.
+    /// A request whose `TLS_CLIENT_HASH` matches one of these is this member;
+    /// the hash is over the certificate, so a reissued certificate is a new
+    /// entry rather than a preserved one.
+    #[serde(default)]
+    pub certificates: Vec<Certificate>,
+    /// Whether the drain is serving the member's site and capsule, and the
+    /// bytes used under the quota. The drain writes these when it reads them;
+    /// absent means it has not, which the capsule renders as exactly that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_served: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capsule_served: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_used: Option<u64>,
+}
+
+/// One pinned client certificate, as a request described it.
+///
+/// The hash is the identity. The subject, issuer and validity dates are
+/// recorded beside it and are never consulted for a decision: a gemini client
+/// certificate is self-signed, so anyone can mint any subject or issuer.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Certificate {
+    /// `TLS_CLIENT_HASH`: the algorithm and the certificate's digest, which is
+    /// the only field a pin is matched on.
+    pub hash: String,
+    /// `REMOTE_USER`, the subject the certificate claims.
+    pub subject: String,
+    /// `TLS_CLIENT_ISSUER`, which on a self-signed certificate is that same
+    /// claim again.
+    pub issuer: String,
+    pub not_before: String,
+    pub not_after: String,
 }
 
 /// The 14-day payment window a paid approval opens.

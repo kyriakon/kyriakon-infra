@@ -104,10 +104,12 @@ fn httpd_post(path: &str, body: &str) -> Vec<u8> {
     )
 }
 
-/// The request gmid builds: the path already decoded and cleaned with no leading
-/// slash, the query still percent-encoded, and no forwarded header of any kind.
-fn gmid_get(path: &str, query: &str) -> Vec<u8> {
-    fixture::gmid(&[
+/// The gmid environment, with whatever a certificate adds appended. gmid sends
+/// `AUTH_TYPE` on every request, empty when no certificate was presented and
+/// `CERTIFICATE` when one was, and a later entry for the same name is the one
+/// the parameter map keeps.
+fn gmid_env(path: &str, query: &str, extra: &[(&str, &str)]) -> Vec<u8> {
+    let mut env = vec![
         ("GATEWAY_INTERFACE", "CGI/1.1"),
         ("REQUEST_METHOD", "GET"),
         ("GEMINI_URL_PATH", path),
@@ -124,7 +126,88 @@ fn gmid_get(path: &str, query: &str) -> Vec<u8> {
         ("SERVER_SOFTWARE", "gmid/2.1.1"),
         ("REMOTE_ADDR", "203.0.113.10"),
         ("AUTH_TYPE", ""),
-    ])
+    ];
+    env.extend_from_slice(extra);
+    fixture::gmid(&env)
+}
+
+/// The request gmid builds: the path already decoded and cleaned with no leading
+/// slash, the query still percent-encoded, and no forwarded header of any kind.
+fn gmid_get(path: &str, query: &str) -> Vec<u8> {
+    gmid_env(path, query, &[])
+}
+
+/// The request gmid builds when the client presented a certificate.
+fn gmid_certificate(path: &str, query: &str, certificate: &Certificate) -> Vec<u8> {
+    gmid_env(
+        path,
+        query,
+        &[
+            ("AUTH_TYPE", "CERTIFICATE"),
+            ("REMOTE_USER", &certificate.subject),
+            ("TLS_CLIENT_ISSUER", &certificate.issuer),
+            ("TLS_CLIENT_HASH", &certificate.hash),
+            ("TLS_CLIENT_NOT_BEFORE", &certificate.not_before),
+            ("TLS_CLIENT_NOT_AFTER", &certificate.not_after),
+        ],
+    )
+}
+
+/// A certificate as gmid would describe one: `SHA256:` and the lowercase digest,
+/// with a subject and issuer that are the same claim on a self-signed one.
+fn certificate(hash: &str, subject: &str) -> Certificate {
+    Certificate {
+        hash: hash.to_string(),
+        subject: subject.to_string(),
+        issuer: subject.to_string(),
+        not_before: "2026-01-01T00:00:00Z".to_string(),
+        not_after: "2036-01-01T00:00:00Z".to_string(),
+    }
+}
+
+/// The hash Alice's account pins, and one that it does not.
+const PINNED: &str = "SHA256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const OTHER: &str = "SHA256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+/// An account in the store: the pinned certificate, the four facts the reading
+/// half renders, and one notice. The handler only ever reads these files.
+fn file_account(dir: &Path) {
+    let pinned = PINNED;
+    let record = format!(
+        r#"{{"version": 1, "username": "alice", "state": "active",
+            "decision": "approve", "decided_at": "2026-09-30T09:00:00Z",
+            "rail": "no_charge", "no_charge": true,
+            "created_at": "2026-09-30T09:00:00Z", "paid_until": null,
+            "certificates": [{{"hash": "{pinned}", "subject": "CN=alice",
+                "issuer": "CN=alice",
+                "not_before": "2026-01-01T00:00:00Z",
+                "not_after": "2036-01-01T00:00:00Z"}}],
+            "site_served": true, "capsule_served": true,
+            "space_used": 432013312}}"#
+    );
+    let account = dir.join("accounts/alice");
+    std::fs::create_dir_all(&account).unwrap();
+    std::fs::write(account.join("account.json"), record).unwrap();
+    std::fs::write(
+        account.join("notices.jsonl"),
+        "{\"version\":1,\"at\":\"2026-09-30T09:00:00Z\",\"type\":\"approval.free\",\
+         \"subject\":\"Application approved, account opened.\",\
+         \"to\":\"alice@kyriakon.net\"}\n",
+    )
+    .unwrap();
+}
+
+/// The bytes of every record the handler writes, so a read can be shown to have
+/// filed nothing.
+fn filed(dir: &Path) -> usize {
+    ["intents", "applications", "drafts"]
+        .iter()
+        .map(|sub| {
+            std::fs::read_dir(dir.join(sub))
+                .map(|rd| rd.count())
+                .unwrap_or(0)
+        })
+        .sum()
 }
 
 /// A record of the shape the store holds, as the drain leaves one when it decides.
@@ -274,6 +357,172 @@ async fn gmid_asks_for_the_capsule_and_gets_the_catalogue() {
     assert!(
         body.contains("=> gemini://mail.kyriakon.net/ Mail: zero-access mail"),
         "{body}"
+    );
+}
+
+/// The join the ticket is about: the hash decides, and a match is the member
+/// on both the catalogue and the reading half.
+#[tokio::test]
+async fn a_pinned_certificate_answers_as_the_member() {
+    let (app, dir) = handler("gmid-pinned").await;
+    file_account(&dir);
+    let pinned = certificate(PINNED, "CN=alice");
+
+    let (code, body) = answer(&app, &gmid_certificate("", "", &pinned)).await;
+    assert_eq!(code, 20);
+    assert!(
+        body.contains("=> gemini://alice.kyriakon.net/ A website"),
+        "the member's own host, not the pattern: {body}"
+    );
+    assert!(!body.contains("gemini://<name>.kyriakon.net/"), "{body}");
+
+    let (code, body) = answer(&app, &gmid_certificate("account", "", &pinned)).await;
+    assert_eq!(code, 20);
+    assert!(body.contains("State: active"), "{body}");
+    assert!(body.contains("Site: serving"), "{body}");
+    assert!(body.contains("Capsule: serving"), "{body}");
+    assert!(body.contains("Space used: 412 MB"), "{body}");
+    assert!(
+        body.contains("Application approved, account opened."),
+        "{body}"
+    );
+    assert!(body.contains("alice@kyriakon.net"), "{body}");
+
+    // The catalogue's account row reaches the page that answered it.
+    let (_, catalogue) = answer(&app, &gmid_certificate("", "", &pinned)).await;
+    assert!(
+        catalogue.contains("=> gemini://signup.kyriakon.net/account Your account"),
+        "{catalogue}"
+    );
+}
+
+/// The ordinary visitor's pages, with the visitor's own fingerprint and no
+/// claim about whether the hash is pinned.
+#[tokio::test]
+async fn a_certificate_that_matches_nothing_answers_as_a_stranger() {
+    let (app, dir) = handler("gmid-unpinned").await;
+    file_account(&dir);
+    let stray = certificate(OTHER, "CN=alice");
+
+    let (code, body) = answer(&app, &gmid_certificate("", "", &stray)).await;
+    assert_eq!(code, 20, "a page, not a refusal");
+    assert!(
+        body.contains("=> gemini://<name>.kyriakon.net/ A website"),
+        "the stranger's hosts: {body}"
+    );
+    assert!(!body.contains("alice.kyriakon.net"), "{body}");
+    assert!(
+        body.contains("SHA256:fedcba98"),
+        "the visitor's own fingerprint: {body}"
+    );
+    assert!(
+        body.contains("https://signup.kyriakon.net/account"),
+        "{body}"
+    );
+    assert!(body.contains("terminal"), "{body}");
+
+    // The account route is a page for a stranger too, and is not the member's.
+    let (code, body) = answer(&app, &gmid_certificate("account", "", &stray)).await;
+    assert_eq!(code, 20);
+    assert!(!body.contains("State: active"), "{body}");
+    assert!(
+        !body.contains("Application approved, account opened."),
+        "{body}"
+    );
+    assert!(body.contains("SHA256:fedcba98"), "{body}");
+
+    // A visitor with no certificate reads the same page without a fingerprint.
+    let (code, body) = answer(&app, &gmid_get("account", "")).await;
+    assert_eq!(code, 20);
+    assert!(!body.contains("SHA256:"), "{body}");
+}
+
+/// The no-oracle rule: whatever the visitor asks for with an unmatched
+/// certificate, no page carries the word for an unknown certificate.
+#[tokio::test]
+async fn no_page_calls_an_unmatched_certificate_unknown() {
+    let (app, dir) = handler("gmid-no-oracle").await;
+    file_account(&dir);
+    let stray = certificate(OTHER, "CN=alice");
+    let status = format!("status/{TOKEN}");
+    for path in ["", "account", status.as_str()] {
+        let (code, body) = answer(&app, &gmid_certificate(path, "", &stray)).await;
+        assert_eq!(code, 20, "{path}: a page, not a refusal");
+        let lower = body.to_lowercase();
+        for tell in [
+            "unknown",
+            "not recognised",
+            "not recognized",
+            "unrecognised",
+        ] {
+            assert!(!lower.contains(tell), "{path} says {tell:?}: {body}");
+        }
+    }
+}
+
+/// The subject and issuer are what the request carried: they are recorded, and
+/// a certificate that claims a member's subject without a pinned hash is still
+/// a stranger. The hash alone names the member, in both directions.
+#[tokio::test]
+async fn the_subject_and_issuer_are_recorded_and_never_trusted() {
+    let (app, dir) = handler("gmid-untrusted").await;
+    file_account(&dir);
+
+    // The claim is alice's; the hash is not.
+    let claimed = certificate(OTHER, "CN=alice");
+    let bytes = gmid_certificate("", "", &claimed);
+    let request = fcgi::read_request(&mut &bytes[..], MAX_BODY)
+        .await
+        .unwrap()
+        .unwrap();
+    let incoming = read(FrontEnd::Gemini, &request);
+    let recorded = incoming
+        .certificate
+        .as_ref()
+        .expect("a certificate was sent");
+    assert_eq!(recorded.subject, "CN=alice");
+    assert_eq!(recorded.issuer, "CN=alice");
+    assert_eq!(recorded.hash, OTHER);
+    assert_eq!(recorded.not_before, "2026-01-01T00:00:00Z");
+    assert_eq!(recorded.not_after, "2036-01-01T00:00:00Z");
+    let (_, body) = answer(&app, &bytes).await;
+    assert!(!body.contains("=> gemini://alice.kyriakon.net/"), "{body}");
+
+    // The hash is alice's; the subject claims otherwise.
+    let impostor = certificate(PINNED, "CN=mallory");
+    let (_, body) = answer(&app, &gmid_certificate("", "", &impostor)).await;
+    assert!(
+        body.contains("=> gemini://alice.kyriakon.net/ A website"),
+        "the hash names the member, not the subject: {body}"
+    );
+
+    // Without a certificate the request carries none, whatever the empty
+    // `AUTH_TYPE` says.
+    let bytes = gmid_get("", "");
+    let request = fcgi::read_request(&mut &bytes[..], MAX_BODY)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(read(FrontEnd::Gemini, &request).certificate.is_none());
+}
+
+/// The reading half changes nothing: the page is rendered, and every record
+/// the handler could write is exactly as it was.
+#[tokio::test]
+async fn the_reading_half_files_nothing() {
+    let (app, dir) = handler("gmid-reads").await;
+    file_account(&dir);
+    let before = std::fs::read(dir.join("accounts/alice/account.json")).unwrap();
+    let filed_before = filed(&dir);
+
+    let pinned = certificate(PINNED, "CN=alice");
+    let (code, _) = answer(&app, &gmid_certificate("account", "", &pinned)).await;
+    assert_eq!(code, 20);
+    assert_eq!(filed(&dir), filed_before, "the read filed nothing");
+    assert_eq!(
+        std::fs::read(dir.join("accounts/alice/account.json")).unwrap(),
+        before,
+        "the account record is unchanged"
     );
 }
 

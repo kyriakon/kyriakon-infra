@@ -1021,6 +1021,10 @@ async fn approve(
         paid_until: None,
         window: window.clone(),
         outside_address: record.outside_address.clone(),
+        certificates: Vec::new(),
+        site_served: None,
+        capsule_served: None,
+        space_used: None,
     };
     store.ensure_dir(&format!("accounts/{username}")).await?;
     let account_bytes = serde_json::to_vec_pretty(&account)
