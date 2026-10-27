@@ -18,7 +18,7 @@ the private key is written by the page itself.
 ## Building it
 
 ```
-cargo build --target wasm32-unknown-unknown --release --lib
+cargo build --target wasm32-unknown-unknown --release --lib --features wasm
 wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/keygen_spike.wasm
 python3 -m http.server 8899 --bind 127.0.0.1
 ```
@@ -65,9 +65,12 @@ Three of the four the capability note left open are now closed.
 
 ## What is still not verified
 
-Thunderbird on desktop and on Android, which need a client rather than a browser. The
-subkey-expiry path also stays unverified, because gpg refuses to export an expired subkey in
-any form, so an artifact from gpg carries either a usable subkey or none.
+Thunderbird on desktop and on Android, which need a client rather than a browser.
+
+The subkey-expiry path is now covered by `fixtures/gpg-expired-subkey.asc`. The earlier note
+here said gpg refuses to export an expired subkey, and that did not reproduce on GnuPG 2.5.24:
+a key made with `--faked-system-time '20200101T000000'` and a one-day encryption subkey exports
+with the expired subkey in place, and `tests/fixtures.rs` checks it.
 
 ## The harness
 

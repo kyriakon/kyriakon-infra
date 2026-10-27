@@ -23,6 +23,13 @@ pub struct Config {
     /// empty one and rendering no services. The question list has no key here:
     /// the crate carries it, so the store holds no copy to move.
     pub catalogue: String,
+    /// The directory of mirrored capsule pages, 0644 at the top of the store:
+    /// the terms, the acceptable use policy, the privacy notice and the key
+    /// walkthrough, rendered to gemtext by `scripts/render-docs.sh --gemini` and
+    /// staged by the deploy. Named here for the catalogue's reason: a later
+    /// layout moves the directory rather than the handler serving 51 for every
+    /// page and looking like a route that was never added.
+    pub pages: String,
     /// The unix socket httpd's signup vhost reaches this responder on. Both
     /// front-ends resolve a FastCGI socket path inside their own chroot, which is
     /// the same directory for the two of them, so the path here is the one on
@@ -156,6 +163,7 @@ mod tests {
             "store_root = \"/var/db/onboard\"\n\
              reserved = \"/var/db/onboard/reserved-usernames.txt\"\n\
              catalogue = \"/var/db/onboard/catalogue.toml\"\n\
+             pages = \"/var/db/onboard/pages\"\n\
              httpd_socket = \"/home/www/run/onboard-httpd/httpd.sock\"\n\
              gemini_socket = \"/home/www/run/onboard/onboard.sock\"\n\
              portal_socket = \"/home/www/run/onboard-portal/portal.sock\"\n\
@@ -163,6 +171,7 @@ mod tests {
              release = \"REPLACE_ME\"\n",
         )
         .unwrap();
+        assert_eq!(c.pages, "/var/db/onboard/pages");
         assert_eq!(c.httpd_socket, "/home/www/run/onboard-httpd/httpd.sock");
         assert_eq!(c.gemini_socket, "/home/www/run/onboard/onboard.sock");
         assert_eq!(c.portal_socket, "/home/www/run/onboard-portal/portal.sock");
@@ -183,13 +192,14 @@ mod tests {
             "/home/www/run/onboard-portal/portal.sock"
         );
         assert_eq!(handler.titan_listener, "127.0.0.1:7081");
+        assert_eq!(handler.pages, "/var/db/onboard/pages");
     }
 
     #[test]
     fn a_typo_is_refused_rather_than_ignored() {
         let r: Result<Config, _> = toml::from_str(
             "store_rooot = \"/x\"\n\
-             reserved=\"r\"\ncatalogue=\"c\"\n\
+             reserved=\"r\"\ncatalogue=\"c\"\npages=\"p\"\n\
              httpd_socket=\"/a\"\ngemini_socket=\"/b\"\n\
              portal_socket=\"/c\"\ntitan_listener=\"127.0.0.1:7081\"\nrelease=\"r\"\n",
         );
@@ -210,6 +220,7 @@ mod tests {
                 "store_root = \"/var/db/onboard\"\n\
                  reserved = \"r\"\n\
                  catalogue = \"c\"\n\
+                 pages = \"p\"\n\
                  httpd_socket = \"/a\"\n\
                  gemini_socket = \"/b\"\n\
                  portal_socket = \"/c\"\n\

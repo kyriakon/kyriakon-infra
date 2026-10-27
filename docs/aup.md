@@ -136,7 +136,9 @@ channel for using this law, or any law, to suppress Orthodox teaching that is no
 itself illegal.
 
 **Zero-access boundary.** This floor governs what you *publish*. Your private mail is
-encrypted to your key; the platform cannot read it. Mail content is therefore not and
+encrypted to your key; the platform cannot read it. That covers message content, not the
+addressing information mail needs to move: sender, recipient, timestamp and size appear in
+the server's logs and in the outer message wrapper. Mail content is therefore not and
 cannot be policed, and this policy makes no claim to the contrary.
 
 ## 3. Resource use

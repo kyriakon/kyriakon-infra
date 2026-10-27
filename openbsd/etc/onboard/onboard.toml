@@ -27,6 +27,14 @@ store_root = "/var/db/onboard"
 reserved = "/var/db/onboard/reserved-usernames.txt"
 catalogue = "/var/db/onboard/catalogue.toml"
 
+# The mirrored capsule pages: the terms, the acceptable use policy, the privacy
+# notice and the key walkthrough, rendered to gemtext from docs/ by
+# scripts/render-docs.sh --gemini and staged here by scripts/deploy-onboard.sh.
+# Named for the same reason as the catalogue, so a layout moves the directory
+# rather than the handler answering 51 for every page. The files are 0644 and
+# the handler reads them once at start-up, so a page change is a deploy.
+pages = "/var/db/onboard/pages"
+
 # The deployed commit and date, substituted at install, e.g.
 # "2026-10-10 1a2b3c4". The acceptance records carry it as the version of each
 # document accepted, and it is the version of the question list an application
