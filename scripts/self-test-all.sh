@@ -47,25 +47,25 @@ setup-env.sh
 # than over the checkout.
 here=${SELF_TEST_ALL_DIR:-$(cd "$(dirname "$0")" && pwd)}
 repo="${1:-$(cd "$here/.." && pwd)}"
+# The box runs pdksh, and a self-test that passes under another ksh proves
+# nothing about it. CI sets this to oksh, the portable OpenBSD shell; a
+# developer's macOS /bin/ksh is ksh93.
+ksh_bin=${SELF_TEST_KSH:-ksh}
 failed=0
 ran=0
-
-detects_itself() {
-	printf '#!/bin/ksh\nself_test() { :; }\n' > "$1"
-}
 
 # The discovery and its refusal are the one branch worth testing here: a script
 # with no self-test must be named and failed, not skipped silently.
 self_test() {
 	work=$(mktemp -d "${TMPDIR:-/tmp}/self-test-all.XXXXXX") || exit 1
 	trap 'rm -rf "$work"' EXIT
-	detects_itself "$work/good.sh"
-	if ! SELF_TEST_ALL_DIR="$work" ksh "$0" >/dev/null 2>&1; then
+	printf '#!/bin/ksh\nself_test() { :; }\n' > "$work/good.sh"
+	if ! SELF_TEST_ALL_DIR="$work" "$ksh_bin" "$0" >/dev/null 2>&1; then
 		printf 'self-test: a script with a self_test() should pass\n' >&2
 		exit 1
 	fi
 	printf '#!/bin/ksh\n: no self-test here\n' > "$work/missing.sh"
-	if SELF_TEST_ALL_DIR="$work" ksh "$0" >/dev/null 2>&1; then
+	if SELF_TEST_ALL_DIR="$work" "$ksh_bin" "$0" >/dev/null 2>&1; then
 		printf 'self-test: a script with no self_test() should fail\n' >&2
 		exit 1
 	fi
@@ -82,7 +82,6 @@ fi
 # this one, which is how the first version of this file ran itself.
 for file in "$here"/*.sh; do
 	name=$(basename "$file")
-	[ "$name" = self-test-all.sh ] && continue
 	if ! grep -q '^self_test()' "$file"; then
 		if printf '%s\n' "$self_test_optional" | grep -qx -- "$name"; then
 			continue
@@ -92,7 +91,6 @@ for file in "$here"/*.sh; do
 		failed=$((failed + 1))
 		continue
 	fi
-	ran=$((ran + 1))
 	case "$name" in
 	deploy-mail.sh) args="$repo" ;;
 	deploy-relayd.sh) args="$repo/openbsd/etc" ;;
@@ -105,8 +103,9 @@ for file in "$here"/*.sh; do
 		limit='timeout 300'
 	fi
 	# shellcheck disable=SC2086 # args is a repo path or empty, and limit is a word or empty
-	if out=$($limit ksh "$file" --self-test $args 2>&1); then
+	if out=$($limit "$ksh_bin" "$file" --self-test $args 2>&1); then
 		printf 'ok   %s\n' "$name"
+		ran=$((ran + 1))
 	else
 		printf 'FAIL %s\n' "$name"
 		printf '%s\n' "$out" | sed -e 's/^/     /'

@@ -1,19 +1,16 @@
 # The checks this repository already has, run on every pull request.
 #
-# Only what a Linux runner can run honestly is here, and three things stay manual
+# Only what a runner can check honestly is here, and what stays manual does so
 # without that being an oversight:
 #
 #   * The OpenBSD config syntax checks (httpd -n, smtpd -n, gmid -n, relayd -n)
 #     need a real host, which the repository's own conventions already say.
-#   * The `--self-test`s in scripts/ rebind their paths and shell out to BSD
-#     userland that a Linux runner does not carry, so they remain the box's
-#     check. A self-test only counts once it has run under the box's own ksh.
-#   * No `ksh -n` pass over scripts/ either, and for the same reason read the
-#     other way round: the ksh a runner can install is not the box's. pdksh has
-#     no arrays, no `[[ ]]` and no `${v//a/b}`, and the ksh that does accepts all
-#     three, so a parse that passes there says nothing about the box. CONTEXT.md
-#     records that trap already, from a script that passed its self-test on a
-#     workstation and died on the box's `typeset -a`.
+#   * No `ksh -n` pass over scripts/: a parse under any shell but the box's
+#     pdksh says nothing about it. The self-tests job is the exception that
+#     carries its own shell: it installs oksh, the portable OpenBSD ksh, and
+#     runs the scripts under it. CONTEXT.md records the trap, from a script
+#     that passed its self-test on a workstation and died on the box's
+#     `typeset -a`.
 #
 #
 # What these catch, all of them found by hand in the 2026-10-15 audit: a status
@@ -95,17 +92,22 @@ jobs:
 
   # The scripts' own tests are the only automated check most of them have, and
   # they run weekly on the box: without this a break reaches main and stays until
-  # Monday. They assert scripts written for OpenBSD and run on a macOS
-  # workstation, and use BSD `stat -f`; the Linux runner's GNU coreutils answers
-  # "cannot read file system information for '%Lp'". macOS ships the same stat
-  # and the ksh the tests run under.
+  # Monday. They assert scripts written for OpenBSD and use BSD `stat -f`, which
+  # the Linux runner's GNU coreutils answers "cannot read file system information
+  # for '%Lp'". macOS carries that stat, and oksh is the portable OpenBSD ksh:
+  # macOS's own /bin/ksh is ksh93, and CONTEXT.md records why a self-test that
+  # passes under it does not count.
   self-tests:
     name: script self-tests
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: pdksh
+        run: brew install oksh
       - name: self-tests
-        run: ksh scripts/self-test-all.sh
+        env:
+          SELF_TEST_KSH: oksh
+        run: oksh scripts/self-test-all.sh
 
   terraform:
     name: terraform
