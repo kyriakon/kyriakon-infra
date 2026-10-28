@@ -52,7 +52,7 @@ use crate::fcgi::{self, Reply, Request};
 use crate::page::{AccountPage, DecidePage, NoticePage, PasswordPage, ReceivedPage, StatusPage};
 use crate::questions::{Branch, Kind, Question, Rule};
 use crate::rate::Key;
-use crate::store::{Acceptance, Certificate, Notice, Record, Store};
+use crate::store::{Acceptance, Account, Certificate, Notice, Record, Store};
 use crate::{
     capsule, catalogue, config, draft, intents, keycheck, page, portal_ipc, questions, rate, store,
     transitions, util, validate,
@@ -543,11 +543,10 @@ fn read(front_end: FrontEnd, request: &Request) -> Incoming {
 
 /// The certificate a gemini client presented, if it presented one.
 ///
-/// `AUTH_TYPE` is read as a value: gmid sends `CERTIFICATE` when a certificate
-/// was provided and the empty string when it was not, whatever the manual says
-/// about the variable being unset. Every other field is copied as gmid sent it,
-/// which is the whole of the record: nothing here verifies a chain, because
-/// there is no chain to verify and no issuer trusted.
+/// gmid sends `AUTH_TYPE` only when the client presented a certificate, as
+/// `CERTIFICATE`; with none it omits the variable, and an absent value reads as
+/// the empty string here. Every other field is copied as gmid sent it: nothing
+/// verifies a chain, because there is none to verify and no issuer is trusted.
 fn certificate(request: &Request) -> Option<Certificate> {
     if request.value("AUTH_TYPE") != "CERTIFICATE" {
         return None;
@@ -752,13 +751,8 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
         let page = status_page(record, OffsetDateTime::now_utc());
         return Reply::gemini(20, "text/gemini", capsule::status(&page));
     }
-    // The two routes that can be read as a member are the only ones that look
-    // the hash up.
-    let member = match &incoming.certificate {
-        Some(certificate) => app.store.account_for_certificate(&certificate.hash).await,
-        None => None,
-    };
     if incoming.path == "account" {
+        let member = member_for(app, incoming).await;
         let body = match &member {
             Some(account) => {
                 let notices = account_notices(app, &account.username).await;
@@ -769,6 +763,7 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
         return Reply::gemini(20, "text/gemini", body);
     }
     if incoming.path.is_empty() {
+        let member = member_for(app, incoming).await;
         let member_name = member.as_ref().map(|account| account.username.as_str());
         let mut page = capsule::front_page(&app.catalogue, member_name);
         // The ordinary page, plus the one line a presented certificate earns
@@ -795,6 +790,16 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
         );
     }
     Reply::gemini(51, "Not found", String::new())
+}
+
+/// The account a presented certificate is pinned to. Only the two routes that
+/// read as a member call this: a certificate-bearing request for any other page
+/// pays nothing for a lookup it would throw away.
+async fn member_for(app: &App, incoming: &Incoming) -> Option<Account> {
+    match &incoming.certificate {
+        Some(certificate) => app.store.account_for_certificate(&certificate.hash).await,
+        None => None,
+    }
 }
 
 /// The certificate a client presented, when there is one to show a

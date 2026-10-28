@@ -189,10 +189,11 @@ pub fn account(account: &Account, notices: &[Notice]) -> String {
     out.push_str(&format!("Site: {}\n", served(account.site_served)));
     out.push_str(&format!("Capsule: {}\n", served(account.capsule_served)));
     out.push_str(&format!("Space used: {}\n", space(account.space_used)));
-    out.push_str(
-        "\nNothing here changes anything. Change it from \
-         https://signup.kyriakon.net/account or from the terminal.\n",
-    );
+    out.push_str(&format!(
+        "\nNothing here changes anything. The account page at https://{HOST}/account \
+         and the terminal are where settings will change; both are read-only until \
+         their own tickets land.\n"
+    ));
     out.push_str("\n## Notices\n\n");
     if notices.is_empty() {
         out.push_str("Nothing has been sent yet.\n");
@@ -230,8 +231,8 @@ pub fn account_stranger(certificate: Option<&Certificate>) -> String {
 /// settings, and where registering it happens.
 pub fn registration(certificate: &Certificate) -> String {
     format!(
-        "To add this device, register the certificate this client presented,\n\
-         from https://signup.kyriakon.net/account or from the terminal:\n\n\
+        "This client presented the certificate below. Registering it is not \
+         available yet; it will be from https://{HOST}/account or from the terminal.\n\n\
          {}\n",
         short_hash(&certificate.hash)
     )

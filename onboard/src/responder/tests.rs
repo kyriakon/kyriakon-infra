@@ -162,9 +162,8 @@ fn httpd_post(path: &str, body: &str) -> Vec<u8> {
 }
 
 /// The gmid environment, with whatever a certificate adds appended. gmid sends
-/// `AUTH_TYPE` on every request, empty when no certificate was presented and
-/// `CERTIFICATE` when one was, and a later entry for the same name is the one
-/// the parameter map keeps.
+/// `AUTH_TYPE` only when the client presented a certificate: an anonymous
+/// request omits it, and the certificate fixture below adds it.
 fn gmid_env(path: &str, query: &str, extra: &[(&str, &str)]) -> Vec<u8> {
     let mut env = vec![
         ("GATEWAY_INTERFACE", "CGI/1.1"),
@@ -182,7 +181,6 @@ fn gmid_env(path: &str, query: &str, extra: &[(&str, &str)]) -> Vec<u8> {
         ("SERVER_PROTOCOL", "GEMINI"),
         ("SERVER_SOFTWARE", "gmid/2.1.1"),
         ("REMOTE_ADDR", "203.0.113.10"),
-        ("AUTH_TYPE", ""),
     ];
     env.extend_from_slice(extra);
     fixture::gmid(&env)
@@ -832,10 +830,8 @@ async fn the_gemini_environment_is_read_as_gmid_builds_it() {
     // forwarded header at all.
     assert_eq!(incoming.key, Key::V4(Ipv4Addr::new(203, 0, 113, 10)));
 
-    // A certificate is not required for anything here, and AUTH_TYPE is present
-    // and empty rather than absent: nothing tests for a variable, so nothing
-    // changes.
-    assert_eq!(request.get("AUTH_TYPE"), Some(""));
+    // An anonymous request carries no AUTH_TYPE at all, which is what gmid sends.
+    assert_eq!(request.get("AUTH_TYPE"), None);
     let (code, _) = answer(&app, &bytes).await;
     assert_eq!(code, 20, "an anonymous visit reads the same page");
 }

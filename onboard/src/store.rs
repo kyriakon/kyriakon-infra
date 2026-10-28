@@ -498,9 +498,9 @@ pub struct Account {
     /// entry rather than a preserved one.
     #[serde(default)]
     pub certificates: Vec<Certificate>,
-    /// Whether the drain is serving the member's site and capsule, and the
-    /// bytes used under the quota. The drain writes these when it reads them;
-    /// absent means it has not, which the capsule renders as exactly that.
+    /// Whether the drain is serving the member's site and capsule, and the bytes
+    /// used under the quota. Nothing writes these yet: they are absent until the
+    /// hosting side records them, which the capsule renders as exactly that.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub site_served: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -609,6 +609,53 @@ mod tests {
     fn crockford_pads_at_the_high_end_like_a_ulid() {
         assert_eq!(crockford128([0u8; 16]), "0".repeat(26));
         assert_eq!(crockford128([0xffu8; 16]), format!("7{}", "z".repeat(25)));
+    }
+
+    /// The certificate lookup: an empty hash answers nothing, an account whose
+    /// record cannot be read is skipped rather than failing the page, and a
+    /// pinned hash finds its account.
+    #[tokio::test]
+    async fn a_pinned_certificate_is_found_and_a_broken_record_is_skipped() {
+        let dir = std::env::temp_dir().join(format!("onboard-store-cert-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("accounts/broken")).unwrap();
+        std::fs::create_dir_all(dir.join("accounts/alice")).unwrap();
+        std::fs::write(dir.join("accounts/broken/account.json"), "not json").unwrap();
+        let account = serde_json::json!({
+            "version": 1,
+            "username": "alice",
+            "state": "active",
+            "decision": "approve",
+            "decided_at": "2026-10-01T09:00:00Z",
+            "rail": "no_charge",
+            "no_charge": true,
+            "created_at": "2026-10-01T09:00:00Z",
+            "paid_until": null,
+            "certificates": [{ "hash": "SHA256:aa" }],
+        });
+        std::fs::write(
+            dir.join("accounts/alice/account.json"),
+            serde_json::to_vec(&account).unwrap(),
+        )
+        .unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+
+        assert!(
+            store.account_for_certificate("").await.is_none(),
+            "an empty hash names no account"
+        );
+        assert_eq!(
+            store
+                .account_for_certificate("SHA256:aa")
+                .await
+                .expect("the pinned account")
+                .username,
+            "alice"
+        );
+        assert!(
+            store.account_for_certificate("SHA256:bb").await.is_none(),
+            "an unpinned hash answers nothing"
+        );
     }
 
     #[tokio::test]
