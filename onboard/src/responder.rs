@@ -32,12 +32,13 @@
 //! * `SERVER_NAME`, `SERVER_PORT`, `PATH_INFO`, `SCRIPT_NAME`, `PATH_TRANSLATED`,
 //!   `SERVER_SOFTWARE`, `GATEWAY_INTERFACE` and `SERVER_PROTOCOL` are the client's
 //!   spelling or a constant, and no code path here selects on any of them.
-//!   `AUTH_TYPE`, `REMOTE_USER`, `TLS_CLIENT_ISSUER` and `TLS_CLIENT_HASH` name a
-//!   certificate nobody verified and a subject anyone can mint; the capsule's
-//!   member identity is [#377]'s and compares the hash against pins, so nothing
-//!   here tests for the presence of one or trusts a value from it.
-//!
-//! [#377]: https://github.com/kyriakon/kyriakon-infra/issues/377
+//! * `AUTH_TYPE` is tested for its value rather than for its presence, because
+//!   gmid always sends the variable and sets it to `CERTIFICATE` only when a
+//!   certificate was provided. The certificate's `TLS_CLIENT_HASH` is compared
+//!   against the pins on the account and nothing else is: `REMOTE_USER`,
+//!   `TLS_CLIENT_ISSUER` and the validity dates are recorded with the request
+//!   and never consulted, because a self-signed certificate can claim any
+//!   subject and any issuer.
 
 use std::collections::{BTreeMap, HashSet};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -53,7 +54,7 @@ use crate::fcgi::{self, Reply, Request};
 use crate::page::{AccountPage, DecidePage, NoticePage, PasswordPage, ReceivedPage, StatusPage};
 use crate::questions::{Branch, Kind, Question, Rule};
 use crate::rate::Key;
-use crate::store::{Acceptance, Record, Store};
+use crate::store::{Acceptance, Account, Certificate, Notice, Record, Store};
 use crate::{
     capsule, catalogue, config, draft, intents, keycheck, page, portal_ipc, questions, rate, store,
     transitions, util, validate,
@@ -212,6 +213,9 @@ struct Incoming {
     key: Key,
     /// The address as the front-end observed it, for the log line.
     addr: String,
+    /// The certificate the client presented, recorded and not trusted. Only
+    /// its `hash` is ever a decision input.
+    certificate: Option<Certificate>,
 }
 
 /// What one request answered, with the two things the log line carries: the route
@@ -895,7 +899,30 @@ fn read(front_end: FrontEnd, request: &Request) -> Incoming {
         query,
         key,
         addr,
+        certificate: match front_end {
+            FrontEnd::Gemini => certificate(request),
+            FrontEnd::Httpd => None,
+        },
     }
+}
+
+/// The certificate a gemini client presented, if it presented one.
+///
+/// gmid sends `AUTH_TYPE` only when the client presented a certificate, as
+/// `CERTIFICATE`; with none it omits the variable, and an absent value reads as
+/// the empty string here. Every other field is copied as gmid sent it: nothing
+/// verifies a chain, because there is none to verify and no issuer is trusted.
+fn certificate(request: &Request) -> Option<Certificate> {
+    if request.value("AUTH_TYPE") != "CERTIFICATE" {
+        return None;
+    }
+    Some(Certificate {
+        hash: request.value("TLS_CLIENT_HASH").to_string(),
+        subject: request.value("REMOTE_USER").to_string(),
+        issuer: request.value("TLS_CLIENT_ISSUER").to_string(),
+        not_before: request.value("TLS_CLIENT_NOT_BEFORE").to_string(),
+        not_after: request.value("TLS_CLIENT_NOT_AFTER").to_string(),
+    })
 }
 
 /// Percent-decode one value. A plus is a space in a form, which is what a browser
@@ -1066,12 +1093,17 @@ fn form_post(request: &Request) -> bool {
         .is_some_and(|t| t.eq_ignore_ascii_case("application/x-www-form-urlencoded"))
 }
 
-/// The gemini front-end: the catalogue, the status page, and the applicant's
-/// draft flow. The apply route reads an answer from `QUERY_STRING`, which gmid
-/// sends still percent-encoded and the responder decodes itself rather than read
-/// from `GEMINI_SEARCH_STRING`: that copy is sent only for a query with no `=`
-/// in it, and its decoder maps `+` to a space, which is not the reading the
-/// specification gives a URI query.
+/// The gemini front-end: the catalogue, the status page, the account, and the
+/// applicant's draft flow. The apply route reads an answer from `QUERY_STRING`,
+/// which gmid sends still percent-encoded and the responder decodes itself
+/// rather than read from `GEMINI_SEARCH_STRING`: that copy is sent only for a
+/// query with no `=` in it, and its decoder maps `+` to a space, which is not
+/// the reading the specification gives a URI query.
+///
+/// The certificate, when one was presented, decides one thing: whether an
+/// account's pin matches its hash. A certificate that matches nothing gets the
+/// same pages a stranger gets, with its own fingerprint and where to register
+/// it, and never a page that says the certificate is unknown.
 async fn gemini(app: &App, incoming: &Incoming) -> Reply {
     if incoming.path == "apply" {
         return capsule_new(app, incoming).await;
@@ -1084,8 +1116,31 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
         let page = status_page(record, OffsetDateTime::now_utc());
         return Reply::gemini(20, "text/gemini", capsule::status(&page));
     }
+    if incoming.path == "account" {
+        let member = member_for(app, incoming).await;
+        let body = match &member {
+            Some(account) => {
+                let notices = account_notices(app, &account.username).await;
+                capsule::account(account, &notices)
+            }
+            None => capsule::account_stranger(presented(incoming)),
+        };
+        return Reply::gemini(20, "text/gemini", body);
+    }
     if incoming.path.is_empty() {
-        return Reply::gemini(20, "text/gemini", capsule::front_page(&app.catalogue, None));
+        let member = member_for(app, incoming).await;
+        let member_name = member.as_ref().map(|account| account.username.as_str());
+        let mut page = capsule::front_page(&app.catalogue, member_name);
+        // The ordinary page, plus the one line a presented certificate earns
+        // when no pin matched it. It carries no word for "known" or "unknown":
+        // the client learns its own fingerprint and nothing else.
+        if member.is_none() {
+            if let Some(certificate) = presented(incoming) {
+                page.push('\n');
+                page.push_str(&capsule::registration(certificate));
+            }
+        }
+        return Reply::gemini(20, "text/gemini", page);
     }
     // The mirrored pages are literals, not paths: the route is a key in the map
     // the handler read at startup, so no request can name a file to read.
@@ -1100,6 +1155,37 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
         );
     }
     Reply::gemini(51, "Not found", String::new())
+}
+
+/// The account a presented certificate is pinned to. Only the two routes that
+/// read as a member call this: a certificate-bearing request for any other page
+/// pays nothing for a lookup it would throw away.
+async fn member_for(app: &App, incoming: &Incoming) -> Option<Account> {
+    match &incoming.certificate {
+        Some(certificate) => app.store.account_for_certificate(&certificate.hash).await,
+        None => None,
+    }
+}
+
+/// The certificate a client presented, when there is one to show a
+/// fingerprint of. A certificate with no hash is not something to fingerprint.
+fn presented(incoming: &Incoming) -> Option<&Certificate> {
+    incoming
+        .certificate
+        .as_ref()
+        .filter(|certificate| !certificate.hash.is_empty())
+}
+
+/// The notices an account has been sent, read from its own `notices.jsonl`. A
+/// line that does not parse is skipped: a notice that cannot be read is not a
+/// reason to refuse the account page.
+async fn account_notices(app: &App, username: &str) -> Vec<Notice> {
+    app.store
+        .lines(&format!("accounts/{username}/notices.jsonl"))
+        .await
+        .iter()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
 }
 
 /// Open a draft and send the client to its first page. The draft token is the

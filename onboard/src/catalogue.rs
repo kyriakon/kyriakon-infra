@@ -255,11 +255,12 @@ pub fn row(s: &Service, protocol: Protocol, member: Option<&str>) -> Row {
     };
     // The web form is the site root, and the capsule's root is its catalogue.
     // An apply row on the capsule therefore has to name the route the draft
-    // flow lives at; without it the row loops back to the catalogue.
-    let path = if protocol == Protocol::Gemini && s.action == Action::Apply {
-        "/apply"
-    } else {
-        "/"
+    // flow lives at, and an account row the account route, or each loops back
+    // to the page it was pressed on.
+    let path = match (protocol, s.action) {
+        (Protocol::Gemini, Action::Apply) => "/apply",
+        (Protocol::Gemini | Protocol::Web, Action::Account) => "/account",
+        _ => "/",
     };
     Row {
         id: s.id.clone(),
