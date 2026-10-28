@@ -8,8 +8,7 @@ while read -r _local_ref local_sha remote_ref _remote_sha; do
 	case "$local_sha" in 0000000000000000000000000000000000000000) continue ;; esac
 	behind=$(git rev-list --count "$local_sha..origin/main" 2>/dev/null || printf '0')
 	if [ "${behind:-0}" -gt 0 ]; then
-		printf 'pre-push: %s is %s commit(s) behind origin/main; rebase before pushing.\n' "$remote_ref" "$behind" >&2
-		printf '  a branch meant to stack on another pushes with --no-verify.\n' >&2
+		printf 'pre-push: %s is %s commit(s) behind origin/main; merge origin/main into it, then push.\n' "$remote_ref" "$behind" >&2
 		exit 1
 	fi
 done
