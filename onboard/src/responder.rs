@@ -15,6 +15,8 @@
 //! certificate, or out of its own configuration, and only the last of those is
 //! ours, so the reading of each one is stated where it is read:
 //!
+//! * A Titan connection's first line is relayd's PROXY line, read with the same
+//!   line bound as the request line rather than a bound of its own.
 //! * The path is `GEMINI_URL_PATH` for gmid, which decodes and cleans it before it
 //!   sends it and strips every leading slash, and `REQUEST_URI` for httpd, which
 //!   passes the client's own spelling. It matches the route names, indexes the
@@ -83,6 +85,13 @@ const MAX_TITAN_BODY: usize = 64 * 1024;
 /// A Titan request line follows the gemini request limit of 1024 bytes. The
 /// PROXY line relayd prepends has its own, shorter bound from the protocol.
 const MAX_TITAN_LINE: usize = 1024;
+/// How long one Titan connection may take, from the first byte to the reply.
+const TITAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Titan connections served at once. The rest wait for a permit, so a flood
+/// costs waiting tasks rather than open sockets.
+const TITAN_CONNECTIONS: usize = 64;
+/// The reply for a failure the client can retry.
+const TEMP_FAILURE: &str = "Temporary failure";
 
 /// What a token the store does not answer for reads as. One constant, because an
 /// unknown token, an expired one and a spent one are the same bytes: that is the
@@ -300,14 +309,32 @@ async fn accept(listener: UnixListener, app: Arc<App>, channel: Channel) -> Resu
 
 /// Accept Titan connections for as long as the listener holds. One connection
 /// carries one upload and closes, like the gemini front-end's.
+///
+/// An accept error does not stop this loop: `accept(2)` reports transient
+/// failures a connection flood can provoke (`EMFILE`, `ECONNABORTED`), and
+/// returning the error would cancel `try_join!` and take the web form and both
+/// unix front-ends down with it. The three unix listeners can share that shape
+/// safely because their sockets are 0660; a public TCP listener cannot.
 async fn titan_accept(listener: TcpListener, app: Arc<App>) -> Result<(), String> {
+    let slots = Arc::new(tokio::sync::Semaphore::new(TITAN_CONNECTIONS));
     loop {
-        let (stream, peer) = listener
-            .accept()
-            .await
-            .map_err(|e| format!("cannot accept a titan connection: {e}"))?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("kyriakon-onboard: cannot accept a titan connection: {e}");
+                // A short pause keeps a hard failure from spinning the loop.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let app = app.clone();
+        let slots = slots.clone();
         tokio::spawn(async move {
+            // A permit bounds the tasks that hold a socket. Waiting tasks are
+            // cheap; unbounded sockets are not.
+            let Ok(_permit) = slots.acquire().await else {
+                return;
+            };
             if let Err(e) = titan_connection(stream, &app, &peer.ip().to_string()).await {
                 eprintln!("kyriakon-onboard: {e}");
             }
@@ -319,51 +346,102 @@ async fn titan_accept(listener: TcpListener, app: Arc<App>) -> Result<(), String
 /// line, then the body. The reply is gemini's framing written straight to the
 /// stream, because this listener is this service's own and has no front-end to
 /// frame for it.
+///
+/// Both halves are bounded: a stranger can open the connection and send nothing,
+/// and a reply to a client that has stopped reading must not hold a task
+/// forever.
 async fn titan_connection(stream: TcpStream, app: &App, peer: &str) -> Result<(), String> {
     let (mut reader, mut writer) = stream.into_split();
-    let (reply, address) = titan_answer(&mut reader, app, Some(peer)).await?;
+    let (reply, address) =
+        match tokio::time::timeout(TITAN_TIMEOUT, titan_answer(&mut reader, app, Some(peer))).await
+        {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => (
+                Reply::gemini(59, "The upload timed out", String::new()),
+                peer.to_string(),
+            ),
+        };
     // The route never carries the token: the token is the capability, and the
     // log line is as long-lived as the rest of the service's.
     eprintln!("kyriakon-onboard: titan /key {} {address}", reply.code());
-    writer
-        .write_all(&reply.head())
-        .await
-        .map_err(|e| format!("cannot write the titan reply: {e}"))?;
-    writer
-        .flush()
-        .await
-        .map_err(|e| format!("cannot flush the titan reply: {e}"))
+    let write = async {
+        writer.write_all(&reply.head()).await?;
+        writer.flush().await
+    };
+    match tokio::time::timeout(TITAN_TIMEOUT, write).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("cannot write the titan reply: {e}")),
+        Err(_) => Err("the titan reply timed out".to_string()),
+    }
 }
 
 /// The three checks this route exists for happen before the body is read: the
-/// token must name a live draft, the size must be inside the cap, and the draft
-/// must not already hold a key. A refusal consumes the request line only, so a
-/// client that sent a body is not made to wait for it to be read first.
+/// token must name a live draft, the size must be inside the cap, and the
+/// mailbox the upload belongs to must not already hold a key. A refusal consumes
+/// the request line only, so a client that sent a body is not made to wait for it
+/// to be read first.
 async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     app: &App,
     peer: Option<&str>,
 ) -> Result<(Reply, String), String> {
-    let Some(first) = titan_line(reader, MAX_TITAN_LINE).await? else {
-        return Ok((
-            Reply::gemini(59, "Empty titan request", String::new()),
-            peer.unwrap_or("").to_string(),
-        ));
-    };
-    let (line, address) = if first.starts_with("PROXY ") {
-        let address = proxy_address(&first).unwrap_or_else(|| peer.unwrap_or("").to_string());
-        let Some(line) = titan_line(reader, MAX_TITAN_LINE).await? else {
+    let first = match titan_line(reader, MAX_TITAN_LINE).await {
+        Ok(Some(line)) => line,
+        Ok(None) => {
             return Ok((
                 Reply::gemini(59, "Empty titan request", String::new()),
-                address,
-            ));
+                peer.unwrap_or("").to_string(),
+            ))
+        }
+        Err(why) => {
+            return Ok((
+                Reply::gemini(59, &why, String::new()),
+                peer.unwrap_or("").to_string(),
+            ))
+        }
+    };
+    let (line, address, key) = if first.starts_with("PROXY ") {
+        let address = proxy_address(&first);
+        let line = match titan_line(reader, MAX_TITAN_LINE).await {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                return Ok((
+                    Reply::gemini(59, "Empty titan request", String::new()),
+                    address.unwrap_or_default(),
+                ))
+            }
+            Err(why) => {
+                return Ok((
+                    Reply::gemini(59, &why, String::new()),
+                    address.unwrap_or_default(),
+                ))
+            }
         };
-        (line, address)
+        // Only a PROXY line relayd wrote gives a client address. With none, or
+        // one that does not parse, the request shares `UnknownForward` rather
+        // than collapsing onto the socket peer: the peer here is relayd, and one
+        // bucket for every client in the world is worse than one bucket for the
+        // requests that never reached relayd.
+        //
+        // The listener is loopback-only, so relayd is the only expected
+        // connector. A local process can send a PROXY line naming any address
+        // and get a fresh bucket; that is not a defence this route can carry,
+        // and a local process on this box has worse to hand.
+        let key = match address.as_deref() {
+            Some(address) => rate::key(None, Some(address)),
+            None => rate::Key::UnknownForward,
+        };
+        (line, address.unwrap_or_default(), key)
     } else {
-        (first, peer.unwrap_or("").to_string())
+        (
+            first,
+            peer.unwrap_or("").to_string(),
+            rate::Key::UnknownForward,
+        )
     };
 
-    if !app.counter.allow_request(rate::key(None, Some(&address))) {
+    if !app.counter.allow_request(key) {
         return Ok((too_many(FrontEnd::Gemini, Which::Minute), address));
     }
 
@@ -372,11 +450,18 @@ async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
         Err(why) => return Ok((Reply::gemini(59, why, String::new()), address)),
     };
     let token = upload.token.as_deref().unwrap_or("");
-    let Some(record) = draft::load(&app.store, token).await? else {
+    let record = match draft::load(&app.store, token).await {
+        Ok(record) => record,
+        Err(e) => {
+            eprintln!("kyriakon-onboard: {e}");
+            return Ok((Reply::gemini(40, TEMP_FAILURE, String::new()), address));
+        }
+    };
+    let Some(record) = record else {
         return Ok((capsule_not_found(), address));
     };
     let size = match upload.size {
-        Some(size) if size > 0 && size <= MAX_TITAN_BODY => size,
+        Some(size) if size <= MAX_TITAN_BODY => size,
         _ => {
             return Ok((
                 Reply::gemini(59, "Upload size is missing or over the cap", String::new()),
@@ -384,16 +469,28 @@ async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
             ))
         }
     };
-    if let Some(refusal) = titan_refusal(&record) {
-        return Ok((refusal, address));
+    // A bare titan:// navigation is a zero-byte upload, so a link to the
+    // endpoint opens rather than failing: nothing is read and nothing is filed.
+    if size == 0 {
+        return Ok((Reply::gemini(20, "text/gemini", String::new()), address));
+    }
+    // The mailbox this upload would fill. When every mailbox in the draft holds
+    // a key, there is nothing left to fill and the refusal is the draft's own
+    // state, not the request's.
+    if titan_mailbox(app, &record).is_none() {
+        return Ok((
+            Reply::gemini(
+                59,
+                "Every mailbox in this draft already has a key",
+                String::new(),
+            ),
+            address,
+        ));
     }
 
     let mut body = vec![0u8; size];
     if reader.read_exact(&mut body).await.is_err() {
-        return Ok((
-            Reply::gemini(40, "Temporary failure", String::new()),
-            address,
-        ));
+        return Ok((Reply::gemini(40, TEMP_FAILURE, String::new()), address));
     }
 
     // The checks run again under the draft lock before anything is written, so
@@ -403,21 +500,26 @@ async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
         Ok(lock) => lock,
         Err(e) => {
             eprintln!("kyriakon-onboard: {e}");
-            return Ok((
-                Reply::gemini(40, "Temporary failure", String::new()),
-                address,
-            ));
+            return Ok((Reply::gemini(40, TEMP_FAILURE, String::new()), address));
         }
     };
-    let Some(mut record) = draft::load(&app.store, token).await? else {
+    let record = match draft::load(&app.store, token).await {
+        Ok(record) => record,
+        Err(e) => {
+            eprintln!("kyriakon-onboard: {e}");
+            return Ok((Reply::gemini(40, TEMP_FAILURE, String::new()), address));
+        }
+    };
+    let Some(mut record) = record else {
         return Ok((capsule_not_found(), address));
     };
-    if let Some(refusal) = titan_refusal(&record) {
-        return Ok((refusal, address));
-    }
     let Some(mailbox) = titan_mailbox(app, &record) else {
         return Ok((
-            Reply::gemini(59, "No key page is open for this draft", String::new()),
+            Reply::gemini(
+                59,
+                "Every mailbox in this draft already has a key",
+                String::new(),
+            ),
             address,
         ));
     };
@@ -428,15 +530,15 @@ async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
             address,
         ));
     }
+    // The same retain-then-push the capsule's key page uses, so a retry for one
+    // mailbox replaces its key rather than adding a second.
+    record.mail_keys.retain(|k| k.mailbox != mailbox);
     record
         .mail_keys
         .push(keycheck::mail_key(mailbox.clone(), &blocks[0]));
     if let Err(e) = draft::save(&app.store, &mut record).await {
         eprintln!("kyriakon-onboard: {e}");
-        return Ok((
-            Reply::gemini(40, "Temporary failure", String::new()),
-            address,
-        ));
+        return Ok((Reply::gemini(40, TEMP_FAILURE, String::new()), address));
     }
     let link = format!("gemini://{HOST}/status/{token}");
     Ok((
@@ -449,28 +551,15 @@ async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
     ))
 }
 
-/// The one refusal the draft's own state adds: a second upload is refused rather
-/// than replacing the first key. The token and size checks are the caller's.
-fn titan_refusal(record: &draft::Draft) -> Option<Reply> {
-    (!record.mail_keys.is_empty())
-        .then(|| Reply::gemini(59, "This draft already has a key", String::new()))
-}
-
-/// The mailbox an upload belongs to: the first key page without a key, or, when
-/// the draft has not reached its key page yet, the account its answers name.
+/// The mailbox an upload belongs to: the first key page without a key. A draft
+/// whose flow has a key page for every mailbox answers `None` once each holds a
+/// key, which is the refusal the caller answers with.
 fn titan_mailbox(app: &App, record: &draft::Draft) -> Option<String> {
     flow_path(&app.questions, &record.answers)
         .into_iter()
         .find_map(|page| {
             let mailbox = page.mailbox?;
             (!record.mail_keys.iter().any(|k| k.mailbox == mailbox.name)).then_some(mailbox.name)
-        })
-        .or_else(|| {
-            if record.answers.get("whose").map(String::as_str) == Some("body") {
-                questions::account_names(&record.answers).into_iter().next()
-            } else {
-                record.answers.get("username").cloned()
-            }
         })
         .filter(|name| !name.is_empty())
 }
@@ -512,8 +601,10 @@ async fn titan_line<R: tokio::io::AsyncRead + Unpin>(
 }
 
 /// The Titan request line's URL and its three parameters. `size` is mandatory;
-/// `mime` and `token` are optional, and an unrecognised parameter is refused
-/// rather than ignored, as the specification's parameter set is closed.
+/// `mime` and `token` are optional. An unrecognised parameter is refused rather
+/// than ignored: this route reads a body from a stranger, and a parameter the
+/// handler does not understand is one it cannot bound.
+#[derive(Debug)]
 struct TitanUpload {
     token: Option<String>,
     size: Option<usize>,

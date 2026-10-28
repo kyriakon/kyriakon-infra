@@ -293,18 +293,18 @@ for s in $drain_scripts; do
 done
 printf 'drain scripts installed in %s\n' "$scripts_dir"
 
-# The two socket paths, read from the installed config rather than written here,
-# so the directories this script creates and the check at the end are the ones the
-# service itself uses: a box whose paths were changed is deployed to where it
-# answers.
-socket_path() {
+# The socket paths and the Titan listener, read from the installed config rather
+# than written here, so the directories this script creates and the check at the
+# end are the ones the service itself uses: a box whose paths were changed is
+# deployed to where it answers.
+config_value() {
 	awk -F'"' -v key="$1" '$1 ~ "^" key "[[:space:]]*=" { print $2; exit }' \
 		/etc/onboard/onboard.toml
 }
-httpd_socket_path=$(socket_path httpd_socket)
-gemini_socket_path=$(socket_path gemini_socket)
-portal_socket_path=$(socket_path portal_socket)
-titan_listener=$(socket_path titan_listener)
+httpd_socket_path=$(config_value httpd_socket)
+gemini_socket_path=$(config_value gemini_socket)
+portal_socket_path=$(config_value portal_socket)
+titan_listener=$(config_value titan_listener)
 [ -n "$httpd_socket_path" ] || die "/etc/onboard/onboard.toml names no httpd_socket"
 [ -n "$gemini_socket_path" ] || die "/etc/onboard/onboard.toml names no gemini_socket"
 [ -n "$portal_socket_path" ] || die "/etc/onboard/onboard.toml names no portal_socket"
@@ -369,8 +369,15 @@ case "$titan_port" in
 	die "/etc/onboard/onboard.toml has no port in titan_listener: '$titan_listener'"
 	;;
 esac
-netstat -na -f inet | awk -v p=".$titan_port" '$4 ~ (p "$") { found = 1 } END { exit !found }' \
-	|| die "nothing is listening on titan_listener $titan_listener: is kyriakon_onboard running?"
+# sockstat names the process that holds the socket, which netstat cannot: a
+# row ending in the port proves only that something listens there. The family
+# follows the configured address so an IPv6 listener is not read as missing.
+family=-4
+case "${titan_listener%:*}" in
+*:*) family=-6 ;;
+esac
+sockstat "$family" -ln | awk -v p=":$titan_port" '$2 == "kyriakon_onboard" && $6 ~ (p "$") { found = 1 } END { exit !found }' \
+	|| die "kyriakon_onboard is not listening on titan_listener $titan_listener"
 printf 'titan: %s\n' "$titan_listener"
 
 printf '\ninstalled. the responder answers %s, %s and %s, and no other local user may connect.\n' \

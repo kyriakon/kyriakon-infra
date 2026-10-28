@@ -1646,3 +1646,84 @@ async fn a_titan_request_reads_the_proxy_line_and_the_request_line() {
     );
     assert_eq!(proxy_address("PROXY UNKNOWN\r"), None);
 }
+
+/// A body draft's flow has one key page per mailbox, and Titan fills the next
+/// one each time: two mailboxes take two uploads, and the third has nothing left
+/// to fill.
+#[tokio::test]
+async fn a_body_draft_takes_one_key_per_mailbox_over_titan() {
+    let (app, dir) = handler("titan-body").await;
+    let mut record = crate::draft::Draft::new(TOKEN.to_string());
+    for (key, value) in [
+        ("whose", "body"),
+        ("body_addresses", "secretary: own\nhall: own"),
+        ("body_account_names", "secretary\nhall"),
+    ] {
+        record.answers.insert(key.to_string(), value.to_string());
+    }
+    crate::draft::save(&app.store, &mut record).await.unwrap();
+
+    let body = GOOD_KEY.as_bytes();
+    let head = format!(
+        "titan://signup.kyriakon.net:1966/key;size={};token={TOKEN}\r\n",
+        body.len()
+    );
+    let (code, reply, _) = titan_exchange(&app, &head, body).await;
+    assert_eq!(code, 20, "{reply}");
+    let (code, reply, _) = titan_exchange(&app, &head, body).await;
+    assert_eq!(code, 20, "{reply}");
+    let filed = read_draft(&dir, TOKEN);
+    let mut boxes: Vec<&str> = filed.mail_keys.iter().map(|k| k.mailbox.as_str()).collect();
+    boxes.sort_unstable();
+    assert_eq!(boxes, vec!["hall", "secretary"], "{:?}", filed.mail_keys);
+
+    let (code, reply, leftover) = titan_exchange(&app, &head, body).await;
+    assert_eq!(code, 59, "{reply}");
+    assert!(
+        reply.contains("Every mailbox"),
+        "the third upload is refused by the draft's state: {reply}"
+    );
+    assert_eq!(leftover, body.len(), "the refusal reads no body: {reply}");
+    assert_eq!(read_draft(&dir, TOKEN).mail_keys.len(), 2);
+}
+
+/// A zero-byte upload is a link being opened, so it answers and files nothing.
+#[tokio::test]
+async fn a_zero_byte_titan_navigation_opens_without_filing() {
+    let (app, dir) = handler("titan-zero").await;
+    let mut record = crate::draft::Draft::new(TOKEN.to_string());
+    record
+        .answers
+        .insert("whose".to_string(), "person".to_string());
+    record
+        .answers
+        .insert("username".to_string(), "secretary".to_string());
+    crate::draft::save(&app.store, &mut record).await.unwrap();
+
+    let head = format!("titan://signup.kyriakon.net:1966/key;size=0;token={TOKEN}\r\n");
+    let (code, reply, leftover) = titan_exchange(&app, &head, b"").await;
+    assert_eq!(code, 20, "{reply}");
+    assert_eq!(leftover, 0, "{reply}");
+    assert!(read_draft(&dir, TOKEN).mail_keys.is_empty());
+}
+
+#[test]
+fn titan_parameters_are_read_or_refused() {
+    let upload = titan_params("titan://signup.kyriakon.net/key;size=12;mime=text/plain;token=abc")
+        .expect("a well-formed line parses");
+    assert_eq!(upload.size, Some(12));
+    assert_eq!(upload.token.as_deref(), Some("abc"));
+
+    assert_eq!(
+        titan_params("titan://signup.kyriakon.net/key;size=twelve").unwrap_err(),
+        "Size is not a number"
+    );
+    assert_eq!(
+        titan_params("titan://signup.kyriakon.net/key;size=1;mode=x").unwrap_err(),
+        "Unknown titan parameter"
+    );
+    assert_eq!(
+        titan_params("gemini://signup.kyriakon.net/key;size=1").unwrap_err(),
+        "Not a titan request"
+    );
+}
