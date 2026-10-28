@@ -13,6 +13,9 @@
 //!   kyriakon-onboardctl [--config PATH] approve <username>
 //!   kyriakon-onboardctl [--config PATH] approve-free <username>
 //!   kyriakon-onboardctl [--config PATH] decline <username>
+//!   kyriakon-onboardctl [--config PATH] address --domain <domain> --action <change> \
+//!       --mailbox <account> [--address <localpart>] [--key-file <path>] \
+//!       [--site-owner <account>]
 //!   kyriakon-onboardctl [--config PATH] show <username>
 //!   kyriakon-onboardctl request list
 //!   kyriakon-onboardctl request record
@@ -33,7 +36,7 @@ use kyriakon_onboard::config::DrainConfig;
 use kyriakon_onboard::intents;
 use kyriakon_onboard::requests;
 use kyriakon_onboard::sign;
-use kyriakon_onboard::store::{Record, Store};
+use kyriakon_onboard::store::{KeyRecord, Record, Store};
 use kyriakon_onboard::transitions::{self, Decision};
 use kyriakon_onboard::validate;
 
@@ -76,6 +79,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
     };
     match verb {
         "request" => request(&store, &rest[1..]).await,
+        "address" => address(&cfg, &store, &rest[1..]).await,
         "show" => show(&store, one_username(rest)?).await,
         // Each decision is signed with the same root-only key the review links
         // are signed with, because the drain carries out a decision intent only
@@ -97,6 +101,9 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
 fn usage() -> String {
     "usage: kyriakon-onboardctl [--config PATH] \
      approve|approve-free|decline|show <username>
+       kyriakon-onboardctl address --domain <domain> \
+     --action <add-alias|add-mailbox|upgrade|remove> --mailbox <account> \
+     [--address <localpart>] [--key-file <path>] [--site-owner <account>]
        kyriakon-onboardctl request list
        kyriakon-onboardctl request record --username <u> --kind <access|erasure|rectification> \
      --received <YYYY-MM-DD> --evidence <text> [--note <text>] \
@@ -147,6 +154,101 @@ fn need<'a>(flags: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str, 
         .get(name)
         .map(String::as_str)
         .ok_or_else(|| format!("--{name} is needed"))
+}
+
+/// File one address change in a group. The signature is the console's, over
+/// every field the drain acts on: an address intent creates a root account or
+/// removes one, and `intents/` is writable by the unprivileged handler.
+///
+/// `--key-file` is the new mailbox's armored public key, read here and carried
+/// in the intent so the drain installs it in the keyring and publishes it.
+async fn address(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), String> {
+    let flags = flags(
+        args,
+        &[
+            "domain",
+            "action",
+            "address",
+            "mailbox",
+            "key-file",
+            "site-owner",
+        ],
+    )?;
+    let domain = need(&flags, "domain")?;
+    if let Some(why) = validate::domain(domain) {
+        return Err(format!("the domain {domain:?}: {why}"));
+    }
+    let action = need(&flags, "action")?;
+    if !transitions::ADDRESS_ACTIONS.contains(&action) {
+        return Err(format!(
+            "--action {action:?} is not one of {:?}\n{}",
+            transitions::ADDRESS_ACTIONS,
+            usage()
+        ));
+    }
+    let mailbox = need(&flags, "mailbox")?;
+    if let Some(why) = validate::username_shape(mailbox) {
+        return Err(format!("the mailbox {mailbox:?}: {why}"));
+    }
+    let address = flags.get("address").map(String::as_str).unwrap_or("");
+    if action != "remove" {
+        if address.is_empty() {
+            return Err("--address is needed for this change".to_string());
+        }
+        if let Some(why) = validate::username_shape(address) {
+            return Err(format!("the address {address:?}: {why}"));
+        }
+    }
+    let site_owner = flags.get("site-owner").map(String::as_str);
+    if let Some(owner) = site_owner {
+        if let Some(why) = validate::username_shape(owner) {
+            return Err(format!("the site owner {owner:?}: {why}"));
+        }
+    }
+    let mail_key = match flags.get("key-file") {
+        Some(path) => {
+            let material = std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read the mail key {path}: {e}"))?;
+            if material.trim().is_empty() {
+                return Err(format!("the mail key {path} is empty"));
+            }
+            Some(KeyRecord {
+                mailbox: mailbox.to_string(),
+                fingerprint: String::new(),
+                material,
+                verdict: "unchecked".to_string(),
+            })
+        }
+        None => None,
+    };
+    if matches!(action, "add-mailbox" | "upgrade") && mail_key.is_none() {
+        return Err("--key-file is needed for a new mailbox".to_string());
+    }
+    let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
+    let sig = sign::sign(
+        &key,
+        &sign::address_payload(
+            domain,
+            action,
+            address,
+            mailbox,
+            site_owner.unwrap_or(""),
+            mail_key.as_ref().map(|k| k.material.as_str()).unwrap_or(""),
+        ),
+    )?;
+    let id = intents::file_group_address(
+        store,
+        domain,
+        action,
+        address,
+        mailbox,
+        mail_key.as_ref(),
+        site_owner,
+        &sig,
+    )
+    .await?;
+    println!("filed {action} for {domain} as intent {id}");
+    Ok(())
 }
 
 async fn request(store: &Store, args: &[String]) -> Result<(), String> {

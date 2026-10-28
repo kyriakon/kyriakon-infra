@@ -598,6 +598,42 @@ pub struct GroupIntent {
     pub mail_keys: Vec<KeyRecord>,
 }
 
+/// The `group-address` intent: one address change inside a body's group, filed
+/// by the reviewer's console and applied in one idempotent pass.
+///
+///   add-alias   one virtual entry pointing at an existing mailbox; nothing else.
+///   add-mailbox one account, its key and its virtual entry, inside the cap.
+///   upgrade     an alias becomes a mailbox: the same entry is repointed.
+///   remove      one mailbox's account, key, quota line and virtual entries.
+///
+/// It carries a signature over every field the drain acts on, because
+/// `intents/` is writable by the unprivileged handler and this is root work:
+/// without one, a compromised handler could file a mailbox or a removal.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GroupAddressIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub domain: String,
+    /// `add-alias`, `add-mailbox`, `upgrade` or `remove`.
+    pub action: String,
+    /// The address's localpart. Unused for `remove`, which names the mailbox.
+    #[serde(default)]
+    pub address: String,
+    /// The mailbox the change concerns: the alias target, the new account, or
+    /// the account being removed.
+    pub mailbox: String,
+    /// The key a new mailbox carries. Required by `add-mailbox` and `upgrade`.
+    #[serde(default)]
+    pub mail_key: Option<KeyRecord>,
+    /// The account that takes the site when `remove` takes the current owner.
+    #[serde(default)]
+    pub site_owner: Option<String>,
+    /// The HMAC-SHA256 of `sign::address_payload` under the approval key.
+    pub sig: String,
+}
+
 /// The 14-day payment window a paid approval opens.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Window {

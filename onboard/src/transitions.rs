@@ -21,8 +21,8 @@ use crate::notice;
 use crate::questions;
 use crate::sign;
 use crate::store::{
-    self, Account, ApplicationRef, GroupAddress, GroupIntent, GroupPayment, GroupRecord, Intent,
-    JournalLine, KeyRecord, Record, Store, TokenRecord, Window,
+    self, Account, ApplicationRef, GroupAddress, GroupAddressIntent, GroupIntent, GroupPayment,
+    GroupRecord, Intent, JournalLine, KeyRecord, Record, Store, TokenRecord, Window,
 };
 use crate::util;
 use crate::validate;
@@ -30,6 +30,10 @@ use crate::validate;
 /// The rails an application may name. `no_charge` is the fourth, and it is a
 /// rail rather than a flag because it is one of the four buttons on the form.
 const RAILS: [&str; 4] = ["card", "cash", "monero", "no_charge"];
+
+/// The address changes a `group-address` intent carries. The console's
+/// `--action` takes one of these and the drain refuses any other.
+pub const ADDRESS_ACTIONS: [&str; 4] = ["add-alias", "add-mailbox", "upgrade", "remove"];
 
 /// One of the three decisions a reviewer can make.
 pub struct Decision {
@@ -937,6 +941,14 @@ async fn approve(
     // never finish.
     if !begun {
         name_allowed(cfg, username).await?;
+        // A group mailbox that closed leaves the name held for ninety days, and
+        // this is the other gate that can create an account. Without it a person
+        // could take a name a removal had just held.
+        if let Some(until) = name_held(store, username).await? {
+            return Err(format!(
+                "the username {username} is held until {until}, so it cannot be reused yet"
+            ));
+        }
     }
 
     // The box is the oracle and the record only a fast path. A name already on
@@ -1430,6 +1442,13 @@ async fn check_group_names(
         if in_record || in_account {
             continue;
         }
+        // A name a removed mailbox left is held for ninety days before the
+        // group can reuse it. Both the approval and an add-mailbox pass here.
+        if let Some(until) = name_held(store, mailbox).await? {
+            return Err(format!(
+                "the account name {mailbox} is held until {until}, so it cannot be reused yet"
+            ));
+        }
         if existing.is_some() {
             return Err(format!("the account name {mailbox} is already taken"));
         }
@@ -1553,14 +1572,7 @@ pub async fn provision_group(
         accounts: intent.mailboxes.clone(),
         site_owner: intent.site_owner.clone(),
     };
-    let bytes = serde_json::to_vec_pretty(&group)
-        .map_err(|e| format!("cannot encode the group record: {e}"))?;
-    store
-        .ensure_dir(&format!("groups/{}", intent.domain))
-        .await?;
-    store
-        .write_record(&format!("groups/{}", intent.domain), "group.json", &bytes)
-        .await?;
+    write_group_record(store, &group).await?;
 
     // The mail tables before the accounts: provision-member.sh restarts smtpd
     // when it adds a new account's platform address, and that restart is what
@@ -1595,7 +1607,7 @@ pub async fn provision_group(
             write_public_key(store, mailbox, &intent.upload_key).await?;
         }
         run_script(cfg, "provision-member.sh", &[mailbox]).await?;
-        write_group_account(store, mailbox, &intent).await?;
+        write_group_account(store, mailbox, &intent.domain, &intent.payment).await?;
         write_group_application(store, mailbox, app_copy.as_deref()).await?;
     }
     // The published set is what the drift check compares the keyring against.
@@ -1669,7 +1681,8 @@ async fn write_group_application(
 async fn write_group_account(
     store: &Store,
     mailbox: &str,
-    intent: &GroupIntent,
+    domain: &str,
+    payment: &GroupPayment,
 ) -> Result<(), String> {
     let existing = existing_account(store, mailbox).await;
     let now = util::filed_at();
@@ -1682,12 +1695,12 @@ async fn write_group_account(
             .as_ref()
             .map(|a| a.decided_at.clone())
             .unwrap_or_else(|| now.clone()),
-        rail: if intent.payment.no_charge {
+        rail: if payment.no_charge {
             "no_charge".to_string()
         } else {
-            intent.payment.rail.clone()
+            payment.rail.clone()
         },
-        no_charge: intent.payment.no_charge,
+        no_charge: payment.no_charge,
         created_at: existing
             .as_ref()
             .map(|a| a.created_at.clone())
@@ -1701,7 +1714,7 @@ async fn write_group_account(
         site_served: None,
         capsule_served: None,
         space_used: None,
-        group: Some(intent.domain.clone()),
+        group: Some(domain.to_string()),
     };
     let mut value =
         serde_json::to_value(&account).map_err(|e| format!("cannot encode the account: {e}"))?;
@@ -1715,6 +1728,19 @@ async fn write_group_account(
     store.ensure_dir(&format!("accounts/{mailbox}")).await?;
     store
         .write_record(&format!("accounts/{mailbox}"), "account.json", &bytes)
+        .await
+}
+
+/// Write one group's record. The caller owns the directory name, which is the
+/// validated domain, so a record can never land outside `groups/`.
+async fn write_group_record(store: &Store, group: &GroupRecord) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(group)
+        .map_err(|e| format!("cannot encode the group record: {e}"))?;
+    store
+        .ensure_dir(&format!("groups/{}", group.domain))
+        .await?;
+    store
+        .write_record(&format!("groups/{}", group.domain), "group.json", &bytes)
         .await
 }
 
@@ -1772,6 +1798,480 @@ fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), 
     entry.push('\n');
     std::io::Write::write_all(&mut file, entry.as_bytes())
         .map_err(|e| format!("cannot append to {path}: {e}"))
+}
+
+/// The value a virtual table maps `name` to, or `None` when the key is absent.
+fn table_value(path: &str, name: &str) -> Result<Option<String>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
+    for line in text.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            if key.trim() == name {
+                return Ok(Some(value.trim().to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// How many addresses the body's domain has: every `<localpart>@<domain>` line,
+/// mailboxes and aliases alike, which is the ten-address cap's count.
+fn address_count(path: &str, domain: &str) -> Result<usize, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
+    let suffix = format!("@{domain}");
+    Ok(text
+        .lines()
+        .filter(|line| {
+            line.split_once(':')
+                .map(|(key, _)| key.trim().ends_with(&suffix))
+                .unwrap_or(false)
+        })
+        .count())
+}
+
+/// Rewrite a table through a temporary beside it, then rename it into place.
+fn write_table(path: &str, text: &str) -> Result<(), String> {
+    let candidate = format!("{path}.onboard.{}", std::process::id());
+    std::fs::write(&candidate, text).map_err(|e| format!("cannot write {candidate}: {e}"))?;
+    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o644))
+        .map_err(|e| format!("cannot set the mode on {candidate}: {e}"))?;
+    std::fs::rename(&candidate, path).map_err(|e| format!("cannot replace {path}: {e}"))
+}
+
+/// Repoint an existing virtual entry, keeping every other line. A value that is
+/// already right is left alone, so an upgrade intent applied twice changes
+/// nothing. `ensure_table_line` refuses a different value on purpose (it must
+/// not overrule a line somebody else made), so this is the explicit repoint.
+///
+/// shortcut: a rewrite can drop a line another pass appends between the read and
+/// the rename; only the operator's own upgrade takes this path, and the drain
+/// does not run two address changes at once.
+fn repoint_table_line(path: &str, name: &str, want: &str) -> Result<(), String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
+    let mut out = String::new();
+    let mut found = false;
+    for line in text.lines() {
+        if let Some((key, have)) = line.split_once(':') {
+            if key.trim() == name {
+                if have.trim() == want {
+                    return Ok(());
+                }
+                out.push_str(&format!("{name}: {want}\n"));
+                found = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !found {
+        return ensure_table_line(path, name, Some(want));
+    }
+    write_table(path, &out)
+}
+
+/// Drop every line for `domain` that points at `mailbox`. That is the mailbox's
+/// own address and any alias into it, so no entry is left delivering nowhere.
+/// Returns whether the table changed.
+fn remove_addresses(path: &str, domain: &str, mailbox: &str) -> Result<bool, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
+    let suffix = format!("@{domain}");
+    let mut out = String::new();
+    let mut changed = false;
+    for line in text.lines() {
+        let remove = line
+            .split_once(':')
+            .map(|(key, value)| key.trim().ends_with(&suffix) && value.trim() == mailbox)
+            .unwrap_or(false);
+        if remove {
+            changed = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if changed {
+        write_table(path, &out)?;
+    }
+    Ok(changed)
+}
+
+/// A username's hold, while it still has time to run. The date is the record's;
+/// a record that cannot be dated has no hold, so a broken file does not keep a
+/// name held forever.
+async fn name_held(store: &Store, username: &str) -> Result<Option<String>, String> {
+    let Some(text) = store
+        .read_record("holds", &format!("{username}.json"))
+        .await
+    else {
+        return Ok(None);
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Ok(None);
+    };
+    let Some(until) = value.get("until").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    match OffsetDateTime::parse(until, &Rfc3339) {
+        Ok(at) if at > OffsetDateTime::now_utc() => Ok(Some(until.to_string())),
+        _ => Ok(None),
+    }
+}
+
+/// Hold a closed account's name for ninety days. Written only when there is no
+/// live hold, so a retry keeps the date the removal first set rather than
+/// pushing the release out by another pass.
+async fn hold_name(store: &Store, username: &str) -> Result<(), String> {
+    if name_held(store, username).await?.is_some() {
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec_pretty(&json!({
+        "username": username,
+        "until": util::after_days(90),
+    }))
+    .map_err(|e| format!("cannot encode the hold: {e}"))?;
+    store.ensure_dir("holds").await?;
+    store
+        .write_record("holds", &format!("{username}.json"), &bytes)
+        .await
+}
+
+/// The mail key a new mailbox carries, checked before anything is written: the
+/// material must be there and must be the mailbox's own key.
+fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, String> {
+    let Some(key) = intent.mail_key.as_ref() else {
+        return Err(format!(
+            "the mailbox {} has no mail key, so its mail would bounce",
+            intent.mailbox
+        ));
+    };
+    if !key.mailbox.is_empty() && key.mailbox != intent.mailbox {
+        return Err(format!(
+            "the mail key names {}, not {}",
+            key.mailbox, intent.mailbox
+        ));
+    }
+    if key.material.trim().is_empty() {
+        return Err(format!("the mail key for {} is empty", intent.mailbox));
+    }
+    // The console carries whatever file the operator named. A private key, an
+    // SSH key or a truncated block would reach the encryptor's keyring and
+    // fail closed, so the shared check refuses it before the journal line.
+    let checked = crate::keycheck::pgp_public_key(&key.material)
+        .map_err(|e| format!("the mail key for {}: {e}", intent.mailbox))?;
+    let mut key = key.clone();
+    key.mailbox = intent.mailbox.clone();
+    key.verdict = checked.verdict;
+    Ok(key)
+}
+
+/// Apply one `group-address` intent: a change inside a body's group that must
+/// not touch the price or the group's paid-until date. Every step is idempotent,
+/// and every check runs before the journal line and the first write, so a
+/// refused intent changes nothing.
+pub async fn group_address(
+    cfg: &DrainConfig,
+    store: &Store,
+    key: &[u8],
+    value: &Value,
+    file: &str,
+) -> Result<(), String> {
+    let intent: GroupAddressIntent = serde_json::from_value(value.clone())
+        .map_err(|e| format!("the address intent does not parse: {e}"))?;
+    if intent.kind != "group-address" {
+        return Err(format!("kind {:?} is not an address intent", intent.kind));
+    }
+    let site_owner = intent.site_owner.as_deref().unwrap_or("");
+    if !sign::verify(
+        key,
+        &sign::address_payload(
+            &intent.domain,
+            &intent.action,
+            &intent.address,
+            &intent.mailbox,
+            site_owner,
+            intent
+                .mail_key
+                .as_ref()
+                .map(|k| k.material.as_str())
+                .unwrap_or(""),
+        ),
+        &intent.sig,
+    ) {
+        return Err("the address intent's signature does not verify".to_string());
+    }
+    if !ADDRESS_ACTIONS.contains(&intent.action.as_str()) {
+        return Err(format!("{:?} is not an address change", intent.action));
+    }
+    if let Some(why) = validate::domain(&intent.domain) {
+        return Err(format!("the domain {:?}: {why}", intent.domain));
+    }
+    let Some(mut group) = group_record(store, &intent.domain).await? else {
+        return Err(format!(
+            "there is no group for {}, so there is no address to change",
+            intent.domain
+        ));
+    };
+    if let Some(why) = validate::username_shape(&intent.mailbox) {
+        return Err(format!("the mailbox {:?}: {why}", intent.mailbox));
+    }
+    if intent.action != "remove" {
+        if let Some(why) = validate::username_shape(&intent.address) {
+            return Err(format!("the address {:?}: {why}", intent.address));
+        }
+    }
+
+    let entry = format!("{}@{}", intent.address, intent.domain);
+    let current = match intent.action.as_str() {
+        "remove" => None,
+        _ => table_value(&cfg.virtuals, &entry)?,
+    };
+    let in_group = |mailbox: &str| group.accounts.iter().any(|a| a == mailbox);
+
+    match intent.action.as_str() {
+        "add-alias" => {
+            if !in_group(&intent.mailbox) {
+                return Err(format!(
+                    "the alias {}@{} points at {}, which is not a mailbox in the group",
+                    intent.address, intent.domain, intent.mailbox
+                ));
+            }
+            match &current {
+                Some(have) if have == &intent.mailbox => {}
+                Some(have) => {
+                    return Err(format!(
+                        "{} already maps {entry} to {have}, not {}",
+                        cfg.virtuals, intent.mailbox
+                    ))
+                }
+                None if address_count(&cfg.virtuals, &intent.domain)? >= 10 => {
+                    return Err(format!(
+                        "{} already carries ten addresses, so {entry} cannot be added",
+                        intent.domain
+                    ))
+                }
+                None => {}
+            }
+        }
+        "add-mailbox" => {
+            address_key(&intent)?;
+            if let Some(have) = &current {
+                if have != &intent.mailbox {
+                    return Err(format!(
+                        "{} already maps {entry} to {have}, not {}",
+                        cfg.virtuals, intent.mailbox
+                    ));
+                }
+            }
+            if !in_group(&intent.mailbox) {
+                check_group_names(
+                    cfg,
+                    store,
+                    &intent.domain,
+                    std::slice::from_ref(&intent.mailbox),
+                    Some(&group),
+                )
+                .await?;
+            }
+            // The cap counts new entries, whether or not the mailbox itself is
+            // already in the group: a second address into an existing mailbox
+            // still costs one of the ten.
+            if current.is_none() && address_count(&cfg.virtuals, &intent.domain)? >= 10 {
+                return Err(format!(
+                    "{} already carries ten addresses, so {} cannot be added",
+                    intent.domain, entry
+                ));
+            }
+        }
+        "upgrade" => {
+            address_key(&intent)?;
+            match &current {
+                None => {
+                    return Err(format!(
+                        "{} is not an address in {}, so there is no alias to upgrade",
+                        entry, intent.domain
+                    ))
+                }
+                Some(have) if have == &intent.mailbox => {}
+                Some(have) => {
+                    if !in_group(have) {
+                        return Err(format!(
+                            "{} points at {have}, which is not a mailbox in the group",
+                            entry
+                        ));
+                    }
+                }
+            }
+            if !in_group(&intent.mailbox) {
+                check_group_names(
+                    cfg,
+                    store,
+                    &intent.domain,
+                    std::slice::from_ref(&intent.mailbox),
+                    Some(&group),
+                )
+                .await?;
+            }
+        }
+        "remove" => {
+            if group.site_owner == intent.mailbox {
+                let Some(replacement) = intent.site_owner.as_deref() else {
+                    return Err(format!(
+                        "{} owns the site, so the intent must name the account that takes it",
+                        intent.mailbox
+                    ));
+                };
+                if replacement == intent.mailbox || !in_group(replacement) {
+                    return Err(format!(
+                        "the replacement site owner {replacement} is not another mailbox in the group"
+                    ));
+                }
+            }
+            let existing = existing_account(store, &intent.mailbox).await;
+            let ours = existing
+                .as_ref()
+                .map(|a| a.group.as_deref() == Some(intent.domain.as_str()))
+                .unwrap_or(false);
+            if !in_group(&intent.mailbox) && !ours && account_on_box(cfg, &intent.mailbox)? {
+                return Err(format!(
+                    "the account {} is not a mailbox in {}",
+                    intent.mailbox, intent.domain
+                ));
+            }
+        }
+        _ => unreachable!("the action was checked against ADDRESS_ACTIONS"),
+    }
+
+    let application = ApplicationRef {
+        username: intent.mailbox.clone(),
+        status_token: intent.domain.clone(),
+    };
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &application,
+        "applying",
+        None,
+    )
+    .await?;
+
+    match intent.action.as_str() {
+        "add-alias" => {
+            ensure_table_line(&cfg.virtuals, &entry, Some(&intent.mailbox))?;
+            // smtpd reads the table at start and has no reload verb, so the
+            // alias does not deliver until it restarts.
+            run_script(cfg, "reload-smtpd.sh", &[]).await?;
+        }
+        "add-mailbox" => {
+            // The record first, as a group's own provisioning does: it is what
+            // tells a retry that an account on the box is this group's.
+            if !in_group(&intent.mailbox) {
+                group.accounts.push(intent.mailbox.clone());
+                write_group_record(store, &group).await?;
+            }
+            let key = address_key(&intent)?;
+            ensure_table_line(&cfg.virtuals, &entry, Some(&intent.mailbox))?;
+            publish_mail_keys(cfg, &intent.mailbox, std::slice::from_ref(&key)).await?;
+            if !account_on_box(cfg, &intent.mailbox)? {
+                run_script_tolerating(cfg, "add-user.sh", &[&intent.mailbox], "already exists")
+                    .await?;
+            }
+            run_script(cfg, "provision-member.sh", &[&intent.mailbox]).await?;
+            write_group_account(store, &intent.mailbox, &intent.domain, &group.payment).await?;
+            publish_mail_keys_publicly(cfg, &intent.mailbox, std::slice::from_ref(&key)).await?;
+        }
+        "upgrade" => {
+            if !in_group(&intent.mailbox) {
+                group.accounts.push(intent.mailbox.clone());
+                write_group_record(store, &group).await?;
+            }
+            let key = address_key(&intent)?;
+            publish_mail_keys(cfg, &intent.mailbox, std::slice::from_ref(&key)).await?;
+            if !account_on_box(cfg, &intent.mailbox)? {
+                run_script_tolerating(cfg, "add-user.sh", &[&intent.mailbox], "already exists")
+                    .await?;
+            }
+            run_script(cfg, "provision-member.sh", &[&intent.mailbox]).await?;
+            write_group_account(store, &intent.mailbox, &intent.domain, &group.payment).await?;
+            repoint_table_line(&cfg.virtuals, &entry, &intent.mailbox)?;
+            // The repoint is a table rewrite after the builder's own restart,
+            // and a retry that finds the account already made restarts nothing.
+            // Without this the upgraded address keeps reaching the shared
+            // mailbox.
+            run_script(cfg, "reload-smtpd.sh", &[]).await?;
+            publish_mail_keys_publicly(cfg, &intent.mailbox, std::slice::from_ref(&key)).await?;
+        }
+        "remove" => {
+            // What this pass actually closes. A mistyped name that is neither in
+            // the group nor on the box closes nothing, so it must not start a
+            // ninety-day hold either.
+            let closing = in_group(&intent.mailbox)
+                || existing_account(store, &intent.mailbox).await.is_some()
+                || account_on_box(cfg, &intent.mailbox)?;
+            // Only a pass that still sees the departing mailbox owning the site
+            // moves the upload key and the lanes. Once the group record names
+            // the replacement, a retry must not copy anything: an intent that
+            // merely named the sitting owner while removing somebody else would
+            // otherwise hand that member's key to the site.
+            let site_owner_leaving = group.site_owner == intent.mailbox;
+            if site_owner_leaving {
+                let replacement = intent
+                    .site_owner
+                    .as_deref()
+                    .ok_or("the site owner is leaving without a replacement")?;
+                let old_key = store
+                    .read_record("keys", &format!("{}.pub", intent.mailbox))
+                    .await;
+                if let Some(material) = &old_key {
+                    write_public_key(store, replacement, material).await?;
+                }
+                run_script(cfg, "provision-member.sh", &[replacement]).await?;
+                group.site_owner = replacement.to_string();
+            }
+            group.accounts.retain(|a| a != &intent.mailbox);
+            write_group_record(store, &group).await?;
+            if remove_addresses(&cfg.virtuals, &intent.domain, &intent.mailbox)? {
+                // delete-user.sh restarts smtpd only when it removed a line;
+                // the lines have gone here, so this pass makes them live.
+                run_script(cfg, "reload-smtpd.sh", &[]).await?;
+            }
+            store
+                .remove("keys", &format!("{}.pub", intent.mailbox))
+                .await?;
+            // The box keyring entry stays, as delete-user.sh leaves it:
+            // check-keyring-drift.sh reports a published key absent from the
+            // box, and the published key's removal is the operator's step
+            // (there is no unpublish path in this tree yet).
+            if closing {
+                hold_name(store, &intent.mailbox).await?;
+            }
+            if intent.site_owner.is_some() {
+                // After the record names the replacement and before the old
+                // tree goes: the vhost root must not point at a directory
+                // delete-user.sh is about to remove.
+                run_script(cfg, "cron-apply.sh", &["--web"]).await?;
+            }
+            run_script(cfg, "delete-user.sh", &[&intent.mailbox]).await?;
+        }
+        _ => unreachable!("the action was checked against ADDRESS_ACTIONS"),
+    }
+
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &application,
+        "applied",
+        None,
+    )
+    .await?;
+    store.remove("intents", file).await
 }
 
 /// The decline: no reason, a message that offers the way back, the application
