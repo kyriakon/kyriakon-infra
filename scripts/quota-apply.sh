@@ -172,20 +172,22 @@ record_offset() {
 	awk -F: -v u="$1" '$1 == u { printf "%d", $3 * 32; exit }' "$passwd_file"
 }
 
-# The four bytes of one u_int32_t, little-endian, as octal escapes for the argument of
-# a printf %b. Escapes rather than bytes, because a command substitution drops NUL
-# bytes outright. Each escape carries the leading zero that a %b argument wants and
-# that printf %o does not produce, so the string is passed as an argument rather than
-# used as the format.
+# The four bytes of one u_int32_t, little-endian, as octal escapes for a printf format.
+# Escapes rather than bytes, because a command substitution drops NUL bytes outright.
+# They go in the format rather than a %b argument because pdksh's %b stops at the first
+# NUL byte, so an allowance with a zero low byte wrote nothing at all. Each is a fixed
+# three digits: pdksh reads a `\0ddd` escape as only three digits, so a variable-width
+# one carrying a leading zero turned 0240 into 024 and a literal 0.
 le32_escapes() {
-	printf '\\0%o\\0%o\\0%o\\0%o' \
+	printf '\\%03o\\%03o\\%03o\\%03o' \
 		"$(($1 & 255))" "$(($1 >> 8 & 255))" "$(($1 >> 16 & 255))" "$(($1 >> 24 & 255))"
 }
 
 # The eight bytes a write replaces: the hard limit then the soft, in the file's order
 # and in the file's 512-byte units.
 limit_bytes() {
-	printf '%b' "$(le32_escapes $((($2) * 2)))$(le32_escapes $((($1) * 2)))"
+	# shellcheck disable=SC2059 # octal escapes this file builds, never an input
+	printf "$(le32_escapes $((($2) * 2)))$(le32_escapes $((($1) * 2)))"
 }
 
 # One field of the record at an offset, read back from the file rather than from a
@@ -400,7 +402,8 @@ EOF
 	# units, and the write touching nothing else in it.
 	check "the record offset is the uid times 32" "$(record_offset member)" "32032"
 	member_offset=$(record_offset member)
-	printf '%b' "$(le32_escapes 0)$(le32_escapes 0)$(le32_escapes 412980)$(le32_escapes 0)$(le32_escapes 0)$(le32_escapes 1234)$(le32_escapes 7)$(le32_escapes 7)" > "$work/record"
+	# shellcheck disable=SC2059 # octal escapes this file builds, never an input
+	printf "$(le32_escapes 0)$(le32_escapes 0)$(le32_escapes 412980)$(le32_escapes 0)$(le32_escapes 0)$(le32_escapes 1234)$(le32_escapes 7)$(le32_escapes 7)" > "$work/record"
 	dd of="$mount/quota.user" bs=1 seek="$member_offset" conv=notrunc < "$work/record" 2>/dev/null
 
 	# 3. the stubs, and quota(1) reporting the kernel's view
