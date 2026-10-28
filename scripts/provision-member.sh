@@ -12,10 +12,10 @@
 #   doas ksh scripts/provision-member.sh <username>
 #
 # The key is optional. A member who only wants mail leaves it empty, and the run
-# then does the mail work and stops: the address and the allowance are the whole
-# account. A member with a key also gets the public tree, the upload session and
-# the two daemon lanes, which is everything the key is needed for. Mail is never
-# behind the key.
+# then does the mail work and stops: the address, the allowance and the login
+# class are the whole account. A member with a key also gets the public tree, the
+# upload session and the two daemon lanes, which is everything the key is needed
+# for. Mail is never behind the key.
 #
 # add-user.sh creates the account, its Maildir and its quota record. This script
 # asserts the account is there rather than making one: a second creation path
@@ -224,35 +224,6 @@ else
 	fi
 fi
 
-# Mail is the account's whole job when there is no key, so a mail-only member
-# stops here: the address and the allowance are in place, and the tree, the
-# upload session and the daemon lanes are not built because there is no key to
-# reach them with.
-if [ "$have_key" = no ]; then
-	printf 'provisioned %s: mail only, no upload key\n' "$user"
-	printf '  the address and the allowance are in place; the public tree, the upload\n'
-	printf '  session and the daemon lanes are not built, because the member holds no key\n'
-	printf 'next: add a key from the member page, then run this script again\n'
-	exit 0
-fi
-
-# The members group is what sshd's Match blocks key on, and both the sftp upload
-# on 22 and git-shell on 2222 sit behind it. An account outside the group has
-# neither, so the tree built below would be unreachable, and that is a refusal
-# rather than a note. deploy-mail.sh creates the group, so a box that has not run
-# it has none.
-if ! getent group members >/dev/null 2>&1; then
-	printf 'no members group, which is what sshd matches for the member sessions\n' >&2
-	printf '  doas ksh scripts/deploy-mail.sh\n' >&2
-	exit 1
-fi
-if ! id -Gn "$user" | tr ' ' '\n' | grep -qx members; then
-	printf '%s is not in the members group, so it has no sftp or git session\n' "$user" >&2
-	printf 'and this tree would be unreachable:\n' >&2
-	printf '  doas usermod -G members %s\n' "$user" >&2
-	exit 1
-fi
-
 # --- the session shell, from the login class --------------------------------
 #
 # One account carries both sessions and the port decides which. Port 22's block
@@ -342,6 +313,41 @@ if [ "$shell_now" != /sbin/nologin ]; then
 		"$user" "$shell_now" >&2
 	printf 'the session shell comes from the login class, so the account keeps no shell of its own\n' >&2
 	exit 1
+fi
+
+# The members group is what sshd's Match blocks key on, and both the sftp upload
+# on 22 and git-shell on 2222 sit behind it. An account outside the group has
+# neither, so the tree built below would be unreachable, and that is a refusal
+# rather than a note. deploy-mail.sh creates the group, so a box that has not run
+# it has none. The check runs for a mail-only account too: the own-domain tier
+# gives every mailbox the class whose shell is git-shell, and the group is what
+# the member sessions match.
+if ! getent group members >/dev/null 2>&1; then
+	printf 'no members group, which is what sshd matches for the member sessions\n' >&2
+	printf '  doas ksh scripts/deploy-mail.sh\n' >&2
+	exit 1
+fi
+if ! id -Gn "$user" | tr ' ' '\n' | grep -qx members; then
+	printf '%s is not in the members group, so it has no sftp or git session\n' "$user" >&2
+	printf 'and this tree would be unreachable:\n' >&2
+	printf '  doas usermod -G members %s\n' "$user" >&2
+	exit 1
+fi
+
+
+# Mail is the account's whole job when there is no key, so a mail-only member
+# stops here: the class, the address and the allowance are in place, and the
+# tree, the upload session and the daemon lanes are not built because there is
+# no key to reach them with. The class is set for a mail-only account too, the
+# same as for one with a key: an own-domain mailbox carries no key of its own,
+# and the spec gives every mailbox the class whose shell is git-shell. An
+# account with no `authorized_keys` cannot use that session either way.
+if [ "$have_key" = no ]; then
+	printf 'provisioned %s: mail only, no upload key\n' "$user"
+	printf '  the class, the address and the allowance are in place; the public tree, the upload\n'
+	printf '  session and the daemon lanes are not built, because the member holds no key\n'
+	printf 'next: add a key from the member page, then run this script again\n'
+	exit 0
 fi
 
 # --- the upload key's source -------------------------------------------------

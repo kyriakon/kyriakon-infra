@@ -70,6 +70,15 @@ gemini_socket = "/home/www/run/onboard/onboard.sock"
 # on-disk one because the portal is not chrooted.
 portal_socket = "/home/www/run/onboard-portal/portal.sock"
 
+# The Titan upload listener: a TCP socket of its own on loopback, because gmid
+# holds the gemini port and a Titan request cannot reach a FastCGI front-end. It
+# is the forward target in the commented relayd block, which terminates TLS with
+# the capsule's certificate and forwards with PROXY protocol v1 so the handler
+# still sees the client's address. Nothing off the box connects here directly:
+# the listener binds loopback, and the public port is the relay's and the
+# firewall's, both propose-only.
+titan_listener = "127.0.0.1:7081"
+
 # The rate limits (sixty requests a minute and five drafts a day per address, no
 # CAPTCHA) are the spec's numbers and live in the handler, not here: they are not
 # a per-box tuning knob, and a config file that could raise them is a config file

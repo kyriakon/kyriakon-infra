@@ -48,6 +48,12 @@ pub struct Config {
     /// Its directory is set-group-id to that account's group for the same reason
     /// the other two carry their daemon's group.
     pub portal_socket: String,
+    /// The TCP address the Titan upload listener binds. It is loopback-only and
+    /// relayd is the only thing off the box that can reach it: the relay
+    /// terminates TLS with the capsule's certificate and forwards with PROXY
+    /// protocol v1, which is how this listener still sees the client's address.
+    /// The address is the forward target in the commented relayd block.
+    pub titan_listener: String,
     /// The deployed commit and date, e.g. "2026-10-10 1a2b3c4". The acceptance
     /// records carry it as the version of each document accepted, and it is the
     /// version of the question list an application was answered against. It is
@@ -96,6 +102,19 @@ pub struct DrainConfig {
     /// hand, has no record under the store, and the drain must neither adopt it
     /// nor release its name. A configuration value so a test can drive it.
     pub passwd: String,
+    /// The virtual table's two files, which smtpd reads at start:
+    /// `/etc/mail/mail_domains` holds one body domain per line and
+    /// `/etc/mail/virtuals` the full-address entries that point at an account.
+    /// scripts/deploy-mail.sh seeds both and owns the platform's own lines; the
+    /// drain adds a body's on approval. Configuration values for the reason
+    /// `passwd` is one.
+    pub mail_domains: String,
+    pub virtuals: String,
+    /// The DKIM filter's domain list, one domain per line. A body's domain is
+    /// appended here when its group is provisioned, so the next deploy's splice
+    /// of the filter's `-d` arguments signs it; the splice itself is the batched
+    /// configuration pass, not this write.
+    pub dkim_domains: String,
     /// The root-only HMAC key the review and password links are signed with.
     pub approval_key: String,
     /// The box keyring the encrypting LMTP reads: one `<localpart>.asc` per
@@ -161,6 +180,7 @@ mod tests {
              httpd_socket = \"/home/www/run/onboard-httpd/httpd.sock\"\n\
              gemini_socket = \"/home/www/run/onboard/onboard.sock\"\n\
              portal_socket = \"/home/www/run/onboard-portal/portal.sock\"\n\
+             titan_listener = \"127.0.0.1:7081\"\n\
              release = \"REPLACE_ME\"\n",
         )
         .unwrap();
@@ -168,6 +188,7 @@ mod tests {
         assert_eq!(c.httpd_socket, "/home/www/run/onboard-httpd/httpd.sock");
         assert_eq!(c.gemini_socket, "/home/www/run/onboard/onboard.sock");
         assert_eq!(c.portal_socket, "/home/www/run/onboard-portal/portal.sock");
+        assert_eq!(c.titan_listener, "127.0.0.1:7081");
     }
 
     /// The handler config the deploy installs, not a fixture that can agree with a
@@ -183,6 +204,7 @@ mod tests {
             handler.portal_socket,
             "/home/www/run/onboard-portal/portal.sock"
         );
+        assert_eq!(handler.titan_listener, "127.0.0.1:7081");
         assert_eq!(handler.pages, "/var/db/onboard/pages");
     }
 
@@ -192,7 +214,7 @@ mod tests {
             "store_rooot = \"/x\"\n\
              reserved=\"r\"\ncatalogue=\"c\"\npages=\"p\"\n\
              httpd_socket=\"/a\"\ngemini_socket=\"/b\"\n\
-             portal_socket=\"/c\"\nrelease=\"r\"\n",
+             portal_socket=\"/c\"\ntitan_listener=\"127.0.0.1:7081\"\nrelease=\"r\"\n",
         );
         assert!(r.is_err());
     }
@@ -215,6 +237,7 @@ mod tests {
                  httpd_socket = \"/a\"\n\
                  gemini_socket = \"/b\"\n\
                  portal_socket = \"/c\"\n\
+                 titan_listener = \"127.0.0.1:7081\"\n\
                  release = \"r\"\n{extra}"
             );
             let r: Result<Config, _> = toml::from_str(&text);
@@ -229,6 +252,9 @@ mod tests {
              scripts = \"/root/bin\"\n\
              sendmail = \"/usr/sbin/sendmail\"\n\
              passwd = \"/etc/passwd\"\n\
+             mail_domains = \"/etc/mail/mail_domains\"\n\
+             virtuals = \"/etc/mail/virtuals\"\n\
+             dkim_domains = \"/etc/mail/dkim_domains\"\n\
              approval_key = \"/etc/kyriakon/onboard/approval-signing-key\"\n\
              keyring_dir = \"/etc/kyriakon/keys\"\n\
              stripe_webhook_secret = \"/etc/kyriakon/onboard/stripe-webhook-secret\"\n\
@@ -258,6 +284,9 @@ mod tests {
         assert_eq!(c.scripts, "/usr/local/libexec/kyriakon/scripts");
         assert_eq!(c.sendmail, "/usr/sbin/sendmail");
         assert_eq!(c.passwd, "/etc/passwd");
+        assert_eq!(c.mail_domains, "/etc/mail/mail_domains");
+        assert_eq!(c.virtuals, "/etc/mail/virtuals");
+        assert_eq!(c.dkim_domains, "/etc/mail/dkim_domains");
         assert_eq!(c.approval_key, "/etc/kyriakon/onboard/approval-signing-key");
         assert_eq!(c.keyring_dir, "/etc/kyriakon/keys");
         assert_eq!(c.reviewer, "admin@kyriakon.net");

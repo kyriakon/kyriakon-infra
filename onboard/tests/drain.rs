@@ -57,6 +57,11 @@ impl Fix {
         // The box's account list, empty to start: the drain reads it to tell its
         // own half-finished approval from somebody else's account.
         std::fs::write(fix.path("passwd"), "").unwrap();
+        // The virtual tables deploy-mail.sh seeds: the platform's domain and no
+        // address entries yet, so a group's lines are the drain's.
+        std::fs::write(fix.path("mail_domains"), "kyriakon.net\n").unwrap();
+        std::fs::write(fix.path("virtuals"), "").unwrap();
+        std::fs::write(fix.path("dkim_domains"), "kyriakon.net\n").unwrap();
         // The held-back names, copied from the tracked list so that a test can add
         // one to the fixture's without touching the repository's.
         let tracked = std::fs::read_to_string(format!(
@@ -83,6 +88,9 @@ impl Fix {
              scripts = \"{}\"\n\
              sendmail = \"{}\"\n\
              passwd = \"{}\"\n\
+             mail_domains = \"{}\"\n\
+             virtuals = \"{}\"\n\
+             dkim_domains = \"{}\"\n\
              approval_key = \"{}\"\n\
              keyring_dir = \"{}\"\n\
              stripe_webhook_secret = \"{}/stripe\"\n\
@@ -99,6 +107,9 @@ impl Fix {
             fix.path("bin"),
             fix.path("bin/enqueuer.sh"),
             fix.path("passwd"),
+            fix.path("mail_domains"),
+            fix.path("virtuals"),
+            fix.path("dkim_domains"),
             fix.path("key"),
             fix.path("keyring"),
             fix.dir.display(),
@@ -219,6 +230,136 @@ impl Fix {
         )
         .unwrap();
         record
+    }
+
+    /// Write one `provision-group` intent under `id`, as an approval files it.
+    fn write_group(
+        &self,
+        id: &str,
+        domain: &str,
+        site_owner: &str,
+        addresses: &[(&str, &str)],
+        mailboxes: &[&str],
+        upload: Option<&str>,
+    ) {
+        let mail_keys: Vec<Value> = mailboxes
+            .iter()
+            .map(|mailbox| {
+                json!({
+                    "mailbox": mailbox,
+                    "fingerprint": "1111 2222 3333 4444",
+                    "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n-----END PGP PUBLIC KEY BLOCK-----",
+                    "verdict": "works",
+                })
+            })
+            .collect();
+        let addresses: Vec<Value> = addresses
+            .iter()
+            .map(|(address, mailbox)| json!({"address": address, "mailbox": mailbox}))
+            .collect();
+        self.write_intent(
+            id,
+            &json!({
+                "id": id,
+                "kind": "provision-group",
+                "filed_at": "2026-10-02T09:00:00Z",
+                "application": {"username": "warden", "status_token": TOKEN},
+                "domain": domain,
+                "name": "Parish of Example",
+                "body_kind": "parish",
+                "payment": {"rail": "cash", "no_charge": false, "paid_until": null},
+                "addresses": addresses,
+                "mailboxes": mailboxes,
+                "site_owner": site_owner,
+                "upload_key": upload.unwrap_or(""),
+                "mail_keys": mail_keys,
+            }),
+        );
+    }
+
+    /// File one `provision-group` intent and hand back its id.
+    fn file_group(
+        &self,
+        domain: &str,
+        site_owner: &str,
+        addresses: &[(&str, &str)],
+        mailboxes: &[&str],
+        upload: Option<&str>,
+    ) -> String {
+        let id = ulid();
+        self.write_group(&id, domain, site_owner, addresses, mailboxes, upload);
+        id
+    }
+
+    /// A virtual table beside the store, as the drain left it.
+    fn table(&self, name: &str) -> String {
+        std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
+    }
+
+    /// A body's application record, as the community block files it: two
+    /// addresses sharing one mailbox, one mail key for it, and the block's
+    /// upload key.
+    fn filed_body(&self, applicant: &str) -> Value {
+        let answers: BTreeMap<&str, &str> = [
+            ("whose", "body"),
+            ("body_name", "Parish of Example"),
+            ("body_kind", "parish"),
+            ("body_domain", "parish.example"),
+            ("body_records", "yes"),
+            ("body_addresses", "secretary: own\noffice: alias secretary"),
+            ("body_account_names", "parish-secretary\nparish-secretary"),
+            ("body_dns_contact", "warden@example.invalid"),
+            ("rail", "cash"),
+        ]
+        .into_iter()
+        .collect();
+        let mail_keys = vec![json!({
+            "mailbox": "parish-secretary",
+            "fingerprint": "1111 2222 3333 4444",
+            "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n-----END PGP PUBLIC KEY BLOCK-----",
+            "verdict": "works",
+        })];
+        let record = json!({
+            "username": applicant,
+            "status_token": TOKEN,
+            "filed_at": "2026-10-01T09:00:00Z",
+            "front_end": "web",
+            "stage": "received",
+            "domain": "parish.example",
+            "outside_address": Value::Null,
+            "answers": answers,
+            "mail_keys": mail_keys,
+            "upload_key": {
+                "mailbox": "",
+                "fingerprint": "AAAA BBBB CCCC DDDD",
+                "material": UPLOAD_KEY,
+                "verdict": "works",
+            },
+            "rail": "cash",
+            "no_charge": false,
+            "acceptances": [{"document": "terms", "version": "2026-10-01 abc1234"}],
+            "question_list": "2026-10-01 abc1234",
+        });
+        std::fs::write(
+            self.dir
+                .join("store/applications")
+                .join(format!("{TOKEN}.json")),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+        record
+    }
+
+    /// Replace the application record `filed_body` wrote, when a test changes
+    /// its answers after building it.
+    fn rewrite_record(&self, record: &Value) {
+        std::fs::write(
+            self.dir
+                .join("store/applications")
+                .join(format!("{TOKEN}.json")),
+            serde_json::to_vec_pretty(record).unwrap(),
+        )
+        .unwrap();
     }
 
     /// File an application intent, as the handler does.
@@ -2302,4 +2443,407 @@ fn mail_without_a_key_block_is_not_answered() {
     assert!(out.status.success(), "{}", body(&out));
     assert!(fix.sent().is_empty(), "{}", fix.sent());
     assert!(fix.names("mail/new").is_empty());
+}
+
+/// One `provision-group` intent makes the group record, the mailbox account, the
+/// two virtual entries, the mail domain line and the site owner's upload key.
+#[test]
+fn a_group_intent_provisions_its_record_accounts_and_addresses() {
+    let fix = Fix::new("group");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-secretary"),
+        ],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert!(!fix.journal().contains("\"failed\""), "{}", fix.journal());
+
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(group["domain"], "parish.example");
+    assert_eq!(group["name"], "Parish of Example");
+    assert_eq!(group["kind"], "parish");
+    assert_eq!(group["accounts"], json!(["parish-secretary"]));
+    assert_eq!(group["site_owner"], "parish-secretary");
+    assert_eq!(group["payment"]["rail"], "cash");
+    assert_eq!(group["payment"]["no_charge"], false);
+
+    // The account is the mailbox's, with a group reference and no paid-until
+    // field of its own.
+    let account = fix.account("parish-secretary");
+    assert_eq!(account["group"], "parish.example");
+    assert!(account.get("paid_until").is_none(), "{account}");
+    assert!(
+        fix.passwd_file().contains("parish-secretary:"),
+        "{}",
+        fix.passwd_file()
+    );
+
+    // One mail domain line and one virtual entry per address, on the body's
+    // domain rather than the platform's.
+    let domains = fix.table("mail_domains");
+    assert_eq!(
+        domains.lines().filter(|l| *l == "parish.example").count(),
+        1,
+        "{domains}"
+    );
+    let virtuals = fix.table("virtuals");
+    for address in ["secretary", "office"] {
+        let key = format!("{address}@parish.example:");
+        assert_eq!(
+            virtuals.lines().filter(|l| l.starts_with(&key)).count(),
+            1,
+            "{virtuals}"
+        );
+        assert!(
+            virtuals.contains(&format!("{key} parish-secretary")),
+            "{virtuals}"
+        );
+    }
+
+    // The block's upload key is where provision-member.sh reads it.
+    let key = fix.read("keys/parish-secretary.pub");
+    assert!(key.contains(UPLOAD_KEY), "{key}");
+
+    let log = fix.scripts_log();
+    assert!(log.contains("add-user.sh parish-secretary"), "{log}");
+    assert!(
+        log.contains("provision-member.sh parish-secretary"),
+        "{log}"
+    );
+}
+
+/// The same intent applied a second time leaves one account, one virtual entry
+/// per address, one public tree and one upload key: the property a retry after a
+/// crash depends on.
+#[test]
+fn a_group_intent_applied_twice_leaves_one_of_each() {
+    let fix = Fix::new("group-twice");
+    let id = fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-secretary"),
+        ],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+
+    // The same intent again, as a crash before the delete leaves it.
+    fix.write_group(
+        &id,
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-secretary"),
+        ],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert_eq!(
+        fix.scripts_log().matches("add-user.sh").count(),
+        1,
+        "add-user.sh ran once, not once per pass: {}",
+        fix.scripts_log()
+    );
+    assert_eq!(
+        fix.passwd_file()
+            .lines()
+            .filter(|l| l.starts_with("parish-secretary:"))
+            .count(),
+        1,
+        "{}",
+        fix.passwd_file()
+    );
+    let virtuals = fix.table("virtuals");
+    for address in ["secretary", "office"] {
+        assert_eq!(
+            virtuals
+                .lines()
+                .filter(|l| l.starts_with(&format!("{address}@parish.example:")))
+                .count(),
+            1,
+            "{virtuals}"
+        );
+    }
+    assert_eq!(
+        fix.table("mail_domains")
+            .lines()
+            .filter(|l| *l == "parish.example")
+            .count(),
+        1
+    );
+    assert_eq!(fix.names("accounts"), vec!["parish-secretary"]);
+    // The key file holds one key, and the tree is the builder's to keep
+    // idempotent: it ran against the same account, not a second one.
+    let key = fix.read("keys/parish-secretary.pub");
+    assert_eq!(
+        key.lines().filter(|l| !l.trim().is_empty()).count(),
+        1,
+        "{key}"
+    );
+    assert_eq!(
+        fix.scripts_log()
+            .matches("provision-member.sh parish-secretary")
+            .count(),
+        2,
+        "the builder is idempotent, so a retry runs it again"
+    );
+}
+
+/// A group whose account name is held back, or already taken, is refused and
+/// the intent stays in place for the operator to fix.
+#[test]
+fn a_group_intent_for_a_reserved_name_is_refused() {
+    let fix = Fix::new("group-reserved");
+    fix.reserve("parish-secretary");
+    let id = fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+
+    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
+    assert!(
+        fix.failed_note().contains("parish-secretary"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(
+        !fix.dir
+            .join("store/groups/parish.example/group.json")
+            .exists(),
+        "a refused group makes no record"
+    );
+    assert!(!fix.passwd_file().contains("parish-secretary:"));
+}
+
+#[test]
+fn a_group_intent_for_a_taken_name_is_refused() {
+    let fix = Fix::new("group-taken");
+    // An account made some other way: the box has it and the store does not.
+    fix.set_passwd("parish-secretary:x:1000:1000::/home/parish-secretary:/sbin/nologin\n");
+    let id = fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+
+    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
+    assert!(
+        fix.failed_note().contains("already in use on this box"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(
+        !fix.dir
+            .join("store/groups/parish.example/group.json")
+            .exists(),
+        "a refused group makes no record"
+    );
+}
+
+/// The approval of a body's application files and applies the group intent in
+/// the same pass: the mailboxes are the address table's, and the applicant's own
+/// username is not made into an account.
+#[test]
+fn a_body_approval_makes_the_group_and_its_mailboxes() {
+    let fix = Fix::new("group-approval");
+    let record = fix.filed_body("warden");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(!fix.journal().contains("\"failed\""), "{}", fix.journal());
+
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(group["accounts"], json!(["parish-secretary"]));
+    assert_eq!(group["site_owner"], "parish-secretary");
+    assert_eq!(group["kind"], "parish");
+    assert_eq!(group["payment"]["rail"], "cash");
+
+    assert!(fix
+        .dir
+        .join("store/accounts/parish-secretary/account.json")
+        .exists());
+    assert!(
+        !fix.dir.join("store/accounts/warden/account.json").exists(),
+        "the accountable person is not a mailbox"
+    );
+    assert!(fix
+        .table("virtuals")
+        .contains("office@parish.example: parish-secretary"));
+    assert!(fix.passwd_file().contains("parish-secretary:"));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    // The application is decided, so a replay changes nothing.
+    assert!(fix.journal().contains("\"applied\""), "{}", fix.journal());
+}
+
+/// An application the form accepts can be approved: the alias line names its own
+/// account, and the address shares the mailbox its `own` target names.
+#[test]
+fn a_body_alias_may_name_itself_and_shares_the_mailbox() {
+    let fix = Fix::new("group-alias-name");
+    let mut record = fix.filed_body("warden");
+    record["answers"]["body_account_names"] = json!("parish-secretary\nparish-office");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.journal().contains("\"failed\""),
+        "an aliased body was refused: {}",
+        fix.journal()
+    );
+
+    let virtuals = fix.table("virtuals");
+    assert!(
+        virtuals.contains("office@parish.example: parish-secretary"),
+        "{virtuals}"
+    );
+    assert!(
+        !fix.passwd_file().contains("parish-office:"),
+        "the alias names no account: {}",
+        fix.passwd_file()
+    );
+}
+
+/// A forge outage does not stop the rest of the body: every account and table
+/// line is made first, and the publish is retried from the intent next pass.
+#[test]
+fn a_forge_outage_still_makes_every_mailbox() {
+    let fix = Fix::new("group-publish-fails");
+    fix.publish_fails();
+    let mut record = fix.filed_body("warden");
+    record["answers"]["body_addresses"] = json!("secretary: own\noffice: own");
+    record["answers"]["body_account_names"] = json!("parish-secretary\nparish-office");
+    record["mail_keys"] = json!([
+        {
+            "mailbox": "parish-secretary",
+            "fingerprint": "1111 2222 3333 4444",
+            "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n-----END PGP PUBLIC KEY BLOCK-----",
+            "verdict": "works"
+        },
+        {
+            "mailbox": "parish-office",
+            "fingerprint": "5555 6666 7777 8888",
+            "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nyy\n-----END PGP PUBLIC KEY BLOCK-----",
+            "verdict": "works"
+        }
+    ]);
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let passwd = fix.passwd_file();
+    assert!(passwd.contains("parish-secretary:"), "{passwd}");
+    assert!(passwd.contains("parish-office:"), "{passwd}");
+    let virtuals = fix.table("virtuals");
+    for address in ["secretary", "office"] {
+        assert!(
+            virtuals.contains(&format!("{address}@parish.example: parish-")),
+            "{virtuals}"
+        );
+    }
+    assert!(
+        fix.dir
+            .join("store/accounts/parish-office/account.json")
+            .exists(),
+        "the later mailbox was made"
+    );
+    assert!(
+        fix.failed_note().contains("publish-mail-key.sh"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(!fix.intents().is_empty(), "the intent waits for the retry");
+}
+
+/// A virtual table line that already points elsewhere is a refusal, and the
+/// drain does not overrule it.
+#[test]
+fn a_conflicting_virtual_line_is_refused() {
+    let fix = Fix::new("group-conflict");
+    std::fs::write(
+        fix.path("virtuals"),
+        "office@parish.example: somebody-else\n",
+    )
+    .unwrap();
+    let id = fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("office", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+
+    assert!(
+        fix.failed_note().contains("already maps"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(
+        fix.table("virtuals")
+            .contains("office@parish.example: somebody-else"),
+        "{}",
+        fix.table("virtuals")
+    );
+    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
+}
+
+/// An address table that cannot be read is a refusal before the approval begins:
+/// no journal line and no group record.
+#[test]
+fn a_body_whose_addresses_do_not_form_a_table_is_refused_before_the_journal() {
+    let fix = Fix::new("group-bad-table");
+    let mut record = fix.filed_body("warden");
+    record["answers"]["body_addresses"] = json!("office: alias nobody");
+    record["answers"]["body_account_names"] = json!("parish-secretary");
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert!(
+        fix.failed_note().contains("not a mailbox in the table"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(
+        !fix.journal().contains("\"applying\""),
+        "a refusal began an approval: {}",
+        fix.journal()
+    );
+    assert!(
+        !fix.dir
+            .join("store/groups/parish.example/group.json")
+            .exists(),
+        "a refused table made a record"
+    );
 }

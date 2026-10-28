@@ -7,7 +7,7 @@
 //! application's own state, so a click on an already-decided application changes
 //! nothing and the journal records only that the click was seen.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 
 use serde_json::{json, Value};
@@ -20,8 +20,8 @@ use crate::notice;
 use crate::questions;
 use crate::sign;
 use crate::store::{
-    self, Account, ApplicationRef, Intent, JournalLine, KeyRecord, Record, Store, TokenRecord,
-    Window,
+    self, Account, ApplicationRef, GroupAddress, GroupIntent, GroupPayment, GroupRecord, Intent,
+    JournalLine, KeyRecord, Record, Store, TokenRecord, Window,
 };
 use crate::util;
 use crate::validate;
@@ -870,6 +870,13 @@ async fn approve(
         return Ok(());
     }
 
+    // A body's accounts are the address table's, not the applicant's: the person
+    // path below would make one account for the accountable person and none of
+    // the mailboxes. The whole application is one group intent instead.
+    if record.domain.is_some() {
+        return approve_group(cfg, store, intent, file, &record, no_charge).await;
+    }
+
     // The recipient is revalidated before anything is written or journaled, so a
     // record whose address could inject a header is refused rather than
     // half-applied.
@@ -1025,6 +1032,7 @@ async fn approve(
         site_served: None,
         capsule_served: None,
         space_used: None,
+        group: None,
     };
     store.ensure_dir(&format!("accounts/{username}")).await?;
     let account_bytes = serde_json::to_vec_pretty(&account)
@@ -1116,6 +1124,606 @@ async fn approve(
     .await?;
     store.remove("intents", file).await?;
     Ok(())
+}
+
+/// The approval of a body's application: the community block's addresses become
+/// one `provision-group` intent, which is then applied in this pass. The intent
+/// is written before it is applied, so a crash between the two leaves the work
+/// for the next pass rather than losing it.
+///
+/// Its name is a fresh ULID, so the intent directory's lexical order stays the
+/// order things were filed; a replay files a second intent whose apply finds its
+/// own accounts and makes nothing twice.
+async fn approve_group(
+    cfg: &DrainConfig,
+    store: &Store,
+    intent: &DecisionIntent,
+    file: &str,
+    record: &Record,
+    no_charge: bool,
+) -> Result<(), String> {
+    let domain = record
+        .domain
+        .clone()
+        .ok_or("the application names no domain")?;
+    if let Some(why) = validate::domain(&domain) {
+        return Err(format!("the domain {domain:?}: {why}"));
+    }
+    // A group that is already there and was not made by this application is
+    // somebody else's, and this approval must not adopt it. A retry of this
+    // application's own approval has its "applying" line, the way the person
+    // path's does.
+    let existing_group = group_record(store, &domain).await?;
+    if existing_group.is_some() && !approval_started(store, &record.status_token).await {
+        return Err(format!(
+            "the domain {domain} already has a group that this application did not make"
+        ));
+    }
+    let (addresses, mailboxes) = group_addresses(record)?;
+    let site_owner = site_owner(record, &mailboxes)?;
+    // Every mailbox's key must be in hand before anything is journaled, so a
+    // refusal records nothing and no intent is left for a name or a key the
+    // applicant has to change.
+    for mailbox in &mailboxes {
+        if !record.mail_keys.iter().any(|k| &k.mailbox == mailbox) {
+            return Err(format!(
+                "the mailbox {mailbox} has no mail key, so its mail would bounce"
+            ));
+        }
+    }
+    // Names, before the journal line and the intent: a reserved or taken name is
+    // a refusal the reviewer has to take back to the applicant, not an approval
+    // that started.
+    check_group_names(cfg, store, &domain, &mailboxes, existing_group.as_ref()).await?;
+    let name = record.answers.get("body_name").cloned().unwrap_or_default();
+    let body_kind = record.answers.get("body_kind").cloned().unwrap_or_default();
+
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &intent.application,
+        "applying",
+        None,
+    )
+    .await?;
+
+    // A fresh ULID rather than the status token: the intent directory sorts by
+    // name and the loop reads it in that order, so every intent's name has to be
+    // a ULID for a lexical sort to be an age sort.
+    let id = ulid::Ulid::new().to_string();
+    let group = json!({
+        "id": id,
+        "kind": "provision-group",
+        "filed_at": util::filed_at(),
+        "application": {
+            "username": record.username,
+            "status_token": record.status_token,
+        },
+        "domain": domain,
+        "name": name,
+        "body_kind": body_kind,
+        "payment": {
+            "rail": if no_charge { "no_charge" } else { record.rail.as_str() },
+            "no_charge": no_charge,
+            "paid_until": Value::Null,
+        },
+        "addresses": addresses,
+        "mailboxes": mailboxes,
+        "site_owner": site_owner,
+        "upload_key": record.upload_key.as_ref().map(|k| k.material.clone()).unwrap_or_default(),
+        "mail_keys": record.mail_keys,
+    });
+    let filename = format!("{id}.json");
+    let bytes =
+        serde_json::to_vec_pretty(&group).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store.write_record("intents", &filename, &bytes).await?;
+    provision_group(cfg, store, &group, &filename).await?;
+
+    let now = util::filed_at();
+    mark_decided(
+        store,
+        &record.status_token,
+        "approved: a group was made",
+        &now,
+        None,
+    )
+    .await?;
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &intent.application,
+        "applied",
+        None,
+    )
+    .await?;
+    store.remove("intents", file).await?;
+    Ok(())
+}
+
+/// The address table the community block answered, paired with the account
+/// names. An `own` line names a mailbox; an `alias` line points at one already
+/// named, and the address shares that mailbox. The name on an alias line is not
+/// used: the mailbox is the one its `own` target names.
+fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec<String>), String> {
+    let text = record
+        .answers
+        .get("body_addresses")
+        .map(String::as_str)
+        .unwrap_or("");
+    if let Some(why) = validate::address_lines(text) {
+        return Err(format!("the address table: {why}"));
+    }
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let names = questions::account_names(&record.answers);
+    if names.len() != lines.len() {
+        return Err(format!(
+            "{} addresses and {} account names; there is one name per address",
+            lines.len(),
+            names.len()
+        ));
+    }
+
+    let mut own: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut seen = HashSet::new();
+    let mut mailboxes: Vec<String> = Vec::new();
+    for (line, name) in lines.iter().zip(&names) {
+        let (local, rest) = line.split_once(':').ok_or_else(|| {
+            format!("the address line {line:?} is not localpart: own or localpart: alias localpart")
+        })?;
+        let local = local.trim();
+        if !seen.insert(local) {
+            return Err(format!("the address {local} is in the table twice"));
+        }
+        if rest.trim() == "own" {
+            if mailboxes.iter().any(|m| m == name) {
+                return Err(format!(
+                    "the mailbox {name} is named by two mailboxes; an alias shares a mailbox instead"
+                ));
+            }
+            own.insert(local, name);
+            mailboxes.push(name.clone());
+        }
+    }
+
+    let mut addresses = Vec::new();
+    for (line, name) in lines.iter().zip(&names) {
+        let (local, rest) = line.split_once(':').ok_or_else(|| {
+            format!("the address line {line:?} is not localpart: own or localpart: alias localpart")
+        })?;
+        let local = local.trim();
+        if rest.trim() != "own" {
+            let target = rest
+                .trim()
+                .strip_prefix("alias ")
+                .map(str::trim)
+                .unwrap_or_default();
+            let shared = own.get(target).ok_or_else(|| {
+                format!("the address {local} is an alias into {target}, which is not a mailbox in the table")
+            })?;
+            addresses.push(GroupAddress {
+                address: local.to_string(),
+                mailbox: (*shared).to_string(),
+            });
+            continue;
+        }
+        addresses.push(GroupAddress {
+            address: local.to_string(),
+            mailbox: name.clone(),
+        });
+    }
+    Ok((addresses, mailboxes))
+}
+
+/// The account that owns the site. The community block names no site owner of
+/// its own yet, so it is the applicant's account when the address table holds
+/// it, and the first mailbox otherwise.
+///
+/// shortcut: the community block has no site-owner question yet, so the site is
+/// the applicant's account when the table names it and the first mailbox
+/// otherwise; add the question and read it here.
+fn site_owner(record: &Record, mailboxes: &[String]) -> Result<String, String> {
+    if mailboxes.iter().any(|m| m == &record.username) {
+        return Ok(record.username.clone());
+    }
+    mailboxes.first().cloned().ok_or_else(|| {
+        "the address table names no mailbox, so no account owns the site".to_string()
+    })
+}
+
+/// The group record, when one is already there. A record that cannot be read or
+/// parsed is an error rather than "no group": treating it as absent would let an
+/// approval adopt accounts the record names.
+async fn group_record(store: &Store, domain: &str) -> Result<Option<GroupRecord>, String> {
+    let Some(text) = store
+        .read_record(&format!("groups/{domain}"), "group.json")
+        .await
+    else {
+        return Ok(None);
+    };
+    let record: GroupRecord = serde_json::from_str(&text)
+        .map_err(|e| format!("groups/{domain}/group.json does not parse: {e}"))?;
+    if record.version != 1 {
+        return Err(format!(
+            "groups/{domain}/group.json has version {}, which this build does not read",
+            record.version
+        ));
+    }
+    Ok(Some(record))
+}
+
+/// Refuse a mailbox name this group did not make. It runs before anything is
+/// journaled or written, so a refusal records nothing; a retry finds its own
+/// accounts named by the group record or by their group reference.
+async fn check_group_names(
+    cfg: &DrainConfig,
+    store: &Store,
+    domain: &str,
+    mailboxes: &[String],
+    record: Option<&GroupRecord>,
+) -> Result<(), String> {
+    for mailbox in mailboxes {
+        name_allowed(cfg, mailbox).await?;
+        let in_record = record
+            .map(|g| g.accounts.iter().any(|a| a == mailbox))
+            .unwrap_or(false);
+        let existing = existing_account(store, mailbox).await;
+        let in_account = existing
+            .as_ref()
+            .map(|a| a.group.as_deref() == Some(domain))
+            .unwrap_or(false);
+        if in_record || in_account {
+            continue;
+        }
+        if existing.is_some() {
+            return Err(format!("the account name {mailbox} is already taken"));
+        }
+        if account_on_box(cfg, mailbox)? {
+            return Err(format!(
+                "the account name {mailbox} is already in use on this box"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Apply one `provision-group` intent: the record, the accounts, the mail table
+/// entries and the site owner's key. Everything is idempotent, so a retry after
+/// a crash makes nothing twice.
+pub async fn provision_group(
+    cfg: &DrainConfig,
+    store: &Store,
+    value: &Value,
+    file: &str,
+) -> Result<(), String> {
+    let intent: GroupIntent = serde_json::from_value(value.clone())
+        .map_err(|e| format!("the group intent does not parse: {e}"))?;
+    if intent.kind != "provision-group" {
+        return Err(format!("kind {:?} is not a group intent", intent.kind));
+    }
+    if let Some(why) = validate::domain(&intent.domain) {
+        return Err(format!("the domain {:?}: {why}", intent.domain));
+    }
+    if intent.mailboxes.is_empty() {
+        return Err("the intent names no mailbox, so there is nothing to provision".to_string());
+    }
+    if !intent.mailboxes.iter().any(|m| m == &intent.site_owner) {
+        return Err(format!(
+            "the site owner {} is not one of the mailboxes",
+            intent.site_owner
+        ));
+    }
+    let mut mailboxes = HashSet::new();
+    for mailbox in &intent.mailboxes {
+        if !mailboxes.insert(mailbox.as_str()) {
+            return Err(format!("the mailbox {mailbox} is named twice"));
+        }
+    }
+    for address in &intent.addresses {
+        if let Some(why) = validate::username_shape(&address.address) {
+            return Err(format!("the address {:?}: {why}", address.address));
+        }
+        if !intent.mailboxes.iter().any(|m| m == &address.mailbox) {
+            return Err(format!(
+                "the address {}@{} points at {}, which is not a mailbox",
+                address.address, intent.domain, address.mailbox
+            ));
+        }
+    }
+    let mut seen = HashSet::new();
+    for address in &intent.addresses {
+        if !seen.insert(address.address.as_str()) {
+            return Err(format!(
+                "the address {} is in the table twice",
+                address.address
+            ));
+        }
+    }
+
+    // Every mailbox's key must be in hand before anything is made, so a missing
+    // one cannot leave a half-made group whose mail bounces.
+    let mut keys: BTreeMap<String, Vec<KeyRecord>> = BTreeMap::new();
+    for mailbox in &intent.mailboxes {
+        let mine: Vec<KeyRecord> = intent
+            .mail_keys
+            .iter()
+            .filter(|k| &k.mailbox == mailbox)
+            .cloned()
+            .collect();
+        if mine.is_empty() {
+            return Err(format!(
+                "the mailbox {mailbox} has no mail key, so its mail would bounce"
+            ));
+        }
+        keys.insert(mailbox.clone(), mine);
+    }
+
+    // Names, before anything is written or journaled. A name this group did not
+    // make is refused rather than adopted: the box and the account record are
+    // both oracles, and a retry finds its own accounts named by the group record
+    // or by their group reference.
+    let record = group_record(store, &intent.domain).await?;
+    check_group_names(
+        cfg,
+        store,
+        &intent.domain,
+        &intent.mailboxes,
+        record.as_ref(),
+    )
+    .await?;
+
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &intent.application,
+        "applying",
+        None,
+    )
+    .await?;
+
+    // The record first: it is what tells a retry which accounts on the box are
+    // this group's.
+    let group = GroupRecord {
+        version: 1,
+        domain: intent.domain.clone(),
+        name: intent.name.clone(),
+        kind: intent.body_kind.clone(),
+        payment: GroupPayment {
+            rail: intent.payment.rail.clone(),
+            no_charge: intent.payment.no_charge,
+            paid_until: intent.payment.paid_until.clone(),
+        },
+        accounts: intent.mailboxes.clone(),
+        site_owner: intent.site_owner.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&group)
+        .map_err(|e| format!("cannot encode the group record: {e}"))?;
+    store
+        .ensure_dir(&format!("groups/{}", intent.domain))
+        .await?;
+    store
+        .write_record(&format!("groups/{}", intent.domain), "group.json", &bytes)
+        .await?;
+
+    // The mail tables before the accounts: provision-member.sh restarts smtpd
+    // when it adds a new account's platform address, and that restart is what
+    // makes these lines live.
+    ensure_table_line(&cfg.mail_domains, &intent.domain, None)?;
+    ensure_table_line(&cfg.dkim_domains, &intent.domain, None)?;
+    for address in &intent.addresses {
+        ensure_table_line(
+            &cfg.virtuals,
+            &format!("{}@{}", address.address, intent.domain),
+            Some(&address.mailbox),
+        )?;
+    }
+
+    let app_copy = application_copy(store, &intent.application.status_token).await?;
+
+    // Every account and its keyring entry first. The public publish is a network
+    // call to the forge, and it runs in a second loop so a forge outage cannot
+    // leave a later mailbox uncreated while its virtual entry already accepts
+    // mail.
+    for mailbox in &intent.mailboxes {
+        if let Some(mine) = keys.get(mailbox) {
+            publish_mail_keys(cfg, mailbox, mine).await?;
+        }
+        if !account_on_box(cfg, mailbox)? {
+            run_script_tolerating(cfg, "add-user.sh", &[mailbox], "already exists").await?;
+        }
+        // The block's upload key is the site owner's, and only theirs: it fills
+        // the site tree and reaches the repositories, so it goes in the one
+        // account named to own the site.
+        if mailbox == &intent.site_owner && !intent.upload_key.trim().is_empty() {
+            write_public_key(store, mailbox, &intent.upload_key).await?;
+        }
+        run_script(cfg, "provision-member.sh", &[mailbox]).await?;
+        write_group_account(store, mailbox, &intent).await?;
+        write_group_application(store, mailbox, app_copy.as_deref()).await?;
+    }
+    // The published set is what the drift check compares the keyring against.
+    for mailbox in &intent.mailboxes {
+        if let Some(mine) = keys.get(mailbox) {
+            publish_mail_keys_publicly(cfg, mailbox, mine).await?;
+        }
+    }
+
+    // A hosting body has new daemon files, so the index and reload pass runs,
+    // the same one a person's hosting approval runs.
+    if !intent.upload_key.trim().is_empty() {
+        run_script(cfg, "cron-apply.sh", &["--web"]).await?;
+    }
+
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &intent.application,
+        "applied",
+        None,
+    )
+    .await?;
+    store.remove("intents", file).await?;
+    Ok(())
+}
+
+/// The application's own copy, written into each mailbox's account so the block's
+/// answers sit inside the ninety-day purge with the rest of the application. The
+/// status link's end is stamped the way the person path's copy is.
+async fn application_copy(store: &Store, token: &str) -> Result<Option<String>, String> {
+    let Some(text) = store
+        .read_record("applications", &format!("{token}.json"))
+        .await
+    else {
+        return Ok(None);
+    };
+    let mut value: Value =
+        serde_json::from_str(&text).map_err(|e| format!("the application record: {e}"))?;
+    value["status_link_until"] = json!(util::after_days(7));
+    let bytes = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("cannot encode the application copy: {e}"))?;
+    Ok(Some(bytes))
+}
+
+/// One mailbox's copy of the application, when the application record is still
+/// there. A retry rewrites the same bytes.
+async fn write_group_application(
+    store: &Store,
+    mailbox: &str,
+    copy: Option<&str>,
+) -> Result<(), String> {
+    let Some(copy) = copy else {
+        return Ok(());
+    };
+    store.ensure_dir(&format!("accounts/{mailbox}")).await?;
+    store
+        .write_record(
+            &format!("accounts/{mailbox}"),
+            "application.json",
+            copy.as_bytes(),
+        )
+        .await
+}
+
+/// The mailbox's account record: a reference to its group and no paid-until
+/// date of its own, which the group holds. A retry keeps the dates the first run
+/// wrote, so applying the same intent twice changes nothing.
+async fn write_group_account(
+    store: &Store,
+    mailbox: &str,
+    intent: &GroupIntent,
+) -> Result<(), String> {
+    let existing = existing_account(store, mailbox).await;
+    let now = util::filed_at();
+    let account = Account {
+        version: 1,
+        username: mailbox.to_string(),
+        state: "active".to_string(),
+        decision: "approve".to_string(),
+        decided_at: existing
+            .as_ref()
+            .map(|a| a.decided_at.clone())
+            .unwrap_or_else(|| now.clone()),
+        rail: if intent.payment.no_charge {
+            "no_charge".to_string()
+        } else {
+            intent.payment.rail.clone()
+        },
+        no_charge: intent.payment.no_charge,
+        created_at: existing
+            .as_ref()
+            .map(|a| a.created_at.clone())
+            .unwrap_or_else(|| now.clone()),
+        token_ref: None,
+        token_issued_at: None,
+        paid_until: None,
+        window: None,
+        outside_address: None,
+        certificates: Vec::new(),
+        site_served: None,
+        capsule_served: None,
+        space_used: None,
+        group: Some(intent.domain.clone()),
+    };
+    let mut value =
+        serde_json::to_value(&account).map_err(|e| format!("cannot encode the account: {e}"))?;
+    // The group holds the paid-until date, so the mailbox's record has no field
+    // for one at all rather than a null that could be mistaken for an unpaid one.
+    if let Some(map) = value.as_object_mut() {
+        map.remove("paid_until");
+    }
+    let bytes =
+        serde_json::to_vec_pretty(&value).map_err(|e| format!("cannot encode the account: {e}"))?;
+    store.ensure_dir(&format!("accounts/{mailbox}")).await?;
+    store
+        .write_record(&format!("accounts/{mailbox}"), "account.json", &bytes)
+        .await
+}
+
+/// Ensure one line is in a virtual table: a bare value when `value` is `None`
+/// (a `mail_domains` line), and `name: value` otherwise (a `virtuals` entry). A
+/// key already present with the same value is left alone; one present with a
+/// different value is a refusal, because overruling it would silently redirect
+/// somebody's mail. Written through a temporary in the same directory, so smtpd
+/// never reads half a table.
+fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match value {
+            None if line == name => return Ok(()),
+            None => {}
+            Some(want) => {
+                let (key, have) = line.split_once(':').unwrap_or((line, ""));
+                if key.trim() == name {
+                    if have.trim() == want {
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "{path} already maps {name} to {}, not {want}",
+                        have.trim()
+                    ));
+                }
+            }
+        }
+    }
+    let line = match value {
+        Some(v) => format!("{name}: {v}"),
+        None => name.to_string(),
+    };
+    // Append rather than rewrite. A rewrite reads the whole table and renames a
+    // copy over it, so a line another drain pass appended between the read and
+    // the rename is lost; two passes can overlap (cron does not lock, and one
+    // approval runs subprocesses and a network call). One append cannot lose a
+    // line. The newline guard is the same one deploy-mail.sh uses: a hand edit
+    // may have left the last line unterminated.
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("cannot open {path}: {e}"))?;
+    let mut entry = String::new();
+    if !text.is_empty() && !text.ends_with('\n') {
+        entry.push('\n');
+    }
+    entry.push_str(&line);
+    entry.push('\n');
+    std::io::Write::write_all(&mut file, entry.as_bytes())
+        .map_err(|e| format!("cannot append to {path}: {e}"))
 }
 
 /// The decline: no reason, a message that offers the way back, the application

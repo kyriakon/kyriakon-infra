@@ -27,6 +27,12 @@ The web half of that configuration now ends behind `scripts/deploy-relayd.sh`, w
 
 		doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-relayd.sh
 
+### The Titan upload port
+
+The Titan upload listener has a public port of its own because gmid holds 1965 and cannot pass a Titan request to the handler. `scripts/pf-apply.sh` proposes the inbound rule for it when `TITAN_PORT` is set in `/root/.kyriakon-env`; `scripts/setup-env.sh` records that value, and the tracked template carries 1966. The handler's own listener is loopback only and is the forward target in `openbsd/etc/relayd.conf`.
+
+Both changes are propose-only. The relayd listener block stays commented in the tracked file, and `pf-apply.sh` only prints the candidate diff until an operator runs it without `--check`. No agent runs the firewall step or turns the relay on. A run with no `TITAN_PORT`, or with the matching rule already present, changes nothing.
+
 Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box without changing anything. It reports permission drift against mtree, the blocklist verdict for the box's address, whether a cron job can still reach the tools it needs, whether the finger service is intact, whether the deployed catalogue matches the tracked one, whether the terraform guard and the restore snapshot are still in place, and whether the two files naming the mail domains agree. It exits non-zero when something is wrong.
 
 ## Deploy a merged change
@@ -168,7 +174,7 @@ The service is decided in #156, and the drain it needs is built: `scripts/deploy
 
 Two halves run with different privilege. The handler is a FastCGI responder, reached by httpd's `signup.kyriakon.net` vhost for the web form and by gmid's signup block for the capsule, with `relayd` terminating TLS ahead of both. It holds no secrets, writes the raw Stripe body and its signature header, files applications, and writes account-page intents. The drain is a one-minute cron job, with a second hourly job for the sweeps, and it owns provisioning, manual payment credits, key publication pull requests, certificate requests, the lifecycle transitions and their notices, the 90-day application purge and the grace sweeps. Notices leave through the local `smtpd` enqueuer, so `filter-dkimsign` signs them the way it signs everything else.
 
-The state is flat files, one directory per account. `account.json` holds the state, the contact and recovery addresses, the key fingerprints, the rail and token reference, the paid-until date and the approval decision. `notices.jsonl` appends each notice with its timestamp. `application.json` holds the application answers and the purge deletes it. A top level `intents/` directory holds pending work, one file per item, and `journal.jsonl` records transitions. The drain appends the journal entry before it carries the transition out, so a crash leaves a record it can rerun. The build fixes the store's path, and the drain adds that path to the payload of `scripts/backup.sh`, which today copies `/home`, `/etc/mail` and the capsule certificate pair.
+The state is flat files, one directory per account. `account.json` holds the state, the contact and recovery addresses, the key fingerprints, the rail and token reference, the paid-until date and the approval decision. `notices.jsonl` appends each notice with its timestamp. `application.json` holds the application answers and the purge deletes it. An own-domain body has `groups/<domain>/group.json` instead of one account record holding its payment state: it carries the domain, the body's name and kind, the payment block, the mailbox accounts and the site owner, and each mailbox's `account.json` carries a `group` reference and no paid-until date of its own. A top level `intents/` directory holds pending work, one file per item, and `journal.jsonl` records transitions. The drain appends the journal entry before it carries the transition out, so a crash leaves a record it can rerun. The build fixes the store's path, and the drain adds that path to the payload of `scripts/backup.sh`, which today copies `/home`, `/etc/mail` and the capsule certificate pair.
 
 Read a member's record by reading their `account.json`. The documents carry a version and the drain validates them on read, so a malformed file stops the drain with an error instead of being skipped.
 

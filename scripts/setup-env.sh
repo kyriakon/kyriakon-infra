@@ -360,6 +360,21 @@ if ! grep -q '^export TUI_PORT=' "$env_dst"; then
 	printf 'chose %s for the onboarding TUI (TUI_PORT)\n' "$tui_port"
 fi
 
+# TITAN_PORT is fixed rather than chosen: relayd's commented listener block names
+# it, and scripts/pf-apply.sh opens the same value. It is appended only when the
+# line is absent, so a re-run against a file written before this change gains it
+# and a box that has already chosen a different one keeps what it has.
+if ! grep -q '^export TITAN_PORT=' "$env_dst"; then
+	{
+		printf '\n'
+		printf '# The public port the Titan upload listener is reached on, behind relayd.\n'
+		printf '# scripts/pf-apply.sh proposes the firewall rule for it; the relayd block\n'
+		printf '# stays commented until an operator opens both by hand.\n'
+		printf "export TITAN_PORT='1966'\n"
+	} >> "$env_dst"
+	printf 'recorded 1966 for the Titan listener (TITAN_PORT)\n'
+fi
+
 missing=""
 placeholder=""
 for v in $vars; do
