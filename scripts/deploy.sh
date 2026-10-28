@@ -93,7 +93,7 @@ classify() {
 	scripts/add-user.sh | scripts/provision-member.sh | scripts/delete-user.sh | \
 		scripts/quota-apply.sh | scripts/provision-member-web.sh | \
 		scripts/provision-member-capsule.sh | scripts/publish-mail-key.sh | \
-		scripts/set-mail-password.sh) needs_onboard=yes ;;
+		scripts/set-mail-password.sh | scripts/reload-smtpd.sh) needs_onboard=yes ;;
 	scripts/cron-apply.sh)
 		needs_onboard=yes
 		manual_cron=yes
@@ -114,7 +114,7 @@ classify() {
 	scripts/*) : ;;
 	keys/*) needs_mail=yes ;;
 	terraform/*) manual_terraform=yes ;;
-	docs/* | .github/* | .githooks/* | openbsd/restore-template/*) : ;;
+	docs/* | .github/* | .githooks/* | .omp/* | openbsd/restore-template/*) : ;;
 	*.md) : ;;
 	*) return 1 ;;
 	esac
@@ -431,6 +431,12 @@ self_test() {
 	reset_plan
 	classify 'scripts/pf-apply.sh'
 	check 'a pf script change is a manual step' "$manual_pf" yes
+	reset_plan
+	classify 'scripts/reload-smtpd.sh'
+	check 'the smtpd reload script plans deploy-onboard' "$needs_onboard" yes
+	reset_plan
+	classify '.omp/lsp.json'
+	check 'developer tooling plans nothing' "$(plan_order)" ''
 
 	plan "$repo" ''
 	check 'no base plans every script' "$(plan_order | paste -sd ' ' -)" \
