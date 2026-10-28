@@ -16,7 +16,7 @@
 //! be replayed against another.
 
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -91,15 +91,23 @@ pub fn password_payload(token: &str, until: &str) -> String {
 
 /// The payload a group-address intent signs: every field the drain acts on, so
 /// a signature for one address change cannot be replayed as another. The
-/// replacement site owner is empty when the change names none.
+/// replacement site owner is empty when the change names none, and a mail key
+/// is covered by its SHA-256 so a handler that holds a valid signature cannot
+/// swap the key the drain installs and publishes.
 pub fn address_payload(
     domain: &str,
     action: &str,
     address: &str,
     mailbox: &str,
     site_owner: &str,
+    mail_key: &str,
 ) -> String {
-    format!("address:{domain}:{action}:{address}:{mailbox}:{site_owner}")
+    let key = if mail_key.is_empty() {
+        String::new()
+    } else {
+        hex(Sha256::digest(mail_key.as_bytes()).as_slice())
+    };
+    format!("address:{domain}:{action}:{address}:{mailbox}:{site_owner}:{key}")
 }
 
 /// One decision link, pointing at the handler's click-through path.

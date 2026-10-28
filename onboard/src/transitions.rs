@@ -1931,6 +1931,11 @@ pub async fn group_address(
             &intent.address,
             &intent.mailbox,
             site_owner,
+            intent
+                .mail_key
+                .as_ref()
+                .map(|k| k.material.as_str())
+                .unwrap_or(""),
         ),
         &intent.sig,
     ) {
@@ -2008,12 +2013,15 @@ pub async fn group_address(
                     Some(&group),
                 )
                 .await?;
-                if current.is_none() && address_count(&cfg.virtuals, &intent.domain)? >= 10 {
-                    return Err(format!(
-                        "{} already carries ten addresses, so {} cannot be added",
-                        intent.domain, entry
-                    ));
-                }
+            }
+            // The cap counts new entries, whether or not the mailbox itself is
+            // already in the group: a second address into an existing mailbox
+            // still costs one of the ten.
+            if current.is_none() && address_count(&cfg.virtuals, &intent.domain)? >= 10 {
+                return Err(format!(
+                    "{} already carries ten addresses, so {} cannot be added",
+                    intent.domain, entry
+                ));
             }
         }
         "upgrade" => {
@@ -2093,6 +2101,9 @@ pub async fn group_address(
     match intent.action.as_str() {
         "add-alias" => {
             ensure_table_line(&cfg.virtuals, &entry, Some(&intent.mailbox))?;
+            // smtpd reads the table at start and has no reload verb, so the
+            // alias does not deliver until it restarts.
+            run_script(cfg, "reload-smtpd.sh", &[]).await?;
         }
         "add-mailbox" => {
             // The record first, as a group's own provisioning does: it is what
@@ -2170,6 +2181,12 @@ pub async fn group_address(
             }
             hold_name(store, &intent.mailbox).await?;
             run_script(cfg, "delete-user.sh", &[&intent.mailbox]).await?;
+            // The account record is the oracle that tells a later approval the
+            // name is taken, and delete-user.sh leaves the store to the drain.
+            // Without this the ninety-day hold could never expire.
+            store
+                .remove_dir(&format!("accounts/{}", intent.mailbox))
+                .await?;
             if moving_site {
                 run_script(cfg, "cron-apply.sh", &["--web"]).await?;
             }

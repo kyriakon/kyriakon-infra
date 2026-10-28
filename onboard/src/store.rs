@@ -224,6 +224,19 @@ impl Store {
         }
     }
 
+    /// Remove one directory and everything under it. A directory that is not
+    /// there reads as done, for the same reason a missing record does: a
+    /// removal interrupted and rerun completes rather than failing on what it
+    /// already cleared.
+    pub async fn remove_dir(&self, dir: &str) -> Result<(), String> {
+        let d = self.root.join(dir);
+        match tokio::fs::remove_dir_all(&d).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("cannot remove {}: {e}", d.display())),
+        }
+    }
+
     /// The non-empty lines of a store file, with a missing file reading as
     /// nothing.
     pub async fn lines(&self, path: &str) -> Vec<String> {

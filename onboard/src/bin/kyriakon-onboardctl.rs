@@ -227,7 +227,14 @@ async fn address(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<()
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(
         &key,
-        &sign::address_payload(domain, action, address, mailbox, site_owner.unwrap_or("")),
+        &sign::address_payload(
+            domain,
+            action,
+            address,
+            mailbox,
+            site_owner.unwrap_or(""),
+            mail_key.as_ref().map(|k| k.material.as_str()).unwrap_or(""),
+        ),
     )?;
     let id = intents::file_group_address(
         store,
