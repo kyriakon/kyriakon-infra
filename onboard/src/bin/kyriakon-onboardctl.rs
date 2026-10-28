@@ -292,6 +292,15 @@ async fn show(store: &Store, username: &str) -> Result<(), String> {
             println!("account {username}");
             println!("  state    {}", account.state);
             println!("  decision {}", account.decision);
+            // A group mailbox holds no payment of its own: the group does. The
+            // token and paid-until fields are empty for exactly that reason, and
+            // printing "no charge" would answer a money question wrongly.
+            if let Some(group) = &account.group {
+                println!("  group    {group}");
+                println!("  token    held by the group");
+                println!("  paid     held by the group, in groups/{group}/group.json");
+                return Ok(());
+            }
             println!(
                 "  token    {}",
                 account.token_ref.as_deref().unwrap_or("none (no charge)")
