@@ -183,7 +183,7 @@ pub fn filed(link: &str) -> String {
 ///
 /// The words for the serving facts are the capsule's own chrome. A fact the
 /// drain has not recorded yet reads as that rather than as a false "no".
-pub fn account(account: &Account, notices: &[Notice]) -> String {
+pub fn account(account: &Account, notices: &[Notice], dns: Option<&crate::dns::Recipe>) -> String {
     let mut out = String::from("# Your account\n\n");
     out.push_str(&format!("State: {}\n", account.state));
     out.push_str(&format!("Site: {}\n", served(account.site_served)));
@@ -205,6 +205,10 @@ pub fn account(account: &Account, notices: &[Notice]) -> String {
             notice.subject,
             notice.to
         ));
+    }
+    if let Some(recipe) = dns {
+        out.push_str("\n## Your domain's DNS records\n\n");
+        out.push_str(&recipe.text());
     }
     out
 }
@@ -441,7 +445,7 @@ mod tests {
             subject: "Application approved, account opened.".into(),
             to: "alice@kyriakon.net".into(),
         }];
-        let text = account(&member(), &notices);
+        let text = account(&member(), &notices, None);
         assert!(text.contains("State: active"), "{text}");
         assert!(text.contains("Site: serving"), "{text}");
         assert!(text.contains("Capsule: not serving"), "{text}");
@@ -460,7 +464,7 @@ mod tests {
         let mut record = member();
         record.site_served = None;
         record.space_used = None;
-        let text = account(&record, &[]);
+        let text = account(&record, &[], None);
         assert!(text.contains("Site: not recorded yet"), "{text}");
         assert!(text.contains("Space used: not recorded yet"), "{text}");
         assert!(text.contains("Nothing has been sent yet."), "{text}");

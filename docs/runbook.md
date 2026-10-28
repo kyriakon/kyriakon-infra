@@ -80,6 +80,13 @@ is both the cash-by-post address and the published trading address, by decision
 (#397), so the two cannot disagree: `scripts/deploy-onboard.sh` writes the same
 value into the drain's `postal_address`.
 
+The same deploy writes the public DNS values every body's recipe is generated
+from. `KYRIAKON_IPV4` and `KYRIAKON_IPV6` come from `/root/.kyriakon-env`, and
+`dkim_public_key` is read from `openbsd/etc/nsd/kyriakon.net.zone`, so the zone
+stays the one copy of the key. The deploy stops on an unset or placeholder
+value rather than installing a recipe that names an address the box does not
+answer on.
+
 `ICO_REFERENCE`, `EU_REPRESENTATIVE` and `EU_REPRESENTATIVE_CONTACT` belong to
 separate decisions. Set them with the same script when those decisions are made:
 

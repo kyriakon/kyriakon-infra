@@ -1059,7 +1059,7 @@ async fn http(app: &App, request: &Request, incoming: &Incoming) -> Reply {
     }
     if incoming.path == "account" {
         return if get {
-            account(app)
+            account(app, request).await
         } else {
             method_not_allowed()
         };
@@ -1121,7 +1121,8 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
         let body = match &member {
             Some(account) => {
                 let notices = account_notices(app, &account.username).await;
-                capsule::account(account, &notices)
+                let recipe = group_recipe(app, account);
+                capsule::account(account, &notices, recipe.as_ref())
             }
             None => capsule::account_stranger(presented(incoming)),
         };
@@ -1649,12 +1650,54 @@ fn branch_step(app: &App, form: BTreeMap<String, String>) -> Reply {
     render_applicant(app, body, &form, &[])
 }
 
-/// The account page. Its login and its capability list are its own ticket's; what
-/// it renders today is the catalogue, from the one file, with no member to render
-/// a `<name>` host from until a session identifies one.
-fn account(app: &App) -> Reply {
-    let page: AccountPage = page::account(&app.catalogue, None);
+/// The account page. Its login and the rest of its capability list are its own
+/// ticket's; what it renders today is the catalogue, and, for a member the
+/// front-end has authenticated, the group's DNS recipe.
+///
+/// `REMOTE_USER` is where the account page's login will reach this route: httpd
+/// sets it only for a request it authenticated, and no auth is configured yet,
+/// so the page is the catalogue for everyone until that ticket lands. A value
+/// that is not a username shape is ignored rather than looked up.
+async fn account(app: &App, request: &Request) -> Reply {
+    let member = web_member(app, request).await;
+    let dns = match &member {
+        Some(account) => group_recipe(app, account),
+        None => None,
+    };
+    let page: AccountPage = page::account(
+        &app.catalogue,
+        member.as_ref().map(|account| account.username.as_str()),
+        dns,
+    );
     Reply::html(200, page_html(&page))
+}
+
+/// The member a web request names, when the front-end authenticated one.
+async fn web_member(app: &App, request: &Request) -> Option<Account> {
+    let username = request.value("REMOTE_USER");
+    if username.is_empty() || validate::username_shape(username).is_some() {
+        return None;
+    }
+    let text = app
+        .store
+        .read_record(&format!("accounts/{username}"), "account.json")
+        .await?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The DNS recipe for an account that names a group. `account.group` already
+/// holds the domain, and the group record is root-only (the handler runs as
+/// `_onboard`), so reading it here would return None and drop the recipe: the
+/// reference is the whole input. An account with no group gets `None`, which is
+/// every person's account.
+fn group_recipe(app: &App, account: &Account) -> Option<crate::dns::Recipe> {
+    let domain = account.group.as_deref()?;
+    let values = crate::dns::Values::from(&app.cfg);
+    if let Err(e) = values.check() {
+        eprintln!("kyriakon-onboard: {e}");
+        return None;
+    }
+    Some(crate::dns::recipe(domain, &values))
 }
 
 /// What a submission is read against.

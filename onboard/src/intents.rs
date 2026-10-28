@@ -48,7 +48,12 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     // The key spool is read after the intents so a filed application is not
     // waiting behind a mailbox pass. The pass handles each message on its own:
     // one that cannot be dealt with is reported and left for the next run.
-    crate::mailbox::run(cfg, store).await
+    crate::mailbox::run(cfg, store).await?;
+    // The groups' own zones are watched last: a record that has stopped
+    // resolving is the one thing about a body's domain the platform can see and
+    // cannot repair, and it must not delay a filed application or a member's
+    // mail. It is due-gated, so most passes do no DNS work.
+    transitions::check_group_dns(cfg, store).await
 }
 
 /// One intent, dispatched by kind.

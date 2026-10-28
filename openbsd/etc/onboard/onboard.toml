@@ -43,6 +43,22 @@ pages = "/var/db/onboard/pages"
 # compare, where a digest of two files is a number nothing acts on.
 release = "REPLACE_ME"
 
+# The platform's published DNS values, which the account page shows a body as a
+# recipe. They are public, and they are still substituted at deploy from
+# /root/.kyriakon-env and the tracked zone rather than restated here: the IPs and
+# the DKIM key are placeholders, so the repository holds no second copy that can
+# drift from what the box publishes. scripts/deploy-onboard.sh refuses a
+# placeholder. The MX names the platform's own mail host because the box's
+# reverse record is fixed against that name and cannot be varied per body. The
+# DMARC record starts at p=none, the policy the recipe publishes until every
+# report row passes.
+mail_host = "mail.kyriakon.net"
+ipv4 = "REPLACE_ME_IPV4"
+ipv6 = "REPLACE_ME_IPV6"
+dkim_selector = "REPLACE_ME"
+dkim_public_key = "REPLACE_ME"
+dmarc_rua = "mailto:dmarc@kyriakon.net"
+
 # The unix sockets the front-ends reach the responder on. There is no listener on
 # a port: the service is a FastCGI responder, and both httpd and gmid resolve a
 # FastCGI socket path inside their own chroot, which is /home/www for each of

@@ -41,6 +41,10 @@ pub struct ApplicantPage {
 #[template(path = "account.html")]
 pub struct AccountPage {
     pub services: Vec<Row>,
+    /// The group's DNS recipe, present only for a mailbox whose account names a
+    /// group. It is the same [`crate::dns::Recipe`] the approval email renders, so
+    /// the values cannot disagree.
+    pub dns: Option<crate::dns::Recipe>,
 }
 
 #[derive(Template)]
@@ -154,10 +158,17 @@ pub fn services(list: &[Service], member: Option<&str>) -> Vec<Row> {
 }
 
 /// The member's page. `member` is the session's member where there is one, which
-/// a host carrying `<name>` is rendered from.
-pub fn account(list: &[Service], member: Option<&str>) -> AccountPage {
+/// a host carrying `<name>` is rendered from. `dns` is the member's group recipe
+/// when the account names a group, and `None` for an account that belongs to no
+/// group, which is what keeps a person's page free of it.
+pub fn account(
+    list: &[Service],
+    member: Option<&str>,
+    dns: Option<crate::dns::Recipe>,
+) -> AccountPage {
     AccountPage {
         services: services(list, member),
+        dns,
     }
 }
 
@@ -491,7 +502,7 @@ mod tests {
         assert!(html.contains("https://mail.example.invalid/"), "{html}");
         assert!(html.contains("<span class=\"tag\">live</span>"), "{html}");
 
-        let listed = account(&catalogue(), None).render().unwrap();
+        let listed = account(&catalogue(), None, None).render().unwrap();
         assert!(listed.contains("zero-access mail"), "{listed}");
         assert!(listed.contains("https://mail.example.invalid/"), "{listed}");
 
@@ -507,13 +518,43 @@ mod tests {
              action = \"read\"\n",
         )
         .unwrap();
-        assert!(account(&pattern, None)
+        assert!(account(&pattern, None, None)
             .render()
             .unwrap()
             .contains("&#60;name&#62;.example.invalid"));
-        assert!(account(&pattern, Some("theophilus"))
+        assert!(account(&pattern, Some("theophilus"), None)
             .render()
             .unwrap()
             .contains("https://theophilus.example.invalid/"));
+    }
+
+    /// A group's recipe is on the page, from the same generator the approval
+    /// email uses, and an account with no group carries none.
+    #[test]
+    fn the_account_page_renders_a_groups_recipe_and_nothing_for_a_person() {
+        let values = crate::dns::Values {
+            mail_host: "mail.kyriakon.net".into(),
+            ipv4: "192.0.2.10".into(),
+            ipv6: "2001:db8::10".into(),
+            dkim_selector: "mail".into(),
+            dkim_public_key: "v=DKIM1; k=rsa; p=example".into(),
+            dmarc_rua: "mailto:dmarc@kyriakon.net".into(),
+        };
+        let recipe = crate::dns::recipe("parish.example", &values);
+        let html = account(&catalogue(), Some("parish-secretary"), Some(recipe))
+            .render()
+            .unwrap();
+        assert!(html.contains("DNS records"), "{html}");
+        assert!(html.contains("10 mail.kyriakon.net."), "{html}");
+        assert!(html.contains("192.0.2.10"), "{html}");
+        assert!(html.contains("2001:db8::10"), "{html}");
+        assert!(html.contains("v=spf1 mx ip6:2001:db8::10 -all"), "{html}");
+        assert!(html.contains("mail._domainkey"), "{html}");
+        assert!(html.contains("v=DMARC1; p=none"), "{html}");
+        assert!(html.contains("does not host your zone"), "{html}");
+        assert!(html.contains("cannot set a reverse DNS record"), "{html}");
+
+        let none = account(&catalogue(), Some("alice"), None).render().unwrap();
+        assert!(!none.contains("DNS records"), "{none}");
     }
 }
