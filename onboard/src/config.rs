@@ -104,6 +104,11 @@ pub struct DrainConfig {
     /// `passwd` is one.
     pub mail_domains: String,
     pub virtuals: String,
+    /// The DKIM filter's domain list, one domain per line. A body's domain is
+    /// appended here when its group is provisioned, so the next deploy's splice
+    /// of the filter's `-d` arguments signs it; the splice itself is the batched
+    /// configuration pass, not this write.
+    pub dkim_domains: String,
     /// The root-only HMAC key the review and password links are signed with.
     pub approval_key: String,
     /// The box keyring the encrypting LMTP reads: one `<localpart>.asc` per
@@ -239,6 +244,7 @@ mod tests {
              passwd = \"/etc/passwd\"\n\
              mail_domains = \"/etc/mail/mail_domains\"\n\
              virtuals = \"/etc/mail/virtuals\"\n\
+             dkim_domains = \"/etc/mail/dkim_domains\"\n\
              approval_key = \"/etc/kyriakon/onboard/approval-signing-key\"\n\
              keyring_dir = \"/etc/kyriakon/keys\"\n\
              stripe_webhook_secret = \"/etc/kyriakon/onboard/stripe-webhook-secret\"\n\
@@ -270,6 +276,7 @@ mod tests {
         assert_eq!(c.passwd, "/etc/passwd");
         assert_eq!(c.mail_domains, "/etc/mail/mail_domains");
         assert_eq!(c.virtuals, "/etc/mail/virtuals");
+        assert_eq!(c.dkim_domains, "/etc/mail/dkim_domains");
         assert_eq!(c.approval_key, "/etc/kyriakon/onboard/approval-signing-key");
         assert_eq!(c.keyring_dir, "/etc/kyriakon/keys");
         assert_eq!(c.reviewer, "admin@kyriakon.net");

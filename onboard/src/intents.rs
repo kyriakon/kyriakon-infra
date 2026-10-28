@@ -53,10 +53,14 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
 
 /// One intent, dispatched by kind.
 async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result<(), String> {
-    let text = store
-        .read_record("intents", file)
-        .await
-        .ok_or("the intent vanished between the listing and the read")?;
+    // The listing is one snapshot, and a pass can delete a file another name in
+    // that snapshot shares: an approval writes and applies its group intent in
+    // the same pass, then removes it. A file that is gone reads as done, the
+    // same rule store.remove uses, rather than as a failure the reviewer is
+    // mailed about.
+    let Some(text) = store.read_record("intents", file).await else {
+        return Ok(());
+    };
     let value: Value =
         serde_json::from_str(&text).map_err(|e| format!("the intent does not parse: {e}"))?;
     let kind = value

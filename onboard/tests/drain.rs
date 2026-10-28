@@ -61,6 +61,7 @@ impl Fix {
         // address entries yet, so a group's lines are the drain's.
         std::fs::write(fix.path("mail_domains"), "kyriakon.net\n").unwrap();
         std::fs::write(fix.path("virtuals"), "").unwrap();
+        std::fs::write(fix.path("dkim_domains"), "kyriakon.net\n").unwrap();
         // The held-back names, copied from the tracked list so that a test can add
         // one to the fixture's without touching the repository's.
         let tracked = std::fs::read_to_string(format!(
@@ -89,6 +90,7 @@ impl Fix {
              passwd = \"{}\"\n\
              mail_domains = \"{}\"\n\
              virtuals = \"{}\"\n\
+             dkim_domains = \"{}\"\n\
              approval_key = \"{}\"\n\
              keyring_dir = \"{}\"\n\
              stripe_webhook_secret = \"{}/stripe\"\n\
@@ -107,6 +109,7 @@ impl Fix {
             fix.path("passwd"),
             fix.path("mail_domains"),
             fix.path("virtuals"),
+            fix.path("dkim_domains"),
             fix.path("key"),
             fix.path("keyring"),
             fix.dir.display(),
@@ -345,6 +348,18 @@ impl Fix {
         )
         .unwrap();
         record
+    }
+
+    /// Replace the application record `filed_body` wrote, when a test changes
+    /// its answers after building it.
+    fn rewrite_record(&self, record: &Value) {
+        std::fs::write(
+            self.dir
+                .join("store/applications")
+                .join(format!("{TOKEN}.json")),
+            serde_json::to_vec_pretty(record).unwrap(),
+        )
+        .unwrap();
     }
 
     /// File an application intent, as the handler does.
@@ -2681,4 +2696,154 @@ fn a_body_approval_makes_the_group_and_its_mailboxes() {
     assert!(fix.intents().is_empty(), "{:?}", fix.intents());
     // The application is decided, so a replay changes nothing.
     assert!(fix.journal().contains("\"applied\""), "{}", fix.journal());
+}
+
+/// An application the form accepts can be approved: the alias line names its own
+/// account, and the address shares the mailbox its `own` target names.
+#[test]
+fn a_body_alias_may_name_itself_and_shares_the_mailbox() {
+    let fix = Fix::new("group-alias-name");
+    let mut record = fix.filed_body("warden");
+    record["answers"]["body_account_names"] = json!("parish-secretary\nparish-office");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.journal().contains("\"failed\""),
+        "an aliased body was refused: {}",
+        fix.journal()
+    );
+
+    let virtuals = fix.table("virtuals");
+    assert!(
+        virtuals.contains("office@parish.example: parish-secretary"),
+        "{virtuals}"
+    );
+    assert!(
+        !fix.passwd_file().contains("parish-office:"),
+        "the alias names no account: {}",
+        fix.passwd_file()
+    );
+}
+
+/// A forge outage does not stop the rest of the body: every account and table
+/// line is made first, and the publish is retried from the intent next pass.
+#[test]
+fn a_forge_outage_still_makes_every_mailbox() {
+    let fix = Fix::new("group-publish-fails");
+    fix.publish_fails();
+    let mut record = fix.filed_body("warden");
+    record["answers"]["body_addresses"] = json!("secretary: own\noffice: own");
+    record["answers"]["body_account_names"] = json!("parish-secretary\nparish-office");
+    record["mail_keys"] = json!([
+        {
+            "mailbox": "parish-secretary",
+            "fingerprint": "1111 2222 3333 4444",
+            "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n-----END PGP PUBLIC KEY BLOCK-----",
+            "verdict": "works"
+        },
+        {
+            "mailbox": "parish-office",
+            "fingerprint": "5555 6666 7777 8888",
+            "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nyy\n-----END PGP PUBLIC KEY BLOCK-----",
+            "verdict": "works"
+        }
+    ]);
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let passwd = fix.passwd_file();
+    assert!(passwd.contains("parish-secretary:"), "{passwd}");
+    assert!(passwd.contains("parish-office:"), "{passwd}");
+    let virtuals = fix.table("virtuals");
+    for address in ["secretary", "office"] {
+        assert!(
+            virtuals.contains(&format!("{address}@parish.example: parish-")),
+            "{virtuals}"
+        );
+    }
+    assert!(
+        fix.dir
+            .join("store/accounts/parish-office/account.json")
+            .exists(),
+        "the later mailbox was made"
+    );
+    assert!(
+        fix.failed_note().contains("publish-mail-key.sh"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(!fix.intents().is_empty(), "the intent waits for the retry");
+}
+
+/// A virtual table line that already points elsewhere is a refusal, and the
+/// drain does not overrule it.
+#[test]
+fn a_conflicting_virtual_line_is_refused() {
+    let fix = Fix::new("group-conflict");
+    std::fs::write(
+        fix.path("virtuals"),
+        "office@parish.example: somebody-else\n",
+    )
+    .unwrap();
+    let id = fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("office", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+
+    assert!(
+        fix.failed_note().contains("already maps"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(
+        fix.table("virtuals")
+            .contains("office@parish.example: somebody-else"),
+        "{}",
+        fix.table("virtuals")
+    );
+    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
+}
+
+/// An address table that cannot be read is a refusal before the approval begins:
+/// no journal line and no group record.
+#[test]
+fn a_body_whose_addresses_do_not_form_a_table_is_refused_before_the_journal() {
+    let fix = Fix::new("group-bad-table");
+    let mut record = fix.filed_body("warden");
+    record["answers"]["body_addresses"] = json!("office: alias nobody");
+    record["answers"]["body_account_names"] = json!("parish-secretary");
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert!(
+        fix.failed_note().contains("not a mailbox in the table"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(
+        !fix.journal().contains("\"applying\""),
+        "a refusal began an approval: {}",
+        fix.journal()
+    );
+    assert!(
+        !fix.dir
+            .join("store/groups/parish.example/group.json")
+            .exists(),
+        "a refused table made a record"
+    );
 }

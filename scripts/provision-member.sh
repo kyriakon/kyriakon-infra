@@ -315,6 +315,26 @@ if [ "$shell_now" != /sbin/nologin ]; then
 	exit 1
 fi
 
+# The members group is what sshd's Match blocks key on, and both the sftp upload
+# on 22 and git-shell on 2222 sit behind it. An account outside the group has
+# neither, so the tree built below would be unreachable, and that is a refusal
+# rather than a note. deploy-mail.sh creates the group, so a box that has not run
+# it has none. The check runs for a mail-only account too: the own-domain tier
+# gives every mailbox the class whose shell is git-shell, and the group is what
+# the member sessions match.
+if ! getent group members >/dev/null 2>&1; then
+	printf 'no members group, which is what sshd matches for the member sessions\n' >&2
+	printf '  doas ksh scripts/deploy-mail.sh\n' >&2
+	exit 1
+fi
+if ! id -Gn "$user" | tr ' ' '\n' | grep -qx members; then
+	printf '%s is not in the members group, so it has no sftp or git session\n' "$user" >&2
+	printf 'and this tree would be unreachable:\n' >&2
+	printf '  doas usermod -G members %s\n' "$user" >&2
+	exit 1
+fi
+
+
 # Mail is the account's whole job when there is no key, so a mail-only member
 # stops here: the class, the address and the allowance are in place, and the
 # tree, the upload session and the daemon lanes are not built because there is
@@ -328,24 +348,6 @@ if [ "$have_key" = no ]; then
 	printf '  session and the daemon lanes are not built, because the member holds no key\n'
 	printf 'next: add a key from the member page, then run this script again\n'
 	exit 0
-fi
-
-# The members group is what sshd's Match blocks key on, and both the sftp upload
-# on 22 and git-shell on 2222 sit behind it. An account outside the group has
-# neither, so the tree built below would be unreachable, and that is a refusal
-# rather than a note. deploy-mail.sh creates the group, so a box that has not run
-# it has none. A mail-only account stopped above, because neither session is
-# built for it.
-if ! getent group members >/dev/null 2>&1; then
-	printf 'no members group, which is what sshd matches for the member sessions\n' >&2
-	printf '  doas ksh scripts/deploy-mail.sh\n' >&2
-	exit 1
-fi
-if ! id -Gn "$user" | tr ' ' '\n' | grep -qx members; then
-	printf '%s is not in the members group, so it has no sftp or git session\n' "$user" >&2
-	printf 'and this tree would be unreachable:\n' >&2
-	printf '  doas usermod -G members %s\n' "$user" >&2
-	exit 1
 fi
 
 # --- the upload key's source -------------------------------------------------

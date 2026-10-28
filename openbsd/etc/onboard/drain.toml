@@ -54,6 +54,13 @@ passwd = "/etc/passwd"
 mail_domains = "/etc/mail/mail_domains"
 virtuals = "/etc/mail/virtuals"
 
+# The DKIM filter's domain list. A body's domain is appended when its group is
+# provisioned, so the platform's one key signs the body's mail at the selector
+# the body publishes. The filter's `-d` list is spliced into smtpd.conf from
+# this file by scripts/deploy-mail.sh, which is the batched configuration pass;
+# until it runs, the domain is listed and not yet signed.
+dkim_domains = "/etc/mail/dkim_domains"
+
 # The root-only HMAC-SHA256 key the review email's three links and the one-time
 # password link are signed with. The drain signs and verifies with it; the
 # handler never reads it, because it only passes a click through as an intent.
