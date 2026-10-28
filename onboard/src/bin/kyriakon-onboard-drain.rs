@@ -56,5 +56,36 @@ async fn main() -> ExitCode {
 async fn run(cfg_path: &Path) -> Result<(), String> {
     let cfg = DrainConfig::load(cfg_path)?;
     let store = Store::new(&cfg.store_root);
+    let _lock = match pass_lock(&store)? {
+        Some(lock) => lock,
+        // Another pass is running and will carry this tick's work; every intent
+        // is idempotent and the next minute tries again.
+        None => return Ok(()),
+    };
     intents::run(&cfg, &store).await
+}
+
+/// One pass at a time. cron starts the drain every minute, and a pass that runs
+/// long (a forge publish, a slow sendmail) would otherwise overlap the next:
+/// two read-modify-write passes on the virtual table or a group record can drop
+/// the other's line, and the intent that wrote it is already deleted. The lock
+/// is held for the process's life and released by the kernel however it exits.
+fn pass_lock(store: &Store) -> Result<Option<std::fs::File>, String> {
+    use std::os::unix::io::AsRawFd;
+    let path = store.path(".drain.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    // SAFETY: `file` owns a valid descriptor for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        return Ok(None);
+    }
+    Err(format!("cannot lock {}: {error}", path.display()))
 }

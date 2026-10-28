@@ -74,13 +74,24 @@ impl Fix {
         fix.script("enqueuer.sh", &format!("#!/bin/sh\ncat >> '{sent}'\n"));
         for s in [
             "provision-member.sh",
-            "delete-user.sh",
             "cron-apply.sh",
             "publish-mail-key.sh",
+            "reload-smtpd.sh",
         ] {
             let log = fix.path("scripts.log");
             fix.script(s, &format!("#!/bin/sh\necho \"{s} $*\" >> '{log}'\n"));
         }
+        // delete-user.sh removes the box account and the store record; the
+        // stub does both so a test sees what the box sees.
+        let log = fix.path("scripts.log");
+        let passwd = fix.path("passwd");
+        let accounts = fix.path("store/accounts");
+        fix.script(
+            "delete-user.sh",
+            &format!(
+                "#!/bin/sh\necho \"delete-user.sh $*\" >> '{log}'\ngrep -v \"^$1:\" '{passwd}' > '{passwd}.del'\nmv '{passwd}.del' '{passwd}'\nrm -rf '{accounts}/'\"$1\"\n",
+            ),
+        );
         fix.add_user_writes_passwd();
         let cfg = format!(
             "store_root = \"{}\"\n\
@@ -288,6 +299,56 @@ impl Fix {
     ) -> String {
         let id = ulid();
         self.write_group(&id, domain, site_owner, addresses, mailboxes, upload);
+        id
+    }
+
+    /// File one `group-address` intent, signed the way the console signs it.
+    /// `key` is the new mailbox's armored mail key, when the change makes one.
+    fn file_address(
+        &self,
+        domain: &str,
+        action: &str,
+        address: &str,
+        mailbox: &str,
+        key: Option<&str>,
+        site_owner: Option<&str>,
+    ) -> String {
+        let id = ulid();
+        let sig = sign::sign(
+            b"the approval key",
+            &sign::address_payload(
+                domain,
+                action,
+                address,
+                mailbox,
+                site_owner.unwrap_or(""),
+                key.unwrap_or(""),
+            ),
+        )
+        .unwrap();
+        let mail_key = key.map(|material| {
+            json!({
+                "mailbox": mailbox,
+                "fingerprint": "1111 2222 3333 4444",
+                "material": material,
+                "verdict": "works",
+            })
+        });
+        self.write_intent(
+            &id,
+            &json!({
+                "id": id,
+                "kind": "group-address",
+                "filed_at": "2026-10-02T09:00:00Z",
+                "domain": domain,
+                "action": action,
+                "address": address,
+                "mailbox": mailbox,
+                "mail_key": mail_key,
+                "site_owner": site_owner,
+                "sig": sig,
+            }),
+        );
         id
     }
 
@@ -2845,5 +2906,838 @@ fn a_body_whose_addresses_do_not_form_a_table_is_refused_before_the_journal() {
             .join("store/groups/parish.example/group.json")
             .exists(),
         "a refused table made a record"
+    );
+}
+
+/// Adding an alias writes one virtual entry pointing at a mailbox in the group.
+/// It creates no account, key, allowance or hosting, and the group record's
+/// accounts and payment are untouched.
+#[test]
+fn an_alias_added_to_a_group_writes_one_entry_and_no_account() {
+    let fix = Fix::new("group-add-alias");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    let passwd = fix.passwd_file();
+    let group = fix.read("groups/parish.example/group.json");
+    let accounts = fix.names("accounts");
+    let scripts = fix.scripts_log();
+
+    fix.file_address(
+        "parish.example",
+        "add-alias",
+        "office",
+        "parish-secretary",
+        None,
+        None,
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert!(!fix.journal().contains("\"failed\""), "{}", fix.journal());
+
+    let virtuals = fix.table("virtuals");
+    assert_eq!(
+        virtuals
+            .lines()
+            .filter(|l| l.starts_with("office@parish.example:"))
+            .count(),
+        1,
+        "{virtuals}"
+    );
+    assert!(
+        virtuals.contains("office@parish.example: parish-secretary"),
+        "{virtuals}"
+    );
+    assert_eq!(fix.passwd_file(), passwd, "an alias made an account");
+    assert_eq!(fix.names("accounts"), accounts);
+    assert!(
+        !fix.dir.join("keyring/office.asc").exists(),
+        "an alias made a key"
+    );
+    assert_eq!(
+        fix.read("groups/parish.example/group.json"),
+        group,
+        "an alias changed the group record"
+    );
+    let log = fix.scripts_log();
+    assert_eq!(
+        log.matches("reload-smtpd.sh").count(),
+        1,
+        "the alias was not made live: {log}"
+    );
+    assert_eq!(
+        log.matches("add-user.sh").count(),
+        scripts.matches("add-user.sh").count(),
+        "an alias made an account: {log}"
+    );
+    assert_eq!(
+        log.matches("provision-member.sh").count(),
+        scripts.matches("provision-member.sh").count(),
+        "an alias built a member: {log}"
+    );
+}
+
+/// Adding a mailbox creates its account, installs its key and points its entry
+/// at it. The group gains the account and keeps everything else.
+#[test]
+fn a_mailbox_added_to_a_group_gets_an_account_key_and_entry() {
+    let fix = Fix::new("group-add-mailbox");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+
+    fix.file_address(
+        "parish.example",
+        "add-mailbox",
+        "office",
+        "parish-office",
+        Some(GOOD_KEY),
+        None,
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert!(!fix.journal().contains("\"failed\""), "{}", fix.journal());
+
+    assert!(
+        fix.passwd_file().contains("parish-office:"),
+        "{}",
+        fix.passwd_file()
+    );
+    let key = std::fs::read_to_string(fix.dir.join("keyring/parish-office.asc"))
+        .expect("the mailbox's key is on the box");
+    assert!(key.contains("BEGIN PGP PUBLIC KEY BLOCK"), "{key}");
+    assert_eq!(fix.account("parish-office")["group"], "parish.example");
+
+    let virtuals = fix.table("virtuals");
+    assert!(
+        virtuals.contains("office@parish.example: parish-office"),
+        "{virtuals}"
+    );
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(
+        group["accounts"],
+        json!(["parish-secretary", "parish-office"])
+    );
+
+    let log = fix.scripts_log();
+    assert!(log.contains("add-user.sh parish-office"), "{log}");
+    assert!(log.contains("provision-member.sh parish-office"), "{log}");
+    assert!(log.contains("publish-mail-key.sh parish-office"), "{log}");
+}
+
+/// Upgrading an alias makes the account and key and repoints the entry. The
+/// address already existed, so the count does not move.
+#[test]
+fn upgrading_an_alias_repoints_it_without_changing_the_count() {
+    let fix = Fix::new("group-upgrade-alias");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-secretary"),
+        ],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    let before = fix
+        .table("virtuals")
+        .lines()
+        .filter(|l| l.ends_with("@parish.example: parish-secretary"))
+        .count();
+    assert_eq!(before, 2);
+
+    fix.file_address(
+        "parish.example",
+        "upgrade",
+        "office",
+        "parish-office",
+        Some(GOOD_KEY),
+        None,
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert!(!fix.journal().contains("\"failed\""), "{}", fix.journal());
+
+    let virtuals = fix.table("virtuals");
+    assert!(
+        virtuals.contains("office@parish.example: parish-office"),
+        "{virtuals}"
+    );
+    assert!(
+        !virtuals.contains("office@parish.example: parish-secretary"),
+        "{virtuals}"
+    );
+    assert_eq!(
+        virtuals
+            .lines()
+            .filter(|l| l.ends_with("@parish.example: parish-secretary")
+                || l.ends_with("@parish.example: parish-office"))
+            .count(),
+        2,
+        "the upgrade changed the address count: {virtuals}"
+    );
+    assert!(fix.passwd_file().contains("parish-office:"));
+    assert!(fix.dir.join("keyring/parish-office.asc").exists());
+    let log = fix.scripts_log();
+    let built = log
+        .rfind("provision-member.sh parish-office")
+        .expect("the upgraded mailbox was built");
+    let reload = log
+        .rfind("reload-smtpd.sh")
+        .expect("the repointed entry was made live");
+    assert!(
+        built < reload,
+        "the repoint was not reloaded after the builder: {log}"
+    );
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(
+        group["accounts"],
+        json!(["parish-secretary", "parish-office"])
+    );
+}
+
+/// Removing a mailbox takes its account, key and every entry pointing at it,
+/// and leaves the group's paid-until date and every other account byte for
+/// byte. The closed name is held for ninety days.
+#[test]
+fn removing_a_mailbox_takes_exactly_its_account_and_entries() {
+    let fix = Fix::new("group-remove-mailbox");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+            ("desk", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    // The group's renewal date is the group's: set one and make sure removal
+    // does not move it.
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["payment"]["paid_until"] = json!("2027-03-01T00:00:00Z");
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    let other = fix.read("accounts/parish-secretary/account.json");
+
+    fix.file_address("parish.example", "remove", "", "parish-office", None, None);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert!(!fix.journal().contains("\"failed\""), "{}", fix.journal());
+
+    assert!(
+        !fix.passwd_file().contains("parish-office:"),
+        "{}",
+        fix.passwd_file()
+    );
+    assert!(
+        !fix.dir.join("store/accounts/parish-office").exists(),
+        "the account record stayed"
+    );
+    assert!(
+        fix.dir.join("keyring/parish-office.asc").exists(),
+        "the box keyring entry stays until the published key goes, as delete-user.sh leaves it"
+    );
+    let virtuals = fix.table("virtuals");
+    assert!(
+        !virtuals.contains("office@parish.example") && !virtuals.contains("desk@parish.example"),
+        "an entry was left pointing at the removed mailbox: {virtuals}"
+    );
+    assert!(
+        virtuals.contains("secretary@parish.example: parish-secretary"),
+        "{virtuals}"
+    );
+
+    let after: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(after["accounts"], json!(["parish-secretary"]));
+    assert_eq!(
+        after["payment"]["paid_until"], "2027-03-01T00:00:00Z",
+        "the group's renewal date moved"
+    );
+    assert_eq!(
+        fix.read("accounts/parish-secretary/account.json"),
+        other,
+        "another account changed"
+    );
+    assert_eq!(fix.names("holds"), vec!["parish-office.json"]);
+    assert!(fix.scripts_log().contains("delete-user.sh parish-office"));
+}
+
+/// A removal intent that names the sitting site owner while closing somebody
+/// else must not move the site's key on a retry: the state below is what a crash
+/// after the group write leaves, and the departing mailbox's own key is still in
+/// the store. Copying it would give that member the body's upload key.
+#[test]
+fn retrying_a_non_owner_removal_does_not_take_the_sites_key() {
+    let fix = Fix::new("group-remove-retry");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let office_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOffice example";
+    std::fs::write(fix.dir.join("store/keys/parish-office.pub"), office_key).unwrap();
+
+    // The crash point: the group record no longer lists the mailbox and its
+    // virtual line is gone, but its account and keys are still there.
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["accounts"] = json!(["parish-secretary"]);
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    let virtuals: Vec<String> = fix
+        .table("virtuals")
+        .lines()
+        .filter(|l| !l.starts_with("office@"))
+        .map(str::to_string)
+        .collect();
+    std::fs::write(fix.dir.join("virtuals"), virtuals.join("\n") + "\n").unwrap();
+
+    fix.file_address(
+        "parish.example",
+        "remove",
+        "",
+        "parish-office",
+        None,
+        Some("parish-secretary"),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.read("keys/parish-secretary.pub").trim(),
+        UPLOAD_KEY.trim(),
+        "the departing mailbox's key replaced the site's"
+    );
+    let after: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(after["site_owner"], "parish-secretary");
+    assert_eq!(after["accounts"], json!(["parish-secretary"]));
+}
+
+/// The same address intent handed to the drain again changes nothing: one
+/// account, one entry, one key.
+#[test]
+fn an_address_intent_applied_twice_changes_nothing() {
+    let fix = Fix::new("group-address-twice");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    let id = fix.file_address(
+        "parish.example",
+        "add-mailbox",
+        "office",
+        "parish-office",
+        Some(GOOD_KEY),
+        None,
+    );
+    assert!(fix.drain().status.success());
+    let intent = fix.read(&format!("intents/{id}.json"));
+    let group = fix.read("groups/parish.example/group.json");
+    let passwd = fix.passwd_file();
+    let virtuals = fix.table("virtuals");
+    let account = fix.read("accounts/parish-office/account.json");
+
+    // The file back, as a crash before the delete would leave it.
+    std::fs::write(
+        fix.dir.join("store/intents").join(format!("{id}.json")),
+        intent,
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert_eq!(fix.read("groups/parish.example/group.json"), group);
+    assert_eq!(fix.passwd_file(), passwd);
+    assert_eq!(fix.table("virtuals"), virtuals);
+    assert_eq!(fix.read("accounts/parish-office/account.json"), account);
+    assert_eq!(
+        fix.scripts_log()
+            .matches("add-user.sh parish-office")
+            .count(),
+        1,
+        "{}",
+        fix.scripts_log()
+    );
+    assert_eq!(
+        fix.names("accounts"),
+        vec!["parish-office", "parish-secretary"]
+    );
+}
+
+/// The ten-address cap counts mailboxes and aliases together: an eleventh
+/// address is refused before anything is written or journaled as applying.
+#[test]
+fn the_eleventh_address_is_refused() {
+    let fix = Fix::new("group-eleven");
+    let names = ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9"];
+    let addresses: Vec<(&str, &str)> = names.iter().map(|n| (*n, "parish-secretary")).collect();
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &addresses,
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.table("virtuals")
+            .lines()
+            .filter(|l| l.ends_with("@parish.example: parish-secretary"))
+            .count(),
+        10
+    );
+
+    let id = fix.file_address(
+        "parish.example",
+        "add-alias",
+        "office",
+        "parish-secretary",
+        None,
+        None,
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
+    assert!(
+        fix.failed_note().contains("ten addresses"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(
+        !fix.table("virtuals").contains("office@parish.example"),
+        "{}",
+        fix.table("virtuals")
+    );
+    assert!(
+        !fix.journal()
+            .lines()
+            .any(|l| l.contains("\"kind\":\"group-address\"")
+                && l.contains("\"outcome\":\"applying\"")),
+        "a refused eleventh address began: {}",
+        fix.journal()
+    );
+}
+
+/// A departing site owner hands the upload key and the generated roots to a
+/// replacement before the account is deleted. Without a replacement the intent
+/// is refused and nothing moves.
+#[test]
+fn a_departing_site_owner_must_name_a_replacement() {
+    let fix = Fix::new("group-site-owner");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    assert!(fix.dir.join("store/keys/parish-secretary.pub").exists());
+
+    let refused = fix.file_address(
+        "parish.example",
+        "remove",
+        "",
+        "parish-secretary",
+        None,
+        None,
+    );
+    assert!(fix.drain().status.success());
+    assert_eq!(fix.intents(), vec![format!("{refused}.json")]);
+    assert!(
+        fix.failed_note().contains("owns the site"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(
+        fix.passwd_file().contains("parish-secretary:"),
+        "a refused removal deleted the owner"
+    );
+
+    std::fs::remove_file(
+        fix.dir
+            .join("store/intents")
+            .join(format!("{refused}.json")),
+    )
+    .unwrap();
+    fix.file_address(
+        "parish.example",
+        "remove",
+        "",
+        "parish-secretary",
+        None,
+        Some("parish-office"),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert!(
+        fix.journal()
+            .lines()
+            .any(|l| l.contains("\"kind\":\"group-address\"")
+                && l.contains("\"outcome\":\"applied\"")),
+        "{}",
+        fix.journal()
+    );
+
+    assert!(!fix.passwd_file().contains("parish-secretary:"));
+    let moved = fix.read("keys/parish-office.pub");
+    assert!(moved.contains(UPLOAD_KEY), "{moved}");
+    assert!(
+        !fix.dir.join("store/keys/parish-secretary.pub").exists(),
+        "the old owner kept the upload key"
+    );
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(group["site_owner"], "parish-office");
+    assert_eq!(group["accounts"], json!(["parish-office"]));
+
+    let log = fix.scripts_log();
+    let builder = log
+        .rfind("provision-member.sh parish-office")
+        .expect("the replacement was built");
+    let delete = log
+        .rfind("delete-user.sh parish-secretary")
+        .expect("the old owner was deleted");
+    assert!(builder < delete, "the replacement was built first: {log}");
+    assert!(log.contains("cron-apply.sh --web"), "{log}");
+}
+
+/// A name a removed mailbox left cannot be reused inside ninety days, on an
+/// add-mailbox or on a new group's approval.
+#[test]
+fn a_closed_username_is_held_for_ninety_days() {
+    let fix = Fix::new("group-hold");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    fix.file_address("parish.example", "remove", "", "parish-office", None, None);
+    assert!(fix.drain().status.success());
+    assert_eq!(fix.names("holds"), vec!["parish-office.json"]);
+
+    let id = fix.file_address(
+        "parish.example",
+        "add-mailbox",
+        "office",
+        "parish-office",
+        Some(GOOD_KEY),
+        None,
+    );
+    assert!(fix.drain().status.success());
+    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
+    assert!(
+        fix.failed_note().contains("held until"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(!fix.passwd_file().contains("parish-office:"));
+
+    // The approval gate reads the same hold. A different domain, so the name is
+    // not already this group's account and the check reaches the hold.
+    std::fs::write(
+        fix.dir.join("store/holds/parish-secretary.json"),
+        br#"{"username":"parish-secretary","until":"2099-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    let mut record = fix.filed_body("warden");
+    record["domain"] = json!("other.example");
+    record["answers"]["body_domain"] = json!("other.example");
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    assert!(fix.drain().status.success());
+    assert!(
+        fix.failed_note().contains("held until"),
+        "{}",
+        fix.failed_note()
+    );
+}
+
+/// The hold is not only a group rule: a person's approval creates an account
+/// too, so a closed group mailbox's name cannot be taken by an applicant.
+#[test]
+fn a_person_cannot_take_a_held_group_name() {
+    let fix = Fix::new("person-held");
+    std::fs::create_dir_all(fix.dir.join("store/holds")).unwrap();
+    std::fs::write(
+        fix.dir.join("store/holds/theophilus.json"),
+        br#"{"username":"theophilus","until":"2099-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    let record = fix.filed("theophilus", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "theophilus");
+    assert!(fix.drain().status.success());
+    assert!(
+        fix.failed_note().contains("held until"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(!fix.dir.join("store/accounts/theophilus").exists());
+    assert!(fix.passwd_file().is_empty(), "{}", fix.passwd_file());
+}
+
+/// The console files a signed address intent the drain then applies, which is
+/// the operator's path when there is no account page for it yet.
+#[test]
+fn the_console_files_an_address_intent() {
+    let fix = Fix::new("group-ctl-address");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+
+    let out = fix.ctl(&[
+        "address",
+        "--domain",
+        "parish.example",
+        "--action",
+        "add-alias",
+        "--address",
+        "office",
+        "--mailbox",
+        "parish-secretary",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let intents = fix.intents();
+    assert_eq!(intents.len(), 1, "{intents:?}");
+    let filed: Value = serde_json::from_str(&fix.read(&format!("intents/{}", intents[0]))).unwrap();
+    assert_eq!(filed["kind"], "group-address");
+    assert_eq!(filed["action"], "add-alias");
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix
+        .table("virtuals")
+        .contains("office@parish.example: parish-secretary"));
+}
+
+/// An address intent without the root key's signature changes nothing:
+/// `intents/` is writable by the unprivileged handler, and this one would
+/// otherwise create or remove a root account.
+#[test]
+fn an_address_intent_with_a_bad_signature_is_refused() {
+    let fix = Fix::new("group-address-sig");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+
+    let id = fix.file_address(
+        "parish.example",
+        "add-mailbox",
+        "office",
+        "parish-office",
+        Some(GOOD_KEY),
+        None,
+    );
+    let mut filed: Value = serde_json::from_str(&fix.read(&format!("intents/{id}.json"))).unwrap();
+    filed["sig"] = json!("00");
+    std::fs::write(
+        fix.dir.join("store/intents").join(format!("{id}.json")),
+        serde_json::to_vec_pretty(&filed).unwrap(),
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
+    assert!(
+        fix.failed_note().contains("signature does not verify"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(
+        !fix.table("virtuals").contains("office@parish.example"),
+        "{}",
+        fix.table("virtuals")
+    );
+    assert!(!fix.passwd_file().contains("parish-office:"));
+}
+
+/// A valid signature does not cover a swapped mail key: the material is hashed
+/// into the payload, so changing it while keeping `sig` is refused and nothing
+/// is installed or published.
+#[test]
+fn a_swapped_mail_key_is_refused() {
+    let fix = Fix::new("group-address-key-swap");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+
+    let id = fix.file_address(
+        "parish.example",
+        "add-mailbox",
+        "office",
+        "parish-office",
+        Some(GOOD_KEY),
+        None,
+    );
+    let mut filed: Value = serde_json::from_str(&fix.read(&format!("intents/{id}.json"))).unwrap();
+    filed["mail_key"]["material"] =
+        json!("-----BEGIN PGP PUBLIC KEY BLOCK-----\nattacker\n-----END PGP PUBLIC KEY BLOCK-----");
+    std::fs::write(
+        fix.dir.join("store/intents").join(format!("{id}.json")),
+        serde_json::to_vec_pretty(&filed).unwrap(),
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
+    assert!(
+        fix.failed_note().contains("signature does not verify"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(
+        !fix.dir.join("keyring/parish-office.asc").exists(),
+        "the swapped key reached the keyring"
+    );
+    assert!(!fix.passwd_file().contains("parish-office:"));
+}
+
+/// A hold that has run out no longer blocks the name, once the account record
+/// has gone with the removal.
+#[test]
+fn an_expired_hold_releases_the_name() {
+    let fix = Fix::new("group-hold-expired");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    fix.file_address("parish.example", "remove", "", "parish-office", None, None);
+    assert!(fix.drain().status.success());
+    assert!(!fix.dir.join("store/accounts/parish-office").exists());
+    assert_eq!(fix.names("holds"), vec!["parish-office.json"]);
+
+    std::fs::write(
+        fix.dir.join("store/holds/parish-office.json"),
+        br#"{"username":"parish-office","until":"2020-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    fix.file_address(
+        "parish.example",
+        "add-mailbox",
+        "desk",
+        "parish-office",
+        Some(GOOD_KEY),
+        None,
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(!fix.journal().contains("\"failed\""), "{}", fix.journal());
+    assert!(fix.passwd_file().contains("parish-office:"));
+    assert!(fix.dir.join("store/accounts/parish-office").exists());
+    assert!(fix
+        .table("virtuals")
+        .contains("desk@parish.example: parish-office"));
+}
+
+/// The cap counts a new entry even when the mailbox it points at is already in
+/// the group: adding a second address to an existing mailbox is still the
+/// eleventh address.
+#[test]
+fn a_second_address_on_an_existing_mailbox_still_counts() {
+    let fix = Fix::new("group-eleven-existing");
+    let names = ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9"];
+    let addresses: Vec<(&str, &str)> = names.iter().map(|n| (*n, "parish-secretary")).collect();
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &addresses,
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+
+    let id = fix.file_address(
+        "parish.example",
+        "add-mailbox",
+        "office",
+        "parish-secretary",
+        Some(GOOD_KEY),
+        None,
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
+    assert!(
+        fix.failed_note().contains("ten addresses"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(
+        !fix.table("virtuals").contains("office@parish.example"),
+        "{}",
+        fix.table("virtuals")
     );
 }
