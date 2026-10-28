@@ -183,6 +183,13 @@ mod tests {
             postal_address: "REPLACE_ME".to_string(),
             mail_dir: dir.join("mail").to_str().unwrap().to_string(),
             release: "2026-10-10 abc1234".to_string(),
+            mail_host: "mail.kyriakon.net".to_string(),
+            ipv4: "192.0.2.10".to_string(),
+            ipv6: "2001:db8::10".to_string(),
+            dkim_selector: "mail".to_string(),
+            dkim_public_key: "v=DKIM1; k=rsa; p=example".to_string(),
+            dmarc_rua: "mailto:dmarc@kyriakon.net".to_string(),
+            resolver: "/usr/bin/dig".to_string(),
         }
     }
 

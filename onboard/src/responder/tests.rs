@@ -64,6 +64,12 @@ fn handler_config(dir: &Path) -> config::Config {
         gemini_socket: String::new(),
         portal_socket: String::new(),
         titan_listener: "127.0.0.1:0".to_string(),
+        mail_host: "mail.kyriakon.net".to_string(),
+        ipv4: "192.0.2.10".to_string(),
+        ipv6: "2001:db8::10".to_string(),
+        dkim_selector: "mail".to_string(),
+        dkim_public_key: "v=DKIM1; k=rsa; p=example".to_string(),
+        dmarc_rua: "mailto:dmarc@kyriakon.net".to_string(),
         release: "2026-10-13 test".to_string(),
     }
 }
@@ -126,20 +132,28 @@ async fn answer(app: &App, bytes: &[u8]) -> (u16, String) {
 
 /// The request httpd builds for a GET, with the address relayd set.
 fn httpd_get(path: &str, query: &str) -> Vec<u8> {
-    fixture::httpd(
-        &[
-            ("REQUEST_METHOD", "GET"),
-            ("REQUEST_URI", path),
-            ("QUERY_STRING", query),
-            ("HTTP_HOST", "signup.kyriakon.net"),
-            ("SERVER_NAME", "signup.kyriakon.net"),
-            ("SERVER_PORT", "8080"),
-            ("REMOTE_ADDR", "127.0.0.1"),
-            ("HTTP_X_FORWARDED_FOR", "203.0.113.10"),
-            ("SERVER_SOFTWARE", "OpenBSD httpd"),
-        ],
-        b"",
-    )
+    httpd_get_as(path, query, None)
+}
+
+/// A GET httpd authenticated, which is the one thing `REMOTE_USER` means. The
+/// account page's login is its own ticket's; this is the environment it will
+/// pass when it lands.
+fn httpd_get_as(path: &str, query: &str, user: Option<&str>) -> Vec<u8> {
+    let mut env = vec![
+        ("REQUEST_METHOD", "GET"),
+        ("REQUEST_URI", path),
+        ("QUERY_STRING", query),
+        ("HTTP_HOST", "signup.kyriakon.net"),
+        ("SERVER_NAME", "signup.kyriakon.net"),
+        ("SERVER_PORT", "8080"),
+        ("REMOTE_ADDR", "127.0.0.1"),
+        ("HTTP_X_FORWARDED_FOR", "203.0.113.10"),
+        ("SERVER_SOFTWARE", "OpenBSD httpd"),
+    ];
+    if let Some(user) = user {
+        env.push(("REMOTE_USER", user));
+    }
+    fixture::httpd(&env, b"")
 }
 
 /// The request httpd builds for a form post.
@@ -249,6 +263,38 @@ fn file_account(dir: &Path) {
         "{\"version\":1,\"at\":\"2026-09-30T09:00:00Z\",\"type\":\"approval.free\",\
          \"subject\":\"Application approved, account opened.\",\
          \"to\":\"alice@kyriakon.net\"}\n",
+    )
+    .unwrap();
+}
+
+/// An account that belongs to a body's group, with the group record the handler
+/// reads to generate the recipe. The certificate is the pinned one.
+fn file_group_account(dir: &Path) {
+    let pinned = PINNED;
+    let record = format!(
+        r#"{{"version": 1, "username": "parish-secretary", "state": "active",
+            "decision": "approve", "decided_at": "2026-09-30T09:00:00Z",
+            "rail": "cash", "no_charge": false,
+            "created_at": "2026-09-30T09:00:00Z",
+            "group": "parish.example",
+            "certificates": [{{"hash": "{pinned}", "subject": "CN=parish-secretary",
+                "issuer": "CN=parish-secretary",
+                "not_before": "2026-01-01T00:00:00Z",
+                "not_after": "2036-01-01T00:00:00Z"}}],
+            "site_served": true, "capsule_served": true,
+            "space_used": 432013312}}"#
+    );
+    let account = dir.join("accounts/parish-secretary");
+    std::fs::create_dir_all(&account).unwrap();
+    std::fs::write(account.join("account.json"), record).unwrap();
+    let group = dir.join("groups/parish.example");
+    std::fs::create_dir_all(&group).unwrap();
+    std::fs::write(
+        group.join("group.json"),
+        r#"{"version": 1, "domain": "parish.example", "name": "Parish of Example",
+            "kind": "parish", "payment": {"rail": "cash", "no_charge": false,
+            "paid_until": null}, "accounts": ["parish-secretary"],
+            "site_owner": "parish-secretary"}"#,
     )
     .unwrap();
 }
@@ -444,6 +490,10 @@ async fn a_pinned_certificate_answers_as_the_member() {
         "{body}"
     );
     assert!(body.contains("alice@kyriakon.net"), "{body}");
+    assert!(
+        !body.contains("DNS records"),
+        "an account with no group carries no recipe: {body}"
+    );
 
     // The catalogue's account row reaches the page that answered it.
     let (_, catalogue) = answer(&app, &gmid_certificate("", "", &pinned)).await;
@@ -451,6 +501,45 @@ async fn a_pinned_certificate_answers_as_the_member() {
         catalogue.contains("=> gemini://signup.kyriakon.net/account Your account"),
         "{catalogue}"
     );
+}
+
+/// A mailbox account's `group` resolves to the group record, and the recipe it
+/// carries is the same on both account pages.
+#[tokio::test]
+async fn a_group_member_reads_the_same_recipe_on_both_account_pages() {
+    let (app, dir) = handler("group-account-recipe").await;
+    file_group_account(&dir);
+    let pinned = certificate(PINNED, "CN=parish-secretary");
+    let needles = [
+        "10 mail.kyriakon.net.",
+        "192.0.2.10",
+        "2001:db8::10",
+        "v=spf1 mx -all",
+        "mail._domainkey",
+        "v=DKIM1; k=rsa; p=example",
+        "v=DMARC1; p=none; rua=mailto:dmarc@kyriakon.net",
+        "does not host your zone",
+    ];
+
+    let (code, capsule) = answer(&app, &gmid_certificate("account", "", &pinned)).await;
+    assert_eq!(code, 20);
+    let (code, web) = answer(&app, &httpd_get_as("account", "", Some("parish-secretary"))).await;
+    assert_eq!(code, 200);
+    for needle in needles {
+        assert!(
+            capsule.contains(needle),
+            "the capsule misses {needle:?}: {capsule}"
+        );
+        assert!(
+            web.contains(needle),
+            "the web page misses {needle:?}: {web}"
+        );
+    }
+
+    // A web request that names no authenticated member is the page it was, and
+    // never another member's recipe.
+    let (_, anonymous) = answer(&app, &httpd_get("account", "")).await;
+    assert!(!anonymous.contains("mail._domainkey"), "{anonymous}");
 }
 
 /// The ordinary visitor's pages, with the visitor's own fingerprint and no

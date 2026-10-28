@@ -82,6 +82,10 @@ impl Fix {
             fix.script(s, &format!("#!/bin/sh\necho \"{s} $*\" >> '{log}'\n"));
         }
         fix.add_user_writes_passwd();
+        // The DNS sweep's resolver. It answers every query with one non-empty
+        // line, so a group with records is not an outage; a test that wants one
+        // rewrites it with `resolver`.
+        fix.resolver(None);
         let cfg = format!(
             "store_root = \"{}\"\n\
              reserved = \"{}\"\n\
@@ -101,7 +105,14 @@ impl Fix {
              price_gbp = \"20.00\"\n\
              postal_address = \"1 Example Street, Example\"\n\
              mail_dir = \"{}/store/mail/new\"\n\
-             release = \"2026-10-10 abc1234\"\n",
+             release = \"2026-10-10 abc1234\"\n\
+             mail_host = \"mail.kyriakon.net\"\n\
+             ipv4 = \"192.0.2.10\"\n\
+             ipv6 = \"2001:db8::10\"\n\
+             dkim_selector = \"mail\"\n\
+             dkim_public_key = \"v=DKIM1; k=rsa; p=examplepublickey\"\n\
+             dmarc_rua = \"mailto:dmarc@kyriakon.net\"\n\
+             resolver = \"{}\"\n",
             fix.path("store"),
             fix.path("reserved"),
             fix.path("bin"),
@@ -115,6 +126,7 @@ impl Fix {
             fix.dir.display(),
             fix.dir.display(),
             fix.dir.display(),
+            fix.path("bin/dig"),
         );
         std::fs::write(fix.path("drain.toml"), cfg).unwrap();
         fix
@@ -173,6 +185,43 @@ impl Fix {
         std::fs::write(&p, body).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The DNS sweep's resolver: it logs every query and answers the row the
+    /// recipe names, unless `missing` is that row's key, in which case it
+    /// answers nothing, or `unmarked` is, in which case it answers a TXT string
+    /// without the expected marker. Keys are `MX`, `A-apex`, `A-www`,
+    /// `AAAA-apex`, `AAAA-www`, `SPF`, `DKIM` and `DMARC`. It is a stub by
+    /// design, so no test resolves a name.
+    fn resolver(&self, missing: Option<&str>) {
+        self.resolver_with(missing, None);
+    }
+
+    fn resolver_with(&self, missing: Option<&str>, unmarked: Option<&str>) {
+        let log = self.path("scripts.log");
+        let missing = missing.unwrap_or("");
+        let unmarked = unmarked.unwrap_or("");
+        self.script(
+            "dig",
+            &format!(
+                "#!/bin/sh\n\
+                 printf 'dig %s\\n' \"$*\" >> '{log}'\n\
+                 case \"$2\" in\n\
+                 MX) key=MX; answer='10 mail.kyriakon.net.' ;;\n\
+                 A) case \"$3\" in www.*) key=A-www ;; *) key=A-apex ;; esac; answer='192.0.2.10' ;;\n\
+                 AAAA) case \"$3\" in www.*) key=AAAA-www ;; *) key=AAAA-apex ;; esac; answer='2001:db8::10' ;;\n\
+                 TXT) case \"$3\" in\n\
+                 _dmarc.*) key=DMARC; answer='v=DMARC1; p=none; rua=mailto:dmarc@kyriakon.net' ;;\n\
+                 *._domainkey.*) key=DKIM; answer='v=DKIM1; k=rsa; p=examplepublickey' ;;\n\
+                 *) key=SPF; answer='v=spf1 mx -all' ;;\n\
+                 esac ;;\n\
+                 *) exit 1 ;;\n\
+                 esac\n\
+                 [ '{unmarked}' = \"$key\" ] && answer='some-other-txt'\n\
+                 [ '{missing}' = \"$key\" ] && exit 0\n\
+                 printf '%s\\n' \"$answer\"\n"
+            ),
+        );
     }
 
     fn config(&self) -> String {
@@ -2696,6 +2745,247 @@ fn a_body_approval_makes_the_group_and_its_mailboxes() {
     assert!(fix.intents().is_empty(), "{:?}", fix.intents());
     // The application is decided, so a replay changes nothing.
     assert!(fix.journal().contains("\"applied\""), "{}", fix.journal());
+}
+
+/// A box whose deploy left a recipe placeholder refuses a body's approval
+/// before the journal line and before any account or table is made.
+#[test]
+fn an_approval_with_a_placeholder_dns_value_makes_nothing() {
+    let fix = Fix::new("group-dns-placeholder");
+    let cfg = std::fs::read_to_string(fix.config())
+        .unwrap()
+        .replace("ipv4 = \"192.0.2.10\"", "ipv4 = \"REPLACE_ME_IPV4\"");
+    std::fs::write(fix.config(), cfg).unwrap();
+    let record = fix.filed_body("warden");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert!(
+        !fix.dir
+            .join("store/groups/parish.example/group.json")
+            .exists(),
+        "a refused approval makes no group record"
+    );
+    assert!(
+        !fix.dir
+            .join("store/accounts/parish-secretary/account.json")
+            .exists(),
+        "and no mailbox account"
+    );
+    assert!(!fix.passwd_file().contains("parish-secretary:"));
+    assert!(!fix.table("mail_domains").contains("parish.example"));
+}
+
+/// A body's approval carries the DNS recipe, generated from its own domain and
+/// the platform's published values, because mail and the website do not work
+/// until the body creates those records.
+#[test]
+fn a_body_approval_email_carries_the_dns_recipe() {
+    let fix = Fix::new("group-dns-recipe-email");
+    let record = fix.filed_body("warden");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let sent = fix.sent();
+    for needle in [
+        "10 mail.kyriakon.net.",
+        "192.0.2.10",
+        "2001:db8::10",
+        "v=spf1 mx -all",
+        "mail._domainkey",
+        "v=DKIM1; k=rsa; p=examplepublickey",
+        "v=DMARC1; p=none; rua=mailto:dmarc@kyriakon.net",
+        "does not host your zone",
+        "cannot set a reverse DNS record for parish.example",
+        "can only observe your records",
+    ] {
+        assert!(sent.contains(needle), "{needle:?} missing:\n{sent}");
+    }
+    // A body has no account of the applicant's own, so the fallback is the site
+    // owner's mailbox on the body's domain.
+    assert!(
+        sent.contains("To: parish-secretary@parish.example"),
+        "{sent}"
+    );
+}
+
+/// A broken zone is notified once per outage to the application's DNS contact,
+/// the state records that it was, and the group record is not touched.
+#[test]
+fn a_broken_zone_notifies_the_dns_contact_once() {
+    let fix = Fix::new("group-dns-broken");
+    fix.resolver(Some("MX"));
+    let record = fix.filed_body("warden");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let group = fix.read("groups/parish.example/group.json");
+    let subject = "Subject: The DNS records for parish.example are not resolving";
+    let sent = fix.sent();
+    assert_eq!(
+        sent.matches(subject).count(),
+        1,
+        "one notice per outage:\n{sent}"
+    );
+    assert!(sent.contains("To: warden@example.invalid"), "{sent}");
+    assert!(
+        fix.dir
+            .join("store/groups/parish.example/dns-check.json")
+            .exists(),
+        "the check is recorded"
+    );
+    let notices = fix.read("accounts/parish-secretary/notices.jsonl");
+    assert!(
+        notices.contains("\"type\":\"dns.broken\""),
+        "the account records the notice: {notices}"
+    );
+    let queries = fix
+        .scripts_log()
+        .lines()
+        .filter(|l| l.starts_with("dig "))
+        .count();
+    assert_eq!(
+        queries, 1,
+        "the first record that answers nothing stops the check"
+    );
+
+    // The next pass is not due, so it neither queries nor sends again, and the
+    // group record still carries no DNS values.
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.sent().matches(subject).count(),
+        1,
+        "a second pass sends none:\n{}",
+        fix.sent()
+    );
+    assert_eq!(
+        fix.scripts_log()
+            .lines()
+            .filter(|l| l.starts_with("dig "))
+            .count(),
+        1,
+        "not due, so the resolver is not run again"
+    );
+    assert_eq!(fix.read("groups/parish.example/group.json"), group);
+}
+
+/// With no DNS contact in the application copy, the notice goes to the
+/// accountable address the applicant gave.
+#[test]
+fn a_broken_zone_falls_back_to_the_accountable_address() {
+    let fix = Fix::new("group-dns-fallback");
+    fix.resolver(Some("MX"));
+    let mut record = fix.filed_body("warden");
+    record["answers"]["body_dns_contact"] = json!("");
+    record["outside_address"] = json!("warden@example.invalid");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let sent = fix.sent();
+    assert_eq!(
+        sent.matches("Subject: The DNS records for parish.example are not resolving")
+            .count(),
+        1,
+        "{sent}"
+    );
+    assert!(sent.contains("To: warden@example.invalid"), "{sent}");
+}
+
+/// Every row the recipe publishes is observed: a missing `www` name, AAAA, SPF,
+/// DKIM or DMARC record is an outage even when the MX and apex A still answer.
+#[test]
+fn each_missing_recipe_row_is_an_outage() {
+    for missing in [
+        "MX",
+        "A-apex",
+        "A-www",
+        "AAAA-apex",
+        "AAAA-www",
+        "SPF",
+        "DKIM",
+        "DMARC",
+    ] {
+        let fix = Fix::new(&format!("group-dns-missing-{missing}"));
+        fix.resolver(Some(missing));
+        fix.file_group(
+            "parish.example",
+            "parish-secretary",
+            &[("secretary", "parish-secretary")],
+            &["parish-secretary"],
+            None,
+        );
+        let out = fix.drain();
+        assert!(out.status.success(), "{missing}: {}", body(&out));
+        assert_eq!(
+            fix.sent()
+                .matches("Subject: The DNS records for parish.example are not resolving")
+                .count(),
+            1,
+            "{missing} was not reported as an outage:\n{}",
+            fix.sent()
+        );
+    }
+}
+
+/// A complete set of the rows the recipe names is not an outage.
+#[test]
+fn a_complete_recipe_sends_no_dns_notice() {
+    let fix = Fix::new("group-dns-complete");
+    fix.resolver(None);
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.sent().contains("not resolving"),
+        "a healthy zone was reported:\n{}",
+        fix.sent()
+    );
+}
+
+/// A TXT answer without the record's marker is not the record: an unrelated
+/// string at the SPF, DKIM or DMARC name is an outage.
+#[test]
+fn a_txt_without_its_marker_is_an_outage() {
+    for unmarked in ["SPF", "DKIM", "DMARC"] {
+        let fix = Fix::new(&format!("group-dns-unmarked-{unmarked}"));
+        fix.resolver_with(None, Some(unmarked));
+        fix.file_group(
+            "parish.example",
+            "parish-secretary",
+            &[("secretary", "parish-secretary")],
+            &["parish-secretary"],
+            None,
+        );
+        let out = fix.drain();
+        assert!(out.status.success(), "{unmarked}: {}", body(&out));
+        assert_eq!(
+            fix.sent()
+                .matches("Subject: The DNS records for parish.example are not resolving")
+                .count(),
+            1,
+            "an unmarked {unmarked} answer was not reported:\n{}",
+            fix.sent()
+        );
+    }
 }
 
 /// An application the form accepts can be approved: the alias line names its own

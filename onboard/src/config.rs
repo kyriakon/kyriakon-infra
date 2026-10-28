@@ -54,6 +54,18 @@ pub struct Config {
     /// protocol v1, which is how this listener still sees the client's address.
     /// The address is the forward target in the commented relayd block.
     pub titan_listener: String,
+    /// The platform's published mail host, IP addresses and DKIM key, which the
+    /// DNS recipe shows a body. The handler holds no secret and these values are
+    /// public, but they are still substituted at deploy from the box's own
+    /// values and zone rather than restated here, so the recipe cannot name an
+    /// address or key the box is not using. `dns::Values::check` refuses a
+    /// placeholder.
+    pub mail_host: String,
+    pub ipv4: String,
+    pub ipv6: String,
+    pub dkim_selector: String,
+    pub dkim_public_key: String,
+    pub dmarc_rua: String,
     /// The deployed commit and date, e.g. "2026-10-10 1a2b3c4". The acceptance
     /// records carry it as the version of each document accepted, and it is the
     /// version of the question list an application was answered against. It is
@@ -156,6 +168,21 @@ pub struct DrainConfig {
     /// it on a journal line so a transition can be traced to the release that
     /// carried it out, and it is the confirmation email's document version.
     pub release: String,
+    /// The platform's published mail host, IP addresses and DKIM key, which the
+    /// DNS recipe shows a body, and the DMARC reporting address. Substituted at
+    /// deploy from the box's values and its tracked zone: the IPs and the DKIM
+    /// key are placeholders here so the repository holds no second copy that can
+    /// drift from what the box publishes.
+    pub mail_host: String,
+    pub ipv4: String,
+    pub ipv6: String,
+    pub dkim_selector: String,
+    pub dkim_public_key: String,
+    pub dmarc_rua: String,
+    /// The resolver the broken-DNS sweep runs: `dig` or `host`, by path. A value
+    /// so the acceptance test can point it at a stub and never touch the
+    /// network.
+    pub resolver: String,
 }
 
 impl DrainConfig {
@@ -181,6 +208,12 @@ mod tests {
              gemini_socket = \"/home/www/run/onboard/onboard.sock\"\n\
              portal_socket = \"/home/www/run/onboard-portal/portal.sock\"\n\
              titan_listener = \"127.0.0.1:7081\"\n\
+             mail_host = \"mail.kyriakon.net\"\n\
+             ipv4 = \"192.0.2.10\"\n\
+             ipv6 = \"2001:db8::10\"\n\
+             dkim_selector = \"mail\"\n\
+             dkim_public_key = \"v=DKIM1; k=rsa; p=example\"\n\
+             dmarc_rua = \"mailto:dmarc@kyriakon.net\"\n\
              release = \"REPLACE_ME\"\n",
         )
         .unwrap();
@@ -265,7 +298,14 @@ mod tests {
              price_gbp = \"20.00\"\n\
              postal_address = \"REPLACE_ME\"\n\
              mail_dir = \"/var/db/onboard/mail/new\"\n\
-             release = \"REPLACE_ME\"\n";
+             release = \"REPLACE_ME\"\n\
+             mail_host = \"mail.kyriakon.net\"\n\
+             ipv4 = \"192.0.2.10\"\n\
+             ipv6 = \"2001:db8::10\"\n\
+             dkim_selector = \"mail\"\n\
+             dkim_public_key = \"v=DKIM1; k=rsa; p=example\"\n\
+             dmarc_rua = \"mailto:dmarc@kyriakon.net\"\n\
+             resolver = \"/usr/bin/dig\"\n";
         let c: DrainConfig = toml::from_str(text).unwrap();
         assert_eq!(c.price_gbp, "20.00");
         assert_eq!(c.scripts, "/root/bin");
@@ -295,5 +335,25 @@ mod tests {
         // The two the deploy leaves for the operator to fill.
         assert_eq!(c.release, "REPLACE_ME");
         assert_eq!(c.postal_address, "REPLACE_ME");
+        // The three the deploy substitutes from the box's values and zone. The
+        // recipe refuses them until it has, so a shipped file that gained a real
+        // address here would be a second copy that can drift.
+        assert_eq!(c.ipv4, "REPLACE_ME_IPV4");
+        assert_eq!(c.ipv6, "REPLACE_ME_IPV6");
+        assert_eq!(c.dkim_public_key, "REPLACE_ME");
+        assert_eq!(c.resolver, "/usr/bin/dig");
+        assert!(crate::dns::Values::from(&c).check().is_err());
+    }
+
+    /// The handler's tracked config is substituted by the same deploy, and the
+    /// recipe refuses its placeholders too.
+    #[test]
+    fn the_tracked_handler_config_names_its_placeholders() {
+        let c: Config =
+            toml::from_str(include_str!("../../openbsd/etc/onboard/onboard.toml")).unwrap();
+        assert_eq!(c.ipv4, "REPLACE_ME_IPV4");
+        assert_eq!(c.ipv6, "REPLACE_ME_IPV6");
+        assert_eq!(c.dkim_public_key, "REPLACE_ME");
+        assert!(crate::dns::Values::from(&c).check().is_err());
     }
 }

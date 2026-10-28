@@ -158,9 +158,66 @@ release=$(git -C "$repo_dir" -c "safe.directory=$repo_dir" rev-parse --short HEA
 	|| die "cannot read the commit from $repo_dir, so the release cannot be named"
 release="$release $(date -u +%F)"
 
+# The values the recipe is generated from, read from the box's own values file
+# and its tracked zone rather than restated in the repository. The postal address
+# is the cash-by-post rail's; the rest are the public DNS values a body copies.
+# Nothing host-specific is edited on the box.
+env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
+[ -r "$env_file" ] || die "no $env_file; run scripts/setup-env.sh first, which installs it"
+# shellcheck source=/dev/null
+. "$env_file"
+case "${POSTAL_ADDRESS:-}" in
+"")
+	die "POSTAL_ADDRESS is not set in $env_file; set it with: scripts/setup-env.sh --postal-address '...'"
+	;;
+*REPLACE_ME*)
+	die "POSTAL_ADDRESS in $env_file is still a placeholder; set it with: scripts/setup-env.sh --postal-address '...'"
+	;;
+esac
+case "${KYRIAKON_IPV4:-}" in
+"" | *REPLACE_ME*)
+	die "KYRIAKON_IPV4 is not set in $env_file; set the box's IPv4 there"
+	;;
+esac
+case "${KYRIAKON_IPV6:-}" in
+"" | *REPLACE_ME*)
+	die "KYRIAKON_IPV6 is not set in $env_file; set the box's IPv6 there"
+	;;
+esac
+
+# The DKIM public key is the one the tracked zone publishes, read here rather
+# than copied into a config: a second copy would keep publishing after a
+# rotation and nothing would fail. The record is two adjacent quoted strings, so
+# the quoted parts are concatenated and the zone's own base64 is what lands.
+dkim_public_key=$(
+	awk '
+		/^mail\._domainkey/ { found = 1 }
+		found {
+			text = $0
+			while (match(text, /"[^"]*"/)) {
+				printf "%s", substr(text, RSTART + 1, RLENGTH - 2)
+				text = substr(text, RSTART + RLENGTH)
+			}
+			if ($0 ~ /\)/) exit
+		}
+	' "$repo_dir/openbsd/etc/nsd/kyriakon.net.zone"
+)
+case "$dkim_public_key" in
+v=DKIM1*)
+	;;
+*)
+	die "cannot read the DKIM public key from $repo_dir/openbsd/etc/nsd/kyriakon.net.zone"
+	;;
+esac
+
 onboard_candidate=$(mktemp /etc/onboard/.onboard.toml.XXXXXX)
-sed -e "s|^release = .*|release = \"$release\"|" \
-	"$repo_dir/openbsd/etc/onboard/onboard.toml" > "$onboard_candidate"
+RELEASE="$release" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" DKIM="$dkim_public_key" awk '
+	/^release[[:space:]]*=/ { print "release = \"" ENVIRON["RELEASE"] "\""; next }
+	/^ipv4[[:space:]]*=/ { print "ipv4 = \"" ENVIRON["IPV4"] "\""; next }
+	/^ipv6[[:space:]]*=/ { print "ipv6 = \"" ENVIRON["IPV6"] "\""; next }
+	/^dkim_public_key[[:space:]]*=/ { print "dkim_public_key = \"" ENVIRON["DKIM"] "\""; next }
+	{ print }
+' "$repo_dir/openbsd/etc/onboard/onboard.toml" > "$onboard_candidate"
 chmod 0644 "$onboard_candidate"
 
 # The two ways this substitution goes wrong, both checked on the candidate: a
@@ -174,43 +231,29 @@ if awk '/REPLACE_ME/ { found = 1 } END { exit !found }' "$onboard_candidate"; th
 fi
 mv "$onboard_candidate" /etc/onboard/onboard.toml
 
-# The postal address the cash-by-post rail gives out, read from the box's own
-# values file rather than edited on the box: nothing host-specific is edited on
-# the box, and this is the file every other deploy already reads. A box that has
-# not set it is told where to, rather than left a config with a hole in it.
-env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
-[ -r "$env_file" ] || die "no $env_file; run scripts/setup-env.sh first, which installs it"
-# shellcheck source=/dev/null
-. "$env_file"
-case "${POSTAL_ADDRESS:-}" in
-"")
-	die "POSTAL_ADDRESS is not set in $env_file; set it with: scripts/setup-env.sh --postal-address '...'"
-	;;
-*REPLACE_ME*)
-	die "POSTAL_ADDRESS in $env_file is still a placeholder; set it with: scripts/setup-env.sh --postal-address '...'"
-	;;
-esac
-
 # The drain's own root-only config, into the drain's home that the store script
-# created. The release and the postal address come from the tracked template,
-# substituted here; nothing is edited on the box.
+# created. The release, the postal address and the DNS values come from the
+# tracked template, substituted here; nothing is edited on the box.
 install -d -m 0700 -o root -g wheel /etc/kyriakon/onboard
 drain_candidate=$(mktemp /etc/kyriakon/onboard/.drain.toml.XXXXXX)
-RELEASE="$release" POSTAL="$POSTAL_ADDRESS" awk '
+RELEASE="$release" POSTAL="$POSTAL_ADDRESS" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" DKIM="$dkim_public_key" awk '
 	/^release[[:space:]]*=/ { print "release = \"" ENVIRON["RELEASE"] "\""; next }
 	/^postal_address[[:space:]]*=/ { print "postal_address = \"" ENVIRON["POSTAL"] "\""; next }
+	/^ipv4[[:space:]]*=/ { print "ipv4 = \"" ENVIRON["IPV4"] "\""; next }
+	/^ipv6[[:space:]]*=/ { print "ipv6 = \"" ENVIRON["IPV6"] "\""; next }
+	/^dkim_public_key[[:space:]]*=/ { print "dkim_public_key = \"" ENVIRON["DKIM"] "\""; next }
 	{ print }
 ' "$repo_dir/openbsd/etc/onboard/drain.toml" > "$drain_candidate"
 chmod 0600 "$drain_candidate"
 awk -v want="release = \"$release\"" '$0 == want { found = 1 } END { exit !found }' \
 	"$drain_candidate" \
 	|| die "/etc/kyriakon/onboard/drain.toml does not name the release $release"
-if grep -q '^release = "REPLACE_ME' "$drain_candidate"; then
-	die "/etc/kyriakon/onboard/drain.toml still carries a REPLACE_ME release"
-fi
 awk -v want="postal_address = \"$POSTAL_ADDRESS\"" '$0 == want { found = 1 } END { exit !found }' \
 	"$drain_candidate" \
 	|| die "/etc/kyriakon/onboard/drain.toml does not name the postal address; it should have been substituted, not left as a placeholder"
+if grep -q 'REPLACE_ME' "$drain_candidate"; then
+	die "/etc/kyriakon/onboard/drain.toml still carries a REPLACE_ME placeholder"
+fi
 mv "$drain_candidate" /etc/kyriakon/onboard/drain.toml
 printf 'release: %s\n' "$release"
 

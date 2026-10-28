@@ -120,3 +120,27 @@ mail_dir = "/var/db/onboard/mail/new"
 # release that carried it out, and it is the document version the confirmation
 # email quotes. It is the release the box is running, not a hash of anything.
 release = "REPLACE_ME"
+
+# The platform's published DNS values, which every body's recipe is generated
+# from. Public values, but the IPs and the DKIM key are placeholders here and are
+# substituted at deploy from /root/.kyriakon-env and the tracked zone. The
+# repository must not hold a second copy: a key restated here would keep
+# publishing after a rotation, and nothing would fail. scripts/deploy-onboard.sh
+# refuses a placeholder, and the drain's own recipe reader refuses one too.
+#
+# The MX names the platform's mail host rather than a name of the body's:
+# the box's reverse record is set at the hosting provider against that host and
+# cannot be varied per body. The selector is the one the DKIM filter signs with;
+# rotating it is one filter change and one new record in every body's zone.
+mail_host = "mail.kyriakon.net"
+ipv4 = "REPLACE_ME_IPV4"
+ipv6 = "REPLACE_ME_IPV6"
+dkim_selector = "mail"
+dkim_public_key = "REPLACE_ME"
+dmarc_rua = "mailto:dmarc@kyriakon.net"
+
+# The resolver the broken-DNS sweep runs, by path. `dig +short` is the shape the
+# issue's own check uses and the zone's tooling assumes. A configuration value
+# rather than a literal so the acceptance tests stub it and never touch the
+# network: the drain can only observe a body's zone, never change it.
+resolver = "/usr/bin/dig"

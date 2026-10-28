@@ -15,4 +15,27 @@
   <li><a href="{{ s.href }}">{{ s.name }}</a> <span class="tag">{{ s.state }}</span> {{ s.summary }}</li>
 {% endfor %}
 </ul>
+
+{#
+  The body's DNS recipe. The values are generated once, from the platform's
+  published mail host, addresses, DKIM key and DMARC address, and the approval
+  email carries the same table. It is absent for an account with no group.
+#}
+{% if let Some(recipe) = dns %}
+<h3>Your domain's DNS records</h3>
+<p>{{ recipe.opening }}</p>
+<table>
+  <thead>
+    <tr><th>What it is for</th><th>Name</th><th>Type</th><th>Value</th></tr>
+  </thead>
+  <tbody>
+  {% for row in recipe.rows %}
+    <tr><td>{{ row.what }}</td><td>{{ row.name }}</td><td>{{ row.record_type }}</td><td><code>{{ row.value }}</code></td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% for line in recipe.closing %}
+<p>{{ line }}</p>
+{% endfor %}
+{% endif %}
 {% endblock %}

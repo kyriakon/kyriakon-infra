@@ -45,6 +45,10 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
         }
     }
     transitions::purge_declined(cfg, store).await?;
+    // The groups' own zones are watched after the intents: a record that has
+    // stopped resolving is the one thing about a body's domain the platform can
+    // see and cannot repair. It is due-gated, so most passes do no DNS work.
+    transitions::check_group_dns(cfg, store).await?;
     // The key spool is read after the intents so a filed application is not
     // waiting behind a mailbox pass. The pass handles each message on its own:
     // one that cannot be dealt with is reported and left for the next run.

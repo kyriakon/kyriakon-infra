@@ -12,6 +12,7 @@
 pub mod capsule;
 pub mod catalogue;
 pub mod config;
+pub mod dns;
 pub mod draft;
 pub mod fcgi;
 pub mod intents;

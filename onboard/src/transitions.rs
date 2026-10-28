@@ -16,6 +16,7 @@ use time::{Duration, OffsetDateTime};
 use tokio::process::Command;
 
 use crate::config::DrainConfig;
+use crate::dns;
 use crate::notice;
 use crate::questions;
 use crate::sign;
@@ -287,6 +288,22 @@ fn recipient(record: &Record, username: &str) -> Result<String, String> {
             Ok(addr.to_string())
         }
         None => Ok(format!("{username}@kyriakon.net")),
+    }
+}
+
+/// The address a body's approval notice goes to. A body has no account of the
+/// applicant's own, so the fallback is the site owner's mailbox on the body's
+/// domain rather than the person path's `username@kyriakon.net`, which the drain
+/// never makes for a body.
+fn group_recipient(record: &Record, site_owner: &str, domain: &str) -> Result<String, String> {
+    match record.outside_address.as_deref() {
+        Some(addr) => {
+            if let Some(why) = validate::address(addr) {
+                return Err(format!("the address outside the platform {addr:?}: {why}"));
+            }
+            Ok(addr.to_string())
+        }
+        None => Ok(format!("{site_owner}@{domain}")),
     }
 }
 
@@ -1149,6 +1166,11 @@ async fn approve_group(
     if let Some(why) = validate::domain(&domain) {
         return Err(format!("the domain {domain:?}: {why}"));
     }
+    // The recipe is part of this approval, so a config the deploy never
+    // substituted refuses before the group check, the journal line or any
+    // account: a misconfigured box must not half-make a body on every pass.
+    let values = dns::Values::from(cfg);
+    values.check()?;
     // A group that is already there and was not made by this application is
     // somebody else's, and this approval must not adopt it. A retry of this
     // application's own approval has its "applying" line, the way the person
@@ -1220,6 +1242,29 @@ async fn approve_group(
         serde_json::to_vec_pretty(&group).map_err(|e| format!("cannot encode the intent: {e}"))?;
     store.write_record("intents", &filename, &bytes).await?;
     provision_group(cfg, store, &group, &filename).await?;
+
+    // The body's approval notice: the recipe is the whole point of it, because
+    // mail and the website do not work until the body has published the records
+    // itself. It is recorded before it is enqueued, so a crash between the two
+    // loses an email rather than sending two on the retry.
+    let recipe = dns::recipe(&domain, &values);
+    let to = group_recipient(record, &site_owner, &domain)?;
+    let subject = decision_subject("approved", &domain);
+    let body = format!(
+        "Your application for {domain} has been approved. The mailboxes in the group are \
+         ready to receive mail as soon as the records below are live.\n\n{}",
+        recipe.text()
+    );
+    notice::send_account_notice(
+        cfg,
+        store,
+        &site_owner,
+        "approval.body",
+        &subject,
+        &to,
+        &body,
+    )
+    .await?;
 
     let now = util::filed_at();
     mark_decided(
@@ -1341,7 +1386,7 @@ fn site_owner(record: &Record, mailboxes: &[String]) -> Result<String, String> {
 /// The group record, when one is already there. A record that cannot be read or
 /// parsed is an error rather than "no group": treating it as absent would let an
 /// approval adopt accounts the record names.
-async fn group_record(store: &Store, domain: &str) -> Result<Option<GroupRecord>, String> {
+pub async fn group_record(store: &Store, domain: &str) -> Result<Option<GroupRecord>, String> {
     let Some(text) = store
         .read_record(&format!("groups/{domain}"), "group.json")
         .await
@@ -1807,6 +1852,213 @@ async fn decline(
     .await?;
     store.remove("intents", file).await?;
     Ok(())
+}
+
+/// How often a group's published records are looked at. The drain runs every
+/// minute, and a DNS query per group per minute is noise on the resolver and on
+/// the body's authority: six hours notices an outage the same day and is far
+/// inside the certificate queue's patience.
+const DNS_CHECK_HOURS: i64 = 6;
+
+/// Watch every group's zone for records that have stopped resolving.
+///
+/// The platform does not host a body's zone and cannot repair it. This sweep is
+/// the whole of what it can do: a query, one notice to the DNS contact the
+/// application gave or the accountable address otherwise, and a state file so
+/// one outage is one mail rather than one per pass. It writes nothing outside
+/// `groups/<domain>/dns-check.json`; the group record and the body's zone are
+/// untouched.
+pub async fn check_group_dns(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+    let now = OffsetDateTime::now_utc();
+    for name in store.list("groups").await? {
+        if name.starts_with('.') {
+            continue;
+        }
+        let Some(text) = store
+            .read_record(&format!("groups/{name}"), "group.json")
+            .await
+        else {
+            continue;
+        };
+        let group: GroupRecord = serde_json::from_str(&text)
+            .map_err(|e| format!("groups/{name}/group.json does not parse: {e}"))?;
+        let state: Option<Value> = store
+            .read_record(&format!("groups/{}", group.domain), "dns-check.json")
+            .await
+            .and_then(|t| serde_json::from_str(&t).ok());
+        let checked_at = state
+            .as_ref()
+            .and_then(|s| s.get("checked_at"))
+            .and_then(Value::as_str)
+            .and_then(|t| OffsetDateTime::parse(t, &Rfc3339).ok());
+        let was_broken = state
+            .as_ref()
+            .and_then(|s| s.get("broken"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let notified = state
+            .as_ref()
+            .and_then(|s| s.get("notified"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // A broken zone whose notice has not gone yet is retried on the next
+        // pass, not six hours later: the state is written before the send so a
+        // crash cannot lose the outage, and the notice itself is deduplicated.
+        let pending = was_broken && !notified;
+        if !pending && checked_at.is_some_and(|at| now - at < Duration::hours(DNS_CHECK_HOURS)) {
+            continue;
+        }
+
+        let broken = dns_broken(cfg, &group.domain).await?;
+        let checked = util::filed_at();
+        if !broken {
+            write_dns_state(store, &group.domain, &checked, false, None, false).await?;
+            continue;
+        }
+        let outage = state
+            .as_ref()
+            .and_then(|s| s.get("outage"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| checked.clone());
+        if !notified {
+            // The outage is recorded before the message, so a crash between the
+            // two retries the same subject and `notices.jsonl` suppresses the
+            // duplicate; the state is the second write that closes it.
+            write_dns_state(store, &group.domain, &checked, true, Some(&outage), false).await?;
+            let to = dns_contact(store, &group).await?;
+            let subject = format!(
+                "The DNS records for {} are not resolving ({outage})",
+                group.domain
+            );
+            let body = format!(
+                "The mail and website records in {domain}'s zone no longer resolve, so \
+                 mail to {domain} stops arriving and the website's certificate cannot renew.\n\n\
+                 The platform does not host the zone, cannot set a reverse record for it, \
+                 and cannot change it. Restore the MX, A, AAAA, SPF, DKIM and DMARC records \
+                 your approval email lists at your own DNS provider, and they will be \
+                 observed again on the next check. This notice is sent once per outage.\n",
+                domain = group.domain
+            );
+            notice::send_account_notice(
+                cfg,
+                store,
+                &group.site_owner,
+                "dns.broken",
+                &subject,
+                &to,
+                &body,
+            )
+            .await?;
+        }
+        write_dns_state(store, &group.domain, &checked, true, Some(&outage), true).await?;
+    }
+    Ok(())
+}
+
+/// One `groups/<domain>/dns-check.json`. `outage` is the moment the current
+/// outage was first seen, and stays fixed across its retries so the notice's
+/// subject is the same one each time.
+async fn write_dns_state(
+    store: &Store,
+    domain: &str,
+    checked_at: &str,
+    broken: bool,
+    outage: Option<&str>,
+    notified: bool,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(&json!({
+        "version": 1,
+        "checked_at": checked_at,
+        "broken": broken,
+        "outage": outage,
+        "notified": notified,
+    }))
+    .map_err(|e| format!("cannot encode the DNS check state: {e}"))?;
+    store
+        .write_record(&format!("groups/{domain}"), "dns-check.json", &bytes)
+        .await
+}
+
+/// Whether any row the recipe names has stopped resolving, or a TXT answer no
+/// longer carries the marker that says it is the record the recipe asks for.
+/// The resolver is a configured command so the acceptance test never touches the
+/// network; it is read-only by construction and the body's zone is not a file
+/// this box can write.
+async fn dns_broken(cfg: &DrainConfig, domain: &str) -> Result<bool, String> {
+    // Every row the recipe publishes: both names for A and AAAA, and the marker
+    // that makes a TXT answer the SPF, DKIM or DMARC record rather than an
+    // unrelated string at the same name.
+    let checks = [
+        ("MX", domain.to_string(), None),
+        ("A", domain.to_string(), None),
+        ("A", format!("www.{domain}"), None),
+        ("AAAA", domain.to_string(), None),
+        ("AAAA", format!("www.{domain}"), None),
+        ("TXT", domain.to_string(), Some("v=spf1")),
+        (
+            "TXT",
+            format!("{}._domainkey.{domain}", cfg.dkim_selector),
+            Some("v=DKIM1"),
+        ),
+        ("TXT", format!("_dmarc.{domain}"), Some("v=DMARC1")),
+    ];
+    for (record_type, name, marker) in checks {
+        let out = Command::new(&cfg.resolver)
+            .args(["+short", record_type, &name])
+            .output()
+            .await
+            .map_err(|e| format!("cannot run the resolver {}: {e}", cfg.resolver))?;
+        let answer = String::from_utf8_lossy(&out.stdout);
+        let answer = answer.trim();
+        if !out.status.success() || answer.is_empty() {
+            return Ok(true);
+        }
+        if marker.is_some_and(|m| !answer.contains(m)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Who a broken-DNS notice goes to: the contact the community block gave, kept
+/// in the mailbox's retained application copy, and the accountable address
+/// otherwise. The copy is inside the ninety-day purge, so an application already
+/// cleared falls back rather than failing the sweep.
+async fn dns_contact(store: &Store, group: &GroupRecord) -> Result<String, String> {
+    let copy: Option<Value> = store
+        .read_record(
+            &format!("accounts/{}", group.site_owner),
+            "application.json",
+        )
+        .await
+        .and_then(|text| serde_json::from_str(&text).ok());
+    if let Some(copy) = &copy {
+        if let Some(contact) = copy
+            .pointer("/answers/body_dns_contact")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            if validate::address(contact).is_none() {
+                return Ok(contact.to_string());
+            }
+        }
+        if let Some(address) = copy
+            .get("outside_address")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            if validate::address(address).is_none() {
+                return Ok(address.to_string());
+            }
+        }
+    }
+    // The accountable fallback: the mailbox that owns the group's site, at the
+    // body's own domain. Unlike the person path's `username@kyriakon.net`, this
+    // is an address the platform actually delivers.
+    Ok(format!("{}@{}", group.site_owner, group.domain))
 }
 
 /// Clear away every declined application whose week is up, and release the
