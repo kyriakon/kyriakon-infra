@@ -81,14 +81,15 @@ impl Fix {
             let log = fix.path("scripts.log");
             fix.script(s, &format!("#!/bin/sh\necho \"{s} $*\" >> '{log}'\n"));
         }
-        // delete-user.sh removes the box account. The store record is the
-        // drain's, so the stub leaves it, as the real script does.
+        // delete-user.sh removes the box account and the store record; the
+        // stub does both so a test sees what the box sees.
         let log = fix.path("scripts.log");
         let passwd = fix.path("passwd");
+        let accounts = fix.path("store/accounts");
         fix.script(
             "delete-user.sh",
             &format!(
-                "#!/bin/sh\necho \"delete-user.sh $*\" >> '{log}'\ngrep -v \"^$1:\" '{passwd}' > '{passwd}.del'\nmv '{passwd}.del' '{passwd}'\n"
+                "#!/bin/sh\necho \"delete-user.sh $*\" >> '{log}'\ngrep -v \"^$1:\" '{passwd}' > '{passwd}.del'\nmv '{passwd}.del' '{passwd}'\nrm -rf '{accounts}/'\"$1\"\n",
             ),
         );
         fix.add_user_writes_passwd();
@@ -3092,6 +3093,17 @@ fn upgrading_an_alias_repoints_it_without_changing_the_count() {
     );
     assert!(fix.passwd_file().contains("parish-office:"));
     assert!(fix.dir.join("keyring/parish-office.asc").exists());
+    let log = fix.scripts_log();
+    let built = log
+        .rfind("provision-member.sh parish-office")
+        .expect("the upgraded mailbox was built");
+    let reload = log
+        .rfind("reload-smtpd.sh")
+        .expect("the repointed entry was made live");
+    assert!(
+        built < reload,
+        "the repoint was not reloaded after the builder: {log}"
+    );
     let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
     assert_eq!(
         group["accounts"],
@@ -3145,8 +3157,8 @@ fn removing_a_mailbox_takes_exactly_its_account_and_entries() {
         "the account record stayed"
     );
     assert!(
-        !fix.dir.join("keyring/parish-office.asc").exists(),
-        "the keyring entry stayed"
+        fix.dir.join("keyring/parish-office.asc").exists(),
+        "the box keyring entry stays until the published key goes, as delete-user.sh leaves it"
     );
     let virtuals = fix.table("virtuals");
     assert!(
@@ -3171,6 +3183,65 @@ fn removing_a_mailbox_takes_exactly_its_account_and_entries() {
     );
     assert_eq!(fix.names("holds"), vec!["parish-office.json"]);
     assert!(fix.scripts_log().contains("delete-user.sh parish-office"));
+}
+
+/// A removal intent that names the sitting site owner while closing somebody
+/// else must not move the site's key on a retry: the state below is what a crash
+/// after the group write leaves, and the departing mailbox's own key is still in
+/// the store. Copying it would give that member the body's upload key.
+#[test]
+fn retrying_a_non_owner_removal_does_not_take_the_sites_key() {
+    let fix = Fix::new("group-remove-retry");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let office_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOffice example";
+    std::fs::write(fix.dir.join("store/keys/parish-office.pub"), office_key).unwrap();
+
+    // The crash point: the group record no longer lists the mailbox and its
+    // virtual line is gone, but its account and keys are still there.
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["accounts"] = json!(["parish-secretary"]);
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    let virtuals: Vec<String> = fix
+        .table("virtuals")
+        .lines()
+        .filter(|l| !l.starts_with("office@"))
+        .map(str::to_string)
+        .collect();
+    std::fs::write(fix.dir.join("virtuals"), virtuals.join("\n") + "\n").unwrap();
+
+    fix.file_address(
+        "parish.example",
+        "remove",
+        "",
+        "parish-office",
+        None,
+        Some("parish-secretary"),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.read("keys/parish-secretary.pub").trim(),
+        UPLOAD_KEY.trim(),
+        "the departing mailbox's key replaced the site's"
+    );
+    let after: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(after["site_owner"], "parish-secretary");
+    assert_eq!(after["accounts"], json!(["parish-secretary"]));
 }
 
 /// The same address intent handed to the drain again changes nothing: one
@@ -3427,6 +3498,31 @@ fn a_closed_username_is_held_for_ninety_days() {
         "{}",
         fix.failed_note()
     );
+}
+
+/// The hold is not only a group rule: a person's approval creates an account
+/// too, so a closed group mailbox's name cannot be taken by an applicant.
+#[test]
+fn a_person_cannot_take_a_held_group_name() {
+    let fix = Fix::new("person-held");
+    std::fs::create_dir_all(fix.dir.join("store/holds")).unwrap();
+    std::fs::write(
+        fix.dir.join("store/holds/theophilus.json"),
+        br#"{"username":"theophilus","until":"2099-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    let record = fix.filed("theophilus", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "theophilus");
+    assert!(fix.drain().status.success());
+    assert!(
+        fix.failed_note().contains("held until"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(!fix.dir.join("store/accounts/theophilus").exists());
+    assert!(fix.passwd_file().is_empty(), "{}", fix.passwd_file());
 }
 
 /// The console files a signed address intent the drain then applies, which is

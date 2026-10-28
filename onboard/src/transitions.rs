@@ -924,6 +924,14 @@ async fn approve(
     // never finish.
     if !begun {
         name_allowed(cfg, username).await?;
+        // A group mailbox that closed leaves the name held for ninety days, and
+        // this is the other gate that can create an account. Without it a person
+        // could take a name a removal had just held.
+        if let Some(until) = name_held(store, username).await? {
+            return Err(format!(
+                "the username {username} is held until {until}, so it cannot be reused yet"
+            ));
+        }
     }
 
     // The box is the oracle and the record only a fast path. A name already on
@@ -1901,8 +1909,14 @@ fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, String> {
     if key.material.trim().is_empty() {
         return Err(format!("the mail key for {} is empty", intent.mailbox));
     }
+    // The console carries whatever file the operator named. A private key, an
+    // SSH key or a truncated block would reach the encryptor's keyring and
+    // fail closed, so the shared check refuses it before the journal line.
+    let checked = crate::keycheck::pgp_public_key(&key.material)
+        .map_err(|e| format!("the mail key for {}: {e}", intent.mailbox))?;
     let mut key = key.clone();
     key.mailbox = intent.mailbox.clone();
+    key.verdict = checked.verdict;
     Ok(key)
 }
 
@@ -2137,26 +2151,34 @@ pub async fn group_address(
             run_script(cfg, "provision-member.sh", &[&intent.mailbox]).await?;
             write_group_account(store, &intent.mailbox, &intent.domain, &group.payment).await?;
             repoint_table_line(&cfg.virtuals, &entry, &intent.mailbox)?;
+            // The repoint is a table rewrite after the builder's own restart,
+            // and a retry that finds the account already made restarts nothing.
+            // Without this the upgraded address keeps reaching the shared
+            // mailbox.
+            run_script(cfg, "reload-smtpd.sh", &[]).await?;
             publish_mail_keys_publicly(cfg, &intent.mailbox, std::slice::from_ref(&key)).await?;
         }
         "remove" => {
-            let old_key = store
-                .read_record("keys", &format!("{}.pub", intent.mailbox))
-                .await;
-            // The site's generated vhost and capsule name the site owner's
-            // public tree. Moving the body's upload key to the replacement and
-            // running the builder for it writes those lanes for the new owner
-            // (provision-member.sh, then the index and reload pass); the old
-            // owner's files go with delete-user.sh.
-            let moving_site = group.site_owner == intent.mailbox
-                || (intent.site_owner.as_deref() == Some(group.site_owner.as_str())
-                    && !in_group(&intent.mailbox)
-                    && in_group(&group.site_owner));
-            if moving_site {
+            // What this pass actually closes. A mistyped name that is neither in
+            // the group nor on the box closes nothing, so it must not start a
+            // ninety-day hold either.
+            let closing = in_group(&intent.mailbox)
+                || existing_account(store, &intent.mailbox).await.is_some()
+                || account_on_box(cfg, &intent.mailbox)?;
+            // Only a pass that still sees the departing mailbox owning the site
+            // moves the upload key and the lanes. Once the group record names
+            // the replacement, a retry must not copy anything: an intent that
+            // merely named the sitting owner while removing somebody else would
+            // otherwise hand that member's key to the site.
+            let site_owner_leaving = group.site_owner == intent.mailbox;
+            if site_owner_leaving {
                 let replacement = intent
                     .site_owner
                     .as_deref()
                     .ok_or("the site owner is leaving without a replacement")?;
+                let old_key = store
+                    .read_record("keys", &format!("{}.pub", intent.mailbox))
+                    .await;
                 if let Some(material) = &old_key {
                     write_public_key(store, replacement, material).await?;
                 }
@@ -2165,31 +2187,28 @@ pub async fn group_address(
             }
             group.accounts.retain(|a| a != &intent.mailbox);
             write_group_record(store, &group).await?;
-            remove_addresses(&cfg.virtuals, &intent.domain, &intent.mailbox)?;
+            if remove_addresses(&cfg.virtuals, &intent.domain, &intent.mailbox)? {
+                // delete-user.sh restarts smtpd only when it removed a line;
+                // the lines have gone here, so this pass makes them live.
+                run_script(cfg, "reload-smtpd.sh", &[]).await?;
+            }
             store
                 .remove("keys", &format!("{}.pub", intent.mailbox))
                 .await?;
-            let keyring = format!(
-                "{}/{}.asc",
-                cfg.keyring_dir.trim_end_matches('/'),
-                intent.mailbox
-            );
-            match std::fs::remove_file(&keyring) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("cannot remove {keyring}: {e}")),
+            // The box keyring entry stays, as delete-user.sh leaves it:
+            // check-keyring-drift.sh reports a published key absent from the
+            // box, and the published key's removal is the operator's step
+            // (there is no unpublish path in this tree yet).
+            if closing {
+                hold_name(store, &intent.mailbox).await?;
             }
-            hold_name(store, &intent.mailbox).await?;
-            run_script(cfg, "delete-user.sh", &[&intent.mailbox]).await?;
-            // The account record is the oracle that tells a later approval the
-            // name is taken, and delete-user.sh leaves the store to the drain.
-            // Without this the ninety-day hold could never expire.
-            store
-                .remove_dir(&format!("accounts/{}", intent.mailbox))
-                .await?;
-            if moving_site {
+            if intent.site_owner.is_some() {
+                // After the record names the replacement and before the old
+                // tree goes: the vhost root must not point at a directory
+                // delete-user.sh is about to remove.
                 run_script(cfg, "cron-apply.sh", &["--web"]).await?;
             }
+            run_script(cfg, "delete-user.sh", &[&intent.mailbox]).await?;
         }
         _ => unreachable!("the action was checked against ADDRESS_ACTIONS"),
     }
