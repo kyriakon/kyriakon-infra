@@ -92,6 +92,13 @@ jobs:
         # The hooks have no .sh suffix, so git ls-files misses them, and nothing else
         # lints them: a quoting mistake there fires on every commit in every clone.
         run: shellcheck $(git ls-files '*.sh') .githooks/commit-msg .githooks/pre-commit .githooks/pre-push
+      # The scripts' own tests are the only automated check most of them have.
+      # They run weekly on the box, so without this a break reaches main and stays
+      # until Monday. The runner has no ksh by default.
+      - name: install ksh
+        run: sudo apt-get update && sudo apt-get install -y ksh
+      - name: self-tests
+        run: ksh scripts/self-test-all.sh
 
   terraform:
     name: terraform

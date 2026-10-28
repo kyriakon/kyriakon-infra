@@ -1028,6 +1028,10 @@ async fn approve(
         paid_until: None,
         window: window.clone(),
         outside_address: record.outside_address.clone(),
+        certificates: Vec::new(),
+        site_served: None,
+        capsule_served: None,
+        space_used: None,
         group: None,
     };
     store.ensure_dir(&format!("accounts/{username}")).await?;
@@ -1645,6 +1649,10 @@ async fn write_group_account(
         paid_until: None,
         window: None,
         outside_address: None,
+        certificates: Vec::new(),
+        site_served: None,
+        capsule_served: None,
+        space_used: None,
         group: Some(intent.domain.clone()),
     };
     let mut value =

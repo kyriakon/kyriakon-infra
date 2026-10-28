@@ -22,19 +22,77 @@ set -euo pipefail
 # drift check's children and every other test get a path that does not exist.
 export KYRIAKON_ENV=/dev/null
 
-here=$(cd "$(dirname "$0")" && pwd)
+# Scripts that cannot answer --self-test. A library has no run to make, and the
+# rest need a live box, root or a service this checkout does not have. A script
+# not named here without a self_test() fails the run, so a new script either
+# carries its test or its exemption is a deliberate edit.
+self_test_optional="
+lib.sh
+add-user.sh
+backup.sh
+deploy-nsd.sh
+deploy-onboard.sh
+gen-finger-page.sh
+onboard-store.sh
+provision-member.sh
+rehearsal.sh
+rekey-mail-key.sh
+renew-acme.sh
+restore-standup.sh
+restore-test.sh
+setup-env.sh
+"
+
+# SELF_TEST_ALL_DIR lets the self-test below run this loop over a fixture rather
+# than over the checkout.
+here=${SELF_TEST_ALL_DIR:-$(cd "$(dirname "$0")" && pwd)}
 repo="${1:-$(cd "$here/.." && pwd)}"
 failed=0
 ran=0
+
+detects_itself() {
+	printf '#!/bin/ksh\nself_test() { :; }\n' > "$1"
+}
+
+# The discovery and its refusal are the one branch worth testing here: a script
+# with no self-test must be named and failed, not skipped silently.
+self_test() {
+	work=$(mktemp -d "${TMPDIR:-/tmp}/self-test-all.XXXXXX") || exit 1
+	trap 'rm -rf "$work"' EXIT
+	detects_itself "$work/good.sh"
+	if ! SELF_TEST_ALL_DIR="$work" ksh "$0" >/dev/null 2>&1; then
+		printf 'self-test: a script with a self_test() should pass\n' >&2
+		exit 1
+	fi
+	printf '#!/bin/ksh\n: no self-test here\n' > "$work/missing.sh"
+	if SELF_TEST_ALL_DIR="$work" ksh "$0" >/dev/null 2>&1; then
+		printf 'self-test: a script with no self_test() should fail\n' >&2
+		exit 1
+	fi
+	printf 'self-test: ok\n'
+}
+
+if [ "${1:-}" = --self-test ]; then
+	self_test
+	exit 0
+fi
 
 # A script is a self-test if it defines self_test(), not if it mentions the
 # flag: every comment that says "--self-test" would otherwise match, including
 # this one, which is how the first version of this file ran itself.
 for file in "$here"/*.sh; do
-	[ "$(basename "$file")" = self-test-all.sh ] && continue
-	grep -q '^self_test()' "$file" || continue
-	ran=$((ran + 1))
 	name=$(basename "$file")
+	[ "$name" = self-test-all.sh ] && continue
+	if ! grep -q '^self_test()' "$file"; then
+		if printf '%s\n' "$self_test_optional" | grep -qx -- "$name"; then
+			continue
+		fi
+		printf 'FAIL %s\n' "$name"
+		printf '     no self_test(); add one, or list it in self_test_optional\n'
+		failed=$((failed + 1))
+		continue
+	fi
+	ran=$((ran + 1))
 	case "$name" in
 	deploy-mail.sh) args="$repo" ;;
 	deploy-relayd.sh) args="$repo/openbsd/etc" ;;
@@ -56,12 +114,12 @@ for file in "$here"/*.sh; do
 	fi
 done
 
-if [ "$ran" -eq 0 ]; then
+if [ "$ran" -eq 0 ] && [ "$failed" -eq 0 ]; then
 	printf 'self-test-all: no script in %s answers --self-test\n' "$here" >&2
 	exit 1
 fi
 if [ "$failed" -ne 0 ]; then
-	printf '\nself-test-all: %s of %s failed\n' "$failed" "$ran" >&2
+	printf '\nself-test-all: %s failed, %s passed\n' "$failed" "$ran" >&2
 	exit 1
 fi
 printf '\nself-test-all: %s passed\n' "$ran"

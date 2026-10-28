@@ -100,6 +100,36 @@ impl Store {
         })
     }
 
+    /// The account a pinned client certificate belongs to, or `None` when no
+    /// account carries the hash.
+    ///
+    /// The scan reads each `account.json` rather than an index beside the pins:
+    /// an index would be a second list that can disagree with the account, and
+    /// the account directory is small enough that one read answers it. An
+    /// account that cannot be read is skipped rather than failing the lookup,
+    /// so a damaged record answers anonymously instead of breaking the page
+    /// for everyone.
+    pub async fn account_for_certificate(&self, hash: &str) -> Option<Account> {
+        if hash.is_empty() {
+            return None;
+        }
+        for username in self.list("accounts").await.ok()? {
+            let Some(text) = self
+                .read_record(&format!("accounts/{username}"), "account.json")
+                .await
+            else {
+                continue;
+            };
+            let Ok(account) = serde_json::from_str::<Account>(&text) else {
+                continue;
+            };
+            if account.certificates.iter().any(|c| c.hash == hash) {
+                return Some(account);
+            }
+        }
+        None
+    }
+
     /// The names in one directory, sorted. A missing directory reads as empty,
     /// which is what a first run against a fresh store is: no intents, no
     /// journal, no notices, and none of those is an error to a reader.
@@ -462,6 +492,21 @@ pub struct Account {
     pub window: Option<Window>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outside_address: Option<String>,
+    /// The gemini client certificates pinned to this account, one per device.
+    /// A request whose `TLS_CLIENT_HASH` matches one of these is this member;
+    /// the hash is over the certificate, so a reissued certificate is a new
+    /// entry rather than a preserved one.
+    #[serde(default)]
+    pub certificates: Vec<Certificate>,
+    /// Whether the drain is serving the member's site and capsule, and the bytes
+    /// used under the quota. Nothing writes these yet: they are absent until the
+    /// hosting side records them, which the capsule renders as exactly that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_served: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capsule_served: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_used: Option<u64>,
     /// The domain of the group this account belongs to, for a mailbox the
     /// own-domain tier made. The group holds the payment state, so an account
     /// with this set carries no `paid_until` of its own. `None` for a person's
@@ -469,6 +514,26 @@ pub struct Account {
     /// existed reads the same.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+}
+
+/// One pinned client certificate, as a request described it.
+///
+/// The hash is the identity. The subject, issuer and validity dates are
+/// recorded beside it and are never consulted for a decision: a gemini client
+/// certificate is self-signed, so anyone can mint any subject or issuer.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Certificate {
+    /// `TLS_CLIENT_HASH`: the algorithm and the certificate's digest, which is
+    /// the only field a pin is matched on.
+    pub hash: String,
+    /// `REMOTE_USER`, the subject the certificate claims.
+    pub subject: String,
+    /// `TLS_CLIENT_ISSUER`, which on a self-signed certificate is that same
+    /// claim again.
+    pub issuer: String,
+    pub not_before: String,
+    pub not_after: String,
 }
 
 /// One address in a group's table: the localpart on the body's domain, and the
@@ -613,6 +678,53 @@ mod tests {
     fn crockford_pads_at_the_high_end_like_a_ulid() {
         assert_eq!(crockford128([0u8; 16]), "0".repeat(26));
         assert_eq!(crockford128([0xffu8; 16]), format!("7{}", "z".repeat(25)));
+    }
+
+    /// The certificate lookup: an empty hash answers nothing, an account whose
+    /// record cannot be read is skipped rather than failing the page, and a
+    /// pinned hash finds its account.
+    #[tokio::test]
+    async fn a_pinned_certificate_is_found_and_a_broken_record_is_skipped() {
+        let dir = std::env::temp_dir().join(format!("onboard-store-cert-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("accounts/broken")).unwrap();
+        std::fs::create_dir_all(dir.join("accounts/alice")).unwrap();
+        std::fs::write(dir.join("accounts/broken/account.json"), "not json").unwrap();
+        let account = serde_json::json!({
+            "version": 1,
+            "username": "alice",
+            "state": "active",
+            "decision": "approve",
+            "decided_at": "2026-10-01T09:00:00Z",
+            "rail": "no_charge",
+            "no_charge": true,
+            "created_at": "2026-10-01T09:00:00Z",
+            "paid_until": null,
+            "certificates": [{ "hash": "SHA256:aa" }],
+        });
+        std::fs::write(
+            dir.join("accounts/alice/account.json"),
+            serde_json::to_vec(&account).unwrap(),
+        )
+        .unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+
+        assert!(
+            store.account_for_certificate("").await.is_none(),
+            "an empty hash names no account"
+        );
+        assert_eq!(
+            store
+                .account_for_certificate("SHA256:aa")
+                .await
+                .expect("the pinned account")
+                .username,
+            "alice"
+        );
+        assert!(
+            store.account_for_certificate("SHA256:bb").await.is_none(),
+            "an unpinned hash answers nothing"
+        );
     }
 
     #[tokio::test]
