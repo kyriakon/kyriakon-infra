@@ -1121,7 +1121,7 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
         let body = match &member {
             Some(account) => {
                 let notices = account_notices(app, &account.username).await;
-                let recipe = group_recipe(app, account).await;
+                let recipe = group_recipe(app, account);
                 capsule::account(account, &notices, recipe.as_ref())
             }
             None => capsule::account_stranger(presented(incoming)),
@@ -1661,7 +1661,7 @@ fn branch_step(app: &App, form: BTreeMap<String, String>) -> Reply {
 async fn account(app: &App, request: &Request) -> Reply {
     let member = web_member(app, request).await;
     let dns = match &member {
-        Some(account) => group_recipe(app, account).await,
+        Some(account) => group_recipe(app, account),
         None => None,
     };
     let page: AccountPage = page::account(
@@ -1685,20 +1685,19 @@ async fn web_member(app: &App, request: &Request) -> Option<Account> {
     serde_json::from_str(&text).ok()
 }
 
-/// The DNS recipe for an account that names a group. The account's `group` is
-/// the reference and `groups/<domain>/group.json` is read for the domain the
-/// recipe is generated from, so a stale reference renders nothing rather than a
-/// recipe for a domain the platform no longer carries. An account with no group
-/// gets `None`, which is every person's account.
-async fn group_recipe(app: &App, account: &Account) -> Option<crate::dns::Recipe> {
+/// The DNS recipe for an account that names a group. `account.group` already
+/// holds the domain, and the group record is root-only (the handler runs as
+/// `_onboard`), so reading it here would return None and drop the recipe: the
+/// reference is the whole input. An account with no group gets `None`, which is
+/// every person's account.
+fn group_recipe(app: &App, account: &Account) -> Option<crate::dns::Recipe> {
     let domain = account.group.as_deref()?;
-    let group = transitions::group_record(&app.store, domain).await.ok()??;
     let values = crate::dns::Values::from(&app.cfg);
     if let Err(e) = values.check() {
         eprintln!("kyriakon-onboard: {e}");
         return None;
     }
-    Some(crate::dns::recipe(&group.domain, &values))
+    Some(crate::dns::recipe(domain, &values))
 }
 
 /// What a submission is read against.

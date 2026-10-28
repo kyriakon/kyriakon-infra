@@ -514,7 +514,7 @@ async fn a_group_member_reads_the_same_recipe_on_both_account_pages() {
         "10 mail.kyriakon.net.",
         "192.0.2.10",
         "2001:db8::10",
-        "v=spf1 mx -all",
+        "v=spf1 mx ip6:2001:db8::10 -all",
         "mail._domainkey",
         "v=DKIM1; k=rsa; p=example",
         "v=DMARC1; p=none; rua=mailto:dmarc@kyriakon.net",

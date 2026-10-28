@@ -135,7 +135,7 @@ release = "REPLACE_ME"
 mail_host = "mail.kyriakon.net"
 ipv4 = "REPLACE_ME_IPV4"
 ipv6 = "REPLACE_ME_IPV6"
-dkim_selector = "mail"
+dkim_selector = "REPLACE_ME"
 dkim_public_key = "REPLACE_ME"
 dmarc_rua = "mailto:dmarc@kyriakon.net"
 

@@ -548,7 +548,7 @@ mod tests {
         assert!(html.contains("10 mail.kyriakon.net."), "{html}");
         assert!(html.contains("192.0.2.10"), "{html}");
         assert!(html.contains("2001:db8::10"), "{html}");
-        assert!(html.contains("v=spf1 mx -all"), "{html}");
+        assert!(html.contains("v=spf1 mx ip6:2001:db8::10 -all"), "{html}");
         assert!(html.contains("mail._domainkey"), "{html}");
         assert!(html.contains("v=DMARC1; p=none"), "{html}");
         assert!(html.contains("does not host your zone"), "{html}");

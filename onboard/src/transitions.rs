@@ -1193,6 +1193,10 @@ async fn approve_group(
             ));
         }
     }
+    // The recipient is read before the journal and the intent for the same
+    // reason the person path does it: an address that cannot be mailed is a
+    // refusal, not a group half-made and an applicant never told.
+    let to = group_recipient(record, &site_owner, &domain)?;
     // Names, before the journal line and the intent: a reserved or taken name is
     // a refusal the reviewer has to take back to the applicant, not an approval
     // that started.
@@ -1248,7 +1252,6 @@ async fn approve_group(
     // itself. It is recorded before it is enqueued, so a crash between the two
     // loses an email rather than sending two on the retry.
     let recipe = dns::recipe(&domain, &values);
-    let to = group_recipient(record, &site_owner, &domain)?;
     let subject = decision_subject("approved", &domain);
     let body = format!(
         "Your application for {domain} has been approved. The mailboxes in the group are \
@@ -1869,6 +1872,13 @@ const DNS_CHECK_HOURS: i64 = 6;
 /// `groups/<domain>/dns-check.json`; the group record and the body's zone are
 /// untouched.
 pub async fn check_group_dns(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+    let values = dns::Values::from(cfg);
+    if let Err(e) = values.check() {
+        // The approval already refuses a placeholder; a box that has one has no
+        // published values to watch, and that is not a reason to hold the pass.
+        eprintln!("kyriakon-onboard: {e}");
+        return Ok(());
+    }
     let now = OffsetDateTime::now_utc();
     for name in store.list("groups").await? {
         if name.starts_with('.') {
@@ -1880,80 +1890,101 @@ pub async fn check_group_dns(cfg: &DrainConfig, store: &Store) -> Result<(), Str
         else {
             continue;
         };
-        let group: GroupRecord = serde_json::from_str(&text)
-            .map_err(|e| format!("groups/{name}/group.json does not parse: {e}"))?;
-        let state: Option<Value> = store
-            .read_record(&format!("groups/{}", group.domain), "dns-check.json")
-            .await
-            .and_then(|t| serde_json::from_str(&t).ok());
-        let checked_at = state
-            .as_ref()
-            .and_then(|s| s.get("checked_at"))
-            .and_then(Value::as_str)
-            .and_then(|t| OffsetDateTime::parse(t, &Rfc3339).ok());
-        let was_broken = state
-            .as_ref()
-            .and_then(|s| s.get("broken"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let notified = state
-            .as_ref()
-            .and_then(|s| s.get("notified"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        // A broken zone whose notice has not gone yet is retried on the next
-        // pass, not six hours later: the state is written before the send so a
-        // crash cannot lose the outage, and the notice itself is deduplicated.
-        let pending = was_broken && !notified;
-        if !pending && checked_at.is_some_and(|at| now - at < Duration::hours(DNS_CHECK_HOURS)) {
-            continue;
+        let group: GroupRecord = match serde_json::from_str(&text) {
+            Ok(group) => group,
+            Err(e) => {
+                eprintln!("kyriakon-onboard: groups/{name}/group.json does not parse: {e}");
+                continue;
+            }
+        };
+        // One group's bad record, failed write or refused notice is reported
+        // and skipped: the other groups are still watched and the pass goes on.
+        if let Err(e) = check_one_group(cfg, store, &values, &group, now).await {
+            eprintln!("kyriakon-onboard: watching {}: {e}", group.domain);
         }
-
-        let broken = dns_broken(cfg, &group.domain).await?;
-        let checked = util::filed_at();
-        if !broken {
-            write_dns_state(store, &group.domain, &checked, false, None, false).await?;
-            continue;
-        }
-        let outage = state
-            .as_ref()
-            .and_then(|s| s.get("outage"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| checked.clone());
-        if !notified {
-            // The outage is recorded before the message, so a crash between the
-            // two retries the same subject and `notices.jsonl` suppresses the
-            // duplicate; the state is the second write that closes it.
-            write_dns_state(store, &group.domain, &checked, true, Some(&outage), false).await?;
-            let to = dns_contact(store, &group).await?;
-            let subject = format!(
-                "The DNS records for {} are not resolving ({outage})",
-                group.domain
-            );
-            let body = format!(
-                "The mail and website records in {domain}'s zone no longer resolve, so \
-                 mail to {domain} stops arriving and the website's certificate cannot renew.\n\n\
-                 The platform does not host the zone, cannot set a reverse record for it, \
-                 and cannot change it. Restore the MX, A, AAAA, SPF, DKIM and DMARC records \
-                 your approval email lists at your own DNS provider, and they will be \
-                 observed again on the next check. This notice is sent once per outage.\n",
-                domain = group.domain
-            );
-            notice::send_account_notice(
-                cfg,
-                store,
-                &group.site_owner,
-                "dns.broken",
-                &subject,
-                &to,
-                &body,
-            )
-            .await?;
-        }
-        write_dns_state(store, &group.domain, &checked, true, Some(&outage), true).await?;
     }
     Ok(())
+}
+
+/// One group's due check and, on an outage, its one notice.
+async fn check_one_group(
+    cfg: &DrainConfig,
+    store: &Store,
+    values: &dns::Values,
+    group: &GroupRecord,
+    now: OffsetDateTime,
+) -> Result<(), String> {
+    let state: Option<Value> = store
+        .read_record(&format!("groups/{}", group.domain), "dns-check.json")
+        .await
+        .and_then(|t| serde_json::from_str(&t).ok());
+    let checked_at = state
+        .as_ref()
+        .and_then(|s| s.get("checked_at"))
+        .and_then(Value::as_str)
+        .and_then(|t| OffsetDateTime::parse(t, &Rfc3339).ok());
+    let was_broken = state
+        .as_ref()
+        .and_then(|s| s.get("broken"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let notified = state
+        .as_ref()
+        .and_then(|s| s.get("notified"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // A broken zone whose notice has not gone yet is retried on the next pass,
+    // not six hours later: the state is written before the send so a crash
+    // cannot lose the outage, and the notice itself is deduplicated.
+    let pending = was_broken && !notified;
+    if !pending && checked_at.is_some_and(|at| now - at < Duration::hours(DNS_CHECK_HOURS)) {
+        return Ok(());
+    }
+
+    let broken = dns_broken(cfg, values, &group.domain).await?;
+    let checked = util::filed_at();
+    if !broken {
+        write_dns_state(store, &group.domain, &checked, false, None, false).await?;
+        return Ok(());
+    }
+    let outage = state
+        .as_ref()
+        .and_then(|s| s.get("outage"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| checked.clone());
+    if !notified {
+        // The outage is recorded before the message, so a crash between the two
+        // retries the same subject and `notices.jsonl` suppresses the duplicate;
+        // the state is the second write that closes it.
+        write_dns_state(store, &group.domain, &checked, true, Some(&outage), false).await?;
+        let to = dns_contact(store, group).await?;
+        let subject = format!(
+            "The DNS records for {} are not resolving ({outage})",
+            group.domain
+        );
+        let body = format!(
+            "One or more of the records in {domain}'s zone that the platform watches no \
+             longer resolve. If the MX, A or AAAA row is the one missing, mail to {domain} \
+             stops arriving and the website's certificate cannot renew.\n\n\
+             The platform does not host the zone, cannot set a reverse record for it, \
+             and cannot change it. Restore the MX, A, AAAA, SPF, DKIM and DMARC records \
+             your approval email lists at your own DNS provider, and they will be \
+             observed again on the next check. This notice is sent once per outage.\n",
+            domain = group.domain
+        );
+        notice::send_account_notice(
+            cfg,
+            store,
+            &group.site_owner,
+            "dns.broken",
+            &subject,
+            &to,
+            &body,
+        )
+        .await?;
+    }
+    write_dns_state(store, &group.domain, &checked, true, Some(&outage), true).await
 }
 
 /// One `groups/<domain>/dns-check.json`. `outage` is the moment the current
@@ -1985,37 +2016,56 @@ async fn write_dns_state(
 /// The resolver is a configured command so the acceptance test never touches the
 /// network; it is read-only by construction and the body's zone is not a file
 /// this box can write.
-async fn dns_broken(cfg: &DrainConfig, domain: &str) -> Result<bool, String> {
-    // Every row the recipe publishes: both names for A and AAAA, and the marker
-    // that makes a TXT answer the SPF, DKIM or DMARC record rather than an
-    // unrelated string at the same name.
-    let checks = [
-        ("MX", domain.to_string(), None),
-        ("A", domain.to_string(), None),
-        ("A", format!("www.{domain}"), None),
-        ("AAAA", domain.to_string(), None),
-        ("AAAA", format!("www.{domain}"), None),
-        ("TXT", domain.to_string(), Some("v=spf1")),
-        (
-            "TXT",
-            format!("{}._domainkey.{domain}", cfg.dkim_selector),
-            Some("v=DKIM1"),
-        ),
-        ("TXT", format!("_dmarc.{domain}"), Some("v=DMARC1")),
-    ];
-    for (record_type, name, marker) in checks {
-        let out = Command::new(&cfg.resolver)
-            .args(["+short", record_type, &name])
-            .output()
-            .await
-            .map_err(|e| format!("cannot run the resolver {}: {e}", cfg.resolver))?;
-        let answer = String::from_utf8_lossy(&out.stdout);
-        let answer = answer.trim();
-        if !out.status.success() || answer.is_empty() {
-            return Ok(true);
-        }
-        if marker.is_some_and(|m| !answer.contains(m)) {
-            return Ok(true);
+async fn dns_broken(cfg: &DrainConfig, values: &dns::Values, domain: &str) -> Result<bool, String> {
+    // The checks come from the recipe itself, so a row added to it (or a
+    // rotated selector) is watched without a second list to edit.
+    let recipe = dns::recipe(domain, values);
+    for row in &recipe.rows {
+        let names = match row.name.as_str() {
+            "@" => vec![domain.to_string()],
+            "@ and www" => vec![domain.to_string(), format!("www.{domain}")],
+            name => vec![format!("{name}.{domain}")],
+        };
+        // A TXT row is matched by its leading tag ("v=spf1", "v=DKIM1;", ...),
+        // so an unrelated string at the same name is not the record.
+        let marker = (row.record_type == "TXT")
+            .then(|| row.value.split_whitespace().next())
+            .flatten();
+        for name in names {
+            // The options go after the name so a caller's own resolver stub can
+            // read the type and name positionally; `+time`/`+tries` bound a
+            // resolver that is not answering.
+            let out = Command::new(&cfg.resolver)
+                .args([
+                    "+short",
+                    row.record_type,
+                    name.as_str(),
+                    "+time=2",
+                    "+tries=1",
+                ])
+                .output()
+                .await
+                .map_err(|e| format!("cannot run the resolver {}: {e}", cfg.resolver))?;
+            if !out.status.success() {
+                // No answer is not the body's zone being broken: dig exits
+                // non-zero when it could not reach a server, and a name that
+                // does not resolve answers successfully with nothing. Only the
+                // second is an outage, so this is the platform's own failure.
+                return Err(format!(
+                    "the resolver {} could not answer {name} {}: {}",
+                    cfg.resolver,
+                    row.record_type,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            let answer = String::from_utf8_lossy(&out.stdout);
+            let answer = answer.trim();
+            if answer.is_empty() {
+                return Ok(true);
+            }
+            if marker.is_some_and(|m| !answer.contains(m)) {
+                return Ok(true);
+            }
         }
     }
     Ok(false)

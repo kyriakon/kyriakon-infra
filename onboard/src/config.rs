@@ -179,7 +179,8 @@ pub struct DrainConfig {
     pub dkim_selector: String,
     pub dkim_public_key: String,
     pub dmarc_rua: String,
-    /// The resolver the broken-DNS sweep runs: `dig` or `host`, by path. A value
+    /// The resolver the broken-DNS sweep runs: `dig`, by path, with its
+    /// `+short` and timeout options. A value
     /// so the acceptance test can point it at a stub and never touch the
     /// network.
     pub resolver: String,
@@ -340,6 +341,7 @@ mod tests {
         // address here would be a second copy that can drift.
         assert_eq!(c.ipv4, "REPLACE_ME_IPV4");
         assert_eq!(c.ipv6, "REPLACE_ME_IPV6");
+        assert_eq!(c.dkim_selector, "REPLACE_ME");
         assert_eq!(c.dkim_public_key, "REPLACE_ME");
         assert_eq!(c.resolver, "/usr/bin/dig");
         assert!(crate::dns::Values::from(&c).check().is_err());
@@ -353,6 +355,7 @@ mod tests {
             toml::from_str(include_str!("../../openbsd/etc/onboard/onboard.toml")).unwrap();
         assert_eq!(c.ipv4, "REPLACE_ME_IPV4");
         assert_eq!(c.ipv6, "REPLACE_ME_IPV6");
+        assert_eq!(c.dkim_selector, "REPLACE_ME");
         assert_eq!(c.dkim_public_key, "REPLACE_ME");
         assert!(crate::dns::Values::from(&c).check().is_err());
     }

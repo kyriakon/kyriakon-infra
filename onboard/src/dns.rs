@@ -20,7 +20,6 @@ pub struct Row {
 /// will not do; the rows are the records the body publishes; the closing repeats
 /// the three things the platform cannot do, plainly.
 pub struct Recipe {
-    pub domain: String,
     pub opening: String,
     pub rows: Vec<Row>,
     pub closing: Vec<String>,
@@ -95,7 +94,6 @@ impl Values {
 /// The recipe for `domain`, generated from the platform's own published values.
 pub fn recipe(domain: &str, values: &Values) -> Recipe {
     Recipe {
-        domain: domain.to_string(),
         opening: format!(
             "You keep {domain}. The platform never touches its zone: you create \
              these records at your own registrar or DNS provider, and mail and the \
@@ -124,7 +122,11 @@ pub fn recipe(domain: &str, values: &Values) -> Recipe {
                 what: "Outbound mail is authorised",
                 name: "@".to_string(),
                 record_type: "TXT",
-                value: "v=spf1 mx -all".to_string(),
+                // `mx` covers only the mail host's A record: it deliberately
+                // has no AAAA, so a message the box sends over IPv6 matches
+                // nothing unless the literal is here. The platform's own zone
+                // carries the same pair for the same reason.
+                value: format!("v=spf1 mx ip6:{} -all", values.ipv6),
             },
             Row {
                 what: "Outbound mail is signed",
@@ -208,7 +210,10 @@ mod tests {
         assert_eq!(row(&built, "MX", "@").value, "10 mail.kyriakon.net.");
         assert_eq!(row(&built, "A", "@ and www").value, "192.0.2.10");
         assert_eq!(row(&built, "AAAA", "@ and www").value, "2001:db8::10");
-        assert_eq!(row(&built, "TXT", "@").value, "v=spf1 mx -all");
+        assert_eq!(
+            row(&built, "TXT", "@").value,
+            "v=spf1 mx ip6:2001:db8::10 -all"
+        );
         assert_eq!(
             row(&built, "TXT", "mail._domainkey").value,
             "v=DKIM1; k=rsa; p=examplepublickey"

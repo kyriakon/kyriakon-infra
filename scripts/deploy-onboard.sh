@@ -185,13 +185,28 @@ case "${KYRIAKON_IPV6:-}" in
 	;;
 esac
 
-# The DKIM public key is the one the tracked zone publishes, read here rather
-# than copied into a config: a second copy would keep publishing after a
-# rotation and nothing would fail. The record is two adjacent quoted strings, so
-# the quoted parts are concatenated and the zone's own base64 is what lands.
-dkim_public_key=$(
+# The DKIM selector and public key are the ones the tracked zone publishes, read
+# here rather than copied into a config: a second copy would keep publishing
+# after a rotation and nothing would fail. The record is two adjacent quoted
+# strings, so the quoted parts are concatenated and the zone's own base64 is
+# what lands.
+dkim_selector=$(
 	awk '
-		/^mail\._domainkey/ { found = 1 }
+		/^[a-z0-9-]+\._domainkey[[:space:]]+IN[[:space:]]+TXT/ {
+			sub(/\._domainkey.*/, "")
+			print
+			exit
+		}
+	' "$repo_dir/openbsd/etc/nsd/kyriakon.net.zone"
+)
+case "$dkim_selector" in
+"" | *REPLACE_ME*)
+	die "cannot read the DKIM selector from $repo_dir/openbsd/etc/nsd/kyriakon.net.zone"
+	;;
+esac
+dkim_public_key=$(
+	awk -v sel="$dkim_selector" '
+		index($0, sel "._domainkey") == 1 { found = 1 }
 		found {
 			text = $0
 			while (match(text, /"[^"]*"/)) {
@@ -211,10 +226,11 @@ v=DKIM1*)
 esac
 
 onboard_candidate=$(mktemp /etc/onboard/.onboard.toml.XXXXXX)
-RELEASE="$release" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" DKIM="$dkim_public_key" awk '
+RELEASE="$release" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
 	/^release[[:space:]]*=/ { print "release = \"" ENVIRON["RELEASE"] "\""; next }
 	/^ipv4[[:space:]]*=/ { print "ipv4 = \"" ENVIRON["IPV4"] "\""; next }
 	/^ipv6[[:space:]]*=/ { print "ipv6 = \"" ENVIRON["IPV6"] "\""; next }
+	/^dkim_selector[[:space:]]*=/ { print "dkim_selector = \"" ENVIRON["SELECTOR"] "\""; next }
 	/^dkim_public_key[[:space:]]*=/ { print "dkim_public_key = \"" ENVIRON["DKIM"] "\""; next }
 	{ print }
 ' "$repo_dir/openbsd/etc/onboard/onboard.toml" > "$onboard_candidate"
@@ -236,11 +252,12 @@ mv "$onboard_candidate" /etc/onboard/onboard.toml
 # tracked template, substituted here; nothing is edited on the box.
 install -d -m 0700 -o root -g wheel /etc/kyriakon/onboard
 drain_candidate=$(mktemp /etc/kyriakon/onboard/.drain.toml.XXXXXX)
-RELEASE="$release" POSTAL="$POSTAL_ADDRESS" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" DKIM="$dkim_public_key" awk '
+RELEASE="$release" POSTAL="$POSTAL_ADDRESS" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
 	/^release[[:space:]]*=/ { print "release = \"" ENVIRON["RELEASE"] "\""; next }
 	/^postal_address[[:space:]]*=/ { print "postal_address = \"" ENVIRON["POSTAL"] "\""; next }
 	/^ipv4[[:space:]]*=/ { print "ipv4 = \"" ENVIRON["IPV4"] "\""; next }
 	/^ipv6[[:space:]]*=/ { print "ipv6 = \"" ENVIRON["IPV6"] "\""; next }
+	/^dkim_selector[[:space:]]*=/ { print "dkim_selector = \"" ENVIRON["SELECTOR"] "\""; next }
 	/^dkim_public_key[[:space:]]*=/ { print "dkim_public_key = \"" ENVIRON["DKIM"] "\""; next }
 	{ print }
 ' "$repo_dir/openbsd/etc/onboard/drain.toml" > "$drain_candidate"

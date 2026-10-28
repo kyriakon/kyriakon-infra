@@ -2797,7 +2797,7 @@ fn a_body_approval_email_carries_the_dns_recipe() {
         "10 mail.kyriakon.net.",
         "192.0.2.10",
         "2001:db8::10",
-        "v=spf1 mx -all",
+        "v=spf1 mx ip6:2001:db8::10 -all",
         "mail._domainkey",
         "v=DKIM1; k=rsa; p=examplepublickey",
         "v=DMARC1; p=none; rua=mailto:dmarc@kyriakon.net",
@@ -2957,6 +2957,63 @@ fn a_complete_recipe_sends_no_dns_notice() {
     assert!(
         !fix.sent().contains("not resolving"),
         "a healthy zone was reported:\n{}",
+        fix.sent()
+    );
+}
+
+/// A resolver that cannot answer says nothing about the body's zone. It must not
+/// mail the contact to repair a zone that may be healthy, and it must not record
+/// an observation it did not make.
+#[test]
+fn a_resolver_that_cannot_answer_is_not_an_outage() {
+    let fix = Fix::new("group-dns-resolver-down");
+    fix.script("dig", "#!/bin/sh\nexit 1\n");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.sent().contains("not resolving"),
+        "a failed lookup was reported as the zone's fault:\n{}",
+        fix.sent()
+    );
+    assert!(
+        !fix.dir
+            .join("store/groups/parish.example/dns-check.json")
+            .exists(),
+        "a check that did not run was recorded"
+    );
+}
+
+/// One group's unreadable record is reported and skipped; the other groups are
+/// still watched and the pass carries on.
+#[test]
+fn one_bad_group_record_does_not_stop_the_sweep() {
+    let fix = Fix::new("group-dns-bad-record");
+    fix.resolver(Some("MX"));
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    let bad = fix.dir.join("store/groups/broken.example");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(bad.join("group.json"), "not json").unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.sent()
+            .matches("Subject: The DNS records for parish.example are not resolving")
+            .count(),
+        1,
+        "the healthy group was not watched after the bad record:\n{}",
         fix.sent()
     );
 }
