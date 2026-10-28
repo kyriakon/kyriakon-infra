@@ -23,10 +23,11 @@
 # page renders) and webhooks/ (a webhook's raw body and signature header). It
 # also owns mail/, the Maildir the smtpd action for apply@ delivers into as that
 # user. The rest belongs to the root drain: accounts, groups, tokens, keys (the
-# members' public upload keys, which the builder reads), ledger, rates and
-# journal.jsonl. `/etc/kyriakon/onboard/` is the drain's own root-only
-# home for Stripe's signing secret and the keyring publish token; it is not under
-# the store root, which is why it is created here too.
+# members' public upload keys, which the builder reads), holds (a closed
+# member's name, kept ninety days), ledger, rates and journal.jsonl.
+# `/etc/kyriakon/onboard/` is the drain's own root-only home for Stripe's
+# signing secret and the keyring publish token; it is not under the store root,
+# which is why it is created here too.
 #
 # The `_onboard` user is created by hand, never by this script: it is a
 # reserved-uid account in the shape `_gmid` has, and useradd is an operator step.
@@ -146,6 +147,7 @@ store_dir accounts     root wheel 750
 store_dir groups       root wheel 750
 store_dir tokens       root wheel 750
 store_dir keys         root wheel 750
+store_dir holds        root wheel 750
 store_dir ledger       root wheel 750
 store_dir rates        root wheel 750
 

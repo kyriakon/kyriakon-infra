@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 
 use crate::config::DrainConfig;
 use crate::sign;
-use crate::store::Store;
+use crate::store::{KeyRecord, Store};
 use crate::transitions::{self, DecisionIntent};
 
 /// One pass: every intent, then the sweeps. The drain is a single short-lived
@@ -81,6 +81,7 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
             transitions::set_password(cfg, store, key, intent, file, &value).await
         }
         "provision-group" => transitions::provision_group(cfg, store, &value, file).await,
+        "group-address" => transitions::group_address(cfg, store, key, &value, file).await,
         _ => transitions::refuse(cfg, store, file, &value).await,
     }
 }
@@ -106,6 +107,43 @@ pub async fn file_decision(
         "filed_at": crate::util::filed_at(),
         "application": { "username": username, "status_token": token },
         "action": action,
+        "sig": sig,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    Ok(id)
+}
+
+/// File one address change in a group, as `kyriakon-onboardctl address` does.
+///
+/// The signature is the console's, over `sign::address_payload` for exactly
+/// these fields: `intents/` belongs to the unprivileged half, so the drain
+/// carries an address change out only when the root-only key signed it.
+#[allow(clippy::too_many_arguments)]
+pub async fn file_group_address(
+    store: &Store,
+    domain: &str,
+    action: &str,
+    address: &str,
+    mailbox: &str,
+    mail_key: Option<&KeyRecord>,
+    site_owner: Option<&str>,
+    sig: &str,
+) -> Result<String, String> {
+    let id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({
+        "id": id,
+        "kind": "group-address",
+        "filed_at": crate::util::filed_at(),
+        "domain": domain,
+        "action": action,
+        "address": address,
+        "mailbox": mailbox,
+        "mail_key": mail_key,
+        "site_owner": site_owner,
         "sig": sig,
     });
     let bytes =

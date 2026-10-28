@@ -89,6 +89,19 @@ pub fn password_payload(token: &str, until: &str) -> String {
     format!("password:{token}:{until}")
 }
 
+/// The payload a group-address intent signs: every field the drain acts on, so
+/// a signature for one address change cannot be replayed as another. The
+/// replacement site owner is empty when the change names none.
+pub fn address_payload(
+    domain: &str,
+    action: &str,
+    address: &str,
+    mailbox: &str,
+    site_owner: &str,
+) -> String {
+    format!("address:{domain}:{action}:{address}:{mailbox}:{site_owner}")
+}
+
 /// One decision link, pointing at the handler's click-through path.
 pub fn decide_link(base: &str, key: &[u8], token: &str, action: &str) -> Result<String, String> {
     let sig = sign(key, &decide_payload(token, action))?;
