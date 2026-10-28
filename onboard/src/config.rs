@@ -48,6 +48,12 @@ pub struct Config {
     /// Its directory is set-group-id to that account's group for the same reason
     /// the other two carry their daemon's group.
     pub portal_socket: String,
+    /// The TCP address the Titan upload listener binds. It is loopback-only and
+    /// relayd is the only thing off the box that can reach it: the relay
+    /// terminates TLS with the capsule's certificate and forwards with PROXY
+    /// protocol v1, which is how this listener still sees the client's address.
+    /// The address is the forward target in the commented relayd block.
+    pub titan_listener: String,
     /// The deployed commit and date, e.g. "2026-10-10 1a2b3c4". The acceptance
     /// records carry it as the version of each document accepted, and it is the
     /// version of the question list an application was answered against. It is
@@ -174,6 +180,7 @@ mod tests {
              httpd_socket = \"/home/www/run/onboard-httpd/httpd.sock\"\n\
              gemini_socket = \"/home/www/run/onboard/onboard.sock\"\n\
              portal_socket = \"/home/www/run/onboard-portal/portal.sock\"\n\
+             titan_listener = \"127.0.0.1:7081\"\n\
              release = \"REPLACE_ME\"\n",
         )
         .unwrap();
@@ -181,6 +188,7 @@ mod tests {
         assert_eq!(c.httpd_socket, "/home/www/run/onboard-httpd/httpd.sock");
         assert_eq!(c.gemini_socket, "/home/www/run/onboard/onboard.sock");
         assert_eq!(c.portal_socket, "/home/www/run/onboard-portal/portal.sock");
+        assert_eq!(c.titan_listener, "127.0.0.1:7081");
     }
 
     /// The handler config the deploy installs, not a fixture that can agree with a
@@ -196,6 +204,7 @@ mod tests {
             handler.portal_socket,
             "/home/www/run/onboard-portal/portal.sock"
         );
+        assert_eq!(handler.titan_listener, "127.0.0.1:7081");
         assert_eq!(handler.pages, "/var/db/onboard/pages");
     }
 
@@ -205,7 +214,7 @@ mod tests {
             "store_rooot = \"/x\"\n\
              reserved=\"r\"\ncatalogue=\"c\"\npages=\"p\"\n\
              httpd_socket=\"/a\"\ngemini_socket=\"/b\"\n\
-             portal_socket=\"/c\"\nrelease=\"r\"\n",
+             portal_socket=\"/c\"\ntitan_listener=\"127.0.0.1:7081\"\nrelease=\"r\"\n",
         );
         assert!(r.is_err());
     }
@@ -228,6 +237,7 @@ mod tests {
                  httpd_socket = \"/a\"\n\
                  gemini_socket = \"/b\"\n\
                  portal_socket = \"/c\"\n\
+                 titan_listener = \"127.0.0.1:7081\"\n\
                  release = \"r\"\n{extra}"
             );
             let r: Result<Config, _> = toml::from_str(&text);
