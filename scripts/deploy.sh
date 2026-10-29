@@ -92,8 +92,15 @@ classify() {
 	# drain's script directory.
 	scripts/add-user.sh | scripts/provision-member.sh | scripts/delete-user.sh | \
 		scripts/quota-apply.sh | scripts/provision-member-web.sh | \
-		scripts/provision-member-capsule.sh | scripts/publish-mail-key.sh | \
+		scripts/provision-member-capsule.sh | scripts/provision-member-acme.sh | \
+		scripts/publish-mail-key.sh | \
 		scripts/set-mail-password.sh | scripts/reload-smtpd.sh) needs_onboard=yes ;;
+	# A helper of both the relay deploy and the drain's web pass, so a change to
+	# it is both.
+	scripts/relayd-members.sh)
+		needs_relayd=yes
+		needs_onboard=yes
+		;;
 	scripts/cron-apply.sh)
 		needs_onboard=yes
 		manual_cron=yes
@@ -400,6 +407,13 @@ self_test() {
 	reset_plan
 	classify 'scripts/provision-member.sh'
 	check 'a drain script plans deploy-onboard' "$needs_onboard" yes
+	reset_plan
+	classify 'scripts/provision-member-acme.sh'
+	check 'the acme lane plans deploy-onboard' "$needs_onboard" yes
+	reset_plan
+	classify 'scripts/relayd-members.sh'
+	check 'the relayd member helper plans both deploys' \
+		"$needs_relayd $needs_onboard" 'yes yes'
 	reset_plan
 	classify 'scripts/lib.sh'
 	check 'lib.sh plans both deploys' "$needs_mail $needs_onboard" 'yes yes'

@@ -53,8 +53,12 @@
 # no entry in services_for below stops the run instead of being renewed into no
 # daemon, so a name cannot be added to the config without this script being told
 # what holds it.
-# Per-member certificates belong in a file the config includes (acme-client.conf(5)
-# documents `include`), so that neither lane inherits the other's domain list.
+# Per-member certificates live in files acme-client.conf includes
+# (acme-client.conf(5) documents `include`), so that neither lane inherits the
+# other's domain list. The top-level parse below deliberately does not follow the
+# include — those names are the queue's for a first issue — and reads the member
+# directory beside it instead, because a renewal is this lane's and spends none of
+# the refill.
 #
 # A Retry-After cannot be honoured here. acme-client 7.9 does not read that
 # header, and it prints the ACME problem detail only for some replies, so a
@@ -162,7 +166,6 @@ trap cleanup EXIT
 
 # One "<handle> <full chain path>" line per domain block. A block starts at
 # column 0 and its settings are indented, so the two patterns cannot collide.
-# Included files are deliberately not followed: those are the queue's names.
 #
 # Comment lines are skipped in this parse and in the challenge directory one
 # below, because the config's prose names the settings it explains and a parser
@@ -171,16 +174,36 @@ trap cleanup EXIT
 # challenge directory called "duplicate", which stopped the run before a single
 # certificate was asked for, every night. A setting is a line that is not a
 # comment.
-domains=$(awk '
-	/^[ \t]*#/ { next }
-	/^domain[ \t]/ { handle = $2; next }
-	handle != "" && /domain full chain certificate/ {
-		path = $5
-		gsub(/"/, "", path)
-		print handle, path
-		handle = ""
-	}
-' "$acme_conf")
+domain_blocks() {
+	awk '
+		/^[ \t]*#/ { next }
+		/^domain[ \t]/ { handle = $2; next }
+		handle != "" && /domain full chain certificate/ {
+			path = $5
+			gsub(/"/, "", path)
+			print handle, path
+			handle = ""
+		}
+	' "$@"
+}
+
+domains=$(domain_blocks "$acme_conf")
+
+# Member blocks live in the directory acme-client.conf includes, one file per
+# name, written by scripts/provision-member-acme.sh. The include is not followed
+# by the top-level parse above, because those are the queue's names for a first
+# issue; a renewal is this lane's, spends none of the refill, and is the only
+# thing that keeps a member's certificate from lapsing ninety days after signup.
+# The same parse reads the files, so the two lanes cannot disagree about a block.
+member_conf_d=${ACME_MEMBER_CONF_D:-/etc/acme-client.d}
+set -- "$member_conf_d"/*.kyriakon.net.conf
+if [ -e "$1" ]; then
+	member_domains=$(domain_blocks "$@")
+	if [ -n "$member_domains" ]; then
+		domains="$domains
+$member_domains"
+	fi
+fi
 
 if [ -z "$domains" ]; then
 	# A config this script cannot parse must not read as a clean run: that is a
@@ -248,6 +271,10 @@ services_for() {
 	mail.kyriakon.net) printf 'dovecot smtpd' ;;
 	kyriakon.net | oliver.kyriakon.net) printf 'relayd' ;;
 	kyriakon.com) printf 'relayd' ;;
+	# A member's own name is presented by the relay's generated keypair region
+	# (openbsd/etc/relayd.conf, scripts/relayd-members.sh), so a renewed member
+	# certificate reaches the daemon that serves it with the same restart.
+	*.kyriakon.net) printf 'relayd' ;;
 	*) return 1 ;;
 	esac
 }

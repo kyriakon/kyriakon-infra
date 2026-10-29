@@ -5,9 +5,10 @@
 #
 #   1. Root's crontab lines for the scheduled scripts (the default mode).
 #   2. The generated indexes that httpd.conf, gmid.conf and acme-client.conf
-#      include, from the per-member files the signup path has written (--web).
-#      httpd and gmid are reloaded after a rewrite; acme-client is not, because
-#      it reads its configuration when it runs rather than holding it open.
+#      include, and the generated member keypair region of relayd.conf, from the
+#      per-member files the signup path has written (--web). httpd, gmid and
+#      relayd are reloaded after a rewrite; acme-client is not, because it reads
+#      its configuration when it runs rather than holding it open.
 #
 # Runs ON the box as root:
 #
@@ -64,6 +65,8 @@
 
 set -euo pipefail
 umask 077
+
+script_dir=$(cd "$(dirname "$0")" && pwd)
 
 check_only=no
 web_only=no
@@ -159,12 +162,24 @@ die() {
 # that is not there, because the drain writes each member file with
 # temp-then-rename and this reads the directory. A file that appears after the
 # index rewrite waits for the next pass, which is the harmless direction.
+#
+# The relayd half runs with them and for the same reason. relayd can only present
+# a certificate its configuration names, and relayd.conf cannot include a file
+# where a keypair is written (include is a top-level statement and a keypair is a
+# statement inside `http protocol`), so the tracked file carries a marked region
+# that scripts/relayd-members.sh fills from the member files. A certificate that
+# lands after provisioning becomes a keypair line, a link relayd can load, and a
+# reload on the next pass; the region is restored from a saved copy if anything
+# in the batch fails, exactly as the indexes are.
 
 httpd_d=/etc/httpd.d
 gmid_d=/etc/gmid.d
 acme_d=/etc/acme-client.d
 httpd_conf=/etc/httpd.conf
 gmid_conf=/etc/gmid.conf
+relayd_conf=/etc/relayd.conf
+ssl_dir=/etc/ssl
+ssl_private=/etc/ssl/private
 
 # regen_index <dir>: rebuild <dir>/index.conf from the member files present.
 # Returns 1 when the index already matches, so the caller skips the reload.
@@ -211,9 +226,44 @@ restore_indexes() {
 	done
 }
 
+# regen_keypairs: the member keypair region of relayd.conf, rewritten from the
+# member files. Returns 0 when the region changed, 1 when it did not and 2 when
+# there is no relayd.conf to rewrite (a box that has not run
+# scripts/deploy-relayd.sh has no 443 at all, so there is nothing to key).
+#
+# The saved copy is taken before the write, and only kept when the region
+# changed, so a failure later in the pass can put the region the running relay
+# was started from back, for the reason restore_indexes exists.
+regen_keypairs() {
+	[ -f "$relayd_conf" ] || return 2
+	if [ "$check_only" = yes ]; then
+		set -- --check "$relayd_conf"
+	else
+		set -- "$relayd_conf"
+	fi
+	result=$(RELAYD_MEMBERS_HTTPD_D="$httpd_d" \
+		RELAYD_MEMBERS_SSL_DIR="$ssl_dir" \
+		RELAYD_MEMBERS_SSL_PRIVATE="$ssl_private" \
+		ksh "$script_dir/relayd-members.sh" "$@") \
+		|| {
+			rm -f "$relayd_conf.saved.$$"
+			die "$relayd_conf could not have its member keypair region rendered, so nothing was reloaded"
+		}
+	case "$result" in
+	changed) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+restore_keypairs() {
+	[ -f "$relayd_conf.saved.$$" ] || return 0
+	mv "$relayd_conf.saved.$$" "$relayd_conf"
+}
+
 apply_web() {
 	changed=""
 	acme_changed=""
+	keypairs_changed=no
 	regen_index "$httpd_d" && changed="$changed httpd"
 	regen_index "$gmid_d" && changed="$changed gmid"
 	# acme-client.conf's index is rewritten the same way and keeps the same saved
@@ -222,24 +272,49 @@ apply_web() {
 	# renewal rather than here, since the check that names a bad member block is
 	# acme-client itself.
 	regen_index "$acme_d" && acme_changed=yes
-	if [ -z "$changed" ] && [ -z "$acme_changed" ]; then
+	# The relayd region, from the same directory. --check passes --check through
+	# to the helper, so a dry run writes neither the file nor the certificate
+	# links it makes.
+	if [ -f "$relayd_conf" ] && [ "$check_only" = no ]; then
+		cp -p "$relayd_conf" "$relayd_conf.saved.$$"
+	fi
+	if regen_keypairs; then
+		keypairs_changed=yes
+	else
+		rm -f "$relayd_conf.saved.$$"
+	fi
+	if [ -z "$changed" ] && [ -z "$acme_changed" ] && [ "$keypairs_changed" = no ]; then
 		printf 'generated indexes: nothing to change, nothing reloaded\n'
 		return 0
 	fi
 	printf 'indexes to rewrite:%s%s\n' "$changed" "${acme_changed:+ acme-client}"
+	if [ "$keypairs_changed" = yes ]; then
+		if [ "$check_only" = yes ]; then
+			printf 'member keypairs: %s would change\n' "$relayd_conf"
+		else
+			printf 'member keypairs: %s rewritten\n' "$relayd_conf"
+		fi
+	fi
 	if [ "$check_only" = yes ]; then
 		printf '\n--check: nothing was written and nothing was reloaded.\n'
 		return 0
 	fi
-	# Check both configs before either reload. rcctl runs the same configtest, but
-	# doing it here names the failing file while both daemons are still serving.
+	# Check every config before either reload. rcctl runs the same configtest, but
+	# doing it here names the failing file while the daemons are still serving.
 	if ! httpd -n -f "$httpd_conf"; then
 		restore_indexes
+		restore_keypairs
 		die "${httpd_conf} does not check, so the running configuration was left alone"
 	fi
 	if ! gmid -n -c "$gmid_conf"; then
 		restore_indexes
+		restore_keypairs
 		die "${gmid_conf} does not check, so the running configuration was left alone"
+	fi
+	if [ -f "$relayd_conf" ] && ! relayd -n -f "$relayd_conf"; then
+		restore_indexes
+		restore_keypairs
+		die "${relayd_conf} does not check, so the running configuration was left alone"
 	fi
 	# A failed reload restores the indexes this pass wrote, as the two configtest
 	# arms above do. The daemon is still serving the old configuration, so leaving
@@ -255,9 +330,13 @@ apply_web() {
 		httpd) idx="$httpd_d/index.conf" ;;
 		gmid) idx="$gmid_d/index.conf" ;;
 		esac
-		rcctl reload "$d" || { restore_indexes; die "rcctl reload $d failed"; }
+		rcctl reload "$d" || { restore_indexes; restore_keypairs; die "rcctl reload $d failed"; }
 		rm -f "$idx.saved.$$"
 	done
+	if [ "$keypairs_changed" = yes ]; then
+		rcctl reload relayd || { restore_indexes; restore_keypairs; die "rcctl reload relayd failed"; }
+		rm -f "$relayd_conf.saved.$$"
+	fi
 	rm -f "$httpd_d/index.conf.saved.$$" "$gmid_d/index.conf.saved.$$" \
 		"$acme_d/index.conf.saved.$$"
 	if [ -n "$changed" ]; then
@@ -286,6 +365,7 @@ self_test() {
 	mkdir "$stub"
 	printf '#!/bin/sh\nexit 0\n' > "$stub/httpd"
 	printf '#!/bin/sh\nexit 0\n' > "$stub/gmid"
+	printf '#!/bin/sh\nexit 0\n' > "$stub/relayd"
 	# The stub expands the variable at its own run time, which is the point, and it
 	# fails one daemon when named, or all of them when told yes.
 	cat > "$stub/rcctl" <<'STUB'
@@ -296,7 +376,7 @@ yes) exit 1 ;;
 *) [ "$2" = "$STUB_RCCTL_FAIL" ] && exit 1; exit 0 ;;
 esac
 STUB
-	chmod 0755 "$stub/httpd" "$stub/gmid" "$stub/rcctl"
+	chmod 0755 "$stub/httpd" "$stub/gmid" "$stub/relayd" "$stub/rcctl"
 	PATH="$stub:$PATH"
 	export PATH
 
@@ -305,8 +385,26 @@ STUB
 	acme_d="$tree/acme.d"
 	httpd_conf="$tree/httpd.conf"
 	gmid_conf="$tree/gmid.conf"
-	mkdir -p "$httpd_d" "$gmid_d" "$acme_d"
+	relayd_conf="$tree/relayd.conf"
+	ssl_dir="$tree/ssl"
+	ssl_private="$ssl_dir/private"
+	mkdir -p "$httpd_d" "$gmid_d" "$acme_d" "$ssl_private"
 	printf 'server "parish.example" {}\n' > "$httpd_d/parish.conf"
+
+	# One member whose certificate is already on disk and one whose certificate
+	# has not landed: the first must gain a relayd keypair line and the second
+	# must not, because a line relayd cannot load fails its config check.
+	cat > "$relayd_conf" <<'EOF'
+http protocol "kyriakon-https" {
+	tls keypair "kyriakon.net"
+	# --- BEGIN member keypairs ---
+	# --- END member keypairs ---
+}
+EOF
+	: > "$httpd_d/alice.kyriakon.net.conf"
+	: > "$httpd_d/bob.kyriakon.net.conf"
+	printf 'certificate\n' > "$ssl_dir/alice.kyriakon.net.fullchain.pem"
+	printf 'key\n' > "$ssl_private/alice.kyriakon.net.key"
 
 	# The first pass writes the indexes and reloads, which is the state everything
 	# below is about.
@@ -315,6 +413,14 @@ STUB
 	apply_web > "$tree/first.out" 2>&1
 	check "the first pass reloads the daemon whose index changed" \
 		"$(grep -c '^reloaded: httpd' "$tree/first.out")" 1
+	check "a member whose certificate is present gains a relayd keypair" \
+		"$(grep -c 'tls keypair "alice.kyriakon.net"' "$relayd_conf")" 1
+	check "and one whose certificate has not landed gains none" \
+		"$(grep -c 'bob.kyriakon.net' "$relayd_conf")" 0
+	check "the region gained a reload of its own" \
+		"$(grep -c 'member keypairs: .* rewritten' "$tree/first.out")" 1
+	check "the tracked keypair is untouched" \
+		"$(grep -c 'tls keypair "kyriakon.net"' "$relayd_conf")" 1
 	index_before=$(cat "$httpd_d/index.conf")
 
 	# A member file appears, and the reload of it fails.
@@ -335,6 +441,8 @@ STUB
 		"$(cat "$httpd_d/index.conf")" "$index_before"
 	set -- "$httpd_d"/*.saved.*
 	check "and no saved copy is left behind" "$([ -e "$1" ] && printf yes || printf no)" no
+	set -- "$tree"/relayd.conf.saved.*
+	check "and the relayd region keeps no saved copy" "$([ -e "$1" ] && printf yes || printf no)" no
 
 	# And so the next pass does the work rather than reporting nothing to change.
 	STUB_RCCTL_FAIL=no
@@ -362,6 +470,22 @@ STUB
 		"$(grep -c 'third.conf' "$httpd_d/index.conf")" 1
 	check "the daemon that failed keeps the old index" \
 		"$(cat "$gmid_d/index.conf")" "$gmid_before"
+
+	# A certificate that lands after provisioning, which is the case this lane
+	# exists for: no member file appears, so no index changes, and only the relayd
+	# region and relayd's own reload are due. The pass before it settles the gmid
+	# retry the half test left pending.
+	STUB_RCCTL_FAIL=no
+	export STUB_RCCTL_FAIL
+	apply_web > /dev/null 2>&1
+	printf 'certificate\n' > "$ssl_dir/bob.kyriakon.net.fullchain.pem"
+	printf 'key\n' > "$ssl_private/bob.kyriakon.net.key"
+	apply_web > "$tree/relayd.out" 2>&1
+	check "a certificate that lands later adds the member's keypair" \
+		"$(grep -c 'tls keypair "bob.kyriakon.net"' "$relayd_conf")" 1
+	check "and the pass rewrites the region" \
+		"$(grep -c 'member keypairs: .* rewritten' "$tree/relayd.out")" 1
+	check "with no index rewritten" "$(grep -c '^reloaded:' "$tree/relayd.out")" 0
 
 	check "the checkout-run checks have lines of their own" \
 		"$(line_for check-hygiene.sh | grep -c 'scripts/check-hygiene.sh')" 1

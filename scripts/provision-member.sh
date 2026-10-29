@@ -32,11 +32,15 @@
 #   /home/<username>/.ssh/authorized_keys       the member, 0600
 #   /etc/login.conf.d/member                    root:wheel 0644
 #
-# and then hands the last two lanes to scripts of their own, so that one command
+# and then hands the last three lanes to scripts of their own, so that one command
 # still provisions a member and each lane can be read on its own:
 #
 #   /etc/httpd.d/<username>.kyriakon.net.conf           provision-member-web.sh
 #   /etc/gmid.d/<username>.kyriakon.net.conf            provision-member-capsule.sh
+#   /etc/acme-client.d/<username>.kyriakon.net.conf     provision-member-acme.sh
+#
+# and the third one files the member's certificate request with the queue after
+# writing its block, which is how the 443 path is built later without a human.
 #
 # The public root is the chroot sshd's port 22 block names, and the two
 # directories under it are the only things the member's sftp session can reach.
@@ -55,16 +59,17 @@
 # thing it always does is run scripts/quota-apply.sh, which rewrites the
 # account's record in place with the same limits.
 #
-# The two lane scripts are idempotent the same way. They are separate scripts
+# The three lane scripts are idempotent the same way. They are separate scripts
 # because one of them has to be run again later: the httpd vhost gains its block
 # behind the relay when the member's certificate lands, which is a second run of
-# provision-member-web.sh rather than an edit by hand. A lane that fails stops
-# this run, because an account with a tree and no vhost is not a provisioned
-# member, and the drain that calls this applies the whole thing or reports it.
+# provision-member-web.sh rather than an edit by hand, and the queue runs it. A
+# lane that fails stops this run, because an account with a tree and no vhost is
+# not a provisioned member, and the drain that calls this applies the whole thing
+# or reports it.
 #
-# Not this script's job: creating the account or its Maildir, the acme-client
-# block for the member's name and the certificate that comes from it (#289), the
-# generated indexes the daemons include and the reloads that follow them
+# Not this script's job: creating the account or its Maildir, issuing the
+# certificate the acme lane queues (scripts/acme-queue.sh --run), the generated
+# indexes and the relayd keypair region and the reloads that follow them
 # (scripts/cron-apply.sh --web), or adding and removing keys.
 
 set -euo pipefail
@@ -514,15 +519,18 @@ for d in /home /home/www "$public"; do
 	esac
 done
 
-# --- the two daemon lanes ---------------------------------------------------
+# --- the daemon lanes -------------------------------------------------------
 #
 # Each lane is its own script, run from here so that one command still provisions
 # a member, and each is idempotent: a second run rewrites nothing and says so.
 # They are separate scripts because the web one has to be run again later, when
 # the member's certificate lands and the block behind the relay becomes due, and
-# because a lane read on its own is a lane reviewed on its own. A lane that fails
-# stops this run: an account with a tree and no vhost is not a provisioned member.
-for lane in provision-member-web.sh provision-member-capsule.sh; do
+# because a lane read on its own is a lane reviewed on its own. The acme lane is
+# the one that makes that later run happen: it writes the member's acme-client
+# block and files the request with the queue, and the queue runs the web lane and
+# cron-apply.sh --web when the certificate lands. A lane that fails stops this
+# run: an account with a tree and no vhost is not a provisioned member.
+for lane in provision-member-web.sh provision-member-capsule.sh provision-member-acme.sh; do
 	if [ ! -f "$script_dir/$lane" ]; then
 		printf 'no %s beside this script, so %s has no generated daemon file\n' "$lane" "$user" >&2
 		printf 'run this from the repository checkout:\n' >&2
@@ -545,6 +553,7 @@ printf '  public:  %s (root:wheel 0755; www and gemini %s:members)\n' "$public" 
 printf '  private: %s/repos 0700, %s/.ssh/authorized_keys 0600\n' "$home" "$home"
 printf '  session: sftp on 22 and git-shell on 2222 from the member login class, one key\n'
 printf '  files:   /etc/httpd.d/%s.kyriakon.net.conf, /etc/gmid.d/%s.kyriakon.net.conf\n' "$user" "$user"
+printf '           /etc/acme-client.d/%s.kyriakon.net.conf, request queued\n' "$user"
 printf '  key from: %s\n' "$key_src"
 printf 'next: doas ksh scripts/cron-apply.sh --web   # index the member files, check, reload\n'
 printf 'then: an sftp session on port 22 as %s uploads into %s/www\n' "$user" "$public"

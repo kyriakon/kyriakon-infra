@@ -27,13 +27,15 @@
 # A member whose certificate is still in the queue has a resolving name, a
 # working challenge and no site yet, in the meantime.
 #
-# The half that is still missing on that second run: the member's keypair line in
-# /etc/relayd.conf, which is what makes the relay present this member's
-# certificate. It is one line in the tls block there, named in a comment where it
-# goes, and this script is the one that has to write it and reload relayd, on the
-# same run that writes the block below. Until it does, a member name is answered
-# with the default certificate. The member certificate queue is #166's and is not
-# built, so no member is in that state yet.
+# The keypair line that makes the relay present this member's certificate is not
+# written here. relayd.conf cannot include a file where a keypair belongs
+# (include is a top-level statement and a keypair is a statement inside
+# `http protocol`), so the tracked file carries a marked region that
+# scripts/relayd-members.sh fills from the member files under /etc/httpd.d, and
+# scripts/cron-apply.sh --web rewrites it and reloads relayd once a certificate
+# is on disk. The queue runs both after it issues: scripts/acme-queue.sh attempt
+# runs this script and then the web apply, so the block below, the keypair line
+# and the reload land together without a human.
 #
 # The paths inside the blocks are httpd's. httpd's chroot is /home/www, so
 # root "/<name>.kyriakon.net/www" is /home/www/<name>.kyriakon.net/www, which is
@@ -56,9 +58,9 @@
 # under TMPDIR, so it needs no root and touches nothing outside it.
 #
 # Not this script's job: the member's tree (scripts/provision-member.sh), the
-# acme-client block for the name and the certificate itself (#289), the index,
-# the reload, or the capsule block for the same name
-# (scripts/provision-member-capsule.sh).
+# acme-client block and the queued request (scripts/provision-member-acme.sh),
+# the index, the relayd keypair region, the reloads, or the capsule block for the
+# same name (scripts/provision-member-capsule.sh).
 
 set -euo pipefail
 
@@ -174,12 +176,12 @@ write_member_conf() {
 
 	if [ -f "$(cert_file)" ]; then
 		printf 'wrote %s: port 80 and the loopback block for %s.kyriakon.net\n' "$target" "$user"
-		printf '  next: add the keypair line for %s.kyriakon.net to /etc/relayd.conf and\n' "$user"
-		printf '  reload relayd, or the relay answers that name with its default certificate\n'
+		printf '  next: doas ksh scripts/cron-apply.sh --web   # adds the relayd keypair, checks, reloads\n'
 	else
 		printf 'wrote %s: port 80 for %s.kyriakon.net; the loopback block lands when\n' \
 			"$target" "$user"
-		printf '  %s exists, which is #289 running the queue\n' "$(cert_file)"
+		printf '  %s exists, which is the certificate queue issuing it; that run\n' "$(cert_file)"
+		printf '  applies this script and cron-apply.sh --web again\n'
 	fi
 }
 
@@ -264,8 +266,8 @@ self_test() {
 	: > "$(cert_file)"
 	write_member_conf > "$tree/certrun.out"
 	check "the port 80 block is still first" "$(awk 'NR == 1' "$conf")" 'server "alice.kyriakon.net" {'
-	check "and names the keypair line the relay still needs" \
-		"$(grep -c 'add the keypair line' "$tree/certrun.out")" 1
+	check "and it points at the pass that adds the relayd keypair" \
+		"$(grep -c 'cron-apply.sh --web' "$tree/certrun.out")" 1
 	check "the second block listens on the relay's loopback port" \
 		"$(grep -c 'listen on 127.0.0.1 port 8080' "$conf")" 1
 	check "it names no certificate or key of its own" \
