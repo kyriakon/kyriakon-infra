@@ -41,6 +41,16 @@ pub struct RequestLine {
     pub relevant: String,
     /// One calendar month from `relevant`, `YYYY-MM-DD`.
     pub due: String,
+    /// Two further months beyond `due`, where a complex request was extended
+    /// under Article 12A. Absent until `request extend`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extended_until: Option<String>,
+    /// The day the extension was decided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extended_at: Option<String>,
+    /// Why the request is complex enough for the extra two months.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extended_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,6 +66,19 @@ pub struct RequestLine {
     /// fills it; the console has no flag for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bundle: Option<String>,
+}
+
+impl RequestLine {
+    /// The answer date in force: the extension's date where there is one.
+    pub fn effective_due(&self) -> &str {
+        self.extended_until.as_deref().unwrap_or(&self.due)
+    }
+
+    /// How the request stands, read from the date in force, so `request list`
+    /// and its counts cannot use the superseded clock.
+    pub fn state(&self, today: Date) -> Result<DueState, String> {
+        Ok(due_state(parse_date(self.effective_due())?, today))
+    }
 }
 
 /// What `record` is given, kept as one value because the call has more fields
@@ -101,18 +124,21 @@ fn format_date(date: Date) -> String {
     )
 }
 
-/// One calendar month later, clamping the day to the shorter month: the 31st of
-/// January answers by the 28th of February, and by the 29th in a leap year.
-/// Article 12's month is a calendar month, not thirty days.
-fn one_month_after(date: Date) -> Date {
-    let (year, month) = if date.month() == Month::December {
-        (date.year() + 1, Month::January)
-    } else {
-        (date.year(), date.month().next())
-    };
+/// `months` calendar months later, clamping the day to the target month's
+/// length: the 31st of January answers by the 28th of February, and by the 29th
+/// in a leap year. Article 12's month is a calendar month, not thirty days.
+fn months_after(date: Date, months: u8) -> Date {
+    let index = date.year() * 12 + i32::from(u8::from(date.month())) - 1 + i32::from(months);
+    let year = index.div_euclid(12);
+    let month = Month::try_from((index.rem_euclid(12) + 1) as u8)
+        .expect("a month index maps to a month of the year");
     let last = month.length(year);
     Date::from_calendar_date(year, month, date.day().min(last))
         .expect("a day clamped to the month's own length is in the month")
+}
+
+fn one_month_after(date: Date) -> Date {
+    months_after(date, 1)
 }
 
 /// The day the clock starts: the latest of receipt, the identity information
@@ -228,6 +254,9 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
         evidence: evidence.to_string(),
         relevant: format_date(relevant),
         due: format_date(due),
+        extended_until: None,
+        extended_at: None,
+        extended_reason: None,
         note: request
             .note
             .map(str::trim)
@@ -296,24 +325,18 @@ async fn find_account(store: &Store, id: &str) -> Result<String, String> {
     found.ok_or_else(|| format!("no request with id {id}"))
 }
 
-/// Write what was done onto the request's own line, and return the closed line.
+/// Rewrite one request's line under the record's lock, through `change`.
 ///
-/// The file is one line per request, not one line per event, so closing rewrites
-/// that request's line and leaves the others as they were. The rewrite goes by
-/// rename (the store's own write), so a reader never sees a half file, and the
-/// whole read and write happen under the record's lock, so a concurrent record
-/// is not dropped.
-pub async fn close(
+/// The file is one line per request, not one line per event, so a change
+/// rewrites that request's line and leaves the others as they were. The rewrite
+/// goes by rename (the store's own write), so a reader never sees a half file,
+/// and the whole read and write happen under the record's lock, so a concurrent
+/// record is not dropped.
+async fn rewrite(
     store: &Store,
     id: &str,
-    done_at: &str,
-    done: &str,
+    change: impl FnOnce(&mut RequestLine) -> Result<(), String>,
 ) -> Result<RequestLine, String> {
-    let done = done.trim();
-    if done.is_empty() {
-        return Err("what was done is needed".to_string());
-    }
-    let done_at = parse_date(done_at)?;
     let username = find_account(store, id).await?;
     let _guard = lock(store, &username).await?;
     let mut lines = read_all(store, &username).await?;
@@ -321,11 +344,7 @@ pub async fn close(
         .iter()
         .position(|l| l.id == id)
         .ok_or_else(|| format!("no request with id {id}"))?;
-    if lines[at].done.is_some() {
-        return Err(format!("request {id} is already closed"));
-    }
-    lines[at].done = Some(done.to_string());
-    lines[at].done_at = Some(format_date(done_at));
+    change(&mut lines[at])?;
 
     let mut bytes = String::new();
     for line in &lines {
@@ -341,6 +360,64 @@ pub async fn close(
     Ok(lines[at].clone())
 }
 
+/// Write what was done onto the request's own line, and return the closed line.
+pub async fn close(
+    store: &Store,
+    id: &str,
+    done_at: &str,
+    done: &str,
+) -> Result<RequestLine, String> {
+    let done = done.trim().to_string();
+    if done.is_empty() {
+        return Err("what was done is needed".to_string());
+    }
+    let done_at = format_date(parse_date(done_at)?);
+    rewrite(store, id, |line| {
+        if line.done.is_some() {
+            return Err(format!("request {id} is already closed"));
+        }
+        line.done = Some(done);
+        line.done_at = Some(done_at);
+        Ok(())
+    })
+    .await
+}
+
+/// Record Article 12A's two further months on the request's own line.
+///
+/// The extra period runs from the current answer date, so the total does not
+/// pass three months from the relevant time, and a second extension is refused
+/// rather than letting the clock move again.
+pub async fn extend(
+    store: &Store,
+    id: &str,
+    reason: &str,
+    extended_at: Option<&str>,
+) -> Result<RequestLine, String> {
+    let reason = reason.trim().to_string();
+    if reason.is_empty() {
+        return Err("the reason for the extension is needed".to_string());
+    }
+    let at = format_date(match extended_at {
+        Some(value) => parse_date(value)?,
+        None => today(),
+    });
+    rewrite(store, id, |line| {
+        if line.done.is_some() {
+            return Err(format!("request {id} is closed"));
+        }
+        if line.extended_until.is_some() {
+            return Err(format!("request {id} is already extended"));
+        }
+        let due = parse_date(&line.due)?;
+        line.extended_until = Some(format_date(months_after(due, 2)));
+        line.extended_at = Some(at);
+        line.extended_reason = Some(reason);
+        Ok(())
+    })
+    .await
+}
+
 /// Every request still open, earliest answer due first.
 pub async fn open(store: &Store) -> Result<Vec<RequestLine>, String> {
     let mut out = Vec::new();
@@ -351,7 +428,11 @@ pub async fn open(store: &Store) -> Result<Vec<RequestLine>, String> {
             }
         }
     }
-    out.sort_by(|a, b| a.due.cmp(&b.due).then_with(|| a.id.cmp(&b.id)));
+    out.sort_by(|a, b| {
+        a.effective_due()
+            .cmp(b.effective_due())
+            .then_with(|| a.id.cmp(&b.id))
+    });
     Ok(out)
 }
 
@@ -425,6 +506,111 @@ mod tests {
             )),
             d("2026-11-20")
         );
+    }
+
+    #[test]
+    fn two_calendar_months_clamp_only_the_month_they_land_in() {
+        assert_eq!(months_after(d("2026-12-31"), 2), d("2027-02-28"));
+        // Clamping at each step would give 28 March: February's 28th is not a
+        // day to count two calendar months from.
+        assert_eq!(months_after(d("2026-01-31"), 2), d("2026-03-31"));
+        assert_eq!(months_after(d("2026-11-30"), 2), d("2027-01-30"));
+        assert_eq!(months_after(d("2028-01-31"), 2), d("2028-03-31"));
+    }
+
+    #[tokio::test]
+    async fn extend_moves_the_due_by_two_months_and_records_why() {
+        let (store, dir) = temp_store("extend");
+        let line = record(&store, new_request("access", "2026-11-30"))
+            .await
+            .unwrap();
+        assert_eq!(line.due, "2026-12-30");
+
+        let extended = extend(&store, &line.id, " complex request ", Some("2026-12-01"))
+            .await
+            .unwrap();
+        assert_eq!(extended.due, "2026-12-30", "the original clock is kept");
+        assert_eq!(extended.extended_until.as_deref(), Some("2027-02-28"));
+        assert_eq!(extended.extended_at.as_deref(), Some("2026-12-01"));
+        assert_eq!(extended.extended_reason.as_deref(), Some("complex request"));
+        assert_eq!(extended.effective_due(), "2027-02-28");
+
+        // The extension is written onto that line, not appended as an event.
+        let lines = read_all(&store, "alice").await.unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], extended);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_second_extension_and_a_closed_request_are_refused() {
+        let (store, dir) = temp_store("extend-refusals");
+        let first = record(&store, new_request("access", "2026-10-01"))
+            .await
+            .unwrap();
+        extend(&store, &first.id, "complex", Some("2026-10-02"))
+            .await
+            .unwrap();
+        let err = extend(&store, &first.id, "again", Some("2026-10-03"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("already extended"), "{err}");
+
+        let closed = record(&store, new_request("erasure", "2026-10-01"))
+            .await
+            .unwrap();
+        close(&store, &closed.id, "2026-10-04", "done")
+            .await
+            .unwrap();
+        let err = extend(&store, &closed.id, "complex", Some("2026-10-05"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("is closed"), "{err}");
+
+        let fresh = record(&store, new_request("rectification", "2026-10-01"))
+            .await
+            .unwrap();
+        let err = extend(&store, &fresh.id, "  ", Some("2026-10-05"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("reason"), "{err}");
+
+        // No refusal moved a clock or appended a line.
+        let lines = read_all(&store, "alice").await.unwrap();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].extended_until.as_deref(), Some("2027-01-01"));
+        assert_eq!(lines[2], fresh);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_orders_and_states_by_the_extended_date() {
+        let (store, dir) = temp_store("extend-order");
+        let extended = record(&store, new_request("access", "2026-10-01"))
+            .await
+            .unwrap();
+        let plain = record(&store, new_request("erasure", "2026-10-10"))
+            .await
+            .unwrap();
+        let extended = extend(&store, &extended.id, "complex request", Some("2026-10-15"))
+            .await
+            .unwrap();
+        assert_eq!(extended.extended_until.as_deref(), Some("2027-01-01"));
+
+        let open = open(&store).await.unwrap();
+        assert_eq!(
+            open.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
+            vec![plain.id.as_str(), extended.id.as_str()],
+            "the extended request is no longer the first due"
+        );
+
+        // On 2026-11-05 the original date has passed but the extension has
+        // not, so the list must read the extended date, not the superseded one.
+        let today = d("2026-11-05");
+        assert_eq!(due_state(d(&extended.due), today), DueState::Overdue);
+        assert_eq!(extended.state(today).unwrap(), DueState::Open);
+        assert_eq!(plain.state(today).unwrap(), DueState::NearlyDue);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
