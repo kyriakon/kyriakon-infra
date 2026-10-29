@@ -310,7 +310,7 @@ async fn read_all(store: &Store, username: &str) -> Result<Vec<RequestLine>, Str
 }
 
 /// The account whose record holds one request id. The read happens before the
-/// lock, and again under it in `close`.
+/// lock, and again under it in `rewrite`.
 async fn find_account(store: &Store, id: &str) -> Result<String, String> {
     let mut found: Option<String> = None;
     for username in store.list("accounts").await? {
@@ -398,10 +398,11 @@ pub async fn extend(
     if reason.is_empty() {
         return Err("the reason for the extension is needed".to_string());
     }
-    let at = format_date(match extended_at {
+    let decided = match extended_at {
         Some(value) => parse_date(value)?,
         None => today(),
-    });
+    };
+    let at = format_date(decided);
     rewrite(store, id, |line| {
         if line.done.is_some() {
             return Err(format!("request {id} is closed"));
@@ -409,7 +410,20 @@ pub async fn extend(
         if line.extended_until.is_some() {
             return Err(format!("request {id} is already extended"));
         }
+        // The extension is Article 12A's two further months inside the answer
+        // period, so a decision that predates receipt or lands after the answer
+        // was due is not one: recording it would move a clock that had already
+        // run out, and `request list` would stop showing the deadline missed.
+        let received = parse_date(&line.received)?;
         let due = parse_date(&line.due)?;
+        if decided < received || decided > due {
+            return Err(format!(
+                "the extension is decided on {}, but the request runs from {} to {}",
+                format_date(decided),
+                line.received,
+                line.due
+            ));
+        }
         line.extended_until = Some(format_date(months_after(due, 2)));
         line.extended_at = Some(at);
         line.extended_reason = Some(reason);
@@ -539,6 +553,31 @@ mod tests {
         let lines = read_all(&store, "alice").await.unwrap();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], extended);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_extension_decided_outside_the_requests_month_is_refused() {
+        let (store, dir) = temp_store("extend-window");
+        let line = record(&store, new_request("access", "2026-10-01"))
+            .await
+            .unwrap();
+        assert_eq!(line.due, "2026-11-01");
+
+        for at in ["2026-09-30", "2026-11-02"] {
+            let err = extend(&store, &line.id, "complex", Some(at))
+                .await
+                .unwrap_err();
+            assert!(err.contains("the request runs from"), "{at}: {err}");
+        }
+        // The day it is due is still inside the month; the day after is not.
+        extend(&store, &line.id, "complex", Some("2026-11-01"))
+            .await
+            .unwrap();
+        let lines = read_all(&store, "alice").await.unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].extended_at.as_deref(), Some("2026-11-01"));
+        assert_eq!(lines[0].extended_until.as_deref(), Some("2027-01-01"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
