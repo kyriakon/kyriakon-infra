@@ -1440,6 +1440,172 @@ fn an_approval_provisions_with_add_user_first() {
     assert!(fix.journal().contains("\"applied\""), "{}", fix.journal());
 }
 
+/// An add-user.sh that logs whether the confirmation had already reached the
+/// enqueuer when the first provisioning script ran. `sent` is the enqueuer's
+/// own output file, so this is the order the envelope saw, not a guess.
+fn add_user_asks_whether_the_confirmation_left(fix: &Fix) {
+    let passwd = fix.path("passwd");
+    let log = fix.path("scripts.log");
+    let sent = fix.path("sent");
+    fix.script(
+        "add-user.sh",
+        &format!(
+            "#!/bin/sh\n\
+             if grep -q 'digital content' '{sent}' 2>/dev/null; then echo confirmation-seen >> '{log}'; else echo confirmation-missing >> '{log}'; fi\n\
+             printf '%s:x:1000:1000::/home/%s:/sbin/nologin\\n' \"$1\" \"$1\" >> '{passwd}'\n"
+        ),
+    );
+}
+
+/// The confirmation the spec promises: to the address the applicant gave,
+/// restating both things the second checkbox recorded and quoting every document
+/// with its version, before the account exists.
+#[test]
+fn an_approval_sends_the_confirmation_to_the_outside_address() {
+    let fix = Fix::new("confirmation");
+    let mut record = fix.filed_with(
+        "secretary",
+        "cash",
+        &[("rail", "cash")],
+        Some("applicant@example.invalid"),
+        Some((UPLOAD_KEY, "works")),
+    );
+    record["acceptances"] = json!([
+        {"document": "terms", "version": "2026-10-01 abc1234"},
+        {"document": "privacy", "version": "2026-09-01 def5678"},
+    ]);
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let sent = fix.sent();
+    assert_eq!(
+        sent.matches("Subject: Your application to kyriakon.net was confirmed")
+            .count(),
+        1,
+        "{sent}"
+    );
+    assert!(sent.contains("To: applicant@example.invalid"), "{sent}");
+    assert!(sent.contains("digital content"), "{sent}");
+    assert!(sent.contains("terms: 2026-10-01 abc1234"), "{sent}");
+    assert!(sent.contains("privacy: 2026-09-01 def5678"), "{sent}");
+    assert!(sent.contains("fourteen days"), "{sent}");
+    assert!(sent.contains("admin@kyriakon.net"), "{sent}");
+    assert!(
+        sent.contains("cancel for any reason, or none"),
+        "the right is stated plainly: {sent}"
+    );
+
+    // The stamp is on the application record, where a retry reads it.
+    let app: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    assert!(app["confirmation_at"].is_string(), "{app}");
+}
+
+/// The confirmation reaches the enqueuer before add-user.sh runs: the envelope
+/// is the record of what was agreed, and it must exist before the service does.
+#[test]
+fn the_confirmation_leaves_before_add_user() {
+    let fix = Fix::new("confirmation-order");
+    add_user_asks_whether_the_confirmation_left(&fix);
+    let record = fix.filed_with(
+        "secretary",
+        "cash",
+        &[("rail", "cash")],
+        Some("applicant@example.invalid"),
+        Some((UPLOAD_KEY, "works")),
+    );
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let log = fix.scripts_log();
+    assert!(
+        log.contains("confirmation-seen"),
+        "add-user.sh ran before the confirmation left: {log}"
+    );
+    assert!(!log.contains("confirmation-missing"), "{log}");
+}
+
+/// A retry after a failed provisioning sends no second confirmation: the stamp
+/// is written before the enqueue, so a crash costs an email rather than a
+/// duplicate.
+#[test]
+fn a_retried_approval_sends_no_second_confirmation() {
+    let fix = Fix::new("confirmation-retry");
+    fix.provision_fails();
+    let record = fix.filed_with(
+        "secretary",
+        "cash",
+        &[("rail", "cash")],
+        Some("applicant@example.invalid"),
+        Some((UPLOAD_KEY, "works")),
+    );
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.sent().matches("was confirmed").count(),
+        1,
+        "the first run sends one: {}",
+        fix.sent()
+    );
+    assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
+
+    // The builder works on the retry, as in `a_retried_approval_completes`.
+    fix.age_failures();
+    fix.provision_requires_key();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix
+        .dir
+        .join("store/accounts/secretary/account.json")
+        .exists());
+    assert_eq!(
+        fix.sent().matches("was confirmed").count(),
+        1,
+        "the retry sends no second confirmation: {}",
+        fix.sent()
+    );
+}
+
+/// An approval with no address outside the platform sends no confirmation and
+/// still provisions: before the account exists there is no mailbox to reach, so
+/// the status page is the applicant's record instead.
+#[test]
+fn an_approval_without_an_outside_address_sends_no_confirmation() {
+    let fix = Fix::new("confirmation-none");
+    add_user_asks_whether_the_confirmation_left(&fix);
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert!(fix
+        .dir
+        .join("store/accounts/secretary/account.json")
+        .exists());
+    let log = fix.scripts_log();
+    assert!(
+        log.contains("confirmation-missing"),
+        "a confirmation left before provisioning: {log}"
+    );
+    assert!(!fix.sent().contains("digital content"), "{}", fix.sent());
+    assert!(
+        !fix.sent().contains("was confirmed"),
+        "no confirmation was sent: {}",
+        fix.sent()
+    );
+}
+
 /// The upload key the application carried is written where `provision-member.sh`
 /// reads it before that script runs, so an approval completes against the real
 /// script's contract rather than only against a stub that ignores the key.

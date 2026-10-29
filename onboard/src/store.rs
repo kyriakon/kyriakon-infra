@@ -305,6 +305,12 @@ pub struct Record {
     pub upload_key: Option<KeyRecord>,
     pub rail: String,
     pub no_charge: bool,
+    /// When the confirmation email left, RFC 3339. It is written before the
+    /// enqueue, so a retry of the same approval sends no second copy. The notice
+    /// cannot be recorded in `accounts/<username>/notices.jsonl` the way every
+    /// later notice is, because the account does not exist yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmation_at: Option<String>,
     pub acceptances: Vec<Acceptance>,
     /// The version of the question list the application was answered against.
     /// This release carries the deployed commit and date rather than a hash of

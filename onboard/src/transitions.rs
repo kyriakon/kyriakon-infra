@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
@@ -280,19 +281,25 @@ async fn publish_mail_keys_publicly(
     Ok(())
 }
 
-/// The address an approval notice goes to: the applicant's own outside address,
-/// validated again here because it was written by the unprivileged half and is
-/// about to become a mail header, or the mailbox the approval just created.
-fn recipient(record: &Record, username: &str) -> Result<String, String> {
+/// The address the applicant gave outside the platform, revalidated here because
+/// it was written by the unprivileged half and is about to become a mail header.
+/// `None` when none was given.
+fn outside_address(record: &Record) -> Result<Option<String>, String> {
     match record.outside_address.as_deref() {
         Some(addr) => {
             if let Some(why) = validate::address(addr) {
                 return Err(format!("the address outside the platform {addr:?}: {why}"));
             }
-            Ok(addr.to_string())
+            Ok(Some(addr.to_string()))
         }
-        None => Ok(format!("{username}@kyriakon.net")),
+        None => Ok(None),
     }
+}
+
+/// The address an approval notice goes to: the applicant's own outside address,
+/// or the mailbox the approval just created.
+fn recipient(record: &Record, username: &str) -> Result<String, String> {
+    Ok(outside_address(record)?.unwrap_or_else(|| format!("{username}@kyriakon.net")))
 }
 
 /// The address a body's approval notice goes to. A body has no account of the
@@ -300,15 +307,68 @@ fn recipient(record: &Record, username: &str) -> Result<String, String> {
 /// domain rather than the person path's `username@kyriakon.net`, which the drain
 /// never makes for a body.
 fn group_recipient(record: &Record, site_owner: &str, domain: &str) -> Result<String, String> {
-    match record.outside_address.as_deref() {
-        Some(addr) => {
-            if let Some(why) = validate::address(addr) {
-                return Err(format!("the address outside the platform {addr:?}: {why}"));
-            }
-            Ok(addr.to_string())
-        }
-        None => Ok(format!("{site_owner}@{domain}")),
+    Ok(outside_address(record)?.unwrap_or_else(|| format!("{site_owner}@{domain}")))
+}
+
+/// The application record's confirmation lock. The stamp is a read-check-write of
+/// a record that is replaced by rename, so the lock lives beside it rather than
+/// on it; two drain passes on the same application could otherwise both read it
+/// as unconfirmed. It is held for the write only, never across the send.
+async fn lock_confirmation(store: &Store) -> Result<tokio::fs::File, String> {
+    let path = store.path("applications/.confirmation.lock");
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).mode(0o600);
+    let file = opts
+        .open(&path)
+        .await
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!(
+            "cannot lock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
     }
+    Ok(file)
+}
+
+/// Send the confirmation the spec promises before provisioning: it restates the
+/// immediate-supply request and the digital-content acknowledgement, quotes every
+/// document accepted with its version, and states the 14-day right with how to
+/// use it.
+///
+/// The stamp is written on the application before the enqueue, the direction
+/// every notice takes: a crash loses an email rather than sending it twice. With
+/// no outside address there is no mailbox that can receive one before the account
+/// exists, so the status page is the record instead.
+async fn confirm(
+    cfg: &DrainConfig,
+    store: &Store,
+    token: &str,
+    record: &Record,
+) -> Result<(), String> {
+    let Some(to) = outside_address(record)? else {
+        return Ok(());
+    };
+    let _lock = lock_confirmation(store).await?;
+    let mut record = application_record(store, token).await?;
+    if record.confirmation_at.is_some() {
+        return Ok(());
+    }
+    record.confirmation_at = Some(util::filed_at());
+    let bytes =
+        serde_json::to_vec_pretty(&record).map_err(|e| format!("cannot encode the record: {e}"))?;
+    let owner = store.dir_owner("applications");
+    store
+        .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
+        .await?;
+    notice::enqueue(
+        cfg,
+        &to,
+        &confirmation_subject(&record.username),
+        &confirmation_body(&record),
+    )
+    .await
 }
 
 /// Append one journal line. The caller writes this before the transition, which
@@ -965,6 +1025,11 @@ async fn approve(
             ));
         }
     }
+
+    // The confirmation the spec promises goes out before the journal's
+    // "applying" line and before any provisioning, so the record of what was
+    // agreed exists before the service begins.
+    confirm(cfg, store, token, &record).await?;
 
     journal(
         store,
@@ -2865,6 +2930,38 @@ async fn append_ledger(
 
 fn decision_subject(what: &str, username: &str) -> String {
     format!("Your application to kyriakon.net was {what} ({username})")
+}
+
+/// The confirmation's subject, in the member-facing shape the decision mail
+/// takes rather than the operator alert's component/event one.
+fn confirmation_subject(username: &str) -> String {
+    format!("Your application to kyriakon.net was confirmed ({username})")
+}
+
+/// The confirmation email. It repeats the two things the second checkbox
+/// recorded, the version of every document accepted, and the 14-day right with
+/// how to use it, in the words `docs/terms.md` uses.
+fn confirmation_body(record: &Record) -> String {
+    let mut out = String::from(
+        "You asked us to start now, before the cancellation period ends, and you\n\
+         acknowledged that digital content is supplied immediately. Provisioning does\n\
+         not take your right to cancel away.\n\n\
+         You accepted:\n\n",
+    );
+    for acceptance in &record.acceptances {
+        out.push_str(&format!(
+            "  {}: {}\n",
+            acceptance.document, acceptance.version
+        ));
+    }
+    out.push_str(
+        "\nYou have fourteen days to cancel, starting the day the contract is made. The\n\
+         right is unconditional: you can cancel for any reason, or none. An email to\n\
+         admin@kyriakon.net saying that you want to cancel is enough. We refund what\n\
+         you paid in full, within fourteen days, in the rail you paid with, or as a\n\
+         credit against the next year if you would rather.\n",
+    );
+    out
 }
 
 /// The decision email for an approval. The words are short because #333 owns
