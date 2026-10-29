@@ -11,6 +11,14 @@
 # the certificates, and this script refuses to start anything until both are
 # true, because a relay and httpd cannot both listen on 443 (see relayd.conf).
 #
+# The candidate it checks and installs is the tracked file with the marked
+# member keypair region rendered by scripts/relayd-members.sh from the member
+# files under /etc/httpd.d. That is what makes a deploy safe after member
+# certificates have landed: installing the tracked file unchanged would drop
+# every member's keypair and answer those names with the default certificate.
+# The render also creates each member's /etc/ssl/<name>.crt link, which is the
+# name relayd looks a keypair up under.
+#
 # So the order on a box that has not run this before is:
 #
 #   doas ksh scripts/deploy-mail.sh     # installs httpd.conf, issues the certs
@@ -34,7 +42,7 @@
 
 set -euo pipefail
 
-script_dir=$(dirname -- "$0")
+script_dir=$(cd "$(dirname -- "$0")" && pwd)
 
 # src_dir: the argument when one is given, and this script's ../openbsd/etc
 # otherwise, which is the repo layout. --self-test takes its directory as a
@@ -142,8 +150,8 @@ install_conf() {
 	printf 'installed %s\n' "$2"
 }
 
-# install_checked_conf — the shipped configuration, checked as a candidate and
-# installed only if the check passes.
+# install_checked_conf — the shipped configuration with the member region
+# rendered, checked as a candidate and installed only if the check passes.
 #
 # The candidate is a file in $conf_dst's own directory, removed on both paths:
 # leaving one in /etc is a file the next run has to explain. Not by an EXIT trap,
@@ -160,6 +168,15 @@ install_conf() {
 install_checked_conf() {
 	conf_candidate=$(mktemp "$conf_dst.XXXXXX")
 	install -m 0600 "$conf_src" "$conf_candidate"
+	# The member keypairs, from the member files present now: the tracked file's
+	# region is the empty one, and installing it as it stands would drop every
+	# member's certificate and answer those names with the default pair. The
+	# render also makes each member's /etc/ssl/<name>.crt link, which relayd
+	# loads during the check below.
+	if ! ksh "$script_dir/relayd-members.sh" "$conf_candidate" >/dev/null; then
+		rm -f "$conf_candidate"
+		die "$conf_src could not have its member keypair region rendered, so $conf_dst was left as it was and nothing was restarted"
+	fi
 	if ! relayd -n -f "$conf_candidate"; then
 		rm -f "$conf_candidate"
 		die "$conf_src does not check, so $conf_dst was left as it was and nothing was restarted"
@@ -297,8 +314,32 @@ self_test() {
 	export PATH
 	conf_src="$tree/shipped.conf"
 	conf_dst="$tree/etc/relayd-checked.conf"
-	printf 'tls keypair "kyriakon.net"\n' > "$conf_src"
+	cat > "$conf_src" <<'EOF'
+http protocol "kyriakon-https" {
+	tls keypair "kyriakon.net"
+	# --- BEGIN member keypairs ---
+	# --- END member keypairs ---
+}
+
+relay "https" {
+	listen on egress port 443 tls
+}
+EOF
 	printf 'the configuration the relay is running\n' > "$conf_dst"
+
+	# Two members: one whose certificate pair is complete, and one whose
+	# certificate has not landed yet. The first gains a keypair line and the
+	# second must not, because a line for a name with no certificate is a config
+	# relayd refuses.
+	RELAYD_MEMBERS_HTTPD_D="$tree/httpd.d"
+	RELAYD_MEMBERS_SSL_DIR="$ssl_dir"
+	RELAYD_MEMBERS_SSL_PRIVATE="$ssl_private"
+	export RELAYD_MEMBERS_HTTPD_D RELAYD_MEMBERS_SSL_DIR RELAYD_MEMBERS_SSL_PRIVATE
+	mkdir -p "$RELAYD_MEMBERS_HTTPD_D"
+	: > "$RELAYD_MEMBERS_HTTPD_D/alice.kyriakon.net.conf"
+	: > "$RELAYD_MEMBERS_HTTPD_D/bob.kyriakon.net.conf"
+	printf 'certificate\n' > "$ssl_dir/alice.kyriakon.net.fullchain.pem"
+	printf 'key\n' > "$ssl_private/alice.kyriakon.net.key"
 
 	STUB_RELAYD_CHECK=fail
 	export STUB_RELAYD_CHECK
@@ -314,8 +355,17 @@ self_test() {
 	STUB_RELAYD_CHECK=ok
 	export STUB_RELAYD_CHECK
 	( install_checked_conf ) > "$tree/checked.out" 2>&1
-	check "a configuration that checks is installed" "$(cat "$conf_dst")" "$(cat "$conf_src")"
 	check "and reported as installed" "$(grep -c '^installed ' "$tree/checked.out")" 1
+	check "a member with a certificate and key gains a keypair line" \
+		"$(grep -c 'tls keypair "alice.kyriakon.net"' "$conf_dst")" 1
+	check "and one whose certificate has not landed gains none" \
+		"$(grep -c 'bob.kyriakon.net' "$conf_dst")" 0
+	check "the tracked keypair comes through the render unchanged" \
+		"$(grep -c 'tls keypair "kyriakon.net"' "$conf_dst")" 1
+	check "and so does the relay below the region" \
+		"$(grep -c 'listen on egress port 443 tls' "$conf_dst")" 1
+	check "the member's certificate link is made for relayd" \
+		"$(readlink "$ssl_dir/alice.kyriakon.net.crt")" "alice.kyriakon.net.fullchain.pem"
 
 	# Neither path leaves its candidate in /etc.
 	set -- "$tree/etc"/relayd-checked.conf.*

@@ -56,8 +56,19 @@
 #   spacing        202 minutes                      the CA's published refill
 #   alert age      1440 minutes (24 hours)          read by scripts/abuse-monitor.sh
 # The store and the client and resolver commands are overridable (ACME_QUEUE_DIR,
-# ACME_CLIENT, ACME_RESOLVER) so the queue can be exercised against a copy or a
-# stub without touching the live store or the CA.
+# ACME_CLIENT, ACME_RESOLVER, ACME_SSL_DIR) so the queue can be exercised against
+# a copy or a stub without touching the live store or the CA.
+#
+# What a successful attempt triggers. A certificate on disk is the member's site
+# half becoming due: scripts/provision-member-web.sh writes the block behind the
+# relay, and scripts/cron-apply.sh --web rewrites the indexes and the relayd
+# member keypair region, checks the configs and reloads what changed. The pass
+# runs both after it closes the request, from the directory scripts/deploy-onboard.sh
+# installs the drain's scripts in. That path is read from the `scripts` key of
+# /etc/kyriakon/onboard/drain.toml, with the compiled-in default and a
+# DRAIN_SCRIPTS override (which the self-test uses). A failure there is mailed and
+# exits 1 while leaving the certificate and the closed request as they are, since
+# those are the state and the apply is the step left undone.
 #
 # acme-queue.sh notes its schedule here, as each scheduled script does, for
 # scripts/cron-apply.sh to install rather than for an operator to paste in. Every
@@ -75,7 +86,8 @@
 # Depends on: /etc/acme-client.conf including /etc/acme-client.d/index.conf (the
 # generated index scripts/cron-apply.sh --web rewrites), the acme-client binary,
 # a resolver command (host(1) from base), and lib.sh installed beside this file,
-# which is where notify_operator comes from.
+# which is where notify_operator comes from. The apply step above needs the drain
+# scripts, installed by scripts/deploy-onboard.sh.
 
 set -euo pipefail
 
@@ -99,6 +111,27 @@ pending_dir="$queue_dir/pending"
 last_attempt_file="$queue_dir/last-attempt"
 client="${ACME_CLIENT:-acme-client}"
 resolver="${ACME_RESOLVER:-host}"
+# Where the certificate lands. A variable so the self-test can point attempt() at
+# a throwaway directory: the success path below checks the file is there.
+ssl_dir="${ACME_SSL_DIR:-/etc/ssl}"
+
+# The directory the drain's privileged scripts are installed in. The apply hook
+# below runs the web lane and scripts/cron-apply.sh --web from there, because
+# they are the drain's copies rather than /root/bin ones and this script runs
+# both from cron and, now, on behalf of the drain's own script directory. The
+# path is read from the drain's configuration rather than typed twice, with the
+# compiled-in default for a box whose config cannot be read. DRAIN_SCRIPTS
+# overrides it, which is what the self-test points at its stubs.
+drain_toml="${DRAIN_TOML:-/etc/kyriakon/onboard/drain.toml}"
+if [ -n "${DRAIN_SCRIPTS:-}" ]; then
+	drain_scripts=$DRAIN_SCRIPTS
+else
+	drain_scripts=/usr/local/libexec/kyriakon/scripts
+	if [ -r "$drain_toml" ]; then
+		configured_scripts=$(awk -F'"' '/^scripts[[:space:]]*=/ { print $2; exit }' "$drain_toml")
+		[ -z "$configured_scripts" ] || drain_scripts=$configured_scripts
+	fi
+fi
 
 # The published refill: 50 new certificates per registered domain per seven days is
 # one every 202 minutes. A constant rather than a tunable, because it is the CA's
@@ -191,6 +224,40 @@ EOF
 	return 0
 }
 
+# apply_member <name> : the two steps a new certificate makes due, run from the
+# drain's script directory. The web lane is what writes the member's block behind
+# the relay, and cron-apply.sh --web is what regenerates the indexes and the
+# relayd keypair region, checks the three configs and reloads what changed. Until
+# both have run the name still answers with the relay's default certificate, so a
+# failure here is mailed rather than swallowed: the certificate and the closed
+# request are the state, and this is the step left undone.
+#
+# Silent on success, because cron mails a job's output and the queue's own notice
+# is the report. On failure the failing step's output is printed, which is what
+# the operator needs and the notice cannot carry.
+apply_member() {
+	typeset apply_name="$1" apply_label apply_web_lane apply_apply step step_out
+	apply_label=${apply_name%.kyriakon.net}
+	apply_web_lane="$drain_scripts/provision-member-web.sh"
+	apply_apply="$drain_scripts/cron-apply.sh"
+	for step in "$apply_web_lane" "$apply_apply"; do
+		if [ ! -f "$step" ]; then
+			printf 'acme-queue: no %s, so %s has a certificate and still no site: scripts/deploy-onboard.sh installs the drain scripts\n' \
+				"$step" "$apply_name" >&2
+			return 1
+		fi
+	done
+	if ! step_out=$(ksh "$apply_web_lane" "$apply_label" 2>&1); then
+		printf '%s\n' "$step_out" >&2
+		return 1
+	fi
+	if ! step_out=$(ksh "$apply_apply" --web 2>&1); then
+		printf '%s\n' "$step_out" >&2
+		return 1
+	fi
+	return 0
+}
+
 # attempt <name> : the one attempt of a pass. Records the attempt whatever happens,
 # closes the request on success, and mails the outcome on every path: cron mails a
 # job's output under a subject of its own, so the report is the mail and nothing is
@@ -198,7 +265,7 @@ EOF
 # 1, because a swallowed refusal is a member who waits for nothing.
 attempt() {
 	name="$1"
-	cert="/etc/ssl/$name.fullchain.pem"
+	cert="$ssl_dir/$name.fullchain.pem"
 	rc=0
 	log=$("$client" "$name" 2>&1) || rc=$?
 	printf '%s\n' "$(date +%s)" > "$last_attempt_file"
@@ -208,14 +275,26 @@ attempt() {
 		[ -f "$cert" ] || die "$name: acme-client exited $rc but $cert is not there"
 		rm -f "$pending_dir/$name"
 		[ ! -e "$pending_dir/$name" ] || die "$name: the request file is still there"
+		# The certificate is the trigger for the member's two remaining pieces:
+		# the vhost behind the relay and the relayd keypair line. Both are applied
+		# here rather than left for a human, because nothing else runs on a new
+		# certificate and the page would otherwise promise a padlock that never
+		# arrives.
+		if ! apply_member "$name"; then
+			found=$(printf '%s: issued or current, and %s is in place, so the request is closed.\nThe web lane or the web apply then failed, so %s still answers with the default certificate.' \
+				"$name" "$cert" "$name")
+			notify_operator acme "apply failed" "$found" \
+				"run doas ksh scripts/cron-apply.sh --web on the box; it rewrites the indexes and the relayd keypair region and reloads what changed"
+			exit 1
+		fi
 		# The two outcomes get different events, so a list of subjects says which
 		# one happened: a first issue spends one of the five per registered
 		# domain, and a renewal that was already current spends none.
 		if [ "$rc" -eq 0 ]; then
-			notify_operator acme issued "$(printf '%s: issued, and %s is in place, so the request is closed.\nThe next attempt can be %s minutes from now at the earliest, and this one spent a slot of the registered domain refill.' \
+			notify_operator acme issued "$(printf '%s: issued, and %s is in place, so the request is closed.\nThe vhost and keypair are applied. The next attempt can be %s minutes from now at the earliest, and this one spent a slot of the registered domain refill.' \
 				"$name" "$cert" "$REFILL_MINUTES")"
 		else
-			notify_operator acme current "$(printf '%s: already had a valid certificate, so the request is closed (%s).\nThe next attempt can be %s minutes from now at the earliest.' \
+			notify_operator acme current "$(printf '%s: already had a valid certificate, so the request is closed (%s).\nThe vhost and keypair are applied. The next attempt can be %s minutes from now at the earliest.' \
 				"$name" "$cert" "$REFILL_MINUTES")"
 		fi
 		;;
@@ -392,6 +471,66 @@ STUB
 	check "nothing is chosen when no pending name resolves" \
 		"$(next_attempt "10 $pending_dir/c.kyriakon.net
 20 $pending_dir/b.kyriakon.net" 2>/dev/null)" ""
+
+	# The apply hook, exercised through attempt() rather than through its own
+	# function: what has to hold is that a pass which issues a certificate runs the
+	# web lane and then the web apply, so removing the call from attempt() or either
+	# step from the hook fails here. The client and both drain scripts are stubs,
+	# and the certificate lands in a throwaway ssl directory.
+	ssl_dir="$work/ssl"
+	last_attempt_file="$work/last-attempt"
+	pending_dir="$work/apply-pending"
+	drain_scripts="$work/drain"
+	mkdir -p "$ssl_dir" "$pending_dir" "$drain_scripts"
+	cat > "$work/bin/acme-client" <<STUB
+#!/bin/sh
+: > "$ssl_dir/\$1.fullchain.pem"
+STUB
+	cat > "$drain_scripts/provision-member-web.sh" <<STUB
+#!/bin/sh
+printf 'web %s\n' "\$1" >> '$work/calls'
+STUB
+	cat > "$drain_scripts/cron-apply.sh" <<STUB
+#!/bin/sh
+printf 'apply %s\n' "\$1" >> '$work/calls'
+STUB
+	chmod 0700 "$work/bin/acme-client" "$drain_scripts/provision-member-web.sh" \
+		"$drain_scripts/cron-apply.sh"
+	client="$work/bin/acme-client"
+	: > "$pending_dir/alice.kyriakon.net"
+	mode=run
+	attempt alice.kyriakon.net > "$work/attempt.out" 2>&1
+	check "an issued certificate closes its request" \
+		"$([ -e "$pending_dir/alice.kyriakon.net" ] && printf yes || printf no)" no
+	check "and runs the web lane then the web apply, in that order" \
+		"$(cat "$work/calls")" "web alice
+apply --web"
+
+	# A web lane that fails stops the hook, and the notice names the command an
+	# operator runs to finish the job by hand.
+	rm -f "$work/calls"
+	printf '#!/bin/sh\necho "the vhost did not write" >&2\nexit 1\n' \
+		> "$drain_scripts/provision-member-web.sh"
+	chmod 0700 "$drain_scripts/provision-member-web.sh"
+	: > "$pending_dir/bob.kyriakon.net"
+	code=0
+	( attempt bob.kyriakon.net ) > "$work/attempt-failed.out" 2>&1 || code=$?
+	check "a failed web lane fails the attempt" "$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and the web apply is not reached" \
+		"$([ -e "$work/calls" ] && printf yes || printf no)" no
+	check "and the notice names the command that finishes it" \
+		"$(grep -c 'doas ksh scripts/cron-apply.sh --web' "$work/attempt-failed.out")" 1
+	check "and carries the lane's own words" \
+		"$(grep -c 'the vhost did not write' "$work/attempt-failed.out")" 1
+
+	# A hook whose scripts the deploy never installed fails rather than reporting a
+	# vhost it did not write.
+	rm -f "$drain_scripts/cron-apply.sh"
+	code=0
+	( apply_member alice.kyriakon.net ) > "$work/attempt-missing.out" 2>&1 || code=$?
+	check "a missing drain script fails the hook" "$code" 1
+	check "and the refusal names the deploy that installs it" \
+		"$(grep -c 'scripts/deploy-onboard.sh' "$work/attempt-missing.out")" 1
 
 	self_test_end
 }
