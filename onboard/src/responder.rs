@@ -2200,6 +2200,9 @@ fn build_record(
         upload_key,
         rail: rail.clone(),
         no_charge: rail == "no_charge",
+        // The drain writes this when it sends the confirmation, which is before
+        // it files anything the handler sees.
+        confirmation_at: None,
         acceptances: capsule::ACCEPTED
             .iter()
             .map(|(document, _)| Acceptance {

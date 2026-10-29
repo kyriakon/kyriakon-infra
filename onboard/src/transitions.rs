@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
@@ -280,19 +281,25 @@ async fn publish_mail_keys_publicly(
     Ok(())
 }
 
-/// The address an approval notice goes to: the applicant's own outside address,
-/// validated again here because it was written by the unprivileged half and is
-/// about to become a mail header, or the mailbox the approval just created.
-fn recipient(record: &Record, username: &str) -> Result<String, String> {
+/// The address the applicant gave outside the platform, revalidated here because
+/// it was written by the unprivileged half and is about to become a mail header.
+/// `None` when none was given.
+fn outside_address(record: &Record) -> Result<Option<String>, String> {
     match record.outside_address.as_deref() {
         Some(addr) => {
             if let Some(why) = validate::address(addr) {
                 return Err(format!("the address outside the platform {addr:?}: {why}"));
             }
-            Ok(addr.to_string())
+            Ok(Some(addr.to_string()))
         }
-        None => Ok(format!("{username}@kyriakon.net")),
+        None => Ok(None),
     }
+}
+
+/// The address an approval notice goes to: the applicant's own outside address,
+/// or the mailbox the approval just created.
+fn recipient(record: &Record, username: &str) -> Result<String, String> {
+    Ok(outside_address(record)?.unwrap_or_else(|| format!("{username}@kyriakon.net")))
 }
 
 /// The address a body's approval notice goes to. A body has no account of the
@@ -300,15 +307,99 @@ fn recipient(record: &Record, username: &str) -> Result<String, String> {
 /// domain rather than the person path's `username@kyriakon.net`, which the drain
 /// never makes for a body.
 fn group_recipient(record: &Record, site_owner: &str, domain: &str) -> Result<String, String> {
-    match record.outside_address.as_deref() {
-        Some(addr) => {
-            if let Some(why) = validate::address(addr) {
-                return Err(format!("the address outside the platform {addr:?}: {why}"));
-            }
-            Ok(addr.to_string())
+    Ok(outside_address(record)?.unwrap_or_else(|| format!("{site_owner}@{domain}")))
+}
+
+/// The application record's confirmation lock. The stamp is a read-check-write of
+/// a record that is replaced by rename, so the lock lives beside it rather than
+/// on it; two drain passes on the same application could otherwise both read it
+/// as unconfirmed.
+///
+/// It is held across the send rather than only across the write. Two passes
+/// serialised for the one enqueue is cheap, and releasing it before the send
+/// reopens the window this lock exists to close: the second pass would find the
+/// stamp and skip, and a failed send would be left recorded as sent.
+///
+/// The drain runs as root and the handler owns `applications/`, so the lock is
+/// handed to the directory's owner like every record `write_record_owned`
+/// writes; a root-owned file there reads as store drift to the hygiene check.
+async fn lock_confirmation(store: &Store) -> Result<tokio::fs::File, String> {
+    let path = store.path("applications/.confirmation.lock");
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).mode(0o600);
+    let file = opts
+        .open(&path)
+        .await
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    if let Some((uid, gid)) = store.dir_owner("applications") {
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&path, Some(uid), Some(gid))
+                .map_err(|e| format!("cannot hand {} to the handler: {e}", path.display()))?;
         }
-        None => Ok(format!("{site_owner}@{domain}")),
     }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!(
+            "cannot lock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(file)
+}
+
+/// Send the confirmation the spec promises before provisioning: it restates the
+/// immediate-supply request and the digital-content acknowledgement, quotes every
+/// document accepted with its version, and states the 14-day right with how to
+/// use it.
+///
+/// The stamp is written on the application before the enqueue, the direction
+/// every notice takes: a crash loses an email rather than sending it twice. An
+/// enqueue that *returns* an error is not a crash, though: the stamp is cleared
+/// before the error leaves this function, so the retry sends the mail. Leaving
+/// it set would provision the applicant without the confirmation and record that
+/// it was sent.
+///
+/// With no outside address there is no mailbox that can receive one before the
+/// account exists. The acceptances stay on the application record, which is what
+/// the confirmation quotes; the status page carries the decision and the
+/// password link, not this letter.
+async fn confirm(
+    cfg: &DrainConfig,
+    store: &Store,
+    token: &str,
+    record: &Record,
+) -> Result<(), String> {
+    let Some(to) = outside_address(record)? else {
+        return Ok(());
+    };
+    let _lock = lock_confirmation(store).await?;
+    let mut live = application_record(store, token).await?;
+    if live.confirmation_at.is_some() {
+        return Ok(());
+    }
+    let subject = confirmation_subject(&live.username);
+    let body = confirmation_body(&live);
+    live.confirmation_at = Some(util::filed_at());
+    save_application(store, token, &live).await?;
+    if let Err(e) = notice::enqueue(cfg, &to, &subject, &body).await {
+        // The stamp goes back before the error, so a retry is a resend rather
+        // than an approval that provisions with the letter lost.
+        live.confirmation_at = None;
+        save_application(store, token, &live).await?;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Write the application record, handed to the handler's owner like every other
+/// record in `applications/`.
+async fn save_application(store: &Store, token: &str, record: &Record) -> Result<(), String> {
+    let bytes =
+        serde_json::to_vec_pretty(record).map_err(|e| format!("cannot encode the record: {e}"))?;
+    let owner = store.dir_owner("applications");
+    store
+        .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
+        .await
 }
 
 /// Append one journal line. The caller writes this before the transition, which
@@ -966,6 +1057,11 @@ async fn approve(
         }
     }
 
+    // The confirmation the spec promises goes out before the journal's
+    // "applying" line and before any provisioning, so the record of what was
+    // agreed exists before the service begins.
+    confirm(cfg, store, token, &record).await?;
+
     journal(
         store,
         &cfg.release,
@@ -1215,6 +1311,11 @@ async fn approve_group(
     check_group_names(cfg, store, &domain, &mailboxes, existing_group.as_ref()).await?;
     let name = record.answers.get("body_name").cloned().unwrap_or_default();
     let body_kind = record.answers.get("body_kind").cloned().unwrap_or_default();
+
+    // The confirmation is the applicant's and goes before the body's accounts
+    // exist, as it does on the person path. Every refusal above has already run,
+    // so a refused application still sends nothing.
+    confirm(cfg, store, &record.status_token, record).await?;
 
     journal(
         store,
@@ -2865,6 +2966,38 @@ async fn append_ledger(
 
 fn decision_subject(what: &str, username: &str) -> String {
     format!("Your application to kyriakon.net was {what} ({username})")
+}
+
+/// The confirmation's subject, in the member-facing shape the decision mail
+/// takes rather than the operator alert's component/event one.
+fn confirmation_subject(username: &str) -> String {
+    format!("Your application to kyriakon.net was confirmed ({username})")
+}
+
+/// The confirmation email. It repeats the two things the second checkbox
+/// recorded, the version of every document accepted, and the 14-day right with
+/// how to use it, in the words `docs/terms.md` uses.
+fn confirmation_body(record: &Record) -> String {
+    let mut out = String::from(
+        "We are starting your account now, before the cancellation period ends:\n\
+         digital content is supplied immediately, and this does not take your right\n\
+         to cancel away.\n\n\
+         You accepted:\n\n",
+    );
+    for acceptance in &record.acceptances {
+        out.push_str(&format!(
+            "  {}: {}\n",
+            acceptance.document, acceptance.version
+        ));
+    }
+    out.push_str(
+        "\nYou have fourteen days to cancel, starting the day the contract is made. The\n\
+         right is unconditional: you can cancel for any reason, or none. An email to\n\
+         admin@kyriakon.net saying that you want to cancel is enough. We refund what\n\
+         you paid in full, within fourteen days, in the rail you paid with, or as a\n\
+         credit against the next year if you would rather.\n",
+    );
+    out
 }
 
 /// The decision email for an approval. The words are short because #333 owns
