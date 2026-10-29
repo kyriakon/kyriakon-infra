@@ -174,7 +174,7 @@ with a pool, since each retry arrives on a different one.
 
 ### What is in the list, and where each entry came from
 
-Three providers, each taken from its own mailing SPF rather than from memory:
+Four providers, each taken from its own mailing SPF rather than from memory:
 
 	Microsoft (Outlook.com, Exchange Online)
 	  dig +short TXT spf.protection.outlook.com
@@ -182,6 +182,8 @@ Three providers, each taken from its own mailing SPF rather than from memory:
 	  dig +short TXT _spf.google.com
 	GitHub (noreply@github.com, out-N.smtp.github.com)
 	  dig +short TXT github.com
+	Mandrill (Mailchimp transactional; join.com's signup mail)
+	  dig +short TXT spf.mandrillapp.com
 
 Microsoft's entries are its mail relays. Google's `74.125.0.0/16` and
 `209.85.128.0/17` are its mail range and not its cloud, which is the distinction
@@ -204,10 +206,20 @@ deferred from `192.30.252.129`, which is `out-30.smtp.github.com` sending as
 `noreply@github.com`, and the tuple was still in the table when it was looked at.
 That pool is one range in GitHub's SPF, `ip4:192.30.252.0/22`. The record's other
 includes are Microsoft's mail and Google's mail, which are already listed, and
-four bulk-mail platforms, SendGrid, Mailchimp, Salesforce and Zendesk, which are
-not listed on purpose. Those carry marketing mail, and this domain has no reason
-to pass marketing ranges straight through. The tuple table held no other address
-inside the range before it was added.
+SendGrid, Salesforce and Zendesk, which are not listed on purpose. Those carry
+marketing mail, and this domain has no reason to pass marketing ranges straight
+through. The tuple table held no other address inside the range before it was
+added.
+
+Mandrill was added on 2026-10-29, against the earlier exclusion of Mailchimp's
+ranges. A join.com signup message to `oliver@kyriakon.net` was deferred from
+`198.2.133.29` (`mail133-29.atl131.mandrillapp.com`, envelope
+`bounce-md_…@et-rp.join.com`) and the tuple expired without a retry, so the mail
+was dropped rather than delayed. `spf.mandrillapp.com` is the transactional set,
+and the twelve prefixes above are the whole of it. The tradeoff is accepted: the
+same ranges carry Mailchimp marketing mail, so greylisting no longer filters that
+provider. The block can be removed again if `abuse-monitor.sh`'s greylist and
+trapped counts show the pool being used against this box.
 
 
 ## Verifying
