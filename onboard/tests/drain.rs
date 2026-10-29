@@ -1606,6 +1606,81 @@ fn an_approval_without_an_outside_address_sends_no_confirmation() {
     );
 }
 
+/// A confirmation the enqueuer refuses is not recorded as sent: the approval
+/// stops before provisioning, the stamp goes back, and the retry sends it. A
+/// stamp left behind would provision the applicant with the letter lost.
+#[test]
+fn a_confirmation_that_cannot_be_sent_is_not_recorded_as_sent() {
+    let fix = Fix::new("confirmation-send-fails");
+    let sent = fix.path("sent");
+    fix.script(
+        "enqueuer.sh",
+        &format!(
+            "#!/bin/sh\nmsg=$(cat)\ncase \"$msg\" in\n*'cancellation period ends'*) echo 'the mail path is broken' >&2; exit 1;;\nesac\nprintf '%s' \"$msg\" >> '{sent}'\n"
+        ),
+    );
+    let record = fix.filed_with(
+        "secretary",
+        "cash",
+        &[("rail", "cash")],
+        Some("applicant@example.invalid"),
+        Some((UPLOAD_KEY, "works")),
+    );
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    assert!(fix.drain().status.success());
+
+    // No account was made, and the application does not claim the letter left.
+    assert!(
+        !fix.dir
+            .join("store/accounts/secretary/account.json")
+            .exists(),
+        "an approval whose confirmation failed must not provision"
+    );
+    let app: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    assert!(app.get("confirmation_at").is_none(), "{app}");
+    assert!(!fix.sent().contains("was confirmed"), "{}", fix.sent());
+
+    // With the mail path back, the retry sends the confirmation once and goes on.
+    fix.enqueuer_works();
+    fix.age_failures();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.sent().matches("was confirmed").count(),
+        1,
+        "{}",
+        fix.sent()
+    );
+    assert!(fix
+        .dir
+        .join("store/accounts/secretary/account.json")
+        .exists());
+}
+
+/// A body's approval sends the applicant the same confirmation before any of the
+/// body's accounts exist, as the person path does.
+#[test]
+fn a_body_approval_sends_the_confirmation() {
+    let fix = Fix::new("group-confirmation");
+    let mut record = fix.filed_body("warden");
+    record["outside_address"] = json!("warden@example.invalid");
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let sent = fix.sent();
+    assert_eq!(sent.matches("was confirmed").count(), 1, "{sent}");
+    assert!(sent.contains("To: warden@example.invalid"), "{sent}");
+    assert!(sent.contains("terms: 2026-10-01 abc1234"), "{sent}");
+    assert!(sent.contains("fourteen days"), "{sent}");
+}
+
 /// The upload key the application carried is written where `provision-member.sh`
 /// reads it before that script runs, so an approval completes against the real
 /// script's contract rather than only against a stub that ignores the key.

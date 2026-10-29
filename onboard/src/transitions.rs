@@ -313,7 +313,16 @@ fn group_recipient(record: &Record, site_owner: &str, domain: &str) -> Result<St
 /// The application record's confirmation lock. The stamp is a read-check-write of
 /// a record that is replaced by rename, so the lock lives beside it rather than
 /// on it; two drain passes on the same application could otherwise both read it
-/// as unconfirmed. It is held for the write only, never across the send.
+/// as unconfirmed.
+///
+/// It is held across the send rather than only across the write. Two passes
+/// serialised for the one enqueue is cheap, and releasing it before the send
+/// reopens the window this lock exists to close: the second pass would find the
+/// stamp and skip, and a failed send would be left recorded as sent.
+///
+/// The drain runs as root and the handler owns `applications/`, so the lock is
+/// handed to the directory's owner like every record `write_record_owned`
+/// writes; a root-owned file there reads as store drift to the hygiene check.
 async fn lock_confirmation(store: &Store) -> Result<tokio::fs::File, String> {
     let path = store.path("applications/.confirmation.lock");
     let mut opts = tokio::fs::OpenOptions::new();
@@ -322,6 +331,12 @@ async fn lock_confirmation(store: &Store) -> Result<tokio::fs::File, String> {
         .open(&path)
         .await
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    if let Some((uid, gid)) = store.dir_owner("applications") {
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&path, Some(uid), Some(gid))
+                .map_err(|e| format!("cannot hand {} to the handler: {e}", path.display()))?;
+        }
+    }
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(format!(
             "cannot lock {}: {}",
@@ -338,9 +353,16 @@ async fn lock_confirmation(store: &Store) -> Result<tokio::fs::File, String> {
 /// use it.
 ///
 /// The stamp is written on the application before the enqueue, the direction
-/// every notice takes: a crash loses an email rather than sending it twice. With
-/// no outside address there is no mailbox that can receive one before the account
-/// exists, so the status page is the record instead.
+/// every notice takes: a crash loses an email rather than sending it twice. An
+/// enqueue that *returns* an error is not a crash, though: the stamp is cleared
+/// before the error leaves this function, so the retry sends the mail. Leaving
+/// it set would provision the applicant without the confirmation and record that
+/// it was sent.
+///
+/// With no outside address there is no mailbox that can receive one before the
+/// account exists. The acceptances stay on the application record, which is what
+/// the confirmation quotes; the status page carries the decision and the
+/// password link, not this letter.
 async fn confirm(
     cfg: &DrainConfig,
     store: &Store,
@@ -351,24 +373,33 @@ async fn confirm(
         return Ok(());
     };
     let _lock = lock_confirmation(store).await?;
-    let mut record = application_record(store, token).await?;
-    if record.confirmation_at.is_some() {
+    let mut live = application_record(store, token).await?;
+    if live.confirmation_at.is_some() {
         return Ok(());
     }
-    record.confirmation_at = Some(util::filed_at());
+    let subject = confirmation_subject(&live.username);
+    let body = confirmation_body(&live);
+    live.confirmation_at = Some(util::filed_at());
+    save_application(store, token, &live).await?;
+    if let Err(e) = notice::enqueue(cfg, &to, &subject, &body).await {
+        // The stamp goes back before the error, so a retry is a resend rather
+        // than an approval that provisions with the letter lost.
+        live.confirmation_at = None;
+        save_application(store, token, &live).await?;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Write the application record, handed to the handler's owner like every other
+/// record in `applications/`.
+async fn save_application(store: &Store, token: &str, record: &Record) -> Result<(), String> {
     let bytes =
-        serde_json::to_vec_pretty(&record).map_err(|e| format!("cannot encode the record: {e}"))?;
+        serde_json::to_vec_pretty(record).map_err(|e| format!("cannot encode the record: {e}"))?;
     let owner = store.dir_owner("applications");
     store
         .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
-        .await?;
-    notice::enqueue(
-        cfg,
-        &to,
-        &confirmation_subject(&record.username),
-        &confirmation_body(&record),
-    )
-    .await
+        .await
 }
 
 /// Append one journal line. The caller writes this before the transition, which
@@ -1280,6 +1311,11 @@ async fn approve_group(
     check_group_names(cfg, store, &domain, &mailboxes, existing_group.as_ref()).await?;
     let name = record.answers.get("body_name").cloned().unwrap_or_default();
     let body_kind = record.answers.get("body_kind").cloned().unwrap_or_default();
+
+    // The confirmation is the applicant's and goes before the body's accounts
+    // exist, as it does on the person path. Every refusal above has already run,
+    // so a refused application still sends nothing.
+    confirm(cfg, store, &record.status_token, record).await?;
 
     journal(
         store,
