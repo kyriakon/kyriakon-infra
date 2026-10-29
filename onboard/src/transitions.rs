@@ -2943,9 +2943,9 @@ fn confirmation_subject(username: &str) -> String {
 /// how to use it, in the words `docs/terms.md` uses.
 fn confirmation_body(record: &Record) -> String {
     let mut out = String::from(
-        "You asked us to start now, before the cancellation period ends, and you\n\
-         acknowledged that digital content is supplied immediately. Provisioning does\n\
-         not take your right to cancel away.\n\n\
+        "We are starting your account now, before the cancellation period ends:\n\
+         digital content is supplied immediately, and this does not take your right\n\
+         to cancel away.\n\n\
          You accepted:\n\n",
     );
     for acceptance in &record.acceptances {
