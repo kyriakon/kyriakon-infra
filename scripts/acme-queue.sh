@@ -284,7 +284,7 @@ attempt() {
 			found=$(printf '%s: issued or current, and %s is in place, so the request is closed.\nThe web lane or the web apply then failed, so %s still answers with the default certificate.' \
 				"$name" "$cert" "$name")
 			notify_operator acme "apply failed" "$found" \
-				"run doas ksh scripts/cron-apply.sh --web on the box; it rewrites the indexes and the relayd keypair region and reloads what changed"
+				"run doas ksh scripts/provision-member-web.sh ${name%.kyriakon.net}, then doas ksh scripts/cron-apply.sh --web, on the box: the first writes the vhost and the second the indexes, the relayd keypair and the reload"
 			exit 1
 		fi
 		# The two outcomes get different events, so a list of subjects says which
@@ -518,7 +518,9 @@ apply --web"
 	check "a failed web lane fails the attempt" "$([ "$code" -ne 0 ] && printf yes || printf no)" yes
 	check "and the web apply is not reached" \
 		"$([ -e "$work/calls" ] && printf yes || printf no)" no
-	check "and the notice names the command that finishes it" \
+	check "and the notice names both commands that finish it" \
+		"$(grep -c 'provision-member-web.sh bob' "$work/attempt-failed.out")" 1
+	check "and the web apply after it" \
 		"$(grep -c 'doas ksh scripts/cron-apply.sh --web' "$work/attempt-failed.out")" 1
 	check "and carries the lane's own words" \
 		"$(grep -c 'the vhost did not write' "$work/attempt-failed.out")" 1

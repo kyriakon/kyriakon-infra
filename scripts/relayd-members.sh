@@ -83,7 +83,10 @@ member_names() {
 # member_ready <name>: the complete pair is on disk, which is the condition for a
 # line and for the link.
 member_ready() {
-	[ -f "$ssl_dir/$1.fullchain.pem" ] && [ -f "$ssl_private/$1.key" ]
+	# -s and not -f: an interrupted acme-client write leaves an empty file, and a
+	# keypair line for it is a `relayd -n` failure that rolls back every other
+	# member's pending change in the same pass.
+	[ -s "$ssl_dir/$1.fullchain.pem" ] && [ -s "$ssl_private/$1.key" ]
 }
 
 # ensure_member_link <name>: /etc/ssl/<name>.crt is the symlink relayd looks the
@@ -136,10 +139,24 @@ apply() {
 	typeset target="$1" mode="$2" begin_line end_line lines candidate name
 
 	[ -f "$target" ] || die "no $target"
-	begin_line=$(grep -n "$begin_marker" "$target" | head -1 | cut -d: -f1)
-	end_line=$(grep -n "$end_marker" "$target" | head -1 | cut -d: -f1)
+	# awk rather than grep, because grep's exit status for no match would end the
+	# run under `set -o pipefail` before the refusal below could name the file.
+	begin_line=$(awk -v m="$begin_marker" 'index($0, m) { print NR; exit }' "$target")
+	end_line=$(awk -v m="$end_marker" 'index($0, m) { print NR; exit }' "$target")
 	if [ -z "$begin_line" ] || [ -z "$end_line" ] || [ "$begin_line" -ge "$end_line" ]; then
 		die "$target does not carry the member keypair markers, so this script has no region it owns there (the tracked relayd.conf does)"
+	fi
+
+	# The links first, in write mode, so a link removed by hand is repaired even
+	# when the region already matches: a region that names a certificate relayd
+	# cannot open is a config its own check rejects. Before the temporary files
+	# below, so a refusal leaves nothing behind in /etc.
+	if [ "$mode" = write ]; then
+		member_names | while read -r name; do
+			if member_ready "$name"; then
+				ensure_member_link "$name"
+			fi
+		done
 	fi
 
 	lines="$target.lines.$$"
@@ -148,17 +165,6 @@ apply() {
 	if ! render "$target" "$lines" > "$candidate"; then
 		rm -f "$lines" "$candidate"
 		die "could not render $target"
-	fi
-
-	# The links first, in write mode, so a link removed by hand is repaired even
-	# when the region already matches: a region that names a certificate relayd
-	# cannot open is a config its own check rejects.
-	if [ "$mode" = write ]; then
-		member_names | while read -r name; do
-			if member_ready "$name"; then
-				ensure_member_link "$name"
-			fi
-		done
 	fi
 
 	# Compared before anything moves, so a run that would produce the same file
@@ -220,8 +226,8 @@ EOF
 	: > "$httpd_d/bob.kyriakon.net.conf"
 	: > "$httpd_d/zed.kyriakon.net.conf"
 	for name in alice.kyriakon.net zed.kyriakon.net carol.kyriakon.net; do
-		: > "$ssl_dir/$name.fullchain.pem"
-		: > "$ssl_private/$name.key"
+		printf 'certificate\n' > "$ssl_dir/$name.fullchain.pem"
+		printf 'key\n' > "$ssl_private/$name.key"
 	done
 	# A vhost for a name that is not a member file shape is not a member.
 	: > "$httpd_d/parish.conf"
@@ -264,8 +270,8 @@ EOF
 
 	# --check sees a change and writes nothing.
 	: > "$httpd_d/third.kyriakon.net.conf"
-	: > "$ssl_dir/third.kyriakon.net.fullchain.pem"
-	: > "$ssl_private/third.kyriakon.net.key"
+	printf 'certificate\n' > "$ssl_dir/third.kyriakon.net.fullchain.pem"
+	printf 'key\n' > "$ssl_private/third.kyriakon.net.key"
 	before=$(stat -f '%i %m %z' "$conf")
 	apply "$conf" check > "$tree/check.out"
 	check "--check reports the change" "$(cat "$tree/check.out")" "changed"
@@ -281,6 +287,22 @@ EOF
 		"$(grep -c 'does not carry the member keypair markers' "$tree/nomarkers.out")" 1
 	check "and the file is untouched" \
 		"$(grep -c 'kyriakon.net' "$tree/nomarkers.conf")" 1
+	# The real entry point, not `apply` inside a subshell whose status is being
+	# tested: the refusal has to print the message there too, or a caller dies with
+	# an empty terminal.
+	code=0
+	ksh "$script_dir/relayd-members.sh" "$tree/nomarkers.conf" > "$tree/direct.out" 2>&1 || code=$?
+	check "the script itself refuses a config with no markers" "$code" 1
+	check "and prints the refusal rather than dying silently" \
+		"$(grep -c 'does not carry the member keypair markers' "$tree/direct.out")" 1
+
+	# An empty full chain is an interrupted write, not a certificate: a keypair
+	# line for it is a config relayd refuses, which would roll back every other
+	# member's change in the same pass.
+	: > "$ssl_dir/zed.kyriakon.net.fullchain.pem"
+	apply "$conf" write > "$tree/empty.out"
+	check "an empty certificate is not treated as ready" \
+		"$(grep -c 'zed.kyriakon.net' "$conf")" 0
 
 	# A real file where the link goes is refused, and left alone.
 	rm -f "$ssl_dir/zed.kyriakon.net.crt"
