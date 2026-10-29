@@ -19,9 +19,10 @@
 //!   kyriakon-onboardctl [--config PATH] show <username>
 //!   kyriakon-onboardctl request list
 //!   kyriakon-onboardctl request record
+//!   kyriakon-onboardctl request extend <id>
 //!   kyriakon-onboardctl request close <id>
 //!
-//! The flags the two writing verbs take are in `usage`, which is the one copy
+//! The flags the three writing verbs take are in `usage`, which is the one copy
 //! of the text.
 //!
 //! The `request` verbs write the data-subject request record straight into the
@@ -108,6 +109,8 @@ fn usage() -> String {
        kyriakon-onboardctl request record --username <u> --kind <access|erasure|rectification> \
      --received <YYYY-MM-DD> --evidence <text> [--note <text>] \
      [--identity-at <YYYY-MM-DD>] [--fee-at <YYYY-MM-DD>] [--id <ulid>] \
+       kyriakon-onboardctl request extend <id> --reason <text> \
+     [--extended-on <YYYY-MM-DD>] \
        kyriakon-onboardctl request close <id> --done <YYYY-MM-DD> --note <text>"
         .to_string()
 }
@@ -254,6 +257,7 @@ async fn address(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<()
 async fn request(store: &Store, args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("record") => request_record(store, &args[1..]).await,
+        Some("extend") => request_extend(store, &args[1..]).await,
         Some("close") => request_close(store, &args[1..]).await,
         Some("list") => request_list(store).await,
         _ => Err(usage()),
@@ -292,6 +296,28 @@ async fn request_record(store: &Store, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+async fn request_extend(store: &Store, args: &[String]) -> Result<(), String> {
+    let (id, rest) = match args {
+        [id, rest @ ..] if !id.starts_with("--") => (id.as_str(), rest),
+        _ => return Err(usage()),
+    };
+    let flags = flags(rest, &["reason", "extended-on"])?;
+    let line = requests::extend(
+        store,
+        id,
+        need(&flags, "reason")?,
+        flags.get("extended-on").map(String::as_str),
+    )
+    .await?;
+    println!(
+        "extended {}; answer due {} (was {})",
+        line.id,
+        line.effective_due(),
+        line.due
+    );
+    Ok(())
+}
+
 async fn request_close(store: &Store, args: &[String]) -> Result<(), String> {
     let (id, rest) = match args {
         [id, rest @ ..] if !id.starts_with("--") => (id.as_str(), rest),
@@ -318,9 +344,10 @@ async fn request_list(store: &Store) -> Result<(), String> {
     let mut overdue = 0;
     let mut rows = Vec::new();
     for line in open {
-        let due =
-            requests::parse_date(&line.due).map_err(|e| format!("request {}: {e}", line.id))?;
-        let state = match requests::due_state(due, today) {
+        let state = match line
+            .state(today)
+            .map_err(|e| format!("request {}: {e}", line.id))?
+        {
             requests::DueState::Overdue => {
                 overdue += 1;
                 "OVERDUE"
@@ -331,16 +358,21 @@ async fn request_list(store: &Store) -> Result<(), String> {
             }
             requests::DueState::Open => "open",
         };
-        rows.push((line, state));
+        let due = if line.extended_until.is_some() {
+            format!("{} (extended from {})", line.effective_due(), line.due)
+        } else {
+            line.effective_due().to_string()
+        };
+        rows.push((line, due, state));
     }
     println!(
         "{} open request(s), {nearly} nearly due, {overdue} overdue",
         rows.len()
     );
-    for (line, state) in rows {
+    for (line, due, state) in rows {
         println!(
             "{}  {}  {}  received {}  due {}  {state}",
-            line.id, line.username, line.kind, line.received, line.due
+            line.id, line.username, line.kind, line.received, due
         );
     }
     Ok(())

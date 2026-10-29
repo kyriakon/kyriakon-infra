@@ -338,7 +338,17 @@ the line is there if the write landed.
 	doas onboardctl request list
 
 The list prints every open request, earliest due first, and counts the ones
-inside seven days and the overdue ones separately.
+inside seven days and the overdue ones separately. An extended request shows
+its extended date and the date it replaced.
+
+	doas onboardctl request extend <id> --reason "the export spans three mailboxes"
+
+A complex request may be extended by two further months under Article 12A. The
+extension runs from the current answer date, so the total is at most three
+months from the relevant time, and the command prints the old and the new date.
+`--extended-on <YYYY-MM-DD>` records the day the decision was made and defaults
+to today. The command refuses a closed request, a request extended already, and
+an empty reason.
 
 	doas onboardctl request close <id> --done <YYYY-MM-DD> --note "collected over sftp"
 
