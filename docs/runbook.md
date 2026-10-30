@@ -178,6 +178,38 @@ Do not give the account a shell. `chsh -s /bin/ksh <username>` undoes the platfo
 
 The per-member hosting design in #154 adds three things to this path: membership of the `members` group, the generated `httpd` and `gmid` files for the site, and the quota entry. `add-user.sh` does the group and the quota, and `provision-member.sh` does the rest of the hosting: it writes the member's own `httpd` and `gmid` files through its lanes, queues the certificate, and `scripts/cron-apply.sh --web` rewrites the indexes and the relayd member keypair region and reloads the daemons. Until the onboarding drain lands, this is the whole of provisioning a member.
 
+## Provision own-domain hosting
+
+An own-domain body's hosting is keyed by the body's domain, and it is served from the site owner's member tree. The upload session is chrooted to `/home/www/<site-account>.kyriakon.net`, and `sshd_config` is applied by hand, so a domain-named document root would need that file changed. Instead the vhosts root the site owner's `www` and `gemini` directories, and a body's upload path is the same as a member's.
+
+The drain applies the hosting from the group intent on approval. For a body already approved, or to repair a generated file, run the three lanes with the domain and the site owner's account:
+
+	doas ksh scripts/provision-group-web.sh <domain> <site-account>
+	doas ksh scripts/provision-group-capsule.sh <domain> <site-account>
+	doas ksh scripts/provision-group-acme.sh <domain> <site-account>
+	doas ksh scripts/cron-apply.sh --web
+
+The site owner's tree has to exist first. `provision-member.sh <site-account> <upload-key-file>` builds it, and a group that left the upload key empty has no tree, so no site.
+
+The three lanes write `/etc/httpd.d/<domain>.conf`, `/etc/gmid.d/<domain>.conf` and `/etc/acme-client.d/<domain>.conf`. `cron-apply.sh --web` rewrites the three indexes, fills the relayd keypair region and reloads what changed. The web lane writes the apex and `www` port 80 vhosts first, each with its challenge location before the redirect. The two loopback vhosts appear only once `/etc/ssl/<domain>.fullchain.pem` exists, so the name answers the challenge and serves nothing over TLS until the certificate lands. `relayd-members.sh` adds the domain's keypair line on the same pass.
+
+The certificate is one order for the domain and `www.<domain>`. The body's A and AAAA records for `@` and `www` have to be live first, or the queue holds the name rather than spending an authorization failure. `doas ksh scripts/acme-queue.sh --status` reads the request and its age. The queue has one global attempt slot every 202 minutes, so the order waits behind earlier requests. It spends one of the body's own registered-domain certificates, not `kyriakon.net`'s. On the pass that issues it, the queue runs the web lane and `cron-apply.sh --web` again, which writes the loopback vhosts, the relayd keypair and the reload.
+
+The capsule gets its own self-signed pair at `/etc/ssl/capsule-<domain>.crt` and `/etc/ssl/private/capsule-<domain>.key`, with `/etc/ssl/capsule-<domain>.cnf` beside it. The pair is generated once, lasts ten years, carries the domain in its subject alternative names and is marked `CA:FALSE` critical. Its fingerprint is what the account page publishes. A lost half regenerates the pair, and every reader trusts it once.
+
+`scripts/renew-acme.sh` reads the generated blocks in `/etc/acme-client.d`, so the domain certificate renews in the daily lane and restarts relayd. Renewals spend none of the refill.
+
+The configuration parses are checked on the box, not by any self-test here:
+
+	doas httpd -n -f /etc/httpd.conf
+	doas gmid -n -c /etc/gmid.conf
+	doas acme-client -n
+	doas openssl x509 -in /etc/ssl/capsule-<domain>.crt -noout -text
+
+The first three print nothing and exit 0. The last shows `DNS:<domain>` and `CA:FALSE` under a critical basic constraint. A live request for `http://<domain>/.well-known/acme-challenge/` is the only way to prove the challenge vhost is served, and `http://www.<domain>/` proves the second name.
+
+No new environment value is needed. `ACME_D`, `PUBLIC_ROOT` and `ACME_QUEUE` are the same overrides the member lanes use, and only the self-tests set them.
+
 ## Provision through the onboarding service
 
 The service is decided in #156, and the drain it needs is built: `scripts/deploy-onboard.sh` installs it and `scripts/cron-apply.sh` schedules it. This section records the shape an operator will work with, so that the decisions are findable beside the procedures they change.

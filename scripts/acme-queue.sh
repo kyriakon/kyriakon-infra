@@ -1,9 +1,10 @@
 #!/bin/ksh
-# acme-queue.sh - the certificate request queue: one request per member name,
-# worked oldest first, spaced against Let's Encrypt's refill rate.
+# acme-queue.sh - the certificate request queue: one request per name, worked
+# oldest first, spaced against Let's Encrypt's refill rate.
 #
 # Usage:
-#   doas ksh acme-queue.sh --add <name>    file one request (the signup path does this)
+#   doas ksh acme-queue.sh --add <name> [<site-owner>]
+#                                          file one request (the signup path does this)
 #   doas ksh acme-queue.sh --status        pending requests, oldest first, with ages; no attempt
 #   doas ksh acme-queue.sh --run           attempt at most one name this pass
 #        ksh acme-queue.sh --self-test     exercise the ordering and spacing unprivileged
@@ -29,6 +30,15 @@
 # the CA's refill and the five-authorization-failures-per-identifier-per-hour
 # limit, and neither of those cares whether the last attempt succeeded. A failed
 # name is left pending, so its age keeps showing in --status.
+#
+# The budget, stated plainly because an own-domain body changes what a slot is
+# spent from. The queue has one global slot: at most one attempt every 202
+# minutes for the whole box, not one slot per name and not one per registered
+# domain. A member name spends one of kyriakon.net's fifty. A group's domain
+# order spends one of that domain's own fifty, because Let's Encrypt counts the
+# registered domain (the eTLD+1) and the body's domain is its own; the platform's
+# fifty is untouched. Either order occupies the queue's one slot for the pass
+# that makes it, so it waits behind earlier requests.
 #
 # Why a name that does not resolve is held, not attempted. An HTTP-01 attempt
 # against a name the world cannot resolve spends one of the five authorization
@@ -139,7 +149,7 @@ fi
 REFILL_MINUTES=202
 
 usage() {
-	printf 'usage: doas ksh %s --add <name> | --status | --run\n       ksh %s --self-test\n' \
+	printf 'usage: doas ksh %s --add <name> [<site-owner>] | --status | --run\n       ksh %s --self-test\n' \
 		"$0" "$0" >&2
 	exit 2
 }
@@ -158,18 +168,26 @@ die() {
 	exit 1
 }
 
-# name_ok <name> : true when the request can be named <name>. A member name is
-# <localpart>.kyriakon.net, and the localpart is the string add-user.sh already
-# accepted as a username, a home directory and a keyring filename, so it is that
-# same set: lowercase [a-z0-9._-], first character alphanumeric, at most 32
-# characters. The name becomes a filename here, so the check is also what keeps a
-# request from being a path.
+# name_ok <name> : true when the request can be named <name>. Two shapes reach
+# the queue: a member's <localpart>.kyriakon.net, and an own-domain body's
+# domain, which is any validated FQDN. Both become a filename here, so the check
+# is also what keeps a request from being a path: lowercase labels of letters,
+# digits and hyphens, at least two labels, no label starting or ending with a
+# hyphen, and at most 253 characters.
 name_ok() {
+	[ "${#1}" -le 253 ] || return 1
 	case "$1" in
-	*.kyriakon.net) label=${1%.kyriakon.net} ;;
+	*.*) ;;
 	*) return 1 ;;
 	esac
-	printf '%s' "$label" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'
+	printf '%s' "$1" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+}
+
+# owner_ok <name> : a site owner is a member account, the string add-user.sh
+# accepted as a username, and it becomes the account named in the 443 vhost the
+# queue writes when an own-domain certificate lands.
+owner_ok() {
+	printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'
 }
 
 # minutes_until_slot <now> <last_attempt> : 0 when a slot is open, else the whole
@@ -236,10 +254,28 @@ EOF
 # is the report. On failure the failing step's output is printed, which is what
 # the operator needs and the notice cannot carry.
 apply_member() {
-	typeset apply_name="$1" apply_label apply_web_lane apply_apply step step_out
-	apply_label=${apply_name%.kyriakon.net}
-	apply_web_lane="$drain_scripts/provision-member-web.sh"
+	typeset apply_name="$1" apply_owner="${2:-}" apply_web_lane="" apply_apply step step_out
+	case "$apply_name" in
+	*.kyriakon.net)
+		apply_web_lane="$drain_scripts/provision-member-web.sh"
+		set -- "${apply_name%.kyriakon.net}"
+		;;
+	*)
+		# An own-domain name's 443 vhost names the site owner's tree, and the
+		# account was recorded with the request because this lane runs after the
+		# provisioning pass that knew it.
+		if [ -n "$apply_owner" ]; then
+			apply_web_lane="$drain_scripts/provision-group-web.sh"
+			set -- "$apply_name" "$apply_owner"
+		fi
+		;;
+	esac
 	apply_apply="$drain_scripts/cron-apply.sh"
+	if [ -z "${apply_web_lane:-}" ]; then
+		printf 'acme-queue: %s has no site owner recorded, so its 443 vhost cannot be written: file it again with --add %s <account>\n' \
+			"$apply_name" "$apply_name" >&2
+		return 1
+	fi
 	for step in "$apply_web_lane" "$apply_apply"; do
 		if [ ! -f "$step" ]; then
 			printf 'acme-queue: no %s, so %s has a certificate and still no site: scripts/deploy-onboard.sh installs the drain scripts\n' \
@@ -247,7 +283,7 @@ apply_member() {
 			return 1
 		fi
 	done
-	if ! step_out=$(ksh "$apply_web_lane" "$apply_label" 2>&1); then
+	if ! step_out=$(ksh "$apply_web_lane" "$@" 2>&1); then
 		printf '%s\n' "$step_out" >&2
 		return 1
 	fi
@@ -264,7 +300,11 @@ apply_member() {
 # printed. On any outcome but success the request is left pending and the run exits
 # 1, because a swallowed refusal is a member who waits for nothing.
 attempt() {
+	typeset request_owner apply_command
 	name="$1"
+	# The request file carries the site owner for an own-domain name, so the web
+	# lane can be run again when the certificate lands. A member's file is empty.
+	request_owner=$(cat "$pending_dir/$name" 2>/dev/null || true)
 	cert="$ssl_dir/$name.fullchain.pem"
 	rc=0
 	log=$("$client" "$name" 2>&1) || rc=$?
@@ -275,16 +315,20 @@ attempt() {
 		[ -f "$cert" ] || die "$name: acme-client exited $rc but $cert is not there"
 		rm -f "$pending_dir/$name"
 		[ ! -e "$pending_dir/$name" ] || die "$name: the request file is still there"
-		# The certificate is the trigger for the member's two remaining pieces:
-		# the vhost behind the relay and the relayd keypair line. Both are applied
+		# The certificate is the trigger for the name's two remaining pieces: the
+		# vhost behind the relay and the relayd keypair line. Both are applied
 		# here rather than left for a human, because nothing else runs on a new
 		# certificate and the page would otherwise promise a padlock that never
 		# arrives.
-		if ! apply_member "$name"; then
+		if ! apply_member "$name" "$request_owner"; then
 			found=$(printf '%s: issued or current, and %s is in place, so the request is closed.\nThe web lane or the web apply then failed, so %s still answers with the default certificate.' \
 				"$name" "$cert" "$name")
+			case "$name" in
+			*.kyriakon.net) apply_command="provision-member-web.sh ${name%.kyriakon.net}" ;;
+			*) apply_command="provision-group-web.sh $name $request_owner" ;;
+			esac
 			notify_operator acme "apply failed" "$found" \
-				"run doas ksh scripts/provision-member-web.sh ${name%.kyriakon.net}, then doas ksh scripts/cron-apply.sh --web, on the box: the first writes the vhost and the second the indexes, the relayd keypair and the reload"
+				"run doas ksh scripts/$apply_command, then doas ksh scripts/cron-apply.sh --web, on the box: the first writes the vhost and the second the indexes, the relayd keypair and the reload"
 			exit 1
 		fi
 		# The two outcomes get different events, so a list of subjects says which
@@ -317,7 +361,17 @@ attempt() {
 
 add_request() {
 	name="$1"
-	name_ok "$name" || die "not a member name: $name (expect <name>.kyriakon.net)"
+	owner="${2:-}"
+	name_ok "$name" || die "not a certificate name: $name (expect an FQDN, such as <name>.kyriakon.net or <domain>)"
+	case "$name" in
+	*.kyriakon.net) ;;
+	*)
+		# An own-domain name needs the account the 443 vhost will root, and the
+		# queue is where it is kept between provisioning and issuance.
+		[ -n "$owner" ] || die "the own-domain name $name needs its site owner account, so the 443 vhost can be written when the certificate lands"
+		owner_ok "$owner" || die "not an account name: $owner"
+		;;
+	esac
 	install -d -m 0700 "$queue_dir" "$pending_dir"
 	req="$pending_dir/$name"
 	if [ -e "$req" ]; then
@@ -325,10 +379,11 @@ add_request() {
 			"$name" "$(( ( $(date +%s) - $(stat -f '%m' "$req") ) / 60 ))"
 		return 0
 	fi
-	# The file is created empty and never rewritten: its mtime is the queue time,
+	# The file is written once and never rewritten: its mtime is the queue time,
 	# and rewriting it would reset the age and let a name that had waited jump back
-	# to the head of the queue.
-	: > "$req"
+	# to the head of the queue. Its content is the site owner for an own-domain
+	# name and empty for a member's.
+	printf '%s\n' "$owner" > "$req"
 	[ -f "$req" ] || die "could not file a request for $name"
 	printf 'queued: %s\n' "$name"
 }
@@ -422,10 +477,14 @@ self_test() {
 	work=$self_test_work
 
 	check "a member name is accepted" "$(name_ok foo.kyriakon.net && printf yes)" "yes"
+	check "an own-domain FQDN is accepted" "$(name_ok parish.example && printf yes || printf no)" "yes"
 	check "a name with a bad character is refused" "$(name_ok Foo.kyriakon.net && printf yes || printf no)" "no"
 	check "a bare localpart is refused" "$(name_ok foo && printf yes || printf no)" "no"
-	check "another domain is refused" "$(name_ok foo.example.invalid && printf yes || printf no)" "no"
+	check "a single-label domain is refused" "$(name_ok localhost && printf yes || printf no)" "no"
+	check "a leading hyphen is refused" "$(name_ok -parish.example && printf yes || printf no)" "no"
 	check "a path is refused" "$(name_ok ../etc/passwd.kyriakon.net && printf yes || printf no)" "no"
+	check "a site owner is a member account name" "$(owner_ok parish-secretary && printf yes || printf no)" "yes"
+	check "and a path is not a site owner" "$(owner_ok ../parish && printf yes || printf no)" "no"
 
 	base=2000000000
 	check "no attempt yet means an open slot" "$(minutes_until_slot "$base" 0)" "0"
@@ -488,14 +547,18 @@ STUB
 STUB
 	cat > "$drain_scripts/provision-member-web.sh" <<STUB
 #!/bin/sh
-printf 'web %s\n' "\$1" >> '$work/calls'
+printf 'web %s\n' "\$*" >> '$work/calls'
+STUB
+	cat > "$drain_scripts/provision-group-web.sh" <<STUB
+#!/bin/sh
+printf 'web %s\n' "\$*" >> '$work/calls'
 STUB
 	cat > "$drain_scripts/cron-apply.sh" <<STUB
 #!/bin/sh
 printf 'apply %s\n' "\$1" >> '$work/calls'
 STUB
 	chmod 0700 "$work/bin/acme-client" "$drain_scripts/provision-member-web.sh" \
-		"$drain_scripts/cron-apply.sh"
+		"$drain_scripts/provision-group-web.sh" "$drain_scripts/cron-apply.sh"
 	client="$work/bin/acme-client"
 	: > "$pending_dir/alice.kyriakon.net"
 	mode=run
@@ -505,6 +568,25 @@ STUB
 	check "and runs the web lane then the web apply, in that order" \
 		"$(cat "$work/calls")" "web alice
 apply --web"
+
+	# An own-domain request carries its site owner, and the web lane is run with
+	# the domain and that account, because the 443 vhost roots the owner's tree.
+	rm -f "$work/calls"
+	printf 'parish-secretary\n' > "$pending_dir/parish.example"
+	attempt parish.example > "$work/domain.out" 2>&1
+	check "an issued own-domain certificate closes its request" \
+		"$([ -e "$pending_dir/parish.example" ] && printf yes || printf no)" no
+	check "and runs the domain's web lane with its owner, then the web apply" \
+		"$(cat "$work/calls")" "web parish.example parish-secretary
+apply --web"
+
+	# An own-domain request with no owner cannot name a document root, so the hook
+	# refuses rather than writing a vhost it would have to guess.
+	code=0
+	( apply_member parish.example ) > "$work/noowner.out" 2>&1 || code=$?
+	check "an own-domain name with no owner is refused" "$code" 1
+	check "and the refusal names the account that must be filed with it" \
+		"$(grep -c 'file it again with --add parish.example <account>' "$work/noowner.out")" 1
 
 	# A web lane that fails stops the hook, and the notice names the command an
 	# operator runs to finish the job by hand.
@@ -525,6 +607,25 @@ apply --web"
 	check "and carries the lane's own words" \
 		"$(grep -c 'the vhost did not write' "$work/attempt-failed.out")" 1
 
+	# A request filed through the parser records the site owner, and a second
+	# filing leaves the age alone.
+	queue_dir="$work/add-queue"
+	pending_dir="$queue_dir/pending"
+	add_request parish.example parish-secretary > "$work/add.out"
+	check "an own-domain request is queued" "$(grep -c '^queued: parish.example$' "$work/add.out")" 1
+	check "and records the site owner for the later apply" \
+		"$(cat "$pending_dir/parish.example")" "parish-secretary"
+	before=$(stat -f '%i %m' "$pending_dir/parish.example")
+	add_request parish.example parish-secretary > "$work/add-again.out"
+	check "a second filing says it is already queued" \
+		"$(grep -c '^already queued: parish.example' "$work/add-again.out")" 1
+	check "and leaves the request alone" "$(stat -f '%i %m' "$pending_dir/parish.example")" "$before"
+	code=0
+	( add_request other.example ) > "$work/add-noowner.out" 2>&1 || code=$?
+	check "an own-domain request with no owner is refused at filing" "$code" 1
+	check "and nothing was filed for it" \
+		"$([ -e "$pending_dir/other.example" ] && printf yes || printf no)" no
+
 	# A hook whose scripts the deploy never installed fails rather than reporting a
 	# vhost it did not write.
 	rm -f "$drain_scripts/cron-apply.sh"
@@ -539,6 +640,7 @@ apply --web"
 
 mode=""
 name=""
+owner=""
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 	--add)
@@ -546,6 +648,12 @@ while [ "$#" -gt 0 ]; do
 		[ "$#" -ge 2 ] || usage
 		name="$2"
 		shift 2
+		# The site owner is optional and follows the name, for an own-domain
+		# order. A member name needs none.
+		if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
+			owner="$1"
+			shift
+		fi
 		;;
 	--status) mode=status; shift ;;
 	--run) mode=run; shift ;;
@@ -564,7 +672,7 @@ if [ "$mode" = add ] || [ "$mode" = run ]; then
 fi
 
 case "$mode" in
-add) add_request "$name" ;;
+add) add_request "$name" "$owner" ;;
 status) status ;;
 run) run ;;
 esac
