@@ -22,8 +22,9 @@ use crate::notice;
 use crate::questions;
 use crate::sign;
 use crate::store::{
-    self, Account, ApplicationRef, GroupAddress, GroupAddressIntent, GroupIntent, GroupPayment,
-    GroupRecord, Intent, JournalLine, KeyRecord, Payment, Record, Store, TokenRecord, Window,
+    self, Account, ApplicationRef, FlatPayment, GroupAddress, GroupAddressIntent, GroupIntent,
+    GroupPayment, GroupRecord, Intent, JournalLine, KeyRecord, Payment, Record, Store, TokenRecord,
+    Window,
 };
 use crate::util;
 use crate::validate;
@@ -1132,8 +1133,8 @@ async fn approve(
     } else {
         match existing
             .as_ref()
-            .and_then(|a| a.payment.as_ref())
-            .and_then(|p| p.token_ref.clone())
+            .and_then(|a| a.payment_state())
+            .and_then(|p| p.token_ref)
         {
             Some(t) => Some(t),
             None => Some(store::payment_token().await?),
@@ -1144,8 +1145,8 @@ async fn approve(
     } else {
         existing
             .as_ref()
-            .and_then(|a| a.payment.as_ref())
-            .and_then(|p| p.window.clone())
+            .and_then(|a| a.payment_state())
+            .and_then(|p| p.window)
             .or_else(|| {
                 Some(Window {
                     opened_at: now.clone(),
@@ -1182,6 +1183,7 @@ async fn approve(
         no_charge,
         created_at: now.clone(),
         payment,
+        legacy_payment: FlatPayment::default(),
         outside_address: record.outside_address.clone(),
         certificates: Vec::new(),
         site_served: None,
@@ -1227,6 +1229,14 @@ async fn approve(
     )
     .map_err(|e| format!("the application record does not parse: {e}"))?;
     app_copy["status_link_until"] = json!(util::after_days(7));
+    // The handler renders the status page as `_onboard` and cannot read the
+    // root-owned account, so the payment block it shows is this copy, written
+    // back into the record it does read. A free approval carries none, which is
+    // also why an undecided application never shows one.
+    if let Some(block) = &account.payment {
+        app_copy["payment"] = serde_json::to_value(block)
+            .map_err(|e| format!("cannot encode the payment block: {e}"))?;
+    }
     let copy_bytes = serde_json::to_vec_pretty(&app_copy)
         .map_err(|e| format!("cannot encode the application copy: {e}"))?;
     store
@@ -1235,6 +1245,10 @@ async fn approve(
             "application.json",
             &copy_bytes,
         )
+        .await?;
+    let owner = store.dir_owner("applications");
+    store
+        .write_record_owned("applications", &format!("{token}.json"), &copy_bytes, owner)
         .await?;
 
     // The decision email, recorded in the account's notices before it is
@@ -1317,7 +1331,7 @@ pub async fn resend(
         .ok_or_else(|| format!("no account for {username}"))?;
     let account: Account = serde_json::from_str(&text)
         .map_err(|e| format!("the account record does not parse: {e}"))?;
-    let Some(payment) = &account.payment else {
+    let Some(payment) = account.payment_state() else {
         return Err(format!(
             "{username} was approved without charge, so there is no payment token to resend"
         ));
@@ -1348,6 +1362,30 @@ pub async fn resend(
         &subject,
         &to,
         &body,
+    )
+    .await?;
+    // Every settling transition journals its outcome, and the line names the
+    // application the account was made from.
+    let application = store
+        .read_record(&format!("accounts/{username}"), "application.json")
+        .await
+        .and_then(|copy| serde_json::from_str::<Value>(&copy).ok())
+        .and_then(|copy| {
+            let status_token = copy.get("status_token")?.as_str()?.to_string();
+            Some(ApplicationRef {
+                username: username.to_string(),
+                status_token,
+            })
+        })
+        .ok_or_else(|| format!("no application record for {username}"))?;
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &application,
+        "applied",
+        None,
     )
     .await?;
     store.remove("intents", file).await
@@ -1912,6 +1950,7 @@ async fn write_group_account(
         // block for one at all rather than a paid-until that could be mistaken
         // for an unpaid person's.
         payment: None,
+        legacy_payment: FlatPayment::default(),
         outside_address: None,
         certificates: Vec::new(),
         site_served: None,

@@ -204,16 +204,17 @@ pub fn account(
 }
 
 /// The payment block for one account: the token and the window while the
-/// account is unpaid, the paid-until date alone once a credit has set one, and
-/// nothing at all for a free account, which the spec gives no window, no token
-/// and no payment block.
+/// account is unpaid, the paid-until date alone once a credit has set one. A
+/// free account has no block, which is why the caller passes one only when the
+/// record carries a `Payment`.
 pub fn payment(
-    account: &crate::store::Account,
+    state: &str,
+    rail: &str,
+    payment: &crate::store::Payment,
     price_gbp: &str,
     postal_address: &str,
     now: OffsetDateTime,
-) -> Option<PaymentView> {
-    let payment = account.payment.as_ref()?;
+) -> PaymentView {
     let unpaid = payment.paid_until.is_none();
     let window = payment.window.as_ref().filter(|_| unpaid);
     let closes_on = window.map(|w| w.closes_at.get(..10).unwrap_or(&w.closes_at).to_string());
@@ -226,9 +227,9 @@ pub fn payment(
         }
         _ => None,
     };
-    Some(PaymentView {
-        state: account.state.clone(),
-        rail: account.rail.clone(),
+    PaymentView {
+        state: state.to_string(),
+        rail: rail.to_string(),
         amount: price_gbp.to_string(),
         token: if unpaid {
             payment.token_ref.clone()
@@ -238,7 +239,7 @@ pub fn payment(
         paid_until: payment.paid_until.clone(),
         window: window_line,
         instructions: if unpaid {
-            crate::transitions::rail_instructions(&account.rail, postal_address)
+            crate::transitions::rail_instructions(rail, postal_address)
         } else {
             Vec::new()
         },
@@ -249,7 +250,7 @@ pub fn payment(
                  pushing stop. Nothing is deleted at that point."
             )
         }),
-    })
+    }
 }
 
 /// Build the page for one branch. `answers` is the last submission when one was

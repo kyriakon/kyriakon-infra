@@ -1256,16 +1256,26 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
     let now = OffsetDateTime::now_utc();
     let post = "1 Example Street, Example";
     let account = stored_account(&fix, "secretary");
-    let payment = account.payment.as_ref().expect("a paid approval's block");
+    let payment = account.payment_state().expect("a paid approval's block");
     let token = payment.token_ref.clone().expect("a paid approval's token");
     let closes_at = payment.window.as_ref().unwrap().closes_at.clone();
     let closes_on = closes_at[..10].to_string();
 
-    // The status page: the token in full, the amount and the close date.
+    let view = |account: &store::Account| {
+        let block = account.payment_state().expect("a paid approval's block");
+        page::payment(&account.state, &account.rail, &block, "20.00", post, now)
+    };
+
+    // The status page reads the copy the drain wrote into the application
+    // record, which is the only payment state the unprivileged handler can see.
     let application: Record =
         serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
-    let view = |account: &store::Account| page::payment(account, "20.00", post, now).unwrap();
-    let status = responder::status_page(Some(application.clone()), Some(view(&account)), now);
+    let block = application
+        .payment
+        .clone()
+        .expect("the drain copied the block onto the application");
+    let status_view = page::payment("active", &application.rail, &block, "20.00", post, now);
+    let status = responder::status_page(Some(application.clone()), Some(status_view), now);
     let html = status.render().unwrap();
     assert!(html.contains(&token), "{html}");
     assert!(html.contains("GBP 20.00"), "{html}");
@@ -1319,6 +1329,15 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
     assert_eq!(paid.paid_until.as_deref(), Some("2027-10-04T00:00:00Z"));
     assert_eq!(paid.token, None, "a paid account shows no token");
     assert_eq!(paid.rail, "cash", "the rail stays visible");
+    // A credit updates the application record's copy too (#300), so the status
+    // page shows the date rather than the token.
+    let mut application: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    application["payment"]["paid_until"] = json!("2027-10-04T00:00:00Z");
+    application["payment"]["window"]["state"] = json!("paid");
+    let application: Record = serde_json::from_value(application).unwrap();
+    let block = application.payment.clone().unwrap();
+    let paid = page::payment("active", &application.rail, &block, "20.00", post, now);
     let status = responder::status_page(Some(application), Some(paid), now);
     let html = status.render().unwrap();
     assert!(html.contains("Paid until 2027-10-04T00:00:00Z"), "{html}");
@@ -1343,7 +1362,7 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
     let out = free.drain();
     assert!(out.status.success(), "{}", body(&out));
     let account = stored_account(&free, "secretary");
-    assert!(page::payment(&account, "20.00", post, now).is_none());
+    assert!(account.payment_state().is_none());
     let web = page::account(&[], Some("secretary"), None, None)
         .render()
         .unwrap();
@@ -1355,6 +1374,26 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
     assert!(
         !gemini.contains("Payment"),
         "a free account has no block: {gemini}"
+    );
+}
+
+/// A filed application carries no payment state, which is what stops a status
+/// link showing an account's token to an applicant who typed that account's
+/// name: the block arrives only with the approval that made the account.
+#[test]
+fn a_filed_application_carries_no_payment_state() {
+    let fix = Fix::new("status-unapproved");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+
+    let filed: Record =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    assert!(filed.decided_at.is_none(), "the drain decided nothing");
+    assert!(
+        filed.payment.is_none(),
+        "{:?}",
+        filed.payment.as_ref().map(|p| &p.token_ref)
     );
 }
 
@@ -1372,16 +1411,22 @@ fn a_status_token_that_resolves_to_nothing_carries_no_payment() {
     assert!(out.status.success(), "{}", body(&out));
 
     let now = OffsetDateTime::now_utc();
-    let account = stored_account(&fix, "secretary");
-    let payment = page::payment(&account, "20.00", "1 Example Street, Example", now);
-    assert!(payment.is_some(), "the account owes for the year");
-
-    // Past the seven days the record's page is the unknown-token page, and the
-    // payment block goes with it.
     let record: Record =
         serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    let block = record.payment.clone().expect("the drain's copy");
+    let payment = page::payment(
+        "active",
+        &record.rail,
+        &block,
+        "20.00",
+        "1 Example Street, Example",
+        now,
+    );
+
+    // Past the seven days the record's page is the unknown-token page, and the
+    // payment block goes with it even when one is handed in.
     let later = now + time::Duration::days(8);
-    let expired = responder::status_page(Some(record), None, later);
+    let expired = responder::status_page(Some(record), Some(payment), later);
     let unknown = responder::status_page(None, None, now);
     assert!(
         expired.payment.is_none(),
@@ -1411,7 +1456,7 @@ fn a_token_resend_sends_the_same_token_and_mints_nothing() {
     assert!(out.status.success(), "{}", body(&out));
 
     let token = stored_account(&fix, "secretary")
-        .payment
+        .payment_state()
         .and_then(|p| p.token_ref)
         .expect("a paid approval's token");
     let tokens_before = fix.names("tokens");
@@ -1441,7 +1486,7 @@ fn a_token_resend_sends_the_same_token_and_mints_nothing() {
     );
     assert_eq!(
         stored_account(&fix, "secretary")
-            .payment
+            .payment_state()
             .and_then(|p| p.token_ref)
             .as_deref(),
         Some(token.as_str())
@@ -1493,7 +1538,7 @@ fn the_drain_prints_no_payment_token() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     let token = stored_account(&fix, "secretary")
-        .payment
+        .payment_state()
         .and_then(|p| p.token_ref)
         .expect("a paid approval's token");
     assert!(

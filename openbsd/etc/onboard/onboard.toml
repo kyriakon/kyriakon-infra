@@ -60,12 +60,12 @@ dkim_public_key = "REPLACE_ME"
 dmarc_rua = "mailto:dmarc@kyriakon.net"
 
 # The yearly price and the postal address a cash-by-post member is given, which
-# the account page shows beside their payment token. The drain's own config names
-# the same two values: the price because the Stripe Price and the prepaid price
-# have to agree, the address because it is the operator's own and this repository
-# is public. Both are substituted at deploy from /root/.kyriakon-env, and the
-# deploy refuses a file that still carries a placeholder.
-price_gbp = "20.00"
+# the account page shows beside their payment token. The address is the
+# operator's own and this repository is public, so it comes from
+# /root/.kyriakon-env. The price is copied from the drain's config at deploy, so
+# the Stripe Price and the prepaid price cannot disagree. The deploy refuses a
+# file that still carries a placeholder.
+price_gbp = "REPLACE_ME"
 postal_address = "REPLACE_ME"
 
 # The unix sockets the front-ends reach the responder on. There is no listener on

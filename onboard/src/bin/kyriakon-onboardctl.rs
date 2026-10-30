@@ -185,9 +185,8 @@ async fn token(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), 
     let account: kyriakon_onboard::store::Account = serde_json::from_str(&text)
         .map_err(|e| format!("the account record does not parse: {e}"))?;
     let token = account
-        .payment
-        .as_ref()
-        .and_then(|p| p.token_ref.clone())
+        .payment_state()
+        .and_then(|p| p.token_ref)
         .ok_or_else(|| {
             format!("{username} was approved without charge, so there is no payment token")
         })?;
@@ -476,7 +475,7 @@ async fn show(store: &Store, username: &str) -> Result<(), String> {
             }
             // A free account has no payment block at all: no window, no token,
             // and nothing that lapses.
-            let Some(payment) = &account.payment else {
+            let Some(payment) = account.payment_state() else {
                 println!("  token    none (no charge)");
                 println!("  paid     none: no charge was made, so nothing expires");
                 return Ok(());

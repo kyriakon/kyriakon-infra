@@ -1117,7 +1117,7 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
     }
     if let Some(token) = incoming.path.strip_prefix("status/") {
         let record = record_for(app, token).await;
-        let payment = payment_for(app, record.as_ref()).await;
+        let payment = payment_for(app, record.as_ref());
         let page = status_page(record, payment, OffsetDateTime::now_utc());
         return Reply::gemini(20, "text/gemini", capsule::status(&page));
     }
@@ -1127,12 +1127,16 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
             Some(account) => {
                 let notices = account_notices(app, &account.username).await;
                 let recipe = group_recipe(app, account);
-                let payment = page::payment(
-                    account,
-                    &app.cfg.price_gbp,
-                    &app.cfg.postal_address,
-                    OffsetDateTime::now_utc(),
-                );
+                let payment = account.payment_state().map(|block| {
+                    page::payment(
+                        &account.state,
+                        &account.rail,
+                        &block,
+                        &app.cfg.price_gbp,
+                        &app.cfg.postal_address,
+                        OffsetDateTime::now_utc(),
+                    )
+                });
                 capsule::account(account, &notices, recipe.as_ref(), payment.as_ref())
             }
             None => capsule::account_stranger(presented(incoming)),
@@ -1676,12 +1680,16 @@ async fn account(app: &App, request: &Request) -> Reply {
         None => None,
     };
     let payment = member.as_ref().and_then(|account| {
-        page::payment(
-            account,
-            &app.cfg.price_gbp,
-            &app.cfg.postal_address,
-            OffsetDateTime::now_utc(),
-        )
+        account.payment_state().map(|block| {
+            page::payment(
+                &account.state,
+                &account.rail,
+                &block,
+                &app.cfg.price_gbp,
+                &app.cfg.postal_address,
+                OffsetDateTime::now_utc(),
+            )
+        })
     });
     let page: AccountPage = page::account(
         &app.catalogue,
@@ -1851,21 +1859,25 @@ async fn apply(app: &App, request: &Request, incoming: &Incoming) -> Reply {
 /// capability in the URL is never stored and its URL is never sent as a referrer.
 async fn status(app: &App, token: &str) -> Reply {
     let record = record_for(app, token).await;
-    let payment = payment_for(app, record.as_ref()).await;
+    let payment = payment_for(app, record.as_ref());
     capability(&status_page(record, payment, OffsetDateTime::now_utc()))
 }
 
-/// The payment block a decided application's status page carries. The record
-/// names the account and holds no payment state of its own; the account does,
-/// and a token that resolves to no account reads as it does with no payment.
-async fn payment_for(app: &App, record: Option<&Record>) -> Option<page::PaymentView> {
-    let account = account_record(app, &record?.username).await?;
-    page::payment(
-        &account,
+/// The payment block a decided application's status page carries. The drain
+/// writes it into this record at approval, so the unprivileged handler renders
+/// it without reading the root-owned account, and a filed or declined
+/// application — which names whatever username its applicant typed — carries
+/// none. A free approval carries none anywhere.
+fn payment_for(app: &App, record: Option<&Record>) -> Option<page::PaymentView> {
+    let record = record?;
+    Some(page::payment(
+        "active",
+        &record.rail,
+        record.payment.as_ref()?,
         &app.cfg.price_gbp,
         &app.cfg.postal_address,
         OffsetDateTime::now_utc(),
-    )
+    ))
 }
 
 /// The decision a link names, with the signature it carries. A link with no
@@ -2246,6 +2258,9 @@ fn build_record(
             .get("address_outside")
             .cloned()
             .filter(|a| !a.trim().is_empty()),
+        // The drain copies the account's block here at approval, which is the
+        // only way the unprivileged handler can render it.
+        payment: None,
         answers,
         mail_keys,
         upload_key,
