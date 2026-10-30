@@ -93,6 +93,8 @@ classify() {
 	scripts/add-user.sh | scripts/provision-member.sh | scripts/delete-user.sh | \
 		scripts/quota-apply.sh | scripts/provision-member-web.sh | \
 		scripts/provision-member-capsule.sh | scripts/provision-member-acme.sh | \
+		scripts/provision-group-web.sh | scripts/provision-group-capsule.sh | \
+		scripts/provision-group-acme.sh | \
 		scripts/publish-mail-key.sh | \
 		scripts/set-mail-password.sh | scripts/reload-smtpd.sh) needs_onboard=yes ;;
 	# A helper of both the relay deploy and the drain's web pass, so a change to
@@ -410,6 +412,12 @@ self_test() {
 	reset_plan
 	classify 'scripts/provision-member-acme.sh'
 	check 'the acme lane plans deploy-onboard' "$needs_onboard" yes
+	reset_plan
+	classify 'scripts/provision-group-web.sh'
+	check 'an own-domain hosting lane plans deploy-onboard' "$needs_onboard" yes
+	reset_plan
+	classify 'scripts/provision-group-acme.sh'
+	check 'the own-domain acme lane plans deploy-onboard' "$needs_onboard" yes
 	reset_plan
 	classify 'scripts/relayd-members.sh'
 	check 'the relayd member helper plans both deploys' \

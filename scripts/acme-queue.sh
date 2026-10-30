@@ -47,7 +47,10 @@
 # section). So resolution is checked first, a name that does not resolve is left
 # pending (held) and the next name that does resolve is attempted instead, so one
 # member's missing record does not wedge the whole queue. If no pending name
-# resolves, nothing is attempted and nothing is recorded.
+# resolves, nothing is attempted and nothing is recorded. Every identifier in the
+# order is checked, not only the name the request is filed under: an own-domain
+# order carries www.<domain> beside the domain, and acme-client validates each
+# one over port 80 before anything is issued.
 #
 # Renewals are exempt and never queue. An order that repeats the exact set of
 # identifiers is a renewal and spends none of the 50, so scripts/renew-acme.sh
@@ -222,6 +225,18 @@ resolve_ok() {
 	"$resolver" -t A "$1" >/dev/null 2>&1
 }
 
+# identifiers_resolve <name> : true when every identifier in the name's order has
+# an A record. A member name is its own order. An own-domain name carries www in
+# the generated acme block, and one unresolved identifier fails the whole attempt
+# while spending the per-identifier failure budget, so both are checked.
+identifiers_resolve() {
+	resolve_ok "$1" || return 1
+	case "$1" in
+	*.kyriakon.net) return 0 ;;
+	esac
+	resolve_ok "www.$1"
+}
+
 # next_attempt <list> : the oldest name in the "<mtime> <path>" list whose records
 # resolve, or nothing when none resolve. A name that does not resolve is skipped
 # and the queue moves past one member's missing record rather than stopping on it
@@ -232,7 +247,7 @@ next_attempt() {
 	while read -r mtime path; do
 		[ -n "$path" ] || continue
 		name=${path##*/}
-		if resolve_ok "$name"; then
+		if identifiers_resolve "$name"; then
 			printf '%s' "$name"
 			return 0
 		fi
@@ -515,7 +530,7 @@ self_test() {
 #!/bin/sh
 # args: -t A <name>
 case "$3" in
-ok.kyriakon.net | a.kyriakon.net) exit 0 ;;
+ok.kyriakon.net | a.kyriakon.net | parish.example | www.both.example | both.example) exit 0 ;;
 *) exit 1 ;;
 esac
 STUB
@@ -530,6 +545,12 @@ STUB
 	check "nothing is chosen when no pending name resolves" \
 		"$(next_attempt "10 $pending_dir/c.kyriakon.net
 20 $pending_dir/b.kyriakon.net" 2>/dev/null)" ""
+	# An own-domain order carries www beside the domain, so a body whose apex
+	# resolves and whose www does not is held rather than attempted.
+	check "an own-domain name whose www does not resolve is held" \
+		"$(next_attempt "10 $pending_dir/parish.example" 2>/dev/null)" ""
+	check "one whose two identifiers both resolve is chosen" \
+		"$(next_attempt "10 $pending_dir/both.example" 2>/dev/null)" "both.example"
 
 	# The apply hook, exercised through attempt() rather than through its own
 	# function: what has to hold is that a pass which issues a certificate runs the

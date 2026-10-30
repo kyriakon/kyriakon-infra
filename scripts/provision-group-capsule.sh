@@ -178,19 +178,27 @@ ensure_capsule_pair() {
 		generated=yes
 	fi
 
+	# Staged beside the installed paths and renamed, so a reader never sees half
+	# a pair and an interrupted run leaves no certificate in place.
+	cert_candidate="$ssl_dir/.capsule-$domain.crt.tmp"
+	key_candidate="$ssl_private/.capsule-$domain.key.tmp"
+	rm -f "$cert_candidate" "$key_candidate"
 	if ! "$openssl" req -x509 -new -nodes -days 3650 -config "$(capsule_cnf)" \
-		-keyout "$key" -out "$cert"; then
-		die "$openssl req failed; $cert and $key may be half written, remove both and run this again"
+		-keyout "$key_candidate" -out "$cert_candidate"; then
+		rm -f "$cert_candidate" "$key_candidate"
+		die "$openssl req failed; nothing was installed, run this again"
 	fi
-	chmod 0644 "$cert"
-	chmod 0600 "$key"
+	chmod 0644 "$cert_candidate"
+	chmod 0600 "$key_candidate"
 
-	for f in "$cert" "$key"; do
+	for f in "$cert_candidate" "$key_candidate"; do
 		[ -s "$f" ] || die "$f is empty after the generation step"
 	done
-	"$openssl" x509 -in "$cert" -noout >/dev/null 2>&1 \
-		|| die "$cert does not parse as a certificate"
-	[ "$(stat -f '%Lp' "$key")" = 600 ] || die "$key is not mode 0600"
+	"$openssl" x509 -in "$cert_candidate" -noout >/dev/null 2>&1 \
+		|| die "$cert_candidate does not parse as a certificate"
+	[ "$(stat -f '%Lp' "$key_candidate")" = 600 ] || die "$key_candidate is not mode 0600"
+	mv "$cert_candidate" "$cert"
+	mv "$key_candidate" "$key"
 
 	if [ "$generated" = no ]; then
 		printf 'capsule pair: generated at %s (ten years, %s)\n' "$cert" "$domain"
