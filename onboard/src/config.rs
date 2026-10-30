@@ -72,6 +72,14 @@ pub struct Config {
     /// the deployed release, not a hash of anything: see the answer record's
     /// comment.
     pub release: String,
+    /// The yearly price and the postal address a cash-by-post member is given,
+    /// which the account page shows beside the token. The drain's config names
+    /// the same two values, and both are substituted at deploy from the box's
+    /// own environment: the price because the Stripe Price and the prepaid price
+    /// have to agree, the address because it is the operator's own and this
+    /// repository is public.
+    pub price_gbp: String,
+    pub postal_address: String,
 }
 
 impl Config {
@@ -215,10 +223,14 @@ mod tests {
              dkim_selector = \"mail\"\n\
              dkim_public_key = \"v=DKIM1; k=rsa; p=example\"\n\
              dmarc_rua = \"mailto:dmarc@kyriakon.net\"\n\
-             release = \"REPLACE_ME\"\n",
+             release = \"REPLACE_ME\"\n\
+             price_gbp = \"20.00\"\n\
+             postal_address = \"REPLACE_ME\"\n",
         )
         .unwrap();
         assert_eq!(c.pages, "/var/db/onboard/pages");
+        assert_eq!(c.price_gbp, "20.00");
+        assert_eq!(c.postal_address, "REPLACE_ME");
         assert_eq!(c.httpd_socket, "/home/www/run/onboard-httpd/httpd.sock");
         assert_eq!(c.gemini_socket, "/home/www/run/onboard/onboard.sock");
         assert_eq!(c.portal_socket, "/home/www/run/onboard-portal/portal.sock");

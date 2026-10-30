@@ -9,6 +9,36 @@
 #}
 <h2>Your account</h2>
 
+{#
+  The payment block sits at the top, above everything else, because it is the one
+  thing on the page that expires. A free account has none at all. Once a credit
+  sets the date the token goes and the date replaces it; the rail stays, because
+  the next payment is quoted for it.
+#}
+{% if let Some(p) = payment %}
+<h3>Payment</h3>
+<p>State: {{ p.state }}. Rail: {{ p.rail }}.</p>
+{% if let Some(until) = p.paid_until %}
+<p>Paid until {{ until }}.</p>
+{% else %}
+{% if let Some(window) = p.window %}
+<p>The payment window {{ window }}.</p>
+{% endif %}
+<p>Amount: GBP {{ p.amount }}.</p>
+{% if let Some(token) = p.token %}
+<p>Your payment reference: <code>{{ token }}</code></p>
+{% endif %}
+<ul>
+{% for line in p.instructions %}
+  <li>{{ line }}</li>
+{% endfor %}
+</ul>
+{% if let Some(deadline) = p.deadline %}
+<p>{{ deadline }}</p>
+{% endif %}
+{% endif %}
+{% endif %}
+
 <h3>What the platform offers</h3>
 <ul class="services">
 {% for s in services %}

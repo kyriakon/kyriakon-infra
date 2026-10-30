@@ -87,6 +87,11 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
         }
         "provision-group" => transitions::provision_group(cfg, store, &value, file).await,
         "group-address" => transitions::group_address(cfg, store, key, &value, file).await,
+        "token-resend" => {
+            let intent: transitions::ResendIntent = serde_json::from_value(value)
+                .map_err(|e| format!("the token resend intent does not parse: {e}"))?;
+            transitions::resend(cfg, store, key, intent, file).await
+        }
         _ => transitions::refuse(cfg, store, file, &value).await,
     }
 }
@@ -149,6 +154,32 @@ pub async fn file_group_address(
         "mailbox": mailbox,
         "mail_key": mail_key,
         "site_owner": site_owner,
+        "sig": sig,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    Ok(id)
+}
+
+/// File a `token-resend`, as `kyriakon-onboardctl token resend` does. The token
+/// is the account's own, read at the terminal, and the signature is over it, so
+/// the drain re-sends nothing the console did not file and mints nothing.
+pub async fn file_resend(
+    store: &Store,
+    username: &str,
+    token: &str,
+    sig: &str,
+) -> Result<String, String> {
+    let id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({
+        "id": id,
+        "kind": "token-resend",
+        "filed_at": crate::util::filed_at(),
+        "username": username,
+        "token": token,
         "sig": sig,
     });
     let bytes =

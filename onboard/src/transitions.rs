@@ -22,8 +22,9 @@ use crate::notice;
 use crate::questions;
 use crate::sign;
 use crate::store::{
-    self, Account, ApplicationRef, GroupAddress, GroupAddressIntent, GroupIntent, GroupPayment,
-    GroupRecord, Intent, JournalLine, KeyRecord, Record, Store, TokenRecord, Window,
+    self, Account, ApplicationRef, FlatPayment, GroupAddress, GroupAddressIntent, GroupIntent,
+    GroupPayment, GroupRecord, Intent, JournalLine, KeyRecord, Payment, Record, Store, TokenRecord,
+    Window,
 };
 use crate::util;
 use crate::validate;
@@ -116,6 +117,22 @@ pub struct PasswordIntent {
     pub sig: String,
     /// The bcrypt hash the handler computed. The password itself never travels.
     pub hash: String,
+}
+
+/// The `token-resend` intent: the member's payment instructions again, and
+/// nothing minted. It carries the token the account already holds, so the drain
+/// can check the account before it sends, and the console's signature, because
+/// `intents/` belongs to the unprivileged half and a second copy of the
+/// instructions is not the handler's to file.
+#[derive(serde::Deserialize)]
+pub struct ResendIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub username: String,
+    pub token: String,
+    pub sig: String,
 }
 
 /// Run one of the repository's privileged scripts by its configured path and
@@ -1114,7 +1131,11 @@ async fn approve(
     let token_ref = if no_charge {
         None
     } else {
-        match existing.as_ref().and_then(|a| a.token_ref.clone()) {
+        match existing
+            .as_ref()
+            .and_then(|a| a.payment_state())
+            .and_then(|p| p.token_ref)
+        {
             Some(t) => Some(t),
             None => Some(store::payment_token().await?),
         }
@@ -1124,7 +1145,8 @@ async fn approve(
     } else {
         existing
             .as_ref()
-            .and_then(|a| a.window.clone())
+            .and_then(|a| a.payment_state())
+            .and_then(|p| p.window)
             .or_else(|| {
                 Some(Window {
                     opened_at: now.clone(),
@@ -1133,6 +1155,18 @@ async fn approve(
                     extensions: 0,
                 })
             })
+    };
+    // A no-charge approval writes no payment block at all: no window, no token,
+    // and nothing that could lapse.
+    let payment = if no_charge {
+        None
+    } else {
+        Some(Payment {
+            token_ref: token_ref.clone(),
+            token_issued_at: Some(now.clone()),
+            paid_until: None,
+            window: window.clone(),
+        })
     };
 
     let account = Account {
@@ -1148,10 +1182,8 @@ async fn approve(
         },
         no_charge,
         created_at: now.clone(),
-        token_ref: token_ref.clone(),
-        token_issued_at: token_ref.as_ref().map(|_| now.clone()),
-        paid_until: None,
-        window: window.clone(),
+        payment,
+        legacy_payment: FlatPayment::default(),
         outside_address: record.outside_address.clone(),
         certificates: Vec::new(),
         site_served: None,
@@ -1197,6 +1229,14 @@ async fn approve(
     )
     .map_err(|e| format!("the application record does not parse: {e}"))?;
     app_copy["status_link_until"] = json!(util::after_days(7));
+    // The handler renders the status page as `_onboard` and cannot read the
+    // root-owned account, so the payment block it shows is this copy, written
+    // back into the record it does read. A free approval carries none, which is
+    // also why an undecided application never shows one.
+    if let Some(block) = &account.payment {
+        app_copy["payment"] = serde_json::to_value(block)
+            .map_err(|e| format!("cannot encode the payment block: {e}"))?;
+    }
     let copy_bytes = serde_json::to_vec_pretty(&app_copy)
         .map_err(|e| format!("cannot encode the application copy: {e}"))?;
     store
@@ -1205,6 +1245,10 @@ async fn approve(
             "application.json",
             &copy_bytes,
         )
+        .await?;
+    let owner = store.dir_owner("applications");
+    store
+        .write_record_owned("applications", &format!("{token}.json"), &copy_bytes, owner)
         .await?;
 
     // The decision email, recorded in the account's notices before it is
@@ -1218,7 +1262,14 @@ async fn approve(
     let password_link = sign::password_link(&cfg.base_url, key, token, &password_until)?;
     let body = format!(
         "{}\n\nSet your mail password from this one-time link, which works until {password_until}:\n\n{password_link}\n\nIt works once. The same link is on your status page.\n",
-        decision_body(cfg, &record, no_charge, token_ref.as_deref(), &window)?
+        decision_body(
+            cfg,
+            &record.username,
+            &record.rail,
+            no_charge,
+            token_ref.as_deref(),
+            &window
+        )?
     );
     let notice_type = if no_charge {
         "approval.free"
@@ -1249,6 +1300,95 @@ async fn approve(
     .await?;
     store.remove("intents", file).await?;
     Ok(())
+}
+
+/// `onboardctl token resend`: the same payment instructions again and nothing
+/// minted. A second token would leave the first one in the ledger as an entry
+/// that no longer resolves to the same member and would orphan a payment already
+/// in flight, so the account's own token is read and re-sent.
+///
+/// The instructions are the approval email's, built by the same function, and
+/// the notice is recorded as a sent one before it leaves. It is sent rather than
+/// deduplicated: the member asking for a second copy is the whole point.
+pub async fn resend(
+    cfg: &DrainConfig,
+    store: &Store,
+    key: &[u8],
+    intent: ResendIntent,
+    file: &str,
+) -> Result<(), String> {
+    if !sign::verify(
+        key,
+        &sign::resend_payload(&intent.username, &intent.token),
+        &intent.sig,
+    ) {
+        return Err("the token resend's signature does not verify".to_string());
+    }
+    let username = intent.username.as_str();
+    let text = store
+        .read_record(&format!("accounts/{username}"), "account.json")
+        .await
+        .ok_or_else(|| format!("no account for {username}"))?;
+    let account: Account = serde_json::from_str(&text)
+        .map_err(|e| format!("the account record does not parse: {e}"))?;
+    let Some(payment) = account.payment_state() else {
+        return Err(format!(
+            "{username} was approved without charge, so there is no payment token to resend"
+        ));
+    };
+    if payment.token_ref.as_deref() != Some(intent.token.as_str()) {
+        return Err(format!(
+            "the token the resend names is not the one {username}'s account holds"
+        ));
+    }
+    let body = decision_body(
+        cfg,
+        username,
+        &account.rail,
+        false,
+        payment.token_ref.as_deref(),
+        &payment.window,
+    )?;
+    let to = account
+        .outside_address
+        .clone()
+        .unwrap_or_else(|| format!("{username}@kyriakon.net"));
+    let subject = decision_subject("approved", username);
+    notice::send_again(
+        cfg,
+        store,
+        username,
+        "prepaid.instructions",
+        &subject,
+        &to,
+        &body,
+    )
+    .await?;
+    // Every settling transition journals its outcome, and the line names the
+    // application the account was made from.
+    let application = store
+        .read_record(&format!("accounts/{username}"), "application.json")
+        .await
+        .and_then(|copy| serde_json::from_str::<Value>(&copy).ok())
+        .and_then(|copy| {
+            let status_token = copy.get("status_token")?.as_str()?.to_string();
+            Some(ApplicationRef {
+                username: username.to_string(),
+                status_token,
+            })
+        })
+        .ok_or_else(|| format!("no application record for {username}"))?;
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &application,
+        "applied",
+        None,
+    )
+    .await?;
+    store.remove("intents", file).await
 }
 
 /// The approval of a body's application: the community block's addresses become
@@ -1776,8 +1916,8 @@ async fn write_group_application(
         .await
 }
 
-/// The mailbox's account record: a reference to its group and no paid-until
-/// date of its own, which the group holds. A retry keeps the dates the first run
+/// The mailbox's account record: a reference to its group and no payment block
+/// of its own, which the group holds. A retry keeps the dates the first run
 /// wrote, so applying the same intent twice changes nothing.
 async fn write_group_account(
     store: &Store,
@@ -1806,10 +1946,11 @@ async fn write_group_account(
             .as_ref()
             .map(|a| a.created_at.clone())
             .unwrap_or_else(|| now.clone()),
-        token_ref: None,
-        token_issued_at: None,
-        paid_until: None,
-        window: None,
+        // The group holds the payment state, so the mailbox's record has no
+        // block for one at all rather than a paid-until that could be mistaken
+        // for an unpaid person's.
+        payment: None,
+        legacy_payment: FlatPayment::default(),
         outside_address: None,
         certificates: Vec::new(),
         site_served: None,
@@ -1817,15 +1958,8 @@ async fn write_group_account(
         space_used: None,
         group: Some(domain.to_string()),
     };
-    let mut value =
-        serde_json::to_value(&account).map_err(|e| format!("cannot encode the account: {e}"))?;
-    // The group holds the paid-until date, so the mailbox's record has no field
-    // for one at all rather than a null that could be mistaken for an unpaid one.
-    if let Some(map) = value.as_object_mut() {
-        map.remove("paid_until");
-    }
-    let bytes =
-        serde_json::to_vec_pretty(&value).map_err(|e| format!("cannot encode the account: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&account)
+        .map_err(|e| format!("cannot encode the account: {e}"))?;
     store.ensure_dir(&format!("accounts/{mailbox}")).await?;
     store
         .write_record(&format!("accounts/{mailbox}"), "account.json", &bytes)
@@ -3000,41 +3134,58 @@ fn confirmation_body(record: &Record) -> String {
     out
 }
 
+/// The rail's own payment instructions, one line each, in the words the
+/// approval email and both account pages carry. Monero has no subaddress until
+/// the operator's wallet makes one, so the line says that rather than leaving an
+/// empty field for the member to wonder at.
+pub fn rail_instructions(rail: &str, postal_address: &str) -> Vec<String> {
+    match rail {
+        "cash" => vec![
+            "Post the money to:".to_string(),
+            postal_address.to_string(),
+            "Write the reference on the envelope, or on a slip inside it.".to_string(),
+        ],
+        "monero" => vec![
+            "Your Monero subaddress is not ready yet; it will follow in a second message."
+                .to_string(),
+            "The pound amount is what is owed; the quoted amount in Monero settles it.".to_string(),
+        ],
+        "card" => vec!["A card payment link will follow in a second message.".to_string()],
+        other => vec![format!(
+            "The rail you chose, {other}, will be quoted to you."
+        )],
+    }
+}
+
 /// The decision email for an approval. The words are short because #333 owns
 /// the notice copy; what matters here is that the token and the rail's own
 /// instructions are on it, and that the free path says neither.
 fn decision_body(
     cfg: &DrainConfig,
-    record: &Record,
+    username: &str,
+    rail: &str,
     no_charge: bool,
     token: Option<&str>,
     window: &Option<Window>,
 ) -> Result<String, String> {
     if no_charge {
         return Ok(format!(
-            "Your application for {} has been approved, with no charge.\n\n\
-             There is nothing to pay and no payment window. The account does not lapse.\n",
-            record.username
+            "Your application for {username} has been approved, with no charge.\n\n\
+             There is nothing to pay and no payment window. The account does not lapse.\n"
         ));
     }
     let token = token.ok_or("a charged approval has no token")?;
     let window = window.as_ref().ok_or("a charged approval has no window")?;
     let mut out = format!(
-        "Your application for {} has been approved.\n\n\
+        "Your application for {username} has been approved.\n\n\
          The amount is GBP {} for the year.\n\
          Your payment reference is {token}.\n",
-        record.username, cfg.price_gbp
+        cfg.price_gbp
     );
-    match record.rail.as_str() {
-        "cash" => out.push_str(&format!(
-            "\nPost the money to:\n\n  {}\n\nWrite the reference on the envelope, or on a slip inside it.\n",
-            cfg.postal_address
-        )),
-        "monero" => out.push_str(
-            "\nYour Monero subaddress will follow in a second message. The pound amount is what is owed; the quoted amount in Monero settles it.\n",
-        ),
-        "card" => out.push_str("\nA card payment link will follow in a second message.\n"),
-        other => out.push_str(&format!("\nThe rail you chose, {other}, will be quoted to you.\n")),
+    out.push('\n');
+    for line in rail_instructions(rail, &cfg.postal_address) {
+        out.push_str(&line);
+        out.push('\n');
     }
     out.push_str(&format!(
         "\nThe money must arrive before {} or the account lapses: mail keeps arriving and\n\

@@ -298,6 +298,14 @@ pub struct Record {
     pub domain: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outside_address: Option<String>,
+    /// The payment block the drain copied here at approval, so the status page
+    /// can show the token without reading the root-owned account. Absent until
+    /// the drain approves, and absent for a free approval, which has no block
+    /// anywhere: that absence is also what stops an undecided application,
+    /// which names whatever username its applicant typed, showing an account's
+    /// payment state. A credit updates it beside the account (#300).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment: Option<Payment>,
     /// Every applicable answer, keyed by the question list's ids.
     pub answers: BTreeMap<String, String>,
     pub mail_keys: Vec<KeyRecord>,
@@ -466,10 +474,11 @@ pub fn is_payment_token(token: &str) -> bool {
 
 /// The account record, `accounts/<username>/account.json`. It holds what this
 /// ticket writes and is deliberately open to the fields later tickets add: the
-/// rails put `payment.*`, the group tier puts a `group` reference, and neither
-/// is a reason to re-read this shape. So there is no `deny_unknown_fields` here,
-/// unlike the configs: an account written by a later release must still be
-/// readable by this one, and the reverse.
+/// group tier puts a `group` reference, the rails put a Monero subaddress and a
+/// balance beside the payment block, and neither is a reason to re-read this
+/// shape. So there is no `deny_unknown_fields` here, unlike the configs: an
+/// account written by a later release must still be readable by this one, and
+/// the reverse.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Account {
     pub version: u32,
@@ -484,18 +493,18 @@ pub struct Account {
     pub rail: String,
     pub no_charge: bool,
     pub created_at: String,
-    /// The payment token, present only on a paid approval. A bearer secret: it
-    /// is never logged.
+    /// The payment state, present only on a paid approval. A free account has
+    /// no window, no token and no payment block at all, which is why this is an
+    /// absent field rather than a block of nulls.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_ref: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_issued_at: Option<String>,
-    /// Null while the window runs, which is the state a paid approval opens in.
-    /// The free path has no window and leaves this null too: nothing lapses
-    /// without a window.
-    pub paid_until: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub window: Option<Window>,
+    pub payment: Option<Payment>,
+    /// The flat shape the account carried before the payment block existed,
+    /// read and folded into [`Account::payment_state`] and never written back.
+    /// Without it a record written by the previous release reads as unpaid: its
+    /// token, window and paid-until date would be dropped on the next rewrite,
+    /// which for a token is the only link between a payment and its account.
+    #[serde(flatten, default, skip_serializing)]
+    pub legacy_payment: FlatPayment,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outside_address: Option<String>,
     /// The gemini client certificates pinned to this account, one per device.
@@ -515,7 +524,7 @@ pub struct Account {
     pub space_used: Option<u64>,
     /// The domain of the group this account belongs to, for a mailbox the
     /// own-domain tier made. The group holds the payment state, so an account
-    /// with this set carries no `paid_until` of its own. `None` for a person's
+    /// with this set carries no payment block of its own. `None` for a person's
     /// account, and absent from the file, so a record written before this field
     /// existed reads the same.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -640,6 +649,67 @@ pub struct GroupAddressIntent {
     pub sig: String,
 }
 
+/// The payment block `accounts/<username>/account.json` carries under
+/// `payment`, named as the spec's State table names it. A paid approval writes
+/// it, opens the window and draws the token; a credit sets `paid_until`, which
+/// is what hides the token from both pages. `#[serde(default)]` so a block that
+/// gains a field in a later release still reads here.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Payment {
+    /// The payment token, present only on a paid approval. A bearer secret: it
+    /// is never logged, and both pages show it only while `paid_until` is null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_issued_at: Option<String>,
+    /// Null while the window runs, which is the state a paid approval opens in.
+    pub paid_until: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<Window>,
+}
+
+/// The account's payment state, from the nested block or, for a record written
+/// before that block existed, from the four flat fields the old shape carried.
+/// The flat fields are read-only: the next write puts the block in their place.
+impl Account {
+    pub fn payment_state(&self) -> Option<Payment> {
+        self.payment
+            .clone()
+            .or_else(|| self.legacy_payment.folded())
+    }
+}
+
+/// The flat payment fields of an account written before the block existed.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct FlatPayment {
+    pub token_ref: Option<String>,
+    pub token_issued_at: Option<String>,
+    pub paid_until: Option<String>,
+    pub window: Option<Window>,
+}
+
+impl FlatPayment {
+    /// The block the flat fields describe, or `None` when the record carried no
+    /// payment state at all, which is the free account and the group mailbox.
+    fn folded(&self) -> Option<Payment> {
+        if self.token_ref.is_none()
+            && self.token_issued_at.is_none()
+            && self.paid_until.is_none()
+            && self.window.is_none()
+        {
+            return None;
+        }
+        Some(Payment {
+            token_ref: self.token_ref.clone(),
+            token_issued_at: self.token_issued_at.clone(),
+            paid_until: self.paid_until.clone(),
+            window: self.window.clone(),
+        })
+    }
+}
+
 /// The 14-day payment window a paid approval opens.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Window {
@@ -741,7 +811,6 @@ mod tests {
             "rail": "no_charge",
             "no_charge": true,
             "created_at": "2026-10-01T09:00:00Z",
-            "paid_until": null,
             "certificates": [{ "hash": "SHA256:aa" }],
         });
         std::fs::write(
@@ -842,6 +911,45 @@ mod tests {
         ] {
             assert!(!is_payment_token(bad), "{bad:?} should be refused");
         }
+    }
+
+    /// A record written before the payment block existed keeps its token: the
+    /// flat fields are folded into the block on read, and a free account, whose
+    /// flat fields were all null, folds to nothing.
+    #[test]
+    fn an_account_written_before_the_payment_block_still_reads_its_token() {
+        let old: Account = serde_json::from_str(
+            r#"{"version": 1, "username": "alice", "state": "active",
+                "decision": "approve", "decided_at": "2026-10-01T09:00:00Z",
+                "rail": "cash", "no_charge": false,
+                "created_at": "2026-10-01T09:00:00Z",
+                "token_ref": "KYR-4F2M-9QH7-XT3B",
+                "token_issued_at": "2026-10-01T09:00:00Z",
+                "paid_until": null,
+                "window": {"opened_at": "2026-10-01T09:00:00Z",
+                           "closes_at": "2026-10-15T09:00:00Z",
+                           "state": "open", "extensions": 0}}"#,
+        )
+        .unwrap();
+        let payment = old.payment_state().expect("the old shape's block");
+        assert_eq!(payment.token_ref.as_deref(), Some("KYR-4F2M-9QH7-XT3B"));
+        assert_eq!(
+            payment.window.as_ref().map(|w| w.closes_at.as_str()),
+            Some("2026-10-15T09:00:00Z")
+        );
+        // The flat fields are read-only: a rewrite keeps the block alone.
+        let written = serde_json::to_string(&old).unwrap();
+        assert!(!written.contains("\"token_ref\""), "{written}");
+        assert!(!written.contains("\"paid_until\""), "{written}");
+
+        let free: Account = serde_json::from_str(
+            r#"{"version": 1, "username": "alice", "state": "active",
+                "decision": "provision", "decided_at": "2026-10-01T09:00:00Z",
+                "rail": "no_charge", "no_charge": true,
+                "created_at": "2026-10-01T09:00:00Z", "paid_until": null}"#,
+        )
+        .unwrap();
+        assert!(free.payment_state().is_none());
     }
 
     #[test]

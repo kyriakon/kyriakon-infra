@@ -37,6 +37,15 @@ pub fn date_after_days(days: i64) -> String {
     after_days(days)[..10].to_string()
 }
 
+/// The whole days from today to the date an RFC 3339 stamp names, which is what
+/// the account page counts a payment window down with. `None` for a stamp that
+/// cannot be read, so a record with a broken date shows no countdown rather than
+/// a fabricated one.
+pub fn days_left(stamp: &str, now: OffsetDateTime) -> Option<i64> {
+    let then = OffsetDateTime::parse(stamp, &Rfc3339).ok()?;
+    Some((then.date() - now.date()).whole_days())
+}
+
 /// Whether the status link of a decided application still answers. `decided_at`
 /// is the field the drain sets when it decides; the handler writes nothing
 /// there and reads it only for this. Seven days after the decision the link

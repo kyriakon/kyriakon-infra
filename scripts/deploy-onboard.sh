@@ -228,9 +228,24 @@ v=DKIM1*)
 	;;
 esac
 
+# The price the pages show is read from the drain's own config rather than
+# repeated here: the Stripe Price and the prepaid price have to agree, and two
+# copies of the number can disagree.
+price_gbp=$(
+	awk -F'"' '/^price_gbp[[:space:]]*=/ { print $2; exit }' \
+		"$repo_dir/openbsd/etc/onboard/drain.toml"
+)
+case "$price_gbp" in
+"" | *REPLACE_ME*)
+	die "cannot read price_gbp from $repo_dir/openbsd/etc/onboard/drain.toml"
+	;;
+esac
+
 onboard_candidate=$(mktemp /etc/onboard/.onboard.toml.XXXXXX)
-RELEASE="$release" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
+RELEASE="$release" PRICE="$price_gbp" POSTAL="$POSTAL_ADDRESS" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
 	/^release[[:space:]]*=/ { print "release = \"" ENVIRON["RELEASE"] "\""; next }
+	/^price_gbp[[:space:]]*=/ { print "price_gbp = \"" ENVIRON["PRICE"] "\""; next }
+	/^postal_address[[:space:]]*=/ { print "postal_address = \"" ENVIRON["POSTAL"] "\""; next }
 	/^ipv4[[:space:]]*=/ { print "ipv4 = \"" ENVIRON["IPV4"] "\""; next }
 	/^ipv6[[:space:]]*=/ { print "ipv6 = \"" ENVIRON["IPV6"] "\""; next }
 	/^dkim_selector[[:space:]]*=/ { print "dkim_selector = \"" ENVIRON["SELECTOR"] "\""; next }

@@ -16,6 +16,7 @@
 //!   kyriakon-onboardctl [--config PATH] address --domain <domain> --action <change> \
 //!       --mailbox <account> [--address <localpart>] [--key-file <path>] \
 //!       [--site-owner <account>]
+//!   kyriakon-onboardctl [--config PATH] token resend <username>
 //!   kyriakon-onboardctl [--config PATH] show <username>
 //!   kyriakon-onboardctl request list
 //!   kyriakon-onboardctl request record
@@ -81,6 +82,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
     match verb {
         "request" => request(&store, &rest[1..]).await,
         "address" => address(&cfg, &store, &rest[1..]).await,
+        "token" => token(&cfg, &store, &rest[1..]).await,
         "show" => show(&store, one_username(rest)?).await,
         // Each decision is signed with the same root-only key the review links
         // are signed with, because the drain carries out a decision intent only
@@ -102,6 +104,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
 fn usage() -> String {
     "usage: kyriakon-onboardctl [--config PATH] \
      approve|approve-free|decline|show <username>
+       kyriakon-onboardctl token resend <username>
        kyriakon-onboardctl address --domain <domain> \
      --action <add-alias|add-mailbox|upgrade|remove> --mailbox <account> \
      [--address <localpart>] [--key-file <path>] [--site-owner <account>]
@@ -157,6 +160,41 @@ fn need<'a>(flags: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str, 
         .get(name)
         .map(String::as_str)
         .ok_or_else(|| format!("--{name} is needed"))
+}
+
+/// `token resend <username>`: the member's payment instructions again, with the
+/// token their account already holds. Nothing is minted, because a second token
+/// would leave the first one in the ledger as an entry that no longer resolves
+/// to the same member and would orphan a payment already in flight.
+///
+/// The account is read here, at the terminal, so a member who was approved
+/// without charge, or one with no account yet, is a refusal the operator sees
+/// now rather than an intent the drain refuses a minute later.
+async fn token(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), String> {
+    let (verb, username) = match args {
+        [verb, username] if verb == "resend" => (verb.as_str(), username.as_str()),
+        _ => return Err(usage()),
+    };
+    if let Some(why) = validate::username_shape(username) {
+        return Err(format!("the username {username:?}: {why}"));
+    }
+    let text = store
+        .read_record(&format!("accounts/{username}"), "account.json")
+        .await
+        .ok_or_else(|| format!("no account for {username}"))?;
+    let account: kyriakon_onboard::store::Account = serde_json::from_str(&text)
+        .map_err(|e| format!("the account record does not parse: {e}"))?;
+    let token = account
+        .payment_state()
+        .and_then(|p| p.token_ref)
+        .ok_or_else(|| {
+            format!("{username} was approved without charge, so there is no payment token")
+        })?;
+    let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
+    let sig = sign::sign(&key, &sign::resend_payload(username, &token))?;
+    let id = intents::file_resend(store, username, &token, &sig).await?;
+    println!("filed {verb} for {username} as intent {id}");
+    Ok(())
 }
 
 /// File one address change in a group. The signature is the console's, over
@@ -427,29 +465,34 @@ async fn show(store: &Store, username: &str) -> Result<(), String> {
             println!("  state    {}", account.state);
             println!("  decision {}", account.decision);
             // A group mailbox holds no payment of its own: the group does. The
-            // token and paid-until fields are empty for exactly that reason, and
-            // printing "no charge" would answer a money question wrongly.
+            // payment block is absent for exactly that reason, and printing
+            // "no charge" would answer a money question wrongly.
             if let Some(group) = &account.group {
                 println!("  group    {group}");
                 println!("  token    held by the group");
                 println!("  paid     held by the group, in groups/{group}/group.json");
                 return Ok(());
             }
+            // A free account has no payment block at all: no window, no token,
+            // and nothing that lapses.
+            let Some(payment) = account.payment_state() else {
+                println!("  token    none (no charge)");
+                println!("  paid     none: no charge was made, so nothing expires");
+                return Ok(());
+            };
             println!(
                 "  token    {}",
-                account.token_ref.as_deref().unwrap_or("none (no charge)")
+                payment.token_ref.as_deref().unwrap_or("none")
             );
             // `paid_until` is null while a window runs, so null alone says
-            // nothing about whether one exists: the window does. A no-charge
-            // approval has no window and never lapses, and saying it does would
-            // have a member watching for one to close.
-            let paid = match (&account.paid_until, &account.window) {
+            // nothing about whether one exists: the window does.
+            let paid = match (&payment.paid_until, &payment.window) {
                 (Some(until), _) => until.as_str(),
                 (None, Some(_)) => "null: the window is open",
-                (None, None) => "none: no charge was made, so nothing expires",
+                (None, None) => "null: no window was opened",
             };
             println!("  paid     {paid}");
-            if let Some(w) = &account.window {
+            if let Some(w) = &payment.window {
                 println!("  window   {} to {}", w.opened_at, w.closes_at);
             }
         }
