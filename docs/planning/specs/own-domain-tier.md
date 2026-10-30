@@ -165,7 +165,7 @@ Paths are relative to the service's store root ([#156](https://github.com/kyriak
 | Path | Status | What the own-domain tier puts in it |
 | --- | --- | --- |
 | `groups/<domain>/group.json` | new | the domain, the body's name and kind, `payment{rail, token_ref, paid_until, window}`, the accounts in the group, and the site owner |
-| `accounts/<username>/account.json` | modified | a `group` reference; no per-account `paid_until` |
+| `accounts/<username>/account.json` | modified | a `group` reference; no per-account payment block |
 | `accounts/<username>/application.json` | modified | the community block's answers, purged with the rest inside ninety days |
 | `tokens/<token>.json` | modified | one token per group, resolving to the group rather than an account |
 | `ledger/payments.jsonl` | unchanged | one line per payment, keyed by the group's token |

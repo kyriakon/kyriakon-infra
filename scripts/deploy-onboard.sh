@@ -229,8 +229,9 @@ v=DKIM1*)
 esac
 
 onboard_candidate=$(mktemp /etc/onboard/.onboard.toml.XXXXXX)
-RELEASE="$release" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
+RELEASE="$release" POSTAL="$POSTAL_ADDRESS" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
 	/^release[[:space:]]*=/ { print "release = \"" ENVIRON["RELEASE"] "\""; next }
+	/^postal_address[[:space:]]*=/ { print "postal_address = \"" ENVIRON["POSTAL"] "\""; next }
 	/^ipv4[[:space:]]*=/ { print "ipv4 = \"" ENVIRON["IPV4"] "\""; next }
 	/^ipv6[[:space:]]*=/ { print "ipv6 = \"" ENVIRON["IPV6"] "\""; next }
 	/^dkim_selector[[:space:]]*=/ { print "dkim_selector = \"" ENVIRON["SELECTOR"] "\""; next }

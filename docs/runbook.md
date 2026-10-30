@@ -78,7 +78,8 @@ command over them and renders the output:
 It reads `/root/.kyriakon-env` (override with `--env <file>`). `POSTAL_ADDRESS`
 is both the cash-by-post address and the published trading address, by decision
 (#397), so the two cannot disagree: `scripts/deploy-onboard.sh` writes the same
-value into the drain's `postal_address`.
+value into `postal_address` in both the drain's config and the handler's, which
+are the two copies the approval email and the account page read it from.
 
 The same deploy writes the public DNS values every body's recipe is generated
 from. `KYRIAKON_IPV4` and `KYRIAKON_IPV6` come from `/root/.kyriakon-env`, and

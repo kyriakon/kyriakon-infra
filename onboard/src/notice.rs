@@ -128,6 +128,35 @@ pub async fn send_account_notice(
     if already_sent(store, username, notice_type, subject).await {
         return Ok(false);
     }
+    record_and_enqueue(cfg, store, username, notice_type, subject, to, body).await?;
+    Ok(true)
+}
+
+/// Record a notice and enqueue it whether or not the account already records
+/// one. The resend of a member's payment instructions is the case: they asked
+/// for the same message again, so the second copy is the point, and the line in
+/// `notices.jsonl` is still written before it leaves.
+pub async fn send_again(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+    notice_type: &str,
+    subject: &str,
+    to: &str,
+    body: &str,
+) -> Result<(), String> {
+    record_and_enqueue(cfg, store, username, notice_type, subject, to, body).await
+}
+
+async fn record_and_enqueue(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+    notice_type: &str,
+    subject: &str,
+    to: &str,
+    body: &str,
+) -> Result<(), String> {
     let line = Notice {
         version: 1,
         at: crate::util::filed_at(),
@@ -143,8 +172,7 @@ pub async fn send_account_notice(
             encoded.as_bytes(),
         )
         .await?;
-    enqueue(cfg, to, subject, body).await?;
-    Ok(true)
+    enqueue(cfg, to, subject, body).await
 }
 
 #[cfg(test)]

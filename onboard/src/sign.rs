@@ -110,6 +110,13 @@ pub fn address_payload(
     format!("address:{domain}:{action}:{address}:{mailbox}:{site_owner}:{key}")
 }
 
+/// The payload a token-resend intent signs: the account and the token it holds.
+/// The console signs it, because a second copy of the instructions is the
+/// member's to ask for and not the handler's to file.
+pub fn resend_payload(username: &str, token: &str) -> String {
+    format!("resend:{username}:{token}")
+}
+
 /// One decision link, pointing at the handler's click-through path.
 pub fn decide_link(base: &str, key: &[u8], token: &str, action: &str) -> Result<String, String> {
     let sig = sign(key, &decide_payload(token, action))?;

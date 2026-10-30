@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use askama::Template;
+use time::OffsetDateTime;
 
 use crate::catalogue::{self, Protocol, Row, Service};
 use crate::questions::{self, Kind, Question, Rule};
@@ -45,6 +46,9 @@ pub struct AccountPage {
     /// group. It is the same [`crate::dns::Recipe`] the approval email renders, so
     /// the values cannot disagree.
     pub dns: Option<crate::dns::Recipe>,
+    /// The payment block, absent for a free account and for one whose approval
+    /// has not happened yet.
+    pub payment: Option<PaymentView>,
 }
 
 #[derive(Template)]
@@ -63,6 +67,31 @@ pub struct StatusPage {
     /// the record carries none. The handler never signs one: it renders what it
     /// finds or nothing at all.
     pub password_link: Option<String>,
+    /// The payment block, present for a decided paid application whose account
+    /// still owes for the year.
+    pub payment: Option<PaymentView>,
+}
+
+/// The payment block, built once from the account and rendered by the web page,
+/// the capsule and the status page, so the three cannot disagree about what a
+/// member owes. The token is in it only while the account is unpaid: a credit
+/// sets `paid_until` and the token goes back to being a secret.
+pub struct PaymentView {
+    /// The account's state, which is the drain's word and not this page's.
+    pub state: String,
+    pub rail: String,
+    /// The amount owed for the year, in pounds.
+    pub amount: String,
+    /// The token in full, while the account is unpaid.
+    pub token: Option<String>,
+    /// The date a credit set. Present instead of the token once money arrived.
+    pub paid_until: Option<String>,
+    /// The window's close date and the days left, while one runs.
+    pub window: Option<String>,
+    /// The rail's own instructions, one line each.
+    pub instructions: Vec<String>,
+    /// What happens if nothing arrives before the window closes.
+    pub deadline: Option<String>,
 }
 
 #[derive(Template)]
@@ -165,11 +194,62 @@ pub fn account(
     list: &[Service],
     member: Option<&str>,
     dns: Option<crate::dns::Recipe>,
+    payment: Option<PaymentView>,
 ) -> AccountPage {
     AccountPage {
         services: services(list, member),
         dns,
+        payment,
     }
+}
+
+/// The payment block for one account: the token and the window while the
+/// account is unpaid, the paid-until date alone once a credit has set one, and
+/// nothing at all for a free account, which the spec gives no window, no token
+/// and no payment block.
+pub fn payment(
+    account: &crate::store::Account,
+    price_gbp: &str,
+    postal_address: &str,
+    now: OffsetDateTime,
+) -> Option<PaymentView> {
+    let payment = account.payment.as_ref()?;
+    let unpaid = payment.paid_until.is_none();
+    let window = payment.window.as_ref().filter(|_| unpaid);
+    let closes_on = window.map(|w| w.closes_at.get(..10).unwrap_or(&w.closes_at).to_string());
+    let window_line = match (window, &closes_on) {
+        (Some(w), Some(date)) => {
+            let days = crate::util::days_left(&w.closes_at, now)
+                .unwrap_or(0)
+                .max(0);
+            Some(format!("closes on {date}: {days} days left"))
+        }
+        _ => None,
+    };
+    Some(PaymentView {
+        state: account.state.clone(),
+        rail: account.rail.clone(),
+        amount: price_gbp.to_string(),
+        token: if unpaid {
+            payment.token_ref.clone()
+        } else {
+            None
+        },
+        paid_until: payment.paid_until.clone(),
+        window: window_line,
+        instructions: if unpaid {
+            crate::transitions::rail_instructions(&account.rail, postal_address)
+        } else {
+            Vec::new()
+        },
+        deadline: closes_on.map(|date| {
+            format!(
+                "The money must arrive before {date}, or the account lapses: mail keeps \
+                 arriving and everything published stays up, and sending, uploading and \
+                 pushing stop. Nothing is deleted at that point."
+            )
+        }),
+    })
 }
 
 /// Build the page for one branch. `answers` is the last submission when one was
@@ -318,6 +398,7 @@ mod tests {
             password_link: Some(
                 "https://signup.kyriakon.net/password/x?until=2026-10-29&sig=abc".into(),
             ),
+            payment: None,
         };
         let html = page.render().expect("the page renders");
         assert!(
@@ -502,7 +583,7 @@ mod tests {
         assert!(html.contains("https://mail.example.invalid/"), "{html}");
         assert!(html.contains("<span class=\"tag\">live</span>"), "{html}");
 
-        let listed = account(&catalogue(), None, None).render().unwrap();
+        let listed = account(&catalogue(), None, None, None).render().unwrap();
         assert!(listed.contains("zero-access mail"), "{listed}");
         assert!(listed.contains("https://mail.example.invalid/"), "{listed}");
 
@@ -518,11 +599,11 @@ mod tests {
              action = \"read\"\n",
         )
         .unwrap();
-        assert!(account(&pattern, None, None)
+        assert!(account(&pattern, None, None, None)
             .render()
             .unwrap()
             .contains("&#60;name&#62;.example.invalid"));
-        assert!(account(&pattern, Some("theophilus"), None)
+        assert!(account(&pattern, Some("theophilus"), None, None)
             .render()
             .unwrap()
             .contains("https://theophilus.example.invalid/"));
@@ -541,7 +622,7 @@ mod tests {
             dmarc_rua: "mailto:dmarc@kyriakon.net".into(),
         };
         let recipe = crate::dns::recipe("parish.example", &values);
-        let html = account(&catalogue(), Some("parish-secretary"), Some(recipe))
+        let html = account(&catalogue(), Some("parish-secretary"), Some(recipe), None)
             .render()
             .unwrap();
         assert!(html.contains("DNS records"), "{html}");
@@ -554,7 +635,9 @@ mod tests {
         assert!(html.contains("does not host your zone"), "{html}");
         assert!(html.contains("cannot set a reverse DNS record"), "{html}");
 
-        let none = account(&catalogue(), Some("alice"), None).render().unwrap();
+        let none = account(&catalogue(), Some("alice"), None, None)
+            .render()
+            .unwrap();
         assert!(!none.contains("DNS records"), "{none}");
     }
 }

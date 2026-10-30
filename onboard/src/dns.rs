@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn the_web_page_and_the_capsule_carry_the_same_table() {
         let web_recipe = recipe("parish.example", &values());
-        let web = crate::page::account(&[], Some("parish-secretary"), Some(web_recipe))
+        let web = crate::page::account(&[], Some("parish-secretary"), Some(web_recipe), None)
             .render()
             .unwrap();
         let capsule_recipe = recipe("parish.example", &values());
@@ -318,7 +318,7 @@ mod tests {
             "group": "parish.example"
         }))
         .unwrap();
-        let capsule = crate::capsule::account(&account, &[], Some(&capsule_recipe));
+        let capsule = crate::capsule::account(&account, &[], Some(&capsule_recipe), None);
         let email = capsule_recipe.text();
         for row in &capsule_recipe.rows {
             assert!(web.contains(&row.value), "web misses {}: {web}", row.value);

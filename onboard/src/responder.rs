@@ -823,7 +823,11 @@ async fn portal_answer(app: &App, address: &str, token: &str) -> portal_ipc::Ans
     if !app.counter.allow_request(rate::key(None, Some(address))) {
         return portal_ipc::Answer::Notice(SLOW_STATUS.to_string());
     }
-    let page = status_page(record_for(app, token).await, OffsetDateTime::now_utc());
+    let page = status_page(
+        record_for(app, token).await,
+        None,
+        OffsetDateTime::now_utc(),
+    );
     if page.notice.is_empty() {
         portal_ipc::Answer::Stage(page.stage)
     } else {
@@ -1113,7 +1117,8 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
     }
     if let Some(token) = incoming.path.strip_prefix("status/") {
         let record = record_for(app, token).await;
-        let page = status_page(record, OffsetDateTime::now_utc());
+        let payment = payment_for(app, record.as_ref()).await;
+        let page = status_page(record, payment, OffsetDateTime::now_utc());
         return Reply::gemini(20, "text/gemini", capsule::status(&page));
     }
     if incoming.path == "account" {
@@ -1122,7 +1127,13 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
             Some(account) => {
                 let notices = account_notices(app, &account.username).await;
                 let recipe = group_recipe(app, account);
-                capsule::account(account, &notices, recipe.as_ref())
+                let payment = page::payment(
+                    account,
+                    &app.cfg.price_gbp,
+                    &app.cfg.postal_address,
+                    OffsetDateTime::now_utc(),
+                );
+                capsule::account(account, &notices, recipe.as_ref(), payment.as_ref())
             }
             None => capsule::account_stranger(presented(incoming)),
         };
@@ -1664,10 +1675,19 @@ async fn account(app: &App, request: &Request) -> Reply {
         Some(account) => group_recipe(app, account),
         None => None,
     };
+    let payment = member.as_ref().and_then(|account| {
+        page::payment(
+            account,
+            &app.cfg.price_gbp,
+            &app.cfg.postal_address,
+            OffsetDateTime::now_utc(),
+        )
+    });
     let page: AccountPage = page::account(
         &app.catalogue,
         member.as_ref().map(|account| account.username.as_str()),
         dns,
+        payment,
     );
     Reply::html(200, page_html(&page))
 }
@@ -1678,6 +1698,13 @@ async fn web_member(app: &App, request: &Request) -> Option<Account> {
     if username.is_empty() || validate::username_shape(username).is_some() {
         return None;
     }
+    account_record(app, username).await
+}
+
+/// One account's record, for a name the request or a decided application
+/// already gave. A record that cannot be read is no account, and the page reads
+/// as it does for everybody: the handler has nothing to say about why.
+async fn account_record(app: &App, username: &str) -> Option<Account> {
     let text = app
         .store
         .read_record(&format!("accounts/{username}"), "account.json")
@@ -1824,7 +1851,21 @@ async fn apply(app: &App, request: &Request, incoming: &Incoming) -> Reply {
 /// capability in the URL is never stored and its URL is never sent as a referrer.
 async fn status(app: &App, token: &str) -> Reply {
     let record = record_for(app, token).await;
-    capability(&status_page(record, OffsetDateTime::now_utc()))
+    let payment = payment_for(app, record.as_ref()).await;
+    capability(&status_page(record, payment, OffsetDateTime::now_utc()))
+}
+
+/// The payment block a decided application's status page carries. The record
+/// names the account and holds no payment state of its own; the account does,
+/// and a token that resolves to no account reads as it does with no payment.
+async fn payment_for(app: &App, record: Option<&Record>) -> Option<page::PaymentView> {
+    let account = account_record(app, &record?.username).await?;
+    page::payment(
+        &account,
+        &app.cfg.price_gbp,
+        &app.cfg.postal_address,
+        OffsetDateTime::now_utc(),
+    )
 }
 
 /// The decision a link names, with the signature it carries. A link with no
@@ -1869,7 +1910,7 @@ fn decision_refusal(query: &BTreeMap<String, String>) -> &'static str {
 async fn decide_confirm(app: &App, token: &str, query: &BTreeMap<String, String>) -> Reply {
     let Some(record) = record_for(app, token).await else {
         // The page an unknown, an expired and a spent token all read as.
-        return capability(&status_page(None, OffsetDateTime::now_utc()));
+        return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     };
     let Some(decision) = decision_from(query) else {
         return refused(decision_refusal(query));
@@ -1893,7 +1934,7 @@ async fn decide_confirm(app: &App, token: &str, query: &BTreeMap<String, String>
 /// answered where the rule already lives and is already tested.
 async fn decide_file(app: &App, token: &str, form: &BTreeMap<String, String>) -> Reply {
     let Some(record) = record_for(app, token).await else {
-        return capability(&status_page(None, OffsetDateTime::now_utc()));
+        return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     };
     let Some(decision) = decision_from(form) else {
         return refused("This link does not name a decision the platform knows.");
@@ -1973,13 +2014,13 @@ mod password_window_tests {
 /// two cannot drift apart.
 async fn password_page(app: &App, token: &str, query: &BTreeMap<String, String>) -> Reply {
     let Some(record) = record_for(app, token).await else {
-        return capability(&status_page(None, OffsetDateTime::now_utc()));
+        return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     };
     let (Some(until), Some(sig)) = (query.get("until"), query.get("sig")) else {
-        return capability(&status_page(None, OffsetDateTime::now_utc()));
+        return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     };
     if record.password_link.is_none() || !password_window_open(until) {
-        return capability(&status_page(None, OffsetDateTime::now_utc()));
+        return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     }
     capability(&PasswordPage {
         username: record.username,
@@ -1995,13 +2036,13 @@ async fn password_page(app: &App, token: &str, query: &BTreeMap<String, String>)
 /// holds no key and proves nothing on its own.
 async fn password_file(app: &App, token: &str, form: &BTreeMap<String, String>) -> Reply {
     let Some(record) = record_for(app, token).await else {
-        return capability(&status_page(None, OffsetDateTime::now_utc()));
+        return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     };
     let (Some(until), Some(sig)) = (form.get("until"), form.get("sig")) else {
-        return capability(&status_page(None, OffsetDateTime::now_utc()));
+        return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     };
     if record.password_link.is_none() || !password_window_open(until) {
-        return capability(&status_page(None, OffsetDateTime::now_utc()));
+        return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     }
     let password = form.get("password").map(String::as_str).unwrap_or("");
     let confirm = form.get("confirm").map(String::as_str).unwrap_or("");
@@ -2036,7 +2077,15 @@ async fn password_file(app: &App, token: &str, form: &BTreeMap<String, String>) 
 /// that is unknown, expired or spent alike. The window is read here and not in the
 /// store, because a record is still on disk after its link has stopped answering:
 /// nothing is deleted for it, the page simply stops.
-fn status_page(record: Option<Record>, now: OffsetDateTime) -> StatusPage {
+///
+/// `payment` is the account's block, and it is dropped with the record: a page
+/// that has stopped answering shows no payment state either, so a dead token
+/// cannot be told from a live one by what the page carries.
+pub fn status_page(
+    record: Option<Record>,
+    payment: Option<page::PaymentView>,
+    now: OffsetDateTime,
+) -> StatusPage {
     let live = record.filter(|r| match r.decided_at.as_deref() {
         // The drain sets `decided_at` when it decides. Until it does, the
         // application has not been decided and the link answers.
@@ -2049,12 +2098,14 @@ fn status_page(record: Option<Record>, now: OffsetDateTime) -> StatusPage {
             filed_at: record.filed_at,
             notice: String::new(),
             password_link: record.password_link,
+            payment,
         },
         None => StatusPage {
             stage: String::new(),
             filed_at: String::new(),
             notice: UNKNOWN_TOKEN.to_string(),
             password_link: None,
+            payment: None,
         },
     }
 }

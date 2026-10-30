@@ -466,10 +466,11 @@ pub fn is_payment_token(token: &str) -> bool {
 
 /// The account record, `accounts/<username>/account.json`. It holds what this
 /// ticket writes and is deliberately open to the fields later tickets add: the
-/// rails put `payment.*`, the group tier puts a `group` reference, and neither
-/// is a reason to re-read this shape. So there is no `deny_unknown_fields` here,
-/// unlike the configs: an account written by a later release must still be
-/// readable by this one, and the reverse.
+/// group tier puts a `group` reference, the rails put a Monero subaddress and a
+/// balance beside the payment block, and neither is a reason to re-read this
+/// shape. So there is no `deny_unknown_fields` here, unlike the configs: an
+/// account written by a later release must still be readable by this one, and
+/// the reverse.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Account {
     pub version: u32,
@@ -484,18 +485,11 @@ pub struct Account {
     pub rail: String,
     pub no_charge: bool,
     pub created_at: String,
-    /// The payment token, present only on a paid approval. A bearer secret: it
-    /// is never logged.
+    /// The payment state, present only on a paid approval. A free account has
+    /// no window, no token and no payment block at all, which is why this is an
+    /// absent field rather than a block of nulls.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_ref: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_issued_at: Option<String>,
-    /// Null while the window runs, which is the state a paid approval opens in.
-    /// The free path has no window and leaves this null too: nothing lapses
-    /// without a window.
-    pub paid_until: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub window: Option<Window>,
+    pub payment: Option<Payment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outside_address: Option<String>,
     /// The gemini client certificates pinned to this account, one per device.
@@ -515,7 +509,7 @@ pub struct Account {
     pub space_used: Option<u64>,
     /// The domain of the group this account belongs to, for a mailbox the
     /// own-domain tier made. The group holds the payment state, so an account
-    /// with this set carries no `paid_until` of its own. `None` for a person's
+    /// with this set carries no payment block of its own. `None` for a person's
     /// account, and absent from the file, so a record written before this field
     /// existed reads the same.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -640,6 +634,26 @@ pub struct GroupAddressIntent {
     pub sig: String,
 }
 
+/// The payment block `accounts/<username>/account.json` carries under
+/// `payment`, named as the spec's State table names it. A paid approval writes
+/// it, opens the window and draws the token; a credit sets `paid_until`, which
+/// is what hides the token from both pages. `#[serde(default)]` so a block that
+/// gains a field in a later release still reads here.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Payment {
+    /// The payment token, present only on a paid approval. A bearer secret: it
+    /// is never logged, and both pages show it only while `paid_until` is null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_issued_at: Option<String>,
+    /// Null while the window runs, which is the state a paid approval opens in.
+    pub paid_until: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<Window>,
+}
+
 /// The 14-day payment window a paid approval opens.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Window {
@@ -741,7 +755,6 @@ mod tests {
             "rail": "no_charge",
             "no_charge": true,
             "created_at": "2026-10-01T09:00:00Z",
-            "paid_until": null,
             "certificates": [{ "hash": "SHA256:aa" }],
         });
         std::fs::write(

@@ -71,6 +71,8 @@ fn handler_config(dir: &Path) -> config::Config {
         dkim_public_key: "v=DKIM1; k=rsa; p=example".to_string(),
         dmarc_rua: "mailto:dmarc@kyriakon.net".to_string(),
         release: "2026-10-13 test".to_string(),
+        price_gbp: "20.00".to_string(),
+        postal_address: "1 Example Street, Example".to_string(),
     }
 }
 
@@ -1203,7 +1205,7 @@ async fn the_status_page_answers_for_seven_days_after_a_decision() {
 fn a_decided_application_answers_for_seven_days_and_then_reads_as_unknown() {
     let now = at("2026-10-05T09:00:00Z");
     // Filed and not yet decided: the link answers.
-    let filed = status_page(Some(decided("received", None, None)), now);
+    let filed = status_page(Some(decided("received", None, None)), None, now);
     assert_eq!(filed.notice, "");
     assert_eq!(filed.stage, "received");
 
@@ -1215,6 +1217,7 @@ fn a_decided_application_answers_for_seven_days_and_then_reads_as_unknown() {
             Some("2026-10-01T09:00:00Z"),
             Some("https://signup.kyriakon.net/password/abcdefghjkmnpqrstvwxyz"),
         )),
+        None,
         now,
     );
     assert_eq!(inside.notice, "");
@@ -1225,7 +1228,7 @@ fn a_decided_application_answers_for_seven_days_and_then_reads_as_unknown() {
     );
 
     // A record without a password link renders none.
-    let without = status_page(Some(decided("received", None, None)), now);
+    let without = status_page(Some(decided("received", None, None)), None, now);
     assert_eq!(without.password_link, None);
 
     // Past the window the record's page is the unknown-token page, byte for byte,
@@ -1237,9 +1240,10 @@ fn a_decided_application_answers_for_seven_days_and_then_reads_as_unknown() {
             Some("2026-10-01T09:00:00Z"),
             password_link,
         )),
+        None,
         at("2026-10-08T09:00:01Z"),
     );
-    let unknown = status_page(None, now);
+    let unknown = status_page(None, None, now);
     assert_eq!(expired.notice, UNKNOWN_TOKEN);
     assert_eq!(expired.stage, "");
     assert_eq!(expired.filed_at, "");

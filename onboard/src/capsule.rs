@@ -8,7 +8,7 @@
 //! pin gets the same page as a stranger, carrying only its own fingerprint.
 
 use crate::catalogue::{self, Protocol, Row, Service};
-use crate::page::StatusPage;
+use crate::page::{PaymentView, StatusPage};
 use crate::questions::{Kind, Question};
 use crate::responder::HOST;
 use crate::store::{Account, Certificate, Notice};
@@ -159,6 +159,21 @@ pub fn status(page: &StatusPage) -> String {
         page.filed_at
     ));
     out.push_str(&format!("Stage: {}\n", page.stage));
+    if let Some(payment) = &page.payment {
+        out.push_str("\n## Paying\n\n");
+        match (&payment.paid_until, &payment.token) {
+            (Some(until), _) => out.push_str(&format!("Paid until {until}.\n")),
+            (None, token) => {
+                if let Some(token) = token {
+                    out.push_str(&format!("Your payment reference is {token}.\n"));
+                }
+                out.push_str(&format!("Amount: GBP {}.\n", payment.amount));
+                if let Some(window) = &payment.window {
+                    out.push_str(&format!("The payment window {window}.\n"));
+                }
+            }
+        }
+    }
     if let Some(link) = &page.password_link {
         out.push_str("\n## Setting your mail password\n\n");
         // A gemtext link is a `=>` line; a bare URL is text to every client, the
@@ -176,15 +191,47 @@ pub fn filed(link: &str) -> String {
     )
 }
 
-/// The member's reading half: the account's state, whether the site and the
-/// capsule are served, the space used and the notices sent. It is a read and
-/// nothing else, so the page carries no prompt, no form and no link that files
-/// anything; changing an account is handed off to the two front-ends that can.
+/// The member's reading half: the payment block, the account's state, whether
+/// the site and the capsule are served, the space used and the notices sent. It
+/// is a read and nothing else, so the page carries no prompt, no form and no
+/// link that files anything; changing an account is handed off to the two
+/// front-ends that can.
+///
+/// `payment` is the same block the web page renders, built from the account by
+/// one function, so the two cannot disagree about what is owed. It is `None` for
+/// a free account, which has no window, no token and no payment block.
 ///
 /// The words for the serving facts are the capsule's own chrome. A fact the
 /// drain has not recorded yet reads as that rather than as a false "no".
-pub fn account(account: &Account, notices: &[Notice], dns: Option<&crate::dns::Recipe>) -> String {
+pub fn account(
+    account: &Account,
+    notices: &[Notice],
+    dns: Option<&crate::dns::Recipe>,
+    payment: Option<&PaymentView>,
+) -> String {
     let mut out = String::from("# Your account\n\n");
+    if let Some(p) = payment {
+        out.push_str("## Payment\n\n");
+        out.push_str(&format!("Rail: {}.\n", p.rail));
+        if let Some(until) = &p.paid_until {
+            out.push_str(&format!("Paid until {until}.\n"));
+        } else {
+            if let Some(window) = &p.window {
+                out.push_str(&format!("The payment window {window}.\n"));
+            }
+            out.push_str(&format!("Amount: GBP {}.\n", p.amount));
+            if let Some(token) = &p.token {
+                out.push_str(&format!("Your payment reference is {token}.\n"));
+            }
+            for line in &p.instructions {
+                out.push_str(&format!("{line}\n"));
+            }
+            if let Some(deadline) = &p.deadline {
+                out.push_str(&format!("{deadline}\n"));
+            }
+        }
+        out.push('\n');
+    }
     out.push_str(&format!("State: {}\n", account.state));
     out.push_str(&format!("Site: {}\n", served(account.site_served)));
     out.push_str(&format!("Capsule: {}\n", served(account.capsule_served)));
@@ -445,7 +492,7 @@ mod tests {
             subject: "Application approved, account opened.".into(),
             to: "alice@kyriakon.net".into(),
         }];
-        let text = account(&member(), &notices, None);
+        let text = account(&member(), &notices, None, None);
         assert!(text.contains("State: active"), "{text}");
         assert!(text.contains("Site: serving"), "{text}");
         assert!(text.contains("Capsule: not serving"), "{text}");
@@ -464,7 +511,7 @@ mod tests {
         let mut record = member();
         record.site_served = None;
         record.space_used = None;
-        let text = account(&record, &[], None);
+        let text = account(&record, &[], None, None);
         assert!(text.contains("Site: not recorded yet"), "{text}");
         assert!(text.contains("Space used: not recorded yet"), "{text}");
         assert!(text.contains("Nothing has been sent yet."), "{text}");
@@ -508,6 +555,7 @@ mod tests {
             password_link: Some(
                 "https://signup.kyriakon.net/password/x?until=2026-10-29&sig=abc".into(),
             ),
+            payment: None,
         };
         let text = status(&page);
         assert!(

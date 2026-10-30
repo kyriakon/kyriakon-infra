@@ -59,6 +59,15 @@ dkim_selector = "REPLACE_ME"
 dkim_public_key = "REPLACE_ME"
 dmarc_rua = "mailto:dmarc@kyriakon.net"
 
+# The yearly price and the postal address a cash-by-post member is given, which
+# the account page shows beside their payment token. The drain's own config names
+# the same two values: the price because the Stripe Price and the prepaid price
+# have to agree, the address because it is the operator's own and this repository
+# is public. Both are substituted at deploy from /root/.kyriakon-env, and the
+# deploy refuses a file that still carries a placeholder.
+price_gbp = "20.00"
+postal_address = "REPLACE_ME"
+
 # The unix sockets the front-ends reach the responder on. There is no listener on
 # a port: the service is a FastCGI responder, and both httpd and gmid resolve a
 # FastCGI socket path inside their own chroot, which is /home/www for each of

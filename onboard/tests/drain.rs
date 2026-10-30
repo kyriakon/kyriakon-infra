@@ -11,8 +11,11 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use kyriakon_onboard::sign;
+use askama::Template;
+use kyriakon_onboard::store::{self, Record};
+use kyriakon_onboard::{capsule, page, responder, sign};
 use serde_json::{json, Value};
+use time::OffsetDateTime;
 
 const DRAIN: &str = env!("CARGO_BIN_EXE_kyriakon-onboard-drain");
 const CTL: &str = env!("CARGO_BIN_EXE_kyriakon-onboardctl");
@@ -1034,16 +1037,29 @@ fn a_paid_approval_writes_a_token_and_a_no_charge_approval_does_not() {
     assert!(out.status.success(), "{}", body(&out));
 
     let account = paid.account("secretary");
-    let token = account["token_ref"]
+    let payment = &account["payment"];
+    let token = payment["token_ref"]
         .as_str()
         .expect("a paid approval writes a token");
     assert!(token.starts_with("KYR-"), "{token}");
     assert_eq!(token.len(), 18, "{token}");
-    assert!(account["paid_until"].is_null(), "{}", account);
     assert!(
-        !account["window"].is_null(),
+        payment["token_issued_at"].is_string(),
+        "the block records when the token was drawn: {account}"
+    );
+    assert!(payment["paid_until"].is_null(), "{}", account);
+    assert!(
+        !payment["window"].is_null(),
         "a paid approval opens a window"
     );
+    // The fields are the spec's `payment.*` and nothing beside them: a top-level
+    // copy would be a second place to keep one fact.
+    for flat in ["token_ref", "token_issued_at", "paid_until", "window"] {
+        assert!(
+            account.get(flat).is_none(),
+            "{flat} is top-level: {account}"
+        );
+    }
     // The join and the ledger line, keyed by the token and holding no username.
     assert!(paid.read(&format!("tokens/{token}.json")).contains(token));
     let ledger = paid.read("ledger/payments.jsonl");
@@ -1073,9 +1089,10 @@ fn a_paid_approval_writes_a_token_and_a_no_charge_approval_does_not() {
     let out = free.drain();
     assert!(out.status.success(), "{}", body(&out));
     let account = free.account("secretary");
-    assert!(account["token_ref"].is_null(), "{account}");
-    assert!(account["paid_until"].is_null(), "{account}");
-    assert!(account["window"].is_null(), "{account}");
+    assert!(
+        account.get("payment").is_none(),
+        "a free account has no payment block at all: {account}"
+    );
     assert_eq!(account["no_charge"], json!(true));
     assert!(
         free.read("ledger/payments.jsonl").is_empty(),
@@ -1097,8 +1114,7 @@ fn an_application_that_asked_for_no_charge_is_never_charged() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     let account = fix.account("secretary");
-    assert!(account["token_ref"].is_null(), "{account}");
-    assert!(account["window"].is_null(), "{account}");
+    assert!(account.get("payment").is_none(), "{account}");
     assert!(
         fix.read("ledger/payments.jsonl").is_empty(),
         "nothing owed, no ledger line"
@@ -1173,7 +1189,7 @@ fn show_names_a_window_only_when_the_account_has_one() {
     assert!(out.status.success(), "{}", body(&out));
 
     let account = charged.account("secretary");
-    let window = &account["window"];
+    let window = &account["payment"]["window"];
     let opened = window["opened_at"]
         .as_str()
         .expect("a charged approval opens a window");
@@ -1206,6 +1222,294 @@ fn show_names_a_window_only_when_the_account_has_one() {
         text.contains("  paid     none: no charge was made, so nothing expires"),
         "the line should say what is true: {text}"
     );
+}
+
+/// The account record as the service reads it.
+fn stored_account(fix: &Fix, username: &str) -> store::Account {
+    serde_json::from_str(&fix.read(&format!("accounts/{username}/account.json"))).unwrap()
+}
+
+/// Whether a page puts the token in a link, which is the only way a page can put
+/// it in a URL for relayd to log. The status page's own address is the status
+/// token's and never the payment token's.
+fn token_is_a_link(page: &str, token: &str) -> bool {
+    page.lines().any(|line| {
+        (line.contains("href=") || line.trim_start().starts_with("=> ")) && line.contains(token)
+    })
+}
+
+/// The token is a bearer secret with a lifetime: the status page and both account
+/// pages show it in full while the account is unpaid, the amount and the window
+/// beside it, and a credit's date replaces it there. The credit path is not built
+/// yet, so the paid state below is the account a credit leaves: `paid_until` set
+/// and the window closed.
+#[test]
+fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
+    let fix = Fix::new("token-display");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let now = OffsetDateTime::now_utc();
+    let post = "1 Example Street, Example";
+    let account = stored_account(&fix, "secretary");
+    let payment = account.payment.as_ref().expect("a paid approval's block");
+    let token = payment.token_ref.clone().expect("a paid approval's token");
+    let closes_at = payment.window.as_ref().unwrap().closes_at.clone();
+    let closes_on = closes_at[..10].to_string();
+
+    // The status page: the token in full, the amount and the close date.
+    let application: Record =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    let view = |account: &store::Account| page::payment(account, "20.00", post, now).unwrap();
+    let status = responder::status_page(Some(application.clone()), Some(view(&account)), now);
+    let html = status.render().unwrap();
+    assert!(html.contains(&token), "{html}");
+    assert!(html.contains("GBP 20.00"), "{html}");
+    assert!(html.contains(&closes_on), "{html}");
+    assert!(
+        !token_is_a_link(&html, &token),
+        "the token is in a URL: {html}"
+    );
+    let gemtext = capsule::status(&status);
+    assert!(gemtext.contains(&token), "{gemtext}");
+    assert!(gemtext.contains(&closes_on), "{gemtext}");
+    assert!(
+        !token_is_a_link(&gemtext, &token),
+        "the token is in a link: {gemtext}"
+    );
+
+    // The account page, web and gemini: the block above the catalogue, with the
+    // rail and the instructions a member has to act on.
+    let web = page::account(&[], Some("secretary"), None, Some(view(&account)))
+        .render()
+        .unwrap();
+    assert!(web.contains(&token), "{web}");
+    assert!(web.contains("Rail: cash"), "{web}");
+    assert!(web.contains(post), "{web}");
+    assert!(web.contains("GBP 20.00"), "{web}");
+    assert!(
+        !token_is_a_link(&web, &token),
+        "the token is in a URL: {web}"
+    );
+    let gemini = capsule::account(&account, &[], None, Some(&view(&account)));
+    assert!(gemini.contains(&token), "{gemini}");
+    assert!(gemini.contains(post), "{gemini}");
+    assert!(
+        !token_is_a_link(&gemini, &token),
+        "the token is in a link: {gemini}"
+    );
+
+    // The credit: `paid_until` set, the window closed. Written by hand because
+    // the credit path does not exist yet.
+    let mut paid = fix.account("secretary");
+    paid["payment"]["paid_until"] = json!("2027-10-04T00:00:00Z");
+    paid["payment"]["window"]["state"] = json!("paid");
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&paid).unwrap(),
+    )
+    .unwrap();
+
+    let account = stored_account(&fix, "secretary");
+    let paid = view(&account);
+    assert_eq!(paid.paid_until.as_deref(), Some("2027-10-04T00:00:00Z"));
+    assert_eq!(paid.token, None, "a paid account shows no token");
+    assert_eq!(paid.rail, "cash", "the rail stays visible");
+    let status = responder::status_page(Some(application), Some(paid), now);
+    let html = status.render().unwrap();
+    assert!(html.contains("Paid until 2027-10-04T00:00:00Z"), "{html}");
+    assert!(!html.contains(&token), "the token is back: {html}");
+    let gemtext = capsule::status(&status);
+    assert!(gemtext.contains("Paid until 2027-10-04"), "{gemtext}");
+    assert!(!gemtext.contains(&token), "the token is back: {gemtext}");
+    let paid = view(&account);
+    let web = page::account(&[], Some("secretary"), None, Some(paid))
+        .render()
+        .unwrap();
+    assert!(web.contains("Paid until 2027-10-04T00:00:00Z"), "{web}");
+    assert!(!web.contains(&token), "the token is back: {web}");
+    assert!(web.contains("Rail: cash"), "{web}");
+
+    // A free account has no payment block at all, on either page.
+    let free = Fix::new("token-display-free");
+    let record = free.filed("secretary", "no_charge", &[("rail", "no_charge")]);
+    free.file_application(&record);
+    assert!(free.drain().status.success());
+    free.decide("provision", "secretary");
+    let out = free.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let account = stored_account(&free, "secretary");
+    assert!(page::payment(&account, "20.00", post, now).is_none());
+    let web = page::account(&[], Some("secretary"), None, None)
+        .render()
+        .unwrap();
+    assert!(
+        !web.contains("Payment"),
+        "a free account has no block: {web}"
+    );
+    let gemini = capsule::account(&account, &[], None, None);
+    assert!(
+        !gemini.contains("Payment"),
+        "a free account has no block: {gemini}"
+    );
+}
+
+/// A status token that resolves to nothing reads exactly as it reads today, and
+/// a decided application past its seven days reads the same: no stage, no token,
+/// no payment state.
+#[test]
+fn a_status_token_that_resolves_to_nothing_carries_no_payment() {
+    let fix = Fix::new("status-unknown");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let now = OffsetDateTime::now_utc();
+    let account = stored_account(&fix, "secretary");
+    let payment = page::payment(&account, "20.00", "1 Example Street, Example", now);
+    assert!(payment.is_some(), "the account owes for the year");
+
+    // Past the seven days the record's page is the unknown-token page, and the
+    // payment block goes with it.
+    let record: Record =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    let later = now + time::Duration::days(8);
+    let expired = responder::status_page(Some(record), None, later);
+    let unknown = responder::status_page(None, None, now);
+    assert!(
+        expired.payment.is_none(),
+        "{:?}",
+        expired.payment.as_ref().map(|p| &p.token)
+    );
+    assert_eq!(
+        expired.render().unwrap(),
+        unknown.render().unwrap(),
+        "an expired link reads as an unknown one"
+    );
+    assert_eq!(capsule::status(&expired), capsule::status(&unknown));
+}
+
+/// `onboardctl token resend` sends the same token again and mints nothing: one
+/// file under `tokens/`, one token in the account, and the member's mail holding
+/// the instructions one more time. A second resend sends a second copy, because
+/// a member asking twice is the whole point of the verb.
+#[test]
+fn a_token_resend_sends_the_same_token_and_mints_nothing() {
+    let fix = Fix::new("resend");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let token = stored_account(&fix, "secretary")
+        .payment
+        .and_then(|p| p.token_ref)
+        .expect("a paid approval's token");
+    let tokens_before = fix.names("tokens");
+    assert_eq!(
+        tokens_before,
+        vec![format!("{token}.json")],
+        "{tokens_before:?}"
+    );
+    let sent_before = fix.sent().matches(&token).count();
+    let mails_before = fix.sent().matches("Subject:").count();
+
+    let out = fix.ctl(&["token", "resend", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+
+    // The same string, one more time, and nothing new minted.
+    let sent = fix.sent();
+    assert_eq!(sent.matches("Subject:").count(), mails_before + 1);
+    assert_eq!(sent.matches(&token).count(), sent_before + 1, "{sent}");
+    assert_eq!(
+        fix.names("tokens"),
+        tokens_before,
+        "a second token was written"
+    );
+    assert_eq!(
+        stored_account(&fix, "secretary")
+            .payment
+            .and_then(|p| p.token_ref)
+            .as_deref(),
+        Some(token.as_str())
+    );
+    assert!(fix
+        .read("accounts/secretary/notices.jsonl")
+        .contains("prepaid.instructions"));
+
+    // A second resend sends a second copy rather than being deduplicated: the
+    // member asked again.
+    let out = fix.ctl(&["token", "resend", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.sent().matches("Subject:").count(),
+        mails_before + 2,
+        "{}",
+        fix.sent()
+    );
+    assert_eq!(fix.names("tokens").len(), 1);
+
+    // A free account has no token to resend, and the console says so now rather
+    // than filing an intent the drain would refuse.
+    let free = Fix::new("resend-free");
+    let record = free.filed("secretary", "no_charge", &[("rail", "no_charge")]);
+    free.file_application(&record);
+    assert!(free.drain().status.success());
+    free.decide("provision", "secretary");
+    let out = free.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let out = free.ctl(&["token", "resend", "secretary"]);
+    assert!(!out.status.success());
+    assert!(body(&out).contains("without charge"), "{}", body(&out));
+    assert!(free.intents().is_empty(), "{:?}", free.intents());
+}
+
+/// Criterion (d): the token is a bearer secret, so the drain's own output never
+/// carries it. Cron mails what the drain prints, and that log is read by more
+/// people than the member's mail is.
+#[test]
+fn the_drain_prints_no_payment_token() {
+    let fix = Fix::new("token-logs");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    // Filing prints the review mail's path and nothing of the account's.
+    assert!(!body(&fix.drain()).contains("KYR-"));
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let token = stored_account(&fix, "secretary")
+        .payment
+        .and_then(|p| p.token_ref)
+        .expect("a paid approval's token");
+    assert!(
+        !body(&out).contains(&token),
+        "the approval printed the token: {}",
+        body(&out)
+    );
+    // A later pass over the same store prints none either, and the resend's
+    // console output names the intent and not the token.
+    assert!(!body(&fix.drain()).contains("KYR-"));
+    let out = fix.ctl(&["token", "resend", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(!body(&out).contains(&token), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(!body(&out).contains(&token), "{}", body(&out));
 }
 
 /// A decline purges nothing on the first run; the run after its week clears the
@@ -2592,7 +2896,7 @@ fn a_second_application_does_not_reuse_the_first_approvals_payment() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
 
-    let token = fix.account("secretary")["token_ref"].clone();
+    let token = fix.account("secretary")["payment"]["token_ref"].clone();
     let ledger = fix.read("ledger/payments.jsonl");
     assert!(
         !ledger.is_empty(),
@@ -2648,7 +2952,7 @@ fn a_second_application_does_not_reuse_the_first_approvals_payment() {
         fix.intents()
     );
     assert_eq!(
-        fix.account("secretary")["token_ref"],
+        fix.account("secretary")["payment"]["token_ref"],
         token,
         "the first approval's token is untouched"
     );
@@ -2829,7 +3133,7 @@ fn a_group_intent_provisions_its_record_accounts_and_addresses() {
     // field of its own.
     let account = fix.account("parish-secretary");
     assert_eq!(account["group"], "parish.example");
-    assert!(account.get("paid_until").is_none(), "{account}");
+    assert!(account.get("payment").is_none(), "{account}");
     assert!(
         fix.passwd_file().contains("parish-secretary:"),
         "{}",
