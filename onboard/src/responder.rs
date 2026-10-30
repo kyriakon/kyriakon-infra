@@ -1696,6 +1696,7 @@ async fn account(app: &App, request: &Request) -> Reply {
         member.as_ref().map(|account| account.username.as_str()),
         dns,
         payment,
+        member.as_ref().is_some_and(|account| account.is_free()),
     );
     Reply::html(200, page_html(&page))
 }

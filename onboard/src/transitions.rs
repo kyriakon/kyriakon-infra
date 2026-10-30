@@ -2868,6 +2868,76 @@ async fn dns_contact(store: &Store, group: &GroupRecord) -> Result<String, Strin
     Ok(format!("{}@{}", group.site_owner, group.domain))
 }
 
+/// The yearly note to an account approved without charge: nothing is due, and
+/// the paid path is there if circumstances have changed. It falls due on the
+/// creation anniversary, at most once a year, and the subject carries the year
+/// because a notice is deduplicated on its type and subject. A group mailbox is
+/// skipped: the group holds the payment, and a body's free permanence is the
+/// own-domain tier's own question.
+pub async fn free_anniversaries(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+    let today = OffsetDateTime::now_utc().date();
+    for username in store.list("accounts").await? {
+        let Some(account) = existing_account(store, &username).await else {
+            continue;
+        };
+        if !account.is_free() {
+            continue;
+        }
+        let Ok(created) = OffsetDateTime::parse(&account.created_at, &Rfc3339) else {
+            continue;
+        };
+        let created = created.date();
+        // The first note falls due on the first anniversary, never at approval.
+        if today.year() <= created.year() {
+            continue;
+        }
+        let due = anniversary(created, today.year());
+        if today < due {
+            continue;
+        }
+        // The address the approval used: the one outside the platform, or the
+        // member's mailbox. It was validated before it was written, and is
+        // validated again here because it is about to become a mail header.
+        let to = match account.outside_address.as_deref() {
+            Some(addr) if validate::address(addr).is_none() => addr.to_string(),
+            _ => format!("{username}@kyriakon.net"),
+        };
+        let subject = format!(
+            "Your kyriakon.net account is free for another year ({})",
+            due.year()
+        );
+        let body = format!(
+            "Nothing is due for {username} this year.\n\n\
+             The account was approved without charge, so there is no payment window and\n\
+             no sum to send, and the account does not lapse. It carries the same 5 GB\n\
+             allowance and the same acceptable use policy as any other account.\n\n\
+             The paid path is there if circumstances have changed: write to\n\
+             admin@kyriakon.net and we will send the payment instructions. There is\n\
+             nothing to prove.\n"
+        );
+        notice::send_account_notice(
+            cfg,
+            store,
+            &username,
+            "free.anniversary",
+            &subject,
+            &to,
+            &body,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The date a free account's yearly note falls due in `year`: the creation day,
+/// clamped to the month's length, so a 29 February creation falls due on 28
+/// February in a common year.
+fn anniversary(created: time::Date, year: i32) -> time::Date {
+    let last = created.month().length(year);
+    time::Date::from_calendar_date(year, created.month(), created.day().min(last))
+        .expect("a day clamped to the month's length is in the month")
+}
+
 /// Clear away every declined application whose week is up, and release the
 /// username. Run once per drain pass, after the intents: this is what carries
 /// the decline's week out without the application being touched again.
@@ -3274,6 +3344,21 @@ mod tests {
         assert_eq!(
             decision_subject("approved", "secretary"),
             "Your application to kyriakon.net was approved (secretary)"
+        );
+    }
+
+    #[test]
+    fn a_free_accounts_note_falls_due_on_the_creation_day_clamped() {
+        let leap = time::Date::from_calendar_date(2024, time::Month::February, 29).unwrap();
+        // A common year has no 29 February, so the note falls due a day early
+        // rather than being skipped for the year.
+        assert_eq!(
+            anniversary(leap, 2025),
+            time::Date::from_calendar_date(2025, time::Month::February, 28).unwrap()
+        );
+        assert_eq!(
+            anniversary(leap, 2028),
+            time::Date::from_calendar_date(2028, time::Month::February, 29).unwrap()
         );
     }
 

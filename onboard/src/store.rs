@@ -678,6 +678,38 @@ impl Account {
             .clone()
             .or_else(|| self.legacy_payment.folded())
     }
+
+    /// Approved without charge: no token, no window, nothing that lapses. A
+    /// group mailbox carries the flag its group was approved with, but the
+    /// group holds the payment, so the mailbox is not a free account itself.
+    pub fn is_free(&self) -> bool {
+        self.no_charge && self.group.is_none()
+    }
+}
+
+/// The count of free accounts, for the console. One read per account, the same
+/// scan the certificate lookup does; a record that cannot be read is skipped
+/// rather than failing the count.
+pub async fn free_account_count(store: &Store) -> usize {
+    let Ok(names) = store.list("accounts").await else {
+        return 0;
+    };
+    let mut free = 0;
+    for username in names {
+        let Some(text) = store
+            .read_record(&format!("accounts/{username}"), "account.json")
+            .await
+        else {
+            continue;
+        };
+        let Ok(account) = serde_json::from_str::<Account>(&text) else {
+            continue;
+        };
+        if account.is_free() {
+            free += 1;
+        }
+    }
+    free
 }
 
 /// The flat payment fields of an account written before the block existed.

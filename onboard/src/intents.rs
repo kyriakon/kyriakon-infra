@@ -45,6 +45,9 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
         }
     }
     transitions::purge_declined(cfg, store).await?;
+    // The free accounts' yearly note, on the same pass: a free account never
+    // lapses, and this is the one message it is sent each year.
+    transitions::free_anniversaries(cfg, store).await?;
     // The key spool is read after the intents so a filed application is not
     // waiting behind a mailbox pass. The pass handles each message on its own:
     // one that cannot be dealt with is reported and left for the next run.

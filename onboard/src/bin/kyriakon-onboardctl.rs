@@ -18,6 +18,7 @@
 //!       [--site-owner <account>]
 //!   kyriakon-onboardctl [--config PATH] token resend <username>
 //!   kyriakon-onboardctl [--config PATH] show <username>
+//!   kyriakon-onboardctl [--config PATH] free
 //!   kyriakon-onboardctl request list
 //!   kyriakon-onboardctl request record
 //!   kyriakon-onboardctl request extend <id>
@@ -38,7 +39,7 @@ use kyriakon_onboard::config::DrainConfig;
 use kyriakon_onboard::intents;
 use kyriakon_onboard::requests;
 use kyriakon_onboard::sign;
-use kyriakon_onboard::store::{KeyRecord, Record, Store};
+use kyriakon_onboard::store::{free_account_count, KeyRecord, Record, Store};
 use kyriakon_onboard::transitions::{self, Decision};
 use kyriakon_onboard::validate;
 
@@ -84,6 +85,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         "address" => address(&cfg, &store, &rest[1..]).await,
         "token" => token(&cfg, &store, &rest[1..]).await,
         "show" => show(&store, one_username(rest)?).await,
+        "free" => free(&store, &rest[1..]).await,
         // Each decision is signed with the same root-only key the review links
         // are signed with, because the drain carries out a decision intent only
         // when its signature verifies, and `intents/` belongs to the
@@ -104,6 +106,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
 fn usage() -> String {
     "usage: kyriakon-onboardctl [--config PATH] \
      approve|approve-free|decline|show <username>
+       kyriakon-onboardctl free
        kyriakon-onboardctl token resend <username>
        kyriakon-onboardctl address --domain <domain> \
      --action <add-alias|add-mailbox|upgrade|remove> --mailbox <account> \
@@ -118,7 +121,7 @@ fn usage() -> String {
         .to_string()
 }
 
-/// The one username a verb other than `request` takes.
+/// The one username a verb that takes one reads. `request` and `free` take none.
 fn one_username(rest: &[String]) -> Result<&str, String> {
     let username = match rest {
         [_, username] => username.as_str(),
@@ -497,6 +500,20 @@ async fn show(store: &Store, username: &str) -> Result<(), String> {
             }
         }
         None => println!("account  none yet"),
+    }
+    Ok(())
+}
+
+/// `free`: how many accounts were approved without charge. The count is read
+/// from the accounts themselves rather than kept beside them, so it cannot
+/// drift; a group mailbox is not counted, because the group holds the payment.
+async fn free(store: &Store, rest: &[String]) -> Result<(), String> {
+    if !rest.is_empty() {
+        return Err(usage());
+    }
+    match free_account_count(store).await {
+        1 => println!("1 account without charge"),
+        n => println!("{n} accounts without charge"),
     }
     Ok(())
 }

@@ -1104,6 +1104,86 @@ fn a_paid_approval_writes_a_token_and_a_no_charge_approval_does_not() {
     assert!(free.names("tokens").is_empty(), "no token without a charge");
 }
 
+/// A free account never lapses, carries no payment block, and is sent one note a
+/// year on the creation anniversary. The console counts free accounts only:
+/// a paid account and a group mailbox are not free accounts of their own.
+#[test]
+fn a_free_account_gets_one_note_a_year_and_the_console_counts_it() {
+    let fix = Fix::new("free-anniversary");
+    let record = fix.filed("secretary", "no_charge", &[("rail", "no_charge")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("provision", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    // Approved this year: no anniversary has fallen due, so no note.
+    assert!(
+        !fix.sent().contains("free for another year"),
+        "{}",
+        fix.sent()
+    );
+
+    // Age the account past an anniversary, as a year of running would.
+    let mut account = fix.account("secretary");
+    account["created_at"] = json!("2019-01-01T09:00:00Z");
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let sent = fix.sent();
+    assert!(sent.contains("free for another year"), "{sent}");
+    assert!(
+        sent.contains("Nothing is due for secretary this year."),
+        "{sent}"
+    );
+    let notices = fix.read("accounts/secretary/notices.jsonl");
+    assert_eq!(notices.matches("free.anniversary").count(), 1, "{notices}");
+
+    // A paid account, and a group mailbox whose group was approved without
+    // charge, are not free accounts of their own: the sweep skips both, so the
+    // second pass still sends one note, and the console counts one account.
+    for (name, group, payment) in [
+        (
+            "paid",
+            Value::Null,
+            json!({"token_ref": "KYR-AAAA-BBBB-CCCC", "paid_until": null}),
+        ),
+        ("parish", json!("parish.example"), Value::Null),
+    ] {
+        let dir = fix.dir.join(format!("store/accounts/{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let account = json!({
+            "version": 1, "username": name, "state": "active",
+            "decision": "approve", "decided_at": "2019-01-01T09:00:00Z",
+            "rail": if group.is_null() { "cash" } else { "no_charge" },
+            "no_charge": !group.is_null(), "created_at": "2019-01-01T09:00:00Z",
+            "payment": payment, "group": group,
+        });
+        std::fs::write(
+            dir.join("account.json"),
+            serde_json::to_vec_pretty(&account).unwrap(),
+        )
+        .unwrap();
+    }
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.sent().matches("free for another year").count(),
+        1,
+        "one note a year, and none for the paid account or the group mailbox"
+    );
+    assert_eq!(fix.account("secretary")["state"], json!("active"));
+    assert!(!notices.contains("lapsed"), "{notices}");
+
+    let out = fix.ctl(&["free"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(body(&out).trim(), "1 account without charge");
+}
+
 /// An application that asked for no charge is never charged, even by the
 /// charge-carrying intent: the reviewer's own button and the applicant's answer
 /// both have to say pay before a token is drawn.
@@ -1297,7 +1377,7 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
 
     // The account page, web and gemini: the block above the catalogue, with the
     // rail and the instructions a member has to act on.
-    let web = page::account(&[], Some("secretary"), None, Some(view(&account)))
+    let web = page::account(&[], Some("secretary"), None, Some(view(&account)), false)
         .render()
         .unwrap();
     assert!(web.contains(&token), "{web}");
@@ -1349,7 +1429,7 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
     assert!(gemtext.contains("Paid until 2027-10-04"), "{gemtext}");
     assert!(!gemtext.contains(&token), "the token is back: {gemtext}");
     let paid = view(&account);
-    let web = page::account(&[], Some("secretary"), None, Some(paid))
+    let web = page::account(&[], Some("secretary"), None, Some(paid), false)
         .render()
         .unwrap();
     assert!(web.contains("Paid until 2027-10-04T00:00:00Z"), "{web}");
@@ -1366,17 +1446,26 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
     assert!(out.status.success(), "{}", body(&out));
     let account = stored_account(&free, "secretary");
     assert!(account.payment_state().is_none());
-    let web = page::account(&[], Some("secretary"), None, None)
+    assert!(account.is_free());
+    let web = page::account(&[], Some("secretary"), None, None, account.is_free())
         .render()
         .unwrap();
     assert!(
         !web.contains("Payment"),
         "a free account has no block: {web}"
     );
+    assert!(
+        web.contains("This account is free: nothing is due, and it does not lapse."),
+        "the page says why there is no block: {web}"
+    );
     let gemini = capsule::account(&account, &[], None, None);
     assert!(
         !gemini.contains("Payment"),
         "a free account has no block: {gemini}"
+    );
+    assert!(
+        gemini.contains("This account is free: nothing is due"),
+        "{gemini}"
     );
 }
 

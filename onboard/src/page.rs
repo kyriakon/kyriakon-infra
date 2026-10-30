@@ -49,6 +49,10 @@ pub struct AccountPage {
     /// The payment block, absent for a free account and for one whose approval
     /// has not happened yet.
     pub payment: Option<PaymentView>,
+    /// Approved without charge: no payment block, nothing due, never lapses.
+    /// The page says so in one line rather than leaving the absence to be read
+    /// as an unpaid account whose block failed to render.
+    pub free: bool,
 }
 
 #[derive(Template)]
@@ -195,11 +199,13 @@ pub fn account(
     member: Option<&str>,
     dns: Option<crate::dns::Recipe>,
     payment: Option<PaymentView>,
+    free: bool,
 ) -> AccountPage {
     AccountPage {
         services: services(list, member),
         dns,
         payment,
+        free,
     }
 }
 
@@ -584,7 +590,9 @@ mod tests {
         assert!(html.contains("https://mail.example.invalid/"), "{html}");
         assert!(html.contains("<span class=\"tag\">live</span>"), "{html}");
 
-        let listed = account(&catalogue(), None, None, None).render().unwrap();
+        let listed = account(&catalogue(), None, None, None, false)
+            .render()
+            .unwrap();
         assert!(listed.contains("zero-access mail"), "{listed}");
         assert!(listed.contains("https://mail.example.invalid/"), "{listed}");
 
@@ -600,11 +608,11 @@ mod tests {
              action = \"read\"\n",
         )
         .unwrap();
-        assert!(account(&pattern, None, None, None)
+        assert!(account(&pattern, None, None, None, false)
             .render()
             .unwrap()
             .contains("&#60;name&#62;.example.invalid"));
-        assert!(account(&pattern, Some("theophilus"), None, None)
+        assert!(account(&pattern, Some("theophilus"), None, None, false)
             .render()
             .unwrap()
             .contains("https://theophilus.example.invalid/"));
@@ -623,9 +631,15 @@ mod tests {
             dmarc_rua: "mailto:dmarc@kyriakon.net".into(),
         };
         let recipe = crate::dns::recipe("parish.example", &values);
-        let html = account(&catalogue(), Some("parish-secretary"), Some(recipe), None)
-            .render()
-            .unwrap();
+        let html = account(
+            &catalogue(),
+            Some("parish-secretary"),
+            Some(recipe),
+            None,
+            false,
+        )
+        .render()
+        .unwrap();
         assert!(html.contains("DNS records"), "{html}");
         assert!(html.contains("10 mail.kyriakon.net."), "{html}");
         assert!(html.contains("192.0.2.10"), "{html}");
@@ -636,7 +650,7 @@ mod tests {
         assert!(html.contains("does not host your zone"), "{html}");
         assert!(html.contains("cannot set a reverse DNS record"), "{html}");
 
-        let none = account(&catalogue(), Some("alice"), None, None)
+        let none = account(&catalogue(), Some("alice"), None, None, false)
             .render()
             .unwrap();
         assert!(!none.contains("DNS records"), "{none}");
