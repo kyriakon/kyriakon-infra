@@ -53,12 +53,13 @@
 # no entry in services_for below stops the run instead of being renewed into no
 # daemon, so a name cannot be added to the config without this script being told
 # what holds it.
-# Per-member certificates live in files acme-client.conf includes
+# Generated certificates live in files acme-client.conf includes
 # (acme-client.conf(5) documents `include`), so that neither lane inherits the
 # other's domain list. The top-level parse below deliberately does not follow the
-# include — those names are the queue's for a first issue — and reads the member
-# directory beside it instead, because a renewal is this lane's and spends none of
-# the refill.
+# include — those names are the queue's for a first issue — and reads the
+# generated directory beside it instead, because a renewal is this lane's and
+# spends none of the refill. That directory holds one file per member name and one
+# per own-domain body, and both are renewed from here.
 #
 # A Retry-After cannot be honoured here. acme-client 7.9 does not read that
 # header, and it prints the ACME problem detail only for some replies, so a
@@ -189,14 +190,16 @@ domain_blocks() {
 
 domains=$(domain_blocks "$acme_conf")
 
-# Member blocks live in the directory acme-client.conf includes, one file per
-# name, written by scripts/provision-member-acme.sh. The include is not followed
-# by the top-level parse above, because those are the queue's names for a first
-# issue; a renewal is this lane's, spends none of the refill, and is the only
-# thing that keeps a member's certificate from lapsing ninety days after signup.
-# The same parse reads the files, so the two lanes cannot disagree about a block.
+# Generated blocks live in the directory acme-client.conf includes, one file per
+# name, written by scripts/provision-member-acme.sh for a member and
+# scripts/provision-group-acme.sh for an own-domain body. The include is not
+# followed by the top-level parse above, because those are the queue's names for
+# a first issue; a renewal is this lane's, spends none of the refill, and is the
+# only thing that keeps a generated certificate from lapsing ninety days after
+# provisioning. The same parse reads the files, so the two lanes cannot disagree
+# about a block; index.conf yields no block and is harmless.
 member_conf_d=${ACME_MEMBER_CONF_D:-/etc/acme-client.d}
-set -- "$member_conf_d"/*.kyriakon.net.conf
+set -- "$member_conf_d"/*.conf
 if [ -e "$1" ]; then
 	member_domains=$(domain_blocks "$@")
 	if [ -n "$member_domains" ]; then
@@ -271,11 +274,21 @@ services_for() {
 	mail.kyriakon.net) printf 'dovecot smtpd' ;;
 	kyriakon.net | oliver.kyriakon.net) printf 'relayd' ;;
 	kyriakon.com) printf 'relayd' ;;
-	# A member's own name is presented by the relay's generated keypair region
-	# (openbsd/etc/relayd.conf, scripts/relayd-members.sh), so a renewed member
-	# certificate reaches the daemon that serves it with the same restart.
+	# A generated name, a member's or an own-domain body's, is presented by the
+	# relay's generated keypair region (openbsd/etc/relayd.conf,
+	# scripts/relayd-members.sh), so a renewed certificate reaches the daemon that
+	# serves it with the same restart.
 	*.kyriakon.net) printf 'relayd' ;;
-	*) return 1 ;;
+	# Any other handle is generated only when its block is in the included
+	# directory; a handle typed into the top level with no service still stops the
+	# run rather than being renewed into no daemon.
+	*)
+		if [ -f "$member_conf_d/$1.conf" ]; then
+			printf 'relayd'
+			return 0
+		fi
+		return 1
+		;;
 	esac
 }
 

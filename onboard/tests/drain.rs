@@ -77,6 +77,9 @@ impl Fix {
         fix.script("enqueuer.sh", &format!("#!/bin/sh\ncat >> '{sent}'\n"));
         for s in [
             "provision-member.sh",
+            "provision-group-web.sh",
+            "provision-group-capsule.sh",
+            "provision-group-acme.sh",
             "cron-apply.sh",
             "publish-mail-key.sh",
             "reload-smtpd.sh",
@@ -3217,6 +3220,19 @@ fn a_group_intent_provisions_its_record_accounts_and_addresses() {
         log.contains("provision-member.sh parish-secretary"),
         "{log}"
     );
+    // The body's hosting is the domain's, not the site owner's member name, and
+    // every lane is given the account whose tree the vhosts root.
+    for lane in [
+        "provision-group-web.sh",
+        "provision-group-capsule.sh",
+        "provision-group-acme.sh",
+    ] {
+        assert!(
+            log.contains(&format!("{lane} parish.example parish-secretary")),
+            "{lane} did not run with the domain and site owner: {log}"
+        );
+    }
+    assert!(log.contains("cron-apply.sh --web"), "{log}");
 }
 
 /// The same intent applied a second time leaves one account, one virtual entry

@@ -1858,9 +1858,31 @@ pub async fn provision_group(
         }
     }
 
-    // A hosting body has new daemon files, so the index and reload pass runs,
-    // the same one a person's hosting approval runs.
+    // The body's hosting, rooted in the site owner's own tree. The upload key
+    // decides hosting the way it does for a member: provision-member.sh builds
+    // no tree without one, so a group that left it empty has no site to serve
+    // and the lanes would refuse.
     if !intent.upload_key.trim().is_empty() {
+        run_script(
+            cfg,
+            "provision-group-web.sh",
+            &[&intent.domain, &intent.site_owner],
+        )
+        .await?;
+        run_script(
+            cfg,
+            "provision-group-capsule.sh",
+            &[&intent.domain, &intent.site_owner],
+        )
+        .await?;
+        run_script(
+            cfg,
+            "provision-group-acme.sh",
+            &[&intent.domain, &intent.site_owner],
+        )
+        .await?;
+        // New daemon files, so the index and reload pass runs, the same one a
+        // person's hosting approval runs.
         run_script(cfg, "cron-apply.sh", &["--web"]).await?;
     }
 

@@ -21,10 +21,13 @@
 # the tracked keypairs, the commented Titan block and the relay below are exactly
 # what is committed.
 #
-# Who is a member. The stems of /etc/httpd.d/*.kyriakon.net.conf, which is the
-# file scripts/provision-member-web.sh writes for every hosting member, and the
-# same set the httpd index is built from. A keypair line is emitted only when the
-# member's pair is complete, /etc/ssl/<name>.fullchain.pem and
+# Who gets a line. Every generated vhost under /etc/httpd.d whose stem is a
+# hostname: a member's <name>.kyriakon.net written by
+# scripts/provision-member-web.sh, and an own-domain body's <domain> written by
+# scripts/provision-group-web.sh. The same directory is what the httpd index is
+# built from, so the two lists cannot disagree. index.conf and any other file
+# whose stem is not a hostname are skipped. A keypair line is emitted only when
+# the name's pair is complete, /etc/ssl/<name>.fullchain.pem and
 # /etc/ssl/private/<name>.key: a line for a name with no certificate is a relayd
 # -n failure, and relayd's config check runs before every reload, so that failure
 # is a reload that never happens rather than a name that is merely wrong. Names
@@ -71,13 +74,20 @@ die() {
 	exit 1
 }
 
-# member_names: every member's name, sorted. A glob with no match is the literal
-# pattern, which the existence test skips.
+# member_names: every generated vhost's hostname, sorted. A glob with no match is
+# the literal pattern, which the existence test skips. index.conf is the include
+# file rather than a vhost, and a stem without a dot is not a hostname, so both
+# are skipped here rather than being left to the certificate check.
 member_names() {
-	for f in "$httpd_d"/*.kyriakon.net.conf; do
+	typeset f name
+	for f in "$httpd_d"/*.conf; do
 		[ -e "$f" ] || continue
-		printf '%s\n' "${f##*/}"
-	done | sed 's/\.conf$//' | LC_ALL=C sort
+		name=${f##*/}
+		name=${name%.conf}
+		case "$name" in
+		*.*) printf '%s\n' "$name" ;;
+		esac
+	done | LC_ALL=C sort
 }
 
 # member_ready <name>: the complete pair is on disk, which is the condition for a
@@ -221,15 +231,18 @@ relay "https" {
 EOF
 
 	# alice and zed have a complete pair, bob has a vhost and no certificate, and
-	# carol has a pair and no vhost.
+	# carol has a pair and no vhost. parish.example is an own-domain body with a
+	# complete pair; another.example is one whose certificate has not landed.
 	: > "$httpd_d/alice.kyriakon.net.conf"
 	: > "$httpd_d/bob.kyriakon.net.conf"
 	: > "$httpd_d/zed.kyriakon.net.conf"
-	for name in alice.kyriakon.net zed.kyriakon.net carol.kyriakon.net; do
+	: > "$httpd_d/parish.example.conf"
+	: > "$httpd_d/another.example.conf"
+	for name in alice.kyriakon.net zed.kyriakon.net carol.kyriakon.net parish.example; do
 		printf 'certificate\n' > "$ssl_dir/$name.fullchain.pem"
 		printf 'key\n' > "$ssl_private/$name.key"
 	done
-	# A vhost for a name that is not a member file shape is not a member.
+	# A vhost whose stem is not a hostname is not a vhost relayd can key.
 	: > "$httpd_d/parish.conf"
 
 	apply "$conf" write > "$tree/first.out"
@@ -240,11 +253,15 @@ EOF
 		"$(grep -c 'bob.kyriakon.net' "$conf")" 0
 	check "one without a vhost gains none" \
 		"$(grep -c 'carol.kyriakon.net' "$conf")" 0
-	check "a file that is not a member vhost is not a member" \
-		"$(grep -c 'parish' "$conf")" 0
+	check "a file whose stem is not a hostname gains none" \
+		"$(grep -c 'tls keypair "parish"' "$conf")" 0
+	check "an own-domain body with a complete pair gains a keypair line" \
+		"$(grep -c 'tls keypair "parish.example"' "$conf")" 1
+	check "one whose certificate has not landed gains none" \
+		"$(grep -c 'another.example' "$conf")" 0
 	check "the names are sorted" \
 		"$(grep 'tls keypair "' "$conf" | sed 's/.*"\(.*\)"/\1/' | paste -s -d ' ' -)" \
-		"kyriakon.net alice.kyriakon.net zed.kyriakon.net"
+		"kyriakon.net alice.kyriakon.net parish.example zed.kyriakon.net"
 	check "the tracked keypair is untouched" \
 		"$(grep -c 'tls keypair "kyriakon.net"' "$conf")" 1
 	check "and so is the line below the region" \
@@ -253,6 +270,8 @@ EOF
 	check "the file is mode 0600" "$(stat -f %Lp "$conf")" 600
 	check "the certificate link relayd looks up is made" \
 		"$(readlink "$ssl_dir/alice.kyriakon.net.crt")" "alice.kyriakon.net.fullchain.pem"
+	check "and the own-domain link is made too" \
+		"$(readlink "$ssl_dir/parish.example.crt")" "parish.example.fullchain.pem"
 
 	# A second run over the same members: same bytes, nothing written.
 	before=$(stat -f '%i %m %z' "$conf")
