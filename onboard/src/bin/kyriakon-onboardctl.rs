@@ -707,10 +707,7 @@ async fn ledger(store: &Store, args: &[String]) -> Result<(), String> {
     println!("{}", fields.join(","));
 
     let mut rows = Vec::new();
-    for line in store.lines("ledger/payments.jsonl").await {
-        let Ok(row) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
+    for row in store.json_lines("ledger/payments.jsonl").await? {
         if !in_tax_year(&row, start, end) {
             continue;
         }
@@ -728,10 +725,7 @@ async fn ledger(store: &Store, args: &[String]) -> Result<(), String> {
     println!();
     println!("# unattributed");
     println!("id,rail,received_on,amount_gbp");
-    for line in store.lines("ledger/unattributed.jsonl").await {
-        let Ok(row) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
+    for row in store.json_lines("ledger/unattributed.jsonl").await? {
         if row["state"].as_str() != Some("held") || !in_tax_year(&row, start, end) {
             continue;
         }

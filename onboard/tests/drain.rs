@@ -2027,27 +2027,6 @@ fn each_credit_appends_the_next_seq_and_never_a_username() {
 const EXPORT_HEADER: &str = "seq,token,kind,rail,received_on,amount_gbp,applied_gbp,\
 paid_until_after,amount_xmr,txid,refund_of,settled_on,rate_quoted,rate_source,rate_at";
 
-/// The next ledger `seq`, as the drain computes it.
-fn next_seq(fix: &Fix) -> u64 {
-    ledger_lines(fix)
-        .iter()
-        .filter_map(|line| line["seq"].as_u64())
-        .max()
-        .unwrap_or(0)
-        + 1
-}
-
-/// Append one line to a store file by hand, for the rows the refund and
-/// reconcile commands write on the parent branch.
-fn append_store_line(fix: &Fix, rel: &str, line: &Value) {
-    let path = fix.dir.join("store").join(rel);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-    text.push_str(&serde_json::to_string(line).unwrap());
-    text.push('\n');
-    std::fs::write(path, text).unwrap();
-}
-
 /// The export prints the tax year's dated lines and nothing else: a credit
 /// outside the year is absent, the approval's undated `window_open` row is
 /// absent, and no row carries a name, an address or a free-text note.
@@ -2138,29 +2117,24 @@ fn the_export_prints_a_refund_as_a_negative_row_naming_its_seq() {
     assert!(fix.drain().status.success());
     let credit_seq = payment_lines(&fix)[0]["seq"].as_u64().unwrap();
 
-    // Written from the documented shape: the refund command lands on the
-    // parent branch, and this is the row it writes.
-    let refund = json!({
-        "version": 1,
-        "seq": next_seq(&fix),
-        "token": token,
-        "kind": "refund",
-        "rail": "cash",
-        "received_on": "2026-11-02",
-        "amount_gbp": "-20.00",
-        "applied_gbp": "-20.00",
-        "paid_until_after": null,
-        "amount_xmr": null,
-        "rate_quoted": null,
-        "rate_source": null,
-        "rate_at": null,
-        "txid": null,
-        "intent": "refund-intent",
-        "note": "secretary, cancelled inside 14 days",
-        "refund_of": credit_seq,
-        "settled_on": "2026-11-05",
-    });
-    append_store_line(&fix, "ledger/payments.jsonl", &refund);
+    let out = fix.ctl(&[
+        "refund",
+        "--token",
+        &token,
+        "--amount",
+        "20.00",
+        "--rail",
+        "cash",
+        "--reason",
+        "secretary, cancelled inside 14 days",
+        "--close",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    let out = fix.ctl(&["refund", "--token", &token, "--settled", "2026-11-05"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    let refund_seq = refund_lines(&fix)[0]["seq"].as_u64().unwrap();
 
     let out = fix.ctl(&[
         "ledger",
@@ -2172,16 +2146,13 @@ fn the_export_prints_a_refund_as_a_negative_row_naming_its_seq() {
     ]);
     assert!(out.status.success(), "{}", body(&out));
     let csv = String::from_utf8_lossy(&out.stdout).into_owned();
-    let row = csv.lines().nth(2).expect("the refund's row");
+    let row = csv
+        .lines()
+        .find(|line| line.starts_with(&format!("{refund_seq},")))
+        .expect("the refund's row");
     let cells: Vec<&str> = row.split(',').collect();
-    assert_eq!(
-        cells[0],
-        refund["seq"].as_u64().unwrap().to_string(),
-        "{csv}"
-    );
     assert_eq!(cells[1], token, "{csv}");
     assert_eq!(cells[2], "refund", "{csv}");
-    assert_eq!(cells[4], "2026-11-02", "{csv}");
     assert_eq!(cells[5], "-20.00", "{csv}");
     assert_eq!(cells[10], credit_seq.to_string(), "refund_of: {csv}");
     assert_eq!(cells[11], "2026-11-05", "settled_on: {csv}");
@@ -2191,7 +2162,8 @@ fn the_export_prints_a_refund_as_a_negative_row_naming_its_seq() {
 
 /// Held money is not income and is not keyed, so it follows the keyed rows
 /// under its own marker and header. A returned line, and a held line outside
-/// the year, stay out; no keyed row loses its token.
+/// the year, stay out; no keyed row loses its token. The ids come from the
+/// commands that produce them, never a hand-typed `UN-` string.
 #[test]
 fn the_export_puts_held_money_after_its_own_marker() {
     let fix = Fix::new("ledger-export-held");
@@ -2210,42 +2182,48 @@ fn the_export_puts_held_money_after_its_own_marker() {
     assert!(out.status.success(), "{}", body(&out));
     assert!(fix.drain().status.success());
 
-    append_store_line(
-        &fix,
-        "ledger/unattributed.jsonl",
-        &json!({
-            "id": "UN-3K7QW2M9",
-            "rail": "cash-hand",
-            "received_on": "2026-10-08",
-            "amount_gbp": "20.00",
-            "state": "held",
-            "note": "no token on the envelope",
-        }),
-    );
-    append_store_line(
-        &fix,
-        "ledger/unattributed.jsonl",
-        &json!({
-            "id": "UN-RETURNED1",
-            "rail": "cash-hand",
-            "received_on": "2026-10-09",
-            "amount_gbp": "20.00",
-            "state": "returned",
-            "note": "posted back",
-        }),
-    );
-    append_store_line(
-        &fix,
-        "ledger/unattributed.jsonl",
-        &json!({
-            "id": "UN-LASTYEAR1",
-            "rail": "cash-hand",
-            "received_on": "2026-04-05",
-            "amount_gbp": "20.00",
-            "state": "held",
-            "note": "last year's post",
-        }),
-    );
+    // One held envelope, one returned envelope and one held payment from last
+    // year. Each is filed and applied through the real console and drain.
+    for (received, note) in [
+        ("2026-10-08", "no token on the envelope"),
+        ("2026-10-09", "returned envelope"),
+        ("2026-04-05", "last year's post"),
+    ] {
+        let out = fix.ctl(&[
+            "credit",
+            "--rail",
+            "cash",
+            "--amount",
+            "20.00",
+            "--received",
+            received,
+            "--note",
+            note,
+        ]);
+        assert!(out.status.success(), "{}", body(&out));
+        assert!(fix.drain().status.success());
+    }
+    let held_id = held_lines(&fix)
+        .iter()
+        .find(|line| line["received_on"] == json!("2026-10-08"))
+        .and_then(|line| line["id"].as_str())
+        .expect("the held envelope has an id")
+        .to_string();
+    let returned_id = held_lines(&fix)
+        .iter()
+        .find(|line| line["received_on"] == json!("2026-10-09"))
+        .and_then(|line| line["id"].as_str())
+        .expect("the returned envelope has an id")
+        .to_string();
+    let out = fix.ctl(&[
+        "reconcile",
+        "return",
+        &returned_id,
+        "--note",
+        "posted back 2026-10-10, receipt in book",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
 
     let out = fix.ctl(&[
         "ledger",
@@ -2272,10 +2250,56 @@ fn the_export_puts_held_money_after_its_own_marker() {
     let rows: Vec<&str> = lines.collect();
     assert_eq!(
         rows,
-        vec!["UN-3K7QW2M9,cash-hand,2026-10-08,20.00"],
+        vec![format!("{held_id},cash,2026-10-08,20.00")],
         "a returned line and a held line from another year stay out: {csv}"
     );
+    assert!(!csv.contains(&returned_id), "{csv}");
     assert!(!csv.contains("no token on the envelope"), "{csv}");
+}
+
+/// The export reads both ledgers strictly: a line that does not parse is a
+/// failure, not a year with less money in it.
+#[test]
+fn the_export_refuses_a_ledger_it_cannot_read() {
+    let fix = Fix::new("ledger-export-corrupt");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+
+    let export = |fix: &Fix| {
+        fix.ctl(&[
+            "ledger",
+            "export",
+            "--tax-year",
+            "2026-27",
+            "--format",
+            "csv",
+        ])
+    };
+    for rel in ["ledger/payments.jsonl", "ledger/unattributed.jsonl"] {
+        let path = fix.dir.join("store").join(rel);
+        let before = std::fs::read_to_string(&path).unwrap_or_default();
+        std::fs::write(&path, format!("{before}{{not json}}\n")).unwrap();
+        let out = export(&fix);
+        assert!(!out.status.success(), "{rel} was read as empty");
+        assert!(
+            body(&out).contains("does not parse"),
+            "{rel}: {}",
+            body(&out)
+        );
+        std::fs::write(&path, before).unwrap();
+    }
 }
 
 /// A year it cannot read and a format it does not print are refused; an empty
