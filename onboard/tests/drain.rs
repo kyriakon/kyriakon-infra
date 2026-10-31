@@ -6816,21 +6816,36 @@ fn a_cash_cancellation_refund_is_posted_back_and_closes_the_account() {
     );
 }
 
-/// An excess refund takes the money out of the ledger and touches neither the
-/// account's state nor its paid-until date.
+/// An excess refund gives back held overpayment. It takes that money out of
+/// `balance_gbp`, touches neither the account's state nor its paid-until date,
+/// and the refunded money cannot then buy access.
 #[test]
-fn an_excess_refund_leaves_the_state_and_paid_until_alone() {
+fn an_excess_refund_spends_the_held_balance_and_leaves_the_state_alone() {
     let fix = Fix::new("refund-excess");
     let token = approved_paid(&fix, "secretary", "cash");
-    let credit = cash_credit(&fix, &token);
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "30.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    let credit = payment_lines(&fix).remove(0);
     let before = fix.account("secretary");
+    assert_eq!(before["payment"]["balance_gbp"], json!("10.00"), "{before}");
 
     let out = fix.ctl(&[
         "refund",
         "--token",
         &token,
         "--amount",
-        "5.00",
+        "10.00",
         "--rail",
         "cash",
         "--reason",
@@ -6843,7 +6858,7 @@ fn an_excess_refund_leaves_the_state_and_paid_until_alone() {
 
     let refunds = refund_lines(&fix);
     assert_eq!(refunds.len(), 1, "{refunds:?}");
-    assert_eq!(refunds[0]["amount_gbp"], json!("-5.00"));
+    assert_eq!(refunds[0]["amount_gbp"], json!("-10.00"));
     assert_eq!(refunds[0]["refund_of"], credit["seq"]);
     let after = fix.account("secretary");
     assert_eq!(after["state"], before["state"], "{after}");
@@ -6855,6 +6870,151 @@ fn an_excess_refund_leaves_the_state_and_paid_until_alone() {
         after.get("closing_until").is_none(),
         "an excess refund closes nothing: {after}"
     );
+    assert!(
+        after["payment"]["balance_gbp"].is_null(),
+        "the refunded balance is still spendable: {after}"
+    );
+
+    // The refunded money is gone: the next GBP 10.00 is a shortfall, so the
+    // paid-until date does not move.
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "10.00",
+        "--received",
+        "2027-10-05",
+        "--confirm-double",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.account("secretary")["payment"]["paid_until"],
+        json!("2027-10-04"),
+        "the refunded balance bought a year"
+    );
+}
+
+/// Refunds of one payment sum to no more than the payment, whatever their
+/// sizes. The balance check alone can miss a balance that is larger than one
+/// payment, so the sum is checked across lines naming the same `refund_of`.
+#[test]
+fn refunds_of_one_payment_cannot_exceed_it() {
+    let fix = Fix::new("refund-sum");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let credit = cash_credit(&fix, &token);
+    // Make the balance larger than the payment, so the balance cap alone would
+    // let the second refund through.
+    let mut account = fix.account("secretary");
+    account["payment"]["balance_gbp"] = json!("100.00");
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+
+    let out = fix.ctl(&[
+        "refund",
+        "--token",
+        &token,
+        "--amount",
+        "15.00",
+        "--rail",
+        "cash",
+        "--reason",
+        "partial excess",
+        "--excess",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    assert_eq!(refund_lines(&fix).len(), 1);
+
+    let out = fix.ctl(&[
+        "refund",
+        "--token",
+        &token,
+        "--amount",
+        "10.00",
+        "--rail",
+        "cash",
+        "--reason",
+        "the rest of the excess",
+        "--excess",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    let refunds = refund_lines(&fix);
+    assert_eq!(
+        refunds.len(),
+        1,
+        "two refunds exceeded the payment: {refunds:?}"
+    );
+    assert_eq!(refunds[0]["refund_of"], credit["seq"]);
+    assert!(
+        fix.journal().contains("would exceed the GBP 20.00"),
+        "{}",
+        fix.journal()
+    );
+}
+
+/// Two refunds of the same amount are two notices. The notices record dedups
+/// on (type, subject), so the subject carries the ledger seq.
+#[test]
+fn two_refunds_of_one_amount_send_two_notices() {
+    let fix = Fix::new("refund-notices");
+    let token = approved_paid(&fix, "secretary", "cash");
+    cash_credit(&fix, &token);
+    // Refund the first payment, then take a second payment of the same amount
+    // and refund it too. Only the ledger seq makes the two notices distinct.
+    for received in ["2026-10-04", "2026-10-05"] {
+        let out = fix.ctl(&[
+            "refund",
+            "--token",
+            &token,
+            "--amount",
+            "20.00",
+            "--rail",
+            "cash",
+            "--reason",
+            "cancelled inside 14 days",
+            "--close",
+        ]);
+        assert!(out.status.success(), "{}", body(&out));
+        assert!(fix.drain().status.success());
+
+        let out = fix.ctl(&[
+            "credit",
+            "--token",
+            &token,
+            "--rail",
+            "cash",
+            "--amount",
+            "20.00",
+            "--received",
+            received,
+            "--confirm-double",
+        ]);
+        assert!(out.status.success(), "{}", body(&out));
+        assert!(fix.drain().status.success());
+    }
+    let refunds = refund_lines(&fix);
+    assert_eq!(refunds.len(), 2, "{refunds:?}");
+    let notices = fix.read("accounts/secretary/notices.jsonl");
+    assert_eq!(
+        notices.matches("prepaid.refund").count(),
+        2,
+        "a second same-amount refund was deduplicated away: {notices}"
+    );
+    for line in &refunds {
+        let seq = line["seq"].as_u64().unwrap();
+        assert!(
+            notices.contains(&format!("refund {seq}")),
+            "the notice does not name refund {seq}: {notices}"
+        );
+    }
 }
 
 /// A refund never leaves on a rail other than the one the payment arrived on.
@@ -7037,7 +7197,6 @@ fn a_card_invoice_appends_a_line_and_a_card_refund_names_it() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
 
-    let today = kyriakon_onboard::util::date_after_days(0);
     let payments = payment_lines(&fix);
     assert_eq!(payments.len(), 1, "{payments:?}");
     assert_eq!(payments[0]["kind"], json!("payment"));
@@ -7045,7 +7204,11 @@ fn a_card_invoice_appends_a_line_and_a_card_refund_names_it() {
     assert_eq!(payments[0]["token"], json!("KYR-AAAA-BBBB-CCCC"));
     assert_eq!(payments[0]["amount_gbp"], json!("20.00"));
     assert_eq!(payments[0]["applied_gbp"], json!("20.00"));
-    assert_eq!(payments[0]["received_on"], json!(today));
+    assert_eq!(
+        payments[0]["received_on"],
+        json!("2026-09-21"),
+        "the invoice's paid date, not the drain's clock"
+    );
     assert_eq!(payments[0]["intent"], json!("in_card"));
     assert_eq!(
         payments[0]["paid_until_after"],
@@ -7097,15 +7260,50 @@ fn a_card_invoice_appends_a_line_and_a_card_refund_names_it() {
     );
 }
 
+/// A card ledger line carries what the invoice paid and when, not the
+/// configured price and the drain's clock: a discount on 10 September is a
+/// September line for GBP 15.00, even though the drain runs in October.
+#[test]
+fn a_card_ledger_line_uses_the_invoice_amount_and_paid_date() {
+    let fix = Fix::new("card-ledger-invoice");
+    fix.card_account("secretary", None);
+    fix.webhook(
+        "evt_card",
+        "invoice.paid",
+        invoice_with("in_discount", 1_500, 1_789_000_000),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let payments = payment_lines(&fix);
+    assert_eq!(payments.len(), 1, "{payments:?}");
+    assert_eq!(payments[0]["amount_gbp"], json!("15.00"), "{payments:?}");
+    assert_eq!(payments[0]["applied_gbp"], json!("15.00"), "{payments:?}");
+    assert_eq!(
+        payments[0]["received_on"],
+        json!("2026-09-10"),
+        "{payments:?}"
+    );
+}
+
 // --- the card rail's webhooks ------------------------------------------------
 
-/// One invoice event's object, naming the fixture subscription.
+/// One invoice event's object, naming the fixture subscription. The amount is
+/// in pence and the paid timestamp is 2026-09-21, so a ledger line that used
+/// the configured price or the drain's clock would not match.
 fn invoice(id: &str) -> Value {
+    invoice_with(id, 2000, 1_790_000_000)
+}
+
+fn invoice_with(id: &str, amount_paid: i64, paid_at: i64) -> Value {
     json!({
         "id": id,
         "subscription": SUBSCRIPTION,
         "customer": "cus_example",
         "attempt_count": 1,
+        "amount_paid": amount_paid,
+        "status_transitions": {"paid_at": paid_at},
+        "created": paid_at,
     })
 }
 
