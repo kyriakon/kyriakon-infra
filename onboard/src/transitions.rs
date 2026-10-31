@@ -4090,10 +4090,10 @@ pub fn rail_instructions(rail: &str, postal_address: &str, card_link: Option<&st
 ///
 /// The reference is the account's `KYR-` token, which is what the token index
 /// joins to the account: the same join `credit()` uses. `client_reference_id`
-/// lets `checkout.session.completed` name the account, and the same value in
-/// `subscription_data[metadata]` is what an invoice with no prior checkout uses
-/// to repair the attachment from the API. A placeholder that reached the box is
-/// refused rather than mailed, because a member cannot pay at REPLACE_ME.
+/// is the one Payment Link parameter that carries it, and it is what
+/// `checkout.session.completed` names the account by. A placeholder that
+/// reached the box is refused rather than mailed, because a member cannot pay
+/// at REPLACE_ME.
 pub fn card_link(payment_link: &str, token: &str) -> Result<Option<String>, String> {
     if token.is_empty() {
         return Ok(None);
@@ -4106,10 +4106,7 @@ pub fn card_link(payment_link: &str, token: &str) -> Result<Option<String>, Stri
         );
     }
     let joiner = if link.contains('?') { '&' } else { '?' };
-    Ok(Some(format!(
-        "{link}{joiner}client_reference_id={token}\
-         &subscription_data[metadata][client_reference_id]={token}"
-    )))
+    Ok(Some(format!("{link}{joiner}client_reference_id={token}")))
 }
 
 /// The decision email for an approval. The words are short because #333 owns
@@ -4697,11 +4694,12 @@ async fn invoice_paid(cfg: &DrainConfig, store: &Store, object: &Value) -> Resul
     let target = match target_for_subscription(store, subscription).await? {
         Some(target) => target,
         None => {
-            let reference = subscription_json
-                .pointer("/metadata/client_reference_id")
-                .or_else(|| subscription_json.pointer("/metadata/kyriakon_application"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            // A missed `checkout.session.completed` leaves no store record, so
+            // the session the subscription came from is the repair: the list
+            // filter names it, and its `client_reference_id` is the account's
+            // token. A subscription with no session reference stays deferred.
+            let session = retrieve_session(cfg, subscription).await?;
+            let reference = card_reference(&session, &subscription_json);
             let Some(mut account) = account_for_payment_reference(store, reference).await? else {
                 return Ok(Settled::Deferred);
             };
@@ -4762,6 +4760,44 @@ async fn retrieve_subscription(cfg: &DrainConfig, subscription: &str) -> Result<
     }
     serde_json::from_slice(&out.stdout)
         .map_err(|e| format!("stripe-api.sh did not answer with a subscription: {e}"))
+}
+
+/// The Checkout Session a subscription came from, read through the same script.
+/// The list is filtered by the subscription and bounded to one; an empty list or
+/// an unreachable API is an error, so the event stays for the next pass.
+async fn retrieve_session(cfg: &DrainConfig, subscription: &str) -> Result<Value, String> {
+    if !subscription
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err(format!("the subscription id {subscription:?} is not an id"));
+    }
+    let out = spawn_script(
+        cfg,
+        "stripe-api.sh",
+        &["session", subscription, &cfg.stripe_api_key],
+    )
+    .await?;
+    if !out.status.success() {
+        return Err(script_error(cfg, "stripe-api.sh", &out));
+    }
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("stripe-api.sh did not answer with a checkout session: {e}"))
+}
+
+/// The account reference a repaired payment carries: the session's own
+/// `client_reference_id` first, then the metadata keys a Stripe object can hold
+/// it under.
+fn card_reference<'a>(session: &'a Value, subscription: &'a Value) -> &'a str {
+    let pick = |value: &'a Value| {
+        value
+            .pointer("/client_reference_id")
+            .or_else(|| value.pointer("/metadata/client_reference_id"))
+            .or_else(|| value.pointer("/metadata/kyriakon_application"))
+            .and_then(Value::as_str)
+            .filter(|reference| !reference.is_empty())
+    };
+    pick(session).or_else(|| pick(subscription)).unwrap_or("")
 }
 
 /// `invoice.payment_failed`: record the attempt and the next retry on the

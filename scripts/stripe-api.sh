@@ -2,12 +2,15 @@
 # stripe-api.sh: read one Stripe object, and nothing else.
 #
 # The drain settles a card payment only after retrieving the subscription and
-# seeing it is active, because a paid invoice does not prove one. This is the
-# only Stripe call the service makes, and it is a read: the webhook path marks no
-# invoice paid, creates no session and cancels nothing.
+# seeing it is active, because a paid invoice does not prove one. It also reads
+# the Checkout Session a subscription came from, which is how a missed
+# `checkout.session.completed` is repaired: the session carries the account's
+# reference. Both calls are reads; the webhook path marks no invoice paid,
+# creates no session and cancels nothing.
 #
 # Usage:
 #   doas ksh scripts/stripe-api.sh subscription <subscription-id> <key-file>
+#   doas ksh scripts/stripe-api.sh session <subscription-id> <key-file>
 #   ksh scripts/stripe-api.sh --self-test
 #
 #   <subscription-id>  the `sub_...` id an invoice or checkout named
@@ -15,9 +18,13 @@
 #
 # The JSON object is written to stdout and nothing else is. The key goes into a
 # curl config file, never an argument, so it is not in the process table and not
-# in any error message. The key needs only read access to subscriptions; the
-# script refuses to run without a 0600 file, and as root without a root-owned
-# one.
+# in any error message. The key needs read access to subscriptions and checkout
+# sessions; the script refuses to run without a 0600 file, and as root without a
+# root-owned one.
+#
+# `session` prints the first Checkout Session for the subscription, which the
+# list filter `?subscription=<id>&limit=1` returns. An empty list exits 1: the
+# drain has nothing to repair from and leaves the event for a later delivery.
 #
 # Exit: 0 the object is on stdout; 1 the API could not be read, so the drain
 #       leaves the event for the next pass; 2 the arguments or the credential
@@ -31,6 +38,7 @@ api_base="${STRIPE_API:-https://api.stripe.com}"
 usage() {
 	cat <<'EOF'
 usage: stripe-api.sh subscription <subscription-id> <key-file>
+       stripe-api.sh session <subscription-id> <key-file>
        stripe-api.sh --self-test
 
   <subscription-id>  the sub_... id to retrieve
@@ -54,13 +62,10 @@ fail() {
 	exit 1
 }
 
-# subscription <id> <key-file>: GET /v1/subscriptions/<id> and print the object.
-subscription() {
+# subscription_id <id>: the id is a path segment and a query value, so its
+# charset is checked before either use.
+subscription_id() {
 	id=$1
-	key_file=$2
-
-	# The id is a path segment, so its charset is checked before it is used as
-	# one.
 	case "$id" in
 	sub_*)
 		case "$id" in
@@ -69,7 +74,12 @@ subscription() {
 		;;
 	*) die "the subscription id $id is not a sub_ id" ;;
 	esac
+}
 
+# credential <key-file>: the key file's shape and ownership, then the curl
+# config that carries it. The key is never an argument.
+credential() {
+	key_file=$1
 	[ -f "$key_file" ] || die "no key file at $key_file"
 	if [ "$(stat -f '%Lp' "$key_file")" != 600 ]; then
 		die "$key_file is not mode 600, and a key another user can read is a key that can read payments"
@@ -86,6 +96,13 @@ subscription() {
 		printf 'silent\nshow-error\nmax-time = 30\n'
 	} >"$curlrc"
 	unset key
+}
+
+# subscription <id> <key-file>: GET /v1/subscriptions/<id> and print the object.
+subscription() {
+	id=$1
+	subscription_id "$id"
+	credential "$2"
 
 	code=$(curl -K "$curlrc" -o "$resp" -w '%{http_code}' \
 		"$api_base/v1/subscriptions/$id") ||
@@ -96,10 +113,39 @@ subscription() {
 		cat "$resp"
 		;;
 	401 | 403)
-		die "the key cannot read subscriptions (HTTP $code); it needs read access to subscriptions only"
+		die "the key cannot read subscriptions and checkout sessions (HTTP $code); it needs read access to both"
 		;;
 	404)
 		fail "Stripe has no subscription $id"
+		;;
+	*)
+		fail "$api_base answered HTTP $code for subscription $id"
+		;;
+	esac
+}
+
+# session <id> <key-file>: the first Checkout Session for the subscription, by
+# the documented list filter. An empty list is a retryable failure: there is
+# nothing to repair from yet.
+session() {
+	id=$1
+	subscription_id "$id"
+	credential "$2"
+	command -v jq >/dev/null || die "jq is not on PATH (pkg_add jq)"
+
+	code=$(curl -K "$curlrc" -o "$resp" -w '%{http_code}' \
+		"$api_base/v1/checkout/sessions?subscription=$id&limit=1") ||
+		fail "curl could not reach $api_base"
+	case "$code" in
+	200)
+		[ -s "$resp" ] || fail "$api_base answered an empty session list"
+		one=$(jq -c '.data[0] // empty' "$resp" 2>/dev/null) ||
+			die "the session list from $api_base is not JSON jq can read"
+		[ -n "$one" ] || fail "Stripe has no checkout session for subscription $id"
+		printf '%s\n' "$one"
+		;;
+	401 | 403)
+		die "the key cannot read subscriptions and checkout sessions (HTTP $code); it needs read access to both"
 		;;
 	*)
 		fail "$api_base answered HTTP $code for subscription $id"
@@ -151,6 +197,18 @@ past_due)
 	code=200
 	printf '%s\n' '{"id":"sub_123","status":"past_due","current_period_end":1790000000,"customer":"cus_1"}' >"$out"
 	;;
+session)
+	code=200
+	printf '%s\n' '{"object":"list","data":[{"id":"cs_123","subscription":"sub_123","client_reference_id":"KYR-AAAA-BBBB-CCCC"}]}' >"$out"
+	;;
+session_empty)
+	code=200
+	printf '%s\n' '{"object":"list","data":[]}' >"$out"
+	;;
+session_no_reference)
+	code=200
+	printf '%s\n' '{"object":"list","data":[{"id":"cs_123","subscription":"sub_123"}]}' >"$out"
+	;;
 missing)
 	code=404
 	: >"$out"
@@ -196,9 +254,11 @@ EOF
 	}
 
 	run() {
+		verb=$1
+		shift
 		: >"$SELFTEST_LOG"
 		: >"$fix/out"
-		if (PATH="$fix/bin:$PATH" subscription "$@" >"$fix/out" 2>&1); then
+		if (PATH="$fix/bin:$PATH" "$verb" "$@" >"$fix/out" 2>&1); then
 			rc=0
 		else
 			rc=$?
@@ -208,38 +268,63 @@ EOF
 
 	printf '%s\n' '--- an active subscription is printed'
 	SELFTEST_MODE=active
-	run sub_123 "$fix/key"
+	run subscription sub_123 "$fix/key"
 	assert_eq 'active exit' 0 "$rc"
 	assert_has 'the object is the API answer' '"status":"active"' "$out"
 	assert_has 'only the subscription URL is read' 'GET https://api.stripe.com/v1/subscriptions/sub_123' "$(cat "$SELFTEST_LOG")"
 
 	printf '%s\n' '--- a past_due subscription is still returned'
 	SELFTEST_MODE=past_due
-	run sub_123 "$fix/key"
+	run subscription sub_123 "$fix/key"
 	assert_eq 'past_due exit' 0 "$rc"
 	assert_has 'the status is the API answer' '"status":"past_due"' "$out"
 
 	printf '%s\n' '--- a missing subscription is a retryable failure'
 	SELFTEST_MODE=missing
-	run sub_123 "$fix/key"
+	run subscription sub_123 "$fix/key"
 	assert_eq 'missing exit' 1 "$rc"
 	assert_has 'the failure names the subscription' 'sub_123' "$out"
 
 	printf '%s\n' '--- a key that cannot read subscriptions is a configuration to fix'
 	SELFTEST_MODE=denied
-	run sub_123 "$fix/key"
+	run subscription sub_123 "$fix/key"
 	assert_eq 'denied exit' 2 "$rc"
 	assert_has 'the failure names the scope' 'subscriptions' "$out"
 
 	printf '%s\n' '--- an unreachable API is a retryable failure'
 	SELFTEST_MODE=unreachable
-	run sub_123 "$fix/key"
+	run subscription sub_123 "$fix/key"
 	assert_eq 'unreachable exit' 1 "$rc"
 	assert_has 'the failure says it could not reach the API' 'could not reach' "$out"
 
+	printf '%s\n' '--- a checkout session is printed by the subscription filter'
+	SELFTEST_MODE=session
+	run session sub_123 "$fix/key"
+	assert_eq 'session exit' 0 "$rc"
+	assert_has 'the session is printed' '"client_reference_id":"KYR-AAAA-BBBB-CCCC"' "$out"
+	assert_has 'the URL filters by subscription' '?subscription=sub_123' "$(cat "$SELFTEST_LOG")"
+	assert_has 'the URL asks for one session' 'limit=1' "$(cat "$SELFTEST_LOG")"
+
+	printf '%s\n' '--- a session with no reference is printed as it is'
+	SELFTEST_MODE=session_no_reference
+	run session sub_123 "$fix/key"
+	assert_eq 'reference-less session exit' 0 "$rc"
+	if printf '%s' "$out" | grep -q 'client_reference_id'; then
+		printf 'FAIL: the reference-less session carries a reference: %s\n' "$out"
+		fail=1
+	else
+		printf 'ok: the session carries no reference\n'
+	fi
+
+	printf '%s\n' '--- an empty session list is a retryable failure'
+	SELFTEST_MODE=session_empty
+	run session sub_123 "$fix/key"
+	assert_eq 'empty session exit' 1 "$rc"
+	assert_has 'the failure names the subscription' 'sub_123' "$out"
+
 	printf '%s\n' '--- the key is never an argument'
 	SELFTEST_MODE=active
-	run sub_123 "$fix/key"
+	run subscription sub_123 "$fix/key"
 	assert_eq 'key run exit' 0 "$rc"
 	if grep -q 'not-a-real-stripe-key' "$SELFTEST_LOG"; then
 		printf 'FAIL: the key reached an argument:\n%s\n' "$(cat "$SELFTEST_LOG")"
@@ -250,14 +335,14 @@ EOF
 
 	printf '%s\n' '--- a key another user can read is refused'
 	chmod 644 "$fix/key"
-	run sub_123 "$fix/key"
+	run subscription sub_123 "$fix/key"
 	assert_eq 'readable key exit' 2 "$rc"
 	assert_has 'the refusal names the file' "$fix/key" "$out"
 	chmod 600 "$fix/key"
 
 	printf '%s\n' '--- an id that is not a subscription id is refused before any call'
 	: >"$SELFTEST_LOG"
-	run '../customers' "$fix/key"
+	run subscription '../customers' "$fix/key"
 	assert_eq 'bad id exit' 2 "$rc"
 	assert_eq 'nothing was called' '' "$(cat "$SELFTEST_LOG")"
 
@@ -287,13 +372,13 @@ case "${1:-}" in
 	usage
 	exit 0
 	;;
-subscription)
+subscription | session)
 	[ "$#" -eq 3 ] || {
 		usage >&2
 		exit 2
 	}
 	command -v curl >/dev/null || die "curl is not on PATH"
-	subscription "$2" "$3"
+	"$1" "$2" "$3"
 	;;
 *)
 	usage >&2

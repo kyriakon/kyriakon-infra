@@ -315,13 +315,23 @@ impl Fix {
         );
     }
 
-    /// The same subscription with the metadata the Payment Link stamps on it,
-    /// which is the repair path for a missed checkout.
-    fn stripe_subscription_with_metadata(&self, status: &str, period_end: i64, reference: &str) {
+    /// A Stripe stub that answers both calls the repair makes: the subscription
+    /// and the Checkout Session the list filter returns, carrying `reference`.
+    fn stripe_session_repair(&self, reference: &str) {
         self.script(
             "stripe-api.sh",
             &format!(
-                "#!/bin/sh\ncat <<'JSON'\n{{\"id\":\"{SUBSCRIPTION}\",\"status\":\"{status}\",\"current_period_end\":{period_end},\"customer\":\"cus_example\",\"metadata\":{{\"client_reference_id\":\"{reference}\"}}}}\nJSON\n"
+                "#!/bin/sh\ncase \"$1\" in\nsubscription) cat <<'JSON'\n{{\"id\":\"{SUBSCRIPTION}\",\"status\":\"active\",\"current_period_end\":1790000000,\"customer\":\"cus_example\"}}\nJSON\n;;\nsession) cat <<'JSON'\n{{\"id\":\"cs_example\",\"subscription\":\"{SUBSCRIPTION}\",\"client_reference_id\":\"{reference}\"}}\nJSON\n;;\n*) exit 1 ;;\nesac\n"
+            ),
+        );
+    }
+
+    /// The same pair, with a session that names no account reference.
+    fn stripe_session_without_reference(&self) {
+        self.script(
+            "stripe-api.sh",
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\nsubscription) cat <<'JSON'\n{{\"id\":\"{SUBSCRIPTION}\",\"status\":\"active\",\"current_period_end\":1790000000,\"customer\":\"cus_example\"}}\nJSON\n;;\nsession) cat <<'JSON'\n{{\"id\":\"cs_example\",\"subscription\":\"{SUBSCRIPTION}\"}}\nJSON\n;;\n*) exit 1 ;;\nesac\n"
             ),
         );
     }
@@ -6462,11 +6472,12 @@ fn a_valid_event_with_no_matching_application_writes_nothing() {
     );
 }
 
-/// A missed checkout is repaired from the subscription's metadata: the Payment
-/// Link stamps the account's token there, so `invoice.paid` can attach the
-/// subscription and set the date without a checkout event ever arriving.
+/// A missed checkout is repaired from the Checkout Session the invoice's
+/// subscription came from: no `checkout.session.completed` ever arrived, the
+/// session list names the account's token, and the invoice still attaches the
+/// subscription and sets exactly one year.
 #[test]
-fn an_invoice_with_no_checkout_repairs_the_attachment_from_metadata() {
+fn an_invoice_with_no_checkout_repairs_the_attachment_from_the_session() {
     let fix = Fix::new("webhook-repair");
     fix.card_account("secretary", None);
     // The account exists with its token index, but no subscription yet: this is
@@ -6477,19 +6488,59 @@ fn an_invoice_with_no_checkout_repairs_the_attachment_from_metadata() {
     account["payment"]["stripe"]["subscription"] = Value::Null;
     std::fs::write(&path, serde_json::to_vec_pretty(&account).unwrap()).unwrap();
 
-    fix.stripe_subscription_with_metadata("active", 1_790_000_000, "KYR-AAAA-BBBB-CCCC");
+    fix.stripe_session_repair("KYR-AAAA-BBBB-CCCC");
     fix.webhook("evt_repair", "invoice.paid", invoice("in_repair"));
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
 
     let account = fix.account("secretary");
-    assert!(
-        paid_until(&fix, "secretary").is_some(),
-        "the repaired attachment extends the date: {account}"
+    let date = paid_until(&fix, "secretary").expect("the repaired payment sets a date");
+    let expected =
+        kyriakon_onboard::billing::extend_paid_until(&kyriakon_onboard::util::filed_at(), None)
+            .unwrap();
+    assert_eq!(
+        &date[..10],
+        &expected[..10],
+        "exactly one year from the repair: {account}"
     );
     assert_eq!(
         account["payment"]["stripe"]["subscription"], SUBSCRIPTION,
-        "the subscription is attached from metadata: {account}"
+        "the subscription is attached from the session: {account}"
+    );
+}
+
+/// A session with no reference cannot name an account, so the invoice is left
+/// in place rather than guessed at.
+#[test]
+fn a_session_with_no_reference_leaves_the_invoice_deferred() {
+    let fix = Fix::new("webhook-no-reference");
+    fix.card_account("secretary", None);
+    let path = fix.dir.join("store/accounts/secretary/account.json");
+    let mut account: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    account["payment"]["stripe"]["subscription"] = Value::Null;
+    std::fs::write(&path, serde_json::to_vec_pretty(&account).unwrap()).unwrap();
+
+    fix.stripe_session_without_reference();
+    fix.webhook(
+        "evt_no_reference",
+        "invoice.paid",
+        invoice("in_no_reference"),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert_eq!(
+        paid_until(&fix, "secretary"),
+        None,
+        "nothing is extended without a reference"
+    );
+    assert!(
+        fix.webhooks()
+            .iter()
+            .any(|n| n.starts_with("evt_no_reference.body")),
+        "the event is left for a later delivery: {:?}",
+        fix.webhooks()
     );
 }
 

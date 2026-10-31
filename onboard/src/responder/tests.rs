@@ -2228,7 +2228,7 @@ async fn the_card_pages_carry_the_keyed_payment_link() {
         "the link is keyed to the account's token: {text}"
     );
     assert!(
-        text.contains("subscription_data[metadata][client_reference_id]=KYR-AAAA-BBBB-CCCC"),
-        "the link stamps the join for the repair path: {text}"
+        !text.contains("subscription_data"),
+        "only the supported Payment Link parameters are used: {text}"
     );
 }
