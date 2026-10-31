@@ -84,8 +84,11 @@ pub struct PaymentView {
     /// The account's state, which is the drain's word and not this page's.
     pub state: String,
     pub rail: String,
-    /// The amount owed for the year, in pounds.
+    /// The amount owed for the year, in pounds. While the account is unpaid and
+    /// a balance is held, this is what remains rather than the full price.
     pub amount: String,
+    /// Money received towards the year but not yet applied, in pounds.
+    pub balance: Option<String>,
     /// The token in full, while the account is unpaid.
     pub token: Option<String>,
     /// The date a credit set. Present instead of the token once money arrived.
@@ -233,10 +236,28 @@ pub fn payment(
         }
         _ => None,
     };
+    // A held balance re-quotes the remainder: the member has already sent part
+    // of the price, so the page asks for what is still owed and never less than
+    // nothing.
+    let amount = if unpaid {
+        match (
+            crate::util::pence(price_gbp),
+            payment.balance_gbp.as_deref(),
+        ) {
+            (Ok(price), Some(balance)) => match crate::util::pence(balance) {
+                Ok(balance) => crate::util::gbp((price - balance).max(0)),
+                Err(_) => price_gbp.to_string(),
+            },
+            _ => price_gbp.to_string(),
+        }
+    } else {
+        price_gbp.to_string()
+    };
     PaymentView {
         state: state.to_string(),
         rail: rail.to_string(),
-        amount: price_gbp.to_string(),
+        amount,
+        balance: payment.balance_gbp.clone(),
         token: if unpaid {
             payment.token_ref.clone()
         } else {

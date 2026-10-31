@@ -117,6 +117,30 @@ pub fn resend_payload(username: &str, token: &str) -> String {
     format!("resend:{username}:{token}")
 }
 
+/// The payload a credit intent signs: every field the drain acts on, because
+/// `intents/` belongs to the unprivileged half and a credit moves a paid-until
+/// date. The token, rail, amount and date are validated shapes; the override
+/// reason is free text and comes last, so no earlier field can be shifted into
+/// it by a colon.
+#[allow(clippy::too_many_arguments)]
+pub fn credit_payload(
+    token: &str,
+    rail: &str,
+    amount_gbp: &str,
+    received: &str,
+    txid: Option<&str>,
+    amount_xmr: Option<&str>,
+    confirm_double: bool,
+    override_reason: Option<&str>,
+) -> String {
+    format!(
+        "credit:{token}:{rail}:{amount_gbp}:{received}:{}:{}:{confirm_double}:{}",
+        txid.unwrap_or(""),
+        amount_xmr.unwrap_or(""),
+        override_reason.unwrap_or(""),
+    )
+}
+
 /// One decision link, pointing at the handler's click-through path.
 pub fn decide_link(base: &str, key: &[u8], token: &str, action: &str) -> Result<String, String> {
     let sig = sign(key, &decide_payload(token, action))?;

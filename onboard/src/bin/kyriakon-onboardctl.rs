@@ -17,6 +17,8 @@
 //!       --mailbox <account> [--address <localpart>] [--key-file <path>] \
 //!       [--site-owner <account>]
 //!   kyriakon-onboardctl [--config PATH] token resend <username>
+//!   kyriakon-onboardctl [--config PATH] credit (--token <t> | --username <u>) \
+//!       --rail <cash|cash-hand|monero> --amount <gbp> --received <YYYY-MM-DD>
 //!   kyriakon-onboardctl [--config PATH] show <username>
 //!   kyriakon-onboardctl [--config PATH] free
 //!   kyriakon-onboardctl request list
@@ -39,8 +41,9 @@ use kyriakon_onboard::config::DrainConfig;
 use kyriakon_onboard::intents;
 use kyriakon_onboard::requests;
 use kyriakon_onboard::sign;
-use kyriakon_onboard::store::{free_account_count, KeyRecord, Record, Store};
+use kyriakon_onboard::store::{self, free_account_count, KeyRecord, Record, Store};
 use kyriakon_onboard::transitions::{self, Decision};
+use kyriakon_onboard::util;
 use kyriakon_onboard::validate;
 
 const DEFAULT_CONFIG: &str = "/etc/kyriakon/onboard/drain.toml";
@@ -84,6 +87,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         "request" => request(&store, &rest[1..]).await,
         "address" => address(&cfg, &store, &rest[1..]).await,
         "token" => token(&cfg, &store, &rest[1..]).await,
+        "credit" => credit(&cfg, &store, &rest[1..]).await,
         "show" => show(&store, one_username(rest)?).await,
         "free" => free(&store, &rest[1..]).await,
         // Each decision is signed with the same root-only key the review links
@@ -108,6 +112,9 @@ fn usage() -> String {
      approve|approve-free|decline|show <username>
        kyriakon-onboardctl free
        kyriakon-onboardctl token resend <username>
+       kyriakon-onboardctl credit (--token <t> | --username <u>) \
+     --rail <cash|cash-hand|monero> --amount <gbp> --received <YYYY-MM-DD> \
+     [--txid <id>] [--xmr <amount>] [--override <reason>] [--confirm-double]
        kyriakon-onboardctl address --domain <domain> \
      --action <add-alias|add-mailbox|upgrade|remove> --mailbox <account> \
      [--address <localpart>] [--key-file <path>] [--site-owner <account>]
@@ -197,6 +204,101 @@ async fn token(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), 
     let sig = sign::sign(&key, &sign::resend_payload(username, &token))?;
     let id = intents::file_resend(store, username, &token, &sig).await?;
     println!("filed {verb} for {username} as intent {id}");
+    Ok(())
+}
+
+/// `credit`: record one payment against the token its account holds. A
+/// `--username` is resolved to the account's token here, at the terminal, so a
+/// name with no token is a refusal the operator sees now rather than an intent
+/// the drain refuses a minute later. The intent carries the token and every
+/// field the drain acts on; the signature is over all of them.
+async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), String> {
+    // `--confirm-double` is a bare switch, which the pair reader does not take.
+    let confirm_double = args.iter().any(|a| a == "--confirm-double");
+    let paired: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--confirm-double")
+        .cloned()
+        .collect();
+    let flags = flags(
+        &paired,
+        &[
+            "token", "username", "rail", "amount", "received", "txid", "xmr", "override",
+        ],
+    )?;
+    let token = match (flags.get("token"), flags.get("username")) {
+        (Some(token), None) => {
+            if !store::is_payment_token(token) {
+                return Err(format!("the token {token:?} is not a payment token"));
+            }
+            token.clone()
+        }
+        (None, Some(username)) => {
+            if let Some(why) = validate::username_shape(username) {
+                return Err(format!("the username {username:?}: {why}"));
+            }
+            let text = store
+                .read_record(&format!("accounts/{username}"), "account.json")
+                .await
+                .ok_or_else(|| format!("no account for {username}"))?;
+            let account: kyriakon_onboard::store::Account = serde_json::from_str(&text)
+                .map_err(|e| format!("the account record does not parse: {e}"))?;
+            account
+                .payment_state()
+                .and_then(|p| p.token_ref)
+                .ok_or_else(|| format!("{username} has no payment token to credit"))?
+        }
+        (Some(_), Some(_)) => return Err("give either --token or --username, not both".to_string()),
+        (None, None) => return Err("give --token or --username".to_string()),
+    };
+    let rail = need(&flags, "rail")?;
+    if !transitions::CREDIT_RAILS.contains(&rail) {
+        return Err(format!(
+            "--rail {rail:?} is not one of {}",
+            transitions::CREDIT_RAILS.join(", ")
+        ));
+    }
+    let amount = need(&flags, "amount")?;
+    match util::pence(amount) {
+        Ok(pence) if pence > 0 => {}
+        Ok(_) => return Err("--amount must be more than zero".to_string()),
+        Err(e) => return Err(format!("--amount: {e}")),
+    }
+    let received = need(&flags, "received")?;
+    if util::parse_date(received).is_none() {
+        return Err(format!("--received {received:?} is not YYYY-MM-DD"));
+    }
+    let txid = flags.get("txid").map(String::as_str);
+    let xmr = flags.get("xmr").map(String::as_str);
+    let override_reason = flags.get("override").map(String::as_str);
+    let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
+    let sig = sign::sign(
+        &key,
+        &sign::credit_payload(
+            &token,
+            rail,
+            amount,
+            received,
+            txid,
+            xmr,
+            confirm_double,
+            override_reason,
+        ),
+    )?;
+    let id = intents::file_credit(
+        store,
+        &token,
+        rail,
+        amount,
+        received,
+        txid,
+        xmr,
+        confirm_double,
+        override_reason,
+        &sig,
+    )
+    .await?;
+    println!("filed credit for {token} as intent {id}");
     Ok(())
 }
 
