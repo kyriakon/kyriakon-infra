@@ -57,6 +57,7 @@ use kyriakon_onboard::store::{self, free_account_count, KeyRecord, Record, Store
 use kyriakon_onboard::transitions::{self, Decision};
 use kyriakon_onboard::util;
 use kyriakon_onboard::validate;
+use serde_json::Value;
 use time::OffsetDateTime;
 
 const DEFAULT_CONFIG: &str = "/etc/kyriakon/onboard/drain.toml";
@@ -106,6 +107,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         "reconcile" => reconcile(&cfg, &store, &rest[1..]).await,
         "payment" => payment(&store, &rest[1..]).await,
         "refund" => refund(&cfg, &store, &rest[1..]).await,
+        "ledger" => ledger(&store, &rest[1..]).await,
         "show" => show(&store, one_username(rest)?).await,
         "free" => free(&store, &rest[1..]).await,
         // Each decision is signed with the same root-only key the review links
@@ -144,6 +146,8 @@ fn usage() -> String {
      (--close | --excess) [--rate <gbp-per-xmr>]
        kyriakon-onboardctl refund (--token <t> | --username <u>) \
      --settled <YYYY-MM-DD>
+       kyriakon-onboardctl ledger export --tax-year <YYYY-YY|YYYY-YYYY> \
+     --format csv
        kyriakon-onboardctl address --domain <domain> \
      --action <add-alias|add-mailbox|upgrade|remove> --mailbox <account> \
      [--address <localpart>] [--key-file <path>] [--site-owner <account>]
@@ -666,6 +670,144 @@ async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
     Ok(())
 }
 
+/// `ledger export --tax-year <year> --format csv`: the year's lines for the
+/// accountant. It reads `ledger/payments.jsonl` in place and prints; nothing is
+/// written, because the ledger is the record and the file is never purged. The
+/// held money in `ledger/unattributed.jsonl` is not income until it is
+/// attributed, so it follows the keyed rows in a section of its own rather than
+/// as a row without a token.
+async fn ledger(store: &Store, args: &[String]) -> Result<(), String> {
+    let rest = match args {
+        [verb, rest @ ..] if verb == "export" => rest,
+        _ => return Err(usage()),
+    };
+    let flags = flags(rest, &["tax-year", "format"])?;
+    let (start, end) = tax_year(need(&flags, "tax-year")?)?;
+    let format = need(&flags, "format")?;
+    if format != "csv" {
+        return Err(format!("--format {format:?} is not csv"));
+    }
+    let fields = [
+        "seq",
+        "token",
+        "kind",
+        "rail",
+        "received_on",
+        "amount_gbp",
+        "applied_gbp",
+        "paid_until_after",
+        "amount_xmr",
+        "txid",
+        "refund_of",
+        "settled_on",
+        "rate_quoted",
+        "rate_source",
+        "rate_at",
+    ];
+    println!("{}", fields.join(","));
+
+    let mut rows = Vec::new();
+    for line in store.lines("ledger/payments.jsonl").await {
+        let Ok(row) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if !in_tax_year(&row, start, end) {
+            continue;
+        }
+        rows.push((row["seq"].as_u64().unwrap_or(0), row));
+    }
+    rows.sort_by_key(|(seq, _)| *seq);
+    for (_, row) in rows {
+        let cells: Vec<String> = fields
+            .iter()
+            .map(|field| csv_cell(&cell(&row[*field])))
+            .collect();
+        println!("{}", cells.join(","));
+    }
+
+    println!();
+    println!("# unattributed");
+    println!("id,rail,received_on,amount_gbp");
+    for line in store.lines("ledger/unattributed.jsonl").await {
+        let Ok(row) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if row["state"].as_str() != Some("held") || !in_tax_year(&row, start, end) {
+            continue;
+        }
+        let cells: Vec<String> = ["id", "rail", "received_on", "amount_gbp"]
+            .iter()
+            .map(|field| csv_cell(&cell(&row[*field])))
+            .collect();
+        println!("{}", cells.join(","));
+    }
+    Ok(())
+}
+
+/// Whether a ledger row's `received_on` falls in the half-open-by-year tax
+/// window it is exported for. A row with no date, such as the approval's
+/// `window_open`, is not in any year.
+fn in_tax_year(row: &Value, start: time::Date, end: time::Date) -> bool {
+    row.get("received_on")
+        .and_then(Value::as_str)
+        .and_then(util::parse_date)
+        .is_some_and(|date| date >= start && date <= end)
+}
+
+/// A tax year's bounds: the `YYYY-YY` or `YYYY-YYYY` spelling, 6 April to the
+/// following 5 April inclusive. The second year is not accepted on trust: a
+/// mistyped pair would quietly export a different year's money.
+fn tax_year(s: &str) -> Result<(time::Date, time::Date), String> {
+    let refuse = || {
+        format!("--tax-year {s:?} is not YYYY-YY or YYYY-YYYY, or its years are not consecutive")
+    };
+    let (first, second) = s.split_once('-').ok_or_else(refuse)?;
+    if first.len() != 4 || !first.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refuse());
+    }
+    let year: i32 = first.parse().map_err(|_| refuse())?;
+    let next = year.checked_add(1).ok_or_else(refuse)?;
+    let second_ok = match second.len() {
+        2 => {
+            second.bytes().all(|b| b.is_ascii_digit())
+                && second.parse::<i32>().map_err(|_| refuse())? == next.rem_euclid(100)
+        }
+        4 => {
+            second.bytes().all(|b| b.is_ascii_digit())
+                && second.parse::<i32>().map_err(|_| refuse())? == next
+        }
+        _ => return Err(refuse()),
+    };
+    if !second_ok {
+        return Err(refuse());
+    }
+    let start =
+        time::Date::from_calendar_date(year, time::Month::April, 6).map_err(|_| refuse())?;
+    let end = time::Date::from_calendar_date(next, time::Month::April, 5).map_err(|_| refuse())?;
+    Ok((start, end))
+}
+
+/// One ledger value as the CSV cell it prints as. A missing or null field is an
+/// empty cell; a number keeps its own spelling.
+fn cell(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// RFC 4180: a comma, a quote or a line break in a cell puts the whole cell in
+/// quotes, and a quote inside it is doubled. The ledger's free text can carry
+/// any of the three, though the export never prints `note`.
+fn csv_cell(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 /// File one address change in a group. The signature is the console's, over
 /// every field the drain acts on: an address intent creates a root account or
 /// removes one, and `intents/` is writable by the unprivileged handler.
@@ -1159,5 +1301,44 @@ mod tests {
         assert!(one_username(&args(&["show", "Alice"]))
             .unwrap_err()
             .contains("starts with"));
+    }
+
+    #[test]
+    fn a_tax_year_is_six_april_to_five_april_in_either_spelling() {
+        let (start, end) = tax_year("2026-27").unwrap();
+        assert_eq!(start.to_string(), "2026-04-06");
+        assert_eq!(end.to_string(), "2027-04-05");
+        assert_eq!(tax_year("2026-2027").unwrap(), (start, end));
+
+        // The two spellings agree across the century's end, where the
+        // two-digit form wraps and the four-digit one does not.
+        let (start, end) = tax_year("2099-00").unwrap();
+        assert_eq!(start.to_string(), "2099-04-06");
+        assert_eq!(end.to_string(), "2100-04-05");
+        assert_eq!(tax_year("2099-2100").unwrap(), (start, end));
+
+        for bad in [
+            "2026-28",
+            "2026-2026",
+            "2026-26",
+            "2026-2",
+            "2026",
+            "26-27",
+            "2026-27-1",
+            "abcd-ef",
+        ] {
+            assert!(tax_year(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_csv_cell_is_quoted_only_when_it_has_to_be() {
+        assert_eq!(csv_cell("cash"), "cash");
+        assert_eq!(csv_cell("20.00"), "20.00");
+        assert_eq!(csv_cell("a,b"), "\"a,b\"");
+        assert_eq!(csv_cell("a\"b"), "\"a\"\"b\"");
+        assert_eq!(csv_cell("a\nb"), "\"a\nb\"");
+        assert_eq!(csv_cell("a\rb"), "\"a\rb\"");
+        assert_eq!(csv_cell(""), "");
     }
 }
