@@ -5,7 +5,7 @@ Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all o
 ## Conventions
 
 - **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies.
-- **Read an issue**: `gh issue view <number> --comments`, filtering comments by `jq` and also fetching labels.
+- **Read an issue**: `gh issue view <number> --json number,title,body,labels,comments --jq '{number, title, body, labels: [.labels[].name], comments: [.comments[].body]}'`. `--comments` and `--json` are mutually exclusive.
 - **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
 - **Comment on an issue**: `gh issue comment <number> --body "..."`
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
@@ -21,6 +21,22 @@ Infer the repo from `git remote -v` — `gh` does this automatically when run in
 - A PR or issue body with backticks or `$` in it: write the body to a file and pass
   `--body-file`. An inline heredoc inside a command substitution expands them, which
   is how a PR body has been published as a list of shell errors.
+
+## Parallel ticket work
+
+Several tickets can run at once, one worktree and one subagent each. The rules that
+keep the merges from costing more than the parallelism saves:
+
+- `git worktree add /tmp/<ticket> -b feat/<slug> origin/main`; the main checkout stays clean.
+- A ticket whose branch needs another ticket's code is **stacked**: branch from the
+  parent branch and set the child PR's base to it, not `main`.
+- Merge the parent first. Then `git rebase --onto origin/main <old-parent-tip>`,
+  force-push the child, and set its PR base to `main` before merging. A squash merge
+  rewrites the parent commit, so retargeting alone leaves the child carrying the
+  parent's commits.
+- `gh pr merge --delete-branch` deletes the base branch, and GitHub **closes** any
+  open PR still based on it instead of retargeting it. Keep a base branch until
+  every child has been rebased and retargeted.
 
 ## Ready queue
 
