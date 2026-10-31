@@ -179,6 +179,14 @@ pub struct AttributeIntent {
     pub item: String,
     /// The payment token the held money is joined to.
     pub token: String,
+    /// A renewal: the token already has a paid-until date, and the operator has
+    /// said this held payment is another year's money.
+    #[serde(default)]
+    pub confirm_double: bool,
+    /// The override reason for a credit that would pass the 24-month ceiling,
+    /// as the corresponding credit flag carries it.
+    #[serde(default)]
+    pub override_reason: Option<String>,
     pub sig: String,
 }
 
@@ -1550,6 +1558,7 @@ pub async fn credit(
         payment,
         amount,
         received,
+        attributed_item: None,
     };
     if apply_payment(cfg, store, file, value, app).await? {
         store.remove("intents", file).await?;
@@ -1626,6 +1635,10 @@ struct PaymentApplication<'a> {
     payment: Payment,
     amount: i64,
     received: time::Date,
+    /// The held item this payment came from, when the transition is a
+    /// `reconcile attribute`. Its own txid is the one in the queue, so that
+    /// item's held line is not a second sighting of the payment.
+    attributed_item: Option<&'a str>,
 }
 
 /// What a credit does to an account: the ceiling, the arithmetic, the account
@@ -1646,6 +1659,7 @@ async fn apply_payment(
         mut payment,
         amount,
         received,
+        attributed_item,
     } = app;
 
     // A pass that journaled `applying` and wrote the account but crashed before
@@ -1748,7 +1762,10 @@ async fn apply_payment(
     let applied = credit_money(price, balance, amount);
 
     // A transaction already in the ledger is the same payment seen again. It
-    // must never extend a date, whatever else the intent says.
+    // must never extend a date, whatever else the intent says. The queue is
+    // checked too: a payment held with no token and then credited with one is
+    // one payment, not two, unless this transition is attributing that very
+    // held item.
     if let Some(txid) = intent.txid.as_deref() {
         if let Some((seq, received_on)) = ledger_txid(store, txid).await {
             return refuse_with(
@@ -1762,6 +1779,21 @@ async fn apply_payment(
             )
             .await
             .map(|()| false);
+        }
+        if let Some((id, received_on)) = held_txid(store, txid).await? {
+            if attributed_item != Some(id.as_str()) {
+                return refuse_with(
+                    cfg,
+                    store,
+                    file,
+                    value,
+                    &format!(
+                        "transaction {txid} is already held as {id}, received on {received_on}; attribute that item instead"
+                    ),
+                )
+                .await
+                .map(|()| false);
+            }
         }
     }
     // A token already credited is a renewal, and the second credit needs the
@@ -1924,9 +1956,23 @@ async fn hold(
         )
         .await;
     };
-    // A transaction already held is the same payment seen again: it must never
-    // become a second line the operator could attribute twice.
+    // A transaction already seen is the same payment, whether it was held or
+    // credited: it must never become a second line the operator could join
+    // twice. The queue and the ledger are two records of one payment, so both
+    // are consulted from either side.
     if let Some(txid) = intent.txid.as_deref() {
+        if let Some((seq, received_on)) = ledger_txid(store, txid).await {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                &format!(
+                    "transaction {txid} was already credited on {received_on} at ledger seq {seq}"
+                ),
+            )
+            .await;
+        }
         if let Some((id, received_on)) = held_txid(store, txid).await? {
             return refuse_with(
                 cfg,
@@ -1986,7 +2032,12 @@ pub async fn reconcile_attribute(
 ) -> Result<(), String> {
     if !sign::verify(
         key,
-        &sign::reconcile_attribute_payload(&intent.item, &intent.token),
+        &sign::reconcile_attribute_payload(
+            &intent.item,
+            &intent.token,
+            intent.confirm_double,
+            intent.override_reason.as_deref(),
+        ),
         &intent.sig,
     ) {
         return refuse_with(
@@ -2078,8 +2129,8 @@ pub async fn reconcile_attribute(
         received: held.received_on.clone(),
         txid: held.txid.clone(),
         amount_xmr: held.amount_xmr.clone(),
-        confirm_double: false,
-        override_reason: None,
+        confirm_double: intent.confirm_double,
+        override_reason: intent.override_reason.clone(),
         note: held.note.clone(),
         sig: String::new(),
     };
@@ -2096,6 +2147,7 @@ pub async fn reconcile_attribute(
         payment,
         amount,
         received,
+        attributed_item: Some(&intent.item),
     };
     if !apply_payment(cfg, store, file, value, app).await? {
         return Ok(());
@@ -2234,17 +2286,22 @@ async fn mark_attributed(store: &Store, item: &str, token: &str) -> Result<(), S
     .await
 }
 
-/// The unattributed queue's exclusive lock. A reconcile reads every line and
-/// writes them back, and the drain and the console are different processes: a
-/// line appended between the read and the write would be dropped by the rewrite.
+/// An exclusive lock on a store file, for the one record write that is not an
+/// append: a reconcile reads every line and writes them back, and the drain and
+/// the console are different processes, so a line appended between the read and
+/// the write would be dropped by the rewrite.
 ///
-/// The lock lives in a file of its own rather than on `unattributed.jsonl`, as
-/// `requests::lock` does: the rewrite replaces the queue by rename, and a lock on
-/// the replaced inode would stop guarding the path the moment the rename landed.
-/// The queue is append-only apart from this one completion, under this lock.
-async fn lock_unattributed(store: &Store) -> Result<tokio::fs::File, String> {
-    store.ensure_dir("ledger").await?;
-    let path = store.path("ledger/.unattributed.lock");
+/// The lock lives in a file of its own rather than on the record, as
+/// `requests::lock` does: the rewrite replaces the record by rename, and a lock
+/// on the replaced inode would stop guarding the path the moment the rename
+/// landed. The caller owns the completion under this lock.
+pub(crate) async fn lock_store_file(store: &Store, rel: &str) -> Result<tokio::fs::File, String> {
+    if let Some(parent) = std::path::Path::new(rel).parent().and_then(|p| p.to_str()) {
+        if !parent.is_empty() {
+            store.ensure_dir(parent).await?;
+        }
+    }
+    let path = store.path(rel);
     let mut opts = tokio::fs::OpenOptions::new();
     opts.read(true).write(true).create(true).mode(0o600);
     let file = opts
@@ -2267,7 +2324,7 @@ async fn rewrite_unattributed(
     id: &str,
     change: impl FnOnce(&mut store::HeldItem) -> Result<(), String>,
 ) -> Result<(), String> {
-    let _guard = lock_unattributed(store).await?;
+    let _guard = lock_store_file(store, "ledger/.unattributed.lock").await?;
     let mut items = store.held().await?;
     let at = items
         .iter()
@@ -2499,6 +2556,21 @@ async fn write_payment_copy(
     Ok(())
 }
 
+/// The next `seq`: one past the highest the ledger holds. Every ledger writer
+/// goes through here, so a refund and a credit cannot both claim the same
+/// number.
+pub(crate) async fn next_ledger_seq(store: &Store) -> u64 {
+    let mut seq = 0u64;
+    for line in store.lines("ledger/payments.jsonl").await {
+        if let Ok(v) = serde_json::from_str::<Value>(&line) {
+            if let Some(s) = v.get("seq").and_then(Value::as_u64) {
+                seq = seq.max(s);
+            }
+        }
+    }
+    seq + 1
+}
+
 /// Append the credit's line: the next `seq`, keyed by the token, with no
 /// username. The rate fields stay null until the Monero quote lands (#303); the
 /// XMR amount and the transaction id are recorded when the operator gave them.
@@ -2510,17 +2582,10 @@ async fn append_credit_ledger(
     applied_gbp: &str,
     paid_until_after: Option<&str>,
 ) -> Result<(), String> {
-    let mut seq = 0u64;
-    for line in store.lines("ledger/payments.jsonl").await {
-        if let Ok(v) = serde_json::from_str::<Value>(&line) {
-            if let Some(s) = v.get("seq").and_then(Value::as_u64) {
-                seq = seq.max(s);
-            }
-        }
-    }
+    let seq = next_ledger_seq(store).await;
     let line = json!({
         "version": 1,
-        "seq": seq + 1,
+        "seq": seq,
         "token": intent.token.as_str(),
         "kind": "payment",
         "rail": intent.rail.as_str(),

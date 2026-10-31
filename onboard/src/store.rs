@@ -162,9 +162,10 @@ impl Store {
     }
 
     /// Append one line to a store file, creating it 0600 and its directory if
-    /// needed. Append is the only write the journal, the notices and the ledger
-    /// use: none of the three is ever rewritten, which is what makes them a
-    /// record rather than a state.
+    /// needed. Append is the write the journal, the notices and the ledger use.
+    /// A record is never rewritten except to complete a line that has to be
+    /// completed later, under the lock `transitions::lock_store_file` takes, as
+    /// a request close and a refund settlement do.
     pub async fn append(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
         let p = self.root.join(path);
         if let Some(parent) = p.parent() {
@@ -248,6 +249,32 @@ impl Store {
             out.push(
                 serde_json::from_str(line)
                     .map_err(|e| format!("{UNATTRIBUTED}: line {} does not parse: {e}", i + 1))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// The JSON lines of a record, strictly: a missing file is empty, but an
+    /// unreadable file or a line that does not parse is an error rather than an
+    /// empty result. A reader that reports "nothing" for a record it could not
+    /// read is a check that cannot see what it is checking.
+    pub async fn json_lines(&self, path: &str) -> Result<Vec<serde_json::Value>, String> {
+        let abs = self.root.join(path);
+        let text = match tokio::fs::read_to_string(&abs).await {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("cannot read {}: {e}", abs.display())),
+        };
+        let mut out = Vec::new();
+        for (i, line) in text
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .enumerate()
+        {
+            out.push(
+                serde_json::from_str(line)
+                    .map_err(|e| format!("{path}: line {} does not parse: {e}", i + 1))?,
             );
         }
         Ok(out)

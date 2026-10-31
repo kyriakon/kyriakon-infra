@@ -137,12 +137,18 @@ pub fn resend_payload(username: &str, token: &str) -> String {
     format!("resend:{username}:{token}")
 }
 
+/// Free text as one unambiguous field: its byte length, then the text. Two
+/// fields whose text contains the separator cannot shift a colon from one field
+/// into the next, which a plain `:` join would allow when both are free text.
+fn free_text(text: &str) -> String {
+    format!("{}:{text}", text.len())
+}
+
 /// The payload a credit intent signs: every field the drain acts on, because
 /// `intents/` belongs to the unprivileged half and a credit moves a paid-until
 /// date. The token, rail, amount and date are validated shapes; the override
-/// reason is free text, and the note a payment with no token carries is free
-/// text too and comes last, so no earlier field can be shifted into it by a
-/// colon.
+/// reason and the note are free text, so each is length-prefixed and cannot
+/// shift a colon into the other.
 #[allow(clippy::too_many_arguments)]
 pub fn credit_payload(
     token: &str,
@@ -159,16 +165,27 @@ pub fn credit_payload(
         "credit:{token}:{rail}:{amount_gbp}:{received}:{}:{}:{confirm_double}:{}:{}",
         txid.unwrap_or(""),
         amount_xmr.unwrap_or(""),
-        override_reason.unwrap_or(""),
-        note.unwrap_or(""),
+        free_text(override_reason.unwrap_or("")),
+        free_text(note.unwrap_or("")),
     )
 }
 
-/// The payload a `reconcile-attribute` intent signs: the held item and the token
-/// it is joined to. Both are validated shapes, and the pair is covered so a
-/// signature for one queue item cannot be replayed against another.
-pub fn reconcile_attribute_payload(item: &str, token: &str) -> String {
-    format!("reconcile-attribute:{item}:{token}")
+/// The payload a `reconcile-attribute` intent signs: the held item, the token it
+/// is joined to, and the two acknowledgements a renewal needs. All are covered,
+/// so a signature for one item cannot be replayed with a different token or a
+/// different acknowledgement. The override reason is free text and
+/// length-prefixed.
+#[allow(clippy::too_many_arguments)]
+pub fn reconcile_attribute_payload(
+    item: &str,
+    token: &str,
+    confirm_double: bool,
+    override_reason: Option<&str>,
+) -> String {
+    format!(
+        "reconcile-attribute:{item}:{token}:{confirm_double}:{}",
+        free_text(override_reason.unwrap_or("")),
+    )
 }
 
 /// The payload a `reconcile-return` intent signs: the held item and the evidence
@@ -268,6 +285,33 @@ mod tests {
         write(b"\n");
         assert!(read_key(&path).is_err(), "an empty key is refused");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn free_text_cannot_shift_a_colon_between_two_fields() {
+        let a = credit_payload(
+            "KYR-4F2M-9QH7-XT3B",
+            "cash",
+            "20.00",
+            "2026-10-04",
+            None,
+            None,
+            false,
+            Some("a:b"),
+            Some("c"),
+        );
+        let b = credit_payload(
+            "KYR-4F2M-9QH7-XT3B",
+            "cash",
+            "20.00",
+            "2026-10-04",
+            None,
+            None,
+            false,
+            Some("a"),
+            Some("b:c"),
+        );
+        assert_ne!(a, b, "two field splits signed the same payload");
     }
 
     #[test]

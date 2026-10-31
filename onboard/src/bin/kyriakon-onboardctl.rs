@@ -24,6 +24,7 @@
 //!   kyriakon-onboardctl [--config PATH] reconcile list
 //!   kyriakon-onboardctl [--config PATH] reconcile attribute <UN-id> --token <t>
 //!   kyriakon-onboardctl [--config PATH] reconcile return <UN-id> --note <evidence>
+//!   kyriakon-onboardctl [--config PATH] payment show --username <u>
 //!   kyriakon-onboardctl [--config PATH] show <username>
 //!   kyriakon-onboardctl [--config PATH] free
 //!   kyriakon-onboardctl request list
@@ -98,6 +99,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         "credit" => credit(&cfg, &store, &rest[1..]).await,
         "prepaid" => prepaid(&store, &rest[1..]).await,
         "reconcile" => reconcile(&cfg, &store, &rest[1..]).await,
+        "payment" => payment(&store, &rest[1..]).await,
         "show" => show(&store, one_username(rest)?).await,
         "free" => free(&store, &rest[1..]).await,
         // Each decision is signed with the same root-only key the review links
@@ -127,8 +129,10 @@ fn usage() -> String {
      [--txid <id>] [--xmr <amount>] [--override <reason>] [--confirm-double]
        kyriakon-onboardctl prepaid list --window open [--expiring <days>]
        kyriakon-onboardctl reconcile list
-       kyriakon-onboardctl reconcile attribute <UN-id> --token <t>
+       kyriakon-onboardctl reconcile attribute <UN-id> --token <t> \
+     [--confirm-double] [--override <reason>]
        kyriakon-onboardctl reconcile return <UN-id> --note <evidence>
+       kyriakon-onboardctl payment show --username <u>
        kyriakon-onboardctl address --domain <domain> \
      --action <add-alias|add-mailbox|upgrade|remove> --mailbox <account> \
      [--address <localpart>] [--key-file <path>] [--site-owner <account>]
@@ -379,7 +383,7 @@ async fn prepaid(store: &Store, args: &[String]) -> Result<(), String> {
     let rows: Vec<_> = prepaid::open_windows(store, OffsetDateTime::now_utc())
         .await?
         .into_iter()
-        .filter(|row| prepaid::within(row.days_left, expiring))
+        .filter(|row| prepaid::closes_within(row.days_left, expiring))
         .collect();
     println!("{} open window(s)", rows.len());
     for row in rows {
@@ -445,14 +449,33 @@ async fn reconcile_attribute(
             "the held item {item:?} is not an unattributed payment id"
         ));
     }
-    let flags = flags(rest, &["token"])?;
+    // `--confirm-double` is a bare switch, which the pair reader does not take.
+    let confirm_double = rest.iter().any(|a| a == "--confirm-double");
+    let paired: Vec<String> = rest
+        .iter()
+        .filter(|a| a.as_str() != "--confirm-double")
+        .cloned()
+        .collect();
+    let flags = flags(&paired, &["token", "override"])?;
     let token = need(&flags, "token")?;
     if !store::is_payment_token(token) {
         return Err(format!("the token {token:?} is not a payment token"));
     }
+    let override_reason = flags.get("override").map(String::as_str);
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
-    let sig = sign::sign(&key, &sign::reconcile_attribute_payload(item, token))?;
-    let id = intents::file_reconcile_attribute(store, item, token, &sig).await?;
+    let sig = sign::sign(
+        &key,
+        &sign::reconcile_attribute_payload(item, token, confirm_double, override_reason),
+    )?;
+    let id = intents::file_reconcile_attribute(
+        store,
+        item,
+        token,
+        confirm_double,
+        override_reason,
+        &sig,
+    )
+    .await?;
     println!("filed reconcile attribute for {item} as intent {id}");
     Ok(())
 }
@@ -743,6 +766,88 @@ async fn sign_and_file(
     )
     .await?;
     println!("filed {} for {username} as intent {id}", decision.kind);
+    Ok(())
+}
+
+/// `payment show --username <u>`: the account's rail, paid-until date and every
+/// ledger line keyed by its token. The ledger is read strictly, so a corrupt
+/// record is an error rather than a payment history that looks empty.
+async fn payment(store: &Store, args: &[String]) -> Result<(), String> {
+    let [verb, rest @ ..] = args else {
+        return Err(usage());
+    };
+    if verb != "show" {
+        return Err(usage());
+    }
+    let flags = flags(rest, &["username"])?;
+    let username = need(&flags, "username")?;
+    if let Some(why) = validate::username_shape(username) {
+        return Err(format!("the username {username:?}: {why}"));
+    }
+    let text = store
+        .read_record(&format!("accounts/{username}"), "account.json")
+        .await
+        .ok_or_else(|| format!("no account for {username}"))?;
+    let account: store::Account = serde_json::from_str(&text)
+        .map_err(|e| format!("the account record does not parse: {e}"))?;
+    let Some(payment) = account.payment_state() else {
+        return Err(format!(
+            "{username} was approved without charge, so there is no payment to show"
+        ));
+    };
+    let Some(token) = payment.token_ref.as_deref() else {
+        return Err(format!("{username} has no payment token"));
+    };
+    println!("account {username}");
+    println!(
+        "  rail     {}",
+        payment.rail.as_deref().unwrap_or(&account.rail)
+    );
+    let paid = match (&payment.paid_until, &payment.window) {
+        (Some(until), _) => until.as_str(),
+        (None, Some(_)) => "null: the window is open",
+        (None, None) => "null: no window was opened",
+    };
+    println!("  paid     {paid}");
+    println!("  token    {token}");
+
+    println!("ledger for {token}");
+    let mut any = false;
+    for line in store.json_lines("ledger/payments.jsonl").await? {
+        if line.get("token").and_then(serde_json::Value::as_str) != Some(token) {
+            continue;
+        }
+        any = true;
+        let seq = line
+            .get("seq")
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let get = |key: &str| {
+            line.get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-")
+        };
+        let mut extra = String::new();
+        if let Some(of) = line.get("refund_of").and_then(serde_json::Value::as_u64) {
+            extra.push_str(&format!("  refund_of {of}"));
+        }
+        if let Some(on) = line.get("settled_on").and_then(serde_json::Value::as_str) {
+            extra.push_str(&format!("  settled_on {on}"));
+        }
+        println!(
+            "  {seq:>5}  {:<8}  {:<4}  {}  {}  applied {}{}",
+            get("kind"),
+            get("rail"),
+            get("received_on"),
+            get("amount_gbp"),
+            get("applied_gbp"),
+            extra,
+        );
+    }
+    if !any {
+        println!("  no ledger lines");
+    }
     Ok(())
 }
 

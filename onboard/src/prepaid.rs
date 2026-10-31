@@ -80,24 +80,24 @@ pub async fn open_windows(store: &Store, now: OffsetDateTime) -> Result<Vec<Open
 /// The rows `--expiring N` keeps: the windows closing within `N` days. A
 /// window that closed earlier today and has not been swept is kept too, because
 /// the operator's pass is what decides whether it lapsed for a reason.
-pub fn within(days_left: i64, expiring: Option<i64>) -> bool {
+pub fn closes_within(days_left: i64, expiring: Option<i64>) -> bool {
     expiring.is_none_or(|days| days_left <= days)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::within;
+    use super::closes_within;
 
     #[test]
     fn expiring_narrows_to_the_windows_closing_within_n_days() {
         // No --expiring is every open window, including one already past its
         // close date that a sweep has not reached.
-        assert!(within(-1, None));
-        assert!(within(14, None));
+        assert!(closes_within(-1, None));
+        assert!(closes_within(14, None));
         // The bound is inclusive: "within three days" keeps the third day.
-        assert!(within(3, Some(3)));
-        assert!(within(0, Some(3)));
-        assert!(within(-1, Some(3)));
-        assert!(!within(4, Some(3)));
+        assert!(closes_within(3, Some(3)));
+        assert!(closes_within(0, Some(3)));
+        assert!(closes_within(-1, Some(3)));
+        assert!(!closes_within(4, Some(3)));
     }
 }

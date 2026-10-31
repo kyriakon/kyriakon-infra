@@ -285,6 +285,8 @@ pub async fn file_reconcile_attribute(
     store: &Store,
     item: &str,
     token: &str,
+    confirm_double: bool,
+    override_reason: Option<&str>,
     sig: &str,
 ) -> Result<String, String> {
     let id = ulid::Ulid::new().to_string();
@@ -294,6 +296,8 @@ pub async fn file_reconcile_attribute(
         "filed_at": crate::util::filed_at(),
         "item": item,
         "token": token,
+        "confirm_double": confirm_double,
+        "override_reason": override_reason,
         "sig": sig,
     });
     let bytes =

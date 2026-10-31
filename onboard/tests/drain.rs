@@ -2724,6 +2724,208 @@ fn a_tokenless_credit_is_held_and_reconcile_attribute_credits_it_once() {
     );
 }
 
+/// One Monero transaction is one payment. Holding it and then crediting it, or
+/// the reverse, is refused from either side; the queue and the ledger are two
+/// records of the same money, not two payments.
+#[test]
+fn a_monero_transaction_is_not_both_held_and_credited() {
+    // Held first, then a token credit naming the same transaction.
+    let held_first = Fix::new("txid-held-first");
+    let token = approved_paid(&held_first, "secretary", "cash");
+    let out = held_first.ctl(&[
+        "credit",
+        "--rail",
+        "monero",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+        "--note",
+        "no subaddress on the transfer",
+        "--txid",
+        TXID,
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(held_first.drain().status.success());
+    assert_eq!(held_lines(&held_first).len(), 1);
+
+    let out = held_first.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "monero",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+        "--txid",
+        TXID,
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(held_first.drain().status.success());
+    assert!(
+        payment_lines(&held_first).is_empty(),
+        "the same transaction was credited after being held: {:?}",
+        payment_lines(&held_first)
+    );
+    assert!(
+        held_first.journal().contains("already held"),
+        "{}",
+        held_first.journal()
+    );
+    assert_eq!(held_lines(&held_first).len(), 1, "a second held line");
+
+    // Credited first, then a tokenless hold naming the same transaction.
+    let credited_first = Fix::new("txid-credited-first");
+    let token = approved_paid(&credited_first, "secretary", "cash");
+    let out = credited_first.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "monero",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+        "--txid",
+        TXID,
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(credited_first.drain().status.success());
+    assert_eq!(payment_lines(&credited_first).len(), 1);
+
+    let out = credited_first.ctl(&[
+        "credit",
+        "--rail",
+        "monero",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+        "--note",
+        "found in the wallet",
+        "--txid",
+        TXID,
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(credited_first.drain().status.success());
+    assert!(
+        held_lines(&credited_first).is_empty(),
+        "a credited transaction was held again: {:?}",
+        held_lines(&credited_first)
+    );
+    assert!(
+        credited_first.journal().contains("already credited"),
+        "{}",
+        credited_first.journal()
+    );
+}
+
+/// A held payment found after the token has already been credited is a renewal,
+/// when the operator says so. The acknowledgement travels through the attribute
+/// intent, and the item is marked attributed rather than left in the queue.
+#[test]
+fn a_held_payment_can_be_attributed_as_a_renewal() {
+    let fix = Fix::new("attribute-renewal");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+
+    let out = fix.ctl(&[
+        "credit",
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-05",
+        "--note",
+        "second envelope, token read later",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    let id = held_lines(&fix)[0]["id"].as_str().unwrap().to_string();
+
+    // Without the acknowledgement the renewal is refused and the item stays
+    // held, so the operator can file it with the flag rather than losing it.
+    let out = fix.ctl(&["reconcile", "attribute", &id, "--token", &token]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    assert_eq!(payment_lines(&fix).len(), 1, "a renewal without the flag");
+    assert_eq!(held_lines(&fix)[0]["state"], json!("held"));
+
+    let out = fix.ctl(&[
+        "reconcile",
+        "attribute",
+        &id,
+        "--token",
+        &token,
+        "--confirm-double",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.account("secretary")["payment"]["paid_until"],
+        json!("2028-10-04")
+    );
+    assert_eq!(payment_lines(&fix).len(), 2, "{:?}", payment_lines(&fix));
+    assert_eq!(held_lines(&fix)[0]["state"], json!("attributed"));
+}
+
+/// `payment show` prints the rail, the paid-until date and the token-keyed
+/// ledger lines, and a corrupt ledger is an error rather than an empty history.
+#[test]
+fn payment_show_prints_the_rail_date_and_ledger_lines() {
+    let fix = Fix::new("payment-show");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+
+    let out = fix.ctl(&["payment", "show", "--username", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let text = body(&out);
+    assert!(text.contains("account secretary"), "{text}");
+    assert!(text.contains("rail     cash"), "{text}");
+    assert!(text.contains("paid     2027-10-04"), "{text}");
+    assert!(text.contains(&format!("ledger for {token}")), "{text}");
+    assert!(text.contains("payment"), "{text}");
+    assert!(text.contains("2026-10-04"), "{text}");
+    assert!(text.contains("20.00"), "{text}");
+
+    // A corrupt line is not an empty ledger.
+    let path = fix.dir.join("store/ledger/payments.jsonl");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str("{not json}\n");
+    std::fs::write(&path, text).unwrap();
+    let out = fix.ctl(&["payment", "show", "--username", "secretary"]);
+    assert!(!out.status.success(), "a corrupt ledger was read as empty");
+    assert!(body(&out).contains("does not parse"), "{}", body(&out));
+}
+
 /// `reconcile return` closes a held item with the evidence, keeping what the
 /// operator first wrote down, and writes no payment line.
 #[test]
