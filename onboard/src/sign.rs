@@ -194,6 +194,26 @@ pub fn reconcile_return_payload(item: &str, note: &str) -> String {
     format!("reconcile-return:{item}:{note}")
 }
 
+/// The payload a refund intent signs: every field the drain acts on. A refund
+/// writes the ledger and can close an account, and `intents/` belongs to the
+/// unprivileged half, so the token, the amount, the rail, the
+/// `--close`/`--excess` choice, the rate and the settlement date are all
+/// covered. The reason is free text and comes last, so no earlier field can be
+/// shifted into it by a colon.
+#[allow(clippy::too_many_arguments)]
+pub fn refund_payload(
+    token: &str,
+    amount_gbp: &str,
+    rail: &str,
+    close: bool,
+    excess: bool,
+    rate: &str,
+    settled_on: &str,
+    reason: &str,
+) -> String {
+    format!("refund:{token}:{amount_gbp}:{rail}:{close}:{excess}:{rate}:{settled_on}:{reason}")
+}
+
 /// One decision link, pointing at the handler's click-through path.
 pub fn decide_link(base: &str, key: &[u8], token: &str, action: &str) -> Result<String, String> {
     let sig = sign(key, &decide_payload(token, action))?;

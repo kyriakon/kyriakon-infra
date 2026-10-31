@@ -203,6 +203,40 @@ pub struct ReturnIntent {
     pub sig: String,
 }
 
+/// A refund: one negative ledger line naming the payment it reverses, or a
+/// settlement of one already recorded. The console resolves a `--username` to
+/// the account's token before filing, and this carries the token, the money, the
+/// rail, the reason and the `--close`/`--excess` choice. A settlement carries
+/// only `settled_on`. The signature covers all of it, because the intent writes
+/// the ledger and closes an account, and `intents/` belongs to the unprivileged
+/// half.
+#[derive(Debug, serde::Deserialize)]
+pub struct RefundIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub token: String,
+    #[serde(default)]
+    pub amount_gbp: Option<String>,
+    #[serde(default)]
+    pub rail: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub close: bool,
+    #[serde(default)]
+    pub excess: bool,
+    /// `--rate`, the sterling price of one XMR on the refund date, when the
+    /// member asked for sterling rather than the recorded XMR back.
+    #[serde(default)]
+    pub rate: Option<String>,
+    /// The day the refund was paid out, for the settlement form.
+    #[serde(default)]
+    pub settled_on: Option<String>,
+    pub sig: String,
+}
+
 /// Run one of the repository's privileged scripts by its configured path and
 /// hand back what it wrote. It is called with argv only: there is no shell
 /// anywhere in the drain, and every value that reaches it was validated first.
@@ -1262,6 +1296,7 @@ async fn approve(
         capsule_served: None,
         space_used: None,
         group: None,
+        closing_until: None,
     };
     store.ensure_dir(&format!("accounts/{username}")).await?;
     let account_bytes = serde_json::to_vec_pretty(&account)
@@ -1914,6 +1949,648 @@ async fn apply_payment(
 
     journal_credit_applied(cfg, store, intent, username, override_reason).await?;
     Ok(true)
+}
+
+/// The rails a refund may name. A refund never leaves on a rail the payment did
+/// not arrive on, and the check is the original line's own rail.
+pub const REFUND_RAILS: [&str; 4] = ["card", "cash", "cash-hand", "monero"];
+
+/// The payment a refund reverses: the token's most recent `kind == "payment"`
+/// line. `seq`, the rail and the amount come from the ledger, never from the
+/// intent, so a refund cannot invent a payment to reverse.
+struct PaymentLine {
+    seq: u64,
+    rail: String,
+    amount: i64,
+    amount_xmr: Option<String>,
+    paid_until_after: Option<String>,
+}
+
+async fn last_payment_line(store: &Store, token: &str) -> Result<Option<PaymentLine>, String> {
+    let mut found = None;
+    for line in store.lines("ledger/payments.jsonl").await {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if v.get("token").and_then(Value::as_str) != Some(token)
+            || v.get("kind").and_then(Value::as_str) != Some("payment")
+        {
+            continue;
+        }
+        let amount = v
+            .get("amount_gbp")
+            .and_then(Value::as_str)
+            .ok_or("a payment line carries no amount")?;
+        found = Some(PaymentLine {
+            seq: v.get("seq").and_then(Value::as_u64).unwrap_or(0),
+            rail: v
+                .get("rail")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            amount: util::pence(amount)
+                .map_err(|e| format!("the payment line's amount cannot be read: {e}"))?,
+            amount_xmr: v
+                .get("amount_xmr")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            paid_until_after: v
+                .get("paid_until_after")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        });
+    }
+    Ok(found)
+}
+
+/// Refund one payment, or settle a refund already recorded. The console signs
+/// every field, and the drain checks the signature before anything else because
+/// `intents/` belongs to the unprivileged half.
+///
+/// The refund form appends one negative line naming the `seq` it reverses and,
+/// with `--close`, sets the account closing. The settlement form rewrites the
+/// newest unsettled refund line under the ledger's lock. The ledger's own
+/// `intent` field is the dedup key for a refund, and `settled_intent` for a
+/// settlement, so a replay writes nothing.
+pub async fn refund(
+    cfg: &DrainConfig,
+    store: &Store,
+    key: &[u8],
+    intent: RefundIntent,
+    file: &str,
+    value: &Value,
+) -> Result<(), String> {
+    let amount_text = intent.amount_gbp.as_deref().unwrap_or("");
+    let rail = intent.rail.as_deref().unwrap_or("");
+    let reason = intent.reason.as_deref().unwrap_or("");
+    let rate_text = intent.rate.as_deref().unwrap_or("");
+    let settled_text = intent.settled_on.as_deref().unwrap_or("");
+    if !sign::verify(
+        key,
+        &sign::refund_payload(
+            &intent.token,
+            amount_text,
+            rail,
+            intent.close,
+            intent.excess,
+            rate_text,
+            settled_text,
+            reason,
+        ),
+        &intent.sig,
+    ) {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the refund intent's signature does not verify",
+        )
+        .await;
+    }
+
+    if !store::is_payment_token(&intent.token) {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the refund's token is not the shape of a payment token",
+        )
+        .await;
+    }
+
+    // The settlement form. It never writes a line of its own, so its dedup is
+    // the `settled_intent` it left on the refund line rather than `intent`.
+    if !settled_text.is_empty() {
+        if intent.amount_gbp.is_some()
+            || intent.rail.is_some()
+            || intent.reason.is_some()
+            || intent.close
+            || intent.excess
+            || intent.rate.is_some()
+        {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                "a settlement names only --settled and the account's token",
+            )
+            .await;
+        }
+        if util::parse_date(settled_text).is_none() {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                "the refund's settled date is not YYYY-MM-DD",
+            )
+            .await;
+        }
+        if ledger_settled_by(store, &intent.id).await {
+            if !journal_has(store, &intent.id, "applied").await {
+                journal(
+                    store,
+                    &cfg.release,
+                    &intent.id,
+                    &intent.kind,
+                    &ApplicationRef {
+                        username: String::new(),
+                        status_token: String::new(),
+                    },
+                    "applied",
+                    Some("replayed: the ledger already records this settlement"),
+                )
+                .await?;
+            }
+            store.remove("intents", file).await?;
+            return Ok(());
+        }
+        if journal_has(store, &intent.id, "refused").await {
+            return Ok(());
+        }
+        return settle_refund(cfg, store, &intent, file, value, settled_text).await;
+    }
+
+    // The ledger line is the settlement marker: a second arrival of the same
+    // intent finds it and stops before any check it already met.
+    if ledger_has_intent(store, &intent.id).await {
+        if !journal_has(store, &intent.id, "applied").await {
+            journal(
+                store,
+                &cfg.release,
+                &intent.id,
+                &intent.kind,
+                &ApplicationRef {
+                    username: String::new(),
+                    status_token: String::new(),
+                },
+                "applied",
+                Some("replayed: the ledger already holds this refund"),
+            )
+            .await?;
+        }
+        store.remove("intents", file).await?;
+        return Ok(());
+    }
+    if journal_has(store, &intent.id, "refused").await {
+        return Ok(());
+    }
+
+    let problem = if !REFUND_RAILS.contains(&rail) {
+        Some("the refund names a rail that is not card, cash, cash-hand or monero")
+    } else if intent.close == intent.excess {
+        Some("the refund needs exactly one of --close or --excess")
+    } else if reason.trim().is_empty() {
+        Some("the refund's reason is empty")
+    } else if intent.rate.is_some() && rail != "monero" {
+        Some("a --rate is only a monero refund paid in sterling")
+    } else {
+        None
+    };
+    if let Some(problem) = problem {
+        return refuse_with(cfg, store, file, value, problem).await;
+    }
+    let amount = match util::pence(amount_text) {
+        Ok(a) if a > 0 => a,
+        Ok(_) => {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                "the refund's amount must be more than zero",
+            )
+            .await
+        }
+        Err(e) => return refuse_with(cfg, store, file, value, &e).await,
+    };
+    let rate = match intent.rate.as_deref() {
+        None => None,
+        Some(text) => match util::pence(text) {
+            Ok(p) if p > 0 => Some(util::gbp(p)),
+            Ok(_) => {
+                return refuse_with(
+                    cfg,
+                    store,
+                    file,
+                    value,
+                    "the refund's rate must be more than zero",
+                )
+                .await
+            }
+            Err(e) => return refuse_with(cfg, store, file, value, &e).await,
+        },
+    };
+
+    // The token index is the only join, through the same helper the credit
+    // path uses, so a refund and a credit cannot disagree about whose token it
+    // is.
+    let (username, mut account, mut payment) = match resolve_payment(store, &intent.token).await {
+        Ok(found) => found,
+        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+    };
+
+    let original = match last_payment_line(store, &intent.token).await {
+        Ok(Some(line)) => line,
+        Ok(None) => {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                "the token has no payment line for a refund to reverse",
+            )
+            .await
+        }
+        Err(e) => return refuse_with(cfg, store, file, value, &e).await,
+    };
+    if rail != original.rail {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            &format!(
+                "the payment arrived by {} and a refund never leaves on another rail",
+                original.rail
+            ),
+        )
+        .await;
+    }
+    if amount > original.amount {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            &format!(
+                "the refund is GBP {}, more than the GBP {} that arrived at ledger seq {}",
+                util::gbp(amount),
+                util::gbp(original.amount),
+                original.seq
+            ),
+        )
+        .await;
+    }
+    if intent.close && amount != original.amount {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            &format!(
+                "a --close refund must be the full GBP {} that arrived at ledger seq {}",
+                util::gbp(original.amount),
+                original.seq
+            ),
+        )
+        .await;
+    }
+    // An excess refund gives back held overpayment, so whatever it takes has
+    // to leave the balance too. The sum check below caps the refund at the
+    // payment; a duplicate payment that bought a year has no balance, and this
+    // leaves that year alone as the spec says.
+    let balance = match payment.balance_gbp.as_deref() {
+        Some(text) => match util::pence(text) {
+            Ok(pence) => pence,
+            Err(e) => {
+                return refuse_with(
+                    cfg,
+                    store,
+                    file,
+                    value,
+                    &format!("the account's balance cannot be read: {e}"),
+                )
+                .await
+            }
+        },
+        None => 0,
+    };
+
+    let deducted = format!("-{}", util::gbp(amount));
+    let mut already_refunded = 0i64;
+    for line in store.lines("ledger/payments.jsonl").await {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if v.get("token").and_then(Value::as_str) != Some(intent.token.as_str())
+            || v.get("kind").and_then(Value::as_str) != Some("refund")
+            || v.get("refund_of").and_then(Value::as_u64) != Some(original.seq)
+        {
+            continue;
+        }
+        let on = v
+            .get("received_on")
+            .and_then(Value::as_str)
+            .unwrap_or("an earlier date");
+        if v.get("amount_gbp").and_then(Value::as_str) == Some(deducted.as_str()) {
+            let first = v.get("seq").and_then(Value::as_u64).unwrap_or(0);
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                &format!("an identical refund is already recorded at ledger seq {first} on {on}"),
+            )
+            .await;
+        }
+        already_refunded += v
+            .get("amount_gbp")
+            .and_then(Value::as_str)
+            .and_then(|text| util::pence(text.strip_prefix('-').unwrap_or(text)).ok())
+            .unwrap_or(0);
+    }
+    // Refunds of one payment sum to no more than that payment, whatever their
+    // sizes: the per-refund check alone lets two partial refunds overshoot.
+    if already_refunded + amount > original.amount {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            &format!(
+                "refunds of ledger seq {} already total GBP {}; another GBP {} would exceed the GBP {} that arrived",
+                original.seq,
+                util::gbp(already_refunded),
+                util::gbp(amount),
+                util::gbp(original.amount)
+            ),
+        )
+        .await;
+    }
+
+    let received_on = util::filed_at()[..10].to_string();
+    let closing_until = util::date_after_days(7);
+    let settlement_by = util::date_after_days(14);
+
+    // The account write comes before the ledger append: a crash between them
+    // leaves a close or a spent balance that a rerun applies again, and the
+    // ledger still holds the one line. The other order would leave the money
+    // recorded and the account still holding it, which no rerun could see.
+    if intent.close || intent.excess {
+        if intent.close {
+            account.state = "closing".to_string();
+            account.closing_until = Some(closing_until);
+        }
+        if intent.excess {
+            let left = (balance - amount).max(0);
+            payment.balance_gbp = (left > 0).then(|| util::gbp(left));
+        }
+        account.payment = Some(payment.clone());
+        let bytes = serde_json::to_vec_pretty(&account)
+            .map_err(|e| format!("cannot encode the account: {e}"))?;
+        store
+            .write_record(&format!("accounts/{username}"), "account.json", &bytes)
+            .await?;
+    }
+
+    let seq = append_refund_ledger(
+        store,
+        &intent,
+        &original,
+        rail,
+        &deducted,
+        reason.trim(),
+        rate.as_deref(),
+        &received_on,
+        payment.paid_until.as_deref(),
+    )
+    .await?;
+
+    let to = account
+        .outside_address
+        .clone()
+        .unwrap_or_else(|| format!("{username}@kyriakon.net"));
+    let (subject, body) = refund_notice(
+        rail,
+        &util::gbp(amount),
+        &received_on,
+        &settlement_by,
+        rate.as_deref(),
+        seq,
+    );
+    notice::send_account_notice(
+        cfg,
+        store,
+        &username,
+        "prepaid.refund",
+        &subject,
+        &to,
+        &body,
+    )
+    .await?;
+
+    let note = if rail == "card" {
+        format!("Stripe Idempotency-Key refund-{seq}")
+    } else {
+        format!("recorded at ledger seq {seq}")
+    };
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &ApplicationRef {
+            username: username.clone(),
+            status_token: String::new(),
+        },
+        "applied",
+        Some(&note),
+    )
+    .await?;
+    if rail == "card" {
+        println!("the Stripe refund's Idempotency-Key is refund-{seq}");
+    }
+    store.remove("intents", file).await
+}
+
+/// The refund notice: what was refunded, by which rail, and the date reg 34(4)
+/// gives to settle it. A cash refund says posted back, and no rail's text names
+/// a bank detail: the cash path holds none at all.
+fn refund_notice(
+    rail: &str,
+    amount: &str,
+    received_on: &str,
+    settlement_by: &str,
+    rate: Option<&str>,
+    seq: u64,
+) -> (String, String) {
+    let how = match rail {
+        "cash" | "cash-hand" => "posted back in cash, to the address you gave us",
+        "card" => "to the card you paid with",
+        _ => "in Monero, in the amount recorded on your receipt",
+    };
+    let price = match (rail, rate) {
+        ("monero", Some(rate)) => {
+            format!("\nThe rate recorded for this refund is GBP {rate} per XMR.\n")
+        }
+        _ => String::new(),
+    };
+    (
+        // The notices record dedups on (type, subject), so two refunds of the
+        // same amount need the ledger seq to be two notices.
+        format!("Your refund from kyriakon.net (GBP {amount}, refund {seq})"),
+        format!(
+            "We have recorded a refund of GBP {amount} on {received_on}, paid {how}.\n\
+             It will be settled by {settlement_by}. Ledger seq {seq}.\n{price}",
+        ),
+    )
+}
+
+/// Append the refund's negative line. The amount is negative in both money
+/// fields so a sum over the ledger is the year's takings; the XMR and the basis
+/// it was computed on stay visible for a Monero refund.
+#[allow(clippy::too_many_arguments)]
+async fn append_refund_ledger(
+    store: &Store,
+    intent: &RefundIntent,
+    original: &PaymentLine,
+    rail: &str,
+    deducted: &str,
+    reason: &str,
+    rate: Option<&str>,
+    received_on: &str,
+    paid_until_after: Option<&str>,
+) -> Result<u64, String> {
+    let seq = next_ledger_seq(store).await;
+    let refund_basis = match rail {
+        "monero" => Some(if rate.is_some() {
+            "sterling"
+        } else {
+            "recorded_xmr"
+        }),
+        _ => None,
+    };
+    let line = json!({
+        "version": 1,
+        "seq": seq,
+        "token": intent.token.as_str(),
+        "kind": "refund",
+        "rail": rail,
+        "received_on": received_on,
+        "amount_gbp": deducted,
+        "applied_gbp": deducted,
+        "paid_until_after": paid_until_after.or(original.paid_until_after.as_deref()),
+        "amount_xmr": original.amount_xmr.as_deref(),
+        "rate_quoted": Value::Null,
+        "rate_source": Value::Null,
+        "rate_at": Value::Null,
+        "txid": Value::Null,
+        "intent": intent.id.as_str(),
+        "note": reason,
+        "refund_of": original.seq,
+        "settled_on": Value::Null,
+        "refund_basis": refund_basis,
+        "rate_refund": rate,
+    });
+    let encoded =
+        serde_json::to_string(&line).map_err(|e| format!("cannot encode the ledger: {e}"))?;
+    store
+        .append("ledger/payments.jsonl", encoded.as_bytes())
+        .await?;
+    Ok(seq)
+}
+
+/// Whether a refund line already records this settlement intent. The settlement
+/// does not append, so `ledger_has_intent` cannot be its dedup key.
+async fn ledger_settled_by(store: &Store, id: &str) -> bool {
+    for line in store.lines("ledger/payments.jsonl").await {
+        if let Ok(v) = serde_json::from_str::<Value>(&line) {
+            if v.get("settled_intent").and_then(Value::as_str) == Some(id) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The index of the newest refund line for the token that has no `settled_on`.
+fn unsettled_refund(lines: &[String], token: &str) -> Option<usize> {
+    let mut found = None;
+    for (index, line) in lines.iter().enumerate() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("token").and_then(Value::as_str) == Some(token)
+            && v.get("kind").and_then(Value::as_str) == Some("refund")
+            && v.get("settled_on").and_then(Value::as_str).is_none()
+        {
+            found = Some(index);
+        }
+    }
+    found
+}
+
+/// A settlement rewrites the newest refund line for the token that has no
+/// `settled_on`, under the ledger's lock, and nothing else on it. This is the
+/// ledger's one non-append write: `--settled` names a line already recorded, and
+/// appending a second line would leave two records of one refund.
+async fn settle_refund(
+    cfg: &DrainConfig,
+    store: &Store,
+    intent: &RefundIntent,
+    file: &str,
+    value: &Value,
+    on: &str,
+) -> Result<(), String> {
+    let settled_on = util::date_string(util::parse_date(on).expect("the date was validated"));
+    // The refusal is decided before the lock is taken: it journals, which can
+    // reach the mail enqueuer, and no append should wait behind that.
+    let before_lock = store.lines("ledger/payments.jsonl").await;
+    if unsettled_refund(&before_lock, &intent.token).is_none() {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the token has no unsettled refund to record a settlement against",
+        )
+        .await;
+    }
+    let _guard = lock_store_file(store, "ledger/.payments.lock").await?;
+    let mut lines = store.lines("ledger/payments.jsonl").await;
+    let Some(index) = unsettled_refund(&lines, &intent.token) else {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the token has no unsettled refund to record a settlement against",
+        )
+        .await;
+    };
+    let mut line: Value = serde_json::from_str(&lines[index])
+        .map_err(|e| format!("the refund line does not parse: {e}"))?;
+    let seq = line.get("seq").and_then(Value::as_u64).unwrap_or(0);
+    line["settled_on"] = json!(settled_on);
+    line["settled_intent"] = json!(intent.id);
+    lines[index] =
+        serde_json::to_string(&line).map_err(|e| format!("cannot encode the ledger: {e}"))?;
+    let mut text = lines.join("\n");
+    text.push('\n');
+    store
+        .write_record("ledger", "payments.jsonl", text.as_bytes())
+        .await?;
+
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &ApplicationRef {
+            username: String::new(),
+            status_token: String::new(),
+        },
+        "applied",
+        Some(&format!(
+            "refund at ledger seq {seq} settled on {settled_on}"
+        )),
+    )
+    .await?;
+    store.remove("intents", file).await
 }
 
 pub const CREDIT_RAILS: [&str; 3] = ["cash", "cash-hand", "monero"];
@@ -3197,6 +3874,7 @@ async fn write_group_account(
         capsule_served: None,
         space_used: None,
         group: Some(domain.to_string()),
+        closing_until: None,
     };
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
@@ -5249,7 +5927,16 @@ async fn invoice_paid(cfg: &DrainConfig, store: &Store, object: &Value) -> Resul
         billing.save(store).await?;
         return Ok(Settled::Applied);
     }
+    // The ledger line must carry what the invoice says was paid, on the day it
+    // was paid, not the configured price on the day the drain happened to run.
+    let (amount_gbp, received_on) = invoice_money(object)?;
     if billing.stripe().last_invoice.as_deref() == Some(invoice) {
+        // The date was saved on an earlier pass. The ledger line it opens may
+        // still be missing if that pass died between the save and the append,
+        // and the invoice id is the dedup key that finishes it once.
+        if let BillingTarget::Account(account) = &billing {
+            append_invoice_ledger(store, account, invoice, &amount_gbp, &received_on).await?;
+        }
         billing.save(store).await?;
         return Ok(Settled::Applied);
     }
@@ -5264,8 +5951,76 @@ async fn invoice_paid(cfg: &DrainConfig, store: &Store, object: &Value) -> Resul
         if let Some(payment) = &account.payment {
             write_payment_copy(store, &account.username, payment).await?;
         }
+        append_invoice_ledger(store, account, invoice, &amount_gbp, &received_on).await?;
     }
     Ok(Settled::Applied)
+}
+
+/// What a paid invoice says it paid, in pounds, and the day it was paid. The
+/// ledger's amount and date must come from the processor's object rather than
+/// the configured price and the drain's clock: a discount, a price change, or
+/// an event applied after the tax-year boundary would otherwise be recorded
+/// wrong. A missing amount or timestamp is an error, which leaves the event for
+/// the next pass rather than writing a guess.
+fn invoice_money(object: &Value) -> Result<(String, String), String> {
+    let amount = object
+        .get("amount_paid")
+        .and_then(Value::as_i64)
+        .ok_or("the paid invoice carries no amount_paid")?;
+    let paid = object
+        .pointer("/status_transitions/paid_at")
+        .and_then(Value::as_i64)
+        .or_else(|| object.get("created").and_then(Value::as_i64))
+        .ok_or("the paid invoice carries no paid timestamp")?;
+    let when = OffsetDateTime::from_unix_timestamp(paid)
+        .map_err(|e| format!("the invoice's paid timestamp cannot be read: {e}"))?;
+    Ok((util::gbp(amount), util::date_string(when.date())))
+}
+
+/// The ledger line a paid card invoice opens. Without it a card payment has no
+/// `seq`, and the refund path has nothing to reverse. A group has no token, so
+/// its payment stays out of the ledger. The invoice id is the dedup key, which
+/// is also what recovers a crash between the account write and this append.
+/// Nothing here talks to Stripe: the card rail stays read-only towards it.
+async fn append_invoice_ledger(
+    store: &Store,
+    account: &Account,
+    invoice: &str,
+    amount_gbp: &str,
+    received_on: &str,
+) -> Result<(), String> {
+    let Some(payment) = account.payment.as_ref() else {
+        return Ok(());
+    };
+    let Some(token) = payment.token_ref.as_deref() else {
+        return Ok(());
+    };
+    if ledger_has_intent(store, invoice).await {
+        return Ok(());
+    }
+    let line = json!({
+        "version": 1,
+        "seq": next_ledger_seq(store).await,
+        "token": token,
+        "kind": "payment",
+        "rail": "card",
+        "received_on": received_on,
+        "amount_gbp": amount_gbp,
+        "applied_gbp": amount_gbp,
+        "paid_until_after": payment.paid_until.as_deref(),
+        "amount_xmr": Value::Null,
+        "rate_quoted": Value::Null,
+        "rate_source": Value::Null,
+        "rate_at": Value::Null,
+        "txid": Value::Null,
+        "intent": invoice,
+        "note": Value::Null,
+    });
+    let encoded =
+        serde_json::to_string(&line).map_err(|e| format!("cannot encode the ledger: {e}"))?;
+    store
+        .append("ledger/payments.jsonl", encoded.as_bytes())
+        .await
 }
 
 /// The current subscription from the Stripe API, through the one script that
