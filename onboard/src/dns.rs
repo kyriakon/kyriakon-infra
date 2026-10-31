@@ -301,9 +301,10 @@ mod tests {
     #[test]
     fn the_web_page_and_the_capsule_carry_the_same_table() {
         let web_recipe = recipe("parish.example", &values());
-        let web = crate::page::account(&[], Some("parish-secretary"), Some(web_recipe), None)
-            .render()
-            .unwrap();
+        let web =
+            crate::page::account(&[], Some("parish-secretary"), Some(web_recipe), None, false)
+                .render()
+                .unwrap();
         let capsule_recipe = recipe("parish.example", &values());
         let account: crate::store::Account = serde_json::from_value(serde_json::json!({
             "version": 1,

@@ -9,6 +9,10 @@
 #}
 <h2>Your account</h2>
 
+{% if free %}
+<p>This account is free: nothing is due, and it does not lapse.</p>
+{% endif %}
+
 {#
   The payment block sits at the top, above everything else, because it is the one
   thing on the page that expires. A free account has none at all. Once a credit

@@ -678,6 +678,46 @@ impl Account {
             .clone()
             .or_else(|| self.legacy_payment.folded())
     }
+
+    /// Approved without charge: no token, no window, nothing that lapses. A
+    /// group mailbox carries the flag its group was approved with, but the
+    /// group holds the payment, so the mailbox is not a free account itself.
+    pub fn is_free(&self) -> bool {
+        self.no_charge && self.group.is_none()
+    }
+}
+
+/// The count of free accounts, for the console. One read per account. A store
+/// that cannot be listed is an error rather than an empty one, and an account
+/// that cannot be read is named on stderr and left out, so the number the
+/// operator sees is never quietly wrong.
+pub async fn free_account_count(store: &Store) -> Result<usize, String> {
+    let names = store.list("accounts").await?;
+    let mut free = 0;
+    for username in names {
+        let Some(text) = store
+            .read_record(&format!("accounts/{username}"), "account.json")
+            .await
+        else {
+            eprintln!(
+                "kyriakon-onboard: accounts/{username}/account.json is unreadable, not counted"
+            );
+            continue;
+        };
+        let account: Account = match serde_json::from_str(&text) {
+            Ok(account) => account,
+            Err(e) => {
+                eprintln!(
+                    "kyriakon-onboard: accounts/{username}/account.json does not parse, not counted: {e}"
+                );
+                continue;
+            }
+        };
+        if account.is_free() {
+            free += 1;
+        }
+    }
+    Ok(free)
 }
 
 /// The flat payment fields of an account written before the block existed.

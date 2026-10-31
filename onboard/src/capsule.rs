@@ -210,6 +210,9 @@ pub fn account(
     payment: Option<&PaymentView>,
 ) -> String {
     let mut out = String::from("# Your account\n\n");
+    if account.is_free() {
+        out.push_str("This account is free: nothing is due, and it does not lapse.\n\n");
+    }
     if let Some(p) = payment {
         out.push_str("## Payment\n\n");
         out.push_str(&format!("Rail: {}.\n", p.rail));
