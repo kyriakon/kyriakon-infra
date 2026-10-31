@@ -18,12 +18,27 @@ pub const UNATTRIBUTED: &str = "ledger/unattributed.jsonl";
 
 pub struct Store {
     root: PathBuf,
+    /// Whether `append` waits for the line to reach the disk. Production does;
+    /// a test store does not, because the integration suite writes thousands of
+    /// lines and APFS fsync is the dominant cost. The bytes and the append
+    /// order are identical; only the durability barrier is skipped.
+    sync: bool,
 }
 
 impl Store {
     pub fn new(root: &str) -> Store {
         Store {
             root: PathBuf::from(root),
+            sync: true,
+        }
+    }
+
+    /// The same store without the per-line durability barrier. Tests only: no
+    /// deployed process should skip the sync an append promises.
+    pub fn new_for_test(root: &str) -> Store {
+        Store {
+            root: PathBuf::from(root),
+            sync: false,
         }
     }
 
@@ -86,7 +101,9 @@ impl Store {
             opts.custom_flags(libc::O_NOFOLLOW);
             let mut f = opts.open(&tmp).await?;
             f.write_all(bytes).await?;
-            f.sync_all().await?;
+            if self.sync {
+                f.sync_all().await?;
+            }
             drop(f);
             // chown needs root, and only root ever needs to hand the file to
             // another owner: a test runs as the directory's own owner already.
@@ -177,6 +194,7 @@ impl Store {
         if !line.ends_with(b"\n") {
             line.push(b'\n');
         }
+        let sync = self.sync;
         let placed = async {
             let mut f = tokio::fs::OpenOptions::new()
                 .create(true)
@@ -185,7 +203,11 @@ impl Store {
                 .open(&p)
                 .await?;
             f.write_all(&line).await?;
-            f.sync_all().await
+            if sync {
+                f.sync_all().await
+            } else {
+                Ok(())
+            }
         }
         .await;
         placed.map_err(|e| format!("cannot append to {}: {e}", p.display()))
