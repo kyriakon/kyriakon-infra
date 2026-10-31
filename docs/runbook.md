@@ -210,6 +210,12 @@ The first three print nothing and exit 0. The last shows `DNS:<domain>` and `CA:
 
 No new environment value is needed. `ACME_D`, `PUBLIC_ROOT` and `ACME_QUEUE` are the same overrides the member lanes use, and only the self-tests set them.
 
+To remove a body's domain, close it from the console:
+
+	doas kyriakon-onboardctl group remove <domain>
+
+The drain removes the domain's lines from the mail tables, its generated vhosts, capsule block, certificate material and queued order, then closes every account in the group through the deletion path and deletes the group record. The records in the body's own zone stay there, and the body removes them.
+
 ## Provision through the onboarding service
 
 The service is decided in #156, and the drain it needs is built: `scripts/deploy-onboard.sh` installs it and `scripts/cron-apply.sh` schedules it. This section records the shape an operator will work with, so that the decisions are findable beside the procedures they change.

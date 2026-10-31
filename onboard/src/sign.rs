@@ -110,6 +110,13 @@ pub fn address_payload(
     format!("address:{domain}:{action}:{address}:{mailbox}:{site_owner}:{key}")
 }
 
+/// The payload a remove-group intent signs: the domain the drain is asked to
+/// take down. Nothing else is in the intent for the drain to act on, so a
+/// signature for one body's domain cannot be replayed against another's.
+pub fn group_remove_payload(domain: &str) -> String {
+    format!("remove-group:{domain}")
+}
+
 /// The payload a token-resend intent signs: the account and the token it holds.
 /// The console signs it, because a second copy of the instructions is the
 /// member's to ask for and not the handler's to file.
