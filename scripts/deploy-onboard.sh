@@ -59,8 +59,8 @@ need_pkg() {
 
 # The scripts the drain runs, by the paths its config names. It invokes
 # add-user.sh, provision-member.sh, delete-user.sh, publish-mail-key.sh,
-# provision-group-web.sh, provision-group-capsule.sh, provision-group-acme.sh and
-# reload-smtpd.sh directly, and those invoke quota-apply.sh,
+# provision-group-web.sh, provision-group-capsule.sh, provision-group-acme.sh,
+# remove-group.sh and reload-smtpd.sh directly, and those invoke quota-apply.sh,
 # provision-member-web.sh, provision-member-capsule.sh, provision-member-acme.sh
 # and cron-apply.sh, so the whole set has to be installed wherever the drain
 # looks. relayd-members.sh is there because cron-apply.sh --web runs it to rewrite
@@ -70,7 +70,7 @@ need_pkg() {
 # ../openbsd/etc/login.conf.d/member), so this deploy installs that file into the
 # layout the relative read resolves to rather than copying the scripts somewhere
 # the read would leave behind.
-drain_scripts="add-user.sh provision-member.sh delete-user.sh quota-apply.sh provision-member-web.sh provision-member-capsule.sh provision-member-acme.sh provision-group-web.sh provision-group-capsule.sh provision-group-acme.sh cron-apply.sh relayd-members.sh publish-mail-key.sh set-mail-password.sh reload-smtpd.sh"
+drain_scripts="add-user.sh provision-member.sh delete-user.sh quota-apply.sh provision-member-web.sh provision-member-capsule.sh provision-member-acme.sh provision-group-web.sh provision-group-capsule.sh provision-group-acme.sh remove-group.sh cron-apply.sh relayd-members.sh publish-mail-key.sh set-mail-password.sh reload-smtpd.sh"
 drain_class="openbsd/etc/login.conf.d/member"
 
 # The service's own account, which scripts/onboard-store.sh refuses to create and

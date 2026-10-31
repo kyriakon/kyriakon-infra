@@ -23,8 +23,8 @@ use crate::questions;
 use crate::sign;
 use crate::store::{
     self, Account, ApplicationRef, CreditProgress, FlatPayment, GroupAddress, GroupAddressIntent,
-    GroupIntent, GroupPayment, GroupRecord, Intent, JournalLine, KeyRecord, Payment, Record, Store,
-    TokenRecord, Window,
+    GroupIntent, GroupPayment, GroupRecord, GroupRemoveIntent, Intent, JournalLine, KeyRecord,
+    Payment, Record, Store, TokenRecord, Window,
 };
 use crate::util;
 use crate::validate;
@@ -2884,6 +2884,18 @@ async fn hold_name(store: &Store, username: &str) -> Result<(), String> {
         .await
 }
 
+/// The three steps that close one mailbox: its name held for ninety days, its
+/// stored upload key dropped, and scripts/delete-user.sh, which removes the box
+/// account, its tree, its quota record and its store record. Shared by a
+/// mailbox leaving a group and a whole group going, so the two cannot disagree
+/// about what a closed account is. The caller removes the virtual entry first,
+/// because it is the one that knows which table line belongs to the account.
+async fn close_mailbox(cfg: &DrainConfig, store: &Store, username: &str) -> Result<(), String> {
+    hold_name(store, username).await?;
+    store.remove("keys", &format!("{username}.pub")).await?;
+    run_script(cfg, "delete-user.sh", &[username]).await
+}
+
 /// The mail key a new mailbox carries, checked before anything is written: the
 /// material must be there and must be the mailbox's own key.
 fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, String> {
@@ -3185,23 +3197,24 @@ pub async fn group_address(
                 // the lines have gone here, so this pass makes them live.
                 run_script(cfg, "reload-smtpd.sh", &[]).await?;
             }
-            store
-                .remove("keys", &format!("{}.pub", intent.mailbox))
-                .await?;
             // The box keyring entry stays, as delete-user.sh leaves it:
             // check-keyring-drift.sh reports a published key absent from the
             // box, and the published key's removal is the operator's step
             // (there is no unpublish path in this tree yet).
-            if closing {
-                hold_name(store, &intent.mailbox).await?;
-            }
             if intent.site_owner.is_some() {
                 // After the record names the replacement and before the old
                 // tree goes: the vhost root must not point at a directory
                 // delete-user.sh is about to remove.
                 run_script(cfg, "cron-apply.sh", &["--web"]).await?;
             }
-            run_script(cfg, "delete-user.sh", &[&intent.mailbox]).await?;
+            if closing {
+                close_mailbox(cfg, store, &intent.mailbox).await?;
+            } else {
+                store
+                    .remove("keys", &format!("{}.pub", intent.mailbox))
+                    .await?;
+                run_script(cfg, "delete-user.sh", &[&intent.mailbox]).await?;
+            }
         }
         _ => unreachable!("the action was checked against ADDRESS_ACTIONS"),
     }
@@ -3217,6 +3230,137 @@ pub async fn group_address(
     )
     .await?;
     store.remove("intents", file).await
+}
+
+/// Apply one `remove-group` intent: take a body's domain off the box whole.
+///
+/// The order is the deletion transition's. The host files go first through
+/// scripts/remove-group.sh, then the index and reload pass, so nothing is
+/// served from a tree the accounts' deletion is about to remove. The accounts
+/// close through the same three steps a mailbox leaving a group takes, and the
+/// group record is the last store write: while it is there a retry can still
+/// find every account it has to close.
+///
+/// Idempotent on replay and after a partial crash. The journal is the marker: a
+/// line that says `applied` means the domain is down, so the pass only clears
+/// the record directory and the intent file. A crash before that line leaves
+/// the group record in place, so the next pass finds its accounts again and
+/// every step below is a no-op over what is already gone.
+pub async fn remove_group(
+    cfg: &DrainConfig,
+    store: &Store,
+    key: &[u8],
+    value: &Value,
+    file: &str,
+) -> Result<(), String> {
+    let intent: GroupRemoveIntent = serde_json::from_value(value.clone())
+        .map_err(|e| format!("the remove-group intent does not parse: {e}"))?;
+    if intent.kind != "remove-group" {
+        return Err(format!(
+            "kind {:?} is not a remove-group intent",
+            intent.kind
+        ));
+    }
+    if !sign::verify(
+        key,
+        &sign::group_remove_payload(&intent.domain),
+        &intent.sig,
+    ) {
+        return Err("the remove-group intent's signature does not verify".to_string());
+    }
+    if let Some(why) = validate::domain(&intent.domain) {
+        return Err(format!("the domain {:?}: {why}", intent.domain));
+    }
+
+    // A replay whose transition finished: the domain is already down, so only
+    // the record directory and the file can be left, and both may be gone.
+    if journal_has(store, &intent.id, "applied").await {
+        remove_group_record(store, &intent.domain).await?;
+        return store.remove("intents", file).await;
+    }
+
+    let Some(group) = group_record(store, &intent.domain).await? else {
+        return Err(format!(
+            "there is no group for {}, so there is no domain to remove",
+            intent.domain
+        ));
+    };
+    let application = ApplicationRef {
+        username: group.site_owner.clone(),
+        status_token: intent.domain.clone(),
+    };
+    if !journal_has(store, &intent.id, "applying").await {
+        journal(
+            store,
+            &cfg.release,
+            &intent.id,
+            &intent.kind,
+            &application,
+            "applying",
+            None,
+        )
+        .await?;
+    }
+
+    // The mail tables, the generated blocks, the certificate material and the
+    // queued order. Then the pass that rewrites the indexes and drops the
+    // relayd keypair line the httpd file carried, which only the reload applies.
+    run_script(cfg, "remove-group.sh", &[&intent.domain]).await?;
+    run_script(cfg, "cron-apply.sh", &["--web"]).await?;
+
+    for account in &group.accounts {
+        close_mailbox(cfg, store, account).await?;
+    }
+    // After the accounts, so a crash between the two steps leaves the record
+    // that names them and the retry finds the token again.
+    close_group_tokens(store, &group.accounts).await?;
+
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &application,
+        "applied",
+        None,
+    )
+    .await?;
+    remove_group_record(store, &intent.domain).await?;
+    store.remove("intents", file).await
+}
+
+/// Remove the group's directory, record and all. A directory that is not there
+/// reads as done, the same rule `Store::remove` applies to a file.
+async fn remove_group_record(store: &Store, domain: &str) -> Result<(), String> {
+    let dir = store.path(&format!("groups/{domain}"));
+    match tokio::fs::remove_dir_all(&dir).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot remove {}: {e}", dir.display())),
+    }
+}
+
+/// Drop every token index entry that resolves to one of the group's accounts,
+/// so the ledger rows keyed by those tokens no longer name an account. The scan
+/// is by `TokenRecord.username` rather than by the filename, because the
+/// directory also holds tokens that are not these accounts' and the record is
+/// what says whose one is.
+async fn close_group_tokens(store: &Store, accounts: &[String]) -> Result<(), String> {
+    for name in store.list("tokens").await? {
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let Some(text) = store.read_record("tokens", &name).await else {
+            continue;
+        };
+        let Ok(token) = serde_json::from_str::<TokenRecord>(&text) else {
+            continue;
+        };
+        if accounts.iter().any(|account| account == &token.username) {
+            store.remove("tokens", &name).await?;
+        }
+    }
+    Ok(())
 }
 
 /// The decline: no reason, a message that offers the way back, the application
