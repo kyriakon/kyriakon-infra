@@ -168,6 +168,9 @@ pub fn status(page: &StatusPage) -> String {
                     out.push_str(&format!("Your payment reference is {token}.\n"));
                 }
                 out.push_str(&format!("Amount: GBP {}.\n", payment.amount));
+                if let Some(balance) = &payment.balance {
+                    out.push_str(&format!("Received so far: GBP {balance}.\n"));
+                }
                 if let Some(window) = &payment.window {
                     out.push_str(&format!("The payment window {window}.\n"));
                 }
@@ -223,6 +226,9 @@ pub fn account(
                 out.push_str(&format!("The payment window {window}.\n"));
             }
             out.push_str(&format!("Amount: GBP {}.\n", p.amount));
+            if let Some(balance) = &p.balance {
+                out.push_str(&format!("Received so far: GBP {balance}.\n"));
+            }
             if let Some(token) = &p.token {
                 out.push_str(&format!("Your payment reference is {token}.\n"));
             }

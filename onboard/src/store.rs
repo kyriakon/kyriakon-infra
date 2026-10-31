@@ -782,6 +782,19 @@ pub struct TokenRecord {
     pub state: String,
 }
 
+/// What a credit computed before it wrote the account: the date it was going to
+/// set (or, for a shortfall, the date it left alone), what it applied and what
+/// it held. A pass that crashed between the account write and the ledger append
+/// reads these back, so it can finish the ledger line without extending the
+/// date twice. Present only on a credit's `applying` journal line.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreditProgress {
+    pub paid: bool,
+    pub paid_until_after: Option<String>,
+    pub applied_gbp: String,
+    pub balance_gbp: Option<String>,
+}
+
 /// One line of `journal.jsonl`. Appended before a transition is carried out, so
 /// a crash leaves a record a rerun can read; and appended again, with a
 /// different `outcome`, when a click finds the application already decided,
@@ -803,6 +816,11 @@ pub struct JournalLine {
     pub outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The values a credit computed before it wrote the account, so a crash
+    /// between the write and the ledger append is recoverable. Absent on every
+    /// other line and on a credit's own `applied` line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit: Option<CreditProgress>,
 }
 
 /// One line of an account's `notices.jsonl`: recorded before the message is

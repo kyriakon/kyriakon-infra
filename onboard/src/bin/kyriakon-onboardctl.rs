@@ -252,9 +252,10 @@ async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
         (None, None) => return Err("give --token or --username".to_string()),
     };
     let rail = need(&flags, "rail")?;
-    if !["cash", "cash-hand", "monero"].contains(&rail) {
+    if !transitions::CREDIT_RAILS.contains(&rail) {
         return Err(format!(
-            "--rail {rail:?} is not one of cash, cash-hand or monero"
+            "--rail {rail:?} is not one of {}",
+            transitions::CREDIT_RAILS.join(", ")
         ));
     }
     let amount = need(&flags, "amount")?;

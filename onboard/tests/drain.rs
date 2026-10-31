@@ -26,6 +26,9 @@ const TOKEN: &str = "0123456789abcdefghjkmnpqrs";
 /// A second status token, for a second application on the same username.
 const OTHER_TOKEN: &str = "fedcba98765432100123456789";
 
+/// A transaction id in the shape a Monero wallet prints: 64 hex characters.
+const TXID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 /// The key file's body: `read_key` reads this and strips the trailing newline,
 /// and the fixtures must be 0600 for it to be accepted at all.
 const KEY: &[u8] = b"the approval key\n";
@@ -1907,6 +1910,265 @@ fn a_credit_tolerates_one_percent_and_holds_the_rest() {
     assert_eq!(account["payment"]["paid_until"], json!("2028-10-04"));
     assert!(account["payment"].get("balance_gbp").is_none());
     assert_eq!(payment_lines(&over)[1]["applied_gbp"], json!("20.00"));
+}
+
+/// One Monero transaction credits once: the second credit naming the same txid
+/// is refused with the first line's date and `seq`, and malformed Monero fields
+/// are refused before anything is written.
+#[test]
+fn a_monero_transaction_is_credited_once_and_bad_monero_fields_are_refused() {
+    let fix = Fix::new("credit-txid");
+    let token = approved_paid(&fix, "secretary", "monero");
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "monero",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+        "--txid",
+        TXID,
+        "--xmr",
+        "0.048847",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    let first = payment_lines(&fix);
+    assert_eq!(first.len(), 1, "{:?}", first);
+    assert_eq!(first[0]["txid"], json!(TXID));
+    assert_eq!(first[0]["amount_xmr"], json!("0.048847"));
+    let first_seq = first[0]["seq"].as_u64().unwrap();
+
+    // The same transaction again, with the renewal flag that would otherwise
+    // let it through: the txid is the reason it is refused.
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "monero",
+        "--amount",
+        "20.00",
+        "--received",
+        "2027-10-04",
+        "--txid",
+        TXID,
+        "--xmr",
+        "0.048847",
+        "--confirm-double",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        payment_lines(&fix).len(),
+        1,
+        "a second credit for one transaction was applied"
+    );
+    assert_eq!(
+        fix.account("secretary")["payment"]["paid_until"],
+        json!("2027-10-04"),
+        "a refused transaction moved the date"
+    );
+    let journal = fix.journal();
+    assert!(journal.contains(TXID), "{journal}");
+    assert!(journal.contains("2026-10-04"), "{journal}");
+    assert!(
+        journal.contains(&format!("ledger seq {first_seq}")),
+        "{journal}"
+    );
+
+    // A txid that is not 64 hex, and an XMR amount that is not decimal, are
+    // refused before the token is even resolved.
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "monero",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+        "--txid",
+        "not-a-txid",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    assert!(
+        fix.journal().contains("64 hexadecimal"),
+        "{}",
+        fix.journal()
+    );
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "monero",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+        "--txid",
+        TXID,
+        "--xmr",
+        "0.1.2",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    assert!(
+        fix.journal().contains("decimal amount"),
+        "{}",
+        fix.journal()
+    );
+    assert_eq!(payment_lines(&fix).len(), 1);
+}
+
+/// A shortfall is recorded, shown on every payment view as what remains, and
+/// acknowledged by a receipt that names both the money received and the money
+/// still owed.
+#[test]
+fn a_shortfall_is_shown_and_quoted_back_and_receipted() {
+    let fix = Fix::new("credit-shortfall-visible");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "15.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+
+    let account = fix.account("secretary");
+    assert!(account["payment"]["paid_until"].is_null(), "{account}");
+    assert_eq!(
+        account["payment"]["balance_gbp"],
+        json!("15.00"),
+        "{account}"
+    );
+
+    let now = OffsetDateTime::now_utc();
+    let post = "1 Example Street, Example";
+    let stored = stored_account(&fix, "secretary");
+    let block = stored.payment_state().expect("a paid approval's block");
+    let view = page::payment(&stored.state, &stored.rail, &block, "20.00", post, now);
+    assert_eq!(view.amount, "5.00", "the page re-quotes the remainder");
+    assert_eq!(view.balance.as_deref(), Some("15.00"));
+
+    // The account page, web and capsule.
+    let web = page::account(&[], Some("secretary"), None, Some(view), false)
+        .render()
+        .unwrap();
+    assert!(web.contains("Amount: GBP 5.00"), "{web}");
+    assert!(web.contains("Received so far: GBP 15.00"), "{web}");
+    let capsule_block = stored.payment_state().expect("a paid approval's block");
+    let capsule_view = page::payment(
+        &stored.state,
+        &stored.rail,
+        &capsule_block,
+        "20.00",
+        post,
+        now,
+    );
+    let gemtext = capsule::account(&stored, &[], None, Some(&capsule_view));
+    assert!(gemtext.contains("Amount: GBP 5.00"), "{gemtext}");
+    assert!(gemtext.contains("Received so far: GBP 15.00"), "{gemtext}");
+
+    // The status page, web and capsule, from the copy the handler reads.
+    let application: Record =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    let block = application
+        .payment
+        .clone()
+        .expect("the drain copied the block onto the application");
+    let status_view = page::payment("active", &application.rail, &block, "20.00", post, now);
+    assert_eq!(status_view.amount, "5.00");
+    let status = responder::status_page(Some(application), Some(status_view), now);
+    let html = status.render().unwrap();
+    assert!(html.contains("Amount: GBP 5.00"), "{html}");
+    assert!(html.contains("Received so far: GBP 15.00"), "{html}");
+    let gemtext = capsule::status(&status);
+    assert!(gemtext.contains("Amount: GBP 5.00"), "{gemtext}");
+    assert!(gemtext.contains("Received so far: GBP 15.00"), "{gemtext}");
+
+    // The receipt names both what arrived and what remains.
+    let sent = fix.sent();
+    assert!(sent.contains("GBP 15.00"), "{sent}");
+    assert!(sent.contains("GBP 5.00"), "{sent}");
+    assert!(
+        fix.read("accounts/secretary/notices.jsonl")
+            .contains("prepaid.receipt"),
+        "{}",
+        fix.read("accounts/secretary/notices.jsonl")
+    );
+}
+
+/// A crash between the account write and the ledger append leaves an `applying`
+/// journal line and the written account. Replaying the intent finishes the
+/// ledger line from those values and does not extend the date again.
+#[test]
+fn a_credit_recovers_a_ledger_line_lost_after_the_account_write() {
+    let fix = Fix::new("credit-recovery");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let names = fix.intents();
+    assert_eq!(names.len(), 1, "{names:?}");
+    let replay = std::fs::read_to_string(fix.dir.join("store/intents").join(&names[0])).unwrap();
+    assert!(fix.drain().status.success());
+    assert_eq!(payment_lines(&fix).len(), 1);
+    let id = names[0].trim_end_matches(".json").to_string();
+
+    // A crash after the account write and before the append leaves the line
+    // missing. The account still carries the credit.
+    let ledger = fix.read("ledger/payments.jsonl");
+    let kept: String = ledger
+        .lines()
+        .filter(|line| !line.contains("\"kind\":\"payment\""))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    std::fs::write(fix.dir.join("store/ledger/payments.jsonl"), kept).unwrap();
+    assert!(payment_lines(&fix).is_empty());
+
+    std::fs::write(fix.dir.join("store/intents").join(&names[0]), &replay).unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    let lines = payment_lines(&fix);
+    assert_eq!(lines.len(), 1, "the line was not rebuilt: {lines:?}");
+    assert_eq!(lines[0]["intent"], json!(id));
+    assert_eq!(
+        fix.account("secretary")["payment"]["paid_until"],
+        json!("2027-10-04"),
+        "recovery extended the date a second year"
+    );
+    assert_eq!(
+        fix.read("accounts/secretary/notices.jsonl")
+            .matches("prepaid.receipt")
+            .count(),
+        1,
+        "recovery sent a second receipt"
+    );
 }
 
 /// A credit past the 24-month ceiling is refused and journals why; a reason

@@ -29,6 +29,9 @@
 <p>The payment window {{ window }}.</p>
 {% endif %}
 <p>Amount: GBP {{ p.amount }}.</p>
+{% if let Some(balance) = p.balance %}
+<p>Received so far: GBP {{ balance }}.</p>
+{% endif %}
 {% if let Some(token) = p.token %}
 <p>Your payment reference: <code>{{ token }}</code></p>
 {% endif %}

@@ -22,9 +22,9 @@ use crate::notice;
 use crate::questions;
 use crate::sign;
 use crate::store::{
-    self, Account, ApplicationRef, FlatPayment, GroupAddress, GroupAddressIntent, GroupIntent,
-    GroupPayment, GroupRecord, Intent, JournalLine, KeyRecord, Payment, Record, Store, TokenRecord,
-    Window,
+    self, Account, ApplicationRef, CreditProgress, FlatPayment, GroupAddress, GroupAddressIntent,
+    GroupIntent, GroupPayment, GroupRecord, Intent, JournalLine, KeyRecord, Payment, Record, Store,
+    TokenRecord, Window,
 };
 use crate::util;
 use crate::validate;
@@ -467,6 +467,7 @@ async fn journal(
         application: application.clone(),
         outcome: outcome.to_string(),
         note: note.map(str::to_string),
+        credit: None,
     };
     let encoded =
         serde_json::to_string(&line).map_err(|e| format!("cannot encode a journal line: {e}"))?;
@@ -1461,7 +1462,7 @@ pub async fn credit(
 
     // The ledger line is the settlement marker. A second arrival of the same
     // intent finds it and stops before any other check, so a replay cannot
-    // refuse itself on the double-payment rule or on a ceiling it already met.
+    // refuse itself on a rule it already met.
     if ledger_has_intent(store, &intent.id).await {
         if !journal_has(store, &intent.id, "applied").await {
             journal(
@@ -1481,11 +1482,13 @@ pub async fn credit(
         store.remove("intents", file).await?;
         return Ok(());
     }
-    if intent_seen(store, &intent.id).await {
+    // A refusal is recorded once; the intent is left in place, as every other
+    // refused intent is, and a new intent is the way to change it.
+    if journal_has(store, &intent.id, "refused").await {
         return Ok(());
     }
 
-    let problem = if !PAYMENT_RAILS.contains(&intent.rail.as_str()) {
+    let problem = if !CREDIT_RAILS.contains(&intent.rail.as_str()) {
         Some("the credit names a rail that is not cash, cash-hand or monero")
     } else if !store::is_payment_token(&intent.token) {
         Some("the credit's token is not the shape of a payment token")
@@ -1603,20 +1606,46 @@ pub async fn credit(
         .await;
     }
 
-    // A token already credited is a renewal, and the second credit needs the
-    // operator to have said so: for cash the second envelope may be a
-    // stranger's with a copied token.
-    if let (Some(paid_until), false) = (payment.paid_until.as_deref(), intent.confirm_double) {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            &format!(
-                "this token was already credited until {paid_until}; give --confirm-double for a renewal"
-            ),
-        )
-        .await;
+    // A pass that journaled `applying` and wrote the account but crashed before
+    // the ledger append is finished here, from the values it recorded then. The
+    // account is the witness: its paid-until date (or, for a shortfall, its
+    // balance) is the one this credit computed, so nothing is extended again and
+    // no second notice is sent.
+    let progress = credit_progress(store, &intent.id).await;
+    let written = progress.as_ref().is_some_and(|p| {
+        if p.paid {
+            payment.paid_until.as_deref() == p.paid_until_after.as_deref()
+        } else {
+            payment.balance_gbp.as_deref() == p.balance_gbp.as_deref()
+        }
+    });
+    if let Some(progress) = progress.as_ref().filter(|_| written) {
+        if !ledger_has_intent(store, &intent.id).await {
+            append_credit_ledger(
+                store,
+                &intent,
+                &util::date_string(received),
+                &util::gbp(amount),
+                &progress.applied_gbp,
+                progress.paid_until_after.as_deref(),
+            )
+            .await?;
+        }
+        // A crash between the account write and its copies leaves the status
+        // page behind; the account is the truth now, so rewrite them from it.
+        write_payment_copy(store, &username, &payment).await?;
+        if !journal_has(store, &intent.id, "applied").await {
+            journal_credit_applied(
+                cfg,
+                store,
+                &intent,
+                &username,
+                intent.override_reason.as_deref(),
+            )
+            .await?;
+        }
+        store.remove("intents", file).await?;
+        return Ok(());
     }
 
     let before = match payment.paid_until.as_deref() {
@@ -1674,19 +1703,74 @@ pub async fn credit(
     };
     let applied = credit_money(price, balance, amount);
 
-    payment.rail = Some(intent.rail.clone());
-    payment.balance_gbp = (applied.balance > 0).then(|| util::gbp(applied.balance));
+    // A transaction already in the ledger is the same payment seen again. It
+    // must never extend a date, whatever else the intent says.
+    if let Some(txid) = intent.txid.as_deref() {
+        if let Some((seq, received_on)) = ledger_txid(store, txid).await {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                &format!(
+                    "transaction {txid} was already credited on {received_on} at ledger seq {seq}"
+                ),
+            )
+            .await;
+        }
+    }
+    // A token already credited is a renewal, and the second credit needs the
+    // operator to have said so: for cash the second envelope may be a
+    // stranger's with a copied token.
+    if let (Some(paid_until), false) = (payment.paid_until.as_deref(), intent.confirm_double) {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            &format!(
+                "this token was already credited until {paid_until}; give --confirm-double for a renewal"
+            ),
+        )
+        .await;
+    }
+
+    let until_text = util::date_string(until);
     let paid_until_after = if applied.paid {
-        payment.paid_until = Some(util::date_string(until));
+        Some(until_text.clone())
+    } else {
+        before.map(util::date_string)
+    };
+    let balance_text = (applied.balance > 0).then(|| util::gbp(applied.balance));
+
+    // The values the account write is about to set, recorded before the write so
+    // a crash leaves enough to finish the ledger line.
+    if progress.is_none() {
+        journal_credit_applying(
+            store,
+            &cfg.release,
+            &intent,
+            &username,
+            &CreditProgress {
+                paid: applied.paid,
+                paid_until_after: paid_until_after.clone(),
+                applied_gbp: util::gbp(applied.applied),
+                balance_gbp: balance_text.clone(),
+            },
+        )
+        .await?;
+    }
+
+    payment.rail = Some(intent.rail.clone());
+    payment.balance_gbp = balance_text;
+    if applied.paid {
+        payment.paid_until = Some(until_text);
         // The window closes with the credit; a null paid-until date is what
         // shows the token, so setting the date is also what hides it.
         if let Some(window) = payment.window.as_mut() {
             window.state = "paid".to_string();
         }
-        Some(util::date_string(until))
-    } else {
-        before.map(util::date_string)
-    };
+    }
     account.payment = Some(payment.clone());
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
@@ -1697,62 +1781,62 @@ pub async fn credit(
     append_credit_ledger(
         store,
         &intent,
-        received,
-        amount,
-        applied.applied,
+        &util::date_string(received),
+        &util::gbp(amount),
+        &util::gbp(applied.applied),
         paid_until_after.as_deref(),
     )
     .await?;
 
-    // The receipt is for money that bought a year; a shortfall leaves the
-    // remainder quoted and is acknowledged on the account page instead.
-    if applied.paid {
-        let to = account
-            .outside_address
-            .clone()
-            .unwrap_or_else(|| format!("{username}@kyriakon.net"));
+    // The receipt is for every payment, including a shortfall: the money
+    // arrived, and the account page quotes what still does.
+    let to = account
+        .outside_address
+        .clone()
+        .unwrap_or_else(|| format!("{username}@kyriakon.net"));
+    let (subject, body) = if applied.paid {
         let paid = util::date_string(until);
-        let subject = format!("Your payment to kyriakon.net was received (paid until {paid})");
-        let body = format!(
-            "We have recorded a payment of GBP {} on {} by {}.\n\n\
-             Your account is paid until {}.\n",
-            util::gbp(amount),
-            util::date_string(received),
-            intent.rail,
-            paid,
-        );
-        notice::send_account_notice(
-            cfg,
-            store,
-            &username,
-            "prepaid.receipt",
-            &subject,
-            &to,
-            &body,
+        (
+            format!("Your payment to kyriakon.net was received (paid until {paid})"),
+            format!(
+                "We have recorded a payment of GBP {} on {} by {}.\n\n\
+                 Your account is paid until {}.\n",
+                util::gbp(amount),
+                util::date_string(received),
+                intent.rail,
+                paid,
+            ),
         )
-        .await?;
-    }
-
-    let note = override_reason.map(|reason| format!("24-month override: {reason}"));
-    journal(
+    } else {
+        let remaining = util::gbp(price - applied.balance);
+        (
+            format!("Your part payment to kyriakon.net was received (GBP {remaining} remains)"),
+            format!(
+                "We have recorded a payment of GBP {} on {} by {}.\n\n\
+                 GBP {} remains due for the year, and your account page quotes it.\n",
+                util::gbp(amount),
+                util::date_string(received),
+                intent.rail,
+                remaining,
+            ),
+        )
+    };
+    notice::send_account_notice(
+        cfg,
         store,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &ApplicationRef {
-            username: username.clone(),
-            status_token: String::new(),
-        },
-        "applied",
-        note.as_deref(),
+        &username,
+        "prepaid.receipt",
+        &subject,
+        &to,
+        &body,
     )
     .await?;
+
+    journal_credit_applied(cfg, store, &intent, &username, override_reason).await?;
     store.remove("intents", file).await
 }
 
-/// The payment rails a manual credit may name. Card is not one: it settles
-/// through Stripe, and the drain's card path is a different ticket.
-const PAYMENT_RAILS: [&str; 3] = ["cash", "cash-hand", "monero"];
+pub const CREDIT_RAILS: [&str; 3] = ["cash", "cash-hand", "monero"];
 
 fn valid_txid(txid: Option<&str>) -> bool {
     match txid {
@@ -1809,6 +1893,94 @@ fn credit_money(price: i64, balance: i64, amount: i64) -> CreditMoney {
             paid: false,
         }
     }
+}
+
+/// The values a credit recorded on its `applying` journal line, if it has got
+/// that far. A pass that finds them again is recovering from a crash between the
+/// account write and the ledger append, not applying a new credit.
+async fn credit_progress(store: &Store, id: &str) -> Option<CreditProgress> {
+    for line in store.lines("journal.jsonl").await {
+        if let Ok(j) = serde_json::from_str::<JournalLine>(&line) {
+            if j.intent == id && j.outcome == "applying" {
+                if let Some(progress) = j.credit {
+                    return Some(progress);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Journal a credit's `applying` line with what it is about to write, so the
+/// ledger line can be finished if the write succeeds and the append does not.
+async fn journal_credit_applying(
+    store: &Store,
+    release: &str,
+    intent: &CreditIntent,
+    username: &str,
+    progress: &CreditProgress,
+) -> Result<(), String> {
+    let line = JournalLine {
+        version: 1,
+        at: util::filed_at(),
+        intent: intent.id.clone(),
+        kind: intent.kind.clone(),
+        release: release.to_string(),
+        application: ApplicationRef {
+            username: username.to_string(),
+            status_token: String::new(),
+        },
+        outcome: "applying".to_string(),
+        note: None,
+        credit: Some(progress.clone()),
+    };
+    let encoded =
+        serde_json::to_string(&line).map_err(|e| format!("cannot encode a journal line: {e}"))?;
+    store.append("journal.jsonl", encoded.as_bytes()).await
+}
+
+/// Journal a credit's completion, carrying an override's reason when there was
+/// one.
+async fn journal_credit_applied(
+    cfg: &DrainConfig,
+    store: &Store,
+    intent: &CreditIntent,
+    username: &str,
+    override_reason: Option<&str>,
+) -> Result<(), String> {
+    let note = override_reason.map(|reason| format!("24-month override: {reason}"));
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &ApplicationRef {
+            username: username.to_string(),
+            status_token: String::new(),
+        },
+        "applied",
+        note.as_deref(),
+    )
+    .await
+}
+
+/// The ledger line carrying this transaction id, with the date it was first
+/// credited and its `seq`, so a second credit can name both.
+async fn ledger_txid(store: &Store, txid: &str) -> Option<(u64, String)> {
+    for line in store.lines("ledger/payments.jsonl").await {
+        if let Ok(v) = serde_json::from_str::<Value>(&line) {
+            if v.get("txid").and_then(Value::as_str) == Some(txid) {
+                let seq = v.get("seq").and_then(Value::as_u64).unwrap_or(0);
+                let received = v
+                    .get("received_on")
+                    .and_then(Value::as_str)
+                    .unwrap_or("an earlier date")
+                    .to_string();
+                return Some((seq, received));
+            }
+        }
+    }
+    None
 }
 
 /// Whether the ledger already holds this intent's line. Read as a `Value`
@@ -1869,9 +2041,9 @@ async fn write_payment_copy(
 async fn append_credit_ledger(
     store: &Store,
     intent: &CreditIntent,
-    received: time::Date,
-    amount: i64,
-    applied: i64,
+    received_on: &str,
+    amount_gbp: &str,
+    applied_gbp: &str,
     paid_until_after: Option<&str>,
 ) -> Result<(), String> {
     let mut seq = 0u64;
@@ -1885,19 +2057,19 @@ async fn append_credit_ledger(
     let line = json!({
         "version": 1,
         "seq": seq + 1,
-        "token": intent.token,
+        "token": intent.token.as_str(),
         "kind": "payment",
-        "rail": intent.rail,
-        "received_on": util::date_string(received),
-        "amount_gbp": util::gbp(amount),
-        "applied_gbp": util::gbp(applied),
+        "rail": intent.rail.as_str(),
+        "received_on": received_on,
+        "amount_gbp": amount_gbp,
+        "applied_gbp": applied_gbp,
         "paid_until_after": paid_until_after,
-        "amount_xmr": intent.amount_xmr,
+        "amount_xmr": intent.amount_xmr.as_deref(),
         "rate_quoted": Value::Null,
         "rate_source": Value::Null,
         "rate_at": Value::Null,
-        "txid": intent.txid,
-        "intent": intent.id,
+        "txid": intent.txid.as_deref(),
+        "intent": intent.id.as_str(),
         "note": Value::Null,
     });
     let encoded =
