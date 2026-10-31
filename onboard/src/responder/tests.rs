@@ -496,6 +496,22 @@ async fn a_pinned_certificate_answers_as_the_member() {
         !body.contains("DNS records"),
         "an account with no group carries no recipe: {body}"
     );
+    // The fixture was approved without charge, and both account pages say so
+    // from the account they read rather than from a page-only flag.
+    assert!(
+        body.contains("This account is free: nothing is due, and it does not lapse."),
+        "{body}"
+    );
+    let (code, web) = answer(&app, &httpd_get_as("account", "", Some("alice"))).await;
+    assert_eq!(code, 200);
+    assert!(
+        web.contains("This account is free: nothing is due, and it does not lapse."),
+        "{web}"
+    );
+    assert!(
+        !web.contains("Payment"),
+        "no block for a free account: {web}"
+    );
 
     // The catalogue's account row reaches the page that answered it.
     let (_, catalogue) = answer(&app, &gmid_certificate("", "", &pinned)).await;

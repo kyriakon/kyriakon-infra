@@ -1184,6 +1184,63 @@ fn a_free_account_gets_one_note_a_year_and_the_console_counts_it() {
     assert_eq!(body(&out).trim(), "1 account without charge");
 }
 
+/// A free account that gave an address outside the platform has its yearly note
+/// sent there, not to the mailbox it may no longer read.
+#[test]
+fn a_free_note_goes_to_the_outside_address_when_there_is_one() {
+    let fix = Fix::new("free-anniversary-outside");
+    let dir = fix.dir.join("store/accounts/secretary");
+    std::fs::create_dir_all(&dir).unwrap();
+    let account = json!({
+        "version": 1, "username": "secretary", "state": "active",
+        "decision": "approve", "decided_at": "2019-01-01T09:00:00Z",
+        "rail": "no_charge", "no_charge": true,
+        "created_at": "2019-01-01T09:00:00Z",
+        "outside_address": "warden@example.invalid",
+    });
+    std::fs::write(
+        dir.join("account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+
+    assert!(fix.drain().status.success());
+    let notices = fix.read("accounts/secretary/notices.jsonl");
+    assert!(notices.contains("free.anniversary"), "{notices}");
+    assert!(notices.contains("warden@example.invalid"), "{notices}");
+    assert!(!notices.contains("secretary@kyriakon.net"), "{notices}");
+}
+
+/// A mail path that refuses one account's note does not fail the pass: the key
+/// spool and the DNS check behind the sweep still run, as they do after the
+/// other sweeps' per-item failures.
+#[test]
+fn a_refused_free_note_does_not_fail_the_pass() {
+    let fix = Fix::new("free-anniversary-refused");
+    fix.enqueuer_fails();
+    let dir = fix.dir.join("store/accounts/secretary");
+    std::fs::create_dir_all(&dir).unwrap();
+    let account = json!({
+        "version": 1, "username": "secretary", "state": "active",
+        "decision": "approve", "decided_at": "2019-01-01T09:00:00Z",
+        "rail": "no_charge", "no_charge": true,
+        "created_at": "2019-01-01T09:00:00Z",
+    });
+    std::fs::write(
+        dir.join("account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    // The notice is recorded before the send, so the refusal is visible and the
+    // year is not mailed twice by a later pass.
+    assert!(fix
+        .read("accounts/secretary/notices.jsonl")
+        .contains("free.anniversary"));
+}
+
 /// An application that asked for no charge is never charged, even by the
 /// charge-carrying intent: the reviewer's own button and the applicant's answer
 /// both have to say pay before a token is drawn.
@@ -1464,7 +1521,7 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
         "a free account has no block: {gemini}"
     );
     assert!(
-        gemini.contains("This account is free: nothing is due"),
+        gemini.contains("This account is free: nothing is due, and it does not lapse."),
         "{gemini}"
     );
 }

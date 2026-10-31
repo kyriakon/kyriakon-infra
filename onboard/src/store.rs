@@ -687,29 +687,37 @@ impl Account {
     }
 }
 
-/// The count of free accounts, for the console. One read per account, the same
-/// scan the certificate lookup does; a record that cannot be read is skipped
-/// rather than failing the count.
-pub async fn free_account_count(store: &Store) -> usize {
-    let Ok(names) = store.list("accounts").await else {
-        return 0;
-    };
+/// The count of free accounts, for the console. One read per account. A store
+/// that cannot be listed is an error rather than an empty one, and an account
+/// that cannot be read is named on stderr and left out, so the number the
+/// operator sees is never quietly wrong.
+pub async fn free_account_count(store: &Store) -> Result<usize, String> {
+    let names = store.list("accounts").await?;
     let mut free = 0;
     for username in names {
         let Some(text) = store
             .read_record(&format!("accounts/{username}"), "account.json")
             .await
         else {
+            eprintln!(
+                "kyriakon-onboard: accounts/{username}/account.json is unreadable, not counted"
+            );
             continue;
         };
-        let Ok(account) = serde_json::from_str::<Account>(&text) else {
-            continue;
+        let account: Account = match serde_json::from_str(&text) {
+            Ok(account) => account,
+            Err(e) => {
+                eprintln!(
+                    "kyriakon-onboard: accounts/{username}/account.json does not parse, not counted: {e}"
+                );
+                continue;
+            }
         };
         if account.is_free() {
             free += 1;
         }
     }
-    free
+    Ok(free)
 }
 
 /// The flat payment fields of an account written before the block existed.

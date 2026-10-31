@@ -2915,7 +2915,10 @@ pub async fn free_anniversaries(cfg: &DrainConfig, store: &Store) -> Result<(), 
              admin@kyriakon.net and we will send the payment instructions. There is\n\
              nothing to prove.\n"
         );
-        notice::send_account_notice(
+        // One account's refused notice is reported and skipped, the way the DNS
+        // sweep treats one group's: it must not stop the pass's mail spool or
+        // the DNS check behind it.
+        if let Err(e) = notice::send_account_notice(
             cfg,
             store,
             &username,
@@ -2924,7 +2927,10 @@ pub async fn free_anniversaries(cfg: &DrainConfig, store: &Store) -> Result<(), 
             &to,
             &body,
         )
-        .await?;
+        .await
+        {
+            eprintln!("kyriakon-onboard: the free anniversary note for {username}: {e}");
+        }
     }
     Ok(())
 }

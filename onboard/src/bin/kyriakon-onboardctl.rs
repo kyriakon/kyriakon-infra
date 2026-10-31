@@ -511,7 +511,7 @@ async fn free(store: &Store, rest: &[String]) -> Result<(), String> {
     if !rest.is_empty() {
         return Err(usage());
     }
-    match free_account_count(store).await {
+    match free_account_count(store).await? {
         1 => println!("1 account without charge"),
         n => println!("{n} accounts without charge"),
     }
