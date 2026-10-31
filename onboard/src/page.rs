@@ -222,6 +222,7 @@ pub fn payment(
     payment: &crate::store::Payment,
     price_gbp: &str,
     postal_address: &str,
+    card_link: Option<&str>,
     now: OffsetDateTime,
 ) -> PaymentView {
     let unpaid = payment.paid_until.is_none();
@@ -266,7 +267,7 @@ pub fn payment(
         paid_until: payment.paid_until.clone(),
         window: window_line,
         instructions: if unpaid {
-            crate::transitions::rail_instructions(rail, postal_address, None)
+            crate::transitions::rail_instructions(rail, postal_address, card_link)
         } else {
             Vec::new()
         },

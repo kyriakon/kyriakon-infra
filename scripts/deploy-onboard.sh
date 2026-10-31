@@ -59,8 +59,9 @@ need_pkg() {
 
 # The scripts the drain runs, by the paths its config names. It invokes
 # add-user.sh, provision-member.sh, delete-user.sh, publish-mail-key.sh,
-# provision-group-web.sh, provision-group-capsule.sh, provision-group-acme.sh,
-# remove-group.sh and reload-smtpd.sh directly, and those invoke quota-apply.sh,
+# stripe-api.sh, provision-group-web.sh, provision-group-capsule.sh,
+# provision-group-acme.sh, remove-group.sh and reload-smtpd.sh directly, and
+# those invoke quota-apply.sh,
 # provision-member-web.sh, provision-member-capsule.sh, provision-member-acme.sh
 # and cron-apply.sh, so the whole set has to be installed wherever the drain
 # looks. relayd-members.sh is there because cron-apply.sh --web runs it to rewrite
@@ -70,7 +71,7 @@ need_pkg() {
 # ../openbsd/etc/login.conf.d/member), so this deploy installs that file into the
 # layout the relative read resolves to rather than copying the scripts somewhere
 # the read would leave behind.
-drain_scripts="add-user.sh provision-member.sh delete-user.sh quota-apply.sh provision-member-web.sh provision-member-capsule.sh provision-member-acme.sh provision-group-web.sh provision-group-capsule.sh provision-group-acme.sh remove-group.sh cron-apply.sh relayd-members.sh publish-mail-key.sh set-mail-password.sh reload-smtpd.sh"
+drain_scripts="add-user.sh provision-member.sh delete-user.sh quota-apply.sh provision-member-web.sh provision-member-capsule.sh provision-member-acme.sh provision-group-web.sh provision-group-capsule.sh provision-group-acme.sh remove-group.sh cron-apply.sh relayd-members.sh publish-mail-key.sh set-mail-password.sh stripe-api.sh reload-smtpd.sh"
 drain_class="openbsd/etc/login.conf.d/member"
 
 # The service's own account, which scripts/onboard-store.sh refuses to create and
@@ -258,10 +259,11 @@ case "$price_gbp" in
 esac
 
 onboard_candidate=$(mktemp /etc/onboard/.onboard.toml.XXXXXX)
-RELEASE="$release" PRICE="$price_gbp" POSTAL="$POSTAL_ADDRESS" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
+RELEASE="$release" PRICE="$price_gbp" POSTAL="$POSTAL_ADDRESS" LINK="$STRIPE_PAYMENT_LINK" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
 	/^release[[:space:]]*=/ { print "release = \"" ENVIRON["RELEASE"] "\""; next }
 	/^price_gbp[[:space:]]*=/ { print "price_gbp = \"" ENVIRON["PRICE"] "\""; next }
 	/^postal_address[[:space:]]*=/ { print "postal_address = \"" ENVIRON["POSTAL"] "\""; next }
+	/^stripe_payment_link[[:space:]]*=/ { print "stripe_payment_link = \"" ENVIRON["LINK"] "\""; next }
 	/^ipv4[[:space:]]*=/ { print "ipv4 = \"" ENVIRON["IPV4"] "\""; next }
 	/^ipv6[[:space:]]*=/ { print "ipv6 = \"" ENVIRON["IPV6"] "\""; next }
 	/^dkim_selector[[:space:]]*=/ { print "dkim_selector = \"" ENVIRON["SELECTOR"] "\""; next }

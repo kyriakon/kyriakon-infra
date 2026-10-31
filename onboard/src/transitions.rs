@@ -4086,6 +4086,32 @@ pub fn rail_instructions(rail: &str, postal_address: &str, card_link: Option<&st
     }
 }
 
+/// The card rail's Payment Link, keyed to one payment token.
+///
+/// The reference is the account's `KYR-` token, which is what the token index
+/// joins to the account: the same join `credit()` uses. `client_reference_id`
+/// lets `checkout.session.completed` name the account, and the same value in
+/// `subscription_data[metadata]` is what an invoice with no prior checkout uses
+/// to repair the attachment from the API. A placeholder that reached the box is
+/// refused rather than mailed, because a member cannot pay at REPLACE_ME.
+pub fn card_link(payment_link: &str, token: &str) -> Result<Option<String>, String> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let link = payment_link.trim_end_matches(['&', '?']);
+    if link.is_empty() || link.contains("REPLACE_ME") {
+        return Err(
+            "stripe_payment_link is not configured, so a card approval has no link to send"
+                .to_string(),
+        );
+    }
+    let joiner = if link.contains('?') { '&' } else { '?' };
+    Ok(Some(format!(
+        "{link}{joiner}client_reference_id={token}\
+         &subscription_data[metadata][client_reference_id]={token}"
+    )))
+}
+
 /// The decision email for an approval. The words are short because #333 owns
 /// the notice copy; what matters here is that the token and the rail's own
 /// instructions are on it, and that the free path says neither.
@@ -4105,22 +4131,8 @@ fn decision_body(
     }
     let token = token.ok_or("a charged approval has no token")?;
     let window = window.as_ref().ok_or("a charged approval has no window")?;
-    // The card link is the configured Payment Link with this application's
-    // reference appended. The reference is the status token, which is the
-    // identifier the approval already carries; Stripe returns it on the session
-    // so `checkout.session.completed` can name the application without a store
-    // of its own. A placeholder that reached the box is refused here rather than
-    // mailed, because a member cannot pay at REPLACE_ME.
     let card_link = if rail == "card" {
-        let link = cfg.stripe_payment_link.trim_end_matches(['&', '?']);
-        if link.is_empty() || link.contains("REPLACE_ME") {
-            return Err(
-                "stripe_payment_link is not configured, so a card approval has no link to send"
-                    .to_string(),
-            );
-        }
-        let joiner = if link.contains('?') { '&' } else { '?' };
-        Some(format!("{link}{joiner}client_reference_id={token}"))
+        card_link(&cfg.stripe_payment_link, token)?
     } else {
         None
     };
@@ -4238,9 +4250,11 @@ pub async fn stripe_webhooks(cfg: &DrainConfig, store: &Store) -> Result<(), Str
                 remove_webhook(store, id).await?;
                 continue;
             }
-            if !object_id.is_empty() && seen.contains(&format!("{kind}:{object_id}")) {
-                remove_webhook(store, id).await?;
-                continue;
+            if let Some(pair) = invoice_pair(kind, object_id) {
+                if seen.contains(&pair) {
+                    remove_webhook(store, id).await?;
+                    continue;
+                }
             }
             match settle_event(cfg, store, kind, &event).await {
                 Ok(Settled::Applied) => {
@@ -4254,8 +4268,8 @@ pub async fn stripe_webhooks(cfg: &DrainConfig, store: &Store) -> Result<(), Str
                         .map_err(|e| format!("cannot encode the processed event: {e}"))?;
                     store.append("webhooks/processed.jsonl", &bytes).await?;
                     seen.insert(format!("event:{event_id}"));
-                    if !object_id.is_empty() {
-                        seen.insert(format!("{kind}:{object_id}"));
+                    if let Some(pair) = invoice_pair(kind, object_id) {
+                        seen.insert(pair);
                     }
                     remove_webhook(store, id).await?;
                 }
@@ -4330,6 +4344,14 @@ async fn remove_webhook(store: &Store, id: &str) -> Result<(), String> {
     store.remove("webhooks", &format!("{id}.sig")).await
 }
 
+/// The one pair key the dedup uses: an invoice is one payment, so a second
+/// `invoice.paid` for the same invoice (with a fresh event id) settles nothing.
+/// Every other event type is deduplicated on its id alone: one subscription's
+/// `updated` arrives many times, and each one is a state to record.
+fn invoice_pair(kind: &str, object: &str) -> Option<String> {
+    (kind == "invoice.paid" && !object.is_empty()).then(|| format!("invoice.paid:{object}"))
+}
+
 /// The event ids and `(type, object)` pairs already settled. One append-only
 /// record, so a resend sees what an earlier pass did.
 async fn processed_events(store: &Store) -> HashSet<String> {
@@ -4345,8 +4367,8 @@ async fn processed_events(store: &Store) -> HashSet<String> {
             value.get("type").and_then(Value::as_str),
             value.get("object").and_then(Value::as_str),
         ) {
-            if !object.is_empty() {
-                seen.insert(format!("{kind}:{object}"));
+            if let Some(pair) = invoice_pair(kind, object) {
+                seen.insert(pair);
             }
         }
     }
@@ -4514,9 +4536,6 @@ async fn target_for_subscription(
     Ok(None)
 }
 
-/// Settle one verified event. `true` means there was something of ours to apply
-/// and the caller records the event; `false` means the event names no account of
-/// this platform and nothing was written.
 /// What settling one event did. `Deferred` leaves the pair in `webhooks/` for
 /// the next pass, because the account it names is not attached yet.
 enum Settled {
@@ -4537,23 +4556,103 @@ async fn settle_event(
     match kind {
         "checkout.session.completed" => checkout_completed(store, object).await,
         "invoice.paid" => invoice_paid(cfg, store, object).await,
-        "invoice.payment_failed" => invoice_payment_failed(cfg, store, object).await,
+        "invoice.payment_failed" => invoice_payment_failed(store, object).await,
+        "invoice.payment_action_required" => {
+            invoice_payment_action_required(cfg, store, object).await
+        }
         "customer.subscription.updated" | "customer.subscription.deleted" => {
             subscription_changed(store, object, kind == "customer.subscription.deleted").await
         }
-        "invoice.upcoming" => invoice_upcoming(cfg, store, object).await,
+        "invoice.upcoming" => invoice_upcoming(store, object).await,
         // Everything else the endpoint is not subscribed to. A verified event of
         // an unknown type is not an error; it is simply not ours.
         _ => Ok(Settled::Ignored),
     }
 }
 
-/// `checkout.session.completed`: the application's `client_reference_id` names
-/// the account, and the subscription and customer are attached to it. This is
-/// the only thing the event does: `invoice.paid` owns the date, so a first
+/// The account a payment token names, through the index the credit path uses:
+/// `tokens/<ref>.json` → username → `accounts/<username>/account.json`. Only a
+/// card account's own token resolves; anything else, including a status token
+/// or a token whose record names another token, is not a reference this rail
+/// answers. The account must carry a payment block, because a free approval has
+/// nothing to settle.
+async fn account_for_payment_reference(
+    store: &Store,
+    reference: &str,
+) -> Result<Option<Account>, String> {
+    if !store::is_payment_token(reference) {
+        return Ok(None);
+    }
+    let Some(join_text) = store
+        .read_record("tokens", &format!("{reference}.json"))
+        .await
+    else {
+        return Ok(None);
+    };
+    let Ok(join) = serde_json::from_str::<TokenRecord>(&join_text) else {
+        return Ok(None);
+    };
+    if join.token != reference || validate::username_shape(&join.username).is_some() {
+        return Ok(None);
+    }
+    let Some(text) = store
+        .read_record(&format!("accounts/{}", join.username), "account.json")
+        .await
+    else {
+        return Ok(None);
+    };
+    let Ok(account) = serde_json::from_str::<Account>(&text) else {
+        return Ok(None);
+    };
+    let Some(payment) = account.payment_state() else {
+        return Ok(None);
+    };
+    if account.rail != "card"
+        || account.no_charge
+        || payment.token_ref.as_deref() != Some(reference)
+    {
+        return Ok(None);
+    }
+    Ok(Some(account))
+}
+
+/// Write an account's record back after the webhook pass changed its payment
+/// block.
+async fn write_account(store: &Store, account: &Account) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(account)
+        .map_err(|e| format!("cannot encode the account: {e}"))?;
+    store
+        .write_record(
+            &format!("accounts/{}", account.username),
+            "account.json",
+            &bytes,
+        )
+        .await
+}
+
+/// Attach a subscription and its customer to an account, which is all a
+/// checkout does. The date stays `invoice.paid`'s to set.
+async fn attach_subscription(
+    store: &Store,
+    account: &mut Account,
+    subscription: &str,
+    customer: Option<&str>,
+) -> Result<(), String> {
+    let payment = account
+        .payment
+        .as_mut()
+        .ok_or("the account has no payment block")?;
+    payment.stripe.subscription = Some(subscription.to_string());
+    payment.stripe.customer = customer.map(str::to_string);
+    write_account(store, account).await
+}
+
+/// `checkout.session.completed`: the `client_reference_id` is the account's
+/// `KYR-` token, and the subscription and customer are attached to the account
+/// it indexes. Nothing else happens: `invoice.paid` owns the date, so a first
 /// payment extends exactly one year and never two.
 async fn checkout_completed(store: &Store, object: &Value) -> Result<Settled, String> {
-    let Some(token) = object
+    let Some(reference) = object
         .get("client_reference_id")
         .and_then(Value::as_str)
         .filter(|t| !t.is_empty())
@@ -4563,32 +4662,11 @@ async fn checkout_completed(store: &Store, object: &Value) -> Result<Settled, St
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
-    if !store::is_status_token(token) {
-        return Ok(Settled::Ignored);
-    }
-    let Some(text) = store
-        .read_record("applications", &format!("{token}.json"))
-        .await
-    else {
-        return Ok(Settled::Ignored);
-    };
-    let record: Record = serde_json::from_str(&text)
-        .map_err(|e| format!("the application {token} does not parse: {e}"))?;
-    if record.rail != "card" {
-        return Ok(Settled::Ignored);
-    }
-    let target = match &record.domain {
-        Some(domain) => TargetRef::Group(domain.clone()),
-        None => TargetRef::Account(record.username.clone()),
-    };
-    let Some(mut billing) = load_target(store, &target).await? else {
+    let Some(mut account) = account_for_payment_reference(store, reference).await? else {
         return Ok(Settled::Ignored);
     };
     let customer = object.get("customer").and_then(Value::as_str);
-    let stripe = billing.stripe_mut();
-    stripe.subscription = Some(subscription.to_string());
-    stripe.customer = customer.map(str::to_string);
-    billing.save(store).await?;
+    attach_subscription(store, &mut account, subscription, customer).await?;
     Ok(Settled::Applied)
 }
 
@@ -4601,18 +4679,14 @@ async fn invoice_paid(cfg: &DrainConfig, store: &Store, object: &Value) -> Resul
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
-    let Some(target) = target_for_subscription(store, subscription).await? else {
-        return Ok(Settled::Deferred);
-    };
     let Some(invoice) = object.get("id").and_then(Value::as_str) else {
-        return Ok(Settled::Ignored);
-    };
-    let Some(mut billing) = load_target(store, &target).await? else {
         return Ok(Settled::Ignored);
     };
     // The API, not the event: a paid invoice does not prove an active
     // subscription. An unreachable API is an error, which leaves the event for
-    // the next pass rather than extending the date on trust.
+    // the next pass rather than extending the date on trust. The same answer is
+    // the repair path: a missed checkout leaves the subscription naming its
+    // account in metadata, and that is how the attachment is made here.
     let subscription_json = retrieve_subscription(cfg, subscription).await?;
     let status = subscription_json
         .get("status")
@@ -4620,6 +4694,24 @@ async fn invoice_paid(cfg: &DrainConfig, store: &Store, object: &Value) -> Resul
         .unwrap_or("");
     let period_end = period_end(&subscription_json);
     let customer = subscription_json.get("customer").and_then(Value::as_str);
+    let target = match target_for_subscription(store, subscription).await? {
+        Some(target) => target,
+        None => {
+            let reference = subscription_json
+                .pointer("/metadata/client_reference_id")
+                .or_else(|| subscription_json.pointer("/metadata/kyriakon_application"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let Some(mut account) = account_for_payment_reference(store, reference).await? else {
+                return Ok(Settled::Deferred);
+            };
+            attach_subscription(store, &mut account, subscription, customer).await?;
+            TargetRef::Account(account.username.clone())
+        }
+    };
+    let Some(mut billing) = load_target(store, &target).await? else {
+        return Ok(Settled::Ignored);
+    };
     {
         let stripe = billing.stripe_mut();
         stripe.status = Some(status.to_string());
@@ -4644,7 +4736,7 @@ async fn invoice_paid(cfg: &DrainConfig, store: &Store, object: &Value) -> Resul
     billing.save(store).await?;
     if let BillingTarget::Account(account) = &billing {
         if let Some(payment) = &account.payment {
-            sync_application_payment(store, &account.username, payment).await?;
+            write_payment_copy(store, &account.username, payment).await?;
         }
     }
     Ok(Settled::Applied)
@@ -4673,13 +4765,10 @@ async fn retrieve_subscription(cfg: &DrainConfig, subscription: &str) -> Result<
 }
 
 /// `invoice.payment_failed`: record the attempt and the next retry on the
-/// account, and tell the member. The date does not move: access is the paid
-/// date's, not a failed attempt's.
-async fn invoice_payment_failed(
-    cfg: &DrainConfig,
-    store: &Store,
-    object: &Value,
-) -> Result<Settled, String> {
+/// account, and nothing else. Stripe's own dunning email is the member's copy;
+/// a platform copy would be a second mail about one failed attempt. The date
+/// does not move: access is the paid date's, not a failed attempt's.
+async fn invoice_payment_failed(store: &Store, object: &Value) -> Result<Settled, String> {
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
@@ -4697,32 +4786,58 @@ async fn invoice_payment_failed(
     {
         let stripe = billing.stripe_mut();
         stripe.failed_attempts = attempts.min(u64::from(u32::MAX)) as u32;
-        stripe.next_payment_attempt = next.clone();
+        stripe.next_payment_attempt = next;
     }
     billing.save(store).await?;
+    Ok(Settled::Applied)
+}
+
+/// `invoice.payment_action_required`: the one card event the member must act
+/// on, because the bank is waiting for authentication and no retry can settle
+/// it. The attempt is recorded and one notice asks them to complete it.
+async fn invoice_payment_action_required(
+    cfg: &DrainConfig,
+    store: &Store,
+    object: &Value,
+) -> Result<Settled, String> {
+    let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
+        return Ok(Settled::Ignored);
+    };
+    let Some(target) = target_for_subscription(store, subscription).await? else {
+        return Ok(Settled::Deferred);
+    };
+    let Some(mut billing) = load_target(store, &target).await? else {
+        return Ok(Settled::Ignored);
+    };
     let invoice = object
         .get("id")
         .and_then(Value::as_str)
         .unwrap_or("an invoice");
-    let when = next
-        .as_deref()
-        .map(|date| format!("\n\nStripe will try again on {date}."))
-        .unwrap_or_default();
-    let body = format!(
-        "A card payment for your membership did not go through. Nothing has been \
-         deleted and your access has not changed.{when}\n\n\
-         Invoice: {invoice}\n\
-         Attempts: {attempts}\n\n\
-         If the card has expired, paying again at the link in your approval email \
-         updates it.\n"
-    );
+    let attempts = object
+        .get("attempt_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::from(billing.stripe().failed_attempts) + 1);
+    {
+        let stripe = billing.stripe_mut();
+        stripe.failed_attempts = attempts.min(u64::from(u32::MAX)) as u32;
+        stripe.next_payment_attempt = object.get("next_payment_attempt").and_then(stamp);
+    }
+    billing.save(store).await?;
     let owner = billing.notice_owner();
+    let body = format!(
+        "A card payment for your membership needs you to complete it: the bank has \
+         asked for authentication and will not settle it on its own. Open the link in \
+         your approval email and complete the payment there. Nothing has been deleted \
+         and your access has not changed.\n\n\
+         Invoice: {invoice}\n\
+         Attempts so far: {attempts}\n"
+    );
     notice::send_account_notice(
         cfg,
         store,
         &owner,
-        "payment.failed",
-        &format!("A card payment did not go through ({invoice}, attempt {attempts})"),
+        "payment.action-required",
+        &format!("Complete your card payment ({invoice})"),
         &billing.recipient(store).await,
         &body,
     )
@@ -4772,44 +4887,21 @@ async fn subscription_changed(
     Ok(Settled::Applied)
 }
 
-/// `invoice.upcoming`: the annual reminder. Recorded as a notice, with no date
-/// change; Stripe sends its own copy, and this is the platform's record that the
-/// renewal is near.
-async fn invoice_upcoming(
-    cfg: &DrainConfig,
-    store: &Store,
-    object: &Value,
-) -> Result<Settled, String> {
+/// `invoice.upcoming`: record the period end the upcoming invoice names. Stripe
+/// sends the annual reminder itself, with its own copy, so the platform sends
+/// none; this event is a state fact and nothing more.
+async fn invoice_upcoming(store: &Store, object: &Value) -> Result<Settled, String> {
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
     let Some(target) = target_for_subscription(store, subscription).await? else {
         return Ok(Settled::Deferred);
     };
-    let Some(billing) = load_target(store, &target).await? else {
+    let Some(mut billing) = load_target(store, &target).await? else {
         return Ok(Settled::Ignored);
     };
-    let period_end = period_end(object).unwrap_or_else(|| "the period's end".to_string());
-    let username = match &billing {
-        BillingTarget::Account(a) => a.username.clone(),
-        BillingTarget::Group(g) => g.site_owner.clone(),
-    };
-    let body = format!(
-        "Your yearly membership renews at the end of {period_end}. Stripe will charge \
-         the card it holds and send its own receipt; this note is the platform's \
-         record that the renewal is near. Nothing is needed from you unless the card \
-         has changed.\n"
-    );
-    notice::send_account_notice(
-        cfg,
-        store,
-        &username,
-        "renewal.upcoming",
-        &format!("Your yearly membership renews soon ({username})"),
-        &billing.recipient(store).await,
-        &body,
-    )
-    .await?;
+    billing.stripe_mut().current_period_end = period_end(object);
+    billing.save(store).await?;
     Ok(Settled::Applied)
 }
 
@@ -4835,48 +4927,6 @@ fn period_end(value: &Value) -> Option<String> {
                 .pointer("/items/data/0/current_period_end")
                 .and_then(stamp)
         })
-}
-
-/// Write the account's payment block into the application copy the status page
-/// renders, when that record is still there. The handler is unprivileged and
-/// cannot read the root-owned account, so this copy is how a member sees a paid
-/// date on the status page.
-async fn sync_application_payment(
-    store: &Store,
-    username: &str,
-    payment: &Payment,
-) -> Result<(), String> {
-    let Some(copy) = store
-        .read_record(&format!("accounts/{username}"), "application.json")
-        .await
-    else {
-        return Ok(());
-    };
-    let Ok(mut value) = serde_json::from_str::<Value>(&copy) else {
-        return Ok(());
-    };
-    let Some(token) = value
-        .get("status_token")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    else {
-        return Ok(());
-    };
-    if store
-        .read_record("applications", &format!("{token}.json"))
-        .await
-        .is_none()
-    {
-        return Ok(());
-    }
-    value["payment"] = serde_json::to_value(payment)
-        .map_err(|e| format!("cannot encode the payment block: {e}"))?;
-    let bytes = serde_json::to_vec_pretty(&value)
-        .map_err(|e| format!("cannot encode the application copy: {e}"))?;
-    let owner = store.dir_owner("applications");
-    store
-        .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
-        .await
 }
 
 fn decline_body(record: &Record) -> String {

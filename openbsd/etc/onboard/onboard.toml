@@ -69,6 +69,12 @@ dmarc_rua = "mailto:dmarc@kyriakon.net"
 price_gbp = "REPLACE_ME"
 postal_address = "REPLACE_ME"
 
+# The card rail's Payment Link, the same one the drain appends each account's
+# token to. The handler holds it so the account and status pages show the link
+# rather than promising one in a later message. It is public and substituted at
+# deploy from /root/.kyriakon-env.
+stripe_payment_link = "REPLACE_ME"
+
 # The unix sockets the front-ends reach the responder on. There is no listener on
 # a port: the service is a FastCGI responder, and both httpd and gmid resolve a
 # FastCGI socket path inside their own chroot, which is /home/www for each of

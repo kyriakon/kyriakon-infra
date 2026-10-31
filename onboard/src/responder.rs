@@ -1112,13 +1112,16 @@ async fn webhook(app: &App, request: &Request) -> Reply {
         return Reply::html(413, String::new());
     }
     let id = ulid::Ulid::new().to_string();
+    // The signature is written before the body. The drain iterates `.body`
+    // files, so the other order leaves a body with no signature for a window,
+    // which it would refuse and delete: a delivery Stripe will not send again.
     let placed = async {
         app.store.ensure_dir("webhooks").await?;
         app.store
-            .write_record("webhooks", &format!("{id}.body"), &request.body)
+            .write_record("webhooks", &format!("{id}.sig"), signature.as_bytes())
             .await?;
         app.store
-            .write_record("webhooks", &format!("{id}.sig"), signature.as_bytes())
+            .write_record("webhooks", &format!("{id}.body"), &request.body)
             .await
     }
     .await;
@@ -1181,6 +1184,7 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
                         &block,
                         &app.cfg.price_gbp,
                         &app.cfg.postal_address,
+                        card_link(app, block.token_ref.as_deref()).as_deref(),
                         OffsetDateTime::now_utc(),
                     )
                 });
@@ -1734,6 +1738,7 @@ async fn account(app: &App, request: &Request) -> Reply {
                 &block,
                 &app.cfg.price_gbp,
                 &app.cfg.postal_address,
+                card_link(app, block.token_ref.as_deref()).as_deref(),
                 OffsetDateTime::now_utc(),
             )
         })
@@ -1918,14 +1923,26 @@ async fn status(app: &App, token: &str) -> Reply {
 /// none. A free approval carries none anywhere.
 fn payment_for(app: &App, record: Option<&Record>) -> Option<page::PaymentView> {
     let record = record?;
+    let payment = record.payment.as_ref()?;
     Some(page::payment(
         "active",
         &record.rail,
-        record.payment.as_ref()?,
+        payment,
         &app.cfg.price_gbp,
         &app.cfg.postal_address,
+        card_link(app, payment.token_ref.as_deref()).as_deref(),
         OffsetDateTime::now_utc(),
     ))
+}
+
+/// The card rail's Payment Link for a page, or `None` when the rail is not card,
+/// there is no token yet, or the box's link is unconfigured. A page is not the
+/// place to refuse an approval for a placeholder: the approval email already
+/// does, and the page simply shows no link rather than a broken one.
+fn card_link(app: &App, token: Option<&str>) -> Option<String> {
+    transitions::card_link(&app.cfg.stripe_payment_link, token?)
+        .ok()
+        .flatten()
 }
 
 /// The decision a link names, with the signature it carries. A link with no

@@ -80,6 +80,10 @@ pub struct Config {
     /// repository is public.
     pub price_gbp: String,
     pub postal_address: String,
+    /// The card rail's Payment Link. It is public (a member is sent it), so the
+    /// handler may hold it to render the same link the approval email carries.
+    /// `REPLACE_ME` in the repository and substituted at deploy with the rest.
+    pub stripe_payment_link: String,
 }
 
 impl Config {
@@ -234,7 +238,8 @@ mod tests {
              dmarc_rua = \"mailto:dmarc@kyriakon.net\"\n\
              release = \"REPLACE_ME\"\n\
              price_gbp = \"20.00\"\n\
-             postal_address = \"REPLACE_ME\"\n",
+             postal_address = \"REPLACE_ME\"\n\
+             stripe_payment_link = \"REPLACE_ME\"\n",
         )
         .unwrap();
         assert_eq!(c.pages, "/var/db/onboard/pages");
@@ -380,6 +385,7 @@ mod tests {
         assert_eq!(c.ipv6, "REPLACE_ME_IPV6");
         assert_eq!(c.dkim_selector, "REPLACE_ME");
         assert_eq!(c.dkim_public_key, "REPLACE_ME");
+        assert_eq!(c.stripe_payment_link, "REPLACE_ME");
         assert!(crate::dns::Values::from(&c).check().is_err());
     }
 }

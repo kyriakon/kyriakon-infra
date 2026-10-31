@@ -315,6 +315,17 @@ impl Fix {
         );
     }
 
+    /// The same subscription with the metadata the Payment Link stamps on it,
+    /// which is the repair path for a missed checkout.
+    fn stripe_subscription_with_metadata(&self, status: &str, period_end: i64, reference: &str) {
+        self.script(
+            "stripe-api.sh",
+            &format!(
+                "#!/bin/sh\ncat <<'JSON'\n{{\"id\":\"{SUBSCRIPTION}\",\"status\":\"{status}\",\"current_period_end\":{period_end},\"customer\":\"cus_example\",\"metadata\":{{\"client_reference_id\":\"{reference}\"}}}}\nJSON\n"
+            ),
+        );
+    }
+
     /// An API the drain cannot reach, which must leave the event for the next
     /// pass rather than extend the date on trust.
     fn stripe_unreachable(&self) {
@@ -365,6 +376,21 @@ impl Fix {
     fn card_account(&self, username: &str, paid_until: Option<&str>) {
         let dir = self.dir.join("store/accounts").join(username);
         std::fs::create_dir_all(&dir).unwrap();
+        let token = "KYR-AAAA-BBBB-CCCC";
+        let token_dir = self.dir.join("store/tokens");
+        std::fs::create_dir_all(&token_dir).unwrap();
+        std::fs::write(
+            token_dir.join(format!("{token}.json")),
+            serde_json::to_vec_pretty(&json!({
+                "token": token,
+                "username": username,
+                "issued_at": "2026-10-02T09:00:00Z",
+                "window_closes_at": "2026-10-16T09:00:00Z",
+                "state": "issued",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let account = json!({
             "version": 1,
             "username": username,
@@ -1645,7 +1671,15 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
 
     let view = |account: &store::Account| {
         let block = account.payment_state().expect("a paid approval's block");
-        page::payment(&account.state, &account.rail, &block, "20.00", post, now)
+        page::payment(
+            &account.state,
+            &account.rail,
+            &block,
+            "20.00",
+            post,
+            None,
+            now,
+        )
     };
 
     // The status page reads the copy the drain wrote into the application
@@ -1656,7 +1690,15 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
         .payment
         .clone()
         .expect("the drain copied the block onto the application");
-    let status_view = page::payment("active", &application.rail, &block, "20.00", post, now);
+    let status_view = page::payment(
+        "active",
+        &application.rail,
+        &block,
+        "20.00",
+        post,
+        None,
+        now,
+    );
     let status = responder::status_page(Some(application.clone()), Some(status_view), now);
     let html = status.render().unwrap();
     assert!(html.contains(&token), "{html}");
@@ -1719,7 +1761,15 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
     application["payment"]["window"]["state"] = json!("paid");
     let application: Record = serde_json::from_value(application).unwrap();
     let block = application.payment.clone().unwrap();
-    let paid = page::payment("active", &application.rail, &block, "20.00", post, now);
+    let paid = page::payment(
+        "active",
+        &application.rail,
+        &block,
+        "20.00",
+        post,
+        None,
+        now,
+    );
     let status = responder::status_page(Some(application), Some(paid), now);
     let html = status.render().unwrap();
     assert!(html.contains("Paid until 2027-10-04T00:00:00Z"), "{html}");
@@ -2257,7 +2307,15 @@ fn a_shortfall_is_shown_and_quoted_back_and_receipted() {
     let post = "1 Example Street, Example";
     let stored = stored_account(&fix, "secretary");
     let block = stored.payment_state().expect("a paid approval's block");
-    let view = page::payment(&stored.state, &stored.rail, &block, "20.00", post, now);
+    let view = page::payment(
+        &stored.state,
+        &stored.rail,
+        &block,
+        "20.00",
+        post,
+        None,
+        now,
+    );
     assert_eq!(view.amount, "5.00", "the page re-quotes the remainder");
     assert_eq!(view.balance.as_deref(), Some("15.00"));
 
@@ -2274,6 +2332,7 @@ fn a_shortfall_is_shown_and_quoted_back_and_receipted() {
         &capsule_block,
         "20.00",
         post,
+        None,
         now,
     );
     let gemtext = capsule::account(&stored, &[], None, Some(&capsule_view));
@@ -2287,7 +2346,15 @@ fn a_shortfall_is_shown_and_quoted_back_and_receipted() {
         .payment
         .clone()
         .expect("the drain copied the block onto the application");
-    let status_view = page::payment("active", &application.rail, &block, "20.00", post, now);
+    let status_view = page::payment(
+        "active",
+        &application.rail,
+        &block,
+        "20.00",
+        post,
+        None,
+        now,
+    );
     assert_eq!(status_view.amount, "5.00");
     let status = responder::status_page(Some(application), Some(status_view), now);
     let html = status.render().unwrap();
@@ -2557,6 +2624,7 @@ fn a_status_token_that_resolves_to_nothing_carries_no_payment() {
         &block,
         "20.00",
         "1 Example Street, Example",
+        None,
         now,
     );
 
@@ -6209,16 +6277,26 @@ fn a_first_payment_with_a_checkout_and_an_invoice_extends_one_year() {
         None,
         "approval opens a window"
     );
+    let token = fix.account("secretary")["payment"]["token_ref"]
+        .as_str()
+        .expect("a paid approval draws a token")
+        .to_string();
+    assert!(
+        fix.sent().contains(&format!("client_reference_id={token}")),
+        "the approval email keys the link to the account's token: {}",
+        fix.sent()
+    );
 
     // Both events of a first payment, the invoice filed first to prove the pass
-    // settles the checkout before it.
+    // settles the checkout before it. The reference is the account's `KYR-`
+    // token, which is what the approval email carried.
     fix.webhook("00-invoice", "invoice.paid", invoice("in_first_payment"));
     fix.webhook(
         "01-checkout",
         "checkout.session.completed",
         json!({
             "id": "cs_example",
-            "client_reference_id": TOKEN,
+            "client_reference_id": token,
             "subscription": SUBSCRIPTION,
             "customer": "cus_example",
         }),
@@ -6381,5 +6459,133 @@ fn a_valid_event_with_no_matching_application_writes_nothing() {
     assert!(
         fix.read("webhooks/processed.jsonl").is_empty(),
         "nothing of ours was settled"
+    );
+}
+
+/// A missed checkout is repaired from the subscription's metadata: the Payment
+/// Link stamps the account's token there, so `invoice.paid` can attach the
+/// subscription and set the date without a checkout event ever arriving.
+#[test]
+fn an_invoice_with_no_checkout_repairs_the_attachment_from_metadata() {
+    let fix = Fix::new("webhook-repair");
+    fix.card_account("secretary", None);
+    // The account exists with its token index, but no subscription yet: this is
+    // the state a delivery gap leaves.
+    let path = fix.dir.join("store/accounts/secretary/account.json");
+    let mut account: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    account["payment"]["stripe"]["subscription"] = Value::Null;
+    std::fs::write(&path, serde_json::to_vec_pretty(&account).unwrap()).unwrap();
+
+    fix.stripe_subscription_with_metadata("active", 1_790_000_000, "KYR-AAAA-BBBB-CCCC");
+    fix.webhook("evt_repair", "invoice.paid", invoice("in_repair"));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let account = fix.account("secretary");
+    assert!(
+        paid_until(&fix, "secretary").is_some(),
+        "the repaired attachment extends the date: {account}"
+    );
+    assert_eq!(
+        account["payment"]["stripe"]["subscription"], SUBSCRIPTION,
+        "the subscription is attached from metadata: {account}"
+    );
+}
+
+/// Only `invoice.paid` is deduplicated on its object. A second subscription
+/// update and a second failed attempt carry the same object and different event
+/// ids, and both are states to record.
+#[test]
+fn repeated_subscription_and_failure_events_are_each_applied() {
+    let fix = Fix::new("webhook-repeat");
+    fix.card_account("secretary", Some("2027-10-04T00:00:00Z"));
+
+    fix.webhook(
+        "evt_updated_1",
+        "customer.subscription.updated",
+        json!({"id": SUBSCRIPTION, "status": "past_due", "customer": "cus_example"}),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.account("secretary")["payment"]["stripe"]["status"],
+        "past_due"
+    );
+
+    fix.webhook(
+        "evt_updated_2",
+        "customer.subscription.updated",
+        json!({"id": SUBSCRIPTION, "status": "active", "customer": "cus_example"}),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.account("secretary")["payment"]["stripe"]["status"],
+        "active",
+        "the second update is applied"
+    );
+
+    fix.webhook(
+        "evt_failed_1",
+        "invoice.payment_failed",
+        json!({"id": "in_failed", "subscription": SUBSCRIPTION, "attempt_count": 1}),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.account("secretary")["payment"]["stripe"]["failed_attempts"],
+        1
+    );
+
+    fix.webhook(
+        "evt_failed_2",
+        "invoice.payment_failed",
+        json!({"id": "in_failed", "subscription": SUBSCRIPTION, "attempt_count": 2}),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.account("secretary")["payment"]["stripe"]["failed_attempts"],
+        2,
+        "the second failed attempt is recorded"
+    );
+}
+
+/// An authentication demand is the one card event the member must act on: the
+/// attempt is recorded and one notice asks them to finish the payment.
+#[test]
+fn payment_action_required_records_the_attempt_and_asks_once() {
+    let fix = Fix::new("webhook-action");
+    fix.card_account("secretary", None);
+
+    fix.webhook(
+        "evt_action",
+        "invoice.payment_action_required",
+        json!({
+            "id": "in_action",
+            "subscription": SUBSCRIPTION,
+            "attempt_count": 2,
+            "next_payment_attempt": Value::Null,
+        }),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["payment"]["stripe"]["failed_attempts"], 2,
+        "the attempt is recorded: {account}"
+    );
+    let notices = fix.read("accounts/secretary/notices.jsonl");
+    assert!(
+        notices.contains("payment.action-required"),
+        "the notice is recorded: {notices}"
+    );
+    assert!(
+        fix.sent()
+            .contains("Complete your card payment (in_action)"),
+        "the member is asked to act: {}",
+        fix.sent()
     );
 }

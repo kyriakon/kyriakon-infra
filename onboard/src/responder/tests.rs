@@ -73,6 +73,7 @@ fn handler_config(dir: &Path) -> config::Config {
         release: "2026-10-13 test".to_string(),
         price_gbp: "20.00".to_string(),
         postal_address: "1 Example Street, Example".to_string(),
+        stripe_payment_link: "https://buy.stripe.com/test_example".to_string(),
     }
 }
 
@@ -2161,4 +2162,73 @@ async fn a_webhook_that_is_not_a_signed_post_writes_nothing() {
         .map(|rd| rd.count())
         .unwrap_or(0);
     assert_eq!(written, 0, "a refused delivery writes no file");
+}
+
+/// The second checkbox is the immediate-supply request and the digital-content
+/// acknowledgement, recorded where the application already keeps acceptances.
+/// Ticking it adds the fourth entry; leaving it unticked adds nothing, so the
+/// record is the evidence of what the applicant actually agreed to.
+#[tokio::test]
+async fn the_second_checkbox_is_recorded_beside_the_documents() {
+    let (app, _dir) = handler("accept-supply").await;
+    let mut form: BTreeMap<String, String> = body_answers()
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    form.insert("accept_supply".to_string(), "yes".to_string());
+    let record = build_record(&app, &form, true, TOKEN, "web").unwrap();
+    let documents: Vec<&str> = record
+        .acceptances
+        .iter()
+        .map(|a| a.document.as_str())
+        .collect();
+    assert_eq!(
+        documents,
+        [
+            "terms",
+            "aup",
+            "privacy",
+            "immediate supply and the digital-content acknowledgement",
+        ],
+        "the second checkbox is recorded with the three documents"
+    );
+
+    form.remove("accept_supply");
+    let record = build_record(&app, &form, true, TOKEN, "web").unwrap();
+    assert_eq!(
+        record.acceptances.len(),
+        3,
+        "an unticked box records no acceptance"
+    );
+}
+
+/// The card pages show the same keyed Payment Link the approval email carried,
+/// rather than promising one in a later message. The status page and both
+/// account pages share this PaymentView, so one check covers the three.
+#[tokio::test]
+async fn the_card_pages_carry_the_keyed_payment_link() {
+    let (app, _dir) = handler("card-link").await;
+    let record: Record = serde_json::from_str(
+        r#"{"username":"secretary","status_token":"abcdefghjkmnpqrstvwxyz0123",
+            "filed_at":"2026-10-01T09:00:00Z","front_end":"web","stage":"decided",
+            "answers":{},"mail_keys":[],"rail":"card","no_charge":false,
+            "acceptances":[],"question_list":"2026-10-13 test",
+            "payment":{"token_ref":"KYR-AAAA-BBBB-CCCC",
+                       "token_issued_at":"2026-10-02T09:00:00Z","paid_until":null,
+                       "window":{"opened_at":"2026-10-02T09:00:00Z",
+                                 "closes_at":"2026-10-16T09:00:00Z",
+                                 "state":"open","extensions":0}}}"#,
+    )
+    .unwrap();
+    let view = payment_for(&app, Some(&record)).expect("a paid approval has a block");
+    let text = view.instructions.join("\n");
+    assert!(
+        text.contains("client_reference_id=KYR-AAAA-BBBB-CCCC"),
+        "the link is keyed to the account's token: {text}"
+    );
+    assert!(
+        text.contains("subscription_data[metadata][client_reference_id]=KYR-AAAA-BBBB-CCCC"),
+        "the link stamps the join for the repair path: {text}"
+    );
 }
