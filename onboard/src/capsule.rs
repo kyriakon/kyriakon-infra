@@ -114,9 +114,10 @@ pub fn front_page(list: &[Service], member: Option<&str>) -> String {
 pub fn acceptances(list: &[Question], release: &str) -> String {
     let mut out = String::from("# What you accept\n\n");
     out.push_str(
-        "When you apply, you accept three documents on one checkbox. A person reads every \
-         application, and the version of each document you accepted is recorded by date and \
-         short commit.\n\n",
+        "When you apply, you accept three documents on one checkbox, and on a second you \
+         ask us to start now and acknowledge that digital content is supplied immediately. \
+         A person reads every application, and the version of each document you accepted \
+         is recorded by date and short commit.\n\n",
     );
     for q in list.iter().filter(|q| q.kind == Kind::Acceptance) {
         out.push_str(&q.prompt);

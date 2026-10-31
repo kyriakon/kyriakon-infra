@@ -12,9 +12,10 @@
 # instance cannot silently pick up a different file.
 
 # The store root. The handler reads the two shared files below it and the
-# application records it renders, and writes intents/, applications/ and the
-# capsule's drafts/. webhooks/ has no writer yet: it is the payment webhook
-# store, a later ticket. It reads no secret and no other member's state.
+# application records it renders, and writes intents/, applications/, the
+# capsule's drafts/ and webhooks/ (a Stripe event's raw body and signature
+# header, verified and settled by the drain). It reads no secret and no other
+# member's state.
 store_root = "/var/db/onboard"
 
 # The reserved set and the service catalogue the front-ends share, both 0644 at

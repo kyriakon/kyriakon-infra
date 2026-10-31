@@ -33,6 +33,13 @@ const TXID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
 /// and the fixtures must be 0600 for it to be accepted at all.
 const KEY: &[u8] = b"the approval key\n";
 
+/// The fixture's Stripe signing secret, without the trailing newline
+/// `sign::read_key` strips from the file.
+const WEBHOOK_SECRET: &[u8] = b"the webhook secret";
+
+/// The subscription every card fixture attaches unless a test says otherwise.
+const SUBSCRIPTION: &str = "sub_example";
+
 /// A bare SSH public key line, the shape `provision-member.sh` accepts and what
 /// the upload key file it reads holds.
 const UPLOAD_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample secretary@example";
@@ -65,6 +72,20 @@ impl Fix {
         let fix = Fix { dir };
         std::fs::write(fix.path("key"), KEY).unwrap();
         std::fs::set_permissions(fix.path("key"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Stripe's webhook signing secret and the restricted API key, both
+        // root-only in the shape `sign::read_key` and the API script refuse to
+        // use otherwise.
+        std::fs::write(fix.path("stripe"), [WEBHOOK_SECRET, b"\n"].concat()).unwrap();
+        std::fs::write(
+            fix.path("stripe-key"),
+            b"rk_test_example_000000000
+",
+        )
+        .unwrap();
+        for file in ["stripe", "stripe-key"] {
+            std::fs::set_permissions(fix.path(file), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
         // The box's account list, empty to start: the drain reads it to tell its
         // own half-finished approval from somebody else's account.
         std::fs::write(fix.path("passwd"), "").unwrap();
@@ -136,6 +157,7 @@ impl Fix {
         // line, so a group with records is not an outage; a test that wants one
         // rewrites it with `resolver`.
         fix.resolver(None);
+        fix.stripe_subscription("active", 1_790_000_000);
         let cfg = format!(
             "store_root = \"{}\"\n\
              reserved = \"{}\"\n\
@@ -148,6 +170,8 @@ impl Fix {
              approval_key = \"{}\"\n\
              keyring_dir = \"{}\"\n\
              stripe_webhook_secret = \"{}/stripe\"\n\
+             stripe_api_key = \"{}/stripe-key\"\n\
+             stripe_payment_link = \"https://buy.stripe.com/test_example\"\n\
              keyring_publish_token = \"{}/keyring-token\"\n\
              reviewer = \"reviewer@example.invalid\"\n\
              from = \"kyriakon <hello@example.invalid>\"\n\
@@ -173,6 +197,7 @@ impl Fix {
             fix.path("dkim_domains"),
             fix.path("key"),
             fix.path("keyring"),
+            fix.dir.display(),
             fix.dir.display(),
             fix.dir.display(),
             fix.dir.display(),
@@ -276,6 +301,101 @@ impl Fix {
 
     fn config(&self) -> String {
         self.path("drain.toml")
+    }
+
+    /// The subscription the Stripe API stub answers with. `status` is what the
+    /// retrieval returns, which is the fact `invoice.paid` checks before it
+    /// extends anything.
+    fn stripe_subscription(&self, status: &str, period_end: i64) {
+        self.script(
+            "stripe-api.sh",
+            &format!(
+                "#!/bin/sh\ncat <<'JSON'\n{{\"id\":\"{SUBSCRIPTION}\",\"status\":\"{status}\",\"current_period_end\":{period_end},\"customer\":\"cus_example\"}}\nJSON\n"
+            ),
+        );
+    }
+
+    /// An API the drain cannot reach, which must leave the event for the next
+    /// pass rather than extend the date on trust.
+    fn stripe_unreachable(&self) {
+        self.script(
+            "stripe-api.sh",
+            "#!/bin/sh\necho 'cannot reach Stripe' >&2\nexit 1\n",
+        );
+    }
+
+    /// Deliver one event the way the handler stored it: the raw body and a
+    /// `Stripe-Signature` header over `t.` and that body, dated now.
+    fn webhook(&self, id: &str, kind: &str, object: Value) {
+        let event = json!({
+            "id": id,
+            "type": kind,
+            "created": OffsetDateTime::now_utc().unix_timestamp(),
+            "data": {"object": object},
+        });
+        let body = serde_json::to_vec(&event).unwrap();
+        let timestamp = OffsetDateTime::now_utc().unix_timestamp();
+        let mut payload = timestamp.to_string().into_bytes();
+        payload.push(b'.');
+        payload.extend_from_slice(&body);
+        let sig = sign::sign_bytes(WEBHOOK_SECRET, &payload).unwrap();
+        self.webhook_raw(id, &body, &format!("t={timestamp},v1={sig}"));
+    }
+
+    /// Deliver bytes and a signature header verbatim, for the refusals a valid
+    /// delivery cannot produce.
+    fn webhook_raw(&self, id: &str, body: &[u8], header: &str) {
+        let dir = self.dir.join("store/webhooks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{id}.body")), body).unwrap();
+        std::fs::write(dir.join(format!("{id}.sig")), header).unwrap();
+    }
+
+    /// The undecided deliveries left in `webhooks/`, which is the body and
+    /// signature pairs rather than the append-only processed record.
+    fn webhooks(&self) -> Vec<String> {
+        self.names("webhooks")
+            .into_iter()
+            .filter(|n| n.ends_with(".body") || n.ends_with(".sig"))
+            .collect()
+    }
+
+    /// A card account as an approval leaves it, with the subscription already
+    /// attached, for a test whose event is an invoice.
+    fn card_account(&self, username: &str, paid_until: Option<&str>) {
+        let dir = self.dir.join("store/accounts").join(username);
+        std::fs::create_dir_all(&dir).unwrap();
+        let account = json!({
+            "version": 1,
+            "username": username,
+            "state": "active",
+            "decision": "approve",
+            "decided_at": "2026-10-02T09:00:00Z",
+            "rail": "card",
+            "no_charge": false,
+            "created_at": "2026-10-02T09:00:00Z",
+            "payment": {
+                "token_ref": "KYR-AAAA-BBBB-CCCC",
+                "token_issued_at": "2026-10-02T09:00:00Z",
+                "paid_until": paid_until,
+                "window": {
+                    "opened_at": "2026-10-02T09:00:00Z",
+                    "closes_at": "2026-10-16T09:00:00Z",
+                    "state": "open",
+                    "extensions": 0
+                },
+                "stripe": {
+                    "subscription": SUBSCRIPTION,
+                    "customer": "cus_example",
+                    "status": "active"
+                }
+            }
+        });
+        std::fs::write(
+            dir.join("account.json"),
+            serde_json::to_vec_pretty(&account).unwrap(),
+        )
+        .unwrap();
     }
 
     /// Write the application record the handler would have written.
@@ -5970,5 +6090,296 @@ fn a_second_address_on_an_existing_mailbox_still_counts() {
         !fix.table("virtuals").contains("office@parish.example"),
         "{}",
         fix.table("virtuals")
+    );
+}
+
+// --- the card rail's webhooks ------------------------------------------------
+
+/// One invoice event's object, naming the fixture subscription.
+fn invoice(id: &str) -> Value {
+    json!({
+        "id": id,
+        "subscription": SUBSCRIPTION,
+        "customer": "cus_example",
+        "attempt_count": 1,
+    })
+}
+
+/// The date a paid card account holds, as the account record has it.
+fn paid_until(fix: &Fix, username: &str) -> Option<String> {
+    fix.account(username)["payment"]["paid_until"]
+        .as_str()
+        .map(str::to_string)
+}
+
+#[test]
+fn a_webhook_that_does_not_verify_leaves_the_store_untouched() {
+    let fix = Fix::new("webhook-verify");
+    fix.card_account("secretary", None);
+    let before = fix.account("secretary");
+
+    let event = json!({
+        "id": "evt_refused",
+        "type": "invoice.paid",
+        "data": {"object": invoice("in_refused")},
+    });
+    let bytes = serde_json::to_vec(&event).unwrap();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+
+    // No signature at all.
+    fix.webhook_raw("01-no-signature", &bytes, "");
+    // A signature that is not over this body.
+    fix.webhook_raw("02-wrong-signature", &bytes, &format!("t={now},v1=0000"));
+    // A correct signature whose timestamp is an hour old: a replay.
+    let stale = now - 3600;
+    let mut payload = stale.to_string().into_bytes();
+    payload.push(b'.');
+    payload.extend_from_slice(&bytes);
+    let sig = sign::sign_bytes(WEBHOOK_SECRET, &payload).unwrap();
+    fix.webhook_raw("03-stale", &bytes, &format!("t={stale},v1={sig}"));
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert_eq!(
+        fix.account("secretary"),
+        before,
+        "a refused webhook changes no record"
+    );
+    assert_eq!(paid_until(&fix, "secretary"), None);
+    assert!(
+        fix.webhooks().is_empty(),
+        "the refused pairs are cleared: {:?}",
+        fix.webhooks()
+    );
+    assert!(
+        fix.read("webhooks/processed.jsonl").is_empty(),
+        "a refused event is not recorded as settled"
+    );
+}
+
+#[test]
+fn a_replayed_event_id_or_invoice_extends_nothing() {
+    let fix = Fix::new("webhook-replay");
+    fix.card_account("secretary", None);
+
+    fix.webhook("evt_paid", "invoice.paid", invoice("in_first"));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let first = paid_until(&fix, "secretary").expect("the payment sets a date");
+    let account = fix.account("secretary");
+
+    // The same event id.
+    fix.webhook("evt_paid", "invoice.paid", invoice("in_first"));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.account("secretary"),
+        account,
+        "a replay changes nothing"
+    );
+
+    // A fresh event id carrying the same invoice: the (type, object) key sees
+    // that it is one payment.
+    fix.webhook("evt_paid_again", "invoice.paid", invoice("in_first"));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        paid_until(&fix, "secretary").as_deref(),
+        Some(first.as_str())
+    );
+    assert_eq!(
+        fix.read("webhooks/processed.jsonl").lines().count(),
+        1,
+        "one payment is recorded once"
+    );
+}
+
+#[test]
+fn a_first_payment_with_a_checkout_and_an_invoice_extends_one_year() {
+    let fix = Fix::new("webhook-first");
+    let record = fix.filed("secretary", "card", &[("rail", "card")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        paid_until(&fix, "secretary"),
+        None,
+        "approval opens a window"
+    );
+
+    // Both events of a first payment, the invoice filed first to prove the pass
+    // settles the checkout before it.
+    fix.webhook("00-invoice", "invoice.paid", invoice("in_first_payment"));
+    fix.webhook(
+        "01-checkout",
+        "checkout.session.completed",
+        json!({
+            "id": "cs_example",
+            "client_reference_id": TOKEN,
+            "subscription": SUBSCRIPTION,
+            "customer": "cus_example",
+        }),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let date = paid_until(&fix, "secretary").expect("the payment sets a date");
+    let expected =
+        kyriakon_onboard::billing::extend_paid_until(&kyriakon_onboard::util::filed_at(), None)
+            .unwrap();
+    assert_eq!(
+        &date[..10],
+        &expected[..10],
+        "one calendar year, not two: {date}"
+    );
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["payment"]["stripe"]["subscription"], SUBSCRIPTION,
+        "the checkout attached the subscription: {account}"
+    );
+    // The status page renders the application copy, so the date is there too.
+    let app: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    assert_eq!(app["payment"]["paid_until"], date);
+}
+
+#[test]
+fn cancel_at_period_end_keeps_the_period_and_deletion_revokes_nothing() {
+    let fix = Fix::new("webhook-cancel");
+    fix.card_account("secretary", Some("2027-10-04T00:00:00Z"));
+
+    fix.webhook(
+        "evt_updated",
+        "customer.subscription.updated",
+        json!({
+            "id": SUBSCRIPTION,
+            "status": "active",
+            "customer": "cus_example",
+            "current_period_end": 1_790_000_000,
+            "cancel_at_period_end": true,
+        }),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["payment"]["paid_until"], "2027-10-04T00:00:00Z",
+        "cancelling stops renewal and keeps the paid period: {account}"
+    );
+    assert_eq!(account["payment"]["stripe"]["status"], "active");
+
+    fix.webhook(
+        "evt_deleted",
+        "customer.subscription.deleted",
+        json!({
+            "id": SUBSCRIPTION,
+            "status": "canceled",
+            "customer": "cus_example",
+            "current_period_end": 1_790_000_000,
+        }),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["payment"]["paid_until"], "2027-10-04T00:00:00Z",
+        "deletion never revokes a paid date: {account}"
+    );
+    assert_eq!(account["payment"]["stripe"]["status"], "canceled");
+}
+
+#[test]
+fn past_due_with_a_future_date_keeps_access() {
+    let fix = Fix::new("webhook-past-due");
+    fix.card_account("secretary", Some("2027-10-04T00:00:00Z"));
+    fix.stripe_subscription("past_due", 1_790_000_000);
+
+    fix.webhook("evt_past_due", "invoice.paid", invoice("in_past_due"));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["payment"]["paid_until"], "2027-10-04T00:00:00Z",
+        "a paid invoice on a non-active subscription does not extend: {account}"
+    );
+    assert_eq!(
+        account["payment"]["stripe"]["status"], "past_due",
+        "the retrieval's status is recorded: {account}"
+    );
+    assert!(
+        fix.webhooks().is_empty(),
+        "the event is settled rather than retried: {:?}",
+        fix.webhooks()
+    );
+}
+
+#[test]
+fn an_invoice_waits_for_an_unreachable_api_and_extends_on_the_next_pass() {
+    let fix = Fix::new("webhook-retry");
+    fix.card_account("secretary", None);
+    fix.stripe_unreachable();
+
+    fix.webhook("evt_retry", "invoice.paid", invoice("in_retry"));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        paid_until(&fix, "secretary"),
+        None,
+        "the date is never extended on trust"
+    );
+    assert!(
+        fix.webhooks()
+            .iter()
+            .any(|n| n.starts_with("evt_retry.body")),
+        "the event is left for the next pass: {:?}",
+        fix.webhooks()
+    );
+
+    fix.stripe_subscription("active", 1_790_000_000);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        paid_until(&fix, "secretary").is_some(),
+        "the retry settles the payment"
+    );
+    assert!(fix.webhooks().is_empty(), "{:?}", fix.webhooks());
+}
+
+#[test]
+fn a_valid_event_with_no_matching_application_writes_nothing() {
+    let fix = Fix::new("webhook-unknown");
+    let before = fix.snapshot();
+
+    // A well-formed token that names no application.
+    fix.webhook(
+        "evt_unknown",
+        "checkout.session.completed",
+        json!({
+            "id": "cs_unknown",
+            "client_reference_id": "zzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "subscription": SUBSCRIPTION,
+            "customer": "cus_example",
+        }),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let after = fix.snapshot();
+    let touching: Vec<_> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|k| !k.starts_with("webhooks/"))
+        .filter(|k| !k.ends_with(".drain.lock"))
+        .filter(|k| before.get(*k) != after.get(*k))
+        .collect();
+    assert!(touching.is_empty(), "changed: {touching:?}");
+    assert!(fix.webhooks().is_empty(), "{:?}", fix.webhooks());
+    assert!(
+        fix.read("webhooks/processed.jsonl").is_empty(),
+        "nothing of ours was settled"
     );
 }

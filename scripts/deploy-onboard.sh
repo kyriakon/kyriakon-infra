@@ -183,6 +183,21 @@ case "${KYRIAKON_IPV4:-}" in
 	die "KYRIAKON_IPV4 is not set in $env_file; set the box's IPv4 there"
 	;;
 esac
+# The card rail's Payment Link, created in the Stripe dashboard. It is a live
+# object's URL, so it comes from the box's values file like the postal address
+# and is never a literal in this repository.
+case "${STRIPE_PAYMENT_LINK:-}" in
+"")
+	die "STRIPE_PAYMENT_LINK is not set in $env_file; add the Payment Link's URL from the Stripe dashboard"
+	;;
+*REPLACE_ME*)
+	die "STRIPE_PAYMENT_LINK in $env_file is still a placeholder; replace it with the Payment Link's URL"
+	;;
+esac
+# The URL is written into a TOML string, so its charset is bounded rather than
+# trusted: a quote or a newline from a paste would break the config.
+printf '%s' "$STRIPE_PAYMENT_LINK" | grep -Eq '^https://[A-Za-z0-9._~:/?#@!$&*+,;=%-]+$' ||
+	die "STRIPE_PAYMENT_LINK in $env_file is not a plain https URL"
 case "${KYRIAKON_IPV6:-}" in
 "" | *REPLACE_ME*)
 	die "KYRIAKON_IPV6 is not set in $env_file; set the box's IPv6 there"
@@ -271,9 +286,10 @@ mv "$onboard_candidate" /etc/onboard/onboard.toml
 # tracked template, substituted here; nothing is edited on the box.
 install -d -m 0700 -o root -g wheel /etc/kyriakon/onboard
 drain_candidate=$(mktemp /etc/kyriakon/onboard/.drain.toml.XXXXXX)
-RELEASE="$release" POSTAL="$POSTAL_ADDRESS" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
+RELEASE="$release" POSTAL="$POSTAL_ADDRESS" LINK="$STRIPE_PAYMENT_LINK" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
 	/^release[[:space:]]*=/ { print "release = \"" ENVIRON["RELEASE"] "\""; next }
 	/^postal_address[[:space:]]*=/ { print "postal_address = \"" ENVIRON["POSTAL"] "\""; next }
+	/^stripe_payment_link[[:space:]]*=/ { print "stripe_payment_link = \"" ENVIRON["LINK"] "\""; next }
 	/^ipv4[[:space:]]*=/ { print "ipv4 = \"" ENVIRON["IPV4"] "\""; next }
 	/^ipv6[[:space:]]*=/ { print "ipv6 = \"" ENVIRON["IPV6"] "\""; next }
 	/^dkim_selector[[:space:]]*=/ { print "dkim_selector = \"" ENVIRON["SELECTOR"] "\""; next }
@@ -287,6 +303,9 @@ awk -v want="release = \"$release\"" '$0 == want { found = 1 } END { exit !found
 awk -v want="postal_address = \"$POSTAL_ADDRESS\"" '$0 == want { found = 1 } END { exit !found }' \
 	"$drain_candidate" \
 	|| die "/etc/kyriakon/onboard/drain.toml does not name the postal address; it should have been substituted, not left as a placeholder"
+awk -v want="stripe_payment_link = \"$STRIPE_PAYMENT_LINK\"" '$0 == want { found = 1 } END { exit !found }' \
+	"$drain_candidate" \
+	|| die "/etc/kyriakon/onboard/drain.toml does not name the Payment Link; it should have been substituted, not left as a placeholder"
 if grep -q 'REPLACE_ME' "$drain_candidate"; then
 	die "/etc/kyriakon/onboard/drain.toml still carries a REPLACE_ME placeholder"
 fi

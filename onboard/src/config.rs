@@ -145,9 +145,18 @@ pub struct DrainConfig {
     /// Stripe's signing secret and the keyring publish token. The drain reads
     /// the token and hands its path to scripts/publish-mail-key.sh, which is
     /// what opens an approved member's key against the public repository. The
-    /// card rail is a later ticket and still reads nothing from its own file,
-    /// so the two stay named together in the one root-only home.
+    /// webhook pass reads the signing secret from the first file and the
+    /// restricted API key from the next, both root-only.
     pub stripe_webhook_secret: String,
+    /// The root-only restricted Stripe key the drain reads to retrieve one
+    /// subscription. The webhook path makes no Stripe writes, and the key is
+    /// passed to `scripts/stripe-api.sh` by path rather than read here.
+    pub stripe_api_key: String,
+    /// The Payment Link the card decision email carries, with
+    /// `client_reference_id` appended per application. A configuration value,
+    /// not a literal: the live link and a sandbox link differ, and the file is
+    /// deployed from the box's own environment.
+    pub stripe_payment_link: String,
     pub keyring_publish_token: String,
     /// The one reviewer the whole application is mailed to.
     pub reviewer: String,
@@ -304,6 +313,8 @@ mod tests {
              approval_key = \"/etc/kyriakon/onboard/approval-signing-key\"\n\
              keyring_dir = \"/etc/kyriakon/keys\"\n\
              stripe_webhook_secret = \"/etc/kyriakon/onboard/stripe-webhook-secret\"\n\
+             stripe_api_key = \"/etc/kyriakon/onboard/stripe-api-key\"\n\
+             stripe_payment_link = \"REPLACE_ME\"\n\
              keyring_publish_token = \"/etc/kyriakon/onboard/keyring-publish-token\"\n\
              reviewer = \"admin@kyriakon.net\"\n\
              from = \"kyriakon <hello@kyriakon.net>\"\n\

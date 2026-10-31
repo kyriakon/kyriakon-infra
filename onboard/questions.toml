@@ -223,3 +223,15 @@ prompt = "I accept the terms, the acceptable use policy and the privacy notice."
 type = "acceptance"
 branch = "all"
 required = true
+
+# The second checkbox. The terms' cancellation section says these are recorded
+# before payment: the express request to start now, and the acknowledgement that
+# digital content is supplied immediately and the right to cancel can be lost
+# once it is. One checkbox, because the member is asked to agree to the pair;
+# both are restated in the confirmation email.
+[[question]]
+id = "accept_supply"
+prompt = "I ask you to start now, and I acknowledge that digital content is supplied immediately and that the right to cancel can be lost once it is."
+type = "acceptance"
+branch = "all"
+required = true

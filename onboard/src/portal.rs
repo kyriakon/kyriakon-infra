@@ -1415,9 +1415,20 @@ mod tests {
         lines.extend(key.lines().map(str::to_string));
         lines.extend(after_key.iter().map(|line| (*line).to_string()));
         lines.extend(
-            ["", "no_charge", "", "layman", "", "", "", "yes", "yes"]
-                .into_iter()
-                .map(str::to_string),
+            [
+                "",
+                "no_charge",
+                "",
+                "layman",
+                "",
+                "",
+                "",
+                "yes",
+                "yes",
+                "yes",
+            ]
+            .into_iter()
+            .map(str::to_string),
         );
         lines
     }
@@ -1555,9 +1566,20 @@ mod tests {
         lines.push("back".to_string());
         lines.extend(KEY_BLOCK.lines().map(str::to_string));
         lines.extend(
-            ["", "no_charge", "", "layman", "", "", "", "yes", "yes"]
-                .into_iter()
-                .map(str::to_string),
+            [
+                "",
+                "no_charge",
+                "",
+                "layman",
+                "",
+                "",
+                "",
+                "yes",
+                "yes",
+                "yes",
+            ]
+            .into_iter()
+            .map(str::to_string),
         );
         let mut script = scripts(&lines);
         let mut files = Files::default();
@@ -1661,6 +1683,7 @@ mod tests {
                 "",
                 "yes",
                 "yes",
+                "yes",
             ]
             .into_iter()
             .map(str::to_string),
@@ -1727,6 +1750,7 @@ mod tests {
                     "",
                     "yes",
                     "yes",
+                    "yes",
                 ]
                 .into_iter()
                 .map(str::to_string),
@@ -1736,7 +1760,7 @@ mod tests {
         let mut files = Files::default();
         let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
         assert_eq!(left, Departure::Quit);
-        assert!(seen.contains("question 10 of 14"), "{seen}");
+        assert!(seen.contains("question 10 of 15"), "{seen}");
         assert_eq!(files.forms.len(), 1);
         assert_eq!(files.forms[0].get("orders").unwrap(), "monk");
         assert_eq!(
@@ -1963,6 +1987,7 @@ mod tests {
                 "",
                 "yes",
                 "yes",
+                "yes",
             ]
             .into_iter()
             .map(str::to_string),
@@ -1972,7 +1997,7 @@ mod tests {
         let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
         assert_eq!(left, Departure::Quit);
         assert!(
-            seen.contains("question 10 of 14"),
+            seen.contains("question 10 of 15"),
             "the monastic counter is not the branch's: {seen}"
         );
         assert!(

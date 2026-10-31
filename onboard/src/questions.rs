@@ -465,7 +465,7 @@ choices = [
     #[test]
     fn the_shipped_question_list_parses_in_display_order() {
         let list = shipped().unwrap();
-        assert_eq!(list.len(), 24);
+        assert_eq!(list.len(), 25);
 
         let ids: Vec<&str> = list.iter().map(|q| q.id.as_str()).collect();
         assert_eq!(
@@ -495,6 +495,7 @@ choices = [
                 "intended_use",
                 "anything_else",
                 "accept_terms",
+                "accept_supply",
             ]
         );
 

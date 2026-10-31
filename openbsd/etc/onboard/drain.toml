@@ -72,14 +72,21 @@ approval_key = "/etc/kyriakon/onboard/approval-signing-key"
 # deliver to the account, because the encryptor fails closed without it.
 keyring_dir = "/etc/kyriakon/keys"
 
-# Stripe's signing secret and the keyring publish token. The drain reads the
-# token and passes its path to scripts/publish-mail-key.sh, which opens an
-# approved member's key against the public repository; the card rail is a later
-# ticket and reads nothing from its own file yet. Both are named here so the one
-# root-only home for the service's secrets is fixed in one place rather than
-# invented per ticket.
+# Stripe's signing secret, the restricted API key and the keyring publish token.
+# The webhook pass verifies with the first and retrieves a subscription with the
+# second; neither is ever printed. The token's path goes to
+# scripts/publish-mail-key.sh, which opens an approved member's key against the
+# public repository. All three are named here so the one root-only home for the
+# service's secrets is fixed in one place rather than invented per ticket.
 stripe_webhook_secret = "/etc/kyriakon/onboard/stripe-webhook-secret"
+stripe_api_key = "/etc/kyriakon/onboard/stripe-api-key"
 keyring_publish_token = "/etc/kyriakon/onboard/keyring-publish-token"
+
+# The Payment Link the card decision email carries. It is the live link created
+# in the Stripe dashboard, with `client_reference_id` appended per application
+# by the drain. Substituted at deploy from /root/.kyriakon-env, because a
+# sandbox link and a live link differ and neither belongs as a literal here.
+stripe_payment_link = "REPLACE_ME"
 
 # The one reviewer the whole application is mailed to. Every answer, the
 # mail-key result, whether an upload key was supplied, the rail, the no-charge

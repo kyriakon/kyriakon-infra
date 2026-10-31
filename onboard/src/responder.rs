@@ -991,6 +991,13 @@ fn fields(raw: &str) -> BTreeMap<String, String> {
 /// The web front-end, which serves the pages the HTTP daemon served.
 async fn http(app: &App, request: &Request, incoming: &Incoming) -> Reply {
     let method = request.value("REQUEST_METHOD");
+    // The payment webhook is not this form and carries no Origin, so it is
+    // dispatched before the origin check and before the body is read as a form.
+    // The handler stores the raw bytes and the signature header and does no
+    // verification: the drain holds the secret and is the half that decides.
+    if incoming.path == "stripe/webhook" {
+        return webhook(app, request).await;
+    }
     // The origin check runs before a route is chosen, as the middleware in front
     // of the old HTTP daemon's router did: a POST from somewhere that is not this
     // form is refused for being that, whatever path it names.
@@ -1084,6 +1091,46 @@ async fn http(app: &App, request: &Request, incoming: &Incoming) -> Reply {
 
 fn method_not_allowed() -> Reply {
     Reply::html(405, String::new())
+}
+
+/// Store one Stripe delivery for the drain: the raw body and the
+/// `Stripe-Signature` header, under `webhooks/`, named by a ULID so the
+/// directory sorts by age. Nothing is verified here and no store record is
+/// written; the handler holds no secret. A non-POST or a request with no
+/// signature header is refused without writing, and a successful store answers
+/// 2xx at once so Stripe does not retry a delivery the drain has not settled
+/// yet.
+async fn webhook(app: &App, request: &Request) -> Reply {
+    if request.value("REQUEST_METHOD") != "POST" {
+        return method_not_allowed();
+    }
+    let signature = request.get("HTTP_STRIPE_SIGNATURE").unwrap_or("");
+    if signature.trim().is_empty() {
+        return Reply::html(400, String::new());
+    }
+    if request.body_too_large {
+        return Reply::html(413, String::new());
+    }
+    let id = ulid::Ulid::new().to_string();
+    let placed = async {
+        app.store.ensure_dir("webhooks").await?;
+        app.store
+            .write_record("webhooks", &format!("{id}.body"), &request.body)
+            .await?;
+        app.store
+            .write_record("webhooks", &format!("{id}.sig"), signature.as_bytes())
+            .await
+    }
+    .await;
+    match placed {
+        Ok(()) => Reply::html(200, String::new()),
+        Err(e) => {
+            // The front-end is mid-request, so the failure is answered rather
+            // than the connection dropped; Stripe retries a non-2xx.
+            eprintln!("kyriakon-onboard: cannot store a webhook: {e}");
+            Reply::html(500, String::new())
+        }
+    }
 }
 
 /// Whether a POST declares the encoding its body is read as. A browser always
@@ -2242,6 +2289,24 @@ fn build_record(
         .trim();
     let upload_key = (!upload.is_empty()).then(|| keycheck::upload_key(upload));
 
+    // The first checkbox records the three documents; the second records the
+    // request for immediate supply and the digital-content acknowledgement in
+    // the same list, so the confirmation email quotes both and nothing has a
+    // second home.
+    let mut acceptances: Vec<Acceptance> = capsule::ACCEPTED
+        .iter()
+        .map(|(document, _)| Acceptance {
+            document: (*document).to_string(),
+            version: app.cfg.release.clone(),
+        })
+        .collect();
+    if form.get("accept_supply").map(String::as_str) == Some("yes") {
+        acceptances.push(Acceptance {
+            document: "immediate supply and the digital-content acknowledgement".to_string(),
+            version: app.cfg.release.clone(),
+        });
+    }
+
     Ok(Record {
         username: form.get("username").cloned().unwrap_or_default(),
         status_token: token.to_string(),
@@ -2270,13 +2335,7 @@ fn build_record(
         // The drain writes this when it sends the confirmation, which is before
         // it files anything the handler sees.
         confirmation_at: None,
-        acceptances: capsule::ACCEPTED
-            .iter()
-            .map(|(document, _)| Acceptance {
-                document: (*document).to_string(),
-                version: app.cfg.release.clone(),
-            })
-            .collect(),
+        acceptances,
         question_list: app.cfg.release.clone(),
     })
 }
