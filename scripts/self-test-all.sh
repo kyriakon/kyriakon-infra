@@ -31,7 +31,6 @@ lib.sh
 add-user.sh
 backup.sh
 deploy-nsd.sh
-deploy-onboard.sh
 gen-finger-page.sh
 onboard-store.sh
 provision-member.sh
@@ -93,6 +92,7 @@ for file in "$here"/*.sh; do
 	fi
 	case "$name" in
 	deploy-mail.sh) args="$repo" ;;
+	deploy-onboard.sh) args="$repo" ;;
 	deploy-relayd.sh) args="$repo/openbsd/etc" ;;
 	*) args='' ;;
 	esac

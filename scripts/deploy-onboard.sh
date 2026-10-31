@@ -16,6 +16,7 @@
 # Runs ON the box as root:
 #
 #   doas ksh scripts/deploy-onboard.sh [repo_dir]
+#        ksh scripts/deploy-onboard.sh --self-test [repo_root]
 #
 # Three things this deliberately does not do.
 #
@@ -38,6 +39,72 @@
 set -euo pipefail
 
 script_dir=$(cd "$(dirname -- "$0")" && pwd)
+
+# --- self-test ---------------------------------------------------------------
+
+# The script names the drain's Rust invokes with `run_script(cfg, "…")` and its
+# two siblings, read from the source rather than a second list that can drift.
+drain_invoked() {
+	tr '\n' ' ' < "$1" \
+		| grep -oE '(run_script|run_script_tolerating|spawn_script)\([[:space:]]*cfg,[[:space:]]*"[^"]+"' \
+		| sed -E 's/.*"([^"]+)"/\1/' | sort -u
+}
+
+# The invoked names that drain_scripts does not install. A missing one is a
+# payment or an approval that fails on the box while every test here passes,
+# which is how stripe-api.sh reached a merge.
+missing_drain_scripts() { # <transitions.rs> <this script>
+	invoked=$(drain_invoked "$1")
+	installed=$(sed -n 's/^drain_scripts="\(.*\)"$/\1/p' "$2")
+	for name in $invoked; do
+		case " $installed " in
+		*" $name "*) ;;
+		*) printf '%s\n' "$name" ;;
+		esac
+	done
+}
+
+self_test() {
+	repo=${1:-$(cd "$script_dir/.." && pwd)}
+	transitions=$repo/onboard/src/transitions.rs
+	[ -f "$transitions" ] || {
+		printf 'self-test: %s is missing\n' "$transitions" >&2
+		exit 1
+	}
+	work=$(mktemp -d "${TMPDIR:-/tmp}/deploy-onboard.XXXXXX") || exit 1
+	trap 'rm -rf "$work"' EXIT
+
+	if missing=$(missing_drain_scripts "$transitions" "$script_dir/deploy-onboard.sh") \
+		&& [ -n "$missing" ]; then
+		printf 'self-test: the drain invokes scripts this deploy does not install:\n%s\n' \
+			"$missing" >&2
+		exit 1
+	fi
+
+	# The check has to see a missing name, or it proves nothing.
+	cp "$transitions" "$work/transitions.rs"
+	printf '\nfn fixture(cfg: &DrainConfig) { let _ = spawn_script(cfg, "not-installed.sh", &[]); }\n' \
+		>> "$work/transitions.rs"
+	if ! missing_drain_scripts "$work/transitions.rs" "$script_dir/deploy-onboard.sh" \
+		| grep -qx 'not-installed.sh'; then
+		printf 'self-test: the check did not see a missing script\n' >&2
+		exit 1
+	fi
+
+	printf 'self-test: ok\n'
+}
+
+case "${1:-}" in
+--self-test)
+	[ "$#" -le 2 ] || {
+		printf 'usage: ksh %s --self-test [repo_root]\n' "$0" >&2
+		exit 2
+	}
+	self_test "${2:-}"
+	exit 0
+	;;
+esac
+
 repo_dir="${1:-$(cd "$script_dir/.." && pwd)}"
 
 # The two configs below are written to a candidate and renamed. A write that
