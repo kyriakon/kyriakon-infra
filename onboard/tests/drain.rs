@@ -54,6 +54,11 @@ impl Fix {
             "store/applications",
             "store/mail/new",
             "bin",
+            "host/httpd.d",
+            "host/gmid.d",
+            "host/acme-client.d",
+            "host/ssl/private",
+            "host/queue/pending",
         ] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
@@ -99,6 +104,31 @@ impl Fix {
             "delete-user.sh",
             &format!(
                 "#!/bin/sh\necho \"delete-user.sh $*\" >> '{log}'\ngrep -v \"^$1:\" '{passwd}' > '{passwd}.del'\nmv '{passwd}.del' '{passwd}'\nrm -rf '{accounts}/'\"$1\"\n",
+            ),
+        );
+        // remove-group.sh is the host-file half of the removal: the fixture's
+        // stub does the same table and file removals against the fixture tree,
+        // so the drain's assertions see what the box would. The script's own
+        // self-test covers that logic in ksh.
+        let log = fix.path("scripts.log");
+        let mail_domains = fix.path("mail_domains");
+        let virtuals = fix.path("virtuals");
+        let dkim_domains = fix.path("dkim_domains");
+        let host = fix.dir.join("host").to_str().unwrap().to_string();
+        fix.script(
+            "remove-group.sh",
+            &format!(
+                "#!/bin/sh\n\
+                 echo \"remove-group.sh $*\" >> '{log}'\n\
+                 d=$1\n\
+                 for f in '{mail_domains}' '{dkim_domains}'; do\n\
+                 \tawk -v d=\"$d\" '$0 != d' \"$f\" > \"$f.new\" && mv \"$f.new\" \"$f\"\n\
+                 done\n\
+                 awk -v s=\"@$d\" -F: '{{ k = $1; gsub(/^[ \\t]+|[ \\t]+$/, \"\", k); if (length(k) >= length(s) && substr(k, length(k) - length(s) + 1) == s) next; print }}' '{virtuals}' > '{virtuals}.new' && mv '{virtuals}.new' '{virtuals}'\n\
+                 rm -f '{host}/httpd.d/'\"$d\"'.conf' '{host}/gmid.d/'\"$d\"'.conf' '{host}/acme-client.d/'\"$d\"'.conf'\n\
+                 rm -f '{host}/ssl/'\"$d\"'.fullchain.pem' '{host}/ssl/private/'\"$d\"'.key' '{host}/ssl/'\"$d\"'.crt'\n\
+                 rm -f '{host}/ssl/capsule-'\"$d\"'.cnf' '{host}/ssl/capsule-'\"$d\"'.crt' '{host}/ssl/private/capsule-'\"$d\"'.key'\n\
+                 rm -f '{host}/queue/pending/'\"$d\"\n",
             ),
         );
         fix.add_user_writes_passwd();
@@ -408,6 +438,52 @@ impl Fix {
             }),
         );
         id
+    }
+
+    /// Write one `remove-group` intent under `id`, signed the way the console
+    /// signs it.
+    fn write_remove_group(&self, id: &str, domain: &str) {
+        let sig = sign::sign(b"the approval key", &sign::group_remove_payload(domain)).unwrap();
+        self.write_intent(
+            id,
+            &json!({
+                "id": id,
+                "kind": "remove-group",
+                "filed_at": "2026-10-02T09:00:00Z",
+                "domain": domain,
+                "sig": sig,
+            }),
+        );
+    }
+
+    /// File one `remove-group` intent and hand back its id.
+    fn file_remove_group(&self, domain: &str) -> String {
+        let id = ulid();
+        self.write_remove_group(&id, domain);
+        id
+    }
+
+    /// One token index entry, as a paid approval writes it.
+    fn write_token(&self, name: &str, username: &str) {
+        std::fs::create_dir_all(self.dir.join("store/tokens")).unwrap();
+        let record = json!({
+            "token": name,
+            "username": username,
+            "issued_at": "2026-10-02T09:00:00Z",
+            "window_closes_at": "2026-10-16T09:00:00Z",
+            "state": "open",
+        });
+        std::fs::write(
+            self.dir.join("store/tokens").join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The fixture's stand-in for the box's host tree: the generated blocks,
+    /// the certificate material and the queue entry.
+    fn host(&self, rel: &str) -> PathBuf {
+        self.dir.join("host").join(rel)
     }
 
     /// A virtual table beside the store, as the drain left it.
@@ -5243,6 +5319,270 @@ fn the_eleventh_address_is_refused() {
         "a refused eleventh address began: {}",
         fix.journal()
     );
+}
+
+/// Removing a body's domain takes the whole name down: the mail tables, the
+/// generated blocks and certificate material the queue names, every account in
+/// the group, their token index entries and the group record. The ledger and an
+/// account outside the group are untouched.
+#[test]
+fn a_group_removal_takes_the_domain_down_and_closes_its_accounts() {
+    let fix = Fix::new("group-remove");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-secretary"),
+            ("warden", "parish-warden"),
+        ],
+        &["parish-secretary", "parish-warden"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+
+    // An account outside the group, with its own token and table line. A
+    // removal that swept the table by account rather than by domain would take
+    // it too.
+    let mut passwd = fix.passwd_file();
+    passwd.push_str("bob:x:1002:1002::/home/bob:/sbin/nologin\n");
+    std::fs::write(fix.path("passwd"), passwd).unwrap();
+    std::fs::create_dir_all(fix.dir.join("store/accounts/bob")).unwrap();
+    std::fs::write(
+        fix.dir.join("store/accounts/bob/account.json"),
+        serde_json::to_vec_pretty(&json!({"username": "bob", "state": "active"})).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(fix.dir.join("store/keys/bob.pub"), "ssh-ed25519 AAAA bob\n").unwrap();
+    fix.write_token("tokbob", "bob");
+    let mut virtuals = fix.table("virtuals");
+    virtuals.push_str("bob@kyriakon.net: bob\n");
+    std::fs::write(fix.path("virtuals"), virtuals).unwrap();
+    fix.write_token("toksecretary", "parish-secretary");
+    fix.write_token("tokwarden", "parish-warden");
+
+    // The generated blocks, the certificate material and the queued order, as
+    // the lanes and the queue would have left them, plus a second body's files
+    // that must survive.
+    for path in [
+        "httpd.d/parish.example.conf",
+        "gmid.d/parish.example.conf",
+        "acme-client.d/parish.example.conf",
+        "ssl/parish.example.fullchain.pem",
+        "ssl/parish.example.crt",
+        "ssl/private/parish.example.key",
+        "ssl/capsule-parish.example.cnf",
+        "ssl/capsule-parish.example.crt",
+        "ssl/private/capsule-parish.example.key",
+        "queue/pending/parish.example",
+        "httpd.d/other.example.conf",
+        "queue/pending/other.example",
+    ] {
+        std::fs::write(fix.host(path), b"generated\n").unwrap();
+    }
+    std::fs::create_dir_all(fix.dir.join("store/ledger")).unwrap();
+    let ledger = "{\"token\":\"toksecretary\",\"amount_gbp\":\"20.00\"}\n";
+    std::fs::write(fix.dir.join("store/ledger/payments.jsonl"), ledger).unwrap();
+
+    let id = fix.file_remove_group("parish.example");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.intents().is_empty(),
+        "{:?}\n{}",
+        fix.intents(),
+        fix.journal()
+    );
+    assert!(!fix.journal().contains("\"failed\""), "{}", fix.journal());
+
+    // The mail tables no longer name the domain, and the platform's own lines
+    // and the other account's address are still there.
+    let domains = fix.table("mail_domains");
+    assert!(!domains.lines().any(|l| l == "parish.example"), "{domains}");
+    assert!(domains.lines().any(|l| l == "kyriakon.net"), "{domains}");
+    let dkim = fix.table("dkim_domains");
+    assert!(!dkim.lines().any(|l| l == "parish.example"), "{dkim}");
+    assert!(dkim.lines().any(|l| l == "kyriakon.net"), "{dkim}");
+    let virtuals = fix.table("virtuals");
+    assert!(!virtuals.contains("parish.example"), "{virtuals}");
+    assert!(virtuals.contains("bob@kyriakon.net: bob"), "{virtuals}");
+
+    // The generated blocks and certificate material went, and the other body's
+    // stayed.
+    for path in [
+        "httpd.d/parish.example.conf",
+        "gmid.d/parish.example.conf",
+        "acme-client.d/parish.example.conf",
+        "ssl/parish.example.fullchain.pem",
+        "ssl/parish.example.crt",
+        "ssl/private/parish.example.key",
+        "ssl/capsule-parish.example.cnf",
+        "ssl/capsule-parish.example.crt",
+        "ssl/private/capsule-parish.example.key",
+        "queue/pending/parish.example",
+    ] {
+        assert!(!fix.host(path).exists(), "{path} was left");
+    }
+    assert!(fix.host("httpd.d/other.example.conf").exists());
+    assert!(fix.host("queue/pending/other.example").exists());
+
+    // Every account in the group closed: the box account, its stored key, its
+    // hold, its store record and its token. The account outside the group did
+    // not.
+    let passwd = fix.passwd_file();
+    assert!(!passwd.contains("parish-secretary:"), "{passwd}");
+    assert!(!passwd.contains("parish-warden:"), "{passwd}");
+    assert!(passwd.contains("bob:"), "{passwd}");
+    assert_eq!(fix.names("accounts"), vec!["bob"]);
+    assert!(!fix.dir.join("store/keys/parish-secretary.pub").exists());
+    assert!(!fix.dir.join("store/keys/parish-warden.pub").exists());
+    assert!(fix.dir.join("store/keys/bob.pub").exists());
+    assert_eq!(
+        fix.names("holds"),
+        vec!["parish-secretary.json", "parish-warden.json"]
+    );
+    assert_eq!(fix.names("tokens"), vec!["tokbob.json"]);
+
+    // The group record and its directory went; the ledger and the journal stay.
+    assert!(!fix.dir.join("store/groups/parish.example").exists());
+    assert_eq!(
+        std::fs::read_to_string(fix.dir.join("store/ledger/payments.jsonl")).unwrap(),
+        ledger
+    );
+    assert_eq!(
+        fix.journal()
+            .matches(&format!("\"intent\":\"{id}\""))
+            .count(),
+        2,
+        "the journal does not hold exactly the two lines: {}",
+        fix.journal()
+    );
+
+    // The host half runs before the pass that regenerates the indexes, and the
+    // accounts close after it, the order the deletion transition uses.
+    let log = fix.scripts_log();
+    let host_at = log.find("remove-group.sh parish.example").unwrap();
+    assert!(
+        log[host_at..].contains("cron-apply.sh --web"),
+        "the index pass did not follow the host removal: {log}"
+    );
+    assert!(
+        log[host_at..].contains("delete-user.sh parish-secretary")
+            && log[host_at..].contains("delete-user.sh parish-warden"),
+        "the accounts did not close after the host removal: {log}"
+    );
+}
+
+/// The same removal intent handed to the drain again changes nothing: no second
+/// journal line, no script run, and the store is byte for byte what it was.
+#[test]
+fn a_remove_group_intent_applied_twice_changes_nothing() {
+    let fix = Fix::new("group-remove-twice");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    fix.write_token("toksecretary", "parish-secretary");
+
+    let id = fix.file_remove_group("parish.example");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let store = fix.snapshot();
+    let log = fix.scripts_log();
+
+    // The file back, as a crash before the delete would leave it.
+    fix.write_remove_group(&id, "parish.example");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert_eq!(fix.snapshot(), store, "a replay changed the store");
+    assert_eq!(fix.scripts_log(), log, "a replay ran a script");
+    assert_eq!(
+        fix.journal()
+            .matches(&format!("\"intent\":\"{id}\""))
+            .count(),
+        2,
+        "a replay journaled again: {}",
+        fix.journal()
+    );
+}
+
+/// A removal for a domain with no group record is refused and changes nothing:
+/// no table line, no script, no account and no group.
+#[test]
+fn a_removal_for_a_domain_that_is_not_a_group_is_refused() {
+    let fix = Fix::new("group-remove-missing");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    let tables = (
+        fix.table("mail_domains"),
+        fix.table("dkim_domains"),
+        fix.table("virtuals"),
+    );
+    let accounts = fix.names("accounts");
+    let log = fix.scripts_log();
+
+    let id = fix.file_remove_group("other.example");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
+    assert!(
+        fix.failed_note()
+            .contains("there is no group for other.example"),
+        "{}",
+        fix.failed_note()
+    );
+    assert_eq!(
+        (
+            fix.table("mail_domains"),
+            fix.table("dkim_domains"),
+            fix.table("virtuals")
+        ),
+        tables,
+        "a refused removal changed a table"
+    );
+    assert_eq!(fix.names("accounts"), accounts);
+    assert_eq!(fix.scripts_log(), log, "a refused removal ran a script");
+    assert!(fix.dir.join("store/groups/parish.example").exists());
+}
+
+/// The console takes `group remove`, signs the domain, and refuses a name that
+/// could not be a body's domain before it files anything.
+#[test]
+fn the_console_files_a_group_removal_and_refuses_a_bad_domain() {
+    let fix = Fix::new("group-remove-console");
+
+    let out = fix.ctl(&["group", "remove", "Parish.Example"]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("lowercase"), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+
+    let out = fix.ctl(&["group", "remove", "parish.example"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let intents = fix.intents();
+    assert_eq!(intents.len(), 1, "{intents:?}");
+    let intent: Value =
+        serde_json::from_str(&fix.read(&format!("intents/{}", intents[0]))).unwrap();
+    assert_eq!(intent["kind"], "remove-group");
+    assert_eq!(intent["domain"], "parish.example");
+    let sig = intent["sig"].as_str().unwrap();
+    assert!(sign::verify(
+        b"the approval key",
+        &sign::group_remove_payload("parish.example"),
+        sig
+    ));
 }
 
 /// A departing site owner hands the upload key and the generated roots to a

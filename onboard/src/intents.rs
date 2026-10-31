@@ -90,6 +90,7 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
         }
         "provision-group" => transitions::provision_group(cfg, store, &value, file).await,
         "group-address" => transitions::group_address(cfg, store, key, &value, file).await,
+        "remove-group" => transitions::remove_group(cfg, store, key, &value, file).await,
         "token-resend" => {
             let intent: transitions::ResendIntent = serde_json::from_value(value)
                 .map_err(|e| format!("the token resend intent does not parse: {e}"))?;
@@ -162,6 +163,28 @@ pub async fn file_group_address(
         "mailbox": mailbox,
         "mail_key": mail_key,
         "site_owner": site_owner,
+        "sig": sig,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    Ok(id)
+}
+
+/// File one group removal, as `kyriakon-onboardctl group remove` does.
+///
+/// The signature is the console's, over `sign::group_remove_payload`, because
+/// the transition deletes every account in the body and `intents/` belongs to
+/// the unprivileged half.
+pub async fn file_remove_group(store: &Store, domain: &str, sig: &str) -> Result<String, String> {
+    let id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({
+        "id": id,
+        "kind": "remove-group",
+        "filed_at": crate::util::filed_at(),
+        "domain": domain,
         "sig": sig,
     });
     let bytes =

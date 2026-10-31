@@ -16,6 +16,7 @@
 //!   kyriakon-onboardctl [--config PATH] address --domain <domain> --action <change> \
 //!       --mailbox <account> [--address <localpart>] [--key-file <path>] \
 //!       [--site-owner <account>]
+//!   kyriakon-onboardctl [--config PATH] group remove <domain>
 //!   kyriakon-onboardctl [--config PATH] token resend <username>
 //!   kyriakon-onboardctl [--config PATH] credit (--token <t> | --username <u>) \
 //!       --rail <cash|cash-hand|monero> --amount <gbp> --received <YYYY-MM-DD>
@@ -86,6 +87,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
     match verb {
         "request" => request(&store, &rest[1..]).await,
         "address" => address(&cfg, &store, &rest[1..]).await,
+        "group" => group(&cfg, &store, &rest[1..]).await,
         "token" => token(&cfg, &store, &rest[1..]).await,
         "credit" => credit(&cfg, &store, &rest[1..]).await,
         "show" => show(&store, one_username(rest)?).await,
@@ -118,6 +120,7 @@ fn usage() -> String {
        kyriakon-onboardctl address --domain <domain> \
      --action <add-alias|add-mailbox|upgrade|remove> --mailbox <account> \
      [--address <localpart>] [--key-file <path>] [--site-owner <account>]
+       kyriakon-onboardctl group remove <domain>
        kyriakon-onboardctl request list
        kyriakon-onboardctl request record --username <u> --kind <access|erasure|rectification> \
      --received <YYYY-MM-DD> --evidence <text> [--note <text>] \
@@ -394,6 +397,26 @@ async fn address(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<()
     )
     .await?;
     println!("filed {action} for {domain} as intent {id}");
+    Ok(())
+}
+
+/// `group remove <domain>`: take a body's domain down and close every account
+/// in it. Signed here, because the transition deletes accounts, and the drain
+/// refuses a domain that has no group record.
+async fn group(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), String> {
+    let [verb, domain] = args else {
+        return Err(usage());
+    };
+    if verb != "remove" {
+        return Err(usage());
+    }
+    if let Some(why) = validate::domain(domain) {
+        return Err(format!("the domain {domain:?}: {why}"));
+    }
+    let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
+    let sig = sign::sign(&key, &sign::group_remove_payload(domain))?;
+    let id = intents::file_remove_group(store, domain, &sig).await?;
+    println!("filed group remove for {domain} as intent {id}");
     Ok(())
 }
 

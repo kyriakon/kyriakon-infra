@@ -649,6 +649,20 @@ pub struct GroupAddressIntent {
     pub sig: String,
 }
 
+/// The `remove-group` intent: take one body's domain down and close every
+/// account in it. The console signs it, because the transition deletes accounts
+/// and `intents/` is writable by the unprivileged handler.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GroupRemoveIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub domain: String,
+    /// The HMAC-SHA256 of `sign::group_remove_payload` under the approval key.
+    pub sig: String,
+}
+
 /// The payment block `accounts/<username>/account.json` carries under
 /// `payment`, named as the spec's State table names it. A paid approval writes
 /// it, opens the window and draws the token; a credit sets `paid_until`, which
