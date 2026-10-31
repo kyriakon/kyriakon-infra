@@ -91,13 +91,28 @@ impl Store {
         bytes: &[u8],
         owner: Option<(u32, u32)>,
     ) -> Result<(), String> {
+        self.write_record_mode(dir, name, bytes, owner, 0o600).await
+    }
+
+    /// Like `write_record_owned`, with the file's mode. An account or group
+    /// record is written 0640, group `_onboard`: the handler renders the page
+    /// from it and cannot be allowed to rewrite it, and a 0600 file is invisible
+    /// to the process the page runs as.
+    pub async fn write_record_mode(
+        &self,
+        dir: &str,
+        name: &str,
+        bytes: &[u8],
+        owner: Option<(u32, u32)>,
+        mode: u32,
+    ) -> Result<(), String> {
         let d = self.root.join(dir);
         let tmp = d.join(format!(".{name}.tmp"));
         let target = d.join(name);
         let _ = tokio::fs::remove_file(&tmp).await;
         let placed = async {
             let mut opts = tokio::fs::OpenOptions::new();
-            opts.write(true).create_new(true).mode(0o600);
+            opts.write(true).create_new(true).mode(mode);
             opts.custom_flags(libc::O_NOFOLLOW);
             let mut f = opts.open(&tmp).await?;
             f.write_all(bytes).await?;
@@ -640,6 +655,17 @@ pub struct Account {
     pub capsule_served: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub space_used: Option<u64>,
+    /// The upload key's fingerprint and the day it was added, one entry per key
+    /// the account may use for sftp and git. The account page shows these so a
+    /// member can tell a key they added from one they did not; the key material
+    /// itself lives where `provision-member.sh` puts it, not here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upload_keys: Vec<UploadKey>,
+    /// Why the account is suspended, in the words the suspension notice used.
+    /// Present only while `state` is `suspended`, and the page stays open so the
+    /// member can read it and answer it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspension_reason: Option<String>,
     /// The domain of the group this account belongs to, for a mailbox the
     /// own-domain tier made. The group holds the payment state, so an account
     /// with this set carries no payment block of its own. `None` for a person's
@@ -652,6 +678,15 @@ pub struct Account {
     /// excess refund and every other transition leave it absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closing_until: Option<String>,
+}
+
+/// One upload key the account carries: its fingerprint and the day it was
+/// added. The material is not kept here, because the page never shows it and a
+/// second copy is a second thing to leak.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UploadKey {
+    pub fingerprint: String,
+    pub added_at: String,
 }
 
 /// One pinned client certificate, as a request described it.

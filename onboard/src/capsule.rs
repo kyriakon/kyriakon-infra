@@ -212,8 +212,25 @@ pub fn account(
     notices: &[Notice],
     dns: Option<&crate::dns::Recipe>,
     payment: Option<&PaymentView>,
+    group: Option<&crate::page::GroupView>,
 ) -> String {
     let mut out = String::from("# Your account\n\n");
+    if let Some(reason) = account
+        .suspension_reason
+        .as_deref()
+        .filter(|_| account.state == "suspended")
+    {
+        out.push_str(&format!(
+            "## This account is suspended\n\n{reason}\n\n\
+             Inbound mail keeps arriving. Write to admin@kyriakon.net to answer it.\n\n"
+        ));
+    }
+    if let Some(date) = &account.closing_until {
+        out.push_str(&format!(
+            "This account is closing. It works normally until {date}, so everything can be \
+             taken out before then.\n\n"
+        ));
+    }
     if account.is_free() {
         out.push_str("This account is free: nothing is due, and it does not lapse.\n\n");
     }
@@ -223,6 +240,17 @@ pub fn account(
         if let Some(until) = &p.paid_until {
             out.push_str(&format!("Paid until {until}.\n"));
         } else {
+            if p.lapsed {
+                out.push_str(&format!(
+                    "Lapsed{}: mail keeps arriving and stays readable, and everything \
+                     published stays up. Sending, uploading and pushing have stopped, and \
+                     nothing has been deleted.\n",
+                    p.closes_on
+                        .as_deref()
+                        .map(|date| format!(" since the payment window closed on {date}"))
+                        .unwrap_or_default()
+                ));
+            }
             if let Some(window) = &p.window {
                 out.push_str(&format!("The payment window {window}.\n"));
             }
@@ -242,15 +270,51 @@ pub fn account(
         }
         out.push('\n');
     }
+    if let Some(g) = group {
+        out.push_str(&format!(
+            "## Your body\n\n{} ({}) on {}.\nState: {}. Rail: {}.\n",
+            g.name, g.kind, g.domain, g.state, g.rail
+        ));
+        if let Some(until) = &g.paid_until {
+            out.push_str(&format!("Paid until {until}.\n"));
+        }
+        out.push_str(&format!(
+            "The group's mailboxes: {}.\n\n",
+            g.accounts.join(", ")
+        ));
+    }
     out.push_str(&format!("State: {}\n", account.state));
     out.push_str(&format!("Site: {}\n", served(account.site_served)));
     out.push_str(&format!("Capsule: {}\n", served(account.capsule_served)));
     out.push_str(&format!("Space used: {}\n", space(account.space_used)));
+    if let Some(address) = &account.outside_address {
+        out.push_str(&format!("Address outside the platform: {address}\n"));
+    } else {
+        out.push_str(
+            "Address outside the platform: none given, so this account is the only way we \
+             can reach you.\n",
+        );
+    }
+    out.push_str("\n## Upload keys\n\n");
+    if account.upload_keys.is_empty() {
+        out.push_str("No upload key is on this account, so there is no sftp or git access.\n");
+    }
+    for key in &account.upload_keys {
+        out.push_str(&format!(
+            "{} (added {})\n",
+            key.fingerprint,
+            key.added_at.get(..10).unwrap_or(&key.added_at)
+        ));
+    }
     out.push_str(&format!(
         "\nNothing here changes anything. The account page at https://{HOST}/account \
          and the terminal are where settings will change; both are read-only until \
          their own tickets land.\n"
     ));
+    out.push_str(
+        "\nThis page cannot read your mail, recover your key, restore deleted mail or give \
+         you a shell.\n",
+    );
     out.push_str("\n## Notices\n\n");
     if notices.is_empty() {
         out.push_str("Nothing has been sent yet.\n");
@@ -326,8 +390,18 @@ fn space(bytes: Option<u64>) -> String {
     const GIB: u64 = 1 << 30;
     const MIB: u64 = 1 << 20;
     match bytes {
-        Some(bytes) if bytes >= GIB => format!("{:.1} GB", bytes as f64 / GIB as f64),
-        Some(bytes) => format!("{} MB", bytes / MIB),
+        Some(bytes) if bytes >= GIB => format!(
+            "{:.1} GB of the {} soft and {} hard allowance",
+            bytes as f64 / GIB as f64,
+            crate::page::QUOTA_SOFT,
+            crate::page::QUOTA_HARD
+        ),
+        Some(bytes) => format!(
+            "{} MB of the {} soft and {} hard allowance",
+            bytes / MIB,
+            crate::page::QUOTA_SOFT,
+            crate::page::QUOTA_HARD
+        ),
         None => "not recorded yet".to_string(),
     }
 }
@@ -502,7 +576,7 @@ mod tests {
             subject: "Application approved, account opened.".into(),
             to: "alice@kyriakon.net".into(),
         }];
-        let text = account(&member(), &notices, None, None);
+        let text = account(&member(), &notices, None, None, None);
         assert!(text.contains("State: active"), "{text}");
         assert!(text.contains("Site: serving"), "{text}");
         assert!(text.contains("Capsule: not serving"), "{text}");
@@ -521,7 +595,7 @@ mod tests {
         let mut record = member();
         record.site_served = None;
         record.space_used = None;
-        let text = account(&record, &[], None, None);
+        let text = account(&record, &[], None, None, None);
         assert!(text.contains("Site: not recorded yet"), "{text}");
         assert!(text.contains("Space used: not recorded yet"), "{text}");
         assert!(text.contains("Nothing has been sent yet."), "{text}");
@@ -549,8 +623,14 @@ mod tests {
 
     #[test]
     fn the_space_and_the_hash_shorten_for_the_page() {
-        assert_eq!(space(Some(1 << 30)), "1.0 GB");
-        assert_eq!(space(Some(432013312)), "412 MB");
+        assert_eq!(
+            space(Some(1 << 30)),
+            "1.0 GB of the 5 GB soft and 5.5 GB hard allowance"
+        );
+        assert_eq!(
+            space(Some(432013312)),
+            "412 MB of the 5 GB soft and 5.5 GB hard allowance"
+        );
         assert_eq!(space(None), "not recorded yet");
         assert_eq!(short_hash("SHA256:0123456789abcdef"), "SHA256:01234567");
         assert_eq!(short_hash("0123456789"), "01234567");

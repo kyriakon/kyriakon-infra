@@ -1,0 +1,6 @@
+# The one doas rule the onboarding service needs: the account page's login runs
+# this fixed-argument checker as root, so `doveadm auth test` is the only
+# subcommand reachable from the unprivileged handler. Install it by appending
+# this line to /etc/doas.conf and checking the file with `doas -C /etc/doas.conf`;
+# scripts/deploy-onboard.sh installs the checker and prints this step.
+permit nopass _onboard as root cmd /usr/local/libexec/kyriakon-authcheck

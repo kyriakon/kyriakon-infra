@@ -24,7 +24,7 @@ use crate::sign;
 use crate::store::{
     self, Account, ApplicationRef, CreditProgress, FlatPayment, GroupAddress, GroupAddressIntent,
     GroupIntent, GroupPayment, GroupRecord, GroupRemoveIntent, Intent, JournalLine, KeyRecord,
-    Payment, Record, Store, TokenRecord, Window,
+    Payment, Record, Store, TokenRecord, UploadKey, Window,
 };
 use crate::util;
 use crate::validate;
@@ -1295,19 +1295,25 @@ async fn approve(
         site_served: None,
         capsule_served: None,
         space_used: None,
+        upload_keys: record
+            .upload_key
+            .as_ref()
+            .filter(|key| !key.fingerprint.is_empty())
+            .map(|key| {
+                vec![UploadKey {
+                    fingerprint: key.fingerprint.clone(),
+                    added_at: now.clone(),
+                }]
+            })
+            .unwrap_or_default(),
+        suspension_reason: None,
         group: None,
         closing_until: None,
     };
     store.ensure_dir(&format!("accounts/{username}")).await?;
     let account_bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
-    store
-        .write_record(
-            &format!("accounts/{username}"),
-            "account.json",
-            &account_bytes,
-        )
-        .await?;
+    write_account_record(store, username, &account_bytes).await?;
 
     if let (Some(token), Some(window)) = (&token_ref, &window) {
         let join = TokenRecord {
@@ -1889,9 +1895,7 @@ async fn apply_payment(
     account.payment = Some(payment.clone());
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
-    store
-        .write_record(&format!("accounts/{username}"), "account.json", &bytes)
-        .await?;
+    write_account_record(store, username, &bytes).await?;
     write_payment_copy(store, username, &payment).await?;
     append_credit_ledger(
         store,
@@ -2342,9 +2346,7 @@ pub async fn refund(
         account.payment = Some(payment.clone());
         let bytes = serde_json::to_vec_pretty(&account)
             .map_err(|e| format!("cannot encode the account: {e}"))?;
-        store
-            .write_record(&format!("accounts/{username}"), "account.json", &bytes)
-            .await?;
+        write_account_record(store, &username, &bytes).await?;
     }
 
     let seq = append_refund_ledger(
@@ -3873,15 +3875,15 @@ async fn write_group_account(
         site_served: None,
         capsule_served: None,
         space_used: None,
+        upload_keys: Vec::new(),
+        suspension_reason: None,
         group: Some(domain.to_string()),
         closing_until: None,
     };
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
     store.ensure_dir(&format!("accounts/{mailbox}")).await?;
-    store
-        .write_record(&format!("accounts/{mailbox}"), "account.json", &bytes)
-        .await
+    write_account_record(store, mailbox, &bytes).await
 }
 
 /// Write one group's record. The caller owns the directory name, which is the
@@ -3892,8 +3894,38 @@ async fn write_group_record(store: &Store, group: &GroupRecord) -> Result<(), St
     store
         .ensure_dir(&format!("groups/{}", group.domain))
         .await?;
+    write_group_state(store, &group.domain, &bytes).await
+}
+
+/// Write one account's record, readable by the handler and not writable by it.
+/// The page is rendered by `_onboard`, which cannot read a 0600 root file, and
+/// the record holds no secret: the group's token stays in `tokens/` and the
+/// ledger. The directory's own group is the owner, so the deploy's modes are
+/// what decide who can read it rather than a second list here.
+async fn write_account_record(store: &Store, username: &str, bytes: &[u8]) -> Result<(), String> {
     store
-        .write_record(&format!("groups/{}", group.domain), "group.json", &bytes)
+        .write_record_mode(
+            &format!("accounts/{username}"),
+            "account.json",
+            bytes,
+            store.dir_owner("accounts"),
+            0o640,
+        )
+        .await
+}
+
+/// The same for a group's record, for the same reason: the account page of any
+/// mailbox in the group reads it, and a root-only 0600 file would leave the
+/// billing block blank.
+async fn write_group_state(store: &Store, domain: &str, bytes: &[u8]) -> Result<(), String> {
+    store
+        .write_record_mode(
+            &format!("groups/{domain}"),
+            "group.json",
+            bytes,
+            store.dir_owner("groups"),
+            0o640,
+        )
         .await
 }
 
@@ -5634,9 +5666,7 @@ impl BillingTarget {
             BillingTarget::Account(a) => {
                 let bytes = serde_json::to_vec_pretty(a)
                     .map_err(|e| format!("cannot encode the account: {e}"))?;
-                store
-                    .write_record(&format!("accounts/{}", a.username), "account.json", &bytes)
-                    .await
+                write_account_record(store, &a.username, &bytes).await
             }
             BillingTarget::Group(g) => write_group_record(store, g).await,
         }

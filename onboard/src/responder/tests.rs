@@ -10,6 +10,7 @@
 use super::*;
 use crate::fcgi::fixture;
 use std::net::Ipv4Addr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use time::format_description::well_known::Rfc3339;
 
@@ -138,9 +139,29 @@ fn httpd_get(path: &str, query: &str) -> Vec<u8> {
     httpd_get_as(path, query, None)
 }
 
-/// A GET httpd authenticated, which is the one thing `REMOTE_USER` means. The
-/// account page's login is its own ticket's; this is the environment it will
-/// pass when it lands.
+/// The request httpd builds for a GET when the browser presents an account-page
+/// session cookie.
+fn httpd_get_session(path: &str, query: &str, cookie: &str) -> Vec<u8> {
+    fixture::httpd(
+        &[
+            ("REQUEST_METHOD", "GET"),
+            ("REQUEST_URI", path),
+            ("QUERY_STRING", query),
+            ("HTTP_HOST", "signup.kyriakon.net"),
+            ("SERVER_NAME", "signup.kyriakon.net"),
+            ("SERVER_PORT", "8080"),
+            ("HTTP_COOKIE", &format!("{}={cookie}", session::COOKIE)),
+            ("REMOTE_ADDR", "127.0.0.1"),
+            ("HTTP_X_FORWARDED_FOR", "203.0.113.10"),
+            ("SERVER_SOFTWARE", "OpenBSD httpd"),
+        ],
+        b"",
+    )
+}
+
+/// A GET that claims a member in `REMOTE_USER` and carries no session. Nothing
+/// authenticates httpd's `REMOTE_USER` on this hostname, and the page must not
+/// read it as an identity.
 fn httpd_get_as(path: &str, query: &str, user: Option<&str>) -> Vec<u8> {
     let mut env = vec![
         ("REQUEST_METHOD", "GET"),
@@ -157,6 +178,33 @@ fn httpd_get_as(path: &str, query: &str, user: Option<&str>) -> Vec<u8> {
         env.push(("REMOTE_USER", user));
     }
     fixture::httpd(&env, b"")
+}
+
+/// A session record for `username` in the fixture store, returning the cookie
+/// value the browser would carry.
+async fn signed_in(app: &App, username: &str) -> String {
+    session::open(&app.store, username, OffsetDateTime::now_utc())
+        .await
+        .expect("the fixture store takes a session")
+}
+
+/// A checker the login route runs directly. The real one is reached through
+/// `doas`, which a test cannot have; this admits only one password.
+fn login_checker(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("onboard-login-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("kyriakon-authcheck");
+    std::fs::write(
+        &path,
+        "#!/bin/sh
+read -r given
+[ \"$given\" = 'right horse battery' ]
+",
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
 }
 
 /// The request httpd builds for a form post.
@@ -296,7 +344,7 @@ fn file_group_account(dir: &Path) {
         group.join("group.json"),
         r#"{"version": 1, "domain": "parish.example", "name": "Parish of Example",
             "kind": "parish", "payment": {"rail": "cash", "no_charge": false,
-            "paid_until": null}, "accounts": ["parish-secretary"],
+            "paid_until": "2027-01-01"}, "accounts": ["parish-secretary"],
             "site_owner": "parish-secretary"}"#,
     )
     .unwrap();
@@ -504,7 +552,8 @@ async fn a_pinned_certificate_answers_as_the_member() {
         body.contains("This account is free: nothing is due, and it does not lapse."),
         "{body}"
     );
-    let (code, web) = answer(&app, &httpd_get_as("account", "", Some("alice"))).await;
+    let cookie = signed_in(&app, "alice").await;
+    let (code, web) = answer(&app, &httpd_get_session("account", "", &cookie)).await;
     assert_eq!(code, 200);
     assert!(
         web.contains("This account is free: nothing is due, and it does not lapse."),
@@ -543,7 +592,8 @@ async fn a_group_member_reads_the_same_recipe_on_both_account_pages() {
 
     let (code, capsule) = answer(&app, &gmid_certificate("account", "", &pinned)).await;
     assert_eq!(code, 20);
-    let (code, web) = answer(&app, &httpd_get_as("account", "", Some("parish-secretary"))).await;
+    let cookie = signed_in(&app, "parish-secretary").await;
+    let (code, web) = answer(&app, &httpd_get_session("account", "", &cookie)).await;
     assert_eq!(code, 200);
     for needle in needles {
         assert!(
@@ -556,10 +606,168 @@ async fn a_group_member_reads_the_same_recipe_on_both_account_pages() {
         );
     }
 
+    // Any mailbox holder sees the body's billing and state, which live on the
+    // group's own record rather than being copied per account.
+    for page in [&capsule, &web] {
+        assert!(page.contains("Parish of Example"), "{page}");
+        assert!(page.contains("parish.example"), "{page}");
+        assert!(page.contains("Paid until 2027-01-01"), "{page}");
+        assert!(page.contains("Rail: cash"), "{page}");
+    }
+
     // A web request that names no authenticated member is the page it was, and
     // never another member's recipe.
     let (_, anonymous) = answer(&app, &httpd_get("account", "")).await;
     assert!(!anonymous.contains("mail._domainkey"), "{anonymous}");
+}
+
+/// A fixture account's record, changed in place: the tests below set one fact
+/// each so the page is read against the record rather than against a page-only
+/// flag.
+fn amend_account(dir: &Path, username: &str, amend: impl FnOnce(&mut serde_json::Value)) {
+    let path = dir.join(format!("accounts/{username}/account.json"));
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    amend(&mut value);
+    std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+}
+
+/// The login route. A correct password sets a signed, HttpOnly, SameSite cookie
+/// with the twelve-hour lifetime; a wrong one comes back as the login page with
+/// no cookie at all.
+#[tokio::test]
+async fn a_correct_mail_password_opens_a_session_and_a_wrong_one_does_not() {
+    let (mut app, _dir) = handler("login").await;
+    app.auth = session::Authenticator {
+        program: login_checker("admits"),
+        args: Vec::new(),
+    };
+
+    let (code, body) = answer(
+        &app,
+        &httpd_post("/login", "username=alice&password=right+horse+battery"),
+    )
+    .await;
+    assert_eq!(code, 303, "{body}");
+    assert!(
+        body.contains("Set-Cookie: kyriakon_session="),
+        "a session cookie is set: {body}"
+    );
+    for flag in ["HttpOnly", "SameSite=Lax", "Max-Age=43200", "Secure"] {
+        assert!(body.contains(flag), "the cookie misses {flag}: {body}");
+    }
+
+    // The cookie it set opens the account page, and a wrong password sets
+    // nothing and comes back as the login page.
+    let cookie = body
+        .split("Set-Cookie: kyriakon_session=")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .expect("the cookie value");
+    let (code, _) = answer(&app, &httpd_get_session("account", "", cookie)).await;
+    assert_eq!(code, 200);
+
+    let (code, wrong) = answer(
+        &app,
+        &httpd_post("/login", "username=alice&password=wrong+horse+battery"),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert!(!wrong.contains("Set-Cookie"), "{wrong}");
+    assert!(wrong.contains("did not match"), "{wrong}");
+}
+
+/// No key admits anyone, and neither does a header the front-end did not
+/// authenticate: a request naming a member in `REMOTE_USER` with no session gets
+/// the login page.
+#[tokio::test]
+async fn no_key_and_no_remote_user_admits_a_member() {
+    let (app, dir) = handler("no-key-admits").await;
+    file_account(&dir);
+    let (code, body) = answer(&app, &httpd_get_as("account", "", Some("alice"))).await;
+    assert_eq!(code, 200);
+    assert!(body.contains("Log in with your mail password"), "{body}");
+    assert!(
+        !body.contains("Application approved, account opened."),
+        "{body}"
+    );
+
+    // The mail password is the only credential; a key presented as one is
+    // refused like any other wrong password.
+    let (mut app, _dir) = handler("no-key-password").await;
+    app.auth = session::Authenticator {
+        program: login_checker("key"),
+        args: Vec::new(),
+    };
+    let (code, body) = answer(
+        &app,
+        &httpd_post(
+            "/login",
+            "username=alice&password=SHA256%3A0123456789abcdef",
+        ),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert!(!body.contains("Set-Cookie"), "{body}");
+}
+
+/// The read-only view: the quota against the published allowance, the address
+/// outside the platform, the upload key fingerprints and dates, and every
+/// notice with the address it went to.
+#[tokio::test]
+async fn the_account_page_shows_the_quota_keys_and_every_notice() {
+    let (app, dir) = handler("account-facts").await;
+    file_account(&dir);
+    amend_account(&dir, "alice", |value| {
+        value["outside_address"] = serde_json::json!("alice@example.invalid");
+        value["upload_keys"] = serde_json::json!([
+            {"fingerprint": "SHA256:AAAAexamplekey", "added_at": "2026-10-02T09:00:00Z"}
+        ]);
+    });
+    let mut notices = std::fs::read_to_string(dir.join("accounts/alice/notices.jsonl")).unwrap();
+    notices.push_str(
+        "{\"version\":1,\"at\":\"2026-10-03T09:00:00Z\",\"type\":\"prepaid.receipt\",\
+         \"subject\":\"Receipt for your payment.\",\"to\":\"alice@example.invalid\"}\n",
+    );
+    std::fs::write(dir.join("accounts/alice/notices.jsonl"), notices).unwrap();
+
+    let cookie = signed_in(&app, "alice").await;
+    let (code, body) = answer(&app, &httpd_get_session("account", "", &cookie)).await;
+    assert_eq!(code, 200);
+    assert!(
+        body.contains("412 MB of the 5 GB soft and 5.5 GB hard allowance"),
+        "{body}"
+    );
+    assert!(body.contains("alice@example.invalid"), "{body}");
+    assert!(body.contains("SHA256:AAAAexamplekey"), "{body}");
+    assert!(body.contains("2026-10-02"), "the key's date: {body}");
+    assert!(
+        body.contains("Application approved, account opened."),
+        "{body}"
+    );
+    assert!(body.contains("Receipt for your payment."), "{body}");
+    assert!(
+        body.contains("alice@kyriakon.net") && body.contains("alice@example.invalid"),
+        "both addresses are listed: {body}"
+    );
+}
+
+/// A suspended page stays open, with the reason, so the member can read it and
+/// answer it.
+#[tokio::test]
+async fn a_suspended_account_still_opens_with_its_reason() {
+    let (app, dir) = handler("suspended").await;
+    file_account(&dir);
+    amend_account(&dir, "alice", |value| {
+        value["state"] = serde_json::json!("suspended");
+        value["suspension_reason"] =
+            serde_json::json!("Outbound mail from this account broke the acceptable use policy.");
+    });
+    let cookie = signed_in(&app, "alice").await;
+    let (code, body) = answer(&app, &httpd_get_session("account", "", &cookie)).await;
+    assert_eq!(code, 200);
+    assert!(body.contains("This account is suspended"), "{body}");
+    assert!(body.contains("broke the acceptable use policy"), "{body}");
 }
 
 /// The ordinary visitor's pages, with the visitor's own fingerprint and no
@@ -2216,8 +2424,8 @@ async fn the_card_pages_carry_the_keyed_payment_link() {
             "acceptances":[],"question_list":"2026-10-13 test",
             "payment":{"token_ref":"KYR-AAAA-BBBB-CCCC",
                        "token_issued_at":"2026-10-02T09:00:00Z","paid_until":null,
-                       "window":{"opened_at":"2026-10-02T09:00:00Z",
-                                 "closes_at":"2026-10-16T09:00:00Z",
+                       "window":{"opened_at":"2099-10-02T09:00:00Z",
+                                 "closes_at":"2099-10-16T09:00:00Z",
                                  "state":"open","extensions":0}}}"#,
     )
     .unwrap();

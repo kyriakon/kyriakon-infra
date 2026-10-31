@@ -51,13 +51,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 
 use crate::fcgi::{self, Reply, Request};
-use crate::page::{AccountPage, DecidePage, NoticePage, PasswordPage, ReceivedPage, StatusPage};
+use crate::page::{DecidePage, LoginPage, NoticePage, PasswordPage, ReceivedPage, StatusPage};
 use crate::questions::{Branch, Kind, Question, Rule};
 use crate::rate::Key;
-use crate::store::{Acceptance, Account, Certificate, Notice, Record, Store};
+use crate::store::{Acceptance, Account, Certificate, GroupRecord, Notice, Record, Store};
 use crate::{
-    capsule, catalogue, config, draft, intents, keycheck, page, portal_ipc, questions, rate, store,
-    transitions, util, validate,
+    capsule, catalogue, config, draft, intents, keycheck, page, portal_ipc, questions, rate,
+    session, store, transitions, util, validate,
 };
 
 /// The fixed hostname for the form and the account page, used as itself. It is
@@ -126,6 +126,9 @@ struct App {
     reserved: HashSet<String>,
     counter: rate::Counter,
     store: Store,
+    /// The login check: `doas` and the fixed checker in production, and the
+    /// checker directly in a test, where no root rule can exist.
+    auth: session::Authenticator,
 }
 
 impl App {
@@ -167,6 +170,7 @@ impl App {
             pages,
             reserved,
             counter: rate::Counter::new(),
+            auth: session::Authenticator::default(),
         })
     }
 }
@@ -1068,6 +1072,22 @@ async fn http(app: &App, request: &Request, incoming: &Incoming) -> Reply {
         }
         return apply(app, request, incoming).await;
     }
+    if incoming.path == "login" {
+        return match method {
+            "GET" | "HEAD" => Reply::html(200, page_html(&LoginPage { error: None })),
+            "POST" => login(app, request).await,
+            _ => method_not_allowed(),
+        };
+    }
+    // Logging out is a POST because it changes the session, and a GET that did
+    // would be fired by any image tag.
+    if incoming.path == "logout" {
+        return if method == "POST" {
+            logout(app, request).await
+        } else {
+            method_not_allowed()
+        };
+    }
     if incoming.path == "account" {
         return if get {
             account(app, request).await
@@ -1177,6 +1197,7 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
             Some(account) => {
                 let notices = account_notices(app, &account.username).await;
                 let recipe = group_recipe(app, account);
+                let group = group_state(app, account.group.as_deref()).await;
                 let payment = account.payment_state().map(|block| {
                     page::payment(
                         &account.state,
@@ -1188,7 +1209,13 @@ async fn gemini(app: &App, incoming: &Incoming) -> Reply {
                         OffsetDateTime::now_utc(),
                     )
                 });
-                capsule::account(account, &notices, recipe.as_ref(), payment.as_ref())
+                capsule::account(
+                    account,
+                    &notices,
+                    recipe.as_ref(),
+                    payment.as_ref(),
+                    group.as_ref(),
+                )
             }
             None => capsule::account_stranger(presented(incoming)),
         };
@@ -1716,50 +1743,81 @@ fn branch_step(app: &App, form: BTreeMap<String, String>) -> Reply {
     render_applicant(app, body, &form, &[])
 }
 
-/// The account page. Its login and the rest of its capability list are its own
-/// ticket's; what it renders today is the catalogue, and, for a member the
-/// front-end has authenticated, the group's DNS recipe.
+/// The account page, for the member its session cookie names. A request with no
+/// live session, and one whose session names no readable account, both get the
+/// login page: the page never says which of the two it was.
 ///
-/// `REMOTE_USER` is where the account page's login will reach this route: httpd
-/// sets it only for a request it authenticated, and no auth is configured yet,
-/// so the page is the catalogue for everyone until that ticket lands. A value
-/// that is not a username shape is ignored rather than looked up.
+/// No key admits anyone here. The mail password is checked by `doveadm auth test`
+/// through the one fixed `doas` rule, and the session is a server-side file the
+/// cookie's own signature names.
 async fn account(app: &App, request: &Request) -> Reply {
-    let member = web_member(app, request).await;
-    let dns = match &member {
-        Some(account) => group_recipe(app, account),
+    let now = OffsetDateTime::now_utc();
+    let cookie = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE);
+    let member = match cookie {
+        Some(cookie) => session::lookup(&app.store, &cookie, now).await,
         None => None,
     };
-    let payment = member.as_ref().and_then(|account| {
-        account.payment_state().map(|block| {
-            page::payment(
-                &account.state,
-                &account.rail,
-                &block,
-                &app.cfg.price_gbp,
-                &app.cfg.postal_address,
-                card_link(app, block.token_ref.as_deref()).as_deref(),
-                OffsetDateTime::now_utc(),
-            )
-        })
+    let Some(member) = member else {
+        return Reply::html(200, page_html(&LoginPage { error: None }));
+    };
+    let Some(account) = account_record(app, &member.username).await else {
+        return Reply::html(200, page_html(&LoginPage { error: None }));
+    };
+    let notices = account_notices(app, &account.username).await;
+    let group = group_state(app, account.group.as_deref()).await;
+    let dns = group_recipe(app, &account);
+    let payment = account.payment_state().map(|block| {
+        page::payment(
+            &account.state,
+            &account.rail,
+            &block,
+            &app.cfg.price_gbp,
+            &app.cfg.postal_address,
+            card_link(app, block.token_ref.as_deref()).as_deref(),
+            now,
+        )
     });
-    let page: AccountPage = page::account(
-        &app.catalogue,
-        member.as_ref().map(|account| account.username.as_str()),
-        dns,
-        payment,
-        member.as_ref().is_some_and(|account| account.is_free()),
-    );
+    let page = page::member_page(&app.catalogue, &account, &notices, group, dns, payment);
     Reply::html(200, page_html(&page))
 }
 
-/// The member a web request names, when the front-end authenticated one.
-async fn web_member(app: &App, request: &Request) -> Option<Account> {
-    let username = request.value("REMOTE_USER");
-    if username.is_empty() || validate::username_shape(username).is_some() {
-        return None;
+/// The login submission. A correct password opens a session and sends the
+/// member to their page; a wrong one, an unknown username and a submission with
+/// a field missing all return the same login page with no cookie set.
+async fn login(app: &App, request: &Request) -> Reply {
+    let form = fields(&String::from_utf8_lossy(&request.body));
+    let username = form.get("username").map(String::as_str).unwrap_or("");
+    let password = form.get("password").map(String::as_str).unwrap_or("");
+    // The shape is checked before the check runs: a name the platform could not
+    // have made is not passed to `doveadm`, and the answer is the same one a
+    // wrong password gets.
+    if username.is_empty()
+        || password.is_empty()
+        || validate::username_shape(username).is_some()
+        || !app.auth.admits(username, password).await
+    {
+        return Reply::html(200, page_html(&LoginPage {
+            error: Some(
+                "That username and password did not match. Check the mail password and try again."
+                    .to_string(),
+            ),
+        }));
     }
-    account_record(app, username).await
+    match session::open(&app.store, username, OffsetDateTime::now_utc()).await {
+        Ok(cookie) => {
+            Reply::redirect("/account").with_header("Set-Cookie", session::cookie(&cookie))
+        }
+        Err(e) => server_error(&e),
+    }
+}
+
+/// End the session the cookie names and send the browser back to the login
+/// page. The cookie is cleared even when the record is already gone.
+async fn logout(app: &App, request: &Request) -> Reply {
+    if let Some(cookie) = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE) {
+        session::close(&app.store, &cookie).await;
+    }
+    Reply::redirect("/account").with_header("Set-Cookie", session::clear_cookie())
 }
 
 /// One account's record, for a name the request or a decided application
@@ -1771,6 +1829,19 @@ async fn account_record(app: &App, username: &str) -> Option<Account> {
         .read_record(&format!("accounts/{username}"), "account.json")
         .await?;
     serde_json::from_str(&text).ok()
+}
+
+/// The group a signed-in mailbox belongs to, from the group's own record. The
+/// payment lives on the group so one renewal writes one date; a record that
+/// cannot be read leaves the page without the block rather than failing it.
+async fn group_state(app: &App, domain: Option<&str>) -> Option<page::GroupView> {
+    let domain = domain?;
+    let text = app
+        .store
+        .read_record(&format!("groups/{domain}"), "group.json")
+        .await?;
+    let record: GroupRecord = serde_json::from_str(&text).ok()?;
+    Some(page::GroupView::from_record(&record))
 }
 
 /// The DNS recipe for an account that names a group. `account.group` already

@@ -2,28 +2,55 @@
 {% block title %}Your account{% endblock %}
 {% block content %}
 {#
-  The account page's own ticket brings the login, the keys, the space used and
-  the rest of the capability table. What is here is the catalogue: one line per
-  entry, from the same file the application page's cards and the capsule's list
-  come from, so what a member is offered cannot drift from what an applicant was.
+  The account page is the member's read-only view. The login and the session are
+  the route's; this template is only ever rendered for a signed-in member, and
+  the login page is `login.html`. The payment block sits at the top, above usage
+  and the rest, because it is the one thing on the page that expires.
 #}
 <h2>Your account</h2>
+<p class="lede"><span class="mono">{{ username }}@kyriakon.net</span></p>
+
+{#
+  A suspension keeps the page open, so the member can read the reason and answer
+  it rather than being locked out of the only place the reason is written. A
+  closing account works normally throughout its window.
+#}
+{% if let Some(reason) = suspended %}
+<div class="warn">
+  <p><strong>This account is suspended.</strong> The reason:</p>
+  <p>{{ reason }}</p>
+  <p>Inbound mail keeps arriving. Write to <a href="mailto:admin@kyriakon.net">admin@kyriakon.net</a> to answer it.</p>
+</div>
+{% endif %}
+{% if let Some(date) = closing_until %}
+<div class="warn">
+  <p>This account is closing. It works normally until {{ date }}, so you can take everything out before then.</p>
+</div>
+{% endif %}
 
 {% if free %}
 <p>This account is free: nothing is due, and it does not lapse.</p>
 {% endif %}
 
 {#
-  The payment block sits at the top, above everything else, because it is the one
-  thing on the page that expires. A free account has none at all. Once a credit
-  sets the date the token goes and the date replaces it; the rail stays, because
-  the next payment is quoted for it.
+  A paid approval opens a window; a credit sets the paid-until date, which
+  replaces the token; a window that closes with nothing recorded reads Lapsed,
+  repeats the close date, states what still works and what stopped, and shows
+  the token again because someone who lost the email still needs it.
 #}
 {% if let Some(p) = payment %}
 <h3>Payment</h3>
 <p>State: {{ p.state }}. Rail: {{ p.rail }}.</p>
 {% if let Some(until) = p.paid_until %}
 <p>Paid until {{ until }}.</p>
+{% else if p.lapsed %}
+<p><strong>Lapsed</strong>{% if let Some(date) = p.closes_on %}: the payment window closed on {{ date }}{% endif %}.</p>
+<p>Mail keeps arriving and stays readable, and everything already published stays up. Sending from your address, uploading to your site and pushing to git have stopped. Nothing has been deleted at this point.</p>
+<p>Amount due: GBP {{ p.amount }}.</p>
+{% if let Some(token) = p.token %}
+<p>Your payment reference: <code>{{ token }}</code></p>
+{% endif %}
+<p>If the money is already on its way, write to <a href="mailto:admin@kyriakon.net">admin@kyriakon.net</a>.</p>
 {% else %}
 {% if let Some(window) = p.window %}
 <p>The payment window {{ window }}.</p>
@@ -46,12 +73,52 @@
 {% endif %}
 {% endif %}
 
-<h3>What the platform offers</h3>
-<ul class="services">
-{% for s in services %}
-  <li><a href="{{ s.href }}">{{ s.name }}</a> <span class="tag">{{ s.state }}</span> {{ s.summary }}</li>
-{% endfor %}
-</ul>
+{#
+  A group mailbox sees the body's billing, quota and state: the payment lives on
+  the group's own record so one renewal writes one date, and the page shows that
+  record rather than a copy of it.
+#}
+{% if let Some(g) = group %}
+<h3>Your body</h3>
+<p>{{ g.name }} ({{ g.kind }}), <span class="mono">{{ g.domain }}</span>.</p>
+<p>State: {{ g.state }}. Rail: {{ g.rail }}.</p>
+{% if let Some(until) = g.paid_until %}
+<p>Paid until {{ until }}.</p>
+{% endif %}
+<p>The group's mailboxes: {% for a in g.accounts %}<span class="mono">{{ a }}</span>{% if !loop.last %}, {% endif %}{% endfor %}.</p>
+{% endif %}
+
+<h3>Space used</h3>
+{% if let Some(used) = space_used %}
+<p>{{ used }} of the {{ space_soft }} soft and {{ space_hard }} hard allowance. The allowance covers mail, your site and your repositories together.</p>
+{% else %}
+<p>The space used has not been recorded yet. The allowance is {{ space_soft }} soft and {{ space_hard }} hard, across mail, your site and your repositories together.</p>
+{% endif %}
+
+<h3>Address outside the platform</h3>
+{% if let Some(address) = outside_address %}
+<p><span class="mono">{{ address }}</span></p>
+<p>We write here as well as to your address on this platform, including if the account is ever in trouble.</p>
+{% else %}
+<p>You gave no address outside the platform. We can only reach you inside this account: if you lose your key or your mail client, you will not hear from us.</p>
+{% endif %}
+
+<h3>Upload keys</h3>
+{% if upload_keys.is_empty() %}
+<p>No upload key is on this account, so there is no sftp or git access. You need one only for a website or repositories.</p>
+{% else %}
+<table>
+  <thead>
+    <tr><th>Fingerprint</th><th>Added</th></tr>
+  </thead>
+  <tbody>
+  {% for key in upload_keys %}
+    <tr><td><span class="mono">{{ key.fingerprint }}</span></td><td>{{ key.added_at }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p>One upload key serves both sftp and git. It is not a login for this page.</p>
+{% endif %}
 
 {#
   The body's DNS recipe. The values are generated once, from the platform's
@@ -75,4 +142,42 @@
 <p>{{ line }}</p>
 {% endfor %}
 {% endif %}
+
+{#
+  Every notice sent, at every address it went to: this list is also the audit of
+  what the platform has told the member, so it is not filtered by address.
+#}
+<h3>Notices</h3>
+{% if notices.is_empty() %}
+<p>Nothing has been sent yet.</p>
+{% else %}
+<table>
+  <thead>
+    <tr><th>Date</th><th>Subject</th><th>To</th></tr>
+  </thead>
+  <tbody>
+  {% for notice in notices %}
+    <tr><td>{{ notice.at }}</td><td>{{ notice.subject }}</td><td><span class="mono">{{ notice.to }}</span></td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{#
+  What the page cannot do. A member will ask, and stating it here is cheaper than
+  a reply that says the same thing.
+#}
+<h3>What this page cannot do</h3>
+<p>It cannot read your mail, recover your key, restore deleted mail, or give you a shell. Mail is read in your mail client; a lost key is replaced by the path in the runbook, and a forgotten password can be reset from the address outside the platform if you gave one.</p>
+
+<h3>What the platform offers</h3>
+<ul class="services">
+{% for s in services %}
+  <li><a href="{{ s.href }}">{{ s.name }}</a> <span class="tag">{{ s.state }}</span> {{ s.summary }}</li>
+{% endfor %}
+</ul>
+
+<form method="post" action="/logout">
+  <button class="btn" type="submit">Log out</button>
+</form>
 {% endblock %}

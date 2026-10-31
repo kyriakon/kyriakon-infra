@@ -247,7 +247,7 @@ pub enum Reply {
     /// carries are ever sent, and `reason` is that table's own spelling.
     Http {
         status: u16,
-        headers: Vec<(&'static str, String)>,
+        headers: Vec<(String, String)>,
         body: String,
     },
     /// gmid's reply, which is gemini's: two digits, a space, the META, CRLF, then
@@ -265,7 +265,10 @@ impl Reply {
     pub fn html(status: u16, body: String) -> Reply {
         Reply::Http {
             status,
-            headers: vec![("Content-Type", "text/html; charset=utf-8".to_string())],
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/html; charset=utf-8".to_string(),
+            )],
             body,
         }
     }
@@ -276,9 +279,12 @@ impl Reply {
         Reply::Http {
             status,
             headers: vec![
-                ("Content-Type", "text/html; charset=utf-8".to_string()),
-                ("Cache-Control", "no-store".to_string()),
-                ("Referrer-Policy", "no-referrer".to_string()),
+                (
+                    "Content-Type".to_string(),
+                    "text/html; charset=utf-8".to_string(),
+                ),
+                ("Cache-Control".to_string(), "no-store".to_string()),
+                ("Referrer-Policy".to_string(), "no-referrer".to_string()),
             ],
             body,
         }
@@ -290,6 +296,31 @@ impl Reply {
             status,
             meta: meta.to_string(),
             body,
+        }
+    }
+
+    /// The same reply with one header added, for a `Set-Cookie` or a
+    /// `Location`. Only the web front-end has headers; a gemini reply is
+    /// returned unchanged.
+    pub fn with_header(mut self, name: &str, value: String) -> Reply {
+        if let Reply::Http { headers, .. } = &mut self {
+            headers.push((name.to_string(), value));
+        }
+        self
+    }
+
+    /// A redirect with no body, which is what a login and a logout answer with.
+    pub fn redirect(location: &str) -> Reply {
+        Reply::Http {
+            status: 303,
+            headers: vec![
+                (
+                    "Content-Type".to_string(),
+                    "text/html; charset=utf-8".to_string(),
+                ),
+                ("Location".to_string(), location.to_string()),
+            ],
+            body: String::new(),
         }
     }
 
@@ -377,6 +408,7 @@ fn reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        303 => "See Other",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
         422 => "Unprocessable Content",
