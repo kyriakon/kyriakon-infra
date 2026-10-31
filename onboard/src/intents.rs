@@ -105,6 +105,16 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
                 .map_err(|e| format!("the credit intent does not parse: {e}"))?;
             transitions::credit(cfg, store, key, intent, file, &value).await
         }
+        "reconcile-attribute" => {
+            let intent: transitions::AttributeIntent = serde_json::from_value(value.clone())
+                .map_err(|e| format!("the reconcile-attribute intent does not parse: {e}"))?;
+            transitions::reconcile_attribute(cfg, store, key, intent, file, &value).await
+        }
+        "reconcile-return" => {
+            let intent: transitions::ReturnIntent = serde_json::from_value(value.clone())
+                .map_err(|e| format!("the reconcile-return intent does not parse: {e}"))?;
+            transitions::reconcile_return(cfg, store, key, intent, file, &value).await
+        }
         _ => transitions::refuse(cfg, store, file, &value).await,
     }
 }
@@ -240,6 +250,7 @@ pub async fn file_credit(
     amount_xmr: Option<&str>,
     confirm_double: bool,
     override_reason: Option<&str>,
+    note: Option<&str>,
     sig: &str,
 ) -> Result<String, String> {
     let id = ulid::Ulid::new().to_string();
@@ -255,6 +266,64 @@ pub async fn file_credit(
         "amount_xmr": amount_xmr,
         "confirm_double": confirm_double,
         "override_reason": override_reason,
+        "note": note,
+        "sig": sig,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    Ok(id)
+}
+
+/// File one reconcile-attribute intent, as `kyriakon-onboardctl reconcile
+/// attribute` does. The held id and the token are both validated shapes, and the
+/// console signs them, because the transition writes a paid-until date and
+/// `intents/` belongs to the unprivileged half.
+pub async fn file_reconcile_attribute(
+    store: &Store,
+    item: &str,
+    token: &str,
+    confirm_double: bool,
+    override_reason: Option<&str>,
+    sig: &str,
+) -> Result<String, String> {
+    let id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({
+        "id": id,
+        "kind": "reconcile-attribute",
+        "filed_at": crate::util::filed_at(),
+        "item": item,
+        "token": token,
+        "confirm_double": confirm_double,
+        "override_reason": override_reason,
+        "sig": sig,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    Ok(id)
+}
+
+/// File one reconcile-return intent, as `kyriakon-onboardctl reconcile return`
+/// does. The evidence is free text and signed last; nothing moves but the held
+/// line's own state.
+pub async fn file_reconcile_return(
+    store: &Store,
+    item: &str,
+    note: &str,
+    sig: &str,
+) -> Result<String, String> {
+    let id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({
+        "id": id,
+        "kind": "reconcile-return",
+        "filed_at": crate::util::filed_at(),
+        "item": item,
+        "note": note,
         "sig": sig,
     });
     let bytes =

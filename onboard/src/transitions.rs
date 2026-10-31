@@ -159,6 +159,47 @@ pub struct CreditIntent {
     pub confirm_double: bool,
     #[serde(default)]
     pub override_reason: Option<String>,
+    /// What the operator wrote down about a payment that carries no token. Free
+    /// text, so it is signed last and never read as a field.
+    #[serde(default)]
+    pub note: Option<String>,
+    pub sig: String,
+}
+
+/// A `reconcile-attribute` intent: the held item and the token it is joined to.
+/// The console signs it, because the transition writes a paid-until date and
+/// `intents/` belongs to the unprivileged half.
+#[derive(Debug, serde::Deserialize)]
+pub struct AttributeIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    /// The `UN-` id of the line in `ledger/unattributed.jsonl`.
+    pub item: String,
+    /// The payment token the held money is joined to.
+    pub token: String,
+    /// A renewal: the token already has a paid-until date, and the operator has
+    /// said this held payment is another year's money.
+    #[serde(default)]
+    pub confirm_double: bool,
+    /// The override reason for a credit that would pass the 24-month ceiling,
+    /// as the corresponding credit flag carries it.
+    #[serde(default)]
+    pub override_reason: Option<String>,
+    pub sig: String,
+}
+
+/// A `reconcile-return` intent: the held item and the evidence it went back or
+/// was kept. The evidence is free text and signed last.
+#[derive(Debug, serde::Deserialize)]
+pub struct ReturnIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub item: String,
+    pub note: String,
     pub sig: String,
 }
 
@@ -1429,6 +1470,10 @@ pub async fn resend(
 /// revalidated here because `intents/` belongs to the unprivileged half. The
 /// ledger's own `intent` field is the dedup key, so a replay writes nothing and
 /// extends nothing.
+///
+/// A credit with no token is the one case with nothing to join: it is held in
+/// `ledger/unattributed.jsonl` rather than refused, because the money is real
+/// and a member may still be found for it.
 pub async fn credit(
     cfg: &DrainConfig,
     store: &Store,
@@ -1448,6 +1493,7 @@ pub async fn credit(
             intent.amount_xmr.as_deref(),
             intent.confirm_double,
             intent.override_reason.as_deref(),
+            intent.note.as_deref(),
         ),
         &intent.sig,
     ) {
@@ -1461,10 +1507,11 @@ pub async fn credit(
         .await;
     }
 
-    // The ledger line is the settlement marker. A second arrival of the same
-    // intent finds it and stops before any other check, so a replay cannot
-    // refuse itself on a rule it already met.
-    if ledger_has_intent(store, &intent.id).await {
+    // The ledger line is the settlement marker, and a credit settles in one of
+    // two: a payment joined to a token, or a held line in the unattributed
+    // queue. A second arrival of the same intent finds its line and stops before
+    // any other check, so a replay cannot refuse itself on a rule it already met.
+    if ledger_has_intent(store, &intent.id).await || held_has_intent(store, &intent.id).await? {
         if !journal_has(store, &intent.id, "applied").await {
             journal(
                 store,
@@ -1488,124 +1535,132 @@ pub async fn credit(
     if journal_has(store, &intent.id, "refused").await {
         return Ok(());
     }
-
-    let problem = if !CREDIT_RAILS.contains(&intent.rail.as_str()) {
-        Some("the credit names a rail that is not cash, cash-hand or monero")
-    } else if !store::is_payment_token(&intent.token) {
-        Some("the credit's token is not the shape of a payment token")
-    } else if util::parse_date(&intent.received).is_none() {
-        Some("the credit's received date is not YYYY-MM-DD")
-    } else if !valid_txid(intent.txid.as_deref()) {
-        Some("the credit's transaction id is not 64 hexadecimal characters")
-    } else if !valid_xmr(intent.amount_xmr.as_deref()) {
-        Some("the credit's XMR amount is not a decimal amount")
-    } else {
-        None
-    };
-    if let Some(problem) = problem {
-        return refuse_with(cfg, store, file, value, problem).await;
-    }
-    let amount = match util::pence(&intent.amount_gbp) {
-        Ok(a) if a > 0 => a,
-        Ok(_) => {
-            return refuse_with(
-                cfg,
-                store,
-                file,
-                value,
-                "the credit's amount must be more than zero",
-            )
-            .await
-        }
-        Err(e) => return refuse_with(cfg, store, file, value, &e).await,
+    let amount = match credit_fields(&intent) {
+        Ok(amount) => amount,
+        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
     };
     let received = util::parse_date(&intent.received).expect("the date was validated above");
 
-    // The token index is the only join. A token that resolves to nothing is a
-    // payment for the unattributed queue, never an account made from a guess.
-    let Some(join_text) = store
-        .read_record("tokens", &format!("{}.json", intent.token))
-        .await
-    else {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            "the token is not in the index; an unattributed payment belongs in the queue",
-        )
-        .await;
+    // A payment with no token cannot be joined to an account, so it is held
+    // until `reconcile` joins it or closes it.
+    if intent.token.is_empty() {
+        return hold(cfg, store, &intent, file, value, amount, received).await;
+    }
+
+    let (username, account, payment) = match resolve_payment(store, &intent.token).await {
+        Ok(found) => found,
+        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
     };
-    let join: TokenRecord = match serde_json::from_str(&join_text) {
-        Ok(join) => join,
-        Err(e) => {
-            return refuse_with(
-                cfg,
-                store,
-                file,
-                value,
-                &format!("the token record does not parse: {e}"),
-            )
-            .await
-        }
+    let app = PaymentApplication {
+        intent: &intent,
+        username: &username,
+        account,
+        payment,
+        amount,
+        received,
+        attributed_item: None,
     };
-    if join.token != intent.token || validate::username_shape(&join.username).is_some() {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            "the token record does not name this token",
-        )
-        .await;
+    if apply_payment(cfg, store, file, value, app).await? {
+        store.remove("intents", file).await?;
+    }
+    Ok(())
+}
+
+/// The fields a credit's money arrives with, revalidated here because `intents/`
+/// belongs to the unprivileged half. Returns the amount in pence. A token is
+/// checked only when there is one: a payment with none is held, not refused.
+fn credit_fields(intent: &CreditIntent) -> Result<i64, String> {
+    if !CREDIT_RAILS.contains(&intent.rail.as_str()) {
+        return Err("the credit names a rail that is not cash, cash-hand or monero".to_string());
+    }
+    if !intent.token.is_empty() && !store::is_payment_token(&intent.token) {
+        return Err("the credit's token is not the shape of a payment token".to_string());
+    }
+    if util::parse_date(&intent.received).is_none() {
+        return Err("the credit's received date is not YYYY-MM-DD".to_string());
+    }
+    if !valid_txid(intent.txid.as_deref()) {
+        return Err("the credit's transaction id is not 64 hexadecimal characters".to_string());
+    }
+    if !valid_xmr(intent.amount_xmr.as_deref()) {
+        return Err("the credit's XMR amount is not a decimal amount".to_string());
+    }
+    match util::pence(&intent.amount_gbp) {
+        Ok(amount) if amount > 0 => Ok(amount),
+        Ok(_) => Err("the credit's amount must be more than zero".to_string()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The account a payment token names, through `tokens/<token>.json` and its
+/// account record. The token index is the only join, so a token that resolves to
+/// nothing is refused rather than made into an account.
+async fn resolve_payment(store: &Store, token: &str) -> Result<(String, Account, Payment), String> {
+    let Some(join_text) = store.read_record("tokens", &format!("{token}.json")).await else {
+        return Err(
+            "the token is not in the index; an unattributed payment belongs in the queue"
+                .to_string(),
+        );
+    };
+    let join: TokenRecord = serde_json::from_str(&join_text)
+        .map_err(|e| format!("the token record does not parse: {e}"))?;
+    if join.token != token || validate::username_shape(&join.username).is_some() {
+        return Err("the token record does not name this token".to_string());
     }
     let username = join.username;
     let Some(account_text) = store
         .read_record(&format!("accounts/{username}"), "account.json")
         .await
     else {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            "the token resolves to an account that is gone",
-        )
-        .await;
+        return Err("the token resolves to an account that is gone".to_string());
     };
-    let mut account: Account = match serde_json::from_str(&account_text) {
-        Ok(account) => account,
-        Err(e) => {
-            return refuse_with(
-                cfg,
-                store,
-                file,
-                value,
-                &format!("the account record does not parse: {e}"),
-            )
-            .await
-        }
+    let account: Account = serde_json::from_str(&account_text)
+        .map_err(|e| format!("the account record does not parse: {e}"))?;
+    let Some(payment) = account.payment_state() else {
+        return Err("the account carries no payment block".to_string());
     };
-    let Some(mut payment) = account.payment_state() else {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            "the account carries no payment block",
-        )
-        .await;
-    };
-    if payment.token_ref.as_deref() != Some(intent.token.as_str()) {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            "the token is not the one the account's payment block holds",
-        )
-        .await;
+    if payment.token_ref.as_deref() != Some(token) {
+        return Err("the token is not the one the account's payment block holds".to_string());
     }
+    Ok((username, account, payment))
+}
+
+/// One payment about to be applied to an account: the values a manual credit and
+/// a `reconcile attribute` both hold once the token has resolved. Passed as one
+/// value, so the two callers cannot disagree about any of them.
+struct PaymentApplication<'a> {
+    intent: &'a CreditIntent,
+    username: &'a str,
+    account: Account,
+    payment: Payment,
+    amount: i64,
+    received: time::Date,
+    /// The held item this payment came from, when the transition is a
+    /// `reconcile attribute`. Its own txid is the one in the queue, so that
+    /// item's held line is not a second sighting of the payment.
+    attributed_item: Option<&'a str>,
+}
+
+/// What a credit does to an account: the ceiling, the arithmetic, the account
+/// write, the payment copy, the ledger line and the receipt. Shared by the
+/// console's credit and `reconcile attribute`, so a held payment and a direct
+/// one are never applied differently.
+async fn apply_payment(
+    cfg: &DrainConfig,
+    store: &Store,
+    file: &str,
+    value: &Value,
+    app: PaymentApplication<'_>,
+) -> Result<bool, String> {
+    let PaymentApplication {
+        intent,
+        username,
+        mut account,
+        mut payment,
+        amount,
+        received,
+        attributed_item,
+    } = app;
 
     // A pass that journaled `applying` and wrote the account but crashed before
     // the ledger append is finished here, from the values it recorded then. The
@@ -1624,7 +1679,7 @@ pub async fn credit(
         if !ledger_has_intent(store, &intent.id).await {
             append_credit_ledger(
                 store,
-                &intent,
+                intent,
                 &util::date_string(received),
                 &util::gbp(amount),
                 &progress.applied_gbp,
@@ -1634,19 +1689,18 @@ pub async fn credit(
         }
         // A crash between the account write and its copies leaves the status
         // page behind; the account is the truth now, so rewrite them from it.
-        write_payment_copy(store, &username, &payment).await?;
+        write_payment_copy(store, username, &payment).await?;
         if !journal_has(store, &intent.id, "applied").await {
             journal_credit_applied(
                 cfg,
                 store,
-                &intent,
-                &username,
+                intent,
+                username,
                 intent.override_reason.as_deref(),
             )
             .await?;
         }
-        store.remove("intents", file).await?;
-        return Ok(());
+        return Ok(true);
     }
 
     let before = match payment.paid_until.as_deref() {
@@ -1661,6 +1715,7 @@ pub async fn credit(
                     "the account's paid-until date cannot be read",
                 )
                 .await
+                .map(|()| false)
             }
         },
         None => None,
@@ -1678,7 +1733,8 @@ pub async fn credit(
             value,
             "the credit would put paid_until more than 24 months past --received; give --override <reason> to mean it",
         )
-        .await;
+        .await
+        .map(|()| false);
     }
 
     let price = util::pence(&cfg.price_gbp)
@@ -1698,6 +1754,7 @@ pub async fn credit(
                     &format!("the account's balance cannot be read: {e}"),
                 )
                 .await
+                .map(|()| false)
             }
         },
         None => 0,
@@ -1705,7 +1762,10 @@ pub async fn credit(
     let applied = credit_money(price, balance, amount);
 
     // A transaction already in the ledger is the same payment seen again. It
-    // must never extend a date, whatever else the intent says.
+    // must never extend a date, whatever else the intent says. The queue is
+    // checked too: a payment held with no token and then credited with one is
+    // one payment, not two, unless this transition is attributing that very
+    // held item.
     if let Some(txid) = intent.txid.as_deref() {
         if let Some((seq, received_on)) = ledger_txid(store, txid).await {
             return refuse_with(
@@ -1717,23 +1777,42 @@ pub async fn credit(
                     "transaction {txid} was already credited on {received_on} at ledger seq {seq}"
                 ),
             )
-            .await;
+            .await
+            .map(|()| false);
+        }
+        if let Some((id, received_on)) = held_txid(store, txid).await? {
+            if attributed_item != Some(id.as_str()) {
+                return refuse_with(
+                    cfg,
+                    store,
+                    file,
+                    value,
+                    &format!(
+                        "transaction {txid} is already held as {id}, received on {received_on}; attribute that item instead"
+                    ),
+                )
+                .await
+                .map(|()| false);
+            }
         }
     }
     // A token already credited is a renewal, and the second credit needs the
     // operator to have said so: for cash the second envelope may be a
-    // stranger's with a copied token.
+    // stranger's with a copied token. Held money is never a renewal, because it
+    // was never joined to the token in the first place.
     if let (Some(paid_until), false) = (payment.paid_until.as_deref(), intent.confirm_double) {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            &format!(
+        let problem = if intent.kind == "credit" {
+            format!(
                 "this token was already credited until {paid_until}; give --confirm-double for a renewal"
-            ),
-        )
-        .await;
+            )
+        } else {
+            format!(
+                "the token was already credited until {paid_until}; record a renewal with `credit --confirm-double`"
+            )
+        };
+        return refuse_with(cfg, store, file, value, &problem)
+            .await
+            .map(|()| false);
     }
 
     let until_text = util::date_string(until);
@@ -1750,8 +1829,8 @@ pub async fn credit(
         journal_credit_applying(
             store,
             &cfg.release,
-            &intent,
-            &username,
+            intent,
+            username,
             &CreditProgress {
                 paid: applied.paid,
                 paid_until_after: paid_until_after.clone(),
@@ -1778,10 +1857,10 @@ pub async fn credit(
     store
         .write_record(&format!("accounts/{username}"), "account.json", &bytes)
         .await?;
-    write_payment_copy(store, &username, &payment).await?;
+    write_payment_copy(store, username, &payment).await?;
     append_credit_ledger(
         store,
-        &intent,
+        intent,
         &util::date_string(received),
         &util::gbp(amount),
         &util::gbp(applied.applied),
@@ -1825,7 +1904,7 @@ pub async fn credit(
     notice::send_account_notice(
         cfg,
         store,
-        &username,
+        username,
         "prepaid.receipt",
         &subject,
         &to,
@@ -1833,11 +1912,452 @@ pub async fn credit(
     )
     .await?;
 
-    journal_credit_applied(cfg, store, &intent, &username, override_reason).await?;
-    store.remove("intents", file).await
+    journal_credit_applied(cfg, store, intent, username, override_reason).await?;
+    Ok(true)
 }
 
 pub const CREDIT_RAILS: [&str; 3] = ["cash", "cash-hand", "monero"];
+
+/// Hold a credit that names no token: validate it exactly as a credit is
+/// validated, dedup it on the intent id and the transaction id, and append one
+/// line to the unattributed queue. No account is written, no payment line is
+/// appended and no notice is sent, because nothing here has a member yet.
+async fn hold(
+    cfg: &DrainConfig,
+    store: &Store,
+    intent: &CreditIntent,
+    file: &str,
+    value: &Value,
+    amount: i64,
+    received: time::Date,
+) -> Result<(), String> {
+    if intent.rail == "cash-hand" {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "cash in hand is credited against a username; give --username",
+        )
+        .await;
+    }
+    let Some(note) = intent
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|note| !note.is_empty())
+    else {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "a payment with no token needs --note so the operator can tell what it is",
+        )
+        .await;
+    };
+    // A transaction already seen is the same payment, whether it was held or
+    // credited: it must never become a second line the operator could join
+    // twice. The queue and the ledger are two records of one payment, so both
+    // are consulted from either side.
+    if let Some(txid) = intent.txid.as_deref() {
+        if let Some((seq, received_on)) = ledger_txid(store, txid).await {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                &format!(
+                    "transaction {txid} was already credited on {received_on} at ledger seq {seq}"
+                ),
+            )
+            .await;
+        }
+        if let Some((id, received_on)) = held_txid(store, txid).await? {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                &format!("transaction {txid} is already held as {id}, received on {received_on}"),
+            )
+            .await;
+        }
+    }
+    let line = json!({
+        "version": 1,
+        "id": store::unattributed_id().await?,
+        "kind": "held",
+        "state": "held",
+        "rail": intent.rail.as_str(),
+        "amount_gbp": util::gbp(amount),
+        "received_on": util::date_string(received),
+        "amount_xmr": intent.amount_xmr.as_deref(),
+        "txid": intent.txid.as_deref(),
+        "intent": intent.id.as_str(),
+        "note": note,
+    });
+    let encoded =
+        serde_json::to_string(&line).map_err(|e| format!("cannot encode the queue: {e}"))?;
+    store
+        .append(store::UNATTRIBUTED, encoded.as_bytes())
+        .await?;
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &ApplicationRef {
+            username: String::new(),
+            status_token: String::new(),
+        },
+        "applied",
+        Some("held: the payment carries no token"),
+    )
+    .await?;
+    store.remove("intents", file).await
+}
+
+/// Join a held payment to an account: the same arithmetic, account write,
+/// payment copy and receipt as a credit, then the one ledger line for the token
+/// and the held line marked `attributed`. The held line names the token it went
+/// to and never the username, because the ledger outlives the account.
+pub async fn reconcile_attribute(
+    cfg: &DrainConfig,
+    store: &Store,
+    key: &[u8],
+    intent: AttributeIntent,
+    file: &str,
+    value: &Value,
+) -> Result<(), String> {
+    if !sign::verify(
+        key,
+        &sign::reconcile_attribute_payload(
+            &intent.item,
+            &intent.token,
+            intent.confirm_double,
+            intent.override_reason.as_deref(),
+        ),
+        &intent.sig,
+    ) {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the reconcile-attribute intent's signature does not verify",
+        )
+        .await;
+    }
+    if !store::is_unattributed_id(&intent.item) {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the held item's id is not the shape of an unattributed payment",
+        )
+        .await;
+    }
+    if !store::is_payment_token(&intent.token) {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the token is not the shape of a payment token",
+        )
+        .await;
+    }
+
+    // The payment line is the settlement marker. A replay of the very intent
+    // that attributed the item still has to finish marking the held line, if a
+    // crash landed between the two writes.
+    if ledger_has_intent(store, &intent.id).await {
+        mark_attributed(store, &intent.item, &intent.token).await?;
+        store.remove("intents", file).await?;
+        return Ok(());
+    }
+    if journal_has(store, &intent.id, "refused").await {
+        return Ok(());
+    }
+
+    let held = match store
+        .held()
+        .await?
+        .into_iter()
+        .find(|line| line.id == intent.item)
+    {
+        Some(held) => held,
+        None => {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                &format!("no held payment with id {}", intent.item),
+            )
+            .await
+        }
+    };
+    if held.state != "held" {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            &format!("{} is {}, not held", intent.item, held.state),
+        )
+        .await;
+    }
+
+    let (username, account, payment) = match resolve_payment(store, &intent.token).await {
+        Ok(found) => found,
+        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+    };
+    // The held line is data the console wrote earlier, so it is revalidated
+    // exactly as a credit's fields are. The intent it carries is this intent's
+    // id: the payment line and the journal are keyed by the join, not by the
+    // hold.
+    let payment_intent = CreditIntent {
+        id: intent.id.clone(),
+        kind: intent.kind.clone(),
+        filed_at: intent.filed_at.clone(),
+        token: intent.token.clone(),
+        rail: held.rail.clone(),
+        amount_gbp: held.amount_gbp.clone(),
+        received: held.received_on.clone(),
+        txid: held.txid.clone(),
+        amount_xmr: held.amount_xmr.clone(),
+        confirm_double: intent.confirm_double,
+        override_reason: intent.override_reason.clone(),
+        note: held.note.clone(),
+        sig: String::new(),
+    };
+    let amount = match credit_fields(&payment_intent) {
+        Ok(amount) => amount,
+        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+    };
+    let received =
+        util::parse_date(&payment_intent.received).expect("the date was validated above");
+    let app = PaymentApplication {
+        intent: &payment_intent,
+        username: &username,
+        account,
+        payment,
+        amount,
+        received,
+        attributed_item: Some(&intent.item),
+    };
+    if !apply_payment(cfg, store, file, value, app).await? {
+        return Ok(());
+    }
+    mark_attributed(store, &intent.item, &intent.token).await?;
+    store.remove("intents", file).await
+}
+
+/// Close a held payment with the evidence it went back or was kept. No payment
+/// line and no notice: no money moved and no account was touched.
+pub async fn reconcile_return(
+    cfg: &DrainConfig,
+    store: &Store,
+    key: &[u8],
+    intent: ReturnIntent,
+    file: &str,
+    value: &Value,
+) -> Result<(), String> {
+    if !sign::verify(
+        key,
+        &sign::reconcile_return_payload(&intent.item, &intent.note),
+        &intent.sig,
+    ) {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the reconcile-return intent's signature does not verify",
+        )
+        .await;
+    }
+    if !store::is_unattributed_id(&intent.item) {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the held item's id is not the shape of an unattributed payment",
+        )
+        .await;
+    }
+    if journal_has(store, &intent.id, "refused").await {
+        return Ok(());
+    }
+    let note = intent.note.trim();
+    if note.is_empty() {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the evidence for the return is needed",
+        )
+        .await;
+    }
+    let state = store
+        .held()
+        .await?
+        .into_iter()
+        .find(|line| line.id == intent.item)
+        .map(|line| line.state);
+    match state.as_deref() {
+        None => {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                &format!("no held payment with id {}", intent.item),
+            )
+            .await
+        }
+        Some("held") => {}
+        Some(other) => {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                &format!("{} is {other}, not held", intent.item),
+            )
+            .await
+        }
+    }
+
+    let evidence = format!("returned: {note}");
+    let item = intent.item.clone();
+    rewrite_unattributed(store, &item, |line| {
+        if line.state != "held" {
+            return Err(format!("{item} is {}, not held", line.state));
+        }
+        line.state = "returned".to_string();
+        line.returned_at = Some(util::filed_at());
+        // The original note is kept and the evidence is appended to it: what the
+        // operator first wrote down is part of the item's history too.
+        line.note = Some(match line.note.take() {
+            Some(original) => format!("{original}; {evidence}"),
+            None => evidence.clone(),
+        });
+        Ok(())
+    })
+    .await?;
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &ApplicationRef {
+            username: String::new(),
+            status_token: String::new(),
+        },
+        "applied",
+        None,
+    )
+    .await?;
+    store.remove("intents", file).await
+}
+
+/// Mark one held line attributed to a token. Idempotent for the replay path, and
+/// a returned item is refused rather than relabelled.
+async fn mark_attributed(store: &Store, item: &str, token: &str) -> Result<(), String> {
+    let id = item.to_string();
+    let token = token.to_string();
+    rewrite_unattributed(store, item, move |line| {
+        if line.state == "returned" {
+            return Err(format!("{id} was returned, so it cannot be attributed"));
+        }
+        if line.state == "held" {
+            line.state = "attributed".to_string();
+            line.attributed_at = Some(util::filed_at());
+            line.attributed_to = Some(token);
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// An exclusive lock on a store file, for the one record write that is not an
+/// append: a reconcile reads every line and writes them back, and the drain and
+/// the console are different processes, so a line appended between the read and
+/// the write would be dropped by the rewrite.
+///
+/// The lock lives in a file of its own rather than on the record, as
+/// `requests::lock` does: the rewrite replaces the record by rename, and a lock
+/// on the replaced inode would stop guarding the path the moment the rename
+/// landed. The caller owns the completion under this lock.
+pub(crate) async fn lock_store_file(store: &Store, rel: &str) -> Result<tokio::fs::File, String> {
+    if let Some(parent) = std::path::Path::new(rel).parent().and_then(|p| p.to_str()) {
+        if !parent.is_empty() {
+            store.ensure_dir(parent).await?;
+        }
+    }
+    let path = store.path(rel);
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).mode(0o600);
+    let file = opts
+        .open(&path)
+        .await
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!(
+            "cannot lock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(file)
+}
+
+/// Rewrite one held line under the queue's lock, through `change`.
+async fn rewrite_unattributed(
+    store: &Store,
+    id: &str,
+    change: impl FnOnce(&mut store::HeldItem) -> Result<(), String>,
+) -> Result<(), String> {
+    let _guard = lock_store_file(store, "ledger/.unattributed.lock").await?;
+    let mut items = store.held().await?;
+    let at = items
+        .iter()
+        .position(|line| line.id == id)
+        .ok_or_else(|| format!("no held payment with id {id}"))?;
+    change(&mut items[at])?;
+    let mut bytes = String::new();
+    for item in &items {
+        bytes.push_str(
+            &serde_json::to_string(item).map_err(|e| format!("cannot encode the queue: {e}"))?,
+        );
+        bytes.push('\n');
+    }
+    store
+        .write_record("ledger", "unattributed.jsonl", bytes.as_bytes())
+        .await
+}
+
+/// Whether the unattributed queue already holds this intent's line.
+async fn held_has_intent(store: &Store, id: &str) -> Result<bool, String> {
+    Ok(store.held().await?.iter().any(|line| line.intent == id))
+}
+
+/// The held line carrying this transaction id, with its id and the date it was
+/// received, so a second sighting of one payment can name both.
+async fn held_txid(store: &Store, txid: &str) -> Result<Option<(String, String)>, String> {
+    Ok(store
+        .held()
+        .await?
+        .into_iter()
+        .find(|line| line.txid.as_deref() == Some(txid))
+        .map(|line| (line.id, line.received_on)))
+}
 
 fn valid_txid(txid: Option<&str>) -> bool {
     match txid {
@@ -2036,6 +2556,21 @@ async fn write_payment_copy(
     Ok(())
 }
 
+/// The next `seq`: one past the highest the ledger holds. Every ledger writer
+/// goes through here, so a refund and a credit cannot both claim the same
+/// number.
+pub(crate) async fn next_ledger_seq(store: &Store) -> u64 {
+    let mut seq = 0u64;
+    for line in store.lines("ledger/payments.jsonl").await {
+        if let Ok(v) = serde_json::from_str::<Value>(&line) {
+            if let Some(s) = v.get("seq").and_then(Value::as_u64) {
+                seq = seq.max(s);
+            }
+        }
+    }
+    seq + 1
+}
+
 /// Append the credit's line: the next `seq`, keyed by the token, with no
 /// username. The rate fields stay null until the Monero quote lands (#303); the
 /// XMR amount and the transaction id are recorded when the operator gave them.
@@ -2047,17 +2582,10 @@ async fn append_credit_ledger(
     applied_gbp: &str,
     paid_until_after: Option<&str>,
 ) -> Result<(), String> {
-    let mut seq = 0u64;
-    for line in store.lines("ledger/payments.jsonl").await {
-        if let Ok(v) = serde_json::from_str::<Value>(&line) {
-            if let Some(s) = v.get("seq").and_then(Value::as_u64) {
-                seq = seq.max(s);
-            }
-        }
-    }
+    let seq = next_ledger_seq(store).await;
     let line = json!({
         "version": 1,
-        "seq": seq + 1,
+        "seq": seq,
         "token": intent.token.as_str(),
         "kind": "payment",
         "rail": intent.rail.as_str(),
@@ -5075,6 +5603,7 @@ mod tests {
             None,
             false,
             Some("posted twice"),
+            None,
         );
         let b = sign::credit_payload(
             "KYR-4F2M-9QH7-XT3B",
@@ -5085,9 +5614,25 @@ mod tests {
             None,
             false,
             Some("posted once"),
+            None,
         );
         assert_ne!(a, b);
         assert!(a.contains("posted twice"));
+        // The note is free text and last, so a note that carries a colon cannot
+        // shift the fields before it into agreeing with another intent's.
+        let c = sign::credit_payload(
+            "",
+            "cash",
+            "20.00",
+            "2026-10-04",
+            None,
+            None,
+            false,
+            None,
+            Some("no token: envelope in book"),
+        );
+        assert!(c.contains("no token: envelope in book"));
+        assert_ne!(c, a);
     }
 
     #[test]

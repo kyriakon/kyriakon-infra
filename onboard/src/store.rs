@@ -12,6 +12,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// The queue money with no token is held in, append-only except for the one
+/// line `reconcile` completes under its lock.
+pub const UNATTRIBUTED: &str = "ledger/unattributed.jsonl";
+
 pub struct Store {
     root: PathBuf,
 }
@@ -158,9 +162,10 @@ impl Store {
     }
 
     /// Append one line to a store file, creating it 0600 and its directory if
-    /// needed. Append is the only write the journal, the notices and the ledger
-    /// use: none of the three is ever rewritten, which is what makes them a
-    /// record rather than a state.
+    /// needed. Append is the write the journal, the notices and the ledger use.
+    /// A record is never rewritten except to complete a line that has to be
+    /// completed later, under the lock `transitions::lock_store_file` takes, as
+    /// a request close and a refund settlement do.
     pub async fn append(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
         let p = self.root.join(path);
         if let Some(parent) = p.parent() {
@@ -222,6 +227,57 @@ impl Store {
                 self.root.join(dir).display()
             )),
         }
+    }
+
+    /// The unattributed queue, one held payment per line. A missing file reads
+    /// as empty; a read error or a line that does not parse is an error, because
+    /// `reconcile list` must not report a clear queue it cannot read.
+    pub async fn held(&self) -> Result<Vec<HeldItem>, String> {
+        let abs = self.root.join(UNATTRIBUTED);
+        let text = match tokio::fs::read_to_string(&abs).await {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("cannot read {}: {e}", abs.display())),
+        };
+        let mut out = Vec::new();
+        for (i, line) in text
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .enumerate()
+        {
+            out.push(
+                serde_json::from_str(line)
+                    .map_err(|e| format!("{UNATTRIBUTED}: line {} does not parse: {e}", i + 1))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// The JSON lines of a record, strictly: a missing file is empty, but an
+    /// unreadable file or a line that does not parse is an error rather than an
+    /// empty result. A reader that reports "nothing" for a record it could not
+    /// read is a check that cannot see what it is checking.
+    pub async fn json_lines(&self, path: &str) -> Result<Vec<serde_json::Value>, String> {
+        let abs = self.root.join(path);
+        let text = match tokio::fs::read_to_string(&abs).await {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("cannot read {}: {e}", abs.display())),
+        };
+        let mut out = Vec::new();
+        for (i, line) in text
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .enumerate()
+        {
+            out.push(
+                serde_json::from_str(line)
+                    .map_err(|e| format!("{path}: line {} does not parse: {e}", i + 1))?,
+            );
+        }
+        Ok(out)
     }
 
     /// The non-empty lines of a store file, with a missing file reading as
@@ -449,6 +505,46 @@ fn crockford12(v: u64) -> String {
         body.push(A[((v >> (5 * i)) & 31) as usize] as char);
     }
     format!("KYR-{}-{}-{}", &body[0..4], &body[4..8], &body[8..12])
+}
+
+/// The unattributed payment id, `UN-` and eight Crockford characters, e.g.
+/// `UN-3K7QW2M9`. It is the handle `reconcile attribute` and `reconcile return`
+/// take, drawn from the kernel pool beside the payment token and for the same
+/// reason: an id derived from the date or the amount would be one the operator
+/// could guess, and this one names money that has no member yet.
+///
+/// Eight characters at five bits each are 40 bits, and 2^40 is an exact
+/// multiple of 32, so masking the low 40 bits of a uniform 64-bit draw is
+/// bias-free.
+pub async fn unattributed_id() -> Result<String, String> {
+    let mut bytes = [0u8; 8];
+    let mut f = tokio::fs::File::open("/dev/urandom")
+        .await
+        .map_err(|e| format!("cannot open /dev/urandom: {e}"))?;
+    f.read_exact(&mut bytes)
+        .await
+        .map_err(|e| format!("cannot read /dev/urandom: {e}"))?;
+    Ok(crockford8(u64::from_be_bytes(bytes) & ((1 << 40) - 1)))
+}
+
+fn crockford8(v: u64) -> String {
+    const A: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut body = String::with_capacity(11);
+    for i in (0..8).rev() {
+        body.push(A[((v >> (5 * i)) & 31) as usize] as char);
+    }
+    format!("UN-{body}")
+}
+
+/// Whether a value is the shape of an unattributed payment id, checked before
+/// it is used to find a line in the queue.
+pub fn is_unattributed_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    b.len() == 11
+        && &b[..3] == b"UN-"
+        && b[3..]
+            .iter()
+            .all(|c| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(c))
 }
 
 /// Whether a value is the shape of a payment token, for revalidation before a
@@ -872,6 +968,40 @@ pub struct JournalLine {
     pub credit: Option<CreditProgress>,
 }
 
+/// One line of `ledger/unattributed.jsonl`: money that could not be joined to
+/// an account, held with its rail, amount, date and note. It names no member;
+/// `attributed_to` is a token, never a username, because the ledger outlives the
+/// account and the join is the token's to keep. The completion fields are
+/// absent on a held line and written once, under the queue's lock, by
+/// `reconcile`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeldItem {
+    pub version: u32,
+    pub id: String,
+    /// `held`, so the line's own name for what it is is visible in the file.
+    pub kind: String,
+    /// `held`, `attributed` or `returned`.
+    pub state: String,
+    pub rail: String,
+    pub amount_gbp: String,
+    pub received_on: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount_xmr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub txid: Option<String>,
+    /// The intent that held it, which is also its dedup key.
+    pub intent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributed_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub returned_at: Option<String>,
+}
+
 /// One line of an account's `notices.jsonl`: recorded before the message is
 /// enqueued, so a crash loses an email rather than sending two. The dedup key is
 /// the pair of `type` and `subject`.
@@ -1013,6 +1143,28 @@ mod tests {
             "{t}"
         );
         assert_ne!(t, payment_token().await.unwrap());
+    }
+
+    /// The queue's handle is `UN-` and eight uppercase Crockford characters: no
+    /// lowercase, and none of the letters Crockford leaves out.
+    #[tokio::test]
+    async fn an_unattributed_id_is_un_and_eight_crockford_characters() {
+        let id = unattributed_id().await.unwrap();
+        assert_eq!(id.len(), 11, "{id}");
+        assert!(id.starts_with("UN-"), "{id}");
+        assert!(is_unattributed_id(&id), "{id}");
+        assert!(!id[3..].contains(['I', 'L', 'O', 'U']), "{id}");
+        assert_ne!(id, unattributed_id().await.unwrap());
+        for bad in [
+            "UN-3K7QW2M",
+            "UN-3K7QW2M9X",
+            "un-3k7qw2m9",
+            "UN3K7QW2M9",
+            "UN-3K7QW2M-",
+            "UN-3K7QW2MI",
+        ] {
+            assert!(!is_unattributed_id(bad), "{bad:?} should be refused");
+        }
     }
 
     #[test]
