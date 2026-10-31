@@ -56,7 +56,11 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     // resolving is the one thing about a body's domain the platform can see and
     // cannot repair, and it must not delay a filed application or a member's
     // mail. It is due-gated, so most passes do no DNS work.
-    transitions::check_group_dns(cfg, store).await
+    transitions::check_group_dns(cfg, store).await?;
+    // The card rail's arriving events are settled after everything else: a
+    // misconfigured signing secret must not hold up an approval, and an event
+    // that cannot be applied yet is left for the next pass.
+    transitions::stripe_webhooks(cfg, store).await
 }
 
 /// One intent, dispatched by kind.

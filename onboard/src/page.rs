@@ -178,7 +178,7 @@ fn section(id: &str) -> Section {
         | "body_account_names" | "body_dns_contact" => Section::Community,
         "mail_key" | "upload_key" | "body_mail_key" | "body_upload_key" => Section::MailKey,
         "rail" => Section::Pay,
-        "accept_terms" => Section::Acceptance,
+        "accept_terms" | "accept_supply" => Section::Acceptance,
         _ => Section::About,
     }
 }
@@ -222,6 +222,7 @@ pub fn payment(
     payment: &crate::store::Payment,
     price_gbp: &str,
     postal_address: &str,
+    card_link: Option<&str>,
     now: OffsetDateTime,
 ) -> PaymentView {
     let unpaid = payment.paid_until.is_none();
@@ -266,7 +267,7 @@ pub fn payment(
         paid_until: payment.paid_until.clone(),
         window: window_line,
         instructions: if unpaid {
-            crate::transitions::rail_instructions(rail, postal_address)
+            crate::transitions::rail_instructions(rail, postal_address, card_link)
         } else {
             Vec::new()
         },
@@ -508,6 +509,13 @@ mod tests {
                 true,
                 Rule::None,
             ),
+            q(
+                "accept_supply",
+                Branch::All,
+                Kind::Acceptance,
+                true,
+                Rule::None,
+            ),
         ]
     }
 
@@ -520,7 +528,7 @@ mod tests {
         assert_eq!(ids(&p.mailkey), ["mail_key"]);
         assert_eq!(ids(&p.pay), ["rail"]);
         assert_eq!(ids(&p.about), ["blessing"]);
-        assert_eq!(ids(&p.acceptance), ["accept_terms"]);
+        assert_eq!(ids(&p.acceptance), ["accept_terms", "accept_supply"]);
     }
 
     #[test]

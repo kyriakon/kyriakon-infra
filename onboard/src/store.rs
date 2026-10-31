@@ -559,15 +559,19 @@ pub struct GroupAddress {
     pub mailbox: String,
 }
 
-/// The payment block `groups/<domain>/group.json` carries. The card rail's
-/// subscription and the prepaid rail's window are #315's; what this record holds
-/// now is the rail the application chose and whether it was approved without
-/// charge, and a paid-until date the group's single renewal will set.
+/// The payment block `groups/<domain>/group.json` carries: the rail the
+/// application chose, whether it was approved without charge, the date the
+/// group's single renewal sets, and the card rail's subscription once one is
+/// attached. The group holds the payment for every mailbox in it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GroupPayment {
     pub rail: String,
     pub no_charge: bool,
     pub paid_until: Option<String>,
+    /// The card rail's subscription, when one is attached. Absent on a prepaid
+    /// or free group, and absent from a record written before the webhook pass.
+    #[serde(default)]
+    pub stripe: StripeBilling,
 }
 
 /// `groups/<domain>/group.json`: one body's record. The name and kind are the
@@ -689,6 +693,36 @@ pub struct Payment {
     /// credit before it asks for more. Absent when nothing is held.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance_gbp: Option<String>,
+    /// The card rail's own facts, attached by `checkout.session.completed` and
+    /// reconciled by the subscription and invoice events. Absent until a card
+    /// payment is heard, and absent from a prepaid or free account.
+    #[serde(default)]
+    pub stripe: StripeBilling,
+}
+
+/// What the card rail records on the account or group it belongs to. Nothing
+/// here grants access: `paid_until` is the date, and this is the evidence of
+/// which subscription sets it and what Stripe last said about it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StripeBilling {
+    /// The subscription `checkout.session.completed` attached.
+    pub subscription: Option<String>,
+    /// The Customer Stripe made for the subscription.
+    pub customer: Option<String>,
+    /// The subscription's last reported status: `active`, `past_due`,
+    /// `canceled`. Recorded and never the thing that revokes a paid date.
+    pub status: Option<String>,
+    /// Stripe's `current_period_end`, RFC 3339. `cancel_at_period_end` runs to
+    /// this date and no further.
+    pub current_period_end: Option<String>,
+    /// The next retry a failed invoice named, RFC 3339.
+    pub next_payment_attempt: Option<String>,
+    /// How many payment attempts have failed since the last paid invoice.
+    pub failed_attempts: u32,
+    /// The invoice whose payment already extended `paid_until`, so a redelivery
+    /// of that invoice settles nothing twice even if its event id is new.
+    pub last_invoice: Option<String>,
 }
 
 /// The account's payment state, from the nested block or, for a record written
@@ -770,6 +804,7 @@ impl FlatPayment {
             window: self.window.clone(),
             rail: None,
             balance_gbp: None,
+            stripe: StripeBilling::default(),
         })
     }
 }

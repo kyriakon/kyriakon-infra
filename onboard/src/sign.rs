@@ -60,9 +60,16 @@ pub fn read_key(path: &std::path::Path) -> Result<Vec<u8>, String> {
 /// accepts a key of any length, and the error path is kept so a caller writes
 /// `?` rather than an `unwrap` on a value the OS randomness feeds.
 pub fn sign(key: &[u8], payload: &str) -> Result<String, String> {
+    sign_bytes(key, payload.as_bytes())
+}
+
+/// The same signature over bytes, for a payload that is not text: a webhook's
+/// raw body is verified exactly as it arrived, and a lossy reread of it would
+/// not be the bytes Stripe signed.
+pub fn sign_bytes(key: &[u8], payload: &[u8]) -> Result<String, String> {
     let mut mac =
         HmacSha256::new_from_slice(key).map_err(|e| format!("cannot key the HMAC: {e}"))?;
-    mac.update(payload.as_bytes());
+    mac.update(payload);
     Ok(hex(&mac.finalize().into_bytes()))
 }
 
@@ -70,7 +77,13 @@ pub fn sign(key: &[u8], payload: &str) -> Result<String, String> {
 /// is over the recomputed signature byte by byte and not with `==`, so the time
 /// it takes does not tell a caller how much of a guess was right.
 pub fn verify(key: &[u8], payload: &str, sig: &str) -> bool {
-    match sign(key, payload) {
+    verify_bytes(key, payload.as_bytes(), sig)
+}
+
+/// Whether a signature is the one this key makes for these bytes. Constant time
+/// for the reason [`verify`] is.
+pub fn verify_bytes(key: &[u8], payload: &[u8], sig: &str) -> bool {
+    match sign_bytes(key, payload) {
         Ok(want) => constant_eq(want.as_bytes(), sig.as_bytes()),
         Err(_) => false,
     }
