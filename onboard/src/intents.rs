@@ -95,6 +95,11 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
                 .map_err(|e| format!("the token resend intent does not parse: {e}"))?;
             transitions::resend(cfg, store, key, intent, file).await
         }
+        "credit" => {
+            let intent: transitions::CreditIntent = serde_json::from_value(value.clone())
+                .map_err(|e| format!("the credit intent does not parse: {e}"))?;
+            transitions::credit(cfg, store, key, intent, file, &value).await
+        }
         _ => transitions::refuse(cfg, store, file, &value).await,
     }
 }
@@ -183,6 +188,46 @@ pub async fn file_resend(
         "filed_at": crate::util::filed_at(),
         "username": username,
         "token": token,
+        "sig": sig,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    Ok(id)
+}
+
+/// File a manual credit, as `kyriakon-onboardctl credit` does. The token is the
+/// account's own, resolved by the console before it signs, and the signature is
+/// over every field the drain acts on: a credit moves a paid-until date, and
+/// `intents/` is writable by the unprivileged handler.
+#[allow(clippy::too_many_arguments)]
+pub async fn file_credit(
+    store: &Store,
+    token: &str,
+    rail: &str,
+    amount_gbp: &str,
+    received: &str,
+    txid: Option<&str>,
+    amount_xmr: Option<&str>,
+    confirm_double: bool,
+    override_reason: Option<&str>,
+    sig: &str,
+) -> Result<String, String> {
+    let id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({
+        "id": id,
+        "kind": "credit",
+        "filed_at": crate::util::filed_at(),
+        "token": token,
+        "rail": rail,
+        "amount_gbp": amount_gbp,
+        "received": received,
+        "txid": txid,
+        "amount_xmr": amount_xmr,
+        "confirm_double": confirm_double,
+        "override_reason": override_reason,
         "sig": sig,
     });
     let bytes =

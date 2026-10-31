@@ -135,6 +135,33 @@ pub struct ResendIntent {
     pub sig: String,
 }
 
+/// A manual credit: one payment recorded against the token its account holds.
+/// The console resolves a `--username` to that token before filing, and this
+/// carries the token, the rail, the money, the day the money arrived and the
+/// override reason when the operator gave one. The signature covers all of it,
+/// because the intent moves a paid-until date and `intents/` belongs to the
+/// unprivileged half.
+#[derive(Debug, serde::Deserialize)]
+pub struct CreditIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub token: String,
+    pub rail: String,
+    pub amount_gbp: String,
+    pub received: String,
+    #[serde(default)]
+    pub txid: Option<String>,
+    #[serde(default)]
+    pub amount_xmr: Option<String>,
+    #[serde(default)]
+    pub confirm_double: bool,
+    #[serde(default)]
+    pub override_reason: Option<String>,
+    pub sig: String,
+}
+
 /// Run one of the repository's privileged scripts by its configured path and
 /// hand back what it wrote. It is called with argv only: there is no shell
 /// anywhere in the drain, and every value that reaches it was validated first.
@@ -1166,6 +1193,8 @@ async fn approve(
             token_issued_at: Some(now.clone()),
             paid_until: None,
             window: window.clone(),
+            rail: Some(record.rail.clone()),
+            balance_gbp: None,
         })
     };
 
@@ -1389,6 +1418,493 @@ pub async fn resend(
     )
     .await?;
     store.remove("intents", file).await
+}
+
+/// Apply a manual credit: one payment, the one date arithmetic, one ledger line.
+///
+/// The token index joins the token to a username and nothing else is trusted
+/// from the intent's shape: the rail, the amount, the date and the token are
+/// revalidated here because `intents/` belongs to the unprivileged half. The
+/// ledger's own `intent` field is the dedup key, so a replay writes nothing and
+/// extends nothing.
+pub async fn credit(
+    cfg: &DrainConfig,
+    store: &Store,
+    key: &[u8],
+    intent: CreditIntent,
+    file: &str,
+    value: &Value,
+) -> Result<(), String> {
+    if !sign::verify(
+        key,
+        &sign::credit_payload(
+            &intent.token,
+            &intent.rail,
+            &intent.amount_gbp,
+            &intent.received,
+            intent.txid.as_deref(),
+            intent.amount_xmr.as_deref(),
+            intent.confirm_double,
+            intent.override_reason.as_deref(),
+        ),
+        &intent.sig,
+    ) {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the credit intent's signature does not verify",
+        )
+        .await;
+    }
+
+    // The ledger line is the settlement marker. A second arrival of the same
+    // intent finds it and stops before any other check, so a replay cannot
+    // refuse itself on the double-payment rule or on a ceiling it already met.
+    if ledger_has_intent(store, &intent.id).await {
+        if !journal_has(store, &intent.id, "applied").await {
+            journal(
+                store,
+                &cfg.release,
+                &intent.id,
+                &intent.kind,
+                &ApplicationRef {
+                    username: String::new(),
+                    status_token: String::new(),
+                },
+                "applied",
+                Some("replayed: the ledger already holds this credit"),
+            )
+            .await?;
+        }
+        store.remove("intents", file).await?;
+        return Ok(());
+    }
+    if intent_seen(store, &intent.id).await {
+        return Ok(());
+    }
+
+    let problem = if !PAYMENT_RAILS.contains(&intent.rail.as_str()) {
+        Some("the credit names a rail that is not cash, cash-hand or monero")
+    } else if !store::is_payment_token(&intent.token) {
+        Some("the credit's token is not the shape of a payment token")
+    } else if util::parse_date(&intent.received).is_none() {
+        Some("the credit's received date is not YYYY-MM-DD")
+    } else if !valid_txid(intent.txid.as_deref()) {
+        Some("the credit's transaction id is not 64 hexadecimal characters")
+    } else if !valid_xmr(intent.amount_xmr.as_deref()) {
+        Some("the credit's XMR amount is not a decimal amount")
+    } else {
+        None
+    };
+    if let Some(problem) = problem {
+        return refuse_with(cfg, store, file, value, problem).await;
+    }
+    let amount = match util::pence(&intent.amount_gbp) {
+        Ok(a) if a > 0 => a,
+        Ok(_) => {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                "the credit's amount must be more than zero",
+            )
+            .await
+        }
+        Err(e) => return refuse_with(cfg, store, file, value, &e).await,
+    };
+    let received = util::parse_date(&intent.received).expect("the date was validated above");
+
+    // The token index is the only join. A token that resolves to nothing is a
+    // payment for the unattributed queue, never an account made from a guess.
+    let Some(join_text) = store
+        .read_record("tokens", &format!("{}.json", intent.token))
+        .await
+    else {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the token is not in the index; an unattributed payment belongs in the queue",
+        )
+        .await;
+    };
+    let join: TokenRecord = match serde_json::from_str(&join_text) {
+        Ok(join) => join,
+        Err(e) => {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                &format!("the token record does not parse: {e}"),
+            )
+            .await
+        }
+    };
+    if join.token != intent.token || validate::username_shape(&join.username).is_some() {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the token record does not name this token",
+        )
+        .await;
+    }
+    let username = join.username;
+    let Some(account_text) = store
+        .read_record(&format!("accounts/{username}"), "account.json")
+        .await
+    else {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the token resolves to an account that is gone",
+        )
+        .await;
+    };
+    let mut account: Account = match serde_json::from_str(&account_text) {
+        Ok(account) => account,
+        Err(e) => {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                &format!("the account record does not parse: {e}"),
+            )
+            .await
+        }
+    };
+    let Some(mut payment) = account.payment_state() else {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the account carries no payment block",
+        )
+        .await;
+    };
+    if payment.token_ref.as_deref() != Some(intent.token.as_str()) {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the token is not the one the account's payment block holds",
+        )
+        .await;
+    }
+
+    // A token already credited is a renewal, and the second credit needs the
+    // operator to have said so: for cash the second envelope may be a
+    // stranger's with a copied token.
+    if let (Some(paid_until), false) = (payment.paid_until.as_deref(), intent.confirm_double) {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            &format!(
+                "this token was already credited until {paid_until}; give --confirm-double for a renewal"
+            ),
+        )
+        .await;
+    }
+
+    let before = match payment.paid_until.as_deref() {
+        Some(stamp) => match util::parse_date(stamp) {
+            Some(date) => Some(date),
+            None => {
+                return refuse_with(
+                    cfg,
+                    store,
+                    file,
+                    value,
+                    "the account's paid-until date cannot be read",
+                )
+                .await
+            }
+        },
+        None => None,
+    };
+    let until = util::paid_until_after(received, before);
+    let override_reason = intent
+        .override_reason
+        .as_deref()
+        .filter(|r| !r.trim().is_empty());
+    if until > util::credit_ceiling(received) && override_reason.is_none() {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the credit would put paid_until more than 24 months past --received; give --override <reason> to mean it",
+        )
+        .await;
+    }
+
+    let price = util::pence(&cfg.price_gbp)
+        .map_err(|e| format!("the drain's configured price_gbp: {e}"))?;
+    if price <= 0 {
+        return Err("the drain's configured price_gbp must be more than zero".to_string());
+    }
+    let balance = match payment.balance_gbp.as_deref() {
+        Some(text) => match util::pence(text) {
+            Ok(pence) => pence,
+            Err(e) => {
+                return refuse_with(
+                    cfg,
+                    store,
+                    file,
+                    value,
+                    &format!("the account's balance cannot be read: {e}"),
+                )
+                .await
+            }
+        },
+        None => 0,
+    };
+    let applied = credit_money(price, balance, amount);
+
+    payment.rail = Some(intent.rail.clone());
+    payment.balance_gbp = (applied.balance > 0).then(|| util::gbp(applied.balance));
+    let paid_until_after = if applied.paid {
+        payment.paid_until = Some(util::date_string(until));
+        // The window closes with the credit; a null paid-until date is what
+        // shows the token, so setting the date is also what hides it.
+        if let Some(window) = payment.window.as_mut() {
+            window.state = "paid".to_string();
+        }
+        Some(util::date_string(until))
+    } else {
+        before.map(util::date_string)
+    };
+    account.payment = Some(payment.clone());
+    let bytes = serde_json::to_vec_pretty(&account)
+        .map_err(|e| format!("cannot encode the account: {e}"))?;
+    store
+        .write_record(&format!("accounts/{username}"), "account.json", &bytes)
+        .await?;
+    write_payment_copy(store, &username, &payment).await?;
+    append_credit_ledger(
+        store,
+        &intent,
+        received,
+        amount,
+        applied.applied,
+        paid_until_after.as_deref(),
+    )
+    .await?;
+
+    // The receipt is for money that bought a year; a shortfall leaves the
+    // remainder quoted and is acknowledged on the account page instead.
+    if applied.paid {
+        let to = account
+            .outside_address
+            .clone()
+            .unwrap_or_else(|| format!("{username}@kyriakon.net"));
+        let paid = util::date_string(until);
+        let subject = format!("Your payment to kyriakon.net was received (paid until {paid})");
+        let body = format!(
+            "We have recorded a payment of GBP {} on {} by {}.\n\n\
+             Your account is paid until {}.\n",
+            util::gbp(amount),
+            util::date_string(received),
+            intent.rail,
+            paid,
+        );
+        notice::send_account_notice(
+            cfg,
+            store,
+            &username,
+            "prepaid.receipt",
+            &subject,
+            &to,
+            &body,
+        )
+        .await?;
+    }
+
+    let note = override_reason.map(|reason| format!("24-month override: {reason}"));
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &ApplicationRef {
+            username: username.clone(),
+            status_token: String::new(),
+        },
+        "applied",
+        note.as_deref(),
+    )
+    .await?;
+    store.remove("intents", file).await
+}
+
+/// The payment rails a manual credit may name. Card is not one: it settles
+/// through Stripe, and the drain's card path is a different ticket.
+const PAYMENT_RAILS: [&str; 3] = ["cash", "cash-hand", "monero"];
+
+fn valid_txid(txid: Option<&str>) -> bool {
+    match txid {
+        None => true,
+        Some(t) => t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()),
+    }
+}
+
+/// An XMR amount is written as a decimal, never a float, with at most the
+/// twelve decimal places the coin's atomic unit carries.
+fn valid_xmr(amount: Option<&str>) -> bool {
+    let Some(amount) = amount else {
+        return true;
+    };
+    let (whole, fraction) = amount.split_once('.').unwrap_or((amount, ""));
+    !whole.is_empty()
+        && whole.bytes().all(|b| b.is_ascii_digit())
+        && fraction.len() <= 12
+        && fraction.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// What a credit's money does, in pence. Any amount at or above the price is
+/// applied in full and the excess is held. A shortfall within one percent is
+/// rounded up to the price, which absorbs the drift and the rounding; a larger
+/// shortfall holds everything received and does not move the date, so the
+/// remainder stays quoted.
+struct CreditMoney {
+    applied: i64,
+    balance: i64,
+    paid: bool,
+}
+
+fn credit_money(price: i64, balance: i64, amount: i64) -> CreditMoney {
+    let total = balance + amount;
+    if total >= price {
+        // Anything above the price is held, however small: the band exists for
+        // a shortfall, not for money that arrived.
+        CreditMoney {
+            applied: price,
+            balance: total - price,
+            paid: true,
+        }
+    } else if (price - total) as u64 * 100 <= price as u64 {
+        // One percent, exactly: a 20.00 quote absorbs 19.80.
+        CreditMoney {
+            applied: price,
+            balance: 0,
+            paid: true,
+        }
+    } else {
+        CreditMoney {
+            applied: 0,
+            balance: total,
+            paid: false,
+        }
+    }
+}
+
+/// Whether the ledger already holds this intent's line. Read as a `Value`
+/// because a line written by a later release may carry fields this one does not
+/// model.
+async fn ledger_has_intent(store: &Store, id: &str) -> bool {
+    store
+        .lines("ledger/payments.jsonl")
+        .await
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|v| v.get("intent").and_then(Value::as_str) == Some(id))
+}
+
+/// Rewrite the payment block on the application copy the handler reads, so a
+/// status page that has the application still shows the credit rather than the
+/// token. The account's copy is rewritten too; the applications copy only when
+/// it still exists, because recreating a purged application would undo the
+/// purge's own promise.
+async fn write_payment_copy(
+    store: &Store,
+    username: &str,
+    payment: &Payment,
+) -> Result<(), String> {
+    let Some(text) = store
+        .read_record(&format!("accounts/{username}"), "application.json")
+        .await
+    else {
+        return Ok(());
+    };
+    let mut copy: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("the application copy does not parse: {e}"))?;
+    copy["payment"] = serde_json::to_value(payment)
+        .map_err(|e| format!("cannot encode the payment block: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&copy)
+        .map_err(|e| format!("cannot encode the application copy: {e}"))?;
+    store
+        .write_record(&format!("accounts/{username}"), "application.json", &bytes)
+        .await?;
+    if let Some(token) = copy.get("status_token").and_then(Value::as_str) {
+        if store
+            .read_record("applications", &format!("{token}.json"))
+            .await
+            .is_some()
+        {
+            let owner = store.dir_owner("applications");
+            store
+                .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Append the credit's line: the next `seq`, keyed by the token, with no
+/// username. The rate fields stay null until the Monero quote lands (#303); the
+/// XMR amount and the transaction id are recorded when the operator gave them.
+async fn append_credit_ledger(
+    store: &Store,
+    intent: &CreditIntent,
+    received: time::Date,
+    amount: i64,
+    applied: i64,
+    paid_until_after: Option<&str>,
+) -> Result<(), String> {
+    let mut seq = 0u64;
+    for line in store.lines("ledger/payments.jsonl").await {
+        if let Ok(v) = serde_json::from_str::<Value>(&line) {
+            if let Some(s) = v.get("seq").and_then(Value::as_u64) {
+                seq = seq.max(s);
+            }
+        }
+    }
+    let line = json!({
+        "version": 1,
+        "seq": seq + 1,
+        "token": intent.token,
+        "kind": "payment",
+        "rail": intent.rail,
+        "received_on": util::date_string(received),
+        "amount_gbp": util::gbp(amount),
+        "applied_gbp": util::gbp(applied),
+        "paid_until_after": paid_until_after,
+        "amount_xmr": intent.amount_xmr,
+        "rate_quoted": Value::Null,
+        "rate_source": Value::Null,
+        "rate_at": Value::Null,
+        "txid": intent.txid,
+        "intent": intent.id,
+        "note": Value::Null,
+    });
+    let encoded =
+        serde_json::to_string(&line).map_err(|e| format!("cannot encode the ledger: {e}"))?;
+    store
+        .append("ledger/payments.jsonl", encoded.as_bytes())
+        .await
 }
 
 /// The approval of a body's application: the community block's addresses become
@@ -2891,7 +3407,7 @@ pub async fn free_anniversaries(cfg: &DrainConfig, store: &Store) -> Result<(), 
         if today.year() <= created.year() {
             continue;
         }
-        let due = anniversary(created, today.year());
+        let due = util::anniversary(created, today.year());
         if today < due {
             continue;
         }
@@ -2933,15 +3449,6 @@ pub async fn free_anniversaries(cfg: &DrainConfig, store: &Store) -> Result<(), 
         }
     }
     Ok(())
-}
-
-/// The date a free account's yearly note falls due in `year`: the creation day,
-/// clamped to the month's length, so a 29 February creation falls due on 28
-/// February in a common year.
-fn anniversary(created: time::Date, year: i32) -> time::Date {
-    let last = created.month().length(year);
-    time::Date::from_calendar_date(year, created.month(), created.day().min(last))
-        .expect("a day clamped to the month's length is in the month")
 }
 
 /// Clear away every declined application whose week is up, and release the
@@ -3359,13 +3866,67 @@ mod tests {
         // A common year has no 29 February, so the note falls due a day early
         // rather than being skipped for the year.
         assert_eq!(
-            anniversary(leap, 2025),
+            util::anniversary(leap, 2025),
             time::Date::from_calendar_date(2025, time::Month::February, 28).unwrap()
         );
         assert_eq!(
-            anniversary(leap, 2028),
+            util::anniversary(leap, 2028),
             time::Date::from_calendar_date(2028, time::Month::February, 29).unwrap()
         );
+    }
+
+    #[test]
+    fn a_credit_applies_the_price_and_holds_the_rest() {
+        // Within one percent, either side, is the price itself.
+        assert_eq!(
+            (
+                credit_money(2000, 0, 1980).applied,
+                credit_money(2000, 0, 1980).balance
+            ),
+            (2000, 0)
+        );
+        assert!(credit_money(2000, 0, 2020).paid);
+        // Above it: the price is applied and the excess is held.
+        let over = credit_money(2000, 0, 2500);
+        assert_eq!((over.applied, over.balance, over.paid), (2000, 500, true));
+        // A larger shortfall holds what arrived and moves nothing.
+        let short = credit_money(2000, 0, 1979);
+        assert_eq!((short.applied, short.balance, short.paid), (0, 1979, false));
+        // A held balance is spent before the new money is counted.
+        let spends = credit_money(2000, 500, 1500);
+        assert_eq!(
+            (spends.applied, spends.balance, spends.paid),
+            (2000, 0, true)
+        );
+        let short_still = credit_money(2000, 500, 1000);
+        assert_eq!(short_still.balance, 1500);
+        assert!(!short_still.paid);
+    }
+
+    #[test]
+    fn a_signed_credit_payload_covers_the_reason_and_the_fields_before_it() {
+        let a = sign::credit_payload(
+            "KYR-4F2M-9QH7-XT3B",
+            "cash",
+            "20.00",
+            "2026-10-04",
+            None,
+            None,
+            false,
+            Some("posted twice"),
+        );
+        let b = sign::credit_payload(
+            "KYR-4F2M-9QH7-XT3B",
+            "cash",
+            "20.00",
+            "2026-10-04",
+            None,
+            None,
+            false,
+            Some("posted once"),
+        );
+        assert_ne!(a, b);
+        assert!(a.contains("posted twice"));
     }
 
     #[test]

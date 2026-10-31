@@ -667,6 +667,14 @@ pub struct Payment {
     pub paid_until: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<Window>,
+    /// The rail the last credit arrived on, which stays visible on the account
+    /// page after the token has gone. Absent until a credit sets it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rail: Option<String>,
+    /// Money received beyond the yearly price, in pounds, spent by the next
+    /// credit before it asks for more. Absent when nothing is held.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_gbp: Option<String>,
 }
 
 /// The account's payment state, from the nested block or, for a record written
@@ -746,6 +754,8 @@ impl FlatPayment {
             token_issued_at: self.token_issued_at.clone(),
             paid_until: self.paid_until.clone(),
             window: self.window.clone(),
+            rail: None,
+            balance_gbp: None,
         })
     }
 }

@@ -1369,6 +1369,50 @@ fn stored_account(fix: &Fix, username: &str) -> store::Account {
     serde_json::from_str(&fix.read(&format!("accounts/{username}/account.json"))).unwrap()
 }
 
+/// A paid account approved through the real drain, and the token it holds.
+fn approved_paid(fix: &Fix, username: &str, rail: &str) -> String {
+    let record = fix.filed(username, rail, &[("rail", rail)]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", username);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    fix.account(username)["payment"]["token_ref"]
+        .as_str()
+        .expect("a paid approval writes a token")
+        .to_string()
+}
+
+/// The ledger's parsed lines.
+fn ledger_lines(fix: &Fix) -> Vec<Value> {
+    fix.read("ledger/payments.jsonl")
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Only the credit lines, which is what a payment appends; the approval's own
+/// line has kind `window_open`.
+fn payment_lines(fix: &Fix) -> Vec<Value> {
+    ledger_lines(fix)
+        .into_iter()
+        .filter(|line| line["kind"] == json!("payment"))
+        .collect()
+}
+
+/// Put an existing paid-until date on an account, as an earlier year's credit
+/// would have left it.
+fn set_paid_until(fix: &Fix, username: &str, paid: &str) {
+    let mut account = fix.account(username);
+    account["payment"]["paid_until"] = json!(paid);
+    std::fs::write(
+        fix.dir
+            .join(format!("store/accounts/{username}/account.json")),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+}
+
 /// Whether a page puts the token in a link, which is the only way a page can put
 /// it in a URL for relayd to log. The status page's own address is the status
 /// token's and never the payment token's.
@@ -1380,9 +1424,8 @@ fn token_is_a_link(page: &str, token: &str) -> bool {
 
 /// The token is a bearer secret with a lifetime: the status page and both account
 /// pages show it in full while the account is unpaid, the amount and the window
-/// beside it, and a credit's date replaces it there. The credit path is not built
-/// yet, so the paid state below is the account a credit leaves: `paid_until` set
-/// and the window closed.
+/// beside it, and a credit's date replaces it there. The paid state below is
+/// written by hand; the credit path itself is exercised by the credit tests.
 #[test]
 fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
     let fix = Fix::new("token-display");
@@ -1524,6 +1567,493 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
         gemini.contains("This account is free: nothing is due, and it does not lapse."),
         "{gemini}"
     );
+}
+
+/// The date arithmetic every credit runs: one calendar year from the later of
+/// the day the money was received and the date already paid to. The existing
+/// dates make the second credit a renewal, which is why those cases pass
+/// `--confirm-double`.
+#[test]
+fn a_credit_extends_from_the_later_of_the_received_day_and_the_existing_date() {
+    let cases = [
+        ("credit-inside-window", None, "2026-10-04", "2027-10-04"),
+        (
+            "credit-after-lapse",
+            Some("2025-01-01"),
+            "2026-10-04",
+            "2027-10-04",
+        ),
+        (
+            "credit-renew-early",
+            Some("2027-06-01"),
+            "2026-10-04",
+            "2028-06-01",
+        ),
+        ("credit-leap-day", None, "2028-02-29", "2029-02-28"),
+    ];
+    for (name, before, received, expected) in cases {
+        let fix = Fix::new(name);
+        let token = approved_paid(&fix, "secretary", "cash");
+        if let Some(before) = before {
+            set_paid_until(&fix, "secretary", before);
+        }
+        let mut args = vec![
+            "credit",
+            "--token",
+            token.as_str(),
+            "--rail",
+            "cash",
+            "--amount",
+            "20.00",
+            "--received",
+            received,
+        ];
+        if before.is_some() {
+            args.push("--confirm-double");
+        }
+        let out = fix.ctl(&args);
+        assert!(out.status.success(), "{name}: {}", body(&out));
+        let out = fix.drain();
+        assert!(out.status.success(), "{name}: {}", body(&out));
+
+        let account = fix.account("secretary");
+        assert_eq!(
+            account["payment"]["paid_until"],
+            json!(expected),
+            "{name}: {account}"
+        );
+        assert_eq!(
+            account["payment"]["window"]["state"],
+            json!("paid"),
+            "{name}: the window closes with the credit: {account}"
+        );
+
+        // The status page reads the application copy, which must carry the same
+        // block rather than the token.
+        let app: Value =
+            serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+        assert_eq!(
+            app["payment"]["paid_until"],
+            json!(expected),
+            "{name}: {app}"
+        );
+        assert_eq!(app["payment"]["window"]["state"], json!("paid"), "{name}");
+    }
+}
+
+/// One intent applied twice leaves one ledger line and one year, which is the
+/// property that has to hold when the drain is restarted mid-write.
+#[test]
+fn a_credit_applied_twice_leaves_one_line_and_one_year() {
+    let fix = Fix::new("credit-idempotent");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+
+    let names = fix.intents();
+    assert_eq!(names.len(), 1, "{names:?}");
+    let replay = std::fs::read_to_string(fix.dir.join("store/intents").join(&names[0])).unwrap();
+    assert!(fix.drain().status.success());
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    let settled = fix.read("ledger/payments.jsonl");
+
+    // File the very same intent again: its own id is on the ledger line.
+    std::fs::write(fix.dir.join("store/intents").join(&names[0]), &replay).unwrap();
+    assert!(fix.drain().status.success());
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert_eq!(
+        fix.read("ledger/payments.jsonl"),
+        settled,
+        "the replay appended a line"
+    );
+    assert_eq!(payment_lines(&fix).len(), 1, "{}", settled);
+    assert_eq!(
+        fix.account("secretary")["payment"]["paid_until"],
+        json!("2027-10-04"),
+        "the replay added a second year"
+    );
+    assert_eq!(
+        fix.read("accounts/secretary/notices.jsonl")
+            .matches("prepaid.receipt")
+            .count(),
+        1,
+        "the replay sent a second receipt"
+    );
+}
+
+/// Every credit appends the next `seq`, and the line holds no username, contact
+/// address or name: the token is the only join.
+#[test]
+fn each_credit_appends_the_next_seq_and_never_a_username() {
+    let fix = Fix::new("credit-seq");
+    let token = approved_paid(&fix, "secretary", "cash");
+    for (received, confirm) in [("2026-10-04", false), ("2026-10-04", true)] {
+        let mut args = vec![
+            "credit",
+            "--token",
+            token.as_str(),
+            "--rail",
+            "cash",
+            "--amount",
+            "20.00",
+            "--received",
+            received,
+        ];
+        if confirm {
+            args.push("--confirm-double");
+        }
+        let out = fix.ctl(&args);
+        assert!(out.status.success(), "{}", body(&out));
+        let out = fix.drain();
+        assert!(out.status.success(), "{}", body(&out));
+    }
+
+    let lines = ledger_lines(&fix);
+    let seqs: Vec<u64> = lines
+        .iter()
+        .map(|line| line["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(seqs, vec![1, 2, 3], "{lines:?}");
+    let payments = payment_lines(&fix);
+    assert_eq!(payments.len(), 2, "{lines:?}");
+    assert_eq!(payments[0]["paid_until_after"], json!("2027-10-04"));
+    assert_eq!(payments[1]["paid_until_after"], json!("2028-10-04"));
+    for payment in &payments {
+        assert_eq!(payment["token"], json!(token));
+        assert_eq!(payment["kind"], json!("payment"));
+        assert_eq!(payment["rail"], json!("cash"));
+        assert_eq!(payment["received_on"], json!("2026-10-04"));
+        assert_eq!(payment["amount_gbp"], json!("20.00"));
+        assert_eq!(payment["applied_gbp"], json!("20.00"));
+        assert!(payment["amount_xmr"].is_null());
+        assert!(payment["rate_quoted"].is_null());
+        assert!(payment["rate_source"].is_null());
+        assert!(payment["rate_at"].is_null());
+        assert!(payment["txid"].is_null());
+        assert!(payment["intent"].as_str().is_some_and(|id| !id.is_empty()));
+        assert!(payment["note"].is_null());
+    }
+    let ledger = fix.read("ledger/payments.jsonl");
+    assert!(!ledger.contains("secretary"), "{ledger}");
+    assert!(!ledger.contains('@'), "{ledger}");
+}
+
+/// One percent either side is the price; a larger shortfall holds what arrived
+/// and does not move the date; an overpayment is held and spent first.
+#[test]
+fn a_credit_tolerates_one_percent_and_holds_the_rest() {
+    // Within one percent is taken as the price.
+    let inside = Fix::new("credit-tolerance");
+    let token = approved_paid(&inside, "secretary", "cash");
+    let out = inside.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "19.80",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(inside.drain().status.success());
+    assert_eq!(
+        inside.account("secretary")["payment"]["paid_until"],
+        json!("2027-10-04")
+    );
+    assert_eq!(payment_lines(&inside)[0]["applied_gbp"], json!("20.00"));
+    assert!(inside.account("secretary")["payment"]
+        .get("balance_gbp")
+        .is_none());
+
+    // A larger shortfall holds what arrived, and the top-up spends it first.
+    let short = Fix::new("credit-shortfall");
+    let token = approved_paid(&short, "secretary", "cash");
+    let out = short.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "15.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(short.drain().status.success());
+    let account = short.account("secretary");
+    assert!(
+        account["payment"]["paid_until"].is_null(),
+        "a shortfall moves no date: {account}"
+    );
+    assert_eq!(account["payment"]["balance_gbp"], json!("15.00"));
+    assert_eq!(account["payment"]["window"]["state"], json!("open"));
+    assert_eq!(payment_lines(&short)[0]["applied_gbp"], json!("0.00"));
+
+    let out = short.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "5.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(short.drain().status.success());
+    let account = short.account("secretary");
+    assert_eq!(account["payment"]["paid_until"], json!("2027-10-04"));
+    assert!(account["payment"].get("balance_gbp").is_none());
+    assert_eq!(payment_lines(&short).len(), 2);
+    assert_eq!(payment_lines(&short)[1]["applied_gbp"], json!("20.00"));
+
+    // An excess inside the band is still held: the band absorbs a shortfall,
+    // not money that arrived.
+    let over_small = Fix::new("credit-overpay-small");
+    let token = approved_paid(&over_small, "secretary", "cash");
+    let out = over_small.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.10",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(over_small.drain().status.success());
+    let account = over_small.account("secretary");
+    assert_eq!(account["payment"]["paid_until"], json!("2027-10-04"));
+    assert_eq!(account["payment"]["balance_gbp"], json!("0.10"));
+    assert_eq!(payment_lines(&over_small)[0]["applied_gbp"], json!("20.00"));
+
+    // An overpayment is held, and the next credit spends it before money.
+    let over = Fix::new("credit-overpay");
+    let token = approved_paid(&over, "secretary", "cash");
+    let out = over.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "25.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(over.drain().status.success());
+    let account = over.account("secretary");
+    assert_eq!(account["payment"]["paid_until"], json!("2027-10-04"));
+    assert_eq!(account["payment"]["balance_gbp"], json!("5.00"));
+
+    // The second credit is a renewal and is refused without the operator
+    // saying so, naming the date the first one reached.
+    let out = over.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "15.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(over.drain().status.success());
+    assert_eq!(
+        payment_lines(&over).len(),
+        1,
+        "a renewal without --confirm-double was applied"
+    );
+    assert!(
+        over.journal().contains("2027-10-04"),
+        "the refusal does not name the first credit's date: {}",
+        over.journal()
+    );
+
+    let out = over.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "15.00",
+        "--received",
+        "2026-10-04",
+        "--confirm-double",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(over.drain().status.success());
+    let account = over.account("secretary");
+    assert_eq!(account["payment"]["paid_until"], json!("2028-10-04"));
+    assert!(account["payment"].get("balance_gbp").is_none());
+    assert_eq!(payment_lines(&over)[1]["applied_gbp"], json!("20.00"));
+}
+
+/// A credit past the 24-month ceiling is refused and journals why; a reason
+/// given with `--override` lets it through and lands on the journal line.
+#[test]
+fn a_credit_past_the_ceiling_is_refused_until_an_override_names_a_reason() {
+    let fix = Fix::new("credit-ceiling");
+    let token = approved_paid(&fix, "secretary", "cash");
+    set_paid_until(&fix, "secretary", "2028-10-04");
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+        "--confirm-double",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+
+    assert!(
+        payment_lines(&fix).is_empty(),
+        "a refused credit writes no ledger line: {}",
+        fix.read("ledger/payments.jsonl")
+    );
+    assert_eq!(
+        fix.account("secretary")["payment"]["paid_until"],
+        json!("2028-10-04"),
+        "a refused credit moves no date"
+    );
+    let journal = fix.journal();
+    assert!(journal.contains("24 months"), "{journal}");
+    assert!(journal.contains("refused"), "{journal}");
+
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+        "--confirm-double",
+        "--override",
+        "member prepaid two years",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.account("secretary")["payment"]["paid_until"],
+        json!("2029-10-04")
+    );
+    assert_eq!(payment_lines(&fix).len(), 1);
+    assert!(
+        fix.journal().contains("member prepaid two years"),
+        "the override reason is not in the journal: {}",
+        fix.journal()
+    );
+}
+
+/// The console refuses what it cannot credit: two references, no account, an
+/// account with no token, a rail it does not record. A username is resolved to
+/// the token before the intent is filed.
+#[test]
+fn the_credit_console_resolves_a_username_and_refuses_what_it_cannot_credit() {
+    let fix = Fix::new("credit-console");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    let base = [
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+    ];
+
+    let mut args = vec!["credit", "--username", "secretary"];
+    args.extend(base);
+    let out = fix.ctl(&args);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("no account"), "{}", body(&out));
+
+    fix.decide("provision", "secretary");
+    assert!(fix.drain().status.success());
+    let mut args = vec!["credit", "--username", "secretary"];
+    args.extend(base);
+    let out = fix.ctl(&args);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("no payment token"), "{}", body(&out));
+
+    let paid = Fix::new("credit-console-paid");
+    let token = approved_paid(&paid, "secretary", "cash");
+    let out = paid.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--username",
+        "secretary",
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("not both"), "{}", body(&out));
+
+    let out = paid.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "card",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("not one of"), "{}", body(&out));
+
+    let out = paid.ctl(&[
+        "credit",
+        "--username",
+        "secretary",
+        "--rail",
+        "cash-hand",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(paid.drain().status.success());
+    let line = &payment_lines(&paid)[0];
+    assert_eq!(line["token"], json!(token));
+    assert_eq!(line["rail"], json!("cash-hand"));
 }
 
 /// A filed application carries no payment state, which is what stops a status
@@ -1821,7 +2351,7 @@ fn an_unimplemented_kind_is_left_in_place_and_refused_once() {
         &id,
         &json!({
             "id": id,
-            "kind": "credit",
+            "kind": "refund",
             "filed_at": "2026-10-02T09:00:00Z",
             "application": {"username": "secretary", "status_token": TOKEN},
         }),
@@ -1831,7 +2361,7 @@ fn an_unimplemented_kind_is_left_in_place_and_refused_once() {
     // Left in place, the second run sees it again.
     assert_eq!(fix.intents(), vec![format!("{id}.json")]);
     assert!(fix.journal().contains("refused"), "{}", fix.journal());
-    assert!(fix.journal().contains("credit"), "{}", fix.journal());
+    assert!(fix.journal().contains("refund"), "{}", fix.journal());
 
     assert!(fix.drain().status.success());
     assert_eq!(fix.intents(), vec![format!("{id}.json")]);

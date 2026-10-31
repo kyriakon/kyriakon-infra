@@ -220,6 +220,8 @@ The state is flat files, one directory per account. `account.json` holds the sta
 
 An account approved without charge has no `payment` block at all, so it has no token, no window and no paid-until date, and its approval writes no ledger line. It never lapses and no grace or deletion notice runs for it. The drain sends it one note a year, on the creation anniversary, and `onboardctl free` prints how many such accounts the store holds. It ends by the member's request, a breach of the acceptable use policy, or the operator closing one that has been unreachable and unused for a year, and then takes the ordinary deletion path.
 
+`onboardctl credit (--token <t> | --username <u>) --rail <cash|cash-hand|monero> --amount <gbp> --received <YYYY-MM-DD>` records one payment against the account's token. The drain applies it on its next pass, sets the paid-until date, sends the receipt and appends the ledger line. A second credit on a token already credited needs `--confirm-double`, and a credit reaching more than 24 months past `--received` needs `--override <reason>`, whose reason is journalled.
+
 Read a member's record by reading their `account.json`. The documents carry a version and the drain validates them on read, so a malformed file stops the drain with an error instead of being skipped.
 
 When the drain is stuck, read in this order: the drain's log, the oldest file in `intents/`, then the last line of `journal.jsonl`. An intent that fails validation names its own file in the log, and a backlog of unapplied intents is what the monitoring signal in #173 alerts on. Rerunning the drain is safe. It verifies each event before acting, keys on the event id, and applies state through the repo-tracked scripts.
