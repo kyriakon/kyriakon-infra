@@ -115,6 +115,11 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
                 .map_err(|e| format!("the reconcile-return intent does not parse: {e}"))?;
             transitions::reconcile_return(cfg, store, key, intent, file, &value).await
         }
+        "refund" => {
+            let intent: transitions::RefundIntent = serde_json::from_value(value.clone())
+                .map_err(|e| format!("the refund intent does not parse: {e}"))?;
+            transitions::refund(cfg, store, key, intent, file, &value).await
+        }
         _ => transitions::refuse(cfg, store, file, &value).await,
     }
 }
@@ -324,6 +329,48 @@ pub async fn file_reconcile_return(
         "filed_at": crate::util::filed_at(),
         "item": item,
         "note": note,
+        "sig": sig,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    Ok(id)
+}
+
+/// File a refund, as `kyriakon-onboardctl refund` does. A refund form carries
+/// the money, the rail, the reason and the `--close`/`--excess` choice; a
+/// settlement carries `settled_on` and nothing else. The token is the account's
+/// own, resolved by the console before it signs, and the signature is over every
+/// field the drain acts on: a refund writes the ledger and can close an account,
+/// and `intents/` is writable by the unprivileged handler.
+#[allow(clippy::too_many_arguments)]
+pub async fn file_refund(
+    store: &Store,
+    token: &str,
+    amount_gbp: Option<&str>,
+    rail: Option<&str>,
+    reason: Option<&str>,
+    close: bool,
+    excess: bool,
+    rate: Option<&str>,
+    settled_on: Option<&str>,
+    sig: &str,
+) -> Result<String, String> {
+    let id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({
+        "id": id,
+        "kind": "refund",
+        "filed_at": crate::util::filed_at(),
+        "token": token,
+        "amount_gbp": amount_gbp,
+        "rail": rail,
+        "reason": reason,
+        "close": close,
+        "excess": excess,
+        "rate": rate,
+        "settled_on": settled_on,
         "sig": sig,
     });
     let bytes =

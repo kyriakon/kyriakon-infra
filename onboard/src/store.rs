@@ -625,6 +625,11 @@ pub struct Account {
     /// existed reads the same.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// The day a cancellation refund's seven-day closing window ends, `YYYY-MM-DD`.
+    /// Written only by a `--close` refund, which sets `state` to `closing`; an
+    /// excess refund and every other transition leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closing_until: Option<String>,
 }
 
 /// One pinned client certificate, as a request described it.

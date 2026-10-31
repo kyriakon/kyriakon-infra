@@ -25,6 +25,11 @@
 //!   kyriakon-onboardctl [--config PATH] reconcile attribute <UN-id> --token <t>
 //!   kyriakon-onboardctl [--config PATH] reconcile return <UN-id> --note <evidence>
 //!   kyriakon-onboardctl [--config PATH] payment show --username <u>
+//!   kyriakon-onboardctl [--config PATH] refund (--token <t> | --username <u>) \
+//!       --rail <card|cash|cash-hand|monero> --amount <gbp> --reason <text> \
+//!       (--close | --excess) [--rate <gbp-per-xmr>]
+//!   kyriakon-onboardctl [--config PATH] refund (--token <t> | --username <u>) \
+//!       --settled <YYYY-MM-DD>
 //!   kyriakon-onboardctl [--config PATH] show <username>
 //!   kyriakon-onboardctl [--config PATH] free
 //!   kyriakon-onboardctl request list
@@ -100,6 +105,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         "prepaid" => prepaid(&store, &rest[1..]).await,
         "reconcile" => reconcile(&cfg, &store, &rest[1..]).await,
         "payment" => payment(&store, &rest[1..]).await,
+        "refund" => refund(&cfg, &store, &rest[1..]).await,
         "show" => show(&store, one_username(rest)?).await,
         "free" => free(&store, &rest[1..]).await,
         // Each decision is signed with the same root-only key the review links
@@ -133,6 +139,11 @@ fn usage() -> String {
      [--confirm-double] [--override <reason>]
        kyriakon-onboardctl reconcile return <UN-id> --note <evidence>
        kyriakon-onboardctl payment show --username <u>
+       kyriakon-onboardctl refund (--token <t> | --username <u>) \
+     --rail <card|cash|cash-hand|monero> --amount <gbp> --reason <text> \
+     (--close | --excess) [--rate <gbp-per-xmr>]
+       kyriakon-onboardctl refund (--token <t> | --username <u>) \
+     --settled <YYYY-MM-DD>
        kyriakon-onboardctl address --domain <domain> \
      --action <add-alias|add-mailbox|upgrade|remove> --mailbox <account> \
      [--address <localpart>] [--key-file <path>] [--site-owner <account>]
@@ -501,6 +512,157 @@ async fn reconcile_return(cfg: &DrainConfig, store: &Store, args: &[String]) -> 
     let sig = sign::sign(&key, &sign::reconcile_return_payload(item, note))?;
     let id = intents::file_reconcile_return(store, item, note, &sig).await?;
     println!("filed reconcile return for {item} as intent {id}");
+    Ok(())
+}
+
+/// The token a `credit` or `refund` acts on: `--token` itself, or the token the
+/// named account's payment block holds, resolved here at the terminal so a name
+/// with no token is a refusal the operator sees now rather than an intent the
+/// drain refuses a minute later.
+async fn payment_token(store: &Store, flags: &BTreeMap<String, String>) -> Result<String, String> {
+    match (flags.get("token"), flags.get("username")) {
+        (Some(token), None) => {
+            if !store::is_payment_token(token) {
+                return Err(format!("the token {token:?} is not a payment token"));
+            }
+            Ok(token.clone())
+        }
+        (None, Some(username)) => {
+            if let Some(why) = validate::username_shape(username) {
+                return Err(format!("the username {username:?}: {why}"));
+            }
+            let text = store
+                .read_record(&format!("accounts/{username}"), "account.json")
+                .await
+                .ok_or_else(|| format!("no account for {username}"))?;
+            let account: kyriakon_onboard::store::Account = serde_json::from_str(&text)
+                .map_err(|e| format!("the account record does not parse: {e}"))?;
+            account
+                .payment_state()
+                .and_then(|p| p.token_ref)
+                .ok_or_else(|| format!("{username} has no payment token"))
+        }
+        (Some(_), Some(_)) => Err("give either --token or --username, not both".to_string()),
+        (None, None) => Err("give --token or --username".to_string()),
+    }
+}
+
+/// `refund`: either record a refund against the payment its token last made, or
+/// settle one already recorded. The refund form names the money, the rail, why
+/// and whether the account closes; the settlement form names only the day. A
+/// `--username` is resolved to the account's token here, as `credit` does, and
+/// the signature covers every field the drain acts on.
+async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), String> {
+    // `--close` and `--excess` are bare switches, which the pair reader does not
+    // take.
+    let close = args.iter().any(|a| a == "--close");
+    let excess = args.iter().any(|a| a == "--excess");
+    let paired: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--close" && a.as_str() != "--excess")
+        .cloned()
+        .collect();
+    let flags = flags(
+        &paired,
+        &[
+            "token", "username", "amount", "rail", "reason", "rate", "settled",
+        ],
+    )?;
+    let token = payment_token(store, &flags).await?;
+
+    if let Some(settled) = flags.get("settled").map(String::as_str) {
+        for name in ["amount", "rail", "reason", "rate"] {
+            if flags.contains_key(name) {
+                return Err(format!("--settled takes no --{name}"));
+            }
+        }
+        if close || excess {
+            return Err("--settled takes no --close or --excess".to_string());
+        }
+        if util::parse_date(settled).is_none() {
+            return Err(format!("--settled {settled:?} is not YYYY-MM-DD"));
+        }
+        let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
+        let sig = sign::sign(
+            &key,
+            &sign::refund_payload(&token, "", "", false, false, "", settled, ""),
+        )?;
+        let id = intents::file_refund(
+            store,
+            &token,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            Some(settled),
+            &sig,
+        )
+        .await?;
+        println!("filed refund settlement for {token} as intent {id}");
+        return Ok(());
+    }
+
+    let rail = need(&flags, "rail")?;
+    if !transitions::REFUND_RAILS.contains(&rail) {
+        return Err(format!(
+            "--rail {rail:?} is not one of {}",
+            transitions::REFUND_RAILS.join(", ")
+        ));
+    }
+    let amount = need(&flags, "amount")?;
+    match util::pence(amount) {
+        Ok(pence) if pence > 0 => {}
+        Ok(_) => return Err("--amount must be more than zero".to_string()),
+        Err(e) => return Err(format!("--amount: {e}")),
+    }
+    let reason = need(&flags, "reason")?;
+    if reason.trim().is_empty() {
+        return Err("--reason must say why the money is going back".to_string());
+    }
+    if close == excess {
+        return Err("give exactly one of --close or --excess".to_string());
+    }
+    let rate = flags.get("rate").map(String::as_str);
+    if let Some(rate) = rate {
+        if rail != "monero" {
+            return Err("--rate is only a monero refund paid in sterling".to_string());
+        }
+        match util::pence(rate) {
+            Ok(pence) if pence > 0 => {}
+            Ok(_) => return Err("--rate must be more than zero".to_string()),
+            Err(e) => return Err(format!("--rate: {e}")),
+        }
+    }
+    let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
+    let sig = sign::sign(
+        &key,
+        &sign::refund_payload(
+            &token,
+            amount,
+            rail,
+            close,
+            excess,
+            rate.unwrap_or(""),
+            "",
+            reason,
+        ),
+    )?;
+    let id = intents::file_refund(
+        store,
+        &token,
+        Some(amount),
+        Some(rail),
+        Some(reason),
+        close,
+        excess,
+        rate,
+        None,
+        &sig,
+    )
+    .await?;
+    println!("filed refund for {token} as intent {id}");
     Ok(())
 }
 
