@@ -140,8 +140,9 @@ pub fn resend_payload(username: &str, token: &str) -> String {
 /// The payload a credit intent signs: every field the drain acts on, because
 /// `intents/` belongs to the unprivileged half and a credit moves a paid-until
 /// date. The token, rail, amount and date are validated shapes; the override
-/// reason is free text and comes last, so no earlier field can be shifted into
-/// it by a colon.
+/// reason is free text, and the note a payment with no token carries is free
+/// text too and comes last, so no earlier field can be shifted into it by a
+/// colon.
 #[allow(clippy::too_many_arguments)]
 pub fn credit_payload(
     token: &str,
@@ -152,13 +153,28 @@ pub fn credit_payload(
     amount_xmr: Option<&str>,
     confirm_double: bool,
     override_reason: Option<&str>,
+    note: Option<&str>,
 ) -> String {
     format!(
-        "credit:{token}:{rail}:{amount_gbp}:{received}:{}:{}:{confirm_double}:{}",
+        "credit:{token}:{rail}:{amount_gbp}:{received}:{}:{}:{confirm_double}:{}:{}",
         txid.unwrap_or(""),
         amount_xmr.unwrap_or(""),
         override_reason.unwrap_or(""),
+        note.unwrap_or(""),
     )
+}
+
+/// The payload a `reconcile-attribute` intent signs: the held item and the token
+/// it is joined to. Both are validated shapes, and the pair is covered so a
+/// signature for one queue item cannot be replayed against another.
+pub fn reconcile_attribute_payload(item: &str, token: &str) -> String {
+    format!("reconcile-attribute:{item}:{token}")
+}
+
+/// The payload a `reconcile-return` intent signs: the held item and the evidence
+/// the operator wrote down, which is free text and last.
+pub fn reconcile_return_payload(item: &str, note: &str) -> String {
+    format!("reconcile-return:{item}:{note}")
 }
 
 /// One decision link, pointing at the handler's click-through path.

@@ -1635,6 +1635,14 @@ fn payment_lines(fix: &Fix) -> Vec<Value> {
         .collect()
 }
 
+/// The unattributed queue's parsed lines.
+fn held_lines(fix: &Fix) -> Vec<Value> {
+    fix.read("ledger/unattributed.jsonl")
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
 /// Put an existing paid-until date on an account, as an earlier year's credit
 /// would have left it.
 fn set_paid_until(fix: &Fix, username: &str, paid: &str) {
@@ -2479,6 +2487,12 @@ fn a_credit_past_the_ceiling_is_refused_until_an_override_names_a_reason() {
     let journal = fix.journal();
     assert!(journal.contains("24 months"), "{journal}");
     assert!(journal.contains("refused"), "{journal}");
+    assert_eq!(
+        fix.intents().len(),
+        1,
+        "a refusal leaves the intent in place: {:?}",
+        fix.intents()
+    );
 
     let out = fix.ctl(&[
         "credit",
@@ -2589,6 +2603,283 @@ fn the_credit_console_resolves_a_username_and_refuses_what_it_cannot_credit() {
     let line = &payment_lines(&paid)[0];
     assert_eq!(line["token"], json!(token));
     assert_eq!(line["rail"], json!("cash-hand"));
+}
+
+/// A credit with no token is held in the unattributed queue: no payment line, no
+/// paid-until date and no receipt. `reconcile list` shows it, `reconcile
+/// attribute` turns it into an ordinary credit one year from the held date, and a
+/// second attribute is refused.
+#[test]
+fn a_tokenless_credit_is_held_and_reconcile_attribute_credits_it_once() {
+    let fix = Fix::new("reconcile-attribute");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let out = fix.ctl(&[
+        "credit",
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+        "--note",
+        "no token on the envelope",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let held = held_lines(&fix);
+    assert_eq!(held.len(), 1, "{held:?}");
+    let line = &held[0];
+    assert_eq!(line["state"], json!("held"), "{line}");
+    assert_eq!(line["kind"], json!("held"), "{line}");
+    assert_eq!(line["rail"], json!("cash"), "{line}");
+    assert_eq!(line["amount_gbp"], json!("20.00"), "{line}");
+    assert_eq!(line["received_on"], json!("2026-10-04"), "{line}");
+    assert_eq!(line["note"], json!("no token on the envelope"), "{line}");
+    assert!(line["amount_xmr"].is_null(), "{line}");
+    assert!(line["txid"].is_null(), "{line}");
+    let id = line["id"]
+        .as_str()
+        .expect("a held line carries its id")
+        .to_string();
+    assert!(store::is_unattributed_id(&id), "{id}");
+    // No member is named, nothing was credited, and no receipt went out.
+    let queue = fix.read("ledger/unattributed.jsonl");
+    assert!(!queue.contains("secretary"), "{queue}");
+    assert!(payment_lines(&fix).is_empty(), "{:?}", payment_lines(&fix));
+    assert!(
+        fix.account("secretary")["payment"]["paid_until"].is_null(),
+        "a held payment moved the date"
+    );
+    assert!(
+        !fix.read("accounts/secretary/notices.jsonl")
+            .contains("prepaid.receipt"),
+        "a held payment sent a receipt"
+    );
+
+    // `reconcile list` shows what is held, with its money, date and note.
+    let out = fix.ctl(&["reconcile", "list"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let text = body(&out);
+    assert!(text.contains(&id), "{text}");
+    assert!(text.contains("20.00"), "{text}");
+    assert!(text.contains("no token on the envelope"), "{text}");
+
+    // Attribute it: one payment line keyed by the token, one year from the held
+    // date, one receipt, and the held line marked attributed to the token.
+    let out = fix.ctl(&["reconcile", "attribute", &id, "--token", &token]);
+    assert!(out.status.success(), "{}", body(&out));
+    let names = fix.intents();
+    assert_eq!(names.len(), 1, "{names:?}");
+    let attribute_id = names[0].trim_end_matches(".json").to_string();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.account("secretary")["payment"]["paid_until"],
+        json!("2027-10-04")
+    );
+    assert_eq!(
+        fix.account("secretary")["payment"]["window"]["state"],
+        json!("paid")
+    );
+    let payments = payment_lines(&fix);
+    assert_eq!(payments.len(), 1, "{payments:?}");
+    assert_eq!(payments[0]["token"], json!(token), "{payments:?}");
+    assert_eq!(payments[0]["received_on"], json!("2026-10-04"));
+    assert_eq!(payments[0]["amount_gbp"], json!("20.00"));
+    assert_eq!(payments[0]["intent"], json!(attribute_id));
+    let marked = held_lines(&fix);
+    assert_eq!(marked[0]["state"], json!("attributed"), "{marked:?}");
+    assert_eq!(marked[0]["attributed_to"], json!(token), "{marked:?}");
+    assert!(marked[0]["attributed_at"].as_str().is_some(), "{marked:?}");
+    assert_eq!(
+        fix.read("accounts/secretary/notices.jsonl")
+            .matches("prepaid.receipt")
+            .count(),
+        1,
+        "attributing sent no receipt, or sent two"
+    );
+
+    // A second attribute of the same item is refused: it is no longer held, and
+    // no second year is added.
+    let out = fix.ctl(&["reconcile", "attribute", &id, "--token", &token]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        payment_lines(&fix).len(),
+        1,
+        "a second attribute was applied"
+    );
+    assert_eq!(
+        fix.account("secretary")["payment"]["paid_until"],
+        json!("2027-10-04"),
+        "a refused attribute moved the date"
+    );
+    assert!(
+        fix.journal().contains("not held"),
+        "the refusal does not say the item is not held: {}",
+        fix.journal()
+    );
+}
+
+/// `reconcile return` closes a held item with the evidence, keeping what the
+/// operator first wrote down, and writes no payment line.
+#[test]
+fn a_reconcile_return_closes_the_held_item_with_its_evidence() {
+    let fix = Fix::new("reconcile-return");
+    let out = fix.ctl(&[
+        "credit",
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+        "--note",
+        "postmark unreadable",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    let id = held_lines(&fix)[0]["id"]
+        .as_str()
+        .expect("a held line carries its id")
+        .to_string();
+
+    let out = fix.ctl(&[
+        "reconcile",
+        "return",
+        &id,
+        "--note",
+        "posted back 2026-10-08, receipt in book",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let held = held_lines(&fix);
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0]["state"], json!("returned"), "{held:?}");
+    assert!(held[0]["returned_at"].as_str().is_some(), "{held:?}");
+    let note = held[0]["note"].as_str().expect("the note is kept");
+    assert!(note.contains("postmark unreadable"), "{note}");
+    assert!(
+        note.contains("posted back 2026-10-08, receipt in book"),
+        "{note}"
+    );
+    assert!(payment_lines(&fix).is_empty(), "{:?}", payment_lines(&fix));
+
+    // The queue no longer offers it.
+    let out = fix.ctl(&["reconcile", "list"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("nothing held"), "{}", body(&out));
+}
+
+/// `prepaid list --window open` shows the token, username, rail, close date and
+/// days left; `--expiring` narrows it; and a credited window, whose state is
+/// `paid`, is not listed at all.
+#[test]
+fn prepaid_list_shows_an_open_window_and_narrows_and_drops_a_credited_one() {
+    let fix = Fix::new("prepaid-list");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let closes_at = fix.account("secretary")["payment"]["window"]
+        .get("closes_at")
+        .and_then(Value::as_str)
+        .expect("a paid approval opens a window")
+        .to_string();
+    let closes_on = closes_at[..10].to_string();
+
+    let out = fix.ctl(&["prepaid", "list", "--window", "open"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let text = body(&out);
+    assert!(text.contains("1 open window(s)"), "{text}");
+    assert!(text.contains(&token), "{text}");
+    assert!(text.contains("secretary"), "{text}");
+    assert!(text.contains("cash"), "{text}");
+    assert!(text.contains(&closes_on), "{text}");
+    let closes =
+        OffsetDateTime::parse(&closes_at, &time::format_description::well_known::Rfc3339).unwrap();
+    let days_left = (closes.date() - OffsetDateTime::now_utc().date()).whole_days();
+    assert!(
+        text.contains(&format!("{days_left} days left")),
+        "expected {days_left} days left: {text}"
+    );
+
+    // The window closes fourteen days after the approval, so three days keeps
+    // nothing and the window's own count keeps it.
+    let out = fix.ctl(&["prepaid", "list", "--window", "open", "--expiring", "3"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("0 open window(s)"), "{}", body(&out));
+    let out = fix.ctl(&["prepaid", "list", "--window", "open", "--expiring", "14"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains(&token), "{}", body(&out));
+
+    // Only the open window is a legal question.
+    let out = fix.ctl(&["prepaid", "list", "--window", "closed"]);
+    assert!(!out.status.success(), "{}", body(&out));
+    let out = fix.ctl(&["prepaid", "list", "--window", "open", "--expiring", "-1"]);
+    assert!(!out.status.success(), "{}", body(&out));
+
+    // A credit closes the window with state `paid`, so the pass stops listing it.
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    let out = fix.ctl(&["prepaid", "list", "--window", "open"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !body(&out).contains(&token),
+        "a credited window was listed: {}",
+        body(&out)
+    );
+}
+
+/// A hand payment is the one rail keyed by a name, so the console refuses one
+/// with no name; and a note is only for money with no token.
+#[test]
+fn the_console_refuses_a_tokenless_cash_hand_payment() {
+    let fix = Fix::new("credit-note-cash-hand");
+    let out = fix.ctl(&[
+        "credit",
+        "--rail",
+        "cash-hand",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+        "--note",
+        "handed over in the street",
+    ]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("username"), "{}", body(&out));
+
+    // A note and a token together is two answers to one question.
+    let token = approved_paid(&fix, "secretary", "cash");
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+        "--note",
+        "posted twice",
+    ]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("--note"), "{}", body(&out));
 }
 
 /// A filed application carries no payment state, which is what stops a status

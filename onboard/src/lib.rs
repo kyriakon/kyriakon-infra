@@ -24,6 +24,7 @@ pub mod page;
 pub mod password;
 pub mod portal;
 pub mod portal_ipc;
+pub mod prepaid;
 pub mod questions;
 pub mod rate;
 pub mod requests;
