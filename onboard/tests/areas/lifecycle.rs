@@ -868,9 +868,9 @@ fn the_drain_records_space_used_from_the_quota_report() {
          Filesystem blocks quota limit grace files quota limit grace\n\
          /dev/sd1l 4096 5242880 5767168 10 0 0\n'",
     ));
-    // The filing pass cached an empty report; the hour is what the state file
-    // keys on, and the account did not exist when it ran.
-    std::fs::remove_file(fix.path("store/quota-check.json")).unwrap();
+    // The filing pass had no account yet, so it wrote no hour stamp. Remove one
+    // if a later pass left it, so this pass reads the report afresh.
+    let _ = std::fs::remove_file(fix.path("store/quota-check.json"));
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     assert!(
