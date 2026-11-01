@@ -189,6 +189,7 @@ async fn signed_in(app: &App, username: &str) -> String {
 
 /// The request httpd builds for a form post.
 fn httpd_post(path: &str, body: &str) -> Vec<u8> {
+<<<<<<< HEAD
     httpd_post_with(path, body, None, None)
 }
 
@@ -197,6 +198,14 @@ fn httpd_post(path: &str, body: &str) -> Vec<u8> {
 fn httpd_post_with(path: &str, body: &str, cookie: Option<&str>, user: Option<&str>) -> Vec<u8> {
     let length = body.len().to_string();
     let cookie_header;
+=======
+    httpd_post_as(path, body, None)
+}
+
+/// A form post httpd authenticated, as [`httpd_get_as`] is.
+fn httpd_post_as(path: &str, body: &str, user: Option<&str>) -> Vec<u8> {
+    let length = body.len().to_string();
+>>>>>>> 9b0318b (feat(onboard): export a member's written record into their chroot)
     let mut env = vec![
         ("REQUEST_METHOD", "POST"),
         ("REQUEST_URI", path),
@@ -209,10 +218,13 @@ fn httpd_post_with(path: &str, body: &str, cookie: Option<&str>, user: Option<&s
         ("REMOTE_ADDR", "127.0.0.1"),
         ("HTTP_X_FORWARDED_FOR", "203.0.113.10"),
     ];
+<<<<<<< HEAD
     if let Some(cookie) = cookie {
         cookie_header = format!("{}={cookie}", session::COOKIE);
         env.push(("HTTP_COOKIE", &cookie_header));
     }
+=======
+>>>>>>> 9b0318b (feat(onboard): export a member's written record into their chroot)
     if let Some(user) = user {
         env.push(("REMOTE_USER", user));
     }
@@ -1096,6 +1108,49 @@ async fn the_reading_half_files_nothing() {
     );
 }
 
+/// "Take my data out" files an export intent for the account the request is
+/// authenticated as, and changes nothing else a member holds. A request with no
+/// authenticated account files nothing.
+#[tokio::test]
+async fn the_account_pages_export_action_files_an_intent_for_the_session_account() {
+    let (app, dir) = handler("account-export").await;
+    file_account(&dir);
+    let before = std::fs::read(dir.join("accounts/alice/account.json")).unwrap();
+
+    let (code, body) = answer(
+        &app,
+        &httpd_post_as("account", "action=export", Some("alice")),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("Your data export is on its way"), "{body}");
+
+    let intents: Vec<PathBuf> = std::fs::read_dir(dir.join("intents"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    assert_eq!(intents.len(), 1, "one intent was filed");
+    let filed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&intents[0]).unwrap()).unwrap();
+    assert_eq!(filed["kind"], "export");
+    assert_eq!(filed["username"], "alice");
+    // The account directory is the drain's to change, not this route's.
+    assert_eq!(
+        std::fs::read(dir.join("accounts/alice/account.json")).unwrap(),
+        before
+    );
+
+    // Without an authenticated account there is nobody the export could belong
+    // to, so nothing is filed.
+    let (code, _) = answer(&app, &httpd_post_as("account", "action=export", None)).await;
+    assert_eq!(code, 403);
+    assert_eq!(
+        std::fs::read_dir(dir.join("intents")).unwrap().count(),
+        1,
+        "no second intent"
+    );
+}
+
 #[tokio::test]
 async fn the_capsule_serves_each_mirrored_page_as_gemtext() {
     let (app, _dir) = handler("gmid-pages").await;
@@ -1160,8 +1215,8 @@ async fn a_path_neither_front_end_serves_is_refused_in_its_own_way() {
     assert_eq!(code, 404);
     assert!(body.starts_with("Status: 404 Not Found\r\n"), "{body}");
 
-    let (code, _body) = answer(&app, &httpd_post("/account", "username=x")).await;
-    assert_eq!(code, 405, "the account page is not a submission");
+    let (code, _body) = answer(&app, &httpd_post("/nonsense", "")).await;
+    assert_eq!(code, 404, "an unserved path answers 404 to a post too");
 
     let (code, body) = answer(&app, &gmid_get("nonsense", "")).await;
     assert_eq!(code, 51, "a capsule page that does not exist");

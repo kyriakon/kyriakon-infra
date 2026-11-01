@@ -126,6 +126,30 @@
 </table>
 <p>One upload key serves both sftp and git. It is not a login for this page.</p>
 {% endif %}
+{% if can_close %}
+{#
+  The member's own data request. It is a plain form so it works without
+  scripting, and it posts only the action: the account comes from the session,
+  and the handler files an intent rather than touching the store's records.
+#}
+<h3>Your data</h3>
+<form method="post" action="/account">
+<input type="hidden" name="action" value="export">
+<button type="submit">Take my data out</button>
+</form>
+<p>The platform gathers its written record of your account into your sftp space,
+as <code>export/&lt;timestamp&gt;/</code> beside <code>www/</code> and
+<code>gemini/</code>, and sends a notice when it is ready. Your mail, your
+repositories and your sites stay where they are; the manifest names each path
+and copies none of them.</p>
+{% endif %}
+
+<h3>What the platform offers</h3>
+<ul class="services">
+{% for s in services %}
+  <li><a href="{{ s.href }}">{{ s.name }}</a> <span class="tag">{{ s.state }}</span> {{ s.summary }}</li>
+{% endfor %}
+</ul>
 
 {#
   The body's DNS recipe. The values are generated once, from the platform's

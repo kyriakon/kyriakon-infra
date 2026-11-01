@@ -176,3 +176,10 @@ rate_endpoint = "https://api.coingecko.com/api/v3/simple/price?ids=monero&vs_cur
 # frozen and a single GET does not earn a client crate. `pkg_add curl`; cron's
 # PATH is not where a package's binary lives.
 rates_fetch = "/usr/local/bin/curl"
+
+# Where the members' public trees live: the sftp chroot
+# `scripts/provision-member.sh` builds as <username>.kyriakon.net. The export
+# writes its bundle under that chroot so the member collects it over the sftp
+# they already have. A value rather than a literal so the acceptance tests
+# point it at a fixture tree.
+public_root = "/home/www"

@@ -82,6 +82,8 @@ impl Fix {
             "host/acme-client.d",
             "host/ssl/private",
             "host/queue/pending",
+            "home/www",
+            "keyring",
         ] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
@@ -214,7 +216,8 @@ impl Fix {
              quota_mount = \"{}\"\n\
              rates = \"{}/store/rates/xmr-gbp.json\"\n\
              rate_endpoint = \"https://rates.example.invalid/simple/price\"\n\
-             rates_fetch = \"{}\"\n",
+             rates_fetch = \"{}\"\n\
+             public_root = \"{}\"\n",
             fix.path("store"),
             fix.path("reserved"),
             fix.path("bin"),
@@ -234,6 +237,7 @@ impl Fix {
             "/home",
             fix.dir.display(),
             fix.path("bin/curl"),
+            fix.path("home/www"),
         );
         std::fs::write(fix.path("drain.toml"), cfg).unwrap();
         fix
@@ -329,6 +333,29 @@ impl Fix {
                  printf '%s\\n' \"$answer\"\n"
             ),
         );
+    }
+
+    /// The member's sftp chroot as `scripts/provision-member.sh` leaves it: the
+    /// public root with the two directories the member already uploads to, and
+    /// nothing else.
+    pub fn member_tree(&self, username: &str) {
+        let root = self
+            .dir
+            .join("home/www")
+            .join(format!("{username}.kyriakon.net"));
+        for sub in ["www", "gemini"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+    }
+
+    /// The member's mail key in the box keyring, the file the encrypting LMTP
+    /// reads and the export mails to.
+    pub fn mail_key(&self, localpart: &str, material: &str) {
+        std::fs::write(
+            self.dir.join("keyring").join(format!("{localpart}.asc")),
+            material,
+        )
+        .unwrap();
     }
 
     pub fn config(&self) -> String {

@@ -143,8 +143,32 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
                 .map_err(|e| format!("the refund intent does not parse: {e}"))?;
             transitions::refund(cfg, store, key, intent, file, &value).await
         }
+        "export" => transitions::export_account(cfg, store, &value, file).await,
         _ => transitions::refuse(cfg, store, file, &value).await,
     }
+}
+
+/// File an export intent, as the account page's "Take my data out" does.
+///
+/// The body names the account and nothing else. The session is the whole claim,
+/// and the export reaches only what that account's own directory and token
+/// reach, so there is nothing a caller could add that would widen it. No
+/// signature: the intent does not move money, delete anything or change the
+/// account, and the drain writes only into the member's own tree.
+pub async fn file_export(store: &Store, username: &str) -> Result<String, String> {
+    let id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({
+        "id": id,
+        "kind": "export",
+        "filed_at": crate::util::filed_at(),
+        "username": username,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    Ok(id)
 }
 
 /// File one decision, as a link's click or the console does.

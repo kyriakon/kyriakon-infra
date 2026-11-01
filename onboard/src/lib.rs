@@ -15,6 +15,7 @@ pub mod catalogue;
 pub mod config;
 pub mod dns;
 pub mod draft;
+pub mod export;
 pub mod fcgi;
 pub mod intents;
 pub mod keycheck;

@@ -75,6 +75,9 @@ pub struct AccountPage {
     /// The page says so in one line rather than leaving the absence to be read
     /// as an unpaid account whose block failed to render.
     pub free: bool,
+    /// Whether the request named an account. The data actions belong to the
+    /// member; the catalogue below is for everyone.
+    pub member: bool,
 }
 
 /// One upload key, as the page shows it.

@@ -5898,6 +5898,59 @@ pub async fn free_anniversaries(cfg: &DrainConfig, store: &Store) -> Result<(), 
     Ok(())
 }
 
+/// Carry out one export intent: the page's "Take my data out", filed by the
+/// handler with the account the session belongs to and nothing else.
+///
+/// The bundle is written into the member's own chroot and the ready notice is
+/// appended in the same pass. The journal line names the application the account
+/// was approved from when the copy is still inside ADR 0005's purge; an export
+/// after the purge has no status token left to name and journals none.
+pub async fn export_account(
+    cfg: &DrainConfig,
+    store: &Store,
+    value: &Value,
+    file: &str,
+) -> Result<(), String> {
+    let username = value
+        .get("username")
+        .and_then(Value::as_str)
+        .ok_or("the export intent names no account")?;
+    if let Some(why) = validate::username_shape(username) {
+        return Err(format!("the export intent's username {username:?}: {why}"));
+    }
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| file.trim_end_matches(".json").to_string());
+    let status_token = store
+        .read_record(&format!("accounts/{username}"), "application.json")
+        .await
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|copy| {
+            copy.get("status_token")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let bundle = crate::export::deliver(cfg, store, username).await?;
+    let application = ApplicationRef {
+        username: username.to_string(),
+        status_token,
+    };
+    journal(
+        store,
+        &cfg.release,
+        &id,
+        "export",
+        &application,
+        "applied",
+        Some(&format!("the bundle is at {bundle}")),
+    )
+    .await?;
+    store.remove("intents", file).await
+}
+
 /// Clear away every declined application whose week is up, and release the
 /// username. Run once per drain pass, after the intents: this is what carries
 /// the decline's week out without the application being touched again.
