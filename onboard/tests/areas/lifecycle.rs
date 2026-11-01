@@ -853,6 +853,39 @@ fn an_approval_writes_the_upload_key_the_builder_reads() {
         .exists());
 }
 
+/// The space-used sweep reads the quota report once and records it on the
+/// account, which is the figure the account page shows against the 5 GB. The
+/// second pass inside the hour reads nothing, so the report is cached.
+#[test]
+fn the_drain_records_space_used_from_the_quota_report() {
+    let fix = Fix::new("quota-sweep");
+    let record = fix.filed("secretary", "no_charge", &[("rail", "no_charge")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    fix.repquota(Some(
+        "printf 'Disk quotas for user secretary (uid 1000):\n\
+         Filesystem blocks quota limit grace files quota limit grace\n\
+         /dev/sd1l 4096 5242880 5767168 10 0 0\n'",
+    ));
+    // The filing pass cached an empty report; the hour is what the state file
+    // keys on, and the account did not exist when it ran.
+    std::fs::remove_file(fix.path("store/quota-check.json")).unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "the sweep reported an error: {}",
+        body(&out)
+    );
+    let account = stored_account(&fix, "secretary");
+    assert_eq!(
+        account.space_used,
+        Some(4096 * 1024),
+        "the used blocks are recorded in bytes"
+    );
+}
+
 /// An approval publishes the member's mail key into the box keyring the
 /// encrypting LMTP reads, named for the localpart and at the mode deploy-mail
 /// installs the tracked keys with, before anything can deliver.

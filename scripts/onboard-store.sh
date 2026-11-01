@@ -158,6 +158,29 @@ store_dir holds        root wheel 750
 store_dir ledger       root wheel 750
 store_dir rates        root wheel 750
 
+# The records the handler renders are readable by its group, and an upgrade
+# must repair the ones an earlier release wrote 0600 root. Only these three are
+# shared: account.json and group.json are what the account page reads, and
+# notices.jsonl is the notice list on it. journal.jsonl and requests.jsonl stay
+# root-only, because nothing outside the drain reads them.
+share_record() {
+	[ -e "$1" ] || return 0
+	if [ "$(stat -f '%Su %Sg %Lp' "$1")" != "root $onboard_user 640" ]; then
+		changed=1
+		chown root:"$onboard_user" "$1"
+		chmod 0640 "$1"
+	fi
+}
+for account in "$store"/accounts/*; do
+	[ -d "$account" ] || continue
+	share_record "$account/account.json"
+	share_record "$account/notices.jsonl"
+done
+for group in "$store"/groups/*; do
+	[ -d "$group" ] || continue
+	share_record "$group/group.json"
+done
+
 # mail/ is _onboard's, not the root drain's, and with the Maildir's three
 # subdirectories. The smtpd action for apply@ runs the delivery as _onboard
 # (`user _onboard`), so the account has to be able to write here, and the drain

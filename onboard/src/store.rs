@@ -199,6 +199,23 @@ impl Store {
     /// completed later, under the lock `transitions::lock_store_file` takes, as
     /// a request close and a refund settlement do.
     pub async fn append(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        self.append_mode(path, bytes, None, 0o600).await
+    }
+
+    /// Append with the file's mode and owner set on every call, including one
+    /// that finds the file already there. `notices.jsonl` is the one append
+    /// file the handler must read: the account page lists every notice sent, so
+    /// it is written 0640 with the accounts directory's group rather than the
+    /// 0600 root-only default. `journal.jsonl` and `requests.jsonl` stay
+    /// root-only, because nothing outside the drain reads them.
+    pub async fn append_mode(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        owner: Option<(u32, u32)>,
+        mode: u32,
+    ) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
         let p = self.root.join(path);
         if let Some(parent) = p.parent() {
             tokio::fs::create_dir_all(parent)
@@ -214,9 +231,23 @@ impl Store {
             let mut f = tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .mode(0o600)
+                .mode(mode)
                 .open(&p)
                 .await?;
+            // The mode argument above applies only at creation, and an upgrade
+            // finds the file already 0600; both are corrected here.
+            f.set_permissions(std::fs::Permissions::from_mode(mode))
+                .await?;
+            if let Some((uid, gid)) = owner {
+                if unsafe { libc::geteuid() } == 0 {
+                    std::os::unix::fs::chown(&p, Some(uid), Some(gid)).map_err(|e| {
+                        std::io::Error::other(format!(
+                            "cannot hand {} to its group: {e}",
+                            p.display()
+                        ))
+                    })?;
+                }
+            }
             f.write_all(&line).await?;
             if sync {
                 f.sync_all().await

@@ -151,3 +151,12 @@ dmarc_rua = "mailto:dmarc@kyriakon.net"
 # rather than a literal so the acceptance tests stub it and never touch the
 # network: the drain can only observe a body's zone, never change it.
 resolver = "/usr/bin/dig"
+
+# The space-used sweep's tools. The account page shows the filesystem quota's
+# used figure against the published 5 GB, and the handler cannot read it: the
+# quota tools need root. The drain runs `repquota -u <mount>` hourly, parses the
+# per-uid block count and records it on each account as `space_used`. A
+# configuration value rather than a literal so the tests drive a fixture and
+# never touch the box's quota files.
+repquota = "/usr/sbin/repquota"
+quota_mount = "/home"

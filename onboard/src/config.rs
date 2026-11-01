@@ -205,6 +205,14 @@ pub struct DrainConfig {
     /// so the acceptance test can point it at a stub and never touch the
     /// network.
     pub resolver: String,
+    /// The quota report the space-used sweep runs: `/usr/sbin/repquota` on the
+    /// box, by path so the test can point it at a fixture. Reads the per-uid
+    /// block counts the platform's 5 GB allowance is written against; the
+    /// handler cannot, because repquota needs root.
+    pub repquota: String,
+    /// The filesystem carrying member homes, `/home`. `repquota -u` takes it as
+    /// its argument; a value rather than a literal so a fixture controls it.
+    pub quota_mount: String,
 }
 
 impl DrainConfig {
@@ -334,7 +342,9 @@ mod tests {
              dkim_selector = \"mail\"\n\
              dkim_public_key = \"v=DKIM1; k=rsa; p=example\"\n\
              dmarc_rua = \"mailto:dmarc@kyriakon.net\"\n\
-             resolver = \"/usr/bin/dig\"\n";
+             resolver = \"/usr/bin/dig\"\n\
+             repquota = \"/usr/sbin/repquota\"\n\
+             quota_mount = \"/home\"\n";
         let c: DrainConfig = toml::from_str(text).unwrap();
         assert_eq!(c.price_gbp, "20.00");
         assert_eq!(c.scripts, "/root/bin");
