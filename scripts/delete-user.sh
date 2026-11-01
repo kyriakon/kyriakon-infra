@@ -75,6 +75,7 @@ ssl_dir=${SSL_DIR:-/etc/ssl}
 ssl_private=${SSL_PRIVATE:-/etc/ssl/private}
 virtuals=${VIRTUALS:-/etc/mail/virtuals}
 onboard_store=${ONBOARD_STORE:-/var/db/onboard}
+finger_page=${FINGER_PAGE:-/etc/kyriakon/finger.txt}
 
 # --- the steps, as functions, so the self-test can replace them -------------
 #
@@ -92,6 +93,21 @@ remove_group() { groupdel "$user" 2>/dev/null; }
 clear_quota() { ksh "$script_dir/quota-apply.sh" --clear "$user"; }
 regen_indexes() { ksh "$script_dir/cron-apply.sh" --web; }
 restart_smtpd() { rcctl restart smtpd >/dev/null; }
+
+# regen_finger: rebuild the page fingerd serves. It is derived from the httpd
+# and gmid configuration, so a member's vhosts leaving is the moment it changes.
+# gen-finger-page.sh lives in the repository checkout rather than the drain's
+# script directory because it reads the tracked configuration beside it.
+regen_finger() {
+	repo=${KYRIAKON_REPO_DIR:-/usr/local/src/kyriakon-infra}
+	tmp=$(mktemp "${TMPDIR:-/tmp}/kyriakon-finger.XXXXXX")
+	if ksh "$repo/scripts/gen-finger-page.sh" >"$tmp"; then
+		install -m 0644 "$tmp" "$finger_page"
+	else
+		printf 'warning: the finger page was not regenerated from %s\n' "$repo" >&2
+	fi
+	rm -f "$tmp"
+}
 
 # would <description> <path>: in --show mode, report rather than remove. Returns
 # 0 when the caller should keep going (the path is there), 1 when there is
@@ -256,6 +272,14 @@ remove_member() {
 		fi
 	fi
 
+	# 8. The finger page, which is derived from the daemon configuration. It runs
+	# last, after the vhost files have gone and the indexes have been rewritten,
+	# so it describes the box as it now stands.
+	if [ "$did" = yes ] && [ "$show" = no ]; then
+		regen_finger
+		printf 'regenerated the finger page\n'
+	fi
+
 	# The last line, and the reason a run that did something is not silent.
 	if [ "$did" = yes ] && [ "$show" = no ]; then
 		printf 'not this script'"'"'s: the ledger line, the keyring'"'"'s published set, the\n'
@@ -325,6 +349,7 @@ self_test() {
 	clear_quota() { printf 'quota-apply --clear %s\n' "$user" >>"$case_dir/calls"; }
 	regen_indexes() { printf 'cron-apply --web\n' >>"$case_dir/calls"; }
 	restart_smtpd() { printf 'rcctl restart smtpd\n' >>"$case_dir/calls"; }
+	regen_finger() { printf 'gen-finger-page\n' >>"$case_dir/calls"; }
 
 	# remove_member is called directly, so the root check, the charset check and
 	# the two guards on the public tree are not in the way: they are the caller's
@@ -360,6 +385,8 @@ self_test() {
 	check "and the account goes last of the tools" "$(awk 'NR == 3' "$case_dir/calls")" 'userdel -r alice'
 	check "smtpd restarted once" "$(grep -c 'rcctl restart smtpd' "$case_dir/calls")" 1
 	check "the member's group goes after the account" "$(awk 'NR == 4' "$case_dir/calls")" 'groupdel alice'
+	check "the finger page is regenerated last" \
+		"$(tail -1 "$case_dir/calls")" 'gen-finger-page'
 	# The store's record goes too: the drain reads it to decide whether a name is
 	# taken, and an account deleted without it makes the next approval refuse the
 	# name as one that exists.

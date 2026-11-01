@@ -45,6 +45,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
         }
     }
     transitions::purge_declined(cfg, store).await?;
+    transitions::purge_closing(cfg, store).await?;
     // The free accounts' yearly note, on the same pass: a free account never
     // lapses, and this is the one message it is sent each year.
     transitions::free_anniversaries(cfg, store).await?;
@@ -98,6 +99,7 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
         "provision-group" => transitions::provision_group(cfg, store, &value, file).await,
         "group-address" => transitions::group_address(cfg, store, key, &value, file).await,
         "remove-group" => transitions::remove_group(cfg, store, key, &value, file).await,
+        "close" => transitions::close_account(cfg, store, &value, file).await,
         "token-resend" => {
             let intent: transitions::ResendIntent = serde_json::from_value(value)
                 .map_err(|e| format!("the token resend intent does not parse: {e}"))?;
@@ -375,6 +377,26 @@ pub async fn file_refund(
         "rate": rate,
         "settled_on": settled_on,
         "sig": sig,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    Ok(id)
+}
+
+/// File one `close` intent, as the account page does. The handler has
+/// authenticated the member and writes only the account name; the drain owns the
+/// state write and the seven-day window. Nothing the caller supplies reaches the
+/// drain beyond the username.
+pub async fn file_close(store: &Store, username: &str) -> Result<String, String> {
+    let id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({
+        "id": id,
+        "kind": "close",
+        "filed_at": crate::util::filed_at(),
+        "username": username,
     });
     let bytes =
         serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;

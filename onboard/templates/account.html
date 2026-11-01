@@ -182,6 +182,16 @@
 {% endfor %}
 </ul>
 
+{% if can_close %}
+{# The irreversible control, so it says what the seven days are for. The drain
+   sets the window and runs the deletion when it ends. #}
+<h3>Close my account</h3>
+<form method="post" action="/account/close">
+  <p>Closing gives you seven days of normal working to take anything you want out. After that the account and the data the platform holds about it are erased; the answer names what survives.</p>
+  <button class="btn" type="submit">Close my account</button>
+</form>
+{% endif %}
+
 <form method="post" action="/logout">
   <button class="btn" type="submit">Log out</button>
 </form>

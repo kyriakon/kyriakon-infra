@@ -433,6 +433,8 @@ A member asks for closure from the account page, or a refund opens it. Closing i
 
 Deletion is a sequence, and the order stops access before anything is destroyed, so the window between the decision and the deletion is closed. The sequence is from the research in #168.
 
+The automated path is `doas kyriakon-onboardctl delete <username>`. It runs the sequence below as the lifecycle's one deletion transition, and the page's closing sweep calls the same transition when the seven days end. The numbered steps remain the operator's fallback when the service is not running.
+
 1. Close access.
 
 		doas usermod -Z <username>
@@ -489,7 +491,7 @@ Deletion is a sequence, and the order stops access before anything is destroyed,
 
 DNS needs nothing. The zone answers every member subdomain from a wildcard, so there is no per-member record to remove.
 
-Two things survive, and both are deliberate. The payment state dies with the account, while the financial ledger is keyed by the approval token and holds the amount, the date, the rail and the paid-until date with no username and no name (ADR 0009), so six years of records stop resolving to a person. The backup repository holds the home until the retention window ages it out, which is about six months, and it cannot delete a single file because it is content addressed (`restic forget --keep-daily 30 --keep-weekly 8 --keep-monthly 6`). The retention window is the mechanism, and `docs/planning/research/encrypted-backup-restore.md` records the reasoning.
+Two things survive, and both are deliberate. The payment state dies with the account, while the financial ledger is keyed by the approval token and holds the amount, the date, the rail and the paid-until date with no username and no name (ADR 0009), so six years of records stop resolving to a person. The backup repository holds the home until the retention window ages it out, which is about seven months, and it cannot delete a single file because it is content addressed (`restic forget --keep-daily 30 --keep-weekly 8 --keep-monthly 6`). The retention window is the mechanism, and `docs/planning/research/encrypted-backup-restore.md` records the reasoning.
 
 The username is held for 90 days and then released. A returning member applies as a new applicant, because the mailbox is gone.
 

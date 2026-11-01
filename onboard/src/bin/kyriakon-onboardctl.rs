@@ -5,14 +5,18 @@
 //! intent and nothing else: the drain applies it on its next minute, exactly as
 //! a click on a signed link would. That is what makes `onboardctl approve` the
 //! equivalent of the review email's first link, and it is also why there is no
-//! privileged work here at all. Root runs it, but it holds no key and touches no
-//! account.
+//! privileged work here at all. Root runs it, but it holds no key beyond the
+//! approval key and touches no account. `delete` is the one exception: the
+//! lifecycle has one deletion transition and the console runs it directly, so an
+//! erasure from the console and one from the page's closing sweep cannot take
+//! different paths.
 //!
 //! Usage:
 //!
 //!   kyriakon-onboardctl [--config PATH] approve <username>
 //!   kyriakon-onboardctl [--config PATH] approve-free <username>
 //!   kyriakon-onboardctl [--config PATH] decline <username>
+//!   kyriakon-onboardctl [--config PATH] delete <username>
 //!   kyriakon-onboardctl [--config PATH] address --domain <domain> --action <change> \
 //!       --mailbox <account> [--address <localpart>] [--key-file <path>] \
 //!       [--site-owner <account>]
@@ -109,6 +113,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         "refund" => refund(&cfg, &store, &rest[1..]).await,
         "ledger" => ledger(&store, &rest[1..]).await,
         "show" => show(&store, one_username(rest)?).await,
+        "delete" => delete(&cfg, &store, rest).await,
         "free" => free(&store, &rest[1..]).await,
         // Each decision is signed with the same root-only key the review links
         // are signed with, because the drain carries out a decision intent only
@@ -129,7 +134,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
 
 fn usage() -> String {
     "usage: kyriakon-onboardctl [--config PATH] \
-     approve|approve-free|decline|show <username>
+     approve|approve-free|decline|delete|show <username>
        kyriakon-onboardctl free
        kyriakon-onboardctl token resend <username>
        kyriakon-onboardctl credit (--token <t> | --username <u> | --note <text>) \
@@ -1205,6 +1210,18 @@ async fn show(store: &Store, username: &str) -> Result<(), String> {
         }
         None => println!("account  none yet"),
     }
+    Ok(())
+}
+
+/// `delete`: the lifecycle's one deletion transition, run now. The page's
+/// closure reaches the same function through the drain's closing sweep, so an
+/// erasure from the console and one from the page cannot differ. No flag: a
+/// deletion erases the account it names and nothing about the deletion is
+/// optional.
+async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(), String> {
+    let username = one_username(rest)?;
+    transitions::delete_account(cfg, store, username).await?;
+    println!("deleted {username}");
     Ok(())
 }
 

@@ -1088,6 +1088,16 @@ async fn http(app: &App, request: &Request, incoming: &Incoming) -> Reply {
             method_not_allowed()
         };
     }
+    // The page's own closure. A POST files a close intent for the session's
+    // account; the drain sets the seven-day window and runs the lifecycle's
+    // deletion when it ends. The page carries no close button for a stranger,
+    // and this route refuses one too.
+    if incoming.path == "account/close" {
+        if method != "POST" {
+            return method_not_allowed();
+        }
+        return account_close(app, request).await;
+    }
     if incoming.path == "account" {
         return if get {
             account(app, request).await
@@ -1828,6 +1838,32 @@ async fn logout(app: &App, request: &Request) -> Reply {
     Reply::capability(303, String::new())
         .with_header("Location", "/account".to_string())
         .with_header("Set-Cookie", session::clear_cookie())
+}
+
+/// The member a request's live session names, with the account it names. Both
+/// the closure route and the page's actions use it: `REMOTE_USER` is not an
+/// identity here, because no HTTP authentication is configured for the host.
+async fn session_member(app: &App, request: &Request) -> Option<Account> {
+    let cookie = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE)?;
+    let member = session::lookup(&app.store, &cookie, OffsetDateTime::now_utc()).await?;
+    account_record(app, &member.username).await
+}
+
+/// The member's own "Close my account": file one close intent for the account
+/// the session names, and answer with the erasure text. The handler holds no
+/// privilege and writes nothing but the intent; the drain owns the state change
+/// and the deletion.
+async fn account_close(app: &App, request: &Request) -> Reply {
+    let Some(account) = session_member(app, request).await else {
+        return refused("Sign in to the account you want to close.");
+    };
+    match intents::file_close(&app.store, &account.username).await {
+        Ok(_) => {
+            let message = crate::requests::erasure_answer(None);
+            Reply::html(200, page_html(&notice("Closing your account", &message)))
+        }
+        Err(e) => server_error(&format!("the closure could not be filed: {e}")),
+    }
 }
 
 /// One account's record, for a name the request or a decided application

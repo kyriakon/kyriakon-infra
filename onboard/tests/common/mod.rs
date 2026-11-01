@@ -890,6 +890,20 @@ impl Fix {
             .unwrap()
     }
 
+    /// File the page's close intent through the handler's own writer, so a test
+    /// exercises the production shape rather than a hand-built one.
+    pub fn file_close(&self, username: &str) -> String {
+        let cfg = DrainConfig::load(Path::new(&self.config())).unwrap();
+        let store = Store::new_for_test(&cfg.store_root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(kyriakon_onboard::intents::file_close(&store, username))
+            .unwrap()
+    }
+
     pub fn read(&self, rel: &str) -> String {
         std::fs::read_to_string(self.dir.join("store").join(rel)).unwrap_or_default()
     }

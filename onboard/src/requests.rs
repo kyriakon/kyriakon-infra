@@ -176,6 +176,32 @@ fn account_dir(username: &str) -> String {
     format!("accounts/{username}")
 }
 
+/// The answer an erasure request carries, shown by the page when the closure is
+/// filed and sent as a notice by the deletion transition. Four facts, because
+/// silence would read as an instant and total delete: the backup window, the
+/// surviving ledger line, the username hold, and the refund position.
+///
+/// `refund` is the ledger's own sentence where a refund line exists; `None` says
+/// plainly that closing does not refund anything by itself.
+pub fn erasure_answer(refund: Option<&str>) -> String {
+    let refund = refund.unwrap_or(
+        "No refund is due: closing the account does not itself refund money already paid. A refund is a separate decision and would be recorded on its own.",
+    );
+    format!(
+        "Your account and the data the platform holds about it are being erased.\n\
+         \n\
+         Three things outlive the account, and you should know them.\n\
+         \n\
+         The backup repository keeps a copy of your home directory until its snapshot expires. It is content-addressed and cannot delete one member's files, so your home can survive there for about seven months.\n\
+         \n\
+         The payment ledger keeps one dated line for each payment: the amount, the date, the rail and the paid-until date, with no username, contact address or name. That line survives, and it no longer resolves to you.\n\
+         \n\
+         Your username is held for 90 days and then released, so nobody else can take it in that time.\n\
+         \n\
+         {refund}\n"
+    )
+}
+
 fn record_path(username: &str) -> String {
     format!("{}/requests.jsonl", account_dir(username))
 }
@@ -823,5 +849,22 @@ mod tests {
         assert!(err.contains("already recorded"), "{err}");
         assert_eq!(read_all(&store, "alice").await.unwrap().len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_erasure_answer_names_the_four_facts_that_survive() {
+        let answer = erasure_answer(Some(
+            "A refund of GBP 20.00 was recorded on 2026-10-04; it is settled separately.",
+        ));
+        assert!(answer.contains("about seven months"), "{answer}");
+        assert!(answer.contains("ledger"), "{answer}");
+        assert!(answer.contains("no username"), "{answer}");
+        assert!(answer.contains("90 days"), "{answer}");
+        assert!(answer.contains("GBP 20.00"), "{answer}");
+        assert!(answer.contains("refund"), "{answer}");
+        // The no-refund form still names the refund position plainly.
+        let none = erasure_answer(None);
+        assert!(none.contains("No refund is due"), "{none}");
+        assert!(!none.contains("GBP 20.00"), "{none}");
     }
 }
