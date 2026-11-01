@@ -4954,6 +4954,12 @@ const QUOTA_CHECK_HOURS: i64 = 1;
 /// a filesystem with quotas off prints nothing and is the same no-op, which is
 /// the state the research found on the box before quotas were enabled.
 pub async fn refresh_space_used(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+    // A pass with no accounts has nothing to record, so it writes neither the
+    // report nor the state. That keeps a store that has never been provisioned
+    // byte-identical across a pass, which the sweep tests rely on.
+    if store.list("accounts").await?.is_empty() {
+        return Ok(());
+    }
     let now = OffsetDateTime::now_utc();
     let state: Option<Value> = store
         .read_record("", "quota-check.json")
