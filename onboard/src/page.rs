@@ -437,6 +437,19 @@ pub fn payment(
             closes_on.as_deref().unwrap_or("the close date")
         )
     });
+    // A running window carries the rail's instructions. A lapsed one shows the
+    // token again but no instructions: the window it would have paid is gone.
+    let instructions = if running {
+        crate::transitions::rail_instructions(
+            rail,
+            postal_address,
+            card_link,
+            payment.monero.as_ref(),
+            &amount,
+        )
+    } else {
+        Vec::new()
+    };
     PaymentView {
         state: if lapsed_closed {
             "lapsed".to_string()
@@ -455,11 +468,7 @@ pub fn payment(
         lapsed_note: lapsed.as_ref().map(|_| LAPSE_NOTE.to_string()),
         lapsed,
         window: window_line,
-        instructions: if running {
-            crate::transitions::rail_instructions(rail, postal_address, card_link)
-        } else {
-            Vec::new()
-        },
+        instructions,
         deadline,
     }
 }

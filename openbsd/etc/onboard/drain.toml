@@ -160,3 +160,19 @@ resolver = "/usr/bin/dig"
 # never touch the box's quota files.
 repquota = "/usr/sbin/repquota"
 quota_mount = "/home"
+
+# The cached XMR/GBP rate the Monero rail quotes from: one file, rewritten at
+# most once every twenty-four hours, so the egress is a handful of requests a
+# day and the member's page never reaches the source. The handler renders the
+# quote the drain recorded on the account and fetches nothing.
+rates = "/var/db/onboard/rates/xmr-gbp.json"
+
+# The one source, CoinGecko's public price endpoint (no key). Named here because
+# it is the only address this box fetches a price from, and retiring or replacing
+# it is an operator's change rather than a rebuild.
+rate_endpoint = "https://api.coingecko.com/api/v3/simple/price?ids=monero&vs_currencies=gbp&include_last_updated_at=true"
+
+# The HTTPS client for that one fetch, by path: the release's dependency list is
+# frozen and a single GET does not earn a client crate. `pkg_add curl`; cron's
+# PATH is not where a package's binary lives.
+rates_fetch = "/usr/local/bin/curl"

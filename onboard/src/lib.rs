@@ -35,3 +35,4 @@ pub mod store;
 pub mod transitions;
 pub mod util;
 pub mod validate;
+pub mod xmr;

@@ -224,6 +224,9 @@ mod tests {
             resolver: "/usr/bin/dig".to_string(),
             repquota: "/usr/sbin/repquota".to_string(),
             quota_mount: "/home".to_string(),
+            rates: dir.join("rates/xmr-gbp.json").to_str().unwrap().to_string(),
+            rate_endpoint: "https://rates.example.invalid/simple/price".to_string(),
+            rates_fetch: "/usr/bin/true".to_string(),
         }
     }
 

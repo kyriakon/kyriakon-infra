@@ -13,9 +13,15 @@ const STATUS_WINDOW_DAYS: i64 = 7;
 /// precision matches the timestamps the store's other records carry and keeps
 /// the JSON stable to read; the ULID beside it already holds milliseconds.
 pub fn filed_at() -> String {
-    let now = OffsetDateTime::now_utc();
-    now.replace_nanosecond(0)
-        .unwrap_or(now)
+    stamp(OffsetDateTime::now_utc())
+}
+
+/// The same RFC 3339 timestamp to the second, for a caller that already holds
+/// the instant. One format for the store's records, so a stamp written by the
+/// rate cache reads like the one beside it in a ledger line.
+pub fn stamp(at: OffsetDateTime) -> String {
+    at.replace_nanosecond(0)
+        .unwrap_or(at)
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }

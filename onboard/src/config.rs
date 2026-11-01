@@ -213,6 +213,20 @@ pub struct DrainConfig {
     /// The filesystem carrying member homes, `/home`. `repquota -u` takes it as
     /// its argument; a value rather than a literal so a fixture controls it.
     pub quota_mount: String,
+    /// The cached XMR/GBP rate, `rates/xmr-gbp.json` under the store. The drain
+    /// writes it at most once every twenty-four hours and reads it at a window's
+    /// opening; the handler renders the quote the drain recorded and never asks
+    /// the source anything. A path rather than a literal so a test can point it
+    /// at a fixture.
+    pub rates: String,
+    /// The rate source's endpoint, CoinGecko's public price endpoint. Named here
+    /// rather than compiled in because it is the one address this box fetches
+    /// from, and an operator changing or retiring it must not need a rebuild.
+    pub rate_endpoint: String,
+    /// The HTTPS client used for the one rate fetch: `curl`, by path. A value so
+    /// a test stubs it and never touches the network, and because cron's PATH is
+    /// not where a package's binary lives.
+    pub rates_fetch: String,
 }
 
 impl DrainConfig {
@@ -344,7 +358,10 @@ mod tests {
              dmarc_rua = \"mailto:dmarc@kyriakon.net\"\n\
              resolver = \"/usr/bin/dig\"\n\
              repquota = \"/usr/sbin/repquota\"\n\
-             quota_mount = \"/home\"\n";
+             quota_mount = \"/home\"\n\
+             rates = \"/var/db/onboard/rates/xmr-gbp.json\"\n\
+             rate_endpoint = \"https://api.coingecko.com/api/v3/simple/price?ids=monero&vs_currencies=gbp&include_last_updated_at=true\"\n\
+             rates_fetch = \"/usr/local/bin/curl\"\n";
         let c: DrainConfig = toml::from_str(text).unwrap();
         assert_eq!(c.price_gbp, "20.00");
         assert_eq!(c.scripts, "/root/bin");

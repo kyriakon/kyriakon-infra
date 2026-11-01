@@ -31,6 +31,7 @@
 //!   kyriakon-onboardctl [--config PATH] reconcile attribute <UN-id> --token <t>
 //!   kyriakon-onboardctl [--config PATH] reconcile return <UN-id> --note <evidence>
 //!   kyriakon-onboardctl [--config PATH] payment show --username <u>
+//!   kyriakon-onboardctl [--config PATH] monero address <username> <address>
 //!   kyriakon-onboardctl [--config PATH] refund (--token <t> | --username <u>) \
 //!       --rail <card|cash|cash-hand|monero> --amount <gbp> --reason <text> \
 //!       (--close | --excess) [--rate <gbp-per-xmr>]
@@ -47,7 +48,8 @@
 //! of the text.
 //!
 //! The `request` verbs write the data-subject request record straight into the
-//! account's store directory. They are root's, like the decisions: the record is
+//! account's store directory, and `monero address` writes the subaddress the
+//! operator's own wallet made. They are root's, like the decisions: the record is
 //! the member's data and the account directory is not the handler's to write.
 
 use std::collections::BTreeMap;
@@ -113,6 +115,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         "window" => window(&cfg, &store, &rest[1..]).await,
         "reconcile" => reconcile(&cfg, &store, &rest[1..]).await,
         "payment" => payment(&store, &rest[1..]).await,
+        "monero" => monero(&store, &rest[1..]).await,
         "refund" => refund(&cfg, &store, &rest[1..]).await,
         "ledger" => ledger(&store, &rest[1..]).await,
         "show" => show(&store, one_username(rest)?).await,
@@ -150,6 +153,7 @@ fn usage() -> String {
      [--confirm-double] [--override <reason>]
        kyriakon-onboardctl reconcile return <UN-id> --note <evidence>
        kyriakon-onboardctl payment show --username <u>
+       kyriakon-onboardctl monero address <username> <address>
        kyriakon-onboardctl refund (--token <t> | --username <u>) \
      --rail <card|cash|cash-hand|monero> --amount <gbp> --reason <text> \
      (--close | --excess) [--rate <gbp-per-xmr>]
@@ -1288,6 +1292,85 @@ async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(),
 /// `free`: how many accounts were approved without charge. The count is read
 /// from the accounts themselves rather than kept beside them, so it cannot
 /// drift; a group mailbox is not counted, because the group holds the payment.
+/// `monero address <username> <address>`: record the subaddress the operator's
+/// own wallet made for this member. The account is read and written here, at the
+/// terminal, because root runs it and the address is the operator's own fact;
+/// the account page then shows it rather than saying it is not ready.
+///
+/// One per account and permanent: the same address again is a replay that says
+/// so, and a different one is refused rather than rotated, because the first
+/// may already have been sent a payment and reusing it for somebody else would
+/// join money to the wrong account.
+async fn monero(store: &Store, args: &[String]) -> Result<(), String> {
+    let (username, address) = match args {
+        [verb, username, address] if verb == "address" => (username.as_str(), address.as_str()),
+        _ => return Err(usage()),
+    };
+    if let Some(why) = validate::username_shape(username) {
+        return Err(format!("the username {username:?}: {why}"));
+    }
+    if let Some(why) = monero_address_shape(address) {
+        return Err(format!("the address {address:?} {why}"));
+    }
+    let text = store
+        .read_record(&format!("accounts/{username}"), "account.json")
+        .await
+        .ok_or_else(|| format!("no account for {username}"))?;
+    let mut account: kyriakon_onboard::store::Account = serde_json::from_str(&text)
+        .map_err(|e| format!("the account record does not parse: {e}"))?;
+    let Some(mut payment) = account.payment_state() else {
+        return Err(format!(
+            "{username} was approved without charge, so it has no Monero rail"
+        ));
+    };
+    if account.rail != "monero" {
+        return Err(format!(
+            "{username} chose the {} rail, so it has no Monero subaddress to record",
+            account.rail
+        ));
+    }
+    let block = payment.monero.get_or_insert_with(Default::default);
+    match block.address.as_deref() {
+        Some(existing) if existing == address => {
+            println!("{username}'s Monero subaddress is already {address}");
+            return Ok(());
+        }
+        Some(existing) => {
+            return Err(format!(
+                "{username}'s Monero subaddress is already {existing}; a subaddress is never rotated or reused"
+            ))
+        }
+        None => block.address = Some(address.to_string()),
+    }
+    account.payment = Some(payment.clone());
+    let bytes = serde_json::to_vec_pretty(&account)
+        .map_err(|e| format!("cannot encode the account: {e}"))?;
+    store
+        .write_record(&format!("accounts/{username}"), "account.json", &bytes)
+        .await?;
+    transitions::write_payment_copy(store, username, &payment).await?;
+    println!("recorded Monero subaddress for {username}: {address}");
+    Ok(())
+}
+
+/// A mainnet Monero subaddress: 95 base58 characters beginning with `8`, the
+/// shape `monero-wallet-cli` gives a subaddress. The checksum is the wallet's to
+/// verify; this refuses a truncated paste and a standard address (which begins
+/// `4`), which are the two ways a wrong value would look right in a store.
+fn monero_address_shape(address: &str) -> Option<&'static str> {
+    const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    if address.len() != 95 {
+        return Some("is not the 95 characters of a Monero address");
+    }
+    if !address.starts_with('8') {
+        return Some("is not a subaddress; a member's address begins with 8");
+    }
+    if !address.bytes().all(|b| BASE58.as_bytes().contains(&b)) {
+        return Some("is not base58");
+    }
+    None
+}
+
 async fn free(store: &Store, rest: &[String]) -> Result<(), String> {
     if !rest.is_empty() {
         return Err(usage());

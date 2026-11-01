@@ -18,6 +18,8 @@ mod export;
 mod group;
 #[path = "areas/lifecycle.rs"]
 mod lifecycle;
+#[path = "areas/monero.rs"]
+mod monero;
 #[path = "areas/prepaid.rs"]
 mod prepaid;
 #[path = "areas/refund.rs"]
