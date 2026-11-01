@@ -170,6 +170,13 @@ pub fn credit_payload(
     )
 }
 
+/// The payload a `window-extend` intent signs: the token, the number of days and
+/// the reason the operator recorded. The reason is free text and last, so no
+/// earlier field can be shifted into it by a colon.
+pub fn window_extend_payload(token: &str, days: i64, reason: &str) -> String {
+    format!("window-extend:{token}:{days}:{reason}")
+}
+
 /// The payload a `reconcile-attribute` intent signs: the held item, the token it
 /// is joined to, and the two acknowledgements a renewal needs. All are covered,
 /// so a signature for one item cannot be replayed with a different token or a

@@ -581,7 +581,7 @@ fn an_unimplemented_kind_is_left_in_place_and_refused_once() {
         &id,
         &json!({
             "id": id,
-            "kind": "window-extend",
+            "kind": "future-kind",
             "filed_at": "2026-10-02T09:00:00Z",
             "application": {"username": "secretary", "status_token": TOKEN},
         }),
@@ -591,7 +591,7 @@ fn an_unimplemented_kind_is_left_in_place_and_refused_once() {
     // Left in place, the second run sees it again.
     assert_eq!(fix.intents(), vec![format!("{id}.json")]);
     assert!(fix.journal().contains("refused"), "{}", fix.journal());
-    assert!(fix.journal().contains("window-extend"), "{}", fix.journal());
+    assert!(fix.journal().contains("future-kind"), "{}", fix.journal());
 
     assert!(fix.drain().status.success());
     assert_eq!(fix.intents(), vec![format!("{id}.json")]);

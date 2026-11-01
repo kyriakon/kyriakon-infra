@@ -255,6 +255,22 @@ pub struct RefundIntent {
     pub sig: String,
 }
 
+/// A `window-extend` intent: the one extension a member with money in the post
+/// is given. The token, the days and the operator's reason are signed, because
+/// the intent moves the date the account lapses on and `intents/` belongs to the
+/// unprivileged half.
+#[derive(Debug, serde::Deserialize)]
+pub struct WindowExtendIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub token: String,
+    pub days: i64,
+    pub reason: String,
+    pub sig: String,
+}
+
 /// Run one of the repository's privileged scripts by its configured path and
 /// hand back what it wrote. It is called with argv only: there is no shell
 /// anywhere in the drain, and every value that reaches it was validated first.
@@ -1327,6 +1343,7 @@ async fn approve(
         suspension_reason: None,
         group: None,
         closing_until: None,
+        grace_until: None,
     };
     store.ensure_dir(&format!("accounts/{username}")).await?;
     let account_bytes = serde_json::to_vec_pretty(&account)
@@ -1520,6 +1537,283 @@ pub async fn resend(
     )
     .await?;
     store.remove("intents", file).await
+}
+
+/// Give an open payment window its one extension, as `onboardctl window extend`
+/// asks. The new close is fourteen days past the old one, and the counter makes
+/// a second extension a refusal: the window is a courtesy, not a free tier.
+pub async fn window_extend(
+    cfg: &DrainConfig,
+    store: &Store,
+    key: &[u8],
+    intent: WindowExtendIntent,
+    file: &str,
+    value: &Value,
+) -> Result<(), String> {
+    if !sign::verify(
+        key,
+        &sign::window_extend_payload(&intent.token, intent.days, &intent.reason),
+        &intent.sig,
+    ) {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the window extension's signature does not verify",
+        )
+        .await;
+    }
+    // A refusal is journaled once and the intent is left in place, as the credit
+    // path does; a new intent is the way to change the answer.
+    if journal_has(store, &intent.id, "refused").await {
+        return Ok(());
+    }
+    if !store::is_payment_token(&intent.token) {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the window extension's token is not a payment token",
+        )
+        .await;
+    }
+    if intent.days != 14 {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "a window extension is fourteen days and no other number",
+        )
+        .await;
+    }
+    if intent.reason.trim().is_empty() {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the window extension gives no reason",
+        )
+        .await;
+    }
+    let (username, mut account, mut payment) = match resolve_payment(store, &intent.token).await {
+        Ok(found) => found,
+        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+    };
+    let Some(window) = payment.window.as_mut() else {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the account has no payment window to extend",
+        )
+        .await;
+    };
+    if payment.paid_until.is_some() || window.state != "open" {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the payment window is not open, so it has nothing to extend",
+        )
+        .await;
+    }
+    if window.extensions >= 1 {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the payment window has already been extended once; a second extension is refused",
+        )
+        .await;
+    }
+    let Ok(closes) = OffsetDateTime::parse(&window.closes_at, &Rfc3339) else {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the window's close date cannot be read",
+        )
+        .await;
+    };
+    let closes = closes + Duration::days(intent.days);
+    window.closes_at = closes
+        .replace_nanosecond(0)
+        .unwrap_or(closes)
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| window.closes_at.clone());
+    window.extensions += 1;
+    let new_close = window.closes_at.clone();
+    account.payment = Some(payment.clone());
+    let bytes = serde_json::to_vec_pretty(&account)
+        .map_err(|e| format!("cannot encode the account: {e}"))?;
+    store
+        .write_record(&format!("accounts/{username}"), "account.json", &bytes)
+        .await?;
+    write_payment_copy(store, &username, &payment).await?;
+    // The token index carries the date the operator's list and any later lookup
+    // sees, so keep it beside the account.
+    if let Some(text) = store
+        .read_record("tokens", &format!("{}.json", intent.token))
+        .await
+    {
+        if let Ok(mut join) = serde_json::from_str::<TokenRecord>(&text) {
+            join.window_closes_at = new_close.clone();
+            let bytes = serde_json::to_vec_pretty(&join)
+                .map_err(|e| format!("cannot encode the token record: {e}"))?;
+            store
+                .write_record("tokens", &format!("{}.json", intent.token), &bytes)
+                .await?;
+        }
+    }
+    let application = store
+        .read_record(&format!("accounts/{username}"), "application.json")
+        .await
+        .and_then(|copy| serde_json::from_str::<Value>(&copy).ok())
+        .and_then(|copy| {
+            Some(ApplicationRef {
+                username: username.clone(),
+                status_token: copy.get("status_token")?.as_str()?.to_string(),
+            })
+        })
+        .unwrap_or_else(|| ApplicationRef {
+            username: username.clone(),
+            status_token: String::new(),
+        });
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &application,
+        "applied",
+        Some(&format!(
+            "the window now closes on {}",
+            &new_close[..10.min(new_close.len())]
+        )),
+    )
+    .await?;
+    store.remove("intents", file).await
+}
+
+/// Close every payment window whose day has passed. A window with a credit
+/// leaves the account active; one without a credit lapses it into the lifecycle
+/// state where mail stays readable and published work stays up, and starts the
+/// same forty-day grace the failed-renewal path uses. The window's own state is
+/// the dedup key, so a second pass lapses nothing twice.
+pub async fn window_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+    let now = OffsetDateTime::now_utc();
+    for username in store.list("accounts").await? {
+        let Some(mut account) = existing_account(store, &username).await else {
+            continue;
+        };
+        let Some(mut payment) = account.payment_state() else {
+            continue;
+        };
+        let Some(window) = payment.window.as_ref() else {
+            continue;
+        };
+        if window.state == "closed" {
+            // The account already lapsed; the notice is re-offered because the
+            // notice record, not the window, is what stops a duplicate.
+            if account.state == "lapsed" {
+                if let Err(e) = lapse_notice(cfg, store, &username, &account, &payment).await {
+                    eprintln!("kyriakon-onboard: the lapse notice for {username}: {e}");
+                }
+            }
+            continue;
+        }
+        if window.state != "open" {
+            continue;
+        }
+        let Ok(closes) = OffsetDateTime::parse(&window.closes_at, &Rfc3339) else {
+            continue;
+        };
+        if now < closes {
+            continue;
+        }
+        // A credit recorded before this pass is the member who paid on the last
+        // day of the window: the date is set, so the window is closed as paid
+        // and the account stays active.
+        if payment.paid_until.is_some() {
+            if let Some(window) = payment.window.as_mut() {
+                window.state = "paid".to_string();
+            }
+            // A credit is what access follows, so a window that closed after
+            // one leaves the account active even if an earlier pass had lapsed
+            // it before the date was written.
+            account.state = "active".to_string();
+            account.grace_until = None;
+            account.payment = Some(payment.clone());
+            if let Ok(bytes) = serde_json::to_vec_pretty(&account) {
+                store
+                    .write_record(&format!("accounts/{username}"), "account.json", &bytes)
+                    .await?;
+            }
+            write_payment_copy(store, &username, &payment).await?;
+            continue;
+        }
+        let Some(window) = payment.window.as_mut() else {
+            continue;
+        };
+        window.state = "closed".to_string();
+        account.state = "lapsed".to_string();
+        account.grace_until = Some(util::date_after_days(40));
+        account.payment = Some(payment.clone());
+        let bytes = serde_json::to_vec_pretty(&account)
+            .map_err(|e| format!("cannot encode the account: {e}"))?;
+        store
+            .write_record(&format!("accounts/{username}"), "account.json", &bytes)
+            .await?;
+        write_payment_copy(store, &username, &payment).await?;
+        if let Err(e) = lapse_notice(cfg, store, &username, &account, &payment).await {
+            eprintln!("kyriakon-onboard: the lapse notice for {username}: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// The lapse notice, and the one line that says what the forty-day grace means.
+/// The failed-renewal path and the window sweep both send this text, so a member
+/// reads one wording whichever reason their account lapsed for.
+async fn lapse_notice(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+    account: &Account,
+    payment: &Payment,
+) -> Result<(), String> {
+    let window = payment
+        .window
+        .as_ref()
+        .ok_or("a lapsed account has no window")?;
+    let closes_on = &window.closes_at[..10.min(window.closes_at.len())];
+    let token = payment.token_ref.as_deref().unwrap_or("");
+    let grace = account.grace_until.as_deref().unwrap_or("");
+    let to = match account.outside_address.as_deref() {
+        Some(addr) if validate::address(addr).is_none() => addr.to_string(),
+        _ => format!("{username}@kyriakon.net"),
+    };
+    let subject = "Your kyriakon.net payment window has closed".to_string();
+    let body = format!(
+        "The payment window for {username} closed on {closes_on} and no payment was recorded.\n\n\
+         Mail keeps arriving and stays readable, and everything you published stays up.\n\
+         Sending, uploading and pushing have stopped. Nothing is deleted at this point.\n\n\
+         Your payment reference is {token}.\n\n\
+         If you have posted the money, write to admin@kyriakon.net. The grace runs until \n\
+         {grace}, forty days from the lapse, and a final notice comes seven days before\n\
+         the end.\n"
+    );
+    notice::send_account_notice(cfg, store, username, "prepaid.lapsed", &subject, &to, &body)
+        .await?;
+    Ok(())
 }
 
 /// Apply a manual credit: one payment, the one date arithmetic, one ledger line.
@@ -1909,6 +2203,9 @@ async fn apply_payment(
         if let Some(window) = payment.window.as_mut() {
             window.state = "paid".to_string();
         }
+        // A payment after a lapse restores access from the day it is recorded.
+        account.state = "active".to_string();
+        account.grace_until = None;
     }
     account.payment = Some(payment.clone());
     let bytes = serde_json::to_vec_pretty(&account)
@@ -3898,6 +4195,7 @@ async fn write_group_account(
         suspension_reason: None,
         group: Some(domain.to_string()),
         closing_until: None,
+        grace_until: None,
     };
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;

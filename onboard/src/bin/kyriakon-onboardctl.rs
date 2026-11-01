@@ -25,6 +25,8 @@
 //!   kyriakon-onboardctl [--config PATH] credit (--token <t> | --username <u> | --note <text>) \
 //!       --rail <cash|cash-hand|monero> --amount <gbp> --received <YYYY-MM-DD>
 //!   kyriakon-onboardctl [--config PATH] prepaid list --window open [--expiring <days>]
+//!   kyriakon-onboardctl [--config PATH] window extend --token <t> --days 14 \
+//!       --reason <text>
 //!   kyriakon-onboardctl [--config PATH] reconcile list
 //!   kyriakon-onboardctl [--config PATH] reconcile attribute <UN-id> --token <t>
 //!   kyriakon-onboardctl [--config PATH] reconcile return <UN-id> --note <evidence>
@@ -108,6 +110,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         "token" => token(&cfg, &store, &rest[1..]).await,
         "credit" => credit(&cfg, &store, &rest[1..]).await,
         "prepaid" => prepaid(&store, &rest[1..]).await,
+        "window" => window(&cfg, &store, &rest[1..]).await,
         "reconcile" => reconcile(&cfg, &store, &rest[1..]).await,
         "payment" => payment(&store, &rest[1..]).await,
         "refund" => refund(&cfg, &store, &rest[1..]).await,
@@ -141,6 +144,7 @@ fn usage() -> String {
      --rail <cash|cash-hand|monero> --amount <gbp> --received <YYYY-MM-DD> \
      [--txid <id>] [--xmr <amount>] [--override <reason>] [--confirm-double]
        kyriakon-onboardctl prepaid list --window open [--expiring <days>]
+       kyriakon-onboardctl window extend --token <t> --days 14 --reason <text>
        kyriakon-onboardctl reconcile list
        kyriakon-onboardctl reconcile attribute <UN-id> --token <t> \
      [--confirm-double] [--override <reason>]
@@ -370,6 +374,39 @@ async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
         token.clone()
     };
     println!("filed credit for {what} as intent {id}");
+    Ok(())
+}
+
+/// `window extend --token <t> --days 14 --reason <text>`: the one extension a
+/// member whose money is in the post is given. The console signs every field the
+/// drain acts on, because the intent moves the date the account lapses on.
+async fn window(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), String> {
+    let (verb, rest) = match args {
+        [verb, rest @ ..] => (verb.as_str(), rest),
+        _ => return Err(usage()),
+    };
+    if verb != "extend" {
+        return Err(usage());
+    }
+    let flags = flags(rest, &["token", "days", "reason"])?;
+    let token = need(&flags, "token")?;
+    if !store::is_payment_token(token) {
+        return Err(format!("the token {token:?} is not a payment token"));
+    }
+    let days = need(&flags, "days")?
+        .parse::<i64>()
+        .map_err(|_| "--days is not a whole number".to_string())?;
+    if days != 14 {
+        return Err("a window extension is fourteen days and no other number".to_string());
+    }
+    let reason = need(&flags, "reason")?;
+    if reason.trim().is_empty() {
+        return Err("--reason must say why the window is being extended".to_string());
+    }
+    let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
+    let sig = sign::sign(&key, &sign::window_extend_payload(token, days, reason))?;
+    let id = intents::file_window_extend(store, token, days, reason, &sig).await?;
+    println!("filed window extension for {token} as intent {id}");
     Ok(())
 }
 

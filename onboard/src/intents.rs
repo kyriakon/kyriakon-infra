@@ -53,6 +53,10 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     // The space used, from the filesystem quota the handler cannot read. Due
     // gated to once an hour, so most passes do no quota work.
     transitions::refresh_space_used(cfg, store).await?;
+    // A payment window whose day has passed either finds its credit and stays
+    // active, or lapses the account and starts the grace. One sweep, so a
+    // member who paid on the last day is not lapsed by a later pass.
+    transitions::window_sweep(cfg, store).await?;
     // The key spool is read after the intents so a filed application is not
     // waiting behind a mailbox pass. The pass handles each message on its own:
     // one that cannot be dealt with is reported and left for the next run.
@@ -110,6 +114,11 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
             let intent: transitions::CreditIntent = serde_json::from_value(value.clone())
                 .map_err(|e| format!("the credit intent does not parse: {e}"))?;
             transitions::credit(cfg, store, key, intent, file, &value).await
+        }
+        "window-extend" => {
+            let intent: transitions::WindowExtendIntent = serde_json::from_value(value.clone())
+                .map_err(|e| format!("the window extension intent does not parse: {e}"))?;
+            transitions::window_extend(cfg, store, key, intent, file, &value).await
         }
         "reconcile-attribute" => {
             let intent: transitions::AttributeIntent = serde_json::from_value(value.clone())
@@ -278,6 +287,35 @@ pub async fn file_credit(
         "confirm_double": confirm_double,
         "override_reason": override_reason,
         "note": note,
+        "sig": sig,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    Ok(id)
+}
+
+/// File a `window-extend` intent, as `kyriakon-onboardctl window extend` does.
+/// The token is validated here and the signature is over every field the drain
+/// acts on, because the extension moves a lapse date and `intents/` belongs to
+/// the unprivileged half.
+pub async fn file_window_extend(
+    store: &Store,
+    token: &str,
+    days: i64,
+    reason: &str,
+    sig: &str,
+) -> Result<String, String> {
+    let id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({
+        "id": id,
+        "kind": "window-extend",
+        "filed_at": crate::util::filed_at(),
+        "token": token,
+        "days": days,
+        "reason": reason,
         "sig": sig,
     });
     let bytes =

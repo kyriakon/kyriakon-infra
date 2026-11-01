@@ -1981,3 +1981,242 @@ fn a_person_cannot_take_a_held_group_name() {
     assert!(!fix.dir.join("store/accounts/theophilus").exists());
     assert!(fix.passwd_file().is_empty(), "{}", fix.passwd_file());
 }
+
+/// A window that closes with nothing recorded lapses the account into the
+/// lifecycle's read-only state: the window is closed, the forty-day grace has a
+/// date, the lapse notice names the close date and the token again, and both
+/// account pages read `Lapsed` with what still works and what stopped.
+#[test]
+fn a_window_that_closes_with_nothing_recorded_lapses_the_account() {
+    let fix = Fix::new("window-lapse");
+    let token = approved_paid(&fix, "secretary", "cash");
+
+    let mut account = fix.account("secretary");
+    account["payment"]["window"]["closes_at"] = json!("2020-01-01T00:00:00Z");
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("lapsed"), "{account}");
+    assert_eq!(
+        account["payment"]["window"]["state"],
+        json!("closed"),
+        "{account}"
+    );
+    assert_eq!(
+        account["payment"]["token_ref"].as_str(),
+        Some(token.as_str()),
+        "the token is still the account's"
+    );
+    assert_eq!(
+        account["grace_until"],
+        json!(kyriakon_onboard::util::date_after_days(40)),
+        "the lapse starts the same forty-day grace as a failed renewal"
+    );
+    let notices = fix.read("accounts/secretary/notices.jsonl");
+    assert!(
+        notices.contains("prepaid.lapsed"),
+        "the lapse notice is recorded: {notices}"
+    );
+    let sent = fix.sent();
+    assert!(sent.contains("2020-01-01"), "{sent}");
+    assert!(sent.contains(&token), "{sent}");
+    assert!(
+        sent.contains("Sending, uploading and pushing have stopped"),
+        "{sent}"
+    );
+
+    // The page's own words, web and gemini, from the same block.
+    let stored = stored_account(&fix, "secretary");
+    let payment = stored
+        .payment_state()
+        .expect("a paid account keeps its block");
+    let view = page::payment(
+        &stored.state,
+        &stored.rail,
+        &payment,
+        "20.00",
+        "1 Example Street, Example",
+        None,
+        OffsetDateTime::now_utc(),
+    );
+    assert_eq!(view.state, "lapsed");
+    assert_eq!(view.lapsed.as_deref(), Some("2020-01-01"));
+    assert_eq!(view.token.as_deref(), Some(token.as_str()));
+    assert!(view.instructions.is_empty(), "a lapsed window has none");
+    let web = page::account(&[], Some("secretary"), None, Some(view.clone()), false)
+        .render()
+        .unwrap();
+    assert!(
+        web.contains("Lapsed: the payment window closed on 2020-01-01"),
+        "{web}"
+    );
+    assert!(
+        web.contains("Sending, uploading and pushing have stopped"),
+        "{web}"
+    );
+    assert!(web.contains(&token), "{web}");
+    assert!(web.contains("admin@kyriakon.net"), "{web}");
+    let gemtext = capsule::account(&stored, &[], None, Some(&view));
+    assert!(
+        gemtext.contains("Lapsed: the payment window closed on 2020-01-01"),
+        "{gemtext}"
+    );
+    assert!(gemtext.contains(&token), "{gemtext}");
+
+    // A second pass over the closed window sends no second notice.
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let notices = fix.read("accounts/secretary/notices.jsonl");
+    assert_eq!(
+        notices.matches("prepaid.lapsed").count(),
+        1,
+        "one lapse notice: {notices}"
+    );
+
+    // Paying after the lapse restores the account and clears the grace.
+    let _ = cash_credit(&fix, &token);
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("active"), "{account}");
+    assert!(
+        account.get("grace_until").is_none(),
+        "a restored account has no grace date: {account}"
+    );
+    assert_eq!(
+        account["payment"]["window"]["state"],
+        json!("paid"),
+        "{account}"
+    );
+}
+
+/// A credit recorded before the sweep reaches a closed window is the member who
+/// paid on the last day: the window is closed as paid and the account stays
+/// active, with no lapse notice.
+#[test]
+fn a_sweep_over_a_window_that_closed_after_a_credit_leaves_it_active() {
+    let fix = Fix::new("window-paid");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let line = cash_credit(&fix, &token);
+    assert_eq!(line["kind"], json!("payment"), "{line}");
+    assert_eq!(fix.account("secretary")["state"], json!("active"));
+
+    // The crash the sweep has to cover: the credit's date is set but the window
+    // still reads open, and its close has passed.
+    let mut account = fix.account("secretary");
+    account["payment"]["window"]["state"] = json!("open");
+    account["payment"]["window"]["closes_at"] = json!("2020-01-01T00:00:00Z");
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("active"), "{account}");
+    assert_eq!(
+        account["payment"]["window"]["state"],
+        json!("paid"),
+        "{account}"
+    );
+    let notices = fix.read("accounts/secretary/notices.jsonl");
+    assert!(
+        !notices.contains("prepaid.lapsed"),
+        "a paid window lapses nobody: {notices}"
+    );
+    assert!(
+        account.get("grace_until").is_none(),
+        "no grace starts for a paid window: {account}"
+    );
+}
+
+/// One extension moves the close fourteen days on and increments the counter;
+/// the same command again is refused and changes nothing.
+#[test]
+fn a_window_is_extended_once_and_a_second_extension_is_refused() {
+    let fix = Fix::new("window-extend");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let before = fix.account("secretary")["payment"]["window"]["closes_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let opens =
+        OffsetDateTime::parse(&before, &time::format_description::well_known::Rfc3339).unwrap();
+
+    let out = fix.ctl(&[
+        "window",
+        "extend",
+        "--token",
+        &token,
+        "--days",
+        "14",
+        "--reason",
+        "member says posted 2026-10-02",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        body(&out).contains("filed window extension"),
+        "{}",
+        body(&out)
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let account = fix.account("secretary");
+    let window = &account["payment"]["window"];
+    assert_eq!(window["extensions"], json!(1), "{account}");
+    let after = window["closes_at"].as_str().unwrap();
+    assert_eq!(
+        after,
+        (opens + time::Duration::days(14))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
+        "{account}"
+    );
+    let join: Value = serde_json::from_str(&fix.read(&format!("tokens/{token}.json"))).unwrap();
+    assert_eq!(join["window_closes_at"], json!(after), "{join}");
+
+    // The operator's list sees the moved date.
+    let out = fix.ctl(&["prepaid", "list", "--window", "open"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains(&after[..10]), "{}", body(&out));
+
+    // The second extension is refused: the date and the counter stand, and the
+    // refusal is journalled.
+    let out = fix.ctl(&[
+        "window",
+        "extend",
+        "--token",
+        &token,
+        "--days",
+        "14",
+        "--reason",
+        "member says posted again",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["payment"]["window"]["closes_at"],
+        json!(after),
+        "{account}"
+    );
+    assert_eq!(
+        account["payment"]["window"]["extensions"],
+        json!(1),
+        "{account}"
+    );
+    assert!(
+        fix.journal().contains("already been extended once"),
+        "{}",
+        fix.journal()
+    );
+}

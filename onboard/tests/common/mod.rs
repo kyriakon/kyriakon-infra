@@ -418,7 +418,7 @@ impl Fix {
                 "token": token,
                 "username": username,
                 "issued_at": "2026-10-02T09:00:00Z",
-                "window_closes_at": "2026-10-16T09:00:00Z",
+                "window_closes_at": "2099-01-01T00:00:00Z",
                 "state": "issued",
             }))
             .unwrap(),
@@ -439,7 +439,7 @@ impl Fix {
                 "paid_until": paid_until,
                 "window": {
                     "opened_at": "2026-10-02T09:00:00Z",
-                    "closes_at": "2026-10-16T09:00:00Z",
+                    "closes_at": "2099-01-01T00:00:00Z",
                     "state": "open",
                     "extensions": 0
                 },
@@ -649,7 +649,7 @@ impl Fix {
             "token": name,
             "username": username,
             "issued_at": "2026-10-02T09:00:00Z",
-            "window_closes_at": "2026-10-16T09:00:00Z",
+            "window_closes_at": "2099-01-01T00:00:00Z",
             "state": "open",
         });
         std::fs::write(
