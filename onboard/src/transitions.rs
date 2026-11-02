@@ -1372,6 +1372,7 @@ async fn approve(
         let join = TokenRecord {
             token: token.clone(),
             username: username.clone(),
+            group: None,
             issued_at: now.clone(),
             window_closes_at: window.closes_at.clone(),
             state: "issued".to_string(),
@@ -1797,6 +1798,174 @@ pub async fn window_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String
             eprintln!("kyriakon-onboard: the lapse notice for {username}: {e}");
         }
     }
+
+    // The groups' own windows. A group lapses whole: every mailbox it holds
+    // stops sending, uploading and pushing, one notice goes to the body, and the
+    // date every mailbox is restored from is the group's.
+    for domain in store.list("groups").await? {
+        let mut group = match group_record(store, &domain).await {
+            Ok(Some(group)) => group,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("kyriakon-onboard: reading {domain}'s window: {e}");
+                continue;
+            }
+        };
+        if group.payment.no_charge {
+            continue;
+        }
+        let Some(window) = group.payment.window.clone() else {
+            continue;
+        };
+        if window.state == "closed" {
+            // The group already lapsed; the notice is re-offered because the
+            // notice record, not the window, is what stops a duplicate.
+            if let Err(e) = group_lapse_notice(cfg, store, &group, &window).await {
+                eprintln!("kyriakon-onboard: the lapse notice for {domain}: {e}");
+            }
+            continue;
+        }
+        if window.state != "open" {
+            continue;
+        }
+        let Ok(closes) = OffsetDateTime::parse(&window.closes_at, &Rfc3339) else {
+            continue;
+        };
+        if now < closes {
+            continue;
+        }
+        // A credit recorded before this pass is the body that paid on the last
+        // day: the date is set, so the window is closed as paid and nothing
+        // lapses.
+        if group.payment.paid_until.is_some() {
+            if let Some(window) = group.payment.window.as_mut() {
+                window.state = "paid".to_string();
+            }
+            write_group_record(store, &group).await?;
+            continue;
+        }
+        // Stop every mailbox before the group's record says lapsed, so the
+        // record never reads lapsed while a mailbox still sends. A script
+        // failure leaves the window open, and the next pass tries again.
+        let grace = group_grace_end(&window.closes_at);
+        let mut stopped = true;
+        for mailbox in &group.accounts {
+            if let Err(e) = run_script(cfg, "lapse-user.sh", &[mailbox.as_str()]).await {
+                eprintln!("kyriakon-onboard: stopping access for {mailbox} in {domain}: {e}");
+                stopped = false;
+                continue;
+            }
+            let Some(mut account) = existing_account(store, mailbox).await else {
+                continue;
+            };
+            // A closing or suspended mailbox keeps its own state: the group's
+            // lapse is not the decision that put it there.
+            if account.state != "active" {
+                continue;
+            }
+            account.state = "lapsed".to_string();
+            account.grace_until = grace.map(util::date_string);
+            let bytes = serde_json::to_vec_pretty(&account)
+                .map_err(|e| format!("cannot encode the account: {e}"))?;
+            write_account_record(store, mailbox, &bytes).await?;
+        }
+        if !stopped {
+            continue;
+        }
+        if let Some(window) = group.payment.window.as_mut() {
+            window.state = "closed".to_string();
+        }
+        write_group_record(store, &group).await?;
+        if let Err(e) = group_lapse_notice(cfg, store, &group, &window).await {
+            eprintln!("kyriakon-onboard: the lapse notice for {domain}: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// The day a lapsed group's forty-day grace ends: the window's close date plus
+/// forty days, which is also the date written onto every mailbox in it. One
+/// date for the whole body, so the notice and the deletion cannot disagree.
+fn group_grace_end(closes_at: &str) -> Option<time::Date> {
+    OffsetDateTime::parse(closes_at, &Rfc3339)
+        .ok()
+        .map(|at| at.date() + Duration::days(40))
+}
+
+/// The group's one lapse notice, in the words the account pages use and on the
+/// address the body's application gave. It is recorded against the site owner,
+/// once for the group rather than once per mailbox.
+async fn group_lapse_notice(
+    cfg: &DrainConfig,
+    store: &Store,
+    group: &GroupRecord,
+    window: &Window,
+) -> Result<(), String> {
+    let to = dns_contact(store, group).await?;
+    let closes_on = &window.closes_at[..10.min(window.closes_at.len())];
+    let token = group.payment.token_ref.as_deref().unwrap_or("");
+    let grace = group_grace_end(&window.closes_at)
+        .map(util::date_string)
+        .unwrap_or_default();
+    let subject = format!(
+        "Your kyriakon.net payment window for {} has closed",
+        group.domain
+    );
+    let body = format!(
+        "The payment window for {} closed on {closes_on} and no payment was recorded.\n\n\
+         {}\n\n\
+         Your payment reference is {token}.\n\n\
+         The grace runs until {grace}, forty days from the lapse, and a final notice comes\n\
+         seven days before every account in the group is deleted.\n",
+        group.domain,
+        crate::page::LAPSE_NOTE
+    );
+    notice::send_account_notice(
+        cfg,
+        store,
+        &group.site_owner,
+        "group.lapsed",
+        &subject,
+        &to,
+        &body,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The last notice before a lapsed group's grace ends, once for the body.
+async fn group_final_notice(
+    cfg: &DrainConfig,
+    store: &Store,
+    group: &GroupRecord,
+    grace: time::Date,
+) -> Result<(), String> {
+    let to = dns_contact(store, group).await?;
+    let grace = util::date_string(grace);
+    let token = group.payment.token_ref.as_deref().unwrap_or("");
+    let subject = format!(
+        "Your kyriakon.net group for {} will be deleted in seven days",
+        group.domain
+    );
+    let body = format!(
+        "The payment window for {} closed and no payment was recorded.\n\n\
+         Mail keeps arriving and stays readable, and everything the group published stays up,\n\
+         but sending, uploading and pushing are stopped. Every account in the group is due to\n\
+         be deleted on {grace}, seven days from this notice.\n\n\
+         Your payment reference is {token}. If you have posted the money, write to\n\
+         admin@kyriakon.net before that date.\n",
+        group.domain
+    );
+    notice::send_account_notice(
+        cfg,
+        store,
+        &group.site_owner,
+        "group.final",
+        &subject,
+        &to,
+        &body,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1812,6 +1981,11 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String>
         let Some(account) = existing_account(store, &username).await else {
             continue;
         };
+        // A group mailbox's grace is the group's: one conversation and one
+        // deletion for the whole body, handled below.
+        if account.group.is_some() {
+            continue;
+        }
         if account.state != "lapsed" {
             continue;
         }
@@ -1841,6 +2015,47 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String>
         if today >= grace - Duration::days(7) {
             if let Err(e) = final_notice(cfg, store, &username, &account).await {
                 eprintln!("kyriakon-onboard: the final notice for {username}: {e}");
+            }
+        }
+    }
+
+    // The groups whose grace has ended: one final notice, then one deletion of
+    // every account in the group, keyed on the group's own journal id so a
+    // failed erase backs off.
+    for domain in store.list("groups").await? {
+        let group = match group_record(store, &domain).await {
+            Ok(Some(group)) => group,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("kyriakon-onboard: reading {domain}'s grace: {e}");
+                continue;
+            }
+        };
+        if group.payment.no_charge {
+            continue;
+        }
+        let Some(window) = group.payment.window.as_ref() else {
+            continue;
+        };
+        if window.state != "closed" {
+            continue;
+        }
+        let Some(grace) = group_grace_end(&window.closes_at) else {
+            continue;
+        };
+        if today >= grace {
+            let id = format!("delete-group-{domain}");
+            if !due(store, &id, now).await {
+                continue;
+            }
+            if let Err(e) = delete_group(cfg, store, &group, &id).await {
+                report_failure(cfg, store, &id, "delete", &e).await;
+            }
+            continue;
+        }
+        if today >= grace - Duration::days(7) {
+            if let Err(e) = group_final_notice(cfg, store, &group, grace).await {
+                eprintln!("kyriakon-onboard: the final notice for {domain}: {e}");
             }
         }
     }
@@ -1885,6 +2100,49 @@ async fn grace_notice(
     notice::send_account_notice(cfg, store, username, "prepaid.grace", &subject, &to, &body)
         .await?;
     Ok(())
+}
+
+/// The end of a lapsed group's grace: the domain comes down and every account in
+/// it closes, through the same steps a `remove-group` intent runs. The group
+/// record is removed last, so a retry after a crash still finds the accounts it
+/// has to close.
+async fn delete_group(
+    cfg: &DrainConfig,
+    store: &Store,
+    group: &GroupRecord,
+    id: &str,
+) -> Result<(), String> {
+    if journal_has(store, id, "applied").await {
+        return remove_group_record(store, &group.domain).await;
+    }
+    let application = ApplicationRef {
+        username: group.site_owner.clone(),
+        status_token: group.domain.clone(),
+    };
+    if !journal_has(store, id, "applying").await {
+        journal(
+            store,
+            &cfg.release,
+            id,
+            "delete",
+            &application,
+            "applying",
+            Some("the group's grace ended, so every account in it is being erased"),
+        )
+        .await?;
+    }
+    take_group_down(cfg, store, &group.domain).await?;
+    journal(
+        store,
+        &cfg.release,
+        id,
+        "delete",
+        &application,
+        "applied",
+        Some("the domain and every account in it were removed; the ledger line stays"),
+    )
+    .await?;
+    remove_group_record(store, &group.domain).await
 }
 
 /// The last notice before a lapsed account's grace ends. Its wording is #333's
@@ -2032,6 +2290,17 @@ pub async fn credit(
         return hold(cfg, store, &intent, file, value, amount, received).await;
     }
 
+    // The token index says which of the two the money pays for: one account, or
+    // the one group a body holds. A group's credit writes the one date every
+    // mailbox in it shares.
+    let join = match token_join(store, &intent.token).await {
+        Ok(join) => join,
+        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+    };
+    if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
+        return group_credit(cfg, store, file, value, &intent, &domain).await;
+    }
+
     let (username, account, payment) = match resolve_payment(store, &intent.token).await {
         Ok(found) => found,
         Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
@@ -2077,19 +2346,37 @@ fn credit_fields(intent: &CreditIntent) -> Result<i64, String> {
     }
 }
 
+/// The token index entry a payment token names, when the entry is this token's.
+/// The index is the only join, so a token that is not in it resolves to nothing.
+async fn token_join(store: &Store, token: &str) -> Result<Option<TokenRecord>, String> {
+    let Some(text) = store.read_record("tokens", &format!("{token}.json")).await else {
+        return Ok(None);
+    };
+    let join: TokenRecord =
+        serde_json::from_str(&text).map_err(|e| format!("the token record does not parse: {e}"))?;
+    if join.token != token {
+        return Err("the token record does not name this token".to_string());
+    }
+    Ok(Some(join))
+}
+
 /// The account a payment token names, through `tokens/<token>.json` and its
 /// account record. The token index is the only join, so a token that resolves to
-/// nothing is refused rather than made into an account.
+/// nothing is refused rather than made into an account. A group's token names no
+/// single account, so the paths that only know about accounts refuse it here.
 async fn resolve_payment(store: &Store, token: &str) -> Result<(String, Account, Payment), String> {
-    let Some(join_text) = store.read_record("tokens", &format!("{token}.json")).await else {
+    let Some(join) = token_join(store, token).await? else {
         return Err(
             "the token is not in the index; an unattributed payment belongs in the queue"
                 .to_string(),
         );
     };
-    let join: TokenRecord = serde_json::from_str(&join_text)
-        .map_err(|e| format!("the token record does not parse: {e}"))?;
-    if join.token != token || validate::username_shape(&join.username).is_some() {
+    if join.group.is_some() {
+        return Err(
+            "the token belongs to a group, whose payment is held on the group's record".to_string(),
+        );
+    }
+    if validate::username_shape(&join.username).is_some() {
         return Err("the token record does not name this token".to_string());
     }
     let username = join.username;
@@ -2165,7 +2452,7 @@ async fn apply_payment(
             append_credit_ledger(
                 store,
                 intent,
-                &payment,
+                payment.monero.as_ref(),
                 &util::date_string(received),
                 &util::gbp(amount),
                 &progress.applied_gbp,
@@ -2359,7 +2646,7 @@ async fn apply_payment(
     append_credit_ledger(
         store,
         intent,
-        &payment,
+        payment.monero.as_ref(),
         &util::date_string(received),
         &util::gbp(amount),
         &util::gbp(applied.applied),
@@ -2413,6 +2700,281 @@ async fn apply_payment(
 
     journal_credit_applied(cfg, store, intent, username, override_reason).await?;
     Ok(true)
+}
+
+/// Apply a prepaid credit to the group its token names. The arithmetic, the
+/// ceiling, the double-credit rule, the transaction check and the ledger line
+/// are the account path's; what differs is where the one date is written and
+/// who is told. One credit sets one date on the group, restores every mailbox in
+/// it that lapsed, and sends one receipt for the body.
+async fn group_credit(
+    cfg: &DrainConfig,
+    store: &Store,
+    file: &str,
+    value: &Value,
+    intent: &CreditIntent,
+    domain: &str,
+) -> Result<(), String> {
+    let amount = match credit_fields(intent) {
+        Ok(amount) => amount,
+        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+    };
+    let received = util::parse_date(&intent.received).expect("the date was validated above");
+    if let Some(why) = validate::domain(domain) {
+        return Err(format!("the token's group domain {domain:?}: {why}"));
+    }
+    let Some(mut group) = group_record(store, domain).await? else {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the token resolves to a group that is gone",
+        )
+        .await;
+    };
+    if group.payment.no_charge {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the group was approved without charge, so it has no payment to record",
+        )
+        .await;
+    }
+    if group.payment.token_ref.as_deref() != Some(intent.token.as_str()) {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the token is not the one the group's payment block holds",
+        )
+        .await;
+    }
+
+    // A pass that journaled `applying` and wrote the group but crashed before
+    // the ledger append is finished here. The group's date is the witness, so
+    // nothing is extended twice and no second receipt is sent.
+    let progress = credit_progress(store, &intent.id).await;
+    let written = progress.as_ref().is_some_and(|p| {
+        p.paid && group.payment.paid_until.as_deref() == p.paid_until_after.as_deref()
+    });
+    if let Some(progress) = progress.as_ref().filter(|_| written) {
+        if !ledger_has_intent(store, &intent.id).await {
+            append_credit_ledger(
+                store,
+                intent,
+                None,
+                &util::date_string(received),
+                &util::gbp(amount),
+                &progress.applied_gbp,
+                progress.paid_until_after.as_deref(),
+            )
+            .await?;
+        }
+        if !journal_has(store, &intent.id, "applied").await {
+            journal_credit_applied(
+                cfg,
+                store,
+                intent,
+                &group.site_owner,
+                intent.override_reason.as_deref(),
+            )
+            .await?;
+        }
+        store.remove("intents", file).await?;
+        return Ok(());
+    }
+
+    let before = match group.payment.paid_until.as_deref() {
+        Some(stamp) => match util::parse_date(stamp) {
+            Some(date) => Some(date),
+            None => {
+                return refuse_with(
+                    cfg,
+                    store,
+                    file,
+                    value,
+                    "the group's paid-until date cannot be read",
+                )
+                .await
+            }
+        },
+        None => None,
+    };
+    let until = util::paid_until_after(received, before);
+    let override_reason = intent
+        .override_reason
+        .as_deref()
+        .filter(|r| !r.trim().is_empty());
+    if until > util::credit_ceiling(received) && override_reason.is_none() {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the credit would put the group's paid_until more than 24 months past --received; give --override <reason> to mean it",
+        )
+        .await;
+    }
+    let price = util::pence(&cfg.price_gbp)
+        .map_err(|e| format!("the drain's configured price_gbp: {e}"))?;
+    if price <= 0 {
+        return Err("the drain's configured price_gbp must be more than zero".to_string());
+    }
+    // The fee covers the whole group, so the year is one payment and the group
+    // holds no balance to carry a shortfall or an excess into.
+    let money = credit_money(price, 0, amount);
+    if !money.paid {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            &format!(
+                "a group's year is one payment of GBP {}; GBP {} is not enough",
+                util::gbp(price),
+                util::gbp(amount)
+            ),
+        )
+        .await;
+    }
+    if money.balance > 0 {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            &format!(
+                "a group's year is one payment of GBP {}; GBP {} is more than the fee",
+                util::gbp(price),
+                util::gbp(amount)
+            ),
+        )
+        .await;
+    }
+
+    // A transaction already in the ledger is the same payment seen again, and a
+    // token already credited is a renewal the operator must have meant.
+    if let Some(txid) = intent.txid.as_deref() {
+        if let Some((seq, received_on)) = ledger_txid(store, txid).await {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                &format!(
+                    "transaction {txid} was already credited on {received_on} at ledger seq {seq}"
+                ),
+            )
+            .await;
+        }
+        if let Some((id, received_on)) = held_txid(store, txid).await? {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                &format!(
+                    "transaction {txid} is already held as {id}, received on {received_on}; attribute that item instead"
+                ),
+            )
+            .await;
+        }
+    }
+    if let Some(paid_until) = group.payment.paid_until.as_deref() {
+        if !intent.confirm_double {
+            return refuse_with(
+                cfg,
+                store,
+                file,
+                value,
+                &format!(
+                    "the group's token was already credited until {paid_until}; give --confirm-double for a renewal"
+                ),
+            )
+            .await;
+        }
+    }
+
+    let until_text = util::date_string(until);
+    let applied = util::gbp(money.applied);
+    journal_credit_applying(
+        store,
+        &cfg.release,
+        intent,
+        &group.site_owner,
+        &CreditProgress {
+            paid: true,
+            paid_until_after: Some(until_text.clone()),
+            applied_gbp: applied.clone(),
+            balance_gbp: None,
+        },
+    )
+    .await?;
+
+    // A payment after a lapse restores every mailbox in the group: the group
+    // lapsed as one and comes back as one. A closing or suspended state is a
+    // decision of its own, and the payment sweep does not overturn it.
+    for mailbox in &group.accounts {
+        let Some(mut account) = existing_account(store, mailbox).await else {
+            continue;
+        };
+        if account.state != "lapsed" {
+            continue;
+        }
+        run_script(cfg, "lapse-user.sh", &["--restore", mailbox]).await?;
+        account.state = "active".to_string();
+        account.grace_until = None;
+        let bytes = serde_json::to_vec_pretty(&account)
+            .map_err(|e| format!("cannot encode the account: {e}"))?;
+        write_account_record(store, mailbox, &bytes).await?;
+    }
+    group.payment.paid_until = Some(until_text.clone());
+    group.payment.rail = intent.rail.clone();
+    if let Some(window) = group.payment.window.as_mut() {
+        window.state = "paid".to_string();
+    }
+    write_group_record(store, &group).await?;
+    append_credit_ledger(
+        store,
+        intent,
+        None,
+        &util::date_string(received),
+        &util::gbp(amount),
+        &applied,
+        Some(&until_text),
+    )
+    .await?;
+
+    // One receipt for the body, on the address its application gave. The
+    // ledger line is keyed by the group's token and holds no username, so the
+    // row stops naming the body once the group is gone.
+    let to = dns_contact(store, &group).await?;
+    let subject = format!("Your payment to kyriakon.net was received (paid until {until_text})");
+    let body = format!(
+        "We have recorded a payment of GBP {} on {} by {} for {}.\n\n\
+         The whole group is paid until {until_text}, and every mailbox in it shares that date.\n",
+        util::gbp(amount),
+        util::date_string(received),
+        intent.rail,
+        group.domain,
+    );
+    notice::send_account_notice(
+        cfg,
+        store,
+        &group.site_owner,
+        "group.receipt",
+        &subject,
+        &to,
+        &body,
+    )
+    .await?;
+    journal_credit_applied(cfg, store, intent, &group.site_owner, override_reason).await?;
+    store.remove("intents", file).await?;
+    Ok(())
 }
 
 /// The rails a refund may name. A refund never leaves on a rail the payment did
@@ -3250,10 +3812,6 @@ pub async fn reconcile_attribute(
         .await;
     }
 
-    let (username, account, payment) = match resolve_payment(store, &intent.token).await {
-        Ok(found) => found,
-        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
-    };
     // The held line is data the console wrote earlier, so it is revalidated
     // exactly as a credit's fields are. The intent it carries is this intent's
     // id: the payment line and the journal are keyed by the join, not by the
@@ -3279,6 +3837,27 @@ pub async fn reconcile_attribute(
     };
     let received =
         util::parse_date(&payment_intent.received).expect("the date was validated above");
+
+    // A group's token takes the held money the same way it takes a direct
+    // credit: one date on the group. The ledger line is the settlement marker,
+    // so the held item is attributed only once that line exists.
+    let join = match token_join(store, &payment_intent.token).await {
+        Ok(join) => join,
+        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+    };
+    if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
+        group_credit(cfg, store, file, value, &payment_intent, &domain).await?;
+        if ledger_has_intent(store, &payment_intent.id).await {
+            mark_attributed(store, &intent.item, &intent.token).await?;
+            store.remove("intents", file).await?;
+        }
+        return Ok(());
+    }
+
+    let (username, account, payment) = match resolve_payment(store, &payment_intent.token).await {
+        Ok(found) => found,
+        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+    };
     let app = PaymentApplication {
         intent: &payment_intent,
         username: &username,
@@ -3718,13 +4297,13 @@ pub(crate) async fn next_ledger_seq(store: &Store) -> u64 {
 async fn append_credit_ledger(
     store: &Store,
     intent: &CreditIntent,
-    payment: &Payment,
+    monero: Option<&Monero>,
     received_on: &str,
     amount_gbp: &str,
     applied_gbp: &str,
     paid_until_after: Option<&str>,
 ) -> Result<(), String> {
-    let quoted = payment.monero.as_ref().filter(|_| intent.rail == "monero");
+    let quoted = monero.filter(|_| intent.rail == "monero");
     let seq = next_ledger_seq(store).await;
     let line = json!({
         "version": 1,
@@ -3863,12 +4442,39 @@ async fn approve_group(
     // The body's approval notice: the recipe is the whole point of it, because
     // mail and the website do not work until the body has published the records
     // itself. It is recorded before it is enqueued, so a crash between the two
-    // loses an email rather than sending two on the retry.
+    // loses an email rather than sending two on the retry. The payment the
+    // approval opened is on the same mail: one token for the whole group, the
+    // rail's own instructions and the date the money must arrive by.
+    let written = group_record(store, &domain)
+        .await?
+        .ok_or("the group record vanished mid-approval")?;
+    let payment_note = match (&written.payment.token_ref, &written.payment.window) {
+        (Some(token), Some(window)) if !written.payment.no_charge => format!(
+            "\n\nThe amount is GBP {} for the year, for the whole group. Your payment \
+             reference is {token}.\n{}\
+             \nThe money must arrive before {} or the whole group lapses: mail keeps \
+             arriving and everything published stays up, and sending, uploading and \
+             pushing stop. Nothing is deleted at that point.\n",
+            cfg.price_gbp,
+            rail_instructions(
+                &written.payment.rail,
+                &cfg.postal_address,
+                card_link(&cfg.stripe_payment_link, token)?.as_deref(),
+                None,
+                &cfg.price_gbp,
+            )
+            .join("\n"),
+            &window.closes_at[..10.min(window.closes_at.len())]
+        ),
+        _ => "\n\nThe group was approved without charge: there is nothing to pay, no \
+              payment window, and the group does not lapse.\n"
+            .to_string(),
+    };
     let recipe = dns::recipe(&domain, &values);
     let subject = decision_subject("approved", &domain);
     let body = format!(
         "Your application for {domain} has been approved. The mailboxes in the group are \
-         ready to receive mail as soon as the records below are live.\n\n{}",
+         ready to receive mail as soon as the records below are live.{payment_note}\n{}",
         recipe.text()
     );
     notice::send_account_notice(
@@ -4159,18 +4765,49 @@ pub async fn provision_group(
     .await?;
 
     // The record first: it is what tells a retry which accounts on the box are
-    // this group's.
+    // this group's. A charged group's one token and one window are drawn here,
+    // and a retry keeps what the first pass wrote, so applying the intent twice
+    // cannot leave two tokens, two windows or a renewal's date overwritten.
+    let now = util::filed_at();
+    let payment = GroupPayment {
+        rail: intent.payment.rail.clone(),
+        no_charge: intent.payment.no_charge,
+        token_ref: if intent.payment.no_charge {
+            None
+        } else {
+            match record.as_ref().and_then(|g| g.payment.token_ref.clone()) {
+                Some(token) => Some(token),
+                None => Some(store::payment_token().await?),
+            }
+        },
+        window: if intent.payment.no_charge {
+            None
+        } else {
+            match record.as_ref().and_then(|g| g.payment.window.clone()) {
+                Some(window) => Some(window),
+                None => Some(Window {
+                    opened_at: now.clone(),
+                    closes_at: util::after_days(14),
+                    state: "open".to_string(),
+                    extensions: 0,
+                }),
+            }
+        },
+        paid_until: record
+            .as_ref()
+            .and_then(|g| g.payment.paid_until.clone())
+            .or_else(|| intent.payment.paid_until.clone()),
+        stripe: match record.as_ref() {
+            Some(g) if g.payment.stripe.subscription.is_some() => g.payment.stripe.clone(),
+            _ => intent.payment.stripe.clone(),
+        },
+    };
     let group = GroupRecord {
         version: 1,
         domain: intent.domain.clone(),
         name: intent.name.clone(),
         kind: intent.body_kind.clone(),
-        payment: GroupPayment {
-            rail: intent.payment.rail.clone(),
-            no_charge: intent.payment.no_charge,
-            paid_until: intent.payment.paid_until.clone(),
-            stripe: intent.payment.stripe.clone(),
-        },
+        payment: payment.clone(),
         accounts: intent.mailboxes.clone(),
         site_owner: intent.site_owner.clone(),
         space_used: None,
@@ -4218,6 +4855,29 @@ pub async fn provision_group(
         if let Some(mine) = keys.get(mailbox) {
             publish_mail_keys_publicly(cfg, mailbox, mine).await?;
         }
+    }
+
+    // The group's one token, after the accounts it pays for exist. The index
+    // resolves the token to the group, so the prepaid credit and the card rail
+    // both write the one date every mailbox shares. A free group has neither a
+    // token nor a ledger line. Both writes are idempotent, so a retry adds
+    // nothing.
+    if let (Some(token), Some(window)) = (&payment.token_ref, &payment.window) {
+        let join = TokenRecord {
+            token: token.clone(),
+            username: intent.site_owner.clone(),
+            group: Some(intent.domain.clone()),
+            issued_at: now.clone(),
+            window_closes_at: window.closes_at.clone(),
+            state: "issued".to_string(),
+        };
+        let bytes = serde_json::to_vec_pretty(&join)
+            .map_err(|e| format!("cannot encode the token record: {e}"))?;
+        store.ensure_dir("tokens").await?;
+        store
+            .write_record("tokens", &format!("{token}.json"), &bytes)
+            .await?;
+        append_ledger(cfg, store, token, &payment.rail, &intent.id, &now).await?;
     }
 
     // The body's hosting, rooted in the site owner's own tree. The upload key
@@ -5337,15 +5997,7 @@ pub async fn remove_group(
     // The mail tables, the generated blocks, the certificate material and the
     // queued order. Then the pass that rewrites the indexes and drops the
     // relayd keypair line the httpd file carried, which only the reload applies.
-    run_script(cfg, "remove-group.sh", &[&intent.domain]).await?;
-    run_script(cfg, "cron-apply.sh", &["--web"]).await?;
-
-    for account in &group.accounts {
-        close_mailbox(cfg, store, account).await?;
-    }
-    // After the accounts, so a crash between the two steps leaves the record
-    // that names them and the retry finds the token again.
-    close_group_tokens(store, &group.accounts).await?;
+    take_group_down(cfg, store, &intent.domain).await?;
 
     journal(
         store,
@@ -5359,6 +6011,26 @@ pub async fn remove_group(
     .await?;
     remove_group_record(store, &intent.domain).await?;
     store.remove("intents", file).await
+}
+
+/// The host files, the index and reload pass, every mailbox's closure and the
+/// token index entries: what "the domain is down" is. Shared by a `remove-group`
+/// intent and the end of a lapsed group's grace, so the two cannot disagree
+/// about what removing a body takes. The group record is the caller's to remove
+/// last, so a retry after a crash still finds the accounts it has to close.
+async fn take_group_down(cfg: &DrainConfig, store: &Store, domain: &str) -> Result<(), String> {
+    run_script(cfg, "remove-group.sh", &[domain]).await?;
+    run_script(cfg, "cron-apply.sh", &["--web"]).await?;
+    let Some(group) = group_record(store, domain).await? else {
+        return Ok(());
+    };
+    for account in &group.accounts {
+        close_mailbox(cfg, store, account).await?;
+    }
+    // After the accounts, so a crash between the two steps leaves the record
+    // that names them and the retry finds the token again.
+    close_group_tokens(store, &group.accounts).await?;
+    Ok(())
 }
 
 /// Remove the group's directory, record and all. A directory that is not there
@@ -6899,8 +7571,18 @@ impl BillingTarget {
         }
     }
 
-    /// A payment extends the date and marks the window paid. A group has no
-    /// window: its single renewal sets the date the mailboxes share.
+    /// The token the ledger line is keyed by. An account's is its own; a
+    /// group's is the one token the whole body shares, so a card payment for a
+    /// group is one line that stops naming the body once the group is gone.
+    fn token(&self) -> Option<&str> {
+        match self {
+            BillingTarget::Account(a) => a.payment.as_ref()?.token_ref.as_deref(),
+            BillingTarget::Group(g) => g.payment.token_ref.as_deref(),
+        }
+    }
+
+    /// A payment extends the date and marks the window paid. A group's window
+    /// closes the same way: one date, shared by every mailbox in it.
     fn set_paid_until(&mut self, date: String) -> Result<(), String> {
         match self {
             BillingTarget::Account(a) => {
@@ -6913,7 +7595,12 @@ impl BillingTarget {
                     window.state = "paid".to_string();
                 }
             }
-            BillingTarget::Group(g) => g.payment.paid_until = Some(date),
+            BillingTarget::Group(g) => {
+                g.payment.paid_until = Some(date);
+                if let Some(window) = g.payment.window.as_mut() {
+                    window.state = "paid".to_string();
+                }
+            }
         }
         Ok(())
     }
@@ -6930,21 +7617,19 @@ impl BillingTarget {
     }
 
     /// The address a notice about this payment goes to: the member's outside
-    /// address, or the mailbox the platform made. A group's notice goes to its
-    /// site owner.
+    /// address, or the mailbox the platform made. A group's notice goes to the
+    /// address its application gave, which for a body is on the body's own
+    /// domain rather than the platform's.
     async fn recipient(&self, store: &Store) -> String {
-        let (username, outside) = match self {
-            BillingTarget::Account(a) => (a.username.clone(), a.outside_address.clone()),
-            BillingTarget::Group(g) => (
-                g.site_owner.clone(),
-                store
-                    .read_record(&format!("accounts/{}", g.site_owner), "account.json")
-                    .await
-                    .and_then(|text| serde_json::from_str::<Account>(&text).ok())
-                    .and_then(|a| a.outside_address),
-            ),
-        };
-        outside.unwrap_or_else(|| format!("{username}@kyriakon.net"))
+        match self {
+            BillingTarget::Account(a) => a
+                .outside_address
+                .clone()
+                .unwrap_or_else(|| format!("{}@kyriakon.net", a.username)),
+            BillingTarget::Group(g) => dns_contact(store, g)
+                .await
+                .unwrap_or_else(|_| format!("{}@{}", g.site_owner, g.domain)),
+        }
     }
 }
 
@@ -7106,36 +7791,59 @@ async fn account_for_payment_reference(
     Ok(Some(account))
 }
 
-/// Write an account's record back after the webhook pass changed its payment
-/// block. The page reads it as `_onboard`, so the record goes through the
-/// handler-readable writer rather than the root-only one.
-async fn write_account(store: &Store, account: &Account) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(account)
-        .map_err(|e| format!("cannot encode the account: {e}"))?;
-    write_account_record(store, &account.username, &bytes).await
+/// The account or group a checkout's `client_reference_id` names. The index
+/// resolves to one or the other: a person's token names their account, a
+/// group's token names the group, so one subscription and one renewal write one
+/// date for every mailbox in it.
+async fn target_for_payment_reference(
+    store: &Store,
+    reference: &str,
+) -> Result<Option<TargetRef>, String> {
+    if let Some(account) = account_for_payment_reference(store, reference).await? {
+        return Ok(Some(TargetRef::Account(account.username)));
+    }
+    if !store::is_payment_token(reference) {
+        return Ok(None);
+    }
+    let Some(join) = token_join(store, reference).await? else {
+        return Ok(None);
+    };
+    let Some(domain) = join.group.as_deref() else {
+        return Ok(None);
+    };
+    if validate::domain(domain).is_some() {
+        return Ok(None);
+    }
+    let Some(group) = group_record(store, domain).await? else {
+        return Ok(None);
+    };
+    if group.payment.no_charge
+        || group.payment.rail != "card"
+        || group.payment.token_ref.as_deref() != Some(reference)
+    {
+        return Ok(None);
+    }
+    Ok(Some(TargetRef::Group(domain.to_string())))
 }
 
-/// Attach a subscription and its customer to an account, which is all a
-/// checkout does. The date stays `invoice.paid`'s to set.
+/// Attach a subscription and its customer to an account or a group, which is
+/// all a checkout does. The date stays `invoice.paid`'s to set.
 async fn attach_subscription(
     store: &Store,
-    account: &mut Account,
+    billing: &mut BillingTarget,
     subscription: &str,
     customer: Option<&str>,
 ) -> Result<(), String> {
-    let payment = account
-        .payment
-        .as_mut()
-        .ok_or("the account has no payment block")?;
-    payment.stripe.subscription = Some(subscription.to_string());
-    payment.stripe.customer = customer.map(str::to_string);
-    write_account(store, account).await
+    let stripe = billing.stripe_mut();
+    stripe.subscription = Some(subscription.to_string());
+    stripe.customer = customer.map(str::to_string);
+    billing.save(store).await
 }
 
-/// `checkout.session.completed`: the `client_reference_id` is the account's
-/// `KYR-` token, and the subscription and customer are attached to the account
-/// it indexes. Nothing else happens: `invoice.paid` owns the date, so a first
-/// payment extends exactly one year and never two.
+/// `checkout.session.completed`: the `client_reference_id` is the account's or
+/// the group's `KYR-` token, and the subscription and customer are attached to
+/// what it indexes. Nothing else happens: `invoice.paid` owns the date, so a
+/// first payment extends exactly one year and never two.
 async fn checkout_completed(store: &Store, object: &Value) -> Result<Settled, String> {
     let Some(reference) = object
         .get("client_reference_id")
@@ -7147,11 +7855,14 @@ async fn checkout_completed(store: &Store, object: &Value) -> Result<Settled, St
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
-    let Some(mut account) = account_for_payment_reference(store, reference).await? else {
+    let Some(target) = target_for_payment_reference(store, reference).await? else {
+        return Ok(Settled::Ignored);
+    };
+    let Some(mut billing) = load_target(store, &target).await? else {
         return Ok(Settled::Ignored);
     };
     let customer = object.get("customer").and_then(Value::as_str);
-    attach_subscription(store, &mut account, subscription, customer).await?;
+    attach_subscription(store, &mut billing, subscription, customer).await?;
     Ok(Settled::Applied)
 }
 
@@ -7184,15 +7895,19 @@ async fn invoice_paid(cfg: &DrainConfig, store: &Store, object: &Value) -> Resul
         None => {
             // A missed `checkout.session.completed` leaves no store record, so
             // the session the subscription came from is the repair: the list
-            // filter names it, and its `client_reference_id` is the account's
-            // token. A subscription with no session reference stays deferred.
+            // filter names it, and its `client_reference_id` is the account's or
+            // the group's token. A subscription with no session reference stays
+            // deferred.
             let session = retrieve_session(cfg, subscription).await?;
             let reference = card_reference(&session, &subscription_json);
-            let Some(mut account) = account_for_payment_reference(store, reference).await? else {
+            let Some(target) = target_for_payment_reference(store, reference).await? else {
                 return Ok(Settled::Deferred);
             };
-            attach_subscription(store, &mut account, subscription, customer).await?;
-            TargetRef::Account(account.username.clone())
+            let Some(mut billing) = load_target(store, &target).await? else {
+                return Ok(Settled::Deferred);
+            };
+            attach_subscription(store, &mut billing, subscription, customer).await?;
+            target
         }
     };
     let Some(mut billing) = load_target(store, &target).await? else {
@@ -7216,9 +7931,15 @@ async fn invoice_paid(cfg: &DrainConfig, store: &Store, object: &Value) -> Resul
         // The date was saved on an earlier pass. The ledger line it opens may
         // still be missing if that pass died between the save and the append,
         // and the invoice id is the dedup key that finishes it once.
-        if let BillingTarget::Account(account) = &billing {
-            append_invoice_ledger(store, account, invoice, &amount_gbp, &received_on).await?;
-        }
+        append_invoice_ledger(
+            store,
+            billing.token(),
+            billing.paid_until(),
+            invoice,
+            &amount_gbp,
+            &received_on,
+        )
+        .await?;
         billing.save(store).await?;
         return Ok(Settled::Applied);
     }
@@ -7233,8 +7954,16 @@ async fn invoice_paid(cfg: &DrainConfig, store: &Store, object: &Value) -> Resul
         if let Some(payment) = &account.payment {
             write_payment_copy(store, &account.username, payment).await?;
         }
-        append_invoice_ledger(store, account, invoice, &amount_gbp, &received_on).await?;
     }
+    append_invoice_ledger(
+        store,
+        billing.token(),
+        billing.paid_until(),
+        invoice,
+        &amount_gbp,
+        &received_on,
+    )
+    .await?;
     Ok(Settled::Applied)
 }
 
@@ -7260,21 +7989,21 @@ fn invoice_money(object: &Value) -> Result<(String, String), String> {
 }
 
 /// The ledger line a paid card invoice opens. Without it a card payment has no
-/// `seq`, and the refund path has nothing to reverse. A group has no token, so
-/// its payment stays out of the ledger. The invoice id is the dedup key, which
-/// is also what recovers a crash between the account write and this append.
-/// Nothing here talks to Stripe: the card rail stays read-only towards it.
+/// `seq`, and the refund path has nothing to reverse. It is keyed by the token
+/// the payment is for: an account's own, or the one token a group holds, so a
+/// body's card payment is one line like its prepaid one. The invoice id is the
+/// dedup key, which is also what recovers a crash between the record write and
+/// this append. Nothing here talks to Stripe: the card rail stays read-only
+/// towards it.
 async fn append_invoice_ledger(
     store: &Store,
-    account: &Account,
+    token: Option<&str>,
+    paid_until_after: Option<&str>,
     invoice: &str,
     amount_gbp: &str,
     received_on: &str,
 ) -> Result<(), String> {
-    let Some(payment) = account.payment.as_ref() else {
-        return Ok(());
-    };
-    let Some(token) = payment.token_ref.as_deref() else {
+    let Some(token) = token else {
         return Ok(());
     };
     if ledger_has_intent(store, invoice).await {
@@ -7289,7 +8018,7 @@ async fn append_invoice_ledger(
         "received_on": received_on,
         "amount_gbp": amount_gbp,
         "applied_gbp": amount_gbp,
-        "paid_until_after": payment.paid_until.as_deref(),
+        "paid_until_after": paid_until_after,
         "amount_xmr": Value::Null,
         "rate_quoted": Value::Null,
         "rate_source": Value::Null,

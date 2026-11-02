@@ -1724,3 +1724,441 @@ fn a_second_address_on_an_existing_mailbox_still_counts() {
         fix.table("virtuals")
     );
 }
+
+/// The group's payment state: one rail, one token, one window and one date on
+/// the group, and nothing of the sort on a mailbox in it.
+#[test]
+fn a_charged_group_holds_one_token_and_one_window_and_no_account_does() {
+    let fix = Fix::new("group-payment");
+    let record = fix.filed_body("warden");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let token = group["payment"]["token_ref"]
+        .as_str()
+        .expect("a charged group draws one token");
+    assert!(kyriakon_onboard::store::is_payment_token(token), "{token}");
+    assert_eq!(
+        group["payment"]["window"]["state"],
+        json!("open"),
+        "{group}"
+    );
+    assert!(
+        group["payment"]["window"]["closes_at"].is_string(),
+        "{group}"
+    );
+    assert!(group["payment"]["paid_until"].is_null(), "{group}");
+
+    // The index resolves the token to the group, not to one of its accounts.
+    let join: Value = serde_json::from_str(&fix.read(&format!("tokens/{token}.json"))).unwrap();
+    assert_eq!(join["group"], json!("parish.example"), "{join}");
+    assert_eq!(join["token"], json!(token), "{join}");
+
+    // The approval opened one ledger line, keyed by the group's token.
+    let opens: Vec<Value> = ledger_lines(&fix)
+        .into_iter()
+        .filter(|line| line["kind"] == json!("window_open"))
+        .collect();
+    assert_eq!(opens.len(), 1, "{opens:?}");
+    assert_eq!(opens[0]["token"], json!(token), "{opens:?}");
+
+    // The mailbox references its group and holds no payment block at all.
+    let account = fix.account("parish-secretary");
+    assert_eq!(account["group"], json!("parish.example"), "{account}");
+    assert!(account.get("payment").is_none(), "{account}");
+    assert!(
+        !fix.read("accounts/parish-secretary/account.json")
+            .contains("paid_until"),
+        "a mailbox holds no paid-until date"
+    );
+
+    // The approval mail carries the token, so the body can pay it.
+    assert!(
+        fix.sent().contains(&format!("reference is {token}")),
+        "{}",
+        fix.sent()
+    );
+}
+
+/// A free group has no token, no window and no date, and never lapses: no sweep
+/// gives it one.
+#[test]
+fn a_free_group_has_no_token_no_window_and_never_lapses() {
+    let fix = Fix::new("group-free");
+    let record = fix.filed_body("warden");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("provision", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(group["payment"]["no_charge"], json!(true), "{group}");
+    assert!(group["payment"]["token_ref"].is_null(), "{group}");
+    assert!(group["payment"].get("window").is_none(), "{group}");
+    assert!(group["payment"]["paid_until"].is_null(), "{group}");
+    assert!(fix.names("tokens").is_empty(), "{:?}", fix.names("tokens"));
+    assert!(payment_lines(&fix).is_empty(), "{:?}", payment_lines(&fix));
+
+    // A year of passes later nothing has lapsed: a free group has no window to
+    // close and no grace to run out.
+    let before = fix.read("groups/parish.example/group.json");
+    assert!(fix.drain().status.success());
+    assert_eq!(fix.read("groups/parish.example/group.json"), before);
+    assert_eq!(
+        fix.account("parish-secretary")["state"],
+        json!("active"),
+        "a free group's mailbox does not lapse"
+    );
+}
+
+/// A prepaid credit keyed by the group's token writes exactly one date, on the
+/// group. The ledger line is keyed by the same token and the receipt is one.
+#[test]
+fn a_group_credit_writes_one_date_on_the_group_alone() {
+    let fix = Fix::new("group-credit");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let token = group["payment"]["token_ref"].as_str().unwrap().to_string();
+
+    // The operator's console takes the mailbox's name and resolves it to the
+    // group's one token.
+    let out = fix.ctl(&[
+        "credit",
+        "--username",
+        "parish-secretary",
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-20",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let date = group["payment"]["paid_until"]
+        .as_str()
+        .expect("the credit sets the group's date")
+        .to_string();
+    let expected = kyriakon_onboard::billing::extend_paid_until("2026-10-20", None).unwrap();
+    assert_eq!(&date[..10], &expected[..10], "{date}");
+    assert_eq!(
+        group["payment"]["window"]["state"],
+        json!("paid"),
+        "{group}"
+    );
+
+    for mailbox in ["parish-secretary", "parish-office"] {
+        let raw = fix.read(&format!("accounts/{mailbox}/account.json"));
+        assert!(!raw.contains("paid_until"), "{mailbox} holds a date: {raw}");
+        assert_eq!(
+            fix.account(mailbox)["group"],
+            json!("parish.example"),
+            "{mailbox}"
+        );
+    }
+    let payments = payment_lines(&fix);
+    assert_eq!(payments.len(), 1, "{payments:?}");
+    assert_eq!(payments[0]["token"], json!(token), "{payments:?}");
+    assert_eq!(payments[0]["applied_gbp"], json!("20.00"), "{payments:?}");
+    assert!(
+        fix.sent().contains("whole group is paid until"),
+        "one receipt for the body: {}",
+        fix.sent()
+    );
+
+    // The console reads the group's payment through a mailbox name, the same
+    // join the page uses.
+    let shown = fix.ctl(&["payment", "show", "--username", "parish-office"]);
+    assert!(shown.status.success(), "{}", body(&shown));
+    let text = body(&shown);
+    assert!(text.contains(&format!("token    {token}")), "{text}");
+    assert!(text.contains(&format!("paid     {date}")), "{text}");
+
+    // A second credit is a renewal: without --confirm-double it is refused, so
+    // a copied token cannot buy another year.
+    let before = fix.read("groups/parish.example/group.json");
+    let refused = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-21",
+    ]);
+    assert!(refused.status.success(), "{}", body(&refused));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.read("groups/parish.example/group.json"),
+        before,
+        "the refused renewal moves nothing"
+    );
+    assert!(
+        fix.journal().contains("already credited"),
+        "{}",
+        fix.journal()
+    );
+
+    // With the operator's word, the renewal extends the group's date by one
+    // year from the date the group already holds, not from today.
+    let renewal = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-21",
+        "--confirm-double",
+    ]);
+    assert!(renewal.status.success(), "{}", body(&renewal));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let renewed = group["payment"]["paid_until"].as_str().unwrap();
+    let expected = kyriakon_onboard::billing::extend_paid_until("2026-10-21", Some(&date)).unwrap();
+    assert_eq!(&renewed[..10], &expected[..10], "{renewed}");
+    assert_eq!(payment_lines(&fix).len(), 2, "{:?}", payment_lines(&fix));
+    for mailbox in ["parish-secretary", "parish-office"] {
+        assert!(
+            !fix.read(&format!("accounts/{mailbox}/account.json"))
+                .contains("paid_until"),
+            "{mailbox} holds a date after the renewal"
+        );
+    }
+}
+
+/// A card renewal: the checkout's reference is the group's token, and the
+/// invoice writes one date on the group. The mailboxes hold none.
+#[test]
+fn a_card_renewal_writes_one_date_on_the_group() {
+    let fix = Fix::new("group-card");
+    let mut record = fix.filed_body("warden");
+    record["rail"] = json!("card");
+    record["answers"]["rail"] = json!("card");
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let token = group["payment"]["token_ref"].as_str().unwrap().to_string();
+    assert_eq!(group["payment"]["rail"], json!("card"), "{group}");
+    assert!(
+        fix.sent().contains(&format!("client_reference_id={token}")),
+        "the approval mail keys the link to the group's token: {}",
+        fix.sent()
+    );
+
+    fix.webhook(
+        "01-checkout",
+        "checkout.session.completed",
+        json!({
+            "id": "cs_example",
+            "client_reference_id": token,
+            "subscription": SUBSCRIPTION,
+            "customer": "cus_example",
+        }),
+    );
+    fix.webhook("02-invoice", "invoice.paid", invoice("in_group_first"));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let date = group["payment"]["paid_until"]
+        .as_str()
+        .expect("the invoice sets the group's date")
+        .to_string();
+    let expected =
+        kyriakon_onboard::billing::extend_paid_until(&kyriakon_onboard::util::filed_at(), None)
+            .unwrap();
+    assert_eq!(&date[..10], &expected[..10], "one year, not two: {date}");
+    assert_eq!(
+        group["payment"]["stripe"]["subscription"],
+        json!(SUBSCRIPTION),
+        "{group}"
+    );
+    assert_eq!(
+        group["payment"]["window"]["state"],
+        json!("paid"),
+        "{group}"
+    );
+
+    let payments = payment_lines(&fix);
+    assert_eq!(payments.len(), 1, "{payments:?}");
+    assert_eq!(payments[0]["token"], json!(token), "{payments:?}");
+    assert_eq!(payments[0]["rail"], json!("card"), "{payments:?}");
+    let raw = fix.read("accounts/parish-secretary/account.json");
+    assert!(!raw.contains("paid_until"), "{raw}");
+}
+
+/// A lapse takes every mailbox in the group at once, one notice runs against the
+/// body rather than one per mailbox, and the group's window is what recorded it.
+#[test]
+fn a_group_lapse_takes_every_mailbox_and_one_conversation_of_notices() {
+    let fix = Fix::new("group-lapse");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+
+    // The window closed ten days ago: the lapse is due, the grace is not.
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let closes = kyriakon_onboard::util::after_days(-10);
+    group["payment"]["window"]["closes_at"] = json!(closes);
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let grace = kyriakon_onboard::util::date_string(
+        kyriakon_onboard::util::parse_date(&closes[..10]).unwrap() + time::Duration::days(40),
+    );
+    for mailbox in ["parish-secretary", "parish-office"] {
+        let account = fix.account(mailbox);
+        assert_eq!(account["state"], json!("lapsed"), "{mailbox}: {account}");
+        assert_eq!(account["grace_until"], json!(grace), "{mailbox}: {account}");
+    }
+    let log = fix.scripts_log();
+    for mailbox in ["parish-secretary", "parish-office"] {
+        assert!(
+            log.contains(&format!("lapse-user.sh {mailbox}")),
+            "{mailbox} still sends: {log}"
+        );
+    }
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(
+        group["payment"]["window"]["state"],
+        json!("closed"),
+        "{group}"
+    );
+
+    // One line on the site owner's record, and none on the other mailbox's.
+    let notices = fix.read("accounts/parish-secretary/notices.jsonl");
+    assert_eq!(notices.matches("group.lapsed").count(), 1, "{notices}");
+    assert!(
+        !fix.read("accounts/parish-office/notices.jsonl")
+            .contains("group.lapsed"),
+        "one conversation for the body, not one per mailbox"
+    );
+
+    // A second pass sends nothing twice.
+    assert!(fix.drain().status.success());
+    let notices = fix.read("accounts/parish-secretary/notices.jsonl");
+    assert_eq!(notices.matches("group.lapsed").count(), 1, "{notices}");
+}
+
+/// The grace's final notice comes once for the body, seven days before the
+/// deletion, and the deletion closes every account in the group and takes the
+/// domain down.
+#[test]
+fn a_group_grace_ends_in_one_deletion_of_every_account() {
+    let fix = Fix::new("group-grace");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    // Thirty-four days ago leaves six days of grace: the final notice is due.
+    group["payment"]["window"]["closes_at"] = json!(kyriakon_onboard::util::after_days(-34));
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+    let notices = fix.read("accounts/parish-secretary/notices.jsonl");
+    assert_eq!(notices.matches("group.final").count(), 1, "{notices}");
+    assert!(
+        notices.contains("seven days"),
+        "the final notice names the date: {notices}"
+    );
+    assert!(
+        !fix.read("accounts/parish-office/notices.jsonl")
+            .contains("group.final"),
+        "one final notice for the body"
+    );
+
+    // Past the forty days: one deletion of every account and the domain.
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["payment"]["window"]["closes_at"] = json!(kyriakon_onboard::util::after_days(-41));
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    for mailbox in ["parish-secretary", "parish-office"] {
+        assert!(
+            !fix.dir.join(format!("store/accounts/{mailbox}")).exists(),
+            "{mailbox}'s record stayed"
+        );
+        assert!(
+            !fix.passwd_file().contains(&format!("{mailbox}:")),
+            "{mailbox} is still on the box: {}",
+            fix.passwd_file()
+        );
+    }
+    assert!(
+        !fix.dir.join("store/groups/parish.example").exists(),
+        "the group record stayed"
+    );
+    assert!(fix.names("tokens").is_empty(), "{:?}", fix.names("tokens"));
+    let log = fix.scripts_log();
+    assert!(
+        log.contains("remove-group.sh parish.example"),
+        "the domain came down: {log}"
+    );
+    assert!(
+        fix.journal().contains("delete-group-parish.example"),
+        "{}",
+        fix.journal()
+    );
+}

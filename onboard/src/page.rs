@@ -102,6 +102,12 @@ pub struct GroupView {
     pub paid_until: Option<String>,
     /// `free`, `active` or `payment due`, from the group's own payment block.
     pub state: String,
+    /// The group's one payment reference while money is still due, in full so
+    /// any mailbox holder can pay it. Absent once the date is set, when the
+    /// token goes back to being a secret, and on a free group.
+    pub token: Option<String>,
+    /// The day the group's one window closes, while it runs.
+    pub window_closes: Option<String>,
     pub accounts: Vec<String>,
     /// The space its mailboxes use together, and the allowance they add up to.
     /// The quota lives on the group record, summed by the drain from the same
@@ -120,6 +126,7 @@ impl GroupView {
         } else {
             "payment due"
         };
+        let unpaid = !payment.no_charge && payment.paid_until.is_none();
         GroupView {
             domain: group.domain.clone(),
             name: group.name.clone(),
@@ -128,6 +135,12 @@ impl GroupView {
             no_charge: payment.no_charge,
             paid_until: payment.paid_until.clone(),
             state: state.to_string(),
+            token: payment.token_ref.clone().filter(|_| unpaid),
+            window_closes: payment
+                .window
+                .as_ref()
+                .filter(|_| unpaid)
+                .map(|w| w.closes_at[..10.min(w.closes_at.len())].to_string()),
             accounts: group.accounts.clone(),
             space_used: group.space_used.map(space),
             allowance: format!(
