@@ -19,6 +19,11 @@ use crate::validate;
 /// which is the pair the spec treats as one answer; the other two are separate.
 const KINDS: [&str; 3] = ["access", "erasure", "rectification"];
 
+/// The routes that establish who is asking. `password` is the page's check
+/// against the system account; `mail-key` is a signed message from the
+/// account's own platform address.
+const IDENTITIES: [&str; 2] = ["password", "mail-key"];
+
 /// What "nearly due" means in `request list`: the deletion path's own seven-day
 /// wait, the only window the spec gives a number for.
 const NEARLY_DUE_DAYS: i64 = 7;
@@ -36,6 +41,10 @@ pub struct RequestLine {
     /// What established who was asking: the page's password check, or a signed
     /// message from the account's own address.
     pub evidence: String,
+    /// Which route established it: `password` or `mail-key`. Absent on lines
+    /// written before the field existed, so those still read.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub identity: String,
     /// The latest of receipt, the identity information asked for, and any fee:
     /// Article 12A's "relevant time".
     pub relevant: String,
@@ -88,6 +97,9 @@ pub struct NewRequest<'a> {
     pub kind: &'a str,
     pub received: &'a str,
     pub evidence: &'a str,
+    /// The route that established the sender: `password` or `mail-key`. A
+    /// record without one is refused.
+    pub identity: &'a str,
     pub note: Option<&'a str>,
     pub identity_at: Option<&'a str>,
     pub fee_at: Option<&'a str>,
@@ -249,6 +261,13 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
     if evidence.is_empty() {
         return Err("the evidence that established who was asking is needed".to_string());
     }
+    let identity = request.identity.trim();
+    if !IDENTITIES.contains(&identity) {
+        return Err(format!(
+            "the identity route {identity:?} is not one of {}",
+            IDENTITIES.join(", ")
+        ));
+    }
     // A request is recorded against an account, never into a directory a
     // mistyped name would create.
     if store
@@ -278,6 +297,7 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
         kind: request.kind.to_string(),
         received: format_date(received),
         evidence: evidence.to_string(),
+        identity: identity.to_string(),
         relevant: format_date(relevant),
         due: format_date(due),
         extended_until: None,
@@ -524,6 +544,7 @@ mod tests {
             kind,
             received,
             evidence: "signed message from the account address",
+            identity: "mail-key",
             note: None,
             identity_at: None,
             fee_at: None,
@@ -766,6 +787,53 @@ mod tests {
             .lines("accounts/alice/requests.jsonl")
             .await
             .is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn record_refuses_a_missing_or_unknown_identity_route() {
+        let (store, dir) = temp_store("record-identity");
+        for identity in ["", "  ", "session-cookie"] {
+            let mut request = new_request("access", "2026-10-22");
+            request.identity = identity;
+            let err = record(&store, request).await.unwrap_err();
+            assert!(err.contains("identity route"), "{identity:?}: {err}");
+        }
+        assert!(store
+            .lines("accounts/alice/requests.jsonl")
+            .await
+            .is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn record_persists_the_route_that_established_the_sender() {
+        let (store, dir) = temp_store("record-identity-persist");
+        let line = record(&store, new_request("access", "2026-10-22"))
+            .await
+            .unwrap();
+        assert_eq!(line.identity, "mail-key");
+        // The route is on the line the next reader sees, not only in the return.
+        let raw = store.lines("accounts/alice/requests.jsonl").await;
+        assert!(raw[0].contains("\"identity\":\"mail-key\""), "{}", raw[0]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_line_written_before_the_identity_field_still_reads_and_lists() {
+        let (store, dir) = temp_store("old-line");
+        std::fs::write(
+            dir.join("accounts/alice/requests.jsonl"),
+            "{\"version\":1,\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\
+             \"username\":\"alice\",\"kind\":\"access\",\
+             \"received\":\"2026-10-01\",\"evidence\":\"the account page\",\
+             \"relevant\":\"2026-10-01\",\"due\":\"2026-11-01\"}\n",
+        )
+        .unwrap();
+        let open = open(&store).await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].identity, "");
+        assert_eq!(open[0].kind, "access");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

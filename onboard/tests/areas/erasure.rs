@@ -208,6 +208,7 @@ fn the_page_close_and_the_console_delete_end_in_the_same_transition() {
             .contains("password re-entered"),
         "{request}"
     );
+    assert_eq!(request["identity"], "password", "{request}");
 
     // The window ends.
     let mut account = account;

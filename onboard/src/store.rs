@@ -1036,6 +1036,16 @@ impl Account {
             .or_else(|| self.legacy_payment.folded())
     }
 
+    /// The account's own platform address: its mailbox at its group's domain,
+    /// or at `kyriakon.net` for a person's account. The outside contact address
+    /// is a separate thing and is never this.
+    pub fn platform_address(&self) -> String {
+        match self.group.as_deref() {
+            Some(domain) => format!("{}@{}", self.username, domain),
+            None => format!("{}@kyriakon.net", self.username),
+        }
+    }
+
     /// Approved without charge: no token, no window, nothing that lapses. A
     /// group mailbox carries the flag its group was approved with, but the
     /// group holds the payment, so the mailbox is not a free account itself.

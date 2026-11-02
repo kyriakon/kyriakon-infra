@@ -413,6 +413,8 @@ fn the_bundle_lands_in_the_chroot_and_the_notice_is_recorded() {
         "2026-10-01",
         "--evidence",
         "the account page",
+        "--identity",
+        "password",
     ]);
     assert!(out.status.success(), "{}", body(&out));
 
@@ -643,6 +645,7 @@ fn the_page_files_an_export_intent_and_the_drain_records_the_request() {
         line["evidence"].as_str().unwrap().contains("account page"),
         "{line}"
     );
+    assert_eq!(line["identity"], "password", "{line}");
     // And the bundle carries it.
     assert!(file(&bundle(&fix, "secretary"), "requests.jsonl").contains(&id));
 }

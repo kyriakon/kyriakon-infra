@@ -83,8 +83,9 @@ Everything else is the operator's, through `onboardctl`, in the shape the other 
 ```
 onboardctl export <username>
 onboardctl request list
+onboardctl request verify --username <u> --message <file> [--signature <file>]
 onboardctl request record --username <u> --kind <access|erasure|rectification> \
-  --received <date> --evidence <text> --note <text>
+  --received <date> --evidence <text> --identity <password|mail-key> --note <text>
 onboardctl request close <id> --done <date> --note <text>
 onboardctl delete <username>
 ```
