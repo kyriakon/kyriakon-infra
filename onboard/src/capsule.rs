@@ -279,9 +279,19 @@ pub fn account(
             out.push_str(&format!("Paid until {until}.\n"));
         }
         out.push_str(&format!(
-            "The group's mailboxes: {}.\n\n",
+            "The group's mailboxes: {}.\n",
             g.accounts.join(", ")
         ));
+        match &g.space_used {
+            Some(used) => out.push_str(&format!(
+                "Space used by the group: {used} of its {}.\n\n",
+                g.allowance
+            )),
+            None => out.push_str(&format!(
+                "The group's space used has not been recorded yet. Its allowance is {}.\n\n",
+                g.allowance
+            )),
+        }
     }
     out.push_str(&format!("State: {}\n", account.state));
     out.push_str(&format!("Site: {}\n", served(account.site_served)));

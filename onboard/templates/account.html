@@ -86,6 +86,11 @@
 <p>Paid until {{ until }}.</p>
 {% endif %}
 <p>The group's mailboxes: {% for a in g.accounts %}<span class="mono">{{ a }}</span>{% if !loop.last %}, {% endif %}{% endfor %}.</p>
+{% if let Some(used) = g.space_used %}
+<p>Space used by the group: {{ used }} of its {{ g.allowance }}.</p>
+{% else %}
+<p>The group's space used has not been recorded yet. Its allowance is {{ g.allowance }}.</p>
+{% endif %}
 {% endif %}
 
 <h3>Space used</h3>

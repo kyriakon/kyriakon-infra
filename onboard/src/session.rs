@@ -83,6 +83,11 @@ impl Authenticator {
             let mut line = password.as_bytes().to_vec();
             line.push(b'\n');
             if stdin.write_all(&line).await.is_err() {
+                // `doas` can exit before the pipe is drained, which is EPIPE.
+                // The child is still this process's to reap, or a refusal that
+                // the handler answers hundreds of times a day leaves zombies in
+                // a process that never exits.
+                let _ = child.wait().await;
                 return false;
             }
             let _ = stdin.shutdown().await;
@@ -111,6 +116,9 @@ pub struct Session {
 /// Open a session for `username` and return the cookie's value: the id, a dot,
 /// and the HMAC of the id under the session's own secret.
 pub async fn open(store: &Store, username: &str, now: OffsetDateTime) -> Result<String, String> {
+    // A new login is where the old sessions are cleared. Nothing else walks the
+    // directory, and an id is random, so an expired file would never be reused.
+    prune(store, now).await;
     let id = crate::store::status_token().await?;
     let secret = crate::store::status_token().await?;
     let expires = (now + Duration::hours(TTL_HOURS))
@@ -140,8 +148,9 @@ pub async fn open(store: &Store, username: &str, now: OffsetDateTime) -> Result<
 }
 
 /// The session a cookie names, when it is live and its signature is the one the
-/// record's own secret makes. An expired session answers nothing and is left
-/// for the next login to overwrite; a cookie naming no record answers nothing.
+/// record's own secret makes. An expired session answers nothing; its file is
+/// removed by the next `open`, which is the only walk of the directory. A cookie
+/// naming no record answers nothing.
 pub async fn lookup(store: &Store, cookie: &str, now: OffsetDateTime) -> Option<Session> {
     let (id, sig) = cookie.split_once('.')?;
     // The id is a store token: 26 lowercase Crockford characters. A cookie of
@@ -161,6 +170,30 @@ pub async fn lookup(store: &Store, cookie: &str, now: OffsetDateTime) -> Option<
     Some(Session {
         username: record.username,
     })
+}
+
+/// Remove the session records whose expiry has passed. One unreadable file is
+/// skipped rather than failing every login: the directory holds only what this
+/// module wrote, and a partial record is not a session either.
+pub async fn prune(store: &Store, now: OffsetDateTime) {
+    let Ok(names) = store.list("sessions").await else {
+        return;
+    };
+    for name in names {
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let Some(text) = store.read_record("sessions", &name).await else {
+            continue;
+        };
+        let expired = serde_json::from_str::<Record>(&text)
+            .ok()
+            .and_then(|record| OffsetDateTime::parse(&record.expires_at, &Rfc3339).ok())
+            .is_none_or(|expires| now >= expires);
+        if expired {
+            let _ = store.remove("sessions", &name).await;
+        }
+    }
 }
 
 /// Remove the session a cookie names. A cookie that names nothing is a no-op:
@@ -201,10 +234,31 @@ pub fn from_header(header: &str, name: &str) -> Option<String> {
     })
 }
 
+/// The stub checker the tests share: one password, read from stdin like the
+/// real checker, and no `doas`, which a test cannot have.
+#[cfg(test)]
+pub(crate) mod stub {
+    use std::path::PathBuf;
+
+    pub(crate) fn checker(name: &str, password: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("onboard-auth-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kyriakon-authcheck");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nread -r given\n[ \"$given\" = '{password}' ]\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn store(name: &str) -> Store {
         let dir =
@@ -218,25 +272,10 @@ mod tests {
         OffsetDateTime::parse("2026-10-31T09:00:00Z", &Rfc3339).unwrap()
     }
 
-    /// A stub checker: it admits only the password `right horse battery`.
-    fn checker(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("onboard-auth-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("kyriakon-authcheck");
-        std::fs::write(
-            &path,
-            "#!/bin/sh\nread -r given\n[ \"$given\" = 'right horse battery' ]\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
-
     #[tokio::test]
     async fn a_correct_password_admits_and_a_wrong_one_does_not() {
         let auth = Authenticator {
-            program: checker("admits"),
+            program: stub::checker("admits", "right horse battery"),
             args: Vec::new(),
         };
         assert!(auth.admits("alice", "right horse battery").await);
@@ -301,5 +340,32 @@ mod tests {
         let header = "other=1; kyriakon_session=abc.def; trailing=2";
         assert_eq!(from_header(header, COOKIE).as_deref(), Some("abc.def"));
         assert_eq!(from_header("other=1", COOKIE), None);
+    }
+
+    #[tokio::test]
+    async fn the_next_login_removes_an_expired_session_and_keeps_a_live_one() {
+        let store = store("prune");
+        let stale = open(&store, "alice", now() - Duration::hours(24))
+            .await
+            .unwrap();
+        let live = open(&store, "bob", now()).await.unwrap();
+        assert!(lookup(&store, &stale, now()).await.is_none());
+        assert!(lookup(&store, &live, now()).await.is_some());
+        assert_eq!(
+            store.list("sessions").await.unwrap().len(),
+            1,
+            "only the live session file remains"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_checker_that_exits_before_reading_admits_nobody() {
+        // The write fails with EPIPE once the child has gone. The check still
+        // answers false, and the child is reaped rather than left a zombie.
+        let auth = Authenticator {
+            program: stub::checker("exits", "unused"),
+            args: Vec::new(),
+        };
+        assert!(!auth.admits("alice", &"x".repeat(256 * 1024)).await);
     }
 }

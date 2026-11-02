@@ -10,7 +10,6 @@
 use super::*;
 use crate::fcgi::fixture;
 use std::net::Ipv4Addr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use time::format_description::well_known::Rfc3339;
 
@@ -188,25 +187,6 @@ async fn signed_in(app: &App, username: &str) -> String {
         .expect("the fixture store takes a session")
 }
 
-/// A checker the login route runs directly. The real one is reached through
-/// `doas`, which a test cannot have; this admits only one password.
-fn login_checker(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("onboard-login-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("kyriakon-authcheck");
-    std::fs::write(
-        &path,
-        "#!/bin/sh
-read -r given
-[ \"$given\" = 'right horse battery' ]
-",
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
-
 /// The request httpd builds for a form post.
 fn httpd_post(path: &str, body: &str) -> Vec<u8> {
     let length = body.len().to_string();
@@ -345,6 +325,7 @@ fn file_group_account(dir: &Path) {
         r#"{"version": 1, "domain": "parish.example", "name": "Parish of Example",
             "kind": "parish", "payment": {"rail": "cash", "no_charge": false,
             "paid_until": "2027-01-01"}, "accounts": ["parish-secretary"],
+            "space_used": 1073741824,
             "site_owner": "parish-secretary"}"#,
     )
     .unwrap();
@@ -613,6 +594,12 @@ async fn a_group_member_reads_the_same_recipe_on_both_account_pages() {
         assert!(page.contains("parish.example"), "{page}");
         assert!(page.contains("Paid until 2027-01-01"), "{page}");
         assert!(page.contains("Rail: cash"), "{page}");
+        assert!(
+            page.contains(
+                "Space used by the group: 1.0 GB of its 1 mailbox, 5 GB soft and 5.5 GB hard each"
+            ),
+            "{page}"
+        );
     }
 
     // A web request that names no authenticated member is the page it was, and
@@ -639,7 +626,7 @@ fn amend_account(dir: &Path, username: &str, amend: impl FnOnce(&mut serde_json:
 async fn a_correct_mail_password_opens_a_session_and_a_wrong_one_does_not() {
     let (mut app, _dir) = handler("login").await;
     app.auth = session::Authenticator {
-        program: login_checker("admits"),
+        program: session::stub::checker("login-admits", "right horse battery"),
         args: Vec::new(),
     };
 
@@ -653,6 +640,8 @@ async fn a_correct_mail_password_opens_a_session_and_a_wrong_one_does_not() {
         body.contains("Set-Cookie: kyriakon_session="),
         "a session cookie is set: {body}"
     );
+    assert!(body.contains("Cache-Control: no-store"), "{body}");
+    assert!(body.contains("Referrer-Policy: no-referrer"), "{body}");
     for flag in ["HttpOnly", "SameSite=Lax", "Max-Age=43200", "Secure"] {
         assert!(body.contains(flag), "the cookie misses {flag}: {body}");
     }
@@ -675,6 +664,15 @@ async fn a_correct_mail_password_opens_a_session_and_a_wrong_one_does_not() {
     assert_eq!(code, 200);
     assert!(!wrong.contains("Set-Cookie"), "{wrong}");
     assert!(wrong.contains("did not match"), "{wrong}");
+    assert!(wrong.contains("Cache-Control: no-store"), "{wrong}");
+    assert!(wrong.contains("Referrer-Policy: no-referrer"), "{wrong}");
+
+    // The login page a request with no session is shown is not cacheable
+    // either: it is the same page the refusal renders.
+    let (code, page) = answer(&app, &httpd_get("account", "")).await;
+    assert_eq!(code, 200);
+    assert!(page.contains("Cache-Control: no-store"), "{page}");
+    assert!(page.contains("Referrer-Policy: no-referrer"), "{page}");
 }
 
 /// No key admits anyone, and neither does a header the front-end did not
@@ -696,7 +694,7 @@ async fn no_key_and_no_remote_user_admits_a_member() {
     // refused like any other wrong password.
     let (mut app, _dir) = handler("no-key-password").await;
     app.auth = session::Authenticator {
-        program: login_checker("key"),
+        program: session::stub::checker("login-key", "right horse battery"),
         args: Vec::new(),
     };
     let (code, body) = answer(
@@ -734,6 +732,8 @@ async fn the_account_page_shows_the_quota_keys_and_every_notice() {
     let cookie = signed_in(&app, "alice").await;
     let (code, body) = answer(&app, &httpd_get_session("account", "", &cookie)).await;
     assert_eq!(code, 200);
+    assert!(body.contains("Cache-Control: no-store"), "{body}");
+    assert!(body.contains("Referrer-Policy: no-referrer"), "{body}");
     assert!(
         body.contains("412 MB of the 5 GB soft and 5.5 GB hard allowance"),
         "{body}"
@@ -750,6 +750,24 @@ async fn the_account_page_shows_the_quota_keys_and_every_notice() {
         body.contains("alice@kyriakon.net") && body.contains("alice@example.invalid"),
         "both addresses are listed: {body}"
     );
+}
+
+/// A session record whose username is not a name the platform could have made
+/// is refused before any store path is built from it.
+#[tokio::test]
+async fn a_session_username_outside_the_charset_is_refused_before_a_path_is_built() {
+    let (app, _dir) = handler("session-shape").await;
+    for bad in ["../alice", "alice/..", "Alice", "alice\u{0}"] {
+        let cookie = session::open(&app.store, bad, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        let (code, body) = answer(&app, &httpd_get_session("account", "", &cookie)).await;
+        assert_eq!(code, 200, "{bad}");
+        assert!(
+            body.contains("Log in with your mail password"),
+            "{bad} reached a page: {body}"
+        );
+    }
 }
 
 /// A suspended page stays open, with the reason, so the member can read it and

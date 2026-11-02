@@ -1074,7 +1074,7 @@ async fn http(app: &App, request: &Request, incoming: &Incoming) -> Reply {
     }
     if incoming.path == "login" {
         return match method {
-            "GET" | "HEAD" => Reply::html(200, page_html(&LoginPage { error: None })),
+            "GET" | "HEAD" => Reply::capability(200, page_html(&LoginPage { error: None })),
             "POST" => login(app, request).await,
             _ => method_not_allowed(),
         };
@@ -1758,10 +1758,16 @@ async fn account(app: &App, request: &Request) -> Reply {
         None => None,
     };
     let Some(member) = member else {
-        return Reply::html(200, page_html(&LoginPage { error: None }));
+        return Reply::capability(200, page_html(&LoginPage { error: None }));
     };
+    // The record the session names is a path under the store, so the name is
+    // checked against the charset the platform makes before it builds one. A
+    // record with anything else in it is not a record this route will read.
+    if validate::username_shape(&member.username).is_some() {
+        return Reply::capability(200, page_html(&LoginPage { error: None }));
+    }
     let Some(account) = account_record(app, &member.username).await else {
-        return Reply::html(200, page_html(&LoginPage { error: None }));
+        return Reply::capability(200, page_html(&LoginPage { error: None }));
     };
     let notices = account_notices(app, &account.username).await;
     let group = group_state(app, account.group.as_deref()).await;
@@ -1778,7 +1784,9 @@ async fn account(app: &App, request: &Request) -> Reply {
         )
     });
     let page = page::member_page(&app.catalogue, &account, &notices, group, dns, payment);
-    Reply::html(200, page_html(&page))
+    // A member's page carries an outside address, notices and an unpaid token:
+    // it is never stored by a cache or sent as a referrer.
+    Reply::capability(200, page_html(&page))
 }
 
 /// The login submission. A correct password opens a session and sends the
@@ -1796,7 +1804,7 @@ async fn login(app: &App, request: &Request) -> Reply {
         || validate::username_shape(username).is_some()
         || !app.auth.admits(username, password).await
     {
-        return Reply::html(200, page_html(&LoginPage {
+        return Reply::capability(200, page_html(&LoginPage {
             error: Some(
                 "That username and password did not match. Check the mail password and try again."
                     .to_string(),
@@ -1804,9 +1812,9 @@ async fn login(app: &App, request: &Request) -> Reply {
         }));
     }
     match session::open(&app.store, username, OffsetDateTime::now_utc()).await {
-        Ok(cookie) => {
-            Reply::redirect("/account").with_header("Set-Cookie", session::cookie(&cookie))
-        }
+        Ok(cookie) => Reply::capability(303, String::new())
+            .with_header("Location", "/account".to_string())
+            .with_header("Set-Cookie", session::cookie(&cookie)),
         Err(e) => server_error(&e),
     }
 }
@@ -1817,7 +1825,9 @@ async fn logout(app: &App, request: &Request) -> Reply {
     if let Some(cookie) = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE) {
         session::close(&app.store, &cookie).await;
     }
-    Reply::redirect("/account").with_header("Set-Cookie", session::clear_cookie())
+    Reply::capability(303, String::new())
+        .with_header("Location", "/account".to_string())
+        .with_header("Set-Cookie", session::clear_cookie())
 }
 
 /// One account's record, for a name the request or a decided application

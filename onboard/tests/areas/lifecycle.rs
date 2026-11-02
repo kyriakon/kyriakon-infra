@@ -864,9 +864,8 @@ fn the_drain_records_space_used_from_the_quota_report() {
     assert!(fix.drain().status.success());
     fix.decide("approve", "secretary");
     fix.repquota(Some(
-        "printf 'Disk quotas for user secretary (uid 1000):\n\
-         Filesystem blocks quota limit grace files quota limit grace\n\
-         /dev/sd1l 4096 5242880 5767168 10 0 0\n'",
+        "printf 'User used soft hard grace used soft hard grace\n\
+         secretary -- 4096 5242880 5767168 -- 10 0 0\n'",
     ));
     // The filing pass had no account yet, so it wrote no hour stamp. Remove one
     // if a later pass left it, so this pass reads the report afresh.

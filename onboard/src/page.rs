@@ -103,6 +103,11 @@ pub struct GroupView {
     /// `free`, `active` or `payment due`, from the group's own payment block.
     pub state: String,
     pub accounts: Vec<String>,
+    /// The space its mailboxes use together, and the allowance they add up to.
+    /// The quota lives on the group record, summed by the drain from the same
+    /// per-account figures the page shows each mailbox.
+    pub space_used: Option<String>,
+    pub allowance: String,
 }
 
 impl GroupView {
@@ -124,6 +129,14 @@ impl GroupView {
             paid_until: payment.paid_until.clone(),
             state: state.to_string(),
             accounts: group.accounts.clone(),
+            space_used: group.space_used.map(space),
+            allowance: format!(
+                "{} mailbox{}, {} soft and {} hard each",
+                group.accounts.len(),
+                if group.accounts.len() == 1 { "" } else { "es" },
+                QUOTA_SOFT,
+                QUOTA_HARD
+            ),
         }
     }
 }
@@ -279,36 +292,6 @@ pub fn services(list: &[Service], member: Option<&str>) -> Vec<Row> {
     list.iter()
         .map(|s| catalogue::row(s, Protocol::Web, member))
         .collect()
-}
-
-/// The member's page, for a caller that has no account record to hand: the
-/// catalogue and the payment block alone. The responder uses [`member_page`],
-/// which adds the facts the record carries; this stays for the tests that only
-/// render a payment block.
-pub fn account(
-    list: &[Service],
-    member: Option<&str>,
-    dns: Option<crate::dns::Recipe>,
-    payment: Option<PaymentView>,
-    free: bool,
-) -> AccountPage {
-    AccountPage {
-        services: services(list, member),
-        username: member.unwrap_or_default().to_string(),
-        outside_address: None,
-        space_used: None,
-        space_soft: QUOTA_SOFT,
-        space_hard: QUOTA_HARD,
-        upload_keys: Vec::new(),
-        notices: Vec::new(),
-        group: None,
-        suspended: None,
-        closing_until: None,
-        can_close: false,
-        dns,
-        payment,
-        free,
-    }
 }
 
 /// The quota the platform publishes, as the page shows it: 5 GB soft and 5.5 GB
@@ -594,6 +577,20 @@ mod tests {
         .expect("a catalogue the file could hold")
     }
 
+    /// A member's record, in the shape the store holds one: enough for the
+    /// renderer to read the username and the free flag, with everything else
+    /// absent. The page's own facts are the account's, so a test builds the
+    /// record rather than a page-only shape.
+    fn member(username: &str, free: bool) -> crate::store::Account {
+        serde_json::from_value(serde_json::json!({
+            "version": 1, "username": username, "state": "active",
+            "decision": "approve", "decided_at": "2026-10-01T09:00:00Z",
+            "rail": if free { "no_charge" } else { "cash" },
+            "no_charge": free, "created_at": "2026-10-01T09:00:00Z"
+        }))
+        .expect("a record the store could hold")
+    }
+
     #[test]
     fn the_status_page_links_the_password_page() {
         // The link is what a member clicks to set the only password they will
@@ -798,14 +795,15 @@ mod tests {
         assert!(html.contains("https://mail.example.invalid/"), "{html}");
         assert!(html.contains("<span class=\"tag\">live</span>"), "{html}");
 
-        let listed = account(&catalogue(), None, None, None, false)
+        let listed = member_page(&catalogue(), &member("alice", false), &[], None, None, None)
             .render()
             .unwrap();
         assert!(listed.contains("zero-access mail"), "{listed}");
         assert!(listed.contains("https://mail.example.invalid/"), "{listed}");
 
-        // No member to render a host from, so the pattern itself is what shows,
-        // HTML-escaped in the markup as `<name>.example.invalid`.
+        // The row's host is the pattern itself when no member is given; the
+        // page is never rendered for an applicant, so this is the row's own
+        // behaviour rather than a second page constructor.
         let pattern = crate::catalogue::parse(
             "[[service]]\n\
              id = \"web\"\n\
@@ -816,14 +814,14 @@ mod tests {
              action = \"read\"\n",
         )
         .unwrap();
-        assert!(account(&pattern, None, None, None, false)
-            .render()
-            .unwrap()
-            .contains("&#60;name&#62;.example.invalid"));
-        assert!(account(&pattern, Some("theophilus"), None, None, false)
-            .render()
-            .unwrap()
-            .contains("https://theophilus.example.invalid/"));
+        assert_eq!(
+            services(&pattern, None)[0].href,
+            "https://<name>.example.invalid/"
+        );
+        assert_eq!(
+            services(&pattern, Some("theophilus"))[0].href,
+            "https://theophilus.example.invalid/"
+        );
     }
 
     /// A group's recipe is on the page, from the same generator the approval
@@ -839,12 +837,13 @@ mod tests {
             dmarc_rua: "mailto:dmarc@kyriakon.net".into(),
         };
         let recipe = crate::dns::recipe("parish.example", &values);
-        let html = account(
+        let html = member_page(
             &catalogue(),
-            Some("parish-secretary"),
+            &member("parish-secretary", false),
+            &[],
+            None,
             Some(recipe),
             None,
-            false,
         )
         .render()
         .unwrap();
@@ -858,7 +857,7 @@ mod tests {
         assert!(html.contains("does not host your zone"), "{html}");
         assert!(html.contains("cannot set a reverse DNS record"), "{html}");
 
-        let none = account(&catalogue(), Some("alice"), None, None, false)
+        let none = member_page(&catalogue(), &member("alice", false), &[], None, None, None)
             .render()
             .unwrap();
         assert!(!none.contains("DNS records"), "{none}");
@@ -903,9 +902,16 @@ mod tests {
             .unwrap()
             .contains("closes on 2026-11-03"));
         assert!(!view.instructions.is_empty());
-        let html = account(&catalogue(), Some("alice"), None, Some(view), false)
-            .render()
-            .unwrap();
+        let html = member_page(
+            &catalogue(),
+            &member("alice", false),
+            &[],
+            None,
+            None,
+            Some(view),
+        )
+        .render()
+        .unwrap();
         assert!(html.contains("KYR-4F2M-9QH7-XT3B"), "{html}");
         assert!(html.contains("1 Example Street"), "{html}");
 
@@ -925,9 +931,16 @@ mod tests {
         assert_eq!(lapsed.closes_on.as_deref(), Some("2026-11-03"));
         assert_eq!(lapsed.token.as_deref(), Some("KYR-4F2M-9QH7-XT3B"));
         assert!(lapsed.instructions.is_empty());
-        let html = account(&catalogue(), Some("alice"), None, Some(lapsed), false)
-            .render()
-            .unwrap();
+        let html = member_page(
+            &catalogue(),
+            &member("alice", false),
+            &[],
+            None,
+            None,
+            Some(lapsed),
+        )
+        .render()
+        .unwrap();
         assert!(html.contains("Lapsed"), "{html}");
         assert!(html.contains("closed on 2026-11-03"), "{html}");
         assert!(html.contains("admin@kyriakon.net"), "{html}");
@@ -946,9 +959,16 @@ mod tests {
         assert!(!paid.lapsed);
         assert_eq!(paid.token, None);
         assert_eq!(paid.paid_until.as_deref(), Some("2027-10-04"));
-        let html = account(&catalogue(), Some("alice"), None, Some(paid), false)
-            .render()
-            .unwrap();
+        let html = member_page(
+            &catalogue(),
+            &member("alice", false),
+            &[],
+            None,
+            None,
+            Some(paid),
+        )
+        .render()
+        .unwrap();
         assert!(html.contains("Paid until 2027-10-04"), "{html}");
         assert!(!html.contains("KYR-4F2M-9QH7-XT3B"), "{html}");
     }

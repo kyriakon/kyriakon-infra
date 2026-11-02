@@ -776,6 +776,13 @@ pub struct GroupRecord {
     pub payment: GroupPayment,
     pub accounts: Vec<String>,
     pub site_owner: String,
+    /// The group's own quota figure, the sum of its mailbox accounts' used
+    /// bytes. The page shows it against the allowance of `5 GB × mailboxes`;
+    /// the drain computes it in the same sweep that reads the filesystem quota,
+    /// so it cannot drift from the accounts it sums. Absent on a record written
+    /// before the sweep, which the page reads as not recorded yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_used: Option<u64>,
 }
 
 /// The `provision-group` intent: everything the drain needs to make one body's

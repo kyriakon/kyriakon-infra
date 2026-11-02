@@ -3709,6 +3709,7 @@ pub async fn provision_group(
         },
         accounts: intent.mailboxes.clone(),
         site_owner: intent.site_owner.clone(),
+        space_used: None,
     };
     write_group_record(store, &group).await?;
 
@@ -5002,55 +5003,117 @@ pub async fn refresh_space_used(cfg: &DrainConfig, store: &Store) -> Result<(), 
         return Ok(());
     }
 
-    for (username, used_kb) in parse_repquota(&String::from_utf8_lossy(&report.stdout)) {
-        let Some(mut account) = existing_account(store, &username).await else {
+    let usage = parse_repquota(&String::from_utf8_lossy(&report.stdout));
+    let mut recorded: HashSet<String> = HashSet::new();
+    for (username, used_kb) in &usage {
+        let Some(mut account) = existing_account(store, username).await else {
             // A uid with no account record is somebody else's, and this sweep
             // writes nothing about it.
             continue;
         };
         let bytes = used_kb.saturating_mul(1024);
         if account.space_used == Some(bytes) {
+            recorded.insert(username.clone());
             continue;
         }
         account.space_used = Some(bytes);
         let encoded = serde_json::to_vec_pretty(&account)
             .map_err(|e| format!("cannot encode the account: {e}"))?;
-        if let Err(e) = write_account_record(store, &username, &encoded).await {
-            eprintln!("kyriakon-onboard: recording {username}'s quota: {e}");
+        match write_account_record(store, username, &encoded).await {
+            Ok(()) => {
+                recorded.insert(username.clone());
+            }
+            Err(e) => eprintln!("kyriakon-onboard: recording {username}'s quota: {e}"),
+        }
+    }
+
+    // The group's figure is the sum of its mailboxes' used bytes, computed from
+    // the accounts this pass just read. A group none of whose accounts appeared
+    // in the report is left alone: an empty or unrelated report must not write a
+    // zero over a real figure.
+    for name in store.list("groups").await? {
+        let Some(mut group) = group_record(store, &name).await? else {
+            continue;
+        };
+        if !group
+            .accounts
+            .iter()
+            .any(|mailbox| recorded.contains(mailbox))
+        {
+            continue;
+        }
+        let mut total = 0u64;
+        let mut seen = false;
+        for mailbox in &group.accounts {
+            if let Some(account) = existing_account(store, mailbox).await {
+                total = total.saturating_add(account.space_used.unwrap_or(0));
+                seen = true;
+            }
+        }
+        if !seen || group.space_used == Some(total) {
+            continue;
+        }
+        group.space_used = Some(total);
+        let encoded = serde_json::to_vec_pretty(&group)
+            .map_err(|e| format!("cannot encode the group record: {e}"))?;
+        if let Err(e) = write_group_state(store, &name, &encoded).await {
+            eprintln!("kyriakon-onboard: recording {name}'s quota: {e}");
         }
     }
     write_quota_state(store).await
 }
 
-/// One `repquota -u` report as `(username, used KB)`. Each member's block is
-/// introduced by `Disk quotas for user <name>` and the first line under it that
-/// begins with the filesystem path carries the used blocks as its second field.
-/// A line the parse cannot follow ends that member's entry rather than being
-/// guessed at.
+/// One OpenBSD `repquota -u` report as `(username, used KB)`.
+///
+/// The table is two header lines and then one row per uid:
+///
+///```text
+///                        KByte limits               File limits
+///User            used    soft    hard  grace    used  soft  hard  grace
+///alice             --    1024 5242880 5767168        --    10     0     0
+///```
+///
+/// The two characters after the name are the block and inode over-soft-limit
+/// flags, written with no space between them. A name that fills the ten-column
+/// field carries them with no separating space, so the pair is recognised at
+/// the end of the first token before the name and the used figure are read. A
+/// report of another shape (`quota -v`'s `Disk quotas for user` blocks, an empty
+/// table, `***` verbose lines) yields nothing rather than a guess.
 pub fn parse_repquota(report: &str) -> Vec<(String, u64)> {
     let mut out = Vec::new();
-    let mut member: Option<String> = None;
     for line in report.lines() {
-        if let Some(rest) = line.strip_prefix("Disk quotas for user ") {
-            member = rest
-                .split_whitespace()
-                .next()
-                .map(|name| name.trim_end_matches(':').to_string());
+        let text = line.trim();
+        if text.is_empty()
+            || text.starts_with("KByte")
+            || text.starts_with("User ")
+            || text.starts_with("***")
+        {
             continue;
         }
-        let Some(name) = member.clone() else {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(first) = fields.first() else {
             continue;
         };
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 2 || fields[0].eq_ignore_ascii_case("Filesystem") {
+        let (name, next) = if first.len() > 2 && over_limit_flags(&first[first.len() - 2..]) {
+            (&first[..first.len() - 2], 1)
+        } else if fields.len() > 2 && over_limit_flags(fields[1]) {
+            (*first, 2)
+        } else {
+            continue;
+        };
+        if name.is_empty() {
             continue;
         }
-        if let Ok(used) = fields[1].parse::<u64>() {
-            out.push((name, used));
-            member = None;
+        if let Some(used) = fields.get(next).and_then(|field| field.parse::<u64>().ok()) {
+            out.push((name.to_string(), used));
         }
     }
     out
+}
+
+/// The two over-limit markers `repquota` prints before the used figure.
+fn over_limit_flags(field: &str) -> bool {
+    field.len() == 2 && field.bytes().all(|b| b == b'+' || b == b'-')
 }
 
 /// The sweep's own due stamp, root-only at the store root. It carries the time
@@ -6553,23 +6616,36 @@ mod tests {
         assert_eq!(retry_after_minutes(40), 60);
     }
 
-    /// `repquota -u` output as the sweep reads it: the used blocks are the
-    /// second field of the filesystem line under each member's header. A
-    /// report it cannot follow yields nothing rather than a guess.
+    /// OpenBSD `repquota -u` output as the sweep reads it: two header lines and
+    /// one row per uid, with the two over-limit markers between the name and the
+    /// used figure. A `quota -v` block, which uses `Disk quotas for user`, and an
+    /// empty table both yield nothing rather than a guess.
     #[test]
     fn a_repquota_report_yields_each_members_used_blocks() {
-        let report = "Disk quotas for user alice (uid 1001):\n\
-                      Filesystem   blocks   quota   limit   grace   files   quota   limit   grace\n\
-                      /dev/sd1l      1024  5242880 5767168              10       0       0\n\
-                      Disk quotas for user secretary (uid 1002):\n\
-                      Filesystem   blocks   quota   limit   grace   files   quota   limit   grace\n\
-                      /dev/sd1l       512  5242880 5767168               3       0       0\n";
+        let report = "                        KByte limits               File limits\n\
+                      User            used    soft    hard  grace    used  soft  hard  grace\n\
+                      alice             --   1024 5242880 5767168        --    10     0     0\n\
+                      secretary         --    512 5242880 5767168        --     3     0     0\n";
         assert_eq!(
             parse_repquota(report),
             [("alice".to_string(), 1024), ("secretary".to_string(), 512)]
         );
-        // A filesystem with quotas off prints nothing, and a report of another
-        // shape changes nothing.
+        // A name that fills the ten-column field carries the markers with no
+        // separating space.
+        assert_eq!(
+            parse_repquota(
+                "User used soft hard grace used soft hard grace\n\
+                 averylonguser--   2048 5242880 5767168        --     1     0     0\n"
+            ),
+            [("averylonguser".to_string(), 2048)]
+        );
+        // `quota -v`'s per-user blocks are another report entirely.
+        assert!(parse_repquota(
+            "Disk quotas for user alice (uid 1001):\n\
+             Filesystem blocks quota limit grace files quota limit grace\n\
+             /dev/sd1l 1024 5242880 5767168 10 0 0\n"
+        )
+        .is_empty());
         assert!(parse_repquota("").is_empty());
         assert!(parse_repquota("no quota table here\n").is_empty());
     }
@@ -6647,10 +6723,26 @@ mod tests {
         std::fs::create_dir_all(dir.join("store")).unwrap();
         fixture_account(&dir.join("store"), "alice");
         fixture_account(&dir.join("store"), "secretary");
+        let group_dir = dir.join("store/groups/parish.example");
+        std::fs::create_dir_all(&group_dir).unwrap();
+        std::fs::write(
+            group_dir.join("group.json"),
+            serde_json::to_vec_pretty(&json!({
+                "version": 1, "domain": "parish.example", "name": "Parish",
+                "kind": "parish",
+                "payment": {"rail": "cash", "no_charge": false, "paid_until": null},
+                "accounts": ["alice", "secretary"], "site_owner": "alice"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let cfg = quota_config(&dir);
         let store = Store::new_for_test(&cfg.store_root);
         // The sweep takes `-u` and the mount the config names.
-        cfg_script(&dir, "printf '%s\\n' 'Disk quotas for user alice (uid 1001):' 'Filesystem blocks quota limit grace files quota limit grace' '/dev/sd1l 1024 5242880 5767168 10 0 0' 'Disk quotas for user secretary (uid 1002):' 'Filesystem blocks quota limit grace files quota limit grace' '/dev/sd1l 512 5242880 5767168 3 0 0'\n");
+        cfg_script(
+            &dir,
+            "printf '%s\\n' 'User used soft hard grace used soft hard grace' 'alice -- 1024 5242880 5767168 -- 10 0 0' 'secretary -- 512 5242880 5767168 -- 3 0 0'\n",
+        );
 
         refresh_space_used(&cfg, &store).await.unwrap();
         assert_eq!(
@@ -6668,9 +6760,18 @@ mod tests {
             std::fs::read_to_string(dir.join("repquota.args")).unwrap(),
             "-u /home\n"
         );
+        // The group holds the sum of its mailboxes' figures.
+        let group = group_record(&store, "parish.example")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(group.space_used, Some((1024 + 512) * 1024));
 
         // The hour's cache: a second pass does not run the report again.
-        cfg_script(&dir, "printf '%s\\n' 'Disk quotas for user alice (uid 1001):' '/dev/sd1l 2048 5242880 5767168 10 0 0'\n");
+        cfg_script(
+            &dir,
+            "printf '%s\\n' 'User used soft hard grace used soft hard grace' 'alice -- 2048 5242880 5767168 -- 10 0 0'\n",
+        );
         refresh_space_used(&cfg, &store).await.unwrap();
         assert_eq!(
             existing_account(&store, "alice").await.unwrap().space_used,
