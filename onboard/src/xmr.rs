@@ -180,17 +180,60 @@ async fn fetch(cfg: &DrainConfig) -> Option<String> {
             .args(["-fsS", "-m", "15", &endpoint])
             .output()
     })
-    .await
-    .ok()?
-    .ok()?;
+    .await;
+    let out = match out {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            eprintln!(
+                "kyriakon-onboard: cannot run the rate fetch {}: {e}; is it installed?",
+                cfg.rates_fetch
+            );
+            return None;
+        }
+        Err(e) => {
+            eprintln!("kyriakon-onboard: the rate fetch did not finish: {e}");
+            return None;
+        }
+    };
     if !out.status.success() {
+        let reason = String::from_utf8_lossy(&out.stderr);
+        eprintln!(
+            "kyriakon-onboard: {} {} exited {}: {}",
+            cfg.rates_fetch,
+            cfg.rate_endpoint,
+            out.status,
+            reason.trim()
+        );
         return None;
     }
-    let body: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let body: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+        Ok(body) => body,
+        Err(e) => {
+            eprintln!(
+                "kyriakon-onboard: {} answered something that is not the price JSON: {e}",
+                cfg.rate_endpoint
+            );
+            return None;
+        }
+    };
     // `{"monero":{"gbp":409.44,"last_updated_at":1790857880}}`. The number's
     // own text is kept, so no float ever reaches the quote's arithmetic.
-    let rate = body.get("monero")?.get("gbp")?.to_string();
-    valid_rate(&rate).then_some(rate)
+    let Some(rate) = body.get("monero").and_then(|m| m.get("gbp")) else {
+        eprintln!(
+            "kyriakon-onboard: {} answered no monero.gbp price",
+            cfg.rate_endpoint
+        );
+        return None;
+    };
+    let rate = rate.to_string();
+    if !valid_rate(&rate) {
+        eprintln!(
+            "kyriakon-onboard: {} answered a rate that is not a decimal: {rate}",
+            cfg.rate_endpoint
+        );
+        return None;
+    }
+    Some(rate)
 }
 
 /// Write the cache. The temporary file and the rename are what keeps a reader

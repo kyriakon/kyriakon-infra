@@ -1,9 +1,17 @@
 use crate::common::*;
 
-/// A mainnet subaddress: 95 base58 characters beginning with `8`, the shape the
-/// operator's wallet prints.
-fn subaddress(tag: char) -> String {
-    format!("8{}", tag.to_string().repeat(94))
+/// A mainnet subaddress in the shape `monero-wallet-cli` prints: 95 characters
+/// beginning with `8`, every one in base58. The checksum is not checked by the
+/// console (the wallet is the one that can), so this walks the alphabet at an
+/// offset rather than repeating a letter, which is what a real address looks
+/// like to the shape check.
+fn subaddress(offset: usize) -> String {
+    const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let mut out = String::from("8");
+    while out.len() < 95 {
+        out.push(BASE58.as_bytes()[(offset + out.len()) % BASE58.len()] as char);
+    }
+    out
 }
 
 fn view(fix: &Fix, username: &str) -> page::PaymentView {
@@ -73,11 +81,19 @@ fn a_monero_window_is_quoted_once_and_the_page_shows_the_address_quote_and_rate(
 
     // The wallet pass records the subaddress; the account page and the status
     // page's copy both carry it.
-    let address = subaddress('A');
+    let address = subaddress(0);
     let out = fix.ctl(&["monero", "address", "secretary", &address]);
     assert!(out.status.success(), "{}", body(&out));
     let account = fix.account("secretary");
     assert_eq!(account["payment"]["monero"]["address"], json!(address));
+    // The handler reads the record as `_onboard`: the write must not leave a
+    // 0600 root file behind.
+    let mode = std::fs::metadata(fix.dir.join("store/accounts/secretary/account.json"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o640, "the account record is readable by the handler");
     assert_eq!(
         fix.rate_fetches(),
         1,
@@ -111,7 +127,7 @@ fn a_monero_window_is_quoted_once_and_the_page_shows_the_address_quote_and_rate(
     let out = fix.ctl(&["monero", "address", "secretary", &address]);
     assert!(out.status.success(), "{}", body(&out));
     assert!(body(&out).contains("already"), "{}", body(&out));
-    let other = subaddress('B');
+    let other = subaddress(7);
     let out = fix.ctl(&["monero", "address", "secretary", &other]);
     assert!(!out.status.success(), "{}", body(&out));
     assert!(body(&out).contains("never rotated"), "{}", body(&out));
@@ -128,7 +144,7 @@ fn a_monero_window_is_quoted_once_and_the_page_shows_the_address_quote_and_rate(
 fn the_address_command_refuses_another_rails_address_and_a_wrong_shape() {
     let fix = Fix::new("monero-address-refusals");
     approved_paid(&fix, "secretary", "cash");
-    let address = subaddress('A');
+    let address = subaddress(0);
     let out = fix.ctl(&["monero", "address", "secretary", &address]);
     assert!(!out.status.success(), "{}", body(&out));
     assert!(body(&out).contains("cash rail"), "{}", body(&out));
@@ -320,5 +336,78 @@ fn a_monero_payment_within_one_percent_is_paid_and_an_excess_is_held() {
         account["payment"]["balance_gbp"],
         json!("0.50"),
         "{account}"
+    );
+}
+
+/// A held balance re-quotes the remainder at the window's rate. The stored quote
+/// is for the full price, so without the recomputation the page would ask for
+/// GBP 19.50 beside the XMR amount for GBP 20.00.
+#[test]
+fn a_part_payment_requotes_the_xmr_for_what_is_still_owed() {
+    let fix = Fix::new("monero-requote");
+    fix.rate_source(Some("409.44"));
+    let token = approved_paid(&fix, "secretary", "monero");
+    let today = kyriakon_onboard::util::date_after_days(0);
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "monero",
+        "--amount",
+        "0.50",
+        "--received",
+        &today,
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["payment"]["balance_gbp"],
+        json!("0.50"),
+        "{account}"
+    );
+    assert!(
+        account["payment"]["paid_until"].is_null(),
+        "the window is still open: {account}"
+    );
+    let instructions = view(&fix, "secretary").instructions.join("\n");
+    let remaining = kyriakon_onboard::xmr::quote_xmr(1950, "409.44").unwrap();
+    assert!(
+        instructions.contains(&format!("Send {remaining} XMR for GBP 19.50")),
+        "{instructions}"
+    );
+    assert!(
+        !instructions.contains("0.048848 XMR"),
+        "the full-price quote is not what is owed: {instructions}"
+    );
+
+    // A shortfall above one percent holds what arrived and quotes the rest.
+    let short = Fix::new("monero-requote-short");
+    short.rate_source(Some("409.44"));
+    let token = approved_paid(&short, "secretary", "monero");
+    let out = short.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "monero",
+        "--amount",
+        "15.00",
+        "--received",
+        &today,
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(short.drain().status.success());
+    assert_eq!(
+        short.account("secretary")["payment"]["balance_gbp"],
+        json!("15.00")
+    );
+    let instructions = view(&short, "secretary").instructions.join("\n");
+    let remaining = kyriakon_onboard::xmr::quote_xmr(500, "409.44").unwrap();
+    assert!(
+        instructions.contains(&format!("Send {remaining} XMR for GBP 5.00")),
+        "{instructions}"
     );
 }

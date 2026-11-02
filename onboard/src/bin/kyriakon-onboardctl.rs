@@ -1289,9 +1289,6 @@ async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(),
     Ok(())
 }
 
-/// `free`: how many accounts were approved without charge. The count is read
-/// from the accounts themselves rather than kept beside them, so it cannot
-/// drift; a group mailbox is not counted, because the group holds the payment.
 /// `monero address <username> <address>`: record the subaddress the operator's
 /// own wallet made for this member. The account is read and written here, at the
 /// terminal, because root runs it and the address is the operator's own fact;
@@ -1345,9 +1342,10 @@ async fn monero(store: &Store, args: &[String]) -> Result<(), String> {
     account.payment = Some(payment.clone());
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
-    store
-        .write_record(&format!("accounts/{username}"), "account.json", &bytes)
-        .await?;
+    // The same writer the drain uses: the handler reads this record as
+    // `_onboard`, so a 0600 root file would leave the page without a payment
+    // block.
+    transitions::write_account_record(store, username, &bytes).await?;
     transitions::write_payment_copy(store, username, &payment).await?;
     println!("recorded Monero subaddress for {username}: {address}");
     Ok(())
@@ -1371,6 +1369,9 @@ fn monero_address_shape(address: &str) -> Option<&'static str> {
     None
 }
 
+/// `free`: how many accounts were approved without charge. The count is read
+/// from the accounts themselves rather than kept beside them, so it cannot
+/// drift; a group mailbox is not counted, because the group holds the payment.
 async fn free(store: &Store, rest: &[String]) -> Result<(), String> {
     if !rest.is_empty() {
         return Err(usage());

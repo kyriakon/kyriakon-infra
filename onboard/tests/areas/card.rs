@@ -297,10 +297,10 @@ fn a_valid_event_with_no_matching_application_writes_nothing() {
         .keys()
         .chain(after.keys())
         .filter(|k| !k.starts_with("webhooks/"))
-        // The rate cache and its failed-attempt stamp are the drain's own
-        // housekeeping, not payment state: a pass refreshes them before it
-        // looks at anything an event could have settled.
-        .filter(|k| !k.starts_with("rates/"))
+        // The drain refreshes the rate cache before it looks at any event: the
+        // cache itself and the stamp for a failed attempt are named exactly, so
+        // a third file appearing under `rates/` still fails this check.
+        .filter(|k| *k != "rates/xmr-gbp.json" && *k != "rates/xmr-gbp.json.attempt")
         .filter(|k| !k.ends_with(".drain.lock"))
         .filter(|k| before.get(*k) != after.get(*k))
         .collect();

@@ -4327,7 +4327,11 @@ async fn write_group_record(store: &Store, group: &GroupRecord) -> Result<(), St
 /// the record holds no secret: the group's token stays in `tokens/` and the
 /// ledger. The directory's own group is the owner, so the deploy's modes are
 /// what decide who can read it rather than a second list here.
-async fn write_account_record(store: &Store, username: &str, bytes: &[u8]) -> Result<(), String> {
+pub async fn write_account_record(
+    store: &Store,
+    username: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
     store
         .write_record_mode(
             &format!("accounts/{username}"),
@@ -6260,17 +6264,26 @@ pub fn rail_instructions(
                             .to_string(),
                     ),
                 }
-                if let (Some(quote), Some(rate)) =
-                    (m.quote_xmr.as_deref(), m.rate_gbp_per_xmr.as_deref())
-                {
-                    let on = m
-                        .rate_at
-                        .as_deref()
-                        .and_then(|at| at.get(..10))
-                        .unwrap_or("");
-                    out.push(format!(
-                        "Send {quote} XMR for GBP {amount_gbp}, quoted at GBP {rate} per XMR on {on}."
-                    ));
+                if let Some(rate) = m.rate_gbp_per_xmr.as_deref() {
+                    // The stored quote is for the full price. A held balance
+                    // re-quotes what is still owed at the same rate, because
+                    // otherwise the page asks for GBP 19.50 and the XMR amount
+                    // for GBP 20.00 beside it. On a window with nothing held the
+                    // recomputation is the stored quote.
+                    let quote = crate::util::pence(amount_gbp)
+                        .ok()
+                        .and_then(|pence| crate::xmr::quote_xmr(pence, rate).ok())
+                        .or_else(|| m.quote_xmr.clone());
+                    if let Some(quote) = quote {
+                        let on = m
+                            .rate_at
+                            .as_deref()
+                            .and_then(|at| at.get(..10))
+                            .unwrap_or("");
+                        out.push(format!(
+                            "Send {quote} XMR for GBP {amount_gbp}, quoted at GBP {rate} per XMR on {on}."
+                        ));
+                    }
                 }
                 out.push(
                     "The pound amount is what is owed; the quoted amount in Monero settles it."
