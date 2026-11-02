@@ -386,6 +386,18 @@ fn filed(dir: &Path) -> usize {
         .sum()
 }
 
+/// The one intent a page action filed, as the drain will read it. A test that
+/// lets the route file a second one is testing the wrong thing, so this is
+/// strict about the count.
+fn filed_intent(dir: &Path) -> serde_json::Value {
+    let mut intents: Vec<PathBuf> = std::fs::read_dir(dir.join("intents"))
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    assert_eq!(intents.len(), 1, "one intent, not {}", intents.len());
+    serde_json::from_str(&std::fs::read_to_string(intents.remove(0)).unwrap()).unwrap()
+}
+
 /// A record of the shape the store holds, as the drain leaves one when it decides.
 /// The fields the drain owns are the caller's.
 fn decided(stage: &str, decided_at: Option<&str>, password_link: Option<&str>) -> Record {
@@ -1160,6 +1172,383 @@ async fn the_account_pages_export_action_files_an_intent_for_the_session_account
         std::fs::read_dir(dir.join("intents")).unwrap().count(),
         1,
         "no second intent"
+    );
+}
+
+/// The password form re-enters the current password whatever the session's age,
+/// and files one intent carrying the new hash and nothing else. A wrong current
+/// password, a short new one and a mismatched pair all file nothing.
+#[tokio::test]
+async fn the_password_form_requires_the_current_password_and_files_one_intent() {
+    let (mut app, dir) = handler("account-password").await;
+    file_account(&dir);
+    app.auth = session::Authenticator {
+        program: session::stub::checker("account-password", "right horse battery"),
+        args: Vec::new(),
+    };
+    let cookie = signed_in(&app, "alice").await;
+
+    for body in [
+        "password=&new_password=twelve+chars%21&confirm_password=twelve+chars%21",
+        "password=wrong+horse+battery&new_password=twelve+chars%21&confirm_password=twelve+chars%21",
+        "password=right+horse+battery&new_password=short&confirm_password=short",
+        "password=right+horse+battery&new_password=twelve+chars%21&confirm_password=other+chars%21",
+    ] {
+        let (code, refused) = answer(
+            &app,
+            &httpd_post_with("/account/password", body, Some(&cookie)),
+        )
+        .await;
+        assert_eq!(code, 403, "{body}: {refused}");
+        assert_eq!(filed(&dir), 0, "{body} filed something");
+    }
+
+    let (code, page) = answer(
+        &app,
+        &httpd_post_with(
+            "/account/password",
+            "password=right+horse+battery&new_password=a+long+new+password&confirm_password=a+long+new+password",
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    assert!(page.contains("Your password is changing"), "{page}");
+    let intent = filed_intent(&dir);
+    assert_eq!(intent["kind"], "change-password");
+    assert_eq!(intent["username"], "alice");
+    assert_eq!(
+        intent["session"],
+        cookie.split('.').next().unwrap(),
+        "the session the drain will verify"
+    );
+    let hash = intent["hash"].as_str().expect("a hash");
+    assert!(crate::password::matches("a long new password", hash));
+    assert!(
+        !serde_json::to_string(&intent)
+            .unwrap()
+            .contains("a long new password"),
+        "the plaintext is nowhere in the intent"
+    );
+}
+
+/// The upload key form adds one key and removes the one on the account; a line
+/// that is not a bare OpenSSH key, and a fingerprint the account does not carry,
+/// are both refused before anything is filed.
+#[tokio::test]
+async fn the_upload_key_forms_add_and_remove_the_one_key() {
+    const UPLOAD: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample secretary@example";
+    let (app, dir) = handler("account-upload-key").await;
+    file_account(&dir);
+    let fingerprint = keycheck::openssh_fingerprint(UPLOAD).unwrap();
+    amend_account(&dir, "alice", |value| {
+        value["upload_keys"] = serde_json::json!([
+            {"fingerprint": fingerprint, "added_at": "2026-10-02T09:00:00Z"}
+        ]);
+    });
+    let cookie = signed_in(&app, "alice").await;
+
+    let (code, refused) = answer(
+        &app,
+        &httpd_post_with(
+            "/account/upload-key",
+            "action=add&key=not+a+key",
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(code, 403, "{refused}");
+    let (code, _) = answer(
+        &app,
+        &httpd_post_with(
+            "/account/upload-key",
+            "action=remove&fingerprint=SHA256%3Anot-on-the-account",
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(code, 403);
+    assert_eq!(filed(&dir), 0, "a refused key filed something");
+
+    let body = format!("action=add&key={}", UPLOAD.replace(' ', "%20"));
+    let (code, page) = answer(
+        &app,
+        &httpd_post_with("/account/upload-key", &body, Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    let intent = filed_intent(&dir);
+    assert_eq!(intent["kind"], "upload-key");
+    assert_eq!(intent["action"], "add");
+    assert_eq!(intent["material"], UPLOAD);
+
+    // The removal names the fingerprint, which is what the page shows.
+    std::fs::remove_dir_all(dir.join("intents")).unwrap();
+    std::fs::create_dir_all(dir.join("intents")).unwrap();
+    let encoded = fingerprint.replace(':', "%3A");
+    let (code, page) = answer(
+        &app,
+        &httpd_post_with(
+            "/account/upload-key",
+            &format!("action=remove&fingerprint={encoded}"),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    let intent = filed_intent(&dir);
+    assert_eq!(intent["kind"], "upload-key");
+    assert_eq!(intent["action"], "remove");
+    assert_eq!(intent["fingerprint"], fingerprint);
+}
+
+/// The contact address form files a set or a clear, and refuses anything that
+/// is not one address.
+#[tokio::test]
+async fn the_address_form_sets_and_clears_the_contact_address() {
+    let (app, dir) = handler("account-address").await;
+    file_account(&dir);
+    let cookie = signed_in(&app, "alice").await;
+
+    let (code, _) = answer(
+        &app,
+        &httpd_post_with(
+            "/account/address",
+            "address=two%40at%40example.invalid",
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(code, 403);
+    assert_eq!(filed(&dir), 0);
+
+    let (code, page) = answer(
+        &app,
+        &httpd_post_with(
+            "/account/address",
+            "address=alice%40example.invalid",
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    let intent = filed_intent(&dir);
+    assert_eq!(intent["kind"], "outside-address");
+    assert_eq!(intent["address"], "alice@example.invalid");
+
+    std::fs::remove_dir_all(dir.join("intents")).unwrap();
+    std::fs::create_dir_all(dir.join("intents")).unwrap();
+    let (code, _) = answer(
+        &app,
+        &httpd_post_with("/account/address", "address=", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 200);
+    let intent = filed_intent(&dir);
+    assert_eq!(intent["kind"], "outside-address");
+    assert_eq!(
+        intent["address"], "",
+        "an empty field is the clear, not a refusal"
+    );
+}
+
+/// The two serving checkboxes are independent: an absent box is off, and the
+/// intent carries both booleans so the drain can leave the other lane alone.
+#[tokio::test]
+async fn the_serving_form_carries_two_independent_booleans() {
+    let (app, dir) = handler("account-serving").await;
+    file_account(&dir);
+    let cookie = signed_in(&app, "alice").await;
+
+    let (code, page) = answer(
+        &app,
+        &httpd_post_with("/account/serving", "gemini=on", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    let intent = filed_intent(&dir);
+    assert_eq!(intent["kind"], "serving");
+    assert_eq!(intent["http"], serde_json::json!(false), "{intent}");
+    assert_eq!(intent["gemini"], serde_json::json!(true), "{intent}");
+}
+
+/// The renewal control is filed only when the account holds a card
+/// subscription; a prepaid or free account is told there is nothing to stop.
+#[tokio::test]
+async fn the_renewal_control_needs_a_card_subscription() {
+    let (app, dir) = handler("account-renewal-none").await;
+    file_account(&dir);
+    let cookie = signed_in(&app, "alice").await;
+    let (code, refused) = answer(
+        &app,
+        &httpd_post_with("/account/renewal", "action=cancel", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 403, "{refused}");
+    assert_eq!(filed(&dir), 0);
+
+    let (app, dir) = handler("account-renewal-card").await;
+    file_account(&dir);
+    amend_account(&dir, "alice", |value| {
+        value["rail"] = serde_json::json!("card");
+        value["no_charge"] = serde_json::json!(false);
+        value["payment"] = serde_json::json!({
+            "paid_until": "2027-10-02",
+            "stripe": {"subscription": "sub_example", "status": "active"}
+        });
+    });
+    let cookie = signed_in(&app, "alice").await;
+    let (code, page) = answer(
+        &app,
+        &httpd_post_with("/account/renewal", "action=cancel", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    let intent = filed_intent(&dir);
+    assert_eq!(intent["kind"], "cancel-renewal");
+}
+
+/// The mail key form rejects a block that is not a public key and the key
+/// already in use, and files both a replacement and a cancel.
+#[tokio::test]
+async fn the_mail_key_form_starts_and_cancels_a_replacement() {
+    let (app, dir) = handler("account-mail-key").await;
+    file_account(&dir);
+    let key = std::fs::read_to_string(format!(
+        "{}/../docs/planning/prototypes/keygen-spike/fixtures/gpg-aead.asc",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let fingerprint = keycheck::pgp_fingerprint(&key).unwrap();
+    amend_account(&dir, "alice", |value| {
+        value["mail_key"] = serde_json::json!(fingerprint);
+    });
+    let cookie = signed_in(&app, "alice").await;
+
+    let (code, _) = answer(
+        &app,
+        &httpd_post_with(
+            "/account/mail-key",
+            "action=replace&key=not+a+key",
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(code, 403);
+    // The key already in use is not a replacement.
+    let body = format!("action=replace&key={}", url_encode(&key));
+    let (code, refused) = answer(
+        &app,
+        &httpd_post_with("/account/mail-key", &body, Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 403, "{refused}");
+    assert_eq!(filed(&dir), 0);
+
+    // A cancel with nothing pending is refused rather than filed.
+    let (code, _) = answer(
+        &app,
+        &httpd_post_with("/account/mail-key", "action=cancel", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 403);
+    assert_eq!(filed(&dir), 0);
+
+    // A different key and an empty signature starts the window.
+    amend_account(&dir, "alice", |value| {
+        value["mail_key"] = serde_json::json!("AAAA");
+    });
+    let other = std::fs::read_to_string(format!(
+        "{}/../docs/planning/prototypes/keygen-spike/fixtures/gpg-no-encryption-subkey.asc",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let body = format!("action=replace&key={}", url_encode(&other));
+    let (code, page) = answer(
+        &app,
+        &httpd_post_with("/account/mail-key", &body, Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    let intent = filed_intent(&dir);
+    assert_eq!(intent["kind"], "mail-key");
+    assert_eq!(intent["action"], "replace");
+    assert_eq!(intent["signature"], "");
+    assert_eq!(intent["material"], other.trim());
+
+    // With a replacement waiting, the cancel files.
+    std::fs::remove_dir_all(dir.join("intents")).unwrap();
+    std::fs::create_dir_all(dir.join("intents")).unwrap();
+    amend_account(&dir, "alice", |value| {
+        value["rotation"] = serde_json::json!({
+            "fingerprint": "AAAA",
+            "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n-----END PGP PUBLIC KEY BLOCK-----",
+            "requested_at": "2026-10-02T09:00:00Z",
+            "applies_at": "2026-10-05T09:00:00Z"
+        });
+    });
+    let (code, page) = answer(
+        &app,
+        &httpd_post_with("/account/mail-key", "action=cancel", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    let intent = filed_intent(&dir);
+    assert_eq!(intent["kind"], "mail-key");
+    assert_eq!(intent["action"], "cancel");
+}
+
+/// A value for an `application/x-www-form-urlencoded` body, so a pasted key
+/// block with newlines and `+` characters survives the round trip.
+fn url_encode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// The page offers each action, and a waiting replacement carries its cancel.
+#[tokio::test]
+async fn the_account_page_offers_every_action() {
+    let (app, dir) = handler("account-actions-page").await;
+    file_account(&dir);
+    amend_account(&dir, "alice", |value| {
+        value["site_served"] = serde_json::json!(true);
+        value["capsule_served"] = serde_json::json!(false);
+        value["upload_keys"] = serde_json::json!([
+            {"fingerprint": "SHA256:AAAAexamplekey", "added_at": "2026-10-02T09:00:00Z"}
+        ]);
+        value["mail_key"] = serde_json::json!("AAAA");
+        value["rotation"] = serde_json::json!({
+            "fingerprint": "BBBB",
+            "material": "key",
+            "requested_at": "2026-10-02T09:00:00Z",
+            "applies_at": "2026-10-05T09:00:00Z"
+        });
+    });
+    let cookie = signed_in(&app, "alice").await;
+    let (code, body) = answer(&app, &httpd_get_session("account", "", &cookie)).await;
+    assert_eq!(code, 200);
+    for action in [
+        "/account/password",
+        "/account/upload-key",
+        "/account/address",
+        "/account/serving",
+        "/account/mail-key",
+    ] {
+        assert!(body.contains(action), "{action} is missing: {body}");
+    }
+    assert!(body.contains("BBBB"), "the pending key: {body}");
+    assert!(body.contains("Cancel the replacement"), "{body}");
+    assert!(
+        body.contains(r#"name="gemini"#) && !body.contains(r#"name="gemini" checked"#),
+        "the two checkboxes carry their own state: {body}"
     );
 }
 

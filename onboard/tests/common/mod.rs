@@ -598,6 +598,63 @@ impl Fix {
         record
     }
 
+    /// One call to a page action's route as the handler files it: the account,
+    /// a real page session opened for it, and the action's own fields. The
+    /// session is real because the drain re-proves it, so a fixture that
+    /// hand-wrote an id would only be testing itself.
+    pub fn file_page_action(&self, kind: &str, username: &str, fields: Value) -> String {
+        let cookie = self.open_session(username);
+        let session = Self::session_id(&cookie);
+        let id = ulid();
+        let mut intent = fields;
+        intent["id"] = json!(id);
+        intent["kind"] = json!(kind);
+        intent["filed_at"] = json!("2026-10-02T09:00:00Z");
+        intent["username"] = json!(username);
+        intent["session"] = json!(session);
+        self.write_intent(&id, &intent);
+        id
+    }
+
+    /// A plain active account with no payment block and no hosting flags, for a
+    /// test whose subject is one of the page's actions. Fields the test names
+    /// are set beside the required ones.
+    pub fn page_account(&self, username: &str, fields: Value) -> Value {
+        let mut account = json!({
+            "version": 1,
+            "username": username,
+            "state": "active",
+            "decision": "approve",
+            "decided_at": "2026-10-02T09:00:00Z",
+            "rail": "no_charge",
+            "no_charge": true,
+            "created_at": "2026-10-02T09:00:00Z",
+        });
+        if let (Some(base), Value::Object(extra)) = (account.as_object_mut(), fields) {
+            base.extend(extra);
+        }
+        self.write_account(username, &account);
+        account
+    }
+
+    /// Write one account record verbatim, as the drain would.
+    pub fn write_account(&self, username: &str, account: &Value) {
+        let dir = self.dir.join("store/accounts").join(username);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("account.json"),
+            serde_json::to_vec_pretty(account).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Change one field of an account the fixture already wrote.
+    pub fn amend_account(&self, username: &str, amend: impl FnOnce(&mut Value)) {
+        let mut account = self.account(username);
+        amend(&mut account);
+        self.write_account(username, &account);
+    }
+
     /// Write one `provision-group` intent under `id`, as an approval files it.
     pub fn write_group(
         &self,

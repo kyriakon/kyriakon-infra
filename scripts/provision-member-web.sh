@@ -78,6 +78,7 @@ conf_owner="root:wheel"
 usage() {
 	cat >&2 <<'USAGE'
 usage: doas ksh provision-member-web.sh <username>
+       doas ksh provision-member-web.sh --remove <username>
        ksh provision-member-web.sh --self-test
 USAGE
 	exit 2
@@ -197,6 +198,20 @@ assert_member_conf() {
 	[ "$shape" = "$conf_owner 644" ] || die "$conf is $shape, wanted $conf_owner 644"
 }
 
+# remove_member_conf: take the member's generated vhost out, for the account
+# page's "serve your website over HTTP: off". The file is the whole config: the
+# tracked httpd.conf includes an index that cron-apply.sh --web regenerates from
+# the files present, so removing it and running that pass is the entire change,
+# and nothing of the member's is deleted.
+remove_member_conf() {
+	typeset target
+	target=$(member_conf)
+	[ -f "$target" ] || return 0
+	rm -f "$target" || die "could not remove $target"
+	printf 'removed %s: %s.kyriakon.net is no longer served over HTTP\n' "$target" "$user"
+	printf '  next: doas ksh scripts/cron-apply.sh --web   # regenerate the index, check httpd, reload\n'
+}
+
 # The tree this file names, which provision-member.sh builds and which no vhost
 # can serve from if it is gone.
 assert_member_tree() {
@@ -309,6 +324,19 @@ self_test() {
 	check "and the refusal names provision-member.sh" \
 		"$(grep -c 'scripts/provision-member.sh nobody' "$tree/notree.out")" 1
 
+	# 7. the account page's "serve over HTTP: off" removes the generated file and
+	# leaves the member's tree alone; a second removal has nothing to say.
+	user=alice
+	rm -f "$(cert_file)"
+	write_member_conf >/dev/null
+	remove_member_conf >"$tree/remove.out"
+	check "the vhost is removed" "$([ -f "$conf" ] && printf yes || printf no)" no
+	check "and the member's tree is still there" \
+		"$([ -d "$public_root/alice.kyriakon.net/www" ] && printf yes || printf no)" yes
+	check "and it points at the reload pass" "$(grep -c 'cron-apply.sh --web' "$tree/remove.out")" 1
+	remove_member_conf >"$tree/remove-again.out"
+	check "a second removal prints nothing" "$(wc -c <"$tree/remove-again.out" | tr -d ' ')" 0
+
 	self_test_end
 }
 
@@ -318,6 +346,14 @@ case "${1:-}" in
 --self-test)
 	[ "$#" -eq 1 ] || usage
 	self_test
+	;;
+--remove)
+	[ "$#" -eq 2 ] || usage
+	user="$2"
+	name_ok "$user" || die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
+	[ "$(id -u)" -eq 0 ] || die "run this with doas: it removes $httpd_d/$user.kyriakon.net.conf"
+	[ -d "$httpd_d" ] || die "no $httpd_d: doas ksh scripts/deploy-mail.sh creates it"
+	remove_member_conf
 	;;
 "")
 	usage

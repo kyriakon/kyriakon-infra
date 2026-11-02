@@ -76,6 +76,25 @@
 {% endif %}
 
 {#
+  The yearly renewal. The card rail renews itself through Stripe, so stopping it
+  sets `cancel_at_period_end`, which runs to the end of the paid period. The
+  prepaid rails have no processor and nothing to stop, which the page says
+  instead of offering a control that would do nothing.
+#}
+{% if renews %}
+<h3>Yearly renewal</h3>
+<form method="post" action="/account/renewal">
+  <input type="hidden" name="action" value="cancel">
+  <p>Your membership renews automatically each year on the card rail. Stopping it runs the subscription to the end of the period you have paid for; nothing stops early and nothing is refunded.</p>
+  <button class="btn" type="submit">Stop the yearly renewal</button>
+</form>
+{% else %}
+{% if renewal_stopped %}
+<p>The yearly renewal is stopped. The account works until the end of the period you have paid for, and nothing is charged after it.</p>
+{% endif %}
+{% endif %}
+
+{#
   A group mailbox sees the body's billing, quota and state: the payment lives on
   the group's own record so one renewal writes one date, and the page shows that
   record rather than a copy of it.
@@ -115,6 +134,17 @@
 {% else %}
 <p>You gave no address outside the platform. We can only reach you inside this account: if you lose your key or your mail client, you will not hear from us.</p>
 {% endif %}
+{#
+  The contact and recovery address. An empty field clears it, which is the one
+  change that makes the account reachable only from inside itself, so the copy
+  says so rather than treating empty as a mistyped field.
+#}
+<form method="post" action="/account/address">
+  <label for="outside-address">Contact and recovery address</label>
+  <input id="outside-address" type="email" name="address" value="{% if let Some(address) = outside_address %}{{ address }}{% endif %}" autocomplete="email">
+  <button class="btn" type="submit">Save the address</button>
+  <p class="hint">One address outside the platform, or empty to remove it. It is used for notices only, it is never shared, and we never use it to look you up anywhere else. If this address bounces we hold on longer before doing anything final.</p>
+</form>
 
 <h3>Upload keys</h3>
 {% if upload_keys.is_empty() %}
@@ -122,17 +152,103 @@
 {% else %}
 <table>
   <thead>
-    <tr><th>Fingerprint</th><th>Added</th></tr>
+    <tr><th>Fingerprint</th><th>Added</th><th></th></tr>
   </thead>
   <tbody>
   {% for key in upload_keys %}
-    <tr><td><span class="mono">{{ key.fingerprint }}</span></td><td>{{ key.added_at }}</td></tr>
+    <tr>
+      <td><span class="mono">{{ key.fingerprint }}</span></td>
+      <td>{{ key.added_at }}</td>
+      <td>
+        <form method="post" action="/account/upload-key">
+          <input type="hidden" name="action" value="remove">
+          <input type="hidden" name="fingerprint" value="{{ key.fingerprint }}">
+          <button class="btn" type="submit">Remove this key</button>
+        </form>
+      </td>
+    </tr>
   {% endfor %}
   </tbody>
 </table>
 <p>One upload key serves both sftp and git. It is not a login for this page.</p>
 {% endif %}
+{#
+  One key, added or replaced from here. Replacing rather than accumulating is
+  the spec's "one key serves sftp and git", and the drain rebuilds the upload
+  session after the change.
+#}
+<form method="post" action="/account/upload-key">
+  <input type="hidden" name="action" value="add">
+  <label for="upload-key">{% if upload_keys.is_empty() %}Add an upload key{% else %}Replace the upload key{% endif %}</label>
+  <textarea id="upload-key" name="key" rows="3" cols="70" required placeholder="ssh-ed25519 AAAA... you@example"></textarea>
+  <button class="btn" type="submit">Save the upload key</button>
+  <p class="hint">One bare OpenSSH public key line, as <code>ssh-keygen</code> writes it. It gives sftp into your <code>www/</code> and <code>gemini/</code> directories and git into your repositories, and nothing else.</p>
+</form>
+
+{% if has_hosting || site_served || capsule_served %}
+{#
+  The two independent serving booleans. The drain removes or regenerates the
+  member's generated include for the lane that changed and reloads the daemons,
+  so the files stay where they are and a lane turned back on serves what is
+  already there.
+#}
+<h3>Serving</h3>
+<form method="post" action="/account/serving">
+  <label><input type="checkbox" name="http" {% if site_served %}checked{% endif %}> Serve your website over HTTP</label>
+  <label><input type="checkbox" name="gemini" {% if capsule_served %}checked{% endif %}> Serve your capsule over gemini</label>
+  <button class="btn" type="submit">Save serving</button>
+  <p class="hint">The two are independent: turning one off leaves the other serving. Nothing is deleted, so turning one back on publishes what is already in the directory.</p>
+</form>
+{% endif %}
+
+<h3>Your mail key</h3>
+{% if let Some(fingerprint) = mail_key %}
+<p>The key delivery uses now: <span class="mono">{{ fingerprint }}</span></p>
+{% else %}
+<p>The platform has not recorded the fingerprint of the key delivery uses yet.</p>
+{% endif %}
+{% if let Some(rotation) = rotation %}
+{#
+  The 72-hour window. It is cancellable until the moment the sweep applies it,
+  and the warning went to every address the account holds.
+#}
+<div class="warn">
+  <p>A replacement is waiting to be applied at {{ rotation.applies_at }}: <span class="mono">{{ rotation.fingerprint }}</span></p>
+  <p>Mail arriving after that is encrypted to the new key. If you did not ask for this, cancel it now.</p>
+  <form method="post" action="/account/mail-key">
+    <input type="hidden" name="action" value="cancel">
+    <button class="btn" type="submit">Cancel the replacement</button>
+  </form>
+</div>
+{% endif %}
+<form method="post" action="/account/mail-key">
+  <input type="hidden" name="action" value="replace">
+  <label for="mail-key">Replace the mail key</label>
+  <textarea id="mail-key" name="key" rows="6" cols="70" required placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----"></textarea>
+  <label for="mail-key-signature">Signature by the key you use now, optional</label>
+  <textarea id="mail-key-signature" name="signature" rows="4" cols="70" placeholder="-----BEGIN PGP SIGNATURE-----"></textarea>
+  <button class="btn" type="submit">Start the replacement</button>
+  <p class="hint">A replacement takes effect after 72 hours, which is the window in which you can cancel it, and a warning goes to every address the account holds. A request signed with your current private key over the new key's fingerprint applies at once: <code>printf '%s' 'FINGERPRINT' | gpg --detach-sign --armor</code>. Mail delivered before the new key applies stays readable with the old private key; the platform cannot recover either.</p>
+</form>
+
 {% if can_close %}
+{#
+  The mail password. The current one is re-entered however fresh the session is,
+  and the new one is hashed by the handler, so no plaintext is written anywhere.
+  The drain sets the hash as root because the check only verifies.
+#}
+<h3>Mail password</h3>
+<form method="post" action="/account/password">
+  <label for="password">Current mail password, entered again</label>
+  <input id="password" type="password" name="password" autocomplete="current-password" required>
+  <label for="new-password">New mail password, at least 12 characters</label>
+  <input id="new-password" type="password" name="new_password" autocomplete="new-password" required>
+  <label for="confirm-password">New mail password again</label>
+  <input id="confirm-password" type="password" name="confirm_password" autocomplete="new-password" required>
+  <button class="btn" type="submit">Change the mail password</button>
+  <p class="hint">Changing it takes effect within a minute and does not touch your keys or your mail client settings. Use at least 12 characters; a few words are stronger than a short scramble.</p>
+</form>
+
 {#
   The member's own data request. It is a plain form so it works without
   scripting, and it posts only the action: the account comes from the session,
@@ -205,7 +321,7 @@ and copies none of them.</p>
   a reply that says the same thing.
 #}
 <h3>What this page cannot do</h3>
-<p>It cannot read your mail, recover your key, restore deleted mail, or give you a shell. Mail is read in your mail client; a lost key is replaced by the path in the runbook, and a forgotten password can be reset from the address outside the platform if you gave one.</p>
+<p>It cannot read your mail, recover a key, restore deleted mail, or give you a shell. Mail is read in your mail client. A key whose private half is lost is replaced from this page: mail delivered before the new key applies stays readable only with the old private key, which the platform does not hold. A forgotten password can be reset from the address outside the platform if you gave one.</p>
 
 <h3>What the platform offers</h3>
 <ul class="services">

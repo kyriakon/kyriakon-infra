@@ -153,6 +153,103 @@ pub struct CloseIntent {
     pub session: String,
 }
 
+/// A `change-password` intent: the new mail password, hashed by the handler, so
+/// no plaintext is written anywhere. The handler re-checked the current password
+/// through `doveadm auth test`; the drain re-proves the session before it writes
+/// the hash as root, because `intents/` belongs to the unprivileged half.
+#[derive(Debug, serde::Deserialize)]
+pub struct ChangePasswordIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub username: String,
+    pub session: String,
+    pub hash: String,
+}
+
+/// An `upload-key` intent: the one key that serves sftp and git, added or
+/// removed. The fingerprint is the handler's reading of the material, and the
+/// drain recomputes it rather than trusting the intent.
+#[derive(Debug, serde::Deserialize)]
+pub struct UploadKeyIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub username: String,
+    pub session: String,
+    pub action: String,
+    /// A bare OpenSSH public key line, for `add`.
+    #[serde(default)]
+    pub material: String,
+    /// The key to remove, for `remove`.
+    #[serde(default)]
+    pub fingerprint: String,
+}
+
+/// An `outside-address` intent: the contact and recovery address, changed or
+/// cleared. An empty address removes it.
+#[derive(Debug, serde::Deserialize)]
+pub struct OutsideAddressIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub username: String,
+    pub session: String,
+    #[serde(default)]
+    pub address: String,
+}
+
+/// A `serving` intent: the two independent booleans the page's toggles move.
+/// The drain writes the account's state, removes or regenerates the member's
+/// generated include and reloads the daemons.
+#[derive(Debug, serde::Deserialize)]
+pub struct ServingIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub username: String,
+    pub session: String,
+    pub http: bool,
+    pub gemini: bool,
+}
+
+/// A `cancel-renewal` intent: stop the card subscription's yearly renewal. The
+/// prepaid rails have no processor and nothing to cancel, so the handler only
+/// files this for a card account with an attached subscription.
+#[derive(Debug, serde::Deserialize)]
+pub struct CancelRenewalIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub username: String,
+    pub session: String,
+}
+
+/// A `mail-key` intent: replace the mail key, or cancel a replacement already
+/// waiting. A replacement signed by the current key applies at once; one that is
+/// not waits out the 72-hour window, which the page can cancel.
+#[derive(Debug, serde::Deserialize)]
+pub struct MailKeyIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub username: String,
+    pub session: String,
+    pub action: String,
+    #[serde(default)]
+    pub material: String,
+    /// An armored detached signature over the new key's fingerprint, made with
+    /// the current key. Empty means the request is not signed.
+    #[serde(default)]
+    pub signature: String,
+}
+
 /// A manual credit: one payment recorded against the token its account holds.
 /// The console resolves a `--username` to that token before filing, and this
 /// carries the token, the rail, the money, the day the money arrived and the
@@ -1358,6 +1455,14 @@ async fn approve(
                 }]
             })
             .unwrap_or_default(),
+        mail_key: record
+            .mail_keys
+            .first()
+            .map(|key| key.fingerprint.clone())
+            .filter(|f| !f.is_empty()),
+        // A retried approval must not cancel a rotation the member began after
+        // the first pass; the window outlives the intent either way.
+        rotation: existing.as_ref().and_then(|a| a.rotation.clone()),
         suspension_reason: None,
         group: None,
         closing_until: None,
@@ -5178,7 +5283,14 @@ pub async fn provision_group(
             write_public_key(store, mailbox, &intent.upload_key).await?;
         }
         run_script(cfg, "provision-member.sh", &[mailbox]).await?;
-        write_group_account(store, mailbox, &intent.domain, &intent.payment).await?;
+        write_group_account(
+            store,
+            mailbox,
+            &intent.domain,
+            &intent.payment,
+            keys.get(mailbox).and_then(|k| k.first()),
+        )
+        .await?;
         write_group_application(store, mailbox, app_copy.as_deref()).await?;
     }
     // The published set is what the drift check compares the keyring against.
@@ -5307,6 +5419,7 @@ async fn write_group_account(
     mailbox: &str,
     domain: &str,
     payment: &GroupPayment,
+    mail_key: Option<&KeyRecord>,
 ) -> Result<(), String> {
     let existing = existing_account(store, mailbox).await;
     let now = util::filed_at();
@@ -5340,6 +5453,11 @@ async fn write_group_account(
         capsule_served: None,
         space_used: None,
         upload_keys: Vec::new(),
+        mail_key: mail_key
+            .map(|key| key.fingerprint.clone())
+            .filter(|f| !f.is_empty())
+            .or_else(|| existing.as_ref().and_then(|a| a.mail_key.clone())),
+        rotation: existing.as_ref().and_then(|a| a.rotation.clone()),
         suspension_reason: None,
         group: Some(domain.to_string()),
         closing_until: None,
@@ -6019,6 +6137,896 @@ pub async fn close_account(
     store.remove("intents", file).await
 }
 
+/// The account a page action acts on. Every action intent carries the page
+/// session that filed it and no signature, because the handler holds no key:
+/// this is the one check that turns an unprivileged half's file into work for
+/// an authenticated account. A mismatched or expired session, and an account
+/// that has gone, both settle the intent with a journal line and nothing else.
+async fn page_account(
+    cfg: &DrainConfig,
+    store: &Store,
+    id: &str,
+    kind: &str,
+    username: &str,
+    session: &str,
+    file: &str,
+) -> Result<Option<Account>, String> {
+    if let Err(reason) = crate::intents::verify_session(store, session, username).await {
+        return settle_page(
+            cfg,
+            store,
+            id,
+            kind,
+            username,
+            file,
+            "refused",
+            Some(&reason),
+        )
+        .await;
+    }
+    match existing_account(store, username).await {
+        Some(account) => Ok(Some(account)),
+        None => {
+            settle_page(
+                cfg,
+                store,
+                id,
+                kind,
+                username,
+                file,
+                "applied",
+                Some("the account had already gone"),
+            )
+            .await
+        }
+    }
+}
+
+/// Journal one page action and remove its file, for the paths with nothing left
+/// to do. `None` is the caller's signal that the intent is settled.
+#[allow(clippy::too_many_arguments)]
+async fn settle_page(
+    cfg: &DrainConfig,
+    store: &Store,
+    id: &str,
+    kind: &str,
+    username: &str,
+    file: &str,
+    outcome: &str,
+    note: Option<&str>,
+) -> Result<Option<Account>, String> {
+    let application = ApplicationRef {
+        username: username.to_string(),
+        status_token: String::new(),
+    };
+    journal(store, &cfg.release, id, kind, &application, outcome, note).await?;
+    store.remove("intents", file).await?;
+    Ok(None)
+}
+
+/// Refuse one page action with its reason, record that it was refused, and
+/// remove it: the handler validated it on the way in, so a refusal here is
+/// something the intent's own fields get wrong rather than a state to retry.
+async fn refuse_page(
+    cfg: &DrainConfig,
+    store: &Store,
+    id: &str,
+    kind: &str,
+    username: &str,
+    file: &str,
+    reason: &str,
+) -> Result<(), String> {
+    settle_page(
+        cfg,
+        store,
+        id,
+        kind,
+        username,
+        file,
+        "refused",
+        Some(reason),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Write an account record back, readable by the handler and owned the way the
+/// directory's other records are.
+async fn save_account(store: &Store, account: &Account) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(account)
+        .map_err(|e| format!("cannot encode the account: {e}"))?;
+    write_account_record(store, &account.username, &bytes).await
+}
+
+/// A password change from the account page. The handler had the current
+/// password re-entered and checked it through `doveadm auth test`; the hash of
+/// the new one is all this carries, so no plaintext reaches the intent or the
+/// store. `set-mail-password.sh` writes it as root, which replaces the old hash
+/// and makes the old password stop working.
+pub async fn change_password(
+    cfg: &DrainConfig,
+    store: &Store,
+    value: &Value,
+    file: &str,
+) -> Result<(), String> {
+    let intent: ChangePasswordIntent = serde_json::from_value(value.clone())
+        .map_err(|e| format!("the password intent does not parse: {e}"))?;
+    let Some(account) = page_account(
+        cfg,
+        store,
+        &intent.id,
+        &intent.kind,
+        &intent.username,
+        &intent.session,
+        file,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    // The hash is the handler's, and a malformed one is a line `usermod -p`
+    // would write rather than refuse.
+    if !crate::password::is_hash(&intent.hash) {
+        return refuse_page(
+            cfg,
+            store,
+            &intent.id,
+            &intent.kind,
+            &intent.username,
+            file,
+            "the intent does not carry a bcrypt hash",
+        )
+        .await;
+    }
+    run_script(
+        cfg,
+        "set-mail-password.sh",
+        &[&account.username, &intent.hash],
+    )
+    .await?;
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &ApplicationRef {
+            username: account.username.clone(),
+            status_token: String::new(),
+        },
+        "applied",
+        Some("the stored hash is replaced, so the old password no longer authenticates"),
+    )
+    .await?;
+    store.remove("intents", file).await
+}
+
+/// Add or remove the one upload key that serves sftp and git. Adding writes the
+/// key where `provision-member.sh` reads it and rebuilds the member's upload
+/// session; removing takes the store's copy and the authorized_keys line away
+/// and leaves the published site and the mail alone.
+pub async fn upload_key(
+    cfg: &DrainConfig,
+    store: &Store,
+    value: &Value,
+    file: &str,
+) -> Result<(), String> {
+    let intent: UploadKeyIntent = serde_json::from_value(value.clone())
+        .map_err(|e| format!("the upload key intent does not parse: {e}"))?;
+    let Some(mut account) = page_account(
+        cfg,
+        store,
+        &intent.id,
+        &intent.kind,
+        &intent.username,
+        &intent.session,
+        file,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let now = util::filed_at();
+    match intent.action.as_str() {
+        "add" => {
+            if let Err(why) = crate::keycheck::openssh_public_key(&intent.material) {
+                return refuse_page(
+                    cfg,
+                    store,
+                    &intent.id,
+                    &intent.kind,
+                    &intent.username,
+                    file,
+                    &format!("the upload key: {why}"),
+                )
+                .await;
+            }
+            let Some(fingerprint) = crate::keycheck::openssh_fingerprint(&intent.material) else {
+                return refuse_page(
+                    cfg,
+                    store,
+                    &intent.id,
+                    &intent.kind,
+                    &intent.username,
+                    file,
+                    "the upload key carries no key material",
+                )
+                .await;
+            };
+            write_public_key(store, &account.username, &intent.material).await?;
+            run_script(cfg, "provision-member.sh", &[&account.username]).await?;
+            // The first key builds the tree and the two daemon files, so the
+            // index and the reload are due exactly as they are at approval.
+            run_script(cfg, "cron-apply.sh", &["--web"]).await?;
+            account.upload_keys = vec![UploadKey {
+                fingerprint,
+                added_at: now,
+            }];
+        }
+        "remove" => {
+            if !account
+                .upload_keys
+                .iter()
+                .any(|key| key.fingerprint == intent.fingerprint)
+            {
+                return refuse_page(
+                    cfg,
+                    store,
+                    &intent.id,
+                    &intent.kind,
+                    &intent.username,
+                    file,
+                    "that key is not on the account",
+                )
+                .await;
+            }
+            store
+                .remove("keys", &format!("{}.pub", account.username))
+                .await?;
+            run_script(cfg, "remove-upload-key.sh", &[&account.username]).await?;
+            account.upload_keys.clear();
+        }
+        other => {
+            return refuse_page(
+                cfg,
+                store,
+                &intent.id,
+                &intent.kind,
+                &intent.username,
+                file,
+                &format!("{other:?} is not an upload-key action"),
+            )
+            .await
+        }
+    }
+    save_account(store, &account).await?;
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &ApplicationRef {
+            username: account.username.clone(),
+            status_token: String::new(),
+        },
+        "applied",
+        Some(&format!("the upload key was {}", intent.action)),
+    )
+    .await?;
+    store.remove("intents", file).await
+}
+
+/// Change or clear the contact and recovery address. The address is
+/// revalidated here because it becomes a mail header, and the drain's notices
+/// read it before they read anything else.
+pub async fn set_outside_address(
+    cfg: &DrainConfig,
+    store: &Store,
+    value: &Value,
+    file: &str,
+) -> Result<(), String> {
+    let intent: OutsideAddressIntent = serde_json::from_value(value.clone())
+        .map_err(|e| format!("the address intent does not parse: {e}"))?;
+    let Some(mut account) = page_account(
+        cfg,
+        store,
+        &intent.id,
+        &intent.kind,
+        &intent.username,
+        &intent.session,
+        file,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let address = intent.address.trim();
+    let outside = if address.is_empty() {
+        None
+    } else {
+        if let Some(why) = validate::address(address) {
+            return refuse_page(
+                cfg,
+                store,
+                &intent.id,
+                &intent.kind,
+                &intent.username,
+                file,
+                &format!("the address outside the platform {address:?}: {why}"),
+            )
+            .await;
+        }
+        Some(address.to_string())
+    };
+    let note = if outside.is_some() {
+        "the contact and recovery address is set"
+    } else {
+        "the contact and recovery address is cleared"
+    };
+    account.outside_address = outside;
+    save_account(store, &account).await?;
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &ApplicationRef {
+            username: account.username.clone(),
+            status_token: String::new(),
+        },
+        "applied",
+        Some(note),
+    )
+    .await?;
+    store.remove("intents", file).await
+}
+
+/// Turn HTTP or gemini serving on or off. The two are independent: the drain
+/// touches only the lane whose boolean changed, and one reload covers both
+/// because it is a config write and not a service call.
+pub async fn set_serving(
+    cfg: &DrainConfig,
+    store: &Store,
+    value: &Value,
+    file: &str,
+) -> Result<(), String> {
+    let intent: ServingIntent = serde_json::from_value(value.clone())
+        .map_err(|e| format!("the serving intent does not parse: {e}"))?;
+    let Some(mut account) = page_account(
+        cfg,
+        store,
+        &intent.id,
+        &intent.kind,
+        &intent.username,
+        &intent.session,
+        file,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let http_changed = account.site_served != Some(intent.http);
+    let gemini_changed = account.capsule_served != Some(intent.gemini);
+    if http_changed {
+        if intent.http {
+            run_script(cfg, "provision-member-web.sh", &[&account.username]).await?;
+        } else {
+            run_script(
+                cfg,
+                "provision-member-web.sh",
+                &["--remove", &account.username],
+            )
+            .await?;
+        }
+    }
+    if gemini_changed {
+        if intent.gemini {
+            run_script(cfg, "provision-member-capsule.sh", &[&account.username]).await?;
+        } else {
+            run_script(
+                cfg,
+                "provision-member-capsule.sh",
+                &["--remove", &account.username],
+            )
+            .await?;
+        }
+    }
+    if http_changed || gemini_changed {
+        // Regenerates the two indexes from the files present, checks each
+        // daemon and reloads it: one pass for a batch rather than one a lane.
+        run_script(cfg, "cron-apply.sh", &["--web"]).await?;
+    }
+    account.site_served = Some(intent.http);
+    account.capsule_served = Some(intent.gemini);
+    save_account(store, &account).await?;
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &ApplicationRef {
+            username: account.username.clone(),
+            status_token: String::new(),
+        },
+        "applied",
+        Some(&format!(
+            "serving is http {} and gemini {}",
+            intent.http, intent.gemini
+        )),
+    )
+    .await?;
+    store.remove("intents", file).await
+}
+
+/// Stop the card subscription's yearly renewal. Stripe's
+/// `cancel_at_period_end` runs to the period's end, and the paid-until date on
+/// the account is what decides access, so nothing is shortened here.
+pub async fn cancel_renewal(
+    cfg: &DrainConfig,
+    store: &Store,
+    value: &Value,
+    file: &str,
+) -> Result<(), String> {
+    let intent: CancelRenewalIntent = serde_json::from_value(value.clone())
+        .map_err(|e| format!("the renewal intent does not parse: {e}"))?;
+    let Some(mut account) = page_account(
+        cfg,
+        store,
+        &intent.id,
+        &intent.kind,
+        &intent.username,
+        &intent.session,
+        file,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let Some(payment) = account.payment.as_mut() else {
+        return refuse_page(
+            cfg,
+            store,
+            &intent.id,
+            &intent.kind,
+            &intent.username,
+            file,
+            "the account has no card subscription to cancel",
+        )
+        .await;
+    };
+    let Some(subscription) = payment.stripe.subscription.clone() else {
+        return refuse_page(
+            cfg,
+            store,
+            &intent.id,
+            &intent.kind,
+            &intent.username,
+            file,
+            "the account has no card subscription to cancel",
+        )
+        .await;
+    };
+    if !payment.stripe.cancel_at_period_end {
+        run_script(
+            cfg,
+            "stripe-api.sh",
+            &["cancel", &subscription, &cfg.stripe_api_key],
+        )
+        .await?;
+        payment.stripe.cancel_at_period_end = true;
+        save_account(store, &account).await?;
+    }
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &ApplicationRef {
+            username: account.username.clone(),
+            status_token: String::new(),
+        },
+        "applied",
+        Some("the subscription stops renewing at the end of the period"),
+    )
+    .await?;
+    store.remove("intents", file).await
+}
+
+/// The addresses a notice about this account goes to: its own platform
+/// address, and the contact address when the member gave one. The platform
+/// address is derived from the mailbox and its group's domain, so a body's
+/// mailbox is not told to write to `@kyriakon.net`.
+fn account_addresses(account: &Account) -> Vec<String> {
+    let own = match account.group.as_deref() {
+        Some(domain) => format!("{}@{}", account.username, domain),
+        None => format!("{}@kyriakon.net", account.username),
+    };
+    let mut out = vec![own];
+    if let Some(outside) = account.outside_address.as_deref() {
+        if out.iter().all(|own| own != outside) {
+            out.push(outside.to_string());
+        }
+    }
+    out
+}
+
+/// One notice to every address the account holds. The record is deduplicated on
+/// its type and subject, so the second address takes a type of its own: the
+/// confirmation has to reach both channels, and a second copy of the same
+/// subject is a different send rather than a retry.
+async fn rotation_notices(
+    cfg: &DrainConfig,
+    store: &Store,
+    account: &Account,
+    notice_type: &str,
+    subject: &str,
+    body: &str,
+) -> Result<(), String> {
+    for (i, to) in account_addresses(account).iter().enumerate() {
+        let kind = if i == 0 {
+            notice_type.to_string()
+        } else {
+            format!("{notice_type}.outside")
+        };
+        notice::send_account_notice(cfg, store, &account.username, &kind, subject, to, body)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Whether `signature` is a detached signature by the key the box delivers
+/// with, over `fingerprint`. A scratch homedir holds just that one key, so a
+/// good signature is by the current key and by nothing else; `Ok(false)` is a
+/// signature that does not verify, and `Err` is gpg failing to run at all.
+async fn signed_by_current_key(
+    cfg: &DrainConfig,
+    key_file: &std::path::Path,
+    fingerprint: &str,
+    signature: &str,
+) -> Result<bool, String> {
+    // gpg's agent socket lives under the homedir, and a UNIX socket path is
+    // bounded: a long per-user temp directory fails to connect the agent rather
+    // than failing to read the key. /tmp is short on every box this runs on.
+    let home = std::path::PathBuf::from("/tmp")
+        .join(format!("kyriakon-rotation-gpg-{}", ulid::Ulid::new()));
+    tokio::fs::create_dir_all(&home)
+        .await
+        .map_err(|e| format!("cannot create {}: {e}", home.display()))?;
+    // gpg refuses a homedir another user could read, and the scratch directory
+    // is created with the process umask otherwise.
+    tokio::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+        .await
+        .map_err(|e| format!("cannot set the mode on {}: {e}", home.display()))?;
+    let run = async {
+        let import = Command::new(&cfg.gpg)
+            .args(["--batch", "--no-tty", "--no-options", "--homedir"])
+            .arg(&home)
+            .arg("--import")
+            .arg(key_file)
+            .output()
+            .await
+            .map_err(|e| format!("cannot run {}: {e}", cfg.gpg))?;
+        if !import.status.success() {
+            return Err(format!(
+                "gpg could not read {} ({}): {}",
+                key_file.display(),
+                import.status,
+                String::from_utf8_lossy(&import.stderr).trim()
+            ));
+        }
+        let payload = home.join("fingerprint");
+        tokio::fs::write(&payload, fingerprint.as_bytes())
+            .await
+            .map_err(|e| format!("cannot write {}: {e}", payload.display()))?;
+        let sig = home.join("signature.asc");
+        tokio::fs::write(&sig, signature.as_bytes())
+            .await
+            .map_err(|e| format!("cannot write {}: {e}", sig.display()))?;
+        let verify = Command::new(&cfg.gpg)
+            .args(["--batch", "--no-tty", "--no-options", "--homedir"])
+            .arg(&home)
+            .arg("--verify")
+            .arg(&sig)
+            .arg(&payload)
+            .output()
+            .await
+            .map_err(|e| format!("cannot run {}: {e}", cfg.gpg))?;
+        Ok(verify.status.success())
+    }
+    .await;
+    let _ = tokio::fs::remove_dir_all(&home).await;
+    run
+}
+
+/// Apply a pending rotation: the new key into the keyring delivery reads, the
+/// fingerprint onto the account, the window cleared and the news sent to every
+/// address. The published set follows by the runbook's rotation path, not here.
+async fn apply_rotation(
+    cfg: &DrainConfig,
+    store: &Store,
+    account: &mut Account,
+    rotation: &store::Rotation,
+) -> Result<(), String> {
+    let key = crate::keycheck::mail_key(String::new(), &rotation.material);
+    if key.fingerprint != rotation.fingerprint {
+        return Err(format!(
+            "the pending key's fingerprint is {} and the key reads as {}",
+            rotation.fingerprint, key.fingerprint
+        ));
+    }
+    publish_mail_keys(cfg, &account.username, std::slice::from_ref(&key)).await?;
+    account.mail_key = Some(rotation.fingerprint.clone());
+    account.rotation = None;
+    save_account(store, account).await?;
+    let body = format!(
+        "The new mail key for {} is in use. Mail arriving from now is encrypted to it, \
+         and mail delivered before it arrived stays readable with the key you held then. \
+         If you did not ask for this, write to admin@kyriakon.net at once.",
+        account.username
+    );
+    rotation_notices(
+        cfg,
+        store,
+        account,
+        "rotation.applied",
+        &format!("Your new mail key is in use ({})", rotation.fingerprint),
+        &body,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Start a mail-key replacement, or cancel one already waiting. A replacement
+/// not signed by the current key waits out the window; the sweep below applies
+/// it when the window closes, and the page's cancel clears it before then.
+pub async fn mail_key(
+    cfg: &DrainConfig,
+    store: &Store,
+    value: &Value,
+    file: &str,
+) -> Result<(), String> {
+    let intent: MailKeyIntent = serde_json::from_value(value.clone())
+        .map_err(|e| format!("the mail key intent does not parse: {e}"))?;
+    let Some(mut account) = page_account(
+        cfg,
+        store,
+        &intent.id,
+        &intent.kind,
+        &intent.username,
+        &intent.session,
+        file,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let application = ApplicationRef {
+        username: account.username.clone(),
+        status_token: String::new(),
+    };
+    match intent.action.as_str() {
+        "cancel" => {
+            let Some(cancelled) = account.rotation.as_ref().map(|r| r.fingerprint.clone()) else {
+                journal(
+                    store,
+                    &cfg.release,
+                    &intent.id,
+                    &intent.kind,
+                    &application,
+                    "applied",
+                    Some("no replacement was pending"),
+                )
+                .await?;
+                return store.remove("intents", file).await;
+            };
+            account.rotation = None;
+            save_account(store, &account).await?;
+            let body = "The replacement of your mail key was cancelled. The key in use is \
+                        unchanged, and mail keeps arriving to it."
+                .to_string();
+            rotation_notices(
+                cfg,
+                store,
+                &account,
+                "rotation.cancelled",
+                &format!("Your mail key replacement was cancelled ({cancelled})"),
+                &body,
+            )
+            .await?;
+            journal(
+                store,
+                &cfg.release,
+                &intent.id,
+                &intent.kind,
+                &application,
+                "applied",
+                Some("the pending replacement was cancelled"),
+            )
+            .await?;
+            store.remove("intents", file).await
+        }
+        "replace" => {
+            if let Err(why) = crate::keycheck::pgp_public_key(&intent.material) {
+                return refuse_page(
+                    cfg,
+                    store,
+                    &intent.id,
+                    &intent.kind,
+                    &intent.username,
+                    file,
+                    &format!("the mail key: {why}"),
+                )
+                .await;
+            }
+            let Some(fingerprint) = crate::keycheck::pgp_fingerprint(&intent.material) else {
+                return refuse_page(
+                    cfg,
+                    store,
+                    &intent.id,
+                    &intent.kind,
+                    &intent.username,
+                    file,
+                    "the mail key carries no key packet",
+                )
+                .await;
+            };
+            if account.mail_key.as_deref() == Some(fingerprint.as_str()) {
+                return refuse_page(
+                    cfg,
+                    store,
+                    &intent.id,
+                    &intent.kind,
+                    &intent.username,
+                    file,
+                    "that is the key already in use",
+                )
+                .await;
+            }
+            let key_file =
+                std::path::Path::new(&cfg.keyring_dir).join(format!("{}.asc", account.username));
+            let signed = if intent.signature.trim().is_empty() {
+                false
+            } else {
+                if !key_file.is_file() {
+                    return refuse_page(
+                        cfg,
+                        store,
+                        &intent.id,
+                        &intent.kind,
+                        &intent.username,
+                        file,
+                        "the box holds no current key to verify a signature against",
+                    )
+                    .await;
+                }
+                match signed_by_current_key(cfg, &key_file, &fingerprint, &intent.signature).await {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        return refuse_page(
+                            cfg,
+                            store,
+                            &intent.id,
+                            &intent.kind,
+                            &intent.username,
+                            file,
+                            "the signature does not verify against the key in use",
+                        )
+                        .await
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            let rotation = store::Rotation {
+                fingerprint,
+                material: intent.material.trim().to_string(),
+                requested_at: util::filed_at(),
+                applies_at: (OffsetDateTime::now_utc() + Duration::hours(72))
+                    .format(&Rfc3339)
+                    .map_err(|e| format!("cannot write the window's end: {e}"))?,
+            };
+            account.rotation = Some(rotation.clone());
+            if signed {
+                apply_rotation(cfg, store, &mut account, &rotation).await?;
+            } else {
+                save_account(store, &account).await?;
+                let body = format!(
+                    "You asked to replace the mail key for {}. If you did make this request, \
+                     nothing else is needed: the new key applies at {} and mail arriving after \
+                     that is encrypted to it. If you did not, open your account page and cancel \
+                     the replacement before then.",
+                    account.username, rotation.applies_at
+                );
+                rotation_notices(
+                    cfg,
+                    store,
+                    &account,
+                    "rotation.pending",
+                    &format!(
+                        "Confirm the replacement of your mail key ({})",
+                        rotation.fingerprint
+                    ),
+                    &body,
+                )
+                .await?;
+            }
+            journal(
+                store,
+                &cfg.release,
+                &intent.id,
+                &intent.kind,
+                &application,
+                "applied",
+                Some(if signed {
+                    "the replacement was signed by the current key and applied at once"
+                } else {
+                    "the replacement waits out the 72-hour window"
+                }),
+            )
+            .await?;
+            store.remove("intents", file).await
+        }
+        other => {
+            refuse_page(
+                cfg,
+                store,
+                &intent.id,
+                &intent.kind,
+                &intent.username,
+                file,
+                &format!("{other:?} is not a mail-key action"),
+            )
+            .await
+        }
+    }
+}
+
+/// Apply every mail-key replacement whose 72 hours have run out. The record's
+/// own `rotation` is the dedup: applying it clears the field, so a pass that
+/// finds nothing pending writes nothing.
+pub async fn mail_key_rotations(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+    for username in store.list("accounts").await? {
+        let Some(mut account) = existing_account(store, &username).await else {
+            continue;
+        };
+        let Some(rotation) = account.rotation.clone() else {
+            continue;
+        };
+        let applies = OffsetDateTime::parse(&rotation.applies_at, &Rfc3339)
+            .map_err(|e| format!("the rotation window of {username} does not parse: {e}"))?;
+        if OffsetDateTime::now_utc() < applies {
+            continue;
+        }
+        let id = format!("rotation-{}", rotation.fingerprint);
+        let application = ApplicationRef {
+            username: username.clone(),
+            status_token: String::new(),
+        };
+        if !journal_has(store, &id, "applying").await {
+            journal(
+                store,
+                &cfg.release,
+                &id,
+                "rotation",
+                &application,
+                "applying",
+                Some("the pending mail key's window has ended"),
+            )
+            .await?;
+        }
+        apply_rotation(cfg, store, &mut account, &rotation).await?;
+        journal(
+            store,
+            &cfg.release,
+            &id,
+            "rotation",
+            &application,
+            "applied",
+            Some("the new mail key is in the keyring"),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// The mail key a new mailbox carries, checked before anything is written: the
 /// material must be there and must be the mailbox's own key.
 fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, String> {
@@ -6262,7 +7270,14 @@ pub async fn group_address(
                     .await?;
             }
             run_script(cfg, "provision-member.sh", &[&intent.mailbox]).await?;
-            write_group_account(store, &intent.mailbox, &intent.domain, &group.payment).await?;
+            write_group_account(
+                store,
+                &intent.mailbox,
+                &intent.domain,
+                &group.payment,
+                Some(&key),
+            )
+            .await?;
             publish_mail_keys_publicly(cfg, &intent.mailbox, std::slice::from_ref(&key)).await?;
         }
         "upgrade" => {
@@ -6277,7 +7292,14 @@ pub async fn group_address(
                     .await?;
             }
             run_script(cfg, "provision-member.sh", &[&intent.mailbox]).await?;
-            write_group_account(store, &intent.mailbox, &intent.domain, &group.payment).await?;
+            write_group_account(
+                store,
+                &intent.mailbox,
+                &intent.domain,
+                &group.payment,
+                Some(&key),
+            )
+            .await?;
             repoint_table_line(&cfg.virtuals, &entry, &intent.mailbox)?;
             // The repoint is a table rewrite after the builder's own restart,
             // and a retry that finds the account already made restarts nothing.
@@ -8147,6 +9169,7 @@ static EMPTY: store::StripeBilling = store::StripeBilling {
     subscription: None,
     customer: None,
     status: None,
+    cancel_at_period_end: false,
     current_period_end: None,
     next_payment_attempt: None,
     failed_attempts: 0,

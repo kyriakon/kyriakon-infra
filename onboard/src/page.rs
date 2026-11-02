@@ -53,6 +53,21 @@ pub struct AccountPage {
     pub space_hard: &'static str,
     /// The upload key fingerprints and the day each was added.
     pub upload_keys: Vec<UploadKeyView>,
+    /// Whether the account has hosting at all, which is whether it has an
+    /// upload key. The serving toggles and the key controls are absent without
+    /// one.
+    pub has_hosting: bool,
+    /// The two independent serving booleans, as the checkboxes show them.
+    pub site_served: bool,
+    pub capsule_served: bool,
+    /// The mail key delivery uses, and a replacement waiting out its window.
+    /// Both are absent until the drain has recorded one.
+    pub mail_key: Option<String>,
+    pub rotation: Option<RotationView>,
+    /// Whether the card subscription is still set to renew: the page offers the
+    /// control only while there is something to stop.
+    pub renews: bool,
+    pub renewal_stopped: bool,
     /// Every notice sent, newest last, each with the address it went to.
     pub notices: Vec<NoticeView>,
     /// The group a mailbox belongs to, with the billing and state the group
@@ -81,6 +96,13 @@ pub struct AccountPage {
 pub struct UploadKeyView {
     pub fingerprint: String,
     pub added_at: String,
+}
+
+/// A mail-key replacement waiting out its window: the new fingerprint and the
+/// moment it applies, so the page can say when and offer the cancel.
+pub struct RotationView {
+    pub fingerprint: String,
+    pub applies_at: String,
 }
 
 /// One notice, as the page shows it.
@@ -353,6 +375,30 @@ pub fn member_page(
                 added_at: key.added_at.get(..10).unwrap_or(&key.added_at).to_string(),
             })
             .collect(),
+        has_hosting: !account.upload_keys.is_empty(),
+        site_served: account.site_served.unwrap_or(false),
+        capsule_served: account.capsule_served.unwrap_or(false),
+        mail_key: account.mail_key.clone(),
+        rotation: account.rotation.as_ref().map(|rotation| RotationView {
+            fingerprint: rotation.fingerprint.clone(),
+            applies_at: rotation
+                .applies_at
+                .get(..16)
+                .unwrap_or(&rotation.applies_at)
+                .to_string(),
+        }),
+        renews: account
+            .payment
+            .as_ref()
+            .map(|payment| {
+                payment.stripe.subscription.is_some() && !payment.stripe.cancel_at_period_end
+            })
+            .unwrap_or(false),
+        renewal_stopped: account
+            .payment
+            .as_ref()
+            .map(|payment| payment.stripe.cancel_at_period_end)
+            .unwrap_or(false),
         notices: notices
             .iter()
             .map(|notice| NoticeView {

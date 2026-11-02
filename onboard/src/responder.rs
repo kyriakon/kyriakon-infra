@@ -1098,6 +1098,23 @@ async fn http(app: &App, request: &Request, incoming: &Incoming) -> Reply {
         }
         return account_close(app, request).await;
     }
+    // The page's other action controls. Each is a POST for the same reason the
+    // closure is: a GET that changed a password or a key would be fired by any
+    // image tag.
+    if let Some(action) = incoming.path.strip_prefix("account/") {
+        if method != "POST" {
+            return method_not_allowed();
+        }
+        return match action {
+            "password" => account_password(app, request).await,
+            "upload-key" => account_upload_key(app, request).await,
+            "address" => account_address(app, request).await,
+            "serving" => account_serving(app, request).await,
+            "renewal" => account_renewal(app, request).await,
+            "mail-key" => account_mail_key(app, request).await,
+            _ => Reply::html(404, String::new()),
+        };
+    }
     if incoming.path == "account" {
         return match (get, method) {
             (true, _) => account(app, request).await,
@@ -1924,6 +1941,363 @@ async fn account_close(app: &App, request: &Request) -> Reply {
             Reply::html(200, page_html(&notice("Closing your account", &message)))
         }
         Err(e) => server_error(&format!("the closure could not be filed: {e}")),
+    }
+}
+
+/// The page's password form: the current password re-entered, then the new one
+/// twice. The current one is checked against the real system account through
+/// `doveadm auth test`, the same proof the login is; the new one is validated
+/// here and only its hash reaches the intent, so no plaintext is written
+/// anywhere. The drain writes the hash as root because the check only verifies.
+async fn account_password(app: &App, request: &Request) -> Reply {
+    let Some((cookie, account)) = session_account(app, request).await else {
+        return refused("Sign in to the account whose password you want to change.");
+    };
+    let Some(session_id) = session::id(&cookie) else {
+        return refused("Sign in to the account whose password you want to change.");
+    };
+    let form = fields(&String::from_utf8_lossy(&request.body));
+    let current = form.get("password").map(String::as_str).unwrap_or("");
+    let new = form.get("new_password").map(String::as_str).unwrap_or("");
+    let confirm = form
+        .get("confirm_password")
+        .map(String::as_str)
+        .unwrap_or("");
+    // The password is re-entered however fresh the session is: a borrowed
+    // browser should not be able to change the password that locks the owner
+    // out of their own account.
+    if current.is_empty() || !app.auth.admits(&account.username, current).await {
+        return refused(
+            "That password did not match. Enter your current mail password to change it.",
+        );
+    }
+    if let Err(why) = crate::password::validate(new) {
+        return refused(&why);
+    }
+    if new != confirm {
+        return refused("The two new passwords do not match.");
+    }
+    let Ok(hash) = crate::password::make(new) else {
+        return server_error("the new password could not be hashed");
+    };
+    match intents::file_action(
+        &app.store,
+        "change-password",
+        session_id,
+        &account.username,
+        serde_json::json!({"hash": hash}),
+    )
+    .await
+    {
+        Ok(_) => {
+            let page = notice(
+                "Your password is changing",
+                "The platform is setting the new password now, and it takes effect within a \
+                 minute. Until it does, the old password still works. No key or client \
+                 setting changes.",
+            );
+            Reply::html(200, page_html(&page))
+        }
+        Err(e) => server_error(&format!("the password change could not be filed: {e}")),
+    }
+}
+
+/// The upload key form: add one key or remove the one on the account. One key
+/// serves sftp and git, so adding replaces rather than accumulates, and the
+/// page shows the fingerprint and the day it was added.
+async fn account_upload_key(app: &App, request: &Request) -> Reply {
+    let Some((cookie, account)) = session_account(app, request).await else {
+        return refused("Sign in to the account whose upload key you want to change.");
+    };
+    let Some(session_id) = session::id(&cookie) else {
+        return refused("Sign in to the account whose upload key you want to change.");
+    };
+    let form = fields(&String::from_utf8_lossy(&request.body));
+    match form.get("action").map(String::as_str) {
+        Some("add") => {
+            let material = form.get("key").map(String::as_str).unwrap_or("").trim();
+            if let Err(why) = keycheck::openssh_public_key(material) {
+                return refused(&why);
+            }
+            if keycheck::openssh_fingerprint(material).is_none() {
+                return refused("That line carries no key material.");
+            }
+            match intents::file_action(
+                &app.store,
+                "upload-key",
+                session_id,
+                &account.username,
+                serde_json::json!({"action": "add", "material": material}),
+            )
+            .await
+            {
+                Ok(_) => {
+                    let page = notice(
+                        "Your upload key is being added",
+                        "The platform is installing the key and rebuilding your sftp and git \
+                         access now; it takes effect within a minute. The page shows the new \
+                         fingerprint once it has.",
+                    );
+                    Reply::html(200, page_html(&page))
+                }
+                Err(e) => server_error(&format!("the upload key could not be filed: {e}")),
+            }
+        }
+        Some("remove") => {
+            let fingerprint = form
+                .get("fingerprint")
+                .map(String::as_str)
+                .unwrap_or("")
+                .trim();
+            if !account
+                .upload_keys
+                .iter()
+                .any(|key| key.fingerprint == fingerprint)
+            {
+                return refused("That key is not on the account.");
+            }
+            match intents::file_action(
+                &app.store,
+                "upload-key",
+                session_id,
+                &account.username,
+                serde_json::json!({"action": "remove", "fingerprint": fingerprint}),
+            )
+            .await
+            {
+                Ok(_) => {
+                    let page = notice(
+                        "Your upload key is being removed",
+                        "sftp and git stop working for that key within a minute. Mail, your \
+                         published site and your repositories are not touched.",
+                    );
+                    Reply::html(200, page_html(&page))
+                }
+                Err(e) => server_error(&format!("the key removal could not be filed: {e}")),
+            }
+        }
+        _ => method_not_allowed(),
+    }
+}
+
+/// The contact and recovery address form. It is the one address the platform
+/// writes to outside the platform, and the only channel a password reset has
+/// when the mailbox is unreachable, so it is validated here and again by the
+/// drain. An empty field clears it.
+async fn account_address(app: &App, request: &Request) -> Reply {
+    let Some((cookie, account)) = session_account(app, request).await else {
+        return refused("Sign in to the account whose address you want to change.");
+    };
+    let Some(session_id) = session::id(&cookie) else {
+        return refused("Sign in to the account whose address you want to change.");
+    };
+    let form = fields(&String::from_utf8_lossy(&request.body));
+    let address = form.get("address").map(String::as_str).unwrap_or("").trim();
+    if !address.is_empty() {
+        if let Some(why) = validate::address(address) {
+            return refused(&format!(
+                "That is not one address outside the platform. {why}"
+            ));
+        }
+    }
+    match intents::file_action(
+        &app.store,
+        "outside-address",
+        session_id,
+        &account.username,
+        serde_json::json!({"address": address}),
+    )
+    .await
+    {
+        Ok(_) => {
+            let message = if address.is_empty() {
+                "The platform is removing the address outside the platform. From now on it can \
+                 only reach you inside this account."
+            } else {
+                "The platform is recording the new address. Notices go there as well as to your \
+                 address on this platform, including if the account is ever in trouble."
+            };
+            Reply::html(
+                200,
+                page_html(&notice("Your contact address is changing", message)),
+            )
+        }
+        Err(e) => server_error(&format!("the address change could not be filed: {e}")),
+    }
+}
+
+/// The serving toggles. Two checkboxes and one submit: a box that is ticked is
+/// on, and an absent box is off. The drain writes the account's two booleans,
+/// removes or regenerates the member's generated include for the lane that
+/// changed, and reloads the daemons once.
+async fn account_serving(app: &App, request: &Request) -> Reply {
+    let Some((cookie, account)) = session_account(app, request).await else {
+        return refused("Sign in to the account whose serving you want to change.");
+    };
+    let Some(session_id) = session::id(&cookie) else {
+        return refused("Sign in to the account whose serving you want to change.");
+    };
+    let form = fields(&String::from_utf8_lossy(&request.body));
+    let http = form.contains_key("http");
+    let gemini = form.contains_key("gemini");
+    match intents::file_action(
+        &app.store,
+        "serving",
+        session_id,
+        &account.username,
+        serde_json::json!({"http": http, "gemini": gemini}),
+    )
+    .await
+    {
+        Ok(_) => {
+            let page = notice(
+                "Your serving is changing",
+                "The platform is writing the change and reloading the daemons now; it takes \
+                 effect within a minute. Your files are untouched either way, so turning a \
+                 lane back on serves what is already there.",
+            );
+            Reply::html(200, page_html(&page))
+        }
+        Err(e) => server_error(&format!("the serving change could not be filed: {e}")),
+    }
+}
+
+/// Stop the card subscription's yearly renewal. Stripe's
+/// `cancel_at_period_end` runs to the end of the period, so the paid-until date
+/// is unchanged and nothing stops early. A prepaid member has no subscription
+/// and nothing that renews itself, which the page says instead of offering this.
+async fn account_renewal(app: &App, request: &Request) -> Reply {
+    let Some((cookie, account)) = session_account(app, request).await else {
+        return refused("Sign in to the account whose renewal you want to stop.");
+    };
+    let Some(session_id) = session::id(&cookie) else {
+        return refused("Sign in to the account whose renewal you want to stop.");
+    };
+    let form = fields(&String::from_utf8_lossy(&request.body));
+    if form.get("action").map(String::as_str) != Some("cancel") {
+        return method_not_allowed();
+    }
+    let card = account
+        .payment
+        .as_ref()
+        .map(|payment| payment.stripe.subscription.is_some())
+        .unwrap_or(false);
+    if !card {
+        return refused(
+            "This account has no card subscription to stop. A prepaid membership renews when you \
+             pay again, and nothing is charged automatically.",
+        );
+    }
+    match intents::file_action(
+        &app.store,
+        "cancel-renewal",
+        session_id,
+        &account.username,
+        serde_json::json!({}),
+    )
+    .await
+    {
+        Ok(_) => {
+            let page = notice(
+                "Your renewal is being stopped",
+                "The platform is telling Stripe to stop the yearly renewal now. The subscription \
+                 runs to the end of the period you have paid for, so nothing stops before then.",
+            );
+            Reply::html(200, page_html(&page))
+        }
+        Err(e) => server_error(&format!("the cancellation could not be filed: {e}")),
+    }
+}
+
+/// Replace the mail key, or cancel a replacement already waiting. A replacement
+/// signed by the current key applies at once, because the signature is the
+/// proof that the holder of the old private key asked for it; one that is not
+/// signed waits 72 hours, and the page cancels it before then.
+///
+/// The signature is checked by the drain, which is the half that holds the
+/// keyring. Nothing here promises which of the two paths the request took.
+async fn account_mail_key(app: &App, request: &Request) -> Reply {
+    let Some((cookie, account)) = session_account(app, request).await else {
+        return refused("Sign in to the account whose mail key you want to replace.");
+    };
+    let Some(session_id) = session::id(&cookie) else {
+        return refused("Sign in to the account whose mail key you want to replace.");
+    };
+    let form = fields(&String::from_utf8_lossy(&request.body));
+    match form.get("action").map(String::as_str) {
+        Some("replace") => {
+            let material = form.get("key").map(String::as_str).unwrap_or("").trim();
+            if let Err(why) = keycheck::pgp_public_key(material) {
+                return refused(&why);
+            }
+            let Some(fingerprint) = keycheck::pgp_fingerprint(material) else {
+                return refused("That block carries no public key packet.");
+            };
+            if account.mail_key.as_deref() == Some(fingerprint.as_str()) {
+                return refused("That is the key already in use.");
+            }
+            let signature = form
+                .get("signature")
+                .map(String::as_str)
+                .unwrap_or("")
+                .trim();
+            let signed = !signature.is_empty();
+            match intents::file_action(
+                &app.store,
+                "mail-key",
+                session_id,
+                &account.username,
+                serde_json::json!({
+                    "action": "replace",
+                    "material": material,
+                    "signature": signature,
+                }),
+            )
+            .await
+            {
+                Ok(_) => {
+                    let message = if signed {
+                        "The platform is checking the signature against the key you use now. If it \
+                         verifies, the new key is in use within a minute; if it does not, nothing \
+                         changes and no replacement starts."
+                    } else {
+                        "The replacement waits 72 hours. A warning goes to every address on the \
+                         account, and until the new key applies you can cancel it on this page. \
+                         If you did not ask for this, cancel it now."
+                    };
+                    Reply::html(
+                        200,
+                        page_html(&notice("Your mail key is being replaced", message)),
+                    )
+                }
+                Err(e) => server_error(&format!("the key replacement could not be filed: {e}")),
+            }
+        }
+        Some("cancel") => {
+            if account.rotation.is_none() {
+                return refused("No replacement is waiting to be cancelled.");
+            }
+            match intents::file_action(
+                &app.store,
+                "mail-key",
+                session_id,
+                &account.username,
+                serde_json::json!({"action": "cancel"}),
+            )
+            .await
+            {
+                Ok(_) => {
+                    let page = notice(
+                        "The replacement is being cancelled",
+                        "The key in use stays as it is, and no new key is installed. Mail keeps \
+                         arriving to the key you already hold.",
+                    );
+                    Reply::html(200, page_html(&page))
+                }
+                Err(e) => server_error(&format!("the cancellation could not be filed: {e}")),
+            }
+        }
+        _ => method_not_allowed(),
     }
 }
 
