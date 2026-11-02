@@ -97,7 +97,7 @@ fn a_monero_window_is_quoted_once_and_the_page_shows_the_address_quote_and_rate(
     assert!(instructions.contains("0.048848 XMR"), "{instructions}");
     assert!(!instructions.contains("not ready"), "{instructions}");
     let account = stored_account(&fix, "secretary");
-    let gemini = capsule::account(&account, &[], None, Some(&view));
+    let gemini = capsule::account(&account, &[], None, Some(&view), None);
     assert!(gemini.contains(&address), "{gemini}");
     assert!(gemini.contains("0.048848"), "{gemini}");
     let web = page::account(&[], Some("secretary"), None, Some(view), false)
