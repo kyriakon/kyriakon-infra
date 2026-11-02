@@ -79,6 +79,9 @@ repo's own root. Two terms most likely to matter while working in this repo:
   same for `kyriakon-encrypt/`. There is no workspace root, so a command without
   `--manifest-path`, run from the repository root, does not find `Cargo.toml` at all.
   `cargo fmt --check` runs in CI.
+- Fast loop while iterating: `cargo test --manifest-path onboard/Cargo.toml --lib`, and
+  `--test drain -- <area>` for one area; the area map is `onboard/tests/README.md`.
+  Run the full crate suite once before pushing, or let CI run it.
 - Shell scripts (`scripts/`): `shellcheck scripts/*.sh`, and
   `ksh scripts/self-test-all.sh` runs every script's `--self-test` with the arguments
   each one needs. On the box, `ksh scripts/check-hygiene.sh` reports its live state.
