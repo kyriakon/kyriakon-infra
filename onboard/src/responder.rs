@@ -2076,7 +2076,7 @@ async fn account_upload_key(app: &App, request: &Request) -> Reply {
                 Err(e) => server_error(&format!("the key removal could not be filed: {e}")),
             }
         }
-        _ => method_not_allowed(),
+        _ => refused("That is not an upload-key action this page carries out."),
     }
 }
 
@@ -2175,7 +2175,7 @@ async fn account_renewal(app: &App, request: &Request) -> Reply {
     };
     let form = fields(&String::from_utf8_lossy(&request.body));
     if form.get("action").map(String::as_str) != Some("cancel") {
-        return method_not_allowed();
+        return refused("That is not a renewal action this page carries out.");
     }
     let card = account
         .payment
@@ -2297,7 +2297,7 @@ async fn account_mail_key(app: &App, request: &Request) -> Reply {
                 Err(e) => server_error(&format!("the cancellation could not be filed: {e}")),
             }
         }
-        _ => method_not_allowed(),
+        _ => refused("That is not a mail-key action this page carries out."),
     }
 }
 
@@ -2317,7 +2317,7 @@ async fn session_member(app: &App, request: &Request) -> Option<Account> {
 async fn account_export(app: &App, request: &Request) -> Reply {
     let form = fields(&String::from_utf8_lossy(&request.body));
     if form.get("action").map(String::as_str) != Some("export") {
-        return method_not_allowed();
+        return refused("That is not an export action this page carries out.");
     }
     let Some(account) = session_member(app, request).await else {
         return refused("Sign in to the account you want to export.");

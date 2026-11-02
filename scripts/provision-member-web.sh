@@ -102,15 +102,22 @@ cert_file() { printf '%s/%s.kyriakon.net.fullchain.pem' "$ssl_dir" "$user"; }
 key_file() { printf '%s/%s.kyriakon.net.key' "$ssl_private" "$user"; }
 member_conf() { printf '%s/%s.kyriakon.net.conf' "$httpd_d" "$user"; }
 
-# The file body, printed rather than written so the caller can hold it in a work
-# file and compare it with what is already there.
-member_conf_body() {
+# The port 80 block every shape starts with: the ACME challenge comes before any
+# catch-all, because httpd uses the first location that matches. Kept on its own
+# so the removal can leave it in place for a renewal while serving is off.
+port_80_challenge() {
 	printf 'server "%s.kyriakon.net" {\n' "$user"
 	printf '\tlisten on * port 80\n'
 	printf '\tlocation "/.well-known/acme-challenge/*" {\n'
 	printf '\t\troot "/acme"\n'
 	printf '\t\trequest strip 2\n'
 	printf '\t}\n'
+}
+
+# The file body, printed rather than written so the caller can hold it in a work
+# file and compare it with what is already there.
+member_conf_body() {
+	port_80_challenge
 	printf '\tlocation "/*" {\n'
 	# shellcheck disable=SC2016 # httpd substitutes $REQUEST_URI per request, so the
 	# generated line carries the token literally and ksh must not expand it here
@@ -198,17 +205,31 @@ assert_member_conf() {
 	[ "$shape" = "$conf_owner 644" ] || die "$conf is $shape, wanted $conf_owner 644"
 }
 
-# remove_member_conf: take the member's generated vhost out, for the account
-# page's "serve your website over HTTP: off". The file is the whole config: the
-# tracked httpd.conf includes an index that cron-apply.sh --web regenerates from
-# the files present, so removing it and running that pass is the entire change,
-# and nothing of the member's is deleted.
+# remove_member_conf: take the member's site out of the generated vhost, for the
+# account page's "serve your website over HTTP: off". The site block is replaced by
+# the port 80 challenge alone, because a renewal has to answer on port 80 whatever
+# the site is doing; an unmatched path is a 404, so nothing else is served. The
+# tracked httpd.conf includes an index that cron-apply.sh --web regenerates from the
+# files present, and nothing of the member's is deleted.
 remove_member_conf() {
-	typeset target
+	typeset target candidate
 	target=$(member_conf)
+	# A member with no file was never served, and there is no challenge to keep.
 	[ -f "$target" ] || return 0
-	rm -f "$target" || die "could not remove $target"
-	printf 'removed %s: %s.kyriakon.net is no longer served over HTTP\n' "$target" "$user"
+	candidate="$target.new.$$"
+	if ! { port_80_challenge; printf '}\n'; } > "$candidate"; then
+		rm -f "$candidate"
+		exit 1
+	fi
+	# A second removal writes the same challenge-only file, so it leaves the file
+	# and its mtime alone and says nothing.
+	if cmp -s "$candidate" "$target"; then
+		rm -f "$candidate"
+		return 0
+	fi
+	chmod 0644 "$candidate"
+	mv "$candidate" "$target" || die "could not write $target"
+	printf '%s: %s.kyriakon.net is no longer served over HTTP; the ACME challenge stays for renewal\n' "$target" "$user"
 	printf '  next: doas ksh scripts/cron-apply.sh --web   # regenerate the index, check httpd, reload\n'
 }
 
@@ -324,18 +345,30 @@ self_test() {
 	check "and the refusal names provision-member.sh" \
 		"$(grep -c 'scripts/provision-member.sh nobody' "$tree/notree.out")" 1
 
-	# 7. the account page's "serve over HTTP: off" removes the generated file and
-	# leaves the member's tree alone; a second removal has nothing to say.
+	# 7. the account page's "serve over HTTP: off" leaves the port 80 challenge
+	# alone: a renewal has to answer while the site is off. The member's tree is
+	# untouched, and a second removal has nothing to say.
 	user=alice
 	rm -f "$(cert_file)"
 	write_member_conf >/dev/null
 	remove_member_conf >"$tree/remove.out"
-	check "the vhost is removed" "$([ -f "$conf" ] && printf yes || printf no)" no
+	check "the vhost is kept for the challenge" "$([ -f "$conf" ] && printf yes || printf no)" yes
+	check "it holds one location, the challenge" \
+		"$(grep -c 'location ' "$conf")" 1
+	check "the challenge is still rooted at /acme" "$(grep -c 'root "/acme"' "$conf")" 1
+	check "the site's catch-all is gone" "$(grep -c 'block return 301' "$conf")" 0
+	check "no block behind the relay is left" "$(grep -c '127.0.0.1 port 8080' "$conf")" 0
 	check "and the member's tree is still there" \
 		"$([ -d "$public_root/alice.kyriakon.net/www" ] && printf yes || printf no)" yes
 	check "and it points at the reload pass" "$(grep -c 'cron-apply.sh --web' "$tree/remove.out")" 1
+	before=$(stat -f '%i %m' "$conf")
 	remove_member_conf >"$tree/remove-again.out"
 	check "a second removal prints nothing" "$(wc -c <"$tree/remove-again.out" | tr -d ' ')" 0
+	check "and leaves the file alone" "$(stat -f '%i %m' "$conf")" "$before"
+	# Turning it back on writes the site again rather than leaving the challenge
+	# shape in place.
+	write_member_conf >/dev/null
+	check "turning serving back on restores the site" "$(grep -c 'block return 301' "$conf")" 1
 
 	self_test_end
 }
@@ -351,7 +384,7 @@ case "${1:-}" in
 	[ "$#" -eq 2 ] || usage
 	user="$2"
 	name_ok "$user" || die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
-	[ "$(id -u)" -eq 0 ] || die "run this with doas: it removes $httpd_d/$user.kyriakon.net.conf"
+	[ "$(id -u)" -eq 0 ] || die "run this with doas: it rewrites $httpd_d/$user.kyriakon.net.conf to the challenge alone"
 	[ -d "$httpd_d" ] || die "no $httpd_d: doas ksh scripts/deploy-mail.sh creates it"
 	remove_member_conf
 	;;

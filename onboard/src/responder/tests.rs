@@ -1270,6 +1270,18 @@ async fn the_upload_key_forms_add_and_remove_the_one_key() {
     assert_eq!(code, 403);
     assert_eq!(filed(&dir), 0, "a refused key filed something");
 
+    // A form whose action is missing or is not one this route carries out is a
+    // refusal, not a method the route does not have.
+    for body in ["action=rename", ""] {
+        let (code, _) = answer(
+            &app,
+            &httpd_post_with("/account/upload-key", body, Some(&cookie)),
+        )
+        .await;
+        assert_eq!(code, 403, "{body:?}");
+    }
+    assert_eq!(filed(&dir), 0);
+
     let body = format!("action=add&key={}", UPLOAD.replace(' ', "%20"));
     let (code, page) = answer(
         &app,

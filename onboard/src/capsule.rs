@@ -311,9 +311,14 @@ pub fn account(
             )),
         }
     }
+    // The same effective value the account page shows: an unrecorded lane on a
+    // member with an upload key is one provision-member.sh wrote.
+    let has_hosting = !account.upload_keys.is_empty();
+    let site = account.site_served.or(has_hosting.then_some(true));
+    let capsule = account.capsule_served.or(has_hosting.then_some(true));
     out.push_str(&format!("State: {}\n", account.state));
-    out.push_str(&format!("Site: {}\n", served(account.site_served)));
-    out.push_str(&format!("Capsule: {}\n", served(account.capsule_served)));
+    out.push_str(&format!("Site: {}\n", served(site)));
+    out.push_str(&format!("Capsule: {}\n", served(capsule)));
     out.push_str(&format!("Space used: {}\n", space(account.space_used)));
     if let Some(address) = &account.outside_address {
         out.push_str(&format!("Address outside the platform: {address}\n"));

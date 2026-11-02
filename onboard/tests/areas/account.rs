@@ -190,6 +190,44 @@ fn an_upload_key_is_added_and_removed_for_both_sessions() {
     );
 }
 
+/// The page session is a file the handler writes, so it cannot prove a name
+/// outside the charset. Without the drain's own shape check, a forged session
+/// naming `alice/../bob` reaches bob's record through the store's path join.
+#[test]
+fn a_forged_session_username_is_refused_and_writes_nothing() {
+    let fix = Fix::new("account-forged-name");
+    fix.page_account("bob", json!({}));
+    let cookie = fix.open_session("alice");
+    let id = Fix::session_id(&cookie).to_string();
+    let path = fix.dir.join("store/sessions").join(format!("{id}.json"));
+    let mut session: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    session["username"] = json!("alice/../bob");
+    std::fs::write(&path, serde_json::to_vec_pretty(&session).unwrap()).unwrap();
+
+    let before = fix.read("accounts/bob/account.json");
+    let intent = ulid();
+    fix.write_intent(
+        &intent,
+        &json!({
+            "id": intent,
+            "kind": "outside-address",
+            "filed_at": "2026-10-02T09:00:00Z",
+            "username": "alice/../bob",
+            "session": id,
+            "address": "evil@example.invalid",
+        }),
+    );
+    assert!(fix.drain().status.success());
+    assert!(fix.intents().is_empty(), "the refused intent is settled");
+    assert!(fix.journal().contains("\"outcome\":\"refused\""));
+    assert_eq!(
+        fix.read("accounts/bob/account.json"),
+        before,
+        "nothing reached the record the traversal names"
+    );
+}
+
 /// The contact and recovery address is changed and cleared from the page, and
 /// an address the form could not have accepted is refused by the drain too.
 #[test]
@@ -263,6 +301,93 @@ fn turning_http_off_removes_only_the_web_include() {
     assert!(fix.scripts_log().contains("provision-member-web.sh alice"));
     assert_eq!(fix.account("alice")["site_served"], json!(true));
     assert_eq!(fix.account("alice")["capsule_served"], json!(true));
+}
+
+/// The record can say nothing about a lane while the lane serves, because
+/// provision-member.sh wrote it. The save compares the effective value, so a
+/// lane that is on and submitted on is not reprovisioned, and a lane already
+/// recorded off and submitted off is not removed again.
+#[test]
+fn saving_a_serving_form_touches_no_lane_that_did_not_change() {
+    let fix = Fix::new("account-serving-saved");
+    fix.page_account(
+        "alice",
+        json!({
+            "capsule_served": false,
+            "upload_keys": [{"fingerprint": "SHA256:example", "added_at": "2026-10-02T09:00:00Z"}],
+        }),
+    );
+    logging_script(&fix, "provision-member-web.sh");
+    logging_script(&fix, "provision-member-capsule.sh");
+    logging_script(&fix, "cron-apply.sh");
+
+    fix.file_page_action("serving", "alice", json!({"http": true, "gemini": false}));
+    assert!(fix.drain().status.success());
+    assert!(
+        !fix.scripts_log().contains("provision-member"),
+        "no lane changed: {}",
+        fix.scripts_log()
+    );
+    assert!(
+        !fix.scripts_log().contains("cron-apply.sh"),
+        "nothing changed, so there is nothing to reload: {}",
+        fix.scripts_log()
+    );
+    let account = fix.account("alice");
+    assert_eq!(account["site_served"], json!(true));
+    assert_eq!(account["capsule_served"], json!(false));
+}
+
+/// Adding an upload key builds the member again, and provision-member.sh writes
+/// both lanes. A lane the member turned off is removed again, so replacing a key
+/// does not turn serving back on.
+#[test]
+fn adding_an_upload_key_keeps_a_lane_the_member_turned_off_off() {
+    let fix = Fix::new("account-upload-key-serving");
+    fix.page_account(
+        "alice",
+        json!({"site_served": false, "capsule_served": true}),
+    );
+    let log = logging_script(&fix, "provision-member.sh");
+    fix.script(
+        "provision-member-web.sh",
+        &format!("#!/bin/sh\necho \"provision-member-web.sh $*\" >> '{log}'\n"),
+    );
+    fix.script(
+        "provision-member-capsule.sh",
+        &format!("#!/bin/sh\necho \"provision-member-capsule.sh $*\" >> '{log}'\n"),
+    );
+    fix.script(
+        "cron-apply.sh",
+        &format!("#!/bin/sh\necho \"cron-apply.sh $*\" >> '{log}'\n"),
+    );
+
+    fix.file_page_action(
+        "upload-key",
+        "alice",
+        json!({"action": "add", "material": UPLOAD_KEY}),
+    );
+    assert!(fix.drain().status.success());
+    let log = fix.scripts_log();
+    assert!(log.contains("provision-member.sh alice"), "{log}");
+    assert!(
+        log.contains("provision-member-web.sh --remove alice"),
+        "the lane the member turned off stays off: {log}"
+    );
+    assert!(
+        !log.contains("provision-member-capsule.sh --remove"),
+        "the lane that is on is left alone: {log}"
+    );
+    let provisioned = log.find("provision-member.sh alice").unwrap();
+    let removed = log.find("provision-member-web.sh --remove alice").unwrap();
+    let reloaded = log.find("cron-apply.sh --web").unwrap();
+    assert!(
+        provisioned < removed && removed < reloaded,
+        "the removal comes after the rebuild and before the index pass: {log}"
+    );
+    let account = fix.account("alice");
+    assert_eq!(account["site_served"], json!(false));
+    assert_eq!(account["capsule_served"], json!(true));
 }
 
 /// Stopping the yearly renewal sets `cancel_at_period_end` through the one API
@@ -357,6 +482,16 @@ fn a_mail_key_replacement_waits_out_its_window_and_can_be_cancelled() {
         json!({"action": "replace", "material": key, "signature": ""}),
     );
     assert!(fix.drain().status.success());
+    // A new request for the same key warns again: the record deduplicates on the
+    // request, so only a retry of one request stays quiet.
+    assert_eq!(
+        fix.sent()
+            .matches("Confirm the replacement of your mail key")
+            .count(),
+        4,
+        "two requests, two addresses each: {}",
+        fix.sent()
+    );
     fix.amend_account("alice", |account| {
         account["rotation"]["applies_at"] = json!("2020-01-01T00:00:00Z");
     });

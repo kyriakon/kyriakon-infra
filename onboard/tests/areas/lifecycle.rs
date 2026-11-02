@@ -851,6 +851,11 @@ fn an_approval_writes_the_upload_key_the_builder_reads() {
         .dir
         .join("store/accounts/secretary/account.json")
         .exists());
+    // provision-member.sh wrote both lanes, so the record says both are on and
+    // the page does not show a member's working site as off.
+    let account = stored_account(&fix, "secretary");
+    assert_eq!(account.site_served, Some(true));
+    assert_eq!(account.capsule_served, Some(true));
 }
 
 /// The space-used sweep reads the quota report once and records it on the
@@ -1092,6 +1097,11 @@ fn an_approval_without_an_upload_key_still_builds_the_member() {
         "a mail-only member has no web files to index: {}",
         fix.scripts_log()
     );
+    // No upload key means no lane was written, so the record says nothing about
+    // serving rather than claiming a lane is off.
+    let account = stored_account(&fix, "secretary");
+    assert_eq!(account.site_served, None);
+    assert_eq!(account.capsule_served, None);
 }
 
 /// A retry completes after a run that died at the builder. The box holds the

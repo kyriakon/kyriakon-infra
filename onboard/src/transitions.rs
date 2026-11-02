@@ -1424,6 +1424,22 @@ async fn approve(
         })
     };
 
+    let upload_keys: Vec<UploadKey> = record
+        .upload_key
+        .as_ref()
+        .filter(|key| !key.fingerprint.is_empty())
+        .map(|key| {
+            vec![UploadKey {
+                fingerprint: key.fingerprint.clone(),
+                added_at: now.clone(),
+            }]
+        })
+        .unwrap_or_default();
+    // provision-member.sh writes both daemon lanes when the application carried
+    // an upload key, so the record says both are on rather than leaving the page
+    // to read a lane nobody has turned off as off.
+    let hosted = record.upload_key.is_some().then_some(true);
+
     let account = Account {
         version: 1,
         username: username.clone(),
@@ -1441,20 +1457,10 @@ async fn approve(
         legacy_payment: FlatPayment::default(),
         outside_address: record.outside_address.clone(),
         certificates: Vec::new(),
-        site_served: None,
-        capsule_served: None,
+        site_served: hosted,
+        capsule_served: hosted,
         space_used: None,
-        upload_keys: record
-            .upload_key
-            .as_ref()
-            .filter(|key| !key.fingerprint.is_empty())
-            .map(|key| {
-                vec![UploadKey {
-                    fingerprint: key.fingerprint.clone(),
-                    added_at: now.clone(),
-                }]
-            })
-            .unwrap_or_default(),
+        upload_keys,
         mail_key: record
             .mail_keys
             .first()
@@ -6151,6 +6157,22 @@ async fn page_account(
     session: &str,
     file: &str,
 ) -> Result<Option<Account>, String> {
+    // The session record is the handler's own file, so this check cannot stand
+    // on it alone: a name outside the charset is a path component in the store
+    // and below, and only an account name may be one.
+    if let Some(why) = validate::username_shape(username) {
+        refuse_page(
+            cfg,
+            store,
+            id,
+            kind,
+            username,
+            file,
+            &format!("the username {username:?}: {why}"),
+        )
+        .await?;
+        return Ok(None);
+    }
     if let Err(reason) = crate::intents::verify_session(store, session, username).await {
         return settle_page(
             cfg,
@@ -6354,6 +6376,27 @@ pub async fn upload_key(
             };
             write_public_key(store, &account.username, &intent.material).await?;
             run_script(cfg, "provision-member.sh", &[&account.username]).await?;
+            // provision-member.sh writes both daemon lanes. A lane the member
+            // turned off is not turned back on by adding a key, so it is removed
+            // again before the index pass, and the record keeps saying so.
+            if account.site_served == Some(false) {
+                run_script(
+                    cfg,
+                    "provision-member-web.sh",
+                    &["--remove", &account.username],
+                )
+                .await?;
+            }
+            if account.capsule_served == Some(false) {
+                run_script(
+                    cfg,
+                    "provision-member-capsule.sh",
+                    &["--remove", &account.username],
+                )
+                .await?;
+            }
+            account.site_served = Some(account.site_served != Some(false));
+            account.capsule_served = Some(account.capsule_served != Some(false));
             // The first key builds the tree and the two daemon files, so the
             // index and the reload are due exactly as they are at approval.
             run_script(cfg, "cron-apply.sh", &["--web"]).await?;
@@ -6504,8 +6547,12 @@ pub async fn set_serving(
     else {
         return Ok(());
     };
-    let http_changed = account.site_served != Some(intent.http);
-    let gemini_changed = account.capsule_served != Some(intent.gemini);
+    // An unrecorded lane on a hosting member is serving: provision-member.sh
+    // wrote it and nobody has turned it off. Comparing the effective value keeps
+    // a save from removing a lane the page showed as on.
+    let has_hosting = !account.upload_keys.is_empty();
+    let http_changed = account.site_served.unwrap_or(has_hosting) != intent.http;
+    let gemini_changed = account.capsule_served.unwrap_or(has_hosting) != intent.gemini;
     if http_changed {
         if intent.http {
             run_script(cfg, "provision-member-web.sh", &[&account.username]).await?;
@@ -6652,20 +6699,23 @@ fn account_addresses(account: &Account) -> Vec<String> {
 /// One notice to every address the account holds. The record is deduplicated on
 /// its type and subject, so the second address takes a type of its own: the
 /// confirmation has to reach both channels, and a second copy of the same
-/// subject is a different send rather than a retry.
+/// subject is a different send rather than a retry. The request's own nonce is
+/// part of the type too: a retry of one request stays deduplicated, while a
+/// cancel followed by a new request for the same key warns again.
 async fn rotation_notices(
     cfg: &DrainConfig,
     store: &Store,
     account: &Account,
     notice_type: &str,
+    request: &str,
     subject: &str,
     body: &str,
 ) -> Result<(), String> {
     for (i, to) in account_addresses(account).iter().enumerate() {
         let kind = if i == 0 {
-            notice_type.to_string()
+            format!("{notice_type}.{request}")
         } else {
-            format!("{notice_type}.outside")
+            format!("{notice_type}.{request}.outside")
         };
         notice::send_account_notice(cfg, store, &account.username, &kind, subject, to, body)
             .await?;
@@ -6768,6 +6818,7 @@ async fn apply_rotation(
         store,
         account,
         "rotation.applied",
+        &rotation.requested_at,
         &format!("Your new mail key is in use ({})", rotation.fingerprint),
         &body,
     )
@@ -6828,6 +6879,7 @@ pub async fn mail_key(
                 store,
                 &account,
                 "rotation.cancelled",
+                &intent.id,
                 &format!("Your mail key replacement was cancelled ({cancelled})"),
                 &body,
             )
@@ -6940,6 +6992,7 @@ pub async fn mail_key(
                     store,
                     &account,
                     "rotation.pending",
+                    &intent.id,
                     &format!(
                         "Confirm the replacement of your mail key ({})",
                         rotation.fingerprint
@@ -9743,6 +9796,14 @@ async fn subscription_changed(
     let stripe = billing.stripe_mut();
     stripe.status = Some(status.to_string());
     stripe.current_period_end = period_end(object);
+    // The flag comes from the event: `updated` carries the member's choice, a
+    // `deleted` subscription renews nothing, and an event that omits it is
+    // another fact about the same subscription rather than a resumption.
+    stripe.cancel_at_period_end = deleted
+        || object
+            .get("cancel_at_period_end")
+            .and_then(Value::as_bool)
+            .unwrap_or(stripe.cancel_at_period_end);
     if let Some(customer) = object.get("customer").and_then(Value::as_str) {
         stripe.customer = Some(customer.to_string());
     }

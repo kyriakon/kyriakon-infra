@@ -194,6 +194,11 @@ fn cancel_at_period_end_keeps_the_period_and_deletion_revokes_nothing() {
         "cancelling stops renewal and keeps the paid period: {account}"
     );
     assert_eq!(account["payment"]["stripe"]["status"], "active");
+    assert_eq!(
+        account["payment"]["stripe"]["cancel_at_period_end"],
+        json!(true),
+        "the event's own flag is recorded: {account}"
+    );
 
     fix.webhook(
         "evt_deleted",
@@ -213,6 +218,11 @@ fn cancel_at_period_end_keeps_the_period_and_deletion_revokes_nothing() {
         "deletion never revokes a paid date: {account}"
     );
     assert_eq!(account["payment"]["stripe"]["status"], "canceled");
+    assert_eq!(
+        account["payment"]["stripe"]["cancel_at_period_end"],
+        json!(true),
+        "a deleted subscription renews nothing: {account}"
+    );
 }
 
 #[test]
