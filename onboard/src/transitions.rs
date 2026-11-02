@@ -6789,7 +6789,10 @@ async fn signed_by_current_key(
 
 /// Apply a pending rotation: the new key into the keyring delivery reads, the
 /// fingerprint onto the account, the window cleared and the news sent to every
-/// address. The published set follows by the runbook's rotation path, not here.
+/// address. The published set is not touched here: scripts/publish-mail-key.sh
+/// refuses to replace a key already on the default branch, because that is this
+/// rotation, so the operator publishes it (the runbook's "Replace a member's
+/// key"). scripts/deploy-mail.sh keeps the rotated keyring file until they do.
 async fn apply_rotation(
     cfg: &DrainConfig,
     store: &Store,
