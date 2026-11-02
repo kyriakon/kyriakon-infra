@@ -2066,7 +2066,7 @@ fn a_window_that_closes_with_nothing_recorded_lapses_the_account() {
     assert_eq!(view.lapsed.as_deref(), Some("2020-01-01"));
     assert_eq!(view.token.as_deref(), Some(token.as_str()));
     assert!(view.instructions.is_empty(), "a lapsed window has none");
-    let web = page::account(&[], Some("secretary"), None, Some(view.clone()), false)
+    let web = page::member_page(&[], &stored, &[], None, None, Some(view.clone()))
         .render()
         .unwrap();
     assert!(
