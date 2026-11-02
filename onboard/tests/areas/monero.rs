@@ -116,7 +116,7 @@ fn a_monero_window_is_quoted_once_and_the_page_shows_the_address_quote_and_rate(
     let gemini = capsule::account(&account, &[], None, Some(&view), None);
     assert!(gemini.contains(&address), "{gemini}");
     assert!(gemini.contains("0.048848"), "{gemini}");
-    let web = page::account(&[], Some("secretary"), None, Some(view), false)
+    let web = page::member_page(&[], &account, &[], None, None, Some(view))
         .render()
         .unwrap();
     assert!(web.contains(&address), "{web}");
