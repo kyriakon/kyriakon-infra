@@ -109,6 +109,11 @@ base_url = "https://signup.kyriakon.net"
 # literal.
 price_gbp = "20.00"
 
+# The yearly price of an own-domain group, which the spec sells at £40 for the
+# whole domain rather than per address. The approval, the credit and the ledger
+# all read this one value, so a group can never be charged a person's price.
+group_price_gbp = "40.00"
+
 # The postal address a cash-by-post member is given. It is the operator's own, so
 # it lives in openbsd/etc/kyriakon.env with the other host-specific values and
 # scripts/deploy-onboard.sh substitutes it here from /root/.kyriakon-env. The

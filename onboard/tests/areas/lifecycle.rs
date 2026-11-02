@@ -459,9 +459,9 @@ fn onboardctl_files_a_decision_and_shows_the_application() {
     assert!(text.contains("application secretary"), "{text}");
     assert!(text.contains("cash"), "{text}");
 
-    // A verb that is not one of the four is refused, and an unknown username
+    // A verb the console does not know is refused, and an unknown username
     // names nothing.
-    assert!(!fix.ctl(&["suspend", "secretary"]).status.success());
+    assert!(!fix.ctl(&["purge", "secretary"]).status.success());
     assert!(!fix.ctl(&["approve", "nobody"]).status.success());
     let _ = record;
 }
@@ -1972,5 +1972,108 @@ fn a_suspension_records_the_reason_and_sends_one_notice() {
             .count(),
         1,
         "still one notice"
+    );
+}
+
+/// A suspension starts the same forty-day grace as a lapse, journals itself, and
+/// its final week sends the suspension's own notice naming the reason and how to
+/// answer. `resume` brings the account back and clears the clock.
+#[test]
+fn a_suspension_starts_the_grace_and_resume_clears_it() {
+    let fix = Fix::new("suspend-grace");
+    let _token = approved_paid(&fix, "secretary", "cash");
+    let reason = "Published material is outside the acceptable use policy.";
+    let out = fix.ctl(&["suspend", "secretary", "--reason", reason]);
+    assert!(out.status.success(), "{}", body(&out));
+
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("suspended"), "{account}");
+    assert_eq!(
+        account["grace_until"],
+        json!(kyriakon_onboard::util::date_after_days(40)),
+        "the suspension promises a grace, so it starts the same one: {account}"
+    );
+    assert!(
+        fix.journal().contains("suspend-secretary-"),
+        "{}",
+        fix.journal()
+    );
+    assert!(
+        fix.journal().contains("\"applying\""),
+        "the suspension journals before it acts: {}",
+        fix.journal()
+    );
+
+    // The final week: the suspension's own notice, naming the reason and the
+    // way to answer, and not the payment lapse's words.
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_onboard::util::date_after_days(6));
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+    let notices = fix.read("accounts/secretary/notices.jsonl");
+    assert_eq!(
+        notices.matches("account.suspended.final").count(),
+        1,
+        "{notices}"
+    );
+    assert!(notices.contains(reason), "the reason again: {notices}");
+    assert!(
+        fix.sent().contains("admin@kyriakon.net"),
+        "how to answer: {}",
+        fix.sent()
+    );
+    assert!(
+        !notices.contains("will be deleted in seven days"),
+        "the payment lapse's final notice is not the suspension's: {notices}"
+    );
+
+    // Resume: the access paths come back, the state is active, and the reason
+    // and grace are gone.
+    let out = fix.ctl(&["resume", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("active"), "{account}");
+    assert!(account.get("suspension_reason").is_none(), "{account}");
+    assert!(account.get("grace_until").is_none(), "{account}");
+    assert!(
+        fix.scripts_log()
+            .contains("lapse-user.sh --restore secretary"),
+        "{}",
+        fix.scripts_log()
+    );
+    assert!(
+        fix.journal().contains("resume-secretary-"),
+        "{}",
+        fix.journal()
+    );
+
+    // A resumed account is not deleted on the old clock.
+    assert!(fix.drain().status.success());
+    assert!(fix.dir.join("store/accounts/secretary").exists());
+
+    // A suspension left unanswered runs out: the deletion transition erases it.
+    let out = fix.ctl(&["suspend", "secretary", "--reason", reason]);
+    assert!(out.status.success(), "{}", body(&out));
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_onboard::util::date_after_days(-1));
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/secretary").exists(),
+        "the suspended account's grace ended and it was not deleted"
+    );
+    assert!(
+        fix.journal().contains("delete-secretary-"),
+        "{}",
+        fix.journal()
     );
 }

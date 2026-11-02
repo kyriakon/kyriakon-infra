@@ -814,6 +814,17 @@ pub struct GroupRecord {
     /// before the sweep, which the page reads as not recorded yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_used: Option<u64>,
+    /// The last day of the 40-day grace after the group lapses, `YYYY-MM-DD`.
+    /// Written when the window sweep lapses the group, so a sweep that runs late
+    /// cannot shorten the grace by measuring from the old close date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_until: Option<String>,
+    /// When the record was made, RFC 3339. The deletion journal id carries it,
+    /// so a domain that is removed and later re-added gets its own deletion
+    /// rather than matching the first one. Absent from a record written before
+    /// this field existed.
+    #[serde(default)]
+    pub created_at: String,
 }
 
 /// The `provision-group` intent: everything the drain needs to make one body's

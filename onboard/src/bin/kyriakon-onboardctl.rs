@@ -123,6 +123,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         "export" => export(&cfg, &store, &rest[1..]).await,
         "show" => show(&store, one_username(rest)?).await,
         "suspend" => suspend(&cfg, &store, &rest[1..]).await,
+        "resume" => resume(&cfg, &store, rest).await,
         "delete" => delete(&cfg, &store, rest).await,
         "free" => free(&store, &rest[1..]).await,
         // Each decision is signed with the same root-only key the review links
@@ -146,6 +147,7 @@ fn usage() -> String {
     "usage: kyriakon-onboardctl [--config PATH] \
      approve|approve-free|decline|delete|show <username>
        kyriakon-onboardctl suspend <username> --reason <text>
+       kyriakon-onboardctl resume <username>
        kyriakon-onboardctl free
        kyriakon-onboardctl token resend <username>
        kyriakon-onboardctl credit (--token <t> | --username <u> | --note <text>) \
@@ -608,10 +610,23 @@ async fn payment_token(store: &Store, flags: &BTreeMap<String, String>) -> Resul
                 .ok_or_else(|| format!("no account for {username}"))?;
             let account: kyriakon_onboard::store::Account = serde_json::from_str(&text)
                 .map_err(|e| format!("the account record does not parse: {e}"))?;
-            account
-                .payment_state()
-                .and_then(|p| p.token_ref)
-                .ok_or_else(|| format!("{username} has no payment token"))
+            match account.payment_state().and_then(|p| p.token_ref) {
+                Some(token) => Ok(token),
+                // A group mailbox holds no payment of its own, so its name
+                // resolves to the one token the whole body paid by, the same
+                // join `credit` uses.
+                None => match account.group.as_deref() {
+                    Some(domain) => {
+                        let group = transitions::group_record(store, domain)
+                            .await?
+                            .ok_or_else(|| format!("no group record for {domain}"))?;
+                        group.payment.token_ref.ok_or_else(|| {
+                            format!("the group {domain} has no payment token to refund")
+                        })
+                    }
+                    None => Err(format!("{username} has no payment token")),
+                },
+            }
         }
         (Some(_), Some(_)) => Err("give either --token or --username, not both".to_string()),
         (None, None) => Err("give --token or --username".to_string()),
@@ -1379,6 +1394,16 @@ async fn suspend(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<()
     let reason = need(&flags, "reason")?;
     transitions::suspend(cfg, store, username, reason).await?;
     println!("suspended {username}");
+    Ok(())
+}
+
+/// `resume`: lift a suspension, the inverse of `suspend`. The three access
+/// paths come back, the state returns to active, and the reason and grace the
+/// suspension started are cleared.
+async fn resume(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(), String> {
+    let username = one_username(rest)?;
+    transitions::resume(cfg, store, username).await?;
+    println!("resumed {username}");
     Ok(())
 }
 

@@ -100,7 +100,9 @@ pub struct GroupView {
     pub rail: String,
     pub no_charge: bool,
     pub paid_until: Option<String>,
-    /// `free`, `active` or `payment due`, from the group's own payment block.
+    /// `free`, `active`, `payment due` or `lapsed`, from the group's own payment
+    /// block. A closed window is the lapse, whether or not the mailbox states
+    /// have been swept.
     pub state: String,
     /// The group's one payment reference while money is still due, in full so
     /// any mailbox holder can pay it. Absent once the date is set, when the
@@ -119,10 +121,16 @@ pub struct GroupView {
 impl GroupView {
     pub fn from_record(group: &crate::store::GroupRecord) -> GroupView {
         let payment = &group.payment;
+        let window = payment.window.as_ref();
+        // A closed window is the lapse, whether or not the mailbox states have
+        // been swept: the page reads the group's own record, and that record is
+        // what says the group lapsed.
         let state = if payment.no_charge {
             "free"
         } else if payment.paid_until.is_some() {
             "active"
+        } else if window.is_some_and(|w| w.state == "closed") {
+            "lapsed"
         } else {
             "payment due"
         };
@@ -136,10 +144,8 @@ impl GroupView {
             paid_until: payment.paid_until.clone(),
             state: state.to_string(),
             token: payment.token_ref.clone().filter(|_| unpaid),
-            window_closes: payment
-                .window
-                .as_ref()
-                .filter(|_| unpaid)
+            window_closes: window
+                .filter(|w| unpaid && w.state == "open")
                 .map(|w| w.closes_at[..10.min(w.closes_at.len())].to_string()),
             accounts: group.accounts.clone(),
             space_used: group.space_used.map(space),
@@ -1013,5 +1019,42 @@ mod tests {
         .unwrap();
         assert!(html.contains("Paid until 2027-10-04"), "{html}");
         assert!(!html.contains("KYR-4F2M-9QH7-XT3B"), "{html}");
+    }
+
+    /// The group's page state follows its one window: an open window is a
+    /// payment due with its close date shown, and a closed one is the lapse with
+    /// no close date left to show.
+    #[test]
+    fn the_group_view_reads_lapsed_once_the_window_closed() {
+        let mut group: crate::store::GroupRecord = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "domain": "parish.example",
+            "name": "Parish of Example",
+            "kind": "parish",
+            "payment": {
+                "rail": "cash",
+                "no_charge": false,
+                "token_ref": "KYR-4F2M-9QH7-XT3B",
+                "window": {
+                    "opened_at": "2026-10-20T09:00:00Z",
+                    "closes_at": "2026-11-03T09:00:00Z",
+                    "state": "open",
+                    "extensions": 0
+                },
+                "paid_until": null
+            },
+            "accounts": ["parish-secretary"],
+            "site_owner": "parish-secretary"
+        }))
+        .expect("a group record the store could hold");
+
+        let view = GroupView::from_record(&group);
+        assert_eq!(view.state, "payment due");
+        assert_eq!(view.window_closes.as_deref(), Some("2026-11-03"));
+
+        group.payment.window.as_mut().unwrap().state = "closed".into();
+        let view = GroupView::from_record(&group);
+        assert_eq!(view.state, "lapsed");
+        assert!(view.window_closes.is_none());
     }
 }

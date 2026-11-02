@@ -1776,10 +1776,16 @@ fn a_charged_group_holds_one_token_and_one_window_and_no_account_does() {
         "a mailbox holds no paid-until date"
     );
 
-    // The approval mail carries the token, so the body can pay it.
+    // The approval mail carries the token and the group's own price, so the
+    // body can pay the right sum for the domain.
     assert!(
         fix.sent().contains(&format!("reference is {token}")),
         "{}",
+        fix.sent()
+    );
+    assert!(
+        fix.sent().contains("GBP 40.00"),
+        "the approval names the group's price, not a person's: {}",
         fix.sent()
     );
 }
@@ -1844,7 +1850,7 @@ fn a_group_credit_writes_one_date_on_the_group_alone() {
         "--rail",
         "cash",
         "--amount",
-        "20.00",
+        "40.00",
         "--received",
         "2026-10-20",
     ]);
@@ -1877,7 +1883,7 @@ fn a_group_credit_writes_one_date_on_the_group_alone() {
     let payments = payment_lines(&fix);
     assert_eq!(payments.len(), 1, "{payments:?}");
     assert_eq!(payments[0]["token"], json!(token), "{payments:?}");
-    assert_eq!(payments[0]["applied_gbp"], json!("20.00"), "{payments:?}");
+    assert_eq!(payments[0]["applied_gbp"], json!("40.00"), "{payments:?}");
     assert!(
         fix.sent().contains("whole group is paid until"),
         "one receipt for the body: {}",
@@ -1902,7 +1908,7 @@ fn a_group_credit_writes_one_date_on_the_group_alone() {
         "--rail",
         "cash",
         "--amount",
-        "20.00",
+        "40.00",
         "--received",
         "2026-10-21",
     ]);
@@ -1929,7 +1935,7 @@ fn a_group_credit_writes_one_date_on_the_group_alone() {
         "--rail",
         "cash",
         "--amount",
-        "20.00",
+        "40.00",
         "--received",
         "2026-10-21",
         "--confirm-double",
@@ -2034,7 +2040,9 @@ fn a_group_lapse_takes_every_mailbox_and_one_conversation_of_notices() {
     );
     assert!(fix.drain().status.success());
 
-    // The window closed ten days ago: the lapse is due, the grace is not.
+    // The window closed ten days ago and the sweep did not run then. The lapse
+    // is due now, and the grace is forty days from this pass rather than from
+    // the old close date, so a missed sweep never shortens it.
     let mut group: Value =
         serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
     let closes = kyriakon_onboard::util::after_days(-10);
@@ -2047,8 +2055,13 @@ fn a_group_lapse_takes_every_mailbox_and_one_conversation_of_notices() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
 
-    let grace = kyriakon_onboard::util::date_string(
+    let grace = kyriakon_onboard::util::date_after_days(40);
+    let from_close = kyriakon_onboard::util::date_string(
         kyriakon_onboard::util::parse_date(&closes[..10]).unwrap() + time::Duration::days(40),
+    );
+    assert_ne!(
+        grace, from_close,
+        "the two dates have to differ to prove it"
     );
     for mailbox in ["parish-secretary", "parish-office"] {
         let account = fix.account(mailbox);
@@ -2068,6 +2081,7 @@ fn a_group_lapse_takes_every_mailbox_and_one_conversation_of_notices() {
         json!("closed"),
         "{group}"
     );
+    assert_eq!(group["grace_until"], json!(grace), "{group}");
 
     // One line on the site owner's record, and none on the other mailbox's.
     let notices = fix.read("accounts/parish-secretary/notices.jsonl");
@@ -2103,8 +2117,27 @@ fn a_group_grace_ends_in_one_deletion_of_every_account() {
     assert!(fix.drain().status.success());
     let mut group: Value =
         serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
-    // Thirty-four days ago leaves six days of grace: the final notice is due.
-    group["payment"]["window"]["closes_at"] = json!(kyriakon_onboard::util::after_days(-34));
+    // The lapse already wrote the window closed. Twenty-nine days of grace
+    // left is the midpoint: the grace notice is due, the final is not.
+    group["payment"]["window"]["state"] = json!("closed");
+    group["grace_until"] = json!(kyriakon_onboard::util::date_after_days(29));
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+    let notices = fix.read("accounts/parish-secretary/notices.jsonl");
+    assert_eq!(notices.matches("group.grace").count(), 1, "{notices}");
+    assert!(
+        !notices.contains("group.final"),
+        "the final notice waits for its week: {notices}"
+    );
+
+    // Six days left: the final notice is due, once for the body.
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["grace_until"] = json!(kyriakon_onboard::util::date_after_days(6));
     std::fs::write(
         fix.dir.join("store/groups/parish.example/group.json"),
         serde_json::to_vec_pretty(&group).unwrap(),
@@ -2123,10 +2156,10 @@ fn a_group_grace_ends_in_one_deletion_of_every_account() {
         "one final notice for the body"
     );
 
-    // Past the forty days: one deletion of every account and the domain.
+    // Past the grace: one deletion of every account and the domain.
     let mut group: Value =
         serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
-    group["payment"]["window"]["closes_at"] = json!(kyriakon_onboard::util::after_days(-41));
+    group["grace_until"] = json!(kyriakon_onboard::util::date_after_days(-1));
     std::fs::write(
         fix.dir.join("store/groups/parish.example/group.json"),
         serde_json::to_vec_pretty(&group).unwrap(),
@@ -2160,5 +2193,316 @@ fn a_group_grace_ends_in_one_deletion_of_every_account() {
         fix.journal().contains("delete-group-parish.example"),
         "{}",
         fix.journal()
+    );
+}
+
+/// The tier's own price: a group year is GBP 40, a GBP 20 credit is refused as
+/// short with the ledger and the window untouched, and the approval mail names
+/// the group's figure rather than a person's.
+#[test]
+fn a_group_year_is_forty_pounds_and_twenty_is_refused_as_short() {
+    let fix = Fix::new("group-price");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let token = group["payment"]["token_ref"].as_str().unwrap().to_string();
+
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-20",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert!(group["payment"]["paid_until"].is_null(), "{group}");
+    assert_eq!(
+        group["payment"]["window"]["state"],
+        json!("open"),
+        "{group}"
+    );
+    assert!(
+        fix.journal().contains("GBP 20.00 is not enough"),
+        "{}",
+        fix.journal()
+    );
+    assert!(payment_lines(&fix).is_empty(), "{:?}", payment_lines(&fix));
+
+    // The group's own price buys the year.
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "40.00",
+        "--received",
+        "2026-10-20",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert!(group["payment"]["paid_until"].is_string(), "{group}");
+    let payments = payment_lines(&fix);
+    assert_eq!(payments.len(), 1, "{payments:?}");
+    assert_eq!(payments[0]["amount_gbp"], json!("40.00"), "{payments:?}");
+    assert_eq!(payments[0]["applied_gbp"], json!("40.00"), "{payments:?}");
+}
+
+/// A body on the cash rail has no Stripe link, and its approval must not ask for
+/// one: a box with no Payment Link configured still approves a cash group.
+#[test]
+fn a_cash_group_approval_does_not_need_a_stripe_link() {
+    let fix = Fix::new("group-cash-nolink");
+    let path = fix.config();
+    let cfg = std::fs::read_to_string(&path).unwrap().replace(
+        "stripe_payment_link = \"https://buy.stripe.com/test_example\"",
+        "stripe_payment_link = \"\"",
+    );
+    std::fs::write(&path, cfg).unwrap();
+
+    let record = fix.filed_body("warden");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.dir.join("store/groups/parish.example").exists(),
+        "the group was not made"
+    );
+    assert!(
+        !fix.journal()
+            .contains("stripe_payment_link is not configured"),
+        "{}",
+        fix.journal()
+    );
+}
+
+/// A card invoice after a group lapse brings every mailbox back: the renewal and
+/// the prepaid credit share one restore loop.
+#[test]
+fn a_card_renewal_restores_a_lapsed_groups_mailboxes() {
+    let fix = Fix::new("group-card-restore");
+    let mut record = fix.filed_body("warden");
+    record["rail"] = json!("card");
+    record["answers"]["rail"] = json!("card");
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.dir.join("store/groups/parish.example").exists(),
+        "the group was not approved: {}",
+        fix.journal()
+    );
+
+    // The lapse stopped the mailbox; the invoice has not arrived yet.
+    let mailbox = "parish-secretary";
+    let mut account = fix.account(mailbox);
+    account["state"] = json!("lapsed");
+    account["grace_until"] = json!(kyriakon_onboard::util::date_after_days(10));
+    std::fs::write(
+        fix.dir
+            .join(format!("store/accounts/{mailbox}/account.json")),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let token = group["payment"]["token_ref"].as_str().unwrap().to_string();
+    fix.webhook(
+        "01-checkout",
+        "checkout.session.completed",
+        json!({
+            "id": "cs_example",
+            "client_reference_id": token,
+            "subscription": SUBSCRIPTION,
+            "customer": "cus_example",
+        }),
+    );
+    fix.webhook("02-invoice", "invoice.paid", invoice("in_group_restore"));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let account = fix.account(mailbox);
+    assert_eq!(account["state"], json!("active"), "{mailbox}: {account}");
+    assert!(account.get("grace_until").is_none(), "{mailbox}: {account}");
+    assert!(
+        fix.scripts_log()
+            .contains(&format!("lapse-user.sh --restore {mailbox}")),
+        "{mailbox} was not restored: {}",
+        fix.scripts_log()
+    );
+}
+
+/// A held Monero payment can be attributed to a group's token: the item being
+/// attributed is not a second sighting of its own transaction id.
+#[test]
+fn a_held_payment_can_be_attributed_to_a_group() {
+    let fix = Fix::new("group-reconcile");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let token = group["payment"]["token_ref"].as_str().unwrap().to_string();
+
+    let out = fix.ctl(&[
+        "credit",
+        "--rail",
+        "monero",
+        "--amount",
+        "40.00",
+        "--received",
+        "2026-10-04",
+        "--txid",
+        TXID,
+        "--note",
+        "wallet main address, no token",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let held = held_lines(&fix);
+    assert_eq!(held.len(), 1, "{held:?}");
+    let id = held[0]["id"].as_str().unwrap().to_string();
+
+    let out = fix.ctl(&["reconcile", "attribute", &id, "--token", &token]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.journal().contains("is already held"),
+        "the group refused its own held item: {}",
+        fix.journal()
+    );
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(
+        group["payment"]["paid_until"],
+        json!("2027-10-04"),
+        "{group}"
+    );
+    let held = held_lines(&fix);
+    assert_eq!(held[0]["state"], json!("attributed"), "{held:?}");
+    assert_eq!(held[0]["attributed_to"], json!(token), "{held:?}");
+}
+
+/// A domain removed and later re-added gets its own deletion: the journal id
+/// carries the group's creation stamp, so the second lapse is not read as the
+/// first one already applied.
+#[test]
+fn a_readded_group_gets_its_own_deletion() {
+    let fix = Fix::new("group-readd");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["created_at"] = json!("2020-01-01T00:00:00Z");
+    group["grace_until"] = json!(kyriakon_onboard::util::date_after_days(-1));
+    group["payment"]["window"]["state"] = json!("closed");
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+    assert!(
+        !fix.dir.join("store/groups/parish.example").exists(),
+        "the first group stayed"
+    );
+    assert!(
+        fix.journal()
+            .contains("delete-group-parish.example-2020-01-01T00:00:00Z"),
+        "{}",
+        fix.journal()
+    );
+
+    // The same domain, a new body: fresh names, because the first body's are
+    // held for ninety days.
+    fix.file_group(
+        "parish.example",
+        "newclerk",
+        &[("secretary", "newclerk")],
+        &["newclerk"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let stamp = group["created_at"].as_str().unwrap().to_string();
+    assert_ne!(stamp, "2020-01-01T00:00:00Z", "{group}");
+    group["grace_until"] = json!(kyriakon_onboard::util::date_after_days(-1));
+    group["payment"]["window"]["state"] = json!("closed");
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/groups/parish.example").exists(),
+        "the second group stayed: the reused journal id hid the deletion"
+    );
+    assert!(
+        fix.journal()
+            .contains(&format!("delete-group-parish.example-{stamp}")),
+        "{}",
+        fix.journal()
+    );
+}
+
+/// Closing the site owner's account does not remove the group's token: it is
+/// indexed under that name but pays for the whole body.
+#[test]
+fn closing_a_site_owner_leaves_the_groups_token_alone() {
+    let fix = Fix::new("group-token-owner");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let token = group["payment"]["token_ref"].as_str().unwrap().to_string();
+
+    let out = fix.ctl(&["delete", "parish-secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.dir.join(format!("store/tokens/{token}.json")).exists(),
+        "the group's token went with one of its mailboxes"
+    );
+    assert!(
+        fix.dir.join("store/groups/parish.example").exists(),
+        "the group went with one of its mailboxes"
     );
 }

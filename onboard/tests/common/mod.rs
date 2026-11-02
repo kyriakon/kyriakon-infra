@@ -202,6 +202,7 @@ impl Fix {
              from = \"kyriakon <hello@example.invalid>\"\n\
              base_url = \"https://signup.kyriakon.net\"\n\
              price_gbp = \"20.00\"\n\
+             group_price_gbp = \"40.00\"\n\
              postal_address = \"1 Example Street, Example\"\n\
              mail_dir = \"{}/store/mail/new\"\n\
              release = \"2026-10-10 abc1234\"\n\

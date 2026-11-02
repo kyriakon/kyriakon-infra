@@ -1383,7 +1383,7 @@ async fn approve(
         store
             .write_record("tokens", &format!("{token}.json"), &bytes)
             .await?;
-        append_ledger(cfg, store, token, &record.rail, &intent.id, &now).await?;
+        append_ledger(store, token, &record.rail, &intent.id, &now, &cfg.price_gbp).await?;
     }
 
     // The account's own copy of the application, inside the 90-day purge, with
@@ -1620,11 +1620,21 @@ pub async fn window_extend(
         )
         .await;
     }
+    // A group's token names the group's one window, and it takes the same one
+    // extension under the same rule.
+    let join = match token_join(store, &intent.token).await {
+        Ok(join) => join,
+        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+    };
+    if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
+        return extend_group_window(cfg, store, intent, file, value, &domain).await;
+    }
     let (username, mut account, mut payment) = match resolve_payment(store, &intent.token).await {
         Ok(found) => found,
         Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
     };
-    let Some(window) = payment.window.as_mut() else {
+    let (paid_until, window) = (&payment.paid_until, &mut payment.window);
+    let Some(window) = window.as_mut() else {
         return refuse_with(
             cfg,
             store,
@@ -1634,44 +1644,10 @@ pub async fn window_extend(
         )
         .await;
     };
-    if payment.paid_until.is_some() || window.state != "open" {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            "the payment window is not open, so it has nothing to extend",
-        )
-        .await;
-    }
-    if window.extensions >= 1 {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            "the payment window has already been extended once; a second extension is refused",
-        )
-        .await;
-    }
-    let Ok(closes) = OffsetDateTime::parse(&window.closes_at, &Rfc3339) else {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            "the window's close date cannot be read",
-        )
-        .await;
+    let new_close = match extend_open_window(paid_until.as_deref(), window, intent.days) {
+        Ok(close) => close,
+        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
     };
-    let closes = closes + Duration::days(intent.days);
-    window.closes_at = closes
-        .replace_nanosecond(0)
-        .unwrap_or(closes)
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| window.closes_at.clone());
-    window.extensions += 1;
-    let new_close = window.closes_at.clone();
     account.payment = Some(payment.clone());
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
@@ -1720,6 +1696,105 @@ pub async fn window_extend(
     )
     .await?;
     store.remove("intents", file).await
+}
+
+/// `window extend` for a group's token: the same fourteen days, the same one
+/// extension, applied to the one window the whole body pays inside.
+async fn extend_group_window(
+    cfg: &DrainConfig,
+    store: &Store,
+    intent: WindowExtendIntent,
+    file: &str,
+    value: &Value,
+    domain: &str,
+) -> Result<(), String> {
+    let Some(mut group) = group_record(store, domain).await? else {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the token resolves to a group that is gone",
+        )
+        .await;
+    };
+    let GroupPayment {
+        paid_until, window, ..
+    } = &mut group.payment;
+    let Some(window) = window.as_mut() else {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the group has no payment window to extend",
+        )
+        .await;
+    };
+    let new_close = match extend_open_window(paid_until.as_deref(), window, intent.days) {
+        Ok(close) => close,
+        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+    };
+    write_group_record(store, &group).await?;
+    if let Some(text) = store
+        .read_record("tokens", &format!("{}.json", intent.token))
+        .await
+    {
+        if let Ok(mut join) = serde_json::from_str::<TokenRecord>(&text) {
+            join.window_closes_at = new_close.clone();
+            let bytes = serde_json::to_vec_pretty(&join)
+                .map_err(|e| format!("cannot encode the token record: {e}"))?;
+            store
+                .write_record("tokens", &format!("{}.json", intent.token), &bytes)
+                .await?;
+        }
+    }
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &ApplicationRef {
+            username: group.site_owner.clone(),
+            status_token: domain.to_string(),
+        },
+        "applied",
+        Some(&format!(
+            "the group's window now closes on {}",
+            &new_close[..10.min(new_close.len())]
+        )),
+    )
+    .await?;
+    store.remove("intents", file).await
+}
+
+/// Move one open window fourteen days on, once. Shared by an account's window
+/// and a group's, so the one-extension rule cannot differ between them.
+fn extend_open_window(
+    paid_until: Option<&str>,
+    window: &mut Window,
+    days: i64,
+) -> Result<String, String> {
+    if paid_until.is_some() || window.state != "open" {
+        return Err("the payment window is not open, so it has nothing to extend".to_string());
+    }
+    if window.extensions >= 1 {
+        return Err(
+            "the payment window has already been extended once; a second extension is refused"
+                .to_string(),
+        );
+    }
+    let Ok(closes) = OffsetDateTime::parse(&window.closes_at, &Rfc3339) else {
+        return Err("the window's close date cannot be read".to_string());
+    };
+    let closes = closes + Duration::days(days);
+    window.closes_at = closes
+        .replace_nanosecond(0)
+        .unwrap_or(closes)
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| window.closes_at.clone());
+    window.extensions += 1;
+    Ok(window.closes_at.clone())
 }
 
 /// Close every payment window whose day has passed. A window with a credit
@@ -1846,8 +1921,10 @@ pub async fn window_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String
         }
         // Stop every mailbox before the group's record says lapsed, so the
         // record never reads lapsed while a mailbox still sends. A script
-        // failure leaves the window open, and the next pass tries again.
-        let grace = group_grace_end(&window.closes_at);
+        // failure leaves the window open, and the next pass tries again. The
+        // grace runs forty days from this pass, not from the close date, so a
+        // sweep that runs late gives the body its whole forty days.
+        let grace = util::date_after_days(40);
         let mut stopped = true;
         for mailbox in &group.accounts {
             if let Err(e) = run_script(cfg, "lapse-user.sh", &[mailbox.as_str()]).await {
@@ -1864,7 +1941,7 @@ pub async fn window_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String
                 continue;
             }
             account.state = "lapsed".to_string();
-            account.grace_until = grace.map(util::date_string);
+            account.grace_until = Some(grace.clone());
             let bytes = serde_json::to_vec_pretty(&account)
                 .map_err(|e| format!("cannot encode the account: {e}"))?;
             write_account_record(store, mailbox, &bytes).await?;
@@ -1875,21 +1952,13 @@ pub async fn window_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String
         if let Some(window) = group.payment.window.as_mut() {
             window.state = "closed".to_string();
         }
+        group.grace_until = Some(grace.clone());
         write_group_record(store, &group).await?;
         if let Err(e) = group_lapse_notice(cfg, store, &group, &window).await {
             eprintln!("kyriakon-onboard: the lapse notice for {domain}: {e}");
         }
     }
     Ok(())
-}
-
-/// The day a lapsed group's forty-day grace ends: the window's close date plus
-/// forty days, which is also the date written onto every mailbox in it. One
-/// date for the whole body, so the notice and the deletion cannot disagree.
-fn group_grace_end(closes_at: &str) -> Option<time::Date> {
-    OffsetDateTime::parse(closes_at, &Rfc3339)
-        .ok()
-        .map(|at| at.date() + Duration::days(40))
 }
 
 /// The group's one lapse notice, in the words the account pages use and on the
@@ -1904,9 +1973,7 @@ async fn group_lapse_notice(
     let to = dns_contact(store, group).await?;
     let closes_on = &window.closes_at[..10.min(window.closes_at.len())];
     let token = group.payment.token_ref.as_deref().unwrap_or("");
-    let grace = group_grace_end(&window.closes_at)
-        .map(util::date_string)
-        .unwrap_or_default();
+    let grace = group.grace_until.clone().unwrap_or_default();
     let subject = format!(
         "Your kyriakon.net payment window for {} has closed",
         group.domain
@@ -1925,6 +1992,44 @@ async fn group_lapse_notice(
         store,
         &group.site_owner,
         "group.lapsed",
+        &subject,
+        &to,
+        &body,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The group grace's midpoint, thirty days before the deletion, once for the
+/// body. The lapse notice opened the grace and the final notice closes it, so
+/// this one gives the body a month's warning before anything is erased.
+async fn group_grace_notice(
+    cfg: &DrainConfig,
+    store: &Store,
+    group: &GroupRecord,
+    grace: time::Date,
+) -> Result<(), String> {
+    let to = dns_contact(store, group).await?;
+    let grace = util::date_string(grace);
+    let token = group.payment.token_ref.as_deref().unwrap_or("");
+    let subject = format!(
+        "The grace for your kyriakon.net group for {} ends on {grace}",
+        group.domain
+    );
+    let body = format!(
+        "The payment window for {} closed and no payment has been recorded.\n\n\
+         {}\n\n\
+         The grace ends on {grace}, thirty days from this notice. After that every\n\
+         account in the group is deleted automatically. Paying restores the whole group.\n\n\
+         Your payment reference is {token}.\n",
+        group.domain,
+        crate::page::LAPSE_NOTE
+    );
+    notice::send_account_notice(
+        cfg,
+        store,
+        &group.site_owner,
+        "group.grace",
         &subject,
         &to,
         &body,
@@ -1986,7 +2091,9 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String>
         if account.group.is_some() {
             continue;
         }
-        if account.state != "lapsed" {
+        // A suspension runs the same clock as a lapse: the same final week and
+        // the same deletion, with the reason carried into its final notice.
+        if account.state != "lapsed" && account.state != "suspended" {
             continue;
         }
         let Some(grace_text) = account.grace_until.as_deref() else {
@@ -2007,13 +2114,21 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String>
         }
         // The grace's own reminder, while a month of it is left. It is skipped
         // once the final notice's week has begun, which is behind this branch.
-        if today >= grace - Duration::days(30) && today < grace - Duration::days(7) {
+        if account.state == "lapsed"
+            && today >= grace - Duration::days(30)
+            && today < grace - Duration::days(7)
+        {
             if let Err(e) = grace_notice(cfg, store, &username, &account).await {
                 eprintln!("kyriakon-onboard: the grace notice for {username}: {e}");
             }
         }
         if today >= grace - Duration::days(7) {
-            if let Err(e) = final_notice(cfg, store, &username, &account).await {
+            let sent = if account.state == "suspended" {
+                suspension_final_notice(cfg, store, &username, &account).await
+            } else {
+                final_notice(cfg, store, &username, &account).await
+            };
+            if let Err(e) = sent {
                 eprintln!("kyriakon-onboard: the final notice for {username}: {e}");
             }
         }
@@ -2034,17 +2149,25 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String>
         if group.payment.no_charge {
             continue;
         }
-        let Some(window) = group.payment.window.as_ref() else {
-            continue;
-        };
-        if window.state != "closed" {
+        if group
+            .payment
+            .window
+            .as_ref()
+            .is_none_or(|window| window.state != "closed")
+        {
             continue;
         }
-        let Some(grace) = group_grace_end(&window.closes_at) else {
+        // The grace is the date the lapse wrote. A record that predates the
+        // field has no grace to run, and a sweep that ran late does not get to
+        // shorten it by measuring from the old close date.
+        let Some(grace) = group.grace_until.as_deref().and_then(util::parse_date) else {
             continue;
         };
         if today >= grace {
-            let id = format!("delete-group-{domain}");
+            // The id carries the group's creation stamp, so a domain that is
+            // removed and re-added gets its own deletion rather than matching
+            // the first lifecycle's journal line.
+            let id = format!("delete-group-{domain}-{}", group.created_at);
             if !due(store, &id, now).await {
                 continue;
             }
@@ -2052,6 +2175,11 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String>
                 report_failure(cfg, store, &id, "delete", &e).await;
             }
             continue;
+        }
+        if today >= grace - Duration::days(30) && today < grace - Duration::days(7) {
+            if let Err(e) = group_grace_notice(cfg, store, &group, grace).await {
+                eprintln!("kyriakon-onboard: the grace notice for {domain}: {e}");
+            }
         }
         if today >= grace - Duration::days(7) {
             if let Err(e) = group_final_notice(cfg, store, &group, grace).await {
@@ -2171,6 +2299,45 @@ async fn final_notice(
     );
     notice::send_account_notice(cfg, store, username, "prepaid.final", &subject, &to, &body)
         .await?;
+    Ok(())
+}
+
+/// The last notice before a suspended account's grace ends. It names the reason
+/// again and the way to answer it, because the member's one chance to stop the
+/// deletion is to write before the date, and it is separate from the lapse's
+/// final notice so neither night's sweep sends the other's words.
+async fn suspension_final_notice(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+    account: &Account,
+) -> Result<(), String> {
+    let grace = account.grace_until.as_deref().unwrap_or("");
+    let reason = account.suspension_reason.as_deref().unwrap_or("");
+    let to = notice_address(account, username);
+    let subject = format!(
+        "Your suspended kyriakon.net account is deleted in seven days: {reason} ({username})"
+    );
+    let body = format!(
+        "The account {username} was suspended: {reason}\n\n\
+         Outbound mail has stopped, and uploading to your site and pushing to git with\n\
+         it. Inbound mail keeps arriving and stays readable, and your account page stays\n\
+         open and shows this reason. The account is due to be deleted on {grace}, seven\n\
+         days from this notice.\n\n\
+         To answer it before then, reply to this message or write to\n\
+         admin@kyriakon.net. A suspension the operator resolves is lifted with\n\
+         `onboardctl resume {username}` and the deletion does not run.\n"
+    );
+    notice::send_account_notice(
+        cfg,
+        store,
+        username,
+        "account.suspended.final",
+        &subject,
+        &to,
+        &body,
+    )
+    .await?;
     Ok(())
 }
 
@@ -2298,7 +2465,7 @@ pub async fn credit(
         Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
     };
     if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
-        return group_credit(cfg, store, file, value, &intent, &domain).await;
+        return group_credit(cfg, store, file, value, &intent, &domain, None).await;
     }
 
     let (username, account, payment) = match resolve_payment(store, &intent.token).await {
@@ -2714,6 +2881,7 @@ async fn group_credit(
     value: &Value,
     intent: &CreditIntent,
     domain: &str,
+    attributed_item: Option<&str>,
 ) -> Result<(), String> {
     let amount = match credit_fields(intent) {
         Ok(amount) => amount,
@@ -2819,10 +2987,10 @@ async fn group_credit(
         )
         .await;
     }
-    let price = util::pence(&cfg.price_gbp)
-        .map_err(|e| format!("the drain's configured price_gbp: {e}"))?;
+    let price = util::pence(&cfg.group_price_gbp)
+        .map_err(|e| format!("the drain's configured group_price_gbp: {e}"))?;
     if price <= 0 {
-        return Err("the drain's configured price_gbp must be more than zero".to_string());
+        return Err("the drain's configured group_price_gbp must be more than zero".to_string());
     }
     // The fee covers the whole group, so the year is one payment and the group
     // holds no balance to carry a shortfall or an excess into.
@@ -2872,16 +3040,20 @@ async fn group_credit(
             .await;
         }
         if let Some((id, received_on)) = held_txid(store, txid).await? {
-            return refuse_with(
-                cfg,
-                store,
-                file,
-                value,
-                &format!(
-                    "transaction {txid} is already held as {id}, received on {received_on}; attribute that item instead"
-                ),
-            )
-            .await;
+            // The item this transition is attributing is not a second sighting
+            // of the payment, exactly as on the account path.
+            if attributed_item != Some(id.as_str()) {
+                return refuse_with(
+                    cfg,
+                    store,
+                    file,
+                    value,
+                    &format!(
+                        "transaction {txid} is already held as {id}, received on {received_on}; attribute that item instead"
+                    ),
+                )
+                .await;
+            }
         }
     }
     if let Some(paid_until) = group.payment.paid_until.as_deref() {
@@ -2915,23 +3087,10 @@ async fn group_credit(
     )
     .await?;
 
-    // A payment after a lapse restores every mailbox in the group: the group
-    // lapsed as one and comes back as one. A closing or suspended state is a
-    // decision of its own, and the payment sweep does not overturn it.
-    for mailbox in &group.accounts {
-        let Some(mut account) = existing_account(store, mailbox).await else {
-            continue;
-        };
-        if account.state != "lapsed" {
-            continue;
-        }
-        run_script(cfg, "lapse-user.sh", &["--restore", mailbox]).await?;
-        account.state = "active".to_string();
-        account.grace_until = None;
-        let bytes = serde_json::to_vec_pretty(&account)
-            .map_err(|e| format!("cannot encode the account: {e}"))?;
-        write_account_record(store, mailbox, &bytes).await?;
-    }
+    // A payment after a lapse restores every mailbox in the group. A closing or
+    // suspended state is a decision of its own, and the payment sweep does not
+    // overturn it.
+    restore_group_mailboxes(cfg, store, &group).await?;
     group.payment.paid_until = Some(until_text.clone());
     group.payment.rail = intent.rail.clone();
     if let Some(window) = group.payment.window.as_mut() {
@@ -2974,6 +3133,31 @@ async fn group_credit(
     .await?;
     journal_credit_applied(cfg, store, intent, &group.site_owner, override_reason).await?;
     store.remove("intents", file).await?;
+    Ok(())
+}
+
+/// Bring back every mailbox in a group that lapsed with it: the group lapsed as
+/// one and comes back as one, so a prepaid credit and a card renewal restore the
+/// same set through the same steps.
+async fn restore_group_mailboxes(
+    cfg: &DrainConfig,
+    store: &Store,
+    group: &GroupRecord,
+) -> Result<(), String> {
+    for mailbox in &group.accounts {
+        let Some(mut account) = existing_account(store, mailbox).await else {
+            continue;
+        };
+        if account.state != "lapsed" {
+            continue;
+        }
+        run_script(cfg, "lapse-user.sh", &["--restore", mailbox]).await?;
+        account.state = "active".to_string();
+        account.grace_until = None;
+        let bytes = serde_json::to_vec_pretty(&account)
+            .map_err(|e| format!("cannot encode the account: {e}"))?;
+        write_account_record(store, mailbox, &bytes).await?;
+    }
     Ok(())
 }
 
@@ -3211,14 +3395,6 @@ pub async fn refund(
         },
     };
 
-    // The token index is the only join, through the same helper the credit
-    // path uses, so a refund and a credit cannot disagree about whose token it
-    // is.
-    let (username, mut account, mut payment) = match resolve_payment(store, &intent.token).await {
-        Ok(found) => found,
-        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
-    };
-
     let original = match last_payment_line(store, &intent.token).await {
         Ok(Some(line)) => line,
         Ok(None) => {
@@ -3275,10 +3451,39 @@ pub async fn refund(
         )
         .await;
     }
+    // The token index is the only join, through the same helper the credit
+    // path uses, so a refund and a credit cannot disagree about whose token it
+    // is. A group's token names the group's one payment, which this path
+    // reverses the same way with one less account to write.
+    let join = match token_join(store, &intent.token).await {
+        Ok(join) => join,
+        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+    };
+    if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
+        return refund_group(
+            cfg,
+            store,
+            &intent,
+            file,
+            value,
+            &domain,
+            rail,
+            amount,
+            reason,
+            rate.as_deref(),
+            &original,
+        )
+        .await;
+    }
+    let (username, mut account, mut payment) = match resolve_payment(store, &intent.token).await {
+        Ok(found) => found,
+        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+    };
+
     // An excess refund gives back held overpayment, so whatever it takes has
-    // to leave the balance too. The sum check below caps the refund at the
-    // payment; a duplicate payment that bought a year has no balance, and this
-    // leaves that year alone as the spec says.
+    // to leave the balance too. The sum check caps the refund at the payment; a
+    // duplicate payment that bought a year has no balance, and this leaves that
+    // year alone as the spec says.
     let balance = match payment.balance_gbp.as_deref() {
         Some(text) => match util::pence(text) {
             Ok(pence) => pence,
@@ -3295,62 +3500,14 @@ pub async fn refund(
         },
         None => 0,
     };
-
-    let deducted = format!("-{}", util::gbp(amount));
-    let mut already_refunded = 0i64;
-    for line in store.lines("ledger/payments.jsonl").await {
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if v.get("token").and_then(Value::as_str) != Some(intent.token.as_str())
-            || v.get("kind").and_then(Value::as_str) != Some("refund")
-            || v.get("refund_of").and_then(Value::as_u64) != Some(original.seq)
-        {
-            continue;
-        }
-        let on = v
-            .get("received_on")
-            .and_then(Value::as_str)
-            .unwrap_or("an earlier date");
-        if v.get("amount_gbp").and_then(Value::as_str) == Some(deducted.as_str()) {
-            let first = v.get("seq").and_then(Value::as_u64).unwrap_or(0);
-            return refuse_with(
-                cfg,
-                store,
-                file,
-                value,
-                &format!("an identical refund is already recorded at ledger seq {first} on {on}"),
-            )
-            .await;
-        }
-        already_refunded += v
-            .get("amount_gbp")
-            .and_then(Value::as_str)
-            .and_then(|text| util::pence(text.strip_prefix('-').unwrap_or(text)).ok())
-            .unwrap_or(0);
-    }
-    // Refunds of one payment sum to no more than that payment, whatever their
-    // sizes: the per-refund check alone lets two partial refunds overshoot.
-    if already_refunded + amount > original.amount {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            &format!(
-                "refunds of ledger seq {} already total GBP {}; another GBP {} would exceed the GBP {} that arrived",
-                original.seq,
-                util::gbp(already_refunded),
-                util::gbp(amount),
-                util::gbp(original.amount)
-            ),
-        )
-        .await;
+    if let Err(problem) = refund_total(store, &intent.token, &original, amount).await {
+        return refuse_with(cfg, store, file, value, &problem).await;
     }
 
     let received_on = util::filed_at()[..10].to_string();
     let closing_until = util::date_after_days(7);
     let settlement_by = util::date_after_days(14);
+    let deducted = format!("-{}", util::gbp(amount));
 
     // The account write comes before the ledger append: a crash between them
     // leaves a close or a spent balance that a rerun applies again, and the
@@ -3420,6 +3577,155 @@ pub async fn refund(
         &ApplicationRef {
             username: username.clone(),
             status_token: String::new(),
+        },
+        "applied",
+        Some(&note),
+    )
+    .await?;
+    if rail == "card" {
+        println!("the Stripe refund's Idempotency-Key is refund-{seq}");
+    }
+    store.remove("intents", file).await
+}
+
+/// Refunds of one payment sum to no more than that payment, whatever their
+/// sizes: the per-refund check alone lets two partial refunds overshoot. An
+/// identical line is the same refund seen twice.
+async fn refund_total(
+    store: &Store,
+    token: &str,
+    original: &PaymentLine,
+    amount: i64,
+) -> Result<(), String> {
+    let deducted = format!("-{}", util::gbp(amount));
+    let mut already_refunded = 0i64;
+    for line in store.lines("ledger/payments.jsonl").await {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if v.get("token").and_then(Value::as_str) != Some(token)
+            || v.get("kind").and_then(Value::as_str) != Some("refund")
+            || v.get("refund_of").and_then(Value::as_u64) != Some(original.seq)
+        {
+            continue;
+        }
+        let on = v
+            .get("received_on")
+            .and_then(Value::as_str)
+            .unwrap_or("an earlier date");
+        if v.get("amount_gbp").and_then(Value::as_str) == Some(deducted.as_str()) {
+            let first = v.get("seq").and_then(Value::as_u64).unwrap_or(0);
+            return Err(format!(
+                "an identical refund is already recorded at ledger seq {first} on {on}"
+            ));
+        }
+        already_refunded += v
+            .get("amount_gbp")
+            .and_then(Value::as_str)
+            .and_then(|text| util::pence(text.strip_prefix('-').unwrap_or(text)).ok())
+            .unwrap_or(0);
+    }
+    if already_refunded + amount > original.amount {
+        return Err(format!(
+            "refunds of ledger seq {} already total GBP {}; another GBP {} would exceed the GBP {} that arrived",
+            original.seq,
+            util::gbp(already_refunded),
+            util::gbp(amount),
+            util::gbp(original.amount)
+        ));
+    }
+    Ok(())
+}
+
+/// Refund one group payment. The group holds no balance and no closing state,
+/// so only `--excess` is meaningful: the negative ledger line reverses the
+/// year, and the group's own removal is the transition that ends the domain.
+// The fields are the refund's own, resolved by the caller; one list keeps the
+// group and account paths' checks identical.
+#[allow(clippy::too_many_arguments)]
+async fn refund_group(
+    cfg: &DrainConfig,
+    store: &Store,
+    intent: &RefundIntent,
+    file: &str,
+    value: &Value,
+    domain: &str,
+    rail: &str,
+    amount: i64,
+    reason: &str,
+    rate: Option<&str>,
+    original: &PaymentLine,
+) -> Result<(), String> {
+    let Some(group) = group_record(store, domain).await? else {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the token resolves to a group that is gone",
+        )
+        .await;
+    };
+    if intent.close {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "a group has no closing state, so --close cannot cancel one; reverse the payment with --excess, and end the group with `onboardctl group remove <domain>`",
+        )
+        .await;
+    }
+    if let Err(problem) = refund_total(store, &intent.token, original, amount).await {
+        return refuse_with(cfg, store, file, value, &problem).await;
+    }
+    let received_on = util::filed_at()[..10].to_string();
+    let settlement_by = util::date_after_days(14);
+    let deducted = format!("-{}", util::gbp(amount));
+    let seq = append_refund_ledger(
+        store,
+        intent,
+        original,
+        rail,
+        &deducted,
+        reason.trim(),
+        rate,
+        &received_on,
+        group.payment.paid_until.as_deref(),
+    )
+    .await?;
+    let to = dns_contact(store, &group).await?;
+    let (subject, body) = refund_notice(
+        rail,
+        &util::gbp(amount),
+        &received_on,
+        &settlement_by,
+        rate,
+        seq,
+    );
+    notice::send_account_notice(
+        cfg,
+        store,
+        &group.site_owner,
+        "group.refund",
+        &subject,
+        &to,
+        &body,
+    )
+    .await?;
+    let note = if rail == "card" {
+        format!("Stripe Idempotency-Key refund-{seq}")
+    } else {
+        format!("recorded at ledger seq {seq}")
+    };
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &ApplicationRef {
+            username: group.site_owner.clone(),
+            status_token: group.domain.clone(),
         },
         "applied",
         Some(&note),
@@ -3846,7 +4152,16 @@ pub async fn reconcile_attribute(
         Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
     };
     if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
-        group_credit(cfg, store, file, value, &payment_intent, &domain).await?;
+        group_credit(
+            cfg,
+            store,
+            file,
+            value,
+            &payment_intent,
+            &domain,
+            Some(&intent.item),
+        )
+        .await?;
         if ledger_has_intent(store, &payment_intent.id).await {
             mark_attributed(store, &intent.item, &intent.token).await?;
             store.remove("intents", file).await?;
@@ -4448,20 +4763,30 @@ async fn approve_group(
     let written = group_record(store, &domain)
         .await?
         .ok_or("the group record vanished mid-approval")?;
+    let price = cfg.group_price_gbp.as_str();
+    // A group on a cash rail has no Stripe link, and asking for one would fail
+    // the approval of a body that never chose the card rail.
+    let link = if written.payment.rail == "card" {
+        card_link(
+            &cfg.stripe_payment_link,
+            written.payment.token_ref.as_deref().unwrap_or(""),
+        )?
+    } else {
+        None
+    };
     let payment_note = match (&written.payment.token_ref, &written.payment.window) {
         (Some(token), Some(window)) if !written.payment.no_charge => format!(
-            "\n\nThe amount is GBP {} for the year, for the whole group. Your payment \
+            "\n\nThe amount is GBP {price} for the year, for the whole group. Your payment \
              reference is {token}.\n{}\
              \nThe money must arrive before {} or the whole group lapses: mail keeps \
              arriving and everything published stays up, and sending, uploading and \
              pushing stop. Nothing is deleted at that point.\n",
-            cfg.price_gbp,
             rail_instructions(
                 &written.payment.rail,
                 &cfg.postal_address,
-                card_link(&cfg.stripe_payment_link, token)?.as_deref(),
+                link.as_deref(),
                 None,
-                &cfg.price_gbp,
+                price,
             )
             .join("\n"),
             &window.closes_at[..10.min(window.closes_at.len())]
@@ -4811,6 +5136,12 @@ pub async fn provision_group(
         accounts: intent.mailboxes.clone(),
         site_owner: intent.site_owner.clone(),
         space_used: None,
+        grace_until: record.as_ref().and_then(|g| g.grace_until.clone()),
+        created_at: record
+            .as_ref()
+            .map(|g| g.created_at.clone())
+            .filter(|stamp| !stamp.is_empty())
+            .unwrap_or_else(|| now.clone()),
     };
     write_group_record(store, &group).await?;
 
@@ -4877,7 +5208,15 @@ pub async fn provision_group(
         store
             .write_record("tokens", &format!("{token}.json"), &bytes)
             .await?;
-        append_ledger(cfg, store, token, &payment.rail, &intent.id, &now).await?;
+        append_ledger(
+            store,
+            token,
+            &payment.rail,
+            &intent.id,
+            &now,
+            &cfg.group_price_gbp,
+        )
+        .await?;
     }
 
     // The body's hosting, rooted in the site owner's own tree. The upload key
@@ -5293,14 +5632,55 @@ pub async fn suspend(
     let Some(mut account) = existing_account(store, username).await else {
         return Err(format!("no account for {username}"));
     };
+    // The id is the account's own, so a retry after a crash finishes the same
+    // suspension rather than starting a second one.
+    let id = format!("suspend-{username}-{}", account.created_at);
+    let application = ApplicationRef {
+        username: username.to_string(),
+        status_token: String::new(),
+    };
+    if !journal_has(store, &id, "applying").await {
+        journal(
+            store,
+            &cfg.release,
+            &id,
+            "suspend",
+            &application,
+            "applying",
+            Some(reason),
+        )
+        .await?;
+    }
     run_script(cfg, "lapse-user.sh", &[username]).await?;
     account.state = "suspended".to_string();
     account.suspension_reason = Some(reason.to_string());
+    // The suspension enters the same forty-day grace as a lapse. A retry of the
+    // same suspension keeps the date it first set.
+    if account.grace_until.is_none() {
+        account.grace_until = Some(util::date_after_days(40));
+    }
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
     write_account_record(store, username, &bytes).await?;
+    if !journal_has(store, &id, "applied").await {
+        journal(
+            store,
+            &cfg.release,
+            &id,
+            "suspend",
+            &application,
+            "applied",
+            Some(&format!(
+                "the grace ends on {}",
+                account.grace_until.as_deref().unwrap_or("")
+            )),
+        )
+        .await?;
+    }
     let to = notice_address(&account, username);
-    let subject = format!("Your kyriakon.net account is suspended ({username})");
+    // The reason is in the subject, so a corrected reason is a new notice and a
+    // rerun of the same one stays deduplicated.
+    let subject = format!("Your kyriakon.net account is suspended: {reason} ({username})");
     let body = format!(
         "The account {username} has been suspended: {reason}\n\n\
          Outbound mail has stopped, and uploading to your site and pushing to git with\n\
@@ -5318,6 +5698,57 @@ pub async fn suspend(
         &subject,
         &to,
         &body,
+    )
+    .await?;
+    Ok(())
+}
+
+/// `onboardctl resume`: the inverse of a suspension. The three access paths come
+/// back through the shared lapse script, the state returns to active, and the
+/// reason and the grace it started are cleared, so a member who answered the
+/// suspension is not deleted on a clock that no longer applies.
+pub async fn resume(cfg: &DrainConfig, store: &Store, username: &str) -> Result<(), String> {
+    if let Some(why) = validate::username_shape(username) {
+        return Err(format!("the username {username:?}: {why}"));
+    }
+    let Some(mut account) = existing_account(store, username).await else {
+        return Err(format!("no account for {username}"));
+    };
+    if account.state != "suspended" {
+        return Err(format!(
+            "{username} is not suspended, so there is nothing to resume"
+        ));
+    }
+    let id = format!("resume-{username}-{}", account.created_at);
+    let application = ApplicationRef {
+        username: username.to_string(),
+        status_token: String::new(),
+    };
+    journal(
+        store,
+        &cfg.release,
+        &id,
+        "resume",
+        &application,
+        "applying",
+        account.suspension_reason.as_deref(),
+    )
+    .await?;
+    run_script(cfg, "lapse-user.sh", &["--restore", username]).await?;
+    account.state = "active".to_string();
+    account.suspension_reason = None;
+    account.grace_until = None;
+    let bytes = serde_json::to_vec_pretty(&account)
+        .map_err(|e| format!("cannot encode the account: {e}"))?;
+    write_account_record(store, username, &bytes).await?;
+    journal(
+        store,
+        &cfg.release,
+        &id,
+        "resume",
+        &application,
+        "applied",
+        None,
     )
     .await?;
     Ok(())
@@ -6028,8 +6459,12 @@ async fn take_group_down(cfg: &DrainConfig, store: &Store, domain: &str) -> Resu
         close_mailbox(cfg, store, account).await?;
     }
     // After the accounts, so a crash between the two steps leaves the record
-    // that names them and the retry finds the token again.
+    // that names them and the retry finds the token again. The group's own
+    // token is not an account's, and closing it is this transition's job.
     close_group_tokens(store, &group.accounts).await?;
+    if let Some(token) = group.payment.token_ref.as_deref() {
+        store.remove("tokens", &format!("{token}.json")).await?;
+    }
     Ok(())
 }
 
@@ -6060,6 +6495,12 @@ async fn close_group_tokens(store: &Store, accounts: &[String]) -> Result<(), St
         let Ok(token) = serde_json::from_str::<TokenRecord>(&text) else {
             continue;
         };
+        // A group's token is indexed under the site owner's name, but it pays
+        // for the whole body: closing that one account must not strand the
+        // group's payments. The group's own removal drops it.
+        if token.group.is_some() {
+            continue;
+        }
         if accounts.iter().any(|account| account == &token.username) {
             store.remove("tokens", &name).await?;
         }
@@ -6691,30 +7132,34 @@ pub async fn prepaid_renewals(cfg: &DrainConfig, store: &Store) -> Result<(), St
         if today < until - Duration::days(30) || today >= until {
             continue;
         }
-        let price = cfg.price_gbp.as_str();
-        let how = match rail {
-            "monero" => format!(
-                "Write to admin@kyriakon.net for the subaddress and the amount in Monero\n\
-                 quoted for this renewal. Send {price} worth, and the pound amount is what\n\
-                 is owed."
-            ),
-            _ => format!(
-                "Post GBP {price} to:\n{}\n\
-                 Write your reference on the envelope, or on a slip inside it.",
-                cfg.postal_address
-            ),
+        // What is still owed: a held overpayment is spent before the member is
+        // asked for the price again.
+        let amount = match (util::pence(&cfg.price_gbp), payment.balance_gbp.as_deref()) {
+            (Ok(price), Some(balance)) => util::pence(balance)
+                .map(|balance| util::gbp((price - balance).max(0)))
+                .unwrap_or_else(|_| cfg.price_gbp.clone()),
+            _ => cfg.price_gbp.clone(),
         };
+        // The rail's own words, so a cash-in-hand member is not told to post an
+        // envelope and a Monero member sees the same instructions as the page.
+        let how = rail_instructions(
+            rail,
+            &cfg.postal_address,
+            None,
+            payment.monero.as_ref(),
+            &amount,
+        )
+        .join("\n");
         let token = payment.token_ref.as_deref().unwrap_or("");
         let to = notice_address(&account, &username);
         let subject = format!("Your kyriakon.net membership runs out on {paid_until} ({username})");
         let body = format!(
             "The membership for {username} is paid until {paid_until}.\n\n\
-             To renew it for another year:\n\n{how}\n\n\
+             To renew it for another year, send GBP {amount}:\n\n{how}\n\n\
              Your payment reference is {token}.\n\n\
-             Nothing is deleted when the date passes: mail keeps arriving and stays\n\
-             readable and everything published stays up, while sending, uploading and\n\
-             pushing stop, and the forty-day grace begins. Write to admin@kyriakon.net if\n\
-             you have already sent the money.\n"
+             Nothing is deleted when the date passes. Write to admin@kyriakon.net to\n\
+             arrange the renewal or if you have already sent the money; the renewal is\n\
+             handled by the operator, and no automatic deletion runs from this date.\n"
         );
         if let Err(e) = notice::send_account_notice(
             cfg,
@@ -6728,6 +7173,63 @@ pub async fn prepaid_renewals(cfg: &DrainConfig, store: &Store) -> Result<(), St
         .await
         {
             eprintln!("kyriakon-onboard: the renewal note for {username}: {e}");
+        }
+    }
+
+    // The groups' own thirty-day note, once for the body. A card group is
+    // Stripe's to remind, and a free group has no date to run out.
+    for domain in store.list("groups").await? {
+        let group = match group_record(store, &domain).await {
+            Ok(Some(group)) => group,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("kyriakon-onboard: reading {domain}'s renewal: {e}");
+                continue;
+            }
+        };
+        if group.payment.no_charge || group.payment.rail == "card" {
+            continue;
+        }
+        let Some(paid_until) = group.payment.paid_until.as_deref() else {
+            continue;
+        };
+        let Some(until) = util::parse_date(paid_until.get(..10).unwrap_or(paid_until)) else {
+            continue;
+        };
+        if today < until - Duration::days(30) || today >= until {
+            continue;
+        }
+        let token = group.payment.token_ref.as_deref().unwrap_or("");
+        let price = cfg.group_price_gbp.as_str();
+        let subject = format!("Your kyriakon.net group for {domain} runs out on {paid_until}");
+        let body = format!(
+            "The membership for {domain} is paid until {paid_until}, and covers every\n\
+             mailbox in the group.\n\n\
+             To renew it for another year, send GBP {price} for the whole group. Your\n\
+             payment reference is {token}.\n\n\
+             Nothing is deleted when the date passes. Write to admin@kyriakon.net to\n\
+             arrange the renewal or if you have already sent the money; the renewal is\n\
+             handled by the operator, and no automatic deletion runs from this date.\n"
+        );
+        let to = match dns_contact(store, &group).await {
+            Ok(to) => to,
+            Err(e) => {
+                eprintln!("kyriakon-onboard: the renewal note for {domain}: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = notice::send_account_notice(
+            cfg,
+            store,
+            &group.site_owner,
+            "group.renewal",
+            &subject,
+            &to,
+            &body,
+        )
+        .await
+        {
+            eprintln!("kyriakon-onboard: the renewal note for {domain}: {e}");
         }
     }
     Ok(())
@@ -7078,12 +7580,12 @@ async fn mark_decided(
 /// window it falls due in, keyed by the token and holding no username. A rerun
 /// finds the line already there and writes none.
 async fn append_ledger(
-    cfg: &DrainConfig,
     store: &Store,
     token: &str,
     rail: &str,
     intent: &str,
     at: &str,
+    amount_gbp: &str,
 ) -> Result<(), String> {
     let mut seq = 0u64;
     for line in store.lines("ledger/payments.jsonl").await {
@@ -7105,7 +7607,7 @@ async fn append_ledger(
         "kind": "window_open",
         "rail": rail,
         "received_on": Value::Null,
-        "amount_gbp": cfg.price_gbp,
+        "amount_gbp": amount_gbp,
         "applied_gbp": "0.00",
         "paid_until_after": Value::Null,
         "amount_xmr": Value::Null,
@@ -7582,8 +8084,15 @@ impl BillingTarget {
     }
 
     /// A payment extends the date and marks the window paid. A group's window
-    /// closes the same way: one date, shared by every mailbox in it.
-    fn set_paid_until(&mut self, date: String) -> Result<(), String> {
+    /// closes the same way: one date, shared by every mailbox in it, and every
+    /// mailbox a lapse had stopped comes back through the same restore loop a
+    /// prepaid credit runs.
+    async fn set_paid_until(
+        &mut self,
+        cfg: &DrainConfig,
+        store: &Store,
+        date: String,
+    ) -> Result<(), String> {
         match self {
             BillingTarget::Account(a) => {
                 let payment = a
@@ -7600,6 +8109,7 @@ impl BillingTarget {
                 if let Some(window) = g.payment.window.as_mut() {
                     window.state = "paid".to_string();
                 }
+                restore_group_mailboxes(cfg, store, g).await?;
             }
         }
         Ok(())
@@ -7945,7 +8455,7 @@ async fn invoice_paid(cfg: &DrainConfig, store: &Store, object: &Value) -> Resul
     }
     let received = util::filed_at();
     let date = crate::billing::extend_paid_until(&received, billing.paid_until())?;
-    billing.set_paid_until(date)?;
+    billing.set_paid_until(cfg, store, date).await?;
     billing.stripe_mut().last_invoice = Some(invoice.to_string());
     billing.stripe_mut().failed_attempts = 0;
     billing.stripe_mut().next_payment_attempt = None;
@@ -8466,6 +8976,7 @@ mod tests {
             from: "kyriakon <hello@example.invalid>".to_string(),
             base_url: "https://signup.kyriakon.net".to_string(),
             price_gbp: "20.00".to_string(),
+            group_price_gbp: "40.00".to_string(),
             postal_address: "1 Example Street".to_string(),
             mail_dir: dir.join("mail").to_str().unwrap().to_string(),
             release: "2026-10-10 abc1234".to_string(),

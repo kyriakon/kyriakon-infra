@@ -543,3 +543,123 @@ fn a_card_invoice_appends_a_line_and_a_card_refund_names_it() {
         fix.journal()
     );
 }
+
+/// A group's payment is reversible: the token names the group's one payment and
+/// the mailbox name resolves to that token, the negative ledger line names the
+/// year it reverses, and `--close` is refused because a group has no closing
+/// state to enter.
+#[test]
+fn a_group_refund_reverses_the_groups_one_payment() {
+    let fix = Fix::new("group-refund");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let token = group["payment"]["token_ref"].as_str().unwrap().to_string();
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "40.00",
+        "--received",
+        "2026-10-20",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    let paid_until = serde_json::from_str::<Value>(&fix.read("groups/parish.example/group.json"))
+        .unwrap()["payment"]["paid_until"]
+        .clone();
+    let credit_seq = payment_lines(&fix)[0]["seq"].as_u64().unwrap();
+
+    // A mailbox name resolves to the group's token, and the line reverses the
+    // payment keyed by that token.
+    let out = fix.ctl(&[
+        "refund",
+        "--username",
+        "parish-secretary",
+        "--amount",
+        "10.00",
+        "--rail",
+        "cash",
+        "--reason",
+        "overpaid for the group",
+        "--excess",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let refunds = refund_lines(&fix);
+    assert_eq!(refunds.len(), 1, "{refunds:?}");
+    assert_eq!(refunds[0]["token"], json!(token), "{refunds:?}");
+    assert_eq!(refunds[0]["amount_gbp"], json!("-10.00"), "{refunds:?}");
+    assert_eq!(refunds[0]["refund_of"], json!(credit_seq), "{refunds:?}");
+
+    // The group's date and state are the refund's to leave alone.
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(group["payment"]["paid_until"], paid_until, "{group}");
+    assert_eq!(
+        group["payment"]["window"]["state"],
+        json!("paid"),
+        "{group}"
+    );
+
+    // The rest by token. A settlement still works against the group's token.
+    let out = fix.ctl(&[
+        "refund",
+        "--token",
+        &token,
+        "--amount",
+        "30.00",
+        "--rail",
+        "cash",
+        "--reason",
+        "the year ended early",
+        "--excess",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    assert_eq!(refund_lines(&fix).len(), 2, "{:?}", refund_lines(&fix));
+
+    // `--close` is not a group transition: it is refused, with the way to end
+    // the group named, and writes no line.
+    let out = fix.ctl(&[
+        "refund",
+        "--token",
+        &token,
+        "--amount",
+        "40.00",
+        "--rail",
+        "cash",
+        "--reason",
+        "cancel the group",
+        "--close",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        refund_lines(&fix).len(),
+        2,
+        "a refused --close wrote a line: {:?}",
+        refund_lines(&fix)
+    );
+    assert!(
+        fix.journal()
+            .contains("a group has no closing state, so --close cannot cancel one"),
+        "{}",
+        fix.journal()
+    );
+    assert!(
+        fix.journal().contains("group remove"),
+        "the refusal names the transition that ends a group: {}",
+        fix.journal()
+    );
+}
