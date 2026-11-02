@@ -1919,6 +1919,36 @@ fn a_group_credit_writes_one_date_on_the_group_alone() {
         "{}",
         fix.journal()
     );
+
+    // With the operator's word, the renewal extends the group's date by one
+    // year from the date the group already holds, not from today.
+    let renewal = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-21",
+        "--confirm-double",
+    ]);
+    assert!(renewal.status.success(), "{}", body(&renewal));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let renewed = group["payment"]["paid_until"].as_str().unwrap();
+    let expected = kyriakon_onboard::billing::extend_paid_until("2026-10-21", Some(&date)).unwrap();
+    assert_eq!(&renewed[..10], &expected[..10], "{renewed}");
+    assert_eq!(payment_lines(&fix).len(), 2, "{:?}", payment_lines(&fix));
+    for mailbox in ["parish-secretary", "parish-office"] {
+        assert!(
+            !fix.read(&format!("accounts/{mailbox}/account.json"))
+                .contains("paid_until"),
+            "{mailbox} holds a date after the renewal"
+        );
+    }
 }
 
 /// A card renewal: the checkout's reference is the group's token, and the
