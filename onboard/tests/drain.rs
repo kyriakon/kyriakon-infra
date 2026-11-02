@@ -8,6 +8,8 @@
 
 mod common;
 
+#[path = "areas/account.rs"]
+mod account;
 #[path = "areas/card.rs"]
 mod card;
 #[path = "areas/erasure.rs"]

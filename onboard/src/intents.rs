@@ -61,6 +61,9 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     // The space used, from the filesystem quota the handler cannot read. Due
     // gated to once an hour, so most passes do no quota work.
     transitions::refresh_space_used(cfg, store).await?;
+    // A mail-key replacement whose 72-hour window has closed applies here, on
+    // the same pass its record is read.
+    transitions::mail_key_rotations(cfg, store).await?;
     // A payment window whose day has passed either finds its credit and stays
     // active, or lapses the account and starts the grace. One sweep, so a
     // member who paid on the last day is not lapsed by a later pass.
@@ -147,6 +150,12 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
             transitions::refund(cfg, store, key, intent, file, &value).await
         }
         "export" => transitions::export_account(cfg, store, &value, file).await,
+        "change-password" => transitions::change_password(cfg, store, &value, file).await,
+        "upload-key" => transitions::upload_key(cfg, store, &value, file).await,
+        "outside-address" => transitions::set_outside_address(cfg, store, &value, file).await,
+        "serving" => transitions::set_serving(cfg, store, &value, file).await,
+        "cancel-renewal" => transitions::cancel_renewal(cfg, store, &value, file).await,
+        "mail-key" => transitions::mail_key(cfg, store, &value, file).await,
         _ => transitions::refuse(cfg, store, file, &value).await,
     }
 }
@@ -167,6 +176,44 @@ pub async fn file_export(store: &Store, session: &str, username: &str) -> Result
         "username": username,
         "session": session,
     });
+    let bytes =
+        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    Ok(id)
+}
+
+/// File one of the account page's actions: the account, the session that filed
+/// it, and the action's own fields.
+///
+/// The handler has authenticated the member and validated each field; the drain
+/// revalidates all of them, because `intents/` belongs to the unprivileged half
+/// and every one of these writes something as root. One writer for the six
+/// actions keeps the envelope, the keys the drain reads before it dispatches,
+/// from drifting between them.
+pub async fn file_action(
+    store: &Store,
+    kind: &str,
+    session: &str,
+    username: &str,
+    fields: serde_json::Value,
+) -> Result<String, String> {
+    let id = ulid::Ulid::new().to_string();
+    let mut intent = serde_json::json!({
+        "id": id,
+        "kind": kind,
+        "filed_at": crate::util::filed_at(),
+        "username": username,
+        "session": session,
+    });
+    let serde_json::Value::Object(extra) = fields else {
+        return Err("a page action's fields have to be an object".to_string());
+    };
+    intent
+        .as_object_mut()
+        .ok_or("the intent is not an object")?
+        .extend(extra);
     let bytes =
         serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
     store

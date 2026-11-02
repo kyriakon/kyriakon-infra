@@ -296,7 +296,12 @@ checked by any script.
 
 Rotation is self-service and never needs a signing key. The account page starts it; the new key applies after a confirmation from every address on the account and a 72-hour window in which any of them can cancel it, and a request signed by the current key skips the delay. Where the member gave no address outside the platform, the delay stands and the warning goes out encrypted to the old key, which only the holder can read. Decided in #155.
 
-The service writes the key into `/etc/kyriakon/keys/<localpart>.asc` so delivery keeps working, and opens a pull request containing `keys/<localpart>.asc` for publication.
+The service writes the key into `/etc/kyriakon/keys/<localpart>.asc` so delivery keeps working. It does not update the published set, because `scripts/publish-mail-key.sh` refuses to replace a key that is already on the default branch and a replacement is this rotation. Publishing the new key is the operator's step, and it comes after the rotation has applied: put it in `keys/<localpart>.asc` on `main`, then deploy.
+
+		doas git -C /usr/local/src/kyriakon-infra pull --ff-only
+		doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-mail.sh
+
+The deploy compares the tracked key's fingerprint with the account record's `mail_key`. While the two differ it keeps the keyring file the rotation wrote and prints both fingerprints, so it cannot silently revert delivery to the key the member has replaced. Once the tracked key is the one the record names, the deploy installs it and the box and the repository agree again.
 
 To replace a key by hand, before the service is built:
 

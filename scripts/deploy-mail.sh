@@ -46,6 +46,11 @@ queue_key_file=/etc/mail/queue.key
 queue_key_len=32
 dkim_key=/etc/mail/dkim/private.rsa.key
 keyring_dir=/etc/kyriakon/keys
+# The store root the drain owns, read here for the one fact the keyring install
+# needs: which mail key an account record says the box is delivering with. A
+# rotation changes it without changing the tracked key, and the install below
+# leaves the rotated key alone.
+store_root=/var/db/onboard
 encrypt_bin=/usr/local/sbin/kyriakon-encrypt
 
 say() { printf '== %s\n' "$*"; }
@@ -163,6 +168,56 @@ install_indexes() {
 		[ -e "$i" ] || : >"$i"
 		chmod 0644 "$i"
 	done
+}
+
+# fpr_of <file>: the primary fingerprint of the first key in a public key file,
+# or nothing when it cannot be read. The same colon-output shape
+# scripts/check-keyring-drift.sh compares.
+fpr_of() {
+	gpg --batch --no-tty --with-colons --import-options show-only --import "$1" 2>/dev/null \
+		| awk -F: '$1 == "fpr" { print $10; exit }'
+}
+
+# install_keyring_key <key-file>: install one tracked key into the keyring, unless
+# the account record names a different fingerprint. A member's rotation writes the
+# new key into the keyring and the record together; installing the tracked key
+# over it would silently revert delivery to a key the member no longer holds, and
+# the published set is the operator's to update after a rotation.
+install_keyring_key() {
+	typeset name localpart account recorded tracked
+	name=$(basename "$1")
+	localpart=${name%.asc}
+	account="$store_root/accounts/$localpart/account.json"
+	if [ -f "$account" ] && command -v jq >/dev/null 2>&1; then
+		recorded=$(jq -r '.mail_key // empty' "$account")
+		tracked=$(fpr_of "$1")
+		if [ -n "$recorded" ] && [ -n "$tracked" ] && [ "$recorded" != "$tracked" ]; then
+			printf 'kept %s: the account record names %s and the tracked key is %s\n' \
+				"$name" "$recorded" "$tracked" >&2
+			printf '  the box keeps delivering with the rotated key; publish it to keys/%s.asc and deploy again\n' \
+				"$localpart" >&2
+			return 0
+		fi
+	fi
+	install -m 0644 "$1" "$keyring_dir/$name"
+	printf 'installed %s\n' "$name"
+	warn_aead "$1"
+}
+
+# The AEAD warning for one installed key. gpg picks AEAD (packet tag 20) when the
+# recipient key advertises it, and no flag on the encrypt side overrides that:
+# --rfc4880 does not stop it. That leaves delivery depending on the reader's AEAD
+# support, where SEIPD (tag 18) is read by every implementation, and
+# Thunderbird's feature check (MDC alone) reports such a key as advertising an
+# unsupported feature. Dropping AEAD from the key's preferences (setpref) removes
+# both the pref-aead subpacket and the AEAD feature bit, which makes gpg emit
+# SEIPD instead. The fix itself runs on the workstation that holds the secret
+# key, not here: scripts/rekey-mail-key.sh.
+warn_aead() {
+	if gpg --list-packets "$1" 2>/dev/null | grep -q 'pref-aead-algos'; then
+		printf 'warning: %s advertises AEAD, so delivery would use packet tag 20 rather than SEIPD\n' "$(basename "$1")" >&2
+		printf '  fix on the workstation holding the key: scripts/rekey-mail-key.sh\n' >&2
+	fi
 }
 
 # self_test — the two writes this deploy makes into files the box reads, against
@@ -298,6 +353,45 @@ self_test() {
 			"$([ -f "$tree/etc/$i.d/index.conf" ] && printf yes || printf no)" yes
 	done
 	check "the index is 0644" "$(stat -f %Lp "$tree/etc/httpd.d/index.conf")" 644
+
+	# --- the keyring install and a rotated key ---
+	# A rotation writes a key the tracked set does not hold. The deploy leaves it
+	# alone rather than putting the old key back, and names both fingerprints in
+	# what it prints. gpg is stubbed: this checks the decision, not GnuPG.
+	gpg() {
+		case " $* " in
+		*" --list-packets "*) return 0 ;;
+		esac
+		printf 'fpr:::::::::BBBB BBBB BBBB BBBB:\n'
+	}
+	keyring_dir="$tree/keyring"
+	store_root="$tree/store"
+	install -d -m 0755 "$keyring_dir" "$store_root/accounts/alice"
+	printf 'tracked alice key\n' > "$tree/alice.asc"
+	printf 'tracked bob key\n' > "$tree/bob.asc"
+	printf '{"version": 1, "username": "alice", "mail_key": "AAAA AAAA AAAA AAAA"}\n' \
+		> "$store_root/accounts/alice/account.json"
+	install_keyring_key "$tree/alice.asc" > "$tree/rotated.out" 2>&1
+	check "a rotated key is not overwritten" \
+		"$([ -f "$keyring_dir/alice.asc" ] && printf yes || printf no)" no
+	check "and the deploy names the account's fingerprint" \
+		"$(grep -c 'AAAA AAAA AAAA AAAA' "$tree/rotated.out")" 1
+	check "and the tracked one" \
+		"$(grep -c 'BBBB BBBB BBBB BBBB' "$tree/rotated.out")" 1
+	check "and says where to publish it" \
+		"$(grep -c 'keys/alice.asc' "$tree/rotated.out")" 1
+
+	# A key with no account record is the ordinary case and installs.
+	install_keyring_key "$tree/bob.asc" > "$tree/new.out" 2>&1
+	check "a key with no account record installs" \
+		"$(cat "$keyring_dir/bob.asc")" 'tracked bob key'
+	# The record names the tracked key, which is what a published rotation looks
+	# like: the tracked file is the one to install.
+	printf '{"mail_key": "BBBB BBBB BBBB BBBB"}\n' \
+		> "$store_root/accounts/alice/account.json"
+	install_keyring_key "$tree/alice.asc" > "$tree/published.out" 2>&1
+	check "a published rotation installs the tracked key" \
+		"$(cat "$keyring_dir/alice.asc")" 'tracked alice key'
 
 	self_test_end
 }
@@ -977,24 +1071,12 @@ install -m 0755 "$repo_dir/kyriakon-encrypt/target/release/kyriakon-encrypt" "$e
 
 say "keyring"
 install -d -m 0755 "$keyring_dir"
+# The install reads each account's mail_key, so the package this deploy already
+# needs comes in before the loop rather than after it.
+need_pkg jq
 for k in "$repo_dir"/keys/*.asc; do
 	[ -e "$k" ] || continue
-	install -m 0644 "$k" "$keyring_dir/$(basename "$k")"
-	printf 'installed %s\n' "$(basename "$k")"
-	# gpg picks AEAD (packet tag 20) when the recipient key advertises it, and no
-	# flag on the encrypt side overrides that: --rfc4880 does not stop it. That
-	# leaves delivery depending on the reader's AEAD support, where SEIPD
-	# (tag 18) is read by every implementation, and Thunderbird's feature check
-	# (MDC alone) reports such a key as advertising an unsupported feature.
-	# Dropping AEAD from the key's preferences (setpref) removes both the
-	# pref-aead subpacket and the AEAD feature bit, which makes gpg emit SEIPD
-	# instead. Warn here rather than let it surface as mail the client cannot
-	# open. The fix itself runs on the workstation that holds the secret key, not
-	# here: scripts/rekey-mail-key.sh.
-	if gpg --list-packets "$k" 2>/dev/null | grep -q 'pref-aead-algos'; then
-		printf 'warning: %s advertises AEAD, so delivery would use packet tag 20 rather than SEIPD\n' "$(basename "$k")" >&2
-		printf '  fix on the workstation holding the key: scripts/rekey-mail-key.sh\n' >&2
-	fi
+	install_keyring_key "$k"
 done
 
 # --- 6. services --------------------------------------------------------
@@ -1115,11 +1197,11 @@ for s in add-user.sh check-hygiene.sh cron-apply.sh delete-user.sh deploy-mail.s
 done
 printf 'cron scripts installed into /root/bin\n'
 
-# restore-standup.sh creates the weekly test box with the hcloud CLI and reads its answer
-# with jq. Both are packages and the weekly job cannot install its own, so they are
-# installed here rather than left to fail at 03:45 on the morning it runs.
+# restore-standup.sh creates the weekly test box with the hcloud CLI and reads
+# its answer with jq, which is installed above for the keyring. hcloud cannot
+# install its own, so it comes in here rather than failing at 03:45 on the
+# morning it runs.
 need_pkg hcloud
-need_pkg jq
 
 # The box's values. setup-env.sh owns the install and is called rather than
 # duplicated here, so a box gets the file whichever deploy runs first: this one

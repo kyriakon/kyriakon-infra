@@ -5,6 +5,7 @@ The suite is one test binary, `drain.rs`, with the cases split into modules unde
 
 | Module | What it drives |
 |---|---|
+| `account` | the account page's actions: password, upload key, contact address, serving, renewal and mail-key rotation |
 | `card` | the Stripe rail: checkout, invoices, subscriptions and card ledger lines |
 | `export` | `onboardctl ledger export` |
 | `group` | the own-domain tier: groups, addresses, aliases and DNS |

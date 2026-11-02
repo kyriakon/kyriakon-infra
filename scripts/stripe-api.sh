@@ -1,16 +1,22 @@
 #!/bin/ksh
-# stripe-api.sh: read one Stripe object, and nothing else.
+# stripe-api.sh: read one Stripe object, and stop one subscription's renewal.
 #
 # The drain settles a card payment only after retrieving the subscription and
 # seeing it is active, because a paid invoice does not prove one. It also reads
 # the Checkout Session a subscription came from, which is how a missed
 # `checkout.session.completed` is repaired: the session carries the account's
-# reference. Both calls are reads; the webhook path marks no invoice paid,
-# creates no session and cancels nothing.
+# reference.
+#
+# The one write is the member's own "stop the yearly renewal", which sets
+# `cancel_at_period_end` on the subscription they already hold. It creates no
+# session, charges nothing, refunds nothing and cancels no subscription
+# outright: the subscription runs to the end of the period paid for, and the
+# paid-until date on the box is what decides access.
 #
 # Usage:
 #   doas ksh scripts/stripe-api.sh subscription <subscription-id> <key-file>
 #   doas ksh scripts/stripe-api.sh session <subscription-id> <key-file>
+#   doas ksh scripts/stripe-api.sh cancel <subscription-id> <key-file>
 #   ksh scripts/stripe-api.sh --self-test
 #
 #   <subscription-id>  the `sub_...` id an invoice or checkout named
@@ -19,16 +25,21 @@
 # The JSON object is written to stdout and nothing else is. The key goes into a
 # curl config file, never an argument, so it is not in the process table and not
 # in any error message. The key needs read access to subscriptions and checkout
-# sessions; the script refuses to run without a 0600 file, and as root without a
-# root-owned one.
+# sessions, and write access to subscriptions for `cancel`; the script refuses to
+# run without a 0600 file, and as root without a root-owned one.
 #
 # `session` prints the first Checkout Session for the subscription, which the
 # list filter `?subscription=<id>&limit=1` returns. An empty list exits 1: the
 # drain has nothing to repair from and leaves the event for a later delivery.
 #
-# Exit: 0 the object is on stdout; 1 the API could not be read, so the drain
-#       leaves the event for the next pass; 2 the arguments or the credential
-#       are unusable, which is a configuration to fix.
+# Exit: 0 the object is on stdout; 1 the API could not be read or written, so
+#       the drain leaves the event or the intent for the next pass; 2 the
+#       arguments or the credential are unusable, which is a configuration to
+#       fix.
+#
+# `cancel` POSTs the one field and prints the subscription Stripe answers with,
+# so the drain can record what the processor now holds. The body is passed
+# literally: there is no other field and no escalation to a full cancellation.
 
 set -euo pipefail
 umask 077
@@ -39,9 +50,10 @@ usage() {
 	cat <<'EOF'
 usage: stripe-api.sh subscription <subscription-id> <key-file>
        stripe-api.sh session <subscription-id> <key-file>
+       stripe-api.sh cancel <subscription-id> <key-file>
        stripe-api.sh --self-test
 
-  <subscription-id>  the sub_... id to retrieve
+  <subscription-id>  the sub_... id to retrieve or to stop renewing
   <key-file>         the root-only restricted Stripe API key
 
 The header of this script documents the mechanism and the exit codes.
@@ -153,6 +165,37 @@ session() {
 	esac
 }
 
+# cancel <id> <key-file>: POST /v1/subscriptions/<id> with
+# `cancel_at_period_end=true`, and print the object Stripe answers with. This is
+# the member's own stop-the-renewal, and it is the one write this script makes:
+# the subscription runs to the end of the paid period, so nothing shortens and
+# nothing needs a refund.
+cancel() {
+	id=$1
+	subscription_id "$id"
+	credential "$2"
+
+	code=$(curl -K "$curlrc" -X POST -o "$resp" -w '%{http_code}' \
+		-d 'cancel_at_period_end=true' \
+		"$api_base/v1/subscriptions/$id") ||
+		fail "curl could not reach $api_base"
+	case "$code" in
+	200)
+		[ -s "$resp" ] || fail "$api_base answered an empty subscription"
+		cat "$resp"
+		;;
+	401 | 403)
+		die "the key cannot write subscriptions (HTTP $code); it needs write access to them for a member to stop a renewal"
+		;;
+	404)
+		fail "Stripe has no subscription $id"
+		;;
+	*)
+		fail "$api_base answered HTTP $code for subscription $id"
+		;;
+	esac
+}
+
 # --- self-test: the decisions, against a stub API -----------------------------
 #
 # curl is replaced on PATH by a stub that answers from SELFTEST_MODE, so what is
@@ -171,9 +214,19 @@ mode="${SELFTEST_MODE:-active}"
 argv="$*"
 out=/dev/null
 url=""
+method=GET
+body=""
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 	-K) shift ;;
+	-X)
+		method=$2
+		shift
+		;;
+	-d)
+		body=$2
+		shift
+		;;
 	-o)
 		out=$2
 		shift
@@ -184,10 +237,10 @@ while [ "$#" -gt 0 ]; do
 	shift
 done
 if [ "$mode" = "unreachable" ]; then
-	printf '%s\n' "GET $url [curl could not connect]" >>"$SELFTEST_LOG"
+	printf '%s\n' "$method $url [curl could not connect]" >>"$SELFTEST_LOG"
 	exit 7
 fi
-printf '%s\n' "GET $url [$argv]" >>"$SELFTEST_LOG"
+printf '%s\n' "$method $url [$argv]" >>"$SELFTEST_LOG"
 case "$mode" in
 active)
 	code=200
@@ -196,6 +249,11 @@ active)
 past_due)
 	code=200
 	printf '%s\n' '{"id":"sub_123","status":"past_due","current_period_end":1790000000,"customer":"cus_1"}' >"$out"
+	;;
+cancel)
+	code=200
+	printf '{"id":"sub_123","status":"active","cancel_at_period_end":%s}\n' \
+		"$(printf '%s' "$body" | sed 's/.*=//')" >"$out"
 	;;
 session)
 	code=200
@@ -322,6 +380,27 @@ EOF
 	assert_eq 'empty session exit' 1 "$rc"
 	assert_has 'the failure names the subscription' 'sub_123' "$out"
 
+	printf '%s\n' '--- stopping a renewal is one POST of one field'
+	SELFTEST_MODE=cancel
+	run cancel sub_123 "$fix/key"
+	assert_eq 'cancel exit' 0 "$rc"
+	assert_has 'the subscription comes back' '"cancel_at_period_end":true' "$out"
+	assert_has 'the call is a POST' 'POST https://api.stripe.com/v1/subscriptions/sub_123' "$(cat "$SELFTEST_LOG")"
+	assert_has 'the body is the one field' 'cancel_at_period_end=true' "$(cat "$SELFTEST_LOG")"
+
+	printf '%s\n' '--- a key that cannot write subscriptions is a configuration to fix'
+	SELFTEST_MODE=denied
+	run cancel sub_123 "$fix/key"
+	assert_eq 'cancel denied exit' 2 "$rc"
+	assert_has 'the refusal names write access' 'write access' "$out"
+	assert_has 'and the scope' 'subscriptions' "$out"
+
+	printf '%s\n' '--- a cancel for an id that is not a subscription calls nothing'
+	: >"$SELFTEST_LOG"
+	run cancel '../customers' "$fix/key"
+	assert_eq 'cancel bad id exit' 2 "$rc"
+	assert_eq 'nothing was called' '' "$(cat "$SELFTEST_LOG")"
+
 	printf '%s\n' '--- the key is never an argument'
 	SELFTEST_MODE=active
 	run subscription sub_123 "$fix/key"
@@ -372,7 +451,7 @@ case "${1:-}" in
 	usage
 	exit 0
 	;;
-subscription | session)
+subscription | session | cancel)
 	[ "$#" -eq 3 ] || {
 		usage >&2
 		exit 2

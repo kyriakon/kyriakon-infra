@@ -708,6 +708,16 @@ pub struct Account {
     /// itself lives where `provision-member.sh` puts it, not here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upload_keys: Vec<UploadKey>,
+    /// The fingerprint of the mail key delivery uses, as the drain wrote the
+    /// keyring file. The page shows it, and a rotation signed by this key skips
+    /// the pending window. Absent on a record written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mail_key: Option<String>,
+    /// A mail-key replacement inside its 72-hour window: the material waits here
+    /// until the window closes, and the page offers to cancel it until then.
+    /// Absent when no replacement is pending, which is every account normally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<Rotation>,
     /// Why the account is suspended, in the words the suspension notice used.
     /// Present only while `state` is `suspended`, and the page stays open so the
     /// member can read it and answer it.
@@ -739,6 +749,19 @@ pub struct Account {
 pub struct UploadKey {
     pub fingerprint: String,
     pub added_at: String,
+}
+
+/// A mail-key replacement waiting out its window. The material is a public key
+/// and the intent that filed it carried the same bytes, so nothing here is a
+/// secret; it is kept in the record because the intent file is deleted once the
+/// request is accepted, and the window outlives it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Rotation {
+    pub fingerprint: String,
+    pub material: String,
+    /// RFC 3339, when the member asked, and the moment the key applies.
+    pub requested_at: String,
+    pub applies_at: String,
 }
 
 /// One pinned client certificate, as a request described it.
@@ -986,6 +1009,11 @@ pub struct StripeBilling {
     /// The subscription's last reported status: `active`, `past_due`,
     /// `canceled`. Recorded and never the thing that revokes a paid date.
     pub status: Option<String>,
+    /// Whether the member has stopped the yearly renewal. The subscription runs
+    /// to the period's end, and the paid-until date is what decides access, so
+    /// this records the choice and never shortens anything by itself.
+    #[serde(default)]
+    pub cancel_at_period_end: bool,
     /// Stripe's `current_period_end`, RFC 3339. `cancel_at_period_end` runs to
     /// this date and no further.
     pub current_period_end: Option<String>,

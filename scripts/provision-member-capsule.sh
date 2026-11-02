@@ -85,6 +85,7 @@ conf_owner="root:wheel"
 usage() {
 	cat >&2 <<'USAGE'
 usage: doas ksh provision-member-capsule.sh <username>
+       doas ksh provision-member-capsule.sh --remove <username>
        doas ksh provision-member-capsule.sh --pair
        ksh scripts/provision-member-capsule.sh --self-test
 USAGE
@@ -264,6 +265,20 @@ assert_member_conf() {
 	[ "$shape" = "$conf_owner 644" ] || die "$target is $shape, wanted $conf_owner 644"
 }
 
+# remove_member_conf: take the member's generated capsule block out, for the
+# account page's "serve your capsule over gemini: off". The block is the whole
+# config: gmid.conf includes an index that cron-apply.sh --web regenerates from
+# the files present, so removing it and running that pass is the entire change.
+# The platform's capsule pair is shared and stays.
+remove_member_conf() {
+	typeset target
+	target=$(member_conf)
+	[ -f "$target" ] || return 0
+	rm -f "$target" || die "could not remove $target"
+	printf 'removed %s: %s.kyriakon.net is no longer served over gemini\n' "$target" "$user"
+	printf '  next: doas ksh scripts/cron-apply.sh --web   # regenerate the index, check gmid, reload\n'
+}
+
 # The tree the block's root names, which provision-member.sh builds.
 assert_member_tree() {
 	typeset public
@@ -378,6 +393,19 @@ self_test() {
 	check "and the refusal names provision-member.sh" \
 		"$(grep -c 'scripts/provision-member.sh nobody' "$tree/notree.out")" 1
 
+	# 8. the account page's "serve over gemini: off" removes the generated block
+	# and leaves the member's tree and the shared pair alone.
+	user=alice
+	write_member_conf >/dev/null
+	remove_member_conf > "$tree/remove.out"
+	check "the capsule block is removed" "$([ -f "$conf" ] && printf yes || printf no)" no
+	check "the member's tree is still there" \
+		"$([ -d "$public_root/alice.kyriakon.net/gemini" ] && printf yes || printf no)" yes
+	check "the shared pair is untouched" "$(pair_present && echo yes || echo no)" yes
+	check "and it points at the reload pass" "$(grep -c 'cron-apply.sh --web' "$tree/remove.out")" 1
+	remove_member_conf > "$tree/remove-again.out"
+	check "a second removal prints nothing" "$(wc -c < "$tree/remove-again.out" | tr -d ' ')" 0
+
 	self_test_end
 }
 
@@ -387,6 +415,14 @@ case "${1:-}" in
 --self-test)
 	[ "$#" -eq 1 ] || usage
 	self_test
+	;;
+--remove)
+	[ "$#" -eq 2 ] || usage
+	user="$2"
+	name_ok "$user" || die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
+	[ "$(id -u)" -eq 0 ] || die "run this with doas: it removes $gmid_d/$user.kyriakon.net.conf"
+	[ -d "$gmid_d" ] || die "no $gmid_d: doas ksh scripts/deploy-mail.sh creates it"
+	remove_member_conf
 	;;
 --pair)
 	# The pair alone, which is all scripts/deploy-mail.sh needs before it

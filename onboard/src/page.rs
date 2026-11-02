@@ -53,6 +53,21 @@ pub struct AccountPage {
     pub space_hard: &'static str,
     /// The upload key fingerprints and the day each was added.
     pub upload_keys: Vec<UploadKeyView>,
+    /// Whether the account has hosting at all, which is whether it has an
+    /// upload key. The serving toggles and the key controls are absent without
+    /// one.
+    pub has_hosting: bool,
+    /// The two independent serving booleans, as the checkboxes show them.
+    pub site_served: bool,
+    pub capsule_served: bool,
+    /// The mail key delivery uses, and a replacement waiting out its window.
+    /// Both are absent until the drain has recorded one.
+    pub mail_key: Option<String>,
+    pub rotation: Option<RotationView>,
+    /// Whether the card subscription is still set to renew: the page offers the
+    /// control only while there is something to stop.
+    pub renews: bool,
+    pub renewal_stopped: bool,
     /// Every notice sent, newest last, each with the address it went to.
     pub notices: Vec<NoticeView>,
     /// The group a mailbox belongs to, with the billing and state the group
@@ -81,6 +96,13 @@ pub struct AccountPage {
 pub struct UploadKeyView {
     pub fingerprint: String,
     pub added_at: String,
+}
+
+/// A mail-key replacement waiting out its window: the new fingerprint and the
+/// moment it applies, so the page can say when and offer the cancel.
+pub struct RotationView {
+    pub fingerprint: String,
+    pub applies_at: String,
 }
 
 /// One notice, as the page shows it.
@@ -338,6 +360,10 @@ pub fn member_page(
     dns: Option<crate::dns::Recipe>,
     payment: Option<PaymentView>,
 ) -> AccountPage {
+    // A member with an upload key has both lanes written by
+    // provision-member.sh until something turns one off, so an unrecorded lane
+    // is on rather than off.
+    let has_hosting = !account.upload_keys.is_empty();
     AccountPage {
         services: services(list, Some(&account.username)),
         username: account.username.clone(),
@@ -353,6 +379,35 @@ pub fn member_page(
                 added_at: key.added_at.get(..10).unwrap_or(&key.added_at).to_string(),
             })
             .collect(),
+        has_hosting,
+        site_served: account.site_served.unwrap_or(has_hosting),
+        capsule_served: account.capsule_served.unwrap_or(has_hosting),
+        mail_key: account.mail_key.clone(),
+        rotation: account.rotation.as_ref().map(|rotation| RotationView {
+            fingerprint: rotation.fingerprint.clone(),
+            applies_at: rotation
+                .applies_at
+                .get(..16)
+                .unwrap_or(&rotation.applies_at)
+                .to_string(),
+        }),
+        renews: account
+            .payment
+            .as_ref()
+            .map(|payment| {
+                payment.stripe.subscription.is_some()
+                    && !payment.stripe.cancel_at_period_end
+                    && payment.stripe.status.as_deref() != Some("canceled")
+            })
+            .unwrap_or(false),
+        renewal_stopped: account
+            .payment
+            .as_ref()
+            .map(|payment| {
+                payment.stripe.cancel_at_period_end
+                    || payment.stripe.status.as_deref() == Some("canceled")
+            })
+            .unwrap_or(false),
         notices: notices
             .iter()
             .map(|notice| NoticeView {
@@ -638,6 +693,47 @@ mod tests {
             "no_charge": free, "created_at": "2026-10-01T09:00:00Z"
         }))
         .expect("a record the store could hold")
+    }
+
+    /// A member whose account carries an upload key: provision-member.sh wrote
+    /// both lanes for them, so an unrecorded lane is serving.
+    fn hosting_member() -> crate::store::Account {
+        let mut record = member("alice", false);
+        record.upload_keys.push(crate::store::UploadKey {
+            fingerprint: "SHA256:example".into(),
+            added_at: "2026-10-01T09:00:00Z".into(),
+        });
+        record
+    }
+
+    #[test]
+    fn an_unrecorded_lane_on_a_hosting_member_is_serving() {
+        let account = hosting_member();
+        assert_eq!(account.site_served, None);
+        assert_eq!(account.capsule_served, None);
+        let page = member_page(&catalogue(), &account, &[], None, None, None);
+        assert!(page.site_served);
+        assert!(page.capsule_served);
+
+        // A mail-only member has no lane written, so neither is claimed.
+        let mail_only = member_page(&catalogue(), &member("alice", false), &[], None, None, None);
+        assert!(!mail_only.site_served);
+        assert!(!mail_only.capsule_served);
+    }
+
+    #[test]
+    fn a_cancelled_subscription_offers_no_renewal() {
+        let mut account = member("alice", false);
+        account.payment = Some(
+            serde_json::from_value(serde_json::json!({
+                "token_ref": "KYR-AAAA-BBBB-CCCC",
+                "stripe": {"subscription": "sub_example", "status": "canceled"}
+            }))
+            .expect("a payment block"),
+        );
+        let page = member_page(&catalogue(), &account, &[], None, None, None);
+        assert!(!page.renews, "a deleted subscription renews nothing");
+        assert!(page.renewal_stopped);
     }
 
     #[test]

@@ -96,6 +96,7 @@ classify() {
 		scripts/provision-group-web.sh | scripts/provision-group-capsule.sh | \
 		scripts/provision-group-acme.sh | \
 		scripts/publish-mail-key.sh | \
+		scripts/remove-upload-key.sh | \
 		scripts/set-mail-password.sh | scripts/reload-smtpd.sh) needs_onboard=yes ;;
 	# A helper of both the relay deploy and the drain's web pass, so a change to
 	# it is both.
@@ -412,6 +413,9 @@ self_test() {
 	reset_plan
 	classify 'scripts/provision-member-acme.sh'
 	check 'the acme lane plans deploy-onboard' "$needs_onboard" yes
+	reset_plan
+	classify 'scripts/remove-upload-key.sh'
+	check 'the upload-key removal plans deploy-onboard' "$needs_onboard" yes
 	reset_plan
 	classify 'scripts/provision-group-web.sh'
 	check 'an own-domain hosting lane plans deploy-onboard' "$needs_onboard" yes
