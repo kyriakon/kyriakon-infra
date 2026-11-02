@@ -151,6 +151,7 @@ onboard_user='_onboard'
 for f in onboard/Cargo.toml openbsd/etc/onboard/onboard.toml openbsd/etc/onboard/drain.toml \
 	onboard/questions.toml \
 	openbsd/etc/rc.d/kyriakon_onboard scripts/onboard-store.sh scripts/render-docs.sh \
+	scripts/kyriakon-authcheck.sh openbsd/etc/doas.conf.onboard \
 	docs/terms.md docs/privacy.md docs/aup.md docs/key-walkthrough.md \
 	reserved-usernames.txt; do
 	[ -e "$repo_dir/$f" ] || die "missing from $repo_dir: $f"
@@ -216,6 +217,14 @@ install -m 0755 "$repo_dir/onboard/target/release/kyriakon-onboardctl" /usr/loca
 # fallback runs it.
 install -m 0755 "$repo_dir/onboard/target/release/kyriakon-onboard-tui" /usr/local/sbin/kyriakon-onboard-tui
 install -m 0755 "$repo_dir/openbsd/etc/rc.d/kyriakon_onboard" /etc/rc.d/kyriakon_onboard
+
+# The login check: the one fixed-argument program the account page may run as
+# root. It takes a username, reads the password from stdin and runs only
+# `doveadm auth test`. doas.conf cannot name the check's arguments (they are the
+# username), so it names this program, and the program is what keeps the
+# subcommand fixed.
+install -d -m 0755 -o root -g wheel /usr/local/libexec
+install -m 0755 "$repo_dir/scripts/kyriakon-authcheck.sh" /usr/local/libexec/kyriakon-authcheck
 
 # The release this box is running, as the config's own comment describes it: the
 # deployed commit and its date. The acceptance records carry it as the version of
@@ -549,6 +558,21 @@ printf 'titan: %s\n' "$titan_listener"
 
 printf '\ninstalled. the responder answers %s, %s and %s, and no other local user may connect.\n' \
 	"$httpd_socket_path" "$gemini_socket_path" "$portal_socket_path"
+# The one doas rule the login needs. It is not written here: doas.conf is the
+# box's privilege list, and a deploy that appended to it could lock the operator
+# out of root. The tracked fragment is the line itself, so the manual step is a
+# copy rather than a retyping.
+say "login check"
+authcheck_rule='permit nopass _onboard as root cmd /usr/local/libexec/kyriakon-authcheck'
+if grep -qxF "$authcheck_rule" /etc/doas.conf 2>/dev/null; then
+	printf 'doas: %s\n' "$authcheck_rule"
+else
+	printf 'the account page login will refuse everyone until this line is in /etc/doas.conf:\n'
+	printf '  %s\n' "$authcheck_rule"
+	printf 'append it and check the file with: doas -C /etc/doas.conf\n'
+	printf 'the tracked copy is %s\n' "$repo_dir/openbsd/etc/doas.conf.onboard"
+fi
+
 printf 'the Titan upload listener is on %s behind the commented relayd block.\n' "$titan_listener"
 printf 'httpd and gmid reach it from their own configs, which their own deploys install.\n'
 printf 'relayd terminates TLS for signup.kyriakon.net and sets the forwarded address\n'

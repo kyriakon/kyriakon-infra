@@ -173,6 +173,9 @@ impl Fix {
         // line, so a group with records is not an outage; a test that wants one
         // rewrites it with `resolver`.
         fix.resolver(None);
+        // The quota sweep's report: an empty table, which is what a filesystem
+        // with quotas off prints. A test that wants usage writes one.
+        fix.repquota(None);
         fix.stripe_subscription("active", 1_790_000_000);
         let cfg = format!(
             "store_root = \"{}\"\n\
@@ -202,7 +205,9 @@ impl Fix {
              dkim_selector = \"mail\"\n\
              dkim_public_key = \"v=DKIM1; k=rsa; p=examplepublickey\"\n\
              dmarc_rua = \"mailto:dmarc@kyriakon.net\"\n\
-             resolver = \"{}\"\n",
+             resolver = \"{}\"\n\
+             repquota = \"{}\"\n\
+             quota_mount = \"{}\"\n",
             fix.path("store"),
             fix.path("reserved"),
             fix.path("bin"),
@@ -218,6 +223,8 @@ impl Fix {
             fix.dir.display(),
             fix.dir.display(),
             fix.path("bin/dig"),
+            fix.path("bin/repquota"),
+            "/home",
         );
         std::fs::write(fix.path("drain.toml"), cfg).unwrap();
         fix
@@ -817,6 +824,16 @@ impl Fix {
     pub fn enqueuer_works(&self) {
         let sent = self.path("sent");
         self.script("enqueuer.sh", &format!("#!/bin/sh\ncat >> '{sent}'\n"));
+    }
+
+    /// The space-used sweep's `repquota -u`. `None` is the empty report a
+    /// filesystem with quotas off prints; a test that wants usage passes the
+    /// lines to print.
+    pub fn repquota(&self, body: Option<&str>) {
+        self.script(
+            "repquota",
+            &format!("#!/bin/sh\n{}\n", body.unwrap_or("exit 0")),
+        );
     }
 
     /// A publish-mail-key.sh that refuses, in the shape the real one has when the

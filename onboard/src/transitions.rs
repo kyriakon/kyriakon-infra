@@ -24,7 +24,7 @@ use crate::sign;
 use crate::store::{
     self, Account, ApplicationRef, CreditProgress, FlatPayment, GroupAddress, GroupAddressIntent,
     GroupIntent, GroupPayment, GroupRecord, GroupRemoveIntent, Intent, JournalLine, KeyRecord,
-    Payment, Record, Store, TokenRecord, Window,
+    Payment, Record, Store, TokenRecord, UploadKey, Window,
 };
 use crate::util;
 use crate::validate;
@@ -1295,19 +1295,25 @@ async fn approve(
         site_served: None,
         capsule_served: None,
         space_used: None,
+        upload_keys: record
+            .upload_key
+            .as_ref()
+            .filter(|key| !key.fingerprint.is_empty())
+            .map(|key| {
+                vec![UploadKey {
+                    fingerprint: key.fingerprint.clone(),
+                    added_at: now.clone(),
+                }]
+            })
+            .unwrap_or_default(),
+        suspension_reason: None,
         group: None,
         closing_until: None,
     };
     store.ensure_dir(&format!("accounts/{username}")).await?;
     let account_bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
-    store
-        .write_record(
-            &format!("accounts/{username}"),
-            "account.json",
-            &account_bytes,
-        )
-        .await?;
+    write_account_record(store, username, &account_bytes).await?;
 
     if let (Some(token), Some(window)) = (&token_ref, &window) {
         let join = TokenRecord {
@@ -1889,9 +1895,7 @@ async fn apply_payment(
     account.payment = Some(payment.clone());
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
-    store
-        .write_record(&format!("accounts/{username}"), "account.json", &bytes)
-        .await?;
+    write_account_record(store, username, &bytes).await?;
     write_payment_copy(store, username, &payment).await?;
     append_credit_ledger(
         store,
@@ -2342,9 +2346,7 @@ pub async fn refund(
         account.payment = Some(payment.clone());
         let bytes = serde_json::to_vec_pretty(&account)
             .map_err(|e| format!("cannot encode the account: {e}"))?;
-        store
-            .write_record(&format!("accounts/{username}"), "account.json", &bytes)
-            .await?;
+        write_account_record(store, &username, &bytes).await?;
     }
 
     let seq = append_refund_ledger(
@@ -3707,6 +3709,7 @@ pub async fn provision_group(
         },
         accounts: intent.mailboxes.clone(),
         site_owner: intent.site_owner.clone(),
+        space_used: None,
     };
     write_group_record(store, &group).await?;
 
@@ -3873,15 +3876,15 @@ async fn write_group_account(
         site_served: None,
         capsule_served: None,
         space_used: None,
+        upload_keys: Vec::new(),
+        suspension_reason: None,
         group: Some(domain.to_string()),
         closing_until: None,
     };
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
     store.ensure_dir(&format!("accounts/{mailbox}")).await?;
-    store
-        .write_record(&format!("accounts/{mailbox}"), "account.json", &bytes)
-        .await
+    write_account_record(store, mailbox, &bytes).await
 }
 
 /// Write one group's record. The caller owns the directory name, which is the
@@ -3892,8 +3895,38 @@ async fn write_group_record(store: &Store, group: &GroupRecord) -> Result<(), St
     store
         .ensure_dir(&format!("groups/{}", group.domain))
         .await?;
+    write_group_state(store, &group.domain, &bytes).await
+}
+
+/// Write one account's record, readable by the handler and not writable by it.
+/// The page is rendered by `_onboard`, which cannot read a 0600 root file, and
+/// the record holds no secret: the group's token stays in `tokens/` and the
+/// ledger. The directory's own group is the owner, so the deploy's modes are
+/// what decide who can read it rather than a second list here.
+async fn write_account_record(store: &Store, username: &str, bytes: &[u8]) -> Result<(), String> {
     store
-        .write_record(&format!("groups/{}", group.domain), "group.json", &bytes)
+        .write_record_mode(
+            &format!("accounts/{username}"),
+            "account.json",
+            bytes,
+            store.dir_owner("accounts"),
+            0o640,
+        )
+        .await
+}
+
+/// The same for a group's record, for the same reason: the account page of any
+/// mailbox in the group reads it, and a root-only 0600 file would leave the
+/// billing block blank.
+async fn write_group_state(store: &Store, domain: &str, bytes: &[u8]) -> Result<(), String> {
+    store
+        .write_record_mode(
+            &format!("groups/{domain}"),
+            "group.json",
+            bytes,
+            store.dir_owner("groups"),
+            0o640,
+        )
         .await
 }
 
@@ -4908,6 +4941,197 @@ async fn dns_contact(store: &Store, group: &GroupRecord) -> Result<String, Strin
     Ok(format!("{}@{}", group.site_owner, group.domain))
 }
 
+/// How often the space-used sweep runs, in hours. It reads the filesystem
+/// quota with `repquota`, which is a whole-filesystem report rather than one
+/// account's read, so doing it every minute would be one process a minute for a
+/// number that moves slowly. The same due-gated shape as the DNS sweep, on a
+/// state file of its own.
+const QUOTA_CHECK_HOURS: i64 = 1;
+
+/// Record each account's used space from the filesystem quota. The account page
+/// shows it against the 5 GB soft and 5.5 GB hard allowance, and the handler
+/// cannot read the quota: repquota needs root. The output is column-aligned
+/// text, so the parse is narrow and a report it cannot read changes nothing;
+/// a filesystem with quotas off prints nothing and is the same no-op, which is
+/// the state the research found on the box before quotas were enabled.
+pub async fn refresh_space_used(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+    // A pass with no accounts has nothing to record, so it writes neither the
+    // report nor the state. That keeps a store that has never been provisioned
+    // byte-identical across a pass, which the sweep tests rely on.
+    if store.list("accounts").await?.is_empty() {
+        return Ok(());
+    }
+    let now = OffsetDateTime::now_utc();
+    let state: Option<Value> = store
+        .read_record("", "quota-check.json")
+        .await
+        .and_then(|text| serde_json::from_str(&text).ok());
+    let checked_at = state
+        .as_ref()
+        .and_then(|s| s.get("checked_at"))
+        .and_then(Value::as_str)
+        .and_then(|stamp| OffsetDateTime::parse(stamp, &Rfc3339).ok());
+    if checked_at.is_some_and(|at| now - at < Duration::hours(QUOTA_CHECK_HOURS)) {
+        return Ok(());
+    }
+
+    let report = match Command::new(&cfg.repquota)
+        .arg("-u")
+        .arg(&cfg.quota_mount)
+        .output()
+        .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            // No repquota on this box, or no permission: the same no-op the
+            // other sweeps take, and the state still moves so the error is not
+            // printed every minute.
+            eprintln!(
+                "kyriakon-onboard: cannot read the quota with {}: {e}",
+                cfg.repquota
+            );
+            write_quota_state(store).await?;
+            return Ok(());
+        }
+    };
+    if !report.status.success() {
+        eprintln!(
+            "kyriakon-onboard: {} exited {}",
+            cfg.repquota, report.status
+        );
+        write_quota_state(store).await?;
+        return Ok(());
+    }
+
+    let usage = parse_repquota(&String::from_utf8_lossy(&report.stdout));
+    let mut recorded: HashSet<String> = HashSet::new();
+    for (username, used_kb) in &usage {
+        let Some(mut account) = existing_account(store, username).await else {
+            // A uid with no account record is somebody else's, and this sweep
+            // writes nothing about it.
+            continue;
+        };
+        let bytes = used_kb.saturating_mul(1024);
+        if account.space_used == Some(bytes) {
+            recorded.insert(username.clone());
+            continue;
+        }
+        account.space_used = Some(bytes);
+        let encoded = serde_json::to_vec_pretty(&account)
+            .map_err(|e| format!("cannot encode the account: {e}"))?;
+        match write_account_record(store, username, &encoded).await {
+            Ok(()) => {
+                recorded.insert(username.clone());
+            }
+            Err(e) => eprintln!("kyriakon-onboard: recording {username}'s quota: {e}"),
+        }
+    }
+
+    // The group's figure is the sum of its mailboxes' used bytes, computed from
+    // the accounts this pass just read. A group none of whose accounts appeared
+    // in the report is left alone: an empty or unrelated report must not write a
+    // zero over a real figure.
+    for name in store.list("groups").await? {
+        // One bad group record is reported and skipped: the other groups, and
+        // the sweeps after this one, still run.
+        let mut group = match group_record(store, &name).await {
+            Ok(Some(group)) => group,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("kyriakon-onboard: reading {name}'s quota: {e}");
+                continue;
+            }
+        };
+        if !group
+            .accounts
+            .iter()
+            .any(|mailbox| recorded.contains(mailbox))
+        {
+            continue;
+        }
+        let mut total = 0u64;
+        let mut seen = false;
+        for mailbox in &group.accounts {
+            if let Some(account) = existing_account(store, mailbox).await {
+                total = total.saturating_add(account.space_used.unwrap_or(0));
+                seen = true;
+            }
+        }
+        if !seen || group.space_used == Some(total) {
+            continue;
+        }
+        group.space_used = Some(total);
+        let encoded = serde_json::to_vec_pretty(&group)
+            .map_err(|e| format!("cannot encode the group record: {e}"))?;
+        if let Err(e) = write_group_state(store, &name, &encoded).await {
+            eprintln!("kyriakon-onboard: recording {name}'s quota: {e}");
+        }
+    }
+    write_quota_state(store).await
+}
+
+/// One OpenBSD `repquota -u` report as `(username, used KB)`.
+///
+/// The table is two header lines and then one row per uid:
+///
+///```text
+///                        KByte limits               File limits
+///User            used    soft    hard  grace    used  soft  hard  grace
+///alice             --    1024 5242880 5767168        --    10     0     0
+///```
+///
+/// The two characters after the name are the block and inode over-soft-limit
+/// flags, written with no space between them. A name that fills the ten-column
+/// field carries them with no separating space, so the pair is recognised at
+/// the end of the first token before the name and the used figure are read. A
+/// report of another shape (`quota -v`'s `Disk quotas for user` blocks, an empty
+/// table, `***` verbose lines) yields nothing rather than a guess.
+pub fn parse_repquota(report: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for line in report.lines() {
+        let text = line.trim();
+        if text.is_empty()
+            || text.starts_with("KByte")
+            || text.starts_with("User ")
+            || text.starts_with("***")
+        {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(first) = fields.first() else {
+            continue;
+        };
+        let (name, next) = if first.len() > 2 && over_limit_flags(&first[first.len() - 2..]) {
+            (&first[..first.len() - 2], 1)
+        } else if fields.len() > 2 && over_limit_flags(fields[1]) {
+            (*first, 2)
+        } else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(used) = fields.get(next).and_then(|field| field.parse::<u64>().ok()) {
+            out.push((name.to_string(), used));
+        }
+    }
+    out
+}
+
+/// The two over-limit markers `repquota` prints before the used figure.
+fn over_limit_flags(field: &str) -> bool {
+    field.len() == 2 && field.bytes().all(|b| b == b'+' || b == b'-')
+}
+
+/// The sweep's own due stamp, root-only at the store root. It carries the time
+/// alone: the figures are on the accounts, where the page reads them.
+async fn write_quota_state(store: &Store) -> Result<(), String> {
+    let state = json!({ "version": 1, "checked_at": util::filed_at() });
+    let bytes = serde_json::to_vec_pretty(&state)
+        .map_err(|e| format!("cannot encode the quota state: {e}"))?;
+    store.write_record("", "quota-check.json", &bytes).await
+}
+
 /// The yearly note to an account approved without charge: nothing is due, and
 /// the paid path is there if circumstances have changed. It falls due on the
 /// creation anniversary, at most once a year, and the subject carries the year
@@ -5634,9 +5858,7 @@ impl BillingTarget {
             BillingTarget::Account(a) => {
                 let bytes = serde_json::to_vec_pretty(a)
                     .map_err(|e| format!("cannot encode the account: {e}"))?;
-                store
-                    .write_record(&format!("accounts/{}", a.username), "account.json", &bytes)
-                    .await
+                write_account_record(store, &a.username, &bytes).await
             }
             BillingTarget::Group(g) => write_group_record(store, g).await,
         }
@@ -6399,5 +6621,191 @@ mod tests {
         assert_eq!(retry_after_minutes(4), 60);
         // The cap holds, so the drain keeps retrying rather than stopping.
         assert_eq!(retry_after_minutes(40), 60);
+    }
+
+    /// OpenBSD `repquota -u` output as the sweep reads it: two header lines and
+    /// one row per uid, with the two over-limit markers between the name and the
+    /// used figure. A `quota -v` block, which uses `Disk quotas for user`, and an
+    /// empty table both yield nothing rather than a guess.
+    #[test]
+    fn a_repquota_report_yields_each_members_used_blocks() {
+        let report = "                        KByte limits               File limits\n\
+                      User            used    soft    hard  grace    used  soft  hard  grace\n\
+                      alice             --   1024 5242880 5767168        --    10     0     0\n\
+                      secretary         --    512 5242880 5767168        --     3     0     0\n";
+        assert_eq!(
+            parse_repquota(report),
+            [("alice".to_string(), 1024), ("secretary".to_string(), 512)]
+        );
+        // A name that fills the ten-column field carries the markers with no
+        // separating space.
+        assert_eq!(
+            parse_repquota(
+                "User used soft hard grace used soft hard grace\n\
+                 averylonguser--   2048 5242880 5767168        --     1     0     0\n"
+            ),
+            [("averylonguser".to_string(), 2048)]
+        );
+        // `quota -v`'s per-user blocks are another report entirely.
+        assert!(parse_repquota(
+            "Disk quotas for user alice (uid 1001):\n\
+             Filesystem blocks quota limit grace files quota limit grace\n\
+             /dev/sd1l 1024 5242880 5767168 10 0 0\n"
+        )
+        .is_empty());
+        assert!(parse_repquota("").is_empty());
+        assert!(parse_repquota("no quota table here\n").is_empty());
+    }
+
+    fn quota_config(dir: &std::path::Path) -> DrainConfig {
+        DrainConfig {
+            store_root: dir.join("store").to_str().unwrap().to_string(),
+            reserved: dir.join("reserved").to_str().unwrap().to_string(),
+            scripts: dir.join("bin").to_str().unwrap().to_string(),
+            sendmail: dir.join("bin/enqueuer.sh").to_str().unwrap().to_string(),
+            passwd: dir.join("passwd").to_str().unwrap().to_string(),
+            mail_domains: dir.join("mail_domains").to_str().unwrap().to_string(),
+            virtuals: dir.join("virtuals").to_str().unwrap().to_string(),
+            dkim_domains: dir.join("dkim_domains").to_str().unwrap().to_string(),
+            approval_key: dir.join("key").to_str().unwrap().to_string(),
+            keyring_dir: dir.join("keyring").to_str().unwrap().to_string(),
+            stripe_webhook_secret: String::new(),
+            stripe_api_key: String::new(),
+            stripe_payment_link: String::new(),
+            keyring_publish_token: String::new(),
+            reviewer: "reviewer@example.invalid".to_string(),
+            from: "kyriakon <hello@example.invalid>".to_string(),
+            base_url: "https://signup.kyriakon.net".to_string(),
+            price_gbp: "20.00".to_string(),
+            postal_address: "1 Example Street".to_string(),
+            mail_dir: dir.join("mail").to_str().unwrap().to_string(),
+            release: "2026-10-10 abc1234".to_string(),
+            mail_host: "mail.kyriakon.net".to_string(),
+            ipv4: "192.0.2.10".to_string(),
+            ipv6: "2001:db8::10".to_string(),
+            dkim_selector: "mail".to_string(),
+            dkim_public_key: "v=DKIM1; k=rsa; p=example".to_string(),
+            dmarc_rua: "mailto:dmarc@kyriakon.net".to_string(),
+            resolver: dir.join("bin/dig").to_str().unwrap().to_string(),
+            repquota: dir.join("bin/repquota").to_str().unwrap().to_string(),
+            quota_mount: "/home".to_string(),
+        }
+    }
+
+    fn fixture_account(store_dir: &std::path::Path, username: &str) {
+        let dir = store_dir.join(format!("accounts/{username}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("account.json"),
+            serde_json::to_vec_pretty(&json!({
+                "version": 1, "username": username, "state": "active",
+                "decision": "approve", "decided_at": "2026-10-01T09:00:00Z",
+                "rail": "cash", "no_charge": false,
+                "created_at": "2026-10-01T09:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn repquota_stub(dir: &std::path::Path, body: &str) -> String {
+        let path = dir.join("bin/repquota");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{body}",
+                dir.join("repquota.args").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn the_quota_sweep_records_usage_once_an_hour_and_shrugs_at_a_bad_report() {
+        let dir = std::env::temp_dir().join(format!("onboard-quota-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("store")).unwrap();
+        fixture_account(&dir.join("store"), "alice");
+        fixture_account(&dir.join("store"), "secretary");
+        let group_dir = dir.join("store/groups/parish.example");
+        std::fs::create_dir_all(&group_dir).unwrap();
+        std::fs::write(
+            group_dir.join("group.json"),
+            serde_json::to_vec_pretty(&json!({
+                "version": 1, "domain": "parish.example", "name": "Parish",
+                "kind": "parish",
+                "payment": {"rail": "cash", "no_charge": false, "paid_until": null},
+                "accounts": ["alice", "secretary"], "site_owner": "alice"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let cfg = quota_config(&dir);
+        let store = Store::new_for_test(&cfg.store_root);
+        // The sweep takes `-u` and the mount the config names.
+        cfg_script(
+            &dir,
+            "printf '%s\\n' 'User used soft hard grace used soft hard grace' 'alice -- 1024 5242880 5767168 -- 10 0 0' 'secretary -- 512 5242880 5767168 -- 3 0 0'\n",
+        );
+
+        refresh_space_used(&cfg, &store).await.unwrap();
+        assert_eq!(
+            existing_account(&store, "alice").await.unwrap().space_used,
+            Some(1024 * 1024)
+        );
+        assert_eq!(
+            existing_account(&store, "secretary")
+                .await
+                .unwrap()
+                .space_used,
+            Some(512 * 1024)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("repquota.args")).unwrap(),
+            "-u /home\n"
+        );
+        // The group holds the sum of its mailboxes' figures.
+        let group = group_record(&store, "parish.example")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(group.space_used, Some((1024 + 512) * 1024));
+
+        // The hour's cache: a second pass does not run the report again.
+        cfg_script(
+            &dir,
+            "printf '%s\\n' 'User used soft hard grace used soft hard grace' 'alice -- 2048 5242880 5767168 -- 10 0 0'\n",
+        );
+        refresh_space_used(&cfg, &store).await.unwrap();
+        assert_eq!(
+            existing_account(&store, "alice").await.unwrap().space_used,
+            Some(1024 * 1024)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("repquota.args"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        // A report the parse cannot follow, on a fresh state, is a no-op rather
+        // than a zero written over a real figure.
+        std::fs::remove_file(store.path("quota-check.json")).unwrap();
+        cfg_script(&dir, "printf 'no quota table here\\n'\n");
+        refresh_space_used(&cfg, &store).await.unwrap();
+        assert_eq!(
+            existing_account(&store, "alice").await.unwrap().space_used,
+            Some(1024 * 1024)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Overwrite the fixture report without rebuilding the config.
+    fn cfg_script(dir: &std::path::Path, body: &str) {
+        repquota_stub(dir, body);
     }
 }

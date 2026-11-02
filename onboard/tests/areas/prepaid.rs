@@ -199,7 +199,7 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
 
     // The account page, web and gemini: the block above the catalogue, with the
     // rail and the instructions a member has to act on.
-    let web = page::account(&[], Some("secretary"), None, Some(view(&account)), false)
+    let web = page::member_page(&[], &account, &[], None, None, Some(view(&account)))
         .render()
         .unwrap();
     assert!(web.contains(&token), "{web}");
@@ -210,7 +210,7 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
         !token_is_a_link(&web, &token),
         "the token is in a URL: {web}"
     );
-    let gemini = capsule::account(&account, &[], None, Some(&view(&account)));
+    let gemini = capsule::account(&account, &[], None, Some(&view(&account)), None);
     assert!(gemini.contains(&token), "{gemini}");
     assert!(gemini.contains(post), "{gemini}");
     assert!(
@@ -259,7 +259,7 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
     assert!(gemtext.contains("Paid until 2027-10-04"), "{gemtext}");
     assert!(!gemtext.contains(&token), "the token is back: {gemtext}");
     let paid = view(&account);
-    let web = page::account(&[], Some("secretary"), None, Some(paid), false)
+    let web = page::member_page(&[], &account, &[], None, None, Some(paid))
         .render()
         .unwrap();
     assert!(web.contains("Paid until 2027-10-04T00:00:00Z"), "{web}");
@@ -277,7 +277,7 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
     let account = stored_account(&free, "secretary");
     assert!(account.payment_state().is_none());
     assert!(account.is_free());
-    let web = page::account(&[], Some("secretary"), None, None, account.is_free())
+    let web = page::member_page(&[], &account, &[], None, None, None)
         .render()
         .unwrap();
     assert!(
@@ -288,7 +288,7 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
         web.contains("This account is free: nothing is due, and it does not lapse."),
         "the page says why there is no block: {web}"
     );
-    let gemini = capsule::account(&account, &[], None, None);
+    let gemini = capsule::account(&account, &[], None, None, None);
     assert!(
         !gemini.contains("Payment"),
         "a free account has no block: {gemini}"
@@ -801,7 +801,7 @@ fn a_shortfall_is_shown_and_quoted_back_and_receipted() {
     assert_eq!(view.balance.as_deref(), Some("15.00"));
 
     // The account page, web and capsule.
-    let web = page::account(&[], Some("secretary"), None, Some(view), false)
+    let web = page::member_page(&[], &stored, &[], None, None, Some(view))
         .render()
         .unwrap();
     assert!(web.contains("Amount: GBP 5.00"), "{web}");
@@ -816,7 +816,7 @@ fn a_shortfall_is_shown_and_quoted_back_and_receipted() {
         None,
         now,
     );
-    let gemtext = capsule::account(&stored, &[], None, Some(&capsule_view));
+    let gemtext = capsule::account(&stored, &[], None, Some(&capsule_view), None);
     assert!(gemtext.contains("Amount: GBP 5.00"), "{gemtext}");
     assert!(gemtext.contains("Received so far: GBP 15.00"), "{gemtext}");
 

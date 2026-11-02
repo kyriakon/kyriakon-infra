@@ -17,14 +17,20 @@
 # this on every run, and a store already in place should not report work it did
 # not do.
 #
-# The split is the spec's. The unprivileged `_onboard` user writes exactly four
+# The split is the spec's. The unprivileged `_onboard` user writes exactly five
 # directories, intents/ (one JSON per submission, written by rename), drafts/
 # (the capsule and TUI's server-side state), applications/ (the record the status
-# page renders) and webhooks/ (a webhook's raw body and signature header). It
-# also owns mail/, the Maildir the smtpd action for apply@ delivers into as that
-# user. The rest belongs to the root drain: accounts, groups, tokens, keys (the
-# members' public upload keys, which the builder reads), holds (a closed
-# member's name, kept ninety days), ledger, rates and journal.jsonl.
+# page renders), sessions/ (one file per live account-page login) and webhooks/
+# (a webhook's raw body and signature header). It also owns mail/, the Maildir
+# the smtpd action for apply@ delivers into as that user. The rest belongs to the
+# root drain: accounts, groups, tokens, keys (the members' public upload keys,
+# which the builder reads), holds (a closed member's name, kept ninety days),
+# ledger, rates and journal.jsonl.
+#
+# accounts/ and groups/ are root:_onboard 0750, and the records the drain writes
+# in them are 0640. The handler renders the account page from those records and
+# runs as _onboard, so a root:wheel 0750 directory would make every page read as
+# missing; the group lets it read without letting it write.
 # `/etc/kyriakon/onboard/` is the drain's own root-only home for Stripe's
 # signing secret and the keyring publish token; it is not under the store root,
 # which is why it is created here too.
@@ -33,11 +39,11 @@
 # reserved-uid account in the shape `_gmid` has, and useradd is an operator step.
 # This script only checks for it, and names the exact line when it is missing.
 #
-# The four writable directories are 0700, owner `_onboard`: tighter than the
-# capsule spec's own rc_pre and much tighter than a bare `install -d` would leave
-# them (0755). They hold a stranger's own words, their public keys, their outside
-# address and the privilege boundary's payloads, and no other local user, member
-# or not, has any reason to read any of them.
+# The writable directories are 0700, owner `_onboard`: tighter than the capsule
+# spec's own rc_pre and much tighter than a bare `install -d` would leave them
+# (0755). They hold a stranger's own words, their public keys, their outside
+# address, live sessions and the privilege boundary's payloads, and no other
+# local user, member or not, has any reason to read any of them.
 
 set -euo pipefail
 
@@ -143,13 +149,37 @@ store_dir intents      "$onboard_user" "$onboard_user" 700
 store_dir webhooks     "$onboard_user" "$onboard_user" 700
 store_dir drafts       "$onboard_user" "$onboard_user" 700
 store_dir applications "$onboard_user" "$onboard_user" 700
-store_dir accounts     root wheel 750
-store_dir groups       root wheel 750
+store_dir sessions     "$onboard_user" "$onboard_user" 700
+store_dir accounts     root "$onboard_user" 750
+store_dir groups       root "$onboard_user" 750
 store_dir tokens       root wheel 750
 store_dir keys         root wheel 750
 store_dir holds        root wheel 750
 store_dir ledger       root wheel 750
 store_dir rates        root wheel 750
+
+# The records the handler renders are readable by its group, and an upgrade
+# must repair the ones an earlier release wrote 0600 root. Only these three are
+# shared: account.json and group.json are what the account page reads, and
+# notices.jsonl is the notice list on it. journal.jsonl and requests.jsonl stay
+# root-only, because nothing outside the drain reads them.
+share_record() {
+	[ -e "$1" ] || return 0
+	if [ "$(stat -f '%Su %Sg %Lp' "$1")" != "root $onboard_user 640" ]; then
+		changed=1
+		chown root:"$onboard_user" "$1"
+		chmod 0640 "$1"
+	fi
+}
+for account in "$store"/accounts/*; do
+	[ -d "$account" ] || continue
+	share_record "$account/account.json"
+	share_record "$account/notices.jsonl"
+done
+for group in "$store"/groups/*; do
+	[ -d "$group" ] || continue
+	share_record "$group/group.json"
+done
 
 # mail/ is _onboard's, not the root drain's, and with the Maildir's three
 # subdirectories. The smtpd action for apply@ runs the delivery as _onboard
@@ -196,6 +226,6 @@ install_file "$catalogue_src" "$store/catalogue.toml" root wheel 644
 [ -s "$store/catalogue.toml" ] || fail "$store/catalogue.toml is empty"
 
 if [ "$changed" -ne 0 ]; then
-	printf 'store ready: %s (four dirs and mail/ writable by %s, the rest root), %s 0700 root\n' \
+	printf 'store ready: %s (five dirs and mail/ writable by %s, the rest root), %s 0700 root\n' \
 		"$store" "$onboard_user" "$drain_conf"
 fi

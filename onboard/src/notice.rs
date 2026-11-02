@@ -167,9 +167,11 @@ async fn record_and_enqueue(
     let encoded =
         serde_json::to_string(&line).map_err(|e| format!("cannot encode a notice: {e}"))?;
     store
-        .append(
+        .append_mode(
             &format!("accounts/{username}/notices.jsonl"),
             encoded.as_bytes(),
+            store.dir_owner("accounts"),
+            0o640,
         )
         .await?;
     enqueue(cfg, to, subject, body).await
@@ -220,6 +222,8 @@ mod tests {
             dkim_public_key: "v=DKIM1; k=rsa; p=example".to_string(),
             dmarc_rua: "mailto:dmarc@kyriakon.net".to_string(),
             resolver: "/usr/bin/dig".to_string(),
+            repquota: "/usr/sbin/repquota".to_string(),
+            quota_mount: "/home".to_string(),
         }
     }
 
@@ -252,6 +256,18 @@ mod tests {
             "{sent}"
         );
         assert!(sent.contains("Subject: Your application"), "{sent}");
+        // The handler renders the notice list from this file, so it is group
+        // readable by the accounts directory's group rather than root-only.
+        use std::os::unix::fs::MetadataExt;
+        let record = std::fs::metadata(dir.join("store/accounts/secretary/notices.jsonl"))
+            .expect("the notice record");
+        assert_eq!(record.mode() & 0o777, 0o640, "the notice record is 0640");
+        let accounts = std::fs::metadata(dir.join("store/accounts")).unwrap();
+        assert_eq!(
+            record.gid(),
+            accounts.gid(),
+            "and carries the accounts directory's group"
+        );
         // The second attempt does nothing: no second message, no second line.
         assert!(!send_account_notice(
             &cfg,

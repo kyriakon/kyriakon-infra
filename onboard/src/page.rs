@@ -42,6 +42,28 @@ pub struct ApplicantPage {
 #[template(path = "account.html")]
 pub struct AccountPage {
     pub services: Vec<Row>,
+    /// The account the session signed in as.
+    pub username: String,
+    /// The address outside the platform, absent when the member gave none. The
+    /// page says plainly that an empty one is the whole recovery path.
+    pub outside_address: Option<String>,
+    /// The space used, formatted, and whether the drain has recorded one.
+    pub space_used: Option<String>,
+    pub space_soft: &'static str,
+    pub space_hard: &'static str,
+    /// The upload key fingerprints and the day each was added.
+    pub upload_keys: Vec<UploadKeyView>,
+    /// Every notice sent, newest last, each with the address it went to.
+    pub notices: Vec<NoticeView>,
+    /// The group a mailbox belongs to, with the billing and state the group
+    /// holds. Absent for a person's account.
+    pub group: Option<GroupView>,
+    /// The reason a suspended account gives, and the day a closing one ends.
+    pub suspended: Option<String>,
+    pub closing_until: Option<String>,
+    /// Whether the page offers the close form. False on the login page, which
+    /// is not an account page at all.
+    pub can_close: bool,
     /// The group's DNS recipe, present only for a mailbox whose account names a
     /// group. It is the same [`crate::dns::Recipe`] the approval email renders, so
     /// the values cannot disagree.
@@ -53,6 +75,79 @@ pub struct AccountPage {
     /// The page says so in one line rather than leaving the absence to be read
     /// as an unpaid account whose block failed to render.
     pub free: bool,
+}
+
+/// One upload key, as the page shows it.
+pub struct UploadKeyView {
+    pub fingerprint: String,
+    pub added_at: String,
+}
+
+/// One notice, as the page shows it.
+pub struct NoticeView {
+    pub at: String,
+    pub subject: String,
+    pub to: String,
+}
+
+/// A group mailbox's body, as the group record holds it. The billing lives on
+/// the group so one renewal writes one date, and the page shows the date rather
+/// than a copy of it.
+pub struct GroupView {
+    pub domain: String,
+    pub name: String,
+    pub kind: String,
+    pub rail: String,
+    pub no_charge: bool,
+    pub paid_until: Option<String>,
+    /// `free`, `active` or `payment due`, from the group's own payment block.
+    pub state: String,
+    pub accounts: Vec<String>,
+    /// The space its mailboxes use together, and the allowance they add up to.
+    /// The quota lives on the group record, summed by the drain from the same
+    /// per-account figures the page shows each mailbox.
+    pub space_used: Option<String>,
+    pub allowance: String,
+}
+
+impl GroupView {
+    pub fn from_record(group: &crate::store::GroupRecord) -> GroupView {
+        let payment = &group.payment;
+        let state = if payment.no_charge {
+            "free"
+        } else if payment.paid_until.is_some() {
+            "active"
+        } else {
+            "payment due"
+        };
+        GroupView {
+            domain: group.domain.clone(),
+            name: group.name.clone(),
+            kind: group.kind.clone(),
+            rail: payment.rail.clone(),
+            no_charge: payment.no_charge,
+            paid_until: payment.paid_until.clone(),
+            state: state.to_string(),
+            accounts: group.accounts.clone(),
+            space_used: group.space_used.map(space),
+            allowance: format!(
+                "{} mailbox{}, {} soft and {} hard each",
+                group.accounts.len(),
+                if group.accounts.len() == 1 { "" } else { "es" },
+                QUOTA_SOFT,
+                QUOTA_HARD
+            ),
+        }
+    }
+}
+
+/// The login page: the only thing a request with no session is shown.
+#[derive(Template)]
+#[template(path = "login.html")]
+pub struct LoginPage {
+    /// Set when a submission was refused, so the form comes back with the
+    /// reason on it rather than a bare page.
+    pub error: Option<String>,
 }
 
 #[derive(Template)]
@@ -95,6 +190,12 @@ pub struct PaymentView {
     pub paid_until: Option<String>,
     /// The window's close date and the days left, while one runs.
     pub window: Option<String>,
+    /// The close date alone, `YYYY-MM-DD`, for a window that has closed. It is
+    /// repeated by the lapsed state, as the spec requires.
+    pub closes_on: Option<String>,
+    /// The window closed with nothing recorded: the page reads `Lapsed`, states
+    /// what still works and what stopped, and shows the token again.
+    pub lapsed: bool,
     /// The rail's own instructions, one line each.
     pub instructions: Vec<String>,
     /// What happens if nothing arrives before the window closes.
@@ -193,29 +294,78 @@ pub fn services(list: &[Service], member: Option<&str>) -> Vec<Row> {
         .collect()
 }
 
-/// The member's page. `member` is the session's member where there is one, which
-/// a host carrying `<name>` is rendered from. `dns` is the member's group recipe
-/// when the account names a group, and `None` for an account that belongs to no
-/// group, which is what keeps a person's page free of it.
-pub fn account(
+/// The quota the platform publishes, as the page shows it: 5 GB soft and 5.5 GB
+/// hard, across mail, the site and the repositories together.
+pub const QUOTA_SOFT: &str = "5 GB";
+pub const QUOTA_HARD: &str = "5.5 GB";
+
+/// The signed-in member's page, built from the account record the drain wrote
+/// and the notices it recorded. `group` is the group the mailbox belongs to,
+/// read from the group's own record rather than copied per account, and `dns`
+/// is that group's recipe.
+pub fn member_page(
     list: &[Service],
-    member: Option<&str>,
+    account: &crate::store::Account,
+    notices: &[crate::store::Notice],
+    group: Option<GroupView>,
     dns: Option<crate::dns::Recipe>,
     payment: Option<PaymentView>,
-    free: bool,
 ) -> AccountPage {
     AccountPage {
-        services: services(list, member),
+        services: services(list, Some(&account.username)),
+        username: account.username.clone(),
+        outside_address: account.outside_address.clone(),
+        space_used: account.space_used.map(space),
+        space_soft: QUOTA_SOFT,
+        space_hard: QUOTA_HARD,
+        upload_keys: account
+            .upload_keys
+            .iter()
+            .map(|key| UploadKeyView {
+                fingerprint: key.fingerprint.clone(),
+                added_at: key.added_at.get(..10).unwrap_or(&key.added_at).to_string(),
+            })
+            .collect(),
+        notices: notices
+            .iter()
+            .map(|notice| NoticeView {
+                at: notice.at.get(..10).unwrap_or(&notice.at).to_string(),
+                subject: notice.subject.clone(),
+                to: notice.to.clone(),
+            })
+            .collect(),
+        group,
+        suspended: account
+            .suspension_reason
+            .clone()
+            .filter(|_| account.state == "suspended"),
+        closing_until: account.closing_until.clone(),
+        can_close: true,
         dns,
         payment,
-        free,
+        free: account.is_free(),
     }
 }
 
-/// The payment block for one account: the token and the window while the
-/// account is unpaid, the paid-until date alone once a credit has set one. A
-/// free account has no block, which is why the caller passes one only when the
-/// record carries a `Payment`.
+/// The space used under the allowance, in the units the quota is set in. Binary
+/// multiples, because 5 GB here is five gibibytes.
+fn space(bytes: u64) -> String {
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    if bytes >= GIB {
+        format!("{:.1} GB", bytes as f64 / GIB as f64)
+    } else {
+        format!("{} MB", bytes / MIB)
+    }
+}
+
+/// The payment block for one account. Its three states are the spec's: a window
+/// still running names the rail, the days left, the close date, the amount, the
+/// token and the rail's instructions; a window that closed with nothing
+/// recorded reads `Lapsed`, repeats the close date, states what still works and
+/// what stopped, and shows the token again; a credit sets `paid_until` and the
+/// date replaces the token. A free account has no block at all, which is why
+/// the caller passes one only when the record carries a `Payment`.
 pub fn payment(
     state: &str,
     rail: &str,
@@ -225,22 +375,30 @@ pub fn payment(
     card_link: Option<&str>,
     now: OffsetDateTime,
 ) -> PaymentView {
-    let unpaid = payment.paid_until.is_none();
-    let window = payment.window.as_ref().filter(|_| unpaid);
+    let paid = payment.paid_until.is_some();
+    let window = payment.window.as_ref().filter(|_| !paid);
     let closes_on = window.map(|w| w.closes_at.get(..10).unwrap_or(&w.closes_at).to_string());
-    let window_line = match (window, &closes_on) {
-        (Some(w), Some(date)) => {
-            let days = crate::util::days_left(&w.closes_at, now)
+    // A window whose state is still `open` after its close date has not been
+    // swept yet, and the member reads the same `Lapsed` the sweep will write:
+    // the date, not the sweep's own progress, is what the page is about.
+    let running = window.is_some_and(|w| {
+        w.state == "open" && crate::util::days_left(&w.closes_at, now).is_some_and(|days| days > 0)
+    });
+    let window_line = if running {
+        closes_on.as_ref().map(|date| {
+            let days = window
+                .and_then(|w| crate::util::days_left(&w.closes_at, now))
                 .unwrap_or(0)
                 .max(0);
-            Some(format!("closes on {date}: {days} days left"))
-        }
-        _ => None,
+            format!("closes on {date}: {days} days left")
+        })
+    } else {
+        None
     };
     // A held balance re-quotes the remainder: the member has already sent part
     // of the price, so the page asks for what is still owed and never less than
     // nothing.
-    let amount = if unpaid {
+    let amount = if !paid {
         match (
             crate::util::pence(price_gbp),
             payment.balance_gbp.as_deref(),
@@ -254,30 +412,34 @@ pub fn payment(
     } else {
         price_gbp.to_string()
     };
+    let deadline = window_line.as_ref().map(|_| {
+        format!(
+            "The money must arrive before {}, or the account lapses: mail keeps \
+             arriving and everything published stays up, and sending, uploading and \
+             pushing stop. Nothing is deleted at that point.",
+            closes_on.as_deref().unwrap_or("the close date")
+        )
+    });
     PaymentView {
         state: state.to_string(),
         rail: rail.to_string(),
         amount,
         balance: payment.balance_gbp.clone(),
-        token: if unpaid {
-            payment.token_ref.clone()
-        } else {
+        token: if paid {
             None
+        } else {
+            payment.token_ref.clone()
         },
         paid_until: payment.paid_until.clone(),
         window: window_line,
-        instructions: if unpaid {
+        closes_on: closes_on.clone(),
+        lapsed: !paid && !running,
+        instructions: if running {
             crate::transitions::rail_instructions(rail, postal_address, card_link)
         } else {
             Vec::new()
         },
-        deadline: closes_on.map(|date| {
-            format!(
-                "The money must arrive before {date}, or the account lapses: mail keeps \
-                 arriving and everything published stays up, and sending, uploading and \
-                 pushing stop. Nothing is deleted at that point."
-            )
-        }),
+        deadline,
     }
 }
 
@@ -413,6 +575,20 @@ mod tests {
              action = \"read\"\n",
         )
         .expect("a catalogue the file could hold")
+    }
+
+    /// A member's record, in the shape the store holds one: enough for the
+    /// renderer to read the username and the free flag, with everything else
+    /// absent. The page's own facts are the account's, so a test builds the
+    /// record rather than a page-only shape.
+    fn member(username: &str, free: bool) -> crate::store::Account {
+        serde_json::from_value(serde_json::json!({
+            "version": 1, "username": username, "state": "active",
+            "decision": "approve", "decided_at": "2026-10-01T09:00:00Z",
+            "rail": if free { "no_charge" } else { "cash" },
+            "no_charge": free, "created_at": "2026-10-01T09:00:00Z"
+        }))
+        .expect("a record the store could hold")
     }
 
     #[test]
@@ -619,14 +795,15 @@ mod tests {
         assert!(html.contains("https://mail.example.invalid/"), "{html}");
         assert!(html.contains("<span class=\"tag\">live</span>"), "{html}");
 
-        let listed = account(&catalogue(), None, None, None, false)
+        let listed = member_page(&catalogue(), &member("alice", false), &[], None, None, None)
             .render()
             .unwrap();
         assert!(listed.contains("zero-access mail"), "{listed}");
         assert!(listed.contains("https://mail.example.invalid/"), "{listed}");
 
-        // No member to render a host from, so the pattern itself is what shows,
-        // HTML-escaped in the markup as `<name>.example.invalid`.
+        // The row's host is the pattern itself when no member is given; the
+        // page is never rendered for an applicant, so this is the row's own
+        // behaviour rather than a second page constructor.
         let pattern = crate::catalogue::parse(
             "[[service]]\n\
              id = \"web\"\n\
@@ -637,14 +814,14 @@ mod tests {
              action = \"read\"\n",
         )
         .unwrap();
-        assert!(account(&pattern, None, None, None, false)
-            .render()
-            .unwrap()
-            .contains("&#60;name&#62;.example.invalid"));
-        assert!(account(&pattern, Some("theophilus"), None, None, false)
-            .render()
-            .unwrap()
-            .contains("https://theophilus.example.invalid/"));
+        assert_eq!(
+            services(&pattern, None)[0].href,
+            "https://<name>.example.invalid/"
+        );
+        assert_eq!(
+            services(&pattern, Some("theophilus"))[0].href,
+            "https://theophilus.example.invalid/"
+        );
     }
 
     /// A group's recipe is on the page, from the same generator the approval
@@ -660,12 +837,13 @@ mod tests {
             dmarc_rua: "mailto:dmarc@kyriakon.net".into(),
         };
         let recipe = crate::dns::recipe("parish.example", &values);
-        let html = account(
+        let html = member_page(
             &catalogue(),
-            Some("parish-secretary"),
+            &member("parish-secretary", false),
+            &[],
+            None,
             Some(recipe),
             None,
-            false,
         )
         .render()
         .unwrap();
@@ -679,9 +857,119 @@ mod tests {
         assert!(html.contains("does not host your zone"), "{html}");
         assert!(html.contains("cannot set a reverse DNS record"), "{html}");
 
-        let none = account(&catalogue(), Some("alice"), None, None, false)
+        let none = member_page(&catalogue(), &member("alice", false), &[], None, None, None)
             .render()
             .unwrap();
         assert!(!none.contains("DNS records"), "{none}");
+    }
+
+    /// One payment block, across each of its three states. The running window
+    /// names the token and the whole rail's instructions; the lapsed one repeats
+    /// the close date, says what still works and what stopped, and shows the
+    /// token again; the paid one shows the date and no token.
+    #[test]
+    fn the_payment_block_reads_running_lapsed_and_paid() {
+        use crate::store::{Payment, Window};
+        let now = OffsetDateTime::parse(
+            "2026-10-31T09:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let mut block = Payment {
+            token_ref: Some("KYR-4F2M-9QH7-XT3B".into()),
+            window: Some(Window {
+                opened_at: "2026-10-20T09:00:00Z".into(),
+                closes_at: "2026-11-03T09:00:00Z".into(),
+                state: "open".into(),
+                extensions: 0,
+            }),
+            ..Payment::default()
+        };
+        let view = payment(
+            "active",
+            "cash",
+            &block,
+            "20.00",
+            "1 Example Street",
+            None,
+            now,
+        );
+        assert!(!view.lapsed);
+        assert_eq!(view.token.as_deref(), Some("KYR-4F2M-9QH7-XT3B"));
+        assert!(view
+            .window
+            .as_deref()
+            .unwrap()
+            .contains("closes on 2026-11-03"));
+        assert!(!view.instructions.is_empty());
+        let html = member_page(
+            &catalogue(),
+            &member("alice", false),
+            &[],
+            None,
+            None,
+            Some(view),
+        )
+        .render()
+        .unwrap();
+        assert!(html.contains("KYR-4F2M-9QH7-XT3B"), "{html}");
+        assert!(html.contains("1 Example Street"), "{html}");
+
+        // The same window, a day after it closed: the sweep may not have run,
+        // and the page still reads Lapsed.
+        block.window.as_mut().unwrap().state = "closed".into();
+        let lapsed = payment(
+            "lapsed",
+            "cash",
+            &block,
+            "20.00",
+            "1 Example Street",
+            None,
+            now + time::Duration::days(10),
+        );
+        assert!(lapsed.lapsed);
+        assert_eq!(lapsed.closes_on.as_deref(), Some("2026-11-03"));
+        assert_eq!(lapsed.token.as_deref(), Some("KYR-4F2M-9QH7-XT3B"));
+        assert!(lapsed.instructions.is_empty());
+        let html = member_page(
+            &catalogue(),
+            &member("alice", false),
+            &[],
+            None,
+            None,
+            Some(lapsed),
+        )
+        .render()
+        .unwrap();
+        assert!(html.contains("Lapsed"), "{html}");
+        assert!(html.contains("closed on 2026-11-03"), "{html}");
+        assert!(html.contains("admin@kyriakon.net"), "{html}");
+
+        // A credit sets the date, which replaces the token.
+        block.paid_until = Some("2027-10-04".into());
+        let paid = payment(
+            "active",
+            "cash",
+            &block,
+            "20.00",
+            "1 Example Street",
+            None,
+            now,
+        );
+        assert!(!paid.lapsed);
+        assert_eq!(paid.token, None);
+        assert_eq!(paid.paid_until.as_deref(), Some("2027-10-04"));
+        let html = member_page(
+            &catalogue(),
+            &member("alice", false),
+            &[],
+            None,
+            None,
+            Some(paid),
+        )
+        .render()
+        .unwrap();
+        assert!(html.contains("Paid until 2027-10-04"), "{html}");
+        assert!(!html.contains("KYR-4F2M-9QH7-XT3B"), "{html}");
     }
 }

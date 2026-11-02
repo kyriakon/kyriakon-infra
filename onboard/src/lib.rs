@@ -29,6 +29,7 @@ pub mod questions;
 pub mod rate;
 pub mod requests;
 pub mod responder;
+pub mod session;
 pub mod sign;
 pub mod store;
 pub mod transitions;

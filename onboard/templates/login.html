@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Your account{% endblock %}
+{% block content %}
+{#
+  The login screen the prototype did not draw. Login is by the mail password
+  alone: no key admits anyone here, because the mail key protects mail and the
+  upload key protects sftp and git, and neither is a session credential.
+#}
+<h2>Your account</h2>
+<div class="card">
+  <p>Log in with your mail password. There is no second way in, and no key logs
+     you in here.</p>
+</div>
+{% if let Some(e) = error %}
+<div class="warn"><p>{{ e }}</p></div>
+{% endif %}
+<form method="post" action="/login">
+  <label for="username">Username</label>
+  <input type="text" id="username" name="username" autocomplete="username" required>
+  <label for="password">Mail password</label>
+  <input type="password" id="password" name="password" autocomplete="current-password" required>
+  <button class="btn" type="submit">Log in</button>
+</form>
+<p class="hint">A session lasts twelve hours. If you have forgotten the password,
+  the address outside the platform is what makes a reset possible without an
+  operator; if you gave none, write to
+  <a href="mailto:admin@kyriakon.net">admin@kyriakon.net</a>.</p>
+{% endblock %}

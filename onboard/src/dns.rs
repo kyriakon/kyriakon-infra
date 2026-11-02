@@ -300,11 +300,6 @@ mod tests {
     /// carry every value the approval email carries.
     #[test]
     fn the_web_page_and_the_capsule_carry_the_same_table() {
-        let web_recipe = recipe("parish.example", &values());
-        let web =
-            crate::page::account(&[], Some("parish-secretary"), Some(web_recipe), None, false)
-                .render()
-                .unwrap();
         let capsule_recipe = recipe("parish.example", &values());
         let account: crate::store::Account = serde_json::from_value(serde_json::json!({
             "version": 1,
@@ -319,7 +314,11 @@ mod tests {
             "group": "parish.example"
         }))
         .unwrap();
-        let capsule = crate::capsule::account(&account, &[], Some(&capsule_recipe), None);
+        let web_recipe = recipe("parish.example", &values());
+        let web = crate::page::member_page(&[], &account, &[], None, Some(web_recipe), None)
+            .render()
+            .unwrap();
+        let capsule = crate::capsule::account(&account, &[], Some(&capsule_recipe), None, None);
         let email = capsule_recipe.text();
         for row in &capsule_recipe.rows {
             assert!(web.contains(&row.value), "web misses {}: {web}", row.value);

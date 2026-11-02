@@ -91,13 +91,28 @@ impl Store {
         bytes: &[u8],
         owner: Option<(u32, u32)>,
     ) -> Result<(), String> {
+        self.write_record_mode(dir, name, bytes, owner, 0o600).await
+    }
+
+    /// Like `write_record_owned`, with the file's mode. An account or group
+    /// record is written 0640, group `_onboard`: the handler renders the page
+    /// from it and cannot be allowed to rewrite it, and a 0600 file is invisible
+    /// to the process the page runs as.
+    pub async fn write_record_mode(
+        &self,
+        dir: &str,
+        name: &str,
+        bytes: &[u8],
+        owner: Option<(u32, u32)>,
+        mode: u32,
+    ) -> Result<(), String> {
         let d = self.root.join(dir);
         let tmp = d.join(format!(".{name}.tmp"));
         let target = d.join(name);
         let _ = tokio::fs::remove_file(&tmp).await;
         let placed = async {
             let mut opts = tokio::fs::OpenOptions::new();
-            opts.write(true).create_new(true).mode(0o600);
+            opts.write(true).create_new(true).mode(mode);
             opts.custom_flags(libc::O_NOFOLLOW);
             let mut f = opts.open(&tmp).await?;
             f.write_all(bytes).await?;
@@ -184,6 +199,23 @@ impl Store {
     /// completed later, under the lock `transitions::lock_store_file` takes, as
     /// a request close and a refund settlement do.
     pub async fn append(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        self.append_mode(path, bytes, None, 0o600).await
+    }
+
+    /// Append with the file's mode and owner set on every call, including one
+    /// that finds the file already there. `notices.jsonl` is the one append
+    /// file the handler must read: the account page lists every notice sent, so
+    /// it is written 0640 with the accounts directory's group rather than the
+    /// 0600 root-only default. `journal.jsonl` and `requests.jsonl` stay
+    /// root-only, because nothing outside the drain reads them.
+    pub async fn append_mode(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        owner: Option<(u32, u32)>,
+        mode: u32,
+    ) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
         let p = self.root.join(path);
         if let Some(parent) = p.parent() {
             tokio::fs::create_dir_all(parent)
@@ -199,9 +231,23 @@ impl Store {
             let mut f = tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .mode(0o600)
+                .mode(mode)
                 .open(&p)
                 .await?;
+            // The mode argument above applies only at creation, and an upgrade
+            // finds the file already 0600; both are corrected here.
+            f.set_permissions(std::fs::Permissions::from_mode(mode))
+                .await?;
+            if let Some((uid, gid)) = owner {
+                if unsafe { libc::geteuid() } == 0 {
+                    std::os::unix::fs::chown(&p, Some(uid), Some(gid)).map_err(|e| {
+                        std::io::Error::other(format!(
+                            "cannot hand {} to its group: {e}",
+                            p.display()
+                        ))
+                    })?;
+                }
+            }
             f.write_all(&line).await?;
             if sync {
                 f.sync_all().await
@@ -640,6 +686,17 @@ pub struct Account {
     pub capsule_served: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub space_used: Option<u64>,
+    /// The upload key's fingerprint and the day it was added, one entry per key
+    /// the account may use for sftp and git. The account page shows these so a
+    /// member can tell a key they added from one they did not; the key material
+    /// itself lives where `provision-member.sh` puts it, not here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upload_keys: Vec<UploadKey>,
+    /// Why the account is suspended, in the words the suspension notice used.
+    /// Present only while `state` is `suspended`, and the page stays open so the
+    /// member can read it and answer it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspension_reason: Option<String>,
     /// The domain of the group this account belongs to, for a mailbox the
     /// own-domain tier made. The group holds the payment state, so an account
     /// with this set carries no payment block of its own. `None` for a person's
@@ -652,6 +709,15 @@ pub struct Account {
     /// excess refund and every other transition leave it absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closing_until: Option<String>,
+}
+
+/// One upload key the account carries: its fingerprint and the day it was
+/// added. The material is not kept here, because the page never shows it and a
+/// second copy is a second thing to leak.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UploadKey {
+    pub fingerprint: String,
+    pub added_at: String,
 }
 
 /// One pinned client certificate, as a request described it.
@@ -710,6 +776,13 @@ pub struct GroupRecord {
     pub payment: GroupPayment,
     pub accounts: Vec<String>,
     pub site_owner: String,
+    /// The group's own quota figure, the sum of its mailbox accounts' used
+    /// bytes. The page shows it against the allowance of `5 GB × mailboxes`;
+    /// the drain computes it in the same sweep that reads the filesystem quota,
+    /// so it cannot drift from the accounts it sums. Absent on a record written
+    /// before the sweep, which the page reads as not recorded yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_used: Option<u64>,
 }
 
 /// The `provision-group` intent: everything the drain needs to make one body's
