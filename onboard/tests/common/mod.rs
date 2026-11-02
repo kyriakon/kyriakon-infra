@@ -122,6 +122,7 @@ impl Fix {
         fix.script("enqueuer.sh", &format!("#!/bin/sh\ncat >> '{sent}'\n"));
         for s in [
             "provision-member.sh",
+            "lapse-user.sh",
             "provision-group-web.sh",
             "provision-group-capsule.sh",
             "provision-group-acme.sh",

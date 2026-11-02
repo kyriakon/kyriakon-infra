@@ -2024,12 +2024,28 @@ fn a_window_that_closes_with_nothing_recorded_lapses_the_account() {
         notices.contains("prepaid.lapsed"),
         "the lapse notice is recorded: {notices}"
     );
+    // The handler renders the page, so the record the sweep wrote must stay
+    // readable to the accounts directory's group.
+    let mode = std::fs::metadata(fix.dir.join("store/accounts/secretary/account.json"))
+        .unwrap()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o640, "the lapsed record keeps the page's mode");
     let sent = fix.sent();
     assert!(sent.contains("2020-01-01"), "{sent}");
     assert!(sent.contains(&token), "{sent}");
     assert!(
         sent.contains("Sending, uploading and pushing have stopped"),
         "{sent}"
+    );
+    assert!(
+        sent.contains(kyriakon_onboard::page::LAPSE_NOTE),
+        "the notice uses the pages' own lapse words: {sent}"
+    );
+    let log = fix.scripts_log();
+    assert!(
+        log.contains("lapse-user.sh secretary"),
+        "the lapse stops access through the shared script: {log}"
     );
 
     // The page's own words, web and gemini, from the same block.
@@ -2080,8 +2096,14 @@ fn a_window_that_closes_with_nothing_recorded_lapses_the_account() {
         "one lapse notice: {notices}"
     );
 
-    // Paying after the lapse restores the account and clears the grace.
+    // Paying after the lapse restores the account, its access and clears the
+    // grace.
     let _ = cash_credit(&fix, &token);
+    let log = fix.scripts_log();
+    assert!(
+        log.contains("lapse-user.sh --restore secretary"),
+        "the credit restores access through the shared script: {log}"
+    );
     let account = fix.account("secretary");
     assert_eq!(account["state"], json!("active"), "{account}");
     assert!(
@@ -2182,6 +2204,11 @@ fn a_window_is_extended_once_and_a_second_extension_is_refused() {
     );
     let join: Value = serde_json::from_str(&fix.read(&format!("tokens/{token}.json"))).unwrap();
     assert_eq!(join["window_closes_at"], json!(after), "{join}");
+    let mode = std::fs::metadata(fix.dir.join("store/accounts/secretary/account.json"))
+        .unwrap()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o640, "the extended record keeps the page's mode");
 
     // The operator's list sees the moved date.
     let out = fix.ctl(&["prepaid", "list", "--window", "open"]);
@@ -2218,5 +2245,122 @@ fn a_window_is_extended_once_and_a_second_extension_is_refused() {
         fix.journal().contains("already been extended once"),
         "{}",
         fix.journal()
+    );
+}
+
+/// The grace that starts at the lapse has its own two events: one final notice
+/// seven days before the end, deduplicated on the notice record, and the one
+/// deletion transition when the forty days end.
+#[test]
+fn the_grace_sends_one_final_notice_then_deletes_the_account() {
+    let fix = Fix::new("window-grace");
+    let _token = approved_paid(&fix, "secretary", "cash");
+    let mut account = fix.account("secretary");
+    account["payment"]["window"]["closes_at"] = json!("2020-01-01T00:00:00Z");
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+    assert_eq!(fix.account("secretary")["state"], json!("lapsed"));
+
+    // Day 33: inside the final notice's seven days.
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_onboard::util::date_after_days(6));
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let notices = fix.read("accounts/secretary/notices.jsonl");
+    assert_eq!(
+        notices.matches("prepaid.final").count(),
+        1,
+        "one final notice: {notices}"
+    );
+    assert!(
+        fix.sent().contains("deleted on"),
+        "the final notice names the date: {}",
+        fix.sent()
+    );
+    // The same pass again sends no second copy.
+    assert!(fix.drain().status.success());
+    let notices = fix.read("accounts/secretary/notices.jsonl");
+    assert_eq!(
+        notices.matches("prepaid.final").count(),
+        1,
+        "still one final notice: {notices}"
+    );
+
+    // Day 40: the one deletion transition, through the script the erasure
+    // path already uses.
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_onboard::util::date_after_days(0));
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/secretary").exists(),
+        "the account is deleted at the end of the grace"
+    );
+    let log = fix.scripts_log();
+    assert!(
+        log.contains("delete-user.sh secretary"),
+        "the deletion is the shared transition: {log}"
+    );
+    assert!(
+        fix.journal()
+            .contains("the account, its home and its store record were removed"),
+        "{}",
+        fix.journal()
+    );
+}
+
+/// A closing or suspended account is not the payment sweep's to overwrite: the
+/// window closing leaves the state and its own date alone, and a credit records
+/// the money without resurrecting it.
+#[test]
+fn a_window_sweep_does_not_resurrect_a_closing_account() {
+    let fix = Fix::new("window-closing");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let closing_until = kyriakon_onboard::util::date_after_days(7);
+    let mut account = fix.account("secretary");
+    account["state"] = json!("closing");
+    account["closing_until"] = json!(closing_until);
+    account["payment"]["window"]["closes_at"] = json!("2020-01-01T00:00:00Z");
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("closing"), "{account}");
+    assert_eq!(account["closing_until"], json!(closing_until), "{account}");
+    assert_eq!(
+        account["payment"]["window"]["state"],
+        json!("open"),
+        "the closing account's window is left alone: {account}"
+    );
+
+    // A credit records the payment and leaves the closing state and its date.
+    let line = cash_credit(&fix, &token);
+    assert_eq!(line["kind"], json!("payment"), "{line}");
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("closing"), "{account}");
+    assert_eq!(account["closing_until"], json!(closing_until), "{account}");
+    let log = fix.scripts_log();
+    assert!(
+        !log.contains("lapse-user.sh"),
+        "a closing account is not lapsed or restored: {log}"
     );
 }

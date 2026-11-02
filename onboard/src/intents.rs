@@ -57,6 +57,9 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     // active, or lapses the account and starts the grace. One sweep, so a
     // member who paid on the last day is not lapsed by a later pass.
     transitions::window_sweep(cfg, store).await?;
+    // A lapsed account's grace: the final notice at day 33, and the one
+    // deletion transition when the 40 days end.
+    transitions::grace_sweep(cfg, store).await?;
     // The key spool is read after the intents so a filed application is not
     // waiting behind a mailbox pass. The pass handles each message on its own:
     // one that cannot be dealt with is reported and left for the next run.

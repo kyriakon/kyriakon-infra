@@ -1654,9 +1654,7 @@ pub async fn window_extend(
     account.payment = Some(payment.clone());
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
-    store
-        .write_record(&format!("accounts/{username}"), "account.json", &bytes)
-        .await?;
+    write_account_record(store, &username, &bytes).await?;
     write_payment_copy(store, &username, &payment).await?;
     // The token index carries the date the operator's list and any later lookup
     // sees, so keep it beside the account.
@@ -1705,9 +1703,13 @@ pub async fn window_extend(
 
 /// Close every payment window whose day has passed. A window with a credit
 /// leaves the account active; one without a credit lapses it into the lifecycle
-/// state where mail stays readable and published work stays up, and starts the
-/// same forty-day grace the failed-renewal path uses. The window's own state is
-/// the dedup key, so a second pass lapses nothing twice.
+/// state where mail stays readable and published work stays up, stops sending,
+/// uploading and pushing through `lapse-user.sh`, and starts the same forty-day
+/// grace the failed-renewal path uses. The window's own state is the dedup key,
+/// so a second pass lapses nothing twice.
+///
+/// A closing or suspended account is left alone: its state is a decision of its
+/// own, and the payment sweep must not overwrite it.
 pub async fn window_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     let now = OffsetDateTime::now_utc();
     for username in store.list("accounts").await? {
@@ -1730,7 +1732,7 @@ pub async fn window_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String
             }
             continue;
         }
-        if window.state != "open" {
+        if window.state != "open" || account.state != "active" {
             continue;
         }
         let Ok(closes) = OffsetDateTime::parse(&window.closes_at, &Rfc3339) else {
@@ -1746,18 +1748,18 @@ pub async fn window_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String
             if let Some(window) = payment.window.as_mut() {
                 window.state = "paid".to_string();
             }
-            // A credit is what access follows, so a window that closed after
-            // one leaves the account active even if an earlier pass had lapsed
-            // it before the date was written.
-            account.state = "active".to_string();
-            account.grace_until = None;
             account.payment = Some(payment.clone());
-            if let Ok(bytes) = serde_json::to_vec_pretty(&account) {
-                store
-                    .write_record(&format!("accounts/{username}"), "account.json", &bytes)
-                    .await?;
-            }
+            let bytes = serde_json::to_vec_pretty(&account)
+                .map_err(|e| format!("cannot encode the account: {e}"))?;
+            write_account_record(store, &username, &bytes).await?;
             write_payment_copy(store, &username, &payment).await?;
+            continue;
+        }
+        // Stop the three access paths before the record says lapsed. A script
+        // failure leaves the window open, so the next pass tries again rather
+        // than the account reading lapsed while it still sends and pushes.
+        if let Err(e) = run_script(cfg, "lapse-user.sh", &[username.as_str()]).await {
+            eprintln!("kyriakon-onboard: stopping access for {username}: {e}");
             continue;
         }
         let Some(window) = payment.window.as_mut() else {
@@ -1769,9 +1771,7 @@ pub async fn window_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String
         account.payment = Some(payment.clone());
         let bytes = serde_json::to_vec_pretty(&account)
             .map_err(|e| format!("cannot encode the account: {e}"))?;
-        store
-            .write_record(&format!("accounts/{username}"), "account.json", &bytes)
-            .await?;
+        write_account_record(store, &username, &bytes).await?;
         write_payment_copy(store, &username, &payment).await?;
         if let Err(e) = lapse_notice(cfg, store, &username, &account, &payment).await {
             eprintln!("kyriakon-onboard: the lapse notice for {username}: {e}");
@@ -1780,9 +1780,81 @@ pub async fn window_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String
     Ok(())
 }
 
-/// The lapse notice, and the one line that says what the forty-day grace means.
-/// The failed-renewal path and the window sweep both send this text, so a member
-/// reads one wording whichever reason their account lapsed for.
+/// The lapse notice and the forty-day grace's own two events, run once per drain
+/// pass after the windows: a final notice at `grace_until - 7` days, and the one
+/// deletion transition at `grace_until`. The notice is deduplicated by its
+/// `notices.jsonl` line, and the deletion is due-gated on the transition's own
+/// journal id so a failed erase backs off rather than being retried every minute.
+pub async fn grace_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+    let now = OffsetDateTime::now_utc();
+    let today = now.date();
+    for username in store.list("accounts").await? {
+        let Some(account) = existing_account(store, &username).await else {
+            continue;
+        };
+        if account.state != "lapsed" {
+            continue;
+        }
+        let Some(grace_text) = account.grace_until.as_deref() else {
+            continue;
+        };
+        let Some(grace) = util::parse_date(grace_text) else {
+            continue;
+        };
+        if today >= grace {
+            let id = format!("delete-{}-{}", username, account.created_at);
+            if !due(store, &id, now).await {
+                continue;
+            }
+            if let Err(e) = delete_account(cfg, store, &username).await {
+                report_failure(cfg, store, &id, "delete", &e).await;
+            }
+            continue;
+        }
+        if today >= grace - Duration::days(7) {
+            if let Err(e) = final_notice(cfg, store, &username, &account).await {
+                eprintln!("kyriakon-onboard: the final notice for {username}: {e}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The last notice before a lapsed account's grace ends. Its wording is #333's
+/// to settle; what matters here is that it is sent once, seven days before the
+/// deletion the same sweep performs.
+async fn final_notice(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+    account: &Account,
+) -> Result<(), String> {
+    let grace = account.grace_until.as_deref().unwrap_or("");
+    let token = account
+        .payment_state()
+        .and_then(|payment| payment.token_ref)
+        .unwrap_or_default();
+    let to = match account.outside_address.as_deref() {
+        Some(addr) if validate::address(addr).is_none() => addr.to_string(),
+        _ => format!("{username}@kyriakon.net"),
+    };
+    let subject = "Your kyriakon.net account will be deleted in seven days".to_string();
+    let body = format!(
+        "The payment window for {username} closed and no payment was recorded.\n\n\
+         Mail keeps arriving and stays readable, and everything you published stays up, but\n\
+         sending, uploading and pushing are stopped. The account is due to be deleted on\n\
+         {grace}, seven days from this notice.\n\n\
+         Your payment reference is {token}. If you have posted the money, write to\n\
+         admin@kyriakon.net before that date.\n"
+    );
+    notice::send_account_notice(cfg, store, username, "prepaid.final", &subject, &to, &body)
+        .await?;
+    Ok(())
+}
+
+/// The lapse notice. The words that say what still works and what stopped are
+/// `page::LAPSE_NOTE`, the same constant both account pages render, so the mail
+/// and the page cannot drift.
 async fn lapse_notice(
     cfg: &DrainConfig,
     store: &Store,
@@ -1804,12 +1876,11 @@ async fn lapse_notice(
     let subject = "Your kyriakon.net payment window has closed".to_string();
     let body = format!(
         "The payment window for {username} closed on {closes_on} and no payment was recorded.\n\n\
-         Mail keeps arriving and stays readable, and everything you published stays up.\n\
-         Sending, uploading and pushing have stopped. Nothing is deleted at this point.\n\n\
+         {}\n\n\
          Your payment reference is {token}.\n\n\
-         If you have posted the money, write to admin@kyriakon.net. The grace runs until \n\
-         {grace}, forty days from the lapse, and a final notice comes seven days before\n\
-         the end.\n"
+         The grace runs until {grace}, forty days from the lapse, and a final notice comes\n\
+         seven days before the end.\n",
+        crate::page::LAPSE_NOTE
     );
     notice::send_account_notice(cfg, store, username, "prepaid.lapsed", &subject, &to, &body)
         .await?;
@@ -2194,6 +2265,13 @@ async fn apply_payment(
         .await?;
     }
 
+    // A payment after a lapse restores access from the day it is recorded. The
+    // restore runs before the record says active: a failure here leaves the
+    // account lapsed, and the retry repeats an idempotent script rather than
+    // reporting an active account whose sending and pushing are still stopped.
+    if applied.paid && account.state == "lapsed" {
+        run_script(cfg, "lapse-user.sh", &["--restore", username]).await?;
+    }
     payment.rail = Some(intent.rail.clone());
     payment.balance_gbp = balance_text;
     if applied.paid {
@@ -2203,9 +2281,13 @@ async fn apply_payment(
         if let Some(window) = payment.window.as_mut() {
             window.state = "paid".to_string();
         }
-        // A payment after a lapse restores access from the day it is recorded.
-        account.state = "active".to_string();
-        account.grace_until = None;
+        // Only a lapsed account is restored. A closing or suspended account
+        // keeps its state: the payment is recorded, and the decision that put
+        // it there is not the payment sweep's to overturn.
+        if account.state == "lapsed" || account.state == "active" {
+            account.state = "active".to_string();
+            account.grace_until = None;
+        }
     }
     account.payment = Some(payment.clone());
     let bytes = serde_json::to_vec_pretty(&account)

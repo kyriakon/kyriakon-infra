@@ -134,12 +134,13 @@ need_pkg() {
 # looks. relayd-members.sh is there because cron-apply.sh --web runs it to rewrite
 # /etc/relayd.conf's member keypair region, and it is run from the directory
 # cron-apply.sh sits in.
-# provision-member.sh also reads the tracked login class next to itself (its own
-# ../openbsd/etc/login.conf.d/member), so this deploy installs that file into the
-# layout the relative read resolves to rather than copying the scripts somewhere
-# the read would leave behind.
-drain_scripts="add-user.sh provision-member.sh delete-user.sh quota-apply.sh provision-member-web.sh provision-member-capsule.sh provision-member-acme.sh provision-group-web.sh provision-group-capsule.sh provision-group-acme.sh remove-group.sh cron-apply.sh relayd-members.sh publish-mail-key.sh set-mail-password.sh stripe-api.sh reload-smtpd.sh"
+# provision-member.sh and lapse-user.sh also read the tracked login classes next
+# to themselves (their own ../openbsd/etc/login.conf.d/member and lapsed), so this
+# deploy installs both files into the layout the relative read resolves to rather
+# than copying the scripts somewhere the read would leave behind.
+drain_scripts="add-user.sh provision-member.sh delete-user.sh lapse-user.sh quota-apply.sh provision-member-web.sh provision-member-capsule.sh provision-member-acme.sh provision-group-web.sh provision-group-capsule.sh provision-group-acme.sh remove-group.sh cron-apply.sh relayd-members.sh publish-mail-key.sh set-mail-password.sh stripe-api.sh reload-smtpd.sh"
 drain_class="openbsd/etc/login.conf.d/member"
+drain_lapsed_class="openbsd/etc/login.conf.d/lapsed"
 
 # The service's own account, which scripts/onboard-store.sh refuses to create and
 # names the useradd line for: the socket directories below are owned by it,
@@ -160,6 +161,7 @@ for s in $drain_scripts; do
 	[ -e "$repo_dir/scripts/$s" ] || die "missing from $repo_dir: scripts/$s"
 done
 [ -e "$repo_dir/$drain_class" ] || die "missing from $repo_dir: $drain_class"
+[ -e "$repo_dir/$drain_lapsed_class" ] || die "missing from $repo_dir: $drain_lapsed_class"
 
 # The store, the four writable directories, the mail spool, the drain's root-only
 # home, and the two files the three front-ends share. One author for all of it:
@@ -461,6 +463,7 @@ done
 install -m 0755 "$repo_dir/scripts/lib.sh" "$scripts_dir/lib.sh"
 install -d -m 0755 "$scripts_root/openbsd/etc/login.conf.d"
 install -m 0644 "$repo_dir/$drain_class" "$scripts_root/openbsd/etc/login.conf.d/member"
+install -m 0644 "$repo_dir/$drain_lapsed_class" "$scripts_root/openbsd/etc/login.conf.d/lapsed"
 # Before the unit starts, every script the drain names must be executable. A
 # missing one is the drain's first intent failing at cron, which is how this gap
 # was found.
