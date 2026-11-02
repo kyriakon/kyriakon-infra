@@ -915,7 +915,7 @@ mod tests {
             None,
             now,
         );
-        assert!(!view.lapsed);
+        assert!(view.lapsed.is_none());
         assert_eq!(view.token.as_deref(), Some("KYR-4F2M-9QH7-XT3B"));
         assert!(view
             .window
@@ -948,8 +948,7 @@ mod tests {
             None,
             now + time::Duration::days(10),
         );
-        assert!(lapsed.lapsed);
-        assert_eq!(lapsed.closes_on.as_deref(), Some("2026-11-03"));
+        assert_eq!(lapsed.lapsed.as_deref(), Some("2026-11-03"));
         assert_eq!(lapsed.token.as_deref(), Some("KYR-4F2M-9QH7-XT3B"));
         assert!(lapsed.instructions.is_empty());
         let html = member_page(
@@ -977,7 +976,7 @@ mod tests {
             None,
             now,
         );
-        assert!(!paid.lapsed);
+        assert!(paid.lapsed.is_none());
         assert_eq!(paid.token, None);
         assert_eq!(paid.paid_until.as_deref(), Some("2027-10-04"));
         let html = member_page(

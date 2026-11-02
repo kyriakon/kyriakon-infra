@@ -2063,7 +2063,7 @@ fn a_window_that_closes_with_nothing_recorded_lapses_the_account() {
     );
     assert!(web.contains(&token), "{web}");
     assert!(web.contains("admin@kyriakon.net"), "{web}");
-    let gemtext = capsule::account(&stored, &[], None, Some(&view));
+    let gemtext = capsule::account(&stored, &[], None, Some(&view), None);
     assert!(
         gemtext.contains("Lapsed: the payment window closed on 2020-01-01"),
         "{gemtext}"
