@@ -69,6 +69,44 @@ pub async fn open_windows(store: &Store, now: OffsetDateTime) -> Result<Vec<Open
             days_left,
         });
     }
+    // A body's group holds one window for the whole domain, and the operator's
+    // weekly pass is the same list: a group window that is about to close is
+    // exactly as worth an email as an account's. The row names the site owner,
+    // which is the account the token is indexed under.
+    for domain in store.list("groups").await? {
+        let group = match crate::transitions::group_record(store, &domain).await {
+            Ok(Some(group)) => group,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!(
+                    "kyriakon-onboard: groups/{domain}/group.json is unreadable, not listed: {e}"
+                );
+                continue;
+            }
+        };
+        if group.payment.no_charge || group.payment.paid_until.is_some() {
+            continue;
+        }
+        let Some(window) = group.payment.window.as_ref() else {
+            continue;
+        };
+        if window.state != "open" {
+            continue;
+        }
+        let Some(token) = group.payment.token_ref.clone() else {
+            continue;
+        };
+        let Some(days_left) = util::days_left(&window.closes_at, now) else {
+            continue;
+        };
+        out.push(OpenWindow {
+            token,
+            username: group.site_owner.clone(),
+            rail: group.payment.rail.clone(),
+            closes_on: window.closes_at[..10.min(window.closes_at.len())].to_string(),
+            days_left,
+        });
+    }
     out.sort_by(|a, b| {
         a.closes_on
             .cmp(&b.closes_on)

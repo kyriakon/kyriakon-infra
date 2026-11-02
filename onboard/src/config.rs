@@ -176,6 +176,10 @@ pub struct DrainConfig {
     /// The yearly price, as the ledger records it. A configuration value because
     /// the Stripe Price and the prepaid price have to agree.
     pub price_gbp: String,
+    /// The yearly price of an own-domain group. It is per domain rather than per
+    /// address, and it is not a person's price with a multiple applied: the spec
+    /// sells the tier at its own figure.
+    pub group_price_gbp: String,
     /// The postal address a cash-by-post member is given. `REPLACE_ME` in the
     /// repository, because it is the operator's own address. `prepaid-rails.md`
     /// leaves it to the deployment.
@@ -363,6 +367,7 @@ mod tests {
              from = \"kyriakon <hello@kyriakon.net>\"\n\
              base_url = \"https://signup.kyriakon.net\"\n\
              price_gbp = \"20.00\"\n\
+             group_price_gbp = \"40.00\"\n\
              postal_address = \"REPLACE_ME\"\n\
              mail_dir = \"/var/db/onboard/mail/new\"\n\
              release = \"REPLACE_ME\"\n\
@@ -381,6 +386,7 @@ mod tests {
              gpg = \"/usr/local/bin/gpg\"\n";
         let c: DrainConfig = toml::from_str(text).unwrap();
         assert_eq!(c.price_gbp, "20.00");
+        assert_eq!(c.group_price_gbp, "40.00");
         assert_eq!(c.scripts, "/root/bin");
         let bad: Result<DrainConfig, _> = toml::from_str(&text.replace("sendmail", "sendmaill"));
         assert!(bad.is_err());
@@ -405,6 +411,7 @@ mod tests {
         assert_eq!(c.reviewer, "admin@kyriakon.net");
         assert_eq!(c.base_url, "https://signup.kyriakon.net");
         assert_eq!(c.price_gbp, "20.00");
+        assert_eq!(c.group_price_gbp, "40.00");
         // The two the deploy leaves for the operator to fill.
         assert_eq!(c.release, "REPLACE_ME");
         assert_eq!(c.postal_address, "REPLACE_ME");

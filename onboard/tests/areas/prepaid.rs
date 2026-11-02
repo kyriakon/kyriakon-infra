@@ -2390,7 +2390,8 @@ fn a_prepaid_member_is_reminded_once_before_the_date_runs_out() {
     assert!(out.status.success(), "{}", body(&out));
     let sent = fix.sent();
     assert!(sent.contains(&due), "the note names the date: {sent}");
-    assert!(sent.contains("Post GBP 20.00"), "{sent}");
+    assert!(sent.contains("send GBP 20.00"), "{sent}");
+    assert!(sent.contains("Post the money to:"), "{sent}");
     assert!(sent.contains(&token), "the reference is the token: {sent}");
     let notices = fix.read("accounts/secretary/notices.jsonl");
     assert_eq!(
@@ -2473,4 +2474,186 @@ fn the_grace_reminds_once_before_the_final_notice() {
     let notices = fix.read("accounts/secretary/notices.jsonl");
     assert_eq!(notices.matches("prepaid.grace").count(), 1, "{notices}");
     assert_eq!(notices.matches("prepaid.final").count(), 1, "{notices}");
+}
+
+/// The renewal note asks for what is still owed after a held balance, and takes
+/// the rail's own words: a cash-in-hand member is not told to post an envelope.
+/// When the date passes, nothing is deleted automatically and the note says so.
+#[test]
+fn a_renewal_spends_a_held_balance_and_speaks_the_rails_words() {
+    let fix = Fix::new("renewal-balance");
+    let _token = approved_paid(&fix, "secretary", "cash");
+    let mut account = fix.account("secretary");
+    account["payment"]["paid_until"] = json!(kyriakon_onboard::util::date_after_days(20));
+    account["payment"]["rail"] = json!("cash-hand");
+    account["payment"]["balance_gbp"] = json!("5.50");
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let sent = fix.sent();
+    assert!(
+        sent.contains("send GBP 14.50"),
+        "the held balance is spent before asking for the price: {sent}"
+    );
+    assert!(sent.contains("cash-hand"), "the rail is named: {sent}");
+    assert!(
+        !sent.contains("Post GBP"),
+        "a hand payment is not posted: {sent}"
+    );
+    assert!(
+        sent.contains("no automatic deletion"),
+        "the note says what actually happens: {sent}"
+    );
+    assert!(
+        !sent.contains("forty-day grace begins"),
+        "the false promise is gone: {sent}"
+    );
+}
+
+/// A body's group has its own thirty-day note, once, to the address its
+/// application gave. A card group is left to Stripe's reminder.
+#[test]
+fn a_group_renewal_note_goes_once_to_the_body() {
+    let fix = Fix::new("group-renewal");
+    let record = fix.filed_body("warden");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let token = group["payment"]["token_ref"].as_str().unwrap().to_string();
+    group["payment"]["paid_until"] = json!(kyriakon_onboard::util::date_after_days(20));
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let sent = fix.sent();
+    assert!(sent.contains("GBP 40.00"), "the group's price: {sent}");
+    assert!(sent.contains(&token), "the group's token: {sent}");
+    assert!(
+        sent.contains("parish.example") && sent.contains("whole group"),
+        "the note is about the group: {sent}"
+    );
+    let notices = fix.read("accounts/parish-secretary/notices.jsonl");
+    assert_eq!(notices.matches("group.renewal").count(), 1, "{notices}");
+    assert!(
+        notices.contains("warden@example.invalid"),
+        "the body's contact, not a mailbox: {notices}"
+    );
+
+    // A second pass sends nothing twice.
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.read("accounts/parish-secretary/notices.jsonl")
+            .matches("group.renewal")
+            .count(),
+        1,
+        "still one note"
+    );
+
+    // A card group: Stripe's subscription sends the reminder, not the platform.
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["payment"]["rail"] = json!("card");
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.read("accounts/parish-secretary/notices.jsonl")
+            .matches("group.renewal")
+            .count(),
+        1,
+        "a card group gets no platform reminder"
+    );
+}
+
+/// `prepaid list` includes a body's open window, and `window extend` gives it
+/// the same single fourteen days an account's window takes.
+#[test]
+fn a_group_window_is_listed_and_takes_its_one_extension() {
+    let fix = Fix::new("group-window-extend");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let token = group["payment"]["token_ref"].as_str().unwrap().to_string();
+    let closes = group["payment"]["window"]["closes_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let out = fix.ctl(&["prepaid", "list", "--window", "open"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let text = body(&out);
+    assert!(text.contains(&token), "the group's token is listed: {text}");
+    assert!(
+        text.contains("parish-secretary"),
+        "the row names the site owner the token is indexed under: {text}"
+    );
+
+    let out = fix.ctl(&[
+        "window",
+        "extend",
+        "--token",
+        &token,
+        "--days",
+        "14",
+        "--reason",
+        "the money is in the post",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(
+        group["payment"]["window"]["extensions"],
+        json!(1),
+        "{group}"
+    );
+    let extended = group["payment"]["window"]["closes_at"].as_str().unwrap();
+    assert_ne!(extended, closes, "the close date moved: {group}");
+    let join: Value = serde_json::from_str(&fix.read(&format!("tokens/{token}.json"))).unwrap();
+    assert_eq!(join["window_closes_at"], json!(extended), "{join}");
+
+    // The second extension from the same window is refused and moves nothing.
+    let before = fix.read("groups/parish.example/group.json");
+    let out = fix.ctl(&[
+        "window", "extend", "--token", &token, "--days", "14", "--reason", "again",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.read("groups/parish.example/group.json"),
+        before,
+        "a second extension moved the window"
+    );
+    assert!(
+        fix.journal().contains("already been extended once"),
+        "{}",
+        fix.journal()
+    );
 }
