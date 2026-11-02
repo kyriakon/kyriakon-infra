@@ -189,22 +189,34 @@ async fn signed_in(app: &App, username: &str) -> String {
 
 /// The request httpd builds for a form post.
 fn httpd_post(path: &str, body: &str) -> Vec<u8> {
+    httpd_post_with(path, body, None, None)
+}
+
+/// The request httpd builds for a form post that carries a session cookie and,
+/// optionally, the `REMOTE_USER` header no host authenticates.
+fn httpd_post_with(path: &str, body: &str, cookie: Option<&str>, user: Option<&str>) -> Vec<u8> {
     let length = body.len().to_string();
-    fixture::httpd(
-        &[
-            ("REQUEST_METHOD", "POST"),
-            ("REQUEST_URI", path),
-            ("QUERY_STRING", ""),
-            ("CONTENT_TYPE", "application/x-www-form-urlencoded"),
-            ("CONTENT_LENGTH", &length),
-            ("HTTP_HOST", "signup.kyriakon.net"),
-            ("HTTP_ORIGIN", OWN_ORIGIN),
-            ("HTTP_SEC_FETCH_SITE", "same-origin"),
-            ("REMOTE_ADDR", "127.0.0.1"),
-            ("HTTP_X_FORWARDED_FOR", "203.0.113.10"),
-        ],
-        body.as_bytes(),
-    )
+    let cookie_header;
+    let mut env = vec![
+        ("REQUEST_METHOD", "POST"),
+        ("REQUEST_URI", path),
+        ("QUERY_STRING", ""),
+        ("CONTENT_TYPE", "application/x-www-form-urlencoded"),
+        ("CONTENT_LENGTH", &length),
+        ("HTTP_HOST", "signup.kyriakon.net"),
+        ("HTTP_ORIGIN", OWN_ORIGIN),
+        ("HTTP_SEC_FETCH_SITE", "same-origin"),
+        ("REMOTE_ADDR", "127.0.0.1"),
+        ("HTTP_X_FORWARDED_FOR", "203.0.113.10"),
+    ];
+    if let Some(cookie) = cookie {
+        cookie_header = format!("{}={cookie}", session::COOKIE);
+        env.push(("HTTP_COOKIE", &cookie_header));
+    }
+    if let Some(user) = user {
+        env.push(("REMOTE_USER", user));
+    }
+    fixture::httpd(&env, body.as_bytes())
 }
 
 /// The gmid environment, with whatever a certificate adds appended. gmid sends
@@ -294,6 +306,38 @@ fn file_account(dir: &Path) {
         "{\"version\":1,\"at\":\"2026-09-30T09:00:00Z\",\"type\":\"approval.free\",\
          \"subject\":\"Application approved, account opened.\",\
          \"to\":\"alice@kyriakon.net\"}\n",
+    )
+    .unwrap();
+}
+
+/// An account with one token-keyed payment, so the closure can read the date
+/// and amount the answer names.
+fn file_payment(dir: &Path, username: &str, token: &str, received_on: &str, amount: &str) {
+    amend_account(dir, username, |value| {
+        value["payment"] = serde_json::json!({
+            "token_ref": token,
+            "rail": "cash",
+            "paid_until": null
+        });
+        value["rail"] = serde_json::json!("cash");
+        value["no_charge"] = serde_json::json!(false);
+    });
+    let ledger = dir.join("ledger");
+    std::fs::create_dir_all(&ledger).unwrap();
+    let line = serde_json::json!({
+        "version": 1,
+        "seq": 1,
+        "token": token,
+        "kind": "payment",
+        "rail": "cash",
+        "amount_gbp": amount,
+        "applied_gbp": amount,
+        "received_on": received_on,
+        "paid_until_after": "2027-10-04"
+    });
+    std::fs::write(
+        ledger.join("payments.jsonl"),
+        format!("{}\n", serde_json::to_string(&line).unwrap()),
     )
     .unwrap();
 }
@@ -673,6 +717,140 @@ async fn a_correct_mail_password_opens_a_session_and_a_wrong_one_does_not() {
     assert_eq!(code, 200);
     assert!(page.contains("Cache-Control: no-store"), "{page}");
     assert!(page.contains("Referrer-Policy: no-referrer"), "{page}");
+}
+
+/// A checker the closure tests run directly. It lives here rather than in a
+/// shared helper because the closure tests are the only ones this branch adds,
+/// and the account-page branch owns the login fixture.
+fn closure_checker(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("onboard-closure-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("kyriakon-authcheck");
+    std::fs::write(
+        &path,
+        "#!/bin/sh
+read -r given
+[ \"$given\" = 'right horse battery' ]
+",
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The page closure asks for the password again, files exactly one intent
+/// carrying the session it used, and a wrong or empty password files nothing.
+#[tokio::test]
+async fn a_page_closure_requires_the_password_and_files_one_intent() {
+    let (mut app, dir) = handler("close-password").await;
+    file_account(&dir);
+    app.auth = session::Authenticator {
+        program: closure_checker("close"),
+        args: Vec::new(),
+    };
+    let cookie = signed_in(&app, "alice").await;
+
+    for body in ["password=wrong+horse+battery", "password="] {
+        let (code, refused) = answer(
+            &app,
+            &httpd_post_with("/account/close", body, Some(&cookie), Some("alice")),
+        )
+        .await;
+        assert_eq!(code, 403, "{refused}");
+        assert!(refused.contains("did not match"), "{refused}");
+        assert_eq!(filed(&dir), 0, "a refused closure filed something");
+    }
+
+    let (code, page) = answer(
+        &app,
+        &httpd_post_with(
+            "/account/close",
+            "password=right+horse+battery",
+            Some(&cookie),
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    assert!(page.contains("about seven months"), "{page}");
+    assert_eq!(filed(&dir), 1, "the closure filed one intent");
+
+    let name = std::fs::read_dir(dir.join("intents"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let intent: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(name).unwrap()).unwrap();
+    assert_eq!(intent["kind"], serde_json::json!("close"), "{intent}");
+    assert_eq!(intent["username"], serde_json::json!("alice"), "{intent}");
+    assert_eq!(
+        intent["session"],
+        serde_json::json!(cookie.split('.').next().unwrap()),
+        "{intent}"
+    );
+}
+
+/// A closure inside the 14-day cancellation right names the refund; one outside
+/// it says no refund is due.
+#[tokio::test]
+async fn a_closure_names_the_refund_only_inside_fourteen_days() {
+    let (mut app, dir) = handler("close-refund-inside").await;
+    file_account(&dir);
+    file_payment(
+        &dir,
+        "alice",
+        "KYR-AAAA-BBBB-CCCC",
+        &crate::util::date_after_days(-3),
+        "20.00",
+    );
+    app.auth = session::Authenticator {
+        program: closure_checker("refund-inside"),
+        args: Vec::new(),
+    };
+    let cookie = signed_in(&app, "alice").await;
+    let (code, page) = answer(
+        &app,
+        &httpd_post_with(
+            "/account/close",
+            "password=right+horse+battery",
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    assert!(page.contains("refund of GBP 20.00"), "{page}");
+
+    let (mut app, dir) = handler("close-refund-outside").await;
+    file_account(&dir);
+    file_payment(
+        &dir,
+        "alice",
+        "KYR-AAAA-BBBB-CCCC",
+        &crate::util::date_after_days(-30),
+        "20.00",
+    );
+    app.auth = session::Authenticator {
+        program: closure_checker("refund-outside"),
+        args: Vec::new(),
+    };
+    let cookie = signed_in(&app, "alice").await;
+    let (code, page) = answer(
+        &app,
+        &httpd_post_with(
+            "/account/close",
+            "password=right+horse+battery",
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    assert!(page.contains("No refund is due"), "{page}");
+    assert!(!page.contains("GBP 20.00"), "{page}");
 }
 
 /// No key admits anyone, and neither does a header the front-end did not

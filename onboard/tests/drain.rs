@@ -10,6 +10,8 @@ mod common;
 
 #[path = "areas/card.rs"]
 mod card;
+#[path = "areas/erasure.rs"]
+mod erasure;
 #[path = "areas/export.rs"]
 mod export;
 #[path = "areas/group.rs"]

@@ -890,6 +890,61 @@ impl Fix {
             .unwrap()
     }
 
+    /// Open a page session for a fixture account and return the cookie value.
+    pub fn open_session(&self, username: &str) -> String {
+        let cfg = DrainConfig::load(Path::new(&self.config())).unwrap();
+        let store = Store::new_for_test(&cfg.store_root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(kyriakon_onboard::session::open(
+                &store,
+                username,
+                OffsetDateTime::now_utc(),
+            ))
+            .unwrap()
+    }
+
+    /// The session id inside a cookie value, which is what a close intent carries.
+    pub fn session_id(cookie: &str) -> &str {
+        cookie.split_once('.').map(|(id, _)| id).unwrap_or("")
+    }
+
+    /// File the page's close intent through the handler's own writer, using a
+    /// live session it opens, so a test exercises the production shape.
+    pub fn file_close(&self, username: &str) -> String {
+        let cookie = self.open_session(username);
+        self.file_close_with_session(username, Self::session_id(&cookie))
+    }
+
+    /// File a close intent carrying a session id the caller chose, for the
+    /// refusal paths.
+    pub fn file_close_with_session(&self, username: &str, session_id: &str) -> String {
+        let cfg = DrainConfig::load(Path::new(&self.config())).unwrap();
+        let store = Store::new_for_test(&cfg.store_root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(kyriakon_onboard::intents::file_close(
+                &store, username, session_id,
+            ))
+            .unwrap()
+    }
+
+    /// Move a session's expiry into the past, as twelve hours passing would.
+    pub fn expire_session(&self, cookie: &str) {
+        let id = Self::session_id(cookie);
+        let path = self.dir.join("store/sessions").join(format!("{id}.json"));
+        let mut value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        value["expires_at"] = json!("2000-01-01T00:00:00Z");
+        std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
     pub fn read(&self, rel: &str) -> String {
         std::fs::read_to_string(self.dir.join("store").join(rel)).unwrap_or_default()
     }

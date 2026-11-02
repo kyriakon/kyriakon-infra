@@ -135,6 +135,24 @@ pub struct ResendIntent {
     pub sig: String,
 }
 
+/// A `close` intent: the member's own "Close my account", filed by the handler
+/// after it authenticated them. It names the account and nothing else, because
+/// the drain owns the state write and the seven-day window; the handler holds no
+/// privilege to set either.
+#[derive(Debug, serde::Deserialize)]
+pub struct CloseIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub username: String,
+    /// The id of the page session that filed this. The drain reads
+    /// `sessions/<id>.json` and refuses the intent when the record names another
+    /// account or the session has expired.
+    #[serde(default)]
+    pub session: String,
+}
+
 /// A manual credit: one payment recorded against the token its account holds.
 /// The console resolves a `--username` to that token before filing, and this
 /// carries the token, the rail, the money, the day the money arrived and the
@@ -4137,6 +4155,277 @@ async fn close_mailbox(cfg: &DrainConfig, store: &Store, username: &str) -> Resu
     run_script(cfg, "delete-user.sh", &[username]).await
 }
 
+/// The lifecycle's one deletion transition. `onboardctl delete` calls it
+/// directly, and a closing account reaches it through the drain's sweep, so an
+/// erasure from the page and one from the console cannot take different paths.
+///
+/// The order is the runbook's: scripts/delete-user.sh removes the vhost files
+/// and their indexes first, reloads the daemons, then the published tree, the
+/// member's certificate, the OS account and home (Maildir and repositories),
+/// the quota record and the store directory, and regenerates the finger page.
+/// The keyring entry and the token index entry are the drain's and go after it:
+/// the account record is what names the token, so removing the record first is
+/// what makes the surviving ledger line unlinkable. The ledger line itself is
+/// never touched.
+///
+/// Idempotent on a replay: the journal id carries the account's `created_at`, so
+/// a name reused after the ninety-day hold gets its own deletion, and every step
+/// treats an already-absent path as done. A retry after a partial pass can still
+/// find the token by its `TokenRecord.username` even when `account.json` has
+/// gone.
+pub async fn delete_account(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+) -> Result<(), String> {
+    if let Some(why) = validate::username_shape(username) {
+        return Err(format!("the username {username}: {why}"));
+    }
+    // The account record is read before the journal line so the answer can name
+    // a refund from the token's ledger lines. A record that has already gone is
+    // a retry: there is nothing left to answer, and the remaining cleanup below
+    // still runs.
+    let account = existing_account(store, username).await;
+    // The id carries the account's creation stamp, so a name reused after the
+    // ninety-day hold gets its own deletion rather than matching the first
+    // lifecycle's journal line. Without it a second account with the same name
+    // would read as already deleted.
+    let Some(account) = account else {
+        // The record has gone: a retry after a partial pass, or a name that is
+        // not here. Only the publication cleanup can be left, and every step is
+        // safe over an already-absent path.
+        store.remove("keys", &format!("{username}.pub")).await?;
+        remove_keyring_entry(cfg, username).await?;
+        close_group_tokens(store, &[username.to_string()]).await?;
+        return Ok(());
+    };
+    let id = format!("delete-{}-{}", username, account.created_at);
+    if journal_has(store, &id, "applied").await {
+        return Ok(());
+    }
+    let application = ApplicationRef {
+        username: username.to_string(),
+        status_token: String::new(),
+    };
+    if !journal_has(store, &id, "applying").await {
+        journal(
+            store,
+            &cfg.release,
+            &id,
+            "delete",
+            &application,
+            "applying",
+            Some("the account is being erased"),
+        )
+        .await?;
+    }
+
+    // The full answer goes into the journal, which outlives the account. The
+    // store directory, including its `notices.jsonl`, is deleted below, so a
+    // notice recorded there is not the durable copy. The notice itself is sent
+    // only to the outside address when there is one: the member's own mailbox is
+    // about to be removed, and a message enqueued to it would not be a reliable
+    // answer.
+    let refund = erasure_refund(store, &account).await;
+    let body = crate::requests::erasure_answer(refund.as_deref());
+    if !journal_has(store, &id, "erasure-answer").await {
+        journal(
+            store,
+            &cfg.release,
+            &id,
+            "delete",
+            &application,
+            "erasure-answer",
+            Some(&body),
+        )
+        .await?;
+    }
+    if let Some(to) = account.outside_address.as_deref() {
+        notice::send_account_notice(
+            cfg,
+            store,
+            username,
+            "account.erasure",
+            "Your kyriakon.net account is being erased",
+            to,
+            &body,
+        )
+        .await?;
+    }
+
+    hold_name(store, username).await?;
+    store.remove("keys", &format!("{username}.pub")).await?;
+    run_script(cfg, "delete-user.sh", &[username]).await?;
+    // The box keyring entry goes now, not before the account: the encryptor
+    // failing closed for a mailbox that still exists would bounce its mail.
+    remove_keyring_entry(cfg, username).await?;
+    close_group_tokens(store, &[username.to_string()]).await?;
+
+    journal(
+        store,
+        &cfg.release,
+        &id,
+        "delete",
+        &application,
+        "applied",
+        Some("the account, its home and its store record were removed; the ledger line stays"),
+    )
+    .await
+}
+
+/// The refund fact the erasure answer carries: the token's recorded refund, or
+/// nothing when the ledger has none. Read from the ledger rather than the
+/// account because the refund is a ledger line and the account record is about
+/// to go.
+async fn erasure_refund(store: &Store, account: &Account) -> Option<String> {
+    let token = account.payment_state()?.token_ref?;
+    let mut found = None;
+    for line in store.lines("ledger/payments.jsonl").await {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("token").and_then(Value::as_str) != Some(token.as_str())
+            || value.get("kind").and_then(Value::as_str) != Some("refund")
+        {
+            continue;
+        }
+        let amount = value
+            .get("amount_gbp")
+            .and_then(Value::as_str)
+            .map(|a| a.trim_start_matches('-'))
+            .unwrap_or("0.00");
+        let on = value
+            .get("received_on")
+            .and_then(Value::as_str)
+            .unwrap_or("an earlier date");
+        found = Some(format!(
+            "A refund of GBP {amount} was recorded on {on}; it is settled separately and is not affected by this closure."
+        ));
+    }
+    found
+}
+
+/// Drop one account's published key from the box keyring. A missing directory or
+/// file is already done, which is what makes a retry safe.
+async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), String> {
+    let path = std::path::Path::new(&cfg.keyring_dir).join(format!("{username}.asc"));
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot remove {}: {e}", path.display())),
+    }
+}
+
+/// Apply one `close` intent: put the account into `closing` with its seven-day
+/// window. The deletion itself is the sweep's, so the account works normally
+/// until the window ends and a replayed intent changes nothing.
+pub async fn close_account(
+    cfg: &DrainConfig,
+    store: &Store,
+    value: &Value,
+    file: &str,
+) -> Result<(), String> {
+    let intent: CloseIntent = serde_json::from_value(value.clone())
+        .map_err(|e| format!("the close intent does not parse: {e}"))?;
+    if intent.kind != "close" {
+        return Err(format!("kind {:?} is not a close intent", intent.kind));
+    }
+    if let Some(why) = validate::username_shape(&intent.username) {
+        return Err(format!("the username {:?}: {why}", intent.username));
+    }
+    let application = ApplicationRef {
+        username: intent.username.clone(),
+        status_token: String::new(),
+    };
+    // The intent is unsigned, so the session id it carries is the proof that the
+    // page authenticated this account. A mismatched or expired session is
+    // journalled and the intent is settled without touching the account.
+    if let Err(reason) =
+        crate::intents::verify_session(store, &intent.session, &intent.username).await
+    {
+        journal(
+            store,
+            &cfg.release,
+            &intent.id,
+            &intent.kind,
+            &application,
+            "refused",
+            Some(&reason),
+        )
+        .await?;
+        return store.remove("intents", file).await;
+    }
+    let Some(mut account) = existing_account(store, &intent.username).await else {
+        // The account the handler authenticated has already gone. That is a
+        // closed request, not new work.
+        journal(
+            store,
+            &cfg.release,
+            &intent.id,
+            &intent.kind,
+            &application,
+            "applied",
+            Some("the account had already gone"),
+        )
+        .await?;
+        return store.remove("intents", file).await;
+    };
+    // Every data-subject request gets one line, whether it arrived from the page
+    // or the console. The id is the intent's, so a retry after the state write
+    // sees the line already there rather than appending a second one.
+    let today = util::date_after_days(0);
+    let request = crate::requests::NewRequest {
+        username: &intent.username,
+        kind: "erasure",
+        received: &today,
+        evidence: "the account page, with the mail password re-entered",
+        note: Some("closure filed from the account page"),
+        identity_at: None,
+        fee_at: None,
+        id: Some(&intent.id),
+    };
+    if let Err(e) = crate::requests::record(store, request).await {
+        if !e.contains("already recorded") {
+            return Err(e);
+        }
+    }
+    if account.state == "closing" {
+        journal(
+            store,
+            &cfg.release,
+            &intent.id,
+            &intent.kind,
+            &application,
+            "applied",
+            Some("the account was already closing"),
+        )
+        .await?;
+        return store.remove("intents", file).await;
+    }
+    account.state = "closing".to_string();
+    account.closing_until = Some(util::date_after_days(7));
+    let bytes = serde_json::to_vec_pretty(&account)
+        .map_err(|e| format!("cannot encode the account: {e}"))?;
+    store
+        .write_record(
+            &format!("accounts/{}", intent.username),
+            "account.json",
+            &bytes,
+        )
+        .await?;
+    journal(
+        store,
+        &cfg.release,
+        &intent.id,
+        &intent.kind,
+        &application,
+        "applied",
+        Some("the account is closing; the deletion runs when the seven days end"),
+    )
+    .await?;
+    store.remove("intents", file).await
+}
+
 /// The mail key a new mailbox carries, checked before anything is written: the
 /// material must be there and must be the mailbox's own key.
 fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, String> {
@@ -5287,6 +5576,52 @@ pub async fn purge_declined(cfg: &DrainConfig, store: &Store) -> Result<(), Stri
             .await?;
         }
         store.remove("applications", &name).await?;
+    }
+    Ok(())
+}
+
+/// Run the one deletion transition for every account whose seven-day closing
+/// window has ended. Run once per drain pass after the intents: a page closure
+/// only sets `closing`, and this is what carries the window out without the
+/// account being touched again.
+///
+/// The journal id is the transition's own (`delete-<username>-<created_at>`), so
+/// a failed pass backs off and mails the operator once through the same rule the
+/// intents use, and a pass that already erased the account finds no record and
+/// does nothing.
+pub async fn purge_closing(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+    let today = util::date_after_days(0);
+    for username in store.list("accounts").await? {
+        if validate::username_shape(&username).is_some() {
+            continue;
+        }
+        let Some(text) = store
+            .read_record(&format!("accounts/{username}"), "account.json")
+            .await
+        else {
+            continue;
+        };
+        let Ok(account) = serde_json::from_str::<Account>(&text) else {
+            continue;
+        };
+        if account.state != "closing" {
+            continue;
+        }
+        // A closing record without a date is not a window this pass can close;
+        // leaving it visible is better than deleting on a guess.
+        let Some(until) = account.closing_until.as_deref() else {
+            continue;
+        };
+        if until > today.as_str() {
+            continue;
+        }
+        let id = format!("delete-{}-{}", username, account.created_at);
+        if !due(store, &id, OffsetDateTime::now_utc()).await {
+            continue;
+        }
+        if let Err(e) = delete_account(cfg, store, &username).await {
+            report_failure(cfg, store, &id, "delete", &e).await;
+        }
     }
     Ok(())
 }

@@ -75,6 +75,7 @@ ssl_dir=${SSL_DIR:-/etc/ssl}
 ssl_private=${SSL_PRIVATE:-/etc/ssl/private}
 virtuals=${VIRTUALS:-/etc/mail/virtuals}
 onboard_store=${ONBOARD_STORE:-/var/db/onboard}
+finger_page=${FINGER_PAGE:-/etc/kyriakon/finger.txt}
 
 # --- the steps, as functions, so the self-test can replace them -------------
 #
@@ -92,6 +93,26 @@ remove_group() { groupdel "$user" 2>/dev/null; }
 clear_quota() { ksh "$script_dir/quota-apply.sh" --clear "$user"; }
 regen_indexes() { ksh "$script_dir/cron-apply.sh" --web; }
 restart_smtpd() { rcctl restart smtpd >/dev/null; }
+
+# regen_finger: rebuild the page fingerd serves. It is derived from the httpd
+# and gmid configuration, so a member's vhosts leaving is the moment it changes.
+# gen-finger-page.sh lives in the repository checkout rather than the drain's
+# script directory because it reads the tracked configuration beside it. The
+# candidate is staged beside the installed page and renamed, so a failed
+# generation cannot leave half a page where fingerd reads it.
+regen_finger() {
+	repo=${KYRIAKON_REPO_DIR:-/usr/local/src/kyriakon-infra}
+	tmp=$(mktemp "${finger_page}.XXXXXX") || return 1
+	if ! ksh "$repo/scripts/gen-finger-page.sh" >"$tmp"; then
+		rm -f "$tmp"
+		return 1
+	fi
+	if ! chmod 0644 "$tmp" || ! mv "$tmp" "$finger_page"; then
+		rm -f "$tmp"
+		return 1
+	fi
+	return 0
+}
 
 # would <description> <path>: in --show mode, report rather than remove. Returns
 # 0 when the caller should keep going (the path is there), 1 when there is
@@ -256,6 +277,17 @@ remove_member() {
 		fi
 	fi
 
+	# 8. The finger page, which is derived from the daemon configuration. It runs
+	# last, after the vhost files have gone and the indexes have been rewritten,
+	# so it describes the box as it now stands.
+	if [ "$did" = yes ] && [ "$show" = no ]; then
+		if ! regen_finger; then
+			printf 'the finger page could not be regenerated; rerun scripts/deploy-mail.sh after fixing the checkout\n' >&2
+			return 1
+		fi
+		printf 'regenerated the finger page\n'
+	fi
+
 	# The last line, and the reason a run that did something is not silent.
 	if [ "$did" = yes ] && [ "$show" = no ]; then
 		printf 'not this script'"'"'s: the ledger line, the keyring'"'"'s published set, the\n'
@@ -325,6 +357,7 @@ self_test() {
 	clear_quota() { printf 'quota-apply --clear %s\n' "$user" >>"$case_dir/calls"; }
 	regen_indexes() { printf 'cron-apply --web\n' >>"$case_dir/calls"; }
 	restart_smtpd() { printf 'rcctl restart smtpd\n' >>"$case_dir/calls"; }
+	regen_finger() { printf 'gen-finger-page\n' >>"$case_dir/calls"; }
 
 	# remove_member is called directly, so the root check, the charset check and
 	# the two guards on the public tree are not in the way: they are the caller's
@@ -360,6 +393,8 @@ self_test() {
 	check "and the account goes last of the tools" "$(awk 'NR == 3' "$case_dir/calls")" 'userdel -r alice'
 	check "smtpd restarted once" "$(grep -c 'rcctl restart smtpd' "$case_dir/calls")" 1
 	check "the member's group goes after the account" "$(awk 'NR == 4' "$case_dir/calls")" 'groupdel alice'
+	check "the finger page is regenerated last" \
+		"$(tail -1 "$case_dir/calls")" 'gen-finger-page'
 	# The store's record goes too: the drain reads it to decide whether a name is
 	# taken, and an account deleted without it makes the next approval refuse the
 	# name as one that exists.
@@ -388,6 +423,23 @@ self_test() {
 	check "--show names each path it would remove" "$(grep -c '^would remove /' "$tree/third.out")" 2
 	check "and names the account" "$(grep -c 'would remove the account alice' "$tree/third.out")" 1
 	check "--show calls no tools" "$(wc -c <"$case_dir/calls" | tr -d ' ')" 0
+
+	# A failed regeneration fails the run and does not print the success line:
+	# otherwise the deletion would report a finger page it did not write.
+	account_exists() { return 0; }
+	regen_finger() { printf 'gen-finger-page\n' >>"$case_dir/calls"; return 1; }
+	show=no
+	: >"$case_dir/calls"
+	set +e
+	remove_member >"$tree/fourth.out" 2>"$tree/fourth.err"
+	code=$?
+	set -e
+	check "a failed finger regeneration fails the run" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and does not claim it regenerated" \
+		"$(grep -c 'regenerated the finger page' "$tree/fourth.out")" 0
+	check "and names the repair" \
+		"$(grep -c 'could not be regenerated' "$tree/fourth.err")" 1
 
 	self_test_end
 }

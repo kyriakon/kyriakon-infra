@@ -8,6 +8,7 @@
 //! until the ticket that understands it lands.
 
 use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::config::DrainConfig;
@@ -45,6 +46,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
         }
     }
     transitions::purge_declined(cfg, store).await?;
+    transitions::purge_closing(cfg, store).await?;
     // The free accounts' yearly note, on the same pass: a free account never
     // lapses, and this is the one message it is sent each year.
     transitions::free_anniversaries(cfg, store).await?;
@@ -98,6 +100,7 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
         "provision-group" => transitions::provision_group(cfg, store, &value, file).await,
         "group-address" => transitions::group_address(cfg, store, key, &value, file).await,
         "remove-group" => transitions::remove_group(cfg, store, key, &value, file).await,
+        "close" => transitions::close_account(cfg, store, &value, file).await,
         "token-resend" => {
             let intent: transitions::ResendIntent = serde_json::from_value(value)
                 .map_err(|e| format!("the token resend intent does not parse: {e}"))?;
@@ -375,6 +378,60 @@ pub async fn file_refund(
         "rate": rate,
         "settled_on": settled_on,
         "sig": sig,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    Ok(id)
+}
+
+/// Whether `id` names a live page session for `username`. The drain runs as
+/// root and the session record lives under the handler's store, so this is the
+/// one check that turns an unsigned intent into work for an authenticated
+/// account. A session for another account and an expired session are refused
+/// with the reason the journal records. The close intent is the first caller;
+/// #498 reuses it.
+pub async fn verify_session(store: &Store, id: &str, username: &str) -> Result<(), String> {
+    if !crate::store::is_status_token(id) {
+        return Err("the intent carries no usable session id".to_string());
+    }
+    let Some(text) = store.read_record("sessions", &format!("{id}.json")).await else {
+        return Err("the session named by the intent has gone".to_string());
+    };
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("the session record does not parse: {e}"))?;
+    let named = value.get("username").and_then(Value::as_str).unwrap_or("");
+    if named != username {
+        return Err(format!(
+            "the session belongs to {named:?}, not {username:?}"
+        ));
+    }
+    let expires = value
+        .get("expires_at")
+        .and_then(Value::as_str)
+        .ok_or("the session record has no expiry")?;
+    let expires = OffsetDateTime::parse(expires, &Rfc3339)
+        .map_err(|e| format!("the session expiry does not parse: {e}"))?;
+    if OffsetDateTime::now_utc() >= expires {
+        return Err("the session named by the intent has expired".to_string());
+    }
+    Ok(())
+}
+
+/// File one `close` intent, as the account page does. The handler has
+/// authenticated the member, writes the account name and the page session it
+/// used, and nothing else. The drain verifies the session, owns the state write
+/// and the seven-day window.
+pub async fn file_close(store: &Store, username: &str, session: &str) -> Result<String, String> {
+    let id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({
+        "id": id,
+        "kind": "close",
+        "filed_at": crate::util::filed_at(),
+        "username": username,
+        "session": session,
     });
     let bytes =
         serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
