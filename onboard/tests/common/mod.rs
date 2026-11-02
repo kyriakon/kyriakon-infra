@@ -178,6 +178,9 @@ impl Fix {
         // with quotas off prints. A test that wants usage writes one.
         fix.repquota(None);
         fix.stripe_subscription("active", 1_790_000_000);
+        // The rate fetch: unreachable by default, so no test reaches CoinGecko
+        // unless it says which rate the source answers with.
+        fix.rate_source(None);
         let cfg = format!(
             "store_root = \"{}\"\n\
              reserved = \"{}\"\n\
@@ -208,7 +211,10 @@ impl Fix {
              dmarc_rua = \"mailto:dmarc@kyriakon.net\"\n\
              resolver = \"{}\"\n\
              repquota = \"{}\"\n\
-             quota_mount = \"{}\"\n",
+             quota_mount = \"{}\"\n\
+             rates = \"{}/store/rates/xmr-gbp.json\"\n\
+             rate_endpoint = \"https://rates.example.invalid/simple/price\"\n\
+             rates_fetch = \"{}\"\n",
             fix.path("store"),
             fix.path("reserved"),
             fix.path("bin"),
@@ -226,6 +232,8 @@ impl Fix {
             fix.path("bin/dig"),
             fix.path("bin/repquota"),
             "/home",
+            fix.dir.display(),
+            fix.path("bin/curl"),
         );
         std::fs::write(fix.path("drain.toml"), cfg).unwrap();
         fix
@@ -337,6 +345,56 @@ impl Fix {
                 "#!/bin/sh\ncat <<'JSON'\n{{\"id\":\"{SUBSCRIPTION}\",\"status\":\"{status}\",\"current_period_end\":{period_end},\"customer\":\"cus_example\"}}\nJSON\n"
             ),
         );
+    }
+
+    /// The rate source's stub. `Some(rate)` answers the CoinGecko shape with
+    /// that GBP-per-XMR rate and logs the call, so a test can see whether the
+    /// source was asked at all; `None` is an unreachable source.
+    pub fn rate_source(&self, rate: Option<&str>) {
+        let log = self.path("rates.log");
+        let body = match rate {
+            Some(rate) => format!("cat <<'JSON'\n{{\"monero\":{{\"gbp\":{rate},\"last_updated_at\":1790857880}}}}\nJSON\n"),
+            None => "printf 'curl: (6) Could not resolve host\\n' >&2\nexit 6\n".to_string(),
+        };
+        self.script(
+            "curl",
+            &format!("#!/bin/sh\nprintf 'curl %s\\n' \"$*\" >> '{log}'\n{body}"),
+        );
+    }
+
+    /// How many times the source has been asked for a rate.
+    pub fn rate_fetches(&self) -> usize {
+        std::fs::read_to_string(self.path("rates.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("curl "))
+            .count()
+    }
+
+    /// The cache path the config names.
+    pub fn rates_path(&self) -> String {
+        self.path("store/rates/xmr-gbp.json")
+    }
+
+    pub fn rate_cache(&self) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(self.rates_path()).unwrap()).unwrap()
+    }
+
+    /// Seed the cache as a previous pass wrote it, `fetched_at` included, so a
+    /// test can say whether it is inside the twenty-four hours.
+    pub fn write_rate_cache(&self, rate: &str, fetched_at: &str) {
+        std::fs::create_dir_all(self.dir.join("store/rates")).unwrap();
+        let cached = json!({
+            "version": 1,
+            "rate_gbp_per_xmr": rate,
+            "source": "coingecko",
+            "fetched_at": fetched_at,
+        });
+        std::fs::write(
+            self.rates_path(),
+            serde_json::to_vec_pretty(&cached).unwrap(),
+        )
+        .unwrap();
     }
 
     /// A Stripe stub that answers both calls the repair makes: the subscription

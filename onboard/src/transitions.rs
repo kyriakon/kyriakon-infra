@@ -24,7 +24,7 @@ use crate::sign;
 use crate::store::{
     self, Account, ApplicationRef, CreditProgress, FlatPayment, GroupAddress, GroupAddressIntent,
     GroupIntent, GroupPayment, GroupRecord, GroupRemoveIntent, Intent, JournalLine, KeyRecord,
-    Payment, Record, Store, TokenRecord, UploadKey, Window,
+    Monero, Payment, Record, Store, TokenRecord, UploadKey, Window,
 };
 use crate::util;
 use crate::validate;
@@ -1293,6 +1293,23 @@ async fn approve(
                 })
             })
     };
+    // The Monero quote is taken once, when the window opens, and honoured for
+    // its fourteen days: a retry of the approval reuses the block already
+    // written rather than re-quoting. A window that opened with no rate ever
+    // fetched carries none at all, which is what leaves cash as the only
+    // prepaid rail on the account page.
+    let monero = if no_charge || record.rail != "monero" {
+        None
+    } else {
+        match existing
+            .as_ref()
+            .and_then(|a| a.payment_state())
+            .and_then(|p| p.monero)
+        {
+            Some(block) => Some(block),
+            None => crate::xmr::quote(cfg, OffsetDateTime::now_utc(), &cfg.price_gbp).await,
+        }
+    };
     // A no-charge approval writes no payment block at all: no window, no token,
     // and nothing that could lapse.
     let payment = if no_charge {
@@ -1306,6 +1323,7 @@ async fn approve(
             rail: Some(record.rail.clone()),
             balance_gbp: None,
             stripe: Default::default(),
+            monero,
         })
     };
 
@@ -1416,7 +1434,8 @@ async fn approve(
             &record.rail,
             no_charge,
             token_ref.as_deref(),
-            &window
+            &window,
+            account.payment.as_ref().and_then(|p| p.monero.as_ref()),
         )?
     );
     let notice_type = if no_charge {
@@ -1496,6 +1515,7 @@ pub async fn resend(
         false,
         payment.token_ref.as_deref(),
         &payment.window,
+        payment.monero.as_ref(),
     )?;
     let to = account
         .outside_address
@@ -2104,6 +2124,7 @@ async fn apply_payment(
             append_credit_ledger(
                 store,
                 intent,
+                &payment,
                 &util::date_string(received),
                 &util::gbp(amount),
                 &progress.applied_gbp,
@@ -2297,6 +2318,7 @@ async fn apply_payment(
     append_credit_ledger(
         store,
         intent,
+        &payment,
         &util::date_string(received),
         &util::gbp(amount),
         &util::gbp(applied.applied),
@@ -3597,7 +3619,7 @@ async fn ledger_has_intent(store: &Store, id: &str) -> bool {
 /// token. The account's copy is rewritten too; the applications copy only when
 /// it still exists, because recreating a purged application would undo the
 /// purge's own promise.
-async fn write_payment_copy(
+pub async fn write_payment_copy(
     store: &Store,
     username: &str,
     payment: &Payment,
@@ -3648,16 +3670,20 @@ pub(crate) async fn next_ledger_seq(store: &Store) -> u64 {
 }
 
 /// Append the credit's line: the next `seq`, keyed by the token, with no
-/// username. The rate fields stay null until the Monero quote lands (#303); the
-/// XMR amount and the transaction id are recorded when the operator gave them.
+/// username. A Monero credit carries the rate that produced the window's quote,
+/// its source and when it was fetched; every other rail's rate fields stay null.
+/// The XMR amount and the transaction id are recorded when the operator gave
+/// them.
 async fn append_credit_ledger(
     store: &Store,
     intent: &CreditIntent,
+    payment: &Payment,
     received_on: &str,
     amount_gbp: &str,
     applied_gbp: &str,
     paid_until_after: Option<&str>,
 ) -> Result<(), String> {
+    let quoted = payment.monero.as_ref().filter(|_| intent.rail == "monero");
     let seq = next_ledger_seq(store).await;
     let line = json!({
         "version": 1,
@@ -3670,9 +3696,9 @@ async fn append_credit_ledger(
         "applied_gbp": applied_gbp,
         "paid_until_after": paid_until_after,
         "amount_xmr": intent.amount_xmr.as_deref(),
-        "rate_quoted": Value::Null,
-        "rate_source": Value::Null,
-        "rate_at": Value::Null,
+        "rate_quoted": quoted.and_then(|m| m.rate_gbp_per_xmr.as_deref()),
+        "rate_source": quoted.and_then(|m| m.rate_source.as_deref()),
+        "rate_at": quoted.and_then(|m| m.rate_at.as_deref()),
         "txid": intent.txid.as_deref(),
         "intent": intent.id.as_str(),
         "note": Value::Null,
@@ -4301,7 +4327,11 @@ async fn write_group_record(store: &Store, group: &GroupRecord) -> Result<(), St
 /// the record holds no secret: the group's token stays in `tokens/` and the
 /// ledger. The directory's own group is the owner, so the deploy's modes are
 /// what decide who can read it rather than a second list here.
-async fn write_account_record(store: &Store, username: &str, bytes: &[u8]) -> Result<(), String> {
+pub async fn write_account_record(
+    store: &Store,
+    username: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
     store
         .write_record_mode(
             &format!("accounts/{username}"),
@@ -6205,19 +6235,77 @@ fn confirmation_body(record: &Record) -> String {
 /// The rail's own payment instructions, one line each, in the words the
 /// approval email and both account pages carry. Monero has no subaddress until
 /// the operator's wallet makes one, so the line says that rather than leaving an
-/// empty field for the member to wonder at.
-pub fn rail_instructions(rail: &str, postal_address: &str, card_link: Option<&str>) -> Vec<String> {
-    match rail {
-        "cash" => vec![
+/// empty field for the member to wonder at; and a window with no usable quote
+/// falls back to cash by post, which is the one prepaid rail it does have.
+pub fn rail_instructions(
+    rail: &str,
+    postal_address: &str,
+    card_link: Option<&str>,
+    monero: Option<&Monero>,
+    amount_gbp: &str,
+) -> Vec<String> {
+    let cash = || {
+        vec![
             "Post the money to:".to_string(),
             postal_address.to_string(),
             "Write the reference on the envelope, or on a slip inside it.".to_string(),
-        ],
-        "monero" => vec![
-            "Your Monero subaddress is not ready yet; it will follow in a second message."
-                .to_string(),
-            "The pound amount is what is owed; the quoted amount in Monero settles it.".to_string(),
-        ],
+        ]
+    };
+    match rail {
+        "cash" => cash(),
+        "monero" => match monero.filter(|m| !m.stale && m.quote_xmr.is_some()) {
+            Some(m) => {
+                let mut out = Vec::new();
+                match m.address.as_deref() {
+                    Some(address) => out.push(format!("Your Monero subaddress is {address}.")),
+                    None => out.push(
+                        "Your Monero subaddress is not ready yet; it will follow in a second \
+                         message."
+                            .to_string(),
+                    ),
+                }
+                if let Some(rate) = m.rate_gbp_per_xmr.as_deref() {
+                    // The stored quote is for the full price. A held balance
+                    // re-quotes what is still owed at the same rate, because
+                    // otherwise the page asks for GBP 19.50 and the XMR amount
+                    // for GBP 20.00 beside it. On a window with nothing held the
+                    // recomputation is the stored quote.
+                    let quote = crate::util::pence(amount_gbp)
+                        .ok()
+                        .and_then(|pence| crate::xmr::quote_xmr(pence, rate).ok())
+                        .or_else(|| m.quote_xmr.clone());
+                    if let Some(quote) = quote {
+                        let on = m
+                            .rate_at
+                            .as_deref()
+                            .and_then(|at| at.get(..10))
+                            .unwrap_or("");
+                        out.push(format!(
+                            "Send {quote} XMR for GBP {amount_gbp}, quoted at GBP {rate} per XMR on {on}."
+                        ));
+                    }
+                }
+                out.push(
+                    "The pound amount is what is owed; the quoted amount in Monero settles it."
+                        .to_string(),
+                );
+                out.push(
+                    "Send it to the subaddress: a payment to the wallet's main address cannot be \
+                     joined to an account."
+                        .to_string(),
+                );
+                out
+            }
+            None => {
+                let mut out = vec![
+                    "Monero is not quoted for this window, so cash by post is the only prepaid \
+                     rail."
+                        .to_string(),
+                ];
+                out.extend(cash());
+                out
+            }
+        },
         "card" => match card_link {
             Some(link) => vec![
                 "Pay by card at this link, which carries your reference:".to_string(),
@@ -6264,6 +6352,7 @@ fn decision_body(
     no_charge: bool,
     token: Option<&str>,
     window: &Option<Window>,
+    monero: Option<&Monero>,
 ) -> Result<String, String> {
     if no_charge {
         return Ok(format!(
@@ -6285,7 +6374,13 @@ fn decision_body(
         cfg.price_gbp
     );
     out.push('\n');
-    for line in rail_instructions(rail, &cfg.postal_address, card_link.as_deref()) {
+    for line in rail_instructions(
+        rail,
+        &cfg.postal_address,
+        card_link.as_deref(),
+        monero,
+        &cfg.price_gbp,
+    ) {
         out.push_str(&line);
         out.push('\n');
     }
@@ -7404,6 +7499,13 @@ mod tests {
             resolver: dir.join("bin/dig").to_str().unwrap().to_string(),
             repquota: dir.join("bin/repquota").to_str().unwrap().to_string(),
             quota_mount: "/home".to_string(),
+            rates: dir
+                .join("store/rates/xmr-gbp.json")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            rate_endpoint: "https://rates.example.invalid/simple/price".to_string(),
+            rates_fetch: dir.join("bin/curl").to_str().unwrap().to_string(),
         }
     }
 

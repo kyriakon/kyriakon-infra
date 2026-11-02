@@ -561,6 +561,20 @@ printf 'titan: %s\n' "$titan_listener"
 
 printf '\ninstalled. the responder answers %s, %s and %s, and no other local user may connect.\n' \
 	"$httpd_socket_path" "$gemini_socket_path" "$portal_socket_path"
+# The command the drain's rate fetch runs. It is a package rather than a base
+# tool, and nothing else on the pass needs it, so a box without it would open
+# every Monero window with no quote and log a failure per attempt. The check is
+# a warning like the doas one: this script does not install packages.
+say "rate fetch"
+rates_fetch=$(awk -F'"' '/^rates_fetch[[:space:]]*=/ { print $2; exit }' /etc/kyriakon/onboard/drain.toml)
+[ -n "$rates_fetch" ] || die "/etc/kyriakon/onboard/drain.toml names no rates_fetch"
+if [ -x "$rates_fetch" ]; then
+	printf 'rates: %s\n' "$rates_fetch"
+else
+	printf 'the Monero quote cannot be fetched until %s exists:\n' "$rates_fetch"
+	printf '  doas pkg_add curl\n'
+fi
+
 # The one doas rule the login needs. It is not written here: doas.conf is the
 # box's privilege list, and a deploy that appended to it could lock the operator
 # out of root. The tracked fragment is the line itself, so the manual step is a

@@ -899,6 +899,41 @@ pub struct Payment {
     /// payment is heard, and absent from a prepaid or free account.
     #[serde(default)]
     pub stripe: StripeBilling,
+    /// The Monero rail's subaddress and the one quote the window is honoured
+    /// at. Absent on an account that is not on the Monero rail, and absent from
+    /// a Monero account whose window opened with no rate ever fetched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monero: Option<Monero>,
+}
+
+/// What the Monero rail records against an account. The subaddress is the
+/// operator's own wallet's, one per account, permanent: nothing here rotates it,
+/// and the console refuses a second, different one. The quote is computed once,
+/// when the window opens, and honoured for its fourteen days, so `rate_at` is
+/// when that rate was fetched rather than anything the page recomputes.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Monero {
+    /// The member's subaddress, recorded by `onboardctl monero address` after
+    /// the operator's wallet makes it. `None` until that wallet pass, which is
+    /// why the page says the address is not ready rather than showing an empty
+    /// field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// `price ÷ rate`, rounded up to six decimal places, as the window's quote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_xmr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_gbp_per_xmr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_source: Option<String>,
+    /// When the rate that produced the quote was fetched, RFC 3339.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_at: Option<String>,
+    /// The quote was taken from a cache the source could not refresh: it is
+    /// still what the member was shown, and the page does not show the block.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 /// What the card rail records on the account or group it belongs to. Nothing
@@ -1006,6 +1041,7 @@ impl FlatPayment {
             rail: None,
             balance_gbp: None,
             stripe: StripeBilling::default(),
+            monero: None,
         })
     }
 }

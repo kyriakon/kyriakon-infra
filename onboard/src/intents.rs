@@ -30,6 +30,11 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
             return Ok(());
         }
     };
+    // The rate cache first, so a window opening later in this pass quotes from
+    // it. It asks the source only when the cache is more than a day old, and a
+    // failure is not the pass's: a stale cache is exactly what the quote falls
+    // back to.
+    let _ = crate::xmr::current(cfg, OffsetDateTime::now_utc()).await;
     // The filenames are ULIDs, so a lexical sort is an age sort.
     for name in store.list("intents").await? {
         if !name.ends_with(".json") {
