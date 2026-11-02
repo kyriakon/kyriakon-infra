@@ -1831,12 +1831,59 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String>
             }
             continue;
         }
+        // The grace's own reminder, while a month of it is left. It is skipped
+        // once the final notice's week has begun, which is behind this branch.
+        if today >= grace - Duration::days(30) && today < grace - Duration::days(7) {
+            if let Err(e) = grace_notice(cfg, store, &username, &account).await {
+                eprintln!("kyriakon-onboard: the grace notice for {username}: {e}");
+            }
+        }
         if today >= grace - Duration::days(7) {
             if let Err(e) = final_notice(cfg, store, &username, &account).await {
                 eprintln!("kyriakon-onboard: the final notice for {username}: {e}");
             }
         }
     }
+    Ok(())
+}
+
+/// The address a lifecycle notice goes to: the contact the member gave, or the
+/// mailbox otherwise. It is validated again because it becomes a mail header,
+/// and a record that reached it from outside the drain is not trusted.
+fn notice_address(account: &Account, username: &str) -> String {
+    match account.outside_address.as_deref() {
+        Some(addr) if validate::address(addr).is_none() => addr.to_string(),
+        _ => format!("{username}@kyriakon.net"),
+    }
+}
+
+/// The grace notice: the midpoint of the forty days, when thirty of them are
+/// left. The lapse notice opened the grace and the final notice closes it, so
+/// this one repeats what still works and what has stopped and gives the member
+/// a month's warning before anything is deleted.
+async fn grace_notice(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+    account: &Account,
+) -> Result<(), String> {
+    let grace = account.grace_until.as_deref().unwrap_or("");
+    let token = account
+        .payment_state()
+        .and_then(|payment| payment.token_ref)
+        .unwrap_or_default();
+    let to = notice_address(account, username);
+    let subject = format!("Your kyriakon.net account's grace ends on {grace} ({username})");
+    let body = format!(
+        "The payment window for {username} closed and no payment has been recorded.\n\n\
+         {}\n\n\
+         The grace ends on {grace}, thirty days from this notice. After that the account\n\
+         is deleted automatically. Paying restores it.\n\n\
+         Your payment reference is {token}.\n",
+        crate::page::LAPSE_NOTE
+    );
+    notice::send_account_notice(cfg, store, username, "prepaid.grace", &subject, &to, &body)
+        .await?;
     Ok(())
 }
 
@@ -1854,10 +1901,7 @@ async fn final_notice(
         .payment_state()
         .and_then(|payment| payment.token_ref)
         .unwrap_or_default();
-    let to = match account.outside_address.as_deref() {
-        Some(addr) if validate::address(addr).is_none() => addr.to_string(),
-        _ => format!("{username}@kyriakon.net"),
-    };
+    let to = notice_address(account, username);
     let subject = "Your kyriakon.net account will be deleted in seven days".to_string();
     let body = format!(
         "The payment window for {username} closed and no payment was recorded.\n\n\
@@ -1889,10 +1933,7 @@ async fn lapse_notice(
     let closes_on = &window.closes_at[..10.min(window.closes_at.len())];
     let token = payment.token_ref.as_deref().unwrap_or("");
     let grace = account.grace_until.as_deref().unwrap_or("");
-    let to = match account.outside_address.as_deref() {
-        Some(addr) if validate::address(addr).is_none() => addr.to_string(),
-        _ => format!("{username}@kyriakon.net"),
-    };
+    let to = notice_address(account, username);
     let subject = "Your kyriakon.net payment window has closed".to_string();
     let body = format!(
         "The payment window for {username} closed on {closes_on} and no payment was recorded.\n\n\
@@ -4565,6 +4606,63 @@ async fn close_mailbox(cfg: &DrainConfig, store: &Store, username: &str) -> Resu
     run_script(cfg, "delete-user.sh", &[username]).await
 }
 
+/// `onboardctl suspend`: the AUP ladder's third rung, run now. It does the
+/// runbook's suspension step: the shared lapse script stops sending, uploading
+/// and pushing, the reason is written where the account page reads it, and the
+/// notice carries the reason and how to answer. Taking the vhosts down stays the
+/// operator's step, because it edits generated include files rather than the
+/// account.
+///
+/// The access change comes before the record says suspended, as the lapse's
+/// does: a script failure leaves the account as it was rather than reading
+/// suspended while it still sends. A second run records nothing new, because the
+/// notice is deduplicated on its type and subject.
+pub async fn suspend(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+    reason: &str,
+) -> Result<(), String> {
+    if let Some(why) = validate::username_shape(username) {
+        return Err(format!("the username {username:?}: {why}"));
+    }
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err("a suspension needs a reason, in the words the member will read".to_string());
+    }
+    let Some(mut account) = existing_account(store, username).await else {
+        return Err(format!("no account for {username}"));
+    };
+    run_script(cfg, "lapse-user.sh", &[username]).await?;
+    account.state = "suspended".to_string();
+    account.suspension_reason = Some(reason.to_string());
+    let bytes = serde_json::to_vec_pretty(&account)
+        .map_err(|e| format!("cannot encode the account: {e}"))?;
+    write_account_record(store, username, &bytes).await?;
+    let to = notice_address(&account, username);
+    let subject = format!("Your kyriakon.net account is suspended ({username})");
+    let body = format!(
+        "The account {username} has been suspended: {reason}\n\n\
+         Outbound mail has stopped, and uploading to your site and pushing to git with\n\
+         it. Inbound mail keeps arriving and stays readable, and your account page stays\n\
+         open and shows this reason.\n\n\
+         To answer it, reply to this message or write to admin@kyriakon.net. A suspension\n\
+         that is not resolved enters the same forty-day grace as an unpaid account, and\n\
+         that grace ends in deletion.\n"
+    );
+    notice::send_account_notice(
+        cfg,
+        store,
+        username,
+        "account.suspended",
+        &subject,
+        &to,
+        &body,
+    )
+    .await?;
+    Ok(())
+}
+
 /// The lifecycle's one deletion transition. `onboardctl delete` calls it
 /// directly, and a closing account reaches it through the drain's sweep, so an
 /// erasure from the page and one from the console cannot take different paths.
@@ -5855,10 +5953,7 @@ pub async fn free_anniversaries(cfg: &DrainConfig, store: &Store) -> Result<(), 
         // The address the approval used: the one outside the platform, or the
         // member's mailbox. It was validated before it was written, and is
         // validated again here because it is about to become a mail header.
-        let to = match account.outside_address.as_deref() {
-            Some(addr) if validate::address(addr).is_none() => addr.to_string(),
-            _ => format!("{username}@kyriakon.net"),
-        };
+        let to = notice_address(&account, &username);
         let subject = format!(
             "Your kyriakon.net account is free for another year ({})",
             due.year()
@@ -5887,6 +5982,80 @@ pub async fn free_anniversaries(cfg: &DrainConfig, store: &Store) -> Result<(), 
         .await
         {
             eprintln!("kyriakon-onboard: the free anniversary note for {username}: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// The thirty-day note before a prepaid membership runs out. A card account is
+/// skipped: Stripe's subscription sends its own upcoming-invoice reminder, and
+/// the platform has no second copy to add. The notice falls due on the account's
+/// own `paid_until - 30`, at most once per date because the subject carries it.
+/// Only an active account is reminded; one already lapsed is the grace sweep's.
+pub async fn prepaid_renewals(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+    let today = OffsetDateTime::now_utc().date();
+    for username in store.list("accounts").await? {
+        let Some(account) = existing_account(store, &username).await else {
+            continue;
+        };
+        if account.state != "active" || account.group.is_some() {
+            continue;
+        }
+        let Some(payment) = account.payment_state() else {
+            continue;
+        };
+        let Some(paid_until) = payment.paid_until.as_deref() else {
+            continue;
+        };
+        let rail = payment.rail.as_deref().unwrap_or(&account.rail);
+        if rail == "card" {
+            continue;
+        }
+        // A paid-until date is written as a day by a credit and as a timestamp
+        // by the card rail, so only its date part is read.
+        let Some(until) = util::parse_date(paid_until.get(..10).unwrap_or(paid_until)) else {
+            continue;
+        };
+        if today < until - Duration::days(30) || today >= until {
+            continue;
+        }
+        let price = cfg.price_gbp.as_str();
+        let how = match rail {
+            "monero" => format!(
+                "Write to admin@kyriakon.net for the subaddress and the amount in Monero\n\
+                 quoted for this renewal. Send {price} worth, and the pound amount is what\n\
+                 is owed."
+            ),
+            _ => format!(
+                "Post GBP {price} to:\n{}\n\
+                 Write your reference on the envelope, or on a slip inside it.",
+                cfg.postal_address
+            ),
+        };
+        let token = payment.token_ref.as_deref().unwrap_or("");
+        let to = notice_address(&account, &username);
+        let subject = format!("Your kyriakon.net membership runs out on {paid_until} ({username})");
+        let body = format!(
+            "The membership for {username} is paid until {paid_until}.\n\n\
+             To renew it for another year:\n\n{how}\n\n\
+             Your payment reference is {token}.\n\n\
+             Nothing is deleted when the date passes: mail keeps arriving and stays\n\
+             readable and everything published stays up, while sending, uploading and\n\
+             pushing stop, and the forty-day grace begins. Write to admin@kyriakon.net if\n\
+             you have already sent the money.\n"
+        );
+        if let Err(e) = notice::send_account_notice(
+            cfg,
+            store,
+            &username,
+            "prepaid.renewal",
+            &subject,
+            &to,
+            &body,
+        )
+        .await
+        {
+            eprintln!("kyriakon-onboard: the renewal note for {username}: {e}");
         }
     }
     Ok(())
