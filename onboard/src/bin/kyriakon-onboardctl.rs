@@ -1133,7 +1133,7 @@ async fn request_verify(cfg: &DrainConfig, store: &Store, args: &[String]) -> Re
             format!("the message is from {from}, not the account's own address {own}")
         });
     }
-    let key_file = std::path::Path::new(&cfg.keyring_dir).join(format!("{username}.asc"));
+    let key_file = keycheck::keyring_file(&cfg.keyring_dir, username);
     if !key_file.is_file() {
         return Err(format!(
             "the box holds no key for {username} at {}",
@@ -1159,43 +1159,78 @@ async fn request_verify(cfg: &DrainConfig, store: &Store, args: &[String]) -> Re
 
 const CLEARSIGNED: &str = "-----BEGIN PGP SIGNED MESSAGE-----";
 
-/// The address in a message's `From:` header. A clearsigned message carries its
-/// headers inside the armour, and those are the bytes the signature covers.
+/// The address in a message's `From:` header. A delivered message carries its
+/// own headers outside the armour, and a client's clearsigned export carries
+/// them inside it. The outer block is read first and the armour's is the
+/// fallback, and a `From:` in both that disagrees is refused: the signature is
+/// the proof, so the outer header adds no forgeable path.
 fn message_from(message: &str) -> Result<String, String> {
     let message = message.replace("\r\n", "\n");
-    let content = match message.split_once(CLEARSIGNED) {
-        Some((_, armour)) => {
-            let body = armour
+    let (outer, armour) = match message.split_once(CLEARSIGNED) {
+        Some((outer, rest)) => {
+            let body = rest
                 .split_once("\n\n")
                 .map(|(_, body)| body)
                 .ok_or("the clearsigned message has no blank line after its armour")?;
-            body.split_once("\n-----BEGIN PGP SIGNATURE-----")
+            let body = body
+                .split_once("\n-----BEGIN PGP SIGNATURE-----")
                 .map(|(body, _)| body)
-                .unwrap_or(body)
+                .unwrap_or(body);
+            (outer, Some(body))
         }
-        None => message.as_str(),
+        None => (message.as_str(), None),
     };
-    let mut found: Option<&str> = None;
-    for line in content.lines() {
+    let outer = header_from(outer)?;
+    let armour = match armour {
+        Some(armour) => header_from(armour)?,
+        None => None,
+    };
+    match (outer, armour) {
+        (Some(outer), Some(armour)) if !outer.eq_ignore_ascii_case(&armour) => Err(format!(
+            "the message's own From: is {outer} but the clearsigned one is {armour}"
+        )),
+        (Some(outer), _) => Ok(outer),
+        (None, Some(armour)) => Ok(armour),
+        (None, None) => Err("the message has no From: header".to_string()),
+    }
+}
+
+/// The address in one header block's `From:`, with RFC 5322 continuation lines
+/// unfolded first. `None` when the block carries no `From:`.
+fn header_from(block: &str) -> Result<Option<String>, String> {
+    let mut headers: Vec<String> = Vec::new();
+    for line in block.lines() {
         if line.is_empty() {
             break;
         }
-        if line.to_ascii_lowercase().starts_with("from:") {
-            if found.is_some() {
-                return Err("the message has more than one From: header".to_string());
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(last) = headers.last_mut() {
+                last.push(' ');
+                last.push_str(line.trim());
             }
-            found = Some(line[5..].trim());
+        } else {
+            headers.push(line.trim_end().to_string());
         }
     }
-    let value = found.ok_or("the message has no From: header")?;
+    let mut values = headers.iter().filter_map(|header| {
+        let (name, value) = header.split_once(':')?;
+        name.eq_ignore_ascii_case("from")
+            .then(|| value.trim().to_string())
+    });
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err("the message has more than one From: header".to_string());
+    }
     let address = match (value.rfind('<'), value.rfind('>')) {
         (Some(open), Some(close)) if open < close => &value[open + 1..close],
-        _ => value,
+        _ => value.as_str(),
     };
     if address.trim().is_empty() {
         return Err("the message's From: header holds no address".to_string());
     }
-    Ok(address.trim().to_string())
+    Ok(Some(address.trim().to_string()))
 }
 
 async fn request_extend(store: &Store, args: &[String]) -> Result<(), String> {
@@ -1768,5 +1803,45 @@ mod tests {
         assert_eq!(csv_cell("a\nb"), "\"a\nb\"");
         assert_eq!(csv_cell("a\rb"), "\"a\rb\"");
         assert_eq!(csv_cell(""), "");
+    }
+
+    const SIGNED: &str = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\n\
+                          From: Alice <alice@kyriakon.net>\n\nPlease send me a copy.\n\
+                          -----BEGIN PGP SIGNATURE-----\n\nAAAA\n\
+                          -----END PGP SIGNATURE-----\n";
+
+    #[test]
+    fn a_delivered_message_takes_its_from_outside_the_armour() {
+        let message = format!(
+            "From: Alice <alice@kyriakon.net>\nTo: admin@kyriakon.net\n\
+             Subject: my data\n\n{SIGNED}"
+        );
+        assert_eq!(message_from(&message).unwrap(), "alice@kyriakon.net");
+    }
+
+    #[test]
+    fn a_folded_from_header_is_unfolded() {
+        let message =
+            "From: A Long Name\n <alice@kyriakon.net>\nTo: admin@kyriakon.net\n\nPlease.\n";
+        assert_eq!(message_from(message).unwrap(), "alice@kyriakon.net");
+    }
+
+    #[test]
+    fn an_outer_from_that_differs_from_the_armour_is_refused() {
+        let message = format!("From: attacker@evil.example\nTo: admin@kyriakon.net\n\n{SIGNED}");
+        let err = message_from(&message).unwrap_err();
+        assert!(err.contains("attacker@evil.example"), "{err}");
+        assert!(err.contains("alice@kyriakon.net"), "{err}");
+    }
+
+    #[test]
+    fn a_quoted_signed_request_under_another_from_is_refused() {
+        let message = format!(
+            "From: attacker@evil.example\nTo: admin@kyriakon.net\nSubject: fwd\n\n\
+             Here is their signed request:\n\n{SIGNED}"
+        );
+        assert!(message_from(&message)
+            .unwrap_err()
+            .contains("but the clearsigned one is alice@kyriakon.net"));
     }
 }

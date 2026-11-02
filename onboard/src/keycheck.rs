@@ -1,5 +1,7 @@
 //! Structural checks on a submitted key: armour framing, base64, and the packet
-//! structure, and the fingerprint of the material either way.
+//! structure, and the fingerprint of the material either way. `verify_signature`
+//! goes beyond structure: it spawns gpg in a scratch home holding only one key,
+//! and a good signature by that key is what decides the mail-key route.
 //!
 //! The three conditions that decide whether mail can actually be delivered to a
 //! key (an encryption-capable subkey, no AEAD preference, not expired) are the
@@ -15,10 +17,11 @@
 //! hashes rather than checks: a number that names material it was not computed
 //! from reads as a number that disagrees with the key on the box. So the
 //! fingerprint is computed here, over the material the record carries, in the
-//! two shapes the two keys have. They decide nothing.
+//! two shapes the two keys have. The fingerprints decide nothing; the signature
+//! check does.
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha1::{Digest, Sha1};
@@ -29,6 +32,12 @@ use crate::store::KeyRecord;
 
 const BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
 const END: &str = "-----END PGP PUBLIC KEY BLOCK-----";
+
+/// The box keyring entry a localpart's mail key is served from: one `<localpart>.asc`
+/// per address, which is what the encrypting LMTP reads.
+pub fn keyring_file(dir: &str, localpart: &str) -> PathBuf {
+    Path::new(dir).join(format!("{localpart}.asc"))
+}
 
 #[derive(Debug)]
 pub struct Checked {

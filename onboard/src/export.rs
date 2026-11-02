@@ -23,6 +23,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Date, Duration, OffsetDateTime};
 
 use crate::config::DrainConfig;
+use crate::keycheck;
 use crate::notice;
 use crate::store::{Account, JournalLine, Store};
 use crate::util;
@@ -281,7 +282,7 @@ async fn written(
         ),
     ));
 
-    let key_path = Path::new(&cfg.keyring_dir).join(format!("{username}.asc"));
+    let key_path = keycheck::keyring_file(&cfg.keyring_dir, username);
     let key = std::fs::read(&key_path).map_err(|e| {
         format!(
             "no mail key for {username} at {}: {e}; the account's own key belongs in the export",
@@ -619,7 +620,7 @@ pub async fn deliver_by_mail(
     if let Some(why) = crate::validate::username_shape(username) {
         return Err(format!("the username {username:?}: {why}"));
     }
-    let key = Path::new(&cfg.keyring_dir).join(format!("{username}.asc"));
+    let key = keycheck::keyring_file(&cfg.keyring_dir, username);
     if !key.is_file() {
         return Err(format!(
             "no public key for {username} at {}, so the written part cannot be sent encrypted.\n\n{}",

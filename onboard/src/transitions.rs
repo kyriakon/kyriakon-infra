@@ -479,7 +479,7 @@ async fn publish_mail_keys(
         if body.is_empty() {
             return Err(format!("the mail key for {localpart} is empty"));
         }
-        let path = dir.join(format!("{localpart}.asc"));
+        let path = crate::keycheck::keyring_file(&cfg.keyring_dir, localpart);
         let mut bytes = body.as_bytes().to_vec();
         bytes.push(b'\n');
         // Written only when the bytes differ. The drift check's seven days for an
@@ -520,7 +520,9 @@ async fn publish_mail_keys_publicly(
     let dir = cfg.keyring_dir.trim_end_matches('/');
     for key in keys {
         let localpart = mail_key_localpart(username, key);
-        let path = format!("{dir}/{localpart}.asc");
+        let path = crate::keycheck::keyring_file(dir, localpart)
+            .display()
+            .to_string();
         run_script(
             cfg,
             "publish-mail-key.sh",
@@ -6031,7 +6033,7 @@ async fn erasure_refund(store: &Store, account: &Account) -> Option<String> {
 /// Drop one account's published key from the box keyring. A missing directory or
 /// file is already done, which is what makes a retry safe.
 async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), String> {
-    let path = std::path::Path::new(&cfg.keyring_dir).join(format!("{username}.asc"));
+    let path = crate::keycheck::keyring_file(&cfg.keyring_dir, username);
     match tokio::fs::remove_file(&path).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -6890,8 +6892,7 @@ pub async fn mail_key(
                 )
                 .await;
             }
-            let key_file =
-                std::path::Path::new(&cfg.keyring_dir).join(format!("{}.asc", account.username));
+            let key_file = crate::keycheck::keyring_file(&cfg.keyring_dir, &account.username);
             let signed = if intent.signature.trim().is_empty() {
                 false
             } else {

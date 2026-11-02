@@ -414,10 +414,11 @@ who is asking": a request from the account page is checked against the system
 account, and a request sent by mail is confirmed by the password or by a signed
 message from the account's own address. The record names which route was used.
 
-The password route is the account page. Ask the member to make the request from
-the page, which checks the password against the real system account through
-`doveadm auth test <username>`; the service holds no copy of it. The page's own
-export and close intents are recorded with this route by the drain.
+The password route is the account page, whose export and close controls are the
+only two it has. They check the password against the real system account through
+`doveadm auth test <username>`, and the drain records those intents with this
+route; the service holds no copy of it. A rectification has no page action, so it
+is established by the mail-key route or not at all.
 
 The mail-key route is for a member who cannot log in but still holds the key. Ask
 for a message from the account's own platform address, `<username>@<group
@@ -427,12 +428,16 @@ the key the platform already encrypts to. Check it here:
 	doas onboardctl request verify --username <username> --message <file> \
 	  [--signature <file>]
 
-`--message` is the saved message and `--signature` its detached signature. A
-message saved clearsigned needs no `--signature`. PGP/MIME is not read, so export
-the clearsigned message or the detached signature from the client. The command
-checks the `From:` header is the account's own address and verifies the signature
-against `/etc/kyriakon/keys/<username>.asc`, printing the verified fingerprint.
-It writes nothing; the request is recorded afterwards.
+`--message` is the saved message and `--signature` its detached signature. The
+signature must be over that saved file itself, headers included: one made over
+the body alone does not match a message that carries headers, so a client that
+can sign only the body should send the message clearsigned instead. A message
+saved clearsigned needs no `--signature`; the command reads the headers outside
+the armour first and falls back to the ones inside it. PGP/MIME is not read, so
+export the clearsigned message or the detached signature from the client. The
+command checks the `From:` header is the account's own address and verifies the
+signature against `/etc/kyriakon/keys/<username>.asc`, printing the verified
+fingerprint. It writes nothing; the request is recorded afterwards.
 
 	cat /etc/kyriakon/keys/<localpart>.asc
 

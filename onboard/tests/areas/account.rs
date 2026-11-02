@@ -797,3 +797,23 @@ fn request_record_requires_and_persists_the_identity_route() {
     .unwrap();
     assert_eq!(line["identity"], "mail-key", "{line}");
 }
+
+/// A line written before the field existed names no route, and `request list`
+/// says so rather than printing an empty one.
+#[test]
+fn request_list_marks_a_legacy_line_unrecorded() {
+    let fix = Fix::new("request-list-unrecorded");
+    fix.page_account("alice", json!({}));
+    std::fs::create_dir_all(fix.dir.join("store/accounts/alice")).unwrap();
+    std::fs::write(
+        fix.dir.join("store/accounts/alice/requests.jsonl"),
+        "{\"version\":1,\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\
+         \"username\":\"alice\",\"kind\":\"access\",\"received\":\"2026-10-01\",\
+         \"evidence\":\"the account page\",\"relevant\":\"2026-10-01\",\
+         \"due\":\"2026-11-01\"}\n",
+    )
+    .unwrap();
+    let out = fix.ctl(&["request", "list"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("identity unrecorded"), "{}", body(&out));
+}
