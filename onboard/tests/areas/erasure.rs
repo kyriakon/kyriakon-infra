@@ -75,6 +75,14 @@ fn the_console_delete_removes_the_account_and_leaves_the_ledger_unlinkable() {
     std::fs::create_dir_all(&keyring).unwrap();
     std::fs::write(keyring.join("secretary.asc"), "public key").unwrap();
     std::fs::write(keyring.join("treasurer.asc"), "public key").unwrap();
+    // The answer has an address that outlives the account to go to.
+    let mut account = fix.account("secretary");
+    account["outside_address"] = json!("secretary@example.invalid");
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
     fake_delete_user(&fix);
     assert!(fix.dir.join(format!("store/tokens/{token}.json")).exists());
 
@@ -130,7 +138,8 @@ fn the_console_delete_removes_the_account_and_leaves_the_ledger_unlinkable() {
         assert!(!ledger.contains(word), "the ledger names {word}: {ledger}");
     }
 
-    // The name is held, and the answer names the four surviving facts.
+    // The name is held, and the durable answer is the journal line, which
+    // outlives the account and its notices file.
     // The hold is ninety days out; the seconds differ by the time between the
     // deletion and this check, so the date is what is compared.
     let hold: Value = serde_json::from_str(&fix.read("holds/secretary.json")).unwrap();
@@ -140,19 +149,27 @@ fn the_console_delete_removes_the_account_and_leaves_the_ledger_unlinkable() {
         until.starts_with(&kyriakon_onboard::util::date_after_days(90)),
         "{until}"
     );
-    let sent = fix.sent();
-    assert!(sent.contains("being erased"), "{sent}");
-    assert!(sent.contains("about seven months"), "{sent}");
-    assert!(sent.contains("ledger"), "{sent}");
-    assert!(sent.contains("no username"), "{sent}");
-    assert!(sent.contains("90 days"), "{sent}");
-    assert!(
-        sent.contains("GBP 20.00"),
-        "the refund fact is missing: {sent}"
-    );
     let journal = fix.journal();
     assert!(journal.contains("\"kind\":\"delete\""), "{journal}");
     assert!(journal.contains("\"outcome\":\"applied\""), "{journal}");
+    assert!(
+        journal.contains("\"outcome\":\"erasure-answer\""),
+        "{journal}"
+    );
+    for fact in ["about seven months", "ledger", "no username", "90 days"] {
+        assert!(
+            journal.contains(fact),
+            "the answer misses {fact}: {journal}"
+        );
+    }
+    assert!(
+        journal.contains("GBP 20.00"),
+        "the refund fact is missing: {journal}"
+    );
+    // The notice goes to the outside address that survives the mailbox.
+    let sent = fix.sent();
+    assert!(sent.contains("To: secretary@example.invalid"), "{sent}");
+    assert!(sent.contains("about seven months"), "{sent}");
 }
 
 /// The page's close and the console's delete end in the same transition: the
@@ -179,6 +196,17 @@ fn the_page_close_and_the_console_delete_end_in_the_same_transition() {
         !page.scripts_log().contains("delete-user.sh"),
         "the page deleted inside the seven-day window: {}",
         page.scripts_log()
+    );
+    let requests = page.read("accounts/secretary/requests.jsonl");
+    let request: Value = serde_json::from_str(requests.lines().next().unwrap()).unwrap();
+    assert_eq!(request["kind"], json!("erasure"), "{request}");
+    assert_eq!(request["username"], json!("secretary"), "{request}");
+    assert!(
+        request["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("password re-entered"),
+        "{request}"
     );
 
     // The window ends.
@@ -225,4 +253,57 @@ fn the_page_close_and_the_console_delete_end_in_the_same_transition() {
         "{console_journal}"
     );
     assert!(console.scripts_log().contains("delete-user.sh secretary"));
+    // The record has gone but the journal line remains, so a retry is accepted
+    // rather than refused as an unknown name.
+    let again = console.ctl(&["delete", "secretary"]);
+    assert!(again.status.success(), "{}", body(&again));
+}
+
+/// A close intent whose session belongs to another account, or has expired, is
+/// refused and changes nothing.
+#[test]
+fn a_close_intent_without_a_matching_live_session_is_refused() {
+    let fix = Fix::new("erasure-forged-session");
+    approved_paid(&fix, "secretary", "cash");
+
+    // A live session for another account. The session record names a different
+    // username, which is enough for the verifier even if that account is absent.
+    let other = fix.open_session("treasurer");
+    fix.file_close_with_session("secretary", Fix::session_id(&other));
+    assert!(fix.drain().status.success());
+    assert_eq!(fix.account("secretary")["state"], json!("active"));
+    assert!(
+        !fix.dir
+            .join("store/accounts/secretary/requests.jsonl")
+            .exists(),
+        "a refused intent wrote a request line"
+    );
+    let journal = fix.journal();
+    assert!(journal.contains("\"outcome\":\"refused\""), "{journal}");
+    assert!(journal.contains("belongs to"), "{journal}");
+
+    // A session for the right account, expired.
+    let cookie = fix.open_session("secretary");
+    fix.expire_session(&cookie);
+    fix.file_close_with_session("secretary", Fix::session_id(&cookie));
+    assert!(fix.drain().status.success());
+    assert_eq!(fix.account("secretary")["state"], json!("active"));
+    let journal = fix.journal();
+    assert!(journal.contains("\"outcome\":\"refused\""), "{journal}");
+    assert!(journal.contains("expired"), "{journal}");
+}
+
+/// A name with no account record and no deletion journal line is not an account
+/// the service made, so the console refuses rather than printing "deleted".
+#[test]
+fn the_console_refuses_a_name_with_no_account_and_no_deletion() {
+    let fix = Fix::new("erasure-unknown");
+    let out = fix.ctl(&["delete", "nobody"]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(
+        body(&out).contains("no account for nobody"),
+        "{}",
+        body(&out)
+    );
+    assert!(!fix.dir.join("store/holds/nobody.json").exists());
 }

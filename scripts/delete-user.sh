@@ -97,16 +97,21 @@ restart_smtpd() { rcctl restart smtpd >/dev/null; }
 # regen_finger: rebuild the page fingerd serves. It is derived from the httpd
 # and gmid configuration, so a member's vhosts leaving is the moment it changes.
 # gen-finger-page.sh lives in the repository checkout rather than the drain's
-# script directory because it reads the tracked configuration beside it.
+# script directory because it reads the tracked configuration beside it. The
+# candidate is staged beside the installed page and renamed, so a failed
+# generation cannot leave half a page where fingerd reads it.
 regen_finger() {
 	repo=${KYRIAKON_REPO_DIR:-/usr/local/src/kyriakon-infra}
-	tmp=$(mktemp "${TMPDIR:-/tmp}/kyriakon-finger.XXXXXX")
-	if ksh "$repo/scripts/gen-finger-page.sh" >"$tmp"; then
-		install -m 0644 "$tmp" "$finger_page"
-	else
-		printf 'warning: the finger page was not regenerated from %s\n' "$repo" >&2
+	tmp=$(mktemp "${finger_page}.XXXXXX") || return 1
+	if ! ksh "$repo/scripts/gen-finger-page.sh" >"$tmp"; then
+		rm -f "$tmp"
+		return 1
 	fi
-	rm -f "$tmp"
+	if ! chmod 0644 "$tmp" || ! mv "$tmp" "$finger_page"; then
+		rm -f "$tmp"
+		return 1
+	fi
+	return 0
 }
 
 # would <description> <path>: in --show mode, report rather than remove. Returns
@@ -276,7 +281,10 @@ remove_member() {
 	# last, after the vhost files have gone and the indexes have been rewritten,
 	# so it describes the box as it now stands.
 	if [ "$did" = yes ] && [ "$show" = no ]; then
-		regen_finger
+		if ! regen_finger; then
+			printf 'the finger page could not be regenerated; rerun scripts/deploy-mail.sh after fixing the checkout\n' >&2
+			return 1
+		fi
 		printf 'regenerated the finger page\n'
 	fi
 
@@ -415,6 +423,23 @@ self_test() {
 	check "--show names each path it would remove" "$(grep -c '^would remove /' "$tree/third.out")" 2
 	check "and names the account" "$(grep -c 'would remove the account alice' "$tree/third.out")" 1
 	check "--show calls no tools" "$(wc -c <"$case_dir/calls" | tr -d ' ')" 0
+
+	# A failed regeneration fails the run and does not print the success line:
+	# otherwise the deletion would report a finger page it did not write.
+	account_exists() { return 0; }
+	regen_finger() { printf 'gen-finger-page\n' >>"$case_dir/calls"; return 1; }
+	show=no
+	: >"$case_dir/calls"
+	set +e
+	remove_member >"$tree/fourth.out" 2>"$tree/fourth.err"
+	code=$?
+	set -e
+	check "a failed finger regeneration fails the run" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and does not claim it regenerated" \
+		"$(grep -c 'regenerated the finger page' "$tree/fourth.out")" 0
+	check "and names the repair" \
+		"$(grep -c 'could not be regenerated' "$tree/fourth.err")" 1
 
 	self_test_end
 }

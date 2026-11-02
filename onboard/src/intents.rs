@@ -8,6 +8,7 @@
 //! until the ticket that understands it lands.
 
 use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::config::DrainConfig;
@@ -386,17 +387,51 @@ pub async fn file_refund(
     Ok(id)
 }
 
+/// Whether `id` names a live page session for `username`. The drain runs as
+/// root and the session record lives under the handler's store, so this is the
+/// one check that turns an unsigned intent into work for an authenticated
+/// account. A session for another account and an expired session are refused
+/// with the reason the journal records. The close intent is the first caller;
+/// #498 reuses it.
+pub async fn verify_session(store: &Store, id: &str, username: &str) -> Result<(), String> {
+    if !crate::store::is_status_token(id) {
+        return Err("the intent carries no usable session id".to_string());
+    }
+    let Some(text) = store.read_record("sessions", &format!("{id}.json")).await else {
+        return Err("the session named by the intent has gone".to_string());
+    };
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("the session record does not parse: {e}"))?;
+    let named = value.get("username").and_then(Value::as_str).unwrap_or("");
+    if named != username {
+        return Err(format!(
+            "the session belongs to {named:?}, not {username:?}"
+        ));
+    }
+    let expires = value
+        .get("expires_at")
+        .and_then(Value::as_str)
+        .ok_or("the session record has no expiry")?;
+    let expires = OffsetDateTime::parse(expires, &Rfc3339)
+        .map_err(|e| format!("the session expiry does not parse: {e}"))?;
+    if OffsetDateTime::now_utc() >= expires {
+        return Err("the session named by the intent has expired".to_string());
+    }
+    Ok(())
+}
+
 /// File one `close` intent, as the account page does. The handler has
-/// authenticated the member and writes only the account name; the drain owns the
-/// state write and the seven-day window. Nothing the caller supplies reaches the
-/// drain beyond the username.
-pub async fn file_close(store: &Store, username: &str) -> Result<String, String> {
+/// authenticated the member, writes the account name and the page session it
+/// used, and nothing else. The drain verifies the session, owns the state write
+/// and the seven-day window.
+pub async fn file_close(store: &Store, username: &str, session: &str) -> Result<String, String> {
     let id = ulid::Ulid::new().to_string();
     let intent = serde_json::json!({
         "id": id,
         "kind": "close",
         "filed_at": crate::util::filed_at(),
         "username": username,
+        "session": session,
     });
     let bytes =
         serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;

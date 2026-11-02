@@ -1220,6 +1220,29 @@ async fn show(store: &Store, username: &str) -> Result<(), String> {
 /// optional.
 async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(), String> {
     let username = one_username(rest)?;
+    // A name with no record and no deletion journal line is not an account this
+    // service made. Refusing here keeps a typo from printing "deleted" and from
+    // touching a keyring or token entry. A deletion that stopped partway is
+    // still accepted: the account record has gone but its journal line has not.
+    let recorded = store
+        .read_record(&format!("accounts/{username}"), "account.json")
+        .await
+        .is_some();
+    let prefix = format!("delete-{username}-");
+    let interrupted = store.lines("journal.jsonl").await.iter().any(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("intent")
+                    .and_then(Value::as_str)
+                    .map(|id| id.starts_with(&prefix))
+            })
+            .unwrap_or(false)
+    });
+    if !recorded && !interrupted {
+        return Err(format!("no account for {username}"));
+    }
     transitions::delete_account(cfg, store, username).await?;
     println!("deleted {username}");
     Ok(())

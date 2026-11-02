@@ -1840,26 +1840,85 @@ async fn logout(app: &App, request: &Request) -> Reply {
         .with_header("Set-Cookie", session::clear_cookie())
 }
 
-/// The member a request's live session names, with the account it names. Both
-/// the closure route and the page's actions use it: `REMOTE_USER` is not an
-/// identity here, because no HTTP authentication is configured for the host.
-async fn session_member(app: &App, request: &Request) -> Option<Account> {
+/// The live page session and the account it names. The closure route needs the
+/// session id as well as the account, because the intent carries it for the
+/// drain to verify.
+async fn session_account(app: &App, request: &Request) -> Option<(String, Account)> {
     let cookie = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE)?;
     let member = session::lookup(&app.store, &cookie, OffsetDateTime::now_utc()).await?;
-    account_record(app, &member.username).await
+    let account = account_record(app, &member.username).await?;
+    Some((cookie, account))
 }
 
-/// The member's own "Close my account": file one close intent for the account
-/// the session names, and answer with the erasure text. The handler holds no
-/// privilege and writes nothing but the intent; the drain owns the state change
-/// and the deletion.
+/// The refund the erasure answer names when the closure falls inside the
+/// cancellation right: the token's latest credit, its `received_on` and its
+/// amount. The ledger is the only place the payment date exists, so this reads
+/// it rather than the account record.
+async fn closure_refund(app: &App, account: &Account) -> Option<String> {
+    let token = account.payment_state()?.token_ref?;
+    let mut latest: Option<(time::Date, String)> = None;
+    for line in app.store.lines("ledger/payments.jsonl").await {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("token").and_then(|v| v.as_str()) != Some(token.as_str())
+            || value.get("kind").and_then(|v| v.as_str()) != Some("payment")
+        {
+            continue;
+        }
+        let Some(received) = value.get("received_on").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(received) = crate::requests::parse_date(received) else {
+            continue;
+        };
+        let amount = value
+            .get("amount_gbp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0.00")
+            .trim_start_matches('-')
+            .to_string();
+        if latest
+            .as_ref()
+            .map(|(date, _)| received > *date)
+            .unwrap_or(true)
+        {
+            latest = Some((received, amount));
+        }
+    }
+    let (received, amount) = latest?;
+    let today = OffsetDateTime::now_utc().date();
+    let days = (today - received).whole_days();
+    (0..=14).contains(&days).then(|| {
+        format!(
+            "A refund of GBP {amount} is due under the 14-day cancellation right; it is settled separately."
+        )
+    })
+}
+
+/// The member's own "Close my account": check the session and the password
+/// again, file one close intent carrying the session id, and answer with the
+/// erasure text. The handler holds no privilege and writes nothing but the
+/// intent; the drain verifies the session, owns the state change and runs the
+/// deletion.
 async fn account_close(app: &App, request: &Request) -> Reply {
-    let Some(account) = session_member(app, request).await else {
+    let Some((cookie, account)) = session_account(app, request).await else {
         return refused("Sign in to the account you want to close.");
     };
-    match intents::file_close(&app.store, &account.username).await {
+    let form = fields(&String::from_utf8_lossy(&request.body));
+    let password = form.get("password").map(String::as_str).unwrap_or("");
+    if password.is_empty() || !app.auth.admits(&account.username, password).await {
+        return refused(
+            "That password did not match. The closure is the irreversible one, so enter the mail password again.",
+        );
+    }
+    let Some(session_id) = cookie.split_once('.').map(|(id, _)| id) else {
+        return refused("Sign in to the account you want to close.");
+    };
+    let refund = closure_refund(app, &account).await;
+    match intents::file_close(&app.store, &account.username, session_id).await {
         Ok(_) => {
-            let message = crate::requests::erasure_answer(None);
+            let message = crate::requests::erasure_answer(refund.as_deref());
             Reply::html(200, page_html(&notice("Closing your account", &message)))
         }
         Err(e) => server_error(&format!("the closure could not be filed: {e}")),

@@ -146,6 +146,11 @@ pub struct CloseIntent {
     #[serde(default)]
     pub filed_at: String,
     pub username: String,
+    /// The id of the page session that filed this. The drain reads
+    /// `sessions/<id>.json` and refuses the intent when the record names another
+    /// account or the session has expired.
+    #[serde(default)]
+    pub session: String,
 }
 
 /// A manual credit: one payment recorded against the token its account holds.
@@ -4163,9 +4168,11 @@ async fn close_mailbox(cfg: &DrainConfig, store: &Store, username: &str) -> Resu
 /// what makes the surviving ledger line unlinkable. The ledger line itself is
 /// never touched.
 ///
-/// Idempotent on a replay: the journal is the marker, and every step treats an
-/// already-absent path as done. A retry after a partial pass can still find the
-/// token by its `TokenRecord.username` even when `account.json` has gone.
+/// Idempotent on a replay: the journal id carries the account's `created_at`, so
+/// a name reused after the ninety-day hold gets its own deletion, and every step
+/// treats an already-absent path as done. A retry after a partial pass can still
+/// find the token by its `TokenRecord.username` even when `account.json` has
+/// gone.
 pub async fn delete_account(
     cfg: &DrainConfig,
     store: &Store,
@@ -4173,10 +4180,6 @@ pub async fn delete_account(
 ) -> Result<(), String> {
     if let Some(why) = validate::username_shape(username) {
         return Err(format!("the username {username}: {why}"));
-    }
-    let id = format!("delete-{username}");
-    if journal_has(store, &id, "applied").await {
-        return Ok(());
     }
     // The account record is read before the journal line so the answer can name
     // a refund from the token's ledger lines. A record that has already gone is
@@ -4217,25 +4220,38 @@ pub async fn delete_account(
         .await?;
     }
 
-    // The answer goes before the account directory does: its own
-    // `notices.jsonl` is part of the record the deletion removes, and the
-    // member's mailbox is still there to receive it.
+    // The full answer goes into the journal, which outlives the account. The
+    // store directory, including its `notices.jsonl`, is deleted below, so a
+    // notice recorded there is not the durable copy. The notice itself is sent
+    // only to the outside address when there is one: the member's own mailbox is
+    // about to be removed, and a message enqueued to it would not be a reliable
+    // answer.
     let refund = erasure_refund(store, &account).await;
-    let to = account
-        .outside_address
-        .clone()
-        .unwrap_or_else(|| format!("{username}@kyriakon.net"));
     let body = crate::requests::erasure_answer(refund.as_deref());
-    notice::send_account_notice(
-        cfg,
-        store,
-        username,
-        "account.erasure",
-        "Your kyriakon.net account is being erased",
-        &to,
-        &body,
-    )
-    .await?;
+    if !journal_has(store, &id, "erasure-answer").await {
+        journal(
+            store,
+            &cfg.release,
+            &id,
+            "delete",
+            &application,
+            "erasure-answer",
+            Some(&body),
+        )
+        .await?;
+    }
+    if let Some(to) = account.outside_address.as_deref() {
+        notice::send_account_notice(
+            cfg,
+            store,
+            username,
+            "account.erasure",
+            "Your kyriakon.net account is being erased",
+            to,
+            &body,
+        )
+        .await?;
+    }
 
     hold_name(store, username).await?;
     store.remove("keys", &format!("{username}.pub")).await?;
@@ -4321,6 +4337,24 @@ pub async fn close_account(
         username: intent.username.clone(),
         status_token: String::new(),
     };
+    // The intent is unsigned, so the session id it carries is the proof that the
+    // page authenticated this account. A mismatched or expired session is
+    // journalled and the intent is settled without touching the account.
+    if let Err(reason) =
+        crate::intents::verify_session(store, &intent.session, &intent.username).await
+    {
+        journal(
+            store,
+            &cfg.release,
+            &intent.id,
+            &intent.kind,
+            &application,
+            "refused",
+            Some(&reason),
+        )
+        .await?;
+        return store.remove("intents", file).await;
+    }
     let Some(mut account) = existing_account(store, &intent.username).await else {
         // The account the handler authenticated has already gone. That is a
         // closed request, not new work.
@@ -4336,6 +4370,25 @@ pub async fn close_account(
         .await?;
         return store.remove("intents", file).await;
     };
+    // Every data-subject request gets one line, whether it arrived from the page
+    // or the console. The id is the intent's, so a retry after the state write
+    // sees the line already there rather than appending a second one.
+    let today = util::date_after_days(0);
+    let request = crate::requests::NewRequest {
+        username: &intent.username,
+        kind: "erasure",
+        received: &today,
+        evidence: "the account page, with the mail password re-entered",
+        note: Some("closure filed from the account page"),
+        identity_at: None,
+        fee_at: None,
+        id: Some(&intent.id),
+    };
+    if let Err(e) = crate::requests::record(store, request).await {
+        if !e.contains("already recorded") {
+            return Err(e);
+        }
+    }
     if account.state == "closing" {
         journal(
             store,
@@ -5532,10 +5585,10 @@ pub async fn purge_declined(cfg: &DrainConfig, store: &Store) -> Result<(), Stri
 /// only sets `closing`, and this is what carries the window out without the
 /// account being touched again.
 ///
-/// The journal id is the transition's own (`delete-<username>`), so a failed
-/// pass backs off and mails the operator once through the same rule the intents
-/// use, and a pass that already erased the account finds no record and does
-/// nothing.
+/// The journal id is the transition's own (`delete-<username>-<created_at>`), so
+/// a failed pass backs off and mails the operator once through the same rule the
+/// intents use, and a pass that already erased the account finds no record and
+/// does nothing.
 pub async fn purge_closing(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     let today = util::date_after_days(0);
     for username in store.list("accounts").await? {

@@ -188,6 +188,8 @@
 <h3>Close my account</h3>
 <form method="post" action="/account/close">
   <p>Closing gives you seven days of normal working to take anything you want out. After that the account and the data the platform holds about it are erased; the answer names what survives.</p>
+  <label for="close-password">Mail password, entered again</label>
+  <input id="close-password" type="password" name="password" autocomplete="current-password" required>
   <button class="btn" type="submit">Close my account</button>
 </form>
 {% endif %}

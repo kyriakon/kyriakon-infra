@@ -177,9 +177,9 @@ fn account_dir(username: &str) -> String {
 }
 
 /// The answer an erasure request carries, shown by the page when the closure is
-/// filed and sent as a notice by the deletion transition. Four facts, because
-/// silence would read as an instant and total delete: the backup window, the
-/// surviving ledger line, the username hold, and the refund position.
+/// filed and journalled by the deletion transition. It names the three things
+/// that outlive the account, because silence would read as an instant and total
+/// delete, and it states the refund position beside them.
 ///
 /// `refund` is the ledger's own sentence where a refund line exists; `None` says
 /// plainly that closing does not refund anything by itself.
@@ -852,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn the_erasure_answer_names_the_four_facts_that_survive() {
+    fn the_erasure_answer_names_the_surviving_facts_and_the_refund() {
         let answer = erasure_answer(Some(
             "A refund of GBP 20.00 was recorded on 2026-10-04; it is settled separately.",
         ));
