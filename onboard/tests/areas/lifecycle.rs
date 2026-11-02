@@ -1929,3 +1929,48 @@ fn an_expired_hold_releases_the_name() {
         .table("virtuals")
         .contains("desk@parish.example: parish-office"));
 }
+
+/// A suspension records the reason where the account page reads it, stops the
+/// three access paths through the shared lapse script, and sends one notice that
+/// names the reason and how to answer it. Running it twice sends one notice.
+#[test]
+fn a_suspension_records_the_reason_and_sends_one_notice() {
+    let fix = Fix::new("suspend-notice");
+    let _token = approved_paid(&fix, "secretary", "cash");
+    let reason = "Published material is outside the acceptable use policy.";
+    let out = fix.ctl(&["suspend", "secretary", "--reason", reason]);
+    assert!(out.status.success(), "{}", body(&out));
+
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("suspended"), "{account}");
+    assert_eq!(account["suspension_reason"], json!(reason), "{account}");
+    assert!(
+        fix.scripts_log().contains("lapse-user.sh secretary"),
+        "the access paths stop through the shared script: {}",
+        fix.scripts_log()
+    );
+    let sent = fix.sent();
+    assert!(sent.contains(reason), "the notice names the reason: {sent}");
+    assert!(
+        sent.contains("admin@kyriakon.net") && sent.contains("answer"),
+        "the notice says how to answer: {sent}"
+    );
+    let notices = fix.read("accounts/secretary/notices.jsonl");
+    assert_eq!(
+        notices.matches("account.suspended").count(),
+        1,
+        "one notice: {notices}"
+    );
+
+    // The same transition twice sends one notice and leaves the account as it is.
+    let out = fix.ctl(&["suspend", "secretary", "--reason", reason]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.account("secretary")["state"], json!("suspended"));
+    assert_eq!(
+        fix.read("accounts/secretary/notices.jsonl")
+            .matches("account.suspended")
+            .count(),
+        1,
+        "still one notice"
+    );
+}

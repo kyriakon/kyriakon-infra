@@ -228,11 +228,11 @@ An account approved without charge has no `payment` block at all, so it has no t
 
 The account page logs a member in with the mail password and nothing else. `scripts/deploy-onboard.sh` installs `/usr/local/libexec/kyriakon-authcheck`, and the handler runs it through `doas`. The rule cannot name `doveadm auth test` itself, because `doas.conf(5)` matches arguments literally and the username would be refused. It names the checker, which takes one username, reads the password from stdin and runs only that subcommand. Append the tracked line in `openbsd/etc/doas.conf.onboard` to `/etc/doas.conf`, then run `doas -C /etc/doas.conf`. The deploy prints both steps when the line is missing, and until it is there every login is refused. The handler reads only the signed-in member's account record, that member's group record and the notices it renders; every store path is built from the session's validated username, and it never opens another member's record, the journal, a request, the ledger or the mail spool.
 
-`onboardctl credit (--token <t> | --username <u>) --rail <cash|cash-hand|monero> --amount <gbp> --received <YYYY-MM-DD>` records one payment against the account's token. The drain applies it on its next pass, sets the paid-until date, sends the receipt and appends the ledger line. A second credit on a token already credited needs `--confirm-double`, and a credit reaching more than 24 months past `--received` needs `--override <reason>`, whose reason is journalled.
+`onboardctl credit (--token <t> | --username <u>) --rail <cash|cash-hand|monero> --amount <gbp> --received <YYYY-MM-DD>` records one payment against the account's token. The drain applies it on its next pass, sets the paid-until date, sends the receipt and appends the ledger line. A second credit on a token already credited needs `--confirm-double`, and a credit reaching more than 24 months past `--received` needs `--override <reason>`, whose reason is journalled. Thirty days before a prepaid account's paid-until date the drain sends the platform's own renewal notice, once for that date. A card account gets Stripe's upcoming-invoice reminder instead.
 
 `onboardctl prepaid list --window open [--expiring <days>]` is the first command of the weekly pass. It lists each open window's token, username, rail, close date and days left, sorted by close date, and `--expiring 3` narrows the list to the windows closing within three days. Only `--window open` is accepted.
 
-`onboardctl window extend --token <t> --days 14 --reason <text>` gives an open window its one extension when the member says the money is in the post. The drain moves `closes_at` fourteen days on and increments the window's counter on its next pass. A second extension from the same window is refused and journalled. A window that reaches its close date with no credit recorded lapses the account. The sweep runs `scripts/lapse-user.sh`, so mail stays readable and published pages stay up while sending, uploading and pushing stop, and the forty-day grace starts. At day 33 the drain sends the final notice, and at the end of the grace it runs the same deletion transition as a closed account. A credit recorded before the sweep reaches the closed window leaves the account active, and a later credit restores a lapsed account through the same script.
+`onboardctl window extend --token <t> --days 14 --reason <text>` gives an open window its one extension when the member says the money is in the post. The drain moves `closes_at` fourteen days on and increments the window's counter on its next pass. A second extension from the same window is refused and journalled. A window that reaches its close date with no credit recorded lapses the account. The sweep runs `scripts/lapse-user.sh`, so mail stays readable and published pages stay up while sending, uploading and pushing stop, and the forty-day grace starts. With thirty days of the grace left the drain sends the grace notice, at day 33 it sends the final notice, and at the end of the grace it runs the same deletion transition as a closed account. A credit recorded before the sweep reaches the closed window leaves the account active, and a later credit restores a lapsed account through the same script.
 
 `onboardctl monero address <username> <address>` records the subaddress the operator's own wallet made for a Monero member: one per account, permanent, never rotated or reused, and a second, different address is refused. Run it after `monero-wallet-cli` prints the address, once per member; until then the account page says the address is not ready rather than showing an empty field. It writes the account and the status page's copy, so both pages carry it at once.
 
@@ -360,13 +360,7 @@ Do not let a deletion proceed on an account whose only notice bounced. That is t
 
 The AUP ladder is detect, warn with 72 hours to respond, suspend, then delete after a 40-day grace (`docs/aup.md` section 5). Suspension follows the state contract in #153: outbound mail stops at once, the site and the Gemini capsule come down, the account page stays open so the member can read the reason and answer, and inbound mail keeps arriving. Refusing inbound mail is a case-by-case decision the operator records, not the default, so a third party's message is not lost during a suspension that may be the wrong call.
 
-1. Stop outbound mail by moving the account into a login class that rejects submission. IMAP keeps working, no daemon restarts, and no second password store is needed (research in #168).
-
-		doas usermod -L lapsed <username>
-
-   The class file lives with the deploy rather than with the account.
-
-2. Take the site down. The per-member vhosts come from generated include files that `httpd.conf` and `gmid.conf` each read, so the site comes down by removing the member's include line and reloading.
+1. Take the site down. The per-member vhosts come from generated include files that `httpd.conf` and `gmid.conf` each read, so the site comes down by removing the member's include line and reloading.
 
 		doas httpd -n -f /etc/httpd.conf
 		doas gmid -n -c /etc/gmid.conf
@@ -374,11 +368,15 @@ The AUP ladder is detect, warn with 72 hours to respond, suspend, then delete af
 
    Keep the `/.well-known/acme-challenge` path served, or the certificate renewal for that name fails.
 
-3. Record the reason and the date on the account, and send the notice with the reason and how to answer.
+2. Record the reason and the date on the account, stop outbound mail, and send the notice with the reason and how to answer.
 
-4. Check afterwards that submission fails for the account, that IMAP still works, and that the site is down while the certificate is still valid.
+		doas onboardctl suspend <username> --reason "<the reason the member reads>"
 
-The generated include files, the `members` group and the account page all arrive with #154 and #156, so steps 2 and 3 are the shape those tickets decided rather than something an operator can do today.
+   The command moves the account into the login class that rejects submission through `scripts/lapse-user.sh`, so IMAP keeps working, and it stops the sftp upload and the git push with the same script. It sets the state to suspended, writes the reason where the account page reads it, and sends the suspension notice with the reason and the way to answer it. A second run with the same reason sends no second notice.
+
+3. Check afterwards that submission fails for the account, that IMAP still works, and that the site is down while the certificate is still valid.
+
+The generated include files, the `members` group and the account page all arrive with #154 and #156, so the site step and the checks above are the shape those tickets decided rather than something an operator can do today.
 
 Do not refuse inbound mail as the default, and do not edit `pf.conf` or `sshd_config` on the box to enforce any of this. Both are propose-only changes; a pull request carries the diff and a human applies it.
 

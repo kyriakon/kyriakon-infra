@@ -122,6 +122,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         "ledger" => ledger(&store, &rest[1..]).await,
         "export" => export(&cfg, &store, &rest[1..]).await,
         "show" => show(&store, one_username(rest)?).await,
+        "suspend" => suspend(&cfg, &store, &rest[1..]).await,
         "delete" => delete(&cfg, &store, rest).await,
         "free" => free(&store, &rest[1..]).await,
         // Each decision is signed with the same root-only key the review links
@@ -144,6 +145,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
 fn usage() -> String {
     "usage: kyriakon-onboardctl [--config PATH] \
      approve|approve-free|decline|delete|show <username>
+       kyriakon-onboardctl suspend <username> --reason <text>
        kyriakon-onboardctl free
        kyriakon-onboardctl token resend <username>
        kyriakon-onboardctl credit (--token <t> | --username <u> | --note <text>) \
@@ -1297,6 +1299,25 @@ async fn show(store: &Store, username: &str) -> Result<(), String> {
         }
         None => println!("account  none yet"),
     }
+    Ok(())
+}
+
+/// `suspend`: the AUP ladder's suspension, run now, because it is the operator's
+/// decision and nothing about it is routine. The reason is required: the notice
+/// and the account page both carry it, and a suspension with no words for the
+/// member is not the state contract #153 decided.
+async fn suspend(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(), String> {
+    let (username, args) = match rest {
+        [username, args @ ..] => (username.as_str(), args),
+        _ => return Err(usage()),
+    };
+    if let Some(why) = validate::username_shape(username) {
+        return Err(format!("the username {username:?}: {why}"));
+    }
+    let flags = flags(args, &["reason"])?;
+    let reason = need(&flags, "reason")?;
+    transitions::suspend(cfg, store, username, reason).await?;
+    println!("suspended {username}");
     Ok(())
 }
 

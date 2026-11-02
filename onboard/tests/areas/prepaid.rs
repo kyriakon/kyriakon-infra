@@ -2364,3 +2364,113 @@ fn a_window_sweep_does_not_resurrect_a_closing_account() {
         "a closing account is not lapsed or restored: {log}"
     );
 }
+
+/// A prepaid member has no processor to send an upcoming-invoice mail, so the
+/// platform sends its own thirty-day note before the paid-until date, once. A
+/// card member is left to Stripe's reminder, and a free account has no date to
+/// be reminded about.
+#[test]
+fn a_prepaid_member_is_reminded_once_before_the_date_runs_out() {
+    let fix = Fix::new("prepaid-renewal");
+    let token = approved_paid(&fix, "secretary", "cash");
+    cash_credit(&fix, &token);
+    // Paid a year from the credit: no reminder has fallen due yet.
+    assert!(!fix.sent().contains("runs out on"), "{}", fix.sent());
+
+    // Age the paid-until date into the reminder's thirty days.
+    let mut account = fix.account("secretary");
+    let due = kyriakon_onboard::util::date_after_days(20);
+    account["payment"]["paid_until"] = json!(due);
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let sent = fix.sent();
+    assert!(sent.contains(&due), "the note names the date: {sent}");
+    assert!(sent.contains("Post GBP 20.00"), "{sent}");
+    assert!(sent.contains(&token), "the reference is the token: {sent}");
+    let notices = fix.read("accounts/secretary/notices.jsonl");
+    assert_eq!(
+        notices.matches("prepaid.renewal").count(),
+        1,
+        "one note: {notices}"
+    );
+
+    // The same transition twice sends one notice.
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.read("accounts/secretary/notices.jsonl")
+            .matches("prepaid.renewal")
+            .count(),
+        1,
+        "still one note"
+    );
+
+    // A card member: Stripe's subscription sends the reminder, not the platform.
+    let card = Fix::new("card-renewal");
+    card.card_account("secretary", Some(&due));
+    let out = card.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !card
+            .read("accounts/secretary/notices.jsonl")
+            .contains("prepaid.renewal"),
+        "a card account gets no platform reminder"
+    );
+}
+
+/// The forty-day grace has a mid-point note: with thirty days left it repeats
+/// what still works and what has stopped, and once the final notice's week
+/// begins it is not sent behind it.
+#[test]
+fn the_grace_reminds_once_before_the_final_notice() {
+    let fix = Fix::new("grace-reminder");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let mut account = fix.account("secretary");
+    account["payment"]["window"]["closes_at"] = json!("2020-01-01T00:00:00Z");
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+
+    // Day 10 of the forty: thirty days remain.
+    let grace = kyriakon_onboard::util::date_after_days(30);
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(grace);
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let sent = fix.sent();
+    assert!(sent.contains(&grace), "the note names the end: {sent}");
+    assert!(sent.contains(&token), "{sent}");
+    let notices = fix.read("accounts/secretary/notices.jsonl");
+    assert_eq!(
+        notices.matches("prepaid.grace").count(),
+        1,
+        "one grace note: {notices}"
+    );
+
+    // The same transition twice, and then the final notice's week: the grace
+    // note is not repeated and the final notice is not preceded by another.
+    assert!(fix.drain().status.success());
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_onboard::util::date_after_days(6));
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+    let notices = fix.read("accounts/secretary/notices.jsonl");
+    assert_eq!(notices.matches("prepaid.grace").count(), 1, "{notices}");
+    assert_eq!(notices.matches("prepaid.final").count(), 1, "{notices}");
+}
