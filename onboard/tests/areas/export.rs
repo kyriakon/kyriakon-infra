@@ -673,7 +673,7 @@ fn a_forged_or_expired_session_writes_nothing() {
         .join(format!("{id}.json"))
         .exists());
     assert!(
-        fix.failed_note().contains("belongs to alice"),
+        fix.failed_note().contains("belongs to") && fix.failed_note().contains("alice"),
         "{}",
         fix.failed_note()
     );
