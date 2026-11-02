@@ -4816,13 +4816,7 @@ pub async fn close_account(
     account.closing_until = Some(util::date_after_days(7));
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
-    store
-        .write_record(
-            &format!("accounts/{}", intent.username),
-            "account.json",
-            &bytes,
-        )
-        .await?;
+    write_account_record(store, &intent.username, &bytes).await?;
     journal(
         store,
         &cfg.release,
@@ -6944,17 +6938,12 @@ async fn account_for_payment_reference(
 }
 
 /// Write an account's record back after the webhook pass changed its payment
-/// block.
+/// block. The page reads it as `_onboard`, so the record goes through the
+/// handler-readable writer rather than the root-only one.
 async fn write_account(store: &Store, account: &Account) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
-    store
-        .write_record(
-            &format!("accounts/{}", account.username),
-            "account.json",
-            &bytes,
-        )
-        .await
+    write_account_record(store, &account.username, &bytes).await
 }
 
 /// Attach a subscription and its customer to an account, which is all a

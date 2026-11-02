@@ -189,12 +189,13 @@ async fn signed_in(app: &App, username: &str) -> String {
 
 /// The request httpd builds for a form post.
 fn httpd_post(path: &str, body: &str) -> Vec<u8> {
-    httpd_post_with(path, body, None, None)
+    httpd_post_with(path, body, None)
 }
 
-/// The request httpd builds for a form post that carries a session cookie and,
-/// optionally, the `REMOTE_USER` header no host authenticates.
-fn httpd_post_with(path: &str, body: &str, cookie: Option<&str>, user: Option<&str>) -> Vec<u8> {
+/// The request httpd builds for a form post that carries a session cookie.
+/// A form post has no other identity: `REMOTE_USER` is not authenticated on
+/// this hostname, so the helper offers no way to claim one.
+fn httpd_post_with(path: &str, body: &str, cookie: Option<&str>) -> Vec<u8> {
     let length = body.len().to_string();
     let cookie_header;
     let mut env = vec![
@@ -212,9 +213,6 @@ fn httpd_post_with(path: &str, body: &str, cookie: Option<&str>, user: Option<&s
     if let Some(cookie) = cookie {
         cookie_header = format!("{}={cookie}", session::COOKIE);
         env.push(("HTTP_COOKIE", &cookie_header));
-    }
-    if let Some(user) = user {
-        env.push(("REMOTE_USER", user));
     }
     fixture::httpd(&env, body.as_bytes())
 }
@@ -754,7 +752,7 @@ async fn a_page_closure_requires_the_password_and_files_one_intent() {
     for body in ["password=wrong+horse+battery", "password="] {
         let (code, refused) = answer(
             &app,
-            &httpd_post_with("/account/close", body, Some(&cookie), Some("alice")),
+            &httpd_post_with("/account/close", body, Some(&cookie)),
         )
         .await;
         assert_eq!(code, 403, "{refused}");
@@ -768,7 +766,6 @@ async fn a_page_closure_requires_the_password_and_files_one_intent() {
             "/account/close",
             "password=right+horse+battery",
             Some(&cookie),
-            Some("alice"),
         ),
     )
     .await;
@@ -817,7 +814,6 @@ async fn a_closure_names_the_refund_only_inside_fourteen_days() {
             "/account/close",
             "password=right+horse+battery",
             Some(&cookie),
-            None,
         ),
     )
     .await;
@@ -844,7 +840,6 @@ async fn a_closure_names_the_refund_only_inside_fourteen_days() {
             "/account/close",
             "password=right+horse+battery",
             Some(&cookie),
-            None,
         ),
     )
     .await;
@@ -1108,7 +1103,7 @@ async fn the_account_pages_export_action_files_an_intent_for_the_session_account
     let cookie = signed_in(&app, "alice").await;
     let (code, body) = answer(
         &app,
-        &httpd_post_with("account", "action=export", Some(&cookie), None),
+        &httpd_post_with("account", "action=export", Some(&cookie)),
     )
     .await;
     assert_eq!(code, 200, "{body}");

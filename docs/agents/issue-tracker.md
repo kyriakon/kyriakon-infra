@@ -34,9 +34,30 @@ keep the merges from costing more than the parallelism saves:
   force-push the child, and set its PR base to `main` before merging. A squash merge
   rewrites the parent commit, so retargeting alone leaves the child carrying the
   parent's commits.
+- Capture `<old-parent-tip>` with `git rev-parse <parent-branch>` **before** merging
+  or force-pushing the parent, and pass that SHA to `--onto`. A branch name moves;
+  using the moved name replays the parent's commits into the child and can empty the
+  child PR.
 - `gh pr merge --delete-branch` deletes the base branch, and GitHub **closes** any
   open PR still based on it instead of retargeting it. Keep a base branch until
   every child has been rebased and retargeted.
+
+## Merging
+
+Squash only. The `Main` ruleset requires one approving review, and the repository
+owner is its bypass actor, so the solo-owner path is:
+
+```sh
+gh pr checks <n> --watch          # green first; "admin" bypasses review, not the bar
+gh pr merge <n> --squash --admin
+```
+
+`--admin` is for the owner's own reviewed-by-agent work. It does not bypass
+`non_fast_forward`: never force-push `main`.
+
+Do not use `--delete-branch` while a child PR still has that branch as its base;
+GitHub closes the child instead of retargeting it. Delete the stack's branches after
+the last child is merged.
 
 ## Ready queue
 

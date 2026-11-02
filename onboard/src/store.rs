@@ -106,6 +106,15 @@ impl Store {
         owner: Option<(u32, u32)>,
         mode: u32,
     ) -> Result<(), String> {
+        // The handler renders account and group records and runs as `_onboard`,
+        // so a root-only mode here is a page that reads as missing. Refuse it
+        // rather than letting three call sites rediscover the rule.
+        if matches!(name, "account.json" | "group.json") && mode & 0o040 == 0 {
+            return Err(format!(
+                "{name} is read by the unprivileged handler; write it 0640 through \
+                 write_account_record or write_group_state"
+            ));
+        }
         let d = self.root.join(dir);
         let tmp = d.join(format!(".{name}.tmp"));
         let target = d.join(name);
@@ -215,6 +224,13 @@ impl Store {
         owner: Option<(u32, u32)>,
         mode: u32,
     ) -> Result<(), String> {
+        // The account page lists every notice, so the handler reads this one
+        // append file; a root-only line is a notice the member cannot see.
+        if path.ends_with("notices.jsonl") && mode & 0o040 == 0 {
+            return Err(
+                "notices.jsonl is read by the unprivileged handler; append it 0640".to_string(),
+            );
+        }
         use std::os::unix::fs::PermissionsExt;
         let p = self.root.join(path);
         if let Some(parent) = p.parent() {
@@ -1223,6 +1239,52 @@ mod tests {
         assert!(
             store.account_for_certificate("SHA256:bb").await.is_none(),
             "an unpinned hash answers nothing"
+        );
+    }
+
+    /// A record the handler renders cannot be written root-only. The three
+    /// helpers that write it in production pass 0640; this is the guard for the
+    /// next branch that calls the root-only one.
+    #[tokio::test]
+    async fn a_handler_read_record_refuses_a_root_only_mode() {
+        let dir =
+            std::env::temp_dir().join(format!("onboard-store-readable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("accounts/alice")).unwrap();
+        std::fs::create_dir_all(dir.join("groups/example")).unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+
+        let err = store
+            .write_record("accounts/alice", "account.json", b"{}")
+            .await
+            .expect_err("a root-only account record must be refused");
+        assert!(err.contains("0640"), "{err}");
+        assert!(store
+            .write_record_mode("accounts/alice", "account.json", b"{}", None, 0o600)
+            .await
+            .is_err());
+        store
+            .write_record_mode("accounts/alice", "account.json", b"{}", None, 0o640)
+            .await
+            .unwrap();
+        assert!(store
+            .write_record("groups/example", "group.json", b"{}")
+            .await
+            .is_err());
+        assert!(store
+            .append("accounts/alice/notices.jsonl", b"{}")
+            .await
+            .is_err());
+        store
+            .append_mode("accounts/alice/notices.jsonl", b"{}", None, 0o640)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .read_record("accounts/alice", "account.json")
+                .await
+                .as_deref(),
+            Some("{}")
         );
     }
 
