@@ -1,0 +1,20 @@
+# The lapsed login class: a member whose payment window closed with nothing
+# recorded, or whose renewal failed, keeps reading mail and keeps their published
+# pages, while sending from the address stops.
+#
+# On-box path: /etc/login.conf.d/lapsed. scripts/lapse-user.sh installs this
+# drop-in and assigns it with `usermod -L lapsed <username>`, and the reverse run
+# assigns the member class again. login.conf.d/<class> takes precedence over the
+# same class in /etc/login.conf, the convention the member and hello classes
+# already use here.
+#
+# `auth-smtp=reject` refuses submission authentication while IMAP finds no
+# auth-imap capability, falls back to the default `auth` list and keeps working
+# with the stored password. Dovecot and smtpd read the class on each attempt, so
+# nothing has to be restarted. cap_mkdb(1) has to run after an edit whenever
+# /etc/login.conf.db exists; the script does that.
+#
+# Upload and push are not this class's: both the sftp and git-shell sessions sit
+# behind sshd's `Match Group members`, so the same script empties the secondary
+# groups and the member keeps their key and their vhosts.
+lapsed:auth-smtp=reject:tc=default:

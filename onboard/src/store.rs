@@ -709,6 +709,11 @@ pub struct Account {
     /// excess refund and every other transition leave it absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closing_until: Option<String>,
+    /// The last day of the 40-day grace after a lapse, `YYYY-MM-DD`. Written
+    /// when a payment window closes with nothing recorded, so the grace and
+    /// deletion sweeps measure from one date rather than from the lapse notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_until: Option<String>,
 }
 
 /// One upload key the account carries: its fingerprint and the day it was

@@ -171,10 +171,18 @@ pub struct StatusPage {
     pub payment: Option<PaymentView>,
 }
 
+/// The lapse's own words, shared by the page, the capsule and the notice: mail
+/// stays readable and published work stays up; sending, uploading and pushing
+/// stop; nothing is deleted at that point.
+pub const LAPSE_NOTE: &str = "Mail keeps arriving and stays readable, and everything you \
+published stays up. Sending, uploading and pushing have stopped. Nothing is deleted at \
+this point. If you have posted the money, write to admin@kyriakon.net.";
+
 /// The payment block, built once from the account and rendered by the web page,
 /// the capsule and the status page, so the three cannot disagree about what a
 /// member owes. The token is in it only while the account is unpaid: a credit
 /// sets `paid_until` and the token goes back to being a secret.
+#[derive(Clone)]
 pub struct PaymentView {
     /// The account's state, which is the drain's word and not this page's.
     pub state: String,
@@ -188,14 +196,14 @@ pub struct PaymentView {
     pub token: Option<String>,
     /// The date a credit set. Present instead of the token once money arrived.
     pub paid_until: Option<String>,
+    /// The date the window closed with nothing recorded, while the account is
+    /// lapsed. Present instead of the window countdown.
+    pub lapsed: Option<String>,
+    /// What still works and what stopped once the account has lapsed, in the
+    /// lapse notice's words.
+    pub lapsed_note: Option<String>,
     /// The window's close date and the days left, while one runs.
     pub window: Option<String>,
-    /// The close date alone, `YYYY-MM-DD`, for a window that has closed. It is
-    /// repeated by the lapsed state, as the spec requires.
-    pub closes_on: Option<String>,
-    /// The window closed with nothing recorded: the page reads `Lapsed`, states
-    /// what still works and what stopped, and shows the token again.
-    pub lapsed: bool,
     /// The rail's own instructions, one line each.
     pub instructions: Vec<String>,
     /// What happens if nothing arrives before the window closes.
@@ -375,8 +383,8 @@ pub fn payment(
     card_link: Option<&str>,
     now: OffsetDateTime,
 ) -> PaymentView {
-    let paid = payment.paid_until.is_some();
-    let window = payment.window.as_ref().filter(|_| !paid);
+    let unpaid = payment.paid_until.is_none();
+    let window = payment.window.as_ref().filter(|_| unpaid);
     let closes_on = window.map(|w| w.closes_at.get(..10).unwrap_or(&w.closes_at).to_string());
     // A window whose state is still `open` after its close date has not been
     // swept yet, and the member reads the same `Lapsed` the sweep will write:
@@ -398,7 +406,7 @@ pub fn payment(
     // A held balance re-quotes the remainder: the member has already sent part
     // of the price, so the page asks for what is still owed and never less than
     // nothing.
-    let amount = if !paid {
+    let amount = if unpaid {
         match (
             crate::util::pence(price_gbp),
             payment.balance_gbp.as_deref(),
@@ -412,6 +420,15 @@ pub fn payment(
     } else {
         price_gbp.to_string()
     };
+    // A window that is closed, or open past its date and not yet swept, is the
+    // lapse; a credit leaves the window paid and the date is what the page
+    // shows instead.
+    let lapsed = if unpaid && !running {
+        closes_on.clone()
+    } else {
+        None
+    };
+    let lapsed_closed = lapsed.is_some();
     let deadline = window_line.as_ref().map(|_| {
         format!(
             "The money must arrive before {}, or the account lapses: mail keeps \
@@ -421,19 +438,23 @@ pub fn payment(
         )
     });
     PaymentView {
-        state: state.to_string(),
+        state: if lapsed_closed {
+            "lapsed".to_string()
+        } else {
+            state.to_string()
+        },
         rail: rail.to_string(),
         amount,
         balance: payment.balance_gbp.clone(),
-        token: if paid {
-            None
-        } else {
+        token: if unpaid {
             payment.token_ref.clone()
+        } else {
+            None
         },
         paid_until: payment.paid_until.clone(),
+        lapsed_note: lapsed.as_ref().map(|_| LAPSE_NOTE.to_string()),
+        lapsed,
         window: window_line,
-        closes_on: closes_on.clone(),
-        lapsed: !paid && !running,
         instructions: if running {
             crate::transitions::rail_instructions(rail, postal_address, card_link)
         } else {
@@ -894,7 +915,7 @@ mod tests {
             None,
             now,
         );
-        assert!(!view.lapsed);
+        assert!(view.lapsed.is_none());
         assert_eq!(view.token.as_deref(), Some("KYR-4F2M-9QH7-XT3B"));
         assert!(view
             .window
@@ -927,8 +948,7 @@ mod tests {
             None,
             now + time::Duration::days(10),
         );
-        assert!(lapsed.lapsed);
-        assert_eq!(lapsed.closes_on.as_deref(), Some("2026-11-03"));
+        assert_eq!(lapsed.lapsed.as_deref(), Some("2026-11-03"));
         assert_eq!(lapsed.token.as_deref(), Some("KYR-4F2M-9QH7-XT3B"));
         assert!(lapsed.instructions.is_empty());
         let html = member_page(
@@ -956,7 +976,7 @@ mod tests {
             None,
             now,
         );
-        assert!(!paid.lapsed);
+        assert!(paid.lapsed.is_none());
         assert_eq!(paid.token, None);
         assert_eq!(paid.paid_until.as_deref(), Some("2027-10-04"));
         let html = member_page(

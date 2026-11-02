@@ -41,16 +41,17 @@
 {% if let Some(p) = payment %}
 <h3>Payment</h3>
 <p>State: {{ p.state }}. Rail: {{ p.rail }}.</p>
-{% if let Some(until) = p.paid_until %}
-<p>Paid until {{ until }}.</p>
-{% else if p.lapsed %}
-<p><strong>Lapsed</strong>{% if let Some(date) = p.closes_on %}: the payment window closed on {{ date }}{% endif %}.</p>
-<p>Mail keeps arriving and stays readable, and everything already published stays up. Sending from your address, uploading to your site and pushing to git have stopped. Nothing has been deleted at this point.</p>
-<p>Amount due: GBP {{ p.amount }}.</p>
+{% if let Some(date) = p.lapsed %}
+<p>Lapsed: the payment window closed on {{ date }}.</p>
+{% if let Some(note) = p.lapsed_note %}
+<p>{{ note }}</p>
+{% endif %}
 {% if let Some(token) = p.token %}
 <p>Your payment reference: <code>{{ token }}</code></p>
 {% endif %}
-<p>If the money is already on its way, write to <a href="mailto:admin@kyriakon.net">admin@kyriakon.net</a>.</p>
+{% else %}
+{% if let Some(until) = p.paid_until %}
+<p>Paid until {{ until }}.</p>
 {% else %}
 {% if let Some(window) = p.window %}
 <p>The payment window {{ window }}.</p>
@@ -69,6 +70,7 @@
 </ul>
 {% if let Some(deadline) = p.deadline %}
 <p>{{ deadline }}</p>
+{% endif %}
 {% endif %}
 {% endif %}
 {% endif %}

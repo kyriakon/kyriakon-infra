@@ -162,18 +162,29 @@ pub fn status(page: &StatusPage) -> String {
     out.push_str(&format!("Stage: {}\n", page.stage));
     if let Some(payment) = &page.payment {
         out.push_str("\n## Paying\n\n");
-        match (&payment.paid_until, &payment.token) {
-            (Some(until), _) => out.push_str(&format!("Paid until {until}.\n")),
-            (None, token) => {
-                if let Some(token) = token {
-                    out.push_str(&format!("Your payment reference is {token}.\n"));
-                }
-                out.push_str(&format!("Amount: GBP {}.\n", payment.amount));
-                if let Some(balance) = &payment.balance {
-                    out.push_str(&format!("Received so far: GBP {balance}.\n"));
-                }
-                if let Some(window) = &payment.window {
-                    out.push_str(&format!("The payment window {window}.\n"));
+        if let Some(date) = &payment.lapsed {
+            out.push_str(&format!("Lapsed: the payment window closed on {date}.\n"));
+            if let Some(note) = &payment.lapsed_note {
+                out.push_str(note);
+                out.push('\n');
+            }
+            if let Some(token) = &payment.token {
+                out.push_str(&format!("Your payment reference is {token}.\n"));
+            }
+        } else {
+            match (&payment.paid_until, &payment.token) {
+                (Some(until), _) => out.push_str(&format!("Paid until {until}.\n")),
+                (None, token) => {
+                    if let Some(token) = token {
+                        out.push_str(&format!("Your payment reference is {token}.\n"));
+                    }
+                    out.push_str(&format!("Amount: GBP {}.\n", payment.amount));
+                    if let Some(balance) = &payment.balance {
+                        out.push_str(&format!("Received so far: GBP {balance}.\n"));
+                    }
+                    if let Some(window) = &payment.window {
+                        out.push_str(&format!("The payment window {window}.\n"));
+                    }
                 }
             }
         }
@@ -237,20 +248,18 @@ pub fn account(
     if let Some(p) = payment {
         out.push_str("## Payment\n\n");
         out.push_str(&format!("Rail: {}.\n", p.rail));
-        if let Some(until) = &p.paid_until {
+        if let Some(date) = &p.lapsed {
+            out.push_str(&format!("Lapsed: the payment window closed on {date}.\n"));
+            if let Some(note) = &p.lapsed_note {
+                out.push_str(note);
+                out.push('\n');
+            }
+            if let Some(token) = &p.token {
+                out.push_str(&format!("Your payment reference is {token}.\n"));
+            }
+        } else if let Some(until) = &p.paid_until {
             out.push_str(&format!("Paid until {until}.\n"));
         } else {
-            if p.lapsed {
-                out.push_str(&format!(
-                    "Lapsed{}: mail keeps arriving and stays readable, and everything \
-                     published stays up. Sending, uploading and pushing have stopped, and \
-                     nothing has been deleted.\n",
-                    p.closes_on
-                        .as_deref()
-                        .map(|date| format!(" since the payment window closed on {date}"))
-                        .unwrap_or_default()
-                ));
-            }
             if let Some(window) = &p.window {
                 out.push_str(&format!("The payment window {window}.\n"));
             }
