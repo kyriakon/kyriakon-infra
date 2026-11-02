@@ -1927,6 +1927,15 @@ async fn account_close(app: &App, request: &Request) -> Reply {
     }
 }
 
+/// The member a request's live session names, with the account it names. The
+/// page's actions use it: `REMOTE_USER` is not an identity here, because no
+/// HTTP authentication is configured for the host.
+async fn session_member(app: &App, request: &Request) -> Option<Account> {
+    let cookie = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE)?;
+    let member = session::lookup(&app.store, &cookie, OffsetDateTime::now_utc()).await?;
+    account_record(app, &member.username).await
+}
+
 /// "Take my data out": file the export intent for the account the session names.
 /// The handler holds no privilege and does nothing but file it; the drain writes
 /// the bundle into the member's own chroot within its next minute. A request
