@@ -189,7 +189,6 @@ async fn signed_in(app: &App, username: &str) -> String {
 
 /// The request httpd builds for a form post.
 fn httpd_post(path: &str, body: &str) -> Vec<u8> {
-<<<<<<< HEAD
     httpd_post_with(path, body, None, None)
 }
 
@@ -198,14 +197,6 @@ fn httpd_post(path: &str, body: &str) -> Vec<u8> {
 fn httpd_post_with(path: &str, body: &str, cookie: Option<&str>, user: Option<&str>) -> Vec<u8> {
     let length = body.len().to_string();
     let cookie_header;
-=======
-    httpd_post_as(path, body, None)
-}
-
-/// A form post httpd authenticated, as [`httpd_get_as`] is.
-fn httpd_post_as(path: &str, body: &str, user: Option<&str>) -> Vec<u8> {
-    let length = body.len().to_string();
->>>>>>> 9b0318b (feat(onboard): export a member's written record into their chroot)
     let mut env = vec![
         ("REQUEST_METHOD", "POST"),
         ("REQUEST_URI", path),
@@ -218,13 +209,10 @@ fn httpd_post_as(path: &str, body: &str, user: Option<&str>) -> Vec<u8> {
         ("REMOTE_ADDR", "127.0.0.1"),
         ("HTTP_X_FORWARDED_FOR", "203.0.113.10"),
     ];
-<<<<<<< HEAD
     if let Some(cookie) = cookie {
         cookie_header = format!("{}={cookie}", session::COOKIE);
         env.push(("HTTP_COOKIE", &cookie_header));
     }
-=======
->>>>>>> 9b0318b (feat(onboard): export a member's written record into their chroot)
     if let Some(user) = user {
         env.push(("REMOTE_USER", user));
     }
@@ -1117,9 +1105,10 @@ async fn the_account_pages_export_action_files_an_intent_for_the_session_account
     file_account(&dir);
     let before = std::fs::read(dir.join("accounts/alice/account.json")).unwrap();
 
+    let cookie = signed_in(&app, "alice").await;
     let (code, body) = answer(
         &app,
-        &httpd_post_as("account", "action=export", Some("alice")),
+        &httpd_post_with("account", "action=export", Some(&cookie), None),
     )
     .await;
     assert_eq!(code, 200, "{body}");
@@ -1134,15 +1123,20 @@ async fn the_account_pages_export_action_files_an_intent_for_the_session_account
         serde_json::from_str(&std::fs::read_to_string(&intents[0]).unwrap()).unwrap();
     assert_eq!(filed["kind"], "export");
     assert_eq!(filed["username"], "alice");
+    assert_eq!(
+        filed["session"],
+        cookie.split('.').next().unwrap(),
+        "the session the drain will verify"
+    );
     // The account directory is the drain's to change, not this route's.
     assert_eq!(
         std::fs::read(dir.join("accounts/alice/account.json")).unwrap(),
         before
     );
 
-    // Without an authenticated account there is nobody the export could belong
-    // to, so nothing is filed.
-    let (code, _) = answer(&app, &httpd_post_as("account", "action=export", None)).await;
+    // Without a session there is nobody the export could belong to, so nothing
+    // is filed.
+    let (code, _) = answer(&app, &httpd_post("account", "action=export")).await;
     assert_eq!(code, 403);
     assert_eq!(
         std::fs::read_dir(dir.join("intents")).unwrap().count(),

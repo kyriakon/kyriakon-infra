@@ -150,18 +150,19 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
 
 /// File an export intent, as the account page's "Take my data out" does.
 ///
-/// The body names the account and nothing else. The session is the whole claim,
-/// and the export reaches only what that account's own directory and token
-/// reach, so there is nothing a caller could add that would widen it. No
-/// signature: the intent does not move money, delete anything or change the
-/// account, and the drain writes only into the member's own tree.
-pub async fn file_export(store: &Store, username: &str) -> Result<String, String> {
+/// The body names the account and the session that asked for it, and nothing
+/// else. The handler is unprivileged and `intents/` is writable by it, so the
+/// drain re-proves the session against its server-side record before it writes
+/// as root: the record's username must be the intent's and it must not have
+/// expired. Nothing the caller supplies can widen the export past the account.
+pub async fn file_export(store: &Store, session: &str, username: &str) -> Result<String, String> {
     let id = ulid::Ulid::new().to_string();
     let intent = serde_json::json!({
         "id": id,
         "kind": "export",
         "filed_at": crate::util::filed_at(),
         "username": username,
+        "session": session,
     });
     let bytes =
         serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
@@ -509,6 +510,45 @@ pub async fn file_close(store: &Store, username: &str, session: &str) -> Result<
         .write_record("intents", &format!("{id}.json"), &bytes)
         .await?;
     Ok(id)
+}
+
+/// The account page's live session, proved by the server-side record it names:
+/// the username must match and the record must not have expired.
+///
+/// #496 adds a helper of this shape on `feat/account-deletion`; this branch
+/// carries it here so the export intent is not privileged work the unprivileged
+/// handler can file for any account it likes, and the two can be folded when
+/// that branch lands.
+pub async fn verify_session(store: &Store, id: &str, username: &str) -> Result<(), String> {
+    if !crate::store::is_status_token(id) {
+        return Err(format!("the session {id:?} is not a session id"));
+    }
+    let text = store
+        .read_record("sessions", &format!("{id}.json"))
+        .await
+        .ok_or_else(|| "no such session, or it has been closed".to_string())?;
+    let record: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("the session record does not parse: {e}"))?;
+    match record.get("username").and_then(Value::as_str) {
+        Some(session_user) if session_user == username => {}
+        Some(session_user) => {
+            return Err(format!(
+                "the session belongs to {session_user}, not {username}"
+            ))
+        }
+        None => return Err("the session record names no account".to_string()),
+    }
+    let expires_at = record
+        .get("expires_at")
+        .and_then(Value::as_str)
+        .ok_or("the session record names no expiry")?;
+    let expires =
+        time::OffsetDateTime::parse(expires_at, &time::format_description::well_known::Rfc3339)
+            .map_err(|e| format!("the session's expiry {expires_at:?}: {e}"))?;
+    if time::OffsetDateTime::now_utc() >= expires {
+        return Err(format!("the session expired at {expires_at}"));
+    }
+    Ok(())
 }
 
 /// File a password set through the member's one-time link.

@@ -177,6 +177,13 @@ rate_endpoint = "https://api.coingecko.com/api/v3/simple/price?ids=monero&vs_cur
 # PATH is not where a package's binary lives.
 rates_fetch = "/usr/local/bin/curl"
 
+# The OpenPGP implementation the export encrypts a member's written part to
+# their own key with. The same binary `kyriakon-encrypt` runs; named by path
+# because cron's PATH is not where a package's binary lives, and the one place
+# the export's mail path depends on gpg is here rather than a literal in the
+# code.
+gpg = "/usr/local/bin/gpg"
+
 # Where the members' public trees live: the sftp chroot
 # `scripts/provision-member.sh` builds as <username>.kyriakon.net. The export
 # writes its bundle under that chroot so the member collects it over the sftp

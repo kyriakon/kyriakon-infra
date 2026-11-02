@@ -217,7 +217,8 @@ impl Fix {
              rates = \"{}/store/rates/xmr-gbp.json\"\n\
              rate_endpoint = \"https://rates.example.invalid/simple/price\"\n\
              rates_fetch = \"{}\"\n\
-             public_root = \"{}\"\n",
+             public_root = \"{}\"\n\
+             gpg = \"gpg\"\n",
             fix.path("store"),
             fix.path("reserved"),
             fix.path("bin"),

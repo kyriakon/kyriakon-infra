@@ -294,6 +294,7 @@ mod tests {
             rates: dir.join("rates/xmr-gbp.json").to_str().unwrap().to_string(),
             rate_endpoint: "https://rates.example.invalid/simple/price".to_string(),
             rates_fetch: "/usr/bin/true".to_string(),
+            gpg: "/usr/bin/true".to_string(),
             public_root: "/home/www".to_string(),
         }
     }

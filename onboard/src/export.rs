@@ -14,7 +14,9 @@
 //! inside the chroot their sftp session is already confined to, and the whole
 //! tree is handed to the account that owns it.
 
-use std::path::Path;
+use std::io::Write;
+use std::os::unix::fs::{fchown, DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use time::format_description::well_known::Rfc3339;
@@ -253,12 +255,10 @@ async fn written(
                 format!("included; the answers are held until {until} under ADR 0005's 90-day purge")
             }
             Some(filed) => purged(filed),
-            // A record with no readable filing date is still the member's own
-            // words inside the store: it is included rather than lost.
-            None => {
-                docs.push(("application.json".to_string(), text.into_bytes()));
-                "included; the record carries no filing date, so the purge boundary cannot be computed from it".to_string()
-            }
+            // No readable filing date means the boundary cannot be proved, and
+            // the purge rule fails closed: the answers are left out rather than
+            // exported outside the window the record cannot show.
+            None => "purged; the record carries no readable filing date, so ADR 0005's 90-day boundary cannot be established and the answers are not included".to_string(),
         },
         None => "purged; the platform no longer holds the application answers (ADR 0005's 90-day purge has run)".to_string(),
     };
@@ -324,57 +324,155 @@ async fn written(
     Ok((account, answer, docs))
 }
 
-fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    std::fs::write(path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("cannot set the mode on {}: {e}", path.display()))
-}
-
-/// Hand every file and directory under `root` to the member. The caller is
-/// root on the box; a test runs as the tree's own owner and skips it, which is
-/// the same rule `store::write_record_owned` applies.
-fn hand_over(root: &Path, (uid, gid): (u32, u32)) -> Result<(), String> {
-    if unsafe { libc::geteuid() } != 0 {
-        return Ok(());
+/// Whether `path` is the directory the export writes through: a real
+/// directory, not a symlink or a file, owned by the caller. On the box the
+/// caller is root and `export/` is root-owned 0755, so the member can read
+/// their bundles and cannot place anything where root will write.
+fn check_export_dir(path: &Path, owner: u32) -> Result<(), String> {
+    let md = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if !md.file_type().is_dir() {
+        return Err(format!(
+            "{} is not a directory, but a symlink or a file planted in the member's tree;              refusing to write the export",
+            path.display()
+        ));
     }
-    std::os::unix::fs::chown(root, Some(uid), Some(gid))
-        .map_err(|e| format!("cannot hand {} to {uid}:{gid}: {e}", root.display()))?;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries =
-            std::fs::read_dir(&dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-        for entry in entries {
-            let path = entry
-                .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
-                .path();
-            std::os::unix::fs::chown(&path, Some(uid), Some(gid))
-                .map_err(|e| format!("cannot hand {} to {uid}:{gid}: {e}", path.display()))?;
-            if path.is_dir() {
-                stack.push(path);
-            }
-        }
+    if md.uid() != owner {
+        return Err(format!(
+            "{} is owned by uid {}, not uid {owner}, the process writing the export; refusing",
+            path.display(),
+            md.uid()
+        ));
     }
     Ok(())
 }
 
-fn write_tree(dir: &Path, docs: &[(String, Vec<u8>)], owner: (u32, u32)) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    use std::os::unix::fs::PermissionsExt;
-    for (name, bytes) in docs {
-        let path = dir.join(name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("cannot set the mode on {}: {e}", parent.display()))?;
+/// The member's `export/` directory: created root-owned 0755 when it is absent,
+/// and validated when it is there. The member reads through it and never writes
+/// to it, so nothing inside it can be theirs to plant.
+fn export_dir(chroot: &Path) -> Result<PathBuf, String> {
+    let path = chroot.join("export");
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .mode(0o755)
+                .create(&path)
+                .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("cannot set the mode on {}: {e}", path.display()))?;
         }
-        write_file(&path, bytes)?;
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    check_export_dir(&path, unsafe { libc::geteuid() })?;
+    Ok(path)
+}
+
+/// One bundle subdirectory (`keys/`, `ledger/`), created root-owned 0700 before
+/// any write. `create_dir` fails on an existing name, so a pre-planted entry is
+/// a refusal rather than a place to follow.
+fn create_bundle_dir(stamp: &Path, sub: &str) -> Result<PathBuf, String> {
+    if sub.is_empty() || sub.contains('/') {
+        return Err(format!(
+            "the bundle path component {sub:?} is not one directory"
+        ));
+    }
+    let dir = stamp.join(sub);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("cannot set the mode on {}: {e}", dir.display()))?;
-    let export = dir.parent().unwrap_or(dir);
-    hand_over(export, owner)
+    Ok(dir)
+}
+
+/// One bundle file, created exclusively and without following a symlink, with
+/// its mode and owner applied to the open descriptor. The stamp directory is
+/// still root-owned 0700 while this runs, so the member cannot race a planted
+/// name into it; the `create_new`/`O_NOFOLLOW` pair is the second line.
+fn write_bundle_file(path: &Path, bytes: &[u8], owner: (u32, u32)) -> Result<(), String> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true).mode(0o600);
+    opts.custom_flags(libc::O_NOFOLLOW);
+    let mut file = opts.open(path).map_err(|e| {
+        format!(
+            "cannot create {}: {e}; the export does not write over or through an existing name",
+            path.display()
+        )
+    })?;
+    file.write_all(bytes)
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("cannot set the mode on {}: {e}", path.display()))?;
+    // chown needs root, and only root ever hands a bundle to another owner: a
+    // test runs as the tree's own owner already.
+    if unsafe { libc::geteuid() } == 0 {
+        fchown(&file, Some(owner.0), Some(owner.1)).map_err(|e| {
+            format!(
+                "cannot hand {} to {}:{}: {e}",
+                path.display(),
+                owner.0,
+                owner.1
+            )
+        })?;
+    }
+    file.sync_all()
+        .map_err(|e| format!("cannot sync {}: {e}", path.display()))
+}
+
+/// Hand one directory to the member, when this process is root. Path-based and
+/// called once per directory, never a walk: the tree is made root-owned first,
+/// so there is no symlink for it to follow and nothing recursive to escape.
+fn hand_one(path: &Path, (uid, gid): (u32, u32)) -> Result<(), String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    std::os::unix::fs::chown(path, Some(uid), Some(gid))
+        .map_err(|e| format!("cannot hand {} to {uid}:{gid}: {e}", path.display()))
+}
+
+/// Create the stamp directory and its files, then hand the files and their
+/// directories to the member. The stamp directory is chowned last, so until the
+/// whole bundle is written the member cannot enter the tree root created.
+fn write_tree(
+    export: &Path,
+    name: &str,
+    docs: &[(String, Vec<u8>)],
+    owner: (u32, u32),
+) -> Result<PathBuf, String> {
+    let stamp = export.join(name);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&stamp)
+        .map_err(|e| {
+            format!(
+                "cannot create {}: {e}; the export directory must not already exist",
+                stamp.display()
+            )
+        })?;
+    std::fs::set_permissions(&stamp, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("cannot set the mode on {}: {e}", stamp.display()))?;
+
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for (name, _) in docs {
+        if let Some((sub, _)) = name.split_once('/') {
+            if !subdirs
+                .iter()
+                .any(|d| d.file_name().and_then(|n| n.to_str()) == Some(sub))
+            {
+                subdirs.push(create_bundle_dir(&stamp, sub)?);
+            }
+        }
+    }
+    for (name, bytes) in docs {
+        write_bundle_file(&stamp.join(name), bytes, owner)?;
+    }
+    for dir in &subdirs {
+        hand_one(dir, owner)?;
+    }
+    hand_one(&stamp, owner)?;
+    Ok(stamp)
 }
 
 /// The address the ready notice goes to: the contact the member gave, and the
@@ -396,15 +494,25 @@ pub async fn deliver(cfg: &DrainConfig, store: &Store, username: &str) -> Result
     let now = OffsetDateTime::now_utc();
     let (account, answer, docs) = written(cfg, store, username, now, false).await?;
     let chroot = Path::new(&cfg.public_root).join(format!("{username}.kyriakon.net"));
-    if !chroot.is_dir() {
-        return Err(format!(
-            "the member's tree {} is not there, so there is no chroot to write the export into",
-            chroot.display()
-        ));
+    match std::fs::symlink_metadata(&chroot) {
+        Ok(md) if md.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "the member's tree {} is not a directory; refusing to write the export",
+                chroot.display()
+            ))
+        }
+        Err(e) => {
+            return Err(format!(
+                "the member's tree {} is not there: {e}",
+                chroot.display()
+            ))
+        }
     }
     let owner = member_owner(&cfg.passwd, username)?;
-    let dir = chroot.join("export").join(stamp(now));
-    write_tree(&dir, &docs, owner)?;
+    let name = stamp(now);
+    let export = export_dir(&chroot)?;
+    write_tree(&export, &name, &docs, owner)?;
     let to = member_address(&account, username);
     notice::send_again(
         cfg,
@@ -416,7 +524,7 @@ pub async fn deliver(cfg: &DrainConfig, store: &Store, username: &str) -> Result
         &answer,
     )
     .await?;
-    Ok(format!("export/{}/", stamp(now)))
+    Ok(format!("export/{name}/"))
 }
 
 /// The bundle as one text file, for the mailed path: the same documents, each
@@ -446,14 +554,14 @@ fn reachable() -> String {
 /// invocation `kyriakon-encrypt` uses for their mail: `--recipient-file` reads
 /// the armored cert directly, and a scratch homedir keeps gpg's own files out
 /// of the keyring.
-async fn encrypt(key: &Path, plain: &[u8]) -> Result<Vec<u8>, String> {
+async fn encrypt(program: &str, key: &Path, plain: &[u8]) -> Result<Vec<u8>, String> {
     use tokio::io::AsyncWriteExt;
     let home = std::env::temp_dir().join(format!("kyriakon-export-gpg-{}", ulid::Ulid::new()));
     tokio::fs::create_dir_all(&home)
         .await
         .map_err(|e| format!("cannot create {}: {e}", home.display()))?;
     let run = async {
-        let mut child = tokio::process::Command::new("gpg")
+        let mut child = tokio::process::Command::new(program)
             .args([
                 "--batch",
                 "--no-tty",
@@ -470,7 +578,7 @@ async fn encrypt(key: &Path, plain: &[u8]) -> Result<Vec<u8>, String> {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("cannot spawn gpg: {e}"))?;
+            .map_err(|e| format!("cannot spawn {program}: {e}"))?;
         let mut stdin = child.stdin.take().ok_or("gpg has no stdin")?;
         stdin
             .write_all(plain)
@@ -521,7 +629,7 @@ pub async fn deliver_by_mail(
     }
     let now = OffsetDateTime::now_utc();
     let (account, answer, docs) = written(cfg, store, username, now, true).await?;
-    let armored = encrypt(&key, bundle_text(&docs).as_bytes()).await?;
+    let armored = encrypt(&cfg.gpg, &key, bundle_text(&docs).as_bytes()).await?;
     let filename = format!("export-{}.txt.asc", stamp(now));
     let to = member_address(&account, username);
     notice::send_account_notice_attachment(
@@ -595,6 +703,44 @@ mod tests {
         );
         assert!(text.contains("does not copy"), "{text}");
         assert!(text.contains("purged"), "{text}");
+    }
+
+    /// A directory owned by anyone but the writer is refused, and a symlink is
+    /// not a directory however it resolves: both are the shapes a member could
+    /// plant where root is about to write.
+    #[test]
+    fn an_export_directory_of_another_owner_or_a_symlink_is_refused() {
+        let dir = std::env::temp_dir().join(format!("kyriakon-export-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let euid = unsafe { libc::geteuid() };
+        assert!(check_export_dir(&dir, euid).is_ok());
+        let err = check_export_dir(&dir, euid + 1).unwrap_err();
+        assert!(err.contains("owned by uid"), "{err}");
+
+        let link = dir.join("export");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let err = check_export_dir(&link, euid).unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+        assert!(err.contains("symlink"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A planted symlink at a bundle file's name is refused and its target is
+    /// left alone: the export does not follow a name the member controls.
+    #[test]
+    fn a_planted_symlink_at_a_bundle_file_is_not_followed() {
+        let dir = std::env::temp_dir().join(format!("kyriakon-export-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        std::fs::write(&target, b"keep me").unwrap();
+        let planted = dir.join("account.json");
+        std::os::unix::fs::symlink(&target, &planted).unwrap();
+        let err = write_bundle_file(&planted, b"export", (0, 0)).unwrap_err();
+        assert!(err.contains("cannot create"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

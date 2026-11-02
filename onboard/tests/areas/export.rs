@@ -365,6 +365,35 @@ fn file(dir: &Path, rel: &str) -> String {
     std::fs::read_to_string(dir.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
 }
 
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+/// A live account-page session for `username`, as the login route makes one,
+/// returning the id the export intent carries.
+fn session_id(fix: &Fix, username: &str) -> String {
+    let store = kyriakon_onboard::store::Store::new(&fix.path("store"));
+    let cookie = runtime()
+        .block_on(kyriakon_onboard::session::open(
+            &store,
+            username,
+            OffsetDateTime::now_utc(),
+        ))
+        .unwrap();
+    cookie.split('.').next().unwrap().to_string()
+}
+
+/// Put one session's record in the past, without touching its secret.
+fn expire_session(fix: &Fix, id: &str) {
+    let path = fix.dir.join("store/sessions").join(format!("{id}.json"));
+    let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    record["expires_at"] = json!("2020-01-01T00:00:00Z");
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+}
+
 /// The written part lands inside the chroot the member's sftp already sees,
 /// beside `www/` and `gemini/`, and the account's own `notices.jsonl` records
 /// the ready notice.
@@ -395,6 +424,12 @@ fn the_bundle_lands_in_the_chroot_and_the_notice_is_recorded() {
     let chroot = fix.dir.join("home/www/secretary.kyriakon.net");
     assert!(chroot.join("www").is_dir());
     assert!(chroot.join("gemini").is_dir());
+    // The parent the member reads through is root's and never theirs to write.
+    let export = chroot.join("export");
+    let md = std::fs::symlink_metadata(&export).unwrap();
+    assert!(md.file_type().is_dir());
+    assert_eq!(md.uid(), unsafe { libc::geteuid() });
+    assert_eq!(md.permissions().mode() & 0o777, 0o755);
     assert_eq!(
         dir.strip_prefix(&chroot).unwrap().components().count(),
         2,
@@ -499,6 +534,27 @@ fn the_application_is_in_the_bundle_only_inside_the_purge() {
     assert!(manifest.contains(&ended), "{manifest}");
 }
 
+/// A filing date that cannot be read fails the purge rule closed: the answers
+/// stay out of the bundle, and the manifest says why rather than staying silent.
+#[test]
+fn an_unreadable_filing_date_keeps_the_answers_out() {
+    let fix = Fix::new("data-export-undated");
+    fix.member_tree("secretary");
+    approved_paid(&fix, "secretary", "cash");
+    let path = fix.dir.join("store/accounts/secretary/application.json");
+    let mut copy: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    copy["filed_at"] = json!("last Tuesday");
+    std::fs::write(&path, serde_json::to_vec_pretty(&copy).unwrap()).unwrap();
+
+    let out = fix.ctl(&["export", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let dir = bundle(&fix, "secretary");
+    assert!(!dir.join("application.json").exists());
+    let manifest = file(&dir, "MANIFEST.txt");
+    assert!(manifest.contains("no readable filing date"), "{manifest}");
+    assert!(manifest.contains("not included"), "{manifest}");
+}
+
 /// The manifest names the member's tree as paths they pull, copies none of it,
 /// and the written answer names the three exclusions the spec states.
 #[test]
@@ -533,20 +589,22 @@ fn the_manifest_and_the_answer_say_what_is_not_in_the_bundle() {
     assert!(answer.contains("password path"), "{answer}");
 }
 
-/// The page's "Take my data out" is an intent carrying the account and nothing
-/// else; the drain writes the same bundle and removes the intent.
+/// The page's "Take my data out" is an intent carrying the account and the
+/// session that asked for it; the drain proves the session, records the request
+/// line, writes the same bundle and removes the intent.
 #[test]
-fn the_page_files_an_export_intent_that_names_only_the_account() {
+fn the_page_files_an_export_intent_and_the_drain_records_the_request() {
     let fix = Fix::new("data-export-intent");
     fix.member_tree("secretary");
     approved_paid(&fix, "secretary", "cash");
     let store = kyriakon_onboard::store::Store::new(&fix.path("store"));
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let id = runtime
-        .block_on(kyriakon_onboard::intents::file_export(&store, "secretary"))
+    let session = session_id(&fix, "secretary");
+    let id = runtime()
+        .block_on(kyriakon_onboard::intents::file_export(
+            &store,
+            &session,
+            "secretary",
+        ))
         .unwrap();
 
     let filed: Value = serde_json::from_str(&fix.read(&format!("intents/{id}.json"))).unwrap();
@@ -557,9 +615,14 @@ fn the_page_files_an_export_intent_that_names_only_the_account() {
         .map(String::as_str)
         .collect();
     keys.sort();
-    assert_eq!(keys, ["filed_at", "id", "kind", "username"], "{filed}");
+    assert_eq!(
+        keys,
+        ["filed_at", "id", "kind", "session", "username"],
+        "{filed}"
+    );
     assert_eq!(filed["kind"], "export");
     assert_eq!(filed["username"], "secretary");
+    assert_eq!(filed["session"], session.as_str());
 
     assert!(fix.drain().status.success());
     assert!(bundle(&fix, "secretary").join("account.json").is_file());
@@ -569,6 +632,104 @@ fn the_page_files_an_export_intent_that_names_only_the_account() {
         .join(format!("{id}.json"))
         .exists());
     assert!(fix.journal().contains("\"kind\":\"export\""));
+
+    // One data-subject request line, keyed by the intent that asked for it.
+    let record = fix.read("accounts/secretary/requests.jsonl");
+    let line: Value = serde_json::from_str(record.lines().last().unwrap()).unwrap();
+    assert_eq!(line["id"], id.as_str());
+    assert_eq!(line["kind"], "access");
+    assert_eq!(line["username"], "secretary");
+    assert!(
+        line["evidence"].as_str().unwrap().contains("account page"),
+        "{line}"
+    );
+    // And the bundle carries it.
+    assert!(file(&bundle(&fix, "secretary"), "requests.jsonl").contains(&id));
+}
+
+/// A forged or expired session is refused before root writes anything: no
+/// bundle, no request line, and the intent stays for the operator to see.
+#[test]
+fn a_forged_or_expired_session_writes_nothing() {
+    let fix = Fix::new("data-export-session");
+    fix.member_tree("secretary");
+    approved_paid(&fix, "secretary", "cash");
+    let store = kyriakon_onboard::store::Store::new(&fix.path("store"));
+
+    // A session that belongs to someone else, asking for this account's record.
+    let wrong = session_id(&fix, "alice");
+    let id = runtime()
+        .block_on(kyriakon_onboard::intents::file_export(
+            &store,
+            &wrong,
+            "secretary",
+        ))
+        .unwrap();
+    assert!(fix.drain().status.success());
+    assert!(!export_root(&fix, "secretary").exists());
+    assert!(fix
+        .dir
+        .join("store/intents")
+        .join(format!("{id}.json"))
+        .exists());
+    assert!(
+        fix.failed_note().contains("belongs to alice"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(fix.read("accounts/secretary/requests.jsonl").is_empty());
+
+    // The right account, on a session that has run out.
+    std::fs::remove_file(fix.dir.join("store/intents").join(format!("{id}.json"))).unwrap();
+    let expired = session_id(&fix, "secretary");
+    expire_session(&fix, &expired);
+    let id = runtime()
+        .block_on(kyriakon_onboard::intents::file_export(
+            &store,
+            &expired,
+            "secretary",
+        ))
+        .unwrap();
+    assert!(fix.drain().status.success());
+    assert!(!export_root(&fix, "secretary").exists());
+    assert!(fix
+        .dir
+        .join("store/intents")
+        .join(format!("{id}.json"))
+        .exists());
+    assert!(
+        fix.failed_note().contains("expired"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(fix.read("accounts/secretary/requests.jsonl").is_empty());
+}
+
+/// A planted `export` symlink is refused before anything is written through
+/// it, and no ready notice claims a bundle exists.
+#[test]
+fn a_planted_export_symlink_is_refused() {
+    let fix = Fix::new("data-export-symlink");
+    fix.member_tree("secretary");
+    approved_paid(&fix, "secretary", "cash");
+    let chroot = fix.dir.join("home/www/secretary.kyriakon.net");
+    let target = fix.dir.join("planted-target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::os::unix::fs::symlink(&target, chroot.join("export")).unwrap();
+
+    let out = fix.ctl(&["export", "secretary"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("symlink"), "{err}");
+    assert!(err.contains("refusing"), "{err}");
+    assert_eq!(
+        std::fs::read_dir(&target).unwrap().count(),
+        0,
+        "nothing was written through the symlink"
+    );
+    assert!(!fix
+        .read("accounts/secretary/notices.jsonl")
+        .contains("export.ready"));
 }
 
 /// A member who cannot log in but still holds their key gets the written part

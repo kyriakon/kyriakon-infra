@@ -1939,7 +1939,11 @@ async fn account_export(app: &App, request: &Request) -> Reply {
     let Some(account) = session_member(app, request).await else {
         return refused("Sign in to the account you want to export.");
     };
-    match crate::intents::file_export(&app.store, &account.username).await {
+    let cookie = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE);
+    let Some(session_id) = cookie.as_deref().and_then(session::id) else {
+        return refused("Sign in to the account you want to export.");
+    };
+    match crate::intents::file_export(&app.store, session_id, &account.username).await {
         Ok(_) => {
             let page = notice(
                 "Your data export is on its way",
