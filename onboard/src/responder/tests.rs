@@ -719,6 +719,26 @@ async fn a_correct_mail_password_opens_a_session_and_a_wrong_one_does_not() {
     assert!(page.contains("Referrer-Policy: no-referrer"), "{page}");
 }
 
+/// A checker the closure tests run directly. It lives here rather than in a
+/// shared helper because the closure tests are the only ones this branch adds,
+/// and the account-page branch owns the login fixture.
+fn closure_checker(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("onboard-closure-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("kyriakon-authcheck");
+    std::fs::write(
+        &path,
+        "#!/bin/sh
+read -r given
+[ \"$given\" = 'right horse battery' ]
+",
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
 /// The page closure asks for the password again, files exactly one intent
 /// carrying the session it used, and a wrong or empty password files nothing.
 #[tokio::test]
@@ -726,7 +746,7 @@ async fn a_page_closure_requires_the_password_and_files_one_intent() {
     let (mut app, dir) = handler("close-password").await;
     file_account(&dir);
     app.auth = session::Authenticator {
-        program: login_checker("close"),
+        program: closure_checker("close"),
         args: Vec::new(),
     };
     let cookie = signed_in(&app, "alice").await;
@@ -787,7 +807,7 @@ async fn a_closure_names_the_refund_only_inside_fourteen_days() {
         "20.00",
     );
     app.auth = session::Authenticator {
-        program: login_checker("refund-inside"),
+        program: closure_checker("refund-inside"),
         args: Vec::new(),
     };
     let cookie = signed_in(&app, "alice").await;
@@ -814,7 +834,7 @@ async fn a_closure_names_the_refund_only_inside_fourteen_days() {
         "20.00",
     );
     app.auth = session::Authenticator {
-        program: login_checker("refund-outside"),
+        program: closure_checker("refund-outside"),
         args: Vec::new(),
     };
     let cookie = signed_in(&app, "alice").await;
