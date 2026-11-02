@@ -7559,6 +7559,7 @@ mod tests {
                 .to_string(),
             rate_endpoint: "https://rates.example.invalid/simple/price".to_string(),
             rates_fetch: dir.join("bin/curl").to_str().unwrap().to_string(),
+            public_root: dir.join("home/www").to_str().unwrap().to_string(),
         }
     }
 
