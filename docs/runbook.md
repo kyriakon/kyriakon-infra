@@ -423,6 +423,26 @@ an empty reason.
 Closing writes what was done onto that request's own line. The record is the
 member's data: it goes out with a later export and is removed with the account.
 
+	doas onboardctl export <username> [--by-mail] [--request <id>]
+
+The export writes the platform's written record of the account into the member's
+own sftp chroot, at `/home/www/<username>.kyriakon.net/export/<timestamp>/`,
+owned by the member and recorded in `notices.jsonl` as `export.ready`. Over sftp
+it appears beside the `www/` and `gemini/` they already upload to. The bundle
+holds `account.json`, `notices.jsonl`, `application.json` while ADR 0005's
+90-day purge still holds it, the account's `journal.jsonl` and `requests.jsonl`
+lines, the keyring entry `keys/<localpart>.asc`, the token's `ledger/payments.jsonl`
+lines, `MANIFEST.txt` and `answer.txt`. The member's Maildir, repositories and
+published roots are named in the manifest as paths they pull; none is copied.
+`--request <id>` records how the bundle was delivered on that request's line.
+
+`--by-mail` is for a member who cannot log in but still holds their key: the
+same written part leaves as one attachment encrypted to the public key in the
+keyring, so nothing is written to a chroot they cannot reach. A member with
+neither the key nor the password cannot be sent the encrypted attachment; the
+command refuses and prints what is still reachable, which is the written part
+from the operator and the login through the password path above.
+
 ## When a member has died
 
 Nothing is released, and the ordinary paths apply. The rule in `docs/planning/specs/data-subject-requests.md` stands: a request from outside the account page is confirmed by the password or by a message from the account's own address signed with the member's key, and where neither can be produced the operator says so and does not answer as though identity were established. A bereaved family holds neither, so nothing can be handed over on their request.

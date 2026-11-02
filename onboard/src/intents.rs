@@ -143,8 +143,33 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
                 .map_err(|e| format!("the refund intent does not parse: {e}"))?;
             transitions::refund(cfg, store, key, intent, file, &value).await
         }
+        "export" => transitions::export_account(cfg, store, &value, file).await,
         _ => transitions::refuse(cfg, store, file, &value).await,
     }
+}
+
+/// File an export intent, as the account page's "Take my data out" does.
+///
+/// The body names the account and the session that asked for it, and nothing
+/// else. The handler is unprivileged and `intents/` is writable by it, so the
+/// drain re-proves the session against its server-side record before it writes
+/// as root: the record's username must be the intent's and it must not have
+/// expired. Nothing the caller supplies can widen the export past the account.
+pub async fn file_export(store: &Store, session: &str, username: &str) -> Result<String, String> {
+    let id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({
+        "id": id,
+        "kind": "export",
+        "filed_at": crate::util::filed_at(),
+        "username": username,
+        "session": session,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    store
+        .write_record("intents", &format!("{id}.json"), &bytes)
+        .await?;
+    Ok(id)
 }
 
 /// File one decision, as a link's click or the console does.

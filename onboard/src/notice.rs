@@ -36,6 +36,13 @@ fn message(from: &str, to: &str, subject: &str, body: &str) -> String {
 
 /// Enqueue one message through the enqueuer the config names.
 pub async fn enqueue(cfg: &DrainConfig, to: &str, subject: &str, body: &str) -> Result<(), String> {
+    enqueue_raw(cfg, &message(&cfg.from, to, subject, body)).await
+}
+
+/// Enqueue an already-built message. The plain path builds one through
+/// [`message`]; the export's encrypted attachment needs the whole MIME body,
+/// which is not a thing `message` can say.
+async fn enqueue_raw(cfg: &DrainConfig, raw: &str) -> Result<(), String> {
     let mut child = Command::new(&cfg.sendmail)
         .arg("-i")
         .arg("-t")
@@ -46,7 +53,7 @@ pub async fn enqueue(cfg: &DrainConfig, to: &str, subject: &str, body: &str) -> 
         .map_err(|e| format!("cannot start {}: {e}", cfg.sendmail))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
-            .write_all(message(&cfg.from, to, subject, body).as_bytes())
+            .write_all(raw.as_bytes())
             .await
             .map_err(|e| format!("cannot write to {}: {e}", cfg.sendmail))?;
         stdin
@@ -148,7 +155,13 @@ pub async fn send_again(
     record_and_enqueue(cfg, store, username, notice_type, subject, to, body).await
 }
 
-async fn record_and_enqueue(
+/// Record a notice and enqueue it with one file attached, already encrypted to
+/// the member's public key. The export's mailed path is the case: the written
+/// part leaves as an attachment the member opens with the key they hold, and
+/// the plain body is the written answer. The line is recorded before the send,
+/// as every other notice's is.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_account_notice_attachment(
     cfg: &DrainConfig,
     store: &Store,
     username: &str,
@@ -156,6 +169,48 @@ async fn record_and_enqueue(
     subject: &str,
     to: &str,
     body: &str,
+    filename: &str,
+    attachment: &[u8],
+) -> Result<(), String> {
+    record(store, username, notice_type, subject, to).await?;
+    enqueue_raw(
+        cfg,
+        &attachment_message(&cfg.from, to, subject, body, filename, attachment),
+    )
+    .await
+}
+
+/// The RFC 5322 message for a plain body with one attachment. The attachment is
+/// armored ciphertext, so 7bit is honest and no base64 layer is needed; the
+/// armor's lines are sixty-four characters, well inside the 998 the standard
+/// allows.
+fn attachment_message(
+    from: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+    filename: &str,
+    attachment: &[u8],
+) -> String {
+    format!(
+        "From: {from}\nTo: {to}\nSubject: {subject}\nMIME-Version: 1.0\n\
+         Content-Type: multipart/mixed; boundary=\"kyriakon-export\"\n\n\
+         --kyriakon-export\nContent-Type: text/plain; charset=utf-8\n\n{body}\n\
+         --kyriakon-export\nContent-Type: application/pgp-encrypted; name=\"{filename}\"\n\
+         Content-Disposition: attachment; filename=\"{filename}\"\n\
+         Content-Transfer-Encoding: 7bit\n\n{attachment}\n--kyriakon-export--\n",
+        attachment = String::from_utf8_lossy(attachment),
+    )
+}
+
+/// Append one notice line. Every sender records before it enqueues, so a crash
+/// between the two loses an email rather than sending a duplicate on a retry.
+async fn record(
+    store: &Store,
+    username: &str,
+    notice_type: &str,
+    subject: &str,
+    to: &str,
 ) -> Result<(), String> {
     let line = Notice {
         version: 1,
@@ -173,7 +228,19 @@ async fn record_and_enqueue(
             store.dir_owner("accounts"),
             0o640,
         )
-        .await?;
+        .await
+}
+
+async fn record_and_enqueue(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+    notice_type: &str,
+    subject: &str,
+    to: &str,
+    body: &str,
+) -> Result<(), String> {
+    record(store, username, notice_type, subject, to).await?;
     enqueue(cfg, to, subject, body).await
 }
 
@@ -227,6 +294,8 @@ mod tests {
             rates: dir.join("rates/xmr-gbp.json").to_str().unwrap().to_string(),
             rate_endpoint: "https://rates.example.invalid/simple/price".to_string(),
             rates_fetch: "/usr/bin/true".to_string(),
+            gpg: "/usr/bin/true".to_string(),
+            public_root: "/home/www".to_string(),
         }
     }
 

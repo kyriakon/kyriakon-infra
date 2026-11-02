@@ -1099,10 +1099,12 @@ async fn http(app: &App, request: &Request, incoming: &Incoming) -> Reply {
         return account_close(app, request).await;
     }
     if incoming.path == "account" {
-        return if get {
-            account(app, request).await
-        } else {
-            method_not_allowed()
+        return match (get, method) {
+            (true, _) => account(app, request).await,
+            // "Take my data out": the only POST the page takes today. It files
+            // the export intent and nothing else.
+            (false, "POST") => account_export(app, request).await,
+            _ => method_not_allowed(),
         };
     }
     if incoming.path.is_empty() {
@@ -1922,6 +1924,48 @@ async fn account_close(app: &App, request: &Request) -> Reply {
             Reply::html(200, page_html(&notice("Closing your account", &message)))
         }
         Err(e) => server_error(&format!("the closure could not be filed: {e}")),
+    }
+}
+
+/// The member a request's live session names, with the account it names. The
+/// page's actions use it: `REMOTE_USER` is not an identity here, because no
+/// HTTP authentication is configured for the host.
+async fn session_member(app: &App, request: &Request) -> Option<Account> {
+    let cookie = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE)?;
+    let member = session::lookup(&app.store, &cookie, OffsetDateTime::now_utc()).await?;
+    account_record(app, &member.username).await
+}
+
+/// "Take my data out": file the export intent for the account the session names.
+/// The handler holds no privilege and does nothing but file it; the drain writes
+/// the bundle into the member's own chroot within its next minute. A request
+/// with no live session files nothing.
+async fn account_export(app: &App, request: &Request) -> Reply {
+    let form = fields(&String::from_utf8_lossy(&request.body));
+    if form.get("action").map(String::as_str) != Some("export") {
+        return method_not_allowed();
+    }
+    let Some(account) = session_member(app, request).await else {
+        return refused("Sign in to the account you want to export.");
+    };
+    let cookie = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE);
+    let Some(session_id) = cookie.as_deref().and_then(session::id) else {
+        return refused("Sign in to the account you want to export.");
+    };
+    match crate::intents::file_export(&app.store, session_id, &account.username).await {
+        Ok(_) => {
+            let page = notice(
+                "Your data export is on its way",
+                "The platform is gathering the written record of your account. It will \
+                 appear in your sftp space as export/<timestamp>/ beside www/ and \
+                 gemini/, and a notice will say when it is ready.",
+            );
+            Reply::html(200, page_html(&page))
+        }
+        Err(e) => {
+            eprintln!("kyriakon-onboard: the export intent: {e}");
+            Reply::html(500, String::new())
+        }
     }
 }
 

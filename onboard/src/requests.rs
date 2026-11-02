@@ -62,8 +62,8 @@ pub struct RequestLine {
     pub done: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub done_at: Option<String>,
-    /// How an export was delivered, where there was one. The export ticket
-    /// fills it; the console has no flag for it.
+    /// How an export was delivered, where there was one. `onboardctl export
+    /// --request <id>` fills it through `set_bundle`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bundle: Option<String>,
 }
@@ -384,6 +384,28 @@ async fn rewrite(
         .write_record(&account_dir(&username), "requests.jsonl", bytes.as_bytes())
         .await?;
     Ok(lines[at].clone())
+}
+
+/// Record how an export was delivered on the request's own line, under the same
+/// lock a close takes. The account is checked against the line the id names, so
+/// a mistyped id cannot write one member's delivery onto another's request.
+pub async fn set_bundle(
+    store: &Store,
+    id: &str,
+    username: &str,
+    bundle: &str,
+) -> Result<RequestLine, String> {
+    rewrite(store, id, |line| {
+        if line.username != username {
+            return Err(format!(
+                "the request {id} belongs to {}, not {username}",
+                line.username
+            ));
+        }
+        line.bundle = Some(bundle.to_string());
+        Ok(())
+    })
+    .await
 }
 
 /// Write what was done onto the request's own line, and return the closed line.

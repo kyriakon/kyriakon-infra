@@ -5898,6 +5898,98 @@ pub async fn free_anniversaries(cfg: &DrainConfig, store: &Store) -> Result<(), 
     Ok(())
 }
 
+/// Carry out one export intent: the page's "Take my data out", filed by the
+/// handler with the account the session belongs to and nothing else.
+///
+/// The bundle is written into the member's own chroot and the ready notice is
+/// appended in the same pass. The journal line names the application the account
+/// was approved from when the copy is still inside ADR 0005's purge; an export
+/// after the purge has no status token left to name and journals none.
+pub async fn export_account(
+    cfg: &DrainConfig,
+    store: &Store,
+    value: &Value,
+    file: &str,
+) -> Result<(), String> {
+    let username = value
+        .get("username")
+        .and_then(Value::as_str)
+        .ok_or("the export intent names no account")?;
+    if let Some(why) = validate::username_shape(username) {
+        return Err(format!("the export intent's username {username:?}: {why}"));
+    }
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| file.trim_end_matches(".json").to_string());
+    // The handler is unprivileged and `intents/` is its to write, so the
+    // session it filed is proved here against the server-side record before
+    // root writes anything: the record's account must be this one and the
+    // session must not have expired. A forger who files a name of their own
+    // gets a refusal, never a bundle.
+    let session = value
+        .get("session")
+        .and_then(Value::as_str)
+        .ok_or("the export intent names no session")?;
+    crate::intents::verify_session(store, session, username).await?;
+    // The spec records one `requests.jsonl` line per data-subject request, and
+    // a page-filed export is one. It is written before the answer, keyed by the
+    // intent's own id so a retry after a failed pass does not append a second
+    // request for the same ask.
+    let recorded = store
+        .lines(&format!("accounts/{username}/requests.jsonl"))
+        .await
+        .iter()
+        .filter_map(|line| serde_json::from_str::<crate::requests::RequestLine>(line).ok())
+        .any(|line| line.id == id);
+    if !recorded {
+        let received = crate::util::date_string(crate::requests::today());
+        crate::requests::record(
+            store,
+            crate::requests::NewRequest {
+                username,
+                kind: "access",
+                received: &received,
+                // The session is the page's whole claim, and it was opened by
+                // the password check the runbook names.
+                evidence: "the account page's password check",
+                note: Some("export filed from the account page"),
+                identity_at: None,
+                fee_at: None,
+                id: Some(id.as_str()),
+            },
+        )
+        .await?;
+    }
+    let status_token = store
+        .read_record(&format!("accounts/{username}"), "application.json")
+        .await
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|copy| {
+            copy.get("status_token")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let bundle = crate::export::deliver(cfg, store, username).await?;
+    let application = ApplicationRef {
+        username: username.to_string(),
+        status_token,
+    };
+    journal(
+        store,
+        &cfg.release,
+        &id,
+        "export",
+        &application,
+        "applied",
+        Some(&format!("the bundle is at {bundle}")),
+    )
+    .await?;
+    store.remove("intents", file).await
+}
+
 /// Clear away every declined application whose week is up, and release the
 /// username. Run once per drain pass, after the intents: this is what carries
 /// the decline's week out without the application being touched again.
@@ -7506,6 +7598,8 @@ mod tests {
                 .to_string(),
             rate_endpoint: "https://rates.example.invalid/simple/price".to_string(),
             rates_fetch: dir.join("bin/curl").to_str().unwrap().to_string(),
+            gpg: "gpg".to_string(),
+            public_root: dir.join("home/www").to_str().unwrap().to_string(),
         }
     }
 

@@ -196,6 +196,14 @@ pub async fn prune(store: &Store, now: OffsetDateTime) {
     }
 }
 
+/// The session id inside a cookie, without verifying it. A caller that needs
+/// the id the drain will check (the export intent) reads it here; the record
+/// behind it is what proves the session, and the drain verifies that.
+pub fn id(cookie: &str) -> Option<&str> {
+    let (id, _) = cookie.split_once('.')?;
+    crate::store::is_status_token(id).then_some(id)
+}
+
 /// Remove the session a cookie names. A cookie that names nothing is a no-op:
 /// logging out twice is not an error.
 pub async fn close(store: &Store, cookie: &str) {

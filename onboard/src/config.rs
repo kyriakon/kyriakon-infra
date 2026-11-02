@@ -227,6 +227,22 @@ pub struct DrainConfig {
     /// a test stubs it and never touches the network, and because cron's PATH is
     /// not where a package's binary lives.
     pub rates_fetch: String,
+    /// The OpenPGP implementation the export encrypts a written part to a
+    /// member's key with: `gpg`, by path. The same binary `kyriakon-encrypt`
+    /// runs, named here because cron's PATH is not where a package's binary
+    /// lives and a test needs to point at it rather than inherit one.
+    pub gpg: String,
+    /// Where the members' public trees live: `/home/www` on the box, where
+    /// `scripts/provision-member.sh` builds `<username>.kyriakon.net`. The
+    /// export writes its bundle under that chroot, so the destination is a
+    /// value a test can point at a fixture tree. Absent from a config written
+    /// before the export existed, which reads the deployed path.
+    #[serde(default = "public_root")]
+    pub public_root: String,
+}
+
+fn public_root() -> String {
+    "/home/www".to_string()
 }
 
 impl DrainConfig {
@@ -361,7 +377,8 @@ mod tests {
              quota_mount = \"/home\"\n\
              rates = \"/var/db/onboard/rates/xmr-gbp.json\"\n\
              rate_endpoint = \"https://api.coingecko.com/api/v3/simple/price?ids=monero&vs_currencies=gbp&include_last_updated_at=true\"\n\
-             rates_fetch = \"/usr/local/bin/curl\"\n";
+             rates_fetch = \"/usr/local/bin/curl\"\n\
+             gpg = \"/usr/local/bin/gpg\"\n";
         let c: DrainConfig = toml::from_str(text).unwrap();
         assert_eq!(c.price_gbp, "20.00");
         assert_eq!(c.scripts, "/root/bin");

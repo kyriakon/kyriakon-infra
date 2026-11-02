@@ -37,6 +37,7 @@
 //!       (--close | --excess) [--rate <gbp-per-xmr>]
 //!   kyriakon-onboardctl [--config PATH] refund (--token <t> | --username <u>) \
 //!       --settled <YYYY-MM-DD>
+//!   kyriakon-onboardctl [--config PATH] export <username> [--by-mail] [--request <id>]
 //!   kyriakon-onboardctl [--config PATH] show <username>
 //!   kyriakon-onboardctl [--config PATH] free
 //!   kyriakon-onboardctl request list
@@ -57,6 +58,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use kyriakon_onboard::config::DrainConfig;
+use kyriakon_onboard::export;
 use kyriakon_onboard::intents;
 use kyriakon_onboard::prepaid;
 use kyriakon_onboard::requests;
@@ -118,6 +120,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         "monero" => monero(&store, &rest[1..]).await,
         "refund" => refund(&cfg, &store, &rest[1..]).await,
         "ledger" => ledger(&store, &rest[1..]).await,
+        "export" => export(&cfg, &store, &rest[1..]).await,
         "show" => show(&store, one_username(rest)?).await,
         "delete" => delete(&cfg, &store, rest).await,
         "free" => free(&store, &rest[1..]).await,
@@ -161,6 +164,7 @@ fn usage() -> String {
      --settled <YYYY-MM-DD>
        kyriakon-onboardctl ledger export --tax-year <YYYY-YY|YYYY-YYYY> \
      --format csv
+       kyriakon-onboardctl export <username> [--by-mail] [--request <id>]
        kyriakon-onboardctl address --domain <domain> \
      --action <add-alias|add-mailbox|upgrade|remove> --mailbox <account> \
      [--address <localpart>] [--key-file <path>] [--site-owner <account>]
@@ -780,6 +784,48 @@ async fn ledger(store: &Store, args: &[String]) -> Result<(), String> {
             .map(|field| csv_cell(&cell(&row[*field])))
             .collect();
         println!("{}", cells.join(","));
+    }
+    Ok(())
+}
+
+/// `export <username>`: the written part of the member's data export.
+///
+/// It goes into the member's own sftp chroot, with a ready notice, because that
+/// is the delivery path they already have. `--by-mail` is the member who cannot
+/// log in but still holds their key: the same written part, as one attachment
+/// encrypted to that public key. `--request <id>` records how the bundle was
+/// delivered on the data-subject request line that asked for it.
+///
+/// Root's, like the request verbs: it reads one account's directory and writes
+/// into the member's home. It never reads the Maildir, which it could not read
+/// anyway.
+async fn export(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), String> {
+    let Some(username) = args.first().map(String::as_str) else {
+        return Err(usage());
+    };
+    if username.starts_with("--") {
+        return Err(usage());
+    }
+    if let Some(why) = validate::username_shape(username) {
+        return Err(format!("the username {username:?}: {why}"));
+    }
+    let rest = &args[1..];
+    let by_mail = rest.iter().any(|arg| arg == "--by-mail");
+    let paired: Vec<String> = rest
+        .iter()
+        .filter(|arg| arg.as_str() != "--by-mail")
+        .cloned()
+        .collect();
+    let flags = flags(&paired, &["request"])?;
+    let delivered = if by_mail {
+        export::deliver_by_mail(cfg, store, username).await?
+    } else {
+        export::deliver(cfg, store, username).await?
+    };
+    println!("{username}: {delivered}");
+    if let Some(id) = flags.get("request") {
+        let line = requests::set_bundle(store, id, username, &delivered).await?;
+        println!("request {}: bundle recorded", line.id);
     }
     Ok(())
 }

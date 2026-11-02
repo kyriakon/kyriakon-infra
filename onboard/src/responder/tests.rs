@@ -1096,6 +1096,55 @@ async fn the_reading_half_files_nothing() {
     );
 }
 
+/// "Take my data out" files an export intent for the account the request is
+/// authenticated as, and changes nothing else a member holds. A request with no
+/// authenticated account files nothing.
+#[tokio::test]
+async fn the_account_pages_export_action_files_an_intent_for_the_session_account() {
+    let (app, dir) = handler("account-export").await;
+    file_account(&dir);
+    let before = std::fs::read(dir.join("accounts/alice/account.json")).unwrap();
+
+    let cookie = signed_in(&app, "alice").await;
+    let (code, body) = answer(
+        &app,
+        &httpd_post_with("account", "action=export", Some(&cookie), None),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("Your data export is on its way"), "{body}");
+
+    let intents: Vec<PathBuf> = std::fs::read_dir(dir.join("intents"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    assert_eq!(intents.len(), 1, "one intent was filed");
+    let filed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&intents[0]).unwrap()).unwrap();
+    assert_eq!(filed["kind"], "export");
+    assert_eq!(filed["username"], "alice");
+    assert_eq!(
+        filed["session"],
+        cookie.split('.').next().unwrap(),
+        "the session the drain will verify"
+    );
+    // The account directory is the drain's to change, not this route's.
+    assert_eq!(
+        std::fs::read(dir.join("accounts/alice/account.json")).unwrap(),
+        before
+    );
+
+    // Without a session there is nobody the export could belong to, so nothing
+    // is filed.
+    let (code, _) = answer(&app, &httpd_post("account", "action=export")).await;
+    assert_eq!(code, 403);
+    assert_eq!(
+        std::fs::read_dir(dir.join("intents")).unwrap().count(),
+        1,
+        "no second intent"
+    );
+}
+
 #[tokio::test]
 async fn the_capsule_serves_each_mirrored_page_as_gemtext() {
     let (app, _dir) = handler("gmid-pages").await;
@@ -1160,8 +1209,8 @@ async fn a_path_neither_front_end_serves_is_refused_in_its_own_way() {
     assert_eq!(code, 404);
     assert!(body.starts_with("Status: 404 Not Found\r\n"), "{body}");
 
-    let (code, _body) = answer(&app, &httpd_post("/account", "username=x")).await;
-    assert_eq!(code, 405, "the account page is not a submission");
+    let (code, _body) = answer(&app, &httpd_post("/nonsense", "")).await;
+    assert_eq!(code, 404, "an unserved path answers 404 to a post too");
 
     let (code, body) = answer(&app, &gmid_get("nonsense", "")).await;
     assert_eq!(code, 51, "a capsule page that does not exist");
