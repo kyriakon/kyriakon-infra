@@ -5032,8 +5032,15 @@ pub async fn refresh_space_used(cfg: &DrainConfig, store: &Store) -> Result<(), 
     // in the report is left alone: an empty or unrelated report must not write a
     // zero over a real figure.
     for name in store.list("groups").await? {
-        let Some(mut group) = group_record(store, &name).await? else {
-            continue;
+        // One bad group record is reported and skipped: the other groups, and
+        // the sweeps after this one, still run.
+        let mut group = match group_record(store, &name).await {
+            Ok(Some(group)) => group,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("kyriakon-onboard: reading {name}'s quota: {e}");
+                continue;
+            }
         };
         if !group
             .accounts
