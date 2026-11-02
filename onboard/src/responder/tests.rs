@@ -648,6 +648,29 @@ async fn a_group_member_reads_the_same_recipe_on_both_account_pages() {
     // never another member's recipe.
     let (_, anonymous) = answer(&app, &httpd_get("account", "")).await;
     assert!(!anonymous.contains("mail._domainkey"), "{anonymous}");
+
+    // While the group's year is unpaid, any mailbox holder sees the one payment
+    // reference and the day its window closes, because the billing lives on the
+    // group rather than on their account.
+    let path = dir.join("groups/parish.example/group.json");
+    let mut group: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    group["payment"]["paid_until"] = serde_json::Value::Null;
+    group["payment"]["token_ref"] = serde_json::json!("KYR-AAAA-BBBB-CCCC");
+    group["payment"]["window"] = serde_json::json!({
+        "opened_at": "2026-10-01T09:00:00Z",
+        "closes_at": "2026-10-15T09:00:00Z",
+        "state": "open",
+        "extensions": 0
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+    let (_, capsule) = answer(&app, &gmid_certificate("account", "", &pinned)).await;
+    let (_, web) = answer(&app, &httpd_get_session("account", "", &cookie)).await;
+    for page in [&capsule, &web] {
+        assert!(page.contains("KYR-AAAA-BBBB-CCCC"), "{page}");
+        assert!(page.contains("closes on 2026-10-15"), "{page}");
+        assert!(page.contains("lapses together"), "{page}");
+    }
 }
 
 /// A fixture account's record, changed in place: the tests below set one fact

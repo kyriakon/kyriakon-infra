@@ -287,6 +287,15 @@ pub fn account(
         if let Some(until) = &g.paid_until {
             out.push_str(&format!("Paid until {until}.\n"));
         }
+        if let Some(token) = &g.token {
+            out.push_str(&format!("Your payment reference is {token}.\n"));
+            if let Some(closes) = &g.window_closes {
+                out.push_str(&format!(
+                    "The payment window closes on {closes}. If nothing arrives, the whole \
+                     group lapses together.\n"
+                ));
+            }
+        }
         out.push_str(&format!(
             "The group's mailboxes: {}.\n",
             g.accounts.join(", ")

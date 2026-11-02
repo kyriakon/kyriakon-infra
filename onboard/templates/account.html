@@ -87,6 +87,12 @@
 {% if let Some(until) = g.paid_until %}
 <p>Paid until {{ until }}.</p>
 {% endif %}
+{% if let Some(token) = g.token %}
+<p>Your payment reference is <span class="mono">{{ token }}</span>.</p>
+{% if let Some(closes) = g.window_closes %}
+<p>The payment window closes on {{ closes }}. If nothing arrives, the whole group lapses together: mail keeps arriving and everything published stays up, and sending, uploading and pushing stop.</p>
+{% endif %}
+{% endif %}
 <p>The group's mailboxes: {% for a in g.accounts %}<span class="mono">{{ a }}</span>{% if !loop.last %}, {% endif %}{% endfor %}.</p>
 {% if let Some(used) = g.space_used %}
 <p>Space used by the group: {{ used }} of its {{ g.allowance }}.</p>

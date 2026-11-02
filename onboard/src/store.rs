@@ -770,13 +770,23 @@ pub struct GroupAddress {
 }
 
 /// The payment block `groups/<domain>/group.json` carries: the rail the
-/// application chose, whether it was approved without charge, the date the
-/// group's single renewal sets, and the card rail's subscription once one is
-/// attached. The group holds the payment for every mailbox in it.
+/// application chose, whether it was approved without charge, the one token a
+/// prepaid renewal is keyed by, the one window the money must arrive in, the
+/// date the group's single renewal sets, and the card rail's subscription once
+/// one is attached. The group holds the payment for every mailbox in it, so one
+/// renewal cannot leave several dates that drift.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GroupPayment {
     pub rail: String,
     pub no_charge: bool,
+    /// The group's one payment token, drawn when a charged group is approved.
+    /// Absent on a free group, which has nothing to pay and nothing to key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_ref: Option<String>,
+    /// The one window the prepaid rail's money must arrive in. Absent on a free
+    /// group, and absent from a record written before the group held a window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<Window>,
     pub paid_until: Option<String>,
     /// The card rail's subscription, when one is attached. Absent on a prepaid
     /// or free group, and absent from a record written before the webhook pass.
@@ -1072,13 +1082,20 @@ pub struct Window {
     pub extensions: u32,
 }
 
-/// `tokens/<token>.json`, the join from a token to an account. Created at a paid
-/// approval and deleted with the account, which is what makes the ledger's row
-/// unlinkable.
+/// `tokens/<token>.json`, the join from a token to what it pays for. Created at
+/// a paid approval and deleted with the account or group, which is what makes
+/// the ledger's row unlinkable.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenRecord {
     pub token: String,
+    /// The account the token pays for, or the group's site owner when the token
+    /// is a group's.
     pub username: String,
+    /// The domain, when this is the one token a body's group holds. The join is
+    /// to the group rather than to one of its accounts, so one renewal writes
+    /// one date on the group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     pub issued_at: String,
     pub window_closes_at: String,
     pub state: String,

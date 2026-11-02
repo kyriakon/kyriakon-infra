@@ -311,10 +311,25 @@ async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
                 .ok_or_else(|| format!("no account for {username}"))?;
             let account: kyriakon_onboard::store::Account = serde_json::from_str(&text)
                 .map_err(|e| format!("the account record does not parse: {e}"))?;
-            account
-                .payment_state()
-                .and_then(|p| p.token_ref)
-                .ok_or_else(|| format!("{username} has no payment token to credit"))?
+            match account.payment_state().and_then(|p| p.token_ref) {
+                Some(token) => token,
+                // A group mailbox holds no payment of its own: its name
+                // resolves to the one token the whole body is credited by, the
+                // same join the group's page and its renewal use.
+                None => match account.group.as_deref() {
+                    Some(domain) => {
+                        let group = transitions::group_record(store, domain)
+                            .await?
+                            .ok_or_else(|| format!("no group record for {domain}"))?;
+                        group.payment.token_ref.ok_or_else(|| {
+                            format!("the group {domain} has no payment token to credit")
+                        })?
+                    }
+                    None => {
+                        return Err(format!("{username} has no payment token to credit"));
+                    }
+                },
+            }
         }
         (Some(_), Some(_), None) => {
             return Err("give either --token or --username, not both".to_string())
@@ -1182,10 +1197,34 @@ async fn payment(store: &Store, args: &[String]) -> Result<(), String> {
         .ok_or_else(|| format!("no account for {username}"))?;
     let account: store::Account = serde_json::from_str(&text)
         .map_err(|e| format!("the account record does not parse: {e}"))?;
-    let Some(payment) = account.payment_state() else {
-        return Err(format!(
-            "{username} was approved without charge, so there is no payment to show"
-        ));
+    // A group mailbox holds no payment block: the group holds the one rail, the
+    // one token and the one date, so a mailbox's name prints those.
+    let payment = match account.payment_state() {
+        Some(payment) => payment,
+        None => match account.group.as_deref() {
+            Some(domain) => {
+                let group = transitions::group_record(store, domain)
+                    .await?
+                    .ok_or_else(|| format!("no group record for {domain}"))?;
+                if group.payment.no_charge {
+                    return Err(format!(
+                        "{domain} was approved without charge, so there is no payment to show"
+                    ));
+                }
+                store::Payment {
+                    token_ref: group.payment.token_ref.clone(),
+                    paid_until: group.payment.paid_until.clone(),
+                    window: group.payment.window.clone(),
+                    rail: Some(group.payment.rail.clone()),
+                    ..store::Payment::default()
+                }
+            }
+            None => {
+                return Err(format!(
+                    "{username} was approved without charge, so there is no payment to show"
+                ));
+            }
+        },
     };
     let Some(token) = payment.token_ref.as_deref() else {
         return Err(format!("{username} has no payment token"));
@@ -1266,12 +1305,34 @@ async fn show(store: &Store, username: &str) -> Result<(), String> {
             println!("  state    {}", account.state);
             println!("  decision {}", account.decision);
             // A group mailbox holds no payment of its own: the group does. The
-            // payment block is absent for exactly that reason, and printing
-            // "no charge" would answer a money question wrongly.
+            // console prints the group's one rail, token, window and date, which
+            // is what the body's page shows too.
             if let Some(group) = &account.group {
                 println!("  group    {group}");
-                println!("  token    held by the group");
-                println!("  paid     held by the group, in groups/{group}/group.json");
+                let Some(text) = store
+                    .read_record(&format!("groups/{group}"), "group.json")
+                    .await
+                else {
+                    println!("  payment  no group record at groups/{group}/group.json");
+                    return Ok(());
+                };
+                let record: store::GroupRecord = serde_json::from_str(&text)
+                    .map_err(|e| format!("the group record does not parse: {e}"))?;
+                let payment = &record.payment;
+                println!("  rail     {}", payment.rail);
+                let paid = match (&payment.paid_until, &payment.window) {
+                    (Some(until), _) => until.as_str(),
+                    (None, Some(_)) => "null: the window is open",
+                    (None, None) => "null: no window was opened",
+                };
+                println!("  paid     {paid}");
+                println!(
+                    "  token    {}",
+                    payment.token_ref.as_deref().unwrap_or("none (no charge)")
+                );
+                if let Some(w) = &payment.window {
+                    println!("  window   {} to {}", w.opened_at, w.closes_at);
+                }
                 return Ok(());
             }
             // A free account has no payment block at all: no window, no token,
