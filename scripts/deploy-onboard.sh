@@ -465,18 +465,19 @@ install -d -m 0755 "$scripts_dir"
 for s in $drain_scripts; do
 	install_staged "$repo_dir/scripts/$s" "$scripts_dir/$s" -m 0755
 done
-# The drain's scripts source lib.sh only from inside --self-test, so the live path
-# keeps no dependency on it. It is installed here for the same reason the scripts
-# are: so one of them can answer --self-test on the box, where the checkout may
-# be older than this deploy.
-install -m 0755 "$repo_dir/scripts/lib.sh" "$scripts_dir/lib.sh"
+# Every drain script sources lib.sh on its live path now, for install_staged and
+# the shared helpers, so it is installed beside them. This is the one install
+# whose helper is the file being installed: the copy in the checkout is what
+# runs, and the temp-then-rename still means a run killed mid-copy leaves the
+# installed copy whole.
+install_staged "$repo_dir/scripts/lib.sh" "$scripts_dir/lib.sh" -m 0755
 install -d -m 0755 "$scripts_root/openbsd/etc/login.conf.d"
 install -m 0644 "$repo_dir/$drain_class" "$scripts_root/openbsd/etc/login.conf.d/member"
 install -m 0644 "$repo_dir/$drain_lapsed_class" "$scripts_root/openbsd/etc/login.conf.d/lapsed"
-# Before the unit starts, every script the drain names must be executable. A
-# missing one is the drain's first intent failing at cron, which is how this gap
-# was found.
-for s in $drain_scripts; do
+# Before the unit starts, every script the drain names must be executable, and so
+# must lib.sh, which they source. A missing one is the drain's first intent
+# failing at cron, which is how this gap was found.
+for s in $drain_scripts lib.sh; do
 	[ -x "$scripts_dir/$s" ] || die "$scripts_dir/$s is not executable"
 done
 printf 'drain scripts installed in %s\n' "$scripts_dir"

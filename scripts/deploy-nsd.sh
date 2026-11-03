@@ -125,7 +125,10 @@ install_rendered() {
 		printf 'could not render %s; %s left as it was\n' "$rendered_src" "$rendered_dst" >&2
 		return 1
 	fi
-	install_staged "$rendered_tmp" "$rendered_dst" -m "$rendered_mode"
+	if ! install_staged "$rendered_tmp" "$rendered_dst" -m "$rendered_mode"; then
+		rm -f "$rendered_tmp"
+		return 1
+	fi
 	rm -f "$rendered_tmp"
 }
 

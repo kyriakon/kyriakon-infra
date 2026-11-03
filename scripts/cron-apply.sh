@@ -267,38 +267,38 @@ restore_keypairs() {
 	mv "$relayd_conf.saved.$$" "$relayd_conf"
 }
 
-# take_web_lock: mkdir is the atomic test-and-set available in base, and the
-# takeover rule is acme-queue.sh's: a lock left by a pass that died is taken over
-# once its pid is gone, so a reboot cannot wedge the web lane. Returns 1 when a
-# live pass holds it, which is the one case the caller does nothing in: that pass
-# writes every index and reloads, so a second pass restoring a saved copy could
-# drop a keypair the first one just wrote.
+# take_web_lock: the lock is one file created with noclobber, so a create only
+# succeeds when no lock file exists and the old mkdir-plus-pid pair cannot be
+# observed half-built. The takeover rule is acme-queue.sh's: a lock whose pid is
+# gone, or whose contents are not a live pid at all, is removed and the create
+# is retried, so a reboot cannot wedge the web lane. Returns 1 with the holder's
+# pid on stderr when a live pass owns it: the caller has to retry, because that
+# pass writes the indexes and this one would otherwise report success having
+# written none of them.
 take_web_lock() {
 	typeset holder
 	mkdir -p "$state_dir" \
 		|| die "could not create $state_dir, so no index was rewritten"
-	if ! mkdir -m 0700 "$web_lock" 2>/dev/null; then
-		holder=$(cat "$web_lock/pid" 2>/dev/null || true)
+	if ! (set -C; printf '%s\n' "$$" > "$web_lock") 2>/dev/null; then
+		holder=$(cat "$web_lock" 2>/dev/null || true)
 		if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+			printf 'another --web pass holds %s (pid %s); retry when it has finished\n' \
+				"$web_lock" "$holder" >&2
 			return 1
 		fi
-		rm -f "$web_lock/pid"
-		rmdir "$web_lock" 2>/dev/null || true
-		mkdir -m 0700 "$web_lock" 2>/dev/null \
+		rm -f "$web_lock"
+		(set -C; printf '%s\n' "$$" > "$web_lock") 2>/dev/null \
 			|| die "could not take $web_lock, and no live process holds it"
 	fi
-	printf '%s\n' "$$" > "$web_lock/pid"
 	return 0
 }
 
 release_web_lock() {
 	[ -n "${web_lock:-}" ] || return 0
-	# Only a lock this process took. The takeover-failure arm never reaches a
-	# state where the pid file is ours, and removing another pass's lock would
-	# be the second writer this exists to prevent.
-	[ "$(cat "$web_lock/pid" 2>/dev/null || true)" = "$$" ] || return 0
-	rm -f "$web_lock/pid"
-	rmdir "$web_lock" 2>/dev/null || true
+	# Only a lock this process wrote. Removing another pass's lock would be the
+	# second writer this exists to prevent.
+	[ "$(cat "$web_lock" 2>/dev/null || true)" = "$$" ] || return 0
+	rm -f "$web_lock"
 }
 
 apply_web() {
@@ -306,8 +306,10 @@ apply_web() {
 	acme_changed=""
 	keypairs_changed=no
 	# A check writes nothing, so it needs no lock and must not block a live pass.
+	# A pass that loses the lock exits non-zero: the holder writes the indexes,
+	# and this pass has not, so the caller must retry rather than settle.
 	if [ "$check_only" = no ]; then
-		take_web_lock || return 0
+		take_web_lock || return 1
 	fi
 	# The relayd region, from the same directory, rendered before any index is
 	# written. A render that fails dies inside regen_keypairs, and doing it first
@@ -563,9 +565,8 @@ EOF
 	check "and no saved copy is left" "$([ -e "$1" ] && printf yes || printf no)" no
 
 	# Two concurrent --web passes must not drop each other's keypair. The second
-	# pass writes nothing at all while a live pid holds the lock: if it did, its
-	# restore step could put back the saved index and relayd.conf from before the
-	# first pass's work, which is the keypair the first one just wrote.
+	# pass writes nothing while a live pid holds the lock, and it exits non-zero
+	# so the caller retries instead of settling on a pass that wrote no index.
 	cat > "$relayd_conf" <<'EOF'
 http protocol "kyriakon-https" {
 	tls keypair "kyriakon.net"
@@ -574,25 +575,43 @@ http protocol "kyriakon-https" {
 }
 EOF
 	mkdir -p "$state_dir"
-	mkdir -m 0700 "$web_lock"
-	printf '%s\n' "$$" > "$web_lock/pid"
+	printf '%s\n' "$$" > "$web_lock"
 	printf 'server "blocked.example" {}\n' > "$httpd_d/blocked.conf"
 	index_before=$(cat "$httpd_d/index.conf")
-	apply_web > "$tree/locked.out" 2>&1
-	check "a pass that loses the writer lock writes nothing" \
-		"$(wc -l < "$tree/locked.out" | tr -d ' ')" 0
+	code=0
+	apply_web > "$tree/locked.out" 2>&1 || code=$?
+	check "a pass that loses the writer lock is a failure" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and names the holder's pid" \
+		"$(grep -c "(pid $$)" "$tree/locked.out")" 1
+	check "and writes nothing" \
+		"$(grep -vc '(pid ' "$tree/locked.out")" 0
 	check "and leaves the index alone" "$(cat "$httpd_d/index.conf")" "$index_before"
-	check "and leaves the holder's lock alone" \
-		"$([ -f "$web_lock/pid" ] && printf yes || printf no)" yes
+	check "and leaves the holder's lock alone" "$(cat "$web_lock")" "$$"
 
 	# A lock left by a pass that died is taken over, so a reboot or a killed run
 	# cannot wedge the web lane for ever.
-	printf '%s\n' 999999 > "$web_lock/pid"
+	printf '%s\n' 999999 > "$web_lock"
 	apply_web > "$tree/takeover.out" 2>&1
 	check "a dead pass's lock is taken over" \
 		"$(grep -c 'blocked.conf' "$httpd_d/index.conf")" 1
 	check "and the pass releases the lock" \
 		"$([ -e "$web_lock" ] && printf yes || printf no)" no
+
+	# An empty or corrupt lock is a dead holder's too, not one to join. Leaving
+	# it in place would make every later pass read it as live forever.
+	printf 'server "empty-lock.example" {}\n' > "$httpd_d/empty-lock.conf"
+	: > "$web_lock"
+	apply_web > "$tree/empty-lock.out" 2>&1
+	check "an empty lock is taken over" \
+		"$(grep -c 'empty-lock.conf' "$httpd_d/index.conf")" 1
+	check "and released" "$([ -e "$web_lock" ] && printf yes || printf no)" no
+	printf 'not-a-pid\n' > "$web_lock"
+	printf 'server "corrupt-lock.example" {}\n' > "$httpd_d/corrupt-lock.conf"
+	apply_web > "$tree/corrupt-lock.out" 2>&1
+	check "a corrupt lock is taken over" \
+		"$(grep -c 'corrupt-lock.conf' "$httpd_d/index.conf")" 1
+	check "and released" "$([ -e "$web_lock" ] && printf yes || printf no)" no
 
 	check "the checkout-run checks have lines of their own" \
 		"$(line_for check-hygiene.sh | grep -c 'scripts/check-hygiene.sh')" 1
