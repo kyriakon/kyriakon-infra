@@ -8,7 +8,6 @@
 //! until the ticket that understands it lands.
 
 use serde_json::Value;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::config::DrainConfig;
@@ -50,6 +49,15 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
             transitions::report_failure(cfg, store, id, "intent", &e).await;
         }
     }
+    // The login proofs are root's, so this is the half that clears the expired
+    // ones; the handler cannot read the directory and does not try. After the
+    // intents, so a close or export filed with a session that has just run out
+    // reads as expired rather than as a missing proof.
+    crate::session::prune_proofs(
+        std::path::Path::new(&cfg.proof_dir),
+        OffsetDateTime::now_utc(),
+    )
+    .await;
     transitions::purge_declined(cfg, store).await?;
     transitions::purge_closing(cfg, store).await?;
     // The free accounts' yearly note, on the same pass: a free account never
@@ -115,7 +123,7 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
                 .map_err(|e| format!("the password intent does not parse: {e}"))?;
             transitions::set_password(cfg, store, key, intent, file, &value).await
         }
-        "provision-group" => transitions::provision_group(cfg, store, &value, file).await,
+        "provision-group" => transitions::provision_group(cfg, store, key, &value, file).await,
         "group-address" => transitions::group_address(cfg, store, key, &value, file).await,
         "remove-group" => transitions::remove_group(cfg, store, key, &value, file).await,
         "close" => transitions::close_account(cfg, store, &value, file).await,
@@ -511,10 +519,17 @@ pub async fn file_refund(
 /// Whether `id` names a live page session for `username`. The drain runs as
 /// root and the session record lives under the handler's store, so this is the
 /// one check that turns an unsigned intent into work for an authenticated
-/// account. A session for another account and an expired session are refused
-/// with the reason the journal records. The close intent is the first caller;
-/// #498 reuses it.
-pub async fn verify_session(store: &Store, id: &str, username: &str) -> Result<(), String> {
+/// account. The record is not trusted: it only names the proof token that the
+/// root-side login check minted in `proof_dir`, and that file's own username
+/// and expiry decide. A forged record, a session for another account and an
+/// expired one are refused with the reason the journal records. The close
+/// intent is the first caller; #498 reuses it.
+pub async fn verify_session(
+    store: &Store,
+    proof_dir: &std::path::Path,
+    id: &str,
+    username: &str,
+) -> Result<(), String> {
     if !crate::store::is_status_token(id) {
         return Err("the intent carries no usable session id".to_string());
     }
@@ -523,22 +538,8 @@ pub async fn verify_session(store: &Store, id: &str, username: &str) -> Result<(
     };
     let value: Value = serde_json::from_str(&text)
         .map_err(|e| format!("the session record does not parse: {e}"))?;
-    let named = value.get("username").and_then(Value::as_str).unwrap_or("");
-    if named != username {
-        return Err(format!(
-            "the session belongs to {named:?}, not {username:?}"
-        ));
-    }
-    let expires = value
-        .get("expires_at")
-        .and_then(Value::as_str)
-        .ok_or("the session record has no expiry")?;
-    let expires = OffsetDateTime::parse(expires, &Rfc3339)
-        .map_err(|e| format!("the session expiry does not parse: {e}"))?;
-    if OffsetDateTime::now_utc() >= expires {
-        return Err("the session named by the intent has expired".to_string());
-    }
-    Ok(())
+    let proof = value.get("proof").and_then(Value::as_str).unwrap_or("");
+    crate::session::verify_proof(proof_dir, proof, username, OffsetDateTime::now_utc()).await
 }
 
 /// File one `close` intent, as the account page does. The handler has

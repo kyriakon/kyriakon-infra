@@ -84,6 +84,12 @@ pub struct Config {
     /// handler may hold it to render the same link the approval email carries.
     /// `REPLACE_ME` in the repository and substituted at deploy with the rest.
     pub stripe_payment_link: String,
+    /// Where the login check writes one proof per admitted login, and the drain
+    /// reads it back. Root-owned 0700, created by `scripts/deploy-onboard.sh`;
+    /// the handler may pass the path to the checker but cannot write there
+    /// itself. A value so a test points it at a temporary directory.
+    #[serde(default = "proof_dir")]
+    pub proof_dir: String,
 }
 
 impl Config {
@@ -92,6 +98,13 @@ impl Config {
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         toml::from_str(&text).map_err(|e| format!("cannot parse {}: {e}", path.display()))
     }
+}
+
+/// The directory the root-side login check writes its proofs in, and the drain
+/// reads them from. Named once, so the handler and the drain cannot be pointed
+/// at different ones by a default that drifts.
+fn proof_dir() -> String {
+    crate::session::PROOF_DIR.to_string()
 }
 
 /// The drain's own configuration, read once per run from
@@ -231,6 +244,14 @@ pub struct DrainConfig {
     /// a test stubs it and never touches the network, and because cron's PATH is
     /// not where a package's binary lives.
     pub rates_fetch: String,
+    /// Where the login check writes one proof per admitted login, and the drain
+    /// reads it back. Root-owned 0700, created by `scripts/deploy-onboard.sh`:
+    /// the handler writes session records in the store, so the proof has to be
+    /// in a directory the handler cannot write. A value so the tests point it at
+    /// a temporary directory, and absent from a config written before it, which
+    /// reads the deployed path.
+    #[serde(default = "proof_dir")]
+    pub proof_dir: String,
     /// The OpenPGP implementation the export encrypts a written part to a
     /// member's key with: `gpg`, by path. The same binary `kyriakon-encrypt`
     /// runs, named here because cron's PATH is not where a package's binary

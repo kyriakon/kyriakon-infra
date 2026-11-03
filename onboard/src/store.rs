@@ -7,6 +7,7 @@
 //! anything root-owned.
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::fchown;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -118,7 +119,19 @@ impl Store {
         let d = self.root.join(dir);
         let tmp = d.join(format!(".{name}.tmp"));
         let target = d.join(name);
-        let _ = tokio::fs::remove_file(&tmp).await;
+        // A stale temporary this code left is removed and rewritten. A symlink
+        // at that name is not one this code left: the directories it writes into
+        // are the handler's, and a path handed to `chown` there must never be
+        // one the handler can redirect. Refuse it rather than unlink it.
+        if let Ok(md) = tokio::fs::symlink_metadata(&tmp).await {
+            if md.file_type().is_symlink() {
+                return Err(format!(
+                    "a symlink is planted at {}; a record is not written through it",
+                    tmp.display()
+                ));
+            }
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
         let placed = async {
             let mut opts = tokio::fs::OpenOptions::new();
             opts.write(true).create_new(true).mode(mode);
@@ -128,12 +141,16 @@ impl Store {
             if self.sync {
                 f.sync_all().await?;
             }
-            drop(f);
             // chown needs root, and only root ever needs to hand the file to
             // another owner: a test runs as the directory's own owner already.
+            //
+            // The descriptor, not the path: the directory is the handler's, so
+            // a name in it can be replaced between the write and a `chown`, and
+            // root would then follow the replacement. `create_new`/O_NOFOLLOW
+            // closed the open; this closes the window after it.
             if let Some((uid, gid)) = owner {
                 if unsafe { libc::geteuid() } == 0 {
-                    std::os::unix::fs::chown(&tmp, Some(uid), Some(gid))?;
+                    fchown(&f, Some(uid), Some(gid))?;
                 }
             }
             tokio::fs::rename(&tmp, &target).await
@@ -256,7 +273,11 @@ impl Store {
                 .await?;
             if let Some((uid, gid)) = owner {
                 if unsafe { libc::geteuid() } == 0 {
-                    std::os::unix::fs::chown(&p, Some(uid), Some(gid)).map_err(|e| {
+                    // The open descriptor, as `write_record_mode` does: the
+                    // record is appended, never replaced, so the path and the
+                    // file are the same thing only while nobody else can
+                    // rename over it.
+                    fchown(&f, Some(uid), Some(gid)).map_err(|e| {
                         std::io::Error::other(format!(
                             "cannot hand {} to its group: {e}",
                             p.display()
@@ -876,6 +897,11 @@ pub struct GroupIntent {
     /// One mail key per mailbox, keyed by the mailbox it serves.
     #[serde(default)]
     pub mail_keys: Vec<KeyRecord>,
+    /// The HMAC-SHA256 of `sign::group_provision_payload` under the approval
+    /// key. Filed by the approval and verified by the drain, because `intents/`
+    /// and `applications/` are writable by the unprivileged handler and this
+    /// intent makes system accounts as root.
+    pub sig: String,
 }
 
 /// The `group-address` intent: one address change inside a body's group, filed
@@ -1386,6 +1412,62 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
             .collect();
         assert!(leftovers.is_empty(), "left a temporary file");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A symlink planted at the temporary's name is refused, and the file it
+    /// points at keeps its owner, mode and bytes. `write_record_mode` used to
+    /// chown the path after dropping the handle, which is the window this covers.
+    #[tokio::test]
+    async fn a_symlink_at_the_temporary_name_is_refused_and_its_target_untouched() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let dir =
+            std::env::temp_dir().join(format!("onboard-store-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let apps = dir.join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        let target = dir.join("master.passwd");
+        let body = b"root:*:0:0::0:0:Charlie Root:/root:/bin/ksh\n";
+        std::fs::write(&target, body).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = std::fs::metadata(&target).unwrap();
+        symlink(&target, apps.join(".tok.json.tmp")).unwrap();
+
+        let store = Store::new(dir.to_str().unwrap());
+        store
+            .write_record_owned(
+                "applications",
+                "tok.json",
+                b"{\"a\":1}",
+                Some((before.uid(), before.gid())),
+            )
+            .await
+            .expect_err("a planted symlink must be refused");
+        let after = std::fs::metadata(&target).unwrap();
+        assert_eq!(
+            (after.uid(), after.gid(), after.mode() & 0o777),
+            (before.uid(), before.gid(), 0o600)
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+        assert!(!apps.join("tok.json").exists(), "a record was placed");
+
+        // A normal write still lands under the directory's owner, with its mode.
+        std::fs::remove_file(apps.join(".tok.json.tmp")).unwrap();
+        let owner = std::fs::metadata(&apps).unwrap();
+        store
+            .write_record_owned(
+                "applications",
+                "tok.json",
+                b"{\"a\":1}",
+                Some((owner.uid(), owner.gid())),
+            )
+            .await
+            .unwrap();
+        let written = std::fs::metadata(apps.join("tok.json")).unwrap();
+        assert_eq!(
+            (written.uid(), written.gid(), written.mode() & 0o777),
+            (owner.uid(), owner.gid(), 0o600)
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

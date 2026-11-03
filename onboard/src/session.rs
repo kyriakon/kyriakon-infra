@@ -13,7 +13,7 @@
 //! long-lived service key, so the handler still holds no key of its own and a
 //! second process with the store cannot mint a cookie from a username.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
@@ -28,8 +28,17 @@ use crate::store::Store;
 /// The cookie's name.
 pub const COOKIE: &str = "kyriakon_session";
 
-/// How long a session lasts, server-side and in the cookie.
+/// How long a session lasts, server-side and in the cookie. The login check's
+/// proof lives for the same span, so a session cannot outlive the login that
+/// made it.
 pub const TTL_HOURS: i64 = 12;
+
+/// Where the root-side login check writes its proofs: one file per admitted
+/// login, named by a random token, holding the username and the expiry. Root
+/// owns it 0700, so the unprivileged handler can neither read a proof it did
+/// not mint nor write one the drain would trust. `scripts/deploy-onboard.sh`
+/// creates it.
+pub const PROOF_DIR: &str = "/var/db/kyriakon/logins";
 
 /// The checker the one `doas` rule authorises. The path is fixed, because
 /// `doas.conf` matches the command path literally: a configurable one would be
@@ -57,16 +66,24 @@ impl Default for Authenticator {
 }
 
 impl Authenticator {
-    /// Whether the mail password admits `username`. The password goes on the
-    /// checker's stdin and never on its command line, where `ps` would show it
-    /// to every local user. Any failure of the check itself is a refusal: a box
-    /// whose `doas` or checker is missing must not admit anyone.
-    pub async fn admits(&self, username: &str, password: &str) -> bool {
+    /// The proof a correct mail password earns, or `None`. The password goes on
+    /// the checker's stdin and never on its command line, where `ps` would show
+    /// it to every local user. The checker mints a proof in `proof_dir` and
+    /// prints its token; the handler stores the token and cannot make one. Any
+    /// failure of the check itself is a refusal: a box whose `doas` or checker
+    /// is missing must not admit anyone.
+    pub async fn authenticate(
+        &self,
+        username: &str,
+        password: &str,
+        proof_dir: &Path,
+    ) -> Option<String> {
         let mut child = match Command::new(&self.program)
             .args(&self.args)
             .arg(username)
+            .arg(proof_dir)
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
         {
@@ -76,7 +93,7 @@ impl Authenticator {
                     "kyriakon-onboard: cannot run the login check {}: {e}",
                     self.program.display()
                 );
-                return false;
+                return None;
             }
         };
         if let Some(mut stdin) = child.stdin.take() {
@@ -88,17 +105,24 @@ impl Authenticator {
                 // the handler answers hundreds of times a day leaves zombies in
                 // a process that never exits.
                 let _ = child.wait().await;
-                return false;
+                return None;
             }
             let _ = stdin.shutdown().await;
         }
-        matches!(child.wait().await, Ok(status) if status.success())
+        let output = child.wait_with_output().await.ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let token = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        (!token.is_empty()).then_some(token)
     }
 }
 
 /// `sessions/<id>.json`: the server-side half. The secret is what signs the
 /// cookie, and the file lives 0600 under the handler's own store directory, so
-/// only the handler and root can read it.
+/// only the handler and root can read it. `proof` names the root-written file
+/// that is the login's actual evidence; it is the handler's copy of a token it
+/// cannot mint.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Record {
     version: u32,
@@ -106,6 +130,92 @@ struct Record {
     created_at: String,
     expires_at: String,
     secret: String,
+    #[serde(default)]
+    proof: String,
+}
+
+/// One root-written login proof, as `scripts/kyriakon-authcheck.sh` writes it.
+#[derive(Deserialize)]
+struct Proof {
+    username: String,
+    /// Unix seconds, when the login that made it stops counting.
+    expires: i64,
+}
+
+/// Whether `token` is the shape the login check mints: 32 random bytes as 64
+/// lowercase hex characters. A name of any other shape is not a file this code
+/// wrote, and a handler-authored record cannot make one into a path.
+fn is_proof_token(token: &str) -> bool {
+    token.len() == 64
+        && token
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Read one proof, `None` when it is missing or is not the shape the script
+/// writes. A proof that cannot be read proves nothing.
+async fn read_proof(dir: &Path, token: &str) -> Option<Proof> {
+    let text = tokio::fs::read_to_string(dir.join(token)).await.ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The root-written proof behind a session, checked without trusting the
+/// record the handler can rewrite: the file's own username and expiry decide.
+/// A token of another shape, a missing file and a file naming another account
+/// are all refusals.
+pub async fn verify_proof(
+    dir: &Path,
+    token: &str,
+    username: &str,
+    now: OffsetDateTime,
+) -> Result<(), String> {
+    if !is_proof_token(token) {
+        return Err("the session carries no proof this box minted".to_string());
+    }
+    let Some(proof) = read_proof(dir, token).await else {
+        return Err("the session's proof is not one this box minted".to_string());
+    };
+    if proof.username != username {
+        return Err(format!(
+            "the session belongs to {:?}, not {username:?}",
+            proof.username
+        ));
+    }
+    if now.unix_timestamp() >= proof.expires {
+        return Err("the session named by the intent has expired".to_string());
+    }
+    Ok(())
+}
+
+/// Remove the proofs whose expiry has passed. The drain runs it as root on each
+/// pass, because the directory is root's 0700 and the handler cannot read it. A
+/// file this code did not write is left alone: only the checker puts anything
+/// there.
+pub async fn prune_proofs(dir: &Path, now: OffsetDateTime) {
+    let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    loop {
+        let Ok(entry) = rd.next_entry().await else {
+            return;
+        };
+        let Some(entry) = entry else {
+            return;
+        };
+        let name = entry.file_name();
+        let Some(token) = name.to_str() else {
+            continue;
+        };
+        if !is_proof_token(token) {
+            continue;
+        }
+        let Some(proof) = read_proof(dir, token).await else {
+            continue;
+        };
+        if now.unix_timestamp() >= proof.expires {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
 }
 
 /// An admitted session, as the account route reads it.
@@ -114,10 +224,19 @@ pub struct Session {
 }
 
 /// Open a session for `username` and return the cookie's value: the id, a dot,
-/// and the HMAC of the id under the session's own secret.
-pub async fn open(store: &Store, username: &str, now: OffsetDateTime) -> Result<String, String> {
+/// and the HMAC of the id under the session's own secret. `proof` is the token
+/// the root-side login check printed, which the drain reads back from its own
+/// proof directory; the handler stores it and cannot mint one.
+pub async fn open(
+    store: &Store,
+    username: &str,
+    proof: &str,
+    now: OffsetDateTime,
+) -> Result<String, String> {
     // A new login is where the old sessions are cleared. Nothing else walks the
     // directory, and an id is random, so an expired file would never be reused.
+    // The proofs are pruned by the drain instead: that directory is root's, and
+    // the handler cannot read it.
     prune(store, now).await;
     let id = crate::store::status_token().await?;
     let secret = crate::store::status_token().await?;
@@ -136,6 +255,7 @@ pub async fn open(store: &Store, username: &str, now: OffsetDateTime) -> Result<
             .format(&Rfc3339)
             .map_err(|e| format!("cannot stamp the session: {e}"))?,
         secret: secret.clone(),
+        proof: proof.to_string(),
     };
     let bytes = serde_json::to_vec_pretty(&record)
         .map_err(|e| format!("cannot encode the session: {e}"))?;
@@ -243,7 +363,9 @@ pub fn from_header(header: &str, name: &str) -> Option<String> {
 }
 
 /// The stub checker the tests share: one password, read from stdin like the
-/// real checker, and no `doas`, which a test cannot have.
+/// real checker, and no `doas`, which a test cannot have. On success it prints
+/// a proof token as the real one does; it writes no proof file, so a test that
+/// needs the drain to accept the session mints its own.
 #[cfg(test)]
 pub(crate) mod stub {
     use std::path::PathBuf;
@@ -256,7 +378,11 @@ pub(crate) mod stub {
         let path = dir.join("kyriakon-authcheck");
         std::fs::write(
             &path,
-            format!("#!/bin/sh\nread -r given\n[ \"$given\" = '{password}' ]\n"),
+            format!(
+                "#!/bin/sh\nread -r given\n[ \"$given\" = '{password}' ] || exit 1\n\
+                 printf '%s\\n' '{}'\n",
+                "ab".repeat(32)
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -273,7 +399,26 @@ mod tests {
             std::env::temp_dir().join(format!("onboard-session-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        std::fs::create_dir_all(dir.join("proofs")).unwrap();
         Store::new_for_test(dir.to_str().unwrap())
+    }
+
+    /// The proof directory beside a test store.
+    fn proofs(store: &Store) -> PathBuf {
+        store.path("proofs")
+    }
+
+    /// One root-written proof, in the shape `kyriakon-authcheck` writes.
+    fn mint(store: &Store, username: &str, expires: i64) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let token = format!("{:064x}", NEXT.fetch_add(1, Ordering::Relaxed));
+        std::fs::write(
+            proofs(store).join(&token),
+            format!("{{\"username\":\"{username}\",\"expires\":{expires}}}\n"),
+        )
+        .unwrap();
+        token
     }
 
     fn now() -> OffsetDateTime {
@@ -282,27 +427,39 @@ mod tests {
 
     #[tokio::test]
     async fn a_correct_password_admits_and_a_wrong_one_does_not() {
+        let store = store("admits");
         let auth = Authenticator {
             program: stub::checker("admits", "right horse battery"),
             args: Vec::new(),
         };
-        assert!(auth.admits("alice", "right horse battery").await);
-        assert!(!auth.admits("alice", "wrong horse battery").await);
+        assert!(auth
+            .authenticate("alice", "right horse battery", &proofs(&store))
+            .await
+            .is_some());
+        assert!(auth
+            .authenticate("alice", "wrong horse battery", &proofs(&store))
+            .await
+            .is_none());
     }
 
     #[tokio::test]
     async fn a_missing_checker_admits_nobody() {
+        let store = store("missing-checker");
         let auth = Authenticator {
             program: PathBuf::from("/nonexistent/kyriakon-authcheck"),
             args: Vec::new(),
         };
-        assert!(!auth.admits("alice", "right horse battery").await);
+        assert!(auth
+            .authenticate("alice", "right horse battery", &proofs(&store))
+            .await
+            .is_none());
     }
 
     #[tokio::test]
     async fn a_session_lives_for_twelve_hours_and_its_cookie_is_signed() {
         let store = store("live");
-        let cookie = open(&store, "alice", now()).await.unwrap();
+        let proof = mint(&store, "alice", now().unix_timestamp() + 3600);
+        let cookie = open(&store, "alice", &proof, now()).await.unwrap();
         assert_eq!(cookie.split('.').count(), 2, "{cookie}");
         let live = lookup(&store, &cookie, now() + Duration::hours(11))
             .await
@@ -314,10 +471,45 @@ mod tests {
             .is_none());
     }
 
+    /// The record the handler writes is not the evidence: the proof the root
+    /// checker wrote is. A token of the right shape with no file behind it, and
+    /// a proof naming another account, are both refused.
+    #[tokio::test]
+    async fn a_session_is_proved_by_the_root_written_file_not_the_record() {
+        let store = store("proof");
+        let proof = mint(&store, "alice", now().unix_timestamp() + 3600);
+        assert!(verify_proof(&proofs(&store), &proof, "alice", now())
+            .await
+            .is_ok());
+        // A made-up token of the right shape: no file, so no proof.
+        let made_up = "0".repeat(64);
+        assert!(verify_proof(&proofs(&store), &made_up, "alice", now())
+            .await
+            .is_err());
+        // A shape that is not a filename this code would build.
+        assert!(
+            verify_proof(&proofs(&store), "../sessions/x", "alice", now())
+                .await
+                .is_err()
+        );
+        // The file's own username, not the record's.
+        assert!(verify_proof(&proofs(&store), &proof, "bob", now())
+            .await
+            .unwrap_err()
+            .contains("belongs to"));
+        // The file's own expiry.
+        let stale = mint(&store, "alice", now().unix_timestamp() - 1);
+        assert!(verify_proof(&proofs(&store), &stale, "alice", now())
+            .await
+            .unwrap_err()
+            .contains("expired"));
+    }
+
     #[tokio::test]
     async fn a_cookie_with_the_wrong_signature_or_another_shape_is_refused() {
         let store = store("forged");
-        let cookie = open(&store, "alice", now()).await.unwrap();
+        let proof = mint(&store, "alice", now().unix_timestamp() + 3600);
+        let cookie = open(&store, "alice", &proof, now()).await.unwrap();
         let (id, sig) = cookie.split_once('.').unwrap();
         let forged = format!("{id}.{}", "0".repeat(sig.len()));
         assert!(lookup(&store, &forged, now()).await.is_none());
@@ -353,10 +545,16 @@ mod tests {
     #[tokio::test]
     async fn the_next_login_removes_an_expired_session_and_keeps_a_live_one() {
         let store = store("prune");
-        let stale = open(&store, "alice", now() - Duration::hours(24))
+        let stale_proof = mint(&store, "alice", now().unix_timestamp() - 1);
+        let stale = open(&store, "alice", &stale_proof, now() - Duration::hours(24))
             .await
             .unwrap();
-        let live = open(&store, "bob", now()).await.unwrap();
+        let live_proof = mint(
+            &store,
+            "bob",
+            (now() + Duration::hours(TTL_HOURS)).unix_timestamp(),
+        );
+        let live = open(&store, "bob", &live_proof, now()).await.unwrap();
         assert!(lookup(&store, &stale, now()).await.is_none());
         assert!(lookup(&store, &live, now()).await.is_some());
         assert_eq!(
@@ -366,14 +564,30 @@ mod tests {
         );
     }
 
+    /// The drain prunes the proofs, because the handler cannot read the root
+    /// directory: the expired file goes and the live one stays.
+    #[tokio::test]
+    async fn an_expired_proof_is_pruned_and_a_live_one_is_kept() {
+        let store = store("prune-proofs");
+        let stale = mint(&store, "alice", now().unix_timestamp() - 1);
+        let live = mint(&store, "alice", now().unix_timestamp() + 3600);
+        prune_proofs(&proofs(&store), now()).await;
+        assert!(!proofs(&store).join(&stale).exists(), "a spent proof goes");
+        assert!(proofs(&store).join(&live).exists(), "a live proof stays");
+    }
+
     #[tokio::test]
     async fn a_checker_that_exits_before_reading_admits_nobody() {
         // The write fails with EPIPE once the child has gone. The check still
-        // answers false, and the child is reaped rather than left a zombie.
+        // answers nothing, and the child is reaped rather than left a zombie.
+        let store = store("exits");
         let auth = Authenticator {
             program: stub::checker("exits", "unused"),
             args: Vec::new(),
         };
-        assert!(!auth.admits("alice", &"x".repeat(256 * 1024)).await);
+        assert!(auth
+            .authenticate("alice", &"x".repeat(256 * 1024), &proofs(&store))
+            .await
+            .is_none());
     }
 }

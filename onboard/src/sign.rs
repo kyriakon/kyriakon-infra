@@ -130,6 +130,82 @@ pub fn group_remove_payload(domain: &str) -> String {
     format!("remove-group:{domain}")
 }
 
+/// The payload a `provision-group` intent signs: every field the drain acts on.
+/// The approval files it, because `intents/` and `applications/` both belong to
+/// the unprivileged half and this intent creates system accounts as root. The
+/// domain, the body's words, the payment, the address table, the mailboxes, the
+/// site owner, the upload key, the mail keys and the application the intent
+/// claims to come from are all covered, so a signature for one body cannot be
+/// replayed with another's mailbox or key. Every text field is length-prefixed,
+/// so a colon inside one cannot be read as the separator before the next.
+pub fn group_provision_payload(intent: &crate::store::GroupIntent) -> String {
+    let addresses = intent
+        .addresses
+        .iter()
+        .map(|a| format!("{}={}", free_text(&a.address), free_text(&a.mailbox)))
+        .collect::<Vec<_>>()
+        .join(";");
+    let mail_keys = intent
+        .mail_keys
+        .iter()
+        .map(|k| {
+            format!(
+                "{}={}={}={}",
+                free_text(&k.mailbox),
+                free_text(&k.fingerprint),
+                free_text(&k.material),
+                free_text(&k.verdict)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let payment = &intent.payment;
+    let window = payment
+        .window
+        .as_ref()
+        .map(|w| {
+            format!(
+                "{}={}={}={}",
+                free_text(&w.opened_at),
+                free_text(&w.closes_at),
+                free_text(&w.state),
+                w.extensions
+            )
+        })
+        .unwrap_or_default();
+    let stripe = &payment.stripe;
+    let stripe = format!(
+        "{}={}={}={}={}={}={}={}",
+        free_text(stripe.subscription.as_deref().unwrap_or("")),
+        free_text(stripe.customer.as_deref().unwrap_or("")),
+        free_text(stripe.status.as_deref().unwrap_or("")),
+        stripe.cancel_at_period_end,
+        free_text(stripe.current_period_end.as_deref().unwrap_or("")),
+        free_text(stripe.next_payment_attempt.as_deref().unwrap_or("")),
+        stripe.failed_attempts,
+        free_text(stripe.last_invoice.as_deref().unwrap_or("")),
+    );
+    format!(
+        "provision-group:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        free_text(&intent.domain),
+        free_text(&intent.name),
+        free_text(&intent.body_kind),
+        free_text(&payment.rail),
+        payment.no_charge,
+        free_text(payment.paid_until.as_deref().unwrap_or("")),
+        free_text(payment.token_ref.as_deref().unwrap_or("")),
+        free_text(&window),
+        free_text(&stripe),
+        free_text(&addresses),
+        free_text(&intent.mailboxes.join(",")),
+        free_text(&intent.site_owner),
+        free_text(&intent.upload_key),
+        free_text(&mail_keys),
+        free_text(&intent.application.username),
+        free_text(&intent.application.status_token),
+    )
+}
+
 /// The payload a token-resend intent signs: the account and the token it holds.
 /// The console signs it, because a second copy of the instructions is the
 /// member's to ask for and not the handler's to file.

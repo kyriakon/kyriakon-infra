@@ -37,7 +37,7 @@ async fn handler(name: &str) -> (App, PathBuf) {
 fn fixture_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("onboard-responder-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    for sub in ["applications", "intents", "pages"] {
+    for sub in ["applications", "intents", "pages", "proofs"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
     dir
@@ -74,6 +74,7 @@ fn handler_config(dir: &Path) -> config::Config {
         price_gbp: "20.00".to_string(),
         postal_address: "1 Example Street, Example".to_string(),
         stripe_payment_link: "https://buy.stripe.com/test_example".to_string(),
+        proof_dir: dir.join("proofs").to_str().unwrap().to_string(),
     }
 }
 
@@ -179,10 +180,28 @@ fn httpd_get_as(path: &str, query: &str, user: Option<&str>) -> Vec<u8> {
     fixture::httpd(&env, b"")
 }
 
+/// One root-written login proof, as `scripts/kyriakon-authcheck.sh` mints it: a
+/// random token, the username and an expiry. The fixture writes it because no
+/// test runs the real checker through `doas`.
+fn mint_proof(app: &App, username: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let token = format!("{:064x}", NEXT.fetch_add(1, Ordering::Relaxed));
+    let expires = OffsetDateTime::now_utc().unix_timestamp() + 3600;
+    std::fs::create_dir_all(&app.cfg.proof_dir).unwrap();
+    std::fs::write(
+        Path::new(&app.cfg.proof_dir).join(&token),
+        format!("{{\"username\":\"{username}\",\"expires\":{expires}}}\n"),
+    )
+    .unwrap();
+    token
+}
+
 /// A session record for `username` in the fixture store, returning the cookie
 /// value the browser would carry.
 async fn signed_in(app: &App, username: &str) -> String {
-    session::open(&app.store, username, OffsetDateTime::now_utc())
+    let proof = mint_proof(app, username);
+    session::open(&app.store, username, &proof, OffsetDateTime::now_utc())
         .await
         .expect("the fixture store takes a session")
 }
@@ -764,7 +783,8 @@ fn closure_checker(name: &str) -> PathBuf {
         &path,
         "#!/bin/sh
 read -r given
-[ \"$given\" = 'right horse battery' ]
+[ \"$given\" = 'right horse battery' ] || exit 1
+printf '%s\\n' 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd'
 ",
     )
     .unwrap();
@@ -966,7 +986,8 @@ async fn the_account_page_shows_the_quota_keys_and_every_notice() {
 async fn a_session_username_outside_the_charset_is_refused_before_a_path_is_built() {
     let (app, _dir) = handler("session-shape").await;
     for bad in ["../alice", "alice/..", "Alice", "alice\u{0}"] {
-        let cookie = session::open(&app.store, bad, OffsetDateTime::now_utc())
+        let proof = mint_proof(&app, bad);
+        let cookie = session::open(&app.store, bad, &proof, OffsetDateTime::now_utc())
             .await
             .unwrap();
         let (code, body) = answer(&app, &httpd_get_session("account", "", &cookie)).await;

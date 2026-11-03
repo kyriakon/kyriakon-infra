@@ -84,6 +84,7 @@ impl Fix {
             "host/queue/pending",
             "home/www",
             "keyring",
+            "proofs",
         ] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
@@ -219,7 +220,8 @@ impl Fix {
              rate_endpoint = \"https://rates.example.invalid/simple/price\"\n\
              rates_fetch = \"{}\"\n\
              public_root = \"{}\"\n\
-             gpg = \"gpg\"\n",
+             gpg = \"gpg\"\n\
+             proof_dir = \"{}\"\n",
             fix.path("store"),
             fix.path("reserved"),
             fix.path("bin"),
@@ -240,6 +242,7 @@ impl Fix {
             fix.dir.display(),
             fix.path("bin/curl"),
             fix.path("home/www"),
+            fix.path("proofs"),
         );
         std::fs::write(fix.path("drain.toml"), cfg).unwrap();
         fix
@@ -680,24 +683,32 @@ impl Fix {
             .iter()
             .map(|(address, mailbox)| json!({"address": address, "mailbox": mailbox}))
             .collect();
-        self.write_intent(
-            id,
-            &json!({
-                "id": id,
-                "kind": "provision-group",
-                "filed_at": "2026-10-02T09:00:00Z",
-                "application": {"username": "warden", "status_token": TOKEN},
-                "domain": domain,
-                "name": "Parish of Example",
-                "body_kind": "parish",
-                "payment": {"rail": "cash", "no_charge": false, "paid_until": null},
-                "addresses": addresses,
-                "mailboxes": mailboxes,
-                "site_owner": site_owner,
-                "upload_key": upload.unwrap_or(""),
-                "mail_keys": mail_keys,
-            }),
-        );
+        let mut intent = json!({
+            "id": id,
+            "kind": "provision-group",
+            "filed_at": "2026-10-02T09:00:00Z",
+            "application": {"username": "warden", "status_token": TOKEN},
+            "domain": domain,
+            "name": "Parish of Example",
+            "body_kind": "parish",
+            "payment": {"rail": "cash", "no_charge": false, "paid_until": null},
+            "addresses": addresses,
+            "mailboxes": mailboxes,
+            "site_owner": site_owner,
+            "upload_key": upload.unwrap_or(""),
+            "mail_keys": mail_keys,
+            "sig": "",
+        });
+        // Signed as the approval signs it, over the same fields the drain reads:
+        // a fixture that filed an unsigned intent would exercise the refusal,
+        // not the transition.
+        let parsed: kyriakon_onboard::store::GroupIntent =
+            serde_json::from_value(intent.clone()).unwrap();
+        intent["sig"] =
+            json!(
+                sign::sign(b"the approval key", &sign::group_provision_payload(&parsed)).unwrap()
+            );
+        self.write_intent(id, &intent);
     }
 
     /// File one `provision-group` intent and hand back its id.
@@ -1035,19 +1046,37 @@ impl Fix {
             .unwrap()
     }
 
+    /// Write one root-side login proof, as `kyriakon-authcheck` does: a token
+    /// as 64 hex characters, the account and an expiry. Returns the token.
+    pub fn mint_proof(&self, username: &str, expires: i64) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let token = format!(
+            "{:016x}{:048x}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        std::fs::write(
+            self.dir.join("proofs").join(&token),
+            serde_json::to_vec(&json!({"username": username, "expires": expires})).unwrap(),
+        )
+        .unwrap();
+        token
+    }
+
     /// Open a page session for a fixture account and return the cookie value.
     pub fn open_session(&self, username: &str) -> String {
         let cfg = DrainConfig::load(Path::new(&self.config())).unwrap();
         let store = Store::new_for_test(&cfg.store_root);
+        let now = OffsetDateTime::now_utc();
+        let proof = self.mint_proof(username, now.unix_timestamp() + 3600);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime
             .block_on(kyriakon_onboard::session::open(
-                &store,
-                username,
-                OffsetDateTime::now_utc(),
+                &store, username, &proof, now,
             ))
             .unwrap()
     }
@@ -1080,14 +1109,21 @@ impl Fix {
             .unwrap()
     }
 
-    /// Move a session's expiry into the past, as twelve hours passing would.
+    /// Move the root-written proof behind a session into the past, as twelve
+    /// hours passing would. The session record's own expiry is the handler's
+    /// copy and proves nothing to the drain.
     pub fn expire_session(&self, cookie: &str) {
         let id = Self::session_id(cookie);
         let path = self.dir.join("store/sessions").join(format!("{id}.json"));
-        let mut value: Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        value["expires_at"] = json!("2000-01-01T00:00:00Z");
-        std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let proof = record["proof"].as_str().unwrap_or("");
+        let username = record["username"].as_str().unwrap_or("");
+        assert!(!proof.is_empty(), "the fixture session carries no proof");
+        std::fs::write(
+            self.dir.join("proofs").join(proof),
+            serde_json::to_vec(&json!({"username": username, "expires": 0})).unwrap(),
+        )
+        .unwrap();
     }
 
     pub fn read(&self, rel: &str) -> String {
