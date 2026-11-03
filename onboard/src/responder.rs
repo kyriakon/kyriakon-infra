@@ -10,6 +10,11 @@
 //! last hop. A request arrives as a CGI environment rather than as an HTTP
 //! request, and the reply is framed for whichever front-end asked.
 //!
+//! Both front ends read one route table (`ROUTES`): a row is a path, a method and
+//! a handler, and the row says which front ends serve it. A page the capsule
+//! carries and the web does not is a row that says so, not an arm missing from one
+//! of two chains, and a handler that both serve renders for whichever asked.
+//!
 //! Nothing but what a route needs is read from that environment. The variables are
 //! built by the front-end out of the request line, out of the client's
 //! certificate, or out of its own configuration, and only the last of those is
@@ -851,7 +856,7 @@ async fn respond(app: &App, request: &Request) -> Outcome {
     }
 
     let reply = match front {
-        FrontEnd::Gemini => gemini(app, &incoming).await,
+        FrontEnd::Gemini => gemini(app, request, &incoming).await,
         FrontEnd::Httpd => http(app, request, &incoming).await,
     };
     outcome(incoming, reply)
@@ -992,20 +997,399 @@ fn fields(raw: &str) -> BTreeMap<String, String> {
     out
 }
 
-/// The web front-end, which serves the pages the HTTP daemon served.
+/// Which front ends a route answers on. A route that serves one front end is a
+/// row that says so here: the alternative was an arm in each front end's own
+/// chain, where a route added to one and not the other answered a page on one
+/// and a refusal on the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fronts {
+    Both,
+    Httpd,
+    /// The pages the capsule carries as gemtext and the web front end does not
+    /// serve: the staged documents have no HTML rendering, so a web row for them
+    /// would have nothing to send.
+    Gemini,
+}
+
+impl Fronts {
+    fn serves(self, front: FrontEnd) -> bool {
+        match (self, front) {
+            (Fronts::Both, _) => true,
+            (Fronts::Httpd, FrontEnd::Httpd) => true,
+            (Fronts::Gemini, FrontEnd::Gemini) => true,
+            (Fronts::Httpd, FrontEnd::Gemini) | (Fronts::Gemini, FrontEnd::Httpd) => false,
+        }
+    }
+}
+
+/// The method a row answers, as the web front end reads it. A capsule request
+/// carries no method at all, so a row's method is not checked for one; `Any` is
+/// the method of a row only the capsule serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Method {
+    Get,
+    Post,
+    Any,
+}
+
+impl Method {
+    fn accepts(self, front: FrontEnd, method: &str) -> bool {
+        match (front, self) {
+            // A gemini request has no verb to check.
+            (FrontEnd::Gemini, _) | (FrontEnd::Httpd, Method::Any) => true,
+            // A browser sends HEAD where it would send GET, and httpd drops the
+            // body of a HEAD response on its own, so the two read one route.
+            (FrontEnd::Httpd, Method::Get) => method == "GET" || method == "HEAD",
+            (FrontEnd::Httpd, Method::Post) => method == "POST",
+        }
+    }
+}
+
+/// What a row answers with. `dispatch` has one arm per variant, so a row cannot
+/// name a handler that has no arm, and a new handler cannot be added without the
+/// compiler asking where it is called.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Handler {
+    Webhook,
+    Status,
+    DecideConfirm,
+    DecideFile,
+    PasswordPage,
+    PasswordFile,
+    Apply,
+    LoginPage,
+    LoginSubmit,
+    Logout,
+    AccountClose,
+    AccountAction,
+    Account,
+    AccountExport,
+    Root,
+    BranchStep,
+    CapsuleApply,
+    Mirrored,
+    Acceptances,
+}
+
+/// One route: the path, the method, and the handler that answers it, with the
+/// front ends it exists on. `capsule::PAGES` is the same shape of table, and the
+/// tests read both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Route {
+    /// The path a request is matched against, with no leading slash. A path
+    /// ending in `/` owns the paths under it and hands the handler the rest;
+    /// every other row is exact.
+    path: &'static str,
+    method: Method,
+    fronts: Fronts,
+    handler: Handler,
+}
+
+impl Route {
+    /// The path after this row's prefix, when the row owns the path.
+    fn matches<'a>(&self, path: &'a str) -> Option<&'a str> {
+        if self.path.ends_with('/') {
+            path.strip_prefix(self.path)
+        } else {
+            (path == self.path).then_some("")
+        }
+    }
+}
+
+/// Every route, once. Order carries no meaning: the longest matching prefix owns
+/// the path, and the method picks between rows that share one, so a row cannot be
+/// shadowed by where it sits in the list. A route that serves one front end says
+/// so in its row rather than in that front end's own chain.
+static ROUTES: &[Route] = &[
+    // The payment webhook is not this form: Stripe's bytes and signature header,
+    // and no Origin. It is the one row the form preflight does not precede, and
+    // the handler stores what it is given without verifying it: the drain holds
+    // the secret and is the half that decides.
+    Route {
+        path: "stripe/webhook",
+        method: Method::Post,
+        fronts: Fronts::Httpd,
+        handler: Handler::Webhook,
+    },
+    // The applicant flow's entry. The web form's submission and the capsule's
+    // first page are one route, because both front ends start the flow here; each
+    // renders its own. A capsule answer continues under `apply/`, which the web
+    // front end does not serve.
+    Route {
+        path: "apply",
+        method: Method::Post,
+        fronts: Fronts::Both,
+        handler: Handler::Apply,
+    },
+    Route {
+        path: "apply/",
+        method: Method::Any,
+        fronts: Fronts::Gemini,
+        handler: Handler::CapsuleApply,
+    },
+    // The status page, which both front ends serve and each renders.
+    Route {
+        path: "status/",
+        method: Method::Get,
+        fronts: Fronts::Both,
+        handler: Handler::Status,
+    },
+    // The account page and the web form's actions on it. A capsule client has no
+    // session and no POST: its certificate is its whole identity, so the read is
+    // the only account route the capsule carries.
+    Route {
+        path: "account/close",
+        method: Method::Post,
+        fronts: Fronts::Httpd,
+        handler: Handler::AccountClose,
+    },
+    Route {
+        path: "account/",
+        method: Method::Post,
+        fronts: Fronts::Httpd,
+        handler: Handler::AccountAction,
+    },
+    Route {
+        path: "account",
+        method: Method::Get,
+        fronts: Fronts::Both,
+        handler: Handler::Account,
+    },
+    Route {
+        path: "account",
+        method: Method::Post,
+        fronts: Fronts::Httpd,
+        handler: Handler::AccountExport,
+    },
+    // Signing in and out, and the two links a decision or a password is filed
+    // through: web sessions and web forms, which the capsule does not carry.
+    Route {
+        path: "login",
+        method: Method::Get,
+        fronts: Fronts::Httpd,
+        handler: Handler::LoginPage,
+    },
+    Route {
+        path: "login",
+        method: Method::Post,
+        fronts: Fronts::Httpd,
+        handler: Handler::LoginSubmit,
+    },
+    Route {
+        path: "logout",
+        method: Method::Post,
+        fronts: Fronts::Httpd,
+        handler: Handler::Logout,
+    },
+    Route {
+        path: "decide/",
+        method: Method::Get,
+        fronts: Fronts::Httpd,
+        handler: Handler::DecideConfirm,
+    },
+    Route {
+        path: "decide/",
+        method: Method::Post,
+        fronts: Fronts::Httpd,
+        handler: Handler::DecideFile,
+    },
+    Route {
+        path: "password/",
+        method: Method::Get,
+        fronts: Fronts::Httpd,
+        handler: Handler::PasswordPage,
+    },
+    Route {
+        path: "password/",
+        method: Method::Post,
+        fronts: Fronts::Httpd,
+        handler: Handler::PasswordFile,
+    },
+    // The front pages: the web form's applicant page and the capsule's catalogue,
+    // from one path. The branch step shares the path under a POST, and is a row
+    // of its own for that reason.
+    Route {
+        path: "",
+        method: Method::Get,
+        fronts: Fronts::Both,
+        handler: Handler::Root,
+    },
+    Route {
+        path: "",
+        method: Method::Post,
+        fronts: Fronts::Httpd,
+        handler: Handler::BranchStep,
+    },
+    // The staged documents and the acceptances page are gemtext and have no HTML
+    // rendering, so they are the capsule's alone. One row per document, and the
+    // test compares this list with `capsule::PAGES`, because the route, the file
+    // and the label must name the same page.
+    Route {
+        path: "terms",
+        method: Method::Any,
+        fronts: Fronts::Gemini,
+        handler: Handler::Mirrored,
+    },
+    Route {
+        path: "aup",
+        method: Method::Any,
+        fronts: Fronts::Gemini,
+        handler: Handler::Mirrored,
+    },
+    Route {
+        path: "privacy",
+        method: Method::Any,
+        fronts: Fronts::Gemini,
+        handler: Handler::Mirrored,
+    },
+    Route {
+        path: "keys",
+        method: Method::Any,
+        fronts: Fronts::Gemini,
+        handler: Handler::Mirrored,
+    },
+    Route {
+        path: capsule::ACCEPTANCES,
+        method: Method::Any,
+        fronts: Fronts::Gemini,
+        handler: Handler::Acceptances,
+    },
+];
+
+/// Whether the form's preflight is this path's. The payment webhook reads its own
+/// bytes and carries no Origin, so it is not a form route; every other row is.
+fn takes_form(path: &str) -> bool {
+    !ROUTES
+        .iter()
+        .any(|row| row.handler == Handler::Webhook && row.matches(path).is_some())
+}
+
+/// What one path resolves to.
+#[derive(Debug)]
+enum Resolution<'a> {
+    /// The row that owns the path, and the path after its prefix.
+    Row(&'static Route, &'a str),
+    /// A row owns the path and not this method, which is the web's 405: a longer
+    /// prefix does not fall through to a shorter one.
+    WrongMethod,
+    /// No row serves this path on this front end.
+    Missing,
+}
+
+/// The row one request dispatches to, on one front end.
+fn route<'a>(front: FrontEnd, path: &'a str, method: &str) -> Resolution<'a> {
+    let mut depth = 0;
+    let mut found = None;
+    let mut matched = false;
+    for row in ROUTES {
+        if !row.fronts.serves(front) {
+            continue;
+        }
+        let Some(rest) = row.matches(path) else {
+            continue;
+        };
+        matched = true;
+        if row.path.len() < depth {
+            continue;
+        }
+        if row.path.len() > depth {
+            depth = row.path.len();
+            found = None;
+        }
+        if found.is_none() && row.method.accepts(front, method) {
+            found = Some((row, rest));
+        }
+    }
+    match found {
+        Some((row, rest)) => Resolution::Row(row, rest),
+        None if matched => Resolution::WrongMethod,
+        None => Resolution::Missing,
+    }
+}
+
+/// One request as a handler reads it.
+struct Call<'a> {
+    front: FrontEnd,
+    request: &'a Request,
+    incoming: &'a Incoming,
+    /// The path after the matched row's prefix: a token for `status/`, a draft
+    /// path for `apply/`, an action for `account/`, nothing for an exact row.
+    rest: &'a str,
+}
+
+impl Call<'_> {
+    /// The form's fields as a GET carries them.
+    fn query(&self) -> BTreeMap<String, String> {
+        fields(self.request.value("QUERY_STRING"))
+    }
+
+    /// The form's fields as a POST carries them.
+    fn form(&self) -> BTreeMap<String, String> {
+        fields(&String::from_utf8_lossy(&self.request.body))
+    }
+}
+
+/// The table's answer to one request: the row's handler, or the front end's own
+/// refusal for a path or a method it does not serve.
+async fn answer(app: &App, front: FrontEnd, request: &Request, incoming: &Incoming) -> Reply {
+    let method = request.value("REQUEST_METHOD");
+    match route(front, &incoming.path, method) {
+        Resolution::Row(row, rest) => {
+            let call = Call {
+                front,
+                request,
+                incoming,
+                rest,
+            };
+            dispatch(app, row.handler, &call).await
+        }
+        // The capsule has no verbs, so a method it does not serve cannot arise.
+        Resolution::WrongMethod => method_not_allowed(),
+        // An empty body behind a path this service does not serve, as the old
+        // HTTP daemon's router left it, and the capsule's status 51.
+        Resolution::Missing => match front {
+            FrontEnd::Httpd => Reply::html(404, String::new()),
+            FrontEnd::Gemini => Reply::gemini(51, "Not found", String::new()),
+        },
+    }
+}
+
+/// One arm per handler. The protocol-specific rendering is inside the handler,
+/// which is what lets one row answer both front ends.
+async fn dispatch(app: &App, handler: Handler, call: &Call<'_>) -> Reply {
+    match handler {
+        Handler::Webhook => webhook(app, call.request).await,
+        Handler::Status => status(app, call).await,
+        Handler::DecideConfirm => decide_confirm(app, call).await,
+        Handler::DecideFile => decide_file(app, call).await,
+        Handler::PasswordPage => password_page(app, call).await,
+        Handler::PasswordFile => password_file(app, call).await,
+        Handler::Apply => apply(app, call).await,
+        Handler::LoginPage => Reply::capability(200, page_html(&LoginPage { error: None })),
+        Handler::LoginSubmit => login(app, call.request).await,
+        Handler::Logout => logout(app, call.request).await,
+        Handler::AccountClose => account_close(app, call.request).await,
+        Handler::AccountAction => account_action(app, call).await,
+        Handler::Account => account(app, call).await,
+        Handler::AccountExport => account_export(app, call.request).await,
+        Handler::Root => root(app, call).await,
+        Handler::BranchStep => branch_step(app, call.form()),
+        Handler::CapsuleApply => capsule_apply(app, call.incoming, call.rest).await,
+        Handler::Mirrored => mirrored(app, call),
+        Handler::Acceptances => acceptances(app),
+    }
+}
+
+/// The web front-end: the form's preflight, then the table.
 async fn http(app: &App, request: &Request, incoming: &Incoming) -> Reply {
     let method = request.value("REQUEST_METHOD");
-    // The payment webhook is not this form and carries no Origin, so it is
-    // dispatched before the origin check and before the body is read as a form.
-    // The handler stores the raw bytes and the signature header and does no
-    // verification: the drain holds the secret and is the half that decides.
-    if incoming.path == "stripe/webhook" {
-        return webhook(app, request).await;
-    }
-    // The origin check runs before a route is chosen, as the middleware in front
-    // of the old HTTP daemon's router did: a POST from somewhere that is not this
-    // form is refused for being that, whatever path it names.
-    if method == "POST" && !own_origin(request) {
+    // Whether the preflight is this path's. It is the form's, and the payment
+    // webhook's body is not the form's: see `takes_form`.
+    let preflight = takes_form(&incoming.path);
+    // A POST from somewhere that is not this form is refused for being that,
+    // whatever path it names, as the middleware in front of the old HTTP daemon's
+    // router did: the check runs before a route is chosen.
+    if preflight && method == "POST" && !own_origin(request) {
         // The two values, in the refusal: neither is a secret and the pair is
         // the only way to tell which kind of client was refused.
         return refused(&format!(
@@ -1020,122 +1404,16 @@ async fn http(app: &App, request: &Request, incoming: &Incoming) -> Reply {
     // daemon's limit drew, and it is the body's whole length that decides it,
     // because a form read from a truncated body is a form the applicant did not
     // write.
-    if request.body_too_large {
+    if preflight && request.body_too_large {
         return Reply::html(413, String::new());
     }
     // The body of a POST is read as `application/x-www-form-urlencoded`, so a
     // request that declares something else is not a request either route that
     // takes a body answers.
-    if method == "POST" && !form_post(request) {
+    if preflight && method == "POST" && !form_post(request) {
         return Reply::html(415, String::new());
     }
-    // A browser sends HEAD where it would send GET, and httpd drops the body of a
-    // HEAD response on its own, so the two read the same route.
-    let get = method == "GET" || method == "HEAD";
-
-    if let Some(token) = incoming.path.strip_prefix("status/") {
-        return if get {
-            status(app, token).await
-        } else {
-            method_not_allowed()
-        };
-    }
-    // A decision link opens a page that says what it would do, and the button on
-    // that page is what files it. See `decide_confirm`.
-    if let Some(token) = incoming.path.strip_prefix("decide/") {
-        if get {
-            let query = fields(request.value("QUERY_STRING"));
-            return decide_confirm(app, token, &query).await;
-        }
-        if method == "POST" {
-            let form = fields(&String::from_utf8_lossy(&request.body));
-            return decide_file(app, token, &form).await;
-        }
-        return method_not_allowed();
-    }
-    // The one-time password link. The page is a form and the submission files an
-    // intent; the link's signature is checked by the drain, which holds the key.
-    if let Some(token) = incoming.path.strip_prefix("password/") {
-        if get {
-            let query = fields(request.value("QUERY_STRING"));
-            return password_page(app, token, &query).await;
-        }
-        if method == "POST" {
-            let form = fields(&String::from_utf8_lossy(&request.body));
-            return password_file(app, token, &form).await;
-        }
-        return method_not_allowed();
-    }
-    if incoming.path == "apply" {
-        if method != "POST" {
-            return method_not_allowed();
-        }
-        return apply(app, request, incoming).await;
-    }
-    if incoming.path == "login" {
-        return match method {
-            "GET" | "HEAD" => Reply::capability(200, page_html(&LoginPage { error: None })),
-            "POST" => login(app, request).await,
-            _ => method_not_allowed(),
-        };
-    }
-    // Logging out is a POST because it changes the session, and a GET that did
-    // would be fired by any image tag.
-    if incoming.path == "logout" {
-        return if method == "POST" {
-            logout(app, request).await
-        } else {
-            method_not_allowed()
-        };
-    }
-    // The page's own closure. A POST files a close intent for the session's
-    // account; the drain sets the seven-day window and runs the lifecycle's
-    // deletion when it ends. The page carries no close button for a stranger,
-    // and this route refuses one too.
-    if incoming.path == "account/close" {
-        if method != "POST" {
-            return method_not_allowed();
-        }
-        return account_close(app, request).await;
-    }
-    // The page's other action controls. Each is a POST for the same reason the
-    // closure is: a GET that changed a password or a key would be fired by any
-    // image tag.
-    if let Some(action) = incoming.path.strip_prefix("account/") {
-        if method != "POST" {
-            return method_not_allowed();
-        }
-        return match action {
-            "password" => account_password(app, request).await,
-            "upload-key" => account_upload_key(app, request).await,
-            "address" => account_address(app, request).await,
-            "serving" => account_serving(app, request).await,
-            "renewal" => account_renewal(app, request).await,
-            "mail-key" => account_mail_key(app, request).await,
-            _ => Reply::html(404, String::new()),
-        };
-    }
-    if incoming.path == "account" {
-        return match (get, method) {
-            (true, _) => account(app, request).await,
-            // "Take my data out": the only POST the page takes today. It files
-            // the export intent and nothing else.
-            (false, "POST") => account_export(app, request).await,
-            _ => method_not_allowed(),
-        };
-    }
-    if incoming.path.is_empty() {
-        if get {
-            return applicant(app, fields(request.value("QUERY_STRING")));
-        }
-        if method == "POST" {
-            return branch_step(app, fields(&String::from_utf8_lossy(&request.body)));
-        }
-        return method_not_allowed();
-    }
-    // An empty body, as the HTTP daemon's own router left these: there is no
-    // rendered page behind a path this service does not serve.
-    Reply::html(404, String::new())
+    answer(app, FrontEnd::Httpd, request, incoming).await
 }
 
 fn method_not_allowed() -> Reply {
@@ -1145,14 +1423,11 @@ fn method_not_allowed() -> Reply {
 /// Store one Stripe delivery for the drain: the raw body and the
 /// `Stripe-Signature` header, under `webhooks/`, named by a ULID so the
 /// directory sorts by age. Nothing is verified here and no store record is
-/// written; the handler holds no secret. A non-POST or a request with no
-/// signature header is refused without writing, and a successful store answers
-/// 2xx at once so Stripe does not retry a delivery the drain has not settled
-/// yet.
+/// written; the handler holds no secret. The row's method is POST and the table
+/// is the half that refuses another one; a delivery with no signature header is
+/// refused without writing, and a successful store answers 2xx at once so Stripe
+/// does not retry a delivery the drain has not settled yet.
 async fn webhook(app: &App, request: &Request) -> Reply {
-    if request.value("REQUEST_METHOD") != "POST" {
-        return method_not_allowed();
-    }
     let signature = request.get("HTTP_STRIPE_SIGNATURE").unwrap_or("");
     if signature.trim().is_empty() {
         return Reply::html(400, String::new());
@@ -1196,88 +1471,89 @@ fn form_post(request: &Request) -> bool {
         .is_some_and(|t| t.eq_ignore_ascii_case("application/x-www-form-urlencoded"))
 }
 
-/// The gemini front-end: the catalogue, the status page, the account, and the
-/// applicant's draft flow. The apply route reads an answer from `QUERY_STRING`,
-/// which gmid sends still percent-encoded and the responder decodes itself
-/// rather than read from `GEMINI_SEARCH_STRING`: that copy is sent only for a
-/// query with no `=` in it, and its decoder maps `+` to a space, which is not
-/// the reading the specification gives a URI query.
+/// The gemini front-end: the same table the web's routes are in, read with no
+/// method to check and no form to read. The apply route reads an answer from
+/// `QUERY_STRING`, which gmid sends still percent-encoded and the responder
+/// decodes itself rather than read from `GEMINI_SEARCH_STRING`: that copy is sent
+/// only for a query with no `=` in it, and its decoder maps `+` to a space, which
+/// is not the reading the specification gives a URI query.
 ///
 /// The certificate, when one was presented, decides one thing: whether an
 /// account's pin matches its hash. A certificate that matches nothing gets the
 /// same pages a stranger gets, with its own fingerprint and where to register
 /// it, and never a page that says the certificate is unknown.
-async fn gemini(app: &App, incoming: &Incoming) -> Reply {
-    if incoming.path == "apply" {
-        return capsule_new(app, incoming).await;
-    }
-    if let Some(rest) = incoming.path.strip_prefix("apply/") {
-        return capsule_apply(app, incoming, rest).await;
-    }
-    if let Some(token) = incoming.path.strip_prefix("status/") {
-        let record = record_for(app, token).await;
-        let payment = payment_for(app, record.as_ref());
-        let page = status_page(record, payment, OffsetDateTime::now_utc());
-        return Reply::gemini(20, "text/gemini", capsule::status(&page));
-    }
-    if incoming.path == "account" {
-        let member = member_for(app, incoming).await;
-        let body = match &member {
-            Some(account) => {
-                let notices = account_notices(app, &account.username).await;
-                let recipe = group_recipe(app, account);
-                let group = group_state(app, account.group.as_deref()).await;
-                let payment = account.payment_state().map(|block| {
-                    page::payment(
-                        &account.state,
-                        &account.rail,
-                        &block,
-                        &app.cfg.price_gbp,
-                        &app.cfg.postal_address,
-                        card_link(app, block.token_ref.as_deref()).as_deref(),
-                        OffsetDateTime::now_utc(),
-                    )
-                });
-                capsule::account(
-                    account,
-                    &notices,
-                    recipe.as_ref(),
-                    payment.as_ref(),
-                    group.as_ref(),
+async fn gemini(app: &App, request: &Request, incoming: &Incoming) -> Reply {
+    answer(app, FrontEnd::Gemini, request, incoming).await
+}
+
+/// The account page for a gemini client: the member its certificate is pinned
+/// to, or the stranger's page carrying the certificate's own fingerprint.
+async fn capsule_account(app: &App, incoming: &Incoming) -> Reply {
+    let member = member_for(app, incoming).await;
+    let body = match &member {
+        Some(account) => {
+            let notices = account_notices(app, &account.username).await;
+            let recipe = group_recipe(app, account);
+            let group = group_state(app, account.group.as_deref()).await;
+            let payment = account.payment_state().map(|block| {
+                page::payment(
+                    &account.state,
+                    &account.rail,
+                    &block,
+                    &app.cfg.price_gbp,
+                    &app.cfg.postal_address,
+                    card_link(app, block.token_ref.as_deref()).as_deref(),
+                    OffsetDateTime::now_utc(),
                 )
-            }
-            None => capsule::account_stranger(presented(incoming)),
-        };
-        return Reply::gemini(20, "text/gemini", body);
-    }
-    if incoming.path.is_empty() {
-        let member = member_for(app, incoming).await;
-        let member_name = member.as_ref().map(|account| account.username.as_str());
-        let mut page = capsule::front_page(&app.catalogue, member_name);
-        // The ordinary page, plus the one line a presented certificate earns
-        // when no pin matched it. It carries no word for "known" or "unknown":
-        // the client learns its own fingerprint and nothing else.
-        if member.is_none() {
-            if let Some(certificate) = presented(incoming) {
-                page.push('\n');
-                page.push_str(&capsule::registration(certificate));
-            }
+            });
+            capsule::account(
+                account,
+                &notices,
+                recipe.as_ref(),
+                payment.as_ref(),
+                group.as_ref(),
+            )
         }
-        return Reply::gemini(20, "text/gemini", page);
+        None => capsule::account_stranger(presented(incoming)),
+    };
+    Reply::gemini(20, "text/gemini", body)
+}
+
+/// The capsule's front page: the catalogue, and the one line a presented
+/// certificate earns when no pin matched it. It carries no word for "known" or
+/// "unknown": the client learns its own fingerprint and nothing else.
+async fn capsule_front(app: &App, incoming: &Incoming) -> Reply {
+    let member = member_for(app, incoming).await;
+    let member_name = member.as_ref().map(|account| account.username.as_str());
+    let mut page = capsule::front_page(&app.catalogue, member_name);
+    if member.is_none() {
+        if let Some(certificate) = presented(incoming) {
+            page.push('\n');
+            page.push_str(&capsule::registration(certificate));
+        }
     }
-    // The mirrored pages are literals, not paths: the route is a key in the map
-    // the handler read at startup, so no request can name a file to read.
-    if let Some(text) = app.pages.get(&incoming.path) {
-        return Reply::gemini(20, "text/gemini", text.clone());
+    Reply::gemini(20, "text/gemini", page)
+}
+
+/// A mirrored document: a literal, not a path. The route is a key in the map the
+/// handler read at startup, so no request can name a file to read. `App::load`
+/// refuses to start without one, so the lookup cannot fail for a row in the
+/// table; it answers 51 if it ever does rather than panicking in a handler.
+fn mirrored(app: &App, call: &Call<'_>) -> Reply {
+    match app.pages.get(&call.incoming.path) {
+        Some(text) => Reply::gemini(20, "text/gemini", text.clone()),
+        None => Reply::gemini(51, "Not found", String::new()),
     }
-    if incoming.path == capsule::ACCEPTANCES {
-        return Reply::gemini(
-            20,
-            "text/gemini",
-            capsule::acceptances(&app.questions, &app.cfg.release),
-        );
-    }
-    Reply::gemini(51, "Not found", String::new())
+}
+
+/// The acceptances page: the three documents and the release the handler carries,
+/// generated rather than staged.
+fn acceptances(app: &App) -> Reply {
+    Reply::gemini(
+        20,
+        "text/gemini",
+        capsule::acceptances(&app.questions, &app.cfg.release),
+    )
 }
 
 /// The account a presented certificate is pinned to. Only the two routes that
@@ -1785,6 +2061,25 @@ fn branch_step(app: &App, form: BTreeMap<String, String>) -> Reply {
     render_applicant(app, body, &form, &[])
 }
 
+/// The front page: the web form's applicant page, and the capsule's catalogue
+/// with its links. The branch step is the same path under a POST, and a row of
+/// its own for that reason.
+async fn root(app: &App, call: &Call<'_>) -> Reply {
+    match call.front {
+        FrontEnd::Httpd => applicant(app, call.query()),
+        FrontEnd::Gemini => capsule_front(app, call.incoming).await,
+    }
+}
+
+/// The account page, which each front end renders for the identity it has: the
+/// web's session cookie and the capsule's certificate.
+async fn account(app: &App, call: &Call<'_>) -> Reply {
+    match call.front {
+        FrontEnd::Httpd => account_web(app, call.request).await,
+        FrontEnd::Gemini => capsule_account(app, call.incoming).await,
+    }
+}
+
 /// The account page, for the member its session cookie names. A request with no
 /// live session, and one whose session names no readable account, both get the
 /// login page: the page never says which of the two it was.
@@ -1792,7 +2087,7 @@ fn branch_step(app: &App, form: BTreeMap<String, String>) -> Reply {
 /// No key admits anyone here. The mail password is checked by `doveadm auth test`
 /// through the one fixed `doas` rule, and the session is a server-side file the
 /// cookie's own signature names.
-async fn account(app: &App, request: &Request) -> Reply {
+async fn account_web(app: &App, request: &Request) -> Reply {
     let now = OffsetDateTime::now_utc();
     let cookie = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE);
     let member = match cookie {
@@ -1942,6 +2237,21 @@ async fn closure_refund(app: &App, account: &Account) -> Option<String> {
             "A refund of GBP {amount} is due under the 14-day cancellation right; it is settled separately."
         )
     })
+}
+
+/// The account page's action controls. Each is a POST for the same reason the
+/// closure is: a GET that changed a password or a key would be fired by any
+/// image tag. The path's remainder is the control's name.
+async fn account_action(app: &App, call: &Call<'_>) -> Reply {
+    match call.rest {
+        "password" => account_password(app, call.request).await,
+        "upload-key" => account_upload_key(app, call.request).await,
+        "address" => account_address(app, call.request).await,
+        "serving" => account_serving(app, call.request).await,
+        "renewal" => account_renewal(app, call.request).await,
+        "mail-key" => account_mail_key(app, call.request).await,
+        _ => Reply::html(404, String::new()),
+    }
 }
 
 /// The member's own "Close my account": check the session and the password
@@ -2485,7 +2795,18 @@ fn own_origin(request: &Request) -> bool {
     }
 }
 
-async fn apply(app: &App, request: &Request, incoming: &Incoming) -> Reply {
+/// The applicant flow's entry: the web form's submission, and the capsule's
+/// first page. One row, because both front ends start the flow at the same path,
+/// and each renders its own.
+async fn apply(app: &App, call: &Call<'_>) -> Reply {
+    match call.front {
+        FrontEnd::Httpd => apply_web(app, call.request, call.incoming).await,
+        FrontEnd::Gemini => capsule_new(app, call.incoming).await,
+    }
+}
+
+/// The web form's submission.
+async fn apply_web(app: &App, request: &Request, incoming: &Incoming) -> Reply {
     let form = fields(&String::from_utf8_lossy(&request.body));
     let Reading { body, shown } = reading(&form);
 
@@ -2551,10 +2872,15 @@ async fn apply(app: &App, request: &Request, incoming: &Incoming) -> Reply {
 
 /// The status page for one token, which is the same page over both front-ends: a
 /// capability in the URL is never stored and its URL is never sent as a referrer.
-async fn status(app: &App, token: &str) -> Reply {
-    let record = record_for(app, token).await;
+/// The web page is the capability itself and the capsule renders it as gemtext.
+async fn status(app: &App, call: &Call<'_>) -> Reply {
+    let record = record_for(app, call.rest).await;
     let payment = payment_for(app, record.as_ref());
-    capability(&status_page(record, payment, OffsetDateTime::now_utc()))
+    let page = status_page(record, payment, OffsetDateTime::now_utc());
+    match call.front {
+        FrontEnd::Httpd => capability(&page),
+        FrontEnd::Gemini => Reply::gemini(20, "text/gemini", capsule::status(&page)),
+    }
 }
 
 /// The payment block a decided application's status page carries. The drain
@@ -2625,13 +2951,15 @@ fn decision_refusal(query: &BTreeMap<String, String>) -> &'static str {
 /// The signature is carried through untouched and is not checked here: the
 /// handler holds no key and holds no privilege, and the drain is the half that
 /// verifies the signature before carrying anything out.
-async fn decide_confirm(app: &App, token: &str, query: &BTreeMap<String, String>) -> Reply {
+async fn decide_confirm(app: &App, call: &Call<'_>) -> Reply {
+    let token = call.rest;
+    let query = call.query();
     let Some(record) = record_for(app, token).await else {
         // The page an unknown, an expired and a spent token all read as.
         return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     };
-    let Some(decision) = decision_from(query) else {
-        return refused(decision_refusal(query));
+    let Some(decision) = decision_from(&query) else {
+        return refused(decision_refusal(&query));
     };
     capability(&DecidePage {
         label: decision.label.to_string(),
@@ -2650,11 +2978,13 @@ async fn decide_confirm(app: &App, token: &str, query: &BTreeMap<String, String>
 /// that is the whole of its job: the drain is the half with the key, and it is
 /// the half that decides whether the click was already seen, so a replay is
 /// answered where the rule already lives and is already tested.
-async fn decide_file(app: &App, token: &str, form: &BTreeMap<String, String>) -> Reply {
+async fn decide_file(app: &App, call: &Call<'_>) -> Reply {
+    let token = call.rest;
+    let form = call.form();
     let Some(record) = record_for(app, token).await else {
         return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     };
-    let Some(decision) = decision_from(form) else {
+    let Some(decision) = decision_from(&form) else {
         return refused("This link does not name a decision the platform knows.");
     };
     let sig = form.get("sig").cloned().unwrap_or_default();
@@ -2730,7 +3060,9 @@ mod password_window_tests {
 /// Past its window, or once the record no longer holds a link, this is the
 /// unknown-token page byte for byte: that page is a function of nothing, so the
 /// two cannot drift apart.
-async fn password_page(app: &App, token: &str, query: &BTreeMap<String, String>) -> Reply {
+async fn password_page(app: &App, call: &Call<'_>) -> Reply {
+    let token = call.rest;
+    let query = call.query();
     let Some(record) = record_for(app, token).await else {
         return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     };
@@ -2753,7 +3085,9 @@ async fn password_page(app: &App, token: &str, query: &BTreeMap<String, String>)
 /// hash, because a handler that supplies the stored hash is a handler that can
 /// choose one the member never typed. The signature travels with it, because the
 /// handler holds no key and proves nothing on its own.
-async fn password_file(app: &App, token: &str, form: &BTreeMap<String, String>) -> Reply {
+async fn password_file(app: &App, call: &Call<'_>) -> Reply {
+    let token = call.rest;
+    let form = call.form();
     let Some(record) = record_for(app, token).await else {
         return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     };
