@@ -1,5 +1,7 @@
 //! Structural checks on a submitted key: armour framing, base64, and the packet
-//! structure, and the fingerprint of the material either way.
+//! structure, and the fingerprint of the material either way. `verify_signature`
+//! goes beyond structure: it spawns gpg in a scratch home holding only one key,
+//! and a good signature by that key is what decides the mail-key route.
 //!
 //! The three conditions that decide whether mail can actually be delivered to a
 //! key (an encryption-capable subkey, no AEAD preference, not expired) are the
@@ -15,17 +17,27 @@
 //! hashes rather than checks: a number that names material it was not computed
 //! from reads as a number that disagrees with the key on the box. So the
 //! fingerprint is computed here, over the material the record carries, in the
-//! two shapes the two keys have. They decide nothing.
+//! two shapes the two keys have. The fingerprints decide nothing; the signature
+//! check does.
 
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
+use tokio::process::Command;
 
 use crate::store::KeyRecord;
 
 const BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
 const END: &str = "-----END PGP PUBLIC KEY BLOCK-----";
+
+/// The box keyring entry a localpart's mail key is served from: one `<localpart>.asc`
+/// per address, which is what the encrypting LMTP reads.
+pub fn keyring_file(dir: &str, localpart: &str) -> PathBuf {
+    Path::new(dir).join(format!("{localpart}.asc"))
+}
 
 #[derive(Debug)]
 pub struct Checked {
@@ -92,6 +104,85 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Verify `payload` with the public key in `key_file`, in a scratch GNUPGHOME
+/// holding only that key, so a good signature is by that key and by nothing
+/// else. `signature` is a detached signature; `None` means `payload` is itself
+/// a clearsigned message. `Ok(Some(fingerprint))` names the signing key gpg
+/// reported, `Ok(None)` is a signature that does not verify, and `Err` is gpg
+/// failing to run or the key not importing.
+pub async fn verify_signature(
+    gpg: &str,
+    key_file: &Path,
+    payload: &[u8],
+    signature: Option<&[u8]>,
+) -> Result<Option<String>, String> {
+    // gpg's agent socket lives under the homedir, and a UNIX socket path is
+    // bounded: a long per-user temp directory fails to connect the agent rather
+    // than failing to read the key. /tmp is short on every box this runs on.
+    let home = std::path::PathBuf::from("/tmp").join(format!("kyriakon-gpg-{}", ulid::Ulid::new()));
+    tokio::fs::create_dir_all(&home)
+        .await
+        .map_err(|e| format!("cannot create {}: {e}", home.display()))?;
+    // gpg refuses a homedir another user could read, and the scratch directory
+    // is created with the process umask otherwise.
+    tokio::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+        .await
+        .map_err(|e| format!("cannot set the mode on {}: {e}", home.display()))?;
+    let run = async {
+        let import = Command::new(gpg)
+            .args(["--batch", "--no-tty", "--no-options", "--homedir"])
+            .arg(&home)
+            .arg("--import")
+            .arg(key_file)
+            .output()
+            .await
+            .map_err(|e| format!("cannot run {gpg}: {e}"))?;
+        if !import.status.success() {
+            return Err(format!(
+                "gpg could not read {} ({}): {}",
+                key_file.display(),
+                import.status,
+                String::from_utf8_lossy(&import.stderr).trim()
+            ));
+        }
+        let message = home.join("message");
+        tokio::fs::write(&message, payload)
+            .await
+            .map_err(|e| format!("cannot write {}: {e}", message.display()))?;
+        let mut verify = Command::new(gpg);
+        verify
+            .args(["--batch", "--no-tty", "--no-options", "--homedir"])
+            .arg(&home)
+            .args(["--status-fd", "1", "--verify"]);
+        if let Some(signature) = signature {
+            let sig = home.join("signature.asc");
+            tokio::fs::write(&sig, signature)
+                .await
+                .map_err(|e| format!("cannot write {}: {e}", sig.display()))?;
+            verify.arg(sig);
+        }
+        let out = verify
+            .arg(&message)
+            .output()
+            .await
+            .map_err(|e| format!("cannot run {gpg}: {e}"))?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        // gpg's own report names the key that made the signature; the status
+        // line is `VALIDSIG <fingerprint> <date> ...`.
+        let status = String::from_utf8_lossy(&out.stdout);
+        Ok(status.lines().find_map(|line| {
+            line.strip_prefix("[GNUPG:] VALIDSIG ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(str::to_string)
+        }))
+    };
+    let result = run.await;
+    let _ = tokio::fs::remove_dir_all(&home).await;
+    result
 }
 
 /// Inspect an OpenSSH public key: the shape sftp and git will accept. A shape

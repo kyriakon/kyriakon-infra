@@ -42,6 +42,7 @@
 //!   kyriakon-onboardctl [--config PATH] free
 //!   kyriakon-onboardctl request list
 //!   kyriakon-onboardctl request record
+//!   kyriakon-onboardctl request verify
 //!   kyriakon-onboardctl request extend <id>
 //!   kyriakon-onboardctl request close <id>
 //!
@@ -60,6 +61,7 @@ use std::process::ExitCode;
 use kyriakon_onboard::config::DrainConfig;
 use kyriakon_onboard::export;
 use kyriakon_onboard::intents;
+use kyriakon_onboard::keycheck;
 use kyriakon_onboard::prepaid;
 use kyriakon_onboard::requests;
 use kyriakon_onboard::sign;
@@ -108,7 +110,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         return Err(usage());
     };
     match verb {
-        "request" => request(&store, &rest[1..]).await,
+        "request" => request(&cfg, &store, &rest[1..]).await,
         "address" => address(&cfg, &store, &rest[1..]).await,
         "group" => group(&cfg, &store, &rest[1..]).await,
         "token" => token(&cfg, &store, &rest[1..]).await,
@@ -175,8 +177,10 @@ fn usage() -> String {
        kyriakon-onboardctl group remove <domain>
        kyriakon-onboardctl request list
        kyriakon-onboardctl request record --username <u> --kind <access|erasure|rectification> \
-     --received <YYYY-MM-DD> --evidence <text> [--note <text>] \
-     [--identity-at <YYYY-MM-DD>] [--fee-at <YYYY-MM-DD>] [--id <ulid>] \
+     --received <YYYY-MM-DD> --evidence <text> --identity <password|mail-key> \
+     [--note <text>] [--identity-at <YYYY-MM-DD>] [--fee-at <YYYY-MM-DD>] [--id <ulid>] \
+       kyriakon-onboardctl request verify --username <u> --message <file> \
+     [--signature <file>] \
        kyriakon-onboardctl request extend <id> --reason <text> \
      [--extended-on <YYYY-MM-DD>] \
        kyriakon-onboardctl request close <id> --done <YYYY-MM-DD> --note <text>"
@@ -1041,9 +1045,10 @@ async fn group(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), 
     Ok(())
 }
 
-async fn request(store: &Store, args: &[String]) -> Result<(), String> {
+async fn request(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("record") => request_record(store, &args[1..]).await,
+        Some("verify") => request_verify(cfg, store, &args[1..]).await,
         Some("extend") => request_extend(store, &args[1..]).await,
         Some("close") => request_close(store, &args[1..]).await,
         Some("list") => request_list(store).await,
@@ -1059,6 +1064,7 @@ async fn request_record(store: &Store, args: &[String]) -> Result<(), String> {
             "kind",
             "received",
             "evidence",
+            "identity",
             "note",
             "identity-at",
             "fee-at",
@@ -1072,6 +1078,7 @@ async fn request_record(store: &Store, args: &[String]) -> Result<(), String> {
             kind: need(&flags, "kind")?,
             received: need(&flags, "received")?,
             evidence: need(&flags, "evidence")?,
+            identity: need(&flags, "identity")?,
             note: flags.get("note").map(String::as_str),
             identity_at: flags.get("identity-at").map(String::as_str),
             fee_at: flags.get("fee-at").map(String::as_str),
@@ -1081,6 +1088,149 @@ async fn request_record(store: &Store, args: &[String]) -> Result<(), String> {
     .await?;
     println!("recorded {}; answer due {}", line.id, line.due);
     Ok(())
+}
+
+/// `request verify`: the mail-key route's check. It reads a message and an
+/// optional detached signature, refuses anything not from the account's own
+/// platform address, and verifies the signature against the keyring entry the
+/// platform encrypts to. It writes nothing: verification is the check the
+/// operator records afterwards with `request record --identity mail-key`.
+async fn request_verify(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), String> {
+    let flags = flags(args, &["username", "message", "signature"])?;
+    let username = need(&flags, "username")?;
+    if let Some(why) = validate::username_shape(username) {
+        return Err(format!("the username {username:?}: {why}"));
+    }
+    let text = store
+        .read_record(&format!("accounts/{username}"), "account.json")
+        .await
+        .ok_or_else(|| format!("no account for {username}"))?;
+    let account: store::Account = serde_json::from_str(&text)
+        .map_err(|e| format!("the account record does not parse: {e}"))?;
+    let own = account.platform_address();
+
+    let message_path = std::path::Path::new(need(&flags, "message")?);
+    let message = std::fs::read(message_path)
+        .map_err(|e| format!("cannot read {}: {e}", message_path.display()))?;
+    let signature = match flags.get("signature") {
+        Some(path) => Some(std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?),
+        None => None,
+    };
+
+    let from = message_from(&String::from_utf8_lossy(&message))?;
+    if !from.eq_ignore_ascii_case(&own) {
+        let outside = account
+            .outside_address
+            .as_deref()
+            .is_some_and(|address| address.eq_ignore_ascii_case(&from));
+        return Err(if outside {
+            format!(
+                "the message is from {from}, the account's outside contact address; \
+                 ask for a message from {own} signed with the mail key, or for the \
+                 password route on the account page"
+            )
+        } else {
+            format!("the message is from {from}, not the account's own address {own}")
+        });
+    }
+    let key_file = keycheck::keyring_file(&cfg.keyring_dir, username);
+    if !key_file.is_file() {
+        return Err(format!(
+            "the box holds no key for {username} at {}",
+            key_file.display()
+        ));
+    }
+    if signature.is_none() && !String::from_utf8_lossy(&message).contains(CLEARSIGNED) {
+        return Err(
+            "the message is not clearsigned; pass --signature with its detached signature \
+             or export the message clearsigned from the client"
+                .to_string(),
+        );
+    }
+    let fingerprint =
+        keycheck::verify_signature(&cfg.gpg, &key_file, &message, signature.as_deref())
+            .await?
+            .ok_or_else(|| {
+                format!("the signature does not verify against {username}'s keyring entry")
+            })?;
+    println!("verified {fingerprint}; From: {own}");
+    Ok(())
+}
+
+const CLEARSIGNED: &str = "-----BEGIN PGP SIGNED MESSAGE-----";
+
+/// The address in a message's `From:` header. A delivered message carries its
+/// own headers outside the armour, and a client's clearsigned export carries
+/// them inside it. The outer block is read first and the armour's is the
+/// fallback, and a `From:` in both that disagrees is refused: the signature is
+/// the proof, so the outer header adds no forgeable path.
+fn message_from(message: &str) -> Result<String, String> {
+    let message = message.replace("\r\n", "\n");
+    let (outer, armour) = match message.split_once(CLEARSIGNED) {
+        Some((outer, rest)) => {
+            let body = rest
+                .split_once("\n\n")
+                .map(|(_, body)| body)
+                .ok_or("the clearsigned message has no blank line after its armour")?;
+            let body = body
+                .split_once("\n-----BEGIN PGP SIGNATURE-----")
+                .map(|(body, _)| body)
+                .unwrap_or(body);
+            (outer, Some(body))
+        }
+        None => (message.as_str(), None),
+    };
+    let outer = header_from(outer)?;
+    let armour = match armour {
+        Some(armour) => header_from(armour)?,
+        None => None,
+    };
+    match (outer, armour) {
+        (Some(outer), Some(armour)) if !outer.eq_ignore_ascii_case(&armour) => Err(format!(
+            "the message's own From: is {outer} but the clearsigned one is {armour}"
+        )),
+        (Some(outer), _) => Ok(outer),
+        (None, Some(armour)) => Ok(armour),
+        (None, None) => Err("the message has no From: header".to_string()),
+    }
+}
+
+/// The address in one header block's `From:`, with RFC 5322 continuation lines
+/// unfolded first. `None` when the block carries no `From:`.
+fn header_from(block: &str) -> Result<Option<String>, String> {
+    let mut headers: Vec<String> = Vec::new();
+    for line in block.lines() {
+        if line.is_empty() {
+            break;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(last) = headers.last_mut() {
+                last.push(' ');
+                last.push_str(line.trim());
+            }
+        } else {
+            headers.push(line.trim_end().to_string());
+        }
+    }
+    let mut values = headers.iter().filter_map(|header| {
+        let (name, value) = header.split_once(':')?;
+        name.eq_ignore_ascii_case("from")
+            .then(|| value.trim().to_string())
+    });
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err("the message has more than one From: header".to_string());
+    }
+    let address = match (value.rfind('<'), value.rfind('>')) {
+        (Some(open), Some(close)) if open < close => &value[open + 1..close],
+        _ => value.as_str(),
+    };
+    if address.trim().is_empty() {
+        return Err("the message's From: header holds no address".to_string());
+    }
+    Ok(Some(address.trim().to_string()))
 }
 
 async fn request_extend(store: &Store, args: &[String]) -> Result<(), String> {
@@ -1157,9 +1307,14 @@ async fn request_list(store: &Store) -> Result<(), String> {
         rows.len()
     );
     for (line, due, state) in rows {
+        let identity = if line.identity.is_empty() {
+            "unrecorded"
+        } else {
+            &line.identity
+        };
         println!(
-            "{}  {}  {}  received {}  due {}  {state}",
-            line.id, line.username, line.kind, line.received, due
+            "{}  {}  {}  identity {}  received {}  due {}  {state}",
+            line.id, line.username, line.kind, identity, line.received, due
         );
     }
     Ok(())
@@ -1648,5 +1803,45 @@ mod tests {
         assert_eq!(csv_cell("a\nb"), "\"a\nb\"");
         assert_eq!(csv_cell("a\rb"), "\"a\rb\"");
         assert_eq!(csv_cell(""), "");
+    }
+
+    const SIGNED: &str = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\n\
+                          From: Alice <alice@kyriakon.net>\n\nPlease send me a copy.\n\
+                          -----BEGIN PGP SIGNATURE-----\n\nAAAA\n\
+                          -----END PGP SIGNATURE-----\n";
+
+    #[test]
+    fn a_delivered_message_takes_its_from_outside_the_armour() {
+        let message = format!(
+            "From: Alice <alice@kyriakon.net>\nTo: admin@kyriakon.net\n\
+             Subject: my data\n\n{SIGNED}"
+        );
+        assert_eq!(message_from(&message).unwrap(), "alice@kyriakon.net");
+    }
+
+    #[test]
+    fn a_folded_from_header_is_unfolded() {
+        let message =
+            "From: A Long Name\n <alice@kyriakon.net>\nTo: admin@kyriakon.net\n\nPlease.\n";
+        assert_eq!(message_from(message).unwrap(), "alice@kyriakon.net");
+    }
+
+    #[test]
+    fn an_outer_from_that_differs_from_the_armour_is_refused() {
+        let message = format!("From: attacker@evil.example\nTo: admin@kyriakon.net\n\n{SIGNED}");
+        let err = message_from(&message).unwrap_err();
+        assert!(err.contains("attacker@evil.example"), "{err}");
+        assert!(err.contains("alice@kyriakon.net"), "{err}");
+    }
+
+    #[test]
+    fn a_quoted_signed_request_under_another_from_is_refused() {
+        let message = format!(
+            "From: attacker@evil.example\nTo: admin@kyriakon.net\nSubject: fwd\n\n\
+             Here is their signed request:\n\n{SIGNED}"
+        );
+        assert!(message_from(&message)
+            .unwrap_err()
+            .contains("but the clearsigned one is alice@kyriakon.net"));
     }
 }

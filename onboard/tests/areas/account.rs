@@ -21,10 +21,11 @@ fn replacement_key() -> String {
     .unwrap()
 }
 
-/// A throwaway signing keypair in a temporary GNUPGHOME, with its public key and
-/// a detached armored signature over `payload`. The private key never enters the
-/// repository, and the homedir is removed with the temp directory.
-fn signing_key(payload: &str) -> (String, String) {
+/// A throwaway signing keypair in a temporary GNUPGHOME, with its public key, a
+/// detached armored signature over `payload`, and `payload` as a clearsigned
+/// message. The private key never enters the repository, and the homedir is
+/// removed with the temp directory.
+fn signing_key(payload: &str) -> (String, String, String) {
     // A short path on purpose: gpg's agent socket lives under the homedir, and a
     // UNIX socket path is bounded, so the per-user temp directory's own long
     // path fails to connect the agent before key generation begins.
@@ -71,6 +72,8 @@ fn signing_key(payload: &str) -> (String, String) {
         "--passphrase",
         "",
         "--armor",
+        "--output",
+        home.join("payload.sig").to_str().unwrap(),
         "--detach-sign",
         message.to_str().unwrap(),
     ]);
@@ -79,8 +82,27 @@ fn signing_key(payload: &str) -> (String, String) {
         "signing failed: {}",
         String::from_utf8_lossy(&sign.stderr)
     );
-    let signature = std::fs::read_to_string(home.join("payload.asc")).expect("the signature file");
-    (public, signature)
+    let clear = gpg(&[
+        "--batch",
+        "--no-tty",
+        "--pinentry-mode",
+        "loopback",
+        "--passphrase",
+        "",
+        "--output",
+        home.join("payload.signed").to_str().unwrap(),
+        "--clearsign",
+        message.to_str().unwrap(),
+    ]);
+    assert!(
+        clear.status.success(),
+        "clearsigning failed: {}",
+        String::from_utf8_lossy(&clear.stderr)
+    );
+    let signature = std::fs::read_to_string(home.join("payload.sig")).expect("the signature file");
+    let clearsigned =
+        std::fs::read_to_string(home.join("payload.signed")).expect("the clearsigned message");
+    (public, signature, clearsigned)
 }
 
 /// A password change files one intent and the drain replaces the stored hash
@@ -519,7 +541,7 @@ fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
     let key = replacement_key();
     let fingerprint = kyriakon_onboard::keycheck::pgp_fingerprint(&key).unwrap();
 
-    let (public, signature) = signing_key(&fingerprint);
+    let (public, signature, _) = signing_key(&fingerprint);
     let current = kyriakon_onboard::keycheck::pgp_fingerprint(&public).unwrap();
     fix.page_account("alice", json!({"mail_key": current}));
     fix.mail_key("alice", &public);
@@ -552,11 +574,11 @@ fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
     // A signature made with a different key is not the current key's, so
     // nothing changes.
     let fix = Fix::new("account-rotation-forged");
-    let (public, _) = signing_key("another fingerprint");
+    let (public, _, _) = signing_key("another fingerprint");
     let current = kyriakon_onboard::keycheck::pgp_fingerprint(&public).unwrap();
     fix.page_account("alice", json!({"mail_key": current}));
     fix.mail_key("alice", &public);
-    let (_, wrong) = signing_key("a different fingerprint");
+    let (_, wrong, _) = signing_key("a different fingerprint");
     fix.file_page_action(
         "mail-key",
         "alice",
@@ -570,4 +592,228 @@ fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
         "a signature that does not verify starts no window: {account}"
     );
     assert!(fix.journal().contains("\"outcome\":\"refused\""));
+}
+
+/// The mail-key route: a detached signature or a clearsigned message over the
+/// account's own platform address verifies against the keyring entry, prints the
+/// signing key's fingerprint, and writes no request line.
+#[test]
+fn request_verify_accepts_the_keyring_key_over_the_accounts_own_address() {
+    let fix = Fix::new("request-verify-key");
+    let message = "From: Alice <alice@kyriakon.net>\nTo: admin@kyriakon.net\n\
+                   Subject: my data\n\nPlease send me a copy.\n";
+    let (public, detached, clearsigned) = signing_key(message);
+    let fingerprint = kyriakon_onboard::keycheck::pgp_fingerprint(&public).unwrap();
+    fix.page_account("alice", json!({}));
+    fix.mail_key("alice", &public);
+
+    let message_path = fix.path("message.eml");
+    std::fs::write(&message_path, message).unwrap();
+    let signature_path = fix.path("message.asc");
+    std::fs::write(&signature_path, &detached).unwrap();
+    let out = fix.ctl(&[
+        "request",
+        "verify",
+        "--username",
+        "alice",
+        "--message",
+        &message_path,
+        "--signature",
+        &signature_path,
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(&fingerprint),
+        "the verified fingerprint is printed: {}",
+        body(&out)
+    );
+
+    // The clearsigned form carries its own signature and needs no flag.
+    let clearsigned_path = fix.path("message-signed.eml");
+    std::fs::write(&clearsigned_path, &clearsigned).unwrap();
+    let out = fix.ctl(&[
+        "request",
+        "verify",
+        "--username",
+        "alice",
+        "--message",
+        &clearsigned_path,
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&fingerprint));
+
+    // A group mailbox's own address is at the group's domain, not kyriakon.net.
+    let group_message = "From: alice@example.org\n\nPlease send me a copy.\n";
+    let (public, detached, _) = signing_key(group_message);
+    fix.page_account("alice", json!({"group": "example.org"}));
+    fix.mail_key("alice", &public);
+    std::fs::write(&message_path, group_message).unwrap();
+    std::fs::write(&signature_path, &detached).unwrap();
+    let out = fix.ctl(&[
+        "request",
+        "verify",
+        "--username",
+        "alice",
+        "--message",
+        &message_path,
+        "--signature",
+        &signature_path,
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert!(
+        !fix.dir.join("store/accounts/alice/requests.jsonl").exists(),
+        "verification wrote a request line"
+    );
+}
+
+/// The check refuses a missing keyring entry, a signature by another key, a
+/// message from the outside contact address, and one from another domain.
+#[test]
+fn request_verify_refuses_a_wrong_signer_from_or_missing_keyring_entry() {
+    let fix = Fix::new("request-verify-refusals");
+    let own = "From: alice@kyriakon.net\n\nPlease send me a copy.\n";
+    let (keyring, keyring_signature, _) = signing_key(own);
+    fix.page_account("alice", json!({"outside_address": "alice@example.invalid"}));
+    let message_path = fix.path("message.eml");
+    std::fs::write(&message_path, own).unwrap();
+    let signature_path = fix.path("signature.asc");
+    std::fs::write(&signature_path, &keyring_signature).unwrap();
+
+    let verify = [
+        "request",
+        "verify",
+        "--username",
+        "alice",
+        "--message",
+        &message_path,
+        "--signature",
+        &signature_path,
+    ];
+    let out = fix.ctl(&verify);
+    assert!(!out.status.success());
+    assert!(body(&out).contains("holds no key"), "{}", body(&out));
+
+    fix.mail_key("alice", &keyring);
+
+    // A signature made with another key over the same text.
+    let (_, wrong_signature, _) = signing_key(own);
+    std::fs::write(&signature_path, &wrong_signature).unwrap();
+    let out = fix.ctl(&verify);
+    assert!(!out.status.success());
+    assert!(body(&out).contains("does not verify"), "{}", body(&out));
+
+    // The account's outside contact address, correctly signed.
+    let outside = "From: alice@example.invalid\n\nPlease send me a copy.\n";
+    let (_, outside_signature, _) = signing_key(outside);
+    std::fs::write(&message_path, outside).unwrap();
+    std::fs::write(&signature_path, &outside_signature).unwrap();
+    let out = fix.ctl(&verify);
+    assert!(!out.status.success());
+    let refusal = body(&out);
+    assert!(refusal.contains("outside contact address"), "{refusal}");
+    assert!(refusal.contains("password route"), "{refusal}");
+
+    // Another domain is not the account's own address even when signed.
+    let other = "From: alice@other.example\n\nPlease send me a copy.\n";
+    let (_, other_signature, _) = signing_key(other);
+    std::fs::write(&message_path, other).unwrap();
+    std::fs::write(&signature_path, &other_signature).unwrap();
+    let out = fix.ctl(&verify);
+    assert!(!out.status.success());
+    assert!(
+        body(&out).contains("not the account's own address"),
+        "{}",
+        body(&out)
+    );
+
+    assert!(
+        !fix.dir.join("store/accounts/alice/requests.jsonl").exists(),
+        "a refused check wrote a request line"
+    );
+}
+
+/// An unsigned message is refused: there is nothing to verify against the key.
+#[test]
+fn request_verify_refuses_an_unsigned_message() {
+    let fix = Fix::new("request-verify-unsigned");
+    fix.page_account("alice", json!({}));
+    fix.mail_key("alice", GOOD_KEY);
+    let message_path = fix.path("message.eml");
+    std::fs::write(&message_path, "From: alice@kyriakon.net\n\nPlease.\n").unwrap();
+    let out = fix.ctl(&[
+        "request",
+        "verify",
+        "--username",
+        "alice",
+        "--message",
+        &message_path,
+    ]);
+    assert!(!out.status.success());
+    assert!(body(&out).contains("not clearsigned"), "{}", body(&out));
+}
+
+/// The record names the route that established the sender. A record without one,
+/// or with a route outside the two, is refused and writes nothing.
+#[test]
+fn request_record_requires_and_persists_the_identity_route() {
+    let fix = Fix::new("request-record-identity");
+    fix.page_account("alice", json!({}));
+    let record = |identity: Option<&str>| {
+        let mut args = vec![
+            "request",
+            "record",
+            "--username",
+            "alice",
+            "--kind",
+            "access",
+            "--received",
+            "2026-10-01",
+            "--evidence",
+            "the account page",
+        ];
+        if let Some(identity) = identity {
+            args.extend(["--identity", identity]);
+        }
+        fix.ctl(&args)
+    };
+
+    let out = record(None);
+    assert!(!out.status.success());
+    assert!(body(&out).contains("--identity"), "{}", body(&out));
+    let out = record(Some("session-cookie"));
+    assert!(!out.status.success());
+    assert!(body(&out).contains("identity route"), "{}", body(&out));
+    assert!(fix.read("accounts/alice/requests.jsonl").is_empty());
+
+    let out = record(Some("mail-key"));
+    assert!(out.status.success(), "{}", body(&out));
+    let line: Value = serde_json::from_str(
+        fix.read("accounts/alice/requests.jsonl")
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(line["identity"], "mail-key", "{line}");
+}
+
+/// A line written before the field existed names no route, and `request list`
+/// says so rather than printing an empty one.
+#[test]
+fn request_list_marks_a_legacy_line_unrecorded() {
+    let fix = Fix::new("request-list-unrecorded");
+    fix.page_account("alice", json!({}));
+    std::fs::create_dir_all(fix.dir.join("store/accounts/alice")).unwrap();
+    std::fs::write(
+        fix.dir.join("store/accounts/alice/requests.jsonl"),
+        "{\"version\":1,\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\
+         \"username\":\"alice\",\"kind\":\"access\",\"received\":\"2026-10-01\",\
+         \"evidence\":\"the account page\",\"relevant\":\"2026-10-01\",\
+         \"due\":\"2026-11-01\"}\n",
+    )
+    .unwrap();
+    let out = fix.ctl(&["request", "list"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("identity unrecorded"), "{}", body(&out));
 }

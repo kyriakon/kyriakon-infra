@@ -62,7 +62,7 @@ Deletion and refund are separate answers. A closure inside the [14-day cancellat
 
 On the account page the member is already authenticated, and the closure re-enters the password regardless of how fresh the session is, because it is the irreversible one. The password is checked against the real system account through `doveadm auth test`, so the service holds no copy of it. What reaches the drain is an intent for one export or one close, carrying the account the session belongs to and nothing else.
 
-Off the page, a request arrives as mail to the role address, `admin@kyriakon.net`, which is the address the lifecycle notices already come from. Two routes show the sender is the member. The first is the password they already hold: the operator asks them to make the request from the page, where it is checked against the real system account through `doveadm auth test`, so the service still holds no copy of it. The second is the mail key, for the hard case of a sender who cannot log in and whose identity has to be established from what they hold rather than from what they remember: a message from the account's own `@kyriakon.net` address, signed by the private key the platform already encrypts to, verifies against the public key already in the keyring. A valid signature shows the sender holds the key that opens the mailbox, and it asks no more of them than the signing button in the client they already use.
+Off the page, a request arrives as mail to the role address, `admin@kyriakon.net`, which is the address the lifecycle notices already come from. Two routes show the sender is the member. The first is the password they already hold: the operator asks them to make the request from the page, where it is checked against the real system account through `doveadm auth test`, so the service still holds no copy of it. The second is the mail key, for the hard case of a sender who cannot log in and whose identity has to be established from what they hold rather than from what they remember: a message from the account's own `@kyriakon.net` address, signed by the private key the platform already encrypts to, verifies against the public key already in the keyring. A valid signature shows the sender holds the key that opens the mailbox, and it asks no more of them than the signing button in the client they already use. For a group mailbox the account's own address is `<username>@<domain>`, its group's domain, and that is the address the verifier accepts as the account's own.
 
 Where the message comes from the outside contact address, or the signature does not verify, the operator asks for the other route: the password through the page, or a signed message from the account address. Where neither can be produced, the operator cannot confirm it is the member, says so, and does not answer as though identity were established. Where the member still holds the key but cannot log in, the operator can put the login back through the runbook's password path once the signed message has shown the account is theirs. The record names which of the two routes was used.
 
@@ -83,8 +83,9 @@ Everything else is the operator's, through `onboardctl`, in the shape the other 
 ```
 onboardctl export <username>
 onboardctl request list
+onboardctl request verify --username <u> --message <file> [--signature <file>]
 onboardctl request record --username <u> --kind <access|erasure|rectification> \
-  --received <date> --evidence <text> --note <text>
+  --received <date> --evidence <text> --identity <password|mail-key> --note <text>
 onboardctl request close <id> --done <date> --note <text>
 onboardctl delete <username>
 ```
@@ -99,7 +100,7 @@ Paths are relative to the store root, except the export destination, which is in
 
 | Path | Status | What this adds |
 |---|---|---|
-| `accounts/<username>/requests.jsonl` | new | one line per request, with its date, evidence, action and due date; deleted with the account |
+| `accounts/<username>/requests.jsonl` | new | one line per request, with its date, evidence, action, the identity route that established the sender, and the due date; deleted with the account |
 | `intents/<id>.json` | modified | new kinds `export` and `close`; the body names the account and nothing else |
 | `journal.jsonl` | modified | one line per request transition, as for every other transition |
 | `/home/www/<name>.kyriakon.net/export/<timestamp>/` | new | the written part of an export, owned by the member, collectable over sftp, removed with the home |

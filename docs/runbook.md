@@ -409,17 +409,51 @@ Do not refuse inbound mail as the default, and do not edit `pf.conf` or `sshd_co
 ## Record a data-subject request
 
 Every request is recorded before it is answered. The identity rule is the one in
-`docs/planning/specs/data-subject-requests.md`: a request from the account page
-is checked against the system account, and a request sent by mail is confirmed
-by a signed message from the account's own address.
+`docs/planning/specs/data-subject-requests.md`, section "How a request arrives and
+who is asking": a request from the account page is checked against the system
+account, and a request sent by mail is confirmed by the password or by a signed
+message from the account's own address. The record names which route was used.
 
-Record the request once the relevant time is known. `--received` is the day it
-arrived, and `--identity-at` or `--fee-at` is the day the identity information
-or a fee arrived. The answer is due one calendar month after the latest of the
-three.
+The password route is the account page, whose export and close controls are the
+only two it has. They check the password against the real system account through
+`doveadm auth test <username>`, and the drain records those intents with this
+route; the service holds no copy of it. A rectification has no page action, so it
+is established by the mail-key route or not at all.
 
-	doas onboardctl request record --username <username> --kind access \
-	  --received <YYYY-MM-DD> --evidence "signed message from the account address" \
+The mail-key route is for a member who cannot log in but still holds the key. Ask
+for a message from the account's own platform address, `<username>@<group
+domain>` for a group mailbox and `<username>@kyriakon.net` otherwise, signed with
+the key the platform already encrypts to. Check it here:
+
+	doas onboardctl request verify --username <username> --message <file> \
+	  [--signature <file>]
+
+`--message` is the saved message and `--signature` its detached signature. The
+signature must be over that saved file itself, headers included: one made over
+the body alone does not match a message that carries headers, so a client that
+can sign only the body should send the message clearsigned instead. A message
+saved clearsigned needs no `--signature`; the command reads the headers outside
+the armour first and falls back to the ones inside it. PGP/MIME is not read, so
+export the clearsigned message or the detached signature from the client. The
+command checks the `From:` header is the account's own address and verifies the
+signature against `/etc/kyriakon/keys/<username>.asc`, printing the verified
+fingerprint. It writes nothing; the request is recorded afterwards.
+
+	cat /etc/kyriakon/keys/<localpart>.asc
+
+Where the message comes from the outside contact address, or the signature does
+not verify, ask for the other route: the password through the page, or a signed
+message from the account's own address. Where neither can be produced, identity
+cannot be confirmed: say so, and do not answer as though it were.
+
+Record the request once the relevant time is known. `--identity` is the route that
+worked, `password` or `mail-key`. `--received` is the day it arrived, and
+`--identity-at` or `--fee-at` is the day the identity information or a fee
+arrived. The answer is due one calendar month after the latest of the three.
+
+	doas onboardctl request record --username <username> --identity mail-key \
+	  --kind access --received <YYYY-MM-DD> \
+	  --evidence "signed message from the account address" \
 	  --identity-at <YYYY-MM-DD> --note "export filed"
 
 `--kind` is `access`, `erasure` or `rectification`. A portability request is
@@ -430,8 +464,9 @@ the line is there if the write landed.
 	doas onboardctl request list
 
 The list prints every open request, earliest due first, and counts the ones
-inside seven days and the overdue ones separately. An extended request shows
-its extended date and the date it replaced.
+inside seven days and the overdue ones separately. It names the route each record
+carries, or `unrecorded` on a line written before the field existed. An extended
+request shows its extended date and the date it replaced.
 
 	doas onboardctl request extend <id> --reason "the export spans three mailboxes"
 

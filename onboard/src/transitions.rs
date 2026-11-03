@@ -479,7 +479,7 @@ async fn publish_mail_keys(
         if body.is_empty() {
             return Err(format!("the mail key for {localpart} is empty"));
         }
-        let path = dir.join(format!("{localpart}.asc"));
+        let path = crate::keycheck::keyring_file(&cfg.keyring_dir, localpart);
         let mut bytes = body.as_bytes().to_vec();
         bytes.push(b'\n');
         // Written only when the bytes differ. The drift check's seven days for an
@@ -520,7 +520,9 @@ async fn publish_mail_keys_publicly(
     let dir = cfg.keyring_dir.trim_end_matches('/');
     for key in keys {
         let localpart = mail_key_localpart(username, key);
-        let path = format!("{dir}/{localpart}.asc");
+        let path = crate::keycheck::keyring_file(dir, localpart)
+            .display()
+            .to_string();
         run_script(
             cfg,
             "publish-mail-key.sh",
@@ -6031,7 +6033,7 @@ async fn erasure_refund(store: &Store, account: &Account) -> Option<String> {
 /// Drop one account's published key from the box keyring. A missing directory or
 /// file is already done, which is what makes a retry safe.
 async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), String> {
-    let path = std::path::Path::new(&cfg.keyring_dir).join(format!("{username}.asc"));
+    let path = crate::keycheck::keyring_file(&cfg.keyring_dir, username);
     match tokio::fs::remove_file(&path).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -6102,6 +6104,7 @@ pub async fn close_account(
         kind: "erasure",
         received: &today,
         evidence: "the account page, with the mail password re-entered",
+        identity: "password",
         note: Some("closure filed from the account page"),
         identity_at: None,
         fee_at: None,
@@ -6683,10 +6686,7 @@ pub async fn cancel_renewal(
 /// address is derived from the mailbox and its group's domain, so a body's
 /// mailbox is not told to write to `@kyriakon.net`.
 fn account_addresses(account: &Account) -> Vec<String> {
-    let own = match account.group.as_deref() {
-        Some(domain) => format!("{}@{}", account.username, domain),
-        None => format!("{}@kyriakon.net", account.username),
-    };
+    let own = account.platform_address();
     let mut out = vec![own];
     if let Some(outside) = account.outside_address.as_deref() {
         if out.iter().all(|own| own != outside) {
@@ -6733,58 +6733,14 @@ async fn signed_by_current_key(
     fingerprint: &str,
     signature: &str,
 ) -> Result<bool, String> {
-    // gpg's agent socket lives under the homedir, and a UNIX socket path is
-    // bounded: a long per-user temp directory fails to connect the agent rather
-    // than failing to read the key. /tmp is short on every box this runs on.
-    let home = std::path::PathBuf::from("/tmp")
-        .join(format!("kyriakon-rotation-gpg-{}", ulid::Ulid::new()));
-    tokio::fs::create_dir_all(&home)
-        .await
-        .map_err(|e| format!("cannot create {}: {e}", home.display()))?;
-    // gpg refuses a homedir another user could read, and the scratch directory
-    // is created with the process umask otherwise.
-    tokio::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
-        .await
-        .map_err(|e| format!("cannot set the mode on {}: {e}", home.display()))?;
-    let run = async {
-        let import = Command::new(&cfg.gpg)
-            .args(["--batch", "--no-tty", "--no-options", "--homedir"])
-            .arg(&home)
-            .arg("--import")
-            .arg(key_file)
-            .output()
-            .await
-            .map_err(|e| format!("cannot run {}: {e}", cfg.gpg))?;
-        if !import.status.success() {
-            return Err(format!(
-                "gpg could not read {} ({}): {}",
-                key_file.display(),
-                import.status,
-                String::from_utf8_lossy(&import.stderr).trim()
-            ));
-        }
-        let payload = home.join("fingerprint");
-        tokio::fs::write(&payload, fingerprint.as_bytes())
-            .await
-            .map_err(|e| format!("cannot write {}: {e}", payload.display()))?;
-        let sig = home.join("signature.asc");
-        tokio::fs::write(&sig, signature.as_bytes())
-            .await
-            .map_err(|e| format!("cannot write {}: {e}", sig.display()))?;
-        let verify = Command::new(&cfg.gpg)
-            .args(["--batch", "--no-tty", "--no-options", "--homedir"])
-            .arg(&home)
-            .arg("--verify")
-            .arg(&sig)
-            .arg(&payload)
-            .output()
-            .await
-            .map_err(|e| format!("cannot run {}: {e}", cfg.gpg))?;
-        Ok(verify.status.success())
-    }
-    .await;
-    let _ = tokio::fs::remove_dir_all(&home).await;
-    run
+    Ok(crate::keycheck::verify_signature(
+        &cfg.gpg,
+        key_file,
+        fingerprint.as_bytes(),
+        Some(signature.as_bytes()),
+    )
+    .await?
+    .is_some())
 }
 
 /// Apply a pending rotation: the new key into the keyring delivery reads, the
@@ -6936,8 +6892,7 @@ pub async fn mail_key(
                 )
                 .await;
             }
-            let key_file =
-                std::path::Path::new(&cfg.keyring_dir).join(format!("{}.asc", account.username));
+            let key_file = crate::keycheck::keyring_file(&cfg.keyring_dir, &account.username);
             let signed = if intent.signature.trim().is_empty() {
                 false
             } else {
@@ -8369,6 +8324,7 @@ pub async fn export_account(
                 // The session is the page's whole claim, and it was opened by
                 // the password check the runbook names.
                 evidence: "the account page's password check",
+                identity: "password",
                 note: Some("export filed from the account page"),
                 identity_at: None,
                 fee_at: None,
