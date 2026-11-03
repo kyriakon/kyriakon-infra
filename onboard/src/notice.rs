@@ -105,19 +105,26 @@ pub async fn alert(cfg: &DrainConfig, component: &str, event: &str, found: &str,
     }
 }
 
-/// Whether the account already records a notice of this type and subject.
-pub async fn already_sent(store: &Store, username: &str, notice_type: &str, subject: &str) -> bool {
+/// Whether the account already records a notice of this type and subject. An
+/// unreadable record is an error rather than "not sent": reading it as empty
+/// would send the member a second copy.
+pub async fn already_sent(
+    store: &Store,
+    username: &str,
+    notice_type: &str,
+    subject: &str,
+) -> Result<bool, String> {
     for line in store
         .lines(&format!("accounts/{username}/notices.jsonl"))
-        .await
+        .await?
     {
         if let Ok(n) = serde_json::from_str::<Notice>(&line) {
             if n.notice_type == notice_type && n.subject == subject {
-                return true;
+                return Ok(true);
             }
         }
     }
-    false
+    Ok(false)
 }
 
 /// Record a notice and then enqueue it, in that order. `false` means the
@@ -132,7 +139,7 @@ pub async fn send_account_notice(
     to: &str,
     body: &str,
 ) -> Result<bool, String> {
-    if already_sent(store, username, notice_type, subject).await {
+    if already_sent(store, username, notice_type, subject).await? {
         return Ok(false);
     }
     record_and_enqueue(cfg, store, username, notice_type, subject, to, body).await?;
@@ -355,7 +362,11 @@ mod tests {
         .await
         .unwrap());
         assert_eq!(
-            store.lines("accounts/secretary/notices.jsonl").await.len(),
+            store
+                .lines("accounts/secretary/notices.jsonl")
+                .await
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(

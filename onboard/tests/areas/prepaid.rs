@@ -986,6 +986,142 @@ fn a_credit_past_the_ceiling_is_refused_until_an_override_names_a_reason() {
     );
 }
 
+/// A credit dated more than two years ahead is refused at the console, before
+/// an intent is filed that the drain would only refuse later.
+#[test]
+fn the_credit_console_refuses_a_date_more_than_two_years_ahead() {
+    let fix = Fix::new("credit-window-console");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "9999-01-01",
+        "--confirm-double",
+    ]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(
+        body(&out).contains("more than two years ahead"),
+        "{}",
+        body(&out)
+    );
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+}
+
+/// A hand-written intent carrying 9999-01-01 is refused and journalled rather
+/// than panicking the pass, and the intent filed after it is still credited: one
+/// bad date does not starve the queue.
+#[test]
+fn a_credit_dated_past_the_calendar_is_refused_and_starves_nothing() {
+    let fix = Fix::new("credit-window-intent");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
+
+    let file = |id: &str, received: &str| {
+        let sig = sign::sign(
+            &key,
+            &sign::credit_payload(
+                &token, "cash", "20.00", received, None, None, false, None, None,
+            ),
+        )
+        .unwrap();
+        fix.write_intent(
+            id,
+            &json!({
+                "id": id,
+                "kind": "credit",
+                "filed_at": "2026-10-02T09:00:00Z",
+                "token": token,
+                "rail": "cash",
+                "amount_gbp": "20.00",
+                "received": received,
+                "txid": null,
+                "amount_xmr": null,
+                "confirm_double": false,
+                "override_reason": null,
+                "note": null,
+                "sig": sig,
+            }),
+        );
+    };
+    // The bad intent sorts first, so a panic would take the good one with it.
+    file("01J00000000000000000BAD9999", "9999-01-01");
+    file("01J00000000000000000GOOD2026", "2026-10-04");
+
+    let out = fix.drain();
+    assert!(
+        out.status.success(),
+        "the pass panicked: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let journal = fix.journal();
+    assert!(journal.contains("more than two years ahead"), "{journal}");
+    assert!(journal.contains("\"outcome\":\"refused\""), "{journal}");
+    assert!(
+        fix.intents()
+            .contains(&"01J00000000000000000BAD9999.json".to_string()),
+        "the refused intent stays for the backoff: {:?}",
+        fix.intents()
+    );
+    assert_eq!(
+        payment_lines(&fix).len(),
+        1,
+        "the intent after the bad date was not credited: {}",
+        fix.read("ledger/payments.jsonl")
+    );
+}
+
+/// A refusal is journalled once. Two passes over the same bad intent append one
+/// line, because a second pass would otherwise grow the journal by a line a
+/// minute and every journal read scans the whole file.
+#[test]
+fn a_refused_intent_is_journalled_once_across_two_passes() {
+    let fix = Fix::new("refusal-once");
+    let id = "01J00000000000000000BADCREDIT";
+    fix.write_intent(
+        id,
+        &json!({
+            "id": id,
+            "kind": "credit",
+            "filed_at": "2026-10-02T09:00:00Z",
+            "token": "abcdefghjkmnpqrstvwxyz0123",
+            "rail": "cash",
+            "amount_gbp": "20.00",
+            "received": "2026-10-04",
+            "txid": null,
+            "amount_xmr": null,
+            "confirm_double": false,
+            "override_reason": null,
+            "note": null,
+            "sig": "00".repeat(32),
+        }),
+    );
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.journal().matches("\"outcome\":\"refused\"").count(),
+        1,
+        "{}",
+        fix.journal()
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let journal = fix.journal();
+    assert_eq!(
+        journal.matches("\"outcome\":\"refused\"").count(),
+        1,
+        "the second pass appended another refusal: {journal}"
+    );
+    assert!(journal.contains("signature does not verify"), "{journal}");
+    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
+}
+
 /// The console refuses what it cannot credit: two references, no account, an
 /// account with no token, a rail it does not record. A username is resolved to
 /// the token before the intent is filed.

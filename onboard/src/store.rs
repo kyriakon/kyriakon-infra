@@ -385,16 +385,19 @@ impl Store {
         Ok(out)
     }
 
-    /// The non-empty lines of a store file, with a missing file reading as
-    /// nothing.
-    pub async fn lines(&self, path: &str) -> Vec<String> {
-        match tokio::fs::read_to_string(self.root.join(path)).await {
-            Ok(s) => s
+    /// The non-empty lines of a store file. A missing file reads as nothing; an
+    /// unreadable one is an error, because a reader that reported "empty" for a
+    /// record it could not read would let a replay settle the same intent twice.
+    pub async fn lines(&self, path: &str) -> Result<Vec<String>, String> {
+        let abs = self.root.join(path);
+        match tokio::fs::read_to_string(&abs).await {
+            Ok(s) => Ok(s
                 .lines()
                 .map(|l| l.trim_end().to_string())
                 .filter(|l| !l.is_empty())
-                .collect(),
-            Err(_) => Vec::new(),
+                .collect()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(format!("cannot read {}: {e}", abs.display())),
         }
     }
 }
@@ -1585,15 +1588,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::new(dir.to_str().unwrap());
         assert!(
-            store.lines("journal.jsonl").await.is_empty(),
+            store.lines("journal.jsonl").await.unwrap().is_empty(),
             "missing reads as empty"
         );
         store.append("journal.jsonl", b"{\"a\":1}").await.unwrap();
         store.append("journal.jsonl", b"{\"a\":2}\n").await.unwrap();
         assert_eq!(
-            store.lines("journal.jsonl").await,
+            store.lines("journal.jsonl").await.unwrap(),
             vec!["{\"a\":1}", "{\"a\":2}"]
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_record_is_an_error_not_an_empty_read() {
+        let dir = std::env::temp_dir().join(format!("onboard-lines-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A directory where the record belongs: the path exists and cannot be read.
+        std::fs::create_dir_all(dir.join("journal.jsonl")).unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+        assert!(store.lines("journal.jsonl").await.is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

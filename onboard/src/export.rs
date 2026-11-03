@@ -235,7 +235,7 @@ async fn written(
         join_lines(
             store
                 .lines(&format!("accounts/{username}/notices.jsonl"))
-                .await,
+                .await?,
         ),
     ));
 
@@ -265,7 +265,7 @@ async fn written(
     };
 
     let mut journal = Vec::new();
-    for line in store.lines("journal.jsonl").await {
+    for line in store.lines("journal.jsonl").await? {
         if let Ok(entry) = serde_json::from_str::<JournalLine>(&line) {
             if entry.application.username == username {
                 journal.push(line);
@@ -278,7 +278,7 @@ async fn written(
         join_lines(
             store
                 .lines(&format!("accounts/{username}/requests.jsonl"))
-                .await,
+                .await?,
         ),
     ));
 
@@ -296,7 +296,7 @@ async fn written(
         .and_then(|payment| payment.token_ref);
     let mut ledger = Vec::new();
     if let Some(token) = token.as_deref() {
-        for line in store.lines("ledger/payments.jsonl").await {
+        for line in store.lines("ledger/payments.jsonl").await? {
             if serde_json::from_str::<serde_json::Value>(&line)
                 .ok()
                 .and_then(|value| {

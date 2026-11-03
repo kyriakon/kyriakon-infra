@@ -42,7 +42,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
         let id = name.trim_end_matches(".json");
         // A failing intent backs off rather than being retried every minute, and
         // its error is mailed once rather than on every pass.
-        if !transitions::due(store, id, OffsetDateTime::now_utc()).await {
+        if !transitions::due(store, id, OffsetDateTime::now_utc()).await? {
             continue;
         }
         if let Err(e) = one(cfg, store, &key, &name).await {

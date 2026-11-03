@@ -139,17 +139,17 @@ fn format_date(date: Date) -> String {
 /// `months` calendar months later, clamping the day to the target month's
 /// length: the 31st of January answers by the 28th of February, and by the 29th
 /// in a leap year. Article 12's month is a calendar month, not thirty days.
-fn months_after(date: Date, months: u8) -> Date {
+/// `None` when the target is off the end of the calendar, so a record holding
+/// 9999 is refused rather than panicking the console.
+fn months_after(date: Date, months: u8) -> Option<Date> {
     let index = date.year() * 12 + i32::from(u8::from(date.month())) - 1 + i32::from(months);
     let year = index.div_euclid(12);
-    let month = Month::try_from((index.rem_euclid(12) + 1) as u8)
-        .expect("a month index maps to a month of the year");
+    let month = Month::try_from((index.rem_euclid(12) + 1) as u8).ok()?;
     let last = month.length(year);
-    Date::from_calendar_date(year, month, date.day().min(last))
-        .expect("a day clamped to the month's own length is in the month")
+    Date::from_calendar_date(year, month, date.day().min(last)).ok()
 }
 
-fn one_month_after(date: Date) -> Date {
+fn one_month_after(date: Date) -> Option<Date> {
     months_after(date, 1)
 }
 
@@ -288,7 +288,12 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
     let identity_at = request.identity_at.map(parse_date).transpose()?;
     let fee_at = request.fee_at.map(parse_date).transpose()?;
     let relevant = relevant_time(received, identity_at, fee_at);
-    let due = one_month_after(relevant);
+    let due = one_month_after(relevant).ok_or_else(|| {
+        format!(
+            "the answer due after {} has no date in the calendar",
+            format_date(relevant)
+        )
+    })?;
 
     let line = RequestLine {
         version: 1,
@@ -492,7 +497,12 @@ pub async fn extend(
                 line.due
             ));
         }
-        line.extended_until = Some(format_date(months_after(due, 2)));
+        line.extended_until = Some(format_date(months_after(due, 2).ok_or_else(|| {
+            format!(
+                "the extension of {} has no date in the calendar",
+                format_date(due)
+            )
+        })?));
         line.extended_at = Some(at);
         line.extended_reason = Some(reason);
         Ok(())
@@ -554,22 +564,22 @@ mod tests {
 
     #[test]
     fn one_calendar_month_clamps_to_the_shorter_months_last_day() {
-        assert_eq!(one_month_after(d("2026-10-22")), d("2026-11-22"));
-        assert_eq!(one_month_after(d("2026-12-15")), d("2027-01-15"));
-        assert_eq!(one_month_after(d("2026-01-31")), d("2026-02-28"));
-        assert_eq!(one_month_after(d("2024-01-31")), d("2024-02-29"));
-        assert_eq!(one_month_after(d("2026-03-31")), d("2026-04-30"));
-        assert_eq!(one_month_after(d("2026-08-31")), d("2026-09-30"));
+        assert_eq!(one_month_after(d("2026-10-22")).unwrap(), d("2026-11-22"));
+        assert_eq!(one_month_after(d("2026-12-15")).unwrap(), d("2027-01-15"));
+        assert_eq!(one_month_after(d("2026-01-31")).unwrap(), d("2026-02-28"));
+        assert_eq!(one_month_after(d("2024-01-31")).unwrap(), d("2024-02-29"));
+        assert_eq!(one_month_after(d("2026-03-31")).unwrap(), d("2026-04-30"));
+        assert_eq!(one_month_after(d("2026-08-31")).unwrap(), d("2026-09-30"));
     }
 
     #[test]
     fn the_clock_starts_at_the_latest_relevant_time() {
         assert_eq!(
-            one_month_after(relevant_time(d("2026-10-01"), None, None)),
+            one_month_after(relevant_time(d("2026-10-01"), None, None)).unwrap(),
             d("2026-11-01")
         );
         assert_eq!(
-            one_month_after(relevant_time(d("2026-10-01"), Some(d("2026-10-09")), None)),
+            one_month_after(relevant_time(d("2026-10-01"), Some(d("2026-10-09")), None)).unwrap(),
             d("2026-11-09")
         );
         // The fee arrived last, so the clock starts there, not at receipt.
@@ -586,19 +596,22 @@ mod tests {
                 d("2026-10-01"),
                 Some(d("2026-10-09")),
                 Some(d("2026-10-20"))
-            )),
+            ))
+            .unwrap(),
             d("2026-11-20")
         );
     }
 
     #[test]
     fn two_calendar_months_clamp_only_the_month_they_land_in() {
-        assert_eq!(months_after(d("2026-12-31"), 2), d("2027-02-28"));
+        assert_eq!(months_after(d("2026-12-31"), 2).unwrap(), d("2027-02-28"));
         // Clamping at each step would give 28 March: February's 28th is not a
         // day to count two calendar months from.
-        assert_eq!(months_after(d("2026-01-31"), 2), d("2026-03-31"));
-        assert_eq!(months_after(d("2026-11-30"), 2), d("2027-01-30"));
-        assert_eq!(months_after(d("2028-01-31"), 2), d("2028-03-31"));
+        assert_eq!(months_after(d("2026-01-31"), 2).unwrap(), d("2026-03-31"));
+        assert_eq!(months_after(d("2026-11-30"), 2).unwrap(), d("2027-01-30"));
+        assert_eq!(months_after(d("2028-01-31"), 2).unwrap(), d("2028-03-31"));
+        // Off the end of the calendar: refused, not a panic.
+        assert_eq!(months_after(d("9999-11-30"), 2), None);
     }
 
     #[tokio::test]
@@ -744,7 +757,7 @@ mod tests {
         assert_eq!(line.due, "2026-11-22");
         assert_eq!(line.relevant, "2026-10-22");
         assert_eq!(line.version, 1);
-        let raw = store.lines("accounts/alice/requests.jsonl").await;
+        let raw = store.lines("accounts/alice/requests.jsonl").await.unwrap();
         assert_eq!(raw.len(), 1);
         assert_eq!(serde_json::from_str::<RequestLine>(&raw[0]).unwrap(), line);
         std::fs::remove_dir_all(dir).unwrap();
@@ -786,6 +799,7 @@ mod tests {
         assert!(store
             .lines("accounts/alice/requests.jsonl")
             .await
+            .unwrap()
             .is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -802,6 +816,7 @@ mod tests {
         assert!(store
             .lines("accounts/alice/requests.jsonl")
             .await
+            .unwrap()
             .is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -814,7 +829,7 @@ mod tests {
             .unwrap();
         assert_eq!(line.identity, "mail-key");
         // The route is on the line the next reader sees, not only in the return.
-        let raw = store.lines("accounts/alice/requests.jsonl").await;
+        let raw = store.lines("accounts/alice/requests.jsonl").await.unwrap();
         assert!(raw[0].contains("\"identity\":\"mail-key\""), "{}", raw[0]);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -856,6 +871,7 @@ mod tests {
         let lines: Vec<RequestLine> = store
             .lines("accounts/alice/requests.jsonl")
             .await
+            .unwrap()
             .iter()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();

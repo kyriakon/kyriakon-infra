@@ -903,6 +903,54 @@ async fn a_closure_names_the_refund_only_inside_fourteen_days() {
     assert!(!page.contains("GBP 20.00"), "{page}");
 }
 
+/// The ledger belongs to root and the handler runs as `_onboard`, so the read
+/// can fail for every paying member. The refund line on the page is an estimate,
+/// so an unreadable ledger shows none rather than failing the Close: the drain's
+/// erasure answer, which reads as root, is the authoritative one.
+#[tokio::test]
+async fn a_closure_is_filed_even_when_the_ledger_cannot_be_read() {
+    let (mut app, dir) = handler("close-refund-unreadable").await;
+    file_account(&dir);
+    file_payment(
+        &dir,
+        "alice",
+        "KYR-AAAA-BBBB-CCCC",
+        &crate::util::date_after_days(-3),
+        "20.00",
+    );
+    // A directory where the ledger belongs: the path cannot be read as a file,
+    // whether or not the process is root.
+    let ledger = dir.join("ledger/payments.jsonl");
+    std::fs::remove_file(&ledger).unwrap();
+    std::fs::create_dir(&ledger).unwrap();
+
+    app.auth = session::Authenticator {
+        program: closure_checker("refund-unreadable"),
+        args: Vec::new(),
+    };
+    let cookie = signed_in(&app, "alice").await;
+    let (code, page) = answer(
+        &app,
+        &httpd_post_with(
+            "/account/close",
+            "password=right+horse+battery",
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    assert!(!page.contains("GBP 20.00"), "{page}");
+    // The closure was filed: one close intent is on disk for the account.
+    let filed: Vec<serde_json::Value> = std::fs::read_dir(dir.join("intents"))
+        .unwrap()
+        .flatten()
+        .map(|entry| serde_json::from_str(&std::fs::read_to_string(entry.path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(filed.len(), 1, "{filed:?}");
+    assert_eq!(filed[0]["kind"].as_str(), Some("close"), "{filed:?}");
+    assert_eq!(filed[0]["username"].as_str(), Some("alice"), "{filed:?}");
+}
+
 /// No key admits anyone, and neither does a header the front-end did not
 /// authenticate: a request naming a member in `REMOTE_USER` with no session gets
 /// the login page.
