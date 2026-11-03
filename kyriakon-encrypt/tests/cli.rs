@@ -1,4 +1,5 @@
-//! Tests for kyriakon-encrypt via its stdin/stdout seam and its unix socket.
+//! Tests for kyriakon-encrypt via its stdin/stdout seam, the one the Dovecot
+//! save path runs.
 //!
 //! A throwaway keypair is generated in a temp GNUPGHOME (never in the repo);
 //! the armored public cert is exported to `keyring/alice.asc`, mirroring the
@@ -6,12 +7,10 @@
 //! round-trips to the exact input, `+tag` resolves to the base localpart,
 //! missing/invalid recipients fail closed with no output.
 
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kyriakon-encrypt");
 
@@ -119,7 +118,7 @@ fn encrypt_seam(env: &TestEnv, user: &str) -> (bool, Vec<u8>) {
 }
 
 /// The same seam with the caller's bytes and a chosen gpg homedir, so a test
-/// can feed it ciphertext and give it the homedir the daemon really has.
+/// can feed it ciphertext and give it the homedir the save path really has.
 fn encrypt_seam_input(
     env: &TestEnv,
     user: &str,
@@ -141,10 +140,10 @@ fn encrypt_seam_input(
     (out.status.success(), out.stdout)
 }
 
-/// A gpg homedir with no secret keys, which is what the daemon has in
-/// production: its scratch directory under /var/run. A test that hands the
-/// daemon the keyring's own homedir instead lets gpg decrypt, and anything
-/// reading that dump then behaves differently from the deployed daemon.
+/// A gpg homedir with no secret keys, which is what the save path has in
+/// production: the plugin's own fresh scratch directory. A test that hands the
+/// encryptor the keyring's own homedir instead lets gpg decrypt, and anything
+/// reading that dump then behaves differently from the deployed save path.
 fn scratch_gpg_home(env: &TestEnv) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let dir = env.keyring.parent().unwrap().join("scratch-gnupg");
@@ -202,25 +201,6 @@ fn assert_valid_envelope(envelope: &[u8]) {
         !text.contains("\nContent-Type: text/plain"),
         "the payload's Content-Type leaked into the wrapper"
     );
-}
-
-/// The daemon's successful response is framed: `KYRIAKON-ENCRYPT 1 OK <len>\n`
-/// and then exactly `<len>` bytes. This is the C shim's check, so a response
-/// that is cut short fails here the way it fails a save.
-fn frame_body(resp: &[u8]) -> Vec<u8> {
-    let nl = resp
-        .iter()
-        .position(|&b| b == b'\n')
-        .unwrap_or_else(|| panic!("no frame header in {} bytes", resp.len()));
-    let len: usize = std::str::from_utf8(&resp[..nl])
-        .expect("frame header is ASCII")
-        .strip_prefix("KYRIAKON-ENCRYPT 1 OK ")
-        .expect("frame prefix")
-        .parse()
-        .expect("frame length");
-    let body = &resp[nl + 1..];
-    assert_eq!(body.len(), len, "truncated frame");
-    body.to_vec()
 }
 
 #[test]
@@ -297,7 +277,7 @@ fn resaving_our_own_envelope_does_not_encrypt_it_again() {
     assert_valid_envelope(&envelope);
 
     // What a client re-uploading a message does to it: ciphertext goes back
-    // through the save path, and the daemon's own scratch homedir holds no
+    // through the save path, and the encryptor's own scratch homedir holds no
     // secret key, which is what gpg sees in production.
     let (ok, again) = encrypt_seam_input(env, "alice", &envelope, &scratch_gpg_home(env));
     assert!(ok, "re-saving our own ciphertext must succeed");
@@ -446,51 +426,27 @@ fn a_message_with_a_foreign_preamble_is_encrypted() {
 }
 
 #[test]
-fn daemon_serves_over_unix_socket() {
+fn a_failed_stdout_write_is_a_failed_save() {
     let env = TestEnv::get();
-    let socket = env.keyring.parent().unwrap().join("encrypt.sock");
     let mut child = Command::new(BIN)
-        .args(["serve", "--socket"])
-        .arg(&socket)
-        .arg("--keyring")
+        .args(["encrypt", "--user", "alice", "--keyring"])
         .arg(&env.keyring)
         .arg("--gpg-home")
-        .arg(&env.gpg_home)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .arg(scratch_gpg_home(env))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .unwrap();
 
-    // Wait for the socket to appear.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !socket.exists() {
-        assert!(Instant::now() < deadline, "daemon did not create socket");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-
-    let request = |user: &str| -> Vec<u8> {
-        let mut conn = UnixStream::connect(&socket).unwrap();
-        conn.write_all(format!("{user}\n").as_bytes()).unwrap();
-        conn.write_all(MESSAGE).unwrap();
-        conn.shutdown(std::net::Shutdown::Write).unwrap();
-        let mut resp = Vec::new();
-        conn.read_to_end(&mut resp).unwrap();
-        resp
-    };
-
-    let ok = frame_body(&request("alice+tag"));
-    assert_valid_envelope(&ok);
-    assert_eq!(
-        env.decrypt(&octet_stream(&ok)),
-        expected_payload().as_bytes()
-    );
-
-    // Fail-closed over the socket: empty response for a missing key.
+    // Exit 0 is the save path's proof that every ciphertext byte arrived, so a
+    // stdout nobody reads has to fail. The child cannot have written yet: it
+    // reads stdin to EOF first, and that pipe is still held here.
+    drop(child.stdout.take());
+    child.stdin.take().unwrap().write_all(MESSAGE).unwrap();
+    let status = child.wait().unwrap();
     assert!(
-        request("nobody").is_empty(),
-        "missing key must yield empty response"
+        !status.success(),
+        "a ciphertext write that fails must not exit 0: {status}"
     );
-
-    child.kill().unwrap();
-    child.wait().unwrap();
 }

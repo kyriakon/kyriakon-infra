@@ -4,7 +4,7 @@
 #   pkg_add dovecot        # ships include/dovecot/*.h and lib/dovecot/*.so
 #
 #   make                  # produces libkyriakon_encrypt_plugin.so
-#   make test             # builds and runs the frame parser's test; needs no headers
+#   make test             # builds and runs the process glue's test; needs no headers
 #   doas make install     # installs into $(MODULEDIR)
 #
 # Paths default to the packaged OpenBSD layout and can be overridden:
@@ -50,21 +50,27 @@ check:
 		exit 1; \
 	fi
 
-${PLUGIN}: kyriakon-encrypt-plugin.c check
-	${CC} ${CFLAGS} ${LDFLAGS} -o ${PLUGIN} kyriakon-encrypt-plugin.c
+${PLUGIN}: kyriakon-encrypt-plugin.c encrypt-run.c encrypt-run.h check
+	${CC} ${CFLAGS} ${LDFLAGS} -o ${PLUGIN} kyriakon-encrypt-plugin.c encrypt-run.c
 
 install: check ${PLUGIN}
 	install -m 0644 ${PLUGIN} ${MODULEDIR}/${PLUGIN}
 
-# The response-frame parser is header-only and needs no Dovecot headers, so it
-# can be compiled and run anywhere. The plugin itself still needs them.
-test: test-frame
-	./test-frame
+# The process glue (fork, pipes, exit status) needs no Dovecot headers, so it
+# can be compiled and run anywhere against a fake encryptor. The plugin itself
+# still needs them.
+test: test-encrypt-run test-fake-encryptor
+	./test-encrypt-run ./test-fake-encryptor
 
-test-frame: test-frame.c frame.h
-	${CC} -std=c99 -Wall -Wextra -Werror -o test-frame test-frame.c
+test-encrypt-run: test-encrypt-run.c encrypt-run.c encrypt-run.h
+	${CC} -std=c99 -Wall -Wextra -Werror -o test-encrypt-run \
+		test-encrypt-run.c encrypt-run.c
+
+test-fake-encryptor: test-fake-encryptor.c
+	${CC} -std=c99 -Wall -Wextra -Werror -o test-fake-encryptor \
+		test-fake-encryptor.c
 
 clean:
-	rm -f ${PLUGIN} test-frame
+	rm -f ${PLUGIN} test-encrypt-run test-fake-encryptor
 
 .PHONY: all check test install clean

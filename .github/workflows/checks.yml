@@ -75,10 +75,10 @@ jobs:
       - name: clippy
         run: cargo clippy --manifest-path kyriakon-encrypt/Cargo.toml --all-targets -- -D warnings
       # The plugin itself needs the dovecot headers, which this runner does not
-      # carry. The response-frame parser needs only libc, and it is the part
-      # that must reject a truncated daemon response, so it is built and run
-      # here rather than left to a review.
-      - name: frame parser
+      # carry. The process glue needs only libc, and it is the part that must
+      # turn a failed or truncated encryption into a failed save, so it is
+      # built and run here rather than left to a review.
+      - name: process glue
         run: make -C dovecot-plugin test
 
   shell:

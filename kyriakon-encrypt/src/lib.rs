@@ -15,26 +15,18 @@
 //! Input that is already an envelope of ours for that recipient is returned
 //! unchanged, so a client re-uploading a message cannot have it encrypted twice.
 //!
-//! Socket protocol (daemon): one request per connection. Request = `<user>\n`
-//! followed by the raw message; message end is the client's half-close (EOF).
-//! Response = `KYRIAKON-ENCRYPT 1 OK <len>\n` and then exactly `<len>` bytes of
-//! ciphertext on success. The length is what lets the caller (C shim) tell a
-//! daemon that died mid-write from a complete answer, and fail the save rather
-//! than store half an armour. On error the connection is closed with no bytes
-//! written, so the save fails and plaintext is never stored.
+//! The Dovecot shim runs `kyriakon-encrypt encrypt` and reads the ciphertext
+//! from its stdout: exit status carries failure, so a gpg error or a write cut
+//! short is a failed save and plaintext is never stored.
 
 use std::fmt;
-use std::io::{self, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// On-box keyring location - sync of the git-tracked published key set.
 pub const DEFAULT_KEYRING: &str = "/etc/kyriakon/keys";
-/// Daemon socket; the Dovecot C shim talks to us here.
-pub const DEFAULT_SOCKET: &str = "/var/run/kyriakon/encrypt.sock";
 /// gpg homedir. gpg writes pubring.kbx/random_seed here even with
 /// `--recipient-file`, so it must be a writable, private dir - never a user's
 /// `$HOME`. Provision owns it and keeps it out of any account path.
@@ -112,7 +104,7 @@ fn armored_ciphertext(key: &Path, gpg_home: &Path, input: &[u8]) -> Result<Vec<u
     ensure_gpg_home(gpg_home)?;
     // --recipient-file reads the armored cert directly: no key import, no
     // trustdb, and the keyring file stays the single source. --homedir points
-    // gpg at the daemon's writable scratch dir (gpg writes pubring.kbx and
+    // gpg at the caller's writable scratch dir (gpg writes pubring.kbx and
     // random_seed even for --recipient-file). --no-options ignores any user
     // gpg.conf (e.g. a default-key).
     let mut child = Command::new("gpg")
@@ -150,9 +142,8 @@ fn armored_ciphertext(key: &Path, gpg_home: &Path, input: &[u8]) -> Result<Vec<u
     Ok(out.stdout)
 }
 
-/// The first line of every envelope this crate produces. The Dovecot C shim
-/// carries the same string as KYRIAKON_MARKER for its save_finish backstop, so
-/// the two have to stay in step.
+/// The first line of every envelope this crate produces: the one definition,
+/// written by `rfc3156_envelope` and required by the envelope gate.
 const ENVELOPE_MARKER: &str =
     "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";";
 
@@ -161,19 +152,6 @@ const ENVELOPE_MARKER: &str =
 /// part is stored in the clear: a sender that puts anything else there has
 /// written a message to encrypt, not ciphertext to keep.
 const ENVELOPE_PREAMBLE: &str = "This is an OpenPGP/MIME encrypted message (RFC 4880 and 3156).";
-
-/// Success-response frame header, carrying the body length. The Dovecot C shim
-/// carries the same string as KYRIAKON_FRAME and refuses a response whose body
-/// is not exactly this long, which is what catches a daemon restarted
-/// mid-write instead of half an armour reaching the Maildir.
-const RESPONSE_FRAME: &str = "KYRIAKON-ENCRYPT 1 OK ";
-
-/// Frame a successful response: the header line, then exactly the ciphertext.
-fn frame_response(ciphertext: &[u8]) -> Vec<u8> {
-    let mut out = format!("{RESPONSE_FRAME}{}\n", ciphertext.len()).into_bytes();
-    out.extend_from_slice(ciphertext);
-    out
-}
 
 /// Whether `input` is already an envelope this crate built for the recipient of
 /// `cert`, in which case it is saved as it stands rather than encrypted again.
@@ -405,7 +383,7 @@ fn long_key_id(id: &str) -> Option<String> {
 ///
 /// The exit status is deliberately ignored. gpg prints the packet listing and
 /// then exits non-zero for a message it cannot decrypt, which is every message
-/// here: the daemon's gpg homedir holds no secret key, by design. Treating that
+/// here: the encryptor's gpg homedir holds no secret key, by design. Treating that
 /// status as fatal discards the listing and the caller sees no recipients at
 /// all.
 fn list_packets(input: &[u8], gpg_home: &Path) -> Vec<u8> {
@@ -439,8 +417,8 @@ fn list_packets(input: &[u8], gpg_home: &Path) -> Vec<u8> {
     }
 }
 
-/// Create the gpg scratch dir (0700). Idempotent; run per message because a
-/// save-path daemon can't assume external setup completed.
+/// Create the gpg scratch dir (0700). Idempotent; run per message because the
+/// save path cannot assume external setup completed.
 fn ensure_gpg_home(gpg_home: &Path) -> Result<(), Error> {
     std::fs::create_dir_all(gpg_home)
         .map_err(|e| Error::Gpg(format!("cannot create gpg homedir: {e}")))?;
@@ -594,13 +572,7 @@ const EXPOSED_HEADERS: [&str; 6] = ["from", "to", "cc", "reply-to", "date", "mes
 fn rfc3156_envelope(boundary: &str, armor: &[u8], msg: &[u8]) -> Vec<u8> {
     let (block, _, _) = split_message(msg);
     let mut out = Vec::with_capacity(armor.len() + msg.len().min(4096) + 512);
-    out.extend_from_slice(
-        format!(
-            "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";\n\
-             \tboundary=\"{boundary}\"\n"
-        )
-        .as_bytes(),
-    );
+    out.extend_from_slice(format!("{ENVELOPE_MARKER}\n\tboundary=\"{boundary}\"\n").as_bytes());
     for (name, start, end) in header_spans(block) {
         if EXPOSED_HEADERS.contains(&name.as_str()) {
             out.extend_from_slice(&block[start..end]);
@@ -635,59 +607,6 @@ fn make_boundary() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("kyriakon-{}-{nanos:x}", std::process::id())
-}
-
-/// Run the daemon: serve one request per connection on `socket`.
-/// Returns only when the listener fails (socket dir missing, bind error).
-pub fn serve(socket: &Path, keyring: &Path, gpg_home: &Path) -> Result<(), Error> {
-    // Stale socket from a previous crash; safe to remove because bind would
-    // fail on it, and a live daemon would make bind fail anyway.
-    let _ = std::fs::remove_file(socket);
-    let listener = UnixListener::bind(socket)?;
-
-    // Dovecot's save path runs as the mailbox user, not as root, so a socket
-    // only root can write to fails closed on every delivery. Set the mode here
-    // rather than rely on umask, which rc.subr does not control. Any local
-    // account can then ask for encryption, which exposes nothing: the keyring
-    // it encrypts to is world-readable (/etc/kyriakon/keys/*.asc, 0644).
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
-
-    for conn in listener.incoming() {
-        match conn {
-            Ok(stream) => {
-                let keyring = keyring.to_path_buf();
-                let gpg_home = gpg_home.to_path_buf();
-                thread::spawn(move || handle_conn(stream, &keyring, &gpg_home));
-            }
-            Err(e) => eprintln!("kyriakon-encrypt: accept: {e}"),
-        }
-    }
-    Ok(())
-}
-
-fn handle_conn(mut stream: UnixStream, keyring: &Path, gpg_home: &Path) {
-    let mut buf = Vec::new();
-    if stream.read_to_end(&mut buf).is_err() {
-        return;
-    }
-    let Some(nl) = buf.iter().position(|&b| b == b'\n') else {
-        eprintln!("kyriakon-encrypt: request missing user line");
-        return;
-    };
-    let user = String::from_utf8_lossy(&buf[..nl]);
-    match encrypt(&user, keyring, gpg_home, &buf[nl + 1..]) {
-        Ok(out) => {
-            if stream.write_all(&frame_response(&out)).is_err() {
-                eprintln!("kyriakon-encrypt: write response: client gone");
-            }
-        }
-        Err(e) => {
-            // Fail-closed: no bytes written, caller must treat empty response
-            // as a failed save. Never emit plaintext on the wire.
-            eprintln!("kyriakon-encrypt: {user}: {e}");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -821,8 +740,8 @@ mod tests {
 
     #[test]
     fn an_envelope_yields_its_ciphertext_part() {
-        // What the daemon puts on the wire for its own envelope comes back as
-        // the armour alone, so the key-id scan sees ciphertext and nothing else.
+        // The envelope's own ciphertext part comes back as the armour alone, so
+        // the key-id scan sees ciphertext and nothing else.
         assert_eq!(envelope_ciphertext(&envelope()), Some(&b"ARMOR\n"[..]));
     }
 
@@ -865,39 +784,5 @@ mod tests {
         let mut junk = whole.clone();
         junk.extend_from_slice(b"epilogue\n");
         assert_eq!(envelope_ciphertext(&junk), None);
-    }
-
-    /// The C shim's half of the response protocol: read to EOF, then accept
-    /// only a frame whose body is exactly the announced length.
-    fn read_frame(mut conn: UnixStream) -> Option<Vec<u8>> {
-        let mut resp = Vec::new();
-        conn.read_to_end(&mut resp).ok()?;
-        let nl = resp.iter().position(|&b| b == b'\n')?;
-        let len: usize = std::str::from_utf8(&resp[..nl])
-            .ok()?
-            .strip_prefix(RESPONSE_FRAME)?
-            .parse()
-            .ok()?;
-        let body = &resp[nl + 1..];
-        (body.len() == len).then(|| body.to_vec())
-    }
-
-    #[test]
-    fn a_truncated_response_fails_and_a_whole_one_is_unchanged() {
-        let ciphertext = envelope();
-        let frame = frame_response(&ciphertext);
-
-        // The daemon restarted after writing half the frame: the caller sees a
-        // short body and must reject it rather than save the fragment.
-        let (mut daemon, conn) = UnixStream::pair().unwrap();
-        daemon.write_all(&frame[..frame.len() / 2]).unwrap();
-        drop(daemon);
-        assert_eq!(read_frame(conn), None);
-
-        // A complete response is the ciphertext, byte for byte.
-        let (mut daemon, conn) = UnixStream::pair().unwrap();
-        daemon.write_all(&frame).unwrap();
-        drop(daemon);
-        assert_eq!(read_frame(conn).as_deref(), Some(&ciphertext[..]));
     }
 }

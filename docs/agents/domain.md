@@ -22,8 +22,8 @@ There is no single source root. Each Rust crate has its own `Cargo.toml`, and th
 ├── AGENTS.md             agent orientation, build commands, never list
 ├── CODING_STANDARDS.md   what a review enforces beyond the tooling
 ├── onboard/              Rust signup service: handler, drain, portal, store
-├── kyriakon-encrypt/     Rust LMTP that encrypts mail at delivery
-├── dovecot-plugin/       C hook that hands saved mail to kyriakon-encrypt
+├── kyriakon-encrypt/     Rust CLI that encrypts one message per save
+├── dovecot-plugin/       C hook that runs kyriakon-encrypt on the save path
 ├── scripts/              deploys, drain scripts, operator checks, self-tests
 ├── openbsd/              every config the box runs, plus the restore template
 ├── terraform/            hcloud stack for the live box and the throwaway
