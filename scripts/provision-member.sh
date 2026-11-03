@@ -210,6 +210,20 @@ else
 			|| { printf 'could not add %s to %s\n' "$key" "$virtuals" >&2; exit 1; }
 		printf 'virtual %s added\n' "$key"
 		changed=yes
+		# The submission allowlist, in the same pass and for the same reason. The
+		# auth rule refuses a MAIL FROM that is not in /etc/mail/mail_from, so a
+		# member provisioned between deploys has no address it will accept until
+		# this adds their own identity. A box that has not run the mail deploy has
+		# no table and is a note rather than a failure, like the virtuals write.
+		if [ -f /etc/mail/mail_from ]; then
+			printf '%s: %s\n' "$key" "$user" >> /etc/mail/mail_from
+			awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' /etc/mail/mail_from \
+				|| { printf 'could not add %s to /etc/mail/mail_from\n' "$key" >&2; exit 1; }
+			printf 'mail_from %s added\n' "$key"
+		else
+			printf 'note: no /etc/mail/mail_from yet, so %s cannot submit until the mail deploy writes it\n' \
+				"$key" >&2
+		fi
 		# smtpd reads the table when it starts, so the line is not live until it
 		# is restarted: /etc/rc.d/smtpd defines no reload verb, and delete-user.sh
 		# restarts it for the same reason. This runs for every member, a mail-only
