@@ -132,6 +132,9 @@ line_for() {
 
 die() {
 	printf 'cron-apply: %s\n' "$*" >&2
+	# A failing --web pass must not leave its writer lock behind: the next run
+	# takes over a dead pid's lock, but a self-test's pid is still alive.
+	release_web_lock 2>/dev/null || true
 	exit 1
 }
 
@@ -180,6 +183,10 @@ gmid_conf=/etc/gmid.conf
 relayd_conf=/etc/relayd.conf
 ssl_dir=/etc/ssl
 ssl_private=/etc/ssl/private
+# One writer at a time for --web. The lock lives beside the deploy marker, which
+# is root's directory on this box, and its shape is acme-queue.sh's run lock.
+state_dir="${KYRIAKON_STATE_DIR:-/var/db/kyriakon}"
+web_lock="$state_dir/cron-apply-web.lock"
 
 # regen_index <dir>: rebuild <dir>/index.conf from the member files present.
 # Returns 1 when the index already matches, so the caller skips the reload.
@@ -260,21 +267,54 @@ restore_keypairs() {
 	mv "$relayd_conf.saved.$$" "$relayd_conf"
 }
 
+# take_web_lock: mkdir is the atomic test-and-set available in base, and the
+# takeover rule is acme-queue.sh's: a lock left by a pass that died is taken over
+# once its pid is gone, so a reboot cannot wedge the web lane. Returns 1 when a
+# live pass holds it, which is the one case the caller does nothing in: that pass
+# writes every index and reloads, so a second pass restoring a saved copy could
+# drop a keypair the first one just wrote.
+take_web_lock() {
+	typeset holder
+	mkdir -p "$state_dir" \
+		|| die "could not create $state_dir, so no index was rewritten"
+	if ! mkdir -m 0700 "$web_lock" 2>/dev/null; then
+		holder=$(cat "$web_lock/pid" 2>/dev/null || true)
+		if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+			return 1
+		fi
+		rm -f "$web_lock/pid"
+		rmdir "$web_lock" 2>/dev/null || true
+		mkdir -m 0700 "$web_lock" 2>/dev/null \
+			|| die "could not take $web_lock, and no live process holds it"
+	fi
+	printf '%s\n' "$$" > "$web_lock/pid"
+	return 0
+}
+
+release_web_lock() {
+	[ -n "${web_lock:-}" ] || return 0
+	# Only a lock this process took. The takeover-failure arm never reaches a
+	# state where the pid file is ours, and removing another pass's lock would
+	# be the second writer this exists to prevent.
+	[ "$(cat "$web_lock/pid" 2>/dev/null || true)" = "$$" ] || return 0
+	rm -f "$web_lock/pid"
+	rmdir "$web_lock" 2>/dev/null || true
+}
+
 apply_web() {
 	changed=""
 	acme_changed=""
 	keypairs_changed=no
-	regen_index "$httpd_d" && changed="$changed httpd"
-	regen_index "$gmid_d" && changed="$changed gmid"
-	# acme-client.conf's index is rewritten the same way and keeps the same saved
-	# copy, but nothing is reloaded: acme-client is not a daemon, and it reads the
-	# file when it next runs. The parse is still checked on the box, by the daily
-	# renewal rather than here, since the check that names a bad member block is
-	# acme-client itself.
-	regen_index "$acme_d" && acme_changed=yes
-	# The relayd region, from the same directory. --check passes --check through
-	# to the helper, so a dry run writes neither the file nor the certificate
-	# links it makes.
+	# A check writes nothing, so it needs no lock and must not block a live pass.
+	if [ "$check_only" = no ]; then
+		take_web_lock || return 0
+	fi
+	# The relayd region, from the same directory, rendered before any index is
+	# written. A render that fails dies inside regen_keypairs, and doing it first
+	# is what keeps that failure from leaving a new index on disk for a daemon
+	# that was never told to read it. --check passes --check through to the
+	# helper, so a dry run writes neither the file nor the certificate links it
+	# makes.
 	if [ -f "$relayd_conf" ] && [ "$check_only" = no ]; then
 		cp -p "$relayd_conf" "$relayd_conf.saved.$$"
 	fi
@@ -283,8 +323,17 @@ apply_web() {
 	else
 		rm -f "$relayd_conf.saved.$$"
 	fi
+	regen_index "$httpd_d" && changed="$changed httpd"
+	regen_index "$gmid_d" && changed="$changed gmid"
+	# acme-client.conf's index is rewritten the same way and keeps the same saved
+	# copy, but nothing is reloaded: acme-client is not a daemon, and it reads the
+	# file when it next runs. The parse is still checked on the box, by the daily
+	# renewal rather than here, since the check that names a bad member block is
+	# acme-client itself.
+	regen_index "$acme_d" && acme_changed=yes
 	if [ -z "$changed" ] && [ -z "$acme_changed" ] && [ "$keypairs_changed" = no ]; then
 		printf 'generated indexes: nothing to change, nothing reloaded\n'
+		release_web_lock
 		return 0
 	fi
 	printf 'indexes to rewrite:%s%s\n' "$changed" "${acme_changed:+ acme-client}"
@@ -345,6 +394,7 @@ apply_web() {
 	if [ -n "$acme_changed" ]; then
 		printf 'acme-client index rewritten; it reads the file at its next run, so nothing was reloaded\n'
 	fi
+	release_web_lock
 }
 
 # self_test — apply_web against a tree of its own, with the two daemons and rcctl
@@ -388,6 +438,8 @@ STUB
 	relayd_conf="$tree/relayd.conf"
 	ssl_dir="$tree/ssl"
 	ssl_private="$ssl_dir/private"
+	state_dir="$tree/state"
+	web_lock="$state_dir/cron-apply-web.lock"
 	mkdir -p "$httpd_d" "$gmid_d" "$acme_d" "$ssl_private"
 	printf 'server "parish.example" {}\n' > "$httpd_d/parish.conf"
 
@@ -421,6 +473,8 @@ EOF
 		"$(grep -c 'member keypairs: .* rewritten' "$tree/first.out")" 1
 	check "the tracked keypair is untouched" \
 		"$(grep -c 'tls keypair "kyriakon.net"' "$relayd_conf")" 1
+	check "a pass releases its writer lock" \
+		"$([ -e "$web_lock" ] && printf yes || printf no)" no
 	index_before=$(cat "$httpd_d/index.conf")
 
 	# A member file appears, and the reload of it fails.
@@ -486,6 +540,59 @@ EOF
 	check "and the pass rewrites the region" \
 		"$(grep -c 'member keypairs: .* rewritten' "$tree/relayd.out")" 1
 	check "with no index rewritten" "$(grep -c '^reloaded:' "$tree/relayd.out")" 0
+
+	# A keypair render that fails must leave the indexes as they were. The render
+	# runs before any index is written, so a relayd.conf the helper cannot read
+	# (here, one without its markers) cannot leave a new index on disk for a
+	# daemon that was never told to read it, while exiting non-zero.
+	printf 'server "later.example" {}\n' > "$httpd_d/later.conf"
+	index_before=$(cat "$httpd_d/index.conf")
+	printf 'http protocol "kyriakon-https" {\n}\n' > "$relayd_conf"
+	relayd_before=$(cat "$relayd_conf")
+	code=0
+	( set -e; apply_web ) > "$tree/render-failed.out" 2>&1 || code=$?
+	check "a keypair render that fails is a failure" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and names the region it could not render" \
+		"$(grep -c 'member keypair region rendered' "$tree/render-failed.out")" 1
+	check "and the index was not rewritten" "$(cat "$httpd_d/index.conf")" "$index_before"
+	check "and the relayd config keeps its bytes" "$(cat "$relayd_conf")" "$relayd_before"
+	check "and no writer lock is left" \
+		"$([ -e "$web_lock" ] && printf yes || printf no)" no
+	set -- "$relayd_conf".saved.*
+	check "and no saved copy is left" "$([ -e "$1" ] && printf yes || printf no)" no
+
+	# Two concurrent --web passes must not drop each other's keypair. The second
+	# pass writes nothing at all while a live pid holds the lock: if it did, its
+	# restore step could put back the saved index and relayd.conf from before the
+	# first pass's work, which is the keypair the first one just wrote.
+	cat > "$relayd_conf" <<'EOF'
+http protocol "kyriakon-https" {
+	tls keypair "kyriakon.net"
+	# --- BEGIN member keypairs ---
+	# --- END member keypairs ---
+}
+EOF
+	mkdir -p "$state_dir"
+	mkdir -m 0700 "$web_lock"
+	printf '%s\n' "$$" > "$web_lock/pid"
+	printf 'server "blocked.example" {}\n' > "$httpd_d/blocked.conf"
+	index_before=$(cat "$httpd_d/index.conf")
+	apply_web > "$tree/locked.out" 2>&1
+	check "a pass that loses the writer lock writes nothing" \
+		"$(wc -l < "$tree/locked.out" | tr -d ' ')" 0
+	check "and leaves the index alone" "$(cat "$httpd_d/index.conf")" "$index_before"
+	check "and leaves the holder's lock alone" \
+		"$([ -f "$web_lock/pid" ] && printf yes || printf no)" yes
+
+	# A lock left by a pass that died is taken over, so a reboot or a killed run
+	# cannot wedge the web lane for ever.
+	printf '%s\n' 999999 > "$web_lock/pid"
+	apply_web > "$tree/takeover.out" 2>&1
+	check "a dead pass's lock is taken over" \
+		"$(grep -c 'blocked.conf' "$httpd_d/index.conf")" 1
+	check "and the pass releases the lock" \
+		"$([ -e "$web_lock" ] && printf yes || printf no)" no
 
 	check "the checkout-run checks have lines of their own" \
 		"$(line_for check-hygiene.sh | grep -c 'scripts/check-hygiene.sh')" 1

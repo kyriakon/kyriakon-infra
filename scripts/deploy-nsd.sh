@@ -59,6 +59,8 @@ secret="${3:-${KYRIAKON_TSIG_SECRET:-}}"
 # fourth argument still overrides it for a box served from elsewhere.
 script_dir=$(dirname -- "$0")
 src_dir="${4:-$script_dir/../openbsd/etc/nsd}"
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
 if [ -z "$ipv4" ] || [ -z "$ipv6" ] || [ -z "$secret" ]; then
 	if [ ! -f "$env_file" ]; then
 		printf 'deploy-nsd: %s does not exist on this box yet.\n' "$env_file" >&2
@@ -109,6 +111,24 @@ printf '%s' "$secret" | grep -Eq '^[A-Za-z0-9+/=]+$' \
 # chroot, so it has to be able to read its own etc directory.
 install -d -m 0750 -o root -g _nsd /var/nsd/etc
 
+# install_rendered <dst> <mode> <src> [sed-expression...]: render <src> through
+# sed into a sibling temp and install it with install_staged. nsd reads every one
+# of these files at start, so a redirection straight onto the live path left a
+# truncated zone or a half-written nsd.conf if the run died mid-render; the
+# rename means the file nsd reads is either the old one or the whole new one.
+install_rendered() {
+	typeset rendered_dst="$1" rendered_mode="$2" rendered_src="$3" rendered_tmp
+	shift 3
+	rendered_tmp="$rendered_dst.render.$$"
+	if ! sed "$@" "$rendered_src" > "$rendered_tmp"; then
+		rm -f "$rendered_tmp"
+		printf 'could not render %s; %s left as it was\n' "$rendered_src" "$rendered_dst" >&2
+		return 1
+	fi
+	install_staged "$rendered_tmp" "$rendered_dst" -m "$rendered_mode"
+	rm -f "$rendered_tmp"
+}
+
 # Zones: substitute the RFC 5737/3849 documentation placeholders with the real
 # IPs. kyriakon.net carries them in four record sets (ns0, apex, mail and a
 # wildcard), kyriakon.com in one (the apex, which only redirects).
@@ -117,34 +137,30 @@ for zone_src in "$src_dir"/*.zone; do
 	[ -r "$zone_src" ] || continue
 	zone_name=$(basename "$zone_src" .zone)
 	zone_dst="/var/nsd/etc/$zone_name.zone"
-	sed -e "s/203\.0\.113\.10/$ipv4/g" -e "s/2001:db8::10/$ipv6/g" "$zone_src" > "$zone_dst"
-	chmod 0644 "$zone_dst"
+	install_rendered "$zone_dst" 0644 "$zone_src" \
+		-e "s/203\.0\.113\.10/$ipv4/g" -e "s/2001:db8::10/$ipv6/g"
 	zone_names="$zone_names $zone_name"
 done
 
 # Interface config: the same documentation IPv6 placeholder, so the address the
 # zone advertises is the address the box holds. Nothing else sets this up, and
 # Hetzner sends no router advertisement, so without this file the box serves an
-# AAAA it cannot answer.
-sed -e "s/2001:db8::10/$ipv6/g" "$iface_src" > "$iface_dst"
-# 0600 rather than the 0644 a plain install would leave: the daily security(8)
-# mail reports any world-readable /etc/hostname.* file, which is how this was
-# found, and the nsd directory above is 0750 for the same reason. Only root reads
-# it; netstart runs as root.
-chmod 0600 "$iface_dst"
+# AAAA it cannot answer. 0600 rather than the 0644 a plain install would leave:
+# the daily security(8) mail reports any world-readable /etc/hostname.* file,
+# which is how this was found, and the nsd directory above is 0750 for the same
+# reason. Only root reads it; netstart runs as root.
+install_rendered "$iface_dst" 0600 "$iface_src" -e "s/2001:db8::10/$ipv6/g"
 
 # nsd.conf: substitute the TSIG secret and the two addresses nsd binds. '|'
 # delimits the secret's s/// because base64 secrets routinely contain '/', which
 # would end a '/'-delimited expression mid-secret. The secret is written only
 # into the deployed file, never stdout. The IP substitution is the same two
 # expressions the zone loop above uses, so nsd listens on exactly the addresses
-# the zones advertise.
-sed -e "s|REPLACE_ME|$secret|" -e "s/203\.0\.113\.10/$ipv4/g" -e "s/2001:db8::10/$ipv6/g" \
-	"$conf_src" > "$conf_dst"
-
-# On-box perms: nsd chroots to /var/nsd and reads this before dropping to
-# _nsd, so root-only is right and the secret stays out of the chroot's reach.
-chmod 0640 "$conf_dst"
+# the zones advertise. 0640 because nsd chroots to /var/nsd and reads this before
+# dropping to _nsd: root-only is right and the secret stays out of the chroot's
+# reach.
+install_rendered "$conf_dst" 0640 "$conf_src" \
+	-e "s|REPLACE_ME|$secret|" -e "s/203\.0\.113\.10/$ipv4/g" -e "s/2001:db8::10/$ipv6/g"
 
 # Per-zone guards, run over what the loop above actually wrote. A surviving
 # placeholder means the IP arguments were wrong, and a parse error leaves nsd

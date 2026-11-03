@@ -39,8 +39,11 @@ Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box witho
 
 `scripts/deploy.sh` is the normal deploy. It reads the last deployed commit from
 `/var/db/kyriakon/deployed`, diffs it to the checkout's `HEAD`, and runs only the
-deploy scripts that diff needs, in this order: `deploy-nsd.sh`, `deploy-mail.sh`,
-`deploy-relayd.sh`, `deploy-onboard.sh`. Each script is idempotent, so a second
+deploy scripts that diff needs, in this order: `deploy-onboard.sh`,
+`deploy-nsd.sh`, `deploy-mail.sh`, `deploy-relayd.sh`. The onboarding service
+goes first because `deploy-mail.sh` refuses to finish unless
+`kyriakon_onboard` is running, and `deploy-relayd.sh` refuses unless the handler
+answers `signup.kyriakon.net` with 200. Each script is idempotent, so a second
 run after a fix is safe.
 
 From the workstation, one command updates the checkout and prints the plan:
@@ -604,10 +607,14 @@ To prove a restored copy becomes a working mail server, rather than merely resto
 2. Work through the checklist the script prints. Start the daemons, clone a test `pass` repository over ssh, send a message from an address outside the platform and read it back over IMAP with a PGP client, confirm MX and PTR point at this box for the window, record the date and the snapshot id, then ping the rehearsal check. The check carries a period of about 90 days, so a skipped quarter alerts on its own.
 
 3. Put the configuration on a replacement box from the repository, in this order.
+   `deploy-onboard.sh` runs first because the mail and relay deploys both check
+   that the handler is up.
 
 		doas ksh scripts/setup-env.sh
+		doas ksh scripts/deploy-onboard.sh
 		doas ksh scripts/deploy-nsd.sh
 		doas ksh scripts/deploy-mail.sh
+		doas ksh scripts/deploy-relayd.sh
 		doas ksh scripts/pf-apply.sh --check
 		doas ksh scripts/pf-apply.sh
 		doas ksh scripts/cron-apply.sh --check

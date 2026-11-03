@@ -40,6 +40,9 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname -- "$0")" && pwd)
 
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
+
 # --- self-test ---------------------------------------------------------------
 
 # The script names the drain's Rust invokes with `run_script(cfg, "…")` and its
@@ -196,6 +199,12 @@ need_pkg rust
 # the only base64 encoder on the box: OpenBSD ships no base64(1).
 need_pkg curl
 need_pkg jq
+# The gemini socket directory below is group _gmid, and that account arrives with
+# the gmid package, not in base. deploy.sh plans this deploy before deploy-mail
+# now, because deploy-mail and deploy-relayd both refuse to finish without the
+# handler, so the package has to be here rather than only in the mail deploy.
+# need_pkg is idempotent, and deploy-mail asks for the same package.
+need_pkg gmid
 cargo build --release --manifest-path "$repo_dir/onboard/Cargo.toml"
 # The handler, the root drain, onboardctl and the portal are one crate and four
 # programs: a build that produced some of them but not the others is half a
@@ -454,7 +463,7 @@ scripts_dir=$(awk -F'"' '/^scripts[[:space:]]*=/ { print $2; exit }' /etc/kyriak
 scripts_root=$(dirname "$scripts_dir")
 install -d -m 0755 "$scripts_dir"
 for s in $drain_scripts; do
-	install -m 0755 "$repo_dir/scripts/$s" "$scripts_dir/$s"
+	install_staged "$repo_dir/scripts/$s" "$scripts_dir/$s" -m 0755
 done
 # The drain's scripts source lib.sh only from inside --self-test, so the live path
 # keeps no dependency on it. It is installed here for the same reason the scripts

@@ -40,6 +40,10 @@ repo_dir="${1:-/usr/local/src/kyriakon-infra}"
 PATH="/usr/local/sbin:/usr/local/bin:$PATH"
 export PATH
 
+script_dir=$(cd "$(dirname -- "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
+
 queue_key_file=/etc/mail/queue.key
 # smtpd's crypto_setup() requires exactly this many characters (KEY_SIZE in
 # usr.sbin/smtpd/crypto.c) and uses them verbatim as the AES-256 key.
@@ -226,8 +230,6 @@ warn_aead() {
 # that is interrupted, or that cannot be made at all, leaves the file with what it
 # had, never with half of a new one.
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	typeset tree code before after candidate i
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
@@ -500,8 +502,11 @@ say "TLS"
 # each member gets: /home/www/<host>/{www,gemini}. /home/www is root-owned 0755
 # because sshd checks every component of a member's ChrootDirectory for root
 # ownership and no group or other write bit, and members' directories sit under
-# this one.
-install -d -m 0755 /home/www
+# this one. Owner and group are given rather than defaulted, because
+# deploy-onboard.sh now runs first and creates /home/www as a parent of the
+# sockets' directories: the mode and owner this line states are the ones the
+# chroot check needs whichever deploy made the directory.
+install -d -m 0755 -o root -g wheel /home/www
 # httpd derives its log directory from the chroot (the chroot plus /logs) and
 # refuses to start without it, so it is created here owned the way /var/www/logs
 # was: root:daemon 0755.
@@ -597,6 +602,21 @@ case "$acme_rc" in
 	2) printf 'oliver.kyriakon.net certificate already current\n' ;;
 	*) printf 'warning: acme-client failed for oliver.kyriakon.net (exit %s); its\n' "$acme_rc" >&2
 	   printf '  https vhost has no certificate until that succeeds.\n' >&2 ;;
+esac
+
+# kyriakon.com, the defensive registration. relayd.conf names its own keypair for
+# it, and deploy-relayd.sh refuses to install without both halves of the pair, so
+# a fresh box would come up with 443 down until the 03:00 renewal ran. Warns
+# rather than exits, like the two above: the name only redirects to the apex, and
+# the mail stack does not depend on it.
+acme_rc=0
+acme-client -v kyriakon.com || acme_rc=$?
+case "$acme_rc" in
+	0) printf 'kyriakon.com certificate issued or renewed\n' ;;
+	2) printf 'kyriakon.com certificate already current\n' ;;
+	*) printf 'warning: acme-client failed for kyriakon.com (exit %s); relayd has no\n' "$acme_rc" >&2
+	   printf '  pair to present for the redirector until that succeeds, and\n' >&2
+	   printf '  scripts/deploy-relayd.sh refuses to run without it.\n' >&2 ;;
 esac
 
 # --- Gemini --------------------------------------------------------------
@@ -1181,7 +1201,7 @@ install -d -m 0755 /root/bin
 # how the monitor spent a week unscheduled. cron-apply.sh puts the lines in; it
 # can only do that if the files it names are deployed first.
 for s in lib.sh abuse-monitor.sh check-keyring-drift.sh backup.sh renew-acme.sh restore-standup.sh acme-queue.sh; do
-	install -m 0755 "$repo_dir/scripts/$s" "/root/bin/$s"
+	install_staged "$repo_dir/scripts/$s" "/root/bin/$s" -m 0755
 done
 # This list used to be longer: before the onboarding service split out of this
 # deploy, the drain's own scripts were installed here too, and a box from that

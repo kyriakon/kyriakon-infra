@@ -43,6 +43,8 @@
 set -euo pipefail
 
 script_dir=$(cd "$(dirname -- "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
 
 # src_dir: the argument when one is given, and this script's ../openbsd/etc
 # otherwise, which is the repo layout. --self-test takes its directory as a
@@ -145,8 +147,9 @@ install_conf() {
 		return 0
 	fi
 	# /etc/mtree/special carries relayd.conf at 0600, and security(8) reports the
-	# difference daily until it matches.
-	install -m 0600 "$1" "$2"
+	# difference daily until it matches. install_staged renames the temp into
+	# place, so a killed deploy cannot leave relayd reading half a config.
+	install_staged "$1" "$2" -m 0600
 	printf 'installed %s\n' "$2"
 }
 
@@ -186,8 +189,6 @@ install_checked_conf() {
 }
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	typeset tree names link code stub
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
@@ -300,6 +301,36 @@ self_test() {
 	check "and installed at the mode mtree special expects" \
 		"$(stat -f %Lp "$tree/etc/relayd.conf")" 600
 	check "and the second run says unchanged" "$(grep -c 'unchanged' "$tree/second.out")" 1
+
+	# --- an install that dies mid-write ---
+	# install_staged writes a sibling temp and renames it over the live file. install
+	# is stubbed to write half a copy into that temp and fail, which is what a killed
+	# install leaves on disk: the live file must still hold the bytes it had, and the
+	# temp must not be left for the next run to explain.
+	failbin="$tree/failbin"
+	mkdir -p "$failbin"
+	cat > "$failbin/install" <<'STUB'
+#!/bin/sh
+for last; do :; done
+printf 'half a file\n' > "$last"
+exit 1
+STUB
+	chmod 0755 "$failbin/install"
+	before=$(cat "$tree/etc/relayd.conf")
+	printf 'http protocol "changed" {}\n' > "$tree/changed.conf"
+	saved_path=$PATH
+	PATH="$failbin:$PATH"
+	code=0
+	install_staged "$tree/changed.conf" "$tree/etc/relayd.conf" -m 0600 \
+		> "$tree/killed.out" 2>&1 || code=$?
+	PATH=$saved_path
+	check "a staged install that fails is a failure" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and the installed file keeps its bytes" "$(cat "$tree/etc/relayd.conf")" "$before"
+	check "and the failure says the file was left as it was" \
+		"$(grep -c 'left as it was' "$tree/killed.out")" 1
+	set -- "$tree/etc"/relayd.conf.new.*
+	check "and no temp is left behind" "$([ -e "$1" ] && printf yes || printf no)" no
 
 	# --- checking the configuration before installing it ---
 	# `relayd -n` needs root and a configuration it can parse, so it is stubbed
