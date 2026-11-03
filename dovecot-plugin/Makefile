@@ -4,6 +4,7 @@
 #   pkg_add dovecot        # ships include/dovecot/*.h and lib/dovecot/*.so
 #
 #   make                  # produces libkyriakon_encrypt_plugin.so
+#   make test             # builds and runs the frame parser's test; needs no headers
 #   doas make install     # installs into $(MODULEDIR)
 #
 # Paths default to the packaged OpenBSD layout and can be overridden:
@@ -55,7 +56,15 @@ ${PLUGIN}: kyriakon-encrypt-plugin.c check
 install: check ${PLUGIN}
 	install -m 0644 ${PLUGIN} ${MODULEDIR}/${PLUGIN}
 
-clean:
-	rm -f ${PLUGIN}
+# The response-frame parser is header-only and needs no Dovecot headers, so it
+# can be compiled and run anywhere. The plugin itself still needs them.
+test: test-frame
+	./test-frame
 
-.PHONY: all check install clean
+test-frame: test-frame.c frame.h
+	${CC} -std=c99 -Wall -Wextra -Werror -o test-frame test-frame.c
+
+clean:
+	rm -f ${PLUGIN} test-frame
+
+.PHONY: all check test install clean

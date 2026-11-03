@@ -13,7 +13,11 @@
  *
  * Socket protocol (must match kyriakon-encrypt's handle_conn): connect, write
  * "<localpart>\n" then the raw message, half-close (shutdown SHUT_WR), read
- * the ciphertext until EOF. An empty response means the daemon failed closed.
+ * the response until EOF. A successful response is framed: a
+ * "KYRIAKON-ENCRYPT 1 OK <len>\n" line and then exactly <len> bytes of
+ * ciphertext. A body shorter than that is a daemon that died mid-write, and
+ * the save fails rather than store half an armour. An empty response means the
+ * daemon failed closed.
  */
 
 #include "lib.h"
@@ -26,6 +30,7 @@
 #include "mail-storage-private.h"
 #include "mail-storage-hooks.h"
 #include "module-context.h"
+#include "frame.h"
 
 #include <errno.h>
 #include <string.h>
@@ -81,6 +86,7 @@ kyriakon_encrypt(struct mailbox *box, struct istream *input,
 	char tmp[8192];
 	const unsigned char *data;
 	size_t size;
+	size_t offset;
 	ssize_t ret;
 
 	*error_r = NULL;
@@ -148,11 +154,27 @@ kyriakon_encrypt(struct mailbox *box, struct istream *input,
 		buffer_free(&resp);
 		return NULL;
 	}
+	/* A non-empty body is not enough: a daemon restarted mid-write leaves
+	   half an armour that starts with the marker like any other. Only the
+	   frame's own length can tell the two apart. */
+	if (!kyriakon_parse_frame(resp->data, resp->used, &offset, &size)) {
+		*error_r = "truncated or malformed encryptor response";
+		buffer_free(&resp);
+		return NULL;
+	}
+	if (size < sizeof(KYRIAKON_MARKER) - 1 ||
+	    memcmp((const unsigned char *)resp->data + offset,
+		   KYRIAKON_MARKER, sizeof(KYRIAKON_MARKER) - 1) != 0) {
+		*error_r = "encryptor response is not kyriakon ciphertext";
+		buffer_free(&resp);
+		return NULL;
+	}
 
 	/* The buffer lives on box->pool, so it outlives the save. ponytail:
 	   buffers the whole ciphertext per save; spool to a temp file only if
 	   mailbox lifetime/volume makes this measurable. */
-	return i_stream_create_from_data(resp->data, resp->used);
+	return i_stream_create_from_data(
+		(const char *)resp->data + offset, size);
 }
 
 static int
