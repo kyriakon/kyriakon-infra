@@ -97,7 +97,12 @@ pub fn decide_payload(token: &str, action: &str) -> String {
 }
 
 /// The payload the one-time password link signs. The date is in the payload so
-/// the expiry is covered by the signature and not merely beside it.
+/// the expiry is covered by the signature and not merely beside it. The password
+/// is not, and cannot usefully be: the drain hashes the plaintext the handler
+/// files, so the signature proves the link and not the password. A compromised
+/// handler can therefore still choose the plaintext it submits, and so set a
+/// password it knows; it cannot install a chosen hash without a plaintext that
+/// produces it.
 pub fn password_payload(token: &str, until: &str) -> String {
     format!("password:{token}:{until}")
 }

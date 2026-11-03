@@ -105,43 +105,52 @@ fn signing_key(payload: &str) -> (String, String, String) {
     (public, signature, clearsigned)
 }
 
-/// A password change files one intent and the drain replaces the stored hash
-/// with the new one, so the old password stops authenticating. A hash this build
-/// did not make is refused and never reaches `usermod`.
+/// A password change files the plaintext and the drain hashes it, so the stored
+/// hash is one the member typed. An intent carrying a handler-made hash is the
+/// old shape and is refused before the script runs.
 #[test]
-fn a_password_change_replaces_the_stored_hash_and_refuses_a_bad_one() {
+fn a_password_change_hashes_the_plaintext_and_refuses_a_hash() {
     let fix = Fix::new("account-password");
     fix.page_account("alice", json!({}));
     let log = logging_script(&fix, "set-mail-password.sh");
-    let hash = kyriakon_onboard::password::make("a long new password").unwrap();
-    assert!(kyriakon_onboard::password::matches(
-        "a long new password",
-        &hash
-    ));
-    assert!(!kyriakon_onboard::password::matches("old password", &hash));
 
-    fix.file_page_action("change-password", "alice", json!({"hash": hash}));
+    fix.file_page_action(
+        "change-password",
+        "alice",
+        json!({"password": "a long new password"}),
+    );
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     assert!(fix.intents().is_empty(), "the applied intent is removed");
     let written = std::fs::read_to_string(&log).unwrap();
-    assert!(
-        written.contains(&format!("set-mail-password.sh alice {hash}")),
-        "the hash the handler made is what usermod is given: {written}"
-    );
+    let hash = written
+        .strip_prefix("set-mail-password.sh alice ")
+        .unwrap_or("")
+        .trim();
+    assert!(kyriakon_onboard::password::is_hash(hash), "{written}");
+    assert!(kyriakon_onboard::password::matches(
+        "a long new password",
+        hash
+    ));
+    assert!(!written.contains("a long new password"), "{written}");
     assert!(fix.journal().contains("\"outcome\":\"applied\""));
 
-    // A line `usermod -p` would take but this build did not make is refused
-    // before the script runs.
-    fix.file_page_action("change-password", "alice", json!({"hash": "not a hash"}));
+    // The old shape: a hash the handler chose, even a valid one, is refused.
+    let chosen = kyriakon_onboard::password::make("a password the member never typed").unwrap();
+    fix.file_page_action("change-password", "alice", json!({"hash": chosen}));
     assert!(fix.drain().status.success());
     assert_eq!(
         std::fs::read_to_string(&log).unwrap(),
         written,
-        "a malformed hash reached usermod"
+        "a handler-made hash reached usermod"
     );
-    assert!(fix.journal().contains("\"outcome\":\"refused\""));
-    assert!(fix.intents().is_empty());
+    assert!(
+        fix.journal()
+            .contains("the intent carries a hash rather than a plaintext"),
+        "{}",
+        fix.journal()
+    );
+    assert!(fix.intents().is_empty(), "the refused intent is settled");
 }
 
 /// One upload key serves sftp and git. Adding it writes the key the builder

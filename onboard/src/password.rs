@@ -1,10 +1,13 @@
 //! The one-time password link's password half: what a password may be, and the
 //! hash the store keeps.
 //!
-//! The handler hashes and the drain sets the hash, so no plaintext is written
-//! anywhere: not to the store, not to the intent file. bcrypt because the
-//! platform's login is BSD auth against the system account, which reads a
-//! `$2b$` hash, and the cost is the crate's default for that format.
+//! The drain hashes the plaintext and installs the hash, so the handler never
+//! chooses what is stored. The plaintext travels only in the intent file: the
+//! drain overwrites it in memory once hashed, removes the file after a
+//! successful apply, and strips it from any intent a refusal leaves in place.
+//! bcrypt because the platform's login is BSD auth against the system account,
+//! which reads a `$2b$` hash, and the cost is the crate's default for that
+//! format.
 
 use bcrypt::{hash, verify, DEFAULT_COST};
 
@@ -43,13 +46,14 @@ pub fn make(plain: &str) -> Result<String, String> {
 pub fn is_hash(stored: &str) -> bool {
     // A bcrypt hash is `$2b$<cost>$<22-byte salt><31-byte digest>`, 60
     // characters: the salt and the digest are one segment, with no separator
-    // between them. Its length is checked because `usermod -p` writes any line,
-    // and a truncated one locks the account.
+    // between them. The body is exactly 53 characters, checked so a longer line
+    // cannot pass as one `usermod -p` would write: BSD auth cannot verify it,
+    // which locks the member out while the intent journals `applied`.
     let mut parts = stored.split('$');
     parts.next() == Some("")
         && matches!(parts.next(), Some("2a" | "2b" | "2y"))
         && parts.next().is_some_and(|cost| cost.parse::<u32>().is_ok())
-        && parts.next().is_some_and(|body| body.len() >= 53)
+        && parts.next().is_some_and(|body| body.len() == 53)
         && parts.next().is_none()
 }
 
@@ -90,5 +94,14 @@ mod tests {
         assert!(!is_hash("not a hash"));
         assert!(!is_hash("$2b$12$"));
         assert!(!is_hash(""));
+    }
+
+    /// A body past bcrypt's 53 characters is a line `usermod -p` would write and
+    /// BSD auth could not verify, so it must never pass as a hash.
+    #[test]
+    fn a_body_longer_than_bcrypts_is_not_a_hash() {
+        let long = format!("$2b$12${}", "a".repeat(54));
+        assert_eq!(long.len(), 61);
+        assert!(!is_hash(&long));
     }
 }

@@ -1638,6 +1638,92 @@ fn the_console_files_an_address_intent() {
         .contains("office@parish.example: parish-secretary"));
 }
 
+/// A `--key-file` that is not a public key block is refused at the console:
+/// filing it would create the mailbox with junk as its key and leave the page
+/// showing a blank fingerprint.
+#[test]
+fn the_console_refuses_a_mail_key_that_is_not_a_public_key() {
+    let fix = Fix::new("group-ctl-key-junk");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+
+    let path = fix.path("certificate.pem");
+    std::fs::write(
+        &path,
+        "-----BEGIN CERTIFICATE-----\nMIIBexample\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    let out = fix.ctl(&[
+        "address",
+        "--domain",
+        "parish.example",
+        "--action",
+        "add-mailbox",
+        "--address",
+        "office",
+        "--mailbox",
+        "parish-office",
+        "--key-file",
+        &path,
+    ]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("public key block"), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert!(!fix.passwd_file().contains("parish-office:"));
+}
+
+/// The same console path with a real public key computes the fingerprint and
+/// files the change the drain then applies.
+#[test]
+fn the_console_files_a_validated_mail_key() {
+    let fix = Fix::new("group-ctl-key-good");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+
+    let path = fix.path("mail.asc");
+    std::fs::write(&path, GOOD_KEY).unwrap();
+    let out = fix.ctl(&[
+        "address",
+        "--domain",
+        "parish.example",
+        "--action",
+        "add-mailbox",
+        "--address",
+        "office",
+        "--mailbox",
+        "parish-office",
+        "--key-file",
+        &path,
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let intents = fix.intents();
+    assert_eq!(intents.len(), 1, "{intents:?}");
+    let filed: Value = serde_json::from_str(&fix.read(&format!("intents/{}", intents[0]))).unwrap();
+    let expected = kyriakon_onboard::keycheck::mail_key("parish-office".to_string(), GOOD_KEY);
+    assert!(!expected.fingerprint.is_empty());
+    assert_eq!(
+        filed["mail_key"]["fingerprint"],
+        json!(expected.fingerprint)
+    );
+    assert_eq!(filed["mail_key"]["verdict"], json!(expected.verdict));
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.passwd_file().contains("parish-office:"));
+}
+
 /// An address intent without the root key's signature changes nothing:
 /// `intents/` is writable by the unprivileged handler, and this one would
 /// otherwise create or remove a root account.

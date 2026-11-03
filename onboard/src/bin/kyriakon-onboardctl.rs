@@ -65,7 +65,7 @@ use kyriakon_onboard::keycheck;
 use kyriakon_onboard::prepaid;
 use kyriakon_onboard::requests;
 use kyriakon_onboard::sign;
-use kyriakon_onboard::store::{self, free_account_count, KeyRecord, Record, Store};
+use kyriakon_onboard::store::{self, free_account_count, Record, Store};
 use kyriakon_onboard::transitions::{self, Decision};
 use kyriakon_onboard::util;
 use kyriakon_onboard::validate;
@@ -986,12 +986,18 @@ async fn address(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<()
             if material.trim().is_empty() {
                 return Err(format!("the mail key {path} is empty"));
             }
-            Some(KeyRecord {
-                mailbox: mailbox.to_string(),
-                fingerprint: String::new(),
-                material,
-                verdict: "unchecked".to_string(),
-            })
+            // The same check the responder and the portal run, so a console
+            // submission cannot file a mailbox the pages would have refused:
+            // the fingerprint and verdict are computed from the material, never
+            // left blank or "unchecked" for something that is not a key.
+            let record = keycheck::mail_key(mailbox.to_string(), &material);
+            if record.fingerprint.is_empty() {
+                let why = keycheck::pgp_public_key(&material)
+                    .err()
+                    .unwrap_or_else(|| "it carries no key packet".to_string());
+                return Err(format!("the mail key {path}: {why}"));
+            }
+            Some(record)
         }
         None => None,
     };
