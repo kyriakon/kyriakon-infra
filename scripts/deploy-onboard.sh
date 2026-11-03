@@ -46,14 +46,6 @@ install_set="$script_dir/install-set.tsv"
 
 # --- self-test ---------------------------------------------------------------
 
-# table_drain_scripts <table> — the scripts installed into the drain's own
-# directory, one per line, from the one install-set table. The live run and the
-# check below read the same function, so what is installed and what is expected
-# cannot be two lists.
-table_drain_scripts() {
-	awk -F'\t' '!/^#/ && $2 == "drain" { print $1 }' "$1"
-}
-
 # The script names the drain's Rust invokes with `run_script(cfg, "…")` and its
 # two siblings, read from the source rather than a second list that can drift.
 drain_invoked() {
@@ -69,7 +61,7 @@ missing_drain_scripts() { # <transitions.rs> <install-set table>
 	invoked=$(drain_invoked "$1")
 	# One line per row, which is what the table reader prints; the case below
 	# compares space-separated words.
-	installed=$(table_drain_scripts "$2" | tr '\n' ' ') || return 1
+	installed=$(install_rows "$2" drain | tr '\n' ' ') || return 1
 	for name in $invoked; do
 		case " $installed " in
 		*" $name "*) ;;
@@ -92,7 +84,7 @@ self_test() {
 	work=$(mktemp -d "${TMPDIR:-/tmp}/deploy-onboard.XXXXXX") || exit 1
 	trap 'rm -rf "$work"' EXIT
 
-	installed=$(table_drain_scripts "$install_set")
+	installed=$(install_rows "$install_set" drain)
 	[ -n "$installed" ] || {
 		printf 'self-test: %s names no drain scripts\n' "$install_set" >&2
 		exit 1
@@ -175,7 +167,7 @@ need_pkg() {
 # to themselves (their own ../openbsd/etc/login.conf.d/member and lapsed), so this
 # deploy installs both files into the layout the relative read resolves to rather
 # than copying the scripts somewhere the read would leave behind.
-drain_scripts=$(table_drain_scripts "$install_set") \
+drain_scripts=$(install_rows "$install_set" drain) \
 	|| die "cannot read $install_set"
 [ -n "$drain_scripts" ] || die "$install_set names no drain scripts"
 drain_class="openbsd/etc/login.conf.d/member"
@@ -508,6 +500,10 @@ install -d -m 0755 "$scripts_dir"
 for s in $drain_scripts; do
 	install_staged "$repo_dir/scripts/$s" "$scripts_dir/$s" -m 0755
 done
+# cron-apply.sh, installed above, reads this table to build the crontab, and it
+# reads it from its own directory. Installing it here is what makes the deployed
+# copy work; the checkout's copy is the one this run installs from.
+install_staged "$repo_dir/scripts/install-set.tsv" "$scripts_dir/install-set.tsv" -m 0644
 install -d -m 0755 "$scripts_root/openbsd/etc/login.conf.d"
 install -m 0644 "$repo_dir/$drain_class" "$scripts_root/openbsd/etc/login.conf.d/member"
 install -m 0644 "$repo_dir/$drain_lapsed_class" "$scripts_root/openbsd/etc/login.conf.d/lapsed"

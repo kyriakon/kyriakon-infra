@@ -167,18 +167,30 @@ alert_address_problem() {
 # table's rows are what the deploys install, so a row with nothing installed is a
 # finding: comparing only the copies that happen to be there cannot see the
 # install a deploy never made.
+#
+# The drain's directory also holds the table itself, because the installed
+# cron-apply.sh reads it from there, so a stale or missing copy is the same
+# finding: the box would schedule the set the checkout has left behind.
 deployed_drift() {
 	typeset checkout="$1" table="$2" token="$3" dir="$4" file name names
 	if [ ! -d "$dir" ]; then
 		printf '%s: the directory is gone\n' "$dir"
 		return 0
 	fi
-	names=$(awk -F'\t' -v t="$token" '!/^#/ && $2 == t { print $1 }' "$table") || return 1
+	names=$(install_rows "$table" "$token") || return 1
 	for name in $names; do
 		if [ ! -f "$dir/$name" ]; then
 			printf '%s: not installed, and %s names it\n' "$dir/$name" "$table"
 		fi
 	done
+	if [ "$token" = drain ]; then
+		if [ ! -f "$dir/install-set.tsv" ]; then
+			printf '%s: not installed, and the copy there reads it\n' \
+				"$dir/install-set.tsv"
+		elif ! cmp -s "$table" "$dir/install-set.tsv"; then
+			printf '%s differs from %s\n' "$dir/install-set.tsv" "$table"
+		fi
+	fi
 	for file in "$dir"/*.sh; do
 		[ -f "$file" ] || continue
 		name=$(basename "$file")
@@ -439,13 +451,30 @@ EOF
 	*) printf 'FAIL: a missing directory is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
 	esac
 	# A destination the table does not use takes nothing from it: the rows above
-	# are /root/bin's, so a drain check on an empty directory has nothing to report.
-	mkdir "$dir/empty"
-	out=$(deployed_drift "$dir/checkout" "$dir/table" drain "$dir/empty")
+	# are /root/bin's, so a drain check on a directory holding an identical table
+	# copy and no drain rows has nothing to report.
+	mkdir -p "$dir/drain"
+	cp "$dir/table" "$dir/drain/install-set.tsv"
+	cp "$dir/checkout/one.sh" "$dir/drain/one.sh"
+	out=$(deployed_drift "$dir/checkout" "$dir/table" drain "$dir/drain")
 	[ -z "$out" ] || {
 		printf 'FAIL: another destination takes no rows; got [%s]\n' "$out" >&2
 		exit 1
 	}
+	# The table installed beside the drain's scripts is what the installed
+	# cron-apply.sh reads, so a stale copy is a finding.
+	printf 'one.sh\t/root/bin\t-\n' >"$dir/drain/install-set.tsv"
+	out=$(deployed_drift "$dir/checkout" "$dir/table" drain "$dir/drain")
+	case "$out" in
+	*install-set.tsv*) ;;
+	*) printf 'FAIL: a stale installed table is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
+	rm -f "$dir/drain/install-set.tsv"
+	out=$(deployed_drift "$dir/checkout" "$dir/table" drain "$dir/drain")
+	case "$out" in
+	*install-set.tsv*) ;;
+	*) printf 'FAIL: a missing installed table is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
 
 	printf 'mine\n' > "$dir/store/record.json"
 	[ -z "$(store_drift "$dir/store" "$(id -un)")" ] || {
@@ -740,8 +769,14 @@ if [ -d "$repo_dir/scripts" ]; then
 		drift_status=0
 		drift=$(deployed_drift "$repo_dir/scripts" "$install_set" /root/bin /root/bin) \
 			|| drift_status=$?
-		drift="$drift$(deployed_drift "$repo_dir/scripts" "$install_set" drain "$drain_scripts_dir")" \
+		drift_drain=$(deployed_drift "$repo_dir/scripts" "$install_set" drain "$drain_scripts_dir") \
 			|| drift_status=$?
+		if [ -z "$drift" ]; then
+			drift=$drift_drain
+		elif [ -n "$drift_drain" ]; then
+			drift="$drift
+$drift_drain"
+		fi
 		if [ "$drift_status" -ne 0 ]; then
 			printf 'installed scripts: %s could not be read, so the copies were not checked\n' \
 				"$install_set"

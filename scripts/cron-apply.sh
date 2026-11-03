@@ -152,11 +152,14 @@ die() {
 	exit 1
 }
 
-# The scripts this script schedules, read from the table after the only way to
-# report a table it cannot read is defined. An empty one is a table that lost its
-# schedules, not a box with nothing to schedule.
-needed_scripts=$(scheduled_scripts "$install_set") || die "cannot read $install_set"
-[ -n "$needed_scripts" ] || die "$install_set names no scheduled script"
+# read_scheduled_scripts: set needed_scripts from the table. Called from the
+# crontab path rather than at startup, because the --web lane rewrites the index
+# files and never reads the table: a missing table must not fail the pass the
+# drain asks for, and the installed copy finds its table beside itself.
+read_scheduled_scripts() {
+	needed_scripts=$(scheduled_scripts "$install_set") || die "cannot read $install_set"
+	[ -n "$needed_scripts" ] || die "$install_set names no scheduled script"
+}
 
 # The self-test runs against a tree of its own, with the daemons and rcctl stubbed,
 # so it is the one mode that needs no root: every other one here writes root's
@@ -426,7 +429,7 @@ apply_web() {
 self_test() {
 	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
 	. "$(dirname "$0")/lib.sh"
-	typeset tree stub code index_before gmid_before got
+	typeset tree stub code index_before gmid_before got installed
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work
@@ -660,6 +663,44 @@ EOF
 	check "the scheduled set is the table's rows" \
 		"$(scheduled_scripts "$install_set" | grep -c '^lib\.sh$')" 0
 
+	# The table and the two lanes. A missing table has to fail the crontab pass
+	# and name the file; the web pass must run without it, which is what keeps the
+	# drain's --web call working while the table install has not landed.
+	install_set="$tree/absent.tsv"
+	got=0
+	( read_scheduled_scripts ) >"$tree/absent.out" 2>&1 || got=$?
+	check "a missing table fails the crontab pass" \
+		"$([ "$got" -ne 0 ] && printf yes || printf no)" yes
+	check "and names the file it could not read" \
+		"$(grep -c 'cannot read' "$tree/absent.out")" 1
+	check_only=yes
+	code=0
+	apply_web >"$tree/web-no-table.out" 2>&1 || code=$?
+	check "the web pass runs without the table" \
+		"$([ "$code" -eq 0 ] && printf yes || printf no)" yes
+	check "and never reads it" "$(grep -c 'absent.tsv' "$tree/web-no-table.out")" 0
+	check_only=no
+	install_set="$script_dir/install-set.tsv"
+
+	# The installed layout: deploy-onboard.sh copies the table's drain rows, the
+	# table itself and lib.sh into the drain's directory, and that copy reads the
+	# table from its own directory. Its own self-test is the probe, and it covers
+	# both lanes from there. The guard is a file only the checkout has, so the copy
+	# cannot spawn another copy of itself.
+	if [ -f "$script_dir/self-test-all.sh" ]; then
+		installed="$tree/installed"
+		mkdir "$installed"
+		for s in $(install_rows "$script_dir/install-set.tsv" drain); do
+			cp "$script_dir/$s" "$installed/" \
+				|| die "cannot copy $s into the installed-layout probe"
+		done
+		cp "$script_dir/install-set.tsv" "$installed/"
+		code=0
+		ksh "$installed/cron-apply.sh" --self-test >"$tree/installed.out" 2>&1 || code=$?
+		check "the installed copy, with its table beside it, passes its own self-test" \
+			"$([ "$code" -eq 0 ] && printf yes || printf no)" yes
+	fi
+
 	self_test_end
 }
 
@@ -672,6 +713,7 @@ if [ "$web_only" = yes ]; then
 	exit 0
 fi
 
+read_scheduled_scripts
 current=$(crontab -l 2>/dev/null || true)
 
 missing_scripts=""

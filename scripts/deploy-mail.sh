@@ -59,15 +59,29 @@ encrypt_bin=/usr/local/sbin/kyriakon-encrypt
 
 say() { printf '== %s\n' "$*"; }
 
-# The one list of which scripts the box runs, and where; scripts/install-set.tsv
-# is its own explanation. This deploy installs the /root/bin rows, cron-apply.sh
-# schedules them, check-hygiene.sh checks the copies, and deploy.sh routes a
-# changed script by its row.
+# The one list of which scripts the box runs, and where. scripts/install-set.tsv
+# is its own explanation, and lib.sh's install_rows is how this reads it. This
+# deploy installs the /root/bin rows, cron-apply.sh schedules them,
+# check-hygiene.sh checks the copies, and deploy.sh routes a changed script by
+# its row.
 install_set="$script_dir/install-set.tsv"
 
-# root_bin_scripts <table> — the scripts installed into /root/bin, one per line.
-root_bin_scripts() {
-	awk -F'\t' '!/^#/ && $2 == "/root/bin" { print $1 }' "$1"
+# stale_copies <installed names>: the pre-split copies in /root/bin that this
+# deploy still sweeps away, less every name the table installs. Before the
+# onboarding service split out of this deploy, the drain's scripts were installed
+# here too, and a box from that time keeps them; they are stale copies of scripts
+# that now run from the drain's directory, and check-hygiene's section 9 reports
+# every one of them for ever otherwise. The installed set is excluded so a row
+# added later for one of these cannot be installed and removed in the same run.
+stale_copies() {
+	for s in add-user.sh check-hygiene.sh cron-apply.sh delete-user.sh deploy-mail.sh \
+		deploy-onboard.sh deploy-relayd.sh onboard-store.sh provision-member.sh \
+		provision-member-capsule.sh provision-member-web.sh quota-apply.sh restore-test.sh; do
+		case " $(printf '%s\n' "$1" | tr '\n' ' ') " in
+		*" $s "*) continue ;;
+		esac
+		printf '%s\n' "$s"
+	done
 }
 
 need_pkg() {
@@ -506,13 +520,19 @@ keep.sh	/root/bin	30 2 * * *
 drain-only.sh	drain	-
 EOF
 	check "the /root/bin rows are read from the table" \
-		"$(root_bin_scripts "$tree/install-set.tsv")" "$(printf 'lib.sh\nkeep.sh')"
+		"$(install_rows "$tree/install-set.tsv" /root/bin)" "$(printf 'lib.sh\nkeep.sh')"
 	got=0
-	root_bin_scripts "$tree/no-such.tsv" >/dev/null 2>&1 || got=$?
+	install_rows "$tree/no-such.tsv" /root/bin >/dev/null 2>&1 || got=$?
 	check "a missing table is refused rather than read as no scripts" \
 		"$([ "$got" -ne 0 ] && printf yes || printf no)" yes
 	check "the checkout's table names lib.sh for /root/bin" \
-		"$(root_bin_scripts "$script_dir/install-set.tsv" | grep -c '^lib\.sh$')" 1
+		"$(install_rows "$script_dir/install-set.tsv" /root/bin | grep -c '^lib\.sh$')" 1
+	# The sweep removes the pre-split copies, but never a name the table installs:
+	# that would install a new row and delete it in the same run.
+	check "a table row is not swept away" \
+		"$(stale_copies 'add-user.sh' | grep -c '^add-user\.sh$')" 0
+	check "and a script the table does not install still is" \
+		"$(stale_copies 'add-user.sh' | grep -c '^restore-test\.sh$')" 1
 
 	self_test_end
 }
@@ -1341,21 +1361,16 @@ install -d -m 0755 /root/bin
 # line pasted by hand too, which is how the monitor spent a week unscheduled.
 # cron-apply.sh puts the lines in; it can only do that if the files it names are
 # deployed first.
-root_bin=$(root_bin_scripts "$install_set") \
+root_bin=$(install_rows "$install_set" /root/bin) \
 	|| { printf 'cannot read %s\n' "$install_set" >&2; exit 1; }
 [ -n "$root_bin" ] \
 	|| { printf '%s names no /root/bin script\n' "$install_set" >&2; exit 1; }
 for s in $root_bin; do
 	install_staged "$repo_dir/scripts/$s" "/root/bin/$s" -m 0755
 done
-# This list used to be longer: before the onboarding service split out of this
-# deploy, the drain's own scripts were installed here too, and a box from that
-# time keeps them. They are stale copies of scripts that now run from the drain's
-# directory, and check-hygiene's section 9 reports every one of them for ever
-# otherwise, which is noise that hides a real drift.
-for s in add-user.sh check-hygiene.sh cron-apply.sh delete-user.sh deploy-mail.sh \
-	deploy-onboard.sh deploy-relayd.sh onboard-store.sh provision-member.sh \
-	provision-member-capsule.sh provision-member-web.sh quota-apply.sh restore-test.sh; do
+# The stale copies a box from before the onboarding split still holds; the list
+# and why it excludes the installed set are stale_copies' own comment.
+for s in $(stale_copies "$root_bin"); do
 	[ -e "/root/bin/$s" ] || continue
 	rm -f "/root/bin/$s"
 	printf 'removed the stale copy /root/bin/%s\n' "$s"
