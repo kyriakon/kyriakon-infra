@@ -25,7 +25,13 @@ use crate::util;
 pub fn extend_paid_until(received: &str, before: Option<&str>) -> Result<String, String> {
     let received = day(received)?;
     let before = before.map(day).transpose()?;
-    Ok(util::date_string(util::paid_until_after(received, before)))
+    let until = util::paid_until_after(received, before).ok_or_else(|| {
+        format!(
+            "the year after {} has no date in the calendar",
+            util::date_string(received)
+        )
+    })?;
+    Ok(util::date_string(until))
 }
 
 /// The day a stamp names: a store date, or the date part of an RFC 3339 stamp.
@@ -85,5 +91,10 @@ mod tests {
     fn a_date_that_cannot_be_read_is_an_error_not_a_guess() {
         assert!(extend_paid_until("last Tuesday", None).is_err());
         assert!(extend_paid_until("2026-10-31T00:00:00Z", Some("soon")).is_err());
+    }
+
+    #[test]
+    fn a_year_off_the_end_of_the_calendar_is_an_error_not_a_panic() {
+        assert!(extend_paid_until("9999-01-01", None).is_err());
     }
 }

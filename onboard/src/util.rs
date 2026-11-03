@@ -71,25 +71,38 @@ pub fn link_answers(decided_at: &str, now: OffsetDateTime) -> bool {
 /// The same day in `year`, clamped to the month's length. 29 February becomes
 /// 28 February in a common year, which is the clamp the prepaid spec fixes for a
 /// payment's anniversary and the free account's yearly note.
-pub fn anniversary(date: Date, year: i32) -> Date {
+///
+/// `None` when `year` is off the end of the calendar: the date arithmetic is
+/// fed a date an intent or a record carries, and a hand-written 9999 must be
+/// refused rather than panic the pass.
+pub fn anniversary(date: Date, year: i32) -> Option<Date> {
     let last = date.month().length(year);
-    Date::from_calendar_date(year, date.month(), date.day().min(last))
-        .expect("a day clamped to the month's length is in the month")
+    Date::from_calendar_date(year, date.month(), date.day().min(last)).ok()
 }
 
 /// The paid-until date a credit sets: one calendar year after the later of the
 /// day it was recorded and the date already paid to. A renewal paid early keeps
 /// the full year, and a payment after a lapse runs from the day it is recorded.
-pub fn paid_until_after(received: Date, before: Option<Date>) -> Date {
+/// `None` when that year is off the end of the calendar.
+pub fn paid_until_after(received: Date, before: Option<Date>) -> Option<Date> {
     let start = before.map_or(received, |b| b.max(received));
     anniversary(start, start.year() + 1)
 }
 
 /// The farthest a credit may reach: twenty-four months past the day it was
 /// recorded. Anything beyond is a mistyped amount or the same envelope twice,
-/// and the operator needs `--override` to mean it.
-pub fn credit_ceiling(received: Date) -> Date {
+/// and the operator needs `--override` to mean it. `None` when that day is off
+/// the end of the calendar.
+pub fn credit_ceiling(received: Date) -> Option<Date> {
     anniversary(received, received.year() + 2)
+}
+
+/// Whether a credit's `--received` date is more than twenty-four months ahead
+/// of `today`, which is the ceiling `credit_ceiling` measures from. A date
+/// beyond it is a mistyped year, and it is refused here, at both ends that file
+/// and that drain an intent, so the arithmetic never sees one.
+pub fn received_beyond_window(received: Date, today: Date) -> bool {
+    credit_ceiling(today).is_none_or(|ceiling| received > ceiling)
 }
 
 /// A `YYYY-MM-DD` date, which is the form a credit's `--received` and the
@@ -203,24 +216,24 @@ mod tests {
         // Paying inside the window: nothing is paid yet, so a full year from the
         // day the credit is recorded.
         assert_eq!(
-            super::paid_until_after(date("2026-10-04"), None),
+            super::paid_until_after(date("2026-10-04"), None).unwrap(),
             date("2027-10-04")
         );
         // Paying after a lapse: the old date is behind today, so the year runs
         // from today rather than from the date that ran out.
         assert_eq!(
-            super::paid_until_after(date("2026-10-04"), Some(date("2025-01-01"))),
+            super::paid_until_after(date("2026-10-04"), Some(date("2025-01-01"))).unwrap(),
             date("2027-10-04")
         );
         // Renewing before the date: the year runs from the later existing date,
         // so paying early loses nothing.
         assert_eq!(
-            super::paid_until_after(date("2026-10-04"), Some(date("2027-06-01"))),
+            super::paid_until_after(date("2026-10-04"), Some(date("2027-06-01"))).unwrap(),
             date("2028-06-01")
         );
         // 29 February lands on 28 February in the common year that follows.
         assert_eq!(
-            super::paid_until_after(date("2028-02-29"), None),
+            super::paid_until_after(date("2028-02-29"), None).unwrap(),
             date("2029-02-28")
         );
     }
@@ -228,13 +241,28 @@ mod tests {
     #[test]
     fn the_ceiling_is_twenty_four_months_past_the_recorded_day() {
         assert_eq!(
-            super::credit_ceiling(date("2026-10-04")),
+            super::credit_ceiling(date("2026-10-04")).unwrap(),
             date("2028-10-04")
         );
         assert_eq!(
-            super::credit_ceiling(date("2028-02-29")),
+            super::credit_ceiling(date("2028-02-29")).unwrap(),
             date("2030-02-28")
         );
+    }
+
+    #[test]
+    fn a_year_off_the_end_of_the_calendar_is_none_rather_than_a_panic() {
+        assert_eq!(super::anniversary(date("9999-01-01"), 10000), None);
+        assert_eq!(super::paid_until_after(date("9999-01-01"), None), None);
+        assert_eq!(super::credit_ceiling(date("9998-01-01")), None);
+    }
+
+    #[test]
+    fn a_received_date_more_than_two_years_ahead_is_outside_the_window() {
+        let today = date("2026-11-03");
+        assert!(!super::received_beyond_window(date("2028-11-03"), today));
+        assert!(super::received_beyond_window(date("2028-11-04"), today));
+        assert!(super::received_beyond_window(date("9999-01-01"), today));
     }
 
     #[test]
