@@ -140,7 +140,7 @@ Provisioning is manual today. The service that will take it over is covered in t
 		doas git -C /usr/local/src/kyriakon-infra pull --ff-only
 		doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-mail.sh
 
-   Delivery reads the keyring per message, so an account with no usable key bounces inbound mail immediately instead of queueing it.
+   Delivery reads the keyring per message, and the encryptor fails closed when the key is missing. The Dovecot plugin returns `MAIL_ERROR_TEMP` for every encrypt failure, so nothing is bounced at once: the LMTP delivery answers a temporary failure, smtpd keeps the message in its queue and retries for the four-day queue lifetime, and the sender defers it until its own queue expires. What the operator sees is repeated deferrals in `/var/log/maillog`, the message in `doas smtpctl show queue`, and `kyriakon-encrypt: <localpart>: no public key for ... in keyring` in `/var/log/daemon` from the encryptor. Installing the key ends the retries, and the queued mail is delivered on the next pass.
 
 3. Check the account.
 

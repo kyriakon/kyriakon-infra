@@ -54,11 +54,11 @@ Hetzner has no native OpenBSD image, so install once by hand and snapshot it:
    ```sh
    hcloud server create-image --type snapshot \
      --description "kyriakon-openbsd-79-$(date +%Y%m%d)" \
-     --label os=openbsd \
+     --label kind=gold \
      <server>
    ```
 8. Record the returned numeric image ID (operational reference only - Terraform
-   selects by the `os=openbsd` label, not the ID).
+   selects by the `kind=gold` label, not the ID).
 
 ## 2. Provision with Terraform (ticket #22 - apply is human-only)
 
@@ -82,7 +82,7 @@ slightly behind (proposal section 6.10). Then re-snapshot (section 3).
 ## 3. Re-snapshot after every patch cycle
 
 A snapshot freezes base + packages. After each `syspatch`/`pkg_add -u` cycle on
-the live box, shut down cleanly and re-snapshot with the same `os=openbsd`
+the live box, shut down cleanly and re-snapshot with the same `kind=gold`
 label. `most_recent` makes Terraform pick up the newest matching snapshot
 automatically - never reprovision from a stale one, or a rebuilt box boots
 vulnerable rspamd (section 6.10).
@@ -94,7 +94,7 @@ vulnerable rspamd (section 6.10).
 | `server_name`       | -              | host-identifying; set in `terraform.tfvars` |
 | `server_type`       | `cx23`         | disk >= snapshot's source disk |
 | `location`          | `hel1`         | region the storage box is NOT in |
-| `snapshot_selector` | `os=openbsd`   | set at `create-image` time |
+| `snapshot_selector` | `kind=gold`   | set at `create-image` time |
 
 ## The restore template
 
@@ -139,7 +139,7 @@ So the template is section 1 with these differences:
 - Append the mail box's `/root/.ssh/kyriakon-standup.pub` to `/root/.ssh/authorized_keys`.
   The standup reaches the throwaway with it after every boot, since the template carries
   it into the snapshot.
-- Snapshot with `--label kind=restore`, not the `os=openbsd` label section 1 uses, so a
+- Snapshot with `--label kind=restore`, not the `kind=gold` label section 1 uses, so a
   test run can never pick up a provisioning image and provisioning can never pick up the
   template.
 
