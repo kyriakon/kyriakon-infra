@@ -75,6 +75,13 @@ postal_address = "REPLACE_ME"
 # deploy from /root/.kyriakon-env.
 stripe_payment_link = "REPLACE_ME"
 
+# Where the login check writes one proof per admitted login, and the drain reads
+# it back. It is root-owned 0700 and the deploy creates it, because the session
+# record lives in the handler's own store: the handler may hand this path to the
+# checker through `doas`, but it cannot write a proof there itself, and the drain
+# trusts only what the checker wrote.
+proof_dir = "/var/db/kyriakon/logins"
+
 # The unix sockets the front-ends reach the responder on. There is no listener on
 # a port: the service is a FastCGI responder, and both httpd and gmid resolve a
 # FastCGI socket path inside their own chroot, which is /home/www for each of

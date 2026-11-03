@@ -182,6 +182,13 @@ rate_endpoint = "https://api.coingecko.com/api/v3/simple/price?ids=monero&vs_cur
 # PATH is not where a package's binary lives.
 rates_fetch = "/usr/local/bin/curl"
 
+# Where the login check writes one proof per admitted login, and the drain reads
+# it back. Root-owned 0700, created by scripts/deploy-onboard.sh: the session
+# record is the handler's file, so the evidence that a login happened has to be
+# in a directory the handler cannot write. The drain reads a close or export
+# intent's session against this, never against the record's own claims.
+proof_dir = "/var/db/kyriakon/logins"
+
 # The OpenPGP implementation the export encrypts a member's written part to
 # their own key with. The same binary `kyriakon-encrypt` runs; named by path
 # because cron's PATH is not where a package's binary lives, and the one place

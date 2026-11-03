@@ -8,7 +8,7 @@
 //! nothing and the journal records only that the click was seen.
 
 use std::collections::{BTreeMap, HashSet};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{fchown, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 
 use serde_json::{json, Value};
@@ -578,14 +578,23 @@ fn group_recipient(record: &Record, site_owner: &str, domain: &str) -> Result<St
 async fn lock_confirmation(store: &Store) -> Result<tokio::fs::File, String> {
     let path = store.path("applications/.confirmation.lock");
     let mut opts = tokio::fs::OpenOptions::new();
-    opts.read(true).write(true).create(true).mode(0o600);
+    // O_NOFOLLOW: the handler owns `applications/` and could plant the lock as
+    // a symlink. The open refuses it, rather than root writing through it, and
+    // the lock may already exist, so this is not `create_new`.
+    opts.read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
     let file = opts
         .open(&path)
         .await
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     if let Some((uid, gid)) = store.dir_owner("applications") {
         if unsafe { libc::geteuid() } == 0 {
-            std::os::unix::fs::chown(&path, Some(uid), Some(gid))
+            // The descriptor, after the no-follow open: a `chown` of the path
+            // would follow whatever the name points at by the time it runs.
+            fchown(&file, Some(uid), Some(gid))
                 .map_err(|e| format!("cannot hand {} to the handler: {e}", path.display()))?;
         }
     }
@@ -1239,7 +1248,7 @@ async fn approve(
     // path below would make one account for the accountable person and none of
     // the mailboxes. The whole application is one group intent instead.
     if record.domain.is_some() {
-        return approve_group(cfg, store, intent, file, &record, no_charge).await;
+        return approve_group(cfg, store, key, intent, file, &record, no_charge).await;
     }
 
     // The recipient is revalidated before anything is written or journaled, so a
@@ -4769,6 +4778,7 @@ async fn append_credit_ledger(
 async fn approve_group(
     cfg: &DrainConfig,
     store: &Store,
+    key: &[u8],
     intent: &DecisionIntent,
     file: &str,
     record: &Record,
@@ -4839,33 +4849,53 @@ async fn approve_group(
     // name and the loop reads it in that order, so every intent's name has to be
     // a ULID for a lexical sort to be an age sort.
     let id = ulid::Ulid::new().to_string();
-    let group = json!({
-        "id": id,
-        "kind": "provision-group",
-        "filed_at": util::filed_at(),
-        "application": {
-            "username": record.username,
-            "status_token": record.status_token,
+    let mut group = GroupIntent {
+        id: id.clone(),
+        kind: "provision-group".to_string(),
+        filed_at: util::filed_at(),
+        application: ApplicationRef {
+            username: record.username.clone(),
+            status_token: record.status_token.clone(),
         },
-        "domain": domain,
-        "name": name,
-        "body_kind": body_kind,
-        "payment": {
-            "rail": if no_charge { "no_charge" } else { record.rail.as_str() },
-            "no_charge": no_charge,
-            "paid_until": Value::Null,
+        domain: domain.clone(),
+        name,
+        body_kind,
+        payment: GroupPayment {
+            rail: if no_charge {
+                "no_charge"
+            } else {
+                record.rail.as_str()
+            }
+            .to_string(),
+            no_charge,
+            token_ref: None,
+            window: None,
+            paid_until: None,
+            stripe: Default::default(),
         },
-        "addresses": addresses,
-        "mailboxes": mailboxes,
-        "site_owner": site_owner,
-        "upload_key": record.upload_key.as_ref().map(|k| k.material.clone()).unwrap_or_default(),
-        "mail_keys": record.mail_keys,
-    });
+        addresses,
+        mailboxes,
+        site_owner: site_owner.clone(),
+        upload_key: record
+            .upload_key
+            .as_ref()
+            .map(|k| k.material.clone())
+            .unwrap_or_default(),
+        mail_keys: record.mail_keys.clone(),
+        sig: String::new(),
+    };
+    // The signature travels with the intent because `intents/` is the handler's
+    // directory and `provision_group` creates system accounts as root. Every
+    // field the transition acts on is in the payload, so a filed intent cannot
+    // be edited between this write and the drain's next pass.
+    group.sig = sign::sign(key, &sign::group_provision_payload(&group))?;
+    let value =
+        serde_json::to_value(&group).map_err(|e| format!("cannot encode the intent: {e}"))?;
     let filename = format!("{id}.json");
     let bytes =
-        serde_json::to_vec_pretty(&group).map_err(|e| format!("cannot encode the intent: {e}"))?;
+        serde_json::to_vec_pretty(&value).map_err(|e| format!("cannot encode the intent: {e}"))?;
     store.write_record("intents", &filename, &bytes).await?;
-    provision_group(cfg, store, &group, &filename).await?;
+    provision_group(cfg, store, key, &value, &filename).await?;
 
     // The body's approval notice: the recipe is the whole point of it, because
     // mail and the website do not work until the body has published the records
@@ -5112,11 +5142,18 @@ async fn check_group_names(
 pub async fn provision_group(
     cfg: &DrainConfig,
     store: &Store,
+    key: &[u8],
     value: &Value,
     file: &str,
 ) -> Result<(), String> {
     let intent: GroupIntent = serde_json::from_value(value.clone())
         .map_err(|e| format!("the group intent does not parse: {e}"))?;
+    // First, before any field is trusted: `intents/` is the handler's, and this
+    // transition runs scripts and creates accounts as root. The signature is
+    // over every field the rest of this function acts on.
+    if !sign::verify(key, &sign::group_provision_payload(&intent), &intent.sig) {
+        return Err("the group intent's signature does not verify".to_string());
+    }
     if intent.kind != "provision-group" {
         return Err(format!("kind {:?} is not a group intent", intent.kind));
     }
@@ -6065,8 +6102,13 @@ pub async fn close_account(
     // The intent is unsigned, so the session id it carries is the proof that the
     // page authenticated this account. A mismatched or expired session is
     // journalled and the intent is settled without touching the account.
-    if let Err(reason) =
-        crate::intents::verify_session(store, &intent.session, &intent.username).await
+    if let Err(reason) = crate::intents::verify_session(
+        store,
+        std::path::Path::new(&cfg.proof_dir),
+        &intent.session,
+        &intent.username,
+    )
+    .await
     {
         journal(
             store,
@@ -6176,7 +6218,14 @@ async fn page_account(
         .await?;
         return Ok(None);
     }
-    if let Err(reason) = crate::intents::verify_session(store, session, username).await {
+    if let Err(reason) = crate::intents::verify_session(
+        store,
+        std::path::Path::new(&cfg.proof_dir),
+        session,
+        username,
+    )
+    .await
+    {
         return settle_page(
             cfg,
             store,
@@ -8302,7 +8351,13 @@ pub async fn export_account(
         .get("session")
         .and_then(Value::as_str)
         .ok_or("the export intent names no session")?;
-    crate::intents::verify_session(store, session, username).await?;
+    crate::intents::verify_session(
+        store,
+        std::path::Path::new(&cfg.proof_dir),
+        session,
+        username,
+    )
+    .await?;
     // The spec records one `requests.jsonl` line per data-subject request, and
     // a page-filed export is one. It is written before the answer, keyed by the
     // intent's own id so a retry after a failed pass does not append a second
@@ -9851,6 +9906,119 @@ mod tests {
         .unwrap()
     }
 
+    /// The confirmation lock is opened without following a symlink, and the
+    /// descriptor rather than the path is handed to the directory's owner. A
+    /// symlink the handler plants is refused and its target is untouched.
+    #[tokio::test]
+    async fn a_symlink_at_the_confirmation_lock_is_refused() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let dir = std::env::temp_dir().join(format!("onboard-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("applications")).unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+        let target = dir.join("master.passwd");
+        let body = b"root:*:0:0::0:0:Charlie Root:/root:/bin/ksh\n";
+        std::fs::write(&target, body).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = std::fs::metadata(&target).unwrap();
+        let lock_path = dir.join("applications/.confirmation.lock");
+        symlink(&target, &lock_path).unwrap();
+
+        lock_confirmation(&store)
+            .await
+            .expect_err("a planted symlink must be refused");
+        let after = std::fs::metadata(&target).unwrap();
+        assert_eq!(
+            (after.uid(), after.gid(), after.mode() & 0o777),
+            (before.uid(), before.gid(), 0o600)
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+
+        // A real lock is made under the directory's owner at 0600.
+        std::fs::remove_file(&lock_path).unwrap();
+        let _lock = lock_confirmation(&store).await.unwrap();
+        let lock = std::fs::metadata(&lock_path).unwrap();
+        let apps = std::fs::metadata(dir.join("applications")).unwrap();
+        assert_eq!(
+            (lock.uid(), lock.gid(), lock.mode() & 0o777),
+            (apps.uid(), apps.gid(), 0o600)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The `provision-group` payload covers every field the transition acts on:
+    /// changing any one of them changes the payload, so a signature made for one
+    /// body cannot be replayed with another's mailbox, key or payment.
+    #[test]
+    fn a_group_payload_covers_every_field_the_drain_acts_on() {
+        let base = json!({
+            "id": "01HZZZZZZZZZZZZZZZZZZZZZZZ",
+            "kind": "provision-group",
+            "filed_at": "2026-11-01T09:00:00Z",
+            "application": {"username": "warden", "status_token": "abcdefghjkmnpqrstvwxyz0123"},
+            "domain": "parish.example",
+            "name": "Parish of Example",
+            "body_kind": "parish",
+            "payment": {"rail": "cash", "no_charge": false, "paid_until": null},
+            "addresses": [{"address": "secretary", "mailbox": "parish-secretary"}],
+            "mailboxes": ["parish-secretary"],
+            "site_owner": "parish-secretary",
+            "upload_key": "ssh-ed25519 AAAA first@example",
+            "mail_keys": [{"mailbox": "parish-secretary", "fingerprint": "1111 2222",
+                           "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n",
+                           "verdict": "works"}],
+            "sig": "",
+        });
+        let payload = |value: &Value| {
+            let intent: GroupIntent = serde_json::from_value(value.clone()).unwrap();
+            sign::group_provision_payload(&intent)
+        };
+        let original = payload(&base);
+        let changes = [
+            ("domain", json!("other.example")),
+            ("name", json!("Another Parish")),
+            ("body_kind", json!("monastery")),
+            (
+                "payment",
+                json!({"rail": "card", "no_charge": false, "paid_until": null}),
+            ),
+            (
+                "payment",
+                json!({"rail": "cash", "no_charge": true, "paid_until": null}),
+            ),
+            (
+                "payment",
+                json!({"rail": "cash", "no_charge": false, "paid_until": "2027-01-01"}),
+            ),
+            (
+                "addresses",
+                json!([{"address": "office", "mailbox": "parish-secretary"}]),
+            ),
+            ("mailboxes", json!(["parish-office"])),
+            ("site_owner", json!("parish-office")),
+            ("upload_key", json!("ssh-ed25519 AAAA second@example")),
+            (
+                "mail_keys",
+                json!([{"mailbox": "parish-secretary", "fingerprint": "3333 4444",
+                        "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nyy\n",
+                        "verdict": "works"}]),
+            ),
+            (
+                "application",
+                json!({"username": "other", "status_token": "abcdefghjkmnpqrstvwxyz0123"}),
+            ),
+            (
+                "application",
+                json!({"username": "warden", "status_token": "fedcba98765432100123456789"}),
+            ),
+        ];
+        for (field, value) in changes {
+            let mut changed = base.clone();
+            changed[field] = value.clone();
+            assert_ne!(original, payload(&changed), "changing {field} to {value}");
+        }
+    }
+
     #[test]
     fn a_decline_body_names_a_missing_blessing_only_for_a_monastic() {
         let lay = decline_body(&record(&[("orders", "layman")]));
@@ -10040,6 +10208,7 @@ mod tests {
             rate_endpoint: "https://rates.example.invalid/simple/price".to_string(),
             rates_fetch: dir.join("bin/curl").to_str().unwrap().to_string(),
             gpg: "gpg".to_string(),
+            proof_dir: dir.join("logins").to_str().unwrap().to_string(),
             public_root: dir.join("home/www").to_str().unwrap().to_string(),
         }
     }

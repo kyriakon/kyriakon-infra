@@ -130,6 +130,53 @@ pub fn group_remove_payload(domain: &str) -> String {
     format!("remove-group:{domain}")
 }
 
+/// The payload a `provision-group` intent signs: every field the drain acts on.
+/// The approval files it, because `intents/` and `applications/` both belong to
+/// the unprivileged half and this intent creates system accounts as root. The
+/// domain, the body's words, the payment, the address table, the mailboxes, the
+/// site owner, the upload key, the mail keys and the application the intent
+/// claims to come from are all covered, so a signature for one body cannot be
+/// replayed with another's mailbox or key. Every text field is length-prefixed,
+/// so a colon inside one cannot be read as the separator before the next.
+pub fn group_provision_payload(intent: &crate::store::GroupIntent) -> String {
+    let addresses = intent
+        .addresses
+        .iter()
+        .map(|a| format!("{}={}", free_text(&a.address), free_text(&a.mailbox)))
+        .collect::<Vec<_>>()
+        .join(";");
+    let mail_keys = intent
+        .mail_keys
+        .iter()
+        .map(|k| {
+            format!(
+                "{}={}={}={}",
+                free_text(&k.mailbox),
+                free_text(&k.fingerprint),
+                free_text(&k.material),
+                free_text(&k.verdict)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    format!(
+        "provision-group:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        free_text(&intent.domain),
+        free_text(&intent.name),
+        free_text(&intent.body_kind),
+        free_text(&intent.payment.rail),
+        intent.payment.no_charge,
+        free_text(intent.payment.paid_until.as_deref().unwrap_or("")),
+        free_text(&addresses),
+        free_text(&intent.mailboxes.join(",")),
+        free_text(&intent.site_owner),
+        free_text(&intent.upload_key),
+        free_text(&mail_keys),
+        free_text(&intent.application.username),
+        free_text(&intent.application.status_token),
+    )
+}
+
 /// The payload a token-resend intent signs: the account and the token it holds.
 /// The console signs it, because a second copy of the instructions is the
 /// member's to ask for and not the handler's to file.

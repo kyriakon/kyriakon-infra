@@ -221,12 +221,19 @@ install -m 0755 "$repo_dir/onboard/target/release/kyriakon-onboard-tui" /usr/loc
 install -m 0755 "$repo_dir/openbsd/etc/rc.d/kyriakon_onboard" /etc/rc.d/kyriakon_onboard
 
 # The login check: the one fixed-argument program the account page may run as
-# root. It takes a username, reads the password from stdin and runs only
-# `doveadm auth test`. doas.conf cannot name the check's arguments (they are the
-# username), so it names this program, and the program is what keeps the
-# subcommand fixed.
+# root. It takes a username and the proof directory, reads the password from
+# stdin and runs only `doveadm auth test`. doas.conf cannot name the check's
+# arguments (they are the username), so it names this program, and the program
+# is what keeps the subcommand fixed and mints the login proof.
 install -d -m 0755 -o root -g wheel /usr/local/libexec
 install -m 0755 "$repo_dir/scripts/kyriakon-authcheck.sh" /usr/local/libexec/kyriakon-authcheck
+
+# The login proofs: one file per admitted login, named by a random token, written
+# by the checker as root and read back by the drain. Root-owned 0700 is the whole
+# point: the handler writes its own session records, so a proof it could write
+# or replace would prove nothing. install -d creates the missing parent too.
+install -d -m 0755 -o root -g wheel /var/db/kyriakon
+install -d -m 0700 -o root -g wheel /var/db/kyriakon/logins
 
 # The release this box is running, as the config's own comment describes it: the
 # deployed commit and its date. The acceptance records carry it as the version of

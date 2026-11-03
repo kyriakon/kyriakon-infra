@@ -375,23 +375,15 @@ fn runtime() -> tokio::runtime::Runtime {
 /// A live account-page session for `username`, as the login route makes one,
 /// returning the id the export intent carries.
 fn session_id(fix: &Fix, username: &str) -> String {
-    let store = kyriakon_onboard::store::Store::new(&fix.path("store"));
-    let cookie = runtime()
-        .block_on(kyriakon_onboard::session::open(
-            &store,
-            username,
-            OffsetDateTime::now_utc(),
-        ))
-        .unwrap();
+    let cookie = fix.open_session(username);
     cookie.split('.').next().unwrap().to_string()
 }
 
-/// Put one session's record in the past, without touching its secret.
+/// Put the root-written proof behind a session in the past, as twelve hours
+/// passing would. The record's own expiry is the handler's copy and is not
+/// what the drain reads.
 fn expire_session(fix: &Fix, id: &str) {
-    let path = fix.dir.join("store/sessions").join(format!("{id}.json"));
-    let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    record["expires_at"] = json!("2020-01-01T00:00:00Z");
-    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    fix.expire_session(&format!("{id}."));
 }
 
 /// The written part lands inside the chroot the member's sftp already sees,

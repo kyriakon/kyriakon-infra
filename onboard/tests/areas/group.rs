@@ -1685,6 +1685,68 @@ fn an_address_intent_with_a_bad_signature_is_refused() {
     assert!(!fix.passwd_file().contains("parish-office:"));
 }
 
+/// A `provision-group` intent the approval did not sign, or signed over other
+/// fields, is refused before any account: `intents/` is the handler's directory,
+/// and the transition creates system accounts as root.
+#[test]
+fn an_unsigned_or_wrongly_signed_group_intent_creates_no_account() {
+    let fix = Fix::new("group-intent-sig");
+    let unsigned = fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    // The fixture files a correctly signed intent; take the signature away.
+    let path = fix
+        .dir
+        .join("store/intents")
+        .join(format!("{unsigned}.json"));
+    let mut filed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    filed["sig"] = json!("");
+    std::fs::write(&path, serde_json::to_vec_pretty(&filed).unwrap()).unwrap();
+
+    // Signed for one domain, then filed for another: the payload the drain
+    // rebuilds does not match.
+    let forged = fix.file_group(
+        "other.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    let path = fix.dir.join("store/intents").join(format!("{forged}.json"));
+    let mut filed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    filed["domain"] = json!("parish.example");
+    std::fs::write(&path, serde_json::to_vec_pretty(&filed).unwrap()).unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.intents(),
+        vec![format!("{unsigned}.json"), format!("{forged}.json")],
+        "a refused intent stays for the operator"
+    );
+    assert!(
+        fix.passwd_file().is_empty(),
+        "a refused intent made an account: {}",
+        fix.passwd_file()
+    );
+    assert!(!fix.dir.join("store/groups").exists());
+    let journal = fix.journal();
+    for id in [&unsigned, &forged] {
+        let count = journal
+            .lines()
+            .filter(|l| {
+                l.contains(&format!("\"intent\":\"{id}\"")) && l.contains("\"outcome\":\"failed\"")
+            })
+            .count();
+        assert_eq!(count, 1, "one journal line for {id}: {journal}");
+        assert!(journal.contains("signature does not verify"), "{journal}");
+    }
+}
+
 /// The cap counts a new entry even when the mailbox it points at is already in
 /// the group: adding a second address to an existing mailbox is still the
 /// eleventh address.

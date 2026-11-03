@@ -1827,20 +1827,26 @@ async fn login(app: &App, request: &Request) -> Reply {
     let password = form.get("password").map(String::as_str).unwrap_or("");
     // The shape is checked before the check runs: a name the platform could not
     // have made is not passed to `doveadm`, and the answer is the same one a
-    // wrong password gets.
-    if username.is_empty()
+    // wrong password gets. The checker mints the proof in the root-owned
+    // directory and prints its token; the handler stores it and cannot make one.
+    let proof_dir = std::path::Path::new(&app.cfg.proof_dir);
+    let proof = if username.is_empty()
         || password.is_empty()
         || validate::username_shape(username).is_some()
-        || !app.auth.admits(username, password).await
     {
+        None
+    } else {
+        app.auth.authenticate(username, password, proof_dir).await
+    };
+    let Some(proof) = proof else {
         return Reply::capability(200, page_html(&LoginPage {
             error: Some(
                 "That username and password did not match. Check the mail password and try again."
                     .to_string(),
             ),
         }));
-    }
-    match session::open(&app.store, username, OffsetDateTime::now_utc()).await {
+    };
+    match session::open(&app.store, username, &proof, OffsetDateTime::now_utc()).await {
         Ok(cookie) => Reply::capability(303, String::new())
             .with_header("Location", "/account".to_string())
             .with_header("Set-Cookie", session::cookie(&cookie)),
@@ -1926,7 +1932,17 @@ async fn account_close(app: &App, request: &Request) -> Reply {
     };
     let form = fields(&String::from_utf8_lossy(&request.body));
     let password = form.get("password").map(String::as_str).unwrap_or("");
-    if password.is_empty() || !app.auth.admits(&account.username, password).await {
+    if password.is_empty()
+        || !app
+            .auth
+            .authenticate(
+                &account.username,
+                password,
+                std::path::Path::new(&app.cfg.proof_dir),
+            )
+            .await
+            .is_some()
+    {
         return refused(
             "That password did not match. The closure is the irreversible one, so enter the mail password again.",
         );
@@ -1966,7 +1982,17 @@ async fn account_password(app: &App, request: &Request) -> Reply {
     // The password is re-entered however fresh the session is: a borrowed
     // browser should not be able to change the password that locks the owner
     // out of their own account.
-    if current.is_empty() || !app.auth.admits(&account.username, current).await {
+    if current.is_empty()
+        || !app
+            .auth
+            .authenticate(
+                &account.username,
+                current,
+                std::path::Path::new(&app.cfg.proof_dir),
+            )
+            .await
+            .is_some()
+    {
         return refused(
             "That password did not match. Enter your current mail password to change it.",
         );

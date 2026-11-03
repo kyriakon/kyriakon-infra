@@ -292,6 +292,25 @@ fn a_close_intent_without_a_matching_live_session_is_refused() {
     let journal = fix.journal();
     assert!(journal.contains("\"outcome\":\"refused\""), "{journal}");
     assert!(journal.contains("expired"), "{journal}");
+
+    // A record the handler wrote itself, naming a well-formed token no login
+    // ever minted: there is no root-written proof behind it, so it is refused.
+    let cookie = fix.open_session("secretary");
+    let id = Fix::session_id(&cookie).to_string();
+    let path = fix.dir.join("store/sessions").join(format!("{id}.json"));
+    let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    record["proof"] = json!("0".repeat(64));
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    let forged_intent = fix.file_close_with_session("secretary", &id);
+    assert!(fix.drain().status.success());
+    assert_eq!(fix.account("secretary")["state"], json!("active"));
+    let journal = fix.journal();
+    assert!(
+        journal.lines().any(|line| line.contains(&forged_intent)
+            && line.contains("refused")
+            && line.contains("not one this box minted")),
+        "{journal}"
+    );
 }
 
 /// A name with no account record and no deletion journal line is not an account
