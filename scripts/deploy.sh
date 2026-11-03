@@ -227,22 +227,27 @@ print_manual() {
 		# The template ships Port REPLACE_ME, so this renders the file first and
 		# checks that rendering, not the template: an install of the template is a
 		# config sshd refuses to start.
+		#
+		# A stable path, not a temporary one: the plan is printed now and applied by
+		# hand later, and /tmp is cleared on reboot. The file holds the port
+		# substitution and nothing secret, and stays root-only like the values file.
 		onboard_env="${KYRIAKON_ENV:-/root/.kyriakon-env}"
-		onboard_work=$(mktemp -d "${TMPDIR:-/tmp}/kyriakon-sshd-onboard.XXXXXX") ||
-			die "cannot create a temporary directory for the portal sshd render"
-		onboard_src="$onboard_work/sshd_config.onboard"
+		onboard_src="${KYRIAKON_SSHD_RENDER:-/root/sshd_config.onboard.rendered}"
+		if [ ! -d "$(dirname "$onboard_src")" ]; then
+			die "the directory for $onboard_src does not exist; create it, then re-run this plan"
+		fi
 		if ! render_onboard_sshd "$repo_dir/openbsd/etc/sshd_config.onboard" "$onboard_env" "$onboard_src"; then
 			die "no usable TUI_PORT in $onboard_env; run scripts/setup-env.sh, then re-run this plan"
 		fi
+		chmod 0600 "$onboard_src"
 		if ! sshd -t -f "$onboard_src"; then
 			die "$onboard_src does not pass sshd -t; the install step is not printed"
 		fi
-		printf '  # rendered with %s from TUI_PORT in %s\n' \
+		printf '  # rendered with Port %s from TUI_PORT in %s\n' \
 			"$(sed -n 's/^Port //p' "$onboard_src")" "$onboard_env"
 		printf '  doas install -m 0644 %s /etc/ssh/sshd_config.onboard\n' "$onboard_src"
 		printf '  doas sshd -t -f /etc/ssh/sshd_config.onboard\n'
 		printf '  doas rcctl restart kyriakon_onboard_sshd\n'
-		printf '  # sshd -t passed on the TUI_PORT rendering; remove %s after installing\n' "$onboard_work"
 	fi
 	if [ "$manual_member_class" = yes ]; then
 		printf 'the member login class changed; existing accounts keep the old one until:\n'
@@ -532,6 +537,29 @@ self_test() {
 	render_onboard_sshd "$self_test_work/onboard.tpl" "$self_test_work/tui-empty" \
 		"$self_test_work/onboard.none" || got=$?
 	check 'a missing TUI_PORT is refused' "$got" 1
+
+	# The plan is printed now and applied by hand later, possibly after a reboot,
+	# so the install must name a stable path rather than one under /tmp. The sshd
+	# check is stubbed: the box runs it, this only asserts what is printed.
+	mkdir -p "$self_test_work/sshd-bin"
+	printf '#!/bin/sh\nexit 0\n' >"$self_test_work/sshd-bin/sshd"
+	chmod 0755 "$self_test_work/sshd-bin/sshd"
+	render_path="$self_test_work/sshd_config.onboard.rendered"
+	KYRIAKON_ENV="$self_test_work/tui-env"
+	KYRIAKON_SSHD_RENDER="$render_path"
+	manual_sshd_onboard=yes
+	old_path=$PATH
+	PATH="$self_test_work/sshd-bin:$PATH"
+	print_manual >"$self_test_work/plan.out"
+	PATH=$old_path
+	manual_sshd_onboard=no
+	check 'the printed install uses the stable render path' \
+		"$(grep -cF "doas install -m 0644 $render_path /etc/ssh/sshd_config.onboard" \
+			"$self_test_work/plan.out")" 1
+	check 'the plan names the rendered port' \
+		"$(grep -cF "# rendered with Port 2233 from TUI_PORT" "$self_test_work/plan.out")" 1
+	check 'the rendered file is root-only' \
+		"$(find "$render_path" -perm 0600 | wc -l | tr -d ' ')" 1
 
 	plan "$repo" ''
 	check 'no base plans every script' "$(plan_order | paste -sd ' ' -)" \
