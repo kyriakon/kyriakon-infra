@@ -1809,9 +1809,13 @@ fn an_unsigned_or_wrongly_signed_group_intent_creates_no_account() {
 
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
+    // `intents()` sorts by name, and two ULIDs filed in the same millisecond
+    // can sort in either order, so compare the same sorted order.
+    let mut expected = vec![format!("{unsigned}.json"), format!("{forged}.json")];
+    expected.sort();
     assert_eq!(
         fix.intents(),
-        vec![format!("{unsigned}.json"), format!("{forged}.json")],
+        expected,
         "a refused intent stays for the operator"
     );
     assert!(
