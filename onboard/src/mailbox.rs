@@ -90,8 +90,10 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
 }
 
 /// Act on one message. `Ok` means it has been dealt with and may be deleted,
-/// whether that was files, refuse or ignore. The reply address is read only on
-/// the paths that answer: a live token files the key even when From is empty.
+/// whether that was files, refuse or ignore. A live token files the key even
+/// when From is empty, unless the draft recorded an address outside the
+/// platform: then the mail must come from that address, and a message with no
+/// usable From is refused with nothing to reply to.
 async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), String> {
     let message = Message::parse(raw);
     let blocks = labelled_blocks(&message.body);
@@ -106,6 +108,25 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), String> 
         drop(lock);
         return reply_or_drop(cfg, store, &message, &restart_body()).await;
     };
+    // A draft that recorded an address outside the platform takes a mailed key
+    // only from that address. Anyone who learns the token could otherwise
+    // replace the key, and the approval would encrypt the account's future mail
+    // to the attacker. A draft with no such address keeps the old rule: the
+    // portal's applicant has no address to compare against.
+    if let Some(outside) = draft
+        .answers
+        .get("address_outside")
+        .map(String::as_str)
+        .filter(|address| !address.is_empty())
+    {
+        let same = message
+            .reply_address()
+            .is_some_and(|from| from.eq_ignore_ascii_case(outside));
+        if !same {
+            drop(lock);
+            return reply_or_drop(cfg, store, &message, &sender_mismatch_body()).await;
+        }
+    }
     let keys = match assign(&blocks, &draft) {
         Ok(keys) => keys,
         Err(missing) => {
@@ -352,6 +373,17 @@ fn restart_body() -> String {
         "The application this key belongs to has closed, or the subject carried no \
          application token, so the key was not filed.\n\n\
          Start again here, and keep the new link:\n\n\
+         gemini://{HOST}/apply\n"
+    )
+}
+
+/// The refusal for a key mailed from another address. It never names the
+/// recorded address: the sender is whoever holds the token, not necessarily the
+/// applicant.
+fn sender_mismatch_body() -> String {
+    format!(
+        "The key was not filed: the message did not come from the address this \
+         application recorded. Mail it from that address, or start again here:\n\n\
          gemini://{HOST}/apply\n"
     )
 }

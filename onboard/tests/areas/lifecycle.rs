@@ -1692,6 +1692,80 @@ fn a_mailed_key_is_filed_against_the_draft_and_the_spool_empties() {
     );
 }
 
+/// A draft that recorded an address outside the platform takes its mailed key
+/// only from that address: another sender cannot replace the key the approval
+/// will encrypt future mail to.
+#[test]
+fn a_mailed_key_from_another_address_does_not_replace_the_drafts_key() {
+    let fix = Fix::new("mail-key-wrong-sender");
+    fix.write_draft(
+        TOKEN,
+        &[
+            ("username", "secretary"),
+            ("whose", "person"),
+            ("address_outside", "applicant@example.invalid"),
+        ],
+    );
+    fix.mail("one", "applicant@example.invalid", TOKEN, GOOD_KEY);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let before: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
+    let key = before["mail_keys"][0].clone();
+    assert_eq!(key["mailbox"], "secretary");
+
+    const OTHER_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
+                             mAYEAAAAABK4BgQAAAAAEQ==\n\
+                             -----END PGP PUBLIC KEY BLOCK-----\n";
+    fix.mail("two", "attacker@example.invalid", TOKEN, OTHER_KEY);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let after: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
+    assert_eq!(
+        after["mail_keys"],
+        json!([key]),
+        "the key was replaced by another sender"
+    );
+    assert!(
+        fix.sent().contains("did not come from the address"),
+        "{}",
+        fix.sent()
+    );
+}
+
+/// The address the draft recorded still files its key, including when the From
+/// header carries a display name.
+#[test]
+fn a_mailed_key_from_the_recorded_address_is_filed() {
+    let fix = Fix::new("mail-key-right-sender");
+    fix.write_draft(
+        TOKEN,
+        &[
+            ("username", "secretary"),
+            ("whose", "person"),
+            ("address_outside", "applicant@example.invalid"),
+        ],
+    );
+    fix.mail(
+        "one",
+        "Applicant <applicant@example.invalid>",
+        TOKEN,
+        GOOD_KEY,
+    );
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let draft: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
+    assert_eq!(draft["mail_keys"][0]["mailbox"], "secretary");
+    assert!(
+        !draft["mail_keys"][0]["fingerprint"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "{draft}"
+    );
+    assert!(fix.sent().is_empty(), "{}", fix.sent());
+}
+
 /// A body with more than one mailbox and an unlabelled block is refused, and
 /// the reply names the mailboxes the message failed to label.
 #[test]
