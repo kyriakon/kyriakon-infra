@@ -287,6 +287,49 @@ fn a_refused_password_intent_keeps_no_plaintext() {
     );
 }
 
+/// A crash between the `applied` journal line and the intent's removal leaves
+/// the file re-read on every pass. The next pass finishes the remove, and does
+/// not journal a second `applied` line.
+#[test]
+fn an_applied_password_intent_left_behind_is_removed_on_the_next_pass() {
+    let fix = Fix::new("password-applied-cleanup");
+    let id = "01J00000000000000000APPLIED";
+    fix.write_intent(
+        id,
+        &json!({
+            "id": id,
+            "kind": "set-password",
+            "filed_at": "2026-10-21T09:00:00Z",
+            "application": { "username": "secretary", "status_token": TOKEN },
+            "until": "2026-10-28",
+            "sig": "00".repeat(32),
+            "password": "correct horse battery",
+        }),
+    );
+    // The line the crashed pass wrote before it could remove the file.
+    std::fs::write(
+        fix.path("store/journal.jsonl"),
+        format!(
+            "{{\"version\":1,\"at\":\"2026-10-21T09:00:00Z\",\"intent\":\"{id}\",\"kind\":\"set-password\",\"release\":\"test\",\"application\":{{\"username\":\"secretary\",\"status_token\":\"{TOKEN}\"}},\"outcome\":\"applied\"}}\n"
+        ),
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.intents().is_empty(),
+        "the applied intent was left in place: {:?}",
+        fix.intents()
+    );
+    assert_eq!(
+        fix.journal().matches("\"outcome\":\"applied\"").count(),
+        1,
+        "a second applied line was appended: {}",
+        fix.journal()
+    );
+}
+
 /// A click on an already-decided application changes nothing in the store and
 /// sends nothing, and the journal records that it was seen.
 /// The decision email carries the one-time password link, not only the status

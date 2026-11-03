@@ -364,8 +364,17 @@ async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
         Err(e) => return Err(format!("--amount: {e}")),
     }
     let received = need(&flags, "received")?;
-    if util::parse_date(received).is_none() {
-        return Err(format!("--received {received:?} is not YYYY-MM-DD"));
+    let received_date = match util::parse_date(received) {
+        Some(date) => date,
+        None => return Err(format!("--received {received:?} is not YYYY-MM-DD")),
+    };
+    // The drain measures the ceiling from this date, and a year it cannot hold
+    // has no paid-until date: refuse it here rather than file an intent the
+    // drain will only refuse later.
+    if util::received_beyond_window(received_date, requests::today()) {
+        return Err(format!(
+            "--received {received:?} is more than two years ahead"
+        ));
     }
     let txid = flags.get("txid").map(String::as_str);
     let xmr = flags.get("xmr").map(String::as_str);
@@ -1584,7 +1593,7 @@ async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(),
         .await
         .is_some();
     let prefix = format!("delete-{username}-");
-    let interrupted = store.lines("journal.jsonl").await.iter().any(|line| {
+    let interrupted = store.lines("journal.jsonl").await?.iter().any(|line| {
         serde_json::from_str::<Value>(line)
             .ok()
             .and_then(|value| {

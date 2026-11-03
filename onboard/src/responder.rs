@@ -1303,9 +1303,12 @@ fn presented(incoming: &Incoming) -> Option<&Certificate> {
 /// line that does not parse is skipped: a notice that cannot be read is not a
 /// reason to refuse the account page.
 async fn account_notices(app: &App, username: &str) -> Vec<Notice> {
+    // A page that cannot read the notices shows none; nothing is decided from
+    // this list, and failing the page would hide the account over a display gap.
     app.store
         .lines(&format!("accounts/{username}/notices.jsonl"))
         .await
+        .unwrap_or_default()
         .iter()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
@@ -1889,10 +1892,12 @@ async fn session_account(app: &App, request: &Request) -> Option<(String, Accoun
 /// cancellation right: the token's latest credit, its `received_on` and its
 /// amount. The ledger is the only place the payment date exists, so this reads
 /// it rather than the account record.
-async fn closure_refund(app: &App, account: &Account) -> Option<String> {
-    let token = account.payment_state()?.token_ref?;
+async fn closure_refund(app: &App, account: &Account) -> Result<Option<String>, String> {
+    let Some(token) = account.payment_state().and_then(|p| p.token_ref) else {
+        return Ok(None);
+    };
     let mut latest: Option<(time::Date, String)> = None;
-    for line in app.store.lines("ledger/payments.jsonl").await {
+    for line in app.store.lines("ledger/payments.jsonl").await? {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
@@ -1921,14 +1926,16 @@ async fn closure_refund(app: &App, account: &Account) -> Option<String> {
             latest = Some((received, amount));
         }
     }
-    let (received, amount) = latest?;
+    let Some((received, amount)) = latest else {
+        return Ok(None);
+    };
     let today = OffsetDateTime::now_utc().date();
     let days = (today - received).whole_days();
-    (0..=14).contains(&days).then(|| {
+    Ok((0..=14).contains(&days).then(|| {
         format!(
             "A refund of GBP {amount} is due under the 14-day cancellation right; it is settled separately."
         )
-    })
+    }))
 }
 
 /// The member's own "Close my account": check the session and the password
@@ -1960,7 +1967,10 @@ async fn account_close(app: &App, request: &Request) -> Reply {
     let Some(session_id) = cookie.split_once('.').map(|(id, _)| id) else {
         return refused("Sign in to the account you want to close.");
     };
-    let refund = closure_refund(app, &account).await;
+    let refund = match closure_refund(app, &account).await {
+        Ok(refund) => refund,
+        Err(e) => return server_error(&format!("the ledger could not be read: {e}")),
+    };
     match intents::file_close(&app.store, &account.username, session_id).await {
         Ok(_) => {
             let message = crate::requests::erasure_answer(refund.as_deref());
