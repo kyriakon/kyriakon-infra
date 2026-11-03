@@ -10017,6 +10017,64 @@ mod tests {
             changed[field] = value.clone();
             assert_ne!(original, payload(&changed), "changing {field} to {value}");
         }
+
+        // Every payment field the transition copies into the group record: the
+        // token reference, the window's four fields and the Stripe block's
+        // eight. The base payment carries none of them, so a field missing from
+        // the payload leaves these two payloads equal.
+        let with_payment = |payment: Value| {
+            let mut changed = base.clone();
+            changed["payment"] = payment;
+            payload(&changed)
+        };
+        let base_payment = base["payment"].clone();
+        for (label, value) in [
+            ("token_ref", json!("KYR-AAAA-BBBB-CCCC")),
+            ("paid_until", json!("2027-01-01")),
+            ("no_charge", json!(true)),
+            ("rail", json!("card")),
+        ] {
+            let mut payment = base_payment.clone();
+            payment[label] = value;
+            assert_ne!(original, with_payment(payment), "payment.{label}");
+        }
+
+        let window = json!({"opened_at": "2026-11-01T09:00:00Z",
+                            "closes_at": "2026-11-15T09:00:00Z",
+                            "state": "open", "extensions": 0});
+        let mut with_window = base_payment.clone();
+        with_window["window"] = window.clone();
+        let windowed = with_payment(with_window);
+        assert_ne!(original, windowed, "payment.window presence");
+        for (label, value) in [
+            ("opened_at", json!("2026-10-01T09:00:00Z")),
+            ("closes_at", json!("2026-11-20T09:00:00Z")),
+            ("state", json!("paid")),
+            ("extensions", json!(1)),
+        ] {
+            let mut changed = window.clone();
+            changed[label] = value;
+            let mut payment = base_payment.clone();
+            payment["window"] = changed;
+            assert_ne!(windowed, with_payment(payment), "payment.window.{label}");
+        }
+
+        for (label, value) in [
+            ("subscription", json!("sub_example")),
+            ("customer", json!("cus_example")),
+            ("status", json!("active")),
+            ("cancel_at_period_end", json!(true)),
+            ("current_period_end", json!("2027-01-01T00:00:00Z")),
+            ("next_payment_attempt", json!("2026-12-01T00:00:00Z")),
+            ("failed_attempts", json!(2)),
+            ("last_invoice", json!("in_example")),
+        ] {
+            let mut stripe = json!({});
+            stripe[label] = value;
+            let mut payment = base_payment.clone();
+            payment["stripe"] = stripe;
+            assert_ne!(original, with_payment(payment), "payment.stripe.{label}");
+        }
     }
 
     #[test]

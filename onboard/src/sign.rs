@@ -159,14 +159,43 @@ pub fn group_provision_payload(intent: &crate::store::GroupIntent) -> String {
         })
         .collect::<Vec<_>>()
         .join(";");
+    let payment = &intent.payment;
+    let window = payment
+        .window
+        .as_ref()
+        .map(|w| {
+            format!(
+                "{}={}={}={}",
+                free_text(&w.opened_at),
+                free_text(&w.closes_at),
+                free_text(&w.state),
+                w.extensions
+            )
+        })
+        .unwrap_or_default();
+    let stripe = &payment.stripe;
+    let stripe = format!(
+        "{}={}={}={}={}={}={}={}",
+        free_text(stripe.subscription.as_deref().unwrap_or("")),
+        free_text(stripe.customer.as_deref().unwrap_or("")),
+        free_text(stripe.status.as_deref().unwrap_or("")),
+        stripe.cancel_at_period_end,
+        free_text(stripe.current_period_end.as_deref().unwrap_or("")),
+        free_text(stripe.next_payment_attempt.as_deref().unwrap_or("")),
+        stripe.failed_attempts,
+        free_text(stripe.last_invoice.as_deref().unwrap_or("")),
+    );
     format!(
-        "provision-group:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "provision-group:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         free_text(&intent.domain),
         free_text(&intent.name),
         free_text(&intent.body_kind),
-        free_text(&intent.payment.rail),
-        intent.payment.no_charge,
-        free_text(intent.payment.paid_until.as_deref().unwrap_or("")),
+        free_text(&payment.rail),
+        payment.no_charge,
+        free_text(payment.paid_until.as_deref().unwrap_or("")),
+        free_text(payment.token_ref.as_deref().unwrap_or("")),
+        free_text(&window),
+        free_text(&stripe),
         free_text(&addresses),
         free_text(&intent.mailboxes.join(",")),
         free_text(&intent.site_owner),
