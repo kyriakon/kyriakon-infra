@@ -166,6 +166,14 @@ impl Store {
             opts.custom_flags(libc::O_NOFOLLOW);
             let mut f = opts.open(&tmp).await?;
             f.write_all(bytes).await?;
+            // `write_all` on a `tokio::fs::File` returns once the write is
+            // handed to the blocking pool: `poll_write` answers `Ready` straight
+            // after `spawn_mandatory_blocking` and keeps its error for the next
+            // operation. Without this, the rename can publish a record the
+            // write never wrote, and the error is lost. `flush` waits for the
+            // write that is running and returns its result; the durability
+            // barrier below is a separate promise.
+            f.flush().await?;
             if self.sync {
                 f.sync_all().await?;
             }
@@ -310,6 +318,10 @@ impl Store {
                 }
             }
             f.write_all(&line).await?;
+            // See `place_record`: the write is still in the blocking pool when
+            // `write_all` returns, so its error would surface on a later call,
+            // or never on the test store's path.
+            f.flush().await?;
             if sync {
                 f.sync_all().await
             } else {
