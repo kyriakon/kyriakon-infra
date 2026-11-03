@@ -173,6 +173,35 @@ plan_order() {
 	return 0
 }
 
+# render_onboard_sshd <template> <env-file> <out> — write the portal sshd config
+# with its Port line taken from TUI_PORT.
+#
+# The tracked template carries `Port REPLACE_ME`, and sshd refuses that, so the
+# file an operator checks and installs is the rendered one. setup-env.sh chooses
+# the port once and records it in the box's values file; this reads the same file
+# the deploy scripts and cron lines source rather than carrying a second copy of
+# the rule. Returns 1 when the file holds no usable TUI_PORT.
+render_onboard_sshd() {
+	typeset template="$1" env_file="$2" out="$3" port
+	# Sourced, not parsed, which is how the cron lines and deploy-mail.sh read it.
+	# errexit is off for the read only: a values file that errors then names the
+	# missing value below instead of ending the run here.
+	set +e
+	# shellcheck disable=SC1090 # root's own env file, whose path resolves at runtime
+	port=$(. "$env_file" 2>/dev/null; printf '%s' "${TUI_PORT:-}")
+	set -e
+	case "$port" in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+		return 1
+	fi
+	sed "s/^Port REPLACE_ME$/Port $port/" "$template" >"$out"
+	# The substitution must be the one line that changed. A template that lost the
+	# placeholder would otherwise install a file nobody substituted.
+	grep -qx "Port $port" "$out"
+}
+
 manual_any() {
 	[ "$manual_pf" = yes ] || [ "$manual_sshd" = yes ] || [ "$manual_sshd_onboard" = yes ] ||
 		[ "$manual_member_class" = yes ] || [ "$manual_cron" = yes ] ||
@@ -193,11 +222,27 @@ print_manual() {
 	fi
 	if [ "$manual_sshd_onboard" = yes ]; then
 		printf 'propose-only: the portal sshd config or its login class changed. Install by hand:\n'
-		printf '  doas install -m 0644 %s/openbsd/etc/sshd_config.onboard /etc/ssh/sshd_config.onboard\n' "$repo_dir"
 		printf '  doas install -m 0644 %s/openbsd/etc/login.conf.d/hello /etc/login.conf.d/hello\n' "$repo_dir"
 		printf '  doas cap_mkdb /etc/login.conf   # when the class changed\n'
+		# The template ships Port REPLACE_ME, so this renders the file first and
+		# checks that rendering, not the template: an install of the template is a
+		# config sshd refuses to start.
+		onboard_env="${KYRIAKON_ENV:-/root/.kyriakon-env}"
+		onboard_work=$(mktemp -d "${TMPDIR:-/tmp}/kyriakon-sshd-onboard.XXXXXX") ||
+			die "cannot create a temporary directory for the portal sshd render"
+		onboard_src="$onboard_work/sshd_config.onboard"
+		if ! render_onboard_sshd "$repo_dir/openbsd/etc/sshd_config.onboard" "$onboard_env" "$onboard_src"; then
+			die "no usable TUI_PORT in $onboard_env; run scripts/setup-env.sh, then re-run this plan"
+		fi
+		if ! sshd -t -f "$onboard_src"; then
+			die "$onboard_src does not pass sshd -t; the install step is not printed"
+		fi
+		printf '  # rendered with %s from TUI_PORT in %s\n' \
+			"$(sed -n 's/^Port //p' "$onboard_src")" "$onboard_env"
+		printf '  doas install -m 0644 %s /etc/ssh/sshd_config.onboard\n' "$onboard_src"
 		printf '  doas sshd -t -f /etc/ssh/sshd_config.onboard\n'
 		printf '  doas rcctl restart kyriakon_onboard_sshd\n'
+		printf '  # sshd -t passed on the TUI_PORT rendering; remove %s after installing\n' "$onboard_work"
 	fi
 	if [ "$manual_member_class" = yes ]; then
 		printf 'the member login class changed; existing accounts keep the old one until:\n'
@@ -463,6 +508,30 @@ self_test() {
 	reset_plan
 	classify '.omp/lsp.json'
 	check 'developer tooling plans nothing' "$(plan_order)" ''
+
+	# The portal sshd step installs the rendered file, so the port substitution is
+	# the thing to test: an unsubstituted install is a config sshd refuses.
+	printf 'Port REPLACE_ME\nPidFile /var/run/sshd.onboard.pid\n' >"$self_test_work/onboard.tpl"
+	printf "export TUI_PORT='2233'\n" >"$self_test_work/tui-env"
+	if render_onboard_sshd "$self_test_work/onboard.tpl" "$self_test_work/tui-env" \
+		"$self_test_work/onboard.rendered"; then
+		check 'the portal sshd port comes from TUI_PORT' \
+			"$(cat "$self_test_work/onboard.rendered")" \
+			"$(printf 'Port 2233\nPidFile /var/run/sshd.onboard.pid')"
+	else
+		printf 'FAIL: a TUI_PORT in the values file did not render\n' >&2
+		exit 1
+	fi
+	printf "export TUI_PORT='not-a-port'\n" >"$self_test_work/tui-bad"
+	got=0
+	render_onboard_sshd "$self_test_work/onboard.tpl" "$self_test_work/tui-bad" \
+		"$self_test_work/onboard.bad" || got=$?
+	check 'a non-numeric TUI_PORT is refused' "$got" 1
+	: >"$self_test_work/tui-empty"
+	got=0
+	render_onboard_sshd "$self_test_work/onboard.tpl" "$self_test_work/tui-empty" \
+		"$self_test_work/onboard.none" || got=$?
+	check 'a missing TUI_PORT is refused' "$got" 1
 
 	plan "$repo" ''
 	check 'no base plans every script' "$(plan_order | paste -sd ' ' -)" \
