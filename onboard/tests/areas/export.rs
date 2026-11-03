@@ -594,11 +594,16 @@ fn the_page_files_an_export_intent_and_the_drain_records_the_request() {
     let store = kyriakon_onboard::store::Store::new(&fix.path("store"));
     let session = session_id(&fix, "secretary");
     let id = runtime()
-        .block_on(kyriakon_onboard::intents::file_export(
-            &store,
-            &session,
-            "secretary",
-        ))
+        .block_on(
+            kyriakon_onboard::intents::Intent::Export(
+                kyriakon_onboard::transitions::ExportIntent {
+                    username: "secretary".to_string(),
+                    session: session.clone(),
+                    ..Default::default()
+                },
+            )
+            .file(&store),
+        )
         .unwrap();
 
     let filed: Value = serde_json::from_str(&fix.read(&format!("intents/{id}.json"))).unwrap();
@@ -654,11 +659,16 @@ fn a_forged_or_expired_session_writes_nothing() {
     // A session that belongs to someone else, asking for this account's record.
     let wrong = session_id(&fix, "alice");
     let id = runtime()
-        .block_on(kyriakon_onboard::intents::file_export(
-            &store,
-            &wrong,
-            "secretary",
-        ))
+        .block_on(
+            kyriakon_onboard::intents::Intent::Export(
+                kyriakon_onboard::transitions::ExportIntent {
+                    username: "secretary".to_string(),
+                    session: wrong.clone(),
+                    ..Default::default()
+                },
+            )
+            .file(&store),
+        )
         .unwrap();
     assert!(fix.drain().status.success());
     assert!(!export_root(&fix, "secretary").exists());
@@ -679,11 +689,16 @@ fn a_forged_or_expired_session_writes_nothing() {
     let expired = session_id(&fix, "secretary");
     expire_session(&fix, &expired);
     let id = runtime()
-        .block_on(kyriakon_onboard::intents::file_export(
-            &store,
-            &expired,
-            "secretary",
-        ))
+        .block_on(
+            kyriakon_onboard::intents::Intent::Export(
+                kyriakon_onboard::transitions::ExportIntent {
+                    username: "secretary".to_string(),
+                    session: expired.clone(),
+                    ..Default::default()
+                },
+            )
+            .file(&store),
+        )
         .unwrap();
     assert!(fix.drain().status.success());
     assert!(!export_root(&fix, "secretary").exists());

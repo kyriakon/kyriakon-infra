@@ -6,14 +6,24 @@
 //! whose kind this build does not implement is refused by name and left in
 //! place, never silently dropped: a kind added by a later ticket waits here
 //! until the ticket that understands it lands.
+//!
+//! One type is the contract between the handler's directory and the drain's
+//! root work: [`Intent`]. Its variant carries the payload, [`Intent::verify`]
+//! says how the intent is authenticated, and [`Intent::apply`] carries it out.
+//! `verify`'s match has no catch-all, so a verb cannot ship without answering
+//! how it is proved — the hole `provision-group` came through before #506.
 
 use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::config::DrainConfig;
 use crate::sign;
-use crate::store::{KeyRecord, Store};
-use crate::transitions::{self, DecisionIntent};
+use crate::store::{GroupAddressIntent, GroupIntent, GroupRemoveIntent, Store};
+use crate::transitions::{
+    self, AttributeIntent, CancelRenewalIntent, ChangePasswordIntent, CloseIntent, CreditIntent,
+    DecisionIntent, ExportIntent, MailKeyIntent, OutsideAddressIntent, PasswordIntent,
+    RefundIntent, ResendIntent, ReturnIntent, ServingIntent, UploadKeyIntent, WindowExtendIntent,
+};
 
 /// One pass: every intent, then the sweeps. The drain is a single short-lived
 /// process with no listener, so there is no loop inside it; cron runs it again
@@ -94,7 +104,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     transitions::stripe_webhooks(cfg, store).await
 }
 
-/// One intent, dispatched by kind.
+/// One intent file, deserialised once into its variant, proved, then applied.
 async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result<(), String> {
     // The listing is one snapshot, and a pass can delete a file another name in
     // that snapshot shares: an approval writes and applies its group intent in
@@ -106,414 +116,674 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
     };
     let value: Value =
         serde_json::from_str(&text).map_err(|e| format!("the intent does not parse: {e}"))?;
-    let kind = value
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    match kind.as_str() {
-        "application" => transitions::filed_application(cfg, store, key, &text, file).await,
-        "approve" | "provision" | "decline" => {
-            let intent: DecisionIntent = serde_json::from_value(value)
-                .map_err(|e| format!("the decision intent does not parse: {e}"))?;
-            transitions::decision(cfg, store, key, intent, file).await
+    let intent = Intent::parse(&value)?;
+    intent.run(cfg, store, key, file, &value).await?;
+    Ok(())
+}
+
+/// One intent: the variant carries the payload, and the file it was read from
+/// carries what the refusal paths need to rewrite or journal it.
+///
+/// Parsing is by `kind` and lives here, once: the transition a variant applies
+/// takes the parsed payload, so no verb can be reached with a shape its own
+/// verifier has not looked at.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub enum Intent {
+    Application(crate::store::Intent),
+    Decision(DecisionIntent),
+    Password(PasswordIntent),
+    ProvisionGroup(Box<GroupIntent>),
+    GroupAddress(GroupAddressIntent),
+    RemoveGroup(GroupRemoveIntent),
+    Close(CloseIntent),
+    Resend(ResendIntent),
+    Credit(CreditIntent),
+    WindowExtend(WindowExtendIntent),
+    ReconcileAttribute(AttributeIntent),
+    ReconcileReturn(ReturnIntent),
+    Refund(RefundIntent),
+    Export(ExportIntent),
+    ChangePassword(ChangePasswordIntent),
+    UploadKey(UploadKeyIntent),
+    OutsideAddress(OutsideAddressIntent),
+    Serving(ServingIntent),
+    CancelRenewal(CancelRenewalIntent),
+    MailKey(MailKeyIntent),
+    /// A kind this build does not implement, carried as it was read: `verify`
+    /// refuses it by name and leaves the file where a later ticket finds it.
+    Unknown {
+        kind: String,
+        value: Value,
+    },
+}
+
+impl Intent {
+    /// The intent this file holds, by its `kind`. A kind this build does not
+    /// implement is `Unknown` rather than an error, because it is left in place
+    /// for the release that understands it.
+    ///
+    /// The parse error keeps the message the verb's own reader used, so a
+    /// malformed intent is reported with the same words it always was.
+    pub fn parse(value: &Value) -> Result<Intent, String> {
+        let kind = value.get("kind").and_then(Value::as_str).unwrap_or("");
+        let intent = match kind {
+            "application" => Intent::Application(parsed(value, "the intent")?),
+            "approve" | "provision" | "decline" => {
+                Intent::Decision(parsed(value, "the decision intent")?)
+            }
+            "set-password" => Intent::Password(parsed(value, "the password intent")?),
+            "provision-group" => {
+                Intent::ProvisionGroup(Box::new(parsed(value, "the group intent")?))
+            }
+            "group-address" => Intent::GroupAddress(parsed(value, "the address intent")?),
+            "remove-group" => Intent::RemoveGroup(parsed(value, "the remove-group intent")?),
+            "close" => Intent::Close(parsed(value, "the close intent")?),
+            "token-resend" => Intent::Resend(parsed(value, "the token resend intent")?),
+            "credit" => Intent::Credit(parsed(value, "the credit intent")?),
+            "window-extend" => Intent::WindowExtend(parsed(value, "the window extension intent")?),
+            "reconcile-attribute" => {
+                Intent::ReconcileAttribute(parsed(value, "the reconcile-attribute intent")?)
+            }
+            "reconcile-return" => {
+                Intent::ReconcileReturn(parsed(value, "the reconcile-return intent")?)
+            }
+            "refund" => Intent::Refund(parsed(value, "the refund intent")?),
+            "export" => Intent::Export(export_from(value)?),
+            "change-password" => Intent::ChangePassword(parsed(value, "the password intent")?),
+            "upload-key" => Intent::UploadKey(parsed(value, "the upload key intent")?),
+            "outside-address" => Intent::OutsideAddress(parsed(value, "the address intent")?),
+            "serving" => Intent::Serving(parsed(value, "the serving intent")?),
+            "cancel-renewal" => Intent::CancelRenewal(parsed(value, "the renewal intent")?),
+            "mail-key" => Intent::MailKey(parsed(value, "the mail key intent")?),
+            other => Intent::Unknown {
+                kind: other.to_string(),
+                value: value.clone(),
+            },
+        };
+        Ok(intent)
+    }
+
+    /// The `kind` this variant is filed under. The writer stamps it, so a caller
+    /// cannot file a `Close` under a verb it is not.
+    fn kind(&self) -> &str {
+        match self {
+            Intent::Application(_) => "application",
+            // The three decisions are kinds of their own: `approve`, `provision`
+            // and `decline` are what the dispatcher reads.
+            Intent::Decision(intent) => &intent.kind,
+            Intent::Password(_) => "set-password",
+            Intent::ProvisionGroup(_) => "provision-group",
+            Intent::GroupAddress(_) => "group-address",
+            Intent::RemoveGroup(_) => "remove-group",
+            Intent::Close(_) => "close",
+            Intent::Resend(_) => "token-resend",
+            Intent::Credit(_) => "credit",
+            Intent::WindowExtend(_) => "window-extend",
+            Intent::ReconcileAttribute(_) => "reconcile-attribute",
+            Intent::ReconcileReturn(_) => "reconcile-return",
+            Intent::Refund(_) => "refund",
+            Intent::Export(_) => "export",
+            Intent::ChangePassword(_) => "change-password",
+            Intent::UploadKey(_) => "upload-key",
+            Intent::OutsideAddress(_) => "outside-address",
+            Intent::Serving(_) => "serving",
+            Intent::CancelRenewal(_) => "cancel-renewal",
+            Intent::MailKey(_) => "mail-key",
+            Intent::Unknown { kind, .. } => kind,
         }
-        "set-password" => {
-            let intent: transitions::PasswordIntent = serde_json::from_value(value.clone())
-                .map_err(|e| format!("the password intent does not parse: {e}"))?;
-            transitions::set_password(cfg, store, key, intent, file, &value).await
+    }
+
+    /// File this intent as `intents/<id>.json`, and hand back the id.
+    ///
+    /// The id, the kind and the filing time are the writer's: one writer for
+    /// every verb keeps the envelope, and the `kind` the drain dispatches on,
+    /// from drifting between twelve builders. The payload's own fields are the
+    /// wire the handler already writes, and the signature, where there is one,
+    /// travels in them.
+    pub async fn file(self, store: &Store) -> Result<String, String> {
+        let id = ulid::Ulid::new().to_string();
+        let kind = self.kind().to_string();
+        if matches!(self, Intent::Unknown { .. }) {
+            return Err(format!("this build does not implement the kind {kind:?}"));
         }
-        "provision-group" => transitions::provision_group(cfg, store, key, &value, file).await,
-        "group-address" => transitions::group_address(cfg, store, key, &value, file).await,
-        "remove-group" => transitions::remove_group(cfg, store, key, &value, file).await,
-        "close" => transitions::close_account(cfg, store, &value, file).await,
-        "token-resend" => {
-            let intent: transitions::ResendIntent = serde_json::from_value(value)
-                .map_err(|e| format!("the token resend intent does not parse: {e}"))?;
-            transitions::resend(cfg, store, key, intent, file).await
+        let mut value =
+            serde_json::to_value(&self).map_err(|e| format!("cannot encode the intent: {e}"))?;
+        let object = value.as_object_mut().ok_or("the intent is not an object")?;
+        object.insert("id".to_string(), id.clone().into());
+        object.insert("kind".to_string(), kind.into());
+        object.insert("filed_at".to_string(), crate::util::filed_at().into());
+        let bytes = serde_json::to_vec_pretty(&value)
+            .map_err(|e| format!("cannot encode the intent: {e}"))?;
+        store
+            .write_record("intents", &format!("{id}.json"), &bytes)
+            .await?;
+        Ok(id)
+    }
+
+    /// Prove then apply, as the pass does. `false` means `verify` settled the
+    /// intent; nothing is applied.
+    pub async fn run(
+        self,
+        cfg: &DrainConfig,
+        store: &Store,
+        key: &[u8],
+        file: &str,
+        value: &Value,
+    ) -> Result<bool, String> {
+        if !self.verify(cfg, store, key, file, value).await? {
+            return Ok(false);
         }
-        "credit" => {
-            let intent: transitions::CreditIntent = serde_json::from_value(value.clone())
-                .map_err(|e| format!("the credit intent does not parse: {e}"))?;
-            transitions::credit(cfg, store, key, intent, file, &value).await
+        self.apply(cfg, store, key, file, value).await?;
+        Ok(true)
+    }
+
+    /// Prove the intent is the authenticated party's, before anything is
+    /// applied.
+    ///
+    /// There is no catch-all arm: a variant added without deciding what proves
+    /// it does not compile. `Ok(false)` means the intent is settled — its
+    /// refusal line is journalled and its file left for the operator or removed,
+    /// as that verb's rule says — and the caller must not apply it. `Err` is a
+    /// pass that failed, which backs off and is mailed once.
+    ///
+    /// The signature and session checks are the ones the transitions used to
+    /// make themselves; every message and every journal outcome is the same.
+    pub async fn verify(
+        &self,
+        cfg: &DrainConfig,
+        store: &Store,
+        key: &[u8],
+        file: &str,
+        value: &Value,
+    ) -> Result<bool, String> {
+        let proofs = std::path::Path::new(&cfg.proof_dir);
+        match self {
+            // The handler files it and the drain only queues a review: nothing
+            // is written as root until a reviewer's signed decision, which the
+            // `Decision` arm proves.
+            Intent::Application(_) => Ok(true),
+            Intent::Decision(intent) => {
+                if !crate::store::is_status_token(&intent.application.status_token) {
+                    return Err("the status token is not 128 bits of Crockford".to_string());
+                }
+                if let Some(why) = crate::validate::username_shape(&intent.application.username) {
+                    return Err(format!("the username: {why}"));
+                }
+                let Some(decision) = transitions::decision_for_kind(&intent.kind) else {
+                    return Err(format!("kind {:?} is not a decision", intent.kind));
+                };
+                if intent.action != decision.action {
+                    return Err(format!(
+                        "the action {:?} does not match the kind {:?}",
+                        intent.action, intent.kind
+                    ));
+                }
+                if !sign::verify(
+                    key,
+                    &sign::decide_payload(&intent.application.status_token, &intent.action),
+                    &intent.sig,
+                ) {
+                    return Err("the decision intent's signature does not verify".to_string());
+                }
+                Ok(true)
+            }
+            Intent::Password(intent) => {
+                // A re-filed copy of a settled intent is settled again, and a
+                // refused one loses its plaintext.
+                if transitions::journal_has(store, &intent.id, "refused").await? {
+                    transitions::redact_password(store, file, value).await?;
+                    return Ok(false);
+                }
+                if transitions::journal_has(store, &intent.id, "applied").await? {
+                    // A crash between the `applied` line and the remove leaves
+                    // the intent re-read on every pass: finish the remove.
+                    store.remove("intents", file).await?;
+                    return Ok(false);
+                }
+                // The handler files the plaintext and the drain hashes it: a
+                // `hash` field is the old shape, where a handler with a valid
+                // link chose the stored hash.
+                let problem: Option<String> = if value.get("hash").is_some() {
+                    Some("the intent carries a hash rather than a plaintext".to_string())
+                } else if !sign::verify(
+                    key,
+                    &sign::password_payload(&intent.application.status_token, &intent.until),
+                    &intent.sig,
+                ) {
+                    Some("the link's signature does not verify".to_string())
+                } else if intent.until.as_str() < crate::util::date_after_days(0).as_str() {
+                    Some("the link's date has passed".to_string())
+                } else {
+                    crate::password::validate(&intent.password).err()
+                };
+                match problem {
+                    Some(why) => {
+                        transitions::refuse_password(cfg, store, file, value, &why).await?;
+                        Ok(false)
+                    }
+                    None => Ok(true),
+                }
+            }
+            Intent::ProvisionGroup(intent) => {
+                if sign::verify(key, &sign::group_provision_payload(intent), &intent.sig) {
+                    Ok(true)
+                } else {
+                    Err("the group intent's signature does not verify".to_string())
+                }
+            }
+            Intent::GroupAddress(intent) => {
+                let payload = sign::address_payload(
+                    &intent.domain,
+                    &intent.action,
+                    &intent.address,
+                    &intent.mailbox,
+                    intent.site_owner.as_deref().unwrap_or(""),
+                    intent
+                        .mail_key
+                        .as_ref()
+                        .map(|k| k.material.as_str())
+                        .unwrap_or(""),
+                );
+                if sign::verify(key, &payload, &intent.sig) {
+                    Ok(true)
+                } else {
+                    Err("the address intent's signature does not verify".to_string())
+                }
+            }
+            Intent::RemoveGroup(intent) => {
+                if sign::verify(
+                    key,
+                    &sign::group_remove_payload(&intent.domain),
+                    &intent.sig,
+                ) {
+                    Ok(true)
+                } else {
+                    Err("the remove-group intent's signature does not verify".to_string())
+                }
+            }
+            Intent::Close(intent) => {
+                if let Some(why) = crate::validate::username_shape(&intent.username) {
+                    return Err(format!("the username {:?}: {why}", intent.username));
+                }
+                match verify_session(store, proofs, &intent.session, &intent.username).await {
+                    Ok(()) => Ok(true),
+                    Err(reason) => {
+                        transitions::settle_page(
+                            cfg,
+                            store,
+                            &intent.id,
+                            &intent.kind,
+                            &intent.username,
+                            file,
+                            "refused",
+                            Some(&reason),
+                        )
+                        .await?;
+                        Ok(false)
+                    }
+                }
+            }
+            Intent::Resend(intent) => {
+                if sign::verify(
+                    key,
+                    &sign::resend_payload(&intent.username, &intent.token),
+                    &intent.sig,
+                ) {
+                    Ok(true)
+                } else {
+                    Err("the token resend's signature does not verify".to_string())
+                }
+            }
+            Intent::Credit(intent) => {
+                let payload = sign::credit_payload(
+                    &intent.token,
+                    &intent.rail,
+                    &intent.amount_gbp,
+                    &intent.received,
+                    intent.txid.as_deref(),
+                    intent.amount_xmr.as_deref(),
+                    intent.confirm_double,
+                    intent.override_reason.as_deref(),
+                    intent.note.as_deref(),
+                );
+                if sign::verify(key, &payload, &intent.sig) {
+                    Ok(true)
+                } else {
+                    transitions::refuse_with(
+                        cfg,
+                        store,
+                        file,
+                        value,
+                        "the credit intent's signature does not verify",
+                    )
+                    .await?;
+                    Ok(false)
+                }
+            }
+            Intent::WindowExtend(intent) => {
+                if sign::verify(
+                    key,
+                    &sign::window_extend_payload(&intent.token, intent.days, &intent.reason),
+                    &intent.sig,
+                ) {
+                    Ok(true)
+                } else {
+                    transitions::refuse_with(
+                        cfg,
+                        store,
+                        file,
+                        value,
+                        "the window extension's signature does not verify",
+                    )
+                    .await?;
+                    Ok(false)
+                }
+            }
+            Intent::ReconcileAttribute(intent) => {
+                let payload = sign::reconcile_attribute_payload(
+                    &intent.item,
+                    &intent.token,
+                    intent.confirm_double,
+                    intent.override_reason.as_deref(),
+                );
+                if sign::verify(key, &payload, &intent.sig) {
+                    Ok(true)
+                } else {
+                    transitions::refuse_with(
+                        cfg,
+                        store,
+                        file,
+                        value,
+                        "the reconcile-attribute intent's signature does not verify",
+                    )
+                    .await?;
+                    Ok(false)
+                }
+            }
+            Intent::ReconcileReturn(intent) => {
+                if sign::verify(
+                    key,
+                    &sign::reconcile_return_payload(&intent.item, &intent.note),
+                    &intent.sig,
+                ) {
+                    Ok(true)
+                } else {
+                    transitions::refuse_with(
+                        cfg,
+                        store,
+                        file,
+                        value,
+                        "the reconcile-return intent's signature does not verify",
+                    )
+                    .await?;
+                    Ok(false)
+                }
+            }
+            Intent::Refund(intent) => {
+                let payload = sign::refund_payload(
+                    &intent.token,
+                    intent.amount_gbp.as_deref().unwrap_or(""),
+                    intent.rail.as_deref().unwrap_or(""),
+                    intent.close,
+                    intent.excess,
+                    intent.rate.as_deref().unwrap_or(""),
+                    intent.settled_on.as_deref().unwrap_or(""),
+                    intent.reason.as_deref().unwrap_or(""),
+                );
+                if sign::verify(key, &payload, &intent.sig) {
+                    Ok(true)
+                } else {
+                    transitions::refuse_with(
+                        cfg,
+                        store,
+                        file,
+                        value,
+                        "the refund intent's signature does not verify",
+                    )
+                    .await?;
+                    Ok(false)
+                }
+            }
+            Intent::Export(intent) => {
+                if let Some(why) = crate::validate::username_shape(&intent.username) {
+                    return Err(format!(
+                        "the export intent's username {:?}: {why}",
+                        intent.username
+                    ));
+                }
+                verify_session(store, proofs, &intent.session, &intent.username).await?;
+                Ok(true)
+            }
+            // A page action is proved by the session the handler filed, and by
+            // the account name being one an account record can name.
+            Intent::ChangePassword(intent) => {
+                if value.get("hash").is_some() {
+                    transitions::refuse_page(
+                        cfg,
+                        store,
+                        &intent.id,
+                        &intent.kind,
+                        &intent.username,
+                        file,
+                        "the intent carries a hash rather than a plaintext",
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+                page_proved(
+                    cfg,
+                    store,
+                    &intent.id,
+                    &intent.kind,
+                    &intent.username,
+                    &intent.session,
+                    file,
+                )
+                .await
+            }
+            Intent::UploadKey(intent) => {
+                page_proved(
+                    cfg,
+                    store,
+                    &intent.id,
+                    &intent.kind,
+                    &intent.username,
+                    &intent.session,
+                    file,
+                )
+                .await
+            }
+            Intent::OutsideAddress(intent) => {
+                page_proved(
+                    cfg,
+                    store,
+                    &intent.id,
+                    &intent.kind,
+                    &intent.username,
+                    &intent.session,
+                    file,
+                )
+                .await
+            }
+            Intent::Serving(intent) => {
+                page_proved(
+                    cfg,
+                    store,
+                    &intent.id,
+                    &intent.kind,
+                    &intent.username,
+                    &intent.session,
+                    file,
+                )
+                .await
+            }
+            Intent::CancelRenewal(intent) => {
+                page_proved(
+                    cfg,
+                    store,
+                    &intent.id,
+                    &intent.kind,
+                    &intent.username,
+                    &intent.session,
+                    file,
+                )
+                .await
+            }
+            Intent::MailKey(intent) => {
+                page_proved(
+                    cfg,
+                    store,
+                    &intent.id,
+                    &intent.kind,
+                    &intent.username,
+                    &intent.session,
+                    file,
+                )
+                .await
+            }
+            Intent::Unknown { .. } => {
+                transitions::refuse(cfg, store, file, value).await?;
+                Ok(false)
+            }
         }
-        "window-extend" => {
-            let intent: transitions::WindowExtendIntent = serde_json::from_value(value.clone())
-                .map_err(|e| format!("the window extension intent does not parse: {e}"))?;
-            transitions::window_extend(cfg, store, key, intent, file, &value).await
+    }
+
+    /// Carry the intent out. Only reached once `verify` has proved it, so the
+    /// transitions behind these arms make no second proof of their own.
+    pub async fn apply(
+        self,
+        cfg: &DrainConfig,
+        store: &Store,
+        key: &[u8],
+        file: &str,
+        value: &Value,
+    ) -> Result<(), String> {
+        match self {
+            Intent::Application(intent) => {
+                transitions::filed_application(cfg, store, key, intent, file).await
+            }
+            Intent::Decision(intent) => transitions::decision(cfg, store, key, intent, file).await,
+            Intent::Password(intent) => {
+                transitions::set_password(cfg, store, intent, file, value).await
+            }
+            Intent::ProvisionGroup(intent) => {
+                transitions::provision_group(cfg, store, *intent, file).await
+            }
+            Intent::GroupAddress(intent) => {
+                transitions::group_address(cfg, store, intent, file).await
+            }
+            Intent::RemoveGroup(intent) => {
+                transitions::remove_group(cfg, store, intent, file).await
+            }
+            Intent::Close(intent) => transitions::close_account(cfg, store, intent, file).await,
+            Intent::Resend(intent) => transitions::resend(cfg, store, intent, file).await,
+            Intent::Credit(intent) => transitions::credit(cfg, store, intent, file, value).await,
+            Intent::WindowExtend(intent) => {
+                transitions::window_extend(cfg, store, intent, file, value).await
+            }
+            Intent::ReconcileAttribute(intent) => {
+                transitions::reconcile_attribute(cfg, store, intent, file, value).await
+            }
+            Intent::ReconcileReturn(intent) => {
+                transitions::reconcile_return(cfg, store, intent, file, value).await
+            }
+            Intent::Refund(intent) => transitions::refund(cfg, store, intent, file, value).await,
+            Intent::Export(intent) => transitions::export_account(cfg, store, intent, file).await,
+            Intent::ChangePassword(intent) => {
+                transitions::change_password(cfg, store, intent, file).await
+            }
+            Intent::UploadKey(intent) => transitions::upload_key(cfg, store, intent, file).await,
+            Intent::OutsideAddress(intent) => {
+                transitions::set_outside_address(cfg, store, intent, file).await
+            }
+            Intent::Serving(intent) => transitions::set_serving(cfg, store, intent, file).await,
+            Intent::CancelRenewal(intent) => {
+                transitions::cancel_renewal(cfg, store, intent, file).await
+            }
+            Intent::MailKey(intent) => transitions::mail_key(cfg, store, intent, file).await,
+            // `verify` refuses an unknown kind before this is reached.
+            Intent::Unknown { kind, .. } => {
+                Err(format!("this build does not implement the kind {kind:?}"))
+            }
         }
-        "reconcile-attribute" => {
-            let intent: transitions::AttributeIntent = serde_json::from_value(value.clone())
-                .map_err(|e| format!("the reconcile-attribute intent does not parse: {e}"))?;
-            transitions::reconcile_attribute(cfg, store, key, intent, file, &value).await
-        }
-        "reconcile-return" => {
-            let intent: transitions::ReturnIntent = serde_json::from_value(value.clone())
-                .map_err(|e| format!("the reconcile-return intent does not parse: {e}"))?;
-            transitions::reconcile_return(cfg, store, key, intent, file, &value).await
-        }
-        "refund" => {
-            let intent: transitions::RefundIntent = serde_json::from_value(value.clone())
-                .map_err(|e| format!("the refund intent does not parse: {e}"))?;
-            transitions::refund(cfg, store, key, intent, file, &value).await
-        }
-        "export" => transitions::export_account(cfg, store, &value, file).await,
-        "change-password" => transitions::change_password(cfg, store, &value, file).await,
-        "upload-key" => transitions::upload_key(cfg, store, &value, file).await,
-        "outside-address" => transitions::set_outside_address(cfg, store, &value, file).await,
-        "serving" => transitions::set_serving(cfg, store, &value, file).await,
-        "cancel-renewal" => transitions::cancel_renewal(cfg, store, &value, file).await,
-        "mail-key" => transitions::mail_key(cfg, store, &value, file).await,
-        _ => transitions::refuse(cfg, store, file, &value).await,
     }
 }
 
-/// File an export intent, as the account page's "Take my data out" does.
-///
-/// The body names the account and the session that asked for it, and nothing
-/// else. The handler is unprivileged and `intents/` is writable by it, so the
-/// drain re-proves the session against its server-side record before it writes
-/// as root: the record's username must be the intent's and it must not have
-/// expired. Nothing the caller supplies can widen the export past the account.
-pub async fn file_export(store: &Store, session: &str, username: &str) -> Result<String, String> {
-    let id = ulid::Ulid::new().to_string();
-    let intent = serde_json::json!({
-        "id": id,
-        "kind": "export",
-        "filed_at": crate::util::filed_at(),
-        "username": username,
-        "session": session,
-    });
-    let bytes =
-        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store
-        .write_record("intents", &format!("{id}.json"), &bytes)
-        .await?;
-    Ok(id)
+/// One de-serialisation, with the verb's own words for a bad shape.
+fn parsed<T: serde::de::DeserializeOwned>(value: &Value, what: &str) -> Result<T, String> {
+    serde_json::from_value(value.clone()).map_err(|e| format!("{what} does not parse: {e}"))
 }
 
-/// File one of the account page's actions: the account, the session that filed
-/// it, and the action's own fields.
-///
-/// The handler has authenticated the member and validated each field; the drain
-/// revalidates all of them, because `intents/` belongs to the unprivileged half
-/// and every one of these writes something as root. One writer for the six
-/// actions keeps the envelope, the keys the drain reads before it dispatches,
-/// from drifting between them.
-pub async fn file_action(
+/// The export intent, read with the words its transition always used: the
+/// account and the session are its claim, and a file missing either is refused
+/// by name rather than as a serde object error.
+fn export_from(value: &Value) -> Result<ExportIntent, String> {
+    Ok(ExportIntent {
+        id: value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        kind: "export".to_string(),
+        filed_at: value
+            .get("filed_at")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        username: value
+            .get("username")
+            .and_then(Value::as_str)
+            .ok_or("the export intent names no account")?
+            .to_string(),
+        session: value
+            .get("session")
+            .and_then(Value::as_str)
+            .ok_or("the export intent names no session")?
+            .to_string(),
+    })
+}
+
+/// A page action's proof: the account name is a path component in the store and
+/// below, so only an account name may be one, and the session record's proof
+/// names the account. A refusal journals its reason and removes the file, the
+/// way every page action's refusal does.
+async fn page_proved(
+    cfg: &DrainConfig,
     store: &Store,
+    id: &str,
     kind: &str,
+    username: &str,
     session: &str,
-    username: &str,
-    fields: serde_json::Value,
-) -> Result<String, String> {
-    let id = ulid::Ulid::new().to_string();
-    let mut intent = serde_json::json!({
-        "id": id,
-        "kind": kind,
-        "filed_at": crate::util::filed_at(),
-        "username": username,
-        "session": session,
-    });
-    let serde_json::Value::Object(extra) = fields else {
-        return Err("a page action's fields have to be an object".to_string());
-    };
-    intent
-        .as_object_mut()
-        .ok_or("the intent is not an object")?
-        .extend(extra);
-    let bytes =
-        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store
-        .write_record("intents", &format!("{id}.json"), &bytes)
+    file: &str,
+) -> Result<bool, String> {
+    if let Some(why) = crate::validate::username_shape(username) {
+        transitions::refuse_page(
+            cfg,
+            store,
+            id,
+            kind,
+            username,
+            file,
+            &format!("the username {username:?}: {why}"),
+        )
         .await?;
-    Ok(id)
-}
-
-/// File one decision, as a link's click or the console does.
-///
-/// The handler holds no key and signs nothing: the signature travels in the link
-/// the operator was sent, and the drain is the half that verifies it. The console
-/// signs with the root-only key and passes its own. Both build the file here, so
-/// the two callers cannot disagree about the shape the drain parses.
-pub async fn file_decision(
-    store: &Store,
-    kind: &str,
-    action: &str,
-    username: &str,
-    token: &str,
-    sig: &str,
-) -> Result<String, String> {
-    let id = ulid::Ulid::new().to_string();
-    let intent = serde_json::json!({
-        "id": id,
-        "kind": kind,
-        "filed_at": crate::util::filed_at(),
-        "application": { "username": username, "status_token": token },
-        "action": action,
-        "sig": sig,
-    });
-    let bytes =
-        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store
-        .write_record("intents", &format!("{id}.json"), &bytes)
-        .await?;
-    Ok(id)
-}
-
-/// File one address change in a group, as `kyriakon-onboardctl address` does.
-///
-/// The signature is the console's, over `sign::address_payload` for exactly
-/// these fields: `intents/` belongs to the unprivileged half, so the drain
-/// carries an address change out only when the root-only key signed it.
-#[allow(clippy::too_many_arguments)]
-pub async fn file_group_address(
-    store: &Store,
-    domain: &str,
-    action: &str,
-    address: &str,
-    mailbox: &str,
-    mail_key: Option<&KeyRecord>,
-    site_owner: Option<&str>,
-    sig: &str,
-) -> Result<String, String> {
-    let id = ulid::Ulid::new().to_string();
-    let intent = serde_json::json!({
-        "id": id,
-        "kind": "group-address",
-        "filed_at": crate::util::filed_at(),
-        "domain": domain,
-        "action": action,
-        "address": address,
-        "mailbox": mailbox,
-        "mail_key": mail_key,
-        "site_owner": site_owner,
-        "sig": sig,
-    });
-    let bytes =
-        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store
-        .write_record("intents", &format!("{id}.json"), &bytes)
-        .await?;
-    Ok(id)
-}
-
-/// File one group removal, as `kyriakon-onboardctl group remove` does.
-///
-/// The signature is the console's, over `sign::group_remove_payload`, because
-/// the transition deletes every account in the body and `intents/` belongs to
-/// the unprivileged half.
-pub async fn file_remove_group(store: &Store, domain: &str, sig: &str) -> Result<String, String> {
-    let id = ulid::Ulid::new().to_string();
-    let intent = serde_json::json!({
-        "id": id,
-        "kind": "remove-group",
-        "filed_at": crate::util::filed_at(),
-        "domain": domain,
-        "sig": sig,
-    });
-    let bytes =
-        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store
-        .write_record("intents", &format!("{id}.json"), &bytes)
-        .await?;
-    Ok(id)
-}
-
-/// File a `token-resend`, as `kyriakon-onboardctl token resend` does. The token
-/// is the account's own, read at the terminal, and the signature is over it, so
-/// the drain re-sends nothing the console did not file and mints nothing.
-pub async fn file_resend(
-    store: &Store,
-    username: &str,
-    token: &str,
-    sig: &str,
-) -> Result<String, String> {
-    let id = ulid::Ulid::new().to_string();
-    let intent = serde_json::json!({
-        "id": id,
-        "kind": "token-resend",
-        "filed_at": crate::util::filed_at(),
-        "username": username,
-        "token": token,
-        "sig": sig,
-    });
-    let bytes =
-        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store
-        .write_record("intents", &format!("{id}.json"), &bytes)
-        .await?;
-    Ok(id)
-}
-
-/// File a manual credit, as `kyriakon-onboardctl credit` does. The token is the
-/// account's own, resolved by the console before it signs, and the signature is
-/// over every field the drain acts on: a credit moves a paid-until date, and
-/// `intents/` is writable by the unprivileged handler.
-#[allow(clippy::too_many_arguments)]
-pub async fn file_credit(
-    store: &Store,
-    token: &str,
-    rail: &str,
-    amount_gbp: &str,
-    received: &str,
-    txid: Option<&str>,
-    amount_xmr: Option<&str>,
-    confirm_double: bool,
-    override_reason: Option<&str>,
-    note: Option<&str>,
-    sig: &str,
-) -> Result<String, String> {
-    let id = ulid::Ulid::new().to_string();
-    let intent = serde_json::json!({
-        "id": id,
-        "kind": "credit",
-        "filed_at": crate::util::filed_at(),
-        "token": token,
-        "rail": rail,
-        "amount_gbp": amount_gbp,
-        "received": received,
-        "txid": txid,
-        "amount_xmr": amount_xmr,
-        "confirm_double": confirm_double,
-        "override_reason": override_reason,
-        "note": note,
-        "sig": sig,
-    });
-    let bytes =
-        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store
-        .write_record("intents", &format!("{id}.json"), &bytes)
-        .await?;
-    Ok(id)
-}
-
-/// File a `window-extend` intent, as `kyriakon-onboardctl window extend` does.
-/// The token is validated here and the signature is over every field the drain
-/// acts on, because the extension moves a lapse date and `intents/` belongs to
-/// the unprivileged half.
-pub async fn file_window_extend(
-    store: &Store,
-    token: &str,
-    days: i64,
-    reason: &str,
-    sig: &str,
-) -> Result<String, String> {
-    let id = ulid::Ulid::new().to_string();
-    let intent = serde_json::json!({
-        "id": id,
-        "kind": "window-extend",
-        "filed_at": crate::util::filed_at(),
-        "token": token,
-        "days": days,
-        "reason": reason,
-        "sig": sig,
-    });
-    let bytes =
-        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store
-        .write_record("intents", &format!("{id}.json"), &bytes)
-        .await?;
-    Ok(id)
-}
-
-/// File one reconcile-attribute intent, as `kyriakon-onboardctl reconcile
-/// attribute` does. The held id and the token are both validated shapes, and the
-/// console signs them, because the transition writes a paid-until date and
-/// `intents/` belongs to the unprivileged half.
-pub async fn file_reconcile_attribute(
-    store: &Store,
-    item: &str,
-    token: &str,
-    confirm_double: bool,
-    override_reason: Option<&str>,
-    sig: &str,
-) -> Result<String, String> {
-    let id = ulid::Ulid::new().to_string();
-    let intent = serde_json::json!({
-        "id": id,
-        "kind": "reconcile-attribute",
-        "filed_at": crate::util::filed_at(),
-        "item": item,
-        "token": token,
-        "confirm_double": confirm_double,
-        "override_reason": override_reason,
-        "sig": sig,
-    });
-    let bytes =
-        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store
-        .write_record("intents", &format!("{id}.json"), &bytes)
-        .await?;
-    Ok(id)
-}
-
-/// File one reconcile-return intent, as `kyriakon-onboardctl reconcile return`
-/// does. The evidence is free text and signed last; nothing moves but the held
-/// line's own state.
-pub async fn file_reconcile_return(
-    store: &Store,
-    item: &str,
-    note: &str,
-    sig: &str,
-) -> Result<String, String> {
-    let id = ulid::Ulid::new().to_string();
-    let intent = serde_json::json!({
-        "id": id,
-        "kind": "reconcile-return",
-        "filed_at": crate::util::filed_at(),
-        "item": item,
-        "note": note,
-        "sig": sig,
-    });
-    let bytes =
-        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store
-        .write_record("intents", &format!("{id}.json"), &bytes)
-        .await?;
-    Ok(id)
-}
-
-/// File a refund, as `kyriakon-onboardctl refund` does. A refund form carries
-/// the money, the rail, the reason and the `--close`/`--excess` choice; a
-/// settlement carries `settled_on` and nothing else. The token is the account's
-/// own, resolved by the console before it signs, and the signature is over every
-/// field the drain acts on: a refund writes the ledger and can close an account,
-/// and `intents/` is writable by the unprivileged handler.
-#[allow(clippy::too_many_arguments)]
-pub async fn file_refund(
-    store: &Store,
-    token: &str,
-    amount_gbp: Option<&str>,
-    rail: Option<&str>,
-    reason: Option<&str>,
-    close: bool,
-    excess: bool,
-    rate: Option<&str>,
-    settled_on: Option<&str>,
-    sig: &str,
-) -> Result<String, String> {
-    let id = ulid::Ulid::new().to_string();
-    let intent = serde_json::json!({
-        "id": id,
-        "kind": "refund",
-        "filed_at": crate::util::filed_at(),
-        "token": token,
-        "amount_gbp": amount_gbp,
-        "rail": rail,
-        "reason": reason,
-        "close": close,
-        "excess": excess,
-        "rate": rate,
-        "settled_on": settled_on,
-        "sig": sig,
-    });
-    let bytes =
-        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store
-        .write_record("intents", &format!("{id}.json"), &bytes)
-        .await?;
-    Ok(id)
+        return Ok(false);
+    }
+    match verify_session(
+        store,
+        std::path::Path::new(&cfg.proof_dir),
+        session,
+        username,
+    )
+    .await
+    {
+        Ok(()) => Ok(true),
+        Err(reason) => {
+            transitions::refuse_page(cfg, store, id, kind, username, file, &reason).await?;
+            Ok(false)
+        }
+    }
 }
 
 /// Whether `id` names a live page session for `username`. The drain runs as
@@ -522,8 +792,7 @@ pub async fn file_refund(
 /// account. The record is not trusted: it only names the proof token that the
 /// root-side login check minted in `proof_dir`, and that file's own username
 /// and expiry decide. A forged record, a session for another account and an
-/// expired one are refused with the reason the journal records. The close
-/// intent is the first caller; #498 reuses it.
+/// expired one are refused with the reason the journal records.
 pub async fn verify_session(
     store: &Store,
     proof_dir: &std::path::Path,
@@ -540,57 +809,4 @@ pub async fn verify_session(
         .map_err(|e| format!("the session record does not parse: {e}"))?;
     let proof = value.get("proof").and_then(Value::as_str).unwrap_or("");
     crate::session::verify_proof(proof_dir, proof, username, OffsetDateTime::now_utc()).await
-}
-
-/// File one `close` intent, as the account page does. The handler has
-/// authenticated the member, writes the account name and the page session it
-/// used, and nothing else. The drain verifies the session, owns the state write
-/// and the seven-day window.
-pub async fn file_close(store: &Store, username: &str, session: &str) -> Result<String, String> {
-    let id = ulid::Ulid::new().to_string();
-    let intent = serde_json::json!({
-        "id": id,
-        "kind": "close",
-        "filed_at": crate::util::filed_at(),
-        "username": username,
-        "session": session,
-    });
-    let bytes =
-        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store
-        .write_record("intents", &format!("{id}.json"), &bytes)
-        .await?;
-    Ok(id)
-}
-
-/// File a password set through the member's one-time link.
-///
-/// The plaintext is the handler's and the signature is the link's. The drain
-/// hashes the plaintext and checks the signature before it applies anything, so
-/// a forged submission files an intent that is refused, never a password, and a
-/// compromised handler cannot file a hash the member never typed.
-pub async fn file_password(
-    store: &Store,
-    username: &str,
-    token: &str,
-    until: &str,
-    sig: &str,
-    password: &str,
-) -> Result<String, String> {
-    let id = ulid::Ulid::new().to_string();
-    let intent = serde_json::json!({
-        "id": id,
-        "kind": "set-password",
-        "filed_at": crate::util::filed_at(),
-        "application": { "username": username, "status_token": token },
-        "until": until,
-        "sig": sig,
-        "password": password,
-    });
-    let bytes =
-        serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store
-        .write_record("intents", &format!("{id}.json"), &bytes)
-        .await?;
-    Ok(id)
 }

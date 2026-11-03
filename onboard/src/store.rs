@@ -514,7 +514,7 @@ pub struct Intent {
     pub question_list: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ApplicationRef {
     pub username: String,
     pub status_token: String,
@@ -918,7 +918,7 @@ pub struct GroupIntent {
 /// It carries a signature over every field the drain acts on, because
 /// `intents/` is writable by the unprivileged handler and this is root work:
 /// without one, a compromised handler could file a mailbox or a removal.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GroupAddressIntent {
     pub id: String,
     pub kind: String,
@@ -946,7 +946,7 @@ pub struct GroupAddressIntent {
 /// The `remove-group` intent: take one body's domain down and close every
 /// account in it. The console signs it, because the transition deletes accounts
 /// and `intents/` is writable by the unprivileged handler.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GroupRemoveIntent {
     pub id: String,
     pub kind: String,

@@ -261,7 +261,14 @@ async fn token(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), 
         })?;
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::resend_payload(username, &token))?;
-    let id = intents::file_resend(store, username, &token, &sig).await?;
+    let id = intents::Intent::Resend(transitions::ResendIntent {
+        username: username.to_string(),
+        token: token.clone(),
+        sig,
+        ..Default::default()
+    })
+    .file(store)
+    .await?;
     println!("filed {verb} for {username} as intent {id}");
     Ok(())
 }
@@ -394,19 +401,20 @@ async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
             note,
         ),
     )?;
-    let id = intents::file_credit(
-        store,
-        &token,
-        rail,
-        amount,
-        received,
-        txid,
-        xmr,
+    let id = intents::Intent::Credit(transitions::CreditIntent {
+        token: token.clone(),
+        rail: rail.to_string(),
+        amount_gbp: amount.to_string(),
+        received: received.to_string(),
+        txid: txid.map(str::to_string),
+        amount_xmr: xmr.map(str::to_string),
         confirm_double,
-        override_reason,
-        note,
-        &sig,
-    )
+        override_reason: override_reason.map(str::to_string),
+        note: note.map(str::to_string),
+        sig,
+        ..Default::default()
+    })
+    .file(store)
     .await?;
     let what = if token.is_empty() {
         "a payment with no token".to_string()
@@ -445,7 +453,15 @@ async fn window(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::window_extend_payload(token, days, reason))?;
-    let id = intents::file_window_extend(store, token, days, reason, &sig).await?;
+    let id = intents::Intent::WindowExtend(transitions::WindowExtendIntent {
+        token: token.to_string(),
+        days,
+        reason: reason.to_string(),
+        sig,
+        ..Default::default()
+    })
+    .file(store)
+    .await?;
     println!("filed window extension for {token} as intent {id}");
     Ok(())
 }
@@ -564,14 +580,15 @@ async fn reconcile_attribute(
         &key,
         &sign::reconcile_attribute_payload(item, token, confirm_double, override_reason),
     )?;
-    let id = intents::file_reconcile_attribute(
-        store,
-        item,
-        token,
+    let id = intents::Intent::ReconcileAttribute(transitions::AttributeIntent {
+        item: item.to_string(),
+        token: token.to_string(),
         confirm_double,
-        override_reason,
-        &sig,
-    )
+        override_reason: override_reason.map(str::to_string),
+        sig,
+        ..Default::default()
+    })
+    .file(store)
     .await?;
     println!("filed reconcile attribute for {item} as intent {id}");
     Ok(())
@@ -596,7 +613,14 @@ async fn reconcile_return(cfg: &DrainConfig, store: &Store, args: &[String]) -> 
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::reconcile_return_payload(item, note))?;
-    let id = intents::file_reconcile_return(store, item, note, &sig).await?;
+    let id = intents::Intent::ReconcileReturn(transitions::ReturnIntent {
+        item: item.to_string(),
+        note: note.to_string(),
+        sig,
+        ..Default::default()
+    })
+    .file(store)
+    .await?;
     println!("filed reconcile return for {item} as intent {id}");
     Ok(())
 }
@@ -686,18 +710,13 @@ async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
             &key,
             &sign::refund_payload(&token, "", "", false, false, "", settled, ""),
         )?;
-        let id = intents::file_refund(
-            store,
-            &token,
-            None,
-            None,
-            None,
-            false,
-            false,
-            None,
-            Some(settled),
-            &sig,
-        )
+        let id = intents::Intent::Refund(transitions::RefundIntent {
+            token: token.clone(),
+            settled_on: Some(settled.to_string()),
+            sig,
+            ..Default::default()
+        })
+        .file(store)
         .await?;
         println!("filed refund settlement for {token} as intent {id}");
         return Ok(());
@@ -748,18 +767,18 @@ async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
             reason,
         ),
     )?;
-    let id = intents::file_refund(
-        store,
-        &token,
-        Some(amount),
-        Some(rail),
-        Some(reason),
+    let id = intents::Intent::Refund(transitions::RefundIntent {
+        token: token.clone(),
+        amount_gbp: Some(amount.to_string()),
+        rail: Some(rail.to_string()),
+        reason: Some(reason.to_string()),
         close,
         excess,
-        rate,
-        None,
-        &sig,
-    )
+        rate: rate.map(str::to_string),
+        sig,
+        ..Default::default()
+    })
+    .file(store)
     .await?;
     println!("filed refund for {token} as intent {id}");
     Ok(())
@@ -1025,16 +1044,17 @@ async fn address(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<()
             mail_key.as_ref().map(|k| k.material.as_str()).unwrap_or(""),
         ),
     )?;
-    let id = intents::file_group_address(
-        store,
-        domain,
-        action,
-        address,
-        mailbox,
-        mail_key.as_ref(),
-        site_owner,
-        &sig,
-    )
+    let id = intents::Intent::GroupAddress(store::GroupAddressIntent {
+        domain: domain.to_string(),
+        action: action.to_string(),
+        address: address.to_string(),
+        mailbox: mailbox.to_string(),
+        mail_key: mail_key.clone(),
+        site_owner: site_owner.map(str::to_string),
+        sig,
+        ..Default::default()
+    })
+    .file(store)
     .await?;
     println!("filed {action} for {domain} as intent {id}");
     Ok(())
@@ -1055,7 +1075,13 @@ async fn group(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), 
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::group_remove_payload(domain))?;
-    let id = intents::file_remove_group(store, domain, &sig).await?;
+    let id = intents::Intent::RemoveGroup(store::GroupRemoveIntent {
+        domain: domain.to_string(),
+        sig,
+        ..Default::default()
+    })
+    .file(store)
+    .await?;
     println!("filed group remove for {domain} as intent {id}");
     Ok(())
 }
@@ -1348,14 +1374,17 @@ async fn sign_and_file(
 ) -> Result<(), String> {
     let (token, _record) = find_application(store, username).await?;
     let sig = sign::sign(key, &sign::decide_payload(&token, decision.action))?;
-    let id = intents::file_decision(
-        store,
-        decision.kind,
-        decision.action,
-        username,
-        &token,
-        &sig,
-    )
+    let id = intents::Intent::Decision(transitions::DecisionIntent {
+        kind: decision.kind.to_string(),
+        application: store::ApplicationRef {
+            username: username.to_string(),
+            status_token: token.clone(),
+        },
+        action: decision.action.to_string(),
+        sig,
+        ..Default::default()
+    })
+    .file(store)
     .await?;
     println!("filed {} for {username} as intent {id}", decision.kind);
     Ok(())
