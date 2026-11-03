@@ -204,6 +204,25 @@ fn assert_valid_envelope(envelope: &[u8]) {
     );
 }
 
+/// The daemon's successful response is framed: `KYRIAKON-ENCRYPT 1 OK <len>\n`
+/// and then exactly `<len>` bytes. This is the C shim's check, so a response
+/// that is cut short fails here the way it fails a save.
+fn frame_body(resp: &[u8]) -> Vec<u8> {
+    let nl = resp
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or_else(|| panic!("no frame header in {} bytes", resp.len()));
+    let len: usize = std::str::from_utf8(&resp[..nl])
+        .expect("frame header is ASCII")
+        .strip_prefix("KYRIAKON-ENCRYPT 1 OK ")
+        .expect("frame prefix")
+        .parse()
+        .expect("frame length");
+    let body = &resp[nl + 1..];
+    assert_eq!(body.len(), len, "truncated frame");
+    body.to_vec()
+}
+
 #[test]
 fn encrypts_whole_message_round_trip() {
     let env = TestEnv::get();
@@ -313,6 +332,45 @@ fn a_lookalike_for_another_key_is_still_encrypted() {
 }
 
 #[test]
+fn a_plaintext_message_carrying_ciphertext_is_encrypted() {
+    let env = TestEnv::get();
+    // First line is the marker and an attachment is real ciphertext for alice,
+    // so a scan for the marker and the key id anywhere in the stream would
+    // store this message in the clear: subject, body and all.
+    let (ok, inner) = encrypt_seam(env, "alice");
+    assert!(ok, "encrypt failed for alice");
+    let mut msg = b"Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";\n\
+        \tboundary=\"outer\"\n\
+        From: alice@example.invalid\n\
+        Subject: forwarded in the clear\n\
+        MIME-Version: 1.0\n\
+        Content-Type: multipart/mixed; boundary=\"fwd\"\n\
+        \n\
+        --fwd\n\
+        Content-Type: text/plain\n\
+        \n\
+        the plaintext body\n\
+        --fwd\n\
+        Content-Type: message/rfc822\n\
+        \n"
+    .to_vec();
+    msg.extend_from_slice(&inner);
+    msg.extend_from_slice(b"\n--fwd--\n");
+
+    let (ok, out) = encrypt_seam_input(env, "alice", &msg, &scratch_gpg_home(env));
+    assert!(ok, "the message must be encrypted");
+    assert_ne!(out, msg, "it is a message, not an envelope of ours");
+    assert_valid_envelope(&out);
+    let payload = env.decrypt(&octet_stream(&out));
+    assert!(
+        payload
+            .windows(b"the plaintext body".len())
+            .any(|w| w == b"the plaintext body"),
+        "the whole message must be the payload"
+    );
+}
+
+#[test]
 fn daemon_serves_over_unix_socket() {
     let env = TestEnv::get();
     let socket = env.keyring.parent().unwrap().join("encrypt.sock");
@@ -345,7 +403,7 @@ fn daemon_serves_over_unix_socket() {
         resp
     };
 
-    let ok = request("alice+tag");
+    let ok = frame_body(&request("alice+tag"));
     assert_valid_envelope(&ok);
     assert_eq!(
         env.decrypt(&octet_stream(&ok)),

@@ -17,9 +17,11 @@
 //!
 //! Socket protocol (daemon): one request per connection. Request = `<user>\n`
 //! followed by the raw message; message end is the client's half-close (EOF).
-//! Response = ciphertext only on success; on error the connection is closed
-//! with no bytes written, so the caller (C shim) fails the save and never
-//! writes plaintext.
+//! Response = `KYRIAKON-ENCRYPT 1 OK <len>\n` and then exactly `<len>` bytes of
+//! ciphertext on success. The length is what lets the caller (C shim) tell a
+//! daemon that died mid-write from a complete answer, and fail the save rather
+//! than store half an armour. On error the connection is closed with no bytes
+//! written, so the save fails and plaintext is never stored.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -154,6 +156,19 @@ fn armored_ciphertext(key: &Path, gpg_home: &Path, input: &[u8]) -> Result<Vec<u
 const ENVELOPE_MARKER: &str =
     "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";";
 
+/// Success-response frame header, carrying the body length. The Dovecot C shim
+/// carries the same string as KYRIAKON_FRAME and refuses a response whose body
+/// is not exactly this long, which is what catches a daemon restarted
+/// mid-write instead of half an armour reaching the Maildir.
+const RESPONSE_FRAME: &str = "KYRIAKON-ENCRYPT 1 OK ";
+
+/// Frame a successful response: the header line, then exactly the ciphertext.
+fn frame_response(ciphertext: &[u8]) -> Vec<u8> {
+    let mut out = format!("{RESPONSE_FRAME}{}\n", ciphertext.len()).into_bytes();
+    out.extend_from_slice(ciphertext);
+    out
+}
+
 /// Whether `input` is already an envelope this crate built for the recipient of
 /// `cert`, in which case it is saved as it stands rather than encrypted again.
 ///
@@ -163,15 +178,17 @@ const ENVELOPE_MARKER: &str =
 /// files a message by re-uploading it on the save path did that on the live box.
 ///
 /// The marker alone cannot be trusted to mean ciphertext, since a sender could
-/// mail a file that begins with it and have plaintext written to the store as
-/// though it were encrypted. So the input has to name a key of the recipient's
-/// own cert in a public-key encrypted session key packet. Ciphertext addressed
-/// to another key, a copy of the cert carried inline, and a stream gpg cannot
-/// parse all fall through to normal encryption.
+/// mail a message that begins with it - a forwarded mail, say, whose attachment
+/// is ciphertext for this recipient - and have the plaintext written to the
+/// store as though it were encrypted. So the outer MIME has to be the RFC 3156
+/// shape this crate builds (`envelope_ciphertext`), and the key id is read from
+/// that envelope's ciphertext part alone. Ciphertext addressed to another key,
+/// a copy of the cert carried inline, a stream gpg cannot parse, and anything
+/// whose parts do not match all fall through to normal encryption.
 fn already_encrypted(input: &[u8], cert: &Path, gpg_home: &Path) -> bool {
-    if !input.starts_with(ENVELOPE_MARKER.as_bytes()) {
+    let Some(ciphertext) = envelope_ciphertext(input) else {
         return false;
-    }
+    };
     let Ok(cert_packets) = std::fs::read(cert) else {
         return false;
     };
@@ -179,9 +196,137 @@ fn already_encrypted(input: &[u8], cert: &Path, gpg_home: &Path) -> bool {
     if ours.is_empty() {
         return false;
     }
-    message_key_ids(&list_packets(input, gpg_home))
+    message_key_ids(&list_packets(ciphertext, gpg_home))
         .iter()
         .any(|id| ours.contains(id))
+}
+
+/// The armoured ciphertext body of `input` when it is the envelope this crate
+/// builds: the marker Content-Type first, exactly two parts, the second an
+/// `application/octet-stream`, and the message ending at the closing boundary.
+/// Anything else is not our envelope: a message that merely begins with the
+/// marker is a message to encrypt, not ciphertext to keep.
+fn envelope_ciphertext(input: &[u8]) -> Option<&[u8]> {
+    if !input.starts_with(ENVELOPE_MARKER.as_bytes()) {
+        return None;
+    }
+    let (block, sep, body) = split_message(input);
+    if sep.is_empty() {
+        return None;
+    }
+    let (name, start, end) = header_spans(block).into_iter().next()?;
+    if name != "content-type" {
+        return None;
+    }
+    let boundary = boundary_param(&block[start..end])?;
+    second_part(body, &boundary)
+}
+
+/// The `boundary` parameter of a Content-Type header, unquoted.
+fn boundary_param(header: &[u8]) -> Option<String> {
+    let value = header_value(header)?;
+    value.split(';').skip(1).find_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("boundary") {
+            return None;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(value);
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// The value of a header span, from after the colon.
+fn header_value(header: &[u8]) -> Option<&str> {
+    let colon = header.iter().position(|&b| b == b':')?;
+    std::str::from_utf8(&header[colon + 1..]).ok()
+}
+
+/// The type/subtype of a Content-Type header, lowercased and without
+/// parameters.
+fn media_type(header: &[u8]) -> Option<String> {
+    let value = header_value(header)?.trim_start();
+    let end = value
+        .find(|c: char| c == ';' || c.is_ascii_whitespace())
+        .unwrap_or(value.len());
+    Some(value[..end].to_ascii_lowercase())
+}
+
+/// The body of the second part of a two-part multipart body, when the closing
+/// delimiter is the last thing in it.
+fn second_part<'a>(body: &'a [u8], boundary: &str) -> Option<&'a [u8]> {
+    let delim = format!("--{boundary}");
+    let close = format!("--{boundary}--");
+    let (delim, close) = (delim.as_bytes(), close.as_bytes());
+
+    // RFC 2046 allows a preamble before the first delimiter, and this crate's
+    // own envelope carries one.
+    let mut pos = 0;
+    let mut start = loop {
+        let (line, next) = next_line(body, pos)?;
+        if line == close {
+            return None;
+        }
+        if line == delim {
+            break next;
+        }
+        pos = next;
+    };
+    pos = start;
+    let mut parts = 0;
+    while let Some((line, next)) = next_line(body, pos) {
+        if line == close {
+            parts += 1;
+            if parts != 2 || body[next..].iter().any(|b| !matches!(b, b'\n' | b'\r')) {
+                return None;
+            }
+            return part_body(&body[start..pos]);
+        }
+        if line == delim {
+            parts += 1;
+            if parts > 1 {
+                return None; // a third part
+            }
+            start = next;
+        }
+        pos = next;
+    }
+    None
+}
+
+/// The body of a MIME part whose Content-Type is `application/octet-stream`.
+fn part_body(part: &[u8]) -> Option<&[u8]> {
+    let (block, sep, body) = split_message(part);
+    if sep.is_empty() {
+        return None;
+    }
+    let (_, start, end) = header_spans(block)
+        .into_iter()
+        .find(|(name, _, _)| name == "content-type")?;
+    (media_type(&block[start..end])?.as_str() == "application/octet-stream").then_some(body)
+}
+
+/// One line of `block` from `pos`, without its line ending, and the offset of
+/// the line after it. `None` past the end.
+fn next_line(block: &[u8], pos: usize) -> Option<(&[u8], usize)> {
+    if pos >= block.len() {
+        return None;
+    }
+    match block[pos..].iter().position(|&b| b == b'\n') {
+        Some(off) => {
+            let nl = pos + off;
+            let end = if nl > pos && block[nl - 1] == b'\r' {
+                nl - 1
+            } else {
+                nl
+            };
+            Some((&block[pos..end], nl + 1))
+        }
+        None => Some((&block[pos..], block.len())),
+    }
 }
 
 /// Long key ids of the public key packets in a dump of a cert: its primary key
@@ -498,7 +643,7 @@ fn handle_conn(mut stream: UnixStream, keyring: &Path, gpg_home: &Path) {
     let user = String::from_utf8_lossy(&buf[..nl]);
     match encrypt(&user, keyring, gpg_home, &buf[nl + 1..]) {
         Ok(out) => {
-            if stream.write_all(&out).is_err() {
+            if stream.write_all(&frame_response(&out)).is_err() {
                 eprintln!("kyriakon-encrypt: write response: client gone");
             }
         }
@@ -633,5 +778,91 @@ mod tests {
             \tmdc_method: 2\n";
         assert_eq!(message_key_ids(msg), vec!["DC81B0FDFE212297".to_string()]);
         assert!(cert_key_ids(msg).is_empty());
+    }
+
+    fn envelope() -> Vec<u8> {
+        rfc3156_envelope("b", b"ARMOR", MESSAGE)
+    }
+
+    #[test]
+    fn an_envelope_yields_its_ciphertext_part() {
+        // What the daemon puts on the wire for its own envelope comes back as
+        // the armour alone, so the key-id scan sees ciphertext and nothing else.
+        assert_eq!(envelope_ciphertext(&envelope()), Some(&b"ARMOR\n"[..]));
+    }
+
+    #[test]
+    fn a_message_that_only_begins_with_the_marker_is_not_an_envelope() {
+        // A plaintext message whose first line is the marker and whose body
+        // carries a whole envelope as an attachment. It names the recipient's
+        // key inside the attachment, which is not enough: the outer message is
+        // not the two-part shape, so it must be encrypted, not stored in clear.
+        let mut msg =
+            b"Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";\n\
+            \tboundary=\"outer\"\n\
+            From: a@example.invalid\n\
+            Subject: forwarded\n\
+            MIME-Version: 1.0\n\
+            Content-Type: multipart/mixed; boundary=\"fwd\"\n\
+            \n\
+            --fwd\n\
+            Content-Type: text/plain\n\
+            \n\
+            the plaintext body\n\
+            --fwd\n\
+            Content-Type: message/rfc822\n\
+            \n"
+            .to_vec();
+        msg.extend_from_slice(&envelope());
+        msg.extend_from_slice(b"\n--fwd--\n");
+        assert_eq!(envelope_ciphertext(&msg), None);
+    }
+
+    #[test]
+    fn a_truncated_or_trailing_junk_envelope_is_not_an_envelope() {
+        let whole = envelope();
+        // The closing boundary is the end of the message: without it, half an
+        // armour looks like an envelope, and with anything after it, it is not
+        // the shape this crate builds.
+        let cut = whole.len() - b"\n--b--\n".len();
+        assert_eq!(envelope_ciphertext(&whole[..cut]), None);
+
+        let mut junk = whole.clone();
+        junk.extend_from_slice(b"epilogue\n");
+        assert_eq!(envelope_ciphertext(&junk), None);
+    }
+
+    /// The C shim's half of the response protocol: read to EOF, then accept
+    /// only a frame whose body is exactly the announced length.
+    fn read_frame(mut conn: UnixStream) -> Option<Vec<u8>> {
+        let mut resp = Vec::new();
+        conn.read_to_end(&mut resp).ok()?;
+        let nl = resp.iter().position(|&b| b == b'\n')?;
+        let len: usize = std::str::from_utf8(&resp[..nl])
+            .ok()?
+            .strip_prefix(RESPONSE_FRAME)?
+            .parse()
+            .ok()?;
+        let body = &resp[nl + 1..];
+        (body.len() == len).then(|| body.to_vec())
+    }
+
+    #[test]
+    fn a_truncated_response_fails_and_a_whole_one_is_unchanged() {
+        let ciphertext = envelope();
+        let frame = frame_response(&ciphertext);
+
+        // The daemon restarted after writing half the frame: the caller sees a
+        // short body and must reject it rather than save the fragment.
+        let (mut daemon, conn) = UnixStream::pair().unwrap();
+        daemon.write_all(&frame[..frame.len() / 2]).unwrap();
+        drop(daemon);
+        assert_eq!(read_frame(conn), None);
+
+        // A complete response is the ciphertext, byte for byte.
+        let (mut daemon, conn) = UnixStream::pair().unwrap();
+        daemon.write_all(&frame).unwrap();
+        drop(daemon);
+        assert_eq!(read_frame(conn).as_deref(), Some(&ciphertext[..]));
     }
 }

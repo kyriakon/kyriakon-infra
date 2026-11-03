@@ -13,7 +13,11 @@
  *
  * Socket protocol (must match kyriakon-encrypt's handle_conn): connect, write
  * "<localpart>\n" then the raw message, half-close (shutdown SHUT_WR), read
- * the ciphertext until EOF. An empty response means the daemon failed closed.
+ * the response until EOF. A successful response is framed: a
+ * "KYRIAKON-ENCRYPT 1 OK <len>\n" line and then exactly <len> bytes of
+ * ciphertext. A body shorter than that is a daemon that died mid-write, and
+ * the save fails rather than store half an armour. An empty response means the
+ * daemon failed closed.
  */
 
 #include "lib.h"
@@ -28,6 +32,7 @@
 #include "module-context.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -39,6 +44,9 @@
    backstop checks the saved mail starts with this. */
 #define KYRIAKON_MARKER \
 	"Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";"
+/* Success-response header, followed by the decimal ciphertext length in
+   bytes. Must match kyriakon-encrypt's RESPONSE_FRAME. */
+#define KYRIAKON_FRAME "KYRIAKON-ENCRYPT 1 OK "
 
 const char *kyriakon_encrypt_plugin_version = DOVECOT_ABI_VERSION;
 
@@ -68,6 +76,43 @@ kyriakon_write_all(int fd, const void *data, size_t size)
 	return TRUE;
 }
 
+/* True when data holds one complete framed response: the header line names a
+ * body length, and exactly that many bytes follow. A daemon restarted
+ * mid-write leaves a shorter body, which the save must refuse. */
+static bool
+kyriakon_parse_frame(const unsigned char *data, size_t size,
+		     size_t *body_offset_r, size_t *body_size_r)
+{
+	const size_t prefix_len = sizeof(KYRIAKON_FRAME) - 1;
+	const unsigned char *nl;
+	unsigned long long len = 0;
+	size_t header_len, body_size, i;
+
+	nl = memchr(data, '\n', size);
+	if (nl == NULL)
+		return FALSE;
+	header_len = (size_t)(nl - data);
+	if (header_len <= prefix_len ||
+	    memcmp(data, KYRIAKON_FRAME, prefix_len) != 0)
+		return FALSE;
+	for (i = prefix_len; i < header_len; i++) {
+		unsigned long long digit;
+
+		if (data[i] < '0' || data[i] > '9')
+			return FALSE;
+		digit = (unsigned long long)(data[i] - '0');
+		if (len > (ULLONG_MAX - digit) / 10)
+			return FALSE;
+		len = len * 10 + digit;
+	}
+	body_size = size - header_len - 1;
+	if (len != (unsigned long long)body_size)
+		return FALSE;
+	*body_offset_r = header_len + 1;
+	*body_size_r = body_size;
+	return TRUE;
+}
+
 /* Pipe the plaintext message to the daemon and return the ciphertext as an
  * istream over a box-pool buffer, or NULL with *error_r set. */
 static struct istream *
@@ -81,6 +126,7 @@ kyriakon_encrypt(struct mailbox *box, struct istream *input,
 	char tmp[8192];
 	const unsigned char *data;
 	size_t size;
+	size_t offset;
 	ssize_t ret;
 
 	*error_r = NULL;
@@ -148,11 +194,27 @@ kyriakon_encrypt(struct mailbox *box, struct istream *input,
 		buffer_free(&resp);
 		return NULL;
 	}
+	/* A non-empty body is not enough: a daemon restarted mid-write leaves
+	   half an armour that starts with the marker like any other. Only the
+	   frame's own length can tell the two apart. */
+	if (!kyriakon_parse_frame(resp->data, resp->used, &offset, &size)) {
+		*error_r = "truncated or malformed encryptor response";
+		buffer_free(&resp);
+		return NULL;
+	}
+	if (size < sizeof(KYRIAKON_MARKER) - 1 ||
+	    memcmp((const unsigned char *)resp->data + offset,
+		   KYRIAKON_MARKER, sizeof(KYRIAKON_MARKER) - 1) != 0) {
+		*error_r = "encryptor response is not kyriakon ciphertext";
+		buffer_free(&resp);
+		return NULL;
+	}
 
 	/* The buffer lives on box->pool, so it outlives the save. ponytail:
 	   buffers the whole ciphertext per save; spool to a temp file only if
 	   mailbox lifetime/volume makes this measurable. */
-	return i_stream_create_from_data(resp->data, resp->used);
+	return i_stream_create_from_data(
+		(const char *)resp->data + offset, size);
 }
 
 static int
