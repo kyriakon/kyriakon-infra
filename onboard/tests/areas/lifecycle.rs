@@ -76,9 +76,9 @@ fn a_filed_application_produces_one_review_email() {
 }
 
 /// A password set through the one-time link is applied once, and only with a
-/// signature over the link's own token and date. The hash reaches the script,
-/// the record stops holding the link, and a replay or a forged signature is
-/// refused without the script being run.
+/// signature over the link's own token and date. The drain hashes the plaintext
+/// it is given, the record stops holding the link, and a replay or a forged
+/// signature is refused without the script being run.
 #[test]
 fn a_password_link_applies_once_and_only_when_signed() {
     let fix = Fix::new("password");
@@ -89,7 +89,6 @@ fn a_password_link_applies_once_and_only_when_signed() {
     );
     let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
     let until = kyriakon_onboard::util::date_after_days(7);
-    let hash = kyriakon_onboard::password::make("correct horse battery").unwrap();
 
     let mut record = fix.filed("secretary", "cash", &[("rail", "cash")]);
     record["password_link"] = json!(format!(
@@ -109,7 +108,7 @@ fn a_password_link_applies_once_and_only_when_signed() {
         "application": { "username": "secretary", "status_token": TOKEN },
         "until": until,
         "sig": sig,
-        "hash": hash,
+        "password": "correct horse battery",
     });
     fix.write_intent("01J00000000000000000PASSWORD", &intent);
     let out = fix.drain();
@@ -121,12 +120,18 @@ fn a_password_link_applies_once_and_only_when_signed() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // The script ran once, with the account and the hash and never a plaintext.
+    // The script ran once, with the account and a hash of the plaintext the
+    // intent carried, and never the plaintext itself.
     let written = std::fs::read_to_string(&log).unwrap_or_default();
+    let installed = written.strip_prefix("secretary ").unwrap_or("").trim();
     assert!(
-        written.contains(&format!("secretary {hash}")),
+        kyriakon_onboard::password::is_hash(installed),
         "journal: {}",
         std::fs::read_to_string(fix.path("store/journal.jsonl")).unwrap_or_default()
+    );
+    assert!(
+        kyriakon_onboard::password::matches("correct horse battery", installed),
+        "{written}"
     );
     assert!(!written.contains("correct horse"), "{written}");
 
@@ -176,6 +181,67 @@ fn a_password_link_applies_once_and_only_when_signed() {
     );
 }
 
+/// A `set-password` intent that carries a hash is refused even under a valid
+/// link signature: the drain hashes the plaintext, so a handler that holds a
+/// valid link cannot install a hash of its own choosing.
+#[test]
+fn a_password_intent_carrying_a_hash_is_refused() {
+    let fix = Fix::new("password-hash-refused");
+    let log = fix.path("password.log");
+    fix.script(
+        "set-mail-password.sh",
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n"),
+    );
+    let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
+    let until = kyriakon_onboard::util::date_after_days(7);
+    let mut record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    record["password_link"] = json!(format!(
+        "https://signup.example.invalid/password/{TOKEN}?until={until}&sig=x"
+    ));
+    std::fs::write(
+        fix.path(&format!("store/applications/{TOKEN}.json")),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+
+    let sig = sign::sign(&key, &sign::password_payload(TOKEN, &until)).unwrap();
+    let chosen = kyriakon_onboard::password::make("a password the member never typed").unwrap();
+    let base = json!({
+        "kind": "set-password",
+        "filed_at": "2026-10-21T09:00:00Z",
+        "application": { "username": "secretary", "status_token": TOKEN },
+        "until": until,
+        "sig": sig,
+    });
+    // The old shape: a hash and no plaintext.
+    let mut hash_only = base.clone();
+    hash_only["id"] = json!("01J00000000000000000HASHONLY");
+    hash_only["hash"] = json!(chosen);
+    fix.write_intent("01J00000000000000000HASHONLY", &hash_only);
+    // The swap: a valid plaintext beside a hash of the handler's choosing.
+    let mut swap = base.clone();
+    swap["id"] = json!("01J00000000000000000HASHSWAP");
+    swap["password"] = json!("correct horse battery");
+    swap["hash"] = json!(chosen);
+    fix.write_intent("01J00000000000000000HASHSWAP", &swap);
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(!std::path::Path::new(&log).exists(), "the script ran");
+    assert!(
+        fix.journal().matches("carries a hash").count() == 2,
+        "{}",
+        fix.journal()
+    );
+    assert_eq!(fix.intents().len(), 2, "a refusal is not a settlement");
+    // The link is still live: nothing was applied.
+    let after: Value = serde_json::from_str(
+        &std::fs::read_to_string(fix.path(&format!("store/applications/{TOKEN}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert!(!after["password_link"].is_null(), "{after}");
+}
+
 /// A click on an already-decided application changes nothing in the store and
 /// sends nothing, and the journal records that it was seen.
 /// The decision email carries the one-time password link, not only the status
@@ -208,7 +274,6 @@ fn a_failed_password_pass_is_retried_after_the_backoff() {
     );
     let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
     let until = kyriakon_onboard::util::date_after_days(7);
-    let hash = kyriakon_onboard::password::make("correct horse battery").unwrap();
     let mut record = fix.filed("secretary", "cash", &[("rail", "cash")]);
     record["password_link"] = json!("https://signup.example.invalid/password/x");
     std::fs::write(
@@ -226,7 +291,7 @@ fn a_failed_password_pass_is_retried_after_the_backoff() {
             "application": { "username": "secretary", "status_token": TOKEN },
             "until": until,
             "sig": sig,
-            "hash": hash,
+            "password": "correct horse battery",
         }),
     );
     std::fs::write(

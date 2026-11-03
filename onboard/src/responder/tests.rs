@@ -2714,6 +2714,67 @@ async fn a_complete_capsule_draft_files_the_application() {
     assert!(!dir.join("drafts").join(format!("{TOKEN}.json")).exists());
 }
 
+/// A submission whose intent cannot be written leaves no application record:
+/// the record alone is never reviewed and never purged, and the applicant
+/// retries under a fresh token.
+#[tokio::test]
+async fn a_failed_intent_write_leaves_no_application_record() {
+    let (app, dir) = handler("capsule-intent-failure").await;
+    let answers: BTreeMap<String, String> = body_answers()
+        .into_iter()
+        .map(|(id, value)| (id.to_string(), value.to_string()))
+        .collect();
+    let mut record = crate::draft::Draft::new(TOKEN.to_string());
+    record.answers = answers;
+    record.cursor = flow_path(&app.questions, &record.answers).len();
+    crate::draft::save(&app.store, &mut record).await.unwrap();
+
+    // A regular file where the intents directory should be makes the second
+    // write fail while the application write succeeds.
+    std::fs::remove_dir_all(dir.join("intents")).unwrap();
+    std::fs::write(dir.join("intents"), b"not a directory").unwrap();
+
+    let (code, page) = answer(&app, &gmid_get(&format!("apply/{TOKEN}/1"), "")).await;
+    assert_eq!(code, 40, "{page}");
+    assert_eq!(
+        std::fs::read_dir(dir.join("applications")).unwrap().count(),
+        0,
+        "the record outlived the intent it was filed with"
+    );
+}
+
+/// The one-time password page files the plaintext for the drain to hash, never
+/// a hash the handler chose.
+#[tokio::test]
+async fn the_password_page_files_the_plaintext_and_not_a_hash() {
+    let (app, dir) = handler("password-plaintext").await;
+    let until = crate::util::date_after_days(7);
+    file_application(
+        &dir,
+        &decided(
+            "received",
+            None,
+            Some("https://signup.example.invalid/password/x"),
+        ),
+    );
+    let form: BTreeMap<String, String> = [
+        ("until", until.as_str()),
+        ("sig", "00"),
+        ("password", "correct horse battery"),
+        ("confirm", "correct horse battery"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+
+    let reply = password_file(&app, TOKEN, &form).await;
+    assert_eq!(reply.code(), 200);
+    let intent = filed_intent(&dir);
+    assert_eq!(intent["kind"], "set-password");
+    assert_eq!(intent["password"], "correct horse battery");
+    assert!(intent.get("hash").is_none(), "{intent}");
+}
+
 /// One Titan exchange: the request line (and any PROXY line) and a body, put in
 /// front of the handler together. The leftover count is what the handler did not
 /// read, which is how a refusal proves it left the body alone.

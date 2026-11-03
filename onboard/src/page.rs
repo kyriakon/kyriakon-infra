@@ -272,9 +272,10 @@ pub struct DecidePage {
     pub sig: String,
 }
 
-/// The page a one-time password link opens. It shows the form; the hash it
-/// submits is checked against the link's signature by the drain, which holds the
-/// key, so this page proves nothing and cannot know the link is spent.
+/// The page a one-time password link opens. It shows the form; the signature it
+/// submits with the plaintext is checked by the drain, which holds the key and
+/// does the hashing, so this page proves nothing and cannot know the link is
+/// spent.
 #[derive(Template)]
 #[template(path = "password.html")]
 pub struct PasswordPage {

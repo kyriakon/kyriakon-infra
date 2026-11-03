@@ -564,16 +564,17 @@ pub async fn file_close(store: &Store, username: &str, session: &str) -> Result<
 
 /// File a password set through the member's one-time link.
 ///
-/// The hash is the handler's and the signature is the link's. The drain checks
-/// the signature before it applies anything, so a forged submission files an
-/// intent that is refused, never a password.
+/// The plaintext is the handler's and the signature is the link's. The drain
+/// hashes the plaintext and checks the signature before it applies anything, so
+/// a forged submission files an intent that is refused, never a password, and a
+/// compromised handler cannot file a hash the member never typed.
 pub async fn file_password(
     store: &Store,
     username: &str,
     token: &str,
     until: &str,
     sig: &str,
-    hash: &str,
+    password: &str,
 ) -> Result<String, String> {
     let id = ulid::Ulid::new().to_string();
     let intent = serde_json::json!({
@@ -583,7 +584,7 @@ pub async fn file_password(
         "application": { "username": username, "status_token": token },
         "until": until,
         "sig": sig,
-        "hash": hash,
+        "password": password,
     });
     let bytes =
         serde_json::to_vec_pretty(&intent).map_err(|e| format!("cannot encode the intent: {e}"))?;

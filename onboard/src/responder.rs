@@ -1686,20 +1686,30 @@ fn capsule_not_found() -> Reply {
 /// between them.
 async fn file_application(app: &App, record: &Record) -> Result<(), String> {
     let id = ulid::Ulid::new().to_string();
+    let name = format!("{}.json", record.status_token);
+    // Both encodings first: an encoding failure must leave no record either.
     let bytes = serde_json::to_vec_pretty(record)
         .map_err(|e| format!("cannot encode the application: {e}"))?;
-    app.store
-        .write_record(
-            "applications",
-            &format!("{}.json", record.status_token),
-            &bytes,
-        )
-        .await?;
     let intent = serde_json::to_vec_pretty(&record.intent(&id))
         .map_err(|e| format!("cannot encode the intent: {e}"))?;
     app.store
+        .write_record("applications", &name, &bytes)
+        .await?;
+    if let Err(e) = app
+        .store
         .write_record("intents", &format!("{id}.json"), &intent)
         .await
+    {
+        // A record whose intent was never written is never reviewed and never
+        // purged, and the applicant retries under a fresh token. Remove it so
+        // the retry starts clean; a failure to remove is reported beside the
+        // original error rather than replacing it.
+        if let Err(remove) = app.store.remove("applications", &name).await {
+            eprintln!("kyriakon-onboard: the orphaned application record {name} stays: {remove}");
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Every answer is in hand: file the application and the one intent through the
@@ -2702,9 +2712,10 @@ async fn password_page(app: &App, token: &str, query: &BTreeMap<String, String>)
     })
 }
 
-/// The submission: check the password, hash it, and file the intent the drain
-/// verifies and applies. The signature travels with it, because the handler
-/// holds no key and proves nothing on its own.
+/// The submission: check the password and file the plaintext for the drain to
+/// hash, because a handler that supplies the stored hash is a handler that can
+/// choose one the member never typed. The signature travels with it, because the
+/// handler holds no key and proves nothing on its own.
 async fn password_file(app: &App, token: &str, form: &BTreeMap<String, String>) -> Reply {
     let Some(record) = record_for(app, token).await else {
         return capability(&status_page(None, None, OffsetDateTime::now_utc()));
@@ -2731,11 +2742,7 @@ async fn password_file(app: &App, token: &str, form: &BTreeMap<String, String>) 
             error: Some(problem),
         });
     }
-    let hash = match crate::password::make(password) {
-        Ok(hash) => hash,
-        Err(e) => return server_error(&e),
-    };
-    match intents::file_password(&app.store, &record.username, token, until, sig, &hash).await {
+    match intents::file_password(&app.store, &record.username, token, until, sig, password).await {
         Ok(_) => capability(&notice(
             "Password set",
             "The platform sets it on its next pass, within a minute. This link will not work again.",

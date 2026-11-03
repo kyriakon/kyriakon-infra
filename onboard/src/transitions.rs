@@ -115,8 +115,12 @@ pub struct PasswordIntent {
     /// The date the link carried. In the signed payload, never beside it.
     pub until: String,
     pub sig: String,
-    /// The bcrypt hash the handler computed. The password itself never travels.
-    pub hash: String,
+    /// The plaintext the member typed, hashed here and nowhere else. An intent
+    /// carrying a `hash` is refused rather than parsed, so the handler cannot
+    /// choose the stored hash; defaulted so that refusal is reached with the
+    /// hash check's own reason rather than a serde error.
+    #[serde(default)]
+    pub password: String,
 }
 
 /// The `token-resend` intent: the member's payment instructions again, and
@@ -856,17 +860,21 @@ async fn application_seen(store: &Store, token: &str, kind: &str, outcome: &str)
         .any(|(at, id)| !failed.iter().any(|(f, fid)| fid == id && f > at))
 }
 
-/// Refuse an intent of a kind this build does not implement, by name, and leave
-/// it in place. The journal records the refusal once, so two runs over the same
-/// directory do not append the same line twice.
 /// Apply a password set through a one-time link.
 ///
-/// Four checks before anything runs, and each is the half the handler cannot do:
-/// the signature over the token and its date (the key is root-only), the date
-/// still being ahead, the hash being one this build made, and the record still
-/// holding the link. The last is what makes the link one-time: applying it clears
-/// the link, so a replay finds nothing to apply and is refused like any other
-/// spent link.
+/// The checks before anything runs are each the half the handler cannot do: the
+/// intent carries a plaintext and not a hash, the signature over the token and
+/// its date (the key is root-only), the date still being ahead, the plaintext
+/// passing the same validation the page applied, the hash this process made
+/// from it being one this build made, and the record still holding the link. The
+/// last is what makes the link one-time:
+/// applying it clears the link, so a replay finds nothing to apply and is
+/// refused like any other spent link.
+///
+/// The remaining limit: a compromised handler chooses the plaintext it submits,
+/// so it can still set a password it knows. It can no longer install a chosen
+/// hash without a matching plaintext, which is the difference between a password
+/// the member can reset and a login the member can never enter.
 pub async fn set_password(
     cfg: &DrainConfig,
     store: &Store,
@@ -878,24 +886,47 @@ pub async fn set_password(
     if intent_seen(store, &intent.id).await {
         return Ok(());
     }
+    // The handler files the plaintext and the drain hashes it: a `hash` field
+    // is the old shape, where a handler with a valid link chose the stored hash.
+    if value.get("hash").is_some() {
+        return refuse_with(
+            cfg,
+            store,
+            file,
+            value,
+            "the intent carries a hash rather than a plaintext",
+        )
+        .await;
+    }
     let token = intent.application.status_token.as_str();
     let username = intent.application.username.as_str();
-    let problem = if !sign::verify(
+    let problem: Option<String> = if !sign::verify(
         key,
         &sign::password_payload(token, &intent.until),
         &intent.sig,
     ) {
-        Some("the link's signature does not verify")
+        Some("the link's signature does not verify".to_string())
     } else if intent.until.as_str() < util::date_after_days(0).as_str() {
-        Some("the link's date has passed")
-    } else if !crate::password::is_hash(&intent.hash) {
-        Some("the intent does not carry a bcrypt hash")
+        Some("the link's date has passed".to_string())
     } else {
-        None
+        crate::password::validate(&intent.password).err()
     };
     if let Some(problem) = problem {
-        return refuse_with(cfg, store, file, value, problem).await;
+        return refuse_with(cfg, store, file, value, &problem).await;
     }
+    let mut plain = intent.password;
+    let hash = match crate::password::make(&plain) {
+        Ok(hash) if crate::password::is_hash(&hash) => hash,
+        Ok(_) => {
+            return refuse_with(cfg, store, file, value, "the password did not hash").await;
+        }
+        Err(e) => return refuse_with(cfg, store, file, value, &e).await,
+    };
+    // Overwrite the plaintext in place now it has been hashed; zero bytes are
+    // still valid UTF-8, which is what `as_mut_vec` requires. The intent file
+    // still holds a copy until the remove below, which is why that remove is the
+    // pass's last act and runs on the success path only.
+    unsafe { plain.as_mut_vec().fill(0) };
     let name = format!("{token}.json");
     let Some(text) = store.read_record("applications", &name).await else {
         return refuse_with(cfg, store, file, value, "the application record is gone").await;
@@ -911,7 +942,7 @@ pub async fn set_password(
     if record.get("password_link").is_none_or(Value::is_null) {
         return refuse_with(cfg, store, file, value, "the link has already been used").await;
     }
-    run_script(cfg, "set-mail-password.sh", &[username, &intent.hash]).await?;
+    run_script(cfg, "set-mail-password.sh", &[username, &hash]).await?;
     // One use: the record keeps no link, so the page stops answering.
     record["password_link"] = Value::Null;
     let bytes = serde_json::to_vec_pretty(&record)
@@ -974,6 +1005,9 @@ async fn refuse_with(
     .await
 }
 
+/// Refuse an intent of a kind this build does not implement, by name, and leave
+/// it in place. The journal records the refusal once, so two runs over the same
+/// directory do not append the same line twice.
 pub async fn refuse(
     cfg: &DrainConfig,
     store: &Store,
