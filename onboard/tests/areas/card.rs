@@ -490,3 +490,80 @@ fn payment_action_required_records_the_attempt_and_asks_once() {
         fix.sent()
     );
 }
+
+/// A missing webhook secret is a misconfigured box, not a failed pass: the
+/// delivery stays for the pass that can verify it, the pass exits 0, and the
+/// mail is sent once rather than every minute.
+#[test]
+fn a_missing_webhook_secret_is_mailed_once_and_keeps_the_delivery() {
+    let fix = Fix::new("webhook-no-secret");
+    fix.card_account("secretary", None);
+    fix.webhook("evt_no_secret", "invoice.paid", invoice("in_no_secret"));
+    std::fs::remove_file(fix.path("stripe")).unwrap();
+
+    for _ in 0..2 {
+        let out = fix.drain();
+        assert!(out.status.success(), "{}", body(&out));
+    }
+
+    let sent = fix.sent();
+    assert!(
+        sent.contains("Subject: kyriakon: onboard: drain failed"),
+        "{sent}"
+    );
+    assert!(sent.contains("config stripe-secret"), "{sent}");
+    assert_eq!(
+        sent.matches("Subject:").count(),
+        1,
+        "a second pass mailed the same failure: {sent}"
+    );
+    assert!(
+        fix.webhooks()
+            .iter()
+            .any(|n| n.starts_with("evt_no_secret.body")),
+        "the delivery was dropped: {:?}",
+        fix.webhooks()
+    );
+}
+
+/// An account record that is there and does not parse is drift, not an account
+/// that is gone: the checkout is left for the next pass and the pass says why
+/// rather than settling it as ignored and deleting the delivery.
+#[test]
+fn a_corrupt_account_record_keeps_the_checkout_and_reports() {
+    let fix = Fix::new("webhook-corrupt-account");
+    fix.card_account("secretary", None);
+    let path = fix.dir.join("store/accounts/secretary/account.json");
+    std::fs::write(&path, b"{\"version\": 1, \"username\": \"secre").unwrap();
+    fix.webhook(
+        "evt_corrupt",
+        "checkout.session.completed",
+        json!({
+            "id": "cs_corrupt",
+            "client_reference_id": "KYR-AAAA-BBBB-CCCC",
+            "subscription": SUBSCRIPTION,
+            "customer": "cus_example",
+        }),
+    );
+
+    // The binary, because the report is the line it prints for cron to mail.
+    let out = fix.drain_binary();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        body(&out).contains("webhook evt_corrupt (checkout.session.completed)")
+            && body(&out).contains("does not parse"),
+        "the delivery is not reported: {}",
+        body(&out)
+    );
+    assert!(
+        fix.webhooks()
+            .iter()
+            .any(|n| n.starts_with("evt_corrupt.body")),
+        "the delivery was deleted: {:?}",
+        fix.webhooks()
+    );
+    assert!(
+        fix.read("webhooks/processed.jsonl").is_empty(),
+        "the delivery was recorded as settled"
+    );
+}

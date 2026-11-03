@@ -3862,17 +3862,21 @@ async fn refund_total(
             .get("received_on")
             .and_then(Value::as_str)
             .unwrap_or("an earlier date");
+        let seq = v.get("seq").and_then(Value::as_u64).unwrap_or(0);
         if v.get("amount_gbp").and_then(Value::as_str) == Some(deducted.as_str()) {
-            let first = v.get("seq").and_then(Value::as_u64).unwrap_or(0);
             return Err(format!(
-                "an identical refund is already recorded at ledger seq {first} on {on}"
+                "an identical refund is already recorded at ledger seq {seq} on {on}"
             ));
         }
-        already_refunded += v
+        // A line this cannot read is not zero: counting it as zero would let
+        // this refund and the unreadable one together exceed the payment.
+        let text = v
             .get("amount_gbp")
             .and_then(Value::as_str)
-            .and_then(|text| util::pence(text.strip_prefix('-').unwrap_or(text)).ok())
-            .unwrap_or(0);
+            .ok_or_else(|| format!("the refund at ledger seq {seq} has no amount"))?;
+        let pence = util::pence(text.strip_prefix('-').unwrap_or(text))
+            .map_err(|e| format!("the refund at ledger seq {seq} cannot be read: {e}"))?;
+        already_refunded += pence;
     }
     if already_refunded + amount > original.amount {
         return Err(format!(
@@ -4129,9 +4133,12 @@ async fn settle_refund(
         )
         .await;
     }
-    let _guard = lock_store_file(store, "ledger/.payments.lock").await?;
+    let guard = lock_store_file(store, "ledger/.payments.lock").await?;
     let mut lines = store.lines("ledger/payments.jsonl").await?;
     let Some(index) = unsettled_refund(&lines, &intent.token) else {
+        // The guard goes first: the refusal journals, and no caller should wait
+        // behind a lock this one no longer needs.
+        drop(guard);
         return refuse_with(
             cfg,
             store,
@@ -4153,6 +4160,10 @@ async fn settle_refund(
     store
         .write_record("ledger", "payments.jsonl", text.as_bytes())
         .await?;
+    // Released with the ledger write: the journal line below is not part of the
+    // record, and holding the lock through it would make every append wait for
+    // a mail enqueuer.
+    drop(guard);
 
     journal(
         store,
@@ -9113,7 +9124,15 @@ pub async fn stripe_webhooks(cfg: &DrainConfig, store: &Store) -> Result<(), Str
     {
         return Ok(());
     }
-    let secret = sign::read_key(std::path::Path::new(&cfg.stripe_webhook_secret))?;
+    // A missing secret is a misconfigured box, not a failed pass: mailed once,
+    // and the deliveries stay for the pass that has a secret to verify them.
+    let secret = match sign::read_key(std::path::Path::new(&cfg.stripe_webhook_secret)) {
+        Ok(secret) => secret,
+        Err(e) => {
+            report_failure(cfg, store, "stripe-secret", "config", &e).await;
+            return Ok(());
+        }
+    };
     let mut seen = processed_events(store).await?;
     // A checkout that attaches a subscription is settled before the invoice
     // that names it, whatever order the two files were written in: Stripe does
@@ -9535,9 +9554,11 @@ async fn account_for_payment_reference(
     else {
         return Ok(None);
     };
-    let Ok(join) = serde_json::from_str::<TokenRecord>(&join_text) else {
-        return Ok(None);
-    };
+    // A record that is there and does not parse is drift, not a token that
+    // names nothing: an `Ok(None)` here would settle the delivery as ignored
+    // and delete it, so the caller gets the reason and leaves it for a retry.
+    let join: TokenRecord = serde_json::from_str(&join_text)
+        .map_err(|e| format!("the token record {reference} does not parse: {e}"))?;
     if join.token != reference || validate::username_shape(&join.username).is_some() {
         return Ok(None);
     }
@@ -9547,9 +9568,8 @@ async fn account_for_payment_reference(
     else {
         return Ok(None);
     };
-    let Ok(account) = serde_json::from_str::<Account>(&text) else {
-        return Ok(None);
-    };
+    let account: Account = serde_json::from_str(&text)
+        .map_err(|e| format!("the account {} does not parse: {e}", join.username))?;
     let Some(payment) = account.payment_state() else {
         return Ok(None);
     };
@@ -10557,5 +10577,139 @@ mod tests {
     /// Overwrite the fixture report without rebuilding the config.
     fn cfg_script(dir: &std::path::Path, body: &str) {
         repquota_stub(dir, body);
+    }
+
+    /// Whether the ledger lock can be taken without waiting. `false` means a
+    /// descriptor in this process holds it.
+    fn ledger_lock_is_free(path: &std::path::Path) -> bool {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        else {
+            return false;
+        };
+        let fd = file.as_raw_fd();
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A settlement releases the ledger lock with its write. The journal line
+    /// that follows is not part of the ledger, so a second writer must be able
+    /// to take the lock while the line is being appended: here the append blocks
+    /// on a pipe nobody reads yet, which holds the settlement exactly there.
+    #[test]
+    fn a_settlement_journals_with_the_ledger_lock_released() {
+        use std::ffi::CString;
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("onboard-settle-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("store");
+        std::fs::create_dir_all(root.join("ledger")).unwrap();
+        let root_text = root.to_str().unwrap().to_string();
+        let token = "KYR-AAAA-BBBB-CCCC";
+        let ledger = root.join("ledger/payments.jsonl");
+        std::fs::write(
+            &ledger,
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "version": 1,
+                    "seq": 7,
+                    "token": token,
+                    "kind": "refund",
+                    "rail": "cash",
+                    "received_on": "2026-11-04",
+                    "amount_gbp": "-5.00",
+                    "applied_gbp": "-5.00",
+                    "refund_of": 1,
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+        // The journal is a pipe, so its append waits for a reader: the state of
+        // the lock is observable at that point rather than a race.
+        let journal = root.join("journal.jsonl");
+        let c_path = CString::new(journal.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let value = json!({
+            "id": "01HZZZZZZZZZZZZZZZZZZZZZZZ",
+            "kind": "refund",
+            "token": token,
+            "settled_on": "2026-11-05",
+            "sig": "",
+        });
+        let intent: RefundIntent = serde_json::from_value(value.clone()).unwrap();
+        let thread_dir = dir.clone();
+        let settle = std::thread::spawn(move || {
+            let cfg = quota_config(&thread_dir);
+            let store = Store::new_for_test(&root_text);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(settle_refund(
+                &cfg,
+                &store,
+                &intent,
+                "settle.json",
+                &value,
+                "2026-11-05",
+            ))
+        });
+
+        // Wait for the ledger write, which is the step the guard covers.
+        let wrote = || {
+            std::fs::read_to_string(&ledger)
+                .map(|text| text.contains("settled_on"))
+                .unwrap_or(false)
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !wrote() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(wrote(), "the settlement never wrote the ledger");
+
+        // The append is now waiting on the pipe. The lock must be free: a
+        // retry covers the instant between the write and the guard's drop.
+        let lock_path = root.join("ledger/.payments.lock");
+        let mut free = false;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if ledger_lock_is_free(&lock_path) {
+                free = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Unblock the append and let the settlement finish either way, so a
+        // failure reads as an assertion rather than a hang.
+        let read_journal = {
+            let journal = journal.clone();
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                std::fs::File::open(&journal)
+                    .and_then(|mut f| f.read_to_string(&mut text))
+                    .map(|_| text)
+            })
+        };
+        let settled = settle.join().unwrap();
+        read_journal.join().unwrap().unwrap();
+
+        assert!(
+            free,
+            "the ledger lock is still held while the settlement journals"
+        );
+        assert!(settled.is_ok(), "{settled:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
