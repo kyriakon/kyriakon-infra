@@ -39,6 +39,7 @@
 set -euo pipefail
 
 script_dir=$(cd "$(dirname -- "$0")" && pwd)
+install_set="$script_dir/install-set.tsv"
 
 # shellcheck disable=SC1091 # resolves at runtime from this script's directory
 . "$script_dir/lib.sh"
@@ -53,12 +54,14 @@ drain_invoked() {
 		| sed -E 's/.*"([^"]+)"/\1/' | sort -u
 }
 
-# The invoked names that drain_scripts does not install. A missing one is a
+# The invoked names the drain's directory does not get. A missing one is a
 # payment or an approval that fails on the box while every test here passes,
 # which is how stripe-api.sh reached a merge.
-missing_drain_scripts() { # <transitions.rs> <this script>
+missing_drain_scripts() { # <transitions.rs> <install-set table>
 	invoked=$(drain_invoked "$1")
-	installed=$(sed -n 's/^drain_scripts="\(.*\)"$/\1/p' "$2")
+	# One line per row, which is what the table reader prints; the case below
+	# compares space-separated words.
+	installed=$(install_rows "$2" drain | tr '\n' ' ') || return 1
 	for name in $invoked; do
 		case " $installed " in
 		*" $name "*) ;;
@@ -74,25 +77,47 @@ self_test() {
 		printf 'self-test: %s is missing\n' "$transitions" >&2
 		exit 1
 	}
+	[ -f "$install_set" ] || {
+		printf 'self-test: %s is missing\n' "$install_set" >&2
+		exit 1
+	}
 	work=$(mktemp -d "${TMPDIR:-/tmp}/deploy-onboard.XXXXXX") || exit 1
 	trap 'rm -rf "$work"' EXIT
 
-	if missing=$(missing_drain_scripts "$transitions" "$script_dir/deploy-onboard.sh") \
+	installed=$(install_rows "$install_set" drain)
+	[ -n "$installed" ] || {
+		printf 'self-test: %s names no drain scripts\n' "$install_set" >&2
+		exit 1
+	}
+
+	if missing=$(missing_drain_scripts "$transitions" "$install_set") \
 		&& [ -n "$missing" ]; then
 		printf 'self-test: the drain invokes scripts this deploy does not install:\n%s\n' \
 			"$missing" >&2
 		exit 1
 	fi
 
-	# The check has to see a missing name, or it proves nothing.
+	# The check has to see a missing name, or it proves nothing: here the source
+	# invokes one the table has no row for.
 	cp "$transitions" "$work/transitions.rs"
 	printf '\nfn fixture(cfg: &DrainConfig) { let _ = spawn_script(cfg, "not-installed.sh", &[]); }\n' \
 		>> "$work/transitions.rs"
-	if ! missing_drain_scripts "$work/transitions.rs" "$script_dir/deploy-onboard.sh" \
+	if ! missing_drain_scripts "$work/transitions.rs" "$install_set" \
 		| grep -qx 'not-installed.sh'; then
 		printf 'self-test: the check did not see a missing script\n' >&2
 		exit 1
 	fi
+
+	# And a table with no drain rows installs nothing, so every invoked name is a
+	# finding rather than a pass on an empty list.
+	invoked_count=$(drain_invoked "$transitions" | grep -c .)
+	: > "$work/empty.tsv"
+	reported=$(missing_drain_scripts "$transitions" "$work/empty.tsv" | grep -c .)
+	[ "$invoked_count" -gt 0 ] && [ "$reported" -eq "$invoked_count" ] || {
+		printf 'self-test: a table with no drain rows reported %s of %s invoked scripts\n' \
+			"$reported" "$invoked_count" >&2
+		exit 1
+	}
 
 	printf 'self-test: ok\n'
 }
@@ -127,21 +152,24 @@ need_pkg() {
 	pkg_add "$1"
 }
 
-# The scripts the drain runs, by the paths its config names. It invokes
-# add-user.sh, provision-member.sh, delete-user.sh, publish-mail-key.sh,
+# The scripts the drain runs, read from the install-set table's drain rows. The
+# set has to cover everything the drain's Rust invokes and what those scripts in
+# turn run, because they run from the drain's directory and nowhere else: it
+# invokes add-user.sh, provision-member.sh, delete-user.sh, publish-mail-key.sh,
 # remove-upload-key.sh, stripe-api.sh, provision-group-web.sh,
 # provision-group-capsule.sh, provision-group-acme.sh, remove-group.sh and
 # reload-smtpd.sh directly, and those invoke quota-apply.sh,
 # provision-member-web.sh, provision-member-capsule.sh, provision-member-acme.sh
-# and cron-apply.sh, so the whole set has to be installed wherever the drain
-# looks. relayd-members.sh is there because cron-apply.sh --web runs it to rewrite
-# /etc/relayd.conf's member keypair region, and it is run from the directory
-# cron-apply.sh sits in.
+# and cron-apply.sh. relayd-members.sh is there because cron-apply.sh --web runs
+# it to rewrite /etc/relayd.conf's member keypair region, from the directory
+# cron-apply.sh sits in, and lib.sh because every one of them sources it.
 # provision-member.sh and lapse-user.sh also read the tracked login classes next
 # to themselves (their own ../openbsd/etc/login.conf.d/member and lapsed), so this
 # deploy installs both files into the layout the relative read resolves to rather
 # than copying the scripts somewhere the read would leave behind.
-drain_scripts="add-user.sh provision-member.sh delete-user.sh lapse-user.sh quota-apply.sh provision-member-web.sh provision-member-capsule.sh provision-member-acme.sh provision-group-web.sh provision-group-capsule.sh provision-group-acme.sh remove-group.sh remove-upload-key.sh cron-apply.sh relayd-members.sh publish-mail-key.sh set-mail-password.sh stripe-api.sh reload-smtpd.sh"
+drain_scripts=$(install_rows "$install_set" drain) \
+	|| die "cannot read $install_set"
+[ -n "$drain_scripts" ] || die "$install_set names no drain scripts"
 drain_class="openbsd/etc/login.conf.d/member"
 drain_lapsed_class="openbsd/etc/login.conf.d/lapsed"
 
@@ -235,7 +263,7 @@ install -m 0755 "$repo_dir/openbsd/etc/rc.d/kyriakon_onboard" /etc/rc.d/kyriakon
 # arguments (they are the username), so it names this program, and the program
 # is what keeps the subcommand fixed and mints the login proof.
 install -d -m 0755 -o root -g wheel /usr/local/libexec
-install -m 0755 "$repo_dir/scripts/kyriakon-authcheck.sh" /usr/local/libexec/kyriakon-authcheck
+install_staged "$repo_dir/scripts/kyriakon-authcheck.sh" /usr/local/libexec/kyriakon-authcheck -m 0755
 
 # The login proofs: one file per admitted login, named by a random token, written
 # by the checker as root and read back by the drain. Root-owned 0700 is the whole
@@ -472,19 +500,17 @@ install -d -m 0755 "$scripts_dir"
 for s in $drain_scripts; do
 	install_staged "$repo_dir/scripts/$s" "$scripts_dir/$s" -m 0755
 done
-# Every drain script sources lib.sh on its live path now, for install_staged and
-# the shared helpers, so it is installed beside them. This is the one install
-# whose helper is the file being installed: the copy in the checkout is what
-# runs, and the temp-then-rename still means a run killed mid-copy leaves the
-# installed copy whole.
-install_staged "$repo_dir/scripts/lib.sh" "$scripts_dir/lib.sh" -m 0755
+# cron-apply.sh, installed above, reads this table to build the crontab, and it
+# reads it from its own directory. Installing it here is what makes the deployed
+# copy work; the checkout's copy is the one this run installs from.
+install_staged "$repo_dir/scripts/install-set.tsv" "$scripts_dir/install-set.tsv" -m 0644
 install -d -m 0755 "$scripts_root/openbsd/etc/login.conf.d"
 install -m 0644 "$repo_dir/$drain_class" "$scripts_root/openbsd/etc/login.conf.d/member"
 install -m 0644 "$repo_dir/$drain_lapsed_class" "$scripts_root/openbsd/etc/login.conf.d/lapsed"
-# Before the unit starts, every script the drain names must be executable, and so
-# must lib.sh, which they source. A missing one is the drain's first intent
-# failing at cron, which is how this gap was found.
-for s in $drain_scripts lib.sh; do
+# Before the unit starts, every script the drain names must be executable. A
+# missing one is the drain's first intent failing at cron, which is how this gap
+# was found.
+for s in $drain_scripts; do
 	[ -x "$scripts_dir/$s" ] || die "$scripts_dir/$s is not executable"
 done
 printf 'drain scripts installed in %s\n' "$scripts_dir"

@@ -1,0 +1,58 @@
+# install-set.tsv: every script this repository installs on the box, and where.
+#
+# The one list, read by the four places that used to keep their own.
+# scripts/deploy.sh routes a changed script to the deploy that installs it,
+# scripts/deploy-mail.sh and scripts/deploy-onboard.sh install it,
+# scripts/cron-apply.sh schedules it, and scripts/check-hygiene.sh compares the
+# installed copy with the checkout. Adding an installed script is one line here.
+#
+# Columns, tab-separated:
+#
+#   script       the file in scripts/, by name
+#   destination  /root/bin, or drain for the directory the drain's own config
+#                names at run time (installed into by scripts/deploy-onboard.sh)
+#   schedule     the five cron fields, or - when nothing schedules the script
+#   args         the arguments the cron line passes, present only when there are
+#                some
+#
+# A script installed in two places has one line per place. lib.sh is sourced by
+# the /root/bin scripts and by the drain's, so it is in both.
+#
+# Three scripts are not here, because a row is one file installed under its own
+# name:
+#   - check-hygiene.sh and self-test-all.sh, which cron runs from the checkout;
+#   - kyriakon-authcheck.sh, which deploy-onboard.sh installs as
+#     /usr/local/libexec/kyriakon-authcheck;
+#   - render-docs.sh, which deploy-onboard.sh runs from the checkout.
+lib.sh	/root/bin	-
+abuse-monitor.sh	/root/bin	*/15 * * * *
+check-keyring-drift.sh	/root/bin	0 4 * * *	--box
+renew-acme.sh	/root/bin	0 3 * * *
+backup.sh	/root/bin	30 2 * * *
+# Monday, not Sunday. The run creates a box, restores the snapshot into it and
+# mails the operator when it fails, and a failure mailed at 03:45 on a Sunday is
+# one nobody can act on until Monday anyway: the day is chosen for the morning
+# the mail is read, not for the test.
+restore-standup.sh	/root/bin	45 3 * * 1
+acme-queue.sh	/root/bin	*/15 * * * *	--run
+
+lib.sh	drain	-
+add-user.sh	drain	-
+provision-member.sh	drain	-
+delete-user.sh	drain	-
+lapse-user.sh	drain	-
+quota-apply.sh	drain	-
+provision-member-web.sh	drain	-
+provision-member-capsule.sh	drain	-
+provision-member-acme.sh	drain	-
+provision-group-web.sh	drain	-
+provision-group-capsule.sh	drain	-
+provision-group-acme.sh	drain	-
+remove-group.sh	drain	-
+remove-upload-key.sh	drain	-
+cron-apply.sh	drain	-
+relayd-members.sh	drain	-
+publish-mail-key.sh	drain	-
+set-mail-password.sh	drain	-
+stripe-api.sh	drain	-
+reload-smtpd.sh	drain	-

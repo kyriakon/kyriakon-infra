@@ -85,8 +85,17 @@ while [ "$#" -gt 0 ]; do
 done
 
 env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
-needed_scripts="abuse-monitor.sh check-keyring-drift.sh renew-acme.sh backup.sh restore-standup.sh acme-queue.sh"
+# The one list of which scripts the box runs, and where. This script schedules
+# its /root/bin rows; deploy-mail.sh installs them, deploy-onboard.sh installs
+# the drain's, and deploy.sh routes a changed script by its row.
+install_set="$script_dir/install-set.tsv"
 needed_vars="ALERT_EMAIL HEALTHCHECKS_URL KEYRING_HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL"
+
+# scheduled_scripts <table> — the /root/bin rows that have a schedule. A row whose
+# schedule is `-` is a helper the other scripts source, which cron never runs.
+scheduled_scripts() {
+	awk -F'\t' '!/^#/ && $2 == "/root/bin" && $3 != "-" { print $1 }' "$1"
+}
 
 # The onboarding drain is a compiled binary, not one of the /root/bin shell
 # scripts above, so it is installed by scripts/deploy-onboard.sh into sbin and
@@ -102,18 +111,15 @@ drain_bin=/usr/local/sbin/kyriakon-onboard-drain
 # block would duplicate the lines of scripts that are already
 # scheduled, which is what the first real run did, leaving the backup and the
 # renewal running twice.
+#
+# An installed script's schedule and arguments are its install-set row, so the
+# pull request that changes either is the review of the same line the deploy and
+# the hygiene check read. The three that are not rows each get a line here: one
+# file installed under its own row's name is what the table carries, and these
+# are a compiled binary and the two checks cron runs from the checkout.
 line_for() {
-	case "$1" in
-	abuse-monitor.sh) printf '*/15 * * * * . /root/.kyriakon-env; /root/bin/abuse-monitor.sh\n' ;;
-	check-keyring-drift.sh) printf '0 4 * * * . /root/.kyriakon-env; /root/bin/check-keyring-drift.sh --box\n' ;;
-	renew-acme.sh) printf '0 3 * * * . /root/.kyriakon-env; /root/bin/renew-acme.sh\n' ;;
-	backup.sh) printf '30 2 * * * . /root/.kyriakon-env; /root/bin/backup.sh\n' ;;
-	# Monday, not Sunday. The run creates a box, restores the snapshot into it and
-	# mails the operator when it fails, and a failure mailed at 03:45 on a Sunday
-	# is one nobody can act on until Monday anyway: the day is chosen for the
-	# morning the mail is read, not for the test.
-	restore-standup.sh) printf '45 3 * * 1 . /root/.kyriakon-env; /root/bin/restore-standup.sh\n' ;;
-	acme-queue.sh) printf '*/15 * * * * . /root/.kyriakon-env; /root/bin/acme-queue.sh --run\n' ;;
+	typeset name="$1" row sched args
+	case "$name" in
 	# The two checks that watch the box rather than run it. They live in the
 	# checkout and are read from there, because self-test-all.sh runs the scripts
 	# beside it and the drain's copies are not all there. Both are weekly and an
@@ -126,7 +132,15 @@ line_for() {
 	# /usr/local: without it, cron-apply.sh inside a provision cannot find gmid,
 	# refuses to reload, and fails the whole approval.
 	kyriakon-onboard-drain) printf '* * * * * . /root/.kyriakon-env; %s\n' "$drain_bin" ;;
-	*) return 1 ;;
+	*)
+		row=$(awk -F'\t' -v n="$name" \
+			'!/^#/ && $1 == n && $2 == "/root/bin" { print; exit }' "$install_set")
+		[ -n "$row" ] || return 1
+		sched=$(printf '%s\n' "$row" | cut -f3)
+		[ "$sched" != '-' ] || return 1
+		args=$(printf '%s\n' "$row" | cut -f4)
+		printf '%s . /root/.kyriakon-env; /root/bin/%s%s\n' "$sched" "$name" "${args:+ $args}"
+		;;
 	esac
 }
 
@@ -136,6 +150,15 @@ die() {
 	# takes over a dead pid's lock, but a self-test's pid is still alive.
 	release_web_lock 2>/dev/null || true
 	exit 1
+}
+
+# read_scheduled_scripts: set needed_scripts from the table. Called from the
+# crontab path rather than at startup, because the --web lane rewrites the index
+# files and never reads the table: a missing table must not fail the pass the
+# drain asks for, and the installed copy finds its table beside itself.
+read_scheduled_scripts() {
+	needed_scripts=$(scheduled_scripts "$install_set") || die "cannot read $install_set"
+	[ -n "$needed_scripts" ] || die "$install_set names no scheduled script"
 }
 
 # The self-test runs against a tree of its own, with the daemons and rcctl stubbed,
@@ -406,7 +429,7 @@ apply_web() {
 self_test() {
 	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
 	. "$(dirname "$0")/lib.sh"
-	typeset tree stub code index_before gmid_before
+	typeset tree stub code index_before gmid_before got installed
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work
@@ -620,6 +643,64 @@ EOF
 	check "a clean weekly run prints nothing to cron" \
 		"$(line_for check-hygiene.sh | grep -c '>/dev/null')" 1
 
+	# An installed script's line is its install-set row, so the row's schedule and
+	# arguments have to reach the crontab unchanged, and a row that has neither a
+	# schedule nor a row at all has to produce no line.
+	check "an installed script's line carries its row's schedule" \
+		"$(line_for backup.sh | cut -d' ' -f1-5)" '30 2 * * *'
+	check "and the row's arguments" \
+		"$(line_for acme-queue.sh)" \
+		"$(printf '%s . /root/.kyriakon-env; /root/bin/acme-queue.sh --run' '*/15 * * * *')"
+	check "a row with no arguments gets no trailing one" \
+		"$(line_for renew-acme.sh)" \
+		"$(printf '%s . /root/.kyriakon-env; /root/bin/renew-acme.sh' '0 3 * * *')"
+	got=0
+	line_for lib.sh >/dev/null || got=$?
+	check "a /root/bin helper has no cron line" "$got" 1
+	got=0
+	line_for no-such-script.sh >/dev/null || got=$?
+	check "a script with no row has no cron line" "$got" 1
+	check "the scheduled set is the table's rows" \
+		"$(scheduled_scripts "$install_set" | grep -c '^lib\.sh$')" 0
+
+	# The table and the two lanes. A missing table has to fail the crontab pass
+	# and name the file; the web pass must run without it, which is what keeps the
+	# drain's --web call working while the table install has not landed.
+	install_set="$tree/absent.tsv"
+	got=0
+	( read_scheduled_scripts ) >"$tree/absent.out" 2>&1 || got=$?
+	check "a missing table fails the crontab pass" \
+		"$([ "$got" -ne 0 ] && printf yes || printf no)" yes
+	check "and names the file it could not read" \
+		"$(grep -c 'cannot read' "$tree/absent.out")" 1
+	check_only=yes
+	code=0
+	apply_web >"$tree/web-no-table.out" 2>&1 || code=$?
+	check "the web pass runs without the table" \
+		"$([ "$code" -eq 0 ] && printf yes || printf no)" yes
+	check "and never reads it" "$(grep -c 'absent.tsv' "$tree/web-no-table.out")" 0
+	check_only=no
+	install_set="$script_dir/install-set.tsv"
+
+	# The installed layout: deploy-onboard.sh copies the table's drain rows, the
+	# table itself and lib.sh into the drain's directory, and that copy reads the
+	# table from its own directory. Its own self-test is the probe, and it covers
+	# both lanes from there. The guard is a file only the checkout has, so the copy
+	# cannot spawn another copy of itself.
+	if [ -f "$script_dir/self-test-all.sh" ]; then
+		installed="$tree/installed"
+		mkdir "$installed"
+		for s in $(install_rows "$script_dir/install-set.tsv" drain); do
+			cp "$script_dir/$s" "$installed/" \
+				|| die "cannot copy $s into the installed-layout probe"
+		done
+		cp "$script_dir/install-set.tsv" "$installed/"
+		code=0
+		ksh "$installed/cron-apply.sh" --self-test >"$tree/installed.out" 2>&1 || code=$?
+		check "the installed copy, with its table beside it, passes its own self-test" \
+			"$([ "$code" -eq 0 ] && printf yes || printf no)" yes
+	fi
+
 	self_test_end
 }
 
@@ -632,6 +713,7 @@ if [ "$web_only" = yes ]; then
 	exit 0
 fi
 
+read_scheduled_scripts
 current=$(crontab -l 2>/dev/null || true)
 
 missing_scripts=""
