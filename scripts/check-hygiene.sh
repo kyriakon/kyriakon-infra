@@ -58,7 +58,7 @@
 # the daily mail already covers the permissions half.
 #
 #   ksh scripts/check-hygiene.sh --self-test   the checks that run on fixtures:
-#                                              sections 7, 8, 9 and 10, and
+#                                              sections 1, 7, 8, 9 and 10, and
 #                                              section 3's remedy lines
 
 set -euo pipefail
@@ -200,8 +200,33 @@ store_drift() {
 	find "$1" -type f ! -user "$2" -print
 }
 
+# permission_drift <mtree-spec>
+#
+# The mode, uid, gid, type, size and link differences mtree reports, one per line.
+# mtree writes its differences and its errors to the same stream, so the two are
+# kept apart here: an mtree that failed prints the reason and returns non-zero.
+# Filtering both through grep and swallowing the status would report a missing
+# /etc/mtree/special as "no drift" and exit 0, which is the one answer a
+# permission check must never give.
+permission_drift() {
+	typeset spec="$1" tmp
+	tmp=$(mktemp "${TMPDIR:-/tmp}/check-hygiene-mtree.XXXXXX") || {
+		printf 'permissions: cannot create a temporary file; mtree did not run\n'
+		return 1
+	}
+	if ! mtree -q -f "$spec" -p / >"$tmp" 2>&1; then
+		printf 'permissions: mtree failed on %s; the drift comparison did not run:\n' "$spec"
+		sed 's/^/  /' "$tmp"
+		rm -f "$tmp"
+		return 1
+	fi
+	grep -E '^(mode|uid|gid|type|size|link)' "$tmp" || true
+	rm -f "$tmp"
+	return 0
+}
+
 # The comparison above, the remedy lines and the address check below, against
-# fixtures, so a change to any of them is not a claim. All three drive a function
+# fixtures, so a change to any of them is not a claim. Each drives a function
 # and not the box, which is why this can run anywhere.
 self_test() {
 	typeset dir out want
@@ -333,6 +358,54 @@ self_test() {
 		;;
 	esac
 
+	# Section 1: mtree's own failure is a finding, not "no drift". A stub on PATH
+	# is the only way to make mtree fail on a machine that runs this suite.
+	mkdir -p "$dir/bin"
+	cat > "$dir/bin/mtree" <<'EOF'
+#!/bin/sh
+printf 'mtree: /etc/mtree/special: No such file or directory\n' >&2
+exit 1
+EOF
+	chmod 0755 "$dir/bin/mtree"
+	printf 'placeholder\n' > "$dir/special"
+	got=0
+	old_path=$PATH
+	PATH="$dir/bin:$PATH"
+	permission_drift "$dir/special" >"$dir/mtree-out" 2>&1 || got=$?
+	PATH=$old_path
+	out=$(cat "$dir/mtree-out")
+	[ "$got" -ne 0 ] || {
+		printf 'FAIL: an mtree failure must not read as no drift\n' >&2
+		exit 1
+	}
+	case "$out" in
+	*mtree*failed*)
+		;;
+	*)
+		printf 'FAIL: an mtree failure must name mtree; got [%s]\n' "$out" >&2
+		exit 1
+		;;
+	esac
+
+	# The successful path still filters the lines that mean nothing and keeps the
+	# ones that name drift, which is the path a real box takes.
+	cat > "$dir/bin/mtree" <<'EOF'
+#!/bin/sh
+printf 'mode 0644\n./etc/thing extra\nsize 12\n'
+exit 0
+EOF
+	want=$(printf 'mode 0644\nsize 12')
+	old_path=$PATH
+	PATH="$dir/bin:$PATH"
+	permission_drift "$dir/special" >"$dir/mtree-out"
+	PATH=$old_path
+	out=$(cat "$dir/mtree-out")
+	[ "$out" = "$want" ] || {
+		printf 'FAIL: only the lines naming drift are reported; expected [%s], got [%s]\n' \
+			"$want" "$out" >&2
+		exit 1
+	}
+
 	# Sections 9 and 10, against fixtures rather than the box.
 	mkdir -p "$dir/checkout" "$dir/deployed" "$dir/store"
 	printf 'same\n' > "$dir/checkout/one.sh"
@@ -390,13 +463,16 @@ repo_root="${KYRIAKON_REPO:-/usr/local/src/kyriakon-infra}"
 
 # --- 1. permission and ownership drift -----------------------------------
 if [ "$(id -u)" -eq 0 ]; then
-	drift=$(mtree -q -f /etc/mtree/special -p / 2>&1 \
-		| grep -E '^(mode|uid|gid|type|size|link)' || true)
-	if [ -n "$drift" ]; then
-		printf 'permissions: drift from /etc/mtree/special\n%s\n' "$drift"
-		status=1
+	if drift=$(permission_drift /etc/mtree/special); then
+		if [ -n "$drift" ]; then
+			printf 'permissions: drift from /etc/mtree/special\n%s\n' "$drift"
+			status=1
+		else
+			printf 'permissions: no drift from /etc/mtree/special\n'
+		fi
 	else
-		printf 'permissions: no drift from /etc/mtree/special\n'
+		printf '%s\n' "$drift"
+		status=1
 	fi
 else
 	printf 'permissions: skipped, needs root to read /etc/mtree/special\n'
