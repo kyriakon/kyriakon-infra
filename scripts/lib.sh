@@ -52,6 +52,31 @@ if [ -r "$KYRIAKON_ENV" ]; then
 fi
 
 
+# install_staged <src> <dst> [install flags...]: install one file without ever
+# leaving a partial one at <dst>. install writes a sibling temp in <dst>'s own
+# directory, so the rename cannot cross a filesystem, and mv puts it in place
+# atomically with the mode and owner install gave it: a run killed mid-write
+# leaves <dst> as it was, and a reader sees either the old file or the whole new
+# one. A failure removes the temp and prints what it was doing, because the
+# caller runs under `set -e` and would otherwise exit without a word.
+install_staged() {
+	typeset staging_src="$1" staging_dst="$2" staging_tmp
+	shift 2
+	staging_tmp="$staging_dst.new.$$"
+	if ! install "$@" "$staging_src" "$staging_tmp"; then
+		rm -f "$staging_tmp"
+		printf 'could not stage %s; %s left as it was\n' "$staging_src" "$staging_dst" >&2
+		return 1
+	fi
+	if ! mv "$staging_tmp" "$staging_dst"; then
+		rm -f "$staging_tmp"
+		printf 'could not rename %s into place; %s left as it was\n' \
+			"$staging_tmp" "$staging_dst" >&2
+		return 1
+	fi
+}
+
+
 # dnsbl_verdict <ip> — ask the blocklists what they make of an address, and print one
 # line naming both the verdict and the list that gave it:
 #

@@ -81,6 +81,8 @@ PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
 export PATH
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
 
 usage() {
 	printf 'usage: %s <username> [public-key-file]\n' "$0" >&2
@@ -491,7 +493,7 @@ if [ -f "$authorized_keys" ] &&
 	cmp -s "$key_src" "$authorized_keys"; then
 	:
 else
-	install -m 0600 -o "$user" -g "$group" "$key_src" "$authorized_keys"
+	install_staged "$key_src" "$authorized_keys" -m 0600 -o "$user" -g "$group"
 	changed=yes
 fi
 

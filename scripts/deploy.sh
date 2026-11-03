@@ -89,8 +89,12 @@ classify() {
 	scripts/abuse-monitor.sh | scripts/check-keyring-drift.sh | scripts/backup.sh | \
 		scripts/renew-acme.sh | scripts/restore-standup.sh | scripts/acme-queue.sh) needs_mail=yes ;;
 	# deploy-onboard.sh installs its drain_scripts list, and lib.sh, into the
-	# drain's script directory.
+	# drain's script directory, and the authcheck and docs renderer beside it.
+	# Every name in that list needs deploy-onboard; the durable install-set table
+	# is #532, and until it lands this list is the one place to add a script.
 	scripts/add-user.sh | scripts/provision-member.sh | scripts/delete-user.sh | \
+		scripts/lapse-user.sh | scripts/remove-group.sh | scripts/stripe-api.sh | \
+		scripts/kyriakon-authcheck.sh | scripts/render-docs.sh | \
 		scripts/quota-apply.sh | scripts/provision-member-web.sh | \
 		scripts/provision-member-capsule.sh | scripts/provision-member-acme.sh | \
 		scripts/provision-group-web.sh | scripts/provision-group-capsule.sh | \
@@ -163,13 +167,19 @@ EOF
 	[ -z "$unknown" ] || die "no deploy rule for:$unknown"
 }
 
-# The fixed order: DNS before mail, mail before the relay, the service last.
-# A second function so the self-test reads the same order the live run uses.
+# The fixed order. The onboarding service goes first because the two deploys
+# after it check that it is up: deploy-mail refuses to finish unless
+# kyriakon_onboard is running (it gates the capsule the handler answers on), and
+# deploy-relayd requires the handler to answer signup.kyriakon.net with 200. The
+# handler needs only the store and its socket directories, which deploy-onboard
+# creates, so it can come up before either front-end. DNS next, then mail, then
+# the relay that needs both. A second function so the self-test reads the same
+# order the live run uses.
 plan_order() {
+	if [ "$needs_onboard" = yes ]; then printf 'deploy-onboard.sh\n'; fi
 	if [ "$needs_nsd" = yes ]; then printf 'deploy-nsd.sh\n'; fi
 	if [ "$needs_mail" = yes ]; then printf 'deploy-mail.sh\n'; fi
 	if [ "$needs_relayd" = yes ]; then printf 'deploy-relayd.sh\n'; fi
-	if [ "$needs_onboard" = yes ]; then printf 'deploy-onboard.sh\n'; fi
 	return 0
 }
 
@@ -435,7 +445,7 @@ self_test() {
 	check 'the sshd change is manual' "$manual_sshd" yes
 	check 'the relayd change is not planned' "$needs_relayd" no
 	check 'the plan order' "$(plan_order | paste -sd ' ' -)" \
-		'deploy-nsd.sh deploy-mail.sh deploy-onboard.sh'
+		'deploy-onboard.sh deploy-nsd.sh deploy-mail.sh'
 	check 'a manual step gates the marker' \
 		"$(if manual_any; then printf yes; else printf no; fi)" yes
 
@@ -510,6 +520,19 @@ self_test() {
 	reset_plan
 	classify 'scripts/reload-smtpd.sh'
 	check 'the smtpd reload script plans deploy-onboard' "$needs_onboard" yes
+
+	# Every script deploy-onboard.sh installs has to plan that deploy, or a fix to
+	# it lands in the checkout and never reaches the box. The list is read from
+	# the deploy script's own drain_scripts line rather than retyped here, so the
+	# check cannot agree with a stale copy of it.
+	onboard_installs=$(sed -n 's/^drain_scripts="\(.*\)"$/\1/p' "$script_dir/deploy-onboard.sh")
+	check 'the drain install list is read from deploy-onboard.sh' \
+		"$([ -n "$onboard_installs" ] && printf yes || printf no)" yes
+	for installed in $onboard_installs kyriakon-authcheck.sh render-docs.sh; do
+		reset_plan
+		classify "scripts/$installed"
+		check "scripts/$installed plans deploy-onboard" "$needs_onboard" yes
+	done
 	reset_plan
 	classify '.omp/lsp.json'
 	check 'developer tooling plans nothing' "$(plan_order)" ''
@@ -563,7 +586,7 @@ self_test() {
 
 	plan "$repo" ''
 	check 'no base plans every script' "$(plan_order | paste -sd ' ' -)" \
-		'deploy-nsd.sh deploy-mail.sh deploy-relayd.sh deploy-onboard.sh'
+		'deploy-onboard.sh deploy-nsd.sh deploy-mail.sh deploy-relayd.sh'
 
 	all_scripts=no
 	reset_plan
