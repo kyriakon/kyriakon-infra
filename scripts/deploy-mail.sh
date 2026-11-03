@@ -139,15 +139,39 @@ set_virtual() {
 	printf 'virtual %s %s\n' "$name" "$how"
 }
 
-# mail_from_entries <passwd-file>: the mail-from table's lines, one
-# "<user>@<platform-domain>: <user>" per account whose home is under /home. That
-# is the same population the virtuals loop seeds and the only accounts that
-# authenticate, so every member has exactly the identity they log in as and no
-# alias, body address or service account can be put in MAIL FROM. The value is
-# unused by the mail-from lookup; it keeps the file in the "name: value" shape
-# virtuals uses.
+# mail_from_entries <passwd-file> <virtuals-file>: the mail-from table's lines,
+# of two kinds. Every account whose home is under /home gets its own identity,
+# <user>@<platform-domain>: <user>. Every full-address virtuals entry whose
+# target is one of those accounts gets a line too, so a group mailbox that
+# authenticates as itself can send as the address it publishes
+# (secretary@parish.example) rather than only as its login name. A bare
+# localpart is not an identity and is left out, as is an address aimed at a
+# service account, and the identity line is not repeated when virtuals already
+# carries it. The value is unused by the mail-from lookup; it keeps the file in
+# the "name: value" shape virtuals uses.
 mail_from_entries() {
-	awk -F: -v d="$platform_domain" '$6 ~ /^\/home\// { print $1 "@" d ": " $1 }' "$1"
+	awk -F: -v d="$platform_domain" '
+		FILENAME == ARGV[1] {
+			if ($6 ~ /^\/home\//) {
+				home[$1] = 1
+				print $1 "@" d ": " $1
+				seen[$1 "@" d] = 1
+			}
+			next
+		}
+		{
+			addr = $1
+			if (addr !~ /@/) next
+			target = $2
+			sub(/^[ \t]+/, "", target)
+			sub(/[ \t]+$/, "", target)
+			sub(/\+.*$/, "", target)
+			if ((target in home) && !(addr in seen)) {
+				print addr ": " target
+				seen[addr] = 1
+			}
+		}
+	' "$1" "$2"
 }
 
 # install_smtpd_conf <destination> <candidate>
@@ -299,20 +323,30 @@ self_test() {
 
 	# --- the mail-from table ---
 	# The submission rule is only as good as this table: it is a set of allowed
-	# envelope senders, not a per-user mapping, so an alias or a body address in it
-	# would let the forgery through just as no table would. Only accounts whose
-	# home is under /home are in it, which is every account that can authenticate.
+	# envelope senders, not a per-user mapping. An account's own identity is in it,
+	# and so is a full-address virtuals line that delivers into an account, which
+	# is how a group mailbox sends as the address it publishes. A bare alias and
+	# an address aimed at a service account are not account identities.
 	platform_domain=kyriakon.net
 	printf '%s\n' 'oliver:x:1000:1000::/home/oliver:/bin/ksh' \
 		'alice:x:1001:1001::/home/alice:/bin/ksh' \
 		'_onboard:x:800:800::/var/db/onboard:/sbin/nologin' > "$tree/passwd"
-	mail_from_entries "$tree/passwd" > "$tree/mail_from"
+	printf '%s\n' 'oliver@kyriakon.net: oliver' \
+		'secretary@parish.example: alice' \
+		'admin@kyriakon.net: alice+Admin' \
+		'hello: alice' \
+		'apply@kyriakon.net: _onboard' > "$tree/virtuals_mail_from"
+	mail_from_entries "$tree/passwd" "$tree/virtuals_mail_from" > "$tree/mail_from"
 	check "each account under /home gets its own address" \
 		"$(grep -c -e '^oliver@kyriakon.net: oliver$' -e '^alice@kyriakon.net: alice$' "$tree/mail_from")" 2
-	check "and a service account with no home under /home gets none" \
-		"$(grep -c '_onboard' "$tree/mail_from")" 0
-	check "and nothing but an account identity is in the table" \
-		"$(wc -l < "$tree/mail_from" | tr -d ' ')" 2
+	check "and an address that delivers into an account is sendable" \
+		"$(grep -c '^secretary@parish.example: alice$' "$tree/mail_from")" 1
+	check "and a delivery detail resolves to the account" \
+		"$(grep -c '^admin@kyriakon.net: alice$' "$tree/mail_from")" 1
+	check "but a bare alias and a service account's address are not" \
+		"$(grep -c -e '^hello' -e '^apply@' -e '_onboard' "$tree/mail_from")" 0
+	check "and an identity virtuals already carries is not repeated" \
+		"$(wc -l < "$tree/mail_from" | tr -d ' ')" 4
 
 	# --- the MTA configuration ---
 	# Against the file that gets installed rather than a fixture: the substitution
@@ -1016,14 +1050,15 @@ EOF
 # smtpd -n and the restart, because smtpd fails to start on a file table it
 # cannot open.
 #
-# It is the accounts' own identities, not the virtuals table: every alias and
-# every body address is in virtuals, and the forgery this closes is a submission
-# using one of those names. A member provisioned after this deploy appends their
-# own line in provision-member.sh, because the next deploy may be days away and
-# they have to send before it.
+# It holds an address when an account owns it: the account's login identity, and
+# every full-address virtuals line that delivers into an account with a home
+# under /home. A bare alias and an address aimed at a service account are not
+# account identities and stay out. A member provisioned after this deploy appends
+# their own line in provision-member.sh, because the next deploy may be days away
+# and they have to send before it.
 mail_from_table=/etc/mail/mail_from
 mail_from_tmp=$(mktemp "$mail_from_table.XXXXXX")
-mail_from_entries /etc/passwd > "$mail_from_tmp"
+mail_from_entries /etc/passwd "$virtuals_table" > "$mail_from_tmp"
 chmod 0644 "$mail_from_tmp"
 mv "$mail_from_tmp" "$mail_from_table"
 printf 'mail_from: %s entries\n' "$(grep -c . "$mail_from_table" || true)"
