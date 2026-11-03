@@ -1303,9 +1303,12 @@ fn presented(incoming: &Incoming) -> Option<&Certificate> {
 /// line that does not parse is skipped: a notice that cannot be read is not a
 /// reason to refuse the account page.
 async fn account_notices(app: &App, username: &str) -> Vec<Notice> {
+    // A page that cannot read the notices shows none; nothing is decided from
+    // this list, and failing the page would hide the account over a display gap.
     app.store
         .lines(&format!("accounts/{username}/notices.jsonl"))
         .await
+        .unwrap_or_default()
         .iter()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
@@ -1892,7 +1895,17 @@ async fn session_account(app: &App, request: &Request) -> Option<(String, Accoun
 async fn closure_refund(app: &App, account: &Account) -> Option<String> {
     let token = account.payment_state()?.token_ref?;
     let mut latest: Option<(time::Date, String)> = None;
-    for line in app.store.lines("ledger/payments.jsonl").await {
+    // Display only, like `account_notices`: `ledger/` belongs to root and the
+    // handler runs as `_onboard`, so this read can fail for every paying
+    // member. The line on the page is an estimate, and the drain's
+    // `erasure_refund`, which reads as root, is the authoritative answer; a
+    // refund it cannot read must not stop the closure being filed.
+    for line in app
+        .store
+        .lines("ledger/payments.jsonl")
+        .await
+        .unwrap_or_default()
+    {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
