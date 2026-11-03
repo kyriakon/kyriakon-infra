@@ -242,6 +242,51 @@ fn a_password_intent_carrying_a_hash_is_refused() {
     assert!(!after["password_link"].is_null(), "{after}");
 }
 
+/// A refused plaintext intent stays on disk because a refusal is not a
+/// settlement, but it carries no password value for a backup to find.
+#[test]
+fn a_refused_password_intent_keeps_no_plaintext() {
+    let fix = Fix::new("password-refused-plaintext");
+    let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
+    let until = "2020-01-01";
+    let mut record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    record["password_link"] = json!(format!(
+        "https://signup.example.invalid/password/{TOKEN}?until={until}&sig=x"
+    ));
+    std::fs::write(
+        fix.path(&format!("store/applications/{TOKEN}.json")),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    let sig = sign::sign(&key, &sign::password_payload(TOKEN, until)).unwrap();
+    fix.write_intent(
+        "01J00000000000000000EXPIRED",
+        &json!({
+            "id": "01J00000000000000000EXPIRED",
+            "kind": "set-password",
+            "filed_at": "2026-10-21T09:00:00Z",
+            "application": { "username": "secretary", "status_token": TOKEN },
+            "until": until,
+            "sig": sig,
+            "password": "correct horse battery",
+        }),
+    );
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.intents(), vec!["01J00000000000000000EXPIRED.json"]);
+    let text = fix.read("intents/01J00000000000000000EXPIRED.json");
+    assert!(!text.contains("correct horse battery"), "{text}");
+    let filed: Value = serde_json::from_str(&text).unwrap();
+    assert!(filed.get("password").is_none(), "{filed}");
+    assert_eq!(filed["kind"], "set-password", "{filed}");
+    assert!(
+        fix.journal().contains("the link's date has passed"),
+        "{}",
+        fix.journal()
+    );
+}
+
 /// A click on an already-decided application changes nothing in the store and
 /// sends nothing, and the journal records that it was seen.
 /// The decision email carries the one-time password link, not only the status

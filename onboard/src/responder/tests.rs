@@ -1222,14 +1222,11 @@ async fn the_password_form_requires_the_current_password_and_files_one_intent() 
         cookie.split('.').next().unwrap(),
         "the session the drain will verify"
     );
-    let hash = intent["hash"].as_str().expect("a hash");
-    assert!(crate::password::matches("a long new password", hash));
-    assert!(
-        !serde_json::to_string(&intent)
-            .unwrap()
-            .contains("a long new password"),
-        "the plaintext is nowhere in the intent"
+    assert_eq!(
+        intent["password"], "a long new password",
+        "the drain hashes the plaintext, so the handler files it"
     );
+    assert!(intent.get("hash").is_none(), "{intent}");
 }
 
 /// The upload key form adds one key and removes the one on the account; a line

@@ -2,8 +2,9 @@
 //! hash the store keeps.
 //!
 //! The drain hashes the plaintext and installs the hash, so the handler never
-//! chooses what is stored. The plaintext travels only in the intent file, which
-//! the drain removes and overwrites in memory as soon as it has hashed it.
+//! chooses what is stored. The plaintext travels only in the intent file: the
+//! drain overwrites it in memory once hashed, removes the file after a
+//! successful apply, and strips it from any intent a refusal leaves in place.
 //! bcrypt because the platform's login is BSD auth against the system account,
 //! which reads a `$2b$` hash, and the cost is the crate's default for that
 //! format.

@@ -157,10 +157,12 @@ pub struct CloseIntent {
     pub session: String,
 }
 
-/// A `change-password` intent: the new mail password, hashed by the handler, so
-/// no plaintext is written anywhere. The handler re-checked the current password
-/// through `doveadm auth test`; the drain re-proves the session before it writes
-/// the hash as root, because `intents/` belongs to the unprivileged half.
+/// A `change-password` intent: the new mail password as the member typed it,
+/// hashed by the drain and nowhere else. The handler re-checked the current
+/// password through `doveadm auth test`; the drain re-proves the session before
+/// it writes the hash as root, because `intents/` belongs to the unprivileged
+/// half. A `hash` field is refused: it is the old shape, where the handler chose
+/// what was stored.
 #[derive(Debug, serde::Deserialize)]
 pub struct ChangePasswordIntent {
     pub id: String,
@@ -169,7 +171,8 @@ pub struct ChangePasswordIntent {
     pub filed_at: String,
     pub username: String,
     pub session: String,
-    pub hash: String,
+    #[serde(default)]
+    pub password: String,
 }
 
 /// An `upload-key` intent: the one key that serves sftp and git, added or
@@ -884,12 +887,13 @@ pub async fn set_password(
     value: &Value,
 ) -> Result<(), String> {
     if intent_seen(store, &intent.id).await {
-        return Ok(());
+        // Nothing is retried, and a re-filed copy must not keep its plaintext.
+        return redact_password(store, file, value).await;
     }
     // The handler files the plaintext and the drain hashes it: a `hash` field
     // is the old shape, where a handler with a valid link chose the stored hash.
     if value.get("hash").is_some() {
-        return refuse_with(
+        return refuse_password(
             cfg,
             store,
             file,
@@ -912,15 +916,15 @@ pub async fn set_password(
         crate::password::validate(&intent.password).err()
     };
     if let Some(problem) = problem {
-        return refuse_with(cfg, store, file, value, &problem).await;
+        return refuse_password(cfg, store, file, value, &problem).await;
     }
     let mut plain = intent.password;
     let hash = match crate::password::make(&plain) {
         Ok(hash) if crate::password::is_hash(&hash) => hash,
         Ok(_) => {
-            return refuse_with(cfg, store, file, value, "the password did not hash").await;
+            return refuse_password(cfg, store, file, value, "the password did not hash").await;
         }
-        Err(e) => return refuse_with(cfg, store, file, value, &e).await,
+        Err(e) => return refuse_password(cfg, store, file, value, &e).await,
     };
     // Overwrite the plaintext in place now it has been hashed; zero bytes are
     // still valid UTF-8, which is what `as_mut_vec` requires. The intent file
@@ -929,7 +933,7 @@ pub async fn set_password(
     unsafe { plain.as_mut_vec().fill(0) };
     let name = format!("{token}.json");
     let Some(text) = store.read_record("applications", &name).await else {
-        return refuse_with(cfg, store, file, value, "the application record is gone").await;
+        return refuse_password(cfg, store, file, value, "the application record is gone").await;
     };
     // Read as a Value and edit one key: the record carries fields this build
     // does not model, and writing it back through the typed struct would drop
@@ -937,10 +941,10 @@ pub async fn set_password(
     let mut record: Value = serde_json::from_str(&text)
         .map_err(|e| format!("the application record does not parse: {e}"))?;
     if record.get("username").and_then(Value::as_str) != Some(username) {
-        return refuse_with(cfg, store, file, value, "the intent names another account").await;
+        return refuse_password(cfg, store, file, value, "the intent names another account").await;
     }
     if record.get("password_link").is_none_or(Value::is_null) {
-        return refuse_with(cfg, store, file, value, "the link has already been used").await;
+        return refuse_password(cfg, store, file, value, "the link has already been used").await;
     }
     run_script(cfg, "set-mail-password.sh", &[username, &hash]).await?;
     // One use: the record keeps no link, so the page stops answering.
@@ -965,6 +969,44 @@ pub async fn set_password(
     .await?;
     // Done: the file goes, as every other applied transition removes its own.
     store.remove("intents", file).await
+}
+
+/// Remove a password intent's plaintext before its refusal leaves the file in
+/// place. A refused intent is kept so the journal's line and the file agree, and
+/// a retry is the operator's decision, but the plaintext must not stay in
+/// `intents/` and every backup. The rewrite is the same atomic write, handed to
+/// the directory's owner so the unprivileged handler can still read it.
+async fn redact_password(store: &Store, file: &str, value: &Value) -> Result<(), String> {
+    let mut redacted = value.clone();
+    let Some(object) = redacted.as_object_mut() else {
+        return Ok(());
+    };
+    if object.remove("password").is_none() {
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec_pretty(&redacted)
+        .map_err(|e| format!("cannot encode the intent: {e}"))?;
+    let owner = store.dir_owner("intents");
+    store
+        .write_record_owned("intents", file, &bytes, owner)
+        .await
+}
+
+/// Refuse a password intent: redact the plaintext, then journal the refusal and
+/// leave the file in place.
+async fn refuse_password(
+    cfg: &DrainConfig,
+    store: &Store,
+    file: &str,
+    value: &Value,
+    reason: &str,
+) -> Result<(), String> {
+    // The redaction is attempted first, but a failure to write it must not cost
+    // the journal its refusal: the refusal is recorded either way, and the
+    // write's error is what the pass reports so the plaintext is not forgotten.
+    let redacted = redact_password(store, file, value).await;
+    refuse_with(cfg, store, file, value, reason).await?;
+    redacted
 }
 
 /// Journal a refusal with its reason. The intent is left in place, as `refuse`
@@ -6298,10 +6340,11 @@ async fn save_account(store: &Store, account: &Account) -> Result<(), String> {
 }
 
 /// A password change from the account page. The handler had the current
-/// password re-entered and checked it through `doveadm auth test`; the hash of
-/// the new one is all this carries, so no plaintext reaches the intent or the
-/// store. `set-mail-password.sh` writes it as root, which replaces the old hash
-/// and makes the old password stop working.
+/// password re-entered and checked it through `doveadm auth test`; it files the
+/// new one as plaintext, and the drain hashes it here. An intent carrying a
+/// `hash` is the old shape and is refused. `set-mail-password.sh` writes the
+/// hash as root, which replaces the old hash and makes the old password stop
+/// working.
 pub async fn change_password(
     cfg: &DrainConfig,
     store: &Store,
@@ -6310,6 +6353,18 @@ pub async fn change_password(
 ) -> Result<(), String> {
     let intent: ChangePasswordIntent = serde_json::from_value(value.clone())
         .map_err(|e| format!("the password intent does not parse: {e}"))?;
+    if value.get("hash").is_some() {
+        return refuse_page(
+            cfg,
+            store,
+            &intent.id,
+            &intent.kind,
+            &intent.username,
+            file,
+            "the intent carries a hash rather than a plaintext",
+        )
+        .await;
+    }
     let Some(account) = page_account(
         cfg,
         store,
@@ -6323,9 +6378,12 @@ pub async fn change_password(
     else {
         return Ok(());
     };
-    // The hash is the handler's, and a malformed one is a line `usermod -p`
-    // would write rather than refuse.
-    if !crate::password::is_hash(&intent.hash) {
+    // The plaintext is checked and hashed here. It is overwritten before any
+    // refusal removes the file, so a refusal leaves neither a file nor a buffer
+    // holding it.
+    let mut plain = intent.password;
+    if let Err(why) = crate::password::validate(&plain) {
+        unsafe { plain.as_mut_vec().fill(0) };
         return refuse_page(
             cfg,
             store,
@@ -6333,16 +6391,40 @@ pub async fn change_password(
             &intent.kind,
             &intent.username,
             file,
-            "the intent does not carry a bcrypt hash",
+            &why,
         )
         .await;
     }
-    run_script(
-        cfg,
-        "set-mail-password.sh",
-        &[&account.username, &intent.hash],
-    )
-    .await?;
+    let made = crate::password::make(&plain);
+    unsafe { plain.as_mut_vec().fill(0) };
+    let hash = match made {
+        Ok(hash) if crate::password::is_hash(&hash) => hash,
+        Ok(_) => {
+            return refuse_page(
+                cfg,
+                store,
+                &intent.id,
+                &intent.kind,
+                &intent.username,
+                file,
+                "the password did not hash",
+            )
+            .await;
+        }
+        Err(e) => {
+            return refuse_page(
+                cfg,
+                store,
+                &intent.id,
+                &intent.kind,
+                &intent.username,
+                file,
+                &e,
+            )
+            .await;
+        }
+    };
+    run_script(cfg, "set-mail-password.sh", &[&account.username, &hash]).await?;
     journal(
         store,
         &cfg.release,

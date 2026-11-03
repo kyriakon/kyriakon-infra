@@ -1957,8 +1957,9 @@ async fn account_close(app: &App, request: &Request) -> Reply {
 /// The page's password form: the current password re-entered, then the new one
 /// twice. The current one is checked against the real system account through
 /// `doveadm auth test`, the same proof the login is; the new one is validated
-/// here and only its hash reaches the intent, so no plaintext is written
-/// anywhere. The drain writes the hash as root because the check only verifies.
+/// here and filed as plaintext for the drain to hash, because a handler that
+/// supplies the stored hash can choose one the member never typed. The drain
+/// writes the hash as root because the check only verifies.
 async fn account_password(app: &App, request: &Request) -> Reply {
     let Some((cookie, account)) = session_account(app, request).await else {
         return refused("Sign in to the account whose password you want to change.");
@@ -1987,15 +1988,12 @@ async fn account_password(app: &App, request: &Request) -> Reply {
     if new != confirm {
         return refused("The two new passwords do not match.");
     }
-    let Ok(hash) = crate::password::make(new) else {
-        return server_error("the new password could not be hashed");
-    };
     match intents::file_action(
         &app.store,
         "change-password",
         session_id,
         &account.username,
-        serde_json::json!({"hash": hash}),
+        serde_json::json!({"password": new}),
     )
     .await
     {
