@@ -367,6 +367,10 @@ impl Store {
     /// across the whole read and write, which is what keeps a line another
     /// process appended between them.
     ///
+    /// A lock file is never removed. Removing one while another process holds
+    /// it would let a third create a new file and lock that instead, which is
+    /// no lock at all.
+    ///
     /// The open refuses a symlink: most of these directories belong to the
     /// unprivileged handler, and a name in one can be planted. The descriptor is
     /// then handed to the directory's owner, because the drain takes some of
@@ -386,7 +390,8 @@ impl Store {
 
     /// [`Store::lock`] without waiting: `None` when another process holds it.
     /// The drain's pass lock takes this, because an overlapping tick is one to
-    /// skip rather than one to queue behind.
+    /// skip rather than one to queue behind, and holds it for the process's
+    /// life: the kernel releases it however the process exits.
     pub async fn try_lock(&self, rel: &str) -> Result<Option<tokio::fs::File>, String> {
         let file = self.open_lock(rel).await?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
