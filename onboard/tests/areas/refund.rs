@@ -663,3 +663,69 @@ fn a_group_refund_reverses_the_groups_one_payment() {
         fix.journal()
     );
 }
+
+/// An earlier refund whose amount cannot be read is not counted as zero: the
+/// next refund is refused, because the sum it would join is unknown rather than
+/// smaller than it is.
+#[test]
+fn an_unreadable_refund_amount_refuses_the_next_refund() {
+    let fix = Fix::new("refund-unreadable-sum");
+    let token = approved_paid(&fix, "secretary", "cash");
+    cash_credit(&fix, &token);
+    // Enough balance that the balance cap alone would let the second through.
+    let mut account = fix.account("secretary");
+    account["payment"]["balance_gbp"] = json!("100.00");
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+
+    let out = fix.ctl(&[
+        "refund", "--token", &token, "--amount", "5.00", "--rail", "cash", "--reason", "overpaid",
+        "--excess",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    assert_eq!(refund_lines(&fix).len(), 1);
+
+    // The recorded amount is unreadable, as a hand-edited ledger line is.
+    let path = fix.dir.join("store/ledger/payments.jsonl");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let mut value: Value = serde_json::from_str(line).unwrap();
+        if value["kind"] == json!("refund") {
+            value["amount_gbp"] = json!("not money");
+        }
+        lines.push(serde_json::to_string(&value).unwrap());
+    }
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+    let out = fix.ctl(&[
+        "refund",
+        "--token",
+        &token,
+        "--amount",
+        "3.00",
+        "--rail",
+        "cash",
+        "--reason",
+        "the rest of the excess",
+        "--excess",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        refund_lines(&fix).len(),
+        1,
+        "a refund joined a sum it could not read: {:?}",
+        refund_lines(&fix)
+    );
+    assert!(
+        fix.journal().contains("cannot be read"),
+        "the refusal does not name the unreadable line: {}",
+        fix.journal()
+    );
+}
