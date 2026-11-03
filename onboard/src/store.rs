@@ -138,6 +138,12 @@ impl Store {
             opts.custom_flags(libc::O_NOFOLLOW);
             let mut f = opts.open(&tmp).await?;
             f.write_all(bytes).await?;
+            // `write_all` hands the bytes to a blocking task and returns once
+            // they are queued, so the rename below can overtake the write and
+            // publish an empty record, and a failed write is reported only to
+            // the next operation. Flush waits for the write and reports its
+            // error before the name exists.
+            f.flush().await?;
             if self.sync {
                 f.sync_all().await?;
             }
@@ -286,6 +292,11 @@ impl Store {
                 }
             }
             f.write_all(&line).await?;
+            // The same queueing: the drain reads the journal back in the pass
+            // that wrote it (`journal_has`, `intent_seen`), so the line has to
+            // be written before this returns, and a failed write has to be an
+            // error here rather than the next append's.
+            f.flush().await?;
             if sync {
                 f.sync_all().await
             } else {
