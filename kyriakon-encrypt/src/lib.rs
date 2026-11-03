@@ -156,6 +156,12 @@ fn armored_ciphertext(key: &Path, gpg_home: &Path, input: &[u8]) -> Result<Vec<u
 const ENVELOPE_MARKER: &str =
     "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";";
 
+/// The RFC 3156 preamble the builder writes before the first boundary. The
+/// envelope gate accepts only this text, because everything before the first
+/// part is stored in the clear: a sender that puts anything else there has
+/// written a message to encrypt, not ciphertext to keep.
+const ENVELOPE_PREAMBLE: &str = "This is an OpenPGP/MIME encrypted message (RFC 4880 and 3156).";
+
 /// Success-response frame header, carrying the body length. The Dovecot C shim
 /// carries the same string as KYRIAKON_FRAME and refuses a response whose body
 /// is not exactly this long, which is what catches a daemon restarted
@@ -202,7 +208,8 @@ fn already_encrypted(input: &[u8], cert: &Path, gpg_home: &Path) -> bool {
 }
 
 /// The armoured ciphertext body of `input` when it is the envelope this crate
-/// builds: the marker Content-Type first, exactly two parts, the second an
+/// builds: the marker Content-Type first, the builder's preamble, exactly two
+/// parts, the first `application/pgp-encrypted` with `Version: 1`, the second
 /// `application/octet-stream`, and the message ending at the closing boundary.
 /// Anything else is not our envelope: a message that merely begins with the
 /// marker is a message to encrypt, not ciphertext to keep.
@@ -219,7 +226,23 @@ fn envelope_ciphertext(input: &[u8]) -> Option<&[u8]> {
         return None;
     }
     let boundary = boundary_param(&block[start..end])?;
-    second_part(body, &boundary)
+    let (version, ciphertext) = two_parts(strip_preamble(body)?, &boundary)?;
+    if !is_version_part(version) {
+        return None;
+    }
+    part_body(ciphertext)
+}
+
+/// Strip the builder's preamble and the blank line after it. A client that
+/// re-uploads a stored message may send CRLF, so either ending is accepted;
+/// the line itself has to match.
+fn strip_preamble(body: &[u8]) -> Option<&[u8]> {
+    let rest = body.strip_prefix(ENVELOPE_PREAMBLE.as_bytes())?;
+    let rest = rest
+        .strip_prefix(b"\r\n")
+        .or_else(|| rest.strip_prefix(b"\n"))?;
+    rest.strip_prefix(b"\r\n")
+        .or_else(|| rest.strip_prefix(b"\n"))
 }
 
 /// The `boundary` parameter of a Content-Type header, unquoted.
@@ -255,46 +278,61 @@ fn media_type(header: &[u8]) -> Option<String> {
     Some(value[..end].to_ascii_lowercase())
 }
 
-/// The body of the second part of a two-part multipart body, when the closing
-/// delimiter is the last thing in it.
-fn second_part<'a>(body: &'a [u8], boundary: &str) -> Option<&'a [u8]> {
+/// The two parts of a multipart body that starts at the opening delimiter and
+/// ends at the closing one, with nothing after it.
+fn two_parts<'a>(body: &'a [u8], boundary: &str) -> Option<(&'a [u8], &'a [u8])> {
     let delim = format!("--{boundary}");
     let close = format!("--{boundary}--");
     let (delim, close) = (delim.as_bytes(), close.as_bytes());
 
-    // RFC 2046 allows a preamble before the first delimiter, and this crate's
-    // own envelope carries one.
-    let mut pos = 0;
-    let mut start = loop {
-        let (line, next) = next_line(body, pos)?;
-        if line == close {
-            return None;
-        }
-        if line == delim {
-            break next;
-        }
-        pos = next;
-    };
-    pos = start;
+    let (line, mut pos) = next_line(body, 0)?;
+    if line != delim {
+        return None;
+    }
+    let first_start = pos;
+    let mut first_end = None;
+    let mut second_start = 0;
     let mut parts = 0;
     while let Some((line, next)) = next_line(body, pos) {
-        if line == close {
-            parts += 1;
-            if parts != 2 || body[next..].iter().any(|b| !matches!(b, b'\n' | b'\r')) {
-                return None;
-            }
-            return part_body(&body[start..pos]);
-        }
         if line == delim {
             parts += 1;
             if parts > 1 {
                 return None; // a third part
             }
-            start = next;
+            first_end = Some(pos);
+            second_start = next;
+        } else if line == close {
+            parts += 1;
+            if parts != 2 {
+                return None;
+            }
+            if body[next..].iter().any(|b| !matches!(b, b'\n' | b'\r')) {
+                return None;
+            }
+            return Some((&body[first_start..first_end?], &body[second_start..pos]));
         }
         pos = next;
     }
     None
+}
+
+/// Whether a part is the RFC 3156 version part: `application/pgp-encrypted`
+/// with exactly `Version: 1` as its body.
+fn is_version_part(part: &[u8]) -> bool {
+    let (block, sep, body) = split_message(part);
+    if sep.is_empty() {
+        return false;
+    }
+    let Some((_, start, end)) = header_spans(block)
+        .into_iter()
+        .find(|(name, _, _)| name == "content-type")
+    else {
+        return false;
+    };
+    let Some(media_type) = media_type(&block[start..end]) else {
+        return false;
+    };
+    media_type == "application/pgp-encrypted" && body.trim_ascii_end() == b"Version: 1"
 }
 
 /// The body of a MIME part whose Content-Type is `application/octet-stream`.
@@ -569,14 +607,11 @@ fn rfc3156_envelope(boundary: &str, armor: &[u8], msg: &[u8]) -> Vec<u8> {
             out.push(b'\n');
         }
     }
+    out.extend_from_slice(b"Subject: ...\nMIME-Version: 1.0\n\n");
+    out.extend_from_slice(format!("{ENVELOPE_PREAMBLE}\n\n").as_bytes());
     out.extend_from_slice(
         format!(
-            "Subject: ...\n\
-             MIME-Version: 1.0\n\
-             \n\
-             This is an OpenPGP/MIME encrypted message (RFC 4880 and 3156).\n\
-             \n\
-             --{boundary}\n\
+            "--{boundary}\n\
              Content-Type: application/pgp-encrypted\n\
              \n\
              Version: 1\n\

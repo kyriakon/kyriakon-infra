@@ -30,9 +30,9 @@
 #include "mail-storage-private.h"
 #include "mail-storage-hooks.h"
 #include "module-context.h"
+#include "frame.h"
 
 #include <errno.h>
-#include <limits.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -44,9 +44,6 @@
    backstop checks the saved mail starts with this. */
 #define KYRIAKON_MARKER \
 	"Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";"
-/* Success-response header, followed by the decimal ciphertext length in
-   bytes. Must match kyriakon-encrypt's RESPONSE_FRAME. */
-#define KYRIAKON_FRAME "KYRIAKON-ENCRYPT 1 OK "
 
 const char *kyriakon_encrypt_plugin_version = DOVECOT_ABI_VERSION;
 
@@ -73,43 +70,6 @@ kyriakon_write_all(int fd, const void *data, size_t size)
 		p += ret;
 		size -= ret;
 	}
-	return TRUE;
-}
-
-/* True when data holds one complete framed response: the header line names a
- * body length, and exactly that many bytes follow. A daemon restarted
- * mid-write leaves a shorter body, which the save must refuse. */
-static bool
-kyriakon_parse_frame(const unsigned char *data, size_t size,
-		     size_t *body_offset_r, size_t *body_size_r)
-{
-	const size_t prefix_len = sizeof(KYRIAKON_FRAME) - 1;
-	const unsigned char *nl;
-	unsigned long long len = 0;
-	size_t header_len, body_size, i;
-
-	nl = memchr(data, '\n', size);
-	if (nl == NULL)
-		return FALSE;
-	header_len = (size_t)(nl - data);
-	if (header_len <= prefix_len ||
-	    memcmp(data, KYRIAKON_FRAME, prefix_len) != 0)
-		return FALSE;
-	for (i = prefix_len; i < header_len; i++) {
-		unsigned long long digit;
-
-		if (data[i] < '0' || data[i] > '9')
-			return FALSE;
-		digit = (unsigned long long)(data[i] - '0');
-		if (len > (ULLONG_MAX - digit) / 10)
-			return FALSE;
-		len = len * 10 + digit;
-	}
-	body_size = size - header_len - 1;
-	if (len != (unsigned long long)body_size)
-		return FALSE;
-	*body_offset_r = header_len + 1;
-	*body_size_r = body_size;
 	return TRUE;
 }
 

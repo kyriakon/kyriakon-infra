@@ -371,6 +371,81 @@ fn a_plaintext_message_carrying_ciphertext_is_encrypted() {
 }
 
 #[test]
+fn a_message_with_plaintext_in_its_version_part_is_encrypted() {
+    let env = TestEnv::get();
+    let (ok, real) = encrypt_seam(env, "alice");
+    assert!(ok, "encrypt failed for alice");
+    let armor = octet_stream(&real);
+
+    // Everything outside the octet-stream part is stored in the clear, so the
+    // version part is the place to hide plaintext. Only the fixed
+    // application/pgp-encrypted part with Version: 1 is an envelope.
+    let boundary = "kt511-version";
+    let mut msg = format!(
+        "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";\n\
+         \tboundary=\"{boundary}\"\n\
+         From: alice@example.invalid\n\
+         Subject: plaintext in the version part\n\
+         MIME-Version: 1.0\n\
+         \n\
+         This is an OpenPGP/MIME encrypted message (RFC 4880 and 3156).\n\
+         \n\
+         --{boundary}\n\
+         Content-Type: text/plain\n\
+         \n\
+         the secret body\n\
+         --{boundary}\n\
+         Content-Type: application/octet-stream\n\
+         \n"
+    )
+    .into_bytes();
+    msg.extend_from_slice(&armor);
+    msg.extend_from_slice(format!("\n--{boundary}--\n").as_bytes());
+
+    let (ok, out) = encrypt_seam_input(env, "alice", &msg, &scratch_gpg_home(env));
+    assert!(ok, "the message must be encrypted");
+    assert_ne!(out, msg, "a text/plain version part is not an envelope");
+    assert_valid_envelope(&out);
+    let payload = env.decrypt(&octet_stream(&out));
+    assert!(
+        payload
+            .windows(b"the secret body".len())
+            .any(|w| w == b"the secret body"),
+        "the plaintext part must be inside the ciphertext"
+    );
+}
+
+#[test]
+fn a_message_with_a_foreign_preamble_is_encrypted() {
+    let env = TestEnv::get();
+    let (ok, real) = encrypt_seam(env, "alice");
+    assert!(ok, "encrypt failed for alice");
+
+    // The preamble is stored in the clear too, so replacing the fixed notice
+    // makes this a message to encrypt even though the rest is a real envelope.
+    let text = String::from_utf8(real).expect("envelope is ASCII");
+    let foreign = text.replacen(
+        "This is an OpenPGP/MIME encrypted message (RFC 4880 and 3156).",
+        "hidden plaintext in the preamble",
+        1,
+    );
+    assert_ne!(foreign, text, "the preamble was replaced");
+    let foreign = foreign.into_bytes();
+
+    let (ok, out) = encrypt_seam_input(env, "alice", &foreign, &scratch_gpg_home(env));
+    assert!(ok, "the message must be encrypted");
+    assert_ne!(out, foreign, "a foreign preamble is not an envelope");
+    assert_valid_envelope(&out);
+    let payload = env.decrypt(&octet_stream(&out));
+    assert!(
+        payload
+            .windows(b"hidden plaintext in the preamble".len())
+            .any(|w| w == b"hidden plaintext in the preamble"),
+        "the preamble must be inside the ciphertext"
+    );
+}
+
+#[test]
 fn daemon_serves_over_unix_socket() {
     let env = TestEnv::get();
     let socket = env.keyring.parent().unwrap().join("encrypt.sock");
