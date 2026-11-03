@@ -116,7 +116,11 @@ fn a_variant_that_cannot_prove_itself_is_refused() {
             .unwrap(),
         "an unimplemented kind is settled, not applied"
     );
-    assert!(fix.journal().contains("\"kind\":\"not-a-verb\""));
+    let journal = fix.journal();
+    assert!(
+        journal.contains("\"kind\":\"not-a-verb\""),
+        "no refused line for the unknown kind: {journal:?}"
+    );
     assert!(fix.journal().contains("does not implement this kind"));
     assert!(
         runtime
