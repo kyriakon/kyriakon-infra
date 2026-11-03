@@ -197,6 +197,7 @@ elif [ ! -s /etc/mail/mail_domains ]; then
 else
 	domain=$(sed -n '1p' /etc/mail/mail_domains)
 	key="$user@$domain"
+	mail_changed=no
 	if awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals"; then
 		# An address aimed somewhere else on purpose is left where it is: this
 		# script provisions an account, it does not overrule a forward.
@@ -210,15 +211,37 @@ else
 			|| { printf 'could not add %s to %s\n' "$key" "$virtuals" >&2; exit 1; }
 		printf 'virtual %s added\n' "$key"
 		changed=yes
-		# smtpd reads the table when it starts, so the line is not live until it
-		# is restarted: /etc/rc.d/smtpd defines no reload verb, and delete-user.sh
-		# restarts it for the same reason. This runs for every member, a mail-only
-		# member included, because the address is the account for both; what waits
-		# on hosting is the tree, the upload session and the daemon lanes below.
-		# The configuration is checked first, so a table smtpd would refuse leaves
-		# the running daemon alone, and the restart happens only when a line was
-		# actually added, so a run that finds the address already present
-		# restarts nothing.
+		mail_changed=yes
+	fi
+	# The submission allowlist, in the same pass and for the same reason. The auth
+	# rule refuses a MAIL FROM that is not in /etc/mail/mail_from, so an account
+	# the table does not carry cannot send. It is ensured outside the virtuals
+	# branch so a retried run whose address line already exists still adds the
+	# missing entry, and only when it is absent, so a second run writes nothing. A
+	# box that has not run the mail deploy has no table and is a note rather than
+	# a failure, like the virtuals write.
+	if [ -f /etc/mail/mail_from ]; then
+		if ! awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' /etc/mail/mail_from; then
+			printf '%s: %s\n' "$key" "$user" >> /etc/mail/mail_from
+			awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' /etc/mail/mail_from \
+				|| { printf 'could not add %s to /etc/mail/mail_from\n' "$key" >&2; exit 1; }
+			printf 'mail_from %s added\n' "$key"
+			changed=yes
+			mail_changed=yes
+		fi
+	else
+		printf 'note: no /etc/mail/mail_from yet, so %s cannot submit until the mail deploy writes it\n' \
+			"$key" >&2
+	fi
+	# smtpd reads the table when it starts, so a line is not live until it is
+	# restarted: /etc/rc.d/smtpd defines no reload verb, and delete-user.sh restarts
+	# it for the same reason. This runs for every member, a mail-only member
+	# included, because the address is the account for both; what waits on hosting
+	# is the tree, the upload session and the daemon lanes below. The configuration
+	# is checked first, so a table smtpd would refuse leaves the running daemon
+	# alone, and the restart happens only when a line was actually added, so a run
+	# that finds both lines already present restarts nothing.
+	if [ "$mail_changed" = yes ]; then
 		if [ -f /etc/mail/smtpd.conf ] && smtpd -n -f /etc/mail/smtpd.conf; then
 			rcctl restart smtpd >/dev/null
 			printf 'restarted smtpd, which reads the table at start\n'

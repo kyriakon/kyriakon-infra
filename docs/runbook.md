@@ -768,6 +768,11 @@ Work inbound first, then outbound, and stop when you find it. `doas ksh scripts/
 		doas dig +short @ns1.he.net mail.kyriakon.net TXT
 		doas dig +short @ns1.he.net mail._domainkey.kyriakon.net TXT
 
+10. Is the envelope sender allowed? Two rules in `/etc/mail/smtpd.conf` decide it. `match from local for any action "relay"` carries cron's own mail and every operator alert to the relay, and without it they are refused at RCPT and never leave the box. `match auth from any mail-from <mail_from> for any action "relay"` accepts a submission only when its MAIL FROM is a line in `/etc/mail/mail_from`, which `scripts/deploy-mail.sh` writes with one line per account and `scripts/provision-member.sh` appends to. A submission refused at MAIL FROM usually means the account has no line there; rerun the deploy.
+
+		doas grep -n 'from local for any\|mail-from <mail_from>' /etc/mail/smtpd.conf
+		doas grep -c . /etc/mail/mail_from
+
 Do not restart every daemon at once. It hides which one was broken, and the log that would have named it rotates with the restart. Do not turn greylisting off by editing `/etc/pf.conf` in place, because that file is reviewed line by line and `scripts/pf-apply.sh` only appends. Test with an ordinary message from an address outside the platform.
 
 ## When the blocklist check stops answering
