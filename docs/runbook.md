@@ -319,13 +319,14 @@ To replace a key by hand, before the service is built:
 
    A key that advertises AEAD makes GnuPG emit packet tag 20, which Thunderbird and RNP cannot read, so delivery would produce mail the member cannot open. The wanted shape is `features: 05` and no `pref-aead-algos` line.
 
-3. Check the encrypt path the daemon uses.
+3. Check the encrypt path a delivery uses.
 
-		echo test | doas gpg --batch --no-tty --no-options --encrypt --armor \
-			--no-encrypt-to --recipient-file /etc/kyriakon/keys/<localpart>.asc \
-			--homedir /var/run/kyriakon/gpg | doas gpg --list-packets | grep -E 'tag=|mdc_method'
+		doas ksh -c 'd=$(mktemp -d); echo test | gpg --batch --no-tty --no-options \
+			--encrypt --armor --no-encrypt-to \
+			--recipient-file /etc/kyriakon/keys/<localpart>.asc \
+			--homedir "$d" | gpg --list-packets | grep -E "tag=|mdc_method"; rm -rf "$d"'
 
-   `tag=18` with `mdc_method: 2` is the pass. `tag=20` or an `aead` line means the old key is still deployed.
+   The save path runs gpg with `--recipient-file` and a fresh scratch homedir per message, so this is the same invocation. `tag=18` with `mdc_method: 2` is the pass. `tag=20` or an `aead` line means the old key is still deployed.
 
 4. Send a message from an address outside the platform and ask the member to open it. Their client failing to decrypt is the signal that the key on the box is not the key they hold, and it arrives within a day.
 

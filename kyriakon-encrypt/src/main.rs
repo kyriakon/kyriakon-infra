@@ -31,9 +31,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     match encrypt(&user, &cfg.keyring, &cfg.gpg_home, &input) {
-        // Exit 0 promises the caller every ciphertext byte reached stdout, so a
-        // failed write is a failed save rather than a short armour stored.
-        Ok(out) => match std::io::stdout().write_all(&out) {
+        Ok(out) => match write_ciphertext(std::io::stdout(), &out) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("kyriakon-encrypt: write ciphertext: {e}");
@@ -45,6 +43,15 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Write the whole ciphertext and flush it. Exit 0 is the save path's proof
+/// that every byte arrived, so both a failed write and a failed flush are
+/// errors: stdout is line buffered, and a trailing segment without a newline
+/// would otherwise sit in the buffer while the process reports success.
+fn write_ciphertext(mut out: impl Write, ciphertext: &[u8]) -> std::io::Result<()> {
+    out.write_all(ciphertext)?;
+    out.flush()
 }
 
 /// Command-line config. One struct so every flag is parsed exactly once.
@@ -84,4 +91,36 @@ fn parse_flags(args: &[String]) -> Config {
         }
     }
     cfg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn the_ciphertext_is_written_and_flushed() {
+        let mut out = Vec::new();
+        write_ciphertext(&mut out, b"envelope").unwrap();
+        assert_eq!(out, b"envelope");
+    }
+
+    /// A writer whose buffer only fails on the way out. Without the flush this
+    /// returns Ok and the save path would store a short armour.
+    struct FailsOnFlush;
+
+    impl Write for FailsOnFlush {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[test]
+    fn a_failed_flush_is_an_error() {
+        assert!(write_ciphertext(FailsOnFlush, b"envelope").is_err());
+    }
 }

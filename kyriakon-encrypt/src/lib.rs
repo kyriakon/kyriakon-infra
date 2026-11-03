@@ -27,9 +27,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// On-box keyring location - sync of the git-tracked published key set.
 pub const DEFAULT_KEYRING: &str = "/etc/kyriakon/keys";
-/// gpg homedir. gpg writes pubring.kbx/random_seed here even with
-/// `--recipient-file`, so it must be a writable, private dir - never a user's
-/// `$HOME`. Provision owns it and keeps it out of any account path.
+/// Default gpg homedir for a check run by hand. gpg writes pubring.kbx and
+/// random_seed here even with `--recipient-file`, so it must be a writable,
+/// private dir, never a user's `$HOME`. The save path does not use it: the
+/// plugin passes a fresh 0700 directory per message.
 pub const DEFAULT_GPG_HOME: &str = "/var/run/kyriakon/gpg";
 
 #[derive(Debug)]

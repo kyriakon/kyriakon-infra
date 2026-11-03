@@ -5,6 +5,7 @@
  */
 
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,6 +87,14 @@ main(void)
 	if (mode != NULL && strcmp(mode, "empty") == 0) {
 		free(input);
 		return 0;
+	}
+	/* The process dies mid-write, as a killed CLI does: the parent has bytes
+	 * but no exit status, and the save must fail. */
+	if (mode != NULL && strcmp(mode, "killed") == 0) {
+		free(input);
+		write_all((const unsigned char *)"CT:partial", 10);
+		raise(SIGKILL);
+		return 1;
 	}
 
 	/* Default: a ciphertext that carries the input, so the test can prove the

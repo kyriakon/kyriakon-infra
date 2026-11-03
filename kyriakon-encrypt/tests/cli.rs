@@ -7,7 +7,7 @@
 //! round-trips to the exact input, `+tag` resolves to the base localpart,
 //! missing/invalid recipients fail closed with no output.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -428,25 +428,45 @@ fn a_message_with_a_foreign_preamble_is_encrypted() {
 #[test]
 fn a_failed_stdout_write_is_a_failed_save() {
     let env = TestEnv::get();
-    let mut child = Command::new(BIN)
+
+    // The save path reads stdout to EOF and treats exit 0 as "every byte
+    // arrived", so a write nobody reads has to fail. The shell ignores SIGPIPE
+    // before exec, so the CLI sees EPIPE and has to report it instead of dying
+    // on a signal, which is the branch under test.
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("trap '' 13; exec \"$0\" \"$@\"")
+        .arg(BIN)
         .args(["encrypt", "--user", "alice", "--keyring"])
         .arg(&env.keyring)
         .arg("--gpg-home")
         .arg(scratch_gpg_home(env))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
 
-    // Exit 0 is the save path's proof that every ciphertext byte arrived, so a
-    // stdout nobody reads has to fail. The child cannot have written yet: it
-    // reads stdin to EOF first, and that pipe is still held here.
+    // The child cannot have written yet: it reads stdin to EOF first, and that
+    // pipe is still held here.
     drop(child.stdout.take());
     child.stdin.take().unwrap().write_all(MESSAGE).unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
     let status = child.wait().unwrap();
+
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a failed ciphertext write must exit 1, not die on a signal: {status}, {stderr}"
+    );
     assert!(
-        !status.success(),
-        "a ciphertext write that fails must not exit 0: {status}"
+        stderr.contains("write ciphertext"),
+        "the failure must name the write: {stderr}"
     );
 }

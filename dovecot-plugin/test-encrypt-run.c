@@ -99,6 +99,17 @@ main(int argc, char **argv)
 				      input, input_len, &result);
 	expect(!ok, "an empty ciphertext is rejected");
 
+	/* A CLI killed after writing part of its ciphertext has no exit status at
+	 * all: the parent has to notice the signal, not read 0 as success. */
+	mode("killed");
+	ok = kyriakon_encrypt_message(fake, "alice", "/keyring", "/gpg",
+				      input, input_len, &result);
+	expect(!ok, "a killed encryptor is rejected");
+	expect(result.ciphertext == NULL,
+	       "a killed encryptor returns no bytes");
+	expect(result.exit_code == -1, "a signal is reported as -1");
+	expect(strstr(result.error, "signal") != NULL, "the signal is named");
+
 	/* A host that has SIGCHLD ignored reaps its children without a status, and
 	 * every save would fail on waitpid unless the glue resets it. */
 	mode(NULL);
