@@ -802,7 +802,7 @@ async fn ledger(store: &Store, args: &[String]) -> Result<(), String> {
     println!("{}", fields.join(","));
 
     let mut rows = Vec::new();
-    for row in store.json_lines("ledger/payments.jsonl").await? {
+    for row in store.log("ledger/payments.jsonl").jsonl::<Value>().await? {
         if !in_tax_year(&row, start, end) {
             continue;
         }
@@ -820,7 +820,11 @@ async fn ledger(store: &Store, args: &[String]) -> Result<(), String> {
     println!();
     println!("# unattributed");
     println!("id,rail,received_on,amount_gbp");
-    for row in store.json_lines("ledger/unattributed.jsonl").await? {
+    for row in store
+        .log("ledger/unattributed.jsonl")
+        .jsonl::<Value>()
+        .await?
+    {
         if row["state"].as_str() != Some("held") || !in_tax_year(&row, start, end) {
             continue;
         }
@@ -1429,7 +1433,7 @@ async fn payment(store: &Store, args: &[String]) -> Result<(), String> {
 
     println!("ledger for {token}");
     let mut any = false;
-    for line in store.json_lines("ledger/payments.jsonl").await? {
+    for line in store.log("ledger/payments.jsonl").jsonl::<Value>().await? {
         if line.get("token").and_then(serde_json::Value::as_str) != Some(token) {
             continue;
         }
@@ -1593,17 +1597,17 @@ async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(),
         .await
         .is_some();
     let prefix = format!("delete-{username}-");
-    let interrupted = store.lines("journal.jsonl").await?.iter().any(|line| {
-        serde_json::from_str::<Value>(line)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("intent")
-                    .and_then(Value::as_str)
-                    .map(|id| id.starts_with(&prefix))
-            })
-            .unwrap_or(false)
-    });
+    let interrupted = store
+        .log("journal.jsonl")
+        .jsonl::<Value>()
+        .await?
+        .iter()
+        .any(|value| {
+            value
+                .get("intent")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with(&prefix))
+        });
     if !recorded && !interrupted {
         return Err(format!("no account for {username}"));
     }

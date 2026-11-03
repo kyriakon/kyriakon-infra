@@ -103,7 +103,7 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), String> 
     let Some(token) = token_in_subject(&message.subject) else {
         return reply_or_drop(cfg, store, &message, &restart_body()).await;
     };
-    let lock = draft::lock(store).await?;
+    let lock = store.lock("drafts/.lock").await?;
     let Some(mut draft) = draft::load(store, &token).await? else {
         drop(lock);
         return reply_or_drop(cfg, store, &message, &restart_body()).await;

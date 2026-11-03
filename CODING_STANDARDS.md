@@ -24,7 +24,12 @@ The handler holds no key. Anything it cannot prove is proved by the drain: a lin
 
 ## Records
 
-A store file ending `.jsonl` is a record and stays append-only. The one exception is a line that has to be completed later, as `request close` does: that verb takes an exclusive lock across the read and the write, and the code says why. A rewrite without the lock can drop a line another process appended.
+A store file ending `.jsonl` is a record and stays append-only. It is reached
+through `Store::log`, which has no write, and `Store::write_record` refuses the
+name. The one exception is a line that has to be completed later, as `request
+close` does: that verb holds `Store::lock` across the read and the write and
+calls `Store::rewrite_log`, and the code says why. A rewrite without the lock
+can drop a line another process appended.
 
 ## Docs
 

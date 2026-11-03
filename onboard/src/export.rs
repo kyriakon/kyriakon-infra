@@ -234,7 +234,8 @@ async fn written(
         "notices.jsonl".to_string(),
         join_lines(
             store
-                .lines(&format!("accounts/{username}/notices.jsonl"))
+                .log(&format!("accounts/{username}/notices.jsonl"))
+                .raw_lines()
                 .await?,
         ),
     ));
@@ -264,8 +265,10 @@ async fn written(
         None => "purged; the platform no longer holds the application answers (ADR 0005's 90-day purge has run)".to_string(),
     };
 
+    // Copied as recorded, not re-encoded: the export is the member's copy of
+    // their own record, so a line written by another release keeps its bytes.
     let mut journal = Vec::new();
-    for line in store.lines("journal.jsonl").await? {
+    for line in store.log("journal.jsonl").raw_lines().await? {
         if let Ok(entry) = serde_json::from_str::<JournalLine>(&line) {
             if entry.application.username == username {
                 journal.push(line);
@@ -277,7 +280,8 @@ async fn written(
         "requests.jsonl".to_string(),
         join_lines(
             store
-                .lines(&format!("accounts/{username}/requests.jsonl"))
+                .log(&format!("accounts/{username}/requests.jsonl"))
+                .raw_lines()
                 .await?,
         ),
     ));
@@ -296,7 +300,7 @@ async fn written(
         .and_then(|payment| payment.token_ref);
     let mut ledger = Vec::new();
     if let Some(token) = token.as_deref() {
-        for line in store.lines("ledger/payments.jsonl").await? {
+        for line in store.log("ledger/payments.jsonl").raw_lines().await? {
             if serde_json::from_str::<serde_json::Value>(&line)
                 .ok()
                 .and_then(|value| {
