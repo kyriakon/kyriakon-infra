@@ -160,30 +160,34 @@ alert_address_problem() {
 	fi
 }
 
-# deployed_drift <checkout-scripts> <dir>...
+# deployed_drift <checkout-scripts> <table> <destination> <dir>
 #
-# One line per installed file whose copy is not the checkout's, and per directory
-# that is gone. A script the checkout has and the box does not install is not a
-# finding: the deploys name what they install, and this compares the copies that
-# exist.
+# One line per table row for <destination> with no installed copy, per installed
+# file whose copy is not the checkout's, and per directory that is gone. The
+# table's rows are what the deploys install, so a row with nothing installed is a
+# finding: comparing only the copies that happen to be there cannot see the
+# install a deploy never made.
 deployed_drift() {
-	typeset checkout="$1" dir file name
-	shift
-	for dir in "$@"; do
-		if [ ! -d "$dir" ]; then
-			printf '%s: the directory is gone\n' "$dir"
+	typeset checkout="$1" table="$2" token="$3" dir="$4" file name names
+	if [ ! -d "$dir" ]; then
+		printf '%s: the directory is gone\n' "$dir"
+		return 0
+	fi
+	names=$(awk -F'\t' -v t="$token" '!/^#/ && $2 == t { print $1 }' "$table") || return 1
+	for name in $names; do
+		if [ ! -f "$dir/$name" ]; then
+			printf '%s: not installed, and %s names it\n' "$dir/$name" "$table"
+		fi
+	done
+	for file in "$dir"/*.sh; do
+		[ -f "$file" ] || continue
+		name=$(basename "$file")
+		if [ ! -f "$checkout/$name" ]; then
+			printf '%s: not in the checkout\n' "$file"
 			continue
 		fi
-		for file in "$dir"/*.sh; do
-			[ -f "$file" ] || continue
-			name=$(basename "$file")
-			if [ ! -f "$checkout/$name" ]; then
-				printf '%s: not in the checkout\n' "$file"
-				continue
-			fi
-			cmp -s "$file" "$checkout/$name" \
-				|| printf '%s differs from %s\n' "$file" "$checkout/$name"
-		done
+		cmp -s "$file" "$checkout/$name" \
+			|| printf '%s differs from %s\n' "$file" "$checkout/$name"
 	done
 }
 
@@ -408,11 +412,16 @@ EOF
 
 	# Sections 9 and 10, against fixtures rather than the box.
 	mkdir -p "$dir/checkout" "$dir/deployed" "$dir/store"
+	# The table names three scripts for /root/bin; one is installed and matches,
+	# one is installed and older than the checkout, one is not installed at all.
+	printf 'one.sh\t/root/bin\t-\ntwo.sh\t/root/bin\t-\nthree.sh\t/root/bin\t-\n' \
+		>"$dir/table"
 	printf 'same\n' > "$dir/checkout/one.sh"
 	printf 'same\n' > "$dir/deployed/one.sh"
 	printf 'old\n' > "$dir/deployed/two.sh"
 	printf 'new\n' > "$dir/checkout/two.sh"
-	out=$(deployed_drift "$dir/checkout" "$dir/deployed")
+	printf 'new\n' > "$dir/checkout/three.sh"
+	out=$(deployed_drift "$dir/checkout" "$dir/table" /root/bin "$dir/deployed")
 	case "$out" in
 	*two.sh*) ;;
 	*) printf 'FAIL: a copy older than the checkout is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
@@ -420,11 +429,23 @@ EOF
 	case "$out" in
 	*one.sh*) printf 'FAIL: a matching copy is not a finding; got [%s]\n' "$out" >&2; exit 1 ;;
 	esac
-	out=$(deployed_drift "$dir/checkout" "$dir/gone")
+	case "$out" in
+	*three.sh*) ;;
+	*) printf 'FAIL: a table row with nothing installed is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
+	out=$(deployed_drift "$dir/checkout" "$dir/table" /root/bin "$dir/gone")
 	case "$out" in
 	*gone*) ;;
 	*) printf 'FAIL: a missing directory is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
 	esac
+	# A destination the table does not use takes nothing from it: the rows above
+	# are /root/bin's, so a drain check on an empty directory has nothing to report.
+	mkdir "$dir/empty"
+	out=$(deployed_drift "$dir/checkout" "$dir/table" drain "$dir/empty")
+	[ -z "$out" ] || {
+		printf 'FAIL: another destination takes no rows; got [%s]\n' "$out" >&2
+		exit 1
+	}
 
 	printf 'mine\n' > "$dir/store/record.json"
 	[ -z "$(store_drift "$dir/store" "$(id -un)")" ] || {
@@ -695,10 +716,12 @@ else
 fi
 
 # --- 9. the scripts the box runs are the scripts the checkout has ---------
-# The deploys copy scripts into /root/bin and the drain's directory, and nothing
-# reads them again afterwards. A box running copies older than its checkout gives
-# no sign at all: operator mail went out without the subject fix for months, and
-# it surfaced because someone happened to look at a subject line.
+# The deploys install the rows of scripts/install-set.tsv into /root/bin and the
+# drain's directory, and nothing reads them again afterwards. A box running
+# copies older than its checkout gives no sign at all: operator mail went out
+# without the subject fix for months, and it surfaced because someone happened to
+# look at a subject line. A row with no installed file is the same finding from
+# the other side: the deploy that should have written it did not.
 repo_dir="${KYRIAKON_REPO:-/usr/local/src/kyriakon-infra}"
 # The drain's directory comes from the config that decides it, not from the
 # constant it happens to have today: a changed setting would otherwise leave this
@@ -707,14 +730,30 @@ drain_scripts_dir=$(awk -F'"' '/^scripts[[:space:]]*=/ { print $2; exit }' \
 	/etc/kyriakon/onboard/drain.toml 2>/dev/null || true)
 if [ -n "$drain_scripts_dir" ]; then :; else drain_scripts_dir=/usr/local/libexec/kyriakon/scripts; fi
 if [ -d "$repo_dir/scripts" ]; then
-	drift=$(deployed_drift "$repo_dir/scripts" /root/bin "$drain_scripts_dir")
-	if [ -n "$drift" ]; then
-		printf 'installed scripts: these are not the checkout at %s/scripts:\n' "$repo_dir"
-		printf '%s\n' "$drift" | sed -e 's/^/  /'
-		printf '  the fix is the deploy that installs them: deploy-mail.sh for /root/bin, deploy-onboard.sh for the drain\n'
+	install_set="$repo_dir/scripts/install-set.tsv"
+	if [ ! -f "$install_set" ]; then
+		printf 'installed scripts: %s is missing, so the copies were not checked\n' \
+			"$install_set"
 		status=1
 	else
-		printf 'installed scripts: every copy matches the checkout\n'
+		drift=''
+		drift_status=0
+		drift=$(deployed_drift "$repo_dir/scripts" "$install_set" /root/bin /root/bin) \
+			|| drift_status=$?
+		drift="$drift$(deployed_drift "$repo_dir/scripts" "$install_set" drain "$drain_scripts_dir")" \
+			|| drift_status=$?
+		if [ "$drift_status" -ne 0 ]; then
+			printf 'installed scripts: %s could not be read, so the copies were not checked\n' \
+				"$install_set"
+			status=1
+		elif [ -n "$drift" ]; then
+			printf 'installed scripts: these do not match the checkout at %s/scripts:\n' "$repo_dir"
+			printf '%s\n' "$drift" | sed -e 's/^/  /'
+			printf '  the fix is the deploy that installs them: deploy-mail.sh for /root/bin, deploy-onboard.sh for the drain\n'
+			status=1
+		else
+			printf 'installed scripts: every copy matches the checkout\n'
+		fi
 	fi
 else
 	printf 'installed scripts: no checkout at %s/scripts, so the copies were not checked\n' "$repo_dir"

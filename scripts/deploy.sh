@@ -26,15 +26,17 @@
 # directory has to choose its deploy, which is how a config file added under
 # openbsd/etc/ cannot land without a rule.
 #
-# The mapping follows the repository layout, plus the two install lists each
-# deploy script keeps: deploy-mail's /root/bin set and deploy-onboard's drain
-# scripts. A path in either needs that deploy. A deploy script's own path needs
-# the deploy it runs, so pulling a fix to deploy-mail.sh schedules deploy-mail.sh.
+# The mapping follows the repository layout, plus scripts/install-set.tsv: the
+# destination a script's row names is the deploy that installs it, so adding a
+# script to the box is one row in that table rather than an arm here. A deploy
+# script's own path needs the deploy it runs, so pulling a fix to deploy-mail.sh
+# schedules deploy-mail.sh.
 
 set -euo pipefail
 
 script_dir=$(cd "$(dirname -- "$0")" && pwd)
 repo_dir=$(cd "$script_dir/.." && pwd)
+install_set="$script_dir/install-set.tsv"
 marker="${KYRIAKON_DEPLOY_MARKER:-/var/db/kyriakon/deployed}"
 
 say() { printf '== %s\n' "$*"; }
@@ -57,6 +59,85 @@ reset_plan() {
 	manual_cron=no
 	manual_env=no
 	manual_terraform=no
+}
+
+# install_dests <script name> <table> — set the deploy flags for one script's
+# install-set rows. A table this cannot read, or a destination no deploy
+# installs, is an error rather than a silent skip: the alternative is a script
+# that never reaches the box.
+install_dests() {
+	typeset name="$1" table="$2" dest dests
+	[ -f "$table" ] || die "no install-set table at $table"
+	dests=$(awk -F'\t' -v n="$name" '!/^#/ && $1 == n { print $2 }' "$table") ||
+		die "cannot read $table"
+	for dest in $dests; do
+		case "$dest" in
+		/root/bin) needs_mail=yes ;;
+		drain) needs_onboard=yes ;;
+		*) die "unknown destination $dest for $name in $table" ;;
+		esac
+	done
+}
+
+# classify_script <path> — the scripts/ arms. Most scripts are routed by their
+# install-set row, through install_dests at the end. The arms above it are the
+# ones whose deploy is not their install: the scripts nothing installs, and the
+# deploy scripts themselves, which plan the deploy they are.
+classify_script() {
+	case "$1" in
+	# A helper of both the relay deploy and the drain's web pass, so a change to
+	# it is both. Its one install row is the drain's.
+	scripts/relayd-members.sh) needs_relayd=yes ;;
+	# Its install row is the drain's, and the crontab it writes is a manual step.
+	scripts/cron-apply.sh) manual_cron=yes ;;
+	# The table itself: a row added or removed is an install on one side or the
+	# other, and a schedule changed is the crontab, so a change here is both
+	# deploys and the manual cron step rather than nothing.
+	scripts/install-set.tsv)
+		needs_mail=yes
+		needs_onboard=yes
+		manual_cron=yes
+		return 0
+		;;
+	# Installed by deploy-onboard.sh under a name its own row could not carry
+	# (/usr/local/libexec/kyriakon-authcheck), so its install is that script's
+	# explicit line and this is its route.
+	scripts/kyriakon-authcheck.sh)
+		needs_onboard=yes
+		return 0
+		;;
+	# Rendered into the capsule by the deploy and run from the checkout, so there
+	# is no install row: the pages the handler serves are written by a deploy.
+	scripts/render-docs.sh)
+		needs_onboard=yes
+		return 0
+		;;
+	# A deploy script's own code changed, so run it. `deploy.sh` itself is the
+	# dispatcher and deliberately plans nothing.
+	scripts/deploy-mail.sh)
+		needs_mail=yes
+		return 0
+		;;
+	scripts/deploy-relayd.sh)
+		needs_relayd=yes
+		return 0
+		;;
+	scripts/deploy-onboard.sh)
+		needs_onboard=yes
+		return 0
+		;;
+	scripts/deploy-nsd.sh)
+		needs_nsd=yes
+		return 0
+		;;
+	# The pf fragments live in the script; a change to it is still the propose-only
+	# step, not a deploy this dispatcher runs.
+	scripts/pf-apply.sh)
+		manual_pf=yes
+		return 0
+		;;
+	esac
+	install_dests "${1#scripts/}" "$install_set"
 }
 
 # classify <path> — set the flags for one changed path. Returns 1 when the path
@@ -85,47 +166,9 @@ classify() {
 		manual_member_class=yes
 		;;
 	reserved-usernames.txt | scripts/onboard-store.sh) needs_onboard=yes ;;
-	# deploy-mail.sh installs these into /root/bin (its install loop).
-	scripts/abuse-monitor.sh | scripts/check-keyring-drift.sh | scripts/backup.sh | \
-		scripts/renew-acme.sh | scripts/restore-standup.sh | scripts/acme-queue.sh) needs_mail=yes ;;
-	# deploy-onboard.sh installs its drain_scripts list, and lib.sh, into the
-	# drain's script directory, and the authcheck and docs renderer beside it.
-	# Every name in that list needs deploy-onboard; the durable install-set table
-	# is #532, and until it lands this list is the one place to add a script.
-	scripts/add-user.sh | scripts/provision-member.sh | scripts/delete-user.sh | \
-		scripts/lapse-user.sh | scripts/remove-group.sh | scripts/stripe-api.sh | \
-		scripts/kyriakon-authcheck.sh | scripts/render-docs.sh | \
-		scripts/quota-apply.sh | scripts/provision-member-web.sh | \
-		scripts/provision-member-capsule.sh | scripts/provision-member-acme.sh | \
-		scripts/provision-group-web.sh | scripts/provision-group-capsule.sh | \
-		scripts/provision-group-acme.sh | \
-		scripts/publish-mail-key.sh | \
-		scripts/remove-upload-key.sh | \
-		scripts/set-mail-password.sh | scripts/reload-smtpd.sh) needs_onboard=yes ;;
-	# A helper of both the relay deploy and the drain's web pass, so a change to
-	# it is both.
-	scripts/relayd-members.sh)
-		needs_relayd=yes
-		needs_onboard=yes
-		;;
-	scripts/cron-apply.sh)
-		needs_onboard=yes
-		manual_cron=yes
-		;;
-	scripts/lib.sh)
-		needs_mail=yes
-		needs_onboard=yes
-		;;
-	# A deploy script's own code changed, so run it. `deploy.sh` itself is the
-	# dispatcher and deliberately plans nothing.
-	scripts/deploy-mail.sh) needs_mail=yes ;;
-	scripts/deploy-relayd.sh) needs_relayd=yes ;;
-	scripts/deploy-onboard.sh) needs_onboard=yes ;;
-	scripts/deploy-nsd.sh) needs_nsd=yes ;;
-	# The pf fragments live in the script; a change to it is still the propose-only
-	# step, not a deploy this dispatcher runs.
-	scripts/pf-apply.sh) manual_pf=yes ;;
-	scripts/*) : ;;
+	# The installed set is the table's: a script's row names the deploy that
+	# installs it, so adding one is a row there and not an arm here.
+	scripts/*) classify_script "$1" ;;
 	keys/*) needs_mail=yes ;;
 	terraform/*) manual_terraform=yes ;;
 	docs/* | .github/* | .githooks/* | .omp/* | openbsd/restore-template/*) : ;;
@@ -521,18 +564,47 @@ self_test() {
 	classify 'scripts/reload-smtpd.sh'
 	check 'the smtpd reload script plans deploy-onboard' "$needs_onboard" yes
 
-	# Every script deploy-onboard.sh installs has to plan that deploy, or a fix to
-	# it lands in the checkout and never reaches the box. The list is read from
-	# the deploy script's own drain_scripts line rather than retyped here, so the
-	# check cannot agree with a stale copy of it.
-	onboard_installs=$(sed -n 's/^drain_scripts="\(.*\)"$/\1/p' "$script_dir/deploy-onboard.sh")
-	check 'the drain install list is read from deploy-onboard.sh' \
-		"$([ -n "$onboard_installs" ] && printf yes || printf no)" yes
-	for installed in $onboard_installs kyriakon-authcheck.sh render-docs.sh; do
+	# Every row of the install-set table has to plan the deploy that installs it,
+	# or a fix to that script lands in the checkout and never reaches the box. The
+	# rows are read from the table rather than retyped here, so the check cannot
+	# agree with a stale copy of it. render-docs.sh and kyriakon-authcheck.sh are
+	# not rows: the one runs from the checkout and the other is installed under a
+	# name its row could not carry.
+	drain_rows=$(awk -F'\t' '!/^#/ && $2 == "drain" { print $1 }' "$install_set")
+	root_bin_rows=$(awk -F'\t' '!/^#/ && $2 == "/root/bin" { print $1 }' "$install_set")
+	check 'the table names drain scripts' \
+		"$([ -n "$drain_rows" ] && printf yes || printf no)" yes
+	check 'the table names /root/bin scripts' \
+		"$([ -n "$root_bin_rows" ] && printf yes || printf no)" yes
+	for installed in $drain_rows; do
 		reset_plan
 		classify "scripts/$installed"
 		check "scripts/$installed plans deploy-onboard" "$needs_onboard" yes
 	done
+	for installed in $root_bin_rows; do
+		reset_plan
+		classify "scripts/$installed"
+		check "scripts/$installed plans deploy-mail" "$needs_mail" yes
+	done
+	reset_plan
+	classify 'scripts/install-set.tsv'
+	check 'a table change plans both deploys and the cron step' \
+		"$needs_mail $needs_onboard $manual_cron" 'yes yes yes'
+	reset_plan
+	classify 'scripts/kyriakon-authcheck.sh'
+	check 'the libexec install plans deploy-onboard' "$needs_onboard" yes
+	reset_plan
+	classify 'scripts/render-docs.sh'
+	check 'the pages renderer plans deploy-onboard' "$needs_onboard" yes
+	# A destination nothing installs is refused rather than skipped: a row with a
+	# typo in it would otherwise be a script no deploy puts on the box.
+	printf 'new.sh\tsomewhere-else\t-\n' >"$self_test_work/unknown-dest.tsv"
+	got=0
+	( install_dests new.sh "$self_test_work/unknown-dest.tsv" ) >/dev/null 2>&1 || got=$?
+	check 'an unknown destination is refused' "$got" 1
+	got=0
+	( install_dests new.sh "$self_test_work/no-such-table.tsv" ) >/dev/null 2>&1 || got=$?
+	check 'a missing install-set table is refused' "$got" 1
 	reset_plan
 	classify '.omp/lsp.json'
 	check 'developer tooling plans nothing' "$(plan_order)" ''
