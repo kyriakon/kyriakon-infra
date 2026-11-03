@@ -119,10 +119,19 @@ self_test() {
 		different
 	check "a missing directory mints nothing" \
 		"$(mint_proof "$work/absent" theophilus.1 >/dev/null 2>&1 && printf yes || printf no)" no
-	# The runner's own temp directory is 0700 but not root's, which is the
-	# misconfiguration this check exists to refuse on the box.
+	# The runner's own temp directory is 0700 and not root's, which is the
+	# misconfiguration this check exists to refuse on the box. A root run's mktemp
+	# is root's own, so make one owned by somebody else for that case; `nobody` is
+	# uid 32767 on both OpenBSD and macOS.
+	foreign=$work
+	if [ "$(id -u)" -eq 0 ]; then
+		foreign=$work/foreign
+		mkdir "$foreign"
+		chown 32767 "$foreign"
+		chmod 0700 "$foreign"
+	fi
 	check "a directory not owned by root is refused" \
-		"$(root_proof_dir "$work" && printf yes || printf no)" no
+		"$(root_proof_dir "$foreign" && printf yes || printf no)" no
 	self_test_end
 }
 
