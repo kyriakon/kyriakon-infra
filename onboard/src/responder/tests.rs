@@ -1654,6 +1654,141 @@ async fn a_path_neither_front_end_serves_is_refused_in_its_own_way() {
     assert!(body.starts_with("51 Not found\r\n"), "{body}");
 }
 
+/// The path and the method a row is asked for: a subtree row gets one path under
+/// it, and a row's own method is what the web front end would send for it.
+fn probe(row: &Route) -> (String, &'static str) {
+    let path = match row.path {
+        "status/" | "decide/" | "password/" => format!("{}{TOKEN}", row.path),
+        "apply/" => format!("{}{TOKEN}/1", row.path),
+        "account/" => format!("{}password", row.path),
+        other => other.to_string(),
+    };
+    let method = match row.method {
+        Method::Post => "POST",
+        Method::Get | Method::Any => "GET",
+    };
+    (path, method)
+}
+
+/// The table is the only route list: every row is reached by each front end it
+/// names and by no other, and a second row claiming one front end's path and
+/// method fails here, because the first is the only one reached.
+#[test]
+fn every_row_is_reached_by_the_front_ends_it_names() {
+    for row in ROUTES {
+        assert!(
+            !(row.fronts.serves(FrontEnd::Httpd) && row.method == Method::Any),
+            "{} checks a method on the web front end, so it cannot be `Any`",
+            row.path
+        );
+        let (path, method) = probe(row);
+        for front in [FrontEnd::Httpd, FrontEnd::Gemini] {
+            let reached = match route(front, &path, method) {
+                Resolution::Row(found, _) => Some(found),
+                Resolution::WrongMethod | Resolution::Missing => None,
+            };
+            if row.fronts.serves(front) {
+                assert_eq!(
+                    reached,
+                    Some(row),
+                    "{front:?} does not reach the {:?} row for {path}",
+                    row.path
+                );
+            } else {
+                assert_ne!(
+                    reached,
+                    Some(row),
+                    "{front:?} reaches the {:?} row, which is not its front end",
+                    row.path
+                );
+            }
+        }
+    }
+}
+
+/// A mirrored page is a row in the table beside its line in `capsule::PAGES`,
+/// because the route, the staged file and the link label must name one page.
+/// This is the test that keeps the two lists the same list.
+#[test]
+fn every_staged_page_is_a_mirrored_row_and_nothing_else_is() {
+    let rows: Vec<&str> = ROUTES
+        .iter()
+        .filter(|row| row.handler == Handler::Mirrored)
+        .map(|row| row.path)
+        .collect();
+    let staged: Vec<&str> = capsule::PAGES.iter().map(|(route, _, _)| *route).collect();
+    assert_eq!(rows, staged);
+    for row in ROUTES.iter().filter(|row| row.handler == Handler::Mirrored) {
+        assert_eq!(
+            row.fronts,
+            Fronts::Gemini,
+            "{} is gemtext and has no HTML rendering",
+            row.path
+        );
+    }
+    assert!(
+        ROUTES
+            .iter()
+            .any(|row| row.handler == Handler::Acceptances && row.path == capsule::ACCEPTANCES),
+        "the acceptances page is a route too"
+    );
+}
+
+/// Every row the table gives both front ends answers on both: this is the check
+/// the two chains could not make, and a row added without its capsule rendering
+/// answers 51 here.
+#[tokio::test]
+async fn every_shared_row_answers_on_both_front_ends() {
+    let (app, _dir) = handler("route-table-both").await;
+    for row in ROUTES.iter().filter(|row| row.fronts == Fronts::Both) {
+        let (path, method) = probe(row);
+        let request = if method == "POST" {
+            httpd_post(&format!("/{path}"), "")
+        } else {
+            httpd_get(&format!("/{path}"), "")
+        };
+        let (code, _) = answer(&app, &request).await;
+        assert_ne!(code, 404, "httpd does not reach /{path}");
+        let (code, _) = answer(&app, &gmid_get(&path, "")).await;
+        assert_ne!(code, 51, "gmid does not reach /{path}");
+    }
+}
+
+/// A row that serves one front end is that front end's: the web answers its 404
+/// for a capsule-only page, and the capsule answers its 51 wherever the table
+/// says it serves no path. A page therefore cannot be added on one side alone.
+#[tokio::test]
+async fn protocol_only_rows_are_refused_by_the_other_front_end() {
+    let (app, _dir) = handler("route-table-only").await;
+    for row in ROUTES.iter().filter(|row| row.fronts == Fronts::Gemini) {
+        let (path, _) = probe(row);
+        let (code, body) = answer(&app, &httpd_get(&format!("/{path}"), "")).await;
+        assert_eq!(code, 404, "httpd serves /{path}: {body}");
+    }
+    for row in ROUTES.iter().filter(|row| row.fronts == Fronts::Httpd) {
+        let (path, method) = probe(row);
+        let request = if method == "POST" {
+            httpd_post(&format!("/{path}"), "")
+        } else {
+            httpd_get(&format!("/{path}"), "")
+        };
+        let (code, _) = answer(&app, &request).await;
+        assert_ne!(code, 404, "httpd does not reach /{path}");
+        // The root's POST row shares its path with the shared GET row, so the
+        // capsule serves that path; it cannot serve the row, which is what
+        // `every_row_is_reached_by_the_front_ends_it_names` checks.
+        let served = ROUTES
+            .iter()
+            .any(|other| other.fronts.serves(FrontEnd::Gemini) && other.matches(&path).is_some());
+        let (code, _) = answer(&app, &gmid_get(&path, "")).await;
+        assert_eq!(
+            code == 51,
+            !served,
+            "gmid answers {code} for /{path}, which the table gives it: {served}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_gemini_request_for_an_unknown_token_reads_as_one_that_expired() {
     let (app, dir) = handler("gmid-token").await;
@@ -2775,18 +2910,14 @@ async fn the_password_page_files_the_plaintext_and_not_a_hash() {
             Some("https://signup.example.invalid/password/x"),
         ),
     );
-    let form: BTreeMap<String, String> = [
+    let body = encoded(&[
         ("until", until.as_str()),
         ("sig", "00"),
         ("password", "correct horse battery"),
         ("confirm", "correct horse battery"),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect();
-
-    let reply = password_file(&app, TOKEN, &form).await;
-    assert_eq!(reply.code(), 200);
+    ]);
+    let (code, _) = answer(&app, &httpd_post(&format!("/password/{TOKEN}"), &body)).await;
+    assert_eq!(code, 200);
     let intent = filed_intent(&dir);
     assert_eq!(intent["kind"], "set-password");
     assert_eq!(intent["password"], "correct horse battery");
