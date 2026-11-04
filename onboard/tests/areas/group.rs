@@ -2262,6 +2262,280 @@ fn a_group_lapse_takes_every_mailbox_and_one_conversation_of_notices() {
     assert_eq!(notices.matches("group.lapsed").count(), 1, "{notices}");
 }
 
+/// Every group lifecycle notice follows the address the site owner gave outside
+/// the platform, read from the durable account record the ninety-day purge of
+/// the application copy does not touch.
+#[test]
+fn a_group_notice_follows_the_site_owners_outside_address() {
+    let fix = Fix::new("group-notice-outside");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    fix.amend_account("parish-secretary", |account| {
+        account["outside_address"] = json!("warden@example.invalid");
+    });
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["payment"]["window"]["closes_at"] = json!(kyriakon_onboard::util::after_days(-10));
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+
+    let notices = fix.read("accounts/parish-secretary/notices.jsonl");
+    let notice = |kind: &str| {
+        notices
+            .lines()
+            .find(|line| line.contains(kind))
+            .unwrap_or_else(|| panic!("{kind} is not recorded: {notices}"))
+            .to_string()
+    };
+    let lapsed = notice("group.lapsed");
+    assert!(lapsed.contains("warden@example.invalid"), "{lapsed}");
+    assert!(
+        !lapsed.contains("parish-secretary@parish.example"),
+        "{lapsed}"
+    );
+
+    // The grace's midpoint, then its final week, on the same address.
+    for days in [29, 6] {
+        let mut group: Value =
+            serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+        group["grace_until"] = json!(kyriakon_onboard::util::date_after_days(days));
+        std::fs::write(
+            fix.dir.join("store/groups/parish.example/group.json"),
+            serde_json::to_vec_pretty(&group).unwrap(),
+        )
+        .unwrap();
+        assert!(fix.drain().status.success());
+    }
+    let notices = fix.read("accounts/parish-secretary/notices.jsonl");
+    for kind in ["group.grace", "group.final"] {
+        let line = notices
+            .lines()
+            .find(|line| line.contains(kind))
+            .unwrap_or_else(|| panic!("{kind} is not recorded: {notices}"));
+        assert!(line.contains("warden@example.invalid"), "{line}");
+        assert!(!line.contains("parish-secretary@parish.example"), "{line}");
+    }
+}
+
+/// With no address outside the platform the group notices still reach the site
+/// owner at their mailbox on the group's own domain.
+#[test]
+fn a_group_notice_without_an_outside_address_goes_to_the_platform_mailbox() {
+    let fix = Fix::new("group-notice-platform");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    fix.amend_account("parish-secretary", |account| {
+        account["outside_address"] = Value::Null;
+    });
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["payment"]["window"]["closes_at"] = json!(kyriakon_onboard::util::after_days(-10));
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+
+    let notices = fix.read("accounts/parish-secretary/notices.jsonl");
+    let lapsed = notices
+        .lines()
+        .find(|line| line.contains("group.lapsed"))
+        .unwrap_or_else(|| panic!("group.lapsed is not recorded: {notices}"))
+        .to_string();
+    assert!(
+        lapsed.contains("parish-secretary@parish.example"),
+        "{lapsed}"
+    );
+}
+
+/// A group made through the approval flow has no outside address on its site
+/// owner's account record. The address the application gave is still the one
+/// its lifecycle notices use, read from the copy the approval left behind.
+#[test]
+fn a_group_made_by_approval_notices_the_address_the_application_gave() {
+    let fix = Fix::new("group-notice-approval");
+    let mut record = fix.filed_body("warden");
+    record["outside_address"] = json!("secretary@example.invalid");
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    assert!(fix.drain().status.success());
+
+    let account = fix.account("parish-secretary");
+    assert!(account["outside_address"].is_null(), "{account}");
+
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["payment"]["window"]["closes_at"] = json!(kyriakon_onboard::util::after_days(-10));
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+
+    let notices = fix.read("accounts/parish-secretary/notices.jsonl");
+    let lapsed = notices
+        .lines()
+        .find(|line| line.contains("group.lapsed"))
+        .unwrap_or_else(|| panic!("group.lapsed is not recorded: {notices}"));
+    assert!(lapsed.contains("secretary@example.invalid"), "{lapsed}");
+    assert!(
+        !lapsed.contains("parish-secretary@parish.example"),
+        "{lapsed}"
+    );
+}
+
+/// A site owner's record that is missing or cannot be read is journalled and
+/// mailed once, naming the record, rather than printed every pass or sent to
+/// the platform address in the member's place.
+#[test]
+fn a_missing_or_unreadable_site_owner_record_is_reported_once() {
+    fn remove_the_record(fix: &Fix) {
+        std::fs::remove_file(fix.dir.join("store/accounts/parish-secretary/account.json")).unwrap();
+    }
+    fn truncate_the_record(fix: &Fix) {
+        std::fs::write(
+            fix.dir.join("store/accounts/parish-secretary/account.json"),
+            b"{\"version\": 1, \"username\": \"parish-sec",
+        )
+        .unwrap();
+    }
+
+    /// One way a site owner's record can be unreadable, and the line the
+    /// report about it must carry.
+    struct Damage {
+        case: &'static str,
+        apply: fn(&Fix),
+        phrase: &'static str,
+    }
+
+    let damaged = [
+        Damage {
+            case: "missing",
+            apply: remove_the_record,
+            phrase: "accounts/parish-secretary/account.json is missing",
+        },
+        Damage {
+            case: "corrupt",
+            apply: truncate_the_record,
+            phrase: "accounts/parish-secretary/account.json does not parse",
+        },
+    ];
+    for Damage {
+        case,
+        apply,
+        phrase,
+    } in damaged
+    {
+        let fix = Fix::new(&format!("group-notice-{case}"));
+        fix.file_group(
+            "parish.example",
+            "parish-secretary",
+            &[("secretary", "parish-secretary")],
+            &["parish-secretary"],
+            Some(UPLOAD_KEY),
+        );
+        assert!(fix.drain().status.success());
+        // The window is already closed, so the pass offers the lapse notice
+        // without stopping the mailboxes first.
+        let mut group: Value =
+            serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+        group["payment"]["window"]["state"] = json!("closed");
+        std::fs::write(
+            fix.dir.join("store/groups/parish.example/group.json"),
+            serde_json::to_vec_pretty(&group).unwrap(),
+        )
+        .unwrap();
+        apply(&fix);
+
+        // The binary, because cron mails what a job prints.
+        let out = fix.drain_binary();
+        assert!(out.status.success(), "{case}: {}", body(&out));
+        let printed = body(&out);
+        assert!(
+            !printed.contains("the lapse notice for parish.example"),
+            "{case}: the record failure is printed every pass: {printed}"
+        );
+
+        // One journal line and one mail for the owner's record. A corrupt
+        // record is reported by the account sweep before the group loop, so the
+        // notice's own report dedups to that line; a missing record is one no
+        // sweep visits, so the notice's line carries the group's name too.
+        assert_eq!(
+            fix.journal().matches(phrase).count(),
+            1,
+            "{case}: {}",
+            fix.journal()
+        );
+        assert_eq!(
+            fix.journal()
+                .matches("\"intent\":\"account:parish-secretary\"")
+                .count(),
+            1,
+            "{case}: {}",
+            fix.journal()
+        );
+        if case == "missing" {
+            assert!(
+                fix.journal()
+                    .contains("parish.example's group notice has no addressee"),
+                "{case}: {}",
+                fix.journal()
+            );
+        }
+        assert_eq!(
+            fix.sent().matches(phrase).count(),
+            1,
+            "{case}: {}",
+            fix.sent()
+        );
+
+        // Nothing was sent in the record's place, and a second pass repeats
+        // neither the report nor the notice.
+        assert!(
+            !fix.read("accounts/parish-secretary/notices.jsonl")
+                .contains("group.lapsed"),
+            "{case}: a notice was recorded for a record it could not read"
+        );
+        assert!(
+            !fix.sent()
+                .contains("payment window for parish.example has closed"),
+            "{case}: the notice fell back to the platform address: {}",
+            fix.sent()
+        );
+        assert!(fix.drain_binary().status.success());
+        assert_eq!(
+            fix.journal().matches(phrase).count(),
+            1,
+            "{case}: a second pass reported again"
+        );
+        assert_eq!(
+            fix.sent().matches(phrase).count(),
+            1,
+            "{case}: a second pass mailed again"
+        );
+    }
+}
+
 /// The grace's final notice comes once for the body, seven days before the
 /// deletion, and the deletion closes every account in the group and takes the
 /// domain down.
