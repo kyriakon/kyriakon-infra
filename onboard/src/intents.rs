@@ -688,7 +688,14 @@ impl Intent {
                 transitions::decision(cfg, store, journal, key, intent, file).await
             }
             Intent::Password(intent) => {
-                transitions::set_password(cfg, store, journal, intent, file, value).await
+                // The one settlement path: the verb supplies its envelope and
+                // its body, and `settle` owns dedup, the outcome line and the
+                // remove.
+                let envelope = transitions::Envelope::of(value, file, "set-password");
+                transitions::settle(cfg, store, journal, file, &envelope, async {
+                    transitions::set_password(cfg, store, intent, file, value).await
+                })
+                .await
             }
             Intent::ProvisionGroup(intent) => {
                 transitions::provision_group(cfg, store, journal, *intent, file).await

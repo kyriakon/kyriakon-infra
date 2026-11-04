@@ -8,6 +8,7 @@
 //! nothing and the journal records only that the click was seen.
 
 use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 
 use serde_json::{json, Value};
@@ -672,6 +673,158 @@ async fn write_journal(
     journal.append(store, &line).await
 }
 
+/// The intent file's own words: the id and kind the journal line carries, and
+/// the application it names. Read from the file the pass holds, so the seam's
+/// refusal and the body's settlement name the same intent.
+pub struct Envelope {
+    pub id: String,
+    pub kind: String,
+    pub application: ApplicationRef,
+}
+
+impl Envelope {
+    /// The envelope of one intent file. A file missing its id or its
+    /// application is still journalled under what it does say, exactly as the
+    /// refusal path has always read it.
+    pub fn of(value: &Value, file: &str, kind: &str) -> Self {
+        Envelope {
+            id: value
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| file.trim_end_matches(".json").to_string()),
+            kind: kind.to_string(),
+            application: value
+                .get("application")
+                .and_then(|a| serde_json::from_value::<ApplicationRef>(a.clone()).ok())
+                .unwrap_or_else(|| ApplicationRef {
+                    username: String::new(),
+                    status_token: String::new(),
+                }),
+        }
+    }
+}
+
+/// What a root verb's work settled as: the journal line the intent takes, and
+/// the application it names.
+pub struct Settlement {
+    outcome: &'static str,
+    note: Option<String>,
+    application: ApplicationRef,
+}
+
+impl Settlement {
+    /// The intent was carried out.
+    pub fn applied(application: ApplicationRef, note: Option<String>) -> Self {
+        Settlement {
+            outcome: "applied",
+            note,
+            application,
+        }
+    }
+
+    /// An outcome of the verb's own, such as a page action whose account has
+    /// already gone: the line is still the settlement, and the file goes.
+    pub fn line(outcome: &'static str, application: ApplicationRef, note: Option<String>) -> Self {
+        Settlement {
+            outcome,
+            note,
+            application,
+        }
+    }
+}
+
+/// Why a verb's body returned no settlement.
+pub enum Unsettled {
+    /// The intent is refused. The journal records it once with its reason and
+    /// the file stays for the operator, as every refusal leaves it. `after` is
+    /// work that failed while refusing: the refusal is still recorded, and the
+    /// pass still reports the failure.
+    Refused {
+        reason: String,
+        after: Option<String>,
+    },
+    /// The pass failed: the file stays and the next pass retries it.
+    Failed(String),
+}
+
+impl Unsettled {
+    pub fn refused(reason: impl Into<String>) -> Self {
+        Unsettled::Refused {
+            reason: reason.into(),
+            after: None,
+        }
+    }
+}
+
+impl From<String> for Unsettled {
+    fn from(failure: String) -> Self {
+        Unsettled::Failed(failure)
+    }
+}
+
+/// The one settlement path: dedup, the verb's body, its outcome line, the
+/// remove.
+///
+/// An intent the journal already settled is not work. An `applied` line whose
+/// file survived the crash between the two is finished here by removing the
+/// file; a `refused` line keeps its file for the operator and appends nothing.
+/// The body does the work, writes the `applying` line where the verb has one,
+/// and returns the line the intent settles with. A refusal is appended once,
+/// with its reason, and leaves the file in place.
+pub async fn settle<F>(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    file: &str,
+    envelope: &Envelope,
+    body: F,
+) -> Result<(), String>
+where
+    F: Future<Output = Result<Settlement, Unsettled>>,
+{
+    if journal.has(&envelope.id, "applied") {
+        return store.remove("intents", file).await;
+    }
+    if journal.has(&envelope.id, "refused") {
+        return Ok(());
+    }
+    match body.await {
+        Ok(settled) => {
+            write_journal(
+                store,
+                journal,
+                &cfg.release,
+                &envelope.id,
+                &envelope.kind,
+                &settled.application,
+                settled.outcome,
+                settled.note.as_deref(),
+            )
+            .await?;
+            store.remove("intents", file).await
+        }
+        Err(Unsettled::Refused { reason, after }) => {
+            write_journal(
+                store,
+                journal,
+                &cfg.release,
+                &envelope.id,
+                &envelope.kind,
+                &envelope.application,
+                "refused",
+                Some(&reason),
+            )
+            .await?;
+            match after {
+                Some(failure) => Err(failure),
+                None => Ok(()),
+            }
+        }
+        Err(Unsettled::Failed(failure)) => Err(failure),
+    }
+}
+
 /// How long to wait before retrying an id that has failed `failures` times, in
 /// minutes. A healthy intent is handled on the very next pass, which is the cron
 /// interval; a failing one backs off instead, so a permanent failure is retried
@@ -785,28 +938,19 @@ pub fn due(journal: &Journal, id: &str, now: OffsetDateTime) -> bool {
 pub async fn set_password(
     cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
     intent: PasswordIntent,
     file: &str,
     value: &Value,
-) -> Result<(), String> {
+) -> Result<Settlement, Unsettled> {
     let token = intent.application.status_token.as_str();
     let username = intent.application.username.as_str();
     let mut plain = intent.password;
     let hash = match crate::password::make(&plain) {
         Ok(hash) if crate::password::is_hash(&hash) => hash,
         Ok(_) => {
-            return refuse_password(
-                cfg,
-                store,
-                journal,
-                file,
-                value,
-                "the password did not hash",
-            )
-            .await;
+            return Err(password_refusal(store, file, value, "the password did not hash").await);
         }
-        Err(e) => return refuse_password(cfg, store, journal, file, value, &e).await,
+        Err(e) => return Err(password_refusal(store, file, value, e).await),
     };
     // Overwrite the plaintext in place now it has been hashed; zero bytes are
     // still valid UTF-8, which is what `as_mut_vec` requires. The intent file
@@ -815,15 +959,7 @@ pub async fn set_password(
     unsafe { plain.as_mut_vec().fill(0) };
     let name = format!("{token}.json");
     let Some(text) = store.read_record("applications", &name).await else {
-        return refuse_password(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
-            "the application record is gone",
-        )
-        .await;
+        return Err(password_refusal(store, file, value, "the application record is gone").await);
     };
     // Read as a Value and edit one key: the record carries fields this build
     // does not model, and writing it back through the typed struct would drop
@@ -831,26 +967,10 @@ pub async fn set_password(
     let mut record: Value = serde_json::from_str(&text)
         .map_err(|e| format!("the application record does not parse: {e}"))?;
     if record.get("username").and_then(Value::as_str) != Some(username) {
-        return refuse_password(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
-            "the intent names another account",
-        )
-        .await;
+        return Err(password_refusal(store, file, value, "the intent names another account").await);
     }
     if record.get("password_link").is_none_or(Value::is_null) {
-        return refuse_password(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
-            "the link has already been used",
-        )
-        .await;
+        return Err(password_refusal(store, file, value, "the link has already been used").await);
     }
     run_script(cfg, "set-mail-password.sh", &[username, &hash]).await?;
     // One use: the record keeps no link, so the page stops answering.
@@ -863,19 +983,29 @@ pub async fn set_password(
     store
         .write_record_owned("applications", &name, &bytes, owner)
         .await?;
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &intent.application,
-        "applied",
-        None,
-    )
-    .await?;
-    // Done: the file goes, as every other applied transition removes its own.
-    store.remove("intents", file).await
+    // The settlement, with the link cleared: `settle` appends it and removes
+    // the file, which is why the remove is still the pass's last act.
+    Ok(Settlement::applied(intent.application, None))
+}
+
+/// The password body's refusal: the plaintext is revoked from the file first,
+/// because the file stays, and the refusal is what settles the intent. A failed
+/// redaction still leaves the refusal recorded; the pass reports the failure so
+/// the plaintext is not forgotten.
+async fn password_refusal(
+    store: &Store,
+    file: &str,
+    value: &Value,
+    reason: impl Into<String>,
+) -> Unsettled {
+    let reason = reason.into();
+    match redact_password(store, file, value).await {
+        Ok(()) => Unsettled::refused(reason),
+        Err(after) => Unsettled::Refused {
+            reason,
+            after: Some(after),
+        },
+    }
 }
 
 /// Remove a password intent's plaintext before its refusal leaves the file in
