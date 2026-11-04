@@ -18,6 +18,7 @@ pub mod draft;
 pub mod export;
 pub mod fcgi;
 pub mod intents;
+pub mod journal;
 pub mod keycheck;
 pub mod mailbox;
 pub mod notice;

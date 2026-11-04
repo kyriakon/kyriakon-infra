@@ -61,6 +61,7 @@ use std::process::ExitCode;
 use kyriakon_onboard::config::DrainConfig;
 use kyriakon_onboard::export;
 use kyriakon_onboard::intents;
+use kyriakon_onboard::journal::Journal;
 use kyriakon_onboard::keycheck;
 use kyriakon_onboard::prepaid;
 use kyriakon_onboard::requests;
@@ -1595,7 +1596,8 @@ async fn suspend(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<()
     }
     let flags = flags(args, &["reason"])?;
     let reason = need(&flags, "reason")?;
-    transitions::suspend(cfg, store, username, reason).await?;
+    let journal = Journal::load(store).await?;
+    transitions::suspend(cfg, store, &journal, username, reason).await?;
     println!("suspended {username}");
     Ok(())
 }
@@ -1605,7 +1607,8 @@ async fn suspend(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<()
 /// suspension started are cleared.
 async fn resume(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(), String> {
     let username = one_username(rest)?;
-    transitions::resume(cfg, store, username).await?;
+    let journal = Journal::load(store).await?;
+    transitions::resume(cfg, store, &journal, username).await?;
     println!("resumed {username}");
     Ok(())
 }
@@ -1640,7 +1643,8 @@ async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(),
     if !recorded && !interrupted {
         return Err(format!("no account for {username}"));
     }
-    transitions::delete_account(cfg, store, username).await?;
+    let journal = Journal::load(store).await?;
+    transitions::delete_account(cfg, store, &journal, username).await?;
     println!("deleted {username}");
     Ok(())
 }
