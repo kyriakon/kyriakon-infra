@@ -29,8 +29,6 @@ struct Index {
     lines: usize,
     /// Intent id → the outcomes recorded for it.
     outcomes: HashMap<String, HashSet<String>>,
-    /// Intent ids with at least one line that is not a failure.
-    seen: HashSet<String>,
     /// Intent id → the failed passes recorded against it.
     failures: HashMap<String, Failure>,
     /// Intent id → the positions of its failed lines, in file order.
@@ -57,9 +55,6 @@ impl Index {
             .entry(line.intent.clone())
             .or_default()
             .insert(line.outcome.clone());
-        if line.outcome != "failed" {
-            self.seen.insert(line.intent.clone());
-        }
         if line.outcome == "failed" {
             let failure = self.failures.entry(line.intent.clone()).or_default();
             failure.count += 1;
@@ -135,12 +130,6 @@ impl Journal {
             .outcomes
             .get(id)
             .is_some_and(|outcomes| outcomes.contains(outcome))
-    }
-
-    /// Whether this id has any line that is not a failure. A failed line is the
-    /// reason the next pass retries, not a settlement.
-    pub fn seen(&self, id: &str) -> bool {
-        self.lock().seen.contains(id)
     }
 
     /// The failed passes recorded for an id: how many, when the last was, and
@@ -271,7 +260,6 @@ mod tests {
                 .await
                 .unwrap();
             assert!(journal.has("01H", "applied"));
-            assert!(journal.seen("01H"), "an applied line settles the id");
             assert!(journal.application_seen(TOKEN, "credit", "applied"));
             journal
                 .append(
@@ -303,7 +291,7 @@ mod tests {
 
     /// A failed line is the reason the next pass retries, not a settlement.
     #[test]
-    fn a_failed_line_does_not_count_as_seen() {
+    fn a_failed_line_is_not_a_settlement() {
         let (store, dir) = store("failed");
         runtime().block_on(async {
             let journal = Journal::load(&store).await.unwrap();
@@ -311,8 +299,8 @@ mod tests {
                 .append(&store, &line("01H", "credit", "failed", Some("boom")))
                 .await
                 .unwrap();
-            assert!(!journal.seen("01H"));
             assert!(!journal.has("01H", "applied"));
+            assert_eq!(journal.failures("01H").0, 1);
         });
         std::fs::remove_dir_all(dir).unwrap();
     }

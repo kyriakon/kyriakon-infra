@@ -384,9 +384,9 @@ impl Intent {
                         Ok(Some(
                             match transitions::redact_password(store, file, value).await {
                                 Ok(()) => transitions::Settlement::refused(why),
-                                Err(after) => transitions::Settlement::Refused {
+                                Err(failure) => transitions::Settlement::Refused {
                                     reason: why,
-                                    after: Some(after),
+                                    failure: Some(failure),
                                 },
                             },
                         ))
@@ -528,15 +528,17 @@ impl Intent {
                     )))
                 }
             }
+            // A page action like the rest: an unusable name or session is the
+            // handler's input refused, journalled once and removed, not a pass
+            // that fails and retries forever.
             Intent::Export(intent) => {
                 if let Some(why) = crate::validate::username_shape(&intent.username) {
-                    return Err(format!(
+                    return Ok(Some(transitions::Settlement::refused(format!(
                         "the export intent's username {:?}: {why}",
                         intent.username
-                    ));
+                    ))));
                 }
-                verify_session(store, proofs, &intent.session, &intent.username).await?;
-                Ok(None)
+                session_proved(store, proofs, &intent.session, &intent.username).await
             }
             // A page action is proved by the session the handler filed, and by
             // the account name being one an account record can name.
@@ -686,7 +688,8 @@ impl Intent {
             | Intent::Serving(_)
             | Intent::CancelRenewal(_)
             | Intent::MailKey(_)
-            | Intent::Close(_) => transitions::RefusalFile::Remove,
+            | Intent::Close(_)
+            | Intent::Export(_) => transitions::RefusalFile::Remove,
             Intent::Application(_)
             | Intent::Decision(_)
             | Intent::Password(_)
@@ -699,7 +702,6 @@ impl Intent {
             | Intent::ReconcileAttribute(_)
             | Intent::ReconcileReturn(_)
             | Intent::Refund(_)
-            | Intent::Export(_)
             | Intent::Unknown { .. } => transitions::RefusalFile::Keep,
         };
         transitions::Disposition::new(after, refusal)

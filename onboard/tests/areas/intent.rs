@@ -467,6 +467,12 @@ fn a_page_refusal_removes_its_file_and_an_operator_refusal_keeps_it() {
         journal.contains(&format!("\"intent\":\"{operator}\"")),
         "{journal}"
     );
+    // Both proofs passed and both bodies refused: the page verb's session was
+    // live and the operator's signature was real.
+    assert!(
+        journal.contains("Use at least") && journal.contains("not a payment token"),
+        "the refusals are not the bodies' own: {journal}"
+    );
 }
 
 /// An old journal line wrote its subject's token as a plain string, and a group

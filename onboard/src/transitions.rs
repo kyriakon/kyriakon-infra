@@ -726,12 +726,13 @@ pub enum Settlement {
     Nothing,
     /// The intent is refused. The journal records it once under the file's own
     /// envelope, with this reason, and the file stays for the operator or is
-    /// removed, exactly as `Disposition.refusal` says. `after` is work that
-    /// failed while refusing: the refusal is still recorded, and the pass still
-    /// reports the failure.
+    /// removed, exactly as `Disposition.refusal` says. A refusal runs no
+    /// after-line work: the refused line is the whole settlement. `failure` is
+    /// work that failed while refusing, such as a plaintext redaction; the
+    /// refusal is still recorded, and the pass reports it.
     Refused {
         reason: String,
-        after: Option<String>,
+        failure: Option<String>,
     },
 }
 
@@ -748,7 +749,12 @@ impl Settlement {
 
     /// An outcome of the verb's own, such as a page action whose account has
     /// already gone: the line is still the settlement, and the file goes.
+    ///
+    /// A refusal is not one of these: `Settlement::refused` is the only way to
+    /// say it, because a `Line` with that outcome ignores `Disposition.refusal`
+    /// and would remove a file the operator's verb meant to keep.
     pub fn line(outcome: &'static str, application: ApplicationRef, note: Option<String>) -> Self {
+        debug_assert_ne!(outcome, "refused", "use Settlement::refused, not a line");
         Settlement::Line {
             outcome,
             application,
@@ -764,7 +770,7 @@ impl Settlement {
     pub fn refused(reason: impl ToString) -> Self {
         Settlement::Refused {
             reason: reason.to_string(),
-            after: None,
+            failure: None,
         }
     }
 
@@ -874,12 +880,11 @@ where
         return store.remove("intents", file).await;
     }
     if journal.has(&envelope.id, "refused") {
+        // A refusal ran no after-line work when it was written, so a replay
+        // runs none either. The file disposition still applies.
         return match disposition.refusal {
             RefusalFile::Keep => Ok(()),
-            RefusalFile::Remove => {
-                finish(store, disposition.after).await?;
-                store.remove("intents", file).await
-            }
+            RefusalFile::Remove => store.remove("intents", file).await,
         };
     }
     match body.await? {
@@ -916,27 +921,26 @@ where
             finish(store, disposition.after).await?;
             store.remove("intents", file).await
         }
-        Settlement::Refused { reason, after } => {
-            // The same crash-replay rule as an outcome line: a refusal the
-            // journal already carries is not appended again.
-            if !journal.has(&envelope.id, "refused") {
-                write_journal(
-                    store,
-                    journal,
-                    &cfg.release,
-                    &envelope.id,
-                    &envelope.kind,
-                    &envelope.application,
-                    "refused",
-                    Some(&reason),
-                )
-                .await?;
-            }
-            finish(store, disposition.after).await?;
+        Settlement::Refused { reason, failure } => {
+            // The prologue has already returned on a refused line, so this one
+            // is new. A refusal runs no after-line work: the held line, the
+            // removed record and the rest stay as the refusal found them, and
+            // the refused line is the whole settlement.
+            write_journal(
+                store,
+                journal,
+                &cfg.release,
+                &envelope.id,
+                &envelope.kind,
+                &envelope.application,
+                "refused",
+                Some(&reason),
+            )
+            .await?;
             if disposition.refusal == RefusalFile::Remove {
                 store.remove("intents", file).await?;
             }
-            match after {
+            match failure {
                 Some(failure) => Err(failure),
                 None => Ok(()),
             }
@@ -1191,9 +1195,9 @@ async fn password_refusal(
     let reason = reason.to_string();
     match redact_password(store, file, value).await {
         Ok(()) => Settlement::refused(reason),
-        Err(after) => Settlement::Refused {
+        Err(failure) => Settlement::Refused {
             reason,
-            after: Some(after),
+            failure: Some(failure),
         },
     }
 }

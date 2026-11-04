@@ -2822,3 +2822,62 @@ fn a_group_window_is_listed_and_takes_its_one_extension() {
         fix.journal()
     );
 }
+
+/// A refused attribute is only a refusal. The held line it found stays held, so
+/// the money is still in the queue and the operator can name a token that
+/// resolves. The after-line mark belongs to an applied attribution, never a
+/// refused one.
+#[test]
+fn a_refused_attribute_leaves_the_held_line_held() {
+    let fix = Fix::new("reconcile-attribute-refused");
+    approved_paid(&fix, "secretary", "cash");
+    let out = fix.ctl(&[
+        "credit",
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+        "--note",
+        "no token on the envelope",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let held = held_lines(&fix);
+    assert_eq!(held.len(), 1, "{held:?}");
+    let id = held[0]["id"]
+        .as_str()
+        .expect("a held line has an id")
+        .to_string();
+
+    // A shape-valid token that names nothing: verify passes, the body refuses.
+    let unknown = "KYR-0000-0000-0000";
+    assert!(store::is_payment_token(unknown), "{unknown}");
+    let out = fix.ctl(&["reconcile", "attribute", &id, "--token", unknown]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let held = held_lines(&fix);
+    assert_eq!(
+        held[0]["state"],
+        json!("held"),
+        "a refused attribute left the queue: {held:?}"
+    );
+    assert!(
+        held[0]["attributed_to"].is_null(),
+        "a refused attribute marked the held line: {held:?}"
+    );
+    assert!(
+        payment_lines(&fix).is_empty(),
+        "a refused attribute credited a payment: {:?}",
+        payment_lines(&fix)
+    );
+    assert!(
+        fix.journal().contains("\"outcome\":\"refused\""),
+        "{}",
+        fix.journal()
+    );
+}
