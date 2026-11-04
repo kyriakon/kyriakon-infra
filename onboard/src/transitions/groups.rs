@@ -5,6 +5,10 @@
 //! returns a [`Settlement`](super::Settlement); the seam writes the outcome line
 //! and removes the intent. A retry finds the records this pass already wrote
 //! rather than making them twice.
+//!
+//! [`append_ledger`] writes the window-open line a paid approval or a group
+//! provisioning starts. `review` takes it from here so `groups` does not import
+//! `payments` for one line.
 
 use super::boxrun::{
     publish_mail_keys, publish_mail_keys_publicly, run_script, run_script_tolerating,
