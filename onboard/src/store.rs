@@ -1,15 +1,27 @@
 //! The store: the three shared files read at the top, the records written under
 //! the root, and the on-disk shapes the drain reads.
 //!
-//! Every record is written by rename, so a reader never sees half of one. The
-//! handler writes `applications/<token>.json` (the record the status page
-//! renders) and `intents/<id>.json` (the one filed application). It never writes
-//! anything root-owned.
+//! Two shapes, two APIs. A `.jsonl` file is a log: appended only, through
+//! [`Store::log`], whose handle has no write at all, so the natural overwrite of
+//! a log does not compile. Everything else is a record: replaced whole by
+//! rename, so a reader never sees half of one. The handler writes
+//! `applications/<token>.json` (the record the status page renders) and
+//! `intents/<id>.json` (the one filed application). It never writes anything
+//! root-owned.
+//!
+//! The boundary is a type plus a runtime check, not a type alone: a caller that
+//! names a record as a path string can still pass a `.jsonl` name to
+//! [`Store::write_record_mode`], which refuses it rather than writing it. Names
+//! are built at runtime (`format!("{token}.json")`), so no signature can make
+//! that a compile error. The only write that completes a recorded line is
+//! [`Store::rewrite_log`], measured by the name and by `pub(crate)`.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::fchown;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -44,7 +56,8 @@ impl Store {
     }
 
     /// The absolute path of one store path, for a caller that has to open the
-    /// file itself. The request record takes its lock on a path, not on a handle.
+    /// file itself: a webhook's raw body, the mail replies' record. A lock goes
+    /// through [`Store::lock`], which opens and hands over the descriptor.
     pub fn path(&self, rel: &str) -> PathBuf {
         self.root.join(rel)
     }
@@ -116,6 +129,29 @@ impl Store {
                  write_account_record or write_group_state"
             ));
         }
+        // An append-only record is not replaced whole. The type already refuses
+        // it through `Store::log`; this is the same rule for a caller that names
+        // the file as a path, and the error says the name of the write that is
+        // allowed to.
+        if name.ends_with(".jsonl") {
+            return Err(format!(
+                "{name} is an append-only record; Store::rewrite_log is the one write \
+                 that completes a line already recorded"
+            ));
+        }
+        self.place_record(dir, name, bytes, owner, mode).await
+    }
+
+    /// The rename itself, for a caller that has already decided the write is
+    /// allowed: the record writer, and [`Store::rewrite_log`].
+    async fn place_record(
+        &self,
+        dir: &str,
+        name: &str,
+        bytes: &[u8],
+        owner: Option<(u32, u32)>,
+        mode: u32,
+    ) -> Result<(), String> {
         let d = self.root.join(dir);
         let tmp = d.join(format!(".{name}.tmp"));
         let target = d.join(name);
@@ -138,11 +174,13 @@ impl Store {
             opts.custom_flags(libc::O_NOFOLLOW);
             let mut f = opts.open(&tmp).await?;
             f.write_all(bytes).await?;
-            // `write_all` hands the bytes to a blocking task and returns once
-            // they are queued, so the rename below can overtake the write and
-            // publish an empty record, and a failed write is reported only to
-            // the next operation. Flush waits for the write and reports its
-            // error before the name exists.
+            // `write_all` on a `tokio::fs::File` returns once the write is
+            // handed to the blocking pool: `poll_write` answers `Ready` straight
+            // after `spawn_mandatory_blocking` and keeps its error for the next
+            // operation. Without this, the rename can publish a record the
+            // write never wrote, and the error is lost. `flush` waits for the
+            // write that is running and returns its result; the durability
+            // barrier below is a separate promise.
             f.flush().await?;
             if self.sync {
                 f.sync_all().await?;
@@ -225,22 +263,19 @@ impl Store {
         Ok(out)
     }
 
-    /// Append one line to a store file, creating it 0600 and its directory if
-    /// needed. Append is the write the journal, the notices and the ledger use.
-    /// A record is never rewritten except to complete a line that has to be
-    /// completed later, under the lock `transitions::lock_store_file` takes, as
-    /// a request close and a refund settlement do.
-    pub async fn append(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
-        self.append_mode(path, bytes, None, 0o600).await
+    /// One append-only record: a `.jsonl` file, never rewritten. The type is
+    /// what holds the rule: `Log` has the append, the readers and no write, so
+    /// overwriting a log through it does not compile. [`Store::rewrite_log`] is
+    /// the one named exception. Appends and rewrites both take the record's own
+    /// lock, [`Log::lock`].
+    pub fn log<'a>(&'a self, path: &'a str) -> Log<'a> {
+        Log { store: self, path }
     }
 
-    /// Append with the file's mode and owner set on every call, including one
-    /// that finds the file already there. `notices.jsonl` is the one append
-    /// file the handler must read: the account page lists every notice sent, so
-    /// it is written 0640 with the accounts directory's group rather than the
-    /// 0600 root-only default. `journal.jsonl` and `requests.jsonl` stay
-    /// root-only, because nothing outside the drain reads them.
-    pub async fn append_mode(
+    /// Append one line to a store file, creating it 0600 and its directory if
+    /// needed. Reached through [`Store::log`], which is the only handle that
+    /// appends.
+    async fn append_mode(
         &self,
         path: &str,
         bytes: &[u8],
@@ -292,10 +327,9 @@ impl Store {
                 }
             }
             f.write_all(&line).await?;
-            // The same queueing: the drain reads the journal back in the pass
-            // that wrote it (`journal_has`, `intent_seen`), so the line has to
-            // be written before this returns, and a failed write has to be an
-            // error here rather than the next append's.
+            // See `place_record`: the write is still in the blocking pool when
+            // `write_all` returns, so its error would surface on a later call,
+            // or never on the test store's path.
             f.flush().await?;
             if sync {
                 f.sync_all().await
@@ -345,49 +379,103 @@ impl Store {
         }
     }
 
+    /// An exclusive lock on a lock file of its own, held until the returned
+    /// handle drops. Every writer that needs one takes it here.
+    ///
+    /// The lock lives in a file of its own rather than on the record, because a
+    /// rewrite replaces the record by rename: a lock on the replaced inode would
+    /// stop guarding the path the moment the rename landed. The caller holds it
+    /// across the whole read and write, which is what keeps a line another
+    /// process appended between them.
+    ///
+    /// A lock file is never removed. Removing one while another process holds
+    /// it would let a third create a new file and lock that instead, which is
+    /// no lock at all.
+    ///
+    /// The open refuses a symlink: most of these directories belong to the
+    /// unprivileged handler, and a name in one can be planted. The descriptor is
+    /// then handed to the directory's owner, because the drain takes some of
+    /// these locks as root and a root-owned 0600 lock in the handler's directory
+    /// is one the handler can no longer take.
+    pub async fn lock(&self, rel: &str) -> Result<tokio::fs::File, String> {
+        let file = self.open_lock(rel).await?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!(
+                "cannot lock {}: {}",
+                self.root.join(rel).display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(file)
+    }
+
+    /// [`Store::lock`] without waiting: `None` when another process holds it.
+    /// The drain's pass lock takes this, because an overlapping tick is one to
+    /// skip rather than one to queue behind, and holds it for the process's
+    /// life: the kernel releases it however the process exits.
+    pub async fn try_lock(&self, rel: &str) -> Result<Option<tokio::fs::File>, String> {
+        let file = self.open_lock(rel).await?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(None);
+        }
+        Err(format!(
+            "cannot lock {}: {error}",
+            self.root.join(rel).display()
+        ))
+    }
+
+    /// Open the lock file both of the above take, its directory made if the
+    /// store has not been laid out yet.
+    async fn open_lock(&self, rel: &str) -> Result<tokio::fs::File, String> {
+        // The record's directory, or the store root for a record at the top: a
+        // store not laid out yet still needs a lock file.
+        let dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
+        self.ensure_dir(dir).await?;
+        let path = self.root.join(rel);
+        let mut opts = tokio::fs::OpenOptions::new();
+        // O_NOFOLLOW: the handler owns most of these directories and could
+        // plant the lock as a symlink. The lock file may already exist, so this
+        // is `create`, not `create_new`.
+        opts.read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
+        let file = opts
+            .open(&path)
+            .await
+            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        // chown needs root, and only root ever hands a lock to another owner: a
+        // test runs as the directory's own owner already.
+        if unsafe { libc::geteuid() } == 0 {
+            if let Some((uid, gid)) = self.dir_owner(dir) {
+                // The descriptor, after the no-follow open: a `chown` of the
+                // path would follow whatever the name points at by then.
+                fchown(&file, Some(uid), Some(gid))
+                    .map_err(|e| format!("cannot hand {} to its owner: {e}", path.display()))?;
+            }
+        }
+        Ok(file)
+    }
+
     /// The unattributed queue, one held payment per line. A missing file reads
     /// as empty; a read error or a line that does not parse is an error, because
     /// `reconcile list` must not report a clear queue it cannot read.
     pub async fn held(&self) -> Result<Vec<HeldItem>, String> {
-        let abs = self.root.join(UNATTRIBUTED);
-        let text = match tokio::fs::read_to_string(&abs).await {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(format!("cannot read {}: {e}", abs.display())),
-        };
-        let mut out = Vec::new();
-        for (i, line) in text
-            .lines()
-            .map(str::trim_end)
-            .filter(|line| !line.is_empty())
-            .enumerate()
-        {
-            out.push(
-                serde_json::from_str(line)
-                    .map_err(|e| format!("{UNATTRIBUTED}: line {} does not parse: {e}", i + 1))?,
-            );
-        }
-        Ok(out)
+        self.log(UNATTRIBUTED).jsonl().await
     }
 
-    /// The JSON lines of a record, strictly: a missing file is empty, but an
+    /// The typed lines of an append-only record: a missing file is empty, but an
     /// unreadable file or a line that does not parse is an error rather than an
     /// empty result. A reader that reports "nothing" for a record it could not
     /// read is a check that cannot see what it is checking.
-    pub async fn json_lines(&self, path: &str) -> Result<Vec<serde_json::Value>, String> {
-        let abs = self.root.join(path);
-        let text = match tokio::fs::read_to_string(&abs).await {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(format!("cannot read {}: {e}", abs.display())),
-        };
+    async fn read_jsonl<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, String> {
         let mut out = Vec::new();
-        for (i, line) in text
-            .lines()
-            .map(str::trim_end)
-            .filter(|line| !line.is_empty())
-            .enumerate()
-        {
+        for (i, line) in self.read_lines(path).await?.iter().enumerate() {
             out.push(
                 serde_json::from_str(line)
                     .map_err(|e| format!("{path}: line {} does not parse: {e}", i + 1))?,
@@ -396,10 +484,43 @@ impl Store {
         Ok(out)
     }
 
-    /// The non-empty lines of a store file. A missing file reads as nothing; an
-    /// unreadable one is an error, because a reader that reported "empty" for a
-    /// record it could not read would let a replay settle the same intent twice.
-    pub async fn lines(&self, path: &str) -> Result<Vec<String>, String> {
+    /// Walk a record's lines in order, parsing each and handing it to `walk`,
+    /// which answers whether to go on. One line is parsed at a time, so a caller
+    /// that stops early does not parse the rest of the record.
+    async fn walk_jsonl<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        mut walk: impl FnMut(usize, &T) -> bool,
+    ) -> Result<(), String> {
+        for (i, line) in self.read_lines(path).await?.iter().enumerate() {
+            let value: T = serde_json::from_str(line)
+                .map_err(|e| format!("{path}: line {} does not parse: {e}", i + 1))?;
+            if !walk(i, &value) {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether any line of a record satisfies `pred`, stopping at the first
+    /// that does.
+    async fn read_jsonl_any<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        mut pred: impl FnMut(&T) -> bool,
+    ) -> Result<bool, String> {
+        let mut hit = false;
+        self.walk_jsonl(path, |_, value: &T| {
+            hit = pred(value);
+            !hit
+        })
+        .await?;
+        Ok(hit)
+    }
+
+    /// The non-empty lines of a store file, as recorded. A missing file reads as
+    /// nothing; an unreadable one is an error.
+    async fn read_lines(&self, path: &str) -> Result<Vec<String>, String> {
         let abs = self.root.join(path);
         match tokio::fs::read_to_string(&abs).await {
             Ok(s) => Ok(s
@@ -410,6 +531,119 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(format!("cannot read {}: {e}", abs.display())),
         }
+    }
+
+    /// Rewrite an append-only record whole, under a lock the caller holds.
+    ///
+    /// This is the one exception `CODING_STANDARDS.md` names: a recorded line
+    /// that has to be completed later rather than appended again. The three
+    /// callers (`settle_refund`, `rewrite_unattributed`, `requests::rewrite`)
+    /// each hold [`Log::lock`] across the read and this write, and appends take
+    /// the same lock, so a line another process appends in between is either
+    /// seen by the read or lands after the rewrite. Nothing else may call this,
+    /// and the name is the warning.
+    pub(crate) async fn rewrite_log(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+        self.place_record(dir, name, bytes, None, 0o600).await
+    }
+}
+
+/// One append-only record: a `.jsonl` file, never rewritten except through
+/// [`Store::rewrite_log`].
+///
+/// The type is the rule. It carries append and the readers and no write, and
+/// `Store`'s own record writer refuses a name ending `.jsonl`, so the only way
+/// to overwrite a line is to say so by name:
+///
+/// ```compile_fail,E0599
+/// # async fn f(store: &kyriakon_onboard::store::Store) {
+/// store.log("journal.jsonl").write(b"{}").await;
+/// # }
+/// ```
+pub struct Log<'a> {
+    store: &'a Store,
+    path: &'a str,
+}
+
+impl Log<'_> {
+    /// The record's own lock: `<path>.lock`, held until the handle drops.
+    ///
+    /// An append takes it, and a rewrite must hold it across its read and its
+    /// write. A lock on the record itself would be no lock, because the rewrite
+    /// replaces the record by rename; the lock is a file of its own.
+    pub async fn lock(&self) -> Result<tokio::fs::File, String> {
+        self.store.lock(&format!("{}.lock", self.path)).await
+    }
+
+    /// Append one line, creating the file 0600 and its directory if needed. The
+    /// append takes the record's own lock, so it cannot land between a rewrite's
+    /// read and its rename.
+    pub async fn append(&self, bytes: &[u8]) -> Result<(), String> {
+        let _guard = self.lock().await?;
+        self.store.append_mode(self.path, bytes, None, 0o600).await
+    }
+
+    /// Append with the file's mode and owner set on every call, including one
+    /// that finds the file already there. `notices.jsonl` is the one append file
+    /// the handler must read: the account page lists every notice sent, so it is
+    /// written 0640 with the accounts directory's group rather than the 0600
+    /// root-only default. `journal.jsonl` and `requests.jsonl` stay root-only,
+    /// because nothing outside the drain reads them. Takes the record's lock.
+    pub async fn append_mode(
+        &self,
+        bytes: &[u8],
+        owner: Option<(u32, u32)>,
+        mode: u32,
+    ) -> Result<(), String> {
+        let _guard = self.lock().await?;
+        self.store.append_mode(self.path, bytes, owner, mode).await
+    }
+
+    /// Append under a lock the caller already holds, from [`Self::lock`].
+    ///
+    /// One caller needs it: `requests::record` refuses a request id it has
+    /// already recorded, so its read and its append are one step under one lock.
+    /// Taking the lock twice on two descriptors would deadlock, so this exists
+    /// for that shape and nothing else; every other writer calls [`Self::append`].
+    pub async fn append_while_locked(&self, bytes: &[u8]) -> Result<(), String> {
+        self.store.append_mode(self.path, bytes, None, 0o600).await
+    }
+
+    /// The record's lines, typed: a missing record is empty, an unreadable one
+    /// or a line that does not parse is an error.
+    pub async fn jsonl<T: DeserializeOwned>(&self) -> Result<Vec<T>, String> {
+        self.store.read_jsonl(self.path).await
+    }
+
+    /// Whether any line satisfies `pred`, stopping at the first that does. For
+    /// a question about one line in a journal, which [`Self::jsonl`] would
+    /// answer only after parsing every line into a list.
+    pub async fn jsonl_any<T: DeserializeOwned>(
+        &self,
+        pred: impl FnMut(&T) -> bool,
+    ) -> Result<bool, String> {
+        self.store.read_jsonl_any(self.path, pred).await
+    }
+
+    /// Walk the record's lines in order, parsing one at a time, for a reader
+    /// that accumulates over all of them. The `usize` is the line's index, which
+    /// is what a reader comparing the order of two lines needs.
+    pub async fn jsonl_each<T: DeserializeOwned>(
+        &self,
+        mut walk: impl FnMut(usize, &T),
+    ) -> Result<(), String> {
+        self.store
+            .walk_jsonl(self.path, |i, value: &T| {
+                walk(i, value);
+                true
+            })
+            .await
+    }
+
+    /// The record's lines as written. For the one reader that copies a record
+    /// into an artefact verbatim — the export — rather than reading it.
+    pub async fn raw_lines(&self) -> Result<Vec<String>, String> {
+        self.store.read_lines(self.path).await
     }
 }
 
@@ -1378,11 +1612,13 @@ mod tests {
             .await
             .is_err());
         assert!(store
-            .append("accounts/alice/notices.jsonl", b"{}")
+            .log("accounts/alice/notices.jsonl")
+            .append(b"{}")
             .await
             .is_err());
         store
-            .append_mode("accounts/alice/notices.jsonl", b"{}", None, 0o640)
+            .log("accounts/alice/notices.jsonl")
+            .append_mode(b"{}", None, 0o640)
             .await
             .unwrap();
         assert_eq!(
@@ -1598,19 +1834,27 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("onboard-append-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::new(dir.to_str().unwrap());
+        let log = store.log("journal.jsonl");
         assert!(
-            store.lines("journal.jsonl").await.unwrap().is_empty(),
+            log.raw_lines().await.unwrap().is_empty(),
             "missing reads as empty"
         );
-        store.append("journal.jsonl", b"{\"a\":1}").await.unwrap();
-        store.append("journal.jsonl", b"{\"a\":2}\n").await.unwrap();
+        assert!(log.jsonl::<serde_json::Value>().await.unwrap().is_empty());
+        log.append(b"{\"a\":1}").await.unwrap();
+        log.append(b"{\"a\":2}\n").await.unwrap();
         assert_eq!(
-            store.lines("journal.jsonl").await.unwrap(),
+            log.raw_lines().await.unwrap(),
             vec!["{\"a\":1}", "{\"a\":2}"]
+        );
+        assert_eq!(
+            log.jsonl::<serde_json::Value>().await.unwrap(),
+            vec![serde_json::json!({"a": 1}), serde_json::json!({"a": 2})]
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A missing record is empty to both readers; a record that cannot be read
+    /// is an error, never an empty one.
     #[tokio::test]
     async fn an_unreadable_record_is_an_error_not_an_empty_read() {
         let dir = std::env::temp_dir().join(format!("onboard-lines-{}", std::process::id()));
@@ -1618,7 +1862,185 @@ mod tests {
         // A directory where the record belongs: the path exists and cannot be read.
         std::fs::create_dir_all(dir.join("journal.jsonl")).unwrap();
         let store = Store::new(dir.to_str().unwrap());
-        assert!(store.lines("journal.jsonl").await.is_err());
+        assert!(store.log("journal.jsonl").raw_lines().await.is_err());
+        assert!(store
+            .log("journal.jsonl")
+            .jsonl::<serde_json::Value>()
+            .await
+            .is_err());
+
+        // A line that does not parse names itself, rather than reading as a
+        // record with one line fewer.
+        std::fs::remove_dir_all(dir.join("journal.jsonl")).unwrap();
+        store
+            .log("journal.jsonl")
+            .append(b"{\"a\":1}")
+            .await
+            .unwrap();
+        store
+            .log("journal.jsonl")
+            .append(b"not json")
+            .await
+            .unwrap();
+        let err = store
+            .log("journal.jsonl")
+            .jsonl::<serde_json::Value>()
+            .await
+            .expect_err("a line that does not parse is an error");
+        assert!(err.contains("line 2"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An append-only record is not replaced whole: the `Log` type has no write,
+    /// and the record writer refuses the name. The one write that completes a
+    /// recorded line is `rewrite_log`, and it says so.
+    #[tokio::test]
+    async fn an_append_only_record_is_not_written_as_a_record() {
+        let dir = std::env::temp_dir().join(format!("onboard-rewrite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.to_str().unwrap());
+        store.ensure_dir("ledger").await.unwrap();
+        let err = store
+            .write_record("ledger", "payments.jsonl", b"{}\n")
+            .await
+            .expect_err("an append-only record must be refused");
+        assert!(err.contains("rewrite_log"), "{err}");
+        assert!(!store.path("ledger/payments.jsonl").exists());
+
+        store
+            .rewrite_log(
+                "ledger/payments.jsonl",
+                b"{\"settled_on\":\"2026-11-03\"}\n",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .log("ledger/payments.jsonl")
+                .raw_lines()
+                .await
+                .unwrap(),
+            vec!["{\"settled_on\":\"2026-11-03\"}"]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The lock is opened without following a symlink, and the descriptor rather
+    /// than the path is handed to the directory's owner: a symlink the
+    /// unprivileged handler plants is refused and its target untouched.
+    #[tokio::test]
+    async fn a_lock_refuses_a_planted_symlink_and_leaves_its_target_alone() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("onboard-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("applications")).unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+        let target = dir.join("master.passwd");
+        let body = b"root:*:0:0::0:0:Charlie Root:/root:/bin/ksh\n";
+        std::fs::write(&target, body).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = std::fs::metadata(&target).unwrap();
+        let lock_path = dir.join("applications/.confirmation.lock");
+        symlink(&target, &lock_path).unwrap();
+
+        store
+            .lock("applications/.confirmation.lock")
+            .await
+            .expect_err("a planted symlink must be refused");
+        let after = std::fs::metadata(&target).unwrap();
+        assert_eq!(
+            (after.uid(), after.gid(), after.mode() & 0o777),
+            (before.uid(), before.gid(), 0o600)
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+
+        // A real lock is made under the directory's owner, 0600, in a directory
+        // the store has not laid out yet.
+        std::fs::remove_file(&lock_path).unwrap();
+        let _lock = store.lock("applications/.confirmation.lock").await.unwrap();
+        let lock = std::fs::metadata(&lock_path).unwrap();
+        let apps = std::fs::metadata(dir.join("applications")).unwrap();
+        assert_eq!(
+            (lock.uid(), lock.gid(), lock.mode() & 0o777),
+            (apps.uid(), apps.gid(), 0o600)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An append takes the record's own lock, `<path>.lock`: the same one a
+    /// rewrite holds across its read and its rename. Held, the append waits and
+    /// the record stays as it was; released, it lands and lets the lock go.
+    ///
+    /// The second append runs on its own thread with its own runtime, because
+    /// `flock` blocks the thread that calls it and a current-thread runtime
+    /// cannot time out or drop a future that is parked inside a blocking call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_append_takes_the_records_own_lock() {
+        let dir = std::env::temp_dir().join(format!("onboard-log-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.to_str().unwrap());
+        let log = store.log("ledger/payments.jsonl");
+        let held = log.lock().await.unwrap();
+        // The append is the same lock: a second holder cannot take it.
+        assert!(store
+            .try_lock("ledger/payments.jsonl.lock")
+            .await
+            .unwrap()
+            .is_none());
+
+        let root = dir.to_str().unwrap().to_string();
+        let append = std::thread::spawn(move || {
+            let store = Store::new(&root);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(store.log("ledger/payments.jsonl").append(b"{}\n"))
+        });
+        // Long enough for the thread to reach the lock. If appends did not take
+        // it, the line would be on disk by now.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            log.raw_lines().await.unwrap().is_empty(),
+            "the append wrote without the record's lock"
+        );
+        drop(held);
+        append.join().unwrap().unwrap();
+        assert_eq!(log.raw_lines().await.unwrap(), vec!["{}"]);
+        assert!(
+            store
+                .try_lock("ledger/payments.jsonl.lock")
+                .await
+                .unwrap()
+                .is_some(),
+            "the append left the record's lock held"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// One lock at a time, and the non-blocking form reports the holder rather
+    /// than waiting: that is what the drain's pass lock is.
+    #[tokio::test]
+    async fn a_second_try_on_a_held_lock_is_none_and_a_freed_one_is_some() {
+        let dir = std::env::temp_dir().join(format!("onboard-lock-try-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.to_str().unwrap());
+        let held = store
+            .try_lock("ledger/payments.jsonl.lock")
+            .await
+            .unwrap()
+            .expect("the first takes the lock and makes the directory");
+        assert!(store
+            .try_lock("ledger/payments.jsonl.lock")
+            .await
+            .unwrap()
+            .is_none());
+        drop(held);
+        assert!(store
+            .try_lock("ledger/payments.jsonl.lock")
+            .await
+            .unwrap()
+            .is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

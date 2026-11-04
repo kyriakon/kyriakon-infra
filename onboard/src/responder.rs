@@ -509,7 +509,7 @@ async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
     // The checks run again under the draft lock before anything is written, so
     // two uploads that both read a keyless draft cannot both file a key. The
     // lock is held across the read-modify-write and not across the body read.
-    let _lock = match draft::lock(&app.store).await {
+    let _lock = match app.store.lock("drafts/.lock").await {
         Ok(lock) => lock,
         Err(e) => {
             eprintln!("kyriakon-onboard: {e}");
@@ -1582,7 +1582,8 @@ async fn account_notices(app: &App, username: &str) -> Vec<Notice> {
     // A page that cannot read the notices shows none; nothing is decided from
     // this list, and failing the page would hide the account over a display gap.
     app.store
-        .lines(&format!("accounts/{username}/notices.jsonl"))
+        .log(&format!("accounts/{username}/notices.jsonl"))
+        .raw_lines()
         .await
         .unwrap_or_default()
         .iter()
@@ -1634,7 +1635,7 @@ async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) -> Reply {
     // One lock around the read and every write: the drain files a mailed key
     // into this same record as root, and two unsynchronised read-modify-writes
     // would lose one of them.
-    let _lock = match draft::lock(&app.store).await {
+    let _lock = match app.store.lock("drafts/.lock").await {
         Ok(lock) => lock,
         Err(e) => {
             eprintln!("kyriakon-onboard: {e}");
@@ -2195,15 +2196,15 @@ async fn closure_refund(app: &App, account: &Account) -> Option<String> {
     // member. The line on the page is an estimate, and the drain's
     // `erasure_refund`, which reads as root, is the authoritative answer; a
     // refund it cannot read must not stop the closure being filed.
-    for line in app
+    for value in app
         .store
-        .lines("ledger/payments.jsonl")
+        .log("ledger/payments.jsonl")
+        .raw_lines()
         .await
         .unwrap_or_default()
+        .iter()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
     {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
         if value.get("token").and_then(|v| v.as_str()) != Some(token.as_str())
             || value.get("kind").and_then(|v| v.as_str()) != Some("payment")
         {

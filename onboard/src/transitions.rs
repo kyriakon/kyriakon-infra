@@ -8,8 +8,7 @@
 //! nothing and the journal records only that the click was seen.
 
 use std::collections::{BTreeMap, HashSet};
-use std::os::unix::fs::{fchown, PermissionsExt};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
@@ -583,52 +582,6 @@ fn group_recipient(record: &Record, site_owner: &str, domain: &str) -> Result<St
     Ok(outside_address(record)?.unwrap_or_else(|| format!("{site_owner}@{domain}")))
 }
 
-/// The application record's confirmation lock. The stamp is a read-check-write of
-/// a record that is replaced by rename, so the lock lives beside it rather than
-/// on it; two drain passes on the same application could otherwise both read it
-/// as unconfirmed.
-///
-/// It is held across the send rather than only across the write. Two passes
-/// serialised for the one enqueue is cheap, and releasing it before the send
-/// reopens the window this lock exists to close: the second pass would find the
-/// stamp and skip, and a failed send would be left recorded as sent.
-///
-/// The drain runs as root and the handler owns `applications/`, so the lock is
-/// handed to the directory's owner like every record `write_record_owned`
-/// writes; a root-owned file there reads as store drift to the hygiene check.
-async fn lock_confirmation(store: &Store) -> Result<tokio::fs::File, String> {
-    let path = store.path("applications/.confirmation.lock");
-    let mut opts = tokio::fs::OpenOptions::new();
-    // O_NOFOLLOW: the handler owns `applications/` and could plant the lock as
-    // a symlink. The open refuses it, rather than root writing through it, and
-    // the lock may already exist, so this is not `create_new`.
-    opts.read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW);
-    let file = opts
-        .open(&path)
-        .await
-        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    if let Some((uid, gid)) = store.dir_owner("applications") {
-        if unsafe { libc::geteuid() } == 0 {
-            // The descriptor, after the no-follow open: a `chown` of the path
-            // would follow whatever the name points at by the time it runs.
-            fchown(&file, Some(uid), Some(gid))
-                .map_err(|e| format!("cannot hand {} to the handler: {e}", path.display()))?;
-        }
-    }
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(format!(
-            "cannot lock {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(file)
-}
-
 /// Send the confirmation the spec promises before provisioning: it restates the
 /// immediate-supply request and the digital-content acknowledgement, quotes every
 /// document accepted with its version, and states the 14-day right with how to
@@ -654,7 +607,12 @@ async fn confirm(
     let Some(to) = outside_address(record)? else {
         return Ok(());
     };
-    let _lock = lock_confirmation(store).await?;
+    // The stamp is a read-check-write of a record replaced by rename, so the
+    // lock lives beside it; two drain passes on the same application could
+    // otherwise both read it as unconfirmed. It is held across the send rather
+    // than only the write: releasing it before the send would let the second
+    // pass find the stamp and skip while a failed send is recorded as sent.
+    let _lock = store.lock("applications/.confirmation.lock").await?;
     let mut live = application_record(store, token).await?;
     if live.confirmation_at.is_some() {
         return Ok(());
@@ -709,36 +667,28 @@ async fn journal(
     };
     let encoded =
         serde_json::to_string(&line).map_err(|e| format!("cannot encode a journal line: {e}"))?;
-    store.append("journal.jsonl", encoded.as_bytes()).await
+    store.log("journal.jsonl").append(encoded.as_bytes()).await
 }
 
 /// Whether the journal already holds a line for this intent id with this
 /// outcome. A refusal is recorded once, and a purge that already released the
 /// name is not released twice.
 pub(crate) async fn journal_has(store: &Store, id: &str, outcome: &str) -> Result<bool, String> {
-    for line in store.lines("journal.jsonl").await? {
-        if let Ok(j) = serde_json::from_str::<JournalLine>(&line) {
-            if j.intent == id && j.outcome == outcome {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+    store
+        .log("journal.jsonl")
+        .jsonl_any(|j: &JournalLine| j.intent == id && j.outcome == outcome)
+        .await
 }
 
 /// Whether the journal already holds a line for this intent id, whatever its
 /// outcome.
 async fn intent_seen(store: &Store, id: &str) -> Result<bool, String> {
-    for line in store.lines("journal.jsonl").await? {
-        if let Ok(j) = serde_json::from_str::<JournalLine>(&line) {
-            // A failed line is the reason the next pass retries, not a
-            // settlement: counting it would drop the intent after one failure.
-            if j.intent == id && j.outcome != "failed" {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+    // A failed line is the reason the next pass retries, not a settlement:
+    // counting it would drop the intent after one failure.
+    store
+        .log("journal.jsonl")
+        .jsonl_any(|j: &JournalLine| j.intent == id && j.outcome != "failed")
+        .await
 }
 
 /// How long to wait before retrying an id that has failed `failures` times, in
@@ -764,21 +714,24 @@ pub async fn failures(
     id: &str,
 ) -> Result<(u32, Option<OffsetDateTime>, Option<String>), String> {
     let mut count = 0u32;
-    let mut last = None;
-    let mut message = None;
-    for line in store.lines("journal.jsonl").await? {
-        if let Ok(j) = serde_json::from_str::<JournalLine>(&line) {
+    let mut last: Option<OffsetDateTime> = None;
+    let mut message: Option<String> = None;
+    // Every failed line counts, so this reads the whole journal: one line at a
+    // time, rather than a list of all of them first.
+    store
+        .log("journal.jsonl")
+        .jsonl_each(|_, j: &JournalLine| {
             if j.intent == id && j.outcome == "failed" {
                 count += 1;
                 if let Ok(at) = OffsetDateTime::parse(&j.at, &Rfc3339) {
                     last = Some(at);
                 }
                 if j.note.is_some() {
-                    message = j.note;
+                    message = j.note.clone();
                 }
             }
-        }
-    }
+        })
+        .await?;
     Ok((count, last, message))
 }
 
@@ -879,16 +832,19 @@ async fn application_seen(
 ) -> Result<bool, String> {
     let mut marks: Vec<(usize, String)> = Vec::new();
     let mut failed: Vec<(usize, String)> = Vec::new();
-    for (at, line) in store.lines("journal.jsonl").await?.iter().enumerate() {
-        if let Ok(j) = serde_json::from_str::<JournalLine>(line) {
+    // Both lists are needed to compare a mark against any later failure, so the
+    // whole journal is read, one line at a time rather than all of them first.
+    store
+        .log("journal.jsonl")
+        .jsonl_each(|at, j: &JournalLine| {
             if j.outcome == "failed" {
                 failed.push((at, j.intent.clone()));
             }
             if j.application.status_token == token && j.kind == kind && j.outcome == outcome {
-                marks.push((at, j.intent));
+                marks.push((at, j.intent.clone()));
             }
-        }
-    }
+        })
+        .await?;
     Ok(marks
         .iter()
         .any(|(at, id)| !failed.iter().any(|(f, fid)| fid == id && f > at)))
@@ -3335,10 +3291,7 @@ struct PaymentLine {
 
 async fn last_payment_line(store: &Store, token: &str) -> Result<Option<PaymentLine>, String> {
     let mut found = None;
-    for line in store.lines("ledger/payments.jsonl").await? {
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
+    for v in store.log("ledger/payments.jsonl").jsonl::<Value>().await? {
         if v.get("token").and_then(Value::as_str) != Some(token)
             || v.get("kind").and_then(Value::as_str) != Some("payment")
         {
@@ -3730,10 +3683,7 @@ async fn refund_total(
 ) -> Result<(), String> {
     let deducted = format!("-{}", util::gbp(amount));
     let mut already_refunded = 0i64;
-    for line in store.lines("ledger/payments.jsonl").await? {
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
+    for v in store.log("ledger/payments.jsonl").jsonl::<Value>().await? {
         if v.get("token").and_then(Value::as_str) != Some(token)
             || v.get("kind").and_then(Value::as_str) != Some("refund")
             || v.get("refund_of").and_then(Value::as_u64) != Some(original.seq)
@@ -3954,7 +3904,8 @@ async fn append_refund_ledger(
     let encoded =
         serde_json::to_string(&line).map_err(|e| format!("cannot encode the ledger: {e}"))?;
     store
-        .append("ledger/payments.jsonl", encoded.as_bytes())
+        .log("ledger/payments.jsonl")
+        .append(encoded.as_bytes())
         .await?;
     Ok(seq)
 }
@@ -3962,23 +3913,24 @@ async fn append_refund_ledger(
 /// Whether a refund line already records this settlement intent. The settlement
 /// does not append, so `ledger_has_intent` cannot be its dedup key.
 async fn ledger_settled_by(store: &Store, id: &str) -> Result<bool, String> {
-    for line in store.lines("ledger/payments.jsonl").await? {
-        if let Ok(v) = serde_json::from_str::<Value>(&line) {
-            if v.get("settled_intent").and_then(Value::as_str) == Some(id) {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+    store
+        .log("ledger/payments.jsonl")
+        .jsonl_any(|v: &Value| v.get("settled_intent").and_then(Value::as_str) == Some(id))
+        .await
 }
 
 /// The index of the newest refund line for the token that has no `settled_on`.
-fn unsettled_refund(lines: &[String], token: &str) -> Option<usize> {
+/// A line that does not parse is an error: a settlement must not skip a line it
+/// cannot read and settle an older one in its place.
+fn unsettled_refund(lines: &[String], token: &str) -> Result<Option<usize>, String> {
     let mut found = None;
     for (index, line) in lines.iter().enumerate() {
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+        let v: Value = serde_json::from_str(line).map_err(|e| {
+            format!(
+                "ledger/payments.jsonl: line {} does not parse: {e}",
+                index + 1
+            )
+        })?;
         if v.get("token").and_then(Value::as_str) == Some(token)
             && v.get("kind").and_then(Value::as_str) == Some("refund")
             && v.get("settled_on").and_then(Value::as_str).is_none()
@@ -3986,7 +3938,7 @@ fn unsettled_refund(lines: &[String], token: &str) -> Option<usize> {
             found = Some(index);
         }
     }
-    found
+    Ok(found)
 }
 
 /// A settlement rewrites the newest refund line for the token that has no
@@ -4004,8 +3956,8 @@ async fn settle_refund(
     let settled_on = util::date_string(util::parse_date(on).expect("the date was validated"));
     // The refusal is decided before the lock is taken: it journals, which can
     // reach the mail enqueuer, and no append should wait behind that.
-    let before_lock = store.lines("ledger/payments.jsonl").await?;
-    if unsettled_refund(&before_lock, &intent.token).is_none() {
+    let before_lock = store.log("ledger/payments.jsonl").raw_lines().await?;
+    if unsettled_refund(&before_lock, &intent.token)?.is_none() {
         return refuse_with(
             cfg,
             store,
@@ -4015,9 +3967,11 @@ async fn settle_refund(
         )
         .await;
     }
-    let guard = lock_store_file(store, "ledger/.payments.lock").await?;
-    let mut lines = store.lines("ledger/payments.jsonl").await?;
-    let Some(index) = unsettled_refund(&lines, &intent.token) else {
+    let guard = store.log("ledger/payments.jsonl").lock().await?;
+    // The lines stay as recorded: only the settled one is re-encoded, so a line
+    // an earlier release wrote keeps its bytes through the rewrite.
+    let mut lines = store.log("ledger/payments.jsonl").raw_lines().await?;
+    let Some(index) = unsettled_refund(&lines, &intent.token)? else {
         // The guard goes first: the refusal journals, and no caller should wait
         // behind a lock this one no longer needs.
         drop(guard);
@@ -4040,7 +3994,7 @@ async fn settle_refund(
     let mut text = lines.join("\n");
     text.push('\n');
     store
-        .write_record("ledger", "payments.jsonl", text.as_bytes())
+        .rewrite_log("ledger/payments.jsonl", text.as_bytes())
         .await?;
     // Released with the ledger write: the journal line below is not part of the
     // record, and holding the lock through it would make every append wait for
@@ -4149,7 +4103,8 @@ async fn hold(
     let encoded =
         serde_json::to_string(&line).map_err(|e| format!("cannot encode the queue: {e}"))?;
     store
-        .append(store::UNATTRIBUTED, encoded.as_bytes())
+        .log(store::UNATTRIBUTED)
+        .append(encoded.as_bytes())
         .await?;
     journal(
         store,
@@ -4426,45 +4381,18 @@ async fn mark_attributed(store: &Store, item: &str, token: &str) -> Result<(), S
     .await
 }
 
-/// An exclusive lock on a store file, for the one record write that is not an
-/// append: a reconcile reads every line and writes them back, and the drain and
-/// the console are different processes, so a line appended between the read and
-/// the write would be dropped by the rewrite.
-///
-/// The lock lives in a file of its own rather than on the record, as
-/// `requests::lock` does: the rewrite replaces the record by rename, and a lock
-/// on the replaced inode would stop guarding the path the moment the rename
-/// landed. The caller owns the completion under this lock.
-pub(crate) async fn lock_store_file(store: &Store, rel: &str) -> Result<tokio::fs::File, String> {
-    if let Some(parent) = std::path::Path::new(rel).parent().and_then(|p| p.to_str()) {
-        if !parent.is_empty() {
-            store.ensure_dir(parent).await?;
-        }
-    }
-    let path = store.path(rel);
-    let mut opts = tokio::fs::OpenOptions::new();
-    opts.read(true).write(true).create(true).mode(0o600);
-    let file = opts
-        .open(&path)
-        .await
-        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(format!(
-            "cannot lock {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(file)
-}
-
 /// Rewrite one held line under the queue's lock, through `change`.
+///
+/// The lock is in a file of its own, not on the queue: the rewrite replaces the
+/// record by rename, and a lock on the replaced inode would stop guarding the
+/// path the moment the rename landed. It is held across the read and the write,
+/// so a line the drain appended in between is not dropped.
 async fn rewrite_unattributed(
     store: &Store,
     id: &str,
     change: impl FnOnce(&mut store::HeldItem) -> Result<(), String>,
 ) -> Result<(), String> {
-    let _guard = lock_store_file(store, "ledger/.unattributed.lock").await?;
+    let _guard = store.log(store::UNATTRIBUTED).lock().await?;
     let mut items = store.held().await?;
     let at = items
         .iter()
@@ -4479,13 +4407,16 @@ async fn rewrite_unattributed(
         bytes.push('\n');
     }
     store
-        .write_record("ledger", "unattributed.jsonl", bytes.as_bytes())
+        .rewrite_log(store::UNATTRIBUTED, bytes.as_bytes())
         .await
 }
 
 /// Whether the unattributed queue already holds this intent's line.
 async fn held_has_intent(store: &Store, id: &str) -> Result<bool, String> {
-    Ok(store.held().await?.iter().any(|line| line.intent == id))
+    store
+        .log(store::UNATTRIBUTED)
+        .jsonl_any(|line: &store::HeldItem| line.intent == id)
+        .await
 }
 
 /// The held line carrying this transaction id, with its id and the date it was
@@ -4560,12 +4491,10 @@ fn credit_money(price: i64, balance: i64, amount: i64) -> CreditMoney {
 /// that far. A pass that finds them again is recovering from a crash between the
 /// account write and the ledger append, not applying a new credit.
 async fn credit_progress(store: &Store, id: &str) -> Result<Option<CreditProgress>, String> {
-    for line in store.lines("journal.jsonl").await? {
-        if let Ok(j) = serde_json::from_str::<JournalLine>(&line) {
-            if j.intent == id && j.outcome == "applying" {
-                if let Some(progress) = j.credit {
-                    return Ok(Some(progress));
-                }
+    for j in store.log("journal.jsonl").jsonl::<JournalLine>().await? {
+        if j.intent == id && j.outcome == "applying" {
+            if let Some(progress) = j.credit {
+                return Ok(Some(progress));
             }
         }
     }
@@ -4597,7 +4526,7 @@ async fn journal_credit_applying(
     };
     let encoded =
         serde_json::to_string(&line).map_err(|e| format!("cannot encode a journal line: {e}"))?;
-    store.append("journal.jsonl", encoded.as_bytes()).await
+    store.log("journal.jsonl").append(encoded.as_bytes()).await
 }
 
 /// Journal a credit's completion, carrying an override's reason when there was
@@ -4628,17 +4557,15 @@ async fn journal_credit_applied(
 /// The ledger line carrying this transaction id, with the date it was first
 /// credited and its `seq`, so a second credit can name both.
 async fn ledger_txid(store: &Store, txid: &str) -> Result<Option<(u64, String)>, String> {
-    for line in store.lines("ledger/payments.jsonl").await? {
-        if let Ok(v) = serde_json::from_str::<Value>(&line) {
-            if v.get("txid").and_then(Value::as_str) == Some(txid) {
-                let seq = v.get("seq").and_then(Value::as_u64).unwrap_or(0);
-                let received = v
-                    .get("received_on")
-                    .and_then(Value::as_str)
-                    .unwrap_or("an earlier date")
-                    .to_string();
-                return Ok(Some((seq, received)));
-            }
+    for v in store.log("ledger/payments.jsonl").jsonl::<Value>().await? {
+        if v.get("txid").and_then(Value::as_str) == Some(txid) {
+            let seq = v.get("seq").and_then(Value::as_u64).unwrap_or(0);
+            let received = v
+                .get("received_on")
+                .and_then(Value::as_str)
+                .unwrap_or("an earlier date")
+                .to_string();
+            return Ok(Some((seq, received)));
         }
     }
     Ok(None)
@@ -4648,12 +4575,10 @@ async fn ledger_txid(store: &Store, txid: &str) -> Result<Option<(u64, String)>,
 /// because a line written by a later release may carry fields this one does not
 /// model.
 async fn ledger_has_intent(store: &Store, id: &str) -> Result<bool, String> {
-    Ok(store
-        .lines("ledger/payments.jsonl")
-        .await?
-        .iter()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .any(|v| v.get("intent").and_then(Value::as_str) == Some(id)))
+    store
+        .log("ledger/payments.jsonl")
+        .jsonl_any(|v: &Value| v.get("intent").and_then(Value::as_str) == Some(id))
+        .await
 }
 
 /// Rewrite the payment block on the application copy the handler reads, so a
@@ -4701,11 +4626,9 @@ pub async fn write_payment_copy(
 /// number.
 pub(crate) async fn next_ledger_seq(store: &Store) -> Result<u64, String> {
     let mut seq = 0u64;
-    for line in store.lines("ledger/payments.jsonl").await? {
-        if let Ok(v) = serde_json::from_str::<Value>(&line) {
-            if let Some(s) = v.get("seq").and_then(Value::as_u64) {
-                seq = seq.max(s);
-            }
+    for v in store.log("ledger/payments.jsonl").jsonl::<Value>().await? {
+        if let Some(s) = v.get("seq").and_then(Value::as_u64) {
+            seq = seq.max(s);
         }
     }
     Ok(seq + 1)
@@ -4748,7 +4671,8 @@ async fn append_credit_ledger(
     let encoded =
         serde_json::to_string(&line).map_err(|e| format!("cannot encode the ledger: {e}"))?;
     store
-        .append("ledger/payments.jsonl", encoded.as_bytes())
+        .log("ledger/payments.jsonl")
+        .append(encoded.as_bytes())
         .await
 }
 
@@ -6032,10 +5956,7 @@ async fn erasure_refund(store: &Store, account: &Account) -> Result<Option<Strin
         return Ok(None);
     };
     let mut found = None;
-    for line in store.lines("ledger/payments.jsonl").await? {
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
+    for value in store.log("ledger/payments.jsonl").jsonl::<Value>().await? {
         if value.get("token").and_then(Value::as_str) != Some(token.as_str())
             || value.get("kind").and_then(Value::as_str) != Some("refund")
         {
@@ -8205,10 +8126,10 @@ pub async fn export_account(
     // intent's own id so a retry after a failed pass does not append a second
     // request for the same ask.
     let recorded = store
-        .lines(&format!("accounts/{username}/requests.jsonl"))
+        .log(&format!("accounts/{username}/requests.jsonl"))
+        .jsonl::<crate::requests::RequestLine>()
         .await?
         .iter()
-        .filter_map(|line| serde_json::from_str::<crate::requests::RequestLine>(line).ok())
         .any(|line| line.id == id);
     if !recorded {
         let received = crate::util::date_string(crate::requests::today());
@@ -8464,17 +8385,14 @@ async fn name_allowed(cfg: &DrainConfig, username: &str) -> Result<(), String> {
 /// the account on the box was its own, and it would adopt a name this
 /// application never made.
 async fn approval_started(store: &Store, token: &str) -> Result<bool, String> {
-    for line in store.lines("journal.jsonl").await? {
-        if let Ok(j) = serde_json::from_str::<JournalLine>(&line) {
-            if j.application.status_token == token
+    store
+        .log("journal.jsonl")
+        .jsonl_any(|j: &JournalLine| {
+            j.application.status_token == token
                 && j.outcome == "applying"
                 && (j.kind == "approve" || j.kind == "provision")
-            {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+        })
+        .await
 }
 
 /// Write the decision onto the application record. `password_link` is written
@@ -8519,16 +8437,14 @@ async fn append_ledger(
     amount_gbp: &str,
 ) -> Result<(), String> {
     let mut seq = 0u64;
-    for line in store.lines("ledger/payments.jsonl").await? {
-        if let Ok(v) = serde_json::from_str::<Value>(&line) {
-            if let Some(t) = v.get("token").and_then(Value::as_str) {
-                if t == token && v.get("kind").and_then(Value::as_str) == Some("window_open") {
-                    return Ok(());
-                }
+    for v in store.log("ledger/payments.jsonl").jsonl::<Value>().await? {
+        if let Some(t) = v.get("token").and_then(Value::as_str) {
+            if t == token && v.get("kind").and_then(Value::as_str) == Some("window_open") {
+                return Ok(());
             }
-            if let Some(s) = v.get("seq").and_then(Value::as_u64) {
-                seq = seq.max(s);
-            }
+        }
+        if let Some(s) = v.get("seq").and_then(Value::as_u64) {
+            seq = seq.max(s);
         }
     }
     let line = json!({
@@ -8552,7 +8468,8 @@ async fn append_ledger(
     let encoded =
         serde_json::to_string(&line).map_err(|e| format!("cannot encode the ledger: {e}"))?;
     store
-        .append("ledger/payments.jsonl", encoded.as_bytes())
+        .log("ledger/payments.jsonl")
+        .append(encoded.as_bytes())
         .await
 }
 
@@ -8871,7 +8788,7 @@ pub async fn stripe_webhooks(cfg: &DrainConfig, store: &Store) -> Result<(), Str
                     });
                     let bytes = serde_json::to_vec(&line)
                         .map_err(|e| format!("cannot encode the processed event: {e}"))?;
-                    store.append("webhooks/processed.jsonl", &bytes).await?;
+                    store.log("webhooks/processed.jsonl").append(&bytes).await?;
                     seen.insert(format!("event:{event_id}"));
                     if let Some(pair) = invoice_pair(kind, object_id) {
                         seen.insert(pair);
@@ -8961,10 +8878,11 @@ fn invoice_pair(kind: &str, object: &str) -> Option<String> {
 /// record, so a resend sees what an earlier pass did.
 async fn processed_events(store: &Store) -> Result<HashSet<String>, String> {
     let mut seen = HashSet::new();
-    for line in store.lines("webhooks/processed.jsonl").await? {
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
+    for value in store
+        .log("webhooks/processed.jsonl")
+        .jsonl::<Value>()
+        .await?
+    {
         if let Some(event) = value.get("event").and_then(Value::as_str) {
             seen.insert(format!("event:{event}"));
         }
@@ -9481,7 +9399,8 @@ async fn append_invoice_ledger(
     let encoded =
         serde_json::to_string(&line).map_err(|e| format!("cannot encode the ledger: {e}"))?;
     store
-        .append("ledger/payments.jsonl", encoded.as_bytes())
+        .log("ledger/payments.jsonl")
+        .append(encoded.as_bytes())
         .await
 }
 
@@ -9739,6 +9658,7 @@ fn decline_body(record: &Record) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::io::AsRawFd;
 
     fn record(answers: &[(&str, &str)]) -> Record {
         serde_json::from_value(json!({
@@ -9755,46 +9675,6 @@ mod tests {
             "question_list": "2026-10-01 abc1234"
         }))
         .unwrap()
-    }
-
-    /// The confirmation lock is opened without following a symlink, and the
-    /// descriptor rather than the path is handed to the directory's owner. A
-    /// symlink the handler plants is refused and its target is untouched.
-    #[tokio::test]
-    async fn a_symlink_at_the_confirmation_lock_is_refused() {
-        use std::os::unix::fs::{symlink, MetadataExt};
-        let dir = std::env::temp_dir().join(format!("onboard-lock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("applications")).unwrap();
-        let store = Store::new(dir.to_str().unwrap());
-        let target = dir.join("master.passwd");
-        let body = b"root:*:0:0::0:0:Charlie Root:/root:/bin/ksh\n";
-        std::fs::write(&target, body).unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let before = std::fs::metadata(&target).unwrap();
-        let lock_path = dir.join("applications/.confirmation.lock");
-        symlink(&target, &lock_path).unwrap();
-
-        lock_confirmation(&store)
-            .await
-            .expect_err("a planted symlink must be refused");
-        let after = std::fs::metadata(&target).unwrap();
-        assert_eq!(
-            (after.uid(), after.gid(), after.mode() & 0o777),
-            (before.uid(), before.gid(), 0o600)
-        );
-        assert_eq!(std::fs::read(&target).unwrap(), body);
-
-        // A real lock is made under the directory's owner at 0600.
-        std::fs::remove_file(&lock_path).unwrap();
-        let _lock = lock_confirmation(&store).await.unwrap();
-        let lock = std::fs::metadata(&lock_path).unwrap();
-        let apps = std::fs::metadata(dir.join("applications")).unwrap();
-        assert_eq!(
-            (lock.uid(), lock.gid(), lock.mode() & 0o777),
-            (apps.uid(), apps.gid(), 0o600)
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The `provision-group` payload covers every field the transition acts on:
@@ -10340,7 +10220,7 @@ mod tests {
 
         // The append is now waiting on the pipe. The lock must be free: a
         // retry covers the instant between the write and the guard's drop.
-        let lock_path = root.join("ledger/.payments.lock");
+        let lock_path = root.join("ledger/payments.jsonl.lock");
         let mut free = false;
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {

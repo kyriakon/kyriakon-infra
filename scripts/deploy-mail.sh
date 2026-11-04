@@ -24,7 +24,8 @@
 #      for
 #   4. generates the DKIM key if absent, and checks the published DKIM and SPF
 #      records
-#   5. builds and installs the Dovecot plugin and the kyriakon-encrypt daemon
+#   5. builds and installs the Dovecot plugin and the kyriakon-encrypt binary
+#      it runs per save
 #   6. syncs the published keyring, starts every service, creates oliver
 #
 # The queue-encryption key is generated once and persisted in
@@ -559,7 +560,7 @@ esac
 
 for f in openbsd/etc/smtpd.conf openbsd/etc/httpd.conf openbsd/etc/gmid.conf \
 	openbsd/etc/acme-client.conf \
-	openbsd/etc/rc.d/kyriakon_encrypt openbsd/dovecot/dovecot.conf \
+	openbsd/dovecot/dovecot.conf \
 	openbsd/etc/spamd.alloweddomains openbsd/etc/spamd.conf openbsd/etc/nospamd \
 	openbsd/etc/kyriakon.env openbsd/etc/newsyslog.conf \
 	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml keys scripts/setup-env.sh; do
@@ -1262,10 +1263,12 @@ done
 # --- 6. services --------------------------------------------------------
 
 say "services"
-install -m 0755 "$repo_dir/openbsd/etc/rc.d/kyriakon_encrypt" /etc/rc.d/kyriakon_encrypt
-start_service kyriakon_encrypt
-[ -S /var/run/kyriakon/encrypt.sock ] \
-	|| { printf 'encryptor socket missing; delivery would fail closed\n' >&2; exit 1; }
+# Nothing to start for the encryptor: the Dovecot plugin runs the binary
+# installed above, as the mailbox user, once per save. A box deployed while the
+# encryptor was still a daemon keeps it and its socket until it is retired here.
+rcctl stop kyriakon_encrypt >/dev/null 2>&1 || true
+rcctl disable kyriakon_encrypt >/dev/null 2>&1 || true
+rm -f /etc/rc.d/kyriakon_encrypt
 
 start_service dovecot
 start_service smtpd
@@ -1455,9 +1458,37 @@ printf 'Maildir: %s/Maildir (owner %s, shell %s)\n' "$home" "$owner" "$shell"
 # --- 8. verify ----------------------------------------------------------
 
 say "verify"
-for s in dovecot smtpd kyriakon_encrypt httpd spamd inetd; do
+for s in dovecot smtpd httpd spamd inetd; do
 	printf '%-18s %s\n' "$s" "$(rcctl check "$s" 2>&1 || true)"
 done
+
+# The save path runs the encryptor as the mailbox user, not as root, so prove
+# the installed binary and keyring work for that identity. oliver is the
+# account this deploy creates and the operator's mail account, so it is the
+# one the LMTP process runs as for the first mailbox.
+probe_key="$keyring_dir/oliver.asc"
+probe_cmd="test -x '$encrypt_bin' &&
+	test -x '$keyring_dir' &&
+	test -r '$probe_key' || exit 1
+	d=\$(mktemp -d) || exit 1
+	printf 'From: deploy-check@example.invalid\n\nprobe\n' |
+		'$encrypt_bin' encrypt --user oliver --keyring '$keyring_dir' --gpg-home \"\$d\" >/dev/null
+	rc=\$?
+	rm -rf \"\$d\"
+	exit \$rc"
+if id oliver >/dev/null 2>&1; then
+	if su oliver -c "$probe_cmd"; then
+		printf 'encryptor: runs as oliver and encrypted a probe message\n'
+	else
+		printf 'encryptor probe failed as oliver: every save would fail closed.\n' >&2
+		printf 'Check that %s and %s are readable by a non-root account.\n' \
+			"$encrypt_bin" "$probe_key" >&2
+		exit 1
+	fi
+else
+	printf 'encryptor probe skipped: no oliver account to run it as, so the first\n' >&2
+	printf 'LMTP delivery is the first proof it runs as the mailbox user.\n' >&2
+fi
 # The daemon being up says nothing about whether greylisting is on: the switch is
 # the pf divert, which this script must not apply. Report which state the box is
 # actually in rather than implying the enabled one.

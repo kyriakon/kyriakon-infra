@@ -6,9 +6,6 @@
 //! intents write through the same functions when the drain carries them, so a
 //! page-filed request and a scripted one cannot produce different lines.
 
-use std::io::ErrorKind;
-use std::os::unix::io::AsRawFd;
-
 use serde::{Deserialize, Serialize};
 use time::{Date, Month, OffsetDateTime};
 
@@ -218,31 +215,12 @@ fn record_path(username: &str) -> String {
     format!("{}/requests.jsonl", account_dir(username))
 }
 
-/// The request record's exclusive lock. The console and the drain are different
-/// processes, and a close reads every line and writes them back, so a record
-/// appended between the read and the write would be lost without this. The lock
-/// is held for one small read or write, so blocking a runtime thread that long
-/// is fine.
-///
-/// The lock lives in a file of its own rather than on `requests.jsonl`: the
-/// close replaces that file by rename, and a lock on the replaced inode would
-/// stop guarding the path the moment the rename landed.
-async fn lock(store: &Store, username: &str) -> Result<tokio::fs::File, String> {
-    let path = store.path(&format!("{}/.requests.lock", account_dir(username)));
-    let mut opts = tokio::fs::OpenOptions::new();
-    opts.read(true).write(true).create(true).mode(0o600);
-    let file = opts
-        .open(&path)
-        .await
-        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(format!(
-            "cannot lock {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(file)
+/// Read one account's request lines. The reader's rule is the store's: a missing
+/// file is an empty record, and a record that cannot be read or parsed is an
+/// error, because a record the command cannot see must not read as a clear
+/// docket.
+async fn read_all(store: &Store, username: &str) -> Result<Vec<RequestLine>, String> {
+    store.log(&record_path(username)).jsonl().await
 }
 
 /// Append one request line and return it, so the caller can print the due date.
@@ -319,45 +297,21 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
         done_at: None,
         bundle: None,
     };
-    let _guard = lock(store, request.username).await?;
+    let path = record_path(&line.username);
+    let log = store.log(&path);
+    let _guard = log.lock().await?;
     // A retry that carries an id must not write the same request twice. The
-    // read is under the lock, so it sees a record that another process lands
-    // first.
+    // read is under the record's own lock, which the append also takes, so it
+    // sees a record that another process lands first.
     if request.id.is_some() {
-        let existing = read_all(store, request.username).await?;
+        let existing = log.jsonl::<RequestLine>().await?;
         if existing.iter().any(|l| l.id == line.id) {
             return Err(format!("request {} is already recorded", line.id));
         }
     }
     let bytes = serde_json::to_vec(&line).map_err(|e| format!("cannot write the request: {e}"))?;
-    store.append(&record_path(&line.username), &bytes).await?;
+    log.append_while_locked(&bytes).await?;
     Ok(line)
-}
-
-/// Read one account's request lines. A missing file is an empty record; any
-/// other read error is an error, because a record the command cannot see must
-/// not read as a clear docket.
-async fn read_all(store: &Store, username: &str) -> Result<Vec<RequestLine>, String> {
-    let path = record_path(username);
-    let abs = store.path(&path);
-    let text = match tokio::fs::read_to_string(&abs).await {
-        Ok(text) => text,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("cannot read {}: {e}", abs.display())),
-    };
-    let mut out = Vec::new();
-    for (i, line) in text
-        .lines()
-        .map(str::trim_end)
-        .filter(|l| !l.is_empty())
-        .enumerate()
-    {
-        out.push(
-            serde_json::from_str(line)
-                .map_err(|e| format!("{path}: line {} does not parse: {e}", i + 1))?,
-        );
-    }
-    Ok(out)
 }
 
 /// The account whose record holds one request id. The read happens before the
@@ -379,18 +333,19 @@ async fn find_account(store: &Store, id: &str) -> Result<String, String> {
 /// Rewrite one request's line under the record's lock, through `change`.
 ///
 /// The file is one line per request, not one line per event, so a change
-/// rewrites that request's line and leaves the others as they were. The rewrite
-/// goes by rename (the store's own write), so a reader never sees a half file,
-/// and the whole read and write happen under the record's lock, so a concurrent
-/// record is not dropped.
+/// rewrites that request's line and leaves the others as they were. This is one
+/// of the three writes `Store::rewrite_log` exists for, and the whole read and
+/// write happen under the record's lock, so a concurrent append is not dropped.
 async fn rewrite(
     store: &Store,
     id: &str,
     change: impl FnOnce(&mut RequestLine) -> Result<(), String>,
 ) -> Result<RequestLine, String> {
     let username = find_account(store, id).await?;
-    let _guard = lock(store, &username).await?;
-    let mut lines = read_all(store, &username).await?;
+    let path = record_path(&username);
+    let log = store.log(&path);
+    let _guard = log.lock().await?;
+    let mut lines = log.jsonl::<RequestLine>().await?;
     let at = lines
         .iter()
         .position(|l| l.id == id)
@@ -406,7 +361,7 @@ async fn rewrite(
         bytes.push('\n');
     }
     store
-        .write_record(&account_dir(&username), "requests.jsonl", bytes.as_bytes())
+        .rewrite_log(&record_path(&username), bytes.as_bytes())
         .await?;
     Ok(lines[at].clone())
 }
@@ -757,9 +712,12 @@ mod tests {
         assert_eq!(line.due, "2026-11-22");
         assert_eq!(line.relevant, "2026-10-22");
         assert_eq!(line.version, 1);
-        let raw = store.lines("accounts/alice/requests.jsonl").await.unwrap();
-        assert_eq!(raw.len(), 1);
-        assert_eq!(serde_json::from_str::<RequestLine>(&raw[0]).unwrap(), line);
+        let raw = store
+            .log("accounts/alice/requests.jsonl")
+            .jsonl::<RequestLine>()
+            .await
+            .unwrap();
+        assert_eq!(raw, vec![line]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -797,7 +755,8 @@ mod tests {
         request.evidence = "  ";
         assert!(record(&store, request).await.is_err());
         assert!(store
-            .lines("accounts/alice/requests.jsonl")
+            .log("accounts/alice/requests.jsonl")
+            .jsonl::<RequestLine>()
             .await
             .unwrap()
             .is_empty());
@@ -814,7 +773,8 @@ mod tests {
             assert!(err.contains("identity route"), "{identity:?}: {err}");
         }
         assert!(store
-            .lines("accounts/alice/requests.jsonl")
+            .log("accounts/alice/requests.jsonl")
+            .jsonl::<RequestLine>()
             .await
             .unwrap()
             .is_empty());
@@ -829,7 +789,11 @@ mod tests {
             .unwrap();
         assert_eq!(line.identity, "mail-key");
         // The route is on the line the next reader sees, not only in the return.
-        let raw = store.lines("accounts/alice/requests.jsonl").await.unwrap();
+        let raw = store
+            .log("accounts/alice/requests.jsonl")
+            .raw_lines()
+            .await
+            .unwrap();
         assert!(raw[0].contains("\"identity\":\"mail-key\""), "{}", raw[0]);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -868,13 +832,11 @@ mod tests {
         assert_eq!(closed.done.as_deref(), Some("collected over sftp"));
         assert_eq!(closed.done_at.as_deref(), Some("2026-10-05"));
 
-        let lines: Vec<RequestLine> = store
-            .lines("accounts/alice/requests.jsonl")
+        let lines = store
+            .log("accounts/alice/requests.jsonl")
+            .jsonl::<RequestLine>()
             .await
-            .unwrap()
-            .iter()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
+            .unwrap();
         assert_eq!(
             lines.len(),
             2,

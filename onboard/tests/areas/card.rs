@@ -311,7 +311,9 @@ fn a_valid_event_with_no_matching_application_writes_nothing() {
         // cache itself and the stamp for a failed attempt are named exactly, so
         // a third file appearing under `rates/` still fails this check.
         .filter(|k| *k != "rates/xmr-gbp.json" && *k != "rates/xmr-gbp.json.attempt")
-        .filter(|k| !k.ends_with(".drain.lock"))
+        // A lock file is not a record: the drain's pass lock and the
+        // per-record locks a rewrite or an append takes are named, not content.
+        .filter(|k| !k.ends_with(".lock"))
         .filter(|k| before.get(*k) != after.get(*k))
         .collect();
     assert!(touching.is_empty(), "changed: {touching:?}");

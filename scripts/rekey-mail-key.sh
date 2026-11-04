@@ -172,10 +172,12 @@ printf '       git push\n'
 printf '  2. on the box, deploy it:\n'
 printf '       cd /usr/local/src/kyriakon-infra && git pull --ff-only && doas ksh scripts/deploy-mail.sh\n'
 printf '     the keyring section must install %s with no AEAD warning\n' "${published##*/}"
-printf '  3. on the box, encrypt the way the daemon does and check the packet shape:\n'
-printf '       echo test | doas gpg --batch --no-tty --no-options --encrypt --armor \\\n'
-printf '         --no-encrypt-to --recipient-file /etc/kyriakon/keys/%s \\\n' "${published##*/}"
-printf '         --homedir /var/run/kyriakon/gpg | doas gpg --list-packets | grep -E "tag=|mdc_method"\n'
+printf '%s\n' \
+	'  3. on the box, encrypt the way a delivery does and check the packet shape:' \
+	"       d=\$(mktemp -d); echo test | doas gpg --batch --no-tty --no-options \\" \
+	"         --encrypt --armor --no-encrypt-to \\" \
+	"         --recipient-file /etc/kyriakon/keys/${published##*/} --homedir \"\$d\" \\" \
+	"         | gpg --list-packets | grep -E \"tag=|mdc_method\"; rm -rf \"\$d\""
 printf '     kyriakon-encrypt encrypts with --recipient-file and imports no key, so this is\n'
 printf '     the same path a delivery takes, with the deployed file as its only input\n'
 printf '     tag=18 with mdc_method: 2 is the pass. tag=20 or an aead line means the old\n'

@@ -114,17 +114,12 @@ pub async fn already_sent(
     notice_type: &str,
     subject: &str,
 ) -> Result<bool, String> {
-    for line in store
-        .lines(&format!("accounts/{username}/notices.jsonl"))
+    Ok(store
+        .log(&format!("accounts/{username}/notices.jsonl"))
+        .jsonl::<Notice>()
         .await?
-    {
-        if let Ok(n) = serde_json::from_str::<Notice>(&line) {
-            if n.notice_type == notice_type && n.subject == subject {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+        .iter()
+        .any(|n| n.notice_type == notice_type && n.subject == subject))
 }
 
 /// Record a notice and then enqueue it, in that order. `false` means the
@@ -229,12 +224,8 @@ async fn record(
     let encoded =
         serde_json::to_string(&line).map_err(|e| format!("cannot encode a notice: {e}"))?;
     store
-        .append_mode(
-            &format!("accounts/{username}/notices.jsonl"),
-            encoded.as_bytes(),
-            store.dir_owner("accounts"),
-            0o640,
-        )
+        .log(&format!("accounts/{username}/notices.jsonl"))
+        .append_mode(encoded.as_bytes(), store.dir_owner("accounts"), 0o640)
         .await
 }
 
@@ -363,7 +354,8 @@ mod tests {
         .unwrap());
         assert_eq!(
             store
-                .lines("accounts/secretary/notices.jsonl")
+                .log("accounts/secretary/notices.jsonl")
+                .jsonl::<Notice>()
                 .await
                 .unwrap()
                 .len(),
