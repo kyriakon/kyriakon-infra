@@ -10,6 +10,7 @@ use crate::common::*;
 use kyriakon_onboard::config::DrainConfig;
 use kyriakon_onboard::intents::Intent;
 use kyriakon_onboard::journal::Journal;
+use kyriakon_onboard::sign;
 use kyriakon_onboard::store::{self as st, Store};
 use kyriakon_onboard::transitions as tr;
 
@@ -60,8 +61,9 @@ fn a_variant_proves_itself_before_it_is_applied() {
     );
     assert!(
         runtime
-            .block_on(intent.verify(&cfg, &store, &journal, KEY, &file, &value))
-            .unwrap(),
+            .block_on(intent.verify(&cfg, &store, KEY, &file, &value))
+            .unwrap()
+            .is_none(),
         "a live session proves the close"
     );
     assert_eq!(fix.account("secretary")["state"], "active");
@@ -95,7 +97,7 @@ fn a_variant_that_cannot_prove_itself_is_refused() {
     });
     let value = serde_json::to_value(&intent).unwrap();
     let refused = runtime
-        .block_on(intent.verify(&cfg, &store, &journal, KEY, "unsigned.json", &value))
+        .block_on(intent.verify(&cfg, &store, KEY, "unsigned.json", &value))
         .unwrap_err();
     assert_eq!(
         refused, "the token resend's signature does not verify",
@@ -113,11 +115,24 @@ fn a_variant_that_cannot_prove_itself_is_refused() {
     let unknown = Intent::parse(&raw).unwrap();
     assert!(matches!(unknown, Intent::Unknown { .. }));
     assert!(
-        !runtime
-            .block_on(unknown.verify(&cfg, &store, &journal, KEY, "unknown.json", &raw))
-            .unwrap(),
+        runtime
+            .block_on(unknown.verify(&cfg, &store, KEY, "unknown.json", &raw))
+            .unwrap()
+            .is_some(),
         "an unimplemented kind is settled, not applied"
     );
+    // The refusal is journalled by `settle`, which is the only writer: the
+    // verify side hands it the settlement and does not write anything itself.
+    runtime
+        .block_on(Intent::parse(&raw).unwrap().run(
+            &cfg,
+            &store,
+            &journal,
+            KEY,
+            "unknown.json",
+            &raw,
+        ))
+        .unwrap();
     let journal = fix.journal();
     assert!(
         journal.contains("\"kind\":\"not-a-verb\""),
@@ -297,8 +312,9 @@ fn a_settled_intent_is_not_applied_again() {
     let value: Value = serde_json::from_str(&fix.read(&format!("intents/{id}.json"))).unwrap();
     let intent = Intent::parse(&value).unwrap();
     assert!(runtime
-        .block_on(intent.verify(&cfg, &store, &journal, KEY, &file, &value))
-        .unwrap());
+        .block_on(intent.verify(&cfg, &store, KEY, &file, &value))
+        .unwrap()
+        .is_none());
     runtime
         .block_on(intent.apply(&cfg, &store, &journal, KEY, &file, &value))
         .unwrap();
@@ -332,4 +348,152 @@ fn a_settled_intent_is_not_applied_again() {
         fix.journal()
     );
     assert_eq!(fix.account("secretary")["state"], "closing");
+}
+
+/// A page refusal is one line, and the file goes with it. A pass that finds the
+/// line and the file a crash left behind removes the file and appends nothing:
+/// the verify side hands `settle` the refusal, and `settle` owns the guard.
+#[test]
+fn a_page_refusal_is_journalled_once_and_its_file_removed() {
+    let fix = Fix::new("intent-page-refusal-replay");
+    fix.page_account("secretary", json!({}));
+    let id = fix.file_page_action(
+        "serving",
+        "secretary",
+        json!({"http": true, "gemini": false}),
+    );
+    let file = format!("intents/{id}.json");
+    let value: Value = serde_json::from_str(&fix.read(&file)).unwrap();
+    // The session record is gone, as expiry leaves it, so the proof refuses.
+    let session = value["session"].as_str().unwrap().to_string();
+    std::fs::remove_file(fix.path(&format!("store/sessions/{session}.json"))).unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !std::path::Path::new(&fix.path(&format!("store/{file}"))).exists(),
+        "a page refusal removes its file"
+    );
+    let journal = fix.journal();
+    assert_eq!(
+        journal.matches(&format!("\"intent\":\"{id}\"")).count(),
+        1,
+        "{journal}"
+    );
+    assert_eq!(
+        journal.matches("\"outcome\":\"refused\"").count(),
+        1,
+        "{journal}"
+    );
+    assert!(
+        journal.contains("\"username\":\"secretary\""),
+        "the refusal line names the account: {journal}"
+    );
+    assert!(
+        !journal.contains("status_token"),
+        "a page line wrote a token field: {journal}"
+    );
+
+    // The file back, as a crash between the line and the remove leaves it.
+    std::fs::write(
+        fix.path(&format!("store/{file}")),
+        serde_json::to_vec_pretty(&value).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !std::path::Path::new(&fix.path(&format!("store/{file}"))).exists(),
+        "the replayed refusal left its file behind"
+    );
+    assert_eq!(
+        fix.journal()
+            .matches(&format!("\"intent\":\"{id}\""))
+            .count(),
+        1,
+        "the replay appended a second refusal: {}",
+        fix.journal()
+    );
+}
+
+/// The two refusal shapes keep opposite files: a page verb's refusal is the
+/// handler's input and goes, an operator's is a decision to read and stays.
+#[test]
+fn a_page_refusal_removes_its_file_and_an_operator_refusal_keeps_it() {
+    let fix = Fix::new("intent-refusal-dispositions");
+    fix.page_account("secretary", json!({}));
+    // The body refuses a plaintext that cannot be a password, which is a page
+    // verb's own refusal.
+    let page = fix.file_page_action("change-password", "secretary", json!({"password": "short"}));
+
+    // The body refuses a token that is not a payment token. The console's
+    // signature is real, so verify passes and the refusal is the body's.
+    let operator = ulid();
+    let token = "not-a-token";
+    let sig = sign::sign(
+        b"the approval key",
+        &sign::window_extend_payload(token, 14, "because the window lapsed"),
+    )
+    .unwrap();
+    fix.write_intent(
+        &operator,
+        &json!({
+            "id": operator,
+            "kind": "window-extend",
+            "filed_at": "2026-10-02T09:00:00Z",
+            "token": token,
+            "days": 14,
+            "reason": "because the window lapsed",
+            "sig": sig,
+        }),
+    );
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !std::path::Path::new(&fix.path(&format!("store/intents/{page}.json"))).exists(),
+        "a page refusal kept its file"
+    );
+    assert!(
+        std::path::Path::new(&fix.path(&format!("store/intents/{operator}.json"))).exists(),
+        "an operator refusal removed its file"
+    );
+    let journal = fix.journal();
+    assert!(
+        journal.contains(&format!("\"intent\":\"{page}\"")) && journal.contains("\"refused\""),
+        "{journal}"
+    );
+    assert!(
+        journal.contains(&format!("\"intent\":\"{operator}\"")),
+        "{journal}"
+    );
+}
+
+/// An old journal line wrote its subject's token as a plain string, and a group
+/// line put a domain there. Both still load, and the refusal the line records
+/// still dedups: the pass appends nothing.
+#[test]
+fn an_old_journal_line_still_loads_and_dedups() {
+    let fix = Fix::new("intent-old-journal-line");
+    let id = ulid();
+    fix.write_intent(&id, &json!({"id": id, "kind": "not-a-verb"}));
+    let old = format!(
+        "{{\"version\":1,\"at\":\"2026-11-04T09:00:00Z\",\"intent\":\"{id}\",\"kind\":\"not-a-verb\",\"release\":\"old\",\"application\":{{\"username\":\"warden\",\"status_token\":\"parish.example\"}},\"outcome\":\"refused\",\"note\":\"this build does not implement this kind; the intent is left in place\"}}\n"
+    );
+    std::fs::write(fix.dir.join("store/journal.jsonl"), old).unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.journal()
+            .matches(&format!("\"intent\":\"{id}\""))
+            .count(),
+        1,
+        "the old line was not read as the settlement it is: {}",
+        fix.journal()
+    );
+    assert!(
+        std::path::Path::new(&fix.path(&format!("store/intents/{id}.json"))).exists(),
+        "a refused unknown kind is left for the operator"
+    );
 }

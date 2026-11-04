@@ -1373,10 +1373,7 @@ async fn sign_and_file(
     let sig = sign::sign(key, &sign::decide_payload(&token, decision.action))?;
     let id = intents::Intent::Decision(transitions::DecisionIntent {
         kind: decision.kind.to_string(),
-        application: store::ApplicationRef {
-            username: username.to_string(),
-            status_token: token.clone(),
-        },
+        application: store::ApplicationRef::application(username.to_string(), token.clone()),
         action: decision.action.to_string(),
         sig,
         ..Default::default()

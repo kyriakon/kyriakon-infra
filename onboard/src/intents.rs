@@ -273,8 +273,9 @@ impl Intent {
         Ok(id)
     }
 
-    /// Prove then apply, as the pass does. A `verify` that settles the intent
-    /// applies nothing.
+    /// Prove then apply, as the pass does. A `verify` that refuses the intent
+    /// hands its refusal to `settle`, which is the one place the line, the
+    /// dedup, the after-line work and the remove happen.
     pub async fn run(
         self,
         cfg: &DrainConfig,
@@ -284,8 +285,18 @@ impl Intent {
         file: &str,
         value: &Value,
     ) -> Result<(), String> {
-        if !self.verify(cfg, store, journal, key, file, value).await? {
-            return Ok(());
+        if let Some(settlement) = self.verify(cfg, store, key, file, value).await? {
+            let envelope = transitions::Envelope::of(value, file, self.kind());
+            return transitions::settle(
+                cfg,
+                store,
+                journal,
+                file,
+                &envelope,
+                self.disposition(),
+                async { Ok(settlement) },
+            )
+            .await;
         }
         self.apply(cfg, store, journal, key, file, value).await
     }
@@ -294,10 +305,11 @@ impl Intent {
     /// applied.
     ///
     /// There is no catch-all arm: a variant added without deciding what proves
-    /// it does not compile. `Ok(false)` means the intent is settled — its
-    /// refusal line is journalled and its file left for the operator or removed,
-    /// as that verb's rule says — and the caller must not apply it. `Err` is a
-    /// pass that failed, which backs off and is mailed once.
+    /// it does not compile. `Ok(None)` means the intent is proved and may be
+    /// applied. `Ok(Some(settlement))` is a refusal: the settlement is fed to
+    /// `settle`, which writes its one line and leaves or removes the file as
+    /// the verb's disposition says. `Err` is a pass that failed, which backs off
+    /// and is mailed once.
     ///
     /// The signature and session checks are the ones the transitions used to
     /// make themselves; every message and every journal outcome is the same.
@@ -305,19 +317,22 @@ impl Intent {
         &self,
         cfg: &DrainConfig,
         store: &Store,
-        journal: &Journal,
         key: &[u8],
         file: &str,
         value: &Value,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<transitions::Settlement>, String> {
         let proofs = std::path::Path::new(&cfg.proof_dir);
         match self {
             // The handler files it and the drain only queues a review: nothing
             // is written as root until a reviewer's signed decision, which the
             // `Decision` arm proves.
-            Intent::Application(_) => Ok(true),
+            Intent::Application(_) => Ok(None),
             Intent::Decision(intent) => {
-                if !crate::store::is_status_token(&intent.application.status_token) {
+                let token =
+                    intent.application.status_token.as_deref().ok_or_else(|| {
+                        "the status token is not 128 bits of Crockford".to_string()
+                    })?;
+                if !crate::store::is_status_token(token) {
                     return Err("the status token is not 128 bits of Crockford".to_string());
                 }
                 if let Some(why) = crate::validate::username_shape(&intent.application.username) {
@@ -334,34 +349,24 @@ impl Intent {
                 }
                 if !sign::verify(
                     key,
-                    &sign::decide_payload(&intent.application.status_token, &intent.action),
+                    &sign::decide_payload(token, &intent.action),
                     &intent.sig,
                 ) {
                     return Err("the decision intent's signature does not verify".to_string());
                 }
-                Ok(true)
+                Ok(None)
             }
             Intent::Password(intent) => {
-                // A re-filed copy of a settled intent is settled again, and a
-                // refused one loses its plaintext.
-                if journal.has(&intent.id, "refused") {
-                    transitions::redact_password(store, file, value).await?;
-                    return Ok(false);
-                }
-                if journal.has(&intent.id, "applied") {
-                    // A crash between the `applied` line and the remove leaves
-                    // the intent re-read on every pass: finish the remove.
-                    store.remove("intents", file).await?;
-                    return Ok(false);
-                }
                 // The handler files the plaintext and the drain hashes it: a
                 // `hash` field is the old shape, where a handler with a valid
-                // link chose the stored hash.
+                // link chose the stored hash. `settle` owns the replay guards:
+                // a settled intent never reaches this problem check again.
+                let token = intent.application.status_token.as_deref().unwrap_or("");
                 let problem: Option<String> = if value.get("hash").is_some() {
                     Some("the intent carries a hash rather than a plaintext".to_string())
                 } else if !sign::verify(
                     key,
-                    &sign::password_payload(&intent.application.status_token, &intent.until),
+                    &sign::password_payload(token, &intent.until),
                     &intent.sig,
                 ) {
                     Some("the link's signature does not verify".to_string())
@@ -372,16 +377,26 @@ impl Intent {
                 };
                 match problem {
                     Some(why) => {
-                        transitions::refuse_password(cfg, store, journal, file, value, &why)
-                            .await?;
-                        Ok(false)
+                        // The plaintext is revoked before the file is left in
+                        // place, as every password refusal does; a failed
+                        // redaction still leaves the refusal recorded, and the
+                        // pass reports it.
+                        Ok(Some(
+                            match transitions::redact_password(store, file, value).await {
+                                Ok(()) => transitions::Settlement::refused(why),
+                                Err(after) => transitions::Settlement::Refused {
+                                    reason: why,
+                                    after: Some(after),
+                                },
+                            },
+                        ))
                     }
-                    None => Ok(true),
+                    None => Ok(None),
                 }
             }
             Intent::ProvisionGroup(intent) => {
                 if sign::verify(key, &sign::group_provision_payload(intent), &intent.sig) {
-                    Ok(true)
+                    Ok(None)
                 } else {
                     Err("the group intent's signature does not verify".to_string())
                 }
@@ -400,7 +415,7 @@ impl Intent {
                         .unwrap_or(""),
                 );
                 if sign::verify(key, &payload, &intent.sig) {
-                    Ok(true)
+                    Ok(None)
                 } else {
                     Err("the address intent's signature does not verify".to_string())
                 }
@@ -411,7 +426,7 @@ impl Intent {
                     &sign::group_remove_payload(&intent.domain),
                     &intent.sig,
                 ) {
-                    Ok(true)
+                    Ok(None)
                 } else {
                     Err("the remove-group intent's signature does not verify".to_string())
                 }
@@ -420,17 +435,7 @@ impl Intent {
                 // A close reports a name it cannot use as a pass failure, where
                 // a page action refuses it; the session proof is shared.
                 account_name(&intent.username)?;
-                session_proved(
-                    cfg,
-                    store,
-                    journal,
-                    &intent.id,
-                    &intent.kind,
-                    &intent.username,
-                    &intent.session,
-                    file,
-                )
-                .await
+                session_proved(store, proofs, &intent.session, &intent.username).await
             }
             Intent::Resend(intent) => {
                 if sign::verify(
@@ -438,7 +443,7 @@ impl Intent {
                     &sign::resend_payload(&intent.username, &intent.token),
                     &intent.sig,
                 ) {
-                    Ok(true)
+                    Ok(None)
                 } else {
                     Err("the token resend's signature does not verify".to_string())
                 }
@@ -456,18 +461,11 @@ impl Intent {
                     intent.note.as_deref(),
                 );
                 if sign::verify(key, &payload, &intent.sig) {
-                    Ok(true)
+                    Ok(None)
                 } else {
-                    transitions::refuse_with(
-                        cfg,
-                        store,
-                        journal,
-                        file,
-                        value,
+                    Ok(Some(transitions::Settlement::refused(
                         "the credit intent's signature does not verify",
-                    )
-                    .await?;
-                    Ok(false)
+                    )))
                 }
             }
             Intent::WindowExtend(intent) => {
@@ -476,18 +474,11 @@ impl Intent {
                     &sign::window_extend_payload(&intent.token, intent.days, &intent.reason),
                     &intent.sig,
                 ) {
-                    Ok(true)
+                    Ok(None)
                 } else {
-                    transitions::refuse_with(
-                        cfg,
-                        store,
-                        journal,
-                        file,
-                        value,
+                    Ok(Some(transitions::Settlement::refused(
                         "the window extension's signature does not verify",
-                    )
-                    .await?;
-                    Ok(false)
+                    )))
                 }
             }
             Intent::ReconcileAttribute(intent) => {
@@ -498,18 +489,11 @@ impl Intent {
                     intent.override_reason.as_deref(),
                 );
                 if sign::verify(key, &payload, &intent.sig) {
-                    Ok(true)
+                    Ok(None)
                 } else {
-                    transitions::refuse_with(
-                        cfg,
-                        store,
-                        journal,
-                        file,
-                        value,
+                    Ok(Some(transitions::Settlement::refused(
                         "the reconcile-attribute intent's signature does not verify",
-                    )
-                    .await?;
-                    Ok(false)
+                    )))
                 }
             }
             Intent::ReconcileReturn(intent) => {
@@ -518,18 +502,11 @@ impl Intent {
                     &sign::reconcile_return_payload(&intent.item, &intent.note),
                     &intent.sig,
                 ) {
-                    Ok(true)
+                    Ok(None)
                 } else {
-                    transitions::refuse_with(
-                        cfg,
-                        store,
-                        journal,
-                        file,
-                        value,
+                    Ok(Some(transitions::Settlement::refused(
                         "the reconcile-return intent's signature does not verify",
-                    )
-                    .await?;
-                    Ok(false)
+                    )))
                 }
             }
             Intent::Refund(intent) => {
@@ -544,18 +521,11 @@ impl Intent {
                     intent.reason.as_deref().unwrap_or(""),
                 );
                 if sign::verify(key, &payload, &intent.sig) {
-                    Ok(true)
+                    Ok(None)
                 } else {
-                    transitions::refuse_with(
-                        cfg,
-                        store,
-                        journal,
-                        file,
-                        value,
+                    Ok(Some(transitions::Settlement::refused(
                         "the refund intent's signature does not verify",
-                    )
-                    .await?;
-                    Ok(false)
+                    )))
                 }
             }
             Intent::Export(intent) => {
@@ -566,106 +536,36 @@ impl Intent {
                     ));
                 }
                 verify_session(store, proofs, &intent.session, &intent.username).await?;
-                Ok(true)
+                Ok(None)
             }
             // A page action is proved by the session the handler filed, and by
             // the account name being one an account record can name.
             Intent::ChangePassword(intent) => {
                 if value.get("hash").is_some() {
-                    transitions::refuse_page(
-                        cfg,
-                        store,
-                        journal,
-                        &intent.id,
-                        &intent.kind,
-                        &intent.username,
-                        file,
+                    return Ok(Some(transitions::Settlement::refused(
                         "the intent carries a hash rather than a plaintext",
-                    )
-                    .await?;
-                    return Ok(false);
+                    )));
                 }
-                page_proved(
-                    cfg,
-                    store,
-                    journal,
-                    &intent.id,
-                    &intent.kind,
-                    &intent.username,
-                    &intent.session,
-                    file,
-                )
-                .await
+                page_proved(store, proofs, &intent.session, &intent.username).await
             }
             Intent::UploadKey(intent) => {
-                page_proved(
-                    cfg,
-                    store,
-                    journal,
-                    &intent.id,
-                    &intent.kind,
-                    &intent.username,
-                    &intent.session,
-                    file,
-                )
-                .await
+                page_proved(store, proofs, &intent.session, &intent.username).await
             }
             Intent::OutsideAddress(intent) => {
-                page_proved(
-                    cfg,
-                    store,
-                    journal,
-                    &intent.id,
-                    &intent.kind,
-                    &intent.username,
-                    &intent.session,
-                    file,
-                )
-                .await
+                page_proved(store, proofs, &intent.session, &intent.username).await
             }
             Intent::Serving(intent) => {
-                page_proved(
-                    cfg,
-                    store,
-                    journal,
-                    &intent.id,
-                    &intent.kind,
-                    &intent.username,
-                    &intent.session,
-                    file,
-                )
-                .await
+                page_proved(store, proofs, &intent.session, &intent.username).await
             }
             Intent::CancelRenewal(intent) => {
-                page_proved(
-                    cfg,
-                    store,
-                    journal,
-                    &intent.id,
-                    &intent.kind,
-                    &intent.username,
-                    &intent.session,
-                    file,
-                )
-                .await
+                page_proved(store, proofs, &intent.session, &intent.username).await
             }
             Intent::MailKey(intent) => {
-                page_proved(
-                    cfg,
-                    store,
-                    journal,
-                    &intent.id,
-                    &intent.kind,
-                    &intent.username,
-                    &intent.session,
-                    file,
-                )
-                .await
+                page_proved(store, proofs, &intent.session, &intent.username).await
             }
-            Intent::Unknown { .. } => {
-                transitions::refuse(cfg, store, journal, file, value).await?;
-                Ok(false)
-            }
+            Intent::Unknown { .. } => Ok(Some(transitions::Settlement::refused(
+                "this build does not implement this kind; the intent is left in place",
+            ))),
         }
     }
 
@@ -686,10 +586,69 @@ impl Intent {
     ) -> Result<(), String> {
         let kind = self.kind().to_string();
         let envelope = transitions::Envelope::of(value, file, &kind);
+        let disposition = self.disposition();
+        transitions::settle(cfg, store, journal, file, &envelope, disposition, async {
+            match self {
+                Intent::Application(intent) => {
+                    transitions::filed_application(cfg, store, journal, key, intent).await
+                }
+                Intent::Decision(intent) => {
+                    transitions::decision(cfg, store, journal, key, intent).await
+                }
+                Intent::Password(intent) => {
+                    transitions::set_password(cfg, store, intent, file, value).await
+                }
+                Intent::ProvisionGroup(intent) => {
+                    transitions::provision_group(cfg, store, journal, *intent).await
+                }
+                Intent::GroupAddress(intent) => {
+                    transitions::group_address(cfg, store, journal, intent).await
+                }
+                Intent::RemoveGroup(intent) => {
+                    transitions::remove_group(cfg, store, journal, intent).await
+                }
+                Intent::Close(intent) => transitions::close_account(store, intent).await,
+                Intent::Resend(intent) => transitions::resend(cfg, store, intent).await,
+                Intent::Credit(intent) => transitions::credit(cfg, store, journal, intent).await,
+                Intent::WindowExtend(intent) => transitions::window_extend(store, intent).await,
+                Intent::ReconcileAttribute(intent) => {
+                    transitions::reconcile_attribute(cfg, store, journal, intent).await
+                }
+                Intent::ReconcileReturn(intent) => {
+                    transitions::reconcile_return(store, intent).await
+                }
+                Intent::Refund(intent) => transitions::refund(cfg, store, intent).await,
+                Intent::Export(intent) => {
+                    transitions::export_account(cfg, store, intent, file).await
+                }
+                Intent::ChangePassword(intent) => {
+                    transitions::change_password(cfg, store, intent).await
+                }
+                Intent::UploadKey(intent) => transitions::upload_key(cfg, store, intent).await,
+                Intent::OutsideAddress(intent) => {
+                    transitions::set_outside_address(store, intent).await
+                }
+                Intent::Serving(intent) => transitions::set_serving(cfg, store, intent).await,
+                Intent::CancelRenewal(intent) => {
+                    transitions::cancel_renewal(cfg, store, intent).await
+                }
+                Intent::MailKey(intent) => transitions::mail_key(cfg, store, intent).await,
+                // `verify` refuses an unknown kind before this is reached.
+                Intent::Unknown { kind, .. } => {
+                    Err(format!("this build does not implement the kind {kind:?}"))
+                }
+            }
+        })
+        .await
+    }
+
+    /// What this verb's settlement owes beyond its body: the work its line must
+    /// precede, and what a refusal leaves of its file. Every variant is listed,
+    /// so a new one has to say both.
+    fn disposition(&self) -> transitions::Disposition {
         // The verbs whose line and record cleanup cannot be one write name that
-        // work here, once; every variant is listed so a new one has to say
-        // whether it owes anything after its line.
-        let after = match &self {
+        // work here, once.
+        let after = match self {
             Intent::RemoveGroup(intent) => {
                 transitions::AfterLine::RemoveGroupRecord(intent.domain.clone())
             }
@@ -718,21 +677,22 @@ impl Intent {
             | Intent::Unknown { .. } => transitions::AfterLine::Nothing,
         };
         // A page action's refusal is the handler's own input, so its file goes;
-        // every other verb keeps a refusal for the operator.
-        let refusal = match &self {
+        // every other verb keeps a refusal for the operator. A close is a page
+        // action too, though its only refusal is the session proof's.
+        let refusal = match self {
             Intent::ChangePassword(_)
             | Intent::UploadKey(_)
             | Intent::OutsideAddress(_)
             | Intent::Serving(_)
             | Intent::CancelRenewal(_)
-            | Intent::MailKey(_) => transitions::RefusalFile::Remove,
+            | Intent::MailKey(_)
+            | Intent::Close(_) => transitions::RefusalFile::Remove,
             Intent::Application(_)
             | Intent::Decision(_)
             | Intent::Password(_)
             | Intent::ProvisionGroup(_)
             | Intent::GroupAddress(_)
             | Intent::RemoveGroup(_)
-            | Intent::Close(_)
             | Intent::Resend(_)
             | Intent::Credit(_)
             | Intent::WindowExtend(_)
@@ -742,69 +702,7 @@ impl Intent {
             | Intent::Export(_)
             | Intent::Unknown { .. } => transitions::RefusalFile::Keep,
         };
-        transitions::settle(
-            cfg,
-            store,
-            journal,
-            file,
-            &envelope,
-            transitions::Disposition::new(after, refusal),
-            async {
-                match self {
-                    Intent::Application(intent) => {
-                        transitions::filed_application(cfg, store, journal, key, intent).await
-                    }
-                    Intent::Decision(intent) => {
-                        transitions::decision(cfg, store, journal, key, intent).await
-                    }
-                    Intent::Password(intent) => {
-                        transitions::set_password(cfg, store, intent, file, value).await
-                    }
-                    Intent::ProvisionGroup(intent) => {
-                        transitions::provision_group(cfg, store, journal, *intent).await
-                    }
-                    Intent::GroupAddress(intent) => {
-                        transitions::group_address(cfg, store, journal, intent).await
-                    }
-                    Intent::RemoveGroup(intent) => {
-                        transitions::remove_group(cfg, store, journal, intent).await
-                    }
-                    Intent::Close(intent) => transitions::close_account(store, intent).await,
-                    Intent::Resend(intent) => transitions::resend(cfg, store, intent).await,
-                    Intent::Credit(intent) => {
-                        transitions::credit(cfg, store, journal, intent).await
-                    }
-                    Intent::WindowExtend(intent) => transitions::window_extend(store, intent).await,
-                    Intent::ReconcileAttribute(intent) => {
-                        transitions::reconcile_attribute(cfg, store, journal, intent).await
-                    }
-                    Intent::ReconcileReturn(intent) => {
-                        transitions::reconcile_return(store, intent).await
-                    }
-                    Intent::Refund(intent) => transitions::refund(cfg, store, intent).await,
-                    Intent::Export(intent) => {
-                        transitions::export_account(cfg, store, intent, file).await
-                    }
-                    Intent::ChangePassword(intent) => {
-                        transitions::change_password(cfg, store, intent).await
-                    }
-                    Intent::UploadKey(intent) => transitions::upload_key(cfg, store, intent).await,
-                    Intent::OutsideAddress(intent) => {
-                        transitions::set_outside_address(store, intent).await
-                    }
-                    Intent::Serving(intent) => transitions::set_serving(cfg, store, intent).await,
-                    Intent::CancelRenewal(intent) => {
-                        transitions::cancel_renewal(cfg, store, intent).await
-                    }
-                    Intent::MailKey(intent) => transitions::mail_key(cfg, store, intent).await,
-                    // `verify` refuses an unknown kind before this is reached.
-                    Intent::Unknown { kind, .. } => {
-                        Err(format!("this build does not implement the kind {kind:?}"))
-                    }
-                }
-            },
-        )
-        .await
+        transitions::Disposition::new(after, refusal)
     }
 }
 
@@ -853,66 +751,32 @@ fn account_name(username: &str) -> Result<(), String> {
 }
 
 /// The page verbs' and close's one session proof: the record's proof names the
-/// account. A mismatch, an expiry and a session that has gone are journalled as
-/// a refusal and the file is removed; `Ok(false)` tells the caller nothing is
-/// applied.
-#[allow(clippy::too_many_arguments)]
+/// account. A mismatch, an expiry and a session that has gone are the refusal
+/// this returns; `settle` records it once and removes the file.
 async fn session_proved(
-    cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
-    id: &str,
-    kind: &str,
-    username: &str,
+    proofs: &std::path::Path,
     session: &str,
-    file: &str,
-) -> Result<bool, String> {
-    match verify_session(
-        store,
-        std::path::Path::new(&cfg.proof_dir),
-        session,
-        username,
-    )
-    .await
-    {
-        Ok(()) => Ok(true),
-        Err(reason) => {
-            transitions::settle_page(
-                cfg,
-                store,
-                journal,
-                id,
-                kind,
-                username,
-                file,
-                "refused",
-                Some(&reason),
-            )
-            .await?;
-            Ok(false)
-        }
+    username: &str,
+) -> Result<Option<transitions::Settlement>, String> {
+    match verify_session(store, proofs, session, username).await {
+        Ok(()) => Ok(None),
+        Err(reason) => Ok(Some(transitions::Settlement::refused(reason))),
     }
 }
 
-/// A page action's proof: the account name rule, then the session. A refusal
-/// journals its reason and removes the file, the way every page action's
-/// refusal does.
-#[allow(clippy::too_many_arguments)]
+/// A page action's proof: the account name rule, then the session. A refusal is
+/// the settlement the caller hands to `settle`.
 async fn page_proved(
-    cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
-    id: &str,
-    kind: &str,
-    username: &str,
+    proofs: &std::path::Path,
     session: &str,
-    file: &str,
-) -> Result<bool, String> {
+    username: &str,
+) -> Result<Option<transitions::Settlement>, String> {
     if let Err(why) = account_name(username) {
-        transitions::refuse_page(cfg, store, journal, id, kind, username, file, &why).await?;
-        return Ok(false);
+        return Ok(Some(transitions::Settlement::refused(why)));
     }
-    session_proved(cfg, store, journal, id, kind, username, session, file).await
+    session_proved(store, proofs, session, username).await
 }
 
 /// Whether `id` names a live page session for `username`. The drain runs as

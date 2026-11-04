@@ -694,18 +694,23 @@ impl Envelope {
                 .map(str::to_string)
                 .unwrap_or_else(|| file.trim_end_matches(".json").to_string()),
             kind: kind.to_string(),
+            // A page action names its account at the top level rather than in an
+            // `application` block, and its refusal is journalled under it: the
+            // subject is whichever the file carries.
             application: value
                 .get("application")
                 .and_then(|a| serde_json::from_value::<ApplicationRef>(a.clone()).ok())
-                .unwrap_or_else(|| ApplicationRef {
-                    username: String::new(),
-                    status_token: String::new(),
+                .unwrap_or_else(|| {
+                    ApplicationRef::account(
+                        value.get("username").and_then(Value::as_str).unwrap_or(""),
+                    )
                 }),
         }
     }
 }
 
 /// What a root verb's body settled as.
+#[derive(Debug)]
 pub enum Settlement {
     /// The journal line the intent takes, and the application it names. The
     /// file goes once the line is written. `after` is work the line itself
@@ -720,9 +725,10 @@ pub enum Settlement {
     /// replay whose line the crashed pass had already written.
     Nothing,
     /// The intent is refused. The journal records it once under the file's own
-    /// envelope, with this reason, and the file stays for the operator. `after`
-    /// is work that failed while refusing: the refusal is still recorded, and
-    /// the pass still reports the failure.
+    /// envelope, with this reason, and the file stays for the operator or is
+    /// removed, exactly as `Disposition.refusal` says. `after` is work that
+    /// failed while refusing: the refusal is still recorded, and the pass still
+    /// reports the failure.
     Refused {
         reason: String,
         after: Option<String>,
@@ -785,6 +791,7 @@ impl Settlement {
 /// What a verb still owes after its outcome line: work that must not precede
 /// the line, because a repeat would no longer find what it acts on, and that
 /// must also run on a pass that finds the line and the file a crash left behind.
+#[derive(Debug)]
 pub enum AfterLine {
     Nothing,
     /// Take a removed domain's record directory away.
@@ -910,17 +917,25 @@ where
             store.remove("intents", file).await
         }
         Settlement::Refused { reason, after } => {
-            write_journal(
-                store,
-                journal,
-                &cfg.release,
-                &envelope.id,
-                &envelope.kind,
-                &envelope.application,
-                "refused",
-                Some(&reason),
-            )
-            .await?;
+            // The same crash-replay rule as an outcome line: a refusal the
+            // journal already carries is not appended again.
+            if !journal.has(&envelope.id, "refused") {
+                write_journal(
+                    store,
+                    journal,
+                    &cfg.release,
+                    &envelope.id,
+                    &envelope.kind,
+                    &envelope.application,
+                    "refused",
+                    Some(&reason),
+                )
+                .await?;
+            }
+            finish(store, disposition.after).await?;
+            if disposition.refusal == RefusalFile::Remove {
+                store.remove("intents", file).await?;
+            }
             match after {
                 Some(failure) => Err(failure),
                 None => Ok(()),
@@ -962,10 +977,7 @@ pub async fn note_failure(
         release,
         id,
         kind,
-        &ApplicationRef {
-            username: String::new(),
-            status_token: String::new(),
-        },
+        &ApplicationRef::default(),
         "failed",
         Some(message),
     )
@@ -1116,7 +1128,11 @@ pub async fn set_password(
     file: &str,
     value: &Value,
 ) -> Result<Settlement, String> {
-    let token = intent.application.status_token.as_str();
+    let token = intent
+        .application
+        .status_token
+        .as_deref()
+        .ok_or("the password intent names no status token")?;
     let username = intent.application.username.as_str();
     let mut plain = intent.password;
     let hash = match crate::password::make(&plain) {
@@ -1207,88 +1223,6 @@ pub(crate) async fn redact_password(
         .await
 }
 
-/// Refuse a password intent: redact the plaintext, then journal the refusal and
-/// leave the file in place.
-pub(crate) async fn refuse_password(
-    cfg: &DrainConfig,
-    store: &Store,
-    journal: &Journal,
-    file: &str,
-    value: &Value,
-    reason: &str,
-) -> Result<(), String> {
-    // The redaction is attempted first, but a failure to write it must not cost
-    // the journal its refusal: the refusal is recorded either way, and the
-    // write's error is what the pass reports so the plaintext is not forgotten.
-    let redacted = redact_password(store, file, value).await;
-    refuse_with(cfg, store, journal, file, value, reason).await?;
-    redacted
-}
-
-/// Journal a refusal with its reason. The intent is left in place, as `refuse`
-/// leaves an unknown kind, and the journal's own line stops it being retried.
-pub(crate) async fn refuse_with(
-    cfg: &DrainConfig,
-    store: &Store,
-    journal: &Journal,
-    file: &str,
-    value: &Value,
-    reason: &str,
-) -> Result<(), String> {
-    let envelope = Envelope::of(
-        value,
-        file,
-        value.get("kind").and_then(Value::as_str).unwrap_or(""),
-    );
-    // One refusal per intent: a second pass over the same bad file must not
-    // append a second line, and the index already carries the first.
-    if journal.has(&envelope.id, "refused") {
-        return Ok(());
-    }
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &envelope.id,
-        &envelope.kind,
-        &envelope.application,
-        "refused",
-        Some(reason),
-    )
-    .await
-}
-
-/// Refuse an intent of a kind this build does not implement, by name, and leave
-/// it in place. The journal records the refusal once, so two runs over the same
-/// directory do not append the same line twice.
-pub async fn refuse(
-    cfg: &DrainConfig,
-    store: &Store,
-    journal: &Journal,
-    file: &str,
-    value: &Value,
-) -> Result<(), String> {
-    let envelope = Envelope::of(
-        value,
-        file,
-        value.get("kind").and_then(Value::as_str).unwrap_or(""),
-    );
-    if journal.seen(&envelope.id) {
-        return Ok(());
-    }
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &envelope.id,
-        &envelope.kind,
-        &envelope.application,
-        "refused",
-        Some("this build does not implement this kind; the intent is left in place"),
-    )
-    .await
-}
-
 /// A filed application: one review email to the reviewer, carrying every answer,
 /// the mail-key result, whether an upload key was supplied, the rail, whether no
 /// charge was asked for, and three signed links.
@@ -1303,7 +1237,10 @@ pub async fn filed_application(
         return Err(format!("kind {:?} is not an application", intent.kind));
     }
     name_allowed(cfg, &intent.application.username).await?;
-    if !store::is_status_token(&intent.application.status_token) {
+    let Some(token) = intent.application.status_token.as_deref() else {
+        return Err("the status token is not 128 bits of Crockford".to_string());
+    };
+    if !store::is_status_token(token) {
         return Err("the status token is not 128 bits of Crockford".to_string());
     }
     if !RAILS.contains(&intent.rail.as_str()) {
@@ -1313,7 +1250,6 @@ pub async fn filed_application(
     // One review email per application, not per intent: the journal is the
     // record and it is written before the send, so a crash loses an email
     // rather than sending two.
-    let token = &intent.application.status_token;
     if journal.application_seen(token, "application", "review-sent") {
         // The line is the settlement; a crash left only the file.
         return Ok(Settlement::nothing());
@@ -1338,7 +1274,8 @@ pub async fn filed_application(
         "onboard",
         &format!(
             "application filed ({}, {})",
-            intent.application.username, intent.application.status_token
+            intent.application.username,
+            intent.application.status_token.as_deref().unwrap_or("")
         ),
     );
     let body = review_body(cfg, key, &intent)?;
@@ -1351,7 +1288,11 @@ pub async fn filed_application(
 /// The review email's body. Every field the ticket lists, and the three links
 /// beside their `kyriakon-onboardctl` equivalents.
 fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String, String> {
-    let token = &intent.application.status_token;
+    let token = intent
+        .application
+        .status_token
+        .as_deref()
+        .ok_or("the application intent names no status token")?;
     let mut out = String::new();
     out.push_str(&format!("Application {}\n", intent.application.username));
     out.push_str(&format!(
@@ -1468,7 +1409,11 @@ async fn approve(
     intent: &DecisionIntent,
     no_charge: bool,
 ) -> Result<Settlement, String> {
-    let token = &intent.application.status_token;
+    let token = intent
+        .application
+        .status_token
+        .as_deref()
+        .ok_or("the decision names no status token")?;
     let username = &intent.application.username;
     let record = application_record(store, token).await?;
     if record.username != *username {
@@ -1872,10 +1817,10 @@ pub async fn resend(
         .and_then(|copy| serde_json::from_str::<Value>(&copy).ok())
         .and_then(|copy| {
             let status_token = copy.get("status_token")?.as_str()?.to_string();
-            Some(ApplicationRef {
-                username: username.to_string(),
+            Some(ApplicationRef::application(
+                username.to_string(),
                 status_token,
-            })
+            ))
         })
         .ok_or_else(|| format!("no application record for {username}"))?;
     Ok(Settlement::line("applied", application, None))
@@ -1949,15 +1894,12 @@ pub async fn window_extend(
         .await?
         .and_then(|copy| serde_json::from_str::<Value>(&copy).ok())
         .and_then(|copy| {
-            Some(ApplicationRef {
-                username: username.clone(),
-                status_token: copy.get("status_token")?.as_str()?.to_string(),
-            })
+            Some(ApplicationRef::application(
+                username.clone(),
+                copy.get("status_token")?.as_str()?.to_string(),
+            ))
         })
-        .unwrap_or_else(|| ApplicationRef {
-            username: username.clone(),
-            status_token: String::new(),
-        });
+        .unwrap_or_else(|| ApplicationRef::account(username.clone()));
     Ok(Settlement::line(
         "applied",
         application.clone(),
@@ -2005,10 +1947,7 @@ async fn extend_group_window(
     }
     Ok(Settlement::line(
         "applied",
-        ApplicationRef {
-            username: group.site_owner.clone(),
-            status_token: domain.to_string(),
-        },
+        ApplicationRef::group(group.site_owner.clone(), domain.to_string()),
         Some(format!(
             "the group's window now closes on {}",
             &new_close[..10.min(new_close.len())]
@@ -2501,10 +2440,7 @@ async fn delete_group(
     if journal.has(id, "applied") {
         return remove_group_record(store, &group.domain).await;
     }
-    let application = ApplicationRef {
-        username: group.site_owner.clone(),
-        status_token: group.domain.clone(),
-    };
+    let application = ApplicationRef::group(group.site_owner.clone(), group.domain.clone());
     if !journal.has(id, "applying") {
         write_journal(
             store,
@@ -2656,10 +2592,7 @@ pub async fn credit(
     // any other check, so a replay cannot refuse itself on a rule it already met.
     if ledger_has_intent(store, &intent.id).await? || held_has_intent(store, &intent.id).await? {
         return Ok(Settlement::applied(
-            ApplicationRef {
-                username: String::new(),
-                status_token: String::new(),
-            },
+            ApplicationRef::default(),
             Some("replayed: the ledger already holds this credit".to_string()),
         ));
     }
@@ -2850,10 +2783,7 @@ async fn apply_payment(
         // page behind; the account is the truth now, so rewrite them from it.
         write_payment_copy(store, username, &payment).await?;
         return Ok(Settlement::applied(
-            ApplicationRef {
-                username: username.to_string(),
-                status_token: String::new(),
-            },
+            ApplicationRef::account(username.to_string()),
             override_note(intent.override_reason.as_deref()),
         ));
     }
@@ -3050,10 +2980,7 @@ async fn apply_payment(
     .await?;
 
     Ok(Settlement::applied(
-        ApplicationRef {
-            username: username.to_string(),
-            status_token: String::new(),
-        },
+        ApplicationRef::account(username.to_string()),
         override_note(override_reason),
     ))
 }
@@ -3117,10 +3044,7 @@ async fn group_credit(
             .await?;
         }
         return Ok(Settlement::applied(
-            ApplicationRef {
-                username: group.site_owner.clone(),
-                status_token: String::new(),
-            },
+            ApplicationRef::account(group.site_owner.clone()),
             override_note(intent.override_reason.as_deref()),
         ));
     }
@@ -3261,10 +3185,7 @@ async fn group_credit(
     )
     .await?;
     Ok(Settlement::applied(
-        ApplicationRef {
-            username: group.site_owner.clone(),
-            status_token: String::new(),
-        },
+        ApplicationRef::account(group.site_owner.clone()),
         override_note(override_reason),
     ))
 }
@@ -3388,10 +3309,7 @@ pub async fn refund(
         }
         if ledger_settled_by(store, &intent.id).await? {
             return Ok(Settlement::applied(
-                ApplicationRef {
-                    username: String::new(),
-                    status_token: String::new(),
-                },
+                ApplicationRef::default(),
                 Some("replayed: the ledger already records this settlement".to_string()),
             ));
         }
@@ -3402,10 +3320,7 @@ pub async fn refund(
     // intent finds it and stops before any check it already met.
     if ledger_has_intent(store, &intent.id).await? {
         return Ok(Settlement::applied(
-            ApplicationRef {
-                username: String::new(),
-                status_token: String::new(),
-            },
+            ApplicationRef::default(),
             Some("replayed: the ledger already holds this refund".to_string()),
         ));
     }
@@ -3596,10 +3511,7 @@ pub async fn refund(
     };
     Ok(Settlement::line(
         "applied",
-        ApplicationRef {
-            username: username.clone(),
-            status_token: String::new(),
-        },
+        ApplicationRef::account(username.clone()),
         Some(note.clone()),
     )
     .with_after(printed))
@@ -3731,10 +3643,7 @@ async fn refund_group(
     };
     Ok(Settlement::line(
         "applied",
-        ApplicationRef {
-            username: group.site_owner.clone(),
-            status_token: group.domain.clone(),
-        },
+        ApplicationRef::group(group.site_owner.clone(), group.domain.clone()),
         Some(note.clone()),
     )
     .with_after(printed))
@@ -3908,10 +3817,7 @@ async fn settle_refund(
 
     Ok(Settlement::line(
         "applied",
-        ApplicationRef {
-            username: String::new(),
-            status_token: String::new(),
-        },
+        ApplicationRef::default(),
         Some(format!(
             "refund at ledger seq {seq} settled on {settled_on}"
         )),
@@ -3983,10 +3889,7 @@ async fn hold(
         .await?;
     Ok(Settlement::line(
         "applied",
-        ApplicationRef {
-            username: String::new(),
-            status_token: String::new(),
-        },
+        ApplicationRef::default(),
         Some("held: the payment carries no token".to_string()),
     ))
 }
@@ -4021,10 +3924,7 @@ pub async fn reconcile_attribute(
             .map(|join| join.username)
             .unwrap_or_default();
         return Ok(Settlement::applied(
-            ApplicationRef {
-                username,
-                status_token: String::new(),
-            },
+            ApplicationRef::account(username),
             override_note(intent.override_reason.as_deref()),
         ));
     }
@@ -4163,14 +4063,7 @@ pub async fn reconcile_return(store: &Store, intent: ReturnIntent) -> Result<Set
         Ok(())
     })
     .await?;
-    Ok(Settlement::line(
-        "applied",
-        ApplicationRef {
-            username: String::new(),
-            status_token: String::new(),
-        },
-        None,
-    ))
+    Ok(Settlement::line("applied", ApplicationRef::default(), None))
 }
 
 /// Mark one held line attributed to a token. Idempotent for the replay path, and
@@ -4314,10 +4207,7 @@ async fn journal_credit_applying(
         intent: intent.id.clone(),
         kind: intent.kind.clone(),
         release: release.to_string(),
-        application: ApplicationRef {
-            username: username.to_string(),
-            status_token: String::new(),
-        },
+        application: ApplicationRef::account(username.to_string()),
         outcome: "applying".to_string(),
         note: None,
         credit: Some(progress.clone()),
@@ -4527,10 +4417,10 @@ async fn approve_group(
         id: String::new(),
         kind: String::new(),
         filed_at: String::new(),
-        application: ApplicationRef {
-            username: record.username.clone(),
-            status_token: record.status_token.clone(),
-        },
+        application: ApplicationRef::application(
+            record.username.clone(),
+            record.status_token.clone(),
+        ),
         domain: domain.clone(),
         name,
         body_kind,
@@ -4578,13 +4468,11 @@ async fn approve_group(
         .map_err(|e| format!("the intent this pass filed does not parse: {e}"))?;
     let filed = crate::intents::Intent::parse(&value)?;
     // The provision-group arm verifies or fails; it has no refusal of its own,
-    // because the signature it checks is the one this pass just made.
-    filed
-        .verify(cfg, store, journal, key, &filename, &value)
-        .await?;
+    // because the signature it checks is the one this pass just made. `run` is
+    // the seam the next pass would use, so the line and the remove are its.
     // Boxed: this file's own approval path reaches `apply`, which reaches the
     // group transition, so the future would otherwise be infinitely sized.
-    Box::pin(filed.apply(cfg, store, journal, key, &filename, &value)).await?;
+    Box::pin(filed.run(cfg, store, journal, key, &filename, &value)).await?;
 
     // The body's approval notice: the recipe is the whole point of it, because
     // mail and the website do not work until the body has published the records
@@ -4977,7 +4865,15 @@ pub async fn provision_group(
         )?;
     }
 
-    let app_copy = application_copy(store, &intent.application.status_token).await?;
+    let app_copy = application_copy(
+        store,
+        intent
+            .application
+            .status_token
+            .as_deref()
+            .ok_or("the group intent names no application token")?,
+    )
+    .await?;
 
     // Every account and its keyring entry first. The public publish is a network
     // call to the forge, and it runs in a second loop so a forge outage cannot
@@ -5548,10 +5444,7 @@ pub async fn suspend(
     // The id is the account's own, so a retry after a crash finishes the same
     // suspension rather than starting a second one.
     let id = format!("suspend-{username}-{}", account.created_at);
-    let application = ApplicationRef {
-        username: username.to_string(),
-        status_token: String::new(),
-    };
+    let application = ApplicationRef::account(username.to_string());
     if !journal.has(&id, "applying") {
         write_journal(
             store,
@@ -5640,10 +5533,7 @@ pub async fn resume(
         ));
     }
     let id = format!("resume-{username}-{}", account.created_at);
-    let application = ApplicationRef {
-        username: username.to_string(),
-        status_token: String::new(),
-    };
+    let application = ApplicationRef::account(username.to_string());
     write_journal(
         store,
         journal,
@@ -5725,10 +5615,7 @@ pub async fn delete_account(
     if journal.has(&id, "applied") {
         return Ok(());
     }
-    let application = ApplicationRef {
-        username: username.to_string(),
-        status_token: String::new(),
-    };
+    let application = ApplicationRef::account(username.to_string());
     if !journal.has(&id, "applying") {
         write_journal(
             store,
@@ -5848,10 +5735,7 @@ pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlem
     if intent.kind != "close" {
         return Err(format!("kind {:?} is not a close intent", intent.kind));
     }
-    let application = ApplicationRef {
-        username: intent.username.clone(),
-        status_token: String::new(),
-    };
+    let application = ApplicationRef::account(intent.username.clone());
     let Some(mut account) = store.account(&intent.username).await? else {
         // The account the handler authenticated has already gone. That is a
         // closed request, not new work.
@@ -5900,88 +5784,9 @@ pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlem
 /// gone. The file goes with it, because there is nothing left to act on.
 fn account_gone(username: &str) -> Settlement {
     Settlement::applied(
-        ApplicationRef {
-            username: username.to_string(),
-            status_token: String::new(),
-        },
+        ApplicationRef::account(username.to_string()),
         Some("the account had already gone".to_string()),
     )
-}
-
-/// A page action's refusal: the handler validated it on the way in, so a
-/// refusal here means the intent's own fields got something wrong, and the file
-/// goes with the line rather than waiting for the operator.
-fn refused_page(username: &str, reason: impl ToString) -> Settlement {
-    Settlement::line(
-        "refused",
-        ApplicationRef {
-            username: username.to_string(),
-            status_token: String::new(),
-        },
-        Some(reason.to_string()),
-    )
-}
-
-/// Journal one page action and remove its file, for the paths with nothing left
-/// to do. `None` is the caller's signal that the intent is settled.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn settle_page(
-    cfg: &DrainConfig,
-    store: &Store,
-    journal: &Journal,
-    id: &str,
-    kind: &str,
-    username: &str,
-    file: &str,
-    outcome: &str,
-    note: Option<&str>,
-) -> Result<Option<Account>, String> {
-    let application = ApplicationRef {
-        username: username.to_string(),
-        status_token: String::new(),
-    };
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        id,
-        kind,
-        &application,
-        outcome,
-        note,
-    )
-    .await?;
-    store.remove("intents", file).await?;
-    Ok(None)
-}
-
-/// Refuse one page action with its reason, record that it was refused, and
-/// remove it: the handler validated it on the way in, so a refusal here is
-/// something the intent's own fields get wrong rather than a state to retry.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn refuse_page(
-    cfg: &DrainConfig,
-    store: &Store,
-    journal: &Journal,
-    id: &str,
-    kind: &str,
-    username: &str,
-    file: &str,
-    reason: &str,
-) -> Result<(), String> {
-    settle_page(
-        cfg,
-        store,
-        journal,
-        id,
-        kind,
-        username,
-        file,
-        "refused",
-        Some(reason),
-    )
-    .await?;
-    Ok(())
 }
 
 /// Write an account record back, readable by the handler and owned the way the
@@ -6012,26 +5817,23 @@ pub async fn change_password(
     let mut plain = intent.password;
     if let Err(why) = crate::password::validate(&plain) {
         unsafe { plain.as_mut_vec().fill(0) };
-        return Ok(refused_page(&intent.username, &why));
+        return Ok(Settlement::refused(&why));
     }
     let made = crate::password::make(&plain);
     unsafe { plain.as_mut_vec().fill(0) };
     let hash = match made {
         Ok(hash) if crate::password::is_hash(&hash) => hash,
         Ok(_) => {
-            return Ok(refused_page(&intent.username, "the password did not hash"));
+            return Ok(Settlement::refused("the password did not hash"));
         }
         Err(e) => {
-            return Ok(refused_page(&intent.username, &e));
+            return Ok(Settlement::refused(&e));
         }
     };
     run_script(cfg, "set-mail-password.sh", &[&account.username, &hash]).await?;
     Ok(Settlement::line(
         "applied",
-        ApplicationRef {
-            username: account.username.clone(),
-            status_token: String::new(),
-        },
+        ApplicationRef::account(account.username.clone()),
         Some(
             "the stored hash is replaced, so the old password no longer authenticates".to_string(),
         ),
@@ -6054,14 +5856,10 @@ pub async fn upload_key(
     match intent.action.as_str() {
         "add" => {
             if let Err(why) = crate::keycheck::openssh_public_key(&intent.material) {
-                return Ok(refused_page(
-                    &intent.username,
-                    format!("the upload key: {why}"),
-                ));
+                return Ok(Settlement::refused(format!("the upload key: {why}")));
             }
             let Some(fingerprint) = crate::keycheck::openssh_fingerprint(&intent.material) else {
-                return Ok(refused_page(
-                    &intent.username,
+                return Ok(Settlement::refused(
                     "the upload key carries no key material",
                 ));
             };
@@ -6102,10 +5900,7 @@ pub async fn upload_key(
                 .iter()
                 .any(|key| key.fingerprint == intent.fingerprint)
             {
-                return Ok(refused_page(
-                    &intent.username,
-                    "that key is not on the account",
-                ));
+                return Ok(Settlement::refused("that key is not on the account"));
             }
             store
                 .remove("keys", &format!("{}.pub", account.username))
@@ -6114,19 +5909,15 @@ pub async fn upload_key(
             account.upload_keys.clear();
         }
         other => {
-            return Ok(refused_page(
-                &intent.username,
-                format!("{other:?} is not an upload-key action"),
-            ))
+            return Ok(Settlement::refused(format!(
+                "{other:?} is not an upload-key action"
+            )))
         }
     }
     save_account(store, &account).await?;
     Ok(Settlement::line(
         "applied",
-        ApplicationRef {
-            username: account.username.clone(),
-            status_token: String::new(),
-        },
+        ApplicationRef::account(account.username.clone()),
         Some(format!("the upload key was {}", intent.action)),
     ))
 }
@@ -6146,10 +5937,9 @@ pub async fn set_outside_address(
         None
     } else {
         if let Some(why) = validate::address(address) {
-            return Ok(refused_page(
-                &intent.username,
-                format!("the address outside the platform {address:?}: {why}"),
-            ));
+            return Ok(Settlement::refused(format!(
+                "the address outside the platform {address:?}: {why}"
+            )));
         }
         Some(address.to_string())
     };
@@ -6162,10 +5952,7 @@ pub async fn set_outside_address(
     save_account(store, &account).await?;
     Ok(Settlement::line(
         "applied",
-        ApplicationRef {
-            username: account.username.clone(),
-            status_token: String::new(),
-        },
+        ApplicationRef::account(account.username.clone()),
         Some(note.to_string()),
     ))
 }
@@ -6221,10 +6008,7 @@ pub async fn set_serving(
     save_account(store, &account).await?;
     Ok(Settlement::line(
         "applied",
-        ApplicationRef {
-            username: account.username.clone(),
-            status_token: String::new(),
-        },
+        ApplicationRef::account(account.username.clone()),
         Some(format!(
             "serving is http {} and gemini {}",
             intent.http, intent.gemini
@@ -6244,14 +6028,12 @@ pub async fn cancel_renewal(
         return Ok(account_gone(&intent.username));
     };
     let Some(payment) = account.payment.as_mut() else {
-        return Ok(refused_page(
-            &intent.username,
+        return Ok(Settlement::refused(
             "the account has no card subscription to cancel",
         ));
     };
     let Some(subscription) = payment.stripe.subscription.clone() else {
-        return Ok(refused_page(
-            &intent.username,
+        return Ok(Settlement::refused(
             "the account has no card subscription to cancel",
         ));
     };
@@ -6267,10 +6049,7 @@ pub async fn cancel_renewal(
     }
     Ok(Settlement::line(
         "applied",
-        ApplicationRef {
-            username: account.username.clone(),
-            status_token: String::new(),
-        },
+        ApplicationRef::account(account.username.clone()),
         Some("the subscription stops renewing at the end of the period".to_string()),
     ))
 }
@@ -6390,10 +6169,7 @@ pub async fn mail_key(
     let Some(mut account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
-    let application = ApplicationRef {
-        username: account.username.clone(),
-        status_token: String::new(),
-    };
+    let application = ApplicationRef::account(account.username.clone());
     match intent.action.as_str() {
         "cancel" => {
             let Some(cancelled) = account.rotation.as_ref().map(|r| r.fingerprint.clone()) else {
@@ -6426,38 +6202,27 @@ pub async fn mail_key(
         }
         "replace" => {
             if let Err(why) = crate::keycheck::pgp_public_key(&intent.material) {
-                return Ok(refused_page(
-                    &intent.username,
-                    format!("the mail key: {why}"),
-                ));
+                return Ok(Settlement::refused(format!("the mail key: {why}")));
             }
             let Some(fingerprint) = crate::keycheck::pgp_fingerprint(&intent.material) else {
-                return Ok(refused_page(
-                    &intent.username,
-                    "the mail key carries no key packet",
-                ));
+                return Ok(Settlement::refused("the mail key carries no key packet"));
             };
             if account.mail_key.as_deref() == Some(fingerprint.as_str()) {
-                return Ok(refused_page(
-                    &intent.username,
-                    "that is the key already in use",
-                ));
+                return Ok(Settlement::refused("that is the key already in use"));
             }
             let key_file = crate::keycheck::keyring_file(&cfg.keyring_dir, &account.username);
             let signed = if intent.signature.trim().is_empty() {
                 false
             } else {
                 if !key_file.is_file() {
-                    return Ok(refused_page(
-                        &intent.username,
+                    return Ok(Settlement::refused(
                         "the box holds no current key to verify a signature against",
                     ));
                 }
                 match signed_by_current_key(cfg, &key_file, &fingerprint, &intent.signature).await {
                     Ok(true) => true,
                     Ok(false) => {
-                        return Ok(refused_page(
-                            &intent.username,
+                        return Ok(Settlement::refused(
                             "the signature does not verify against the key in use",
                         ))
                     }
@@ -6511,10 +6276,9 @@ pub async fn mail_key(
                 ),
             ))
         }
-        other => Ok(refused_page(
-            &intent.username,
-            format!("{other:?} is not a mail-key action"),
-        )),
+        other => Ok(Settlement::refused(format!(
+            "{other:?} is not a mail-key action"
+        ))),
     }
 }
 
@@ -6539,10 +6303,7 @@ pub async fn mail_key_rotations(
             continue;
         }
         let id = format!("rotation-{}", rotation.fingerprint);
-        let application = ApplicationRef {
-            username: username.clone(),
-            status_token: String::new(),
-        };
+        let application = ApplicationRef::account(username.clone());
         if !journal.has(&id, "applying") {
             write_journal(
                 store,
@@ -6756,10 +6517,7 @@ pub async fn group_address(
         _ => unreachable!("the action was checked against ADDRESS_ACTIONS"),
     }
 
-    let application = ApplicationRef {
-        username: intent.mailbox.clone(),
-        status_token: intent.domain.clone(),
-    };
+    let application = ApplicationRef::group(intent.mailbox.clone(), intent.domain.clone());
     write_journal(
         store,
         journal,
@@ -6927,10 +6685,7 @@ pub async fn remove_group(
             intent.domain
         ));
     };
-    let application = ApplicationRef {
-        username: group.site_owner.clone(),
-        status_token: intent.domain.clone(),
-    };
+    let application = ApplicationRef::group(group.site_owner.clone(), intent.domain.clone());
     if !journal.has(&intent.id, "applying") {
         write_journal(
             store,
@@ -7024,7 +6779,11 @@ async fn decline(
     journal: &Journal,
     intent: &DecisionIntent,
 ) -> Result<Settlement, String> {
-    let token = &intent.application.status_token;
+    let token = intent
+        .application
+        .status_token
+        .as_deref()
+        .ok_or("the decision names no status token")?;
     let username = &intent.application.username;
     let record = application_record(store, token).await?;
     if record.username != *username {
@@ -7802,10 +7561,7 @@ pub async fn export_account(
         })
         .unwrap_or_default();
     let bundle = crate::export::deliver(cfg, store, username).await?;
-    let application = ApplicationRef {
-        username: username.to_string(),
-        status_token,
-    };
+    let application = ApplicationRef::application(username.to_string(), status_token);
     Ok(Settlement::line(
         "applied",
         application.clone(),
@@ -7851,10 +7607,7 @@ pub async fn purge_declined(
             );
             continue;
         }
-        let app = ApplicationRef {
-            username: record.username.clone(),
-            status_token: record.status_token.clone(),
-        };
+        let app = ApplicationRef::application(record.username.clone(), record.status_token.clone());
         let purge_id = format!("purge-{}", record.status_token);
         // A purge that keeps failing backs off, and its error is mailed once,
         // through the same rule the intents use.
@@ -10197,10 +9950,7 @@ mod tests {
                     async {
                         Ok(Settlement::line(
                             "already-decided",
-                            ApplicationRef {
-                                username: "secretary".to_string(),
-                                status_token: String::new(),
-                            },
+                            ApplicationRef::account("secretary".to_string()),
                             None,
                         ))
                     },

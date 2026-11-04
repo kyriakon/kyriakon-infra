@@ -207,7 +207,7 @@ pub fn group_provision_payload(intent: &crate::store::GroupIntent) -> String {
         free_text(&intent.upload_key),
         free_text(&mail_keys),
         free_text(&intent.application.username),
-        free_text(&intent.application.status_token),
+        free_text(intent.application.status_token.as_deref().unwrap_or("")),
     )
 }
 
