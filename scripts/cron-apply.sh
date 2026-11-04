@@ -91,10 +91,33 @@ env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
 install_set="$script_dir/install-set.tsv"
 needed_vars="ALERT_EMAIL HEALTHCHECKS_URL KEYRING_HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL"
 
-# scheduled_scripts <table> — the /root/bin rows that have a schedule. A row whose
-# schedule is `-` is a helper the other scripts source, which cron never runs.
+# row_dir <destination> — where the box reads that destination's scripts from at
+# run time. This is the one place the destinations are named: only the two cron
+# runs itself have a directory, because a drain row is installed by
+# scripts/deploy-onboard.sh into the directory the drain's config names.
+row_dir() {
+	case "$1" in
+	/root/bin) printf '/root/bin' ;;
+	checkout) printf '%s/scripts' "$repo_dir" ;;
+	*) return 1 ;;
+	esac
+}
+
+# scheduled_scripts <table> — the rows that have a schedule, one name per line.
+# A row whose schedule is `-` is a helper the other scripts source, which cron
+# never runs. A scheduled row whose destination has no directory is refused here,
+# once, rather than becoming a line that cannot run.
 scheduled_scripts() {
-	awk -F'\t' '!/^#/ && $2 == "/root/bin" && $3 != "-" { print $1 }' "$1"
+	typeset name dest
+	awk -F'\t' '!/^#/ && $3 != "-" { print $1 "\t" $2 }' "$1" |
+		while IFS="$(printf '\t')" read -r name dest; do
+			row_dir "$dest" >/dev/null || {
+				printf 'cron-apply: %s is scheduled for %s, which no cron line can read\n' \
+					"$name" "$dest" >&2
+				exit 1
+			}
+			printf '%s\n' "$name"
+		done
 }
 
 # The onboarding drain is a compiled binary, not one of the /root/bin shell
@@ -107,41 +130,66 @@ scheduled_scripts() {
 # the decision out.
 drain_bin=/usr/local/sbin/kyriakon-onboard-drain
 
+# Where the checkout's own scripts are read from. A `checkout` row is run from
+# there rather than installed: self-test-all.sh runs the scripts beside it and
+# check-hygiene.sh reports on the tree it is in, so neither has an installed copy
+# to drift from.
+repo_dir=/usr/local/src/kyriakon-infra
+
 # The crontab line for one script. Built per script rather than as one block: a
 # block would duplicate the lines of scripts that are already
 # scheduled, which is what the first real run did, leaving the backup and the
 # renewal running twice.
 #
-# An installed script's schedule and arguments are its install-set row, so the
-# pull request that changes either is the review of the same line the deploy and
-# the hygiene check read. The three that are not rows each get a line here: one
-# file installed under its own row's name is what the table carries, and these
-# are a compiled binary and the two checks cron runs from the checkout.
+# An installed script's destination, schedule and arguments are its install-set
+# row, so the pull request that changes any of them is the review of the same
+# line the deploys and the hygiene check read. The drain is the one line that is
+# not a row: it is a compiled binary.
+#
+# A checkout row is read from the tree, and cron mails only what a job prints, so
+# its line throws a clean run away and names the script when it fails.
 line_for() {
-	typeset name="$1" row sched args
+	typeset name="$1" row dest sched args dir
 	case "$name" in
-	# The two checks that watch the box rather than run it. They live in the
-	# checkout and are read from there, because self-test-all.sh runs the scripts
-	# beside it and the drain's copies are not all there. Both are weekly and an
-	# hour apart, so a failure is one mail and not a pile.
-	# A clean run prints nothing, so cron mails nothing; a failing one prints the
-	# line that says where the detail is.
-	check-hygiene.sh) printf '30 4 * * 1 . /root/.kyriakon-env; ksh /usr/local/src/kyriakon-infra/scripts/check-hygiene.sh >/dev/null || printf "check-hygiene found something; run it as root for the detail\\n"\n' ;;
-	self-test-all.sh) printf '0 5 * * 1 . /root/.kyriakon-env; ksh /usr/local/src/kyriakon-infra/scripts/self-test-all.sh >/dev/null || printf "a self-test failed; run scripts/self-test-all.sh for the detail\\n"\n' ;;
 	# The env file sets PATH, and the drain's scripts need the packages in
 	# /usr/local: without it, cron-apply.sh inside a provision cannot find gmid,
 	# refuses to reload, and fails the whole approval.
 	kyriakon-onboard-drain) printf '* * * * * . /root/.kyriakon-env; %s\n' "$drain_bin" ;;
 	*)
 		row=$(awk -F'\t' -v n="$name" \
-			'!/^#/ && $1 == n && $2 == "/root/bin" { print; exit }' "$install_set")
+			'!/^#/ && $1 == n && $3 != "-" { print; exit }' "$install_set")
 		[ -n "$row" ] || return 1
+		dest=$(printf '%s\n' "$row" | cut -f2)
 		sched=$(printf '%s\n' "$row" | cut -f3)
-		[ "$sched" != '-' ] || return 1
 		args=$(printf '%s\n' "$row" | cut -f4)
-		printf '%s . /root/.kyriakon-env; /root/bin/%s%s\n' "$sched" "$name" "${args:+ $args}"
+		dir=$(row_dir "$dest") || return 1
+		if [ "$dest" = checkout ]; then
+			# A checkout script is read from the tree. A passing run says
+			# nothing to cron, so its output is captured and printed only when
+			# it fails, followed by the command that produced it: the mail
+			# carries the finding, not just that there was one.
+			# shellcheck disable=SC2016 # $out and the escapes are for the cron
+			# shell; crontab(5) ends the command at an unescaped %, so every one
+			# that must reach printf is written \% here.
+			printf '%s . /root/.kyriakon-env; out=$(ksh %s/%s%s 2>&1) || printf "\\%%s\\n\\%%s\\n" "$out" "%s failed; run: ksh %s/%s"\n' \
+				"$sched" "$dir" "$name" "${args:+ $args}" "$name" "$dir" "$name"
+		else
+			printf '%s . /root/.kyriakon-env; %s/%s%s\n' "$sched" "$dir" "$name" "${args:+ $args}"
+		fi
 		;;
 	esac
+}
+
+# script_path <name> — where the box reads that script from at run time, which is
+# what the install check and the crontab dedupe compare against. A drain row is
+# installed into a directory its own config names, not one this can know, and is
+# not scheduled from the table, so it has no path here.
+script_path() {
+	typeset row dir
+	row=$(awk -F'\t' -v n="$1" '!/^#/ && $1 == n { print; exit }' "$install_set") || return 1
+	[ -n "$row" ] || return 1
+	dir=$(row_dir "$(printf '%s\n' "$row" | cut -f2)") || return 1
+	printf '%s/%s\n' "$dir" "$1"
 }
 
 die() {
@@ -157,7 +205,9 @@ die() {
 # files and never reads the table: a missing table must not fail the pass the
 # drain asks for, and the installed copy finds its table beside itself.
 read_scheduled_scripts() {
-	needed_scripts=$(scheduled_scripts "$install_set") || die "cannot read $install_set"
+	[ -f "$install_set" ] || die "cannot read $install_set"
+	needed_scripts=$(scheduled_scripts "$install_set") \
+		|| die "$install_set has a scheduled row no cron line can run"
 	[ -n "$needed_scripts" ] || die "$install_set names no scheduled script"
 }
 
@@ -640,8 +690,52 @@ EOF
 		"$(line_for check-hygiene.sh | grep -c 'scripts/check-hygiene.sh')" 1
 	check "and the self-test runner has one" \
 		"$(line_for self-test-all.sh | grep -c 'scripts/self-test-all.sh')" 1
+	# shellcheck disable=SC2016 # the generated line is what is matched
 	check "a clean weekly run prints nothing to cron" \
-		"$(line_for check-hygiene.sh | grep -c '>/dev/null')" 1
+		"$(line_for check-hygiene.sh | grep -c 'out=$(ksh')" 1
+	# shellcheck disable=SC2016 # as above
+	check "and a failing one keeps its output in the mail" \
+		"$(line_for check-hygiene.sh | grep -cF '"$out"')" 1
+	# crontab(5) ends the command at the first unescaped %, so every percent
+	# that has to reach printf is rendered as \%. A line with a bare one runs a
+	# truncated printf and the mail is a syntax error instead of a finding.
+	check "no unescaped percent reaches the crontab" \
+		"$(line_for check-hygiene.sh | grep -c '[^\\]%')" 0
+	check "and the percents printf needs are escaped" \
+		"$(line_for check-hygiene.sh | grep -oF '\%s' | wc -l | tr -d ' ')" 2
+	check "and does not throw the run away" \
+		"$(line_for check-hygiene.sh | grep -c '>/dev/null')" 0
+	# Both are rows rather than arms here, so the table is what decides they are
+	# scheduled and where they are read from.
+	check "the checkout scripts are the table's checkout rows" \
+		"$(install_rows "$install_set" checkout | paste -sd ' ' -)" \
+		"check-hygiene.sh self-test-all.sh"
+	check "a checkout row's schedule comes from the row" \
+		"$(line_for self-test-all.sh | cut -d' ' -f1-5)" '0 5 * * 1'
+	check "and its path is the checkout's scripts" \
+		"$(script_path check-hygiene.sh)" "$repo_dir/scripts/check-hygiene.sh"
+	got=0
+	script_path kyriakon-onboard-drain >/dev/null || got=$?
+	check "a name with no scheduled row has no path" "$got" 1
+
+	# A checkout row with arguments carries them, the same way an installed
+	# row's do, and the failure line names the command that ran.
+	printf 'probe.sh\tcheckout\t0 5 * * 1\t--box\n' > "$tree/checkout-args.tsv"
+	install_set="$tree/checkout-args.tsv"
+	check "a checkout row's arguments reach the line" \
+		"$(line_for probe.sh | grep -cF 'scripts/probe.sh --box')" 1
+	check "and the failure names the command" \
+		"$(line_for probe.sh | grep -cF "ksh $repo_dir/scripts/probe.sh --box")" 1
+	# A row scheduled for a destination no cron line can read is refused here,
+	# rather than becoming a line that cannot run.
+	printf 'probe.sh\tdrain\t0 5 * * 1\n' > "$tree/mixed.tsv"
+	got=0
+	( scheduled_scripts "$tree/mixed.tsv" ) > "$tree/mixed.out" 2>&1 || got=$?
+	check "a scheduled drain row is refused" \
+		"$([ "$got" -ne 0 ] && printf yes || printf no)" yes
+	check "and names the row and its destination" \
+		"$(grep -c 'probe.sh is scheduled for drain' "$tree/mixed.out")" 1
+	install_set="$script_dir/install-set.tsv"
 
 	# An installed script's line is its install-set row, so the row's schedule and
 	# arguments have to reach the crontab unchanged, and a row that has neither a
@@ -721,8 +815,9 @@ to_add=""
 pending=$(mktemp)
 : >"$pending"
 for s in $needed_scripts; do
-	[ -f "/root/bin/$s" ] || missing_scripts="$missing_scripts $s"
-	if ! printf '%s\n' "$current" | grep -q "bin/$s"; then
+	path=$(script_path "$s") || die "$install_set names $s for no destination this schedules"
+	[ -f "$path" ] || missing_scripts="$missing_scripts $s"
+	if ! printf '%s\n' "$current" | grep -qF "$path"; then
 		to_add="$to_add $s"
 		line_for "$s" >>"$pending"
 	fi
@@ -739,19 +834,6 @@ if ! printf '%s\n' "$current" | grep -qF "$drain_bin"; then
 	line_for kyriakon-onboard-drain >>"$pending"
 fi
 
-# The two checks that run from the checkout rather than /root/bin:
-# self-test-all.sh runs the scripts beside it, and check-hygiene reports on the
-# checkout it is in. Their lines name that path on purpose, so the install check
-# above does not apply to them; the dedupe does.
-repo_dir=/usr/local/src/kyriakon-infra
-for s in check-hygiene.sh self-test-all.sh; do
-	[ -f "$repo_dir/scripts/$s" ] || missing_scripts="$missing_scripts $s"
-	if ! printf '%s\n' "$current" | grep -qF "scripts/$s"; then
-		to_add="$to_add $s"
-		line_for "$s" >>"$pending"
-	fi
-done
-
 if [ -n "$missing_scripts" ]; then
 	printf 'not installed:%s\n' "$missing_scripts"
 fi
@@ -763,9 +845,6 @@ if [ -z "$to_add" ]; then
 		line_for "$s"
 	done
 	line_for kyriakon-onboard-drain
-	for s in check-hygiene.sh self-test-all.sh; do
-		line_for "$s"
-	done
 	exit 0
 fi
 printf 'to be added:%s\n' "$to_add"

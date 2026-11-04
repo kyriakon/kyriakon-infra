@@ -54,6 +54,11 @@ export PATH
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 
+# cert_paths: the same three files the relay deploy and the member pass make, so
+# the removal cannot miss one under a name of its own.
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
+
 usage() {
 	printf 'usage: doas ksh %s <username>\n' "$0" >&2
 	printf '       doas ksh %s --show <username>\n' "$0" >&2
@@ -128,6 +133,7 @@ would() {
 }
 
 # remove_member: the whole job, in the spec's order.
+# shellcheck disable=SC2154 # cert_chain and cert_key come from cert_paths in lib.sh
 remove_member() {
 	did=no
 	reindex=no
@@ -181,7 +187,11 @@ remove_member() {
 	# shared capsule pair stays, and so does the certificate itself, which is
 	# left to expire rather than revoked: revocation is an act with a rate limit
 	# and nothing promises it.
-	for f in "$ssl_dir/$user.kyriakon.net.fullchain.pem" "$ssl_private/$user.kyriakon.net.key"; do
+	# All three of what the relay deploy and the member pass make: a chain and
+	# key without their /etc/ssl/<name>.crt link leave a name relayd would still
+	# try to open, and remove-group.sh removes the same three.
+	cert_paths "$ssl_dir" "$ssl_private" "$user.kyriakon.net"
+	for f in "$cert_chain" "$cert_key" "$cert_link"; do
 		if would "the member's certificate material" "$f"; then
 			if [ "$show" = no ]; then
 				rm -f "$f"
@@ -329,8 +339,6 @@ remove_own_addresses() {
 # so the logic runs anywhere: no root, no account, no daemon, nothing outside
 # TMPDIR. What it checks is this script's own decisions, not the tools'.
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work
@@ -372,6 +380,7 @@ self_test() {
 	: >"$acme_d/$user.kyriakon.net.conf"
 	: >"$ssl_dir/$user.kyriakon.net.fullchain.pem"
 	: >"$ssl_private/$user.kyriakon.net.key"
+	ln -s "$user.kyriakon.net.fullchain.pem" "$ssl_dir/$user.kyriakon.net.crt"
 	{
 		printf 'alice@kyriakon.net: alice\n'
 		printf 'secretary@parish.example: alice\n'
@@ -385,6 +394,8 @@ self_test() {
 	check "the tree went" "$([ -d "$public" ] && echo present || echo gone)" gone
 	check "the member's certificate went" "$([ -e "$ssl_dir/$user.kyriakon.net.fullchain.pem" ] && echo present || echo gone)" gone
 	check "the member's key went" "$([ -e "$ssl_private/$user.kyriakon.net.key" ] && echo present || echo gone)" gone
+	check "the relayd link went with them" \
+		"$([ -L "$ssl_dir/$user.kyriakon.net.crt" ] && echo present || echo gone)" gone
 	check "the member's own address went" "$(awk '/^alice@/' "$virtuals" | wc -l | tr -d ' ')" 0
 	check "someone else's address stayed" "$(awk '/^oliver@/' "$virtuals" | wc -l | tr -d ' ')" 1
 	check "the alias into them stayed" "$(awk '/^secretary@/' "$virtuals" | wc -l | tr -d ' ')" 1

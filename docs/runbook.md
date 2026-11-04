@@ -18,7 +18,7 @@ Three paths appear throughout:
 		doas mv /root/src/kyriakon-infra /usr/local/src/kyriakon-infra
 		doas chown -R root:wheel /usr/local/src/kyriakon-infra
 		ls /usr/local/src/kyriakon-infra   # as the operator, this should list
-- `/root/bin` holds the copies that cron runs. `scripts/deploy-mail.sh` installs the `/root/bin` rows of `scripts/install-set.tsv` there, and `scripts/cron-apply.sh` writes the crontab lines that call them.
+- `/root/bin` holds the copies that cron runs. `scripts/deploy-mail.sh` installs the `/root/bin` rows of `scripts/install-set.tsv` there, and `scripts/cron-apply.sh` writes the crontab lines that call them. Two rows have the `checkout` destination instead and are run from `/usr/local/src/kyriakon-infra/scripts`: `check-hygiene.sh` and `self-test-all.sh`, which both read the tree they are in and so have no installed copy.
 - `/root/.kyriakon-env` holds the box's values, mode 0600, one `export VAR=value` per line. `scripts/setup-env.sh` installs and merges it, and every cron line sources it, so no value is typed twice.
 
 Deploy the configuration with `doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-mail.sh`. It is idempotent, it installs the mail and web configuration, it rebuilds the Dovecot plugin and the encryptor, it installs every `keys/*.asc` into the keyring, and it restarts the daemons. It prints the firewall and `sshd_config` steps instead of taking them, because both are propose-only changes that a human applies.

@@ -70,6 +70,11 @@ set -euo pipefail
 # below runs.
 umask 077
 
+# write_generated and the self-test harness, from the directory this script sits
+# in: deploy-mail.sh installs the two side by side.
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$(dirname "$0")/lib.sh"
+
 # The base system's LibreSSL, which is the openssl the runbook's step and this
 # script agree on. Named in full rather than looked up on PATH because a package
 # openssl in /usr/local is a different parser and this invocation is written for
@@ -145,17 +150,13 @@ pair_present() {
 }
 
 write_capsule_cnf() {
-	typeset target candidate
+	typeset target
 	target=$(capsule_cnf)
-	candidate="$target.new.$$"
-	capsule_cnf_body > "$candidate"
-	if [ -f "$target" ] && cmp -s "$candidate" "$target"; then
-		rm -f "$candidate"
-		return 0
+	write_generated "$target" capsule_cnf_body
+	# Only a rewrite is news: a run that found the same bytes says nothing.
+	if [ "$conf_changed" = yes ]; then
+		printf 'capsule pair: %s written\n' "$target"
 	fi
-	chmod 0644 "$candidate"
-	mv "$candidate" "$target"
-	printf 'capsule pair: %s written\n' "$target"
 	return 0
 }
 
@@ -237,22 +238,13 @@ member_conf_body() {
 # write_member_conf: the file, rewritten only when it would differ. Sets
 # conf_changed for the caller.
 write_member_conf() {
-	typeset target candidate
+	typeset target
 	target=$(member_conf)
-	candidate="$target.new.$$"
-	if ! member_conf_body > "$candidate"; then
-		rm -f "$candidate"
-		exit 1
-	fi
-	if [ -f "$target" ] && cmp -s "$candidate" "$target"; then
-		rm -f "$candidate"
-		conf_changed=no
+	write_generated "$target" member_conf_body
+	if [ "$conf_changed" = no ]; then
 		printf '%s: unchanged\n' "$target"
 		return 0
 	fi
-	chmod 0644 "$candidate"
-	mv "$candidate" "$target"
-	conf_changed=yes
 	printf 'wrote %s: %s.kyriakon.net on 1965 from %s\n' \
 		"$target" "$user" "$(capsule_cert)"
 }
@@ -296,8 +288,6 @@ assert_member_tree() {
 # TMPDIR.
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	typeset tree conf before out
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh

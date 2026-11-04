@@ -69,6 +69,9 @@ set -euo pipefail
 # rename is the one shape that cannot leave a readable half-written vhost behind.
 umask 077
 
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$(dirname "$0")/lib.sh"
+
 httpd_d=/etc/httpd.d
 ssl_dir=/etc/ssl
 ssl_private=/etc/ssl/private
@@ -128,7 +131,9 @@ member_conf_body() {
 	# The block behind the relay, only once the member's certificate is there: the
 	# relay presents what /etc/relayd.conf names, and a name it has no keypair for
 	# is answered with the default certificate.
-	[ -f "$(cert_file)" ] || return 0
+	# -s, not -f: an empty chain is an interrupted acme-client write, and the
+	# relay cannot present it, so it is no certificate at all.
+	[ -s "$(cert_file)" ] || return 0
 	printf '\n'
 	printf 'server "%s.kyriakon.net" {\n' "$user"
 	printf '\tlisten on 127.0.0.1 port 8080\n'
@@ -146,31 +151,18 @@ member_conf_body() {
 # Sets conf_changed, so the caller can say whether the index and the daemon need
 # the --web pass.
 write_member_conf() {
-	typeset target candidate
+	typeset target
 
 	target=$(member_conf)
 
-	# A certificate without its key is a broken pair rather than a state to serve
-	# from: relayd would name a key that is not there, its config check would fail,
-	# and the reload would then take every name on the box down rather than one.
-	# Refusing here leaves the previous file exactly as it was.
-	if [ -f "$(cert_file)" ] && [ ! -f "$(key_file)" ]; then
-		die "$(cert_file) is there and $(key_file) is not, so $target was left alone: the relay needs both halves of the pair"
+	# A certificate without its key is refused by write_generated, which returns 1
+	# with the message and leaves the previous file exactly as it was.
+	if ! write_generated "$target" member_conf_body "$(cert_file)" "$(key_file)"; then
+		return 1
 	fi
 
-	candidate="$target.new.$$"
-	if ! member_conf_body > "$candidate"; then
-		rm -f "$candidate"
-		exit 1
-	fi
-
-	# Compared before anything moves, so a run that would produce the same file
-	# leaves its mtime and inode alone and a run that would change it has the whole
-	# new file in hand first.
-	if [ -f "$target" ] && cmp -s "$candidate" "$target"; then
-		rm -f "$candidate"
-		conf_changed=no
-		if [ -f "$(cert_file)" ]; then
+	if [ "$conf_changed" = no ]; then
+		if [ -s "$(cert_file)" ]; then
 			printf '%s: unchanged, the block behind the relay is in place\n' "$target"
 		else
 			printf '%s: unchanged, port 80 only until %s exists\n' "$target" "$(cert_file)"
@@ -178,11 +170,7 @@ write_member_conf() {
 		return 0
 	fi
 
-	chmod 0644 "$candidate"
-	mv "$candidate" "$target"
-	conf_changed=yes
-
-	if [ -f "$(cert_file)" ]; then
+	if [ -s "$(cert_file)" ]; then
 		printf 'wrote %s: port 80 and the loopback block for %s.kyriakon.net\n' "$target" "$user"
 		printf '  next: doas ksh scripts/cron-apply.sh --web   # adds the relayd keypair, checks, reloads\n'
 	else
@@ -205,6 +193,13 @@ assert_member_conf() {
 	[ "$shape" = "$conf_owner 644" ] || die "$conf is $shape, wanted $conf_owner 644"
 }
 
+# The shape a removal leaves: the port 80 challenge alone, so a renewal still
+# answers while the site is off.
+member_conf_removed_body() {
+	port_80_challenge
+	printf '}\n'
+}
+
 # remove_member_conf: take the member's site out of the generated vhost, for the
 # account page's "serve your website over HTTP: off". The site block is replaced by
 # the port 80 challenge alone, because a renewal has to answer on port 80 whatever
@@ -212,23 +207,16 @@ assert_member_conf() {
 # tracked httpd.conf includes an index that cron-apply.sh --web regenerates from the
 # files present, and nothing of the member's is deleted.
 remove_member_conf() {
-	typeset target candidate
+	typeset target
 	target=$(member_conf)
 	# A member with no file was never served, and there is no challenge to keep.
 	[ -f "$target" ] || return 0
-	candidate="$target.new.$$"
-	if ! { port_80_challenge; printf '}\n'; } > "$candidate"; then
-		rm -f "$candidate"
-		exit 1
+	if ! write_generated "$target" member_conf_removed_body; then
+		return 1
 	fi
-	# A second removal writes the same challenge-only file, so it leaves the file
-	# and its mtime alone and says nothing.
-	if cmp -s "$candidate" "$target"; then
-		rm -f "$candidate"
-		return 0
-	fi
-	chmod 0644 "$candidate"
-	mv "$candidate" "$target" || die "could not write $target"
+	# A second removal writes the same challenge-only file, so write_generated
+	# leaves the file and its mtime alone and this says nothing about it.
+	[ "$conf_changed" = yes ] || return 0
 	printf '%s: %s.kyriakon.net is no longer served over HTTP; the ACME challenge stays for renewal\n' "$target" "$user"
 	printf '  next: doas ksh scripts/cron-apply.sh --web   # regenerate the index, check httpd, reload\n'
 }
@@ -250,8 +238,6 @@ assert_member_tree() {
 # anyone, writes only under TMPDIR.
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	typeset tree conf before
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
@@ -298,8 +284,8 @@ self_test() {
 
 	# 3. the certificate lands: the block behind the relay appears, port 80 stays
 	# first, and the block names no certificate, because the relay presents it
-	: > "$(key_file)"
-	: > "$(cert_file)"
+	printf 'key\n' > "$(key_file)"
+	printf 'certificate\n' > "$(cert_file)"
 	write_member_conf > "$tree/certrun.out"
 	check "the port 80 block is still first" "$(awk 'NR == 1' "$conf")" 'server "alice.kyriakon.net" {'
 	check "and it points at the pass that adds the relayd keypair" \
@@ -333,6 +319,40 @@ self_test() {
 		"$(grep -c 'was left alone' "$tree/nokey.out")" 1
 	check "and the member file is untouched, inode and all" \
 		"$(stat -f '%i %m %z' "$conf")" "$before"
+
+	# An empty key is an interrupted write, not a key: it is refused as no key
+	# at all, because the file the relay would name is unreadable either way.
+	: > "$(key_file)"
+	set +e
+	( write_member_conf ) > "$tree/emptykey.out" 2>&1
+	rc=$?
+	set -e
+	check "a certificate with an empty key is refused" "$rc" 1
+	check "and leaves the member file as it was" \
+		"$(stat -f '%i %m %z' "$conf")" "$before"
+
+	# The other way round is not a refusal: a key with no certificate is a pair
+	# the queue has not issued yet, so the file is the port 80 block alone.
+	printf 'key\n' > "$(key_file)"
+	rm -f "$(cert_file)"
+	write_member_conf > "$tree/keyonly.out"
+	check "a key with no certificate is not refused" \
+		"$(grep -c 'unchanged\|wrote' "$tree/keyonly.out")" 1
+	check "and the file is port 80 only" \
+		"$(grep -c '127.0.0.1 port 8080' "$conf")" 0
+	# An empty certificate is an interrupted write, not a certificate: the
+	# loopback block stays absent and the port 80 challenge keeps answering.
+	: > "$(cert_file)"
+	write_member_conf > "$tree/emptycert.out"
+	check "an empty certificate serves no loopback block" \
+		"$(grep -c '127.0.0.1 port 8080' "$conf")" 0
+
+	# The helper's own contract: the body runs under umask 077 whatever the
+	# caller's is, so the candidate is never member-readable.
+	umask_body() { : >"$tree/umask-probe"; stat -f '%Lp' "$tree/umask-probe"; }
+	( umask 022; write_generated "$tree/umask.out" umask_body )
+	check "the body runs under umask 077" "$(cat "$tree/umask.out")" 600
+	rm -f "$tree/umask-probe"
 
 	# 6. a member whose tree is not built is refused rather than vhosted
 	user=nobody

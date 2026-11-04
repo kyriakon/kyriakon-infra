@@ -65,6 +65,9 @@ set -euo pipefail
 # half-written vhost behind.
 umask 077
 
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$(dirname "$0")/lib.sh"
+
 httpd_d=/etc/httpd.d
 ssl_dir=/etc/ssl
 ssl_private=/etc/ssl/private
@@ -144,7 +147,9 @@ group_conf_body() {
 	# The site and its www redirect, only once the certificate is there: the relay
 	# presents what /etc/relayd.conf names, and a name it has no keypair for is
 	# answered with the default certificate.
-	[ -f "$(cert_file)" ] || return 0
+	# -s, not -f: an empty chain is an interrupted acme-client write, and the
+	# relay cannot present it, so it is no certificate at all.
+	[ -s "$(cert_file)" ] || return 0
 	printf '\n'
 	printf 'server "%s" {\n' "$domain"
 	printf '\tlisten on 127.0.0.1 port 8080\n'
@@ -172,27 +177,18 @@ group_conf_body() {
 # Sets conf_changed so the caller can say whether the index and daemon need the
 # --web pass.
 write_group_conf() {
-	typeset target candidate
+	typeset target
 
 	target=$(group_conf)
 
-	# A certificate without its key is a broken pair rather than a state to serve
-	# from: relayd would name a key that is not there and its config check would
-	# fail. Refusing leaves the previous file exactly as it was.
-	if [ -f "$(cert_file)" ] && [ ! -f "$(key_file)" ]; then
-		die "$(cert_file) is there and $(key_file) is not, so $target was left alone: the relay needs both halves of the pair"
+	# A certificate without its key is refused by write_generated, which returns 1
+	# with the message and leaves the previous file exactly as it was.
+	if ! write_generated "$target" group_conf_body "$(cert_file)" "$(key_file)"; then
+		return 1
 	fi
 
-	candidate="$target.new.$$"
-	if ! group_conf_body > "$candidate"; then
-		rm -f "$candidate"
-		exit 1
-	fi
-
-	if [ -f "$target" ] && cmp -s "$candidate" "$target"; then
-		rm -f "$candidate"
-		conf_changed=no
-		if [ -f "$(cert_file)" ]; then
+	if [ "$conf_changed" = no ]; then
+		if [ -s "$(cert_file)" ]; then
 			printf '%s: unchanged, the site and the www redirect are in place\n' "$target"
 		else
 			printf '%s: unchanged, port 80 only until %s exists\n' "$target" "$(cert_file)"
@@ -200,11 +196,7 @@ write_group_conf() {
 		return 0
 	fi
 
-	chmod 0644 "$candidate"
-	mv "$candidate" "$target"
-	conf_changed=yes
-
-	if [ -f "$(cert_file)" ]; then
+	if [ -s "$(cert_file)" ]; then
 		printf 'wrote %s: port 80, the site and the www redirect for %s\n' "$target" "$domain"
 		printf '  next: doas ksh scripts/cron-apply.sh --web   # adds the relayd keypair, checks, reloads\n'
 	else
@@ -241,8 +233,6 @@ assert_site_tree() {
 # in each state, and the refusals. Runs as anyone, writes only under TMPDIR.
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	typeset tree conf before code
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
@@ -282,8 +272,8 @@ self_test() {
 		"$(grep -c 'unchanged, port 80 only until' "$tree/again.out")" 1
 
 	# 3. the certificate lands: the site and the www redirect appear, port 80 stays
-	: > "$(key_file)"
-	: > "$(cert_file)"
+	printf 'key\n' > "$(key_file)"
+	printf 'certificate\n' > "$(cert_file)"
 	write_group_conf > "$tree/certrun.out"
 	check "the apex block is still first" "$(awk 'NR == 1' "$conf")" 'server "parish.example" {'
 	check "both names now have a loopback block" "$(grep -c 'listen on 127.0.0.1 port 8080' "$conf")" 2

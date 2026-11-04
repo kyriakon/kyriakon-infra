@@ -57,6 +57,11 @@ set -euo pipefail
 # is never readable by anyone else even before the chmod below runs.
 umask 077
 
+# write_generated and the self-test harness, from the directory this script sits
+# in: deploy-mail.sh installs the two side by side.
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$(dirname "$0")/lib.sh"
+
 # The base system's LibreSSL, which the runbook's step and this script agree on.
 openssl=/usr/bin/openssl
 
@@ -137,17 +142,13 @@ pair_present() {
 }
 
 write_capsule_cnf() {
-	typeset target candidate
+	typeset target
 	target=$(capsule_cnf)
-	candidate="$target.new.$$"
-	capsule_cnf_body > "$candidate"
-	if [ -f "$target" ] && cmp -s "$candidate" "$target"; then
-		rm -f "$candidate"
-		return 0
+	write_generated "$target" capsule_cnf_body
+	# Only a rewrite is news: a run that found the same bytes says nothing.
+	if [ "$conf_changed" = yes ]; then
+		printf 'capsule pair: %s written\n' "$target"
 	fi
-	chmod 0644 "$candidate"
-	mv "$candidate" "$target"
-	printf 'capsule pair: %s written\n' "$target"
 	return 0
 }
 
@@ -230,22 +231,13 @@ group_conf_body() {
 
 # write_group_conf: the file, rewritten only when it would differ.
 write_group_conf() {
-	typeset target candidate
+	typeset target
 	target=$(group_conf)
-	candidate="$target.new.$$"
-	if ! group_conf_body > "$candidate"; then
-		rm -f "$candidate"
-		exit 1
-	fi
-	if [ -f "$target" ] && cmp -s "$candidate" "$target"; then
-		rm -f "$candidate"
-		conf_changed=no
+	write_generated "$target" group_conf_body
+	if [ "$conf_changed" = no ]; then
 		printf '%s: unchanged\n' "$target"
 		return 0
 	fi
-	chmod 0644 "$candidate"
-	mv "$candidate" "$target"
-	conf_changed=yes
 	printf 'wrote %s: %s on 1965 from %s\n' "$target" "$domain" "$(capsule_cert)"
 }
 
@@ -274,8 +266,6 @@ assert_site_tree() {
 # TMPDIR.
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	typeset tree conf before out code
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh

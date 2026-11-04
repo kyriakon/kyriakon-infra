@@ -119,6 +119,62 @@ self_test() {
 		exit 1
 	}
 
+	# need_pkg asks with -e and installs with -I. Both matter: `pkg_info -q`
+	# printed a version, matched nothing, and reinstalled every package on every
+	# deploy, and plain pkg_add asks on a tty, so the dispatcher waited at a
+	# prompt that reads as a hung fetch. The two binaries are stubbed.
+	mkdir "$work/bin"
+	cat > "$work/bin/pkg_info" <<'STUB'
+#!/bin/sh
+# Args are -q -e <pattern>. present.sh is installed under its own name;
+# versioned is installed as versioned-1.2, which only the name-* query matches.
+case "${3:-}" in
+present.sh) exit 0 ;;
+versioned-*) exit 0 ;;
+esac
+exit 1
+STUB
+	cat > "$work/bin/pkg_add" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >>"$PKG_ADD_LOG"
+STUB
+	chmod +x "$work/bin/pkg_info" "$work/bin/pkg_add"
+	PKG_ADD_LOG="$work/pkg_add.log"
+	export PKG_ADD_LOG
+	# shellcheck disable=SC2030,SC2031 # the stub PATH is for this call only
+	if ! ( PATH="$work/bin:$PATH"; need_pkg present.sh ) >"$work/pkg.out" 2>&1; then
+		printf 'self-test: need_pkg failed on an installed package\n' >&2
+		exit 1
+	fi
+	[ ! -e "$work/pkg_add.log" ] || {
+		printf 'self-test: need_pkg installed an installed package\n' >&2
+		exit 1
+	}
+	# shellcheck disable=SC2030,SC2031 # as above
+	if ! ( PATH="$work/bin:$PATH"; need_pkg absent.sh ) >"$work/pkg-absent.out" 2>&1; then
+		printf 'self-test: need_pkg failed on a missing package\n' >&2
+		exit 1
+	fi
+	grep -qx -- '-I absent.sh' "$work/pkg_add.log" || {
+		printf 'self-test: need_pkg did not install without questions: %s\n' \
+			"$(cat "$work/pkg_add.log" 2>/dev/null)" >&2
+		exit 1
+	}
+	# A package installed under a versioned name is what the name-* query is
+	# for: asking only for the bare name would reinstall it on every deploy.
+	# Deleting that fallback fails this check.
+	: >"$work/pkg_add.log"
+	# shellcheck disable=SC2030,SC2031 # the stub PATH is for this call only
+	if ! ( PATH="$work/bin:$PATH"; need_pkg versioned ) >"$work/pkg-version.out" 2>&1; then
+		printf 'self-test: need_pkg failed on a versioned package\n' >&2
+		exit 1
+	fi
+	[ ! -s "$work/pkg_add.log" ] || {
+		printf 'self-test: need_pkg reinstalled a versioned package: %s\n' \
+			"$(cat "$work/pkg_add.log")" >&2
+		exit 1
+	}
+
 	printf 'self-test: ok\n'
 }
 
@@ -145,12 +201,6 @@ trap 'rm -f "${onboard_candidate:-}" "${drain_candidate:-}"' EXIT
 
 say() { printf '== %s\n' "$*"; }
 die() { printf '%s: %s\n' "$0" "$*" >&2; exit 1; }
-
-need_pkg() {
-	pkg_info -q "$1" >/dev/null 2>&1 && return 0
-	printf 'installing %s\n' "$1"
-	pkg_add "$1"
-}
 
 # The scripts the drain runs, read from the install-set table's drain rows. The
 # set has to cover everything the drain's Rust invokes and what those scripts in
