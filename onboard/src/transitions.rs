@@ -584,6 +584,13 @@ fn group_recipient(record: &Record, site_owner: &str, domain: &str) -> Result<St
     Ok(outside_address(record)?.unwrap_or_else(|| format!("{site_owner}@{domain}")))
 }
 
+/// The site owner's mailbox on the body's own domain. Unlike the person path's
+/// `username@kyriakon.net`, the drain makes this address for a body, so it is
+/// where a group's notices reach the site owner when they gave no other.
+fn group_mailbox(group: &GroupRecord) -> String {
+    format!("{}@{}", group.site_owner, group.domain)
+}
+
 /// Send the confirmation the spec promises before provisioning: it restates the
 /// immediate-supply request and the digital-content acknowledgement, quotes every
 /// document accepted with its version, and states the 14-day right with how to
@@ -2142,7 +2149,7 @@ pub async fn window_sweep(
         if window.state == "closed" {
             // The group already lapsed; the notice is re-offered because the
             // notice record, not the window, is what stops a duplicate.
-            if let Err(e) = group_lapse_notice(cfg, store, &group, &window).await {
+            if let Err(e) = group_lapse_notice(cfg, store, journal, &group, &window).await {
                 eprintln!("kyriakon-onboard: the lapse notice for {domain}: {e}");
             }
             continue;
@@ -2207,7 +2214,7 @@ pub async fn window_sweep(
         }
         group.grace_until = Some(grace.clone());
         write_group_record(store, &group).await?;
-        if let Err(e) = group_lapse_notice(cfg, store, &group, &window).await {
+        if let Err(e) = group_lapse_notice(cfg, store, journal, &group, &window).await {
             eprintln!("kyriakon-onboard: the lapse notice for {domain}: {e}");
         }
     }
@@ -2220,10 +2227,13 @@ pub async fn window_sweep(
 async fn group_lapse_notice(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     group: &GroupRecord,
     window: &Window,
 ) -> Result<(), String> {
-    let to = group_notice_address(store, group).await?;
+    let Some(to) = group_notice_recipient(cfg, store, journal, group).await else {
+        return Ok(());
+    };
     let closes_on = &window.closes_at[..10.min(window.closes_at.len())];
     let token = group.payment.token_ref.as_deref().unwrap_or("");
     let grace = group.grace_until.clone().unwrap_or_default();
@@ -2259,10 +2269,13 @@ async fn group_lapse_notice(
 async fn group_grace_notice(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     group: &GroupRecord,
     grace: time::Date,
 ) -> Result<(), String> {
-    let to = group_notice_address(store, group).await?;
+    let Some(to) = group_notice_recipient(cfg, store, journal, group).await else {
+        return Ok(());
+    };
     let grace = util::date_string(grace);
     let token = group.payment.token_ref.as_deref().unwrap_or("");
     let subject = format!(
@@ -2295,10 +2308,13 @@ async fn group_grace_notice(
 async fn group_final_notice(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     group: &GroupRecord,
     grace: time::Date,
 ) -> Result<(), String> {
-    let to = group_notice_address(store, group).await?;
+    let Some(to) = group_notice_recipient(cfg, store, journal, group).await else {
+        return Ok(());
+    };
     let grace = util::date_string(grace);
     let token = group.payment.token_ref.as_deref().unwrap_or("");
     let subject = format!(
@@ -2434,12 +2450,12 @@ pub async fn grace_sweep(
             continue;
         }
         if today >= grace - Duration::days(30) && today < grace - Duration::days(7) {
-            if let Err(e) = group_grace_notice(cfg, store, &group, grace).await {
+            if let Err(e) = group_grace_notice(cfg, store, journal, &group, grace).await {
                 eprintln!("kyriakon-onboard: the grace notice for {domain}: {e}");
             }
         }
         if today >= grace - Duration::days(7) {
-            if let Err(e) = group_final_notice(cfg, store, &group, grace).await {
+            if let Err(e) = group_final_notice(cfg, store, journal, &group, grace).await {
                 eprintln!("kyriakon-onboard: the final notice for {domain}: {e}");
             }
         }
@@ -2447,35 +2463,70 @@ pub async fn grace_sweep(
     Ok(())
 }
 
+/// The contact address the member gave, when it validates as a mail header. It
+/// is validated again because it becomes a mail header, and a record that
+/// reached it from outside the drain is not trusted.
+fn valid_contact(address: Option<&str>) -> Option<String> {
+    address
+        .filter(|addr| validate::address(addr).is_none())
+        .map(str::to_string)
+}
+
 /// The address a lifecycle notice goes to: the contact the member gave, or the
-/// mailbox that reaches them on the platform. It is validated again because it
-/// becomes a mail header, and a record that reached it from outside the drain
-/// is not trusted.
-fn notice_recipient(account: &Account, mailbox: String) -> String {
-    match account.outside_address.as_deref() {
-        Some(addr) if validate::address(addr).is_none() => addr.to_string(),
-        _ => mailbox,
-    }
+/// mailbox that reaches them on the platform. A group mailbox's platform
+/// address is its mailbox on the group's own domain.
+fn notice_address(account: &Account) -> String {
+    valid_contact(account.outside_address.as_deref()).unwrap_or_else(|| account.platform_address())
 }
 
-/// A person's notice: their outside address, or `username@kyriakon.net`.
-fn notice_address(account: &Account, username: &str) -> String {
-    notice_recipient(account, format!("{username}@kyriakon.net"))
-}
-
-/// A group's lifecycle notice takes the same rule as a person's, with the site
-/// owner's mailbox on the group's own domain as the fallback. The site owner is
-/// read through the typed accessor, so a record that cannot be read fails the
-/// notice rather than quietly mailing the platform address.
+/// The address a group's lifecycle notice goes to: the site owner's account
+/// first, then the application copy the approval left in their directory,
+/// because provisioning writes a group mailbox's account without an outside
+/// address of its own. Both are read through the typed accessors of #554, and
+/// both are held to the same validation rule as a person's notice.
 async fn group_notice_address(store: &Store, group: &GroupRecord) -> Result<String, String> {
+    let path = format!("accounts/{}/account.json", group.site_owner);
     let account = store
         .account(&group.site_owner)
         .await?
-        .ok_or_else(|| format!("no account for the site owner {}", group.site_owner))?;
-    Ok(notice_recipient(
-        &account,
-        format!("{}@{}", group.site_owner, group.domain),
-    ))
+        .ok_or_else(|| format!("{path} is missing"))?;
+    if let Some(to) = valid_contact(account.outside_address.as_deref()) {
+        return Ok(to);
+    }
+    let copy = store
+        .account_application_text(&group.site_owner)
+        .await?
+        .and_then(|text| serde_json::from_str::<Record>(&text).ok());
+    let from_copy = copy.and_then(|copy| valid_contact(copy.outside_address.as_deref()));
+    Ok(from_copy.unwrap_or_else(|| account.platform_address()))
+}
+
+/// The recipient a group's lifecycle notice takes, or `None` when the site
+/// owner's record cannot be read. The failure is reported against the owner
+/// through the journal, which dedups the message and mails it once, and the
+/// notice is skipped rather than sent to the platform address in the member's
+/// place.
+async fn group_notice_recipient(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    group: &GroupRecord,
+) -> Option<String> {
+    match group_notice_address(store, group).await {
+        Ok(to) => Some(to),
+        Err(e) => {
+            report_record(
+                cfg,
+                store,
+                journal,
+                "account",
+                &group.site_owner,
+                &format!("{e}, so {}'s group notice has no addressee", group.domain),
+            )
+            .await;
+            None
+        }
+    }
 }
 
 /// The grace notice: the midpoint of the forty days, when thirty of them are
@@ -2493,7 +2544,7 @@ async fn grace_notice(
         .payment_state()
         .and_then(|payment| payment.token_ref)
         .unwrap_or_default();
-    let to = notice_address(account, username);
+    let to = notice_address(account);
     let subject = format!("Your kyriakon.net account's grace ends on {grace} ({username})");
     let body = format!(
         "The payment window for {username} closed and no payment has been recorded.\n\n\
@@ -2568,7 +2619,7 @@ async fn final_notice(
         .payment_state()
         .and_then(|payment| payment.token_ref)
         .unwrap_or_default();
-    let to = notice_address(account, username);
+    let to = notice_address(account);
     let subject = "Your kyriakon.net account will be deleted in seven days".to_string();
     let body = format!(
         "The payment window for {username} closed and no payment was recorded.\n\n\
@@ -2595,7 +2646,7 @@ async fn suspension_final_notice(
 ) -> Result<(), String> {
     let grace = account.grace_until.as_deref().unwrap_or("");
     let reason = account.suspension_reason.as_deref().unwrap_or("");
-    let to = notice_address(account, username);
+    let to = notice_address(account);
     let subject = format!(
         "Your suspended kyriakon.net account is deleted in seven days: {reason} ({username})"
     );
@@ -2639,7 +2690,7 @@ async fn lapse_notice(
     let closes_on = &window.closes_at[..10.min(window.closes_at.len())];
     let token = payment.token_ref.as_deref().unwrap_or("");
     let grace = account.grace_until.as_deref().unwrap_or("");
-    let to = notice_address(account, username);
+    let to = notice_address(account);
     let subject = "Your kyriakon.net payment window has closed".to_string();
     let body = format!(
         "The payment window for {username} closed on {closes_on} and no payment was recorded.\n\n\
@@ -5613,7 +5664,7 @@ pub async fn suspend(
         )
         .await?;
     }
-    let to = notice_address(&account, username);
+    let to = notice_address(&account);
     // The reason is in the subject, so a corrected reason is a new notice and a
     // rerun of the same one stays deduplicated.
     let subject = format!("Your kyriakon.net account is suspended: {reason} ({username})");
@@ -7349,7 +7400,7 @@ async fn dns_contact(store: &Store, group: &GroupRecord) -> Result<String, Strin
     // The accountable fallback: the mailbox that owns the group's site, at the
     // body's own domain. Unlike the person path's `username@kyriakon.net`, this
     // is an address the platform actually delivers.
-    Ok(format!("{}@{}", group.site_owner, group.domain))
+    Ok(group_mailbox(group))
 }
 
 /// How often the space-used sweep runs, in hours. It reads the filesystem
@@ -7589,7 +7640,7 @@ pub async fn free_anniversaries(
         // The address the approval used: the one outside the platform, or the
         // member's mailbox. It was validated before it was written, and is
         // validated again here because it is about to become a mail header.
-        let to = notice_address(&account, &username);
+        let to = notice_address(&account);
         let subject = format!(
             "Your kyriakon.net account is free for another year ({})",
             due.year()
@@ -7678,7 +7729,7 @@ pub async fn prepaid_renewals(
         )
         .join("\n");
         let token = payment.token_ref.as_deref().unwrap_or("");
-        let to = notice_address(&account, &username);
+        let to = notice_address(&account);
         let subject = format!("Your kyriakon.net membership runs out on {paid_until} ({username})");
         let body = format!(
             "The membership for {username} is paid until {paid_until}.\n\n\
