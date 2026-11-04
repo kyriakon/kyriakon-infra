@@ -59,7 +59,7 @@ use crate::fcgi::{self, Reply, Request};
 use crate::page::{DecidePage, LoginPage, NoticePage, PasswordPage, ReceivedPage, StatusPage};
 use crate::questions::{Branch, Kind, Question, Rule};
 use crate::rate::Key;
-use crate::store::{Acceptance, Account, Certificate, GroupRecord, Notice, Record, Store};
+use crate::store::{Acceptance, Account, Certificate, Notice, Record, Store};
 use crate::{
     capsule, catalogue, config, draft, intents, keycheck, page, portal_ipc, questions, rate,
     session, store, transitions, util, validate,
@@ -1494,7 +1494,13 @@ async fn capsule_account(app: &App, incoming: &Incoming) -> Reply {
         Some(account) => {
             let notices = account_notices(app, &account.username).await;
             let recipe = group_recipe(app, account);
-            let group = group_state(app, account.group.as_deref()).await;
+            let group = match group_state(app, account.group.as_deref()).await {
+                Ok(group) => group,
+                Err(e) => {
+                    eprintln!("kyriakon-onboard: {e}");
+                    return Reply::gemini(50, "Permanent failure", String::new());
+                }
+            };
             let payment = account.payment_state().map(|block| {
                 page::payment(
                     &account.state,
@@ -2104,11 +2110,16 @@ async fn account_web(app: &App, request: &Request) -> Reply {
     if validate::username_shape(&member.username).is_some() {
         return Reply::capability(200, page_html(&LoginPage { error: None }));
     }
-    let Some(account) = account_record(app, &member.username).await else {
-        return Reply::capability(200, page_html(&LoginPage { error: None }));
+    let account = match account_record(app, &member.username).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return Reply::capability(200, page_html(&LoginPage { error: None })),
+        Err(e) => return server_error(&e),
     };
     let notices = account_notices(app, &account.username).await;
-    let group = group_state(app, account.group.as_deref()).await;
+    let group = match group_state(app, account.group.as_deref()).await {
+        Ok(group) => group,
+        Err(e) => return server_error(&e),
+    };
     let dns = group_recipe(app, &account);
     let payment = account.payment_state().map(|block| {
         page::payment(
@@ -2177,11 +2188,19 @@ async fn logout(app: &App, request: &Request) -> Reply {
 /// The live page session and the account it names. The closure route needs the
 /// session id as well as the account, because the intent carries it for the
 /// drain to verify.
-async fn session_account(app: &App, request: &Request) -> Option<(String, Account)> {
-    let cookie = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE)?;
-    let member = session::lookup(&app.store, &cookie, OffsetDateTime::now_utc()).await?;
-    let account = account_record(app, &member.username).await?;
-    Some((cookie, account))
+async fn session_account(
+    app: &App,
+    request: &Request,
+) -> Result<Option<(String, Account)>, String> {
+    let Some(cookie) = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE) else {
+        return Ok(None);
+    };
+    let Some(member) = session::lookup(&app.store, &cookie, OffsetDateTime::now_utc()).await else {
+        return Ok(None);
+    };
+    Ok(account_record(app, &member.username)
+        .await?
+        .map(|account| (cookie, account)))
 }
 
 /// The refund the erasure answer names when the closure falls inside the
@@ -2261,8 +2280,10 @@ async fn account_action(app: &App, call: &Call<'_>) -> Reply {
 /// intent; the drain verifies the session, owns the state change and runs the
 /// deletion.
 async fn account_close(app: &App, request: &Request) -> Reply {
-    let Some((cookie, account)) = session_account(app, request).await else {
-        return refused("Sign in to the account you want to close.");
+    let (cookie, account) = match session_account(app, request).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return refused("Sign in to the account you want to close."),
+        Err(e) => return server_error(&e),
     };
     let form = fields(&String::from_utf8_lossy(&request.body));
     let password = form.get("password").map(String::as_str).unwrap_or("");
@@ -2306,8 +2327,10 @@ async fn account_close(app: &App, request: &Request) -> Reply {
 /// supplies the stored hash can choose one the member never typed. The drain
 /// writes the hash as root because the check only verifies.
 async fn account_password(app: &App, request: &Request) -> Reply {
-    let Some((cookie, account)) = session_account(app, request).await else {
-        return refused("Sign in to the account whose password you want to change.");
+    let (cookie, account) = match session_account(app, request).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return refused("Sign in to the account whose password you want to change."),
+        Err(e) => return server_error(&e),
     };
     let Some(session_id) = session::id(&cookie) else {
         return refused("Sign in to the account whose password you want to change.");
@@ -2369,8 +2392,10 @@ async fn account_password(app: &App, request: &Request) -> Reply {
 /// serves sftp and git, so adding replaces rather than accumulates, and the
 /// page shows the fingerprint and the day it was added.
 async fn account_upload_key(app: &App, request: &Request) -> Reply {
-    let Some((cookie, account)) = session_account(app, request).await else {
-        return refused("Sign in to the account whose upload key you want to change.");
+    let (cookie, account) = match session_account(app, request).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return refused("Sign in to the account whose upload key you want to change."),
+        Err(e) => return server_error(&e),
     };
     let Some(session_id) = session::id(&cookie) else {
         return refused("Sign in to the account whose upload key you want to change.");
@@ -2450,8 +2475,10 @@ async fn account_upload_key(app: &App, request: &Request) -> Reply {
 /// when the mailbox is unreachable, so it is validated here and again by the
 /// drain. An empty field clears it.
 async fn account_address(app: &App, request: &Request) -> Reply {
-    let Some((cookie, account)) = session_account(app, request).await else {
-        return refused("Sign in to the account whose address you want to change.");
+    let (cookie, account) = match session_account(app, request).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return refused("Sign in to the account whose address you want to change."),
+        Err(e) => return server_error(&e),
     };
     let Some(session_id) = session::id(&cookie) else {
         return refused("Sign in to the account whose address you want to change.");
@@ -2496,8 +2523,10 @@ async fn account_address(app: &App, request: &Request) -> Reply {
 /// removes or regenerates the member's generated include for the lane that
 /// changed, and reloads the daemons once.
 async fn account_serving(app: &App, request: &Request) -> Reply {
-    let Some((cookie, account)) = session_account(app, request).await else {
-        return refused("Sign in to the account whose serving you want to change.");
+    let (cookie, account) = match session_account(app, request).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return refused("Sign in to the account whose serving you want to change."),
+        Err(e) => return server_error(&e),
     };
     let Some(session_id) = session::id(&cookie) else {
         return refused("Sign in to the account whose serving you want to change.");
@@ -2533,8 +2562,10 @@ async fn account_serving(app: &App, request: &Request) -> Reply {
 /// is unchanged and nothing stops early. A prepaid member has no subscription
 /// and nothing that renews itself, which the page says instead of offering this.
 async fn account_renewal(app: &App, request: &Request) -> Reply {
-    let Some((cookie, account)) = session_account(app, request).await else {
-        return refused("Sign in to the account whose renewal you want to stop.");
+    let (cookie, account) = match session_account(app, request).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return refused("Sign in to the account whose renewal you want to stop."),
+        Err(e) => return server_error(&e),
     };
     let Some(session_id) = session::id(&cookie) else {
         return refused("Sign in to the account whose renewal you want to stop.");
@@ -2582,8 +2613,10 @@ async fn account_renewal(app: &App, request: &Request) -> Reply {
 /// The signature is checked by the drain, which is the half that holds the
 /// keyring. Nothing here promises which of the two paths the request took.
 async fn account_mail_key(app: &App, request: &Request) -> Reply {
-    let Some((cookie, account)) = session_account(app, request).await else {
-        return refused("Sign in to the account whose mail key you want to replace.");
+    let (cookie, account) = match session_account(app, request).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return refused("Sign in to the account whose mail key you want to replace."),
+        Err(e) => return server_error(&e),
     };
     let Some(session_id) = session::id(&cookie) else {
         return refused("Sign in to the account whose mail key you want to replace.");
@@ -2667,9 +2700,13 @@ async fn account_mail_key(app: &App, request: &Request) -> Reply {
 /// The member a request's live session names, with the account it names. The
 /// page's actions use it: `REMOTE_USER` is not an identity here, because no
 /// HTTP authentication is configured for the host.
-async fn session_member(app: &App, request: &Request) -> Option<Account> {
-    let cookie = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE)?;
-    let member = session::lookup(&app.store, &cookie, OffsetDateTime::now_utc()).await?;
+async fn session_member(app: &App, request: &Request) -> Result<Option<Account>, String> {
+    let Some(cookie) = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE) else {
+        return Ok(None);
+    };
+    let Some(member) = session::lookup(&app.store, &cookie, OffsetDateTime::now_utc()).await else {
+        return Ok(None);
+    };
     account_record(app, &member.username).await
 }
 
@@ -2682,8 +2719,10 @@ async fn account_export(app: &App, request: &Request) -> Reply {
     if form.get("action").map(String::as_str) != Some("export") {
         return refused("That is not an export action this page carries out.");
     }
-    let Some(account) = session_member(app, request).await else {
-        return refused("Sign in to the account you want to export.");
+    let account = match session_member(app, request).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return refused("Sign in to the account you want to export."),
+        Err(e) => return server_error(&e),
     };
     let cookie = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE);
     let Some(session_id) = cookie.as_deref().and_then(session::id) else {
@@ -2714,27 +2753,27 @@ async fn account_export(app: &App, request: &Request) -> Reply {
 }
 
 /// One account's record, for a name the request or a decided application
-/// already gave. A record that cannot be read is no account, and the page reads
-/// as it does for everybody: the handler has nothing to say about why.
-async fn account_record(app: &App, username: &str) -> Option<Account> {
-    let text = app
-        .store
-        .read_record(&format!("accounts/{username}"), "account.json")
-        .await?;
-    serde_json::from_str(&text).ok()
+/// already gave. A record that has gone leaves the page as it is for a
+/// stranger; a record that cannot be read or parsed is an error the route
+/// reports rather than a member the handler quietly forgets.
+async fn account_record(app: &App, username: &str) -> Result<Option<Account>, String> {
+    app.store.account(username).await
 }
 
 /// The group a signed-in mailbox belongs to, from the group's own record. The
-/// payment lives on the group so one renewal writes one date; a record that
-/// cannot be read leaves the page without the block rather than failing it.
-async fn group_state(app: &App, domain: Option<&str>) -> Option<page::GroupView> {
-    let domain = domain?;
-    let text = app
+/// payment lives on the group so one renewal writes one date. A record that
+/// cannot be read is an error: a page without its payment block would read as a
+/// group that owes nothing.
+async fn group_state(app: &App, domain: Option<&str>) -> Result<Option<page::GroupView>, String> {
+    let Some(domain) = domain else {
+        return Ok(None);
+    };
+    Ok(app
         .store
-        .read_record(&format!("groups/{domain}"), "group.json")
-        .await?;
-    let record: GroupRecord = serde_json::from_str(&text).ok()?;
-    Some(page::GroupView::from_record(&record))
+        .group(domain)
+        .await?
+        .as_ref()
+        .map(page::GroupView::from_record))
 }
 
 /// The DNS recipe for an account that names a group. `account.group` already
@@ -3198,10 +3237,15 @@ async fn record_for(app: &App, token: &str) -> Option<Record> {
     if !well_formed {
         return None;
     }
-    app.store
-        .read_record("applications", &format!("{token}.json"))
-        .await
-        .and_then(|s| serde_json::from_str::<Record>(&s).ok())
+    match app.store.application(token).await {
+        Ok(record) => record,
+        // The status path is not a token oracle: a damaged record answers the
+        // same as an unknown token, and the operator gets the reason on stderr.
+        Err(e) => {
+            eprintln!("kyriakon-onboard: {e}");
+            None
+        }
+    }
 }
 
 /// The front end that filed a submission: `web`, `tui` or `capsule`, and the web

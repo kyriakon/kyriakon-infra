@@ -248,12 +248,10 @@ async fn token(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), 
     if let Some(why) = validate::username_shape(username) {
         return Err(format!("the username {username:?}: {why}"));
     }
-    let text = store
-        .read_record(&format!("accounts/{username}"), "account.json")
-        .await
+    let account = store
+        .account(username)
+        .await?
         .ok_or_else(|| format!("no account for {username}"))?;
-    let account: kyriakon_onboard::store::Account = serde_json::from_str(&text)
-        .map_err(|e| format!("the account record does not parse: {e}"))?;
     let token = account
         .payment_state()
         .and_then(|p| p.token_ref)
@@ -319,12 +317,10 @@ async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
             if let Some(why) = validate::username_shape(username) {
                 return Err(format!("the username {username:?}: {why}"));
             }
-            let text = store
-                .read_record(&format!("accounts/{username}"), "account.json")
-                .await
+            let account = store
+                .account(username)
+                .await?
                 .ok_or_else(|| format!("no account for {username}"))?;
-            let account: kyriakon_onboard::store::Account = serde_json::from_str(&text)
-                .map_err(|e| format!("the account record does not parse: {e}"))?;
             match account.payment_state().and_then(|p| p.token_ref) {
                 Some(token) => token,
                 // A group mailbox holds no payment of its own: its name
@@ -642,12 +638,10 @@ async fn payment_token(store: &Store, flags: &BTreeMap<String, String>) -> Resul
             if let Some(why) = validate::username_shape(username) {
                 return Err(format!("the username {username:?}: {why}"));
             }
-            let text = store
-                .read_record(&format!("accounts/{username}"), "account.json")
-                .await
+            let account = store
+                .account(username)
+                .await?
                 .ok_or_else(|| format!("no account for {username}"))?;
-            let account: kyriakon_onboard::store::Account = serde_json::from_str(&text)
-                .map_err(|e| format!("the account record does not parse: {e}"))?;
             match account.payment_state().and_then(|p| p.token_ref) {
                 Some(token) => Ok(token),
                 // A group mailbox holds no payment of its own, so its name
@@ -1147,12 +1141,10 @@ async fn request_verify(cfg: &DrainConfig, store: &Store, args: &[String]) -> Re
     if let Some(why) = validate::username_shape(username) {
         return Err(format!("the username {username:?}: {why}"));
     }
-    let text = store
-        .read_record(&format!("accounts/{username}"), "account.json")
-        .await
+    let account = store
+        .account(username)
+        .await?
         .ok_or_else(|| format!("no account for {username}"))?;
-    let account: store::Account = serde_json::from_str(&text)
-        .map_err(|e| format!("the account record does not parse: {e}"))?;
     let own = account.platform_address();
 
     let message_path = std::path::Path::new(need(&flags, "message")?);
@@ -1410,12 +1402,10 @@ async fn payment(store: &Store, args: &[String]) -> Result<(), String> {
     if let Some(why) = validate::username_shape(username) {
         return Err(format!("the username {username:?}: {why}"));
     }
-    let text = store
-        .read_record(&format!("accounts/{username}"), "account.json")
-        .await
+    let account = store
+        .account(username)
+        .await?
         .ok_or_else(|| format!("no account for {username}"))?;
-    let account: store::Account = serde_json::from_str(&text)
-        .map_err(|e| format!("the account record does not parse: {e}"))?;
     // A group mailbox holds no payment block: the group holds the one rail, the
     // one token and the one date, so a mailbox's name prints those.
     let payment = match account.payment_state() {
@@ -1513,13 +1503,8 @@ async fn show(store: &Store, username: &str) -> Result<(), String> {
         "  decided  {}",
         record.decided_at.as_deref().unwrap_or("not yet")
     );
-    match store
-        .read_record(&format!("accounts/{username}"), "account.json")
-        .await
-    {
-        Some(text) => {
-            let account: kyriakon_onboard::store::Account = serde_json::from_str(&text)
-                .map_err(|e| format!("the account record does not parse: {e}"))?;
+    match store.account(username).await? {
+        Some(account) => {
             println!("account {username}");
             println!("  state    {}", account.state);
             println!("  decision {}", account.decision);
@@ -1528,15 +1513,10 @@ async fn show(store: &Store, username: &str) -> Result<(), String> {
             // is what the body's page shows too.
             if let Some(group) = &account.group {
                 println!("  group    {group}");
-                let Some(text) = store
-                    .read_record(&format!("groups/{group}"), "group.json")
-                    .await
-                else {
+                let Some(record) = store.group(group).await? else {
                     println!("  payment  no group record at groups/{group}/group.json");
                     return Ok(());
                 };
-                let record: store::GroupRecord = serde_json::from_str(&text)
-                    .map_err(|e| format!("the group record does not parse: {e}"))?;
                 let payment = &record.payment;
                 println!("  rail     {}", payment.rail);
                 let paid = match (&payment.paid_until, &payment.window) {
@@ -1624,10 +1604,7 @@ async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(),
     // service made. Refusing here keeps a typo from printing "deleted" and from
     // touching a keyring or token entry. A deletion that stopped partway is
     // still accepted: the account record has gone but its journal line has not.
-    let recorded = store
-        .read_record(&format!("accounts/{username}"), "account.json")
-        .await
-        .is_some();
+    let recorded = store.account(username).await?.is_some();
     let prefix = format!("delete-{username}-");
     let interrupted = store
         .log("journal.jsonl")
@@ -1669,12 +1646,10 @@ async fn monero(store: &Store, args: &[String]) -> Result<(), String> {
     if let Some(why) = monero_address_shape(address) {
         return Err(format!("the address {address:?} {why}"));
     }
-    let text = store
-        .read_record(&format!("accounts/{username}"), "account.json")
-        .await
+    let mut account = store
+        .account(username)
+        .await?
         .ok_or_else(|| format!("no account for {username}"))?;
-    let mut account: kyriakon_onboard::store::Account = serde_json::from_str(&text)
-        .map_err(|e| format!("the account record does not parse: {e}"))?;
     let Some(mut payment) = account.payment_state() else {
         return Err(format!(
             "{username} was approved without charge, so it has no Monero rail"
@@ -1752,10 +1727,7 @@ async fn find_application(store: &Store, username: &str) -> Result<(String, Reco
         if !name.ends_with(".json") {
             continue;
         }
-        let Some(text) = store.read_record("applications", &name).await else {
-            continue;
-        };
-        let Ok(record) = serde_json::from_str::<Record>(&text) else {
+        let Some(record) = store.application(name.trim_end_matches(".json")).await? else {
             continue;
         };
         if record.username != username {

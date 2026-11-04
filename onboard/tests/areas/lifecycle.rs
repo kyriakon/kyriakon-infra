@@ -2341,3 +2341,72 @@ fn a_suspension_starts_the_grace_and_resume_clears_it() {
         fix.journal()
     );
 }
+
+/// An account record that is there and does not parse is drift, not an account
+/// that has gone: a sweep reports the file rather than skipping the account, so
+/// a lapse or renewal it owes cannot be lost.
+#[test]
+fn a_corrupt_account_record_is_reported_by_the_sweep_not_skipped() {
+    let fix = Fix::new("corrupt-account-sweep");
+    approved_paid(&fix, "secretary", "cash");
+    let mut account = fix.account("secretary");
+    account["payment"]["window"]["closes_at"] = json!("2020-01-01T00:00:00Z");
+    std::fs::write(
+        fix.path("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    // Corrupt it in place: the record is still there and no longer reads.
+    std::fs::write(
+        fix.path("store/accounts/secretary/account.json"),
+        b"{\"version\": 1, \"username\": \"secre",
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(
+        !out.status.success(),
+        "the corrupt record was skipped: {}",
+        body(&out)
+    );
+    assert!(
+        body(&out).contains("accounts/secretary/account.json does not parse"),
+        "the sweep did not name the record: {}",
+        body(&out)
+    );
+    // Nothing settled the lapse on a record it could not read.
+    assert!(
+        !fix.scripts_log().contains("lapse-user.sh secretary"),
+        "{}",
+        fix.scripts_log()
+    );
+}
+
+/// `show` and `approve` name the corrupt application record and the parse
+/// error, rather than reporting that there is no application for the name.
+#[test]
+fn a_corrupt_application_record_is_named_by_show_and_approve() {
+    let fix = Fix::new("corrupt-application");
+    fix.filed("alice", "cash", &[("rail", "cash")]);
+    std::fs::write(
+        fix.path(&format!("store/applications/{TOKEN}.json")),
+        b"{\"username\": \"alice\", \"status_to",
+    )
+    .unwrap();
+
+    for args in [["show", "alice"], ["approve", "alice"]] {
+        let out = fix.ctl(&args);
+        let text = body(&out);
+        assert!(!out.status.success(), "{}: {text}", args.join(" "));
+        assert!(
+            text.contains(&format!("applications/{TOKEN}.json does not parse")),
+            "{}: {text}",
+            args.join(" ")
+        );
+        assert!(
+            !text.contains("no application for alice"),
+            "{}: {text}",
+            args.join(" ")
+        );
+    }
+}

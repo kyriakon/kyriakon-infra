@@ -92,6 +92,72 @@ impl Store {
             .ok()
     }
 
+    /// One record's bytes, `Ok(None)` only when the file is absent. An IO error
+    /// other than not-found is an error naming the file.
+    async fn record_text(&self, rel: &str) -> Result<Option<String>, String> {
+        match tokio::fs::read_to_string(self.root.join(rel)).await {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("cannot read {rel}: {e}")),
+        }
+    }
+
+    /// Read one record as its own type. `Ok(None)` only when the file is not
+    /// there: an IO error or a parse failure is an error naming the file. A
+    /// caller that has to tell a record that has gone from one that is damaged
+    /// reads through this, not [`Store::read_record`], where both are "not
+    /// there".
+    async fn typed_record<T: DeserializeOwned>(&self, rel: &str) -> Result<Option<T>, String> {
+        let Some(text) = self.record_text(rel).await? else {
+            return Ok(None);
+        };
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| format!("{rel} does not parse: {e}"))
+    }
+
+    /// One account record, `accounts/<username>/account.json`.
+    pub async fn account(&self, username: &str) -> Result<Option<Account>, String> {
+        self.typed_record(&format!("accounts/{username}/account.json"))
+            .await
+    }
+
+    /// The same record as written, for the export, which copies it as recorded
+    /// rather than re-encoding the fields this build models.
+    pub async fn account_text(&self, username: &str) -> Result<Option<String>, String> {
+        self.record_text(&format!("accounts/{username}/account.json"))
+            .await
+    }
+
+    /// One group record, `groups/<domain>/group.json`.
+    pub async fn group(&self, domain: &str) -> Result<Option<GroupRecord>, String> {
+        self.typed_record(&format!("groups/{domain}/group.json"))
+            .await
+    }
+
+    /// One filed application, `applications/<token>.json`.
+    pub async fn application(&self, token: &str) -> Result<Option<Record>, String> {
+        self.typed_record(&format!("applications/{token}.json"))
+            .await
+    }
+
+    /// The same record as written. Two callers edit one key and write it back,
+    /// and the record carries fields this build does not model, so a round trip
+    /// through [`Record`] would drop them.
+    pub async fn application_text(&self, token: &str) -> Result<Option<String>, String> {
+        self.record_text(&format!("applications/{token}.json"))
+            .await
+    }
+
+    /// The application's retained copy inside an account directory, as written.
+    /// Its callers parse a field or two and copy it whole for the export, so it
+    /// is read as text; the miss-versus-damage split is the same as the typed
+    /// reads'.
+    pub async fn application_copy(&self, username: &str) -> Result<Option<String>, String> {
+        self.record_text(&format!("accounts/{username}/application.json"))
+            .await
+    }
+
     /// Write one record by rename: a temporary file in the same directory, then
     /// the rename, so a reader never sees half of one and a crash leaves the
     /// temporary file rather than a truncated record. The file is created 0600,
@@ -235,13 +301,7 @@ impl Store {
             return None;
         }
         for username in self.list("accounts").await.ok()? {
-            let Some(text) = self
-                .read_record(&format!("accounts/{username}"), "account.json")
-                .await
-            else {
-                continue;
-            };
-            let Ok(account) = serde_json::from_str::<Account>(&text) else {
+            let Ok(Some(account)) = self.account(&username).await else {
                 continue;
             };
             if account.certificates.iter().any(|c| c.hash == hash) {
@@ -1356,26 +1416,18 @@ pub async fn free_account_count(store: &Store) -> Result<usize, String> {
     let names = store.list("accounts").await?;
     let mut free = 0;
     for username in names {
-        let Some(text) = store
-            .read_record(&format!("accounts/{username}"), "account.json")
-            .await
-        else {
-            eprintln!(
-                "kyriakon-onboard: accounts/{username}/account.json is unreadable, not counted"
-            );
-            continue;
-        };
-        let account: Account = match serde_json::from_str(&text) {
-            Ok(account) => account,
-            Err(e) => {
-                eprintln!(
-                    "kyriakon-onboard: accounts/{username}/account.json does not parse, not counted: {e}"
-                );
-                continue;
+        match store.account(&username).await {
+            Ok(Some(account)) => {
+                if account.is_free() {
+                    free += 1;
+                }
             }
-        };
-        if account.is_free() {
-            free += 1;
+            Ok(None) => {
+                eprintln!(
+                    "kyriakon-onboard: accounts/{username}/account.json is missing, not counted"
+                );
+            }
+            Err(e) => eprintln!("kyriakon-onboard: {e}, not counted"),
         }
     }
     Ok(free)

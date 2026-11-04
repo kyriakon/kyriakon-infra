@@ -1062,7 +1062,7 @@ pub async fn set_password(
     // pass's last act and runs on the success path only.
     unsafe { plain.as_mut_vec().fill(0) };
     let name = format!("{token}.json");
-    let Some(text) = store.read_record("applications", &name).await else {
+    let Some(text) = store.application_text(token).await? else {
         return Ok(password_refusal(store, file, value, "the application record is gone").await);
     };
     // Read as a Value and edit one key: the record carries fields this build
@@ -1429,7 +1429,7 @@ async fn approve(
     // its own "applying" line; anything else holding this name is not this
     // application's.
     let begun = journal.approval_started(token);
-    let existing = existing_account(store, username).await;
+    let existing = existing_account(store, username).await?;
 
     // An account record that this application never began is a second
     // application for a username that already has one. Nothing here is this
@@ -1669,8 +1669,8 @@ async fn approve(
     // the status link's own end written on it.
     let mut app_copy: Value = serde_json::from_str(
         &store
-            .read_record("applications", &format!("{token}.json"))
-            .await
+            .application_text(token)
+            .await?
             .ok_or("the application record vanished mid-approval")?,
     )
     .map_err(|e| format!("the application record does not parse: {e}"))?;
@@ -1756,12 +1756,10 @@ pub async fn resend(
     intent: ResendIntent,
 ) -> Result<Settlement, String> {
     let username = intent.username.as_str();
-    let text = store
-        .read_record(&format!("accounts/{username}"), "account.json")
-        .await
+    let account = store
+        .account(username)
+        .await?
         .ok_or_else(|| format!("no account for {username}"))?;
-    let account: Account = serde_json::from_str(&text)
-        .map_err(|e| format!("the account record does not parse: {e}"))?;
     let Some(payment) = account.payment_state() else {
         return Err(format!(
             "{username} was approved without charge, so there is no payment token to resend"
@@ -1799,8 +1797,8 @@ pub async fn resend(
     // Every settling transition journals its outcome, and the line names the
     // application the account was made from.
     let application = store
-        .read_record(&format!("accounts/{username}"), "application.json")
-        .await
+        .application_copy(username)
+        .await?
         .and_then(|copy| serde_json::from_str::<Value>(&copy).ok())
         .and_then(|copy| {
             let status_token = copy.get("status_token")?.as_str()?.to_string();
@@ -1879,8 +1877,8 @@ pub async fn window_extend(
         }
     }
     let application = store
-        .read_record(&format!("accounts/{username}"), "application.json")
-        .await
+        .application_copy(&username)
+        .await?
         .and_then(|copy| serde_json::from_str::<Value>(&copy).ok())
         .and_then(|copy| {
             Some(ApplicationRef {
@@ -1994,7 +1992,7 @@ fn extend_open_window(
 pub async fn window_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     let now = OffsetDateTime::now_utc();
     for username in store.list("accounts").await? {
-        let Some(mut account) = existing_account(store, &username).await else {
+        let Some(mut account) = existing_account(store, &username).await? else {
             continue;
         };
         let Some(mut payment) = account.payment_state() else {
@@ -2117,7 +2115,7 @@ pub async fn window_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String
                 stopped = false;
                 continue;
             }
-            let Some(mut account) = existing_account(store, mailbox).await else {
+            let Some(mut account) = existing_account(store, mailbox).await? else {
                 continue;
             };
             // A closing or suspended mailbox keeps its own state: the group's
@@ -2272,7 +2270,7 @@ pub async fn grace_sweep(
     let now = OffsetDateTime::now_utc();
     let today = now.date();
     for username in store.list("accounts").await? {
-        let Some(account) = existing_account(store, &username).await else {
+        let Some(account) = existing_account(store, &username).await? else {
             continue;
         };
         // A group mailbox's grace is the group's: one conversation and one
@@ -2706,14 +2704,9 @@ async fn resolve_payment(store: &Store, token: &str) -> Result<(String, Account,
         return Err("the token record does not name this token".to_string());
     }
     let username = join.username;
-    let Some(account_text) = store
-        .read_record(&format!("accounts/{username}"), "account.json")
-        .await
-    else {
+    let Some(account) = store.account(&username).await? else {
         return Err("the token resolves to an account that is gone".to_string());
     };
-    let account: Account = serde_json::from_str(&account_text)
-        .map_err(|e| format!("the account record does not parse: {e}"))?;
     let Some(payment) = account.payment_state() else {
         return Err("the account carries no payment block".to_string());
     };
@@ -3217,7 +3210,7 @@ async fn restore_group_mailboxes(
     group: &GroupRecord,
 ) -> Result<(), String> {
     for mailbox in &group.accounts {
-        let Some(mut account) = existing_account(store, mailbox).await else {
+        let Some(mut account) = existing_account(store, mailbox).await? else {
             continue;
         };
         if account.state != "lapsed" {
@@ -4301,10 +4294,7 @@ pub async fn write_payment_copy(
     username: &str,
     payment: &Payment,
 ) -> Result<(), String> {
-    let Some(text) = store
-        .read_record(&format!("accounts/{username}"), "application.json")
-        .await
-    else {
+    let Some(text) = store.application_copy(username).await? else {
         return Ok(());
     };
     let mut copy: Value = serde_json::from_str(&text)
@@ -4317,11 +4307,7 @@ pub async fn write_payment_copy(
         .write_record(&format!("accounts/{username}"), "application.json", &bytes)
         .await?;
     if let Some(token) = copy.get("status_token").and_then(Value::as_str) {
-        if store
-            .read_record("applications", &format!("{token}.json"))
-            .await
-            .is_some()
-        {
+        if store.application_text(token).await?.is_some() {
             let owner = store.dir_owner("applications");
             store
                 .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
@@ -4705,14 +4691,9 @@ fn site_owner(record: &Record, mailboxes: &[String]) -> Result<String, String> {
 /// parsed is an error rather than "no group": treating it as absent would let an
 /// approval adopt accounts the record names.
 pub async fn group_record(store: &Store, domain: &str) -> Result<Option<GroupRecord>, String> {
-    let Some(text) = store
-        .read_record(&format!("groups/{domain}"), "group.json")
-        .await
-    else {
+    let Some(record) = store.group(domain).await? else {
         return Ok(None);
     };
-    let record: GroupRecord = serde_json::from_str(&text)
-        .map_err(|e| format!("groups/{domain}/group.json does not parse: {e}"))?;
     if record.version != 1 {
         return Err(format!(
             "groups/{domain}/group.json has version {}, which this build does not read",
@@ -4737,7 +4718,7 @@ async fn check_group_names(
         let in_record = record
             .map(|g| g.accounts.iter().any(|a| a == mailbox))
             .unwrap_or(false);
-        let existing = existing_account(store, mailbox).await;
+        let existing = existing_account(store, mailbox).await?;
         let in_account = existing
             .as_ref()
             .map(|a| a.group.as_deref() == Some(domain))
@@ -5035,10 +5016,7 @@ pub async fn provision_group(
 /// answers sit inside the ninety-day purge with the rest of the application. The
 /// status link's end is stamped the way the person path's copy is.
 async fn application_copy(store: &Store, token: &str) -> Result<Option<String>, String> {
-    let Some(text) = store
-        .read_record("applications", &format!("{token}.json"))
-        .await
-    else {
+    let Some(text) = store.application_text(token).await? else {
         return Ok(None);
     };
     let mut value: Value =
@@ -5079,7 +5057,7 @@ async fn write_group_account(
     payment: &GroupPayment,
     mail_key: Option<&KeyRecord>,
 ) -> Result<(), String> {
-    let existing = existing_account(store, mailbox).await;
+    let existing = existing_account(store, mailbox).await?;
     let now = util::filed_at();
     let account = Account {
         version: 1,
@@ -5406,7 +5384,7 @@ pub async fn suspend(
     if reason.is_empty() {
         return Err("a suspension needs a reason, in the words the member will read".to_string());
     }
-    let Some(mut account) = existing_account(store, username).await else {
+    let Some(mut account) = existing_account(store, username).await? else {
         return Err(format!("no account for {username}"));
     };
     // The id is the account's own, so a retry after a crash finishes the same
@@ -5495,7 +5473,7 @@ pub async fn resume(
     if let Some(why) = validate::username_shape(username) {
         return Err(format!("the username {username:?}: {why}"));
     }
-    let Some(mut account) = existing_account(store, username).await else {
+    let Some(mut account) = existing_account(store, username).await? else {
         return Err(format!("no account for {username}"));
     };
     if account.state != "suspended" {
@@ -5571,7 +5549,7 @@ pub async fn delete_account(
     // a refund from the token's ledger lines. A record that has already gone is
     // a retry: there is nothing left to answer, and the remaining cleanup below
     // still runs.
-    let account = existing_account(store, username).await;
+    let account = existing_account(store, username).await?;
     // The id carries the account's creation stamp, so a name reused after the
     // ninety-day hold gets its own deletion rather than matching the first
     // lifecycle's journal line. Without it a second account with the same name
@@ -5716,11 +5694,10 @@ pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlem
         username: intent.username.clone(),
         status_token: String::new(),
     };
-    let mut account = match page_account(store, &intent.username).await {
+    let Some(mut account) = store.account(&intent.username).await? else {
         // The account the handler authenticated has already gone. That is a
         // closed request, not new work.
-        Ok(account) => account,
-        Err(settled) => return Ok(*settled),
+        return Ok(account_gone(&intent.username));
     };
     // Every data-subject request gets one line, whether it arrived from the page
     // or the console. The id is the intent's, so a retry after the state write
@@ -5761,18 +5738,16 @@ pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlem
     ))
 }
 
-/// The account a page action acts on. An account that has gone is not work: the
-/// settlement says so and the file goes.
-async fn page_account(store: &Store, username: &str) -> Result<Account, Box<Settlement>> {
-    existing_account(store, username).await.ok_or_else(|| {
-        Box::new(Settlement::applied(
-            ApplicationRef {
-                username: username.to_string(),
-                status_token: String::new(),
-            },
-            Some("the account had already gone".to_string()),
-        ))
-    })
+/// The settlement a page action files when the account it names has already
+/// gone. The file goes with it, because there is nothing left to act on.
+fn account_gone(username: &str) -> Settlement {
+    Settlement::applied(
+        ApplicationRef {
+            username: username.to_string(),
+            status_token: String::new(),
+        },
+        Some("the account had already gone".to_string()),
+    )
 }
 
 /// A page action's refusal: the handler validated it on the way in, so a
@@ -5870,9 +5845,8 @@ pub async fn change_password(
     store: &Store,
     intent: ChangePasswordIntent,
 ) -> Result<Settlement, String> {
-    let account = match page_account(store, &intent.username).await {
-        Ok(account) => account,
-        Err(settled) => return Ok(*settled),
+    let Some(account) = store.account(&intent.username).await? else {
+        return Ok(account_gone(&intent.username));
     };
     // The plaintext is checked and hashed here. It is overwritten before any
     // refusal removes the file, so a refusal leaves neither a file nor a buffer
@@ -5915,9 +5889,8 @@ pub async fn upload_key(
     store: &Store,
     intent: UploadKeyIntent,
 ) -> Result<Settlement, String> {
-    let mut account = match page_account(store, &intent.username).await {
-        Ok(account) => account,
-        Err(settled) => return Ok(*settled),
+    let Some(mut account) = store.account(&intent.username).await? else {
+        return Ok(account_gone(&intent.username));
     };
     let now = util::filed_at();
     match intent.action.as_str() {
@@ -6007,9 +5980,8 @@ pub async fn set_outside_address(
     store: &Store,
     intent: OutsideAddressIntent,
 ) -> Result<Settlement, String> {
-    let mut account = match page_account(store, &intent.username).await {
-        Ok(account) => account,
-        Err(settled) => return Ok(*settled),
+    let Some(mut account) = store.account(&intent.username).await? else {
+        return Ok(account_gone(&intent.username));
     };
     let address = intent.address.trim();
     let outside = if address.is_empty() {
@@ -6048,9 +6020,8 @@ pub async fn set_serving(
     store: &Store,
     intent: ServingIntent,
 ) -> Result<Settlement, String> {
-    let mut account = match page_account(store, &intent.username).await {
-        Ok(account) => account,
-        Err(settled) => return Ok(*settled),
+    let Some(mut account) = store.account(&intent.username).await? else {
+        return Ok(account_gone(&intent.username));
     };
     // An unrecorded lane on a hosting member is serving: provision-member.sh
     // wrote it and nobody has turned it off. Comparing the effective value keeps
@@ -6111,9 +6082,8 @@ pub async fn cancel_renewal(
     store: &Store,
     intent: CancelRenewalIntent,
 ) -> Result<Settlement, String> {
-    let mut account = match page_account(store, &intent.username).await {
-        Ok(account) => account,
-        Err(settled) => return Ok(*settled),
+    let Some(mut account) = store.account(&intent.username).await? else {
+        return Ok(account_gone(&intent.username));
     };
     let Some(payment) = account.payment.as_mut() else {
         return Ok(refused_page(
@@ -6259,9 +6229,8 @@ pub async fn mail_key(
     store: &Store,
     intent: MailKeyIntent,
 ) -> Result<Settlement, String> {
-    let mut account = match page_account(store, &intent.username).await {
-        Ok(account) => account,
-        Err(settled) => return Ok(*settled),
+    let Some(mut account) = store.account(&intent.username).await? else {
+        return Ok(account_gone(&intent.username));
     };
     let application = ApplicationRef {
         username: account.username.clone(),
@@ -6400,7 +6369,7 @@ pub async fn mail_key_rotations(
     journal: &Journal,
 ) -> Result<(), String> {
     for username in store.list("accounts").await? {
-        let Some(mut account) = existing_account(store, &username).await else {
+        let Some(mut account) = existing_account(store, &username).await? else {
             continue;
         };
         let Some(rotation) = account.rotation.clone() else {
@@ -6614,7 +6583,7 @@ pub async fn group_address(
                     ));
                 }
             }
-            let existing = existing_account(store, &intent.mailbox).await;
+            let existing = existing_account(store, &intent.mailbox).await?;
             let ours = existing
                 .as_ref()
                 .map(|a| a.group.as_deref() == Some(intent.domain.as_str()))
@@ -6710,7 +6679,7 @@ pub async fn group_address(
             // the group nor on the box closes nothing, so it must not start a
             // ninety-day hold either.
             let closing = in_group(&intent.mailbox)
-                || existing_account(store, &intent.mailbox).await.is_some()
+                || existing_account(store, &intent.mailbox).await?.is_some()
                 || account_on_box(cfg, &intent.mailbox)?;
             // Only a pass that still sees the departing mailbox owning the site
             // moves the upload key and the lanes. Once the group record names
@@ -6989,16 +6958,11 @@ pub async fn check_group_dns(cfg: &DrainConfig, store: &Store) -> Result<(), Str
         if name.starts_with('.') {
             continue;
         }
-        let Some(text) = store
-            .read_record(&format!("groups/{name}"), "group.json")
-            .await
-        else {
-            continue;
-        };
-        let group: GroupRecord = match serde_json::from_str(&text) {
-            Ok(group) => group,
+        let group = match group_record(store, &name).await {
+            Ok(Some(group)) => group,
+            Ok(None) => continue,
             Err(e) => {
-                eprintln!("kyriakon-onboard: groups/{name}/group.json does not parse: {e}");
+                eprintln!("kyriakon-onboard: {e}");
                 continue;
             }
         };
@@ -7182,11 +7146,8 @@ async fn dns_broken(cfg: &DrainConfig, values: &dns::Values, domain: &str) -> Re
 /// cleared falls back rather than failing the sweep.
 async fn dns_contact(store: &Store, group: &GroupRecord) -> Result<String, String> {
     let copy: Option<Value> = store
-        .read_record(
-            &format!("accounts/{}", group.site_owner),
-            "application.json",
-        )
-        .await
+        .application_copy(&group.site_owner)
+        .await?
         .and_then(|text| serde_json::from_str(&text).ok());
     if let Some(copy) = &copy {
         if let Some(contact) = copy
@@ -7281,7 +7242,7 @@ pub async fn refresh_space_used(cfg: &DrainConfig, store: &Store) -> Result<(), 
     let usage = parse_repquota(&String::from_utf8_lossy(&report.stdout));
     let mut recorded: HashSet<String> = HashSet::new();
     for (username, used_kb) in &usage {
-        let Some(mut account) = existing_account(store, username).await else {
+        let Some(mut account) = existing_account(store, username).await? else {
             // A uid with no account record is somebody else's, and this sweep
             // writes nothing about it.
             continue;
@@ -7327,7 +7288,7 @@ pub async fn refresh_space_used(cfg: &DrainConfig, store: &Store) -> Result<(), 
         let mut total = 0u64;
         let mut seen = false;
         for mailbox in &group.accounts {
-            if let Some(account) = existing_account(store, mailbox).await {
+            if let Some(account) = existing_account(store, mailbox).await? {
                 total = total.saturating_add(account.space_used.unwrap_or(0));
                 seen = true;
             }
@@ -7416,7 +7377,7 @@ async fn write_quota_state(store: &Store) -> Result<(), String> {
 pub async fn free_anniversaries(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     let today = OffsetDateTime::now_utc().date();
     for username in store.list("accounts").await? {
-        let Some(account) = existing_account(store, &username).await else {
+        let Some(account) = existing_account(store, &username).await? else {
             continue;
         };
         if !account.is_free() {
@@ -7481,7 +7442,7 @@ pub async fn free_anniversaries(cfg: &DrainConfig, store: &Store) -> Result<(), 
 pub async fn prepaid_renewals(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     let today = OffsetDateTime::now_utc().date();
     for username in store.list("accounts").await? {
-        let Some(account) = existing_account(store, &username).await else {
+        let Some(account) = existing_account(store, &username).await? else {
             continue;
         };
         if account.state != "active" || account.group.is_some() {
@@ -7659,8 +7620,8 @@ pub async fn export_account(
         .await?;
     }
     let status_token = store
-        .read_record(&format!("accounts/{username}"), "application.json")
-        .await
+        .application_copy(username)
+        .await?
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|copy| {
             copy.get("status_token")
@@ -7693,10 +7654,7 @@ pub async fn purge_declined(
         if !name.ends_with(".json") {
             continue;
         }
-        let Some(text) = store.read_record("applications", &name).await else {
-            continue;
-        };
-        let Ok(record) = serde_json::from_str::<Record>(&text) else {
+        let Some(record) = store.application(name.trim_end_matches(".json")).await? else {
             continue;
         };
         if !record.stage.starts_with("declined") {
@@ -7753,7 +7711,7 @@ pub async fn purge_declined(
             // in use and the purge must not delete what holds it. A failed
             // script leaves the record for the next pass rather than losing the
             // release, and its error is reported once rather than every minute.
-            let taken = existing_account(store, &record.username).await.is_some()
+            let taken = existing_account(store, &record.username).await?.is_some()
                 || account_on_box(cfg, &record.username)?;
             if !taken {
                 if let Err(e) = run_script(cfg, "delete-user.sh", &[&record.username]).await {
@@ -7797,13 +7755,7 @@ pub async fn purge_closing(
         if validate::username_shape(&username).is_some() {
             continue;
         }
-        let Some(text) = store
-            .read_record(&format!("accounts/{username}"), "account.json")
-            .await
-        else {
-            continue;
-        };
-        let Ok(account) = serde_json::from_str::<Account>(&text) else {
+        let Some(account) = store.account(&username).await? else {
             continue;
         };
         if account.state != "closing" {
@@ -7832,20 +7784,18 @@ pub async fn purge_closing(
 /// missing. A decision intent for an application that is not on disk is refused
 /// rather than creating anything.
 async fn application_record(store: &Store, token: &str) -> Result<Record, String> {
-    let text = store
-        .read_record("applications", &format!("{token}.json"))
-        .await
-        .ok_or("there is no application for this token")?;
-    serde_json::from_str(&text).map_err(|e| format!("the application record does not parse: {e}"))
+    store
+        .application(token)
+        .await?
+        .ok_or_else(|| "there is no application for this token".to_string())
 }
 
 /// The account a username already has, when one is there. This is the fast path:
-/// the box itself, read below, is the oracle.
-async fn existing_account(store: &Store, username: &str) -> Option<Account> {
-    let text = store
-        .read_record(&format!("accounts/{username}"), "account.json")
-        .await?;
-    serde_json::from_str(&text).ok()
+/// the box itself, read below, is the oracle. A record that cannot be read or
+/// parsed is an error rather than "no account": a sweep that skipped it would
+/// never lapse, notice, renew or alert.
+async fn existing_account(store: &Store, username: &str) -> Result<Option<Account>, String> {
+    store.account(username).await
 }
 
 /// Whether the box itself holds an account for a username, read from the passwd
@@ -7894,12 +7844,10 @@ async fn mark_decided(
     decided_at: &str,
     password_link: Option<String>,
 ) -> Result<(), String> {
-    let text = store
-        .read_record("applications", &format!("{token}.json"))
-        .await
+    let mut record = store
+        .application(token)
+        .await?
         .ok_or("the application record vanished before it could be decided")?;
-    let mut record: Record = serde_json::from_str(&text)
-        .map_err(|e| format!("the application record does not parse: {e}"))?;
     record.stage = stage.to_string();
     record.decided_at = Some(decided_at.to_string());
     record.password_link = password_link;
@@ -8515,14 +8463,9 @@ enum TargetRef {
 async fn load_target(store: &Store, target: &TargetRef) -> Result<Option<BillingTarget>, String> {
     match target {
         TargetRef::Account(username) => {
-            let Some(text) = store
-                .read_record(&format!("accounts/{username}"), "account.json")
-                .await
-            else {
+            let Some(account) = store.account(username).await? else {
                 return Ok(None);
             };
-            let account: Account = serde_json::from_str(&text)
-                .map_err(|e| format!("the account {username} does not parse: {e}"))?;
             // A free approval has no payment block, so a card event is not its
             // to change.
             if account.payment.is_none() {
@@ -8544,13 +8487,7 @@ async fn target_for_subscription(
     subscription: &str,
 ) -> Result<Option<TargetRef>, String> {
     for username in store.list("accounts").await? {
-        let Some(text) = store
-            .read_record(&format!("accounts/{username}"), "account.json")
-            .await
-        else {
-            continue;
-        };
-        let Ok(account) = serde_json::from_str::<Account>(&text) else {
+        let Some(account) = store.account(&username).await? else {
             continue;
         };
         if account
@@ -8634,14 +8571,9 @@ async fn account_for_payment_reference(
     if join.token != reference || validate::username_shape(&join.username).is_some() {
         return Ok(None);
     }
-    let Some(text) = store
-        .read_record(&format!("accounts/{}", join.username), "account.json")
-        .await
-    else {
+    let Some(account) = store.account(&join.username).await? else {
         return Ok(None);
     };
-    let account: Account = serde_json::from_str(&text)
-        .map_err(|e| format!("the account {} does not parse: {e}", join.username))?;
     let Some(payment) = account.payment_state() else {
         return Ok(None);
     };
@@ -9557,12 +9489,17 @@ mod tests {
 
         refresh_space_used(&cfg, &store).await.unwrap();
         assert_eq!(
-            existing_account(&store, "alice").await.unwrap().space_used,
+            existing_account(&store, "alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .space_used,
             Some(1024 * 1024)
         );
         assert_eq!(
             existing_account(&store, "secretary")
                 .await
+                .unwrap()
                 .unwrap()
                 .space_used,
             Some(512 * 1024)
@@ -9585,7 +9522,11 @@ mod tests {
         );
         refresh_space_used(&cfg, &store).await.unwrap();
         assert_eq!(
-            existing_account(&store, "alice").await.unwrap().space_used,
+            existing_account(&store, "alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .space_used,
             Some(1024 * 1024)
         );
         assert_eq!(
@@ -9602,7 +9543,11 @@ mod tests {
         cfg_script(&dir, "printf 'no quota table here\\n'\n");
         refresh_space_used(&cfg, &store).await.unwrap();
         assert_eq!(
-            existing_account(&store, "alice").await.unwrap().space_used,
+            existing_account(&store, "alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .space_used,
             Some(1024 * 1024)
         );
         std::fs::remove_dir_all(&dir).unwrap();

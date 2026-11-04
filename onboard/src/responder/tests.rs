@@ -704,6 +704,28 @@ async fn a_group_member_reads_the_same_recipe_on_both_account_pages() {
     }
 }
 
+/// A group record that is there and does not parse fails the page rather than
+/// leaving the payment block out: an absent block reads as a group that owes
+/// nothing.
+#[tokio::test]
+async fn a_corrupt_group_record_fails_the_account_pages() {
+    let (app, dir) = handler("corrupt-group-record").await;
+    file_group_account(&dir);
+    std::fs::write(
+        dir.join("groups/parish.example/group.json"),
+        b"{\"version\": 1, \"domain\": \"parish.exa",
+    )
+    .unwrap();
+    let pinned = certificate(PINNED, "CN=parish-secretary");
+
+    let (code, body) = answer(&app, &gmid_certificate("account", "", &pinned)).await;
+    assert_eq!(code, 50, "the capsule dropped the block: {body}");
+
+    let cookie = signed_in(&app, "parish-secretary").await;
+    let (code, body) = answer(&app, &httpd_get_session("account", "", &cookie)).await;
+    assert_eq!(code, 500, "the page dropped the block: {body}");
+}
+
 /// A fixture account's record, changed in place: the tests below set one fact
 /// each so the page is read against the record rather than against a page-only
 /// flag.
