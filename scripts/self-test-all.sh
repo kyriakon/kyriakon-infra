@@ -39,7 +39,6 @@ rekey-mail-key.sh
 renew-acme.sh
 restore-standup.sh
 restore-test.sh
-setup-env.sh
 "
 
 # SELF_TEST_ALL_DIR lets the self-test below run this loop over a fixture rather

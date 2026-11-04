@@ -9,8 +9,10 @@
 # Columns, tab-separated:
 #
 #   script       the file in scripts/, by name
-#   destination  /root/bin, or drain for the directory the drain's own config
-#                names at run time (installed into by scripts/deploy-onboard.sh)
+#   destination  /root/bin, drain for the directory the drain's own config names
+#                at run time (installed into by scripts/deploy-onboard.sh), or
+#                checkout for a script cron runs from the checkout itself, which
+#                nothing installs
 #   schedule     the five cron fields, or - when nothing schedules the script
 #   args         the arguments the cron line passes, present only when there are
 #                some
@@ -18,9 +20,8 @@
 # A script installed in two places has one line per place. lib.sh is sourced by
 # the /root/bin scripts and by the drain's, so it is in both.
 #
-# Three scripts are not here, because a row is one file installed under its own
+# Two scripts are not here, because a row is one file installed under its own
 # name:
-#   - check-hygiene.sh and self-test-all.sh, which cron runs from the checkout;
 #   - kyriakon-authcheck.sh, which deploy-onboard.sh installs as
 #     /usr/local/libexec/kyriakon-authcheck;
 #   - render-docs.sh, which deploy-onboard.sh runs from the checkout.
@@ -35,6 +36,10 @@ backup.sh	/root/bin	30 2 * * *
 # the mail is read, not for the test.
 restore-standup.sh	/root/bin	45 3 * * 1
 acme-queue.sh	/root/bin	*/15 * * * *	--run
+# Read from the checkout rather than installed, so a pull that fixes one is the
+# whole change. Both are weekly and an hour apart, so a failure is one mail.
+check-hygiene.sh	checkout	30 4 * * 1
+self-test-all.sh	checkout	0 5 * * 1
 
 lib.sh	drain	-
 add-user.sh	drain	-

@@ -49,6 +49,12 @@ script_dir="$(dirname "$0")"
 template="${KYRIAKON_ENV_TEMPLATE:-$script_dir/../openbsd/etc/kyriakon.env}"
 env_dst="${KYRIAKON_ENV:-/root/.kyriakon-env}"
 
+# install_staged: the file every cron job sources is written through a sibling
+# and renamed, so a run killed mid-copy leaves the old one rather than a
+# truncated one that takes PATH and ALERT_EMAIL with it.
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
+
 # The onboarding TUI's port is a property of the box, not a value an operator
 # can be expected to know, so the box picks it here instead of taking it as an
 # argument. The reserved range is 2200-2299.
@@ -88,6 +94,103 @@ choose_tui_port() {
 	return 1
 }
 
+# merge_env <pairs>: rewrite $env_dst with each KEY=value line replaced by the
+# given one, appended when the file has never had it, and every other line —
+# comments and the PATH block included — passed through untouched. Written
+# through install_staged, so the file the cron lines source is either the old one
+# or the whole new one and never a partial copy.
+merge_env() {
+	typeset pairs="$1" tmp
+	tmp=$(mktemp)
+	# Through the environment rather than -v: awk reinterprets escape
+	# sequences in a -v assignment, and these pairs are newline-separated,
+	# which -v rejects outright.
+	PAIRS="$pairs" awk -v q="'" '
+		BEGIN { n = split(ENVIRON["PAIRS"], p, "\n")
+			for (i = 1; i <= n; i++) {
+				eq = index(p[i], "=")
+				if (eq > 0) want[substr(p[i], 1, eq - 1)] = substr(p[i], eq + 1)
+			} }
+		{
+			for (k in want) {
+				if (index($0, "export " k "=") == 1) {
+					print "export " k "=" q want[k] q
+					delete want[k]
+					next
+				}
+			}
+			print
+		}
+		END { for (k in want) print "export " k "=" q want[k] q }
+	' "$env_dst" > "$tmp"
+	install_staged "$tmp" "$env_dst" -m 0600 || {
+		rm -f "$tmp"
+		return 1
+	}
+	rm -f "$tmp"
+}
+
+# --- self-test ---------------------------------------------------------------
+#
+# The merge is the path every later run takes, and it is where a lost comment or
+# a lost PATH block would go unnoticed until a cron job failed at 02:30. The
+# rename is the other half: this file must be the old one or the whole new one,
+# because every cron line sources it. Runs as anyone, writes only under TMPDIR.
+
+self_test() {
+	typeset tree fixture before stub code
+	self_test_begin
+	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
+	tree=$self_test_work
+	fixture=$tree/kyriakon.env
+	cat > "$fixture" <<'EOF'
+# a comment that has to survive the merge
+export KYRIAKON_IPV4='203.0.113.9'
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
+export PATH
+export ALERT_EMAIL='old@example.invalid'
+EOF
+	env_dst=$fixture
+
+	merge_env "ALERT_EMAIL=new@example.invalid
+KYRIAKON_IPV6=2001:db8::10"
+
+	check "the given value is replaced" \
+		"$(grep -c "^export ALERT_EMAIL='new@example.invalid'" "$fixture")" 1
+	check "a value the file had not seen is appended" \
+		"$(grep -c "^export KYRIAKON_IPV6='2001:db8::10'" "$fixture")" 1
+	check "a value not given keeps what it had" \
+		"$(grep -c "^export KYRIAKON_IPV4='203.0.113.9'" "$fixture")" 1
+	check "the comment survives" \
+		"$(grep -c '^# a comment that has to survive the merge$' "$fixture")" 1
+	check "the PATH block survives" "$(grep -c '^export PATH$' "$fixture")" 1
+	# shellcheck disable=SC2016 # the literal text written to the file, not this script's PATH
+	check "with its literal value" \
+		"$(grep -cF 'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"' "$fixture")" 1
+	check "the file is mode 0600" "$(stat -f '%Lp' "$fixture")" 600
+
+	# A write killed between the copy and the rename: the rename is stubbed to
+	# fail, which is what a crash at that point looks like, and the file every
+	# cron job sources has to be untouched rather than half written.
+	before=$(cat "$fixture")
+	stub=$tree/bin
+	mkdir "$stub"
+	printf '#!/bin/sh\nexit 1\n' > "$stub/mv"
+	chmod +x "$stub/mv"
+	code=0
+	( PATH="$stub:$PATH"; merge_env "ALERT_EMAIL=lost@example.invalid" ) \
+		> "$tree/failed.out" 2>&1 || code=$?
+	check "a rename that fails is a failure" "$code" 1
+	check "and says the file was left as it was" \
+		"$(grep -c 'left as it was' "$tree/failed.out")" 1
+	check "and the file is untouched" "$(cat "$fixture")" "$before"
+	set -- "$tree"/*.new.*
+	check "and no candidate is left behind" \
+		"$([ -e "$1" ] && printf yes || printf no)" no
+
+	self_test_end
+}
+
 vars="KYRIAKON_IPV4 KYRIAKON_IPV6 KYRIAKON_TSIG_SECRET RESTIC_REPOSITORY RESTIC_PASSWORD_FILE ALERT_EMAIL HEALTHCHECKS_URL KEYRING_HEALTHCHECKS_URL REHEARSAL_HEALTHCHECKS_URL HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL POSTAL_ADDRESS"
 
 usage() {
@@ -102,6 +205,7 @@ usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
                              --postal-address M
                              [--ico-reference N --eu-representative O
                               --eu-representative-contact P]]
+       ksh scripts/setup-env.sh --self-test
 
   No arguments: install the template if /root/.kyriakon-env is absent, then
   report which values are still missing or placeholders.
@@ -132,6 +236,13 @@ usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
 EOF
 	exit 2
 }
+
+case "${1:-}" in
+--self-test)
+	[ "$#" -eq 1 ] || usage
+	self_test
+	;;
+esac
 
 a_ipv4=
 a_ipv6=
@@ -270,30 +381,7 @@ if [ "$given" -gt 0 ]; then
 			pairs="$pairs
 $kv"
 		done
-		tmp=$(mktemp)
-		# Through the environment rather than -v: awk reinterprets escape
-		# sequences in a -v assignment, and these pairs are newline-separated,
-		# which -v rejects outright.
-		PAIRS="$pairs" awk -v q="'" '
-			BEGIN { n = split(ENVIRON["PAIRS"], p, "\n")
-				for (i = 1; i <= n; i++) {
-					eq = index(p[i], "=")
-					if (eq > 0) want[substr(p[i], 1, eq - 1)] = substr(p[i], eq + 1)
-				} }
-			{
-				for (k in want) {
-					if (index($0, "export " k "=") == 1) {
-						print "export " k "=" q want[k] q
-						delete want[k]
-						next
-					}
-				}
-				print
-			}
-			END { for (k in want) print "export " k "=" q want[k] q }
-		' "$env_dst" > "$tmp"
-		install -m 0600 "$tmp" "$env_dst"
-		rm -f "$tmp"
+		merge_env "$pairs"
 		printf 'updated %s with %s value(s); the rest kept what they had\n' "$env_dst" "$given"
 	else
 	tmp=$(mktemp)
@@ -324,7 +412,7 @@ $kv"
 		if [ -n "$a_rep" ]; then printf "export EU_REPRESENTATIVE='%s'\n" "$a_rep"; fi
 		if [ -n "$a_rep_contact" ]; then printf "export EU_REPRESENTATIVE_CONTACT='%s'\n" "$a_rep_contact"; fi
 	} > "$tmp"
-	install -m 0600 "$tmp" "$env_dst"
+	install_staged "$tmp" "$env_dst" -m 0600
 	rm -f "$tmp"
 	printf 'wrote %s from the arguments\n' "$env_dst"
 	fi
@@ -333,7 +421,7 @@ elif [ ! -f "$env_dst" ]; then
 		printf 'setup-env: no %s, and no template at %s\n' "$env_dst" "$template" >&2
 		exit 1
 	}
-	install -m 0600 "$template" "$env_dst"
+	install_staged "$template" "$env_dst" -m 0600
 	printf 'installed %s from %s\n' "$env_dst" "$template"
 fi
 

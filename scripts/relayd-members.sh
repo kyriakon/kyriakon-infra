@@ -58,6 +58,11 @@ httpd_d=${RELAYD_MEMBERS_HTTPD_D:-/etc/httpd.d}
 ssl_dir=${RELAYD_MEMBERS_SSL_DIR:-/etc/ssl}
 ssl_private=${RELAYD_MEMBERS_SSL_PRIVATE:-/etc/ssl/private}
 
+# link_cert: the certificate link is made here and by deploy-relayd.sh, so the
+# two cannot disagree about which name it points at.
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
+
 # Matched anywhere in a line, because the markers are comments inside a block and
 # may be indented. Nothing else in relayd.conf carries either phrase.
 begin_marker='BEGIN member keypairs'
@@ -97,24 +102,6 @@ member_ready() {
 	# keypair line for it is a `relayd -n` failure that rolls back every other
 	# member's pending change in the same pass.
 	[ -s "$ssl_dir/$1.fullchain.pem" ] && [ -s "$ssl_private/$1.key" ]
-}
-
-# ensure_member_link <name>: /etc/ssl/<name>.crt is the symlink relayd looks the
-# keypair up through. Same rule as deploy-relayd.sh's ensure_cert_link.
-ensure_member_link() {
-	typeset cert_name="$1" cert_link cert_target now
-	cert_link="$ssl_dir/$cert_name.crt"
-	cert_target="$cert_name.fullchain.pem"
-	if [ -L "$cert_link" ]; then
-		now=$(readlink "$cert_link")
-		[ "$now" = "$cert_target" ] && return 0
-		ln -sfn "$cert_target" "$cert_link"
-		return 0
-	fi
-	if [ -e "$cert_link" ]; then
-		die "$cert_link is not a symlink; refusing to replace a file that may be a certificate"
-	fi
-	ln -s "$cert_target" "$cert_link"
 }
 
 # keypair_lines: the region's body, one statement per ready member. The loop's
@@ -164,7 +151,9 @@ apply() {
 	if [ "$mode" = write ]; then
 		member_names | while read -r name; do
 			if member_ready "$name"; then
-				ensure_member_link "$name"
+				# Silenced: this script's stdout is the one word cron-apply.sh
+				# reads, and a link line would be read as a third answer.
+				link_cert "$ssl_dir" "$ssl_private" "$name" >/dev/null
 			fi
 		done
 	fi
@@ -204,8 +193,6 @@ apply() {
 # line outside the region comes through byte for byte.
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$script_dir/lib.sh"
 	typeset tree conf before out code
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
@@ -327,7 +314,7 @@ EOF
 	rm -f "$ssl_dir/zed.kyriakon.net.crt"
 	printf 'not a link\n' > "$ssl_dir/zed.kyriakon.net.crt"
 	code=0
-	( ensure_member_link zed.kyriakon.net ) > "$tree/linkfile.out" 2>&1 || code=$?
+	( link_cert "$ssl_dir" "$ssl_private" zed.kyriakon.net ) > "$tree/linkfile.out" 2>&1 || code=$?
 	check "a real file at the link path is refused" "$code" 1
 	check "and left as it was" "$(cat "$ssl_dir/zed.kyriakon.net.crt")" "not a link"
 

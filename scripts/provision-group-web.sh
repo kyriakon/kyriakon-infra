@@ -65,6 +65,9 @@ set -euo pipefail
 # half-written vhost behind.
 umask 077
 
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$(dirname "$0")/lib.sh"
+
 httpd_d=/etc/httpd.d
 ssl_dir=/etc/ssl
 ssl_private=/etc/ssl/private
@@ -172,26 +175,17 @@ group_conf_body() {
 # Sets conf_changed so the caller can say whether the index and daemon need the
 # --web pass.
 write_group_conf() {
-	typeset target candidate
+	typeset target
 
 	target=$(group_conf)
 
-	# A certificate without its key is a broken pair rather than a state to serve
-	# from: relayd would name a key that is not there and its config check would
-	# fail. Refusing leaves the previous file exactly as it was.
-	if [ -f "$(cert_file)" ] && [ ! -f "$(key_file)" ]; then
-		die "$(cert_file) is there and $(key_file) is not, so $target was left alone: the relay needs both halves of the pair"
+	# A certificate without its key is refused by write_generated, which returns 1
+	# with the message and leaves the previous file exactly as it was.
+	if ! write_generated "$target" group_conf_body "$(cert_file)" "$(key_file)"; then
+		return 1
 	fi
 
-	candidate="$target.new.$$"
-	if ! group_conf_body > "$candidate"; then
-		rm -f "$candidate"
-		exit 1
-	fi
-
-	if [ -f "$target" ] && cmp -s "$candidate" "$target"; then
-		rm -f "$candidate"
-		conf_changed=no
+	if [ "$conf_changed" = no ]; then
 		if [ -f "$(cert_file)" ]; then
 			printf '%s: unchanged, the site and the www redirect are in place\n' "$target"
 		else
@@ -199,10 +193,6 @@ write_group_conf() {
 		fi
 		return 0
 	fi
-
-	chmod 0644 "$candidate"
-	mv "$candidate" "$target"
-	conf_changed=yes
 
 	if [ -f "$(cert_file)" ]; then
 		printf 'wrote %s: port 80, the site and the www redirect for %s\n' "$target" "$domain"
@@ -241,8 +231,6 @@ assert_site_tree() {
 # in each state, and the refusals. Runs as anyone, writes only under TMPDIR.
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	typeset tree conf before code
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh

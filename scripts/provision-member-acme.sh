@@ -63,6 +63,8 @@ set -euo pipefail
 umask 077
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
 acme_d=${ACME_D:-/etc/acme-client.d}
 public_root=${PUBLIC_ROOT:-/home/www}
 acme_queue=${ACME_QUEUE:-/root/bin/acme-queue.sh}
@@ -111,28 +113,15 @@ member_conf_body() {
 # write_member_conf: the file in the shape the member's name calls for. Sets
 # conf_changed so the caller can say which of the two states it found.
 write_member_conf() {
-	typeset target candidate
+	typeset target
 
 	target=$(member_conf)
-	candidate="$target.new.$$"
-	if ! member_conf_body > "$candidate"; then
-		rm -f "$candidate"
-		exit 1
-	fi
-
-	# Compared before anything moves, so a run that would produce the same file
-	# leaves its mtime and inode alone.
-	if [ -f "$target" ] && cmp -s "$candidate" "$target"; then
-		rm -f "$candidate"
-		conf_changed=no
+	write_generated "$target" member_conf_body
+	if [ "$conf_changed" = yes ]; then
+		printf 'wrote %s\n' "$target"
+	else
 		printf '%s: unchanged\n' "$target"
-		return 0
 	fi
-
-	chmod 0644 "$candidate"
-	mv "$candidate" "$target"
-	conf_changed=yes
-	printf 'wrote %s\n' "$target"
 }
 
 # The last line of defence: the file is there, root's, and readable by
@@ -170,8 +159,6 @@ queue_request() {
 # stubbed. Runs as anyone, writes only under TMPDIR.
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$script_dir/lib.sh"
 	typeset tree conf before code calls
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh

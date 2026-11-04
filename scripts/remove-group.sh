@@ -64,6 +64,12 @@ export PATH
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 
+# cert_paths: the link, chain and key are the same three files the relay deploy
+# and the member pass make, so removing one under a different name is how a
+# dotted file is left behind.
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
+
 mail_domains=${MAIL_DOMAINS:-/etc/mail/mail_domains}
 virtuals=${VIRTUALS:-/etc/mail/virtuals}
 dkim_domains=${DKIM_DOMAINS:-/etc/mail/dkim_domains}
@@ -169,6 +175,7 @@ remove_path() {
 }
 
 # remove_group: the whole job, in the order the transition's notes give.
+# shellcheck disable=SC2154 # the three paths come from cert_paths in lib.sh
 remove_group() {
 	tables_changed=no
 
@@ -193,9 +200,10 @@ remove_group() {
 	remove_path "daemon block" "$httpd_d/$domain.conf"
 	remove_path "daemon block" "$gmid_d/$domain.conf"
 	remove_path "daemon block" "$acme_d/$domain.conf"
-	remove_path "certificate chain" "$ssl_dir/$domain.fullchain.pem"
-	remove_path "certificate key" "$ssl_private/$domain.key"
-	remove_path "relayd certificate link" "$ssl_dir/$domain.crt"
+	cert_paths "$ssl_dir" "$ssl_private" "$domain"
+	remove_path "certificate chain" "$cert_chain"
+	remove_path "certificate key" "$cert_key"
+	remove_path "relayd certificate link" "$cert_link"
 	remove_path "capsule configuration" "$ssl_dir/capsule-$domain.cnf"
 	remove_path "capsule certificate" "$ssl_dir/capsule-$domain.crt"
 	remove_path "capsule key" "$ssl_private/capsule-$domain.key"
@@ -217,8 +225,6 @@ remove_group() {
 # script's own decisions, not the tools'.
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$script_dir/lib.sh"
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work

@@ -74,6 +74,9 @@ install_dests() {
 		case "$dest" in
 		/root/bin) needs_mail=yes ;;
 		drain) needs_onboard=yes ;;
+		# Run from the checkout, so a change to it is installed by nothing: the
+		# pull that changes it is the whole deploy.
+		checkout) ;;
 		*) die "unknown destination $dest for $name in $table" ;;
 		esac
 	done
@@ -524,6 +527,11 @@ self_test() {
 	reset_plan
 	classify 'scripts/provision-group-acme.sh'
 	check 'the own-domain acme lane plans deploy-onboard' "$needs_onboard" yes
+	reset_plan
+	classify 'scripts/check-hygiene.sh'
+	check 'a checkout script plans no deploy' "$(plan_order)" ''
+	check 'and no manual step' \
+		"$(if manual_any; then printf yes; else printf no; fi)" no
 	reset_plan
 	classify 'scripts/relayd-members.sh'
 	check 'the relayd member helper plans both deploys' \

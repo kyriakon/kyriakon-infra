@@ -92,6 +92,114 @@ install_rows() {
 }
 
 
+# need_pkg <package>: install it unless it is already there. One copy, because
+# two deploys carried their own and one of them asked with `pkg_info -q` (name
+# and version, which never matched the name it was given, so every deploy
+# reinstalled) and ran pkg_add without -I (which asks on a tty, and a dispatcher
+# waiting at a prompt looks exactly like a hung fetch).
+need_pkg() {
+	if pkg_info -q -e "$1" >/dev/null 2>&1 || pkg_info -q -e "$1-*" >/dev/null 2>&1; then
+		return 0
+	fi
+	printf 'installing %s (fetching; can take a minute)\n' "$1"
+	pkg_add -I "$1"
+}
+
+
+# --- generated files -------------------------------------------------------
+#
+# write_generated <target> <body-fn> [<cert> <key>]: write <target> from the
+# body function, atomically, and only when the bytes differ.
+#
+# The body goes to a sibling candidate, is compared with what is there, and only
+# then is renamed into place at 0644; the candidate's own creation is the
+# caller's umask 077, so a half-written file is never readable by a member. A run
+# killed at any point leaves the file the daemon is reading as it was, and a run
+# that would write the same bytes leaves its inode and mtime alone. Sets
+# conf_changed to yes or no, which is what the callers' "next" lines and the
+# --web pass key off.
+#
+# A <cert> with no <key> is a broken pair rather than a state to serve from:
+# relayd would name a key that is not there, its config check would fail, and the
+# reload would take every name on the box down rather than one. The pair is an
+# argument so the refusal is made once, here, and a lane that writes a file
+# naming the pair cannot forget it.
+write_generated() {
+	typeset gen_target="$1" gen_body="$2" gen_cert="${3:-}" gen_key="${4:-}" gen_candidate
+	if [ -n "$gen_cert" ] && [ -f "$gen_cert" ] && [ ! -f "$gen_key" ]; then
+		printf '%s is there and %s is not, so %s was left alone: the relay needs both halves of the pair\n' \
+			"$gen_cert" "$gen_key" "$gen_target" >&2
+		return 1
+	fi
+	gen_candidate="$gen_target.new.$$"
+	if ! "$gen_body" >"$gen_candidate"; then
+		rm -f "$gen_candidate"
+		printf 'could not write %s for %s; %s left as it was\n' \
+			"$gen_body" "$gen_target" "$gen_target" >&2
+		return 1
+	fi
+	if [ -f "$gen_target" ] && cmp -s "$gen_candidate" "$gen_target"; then
+		rm -f "$gen_candidate"
+		# shellcheck disable=SC2034 # the caller reads it
+		conf_changed=no
+		return 0
+	fi
+	chmod 0644 "$gen_candidate"
+	if ! mv "$gen_candidate" "$gen_target"; then
+		rm -f "$gen_candidate"
+		printf 'could not rename %s into place; %s left as it was\n' \
+			"$gen_candidate" "$gen_target" >&2
+		return 1
+	fi
+	# shellcheck disable=SC2034 # the caller reads it
+	conf_changed=yes
+	return 0
+}
+
+
+# cert_paths <ssl-dir> <private-dir> <name>: set cert_chain, cert_key and
+# cert_link to the files relayd's keypair <name> is made of. One place, because
+# a link made or removed under a different name than the pair is a keypair
+# relayd cannot open, and the relay deploy, the member pass and the removal
+# scripts all touch the same three.
+cert_paths() {
+	cert_chain="$1/$3.fullchain.pem"
+	cert_key="$2/$3.key"
+	cert_link="$1/$3.crt"
+	# Exported so shellcheck sees the cross-file use, the same way CANARY_* is.
+	export cert_chain cert_key cert_link
+}
+
+# link_cert <ssl-dir> <private-dir> <name>: make cert_link the symlink relayd
+# reads <name>'s pair through, and never over a file that is not a link: a real
+# file at that path is somebody else's certificate and deleting it would take a
+# name down. Says what it did when it changed something, so a run that repairs a
+# link removed by hand reads as one that changed something. A missing half of the
+# pair is the caller's check: the deploy names what it needs, and the member pass
+# skips a name that is not ready.
+link_cert() {
+	# Names of their own, because ksh93 binds a function's typeset to a local of
+	# the same name in its caller: a plain `target` here became the caller's.
+	typeset cert_target cert_now
+	cert_paths "$1" "$2" "$3"
+	cert_target="$3.fullchain.pem"
+	if [ -L "$cert_link" ]; then
+		cert_now=$(readlink "$cert_link")
+		[ "$cert_now" = "$cert_target" ] && return 0
+		ln -sfn "$cert_target" "$cert_link"
+		printf '%s: relinked to %s (was %s)\n' "$cert_link" "$cert_target" "$cert_now"
+		return 0
+	fi
+	if [ -e "$cert_link" ]; then
+		printf '%s is not a symlink; refusing to replace a file that may be a certificate\n' \
+			"$cert_link" >&2
+		return 1
+	fi
+	ln -s "$cert_target" "$cert_link"
+	printf 'linked %s -> %s\n' "$cert_link" "$cert_target"
+}
+
+
 # dnsbl_verdict <ip> — ask the blocklists what they make of an address, and print one
 # line naming both the verdict and the list that gave it:
 #

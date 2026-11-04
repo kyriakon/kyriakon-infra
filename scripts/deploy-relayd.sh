@@ -110,33 +110,17 @@ listeners_on_443() {
 	awk '$4 ~ /\.443$/ && $NF == "LISTEN" { n++ } END { print n + 0 }' "${1:--}"
 }
 
-# Put the certificate relayd looks for in place, for one name. A link, and never
-# over a file that is not a link: a real file at that path is somebody else's
-# certificate and deleting it would take a name down.
+# Put the certificate relayd looks for in place, for one name. The link itself is
+# lib.sh's link_cert, which is also what the member pass makes, so the two cannot
+# disagree about the name a link points at or about refusing a real file.
+# shellcheck disable=SC2154 # cert_key and cert_chain come from cert_paths in lib.sh
 ensure_cert_link() {
-	typeset name link target now
-	name="$1"
-	link="$ssl_dir/$name.crt"
-	target="$name.fullchain.pem"
-
-	[ -s "$ssl_private/$name.key" ] \
-		|| die "no $ssl_private/$name.key, so relayd cannot present $name: scripts/deploy-mail.sh issues the pair"
-	[ -s "$ssl_dir/$target" ] \
-		|| die "no $ssl_dir/$target, so relayd cannot present $name: scripts/deploy-mail.sh issues the pair"
-
-	if [ -L "$link" ]; then
-		now=$(readlink "$link")
-		if [ "$now" = "$target" ]; then
-			return 0
-		fi
-		ln -sfn "$target" "$link"
-		printf '%s: relinked to %s (was %s)\n' "$link" "$target" "$now"
-	elif [ -e "$link" ]; then
-		die "$link is not a symlink; refusing to replace a file that may be a certificate"
-	else
-		ln -s "$target" "$link"
-		printf 'linked %s -> %s\n' "$link" "$target"
-	fi
+	cert_paths "$ssl_dir" "$ssl_private" "$1"
+	[ -s "$cert_key" ] \
+		|| die "no $cert_key, so relayd cannot present $1: scripts/deploy-mail.sh issues the pair"
+	[ -s "$cert_chain" ] \
+		|| die "no $cert_chain, so relayd cannot present $1: scripts/deploy-mail.sh issues the pair"
+	link_cert "$ssl_dir" "$ssl_private" "$1"
 }
 
 # Install the config only when it differs, and say which happened: a run that

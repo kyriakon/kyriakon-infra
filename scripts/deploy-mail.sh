@@ -85,18 +85,6 @@ stale_copies() {
 	done
 }
 
-need_pkg() {
-	if pkg_info -q -e "$1" >/dev/null 2>&1 || pkg_info -q -e "$1-*" >/dev/null 2>&1; then
-		printf 'ok: %s already installed\n' "$1"
-	else
-		# -I: no questions. Interactive is the default on a tty, and a deploy
-		# that stops on a prompt (a same-version replacement of quirks, for
-		# instance) looks exactly like a hung fetch.
-		printf 'installing %s (fetching; can take a minute)\n' "$1"
-		pkg_add -I "$1"
-	fi
-}
-
 start_service() {
 	rcctl enable "$1"
 	if rcctl check "$1" >/dev/null 2>&1; then
