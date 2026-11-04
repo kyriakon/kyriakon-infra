@@ -95,6 +95,23 @@ jobs:
         # The hooks have no .sh suffix, so git ls-files misses them, and nothing else
         # lints them: a quoting mistake there fires on every commit in every clone.
         run: shellcheck $(git ls-files '*.sh') .githooks/commit-msg .githooks/pre-commit .githooks/pre-push
+      # A tracked binary is a build artifact, not source: it is unreviewable and
+      # platform-specific. The pre-commit hook refuses a new one; this catches a
+      # commit made with --no-verify.
+      - name: no tracked binaries
+        run: |
+          if git ls-files -z | xargs -0 file | grep -E ': (ELF|Mach-O|PE32)'; then
+            printf 'tracked build artifact: remove it and add its path to .gitignore\n' >&2
+            exit 1
+          fi
+      # The deploy self-test is the one that scans the crate's source for the
+      # drain's script invocations. It needs only oksh and coreutils, not BSD
+      # stat, so it runs here rather than waiting behind the macOS job.
+      - name: deploy source-scan self-test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y oksh
+          oksh scripts/deploy-onboard.sh --self-test
 
   # The scripts' own tests are the only automated check most of them have, and
   # they run weekly on the box: without this a break reaches main and stays until
@@ -105,7 +122,11 @@ jobs:
   # passes under it does not count.
   self-tests:
     name: script self-tests
-    runs-on: macos-latest
+    # Pinned rather than macos-latest: the runner image changing is not a signal
+    # about this repo, and the queue behind a floating label was cancelling this
+    # job at ~15 minutes. The bound turns a hung brew into a fast failure.
+    runs-on: macos-14
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: pdksh
