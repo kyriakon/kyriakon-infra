@@ -7790,8 +7790,18 @@ pub async fn purge_declined(
             // in use and the purge must not delete what holds it. A failed
             // script leaves the record for the next pass rather than losing the
             // release, and its error is reported once rather than every minute.
-            let taken = store.account(&record.username).await?.is_some()
-                || account_on_box(cfg, &record.username)?;
+            let taken = match store.account(&record.username).await {
+                Ok(Some(_)) => true,
+                Ok(None) => account_on_box(cfg, &record.username)?,
+                Err(e) => {
+                    // The account holding the name cannot be read, so the purge
+                    // cannot tell whether releasing the name would take an
+                    // account with it. Report and leave the application for the
+                    // next pass rather than release on a guess.
+                    report_record(cfg, store, journal, "account", &record.username, &e).await;
+                    continue;
+                }
+            };
             if !taken {
                 if let Err(e) = run_script(cfg, "delete-user.sh", &[&record.username]).await {
                     report_failure(cfg, store, journal, &purge_id, "decline", &e).await;
@@ -8291,7 +8301,7 @@ pub async fn stripe_webhooks(
                     continue;
                 }
             }
-            match settle_event(cfg, store, kind, &event).await {
+            match settle_event(cfg, store, journal, kind, &event).await {
                 Ok(Settled::Applied) => {
                     let line = serde_json::json!({
                         "at": util::filed_at(),
@@ -8553,12 +8563,29 @@ async fn load_target(store: &Store, target: &TargetRef) -> Result<Option<Billing
 /// The account or group a subscription belongs to, found by the id the checkout
 /// event attached. Invoices name only the subscription, and the application
 /// record may be long purged, so the subscription is the durable join.
+///
+/// A record that cannot be read is reported and fails this event. The filename
+/// (a username or a domain) does not say whose subscription it is, so the scan
+/// cannot skip a damaged record without risking settling the event as nobody's;
+/// the delivery stays queued until the record is fixed.
 async fn target_for_subscription(
+    cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     subscription: &str,
 ) -> Result<Option<TargetRef>, String> {
     for username in store.list("accounts").await? {
-        let Some(account) = store.account(&username).await? else {
+        let account = match store.account(&username).await {
+            Ok(account) => account,
+            Err(e) => {
+                // A corrupt account could own the subscription, so the scan
+                // cannot skip it. Report the record and fail this event; the
+                // delivery stays queued for the pass after the record is fixed.
+                report_record(cfg, store, journal, "account", &username, &e).await;
+                return Err(e);
+            }
+        };
+        let Some(account) = account else {
             continue;
         };
         if account
@@ -8571,7 +8598,14 @@ async fn target_for_subscription(
         }
     }
     for domain in store.list("groups").await? {
-        let Some(record) = group_record(store, &domain).await? else {
+        let record = match group_record(store, &domain).await {
+            Ok(record) => record,
+            Err(e) => {
+                report_record(cfg, store, journal, "group", &domain, &e).await;
+                return Err(e);
+            }
+        };
+        let Some(record) = record else {
             continue;
         };
         if record.payment.stripe.subscription.as_deref() == Some(subscription) {
@@ -8592,6 +8626,7 @@ enum Settled {
 async fn settle_event(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     kind: &str,
     event: &Value,
 ) -> Result<Settled, String> {
@@ -8600,15 +8635,22 @@ async fn settle_event(
         .ok_or("the event carries no data.object")?;
     match kind {
         "checkout.session.completed" => checkout_completed(store, object).await,
-        "invoice.paid" => invoice_paid(cfg, store, object).await,
-        "invoice.payment_failed" => invoice_payment_failed(store, object).await,
+        "invoice.paid" => invoice_paid(cfg, store, journal, object).await,
+        "invoice.payment_failed" => invoice_payment_failed(cfg, store, journal, object).await,
         "invoice.payment_action_required" => {
-            invoice_payment_action_required(cfg, store, object).await
+            invoice_payment_action_required(cfg, store, journal, object).await
         }
         "customer.subscription.updated" | "customer.subscription.deleted" => {
-            subscription_changed(store, object, kind == "customer.subscription.deleted").await
+            subscription_changed(
+                cfg,
+                store,
+                journal,
+                object,
+                kind == "customer.subscription.deleted",
+            )
+            .await
         }
-        "invoice.upcoming" => invoice_upcoming(store, object).await,
+        "invoice.upcoming" => invoice_upcoming(cfg, store, journal, object).await,
         // Everything else the endpoint is not subscribed to. A verified event of
         // an unknown type is not an error; it is simply not ours.
         _ => Ok(Settled::Ignored),
@@ -8732,7 +8774,12 @@ async fn checkout_completed(store: &Store, object: &Value) -> Result<Settled, St
 /// account already holds. The invoice id is the key the extension is idempotent
 /// on, so a redelivery with a fresh event id settles nothing twice. A
 /// subscription that is not active is recorded and does not move the date.
-async fn invoice_paid(cfg: &DrainConfig, store: &Store, object: &Value) -> Result<Settled, String> {
+async fn invoice_paid(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    object: &Value,
+) -> Result<Settled, String> {
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
@@ -8751,7 +8798,7 @@ async fn invoice_paid(cfg: &DrainConfig, store: &Store, object: &Value) -> Resul
         .unwrap_or("");
     let period_end = period_end(&subscription_json);
     let customer = subscription_json.get("customer").and_then(Value::as_str);
-    let target = match target_for_subscription(store, subscription).await? {
+    let target = match target_for_subscription(cfg, store, journal, subscription).await? {
         Some(target) => target,
         None => {
             // A missed `checkout.session.completed` leaves no store record, so
@@ -8960,11 +9007,16 @@ fn card_reference<'a>(session: &'a Value, subscription: &'a Value) -> &'a str {
 /// account, and nothing else. Stripe's own dunning email is the member's copy;
 /// a platform copy would be a second mail about one failed attempt. The date
 /// does not move: access is the paid date's, not a failed attempt's.
-async fn invoice_payment_failed(store: &Store, object: &Value) -> Result<Settled, String> {
+async fn invoice_payment_failed(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    object: &Value,
+) -> Result<Settled, String> {
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
-    let Some(target) = target_for_subscription(store, subscription).await? else {
+    let Some(target) = target_for_subscription(cfg, store, journal, subscription).await? else {
         return Ok(Settled::Deferred);
     };
     let Some(mut billing) = load_target(store, &target).await? else {
@@ -8990,12 +9042,13 @@ async fn invoice_payment_failed(store: &Store, object: &Value) -> Result<Settled
 async fn invoice_payment_action_required(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     object: &Value,
 ) -> Result<Settled, String> {
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
-    let Some(target) = target_for_subscription(store, subscription).await? else {
+    let Some(target) = target_for_subscription(cfg, store, journal, subscription).await? else {
         return Ok(Settled::Deferred);
     };
     let Some(mut billing) = load_target(store, &target).await? else {
@@ -9051,14 +9104,16 @@ impl BillingTarget {
 /// `customer.subscription.updated` and `deleted`: reconcile the status and the
 /// period end. A deletion stops renewal and never revokes a paid date.
 async fn subscription_changed(
+    cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     object: &Value,
     deleted: bool,
 ) -> Result<Settled, String> {
     let Some(subscription) = object.get("id").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
-    let Some(target) = target_for_subscription(store, subscription).await? else {
+    let Some(target) = target_for_subscription(cfg, store, journal, subscription).await? else {
         return Ok(Settled::Deferred);
     };
     let Some(mut billing) = load_target(store, &target).await? else {
@@ -9090,11 +9145,16 @@ async fn subscription_changed(
 /// `invoice.upcoming`: record the period end the upcoming invoice names. Stripe
 /// sends the annual reminder itself, with its own copy, so the platform sends
 /// none; this event is a state fact and nothing more.
-async fn invoice_upcoming(store: &Store, object: &Value) -> Result<Settled, String> {
+async fn invoice_upcoming(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    object: &Value,
+) -> Result<Settled, String> {
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
-    let Some(target) = target_for_subscription(store, subscription).await? else {
+    let Some(target) = target_for_subscription(cfg, store, journal, subscription).await? else {
         return Ok(Settled::Deferred);
     };
     let Some(mut billing) = load_target(store, &target).await? else {

@@ -2509,3 +2509,63 @@ fn a_corrupt_application_beside_the_requested_one_is_named_by_show() {
         body(&out)
     );
 }
+
+/// A declinee whose account record is damaged is reported and left for the next
+/// pass; the healthy account whose closing window has ended is still deleted in
+/// the same pass.
+#[test]
+fn a_damaged_declinee_does_not_stop_a_healthy_closing_deletion() {
+    let fix = Fix::new("purge-declined-damaged");
+    fix.page_account(
+        "secretary",
+        json!({
+            "state": "closing",
+            "closing_until": kyriakon_onboard::util::date_after_days(-1),
+        }),
+    );
+    // A declined application whose week is up, for a name whose account record
+    // is damaged: the purge cannot tell whether releasing the name would take an
+    // account with it.
+    let record = fix.filed("broken", "cash", &[("rail", "cash")]);
+    let mut app = record.clone();
+    app["stage"] = json!("declined");
+    app["decided_at"] = json!("2026-09-01T00:00:00Z");
+    fix.rewrite_record(&app);
+    std::fs::create_dir_all(fix.dir.join("store/accounts/broken")).unwrap();
+    std::fs::write(
+        fix.dir.join("store/accounts/broken/account.json"),
+        b"{\"version\": 1, \"username\": \"brok",
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    // The healthy closing account is gone.
+    assert!(
+        !fix.dir.join("store/accounts/secretary").exists(),
+        "the healthy closing account was not deleted"
+    );
+    assert!(
+        fix.scripts_log().contains("delete-user.sh secretary"),
+        "{}",
+        fix.scripts_log()
+    );
+    // The damaged declinee is named once and its application is kept for the
+    // pass after the record is fixed.
+    assert!(
+        std::path::Path::new(&fix.path(&format!("store/applications/{TOKEN}.json"))).exists(),
+        "the damaged declinee's application was purged on a guess"
+    );
+    let sent = fix.sent();
+    assert!(
+        sent.contains("accounts/broken/account.json does not parse"),
+        "{sent}"
+    );
+    assert!(
+        fix.journal()
+            .contains("accounts/broken/account.json does not parse"),
+        "{}",
+        fix.journal()
+    );
+}
