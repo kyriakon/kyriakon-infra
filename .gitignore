@@ -30,6 +30,7 @@ tfplan.*
 # `install` copies it to Dovecot's module directory, so the in-tree copy is only
 # ever a build artifact and never something to commit. `make clean` removes it.
 dovecot-plugin/*.so
-# `make -C dovecot-plugin test` builds its two test binaries in place.
+# `make -C dovecot-plugin test` builds its test binaries in place.
 dovecot-plugin/test-encrypt-run
 dovecot-plugin/test-fake-encryptor
+dovecot-plugin/test-frame
