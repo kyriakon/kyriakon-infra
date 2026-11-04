@@ -20,6 +20,7 @@ pub mod fcgi;
 pub mod intents;
 pub mod journal;
 pub mod keycheck;
+pub mod ledger;
 pub mod mailbox;
 pub mod notice;
 pub mod page;

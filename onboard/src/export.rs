@@ -294,25 +294,15 @@ async fn written(
     let token = account
         .payment_state()
         .and_then(|payment| payment.token_ref);
-    let mut ledger = Vec::new();
-    if let Some(token) = token.as_deref() {
-        for line in store.log("ledger/payments.jsonl").raw_lines().await? {
-            if serde_json::from_str::<serde_json::Value>(&line)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("token")
-                        .and_then(|t| t.as_str())
-                        .map(str::to_string)
-                })
-                .as_deref()
-                == Some(token)
-            {
-                ledger.push(line);
-            }
+    let ledger = match token.as_deref() {
+        Some(token) => {
+            crate::ledger::Ledger::open(store)
+                .raw_lines_for(token)
+                .await?
         }
-    }
-    docs.push(("ledger/payments.jsonl".to_string(), join_lines(ledger)));
+        None => Vec::new(),
+    };
+    docs.push((crate::ledger::PAYMENTS.to_string(), join_lines(ledger)));
 
     let stamp = stamp(now);
     let mut files: Vec<String> = docs.iter().map(|(name, _)| name.clone()).collect();

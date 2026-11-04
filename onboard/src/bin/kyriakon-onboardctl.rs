@@ -63,6 +63,7 @@ use kyriakon_onboard::export;
 use kyriakon_onboard::intents;
 use kyriakon_onboard::journal::Journal;
 use kyriakon_onboard::keycheck;
+use kyriakon_onboard::ledger::Ledger;
 use kyriakon_onboard::prepaid;
 use kyriakon_onboard::requests;
 use kyriakon_onboard::sign;
@@ -816,18 +817,34 @@ async fn ledger(store: &Store, args: &[String]) -> Result<(), String> {
     println!("{}", fields.join(","));
 
     let mut rows = Vec::new();
-    for row in store.log("ledger/payments.jsonl").jsonl::<Value>().await? {
-        if !in_tax_year(&row, start, end) {
-            continue;
+    for line in Ledger::open(store).lines().await? {
+        if in_tax_year(line.received_on.as_deref(), start, end) {
+            rows.push(line);
         }
-        rows.push((row["seq"].as_u64().unwrap_or(0), row));
     }
-    rows.sort_by_key(|(seq, _)| *seq);
-    for (_, row) in rows {
-        let cells: Vec<String> = fields
-            .iter()
-            .map(|field| csv_cell(&cell(&row[*field])))
-            .collect();
+    rows.sort_by_key(|line| line.seq);
+    for line in rows {
+        let refund_of = line.refund_of().map(|n| n.to_string()).unwrap_or_default();
+        let settled_on = line.settled_on().unwrap_or_default().to_string();
+        let text = |value: &Option<String>| value.clone().unwrap_or_default();
+        let cells = [
+            line.seq.to_string(),
+            line.token,
+            line.kind,
+            line.rail,
+            text(&line.received_on),
+            text(&line.amount_gbp),
+            text(&line.applied_gbp),
+            text(&line.paid_until_after),
+            text(&line.amount_xmr),
+            text(&line.txid),
+            refund_of,
+            settled_on,
+            text(&line.rate_quoted),
+            text(&line.rate_source),
+            text(&line.rate_at),
+        ];
+        let cells: Vec<String> = cells.iter().map(|cell| csv_cell(cell)).collect();
         println!("{}", cells.join(","));
     }
 
@@ -839,7 +856,9 @@ async fn ledger(store: &Store, args: &[String]) -> Result<(), String> {
         .jsonl::<Value>()
         .await?
     {
-        if row["state"].as_str() != Some("held") || !in_tax_year(&row, start, end) {
+        if row["state"].as_str() != Some("held")
+            || !in_tax_year(row.get("received_on").and_then(Value::as_str), start, end)
+        {
             continue;
         }
         let cells: Vec<String> = ["id", "rail", "received_on", "amount_gbp"]
@@ -896,9 +915,8 @@ async fn export(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
 /// Whether a ledger row's `received_on` falls in the half-open-by-year tax
 /// window it is exported for. A row with no date, such as the approval's
 /// `window_open`, is not in any year.
-fn in_tax_year(row: &Value, start: time::Date, end: time::Date) -> bool {
-    row.get("received_on")
-        .and_then(Value::as_str)
+fn in_tax_year(received_on: Option<&str>, start: time::Date, end: time::Date) -> bool {
+    received_on
         .and_then(util::parse_date)
         .is_some_and(|date| date >= start && date <= end)
 }
@@ -1450,36 +1468,24 @@ async fn payment(store: &Store, args: &[String]) -> Result<(), String> {
 
     println!("ledger for {token}");
     let mut any = false;
-    for line in store.log("ledger/payments.jsonl").jsonl::<Value>().await? {
-        if line.get("token").and_then(serde_json::Value::as_str) != Some(token) {
+    for line in Ledger::open(store).lines().await? {
+        if line.token != token {
             continue;
         }
         any = true;
-        let seq = line
-            .get("seq")
-            .and_then(serde_json::Value::as_u64)
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let get = |key: &str| {
-            line.get(key)
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("-")
-        };
+        let received_on = line.received_on.as_deref().unwrap_or("-");
+        let amount_gbp = line.amount_gbp.as_deref().unwrap_or("-");
+        let applied_gbp = line.applied_gbp.as_deref().unwrap_or("-");
         let mut extra = String::new();
-        if let Some(of) = line.get("refund_of").and_then(serde_json::Value::as_u64) {
+        if let Some(of) = line.refund_of() {
             extra.push_str(&format!("  refund_of {of}"));
         }
-        if let Some(on) = line.get("settled_on").and_then(serde_json::Value::as_str) {
+        if let Some(on) = line.settled_on() {
             extra.push_str(&format!("  settled_on {on}"));
         }
         println!(
-            "  {seq:>5}  {:<8}  {:<4}  {}  {}  applied {}{}",
-            get("kind"),
-            get("rail"),
-            get("received_on"),
-            get("amount_gbp"),
-            get("applied_gbp"),
-            extra,
+            "  {:>5}  {:<8}  {:<4}  {}  {}  applied {}{}",
+            line.seq, line.kind, line.rail, received_on, amount_gbp, applied_gbp, extra,
         );
     }
     if !any {

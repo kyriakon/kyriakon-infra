@@ -729,3 +729,90 @@ fn an_unreadable_refund_amount_refuses_the_next_refund() {
         fix.journal()
     );
 }
+
+/// A credit and a refund keep exactly the ledger key set the accountant's sheet
+/// and every older reader expect. A payment omits the refund block; a refund
+/// carries all four of its fields, null included.
+#[test]
+fn a_credit_and_a_refund_keep_the_recorded_key_shape() {
+    let fix = Fix::new("refund-ledger-keys");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let credit = cash_credit(&fix, &token);
+    let out = fix.ctl(&[
+        "refund", "--token", &token, "--amount", "5.00", "--rail", "cash", "--reason", "overpaid",
+        "--excess",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    let refund = refund_lines(&fix).remove(0);
+
+    let keys = |value: &Value| {
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        keys(&credit),
+        [
+            "amount_gbp",
+            "amount_xmr",
+            "applied_gbp",
+            "intent",
+            "kind",
+            "note",
+            "paid_until_after",
+            "rail",
+            "rate_at",
+            "rate_quoted",
+            "rate_source",
+            "received_on",
+            "seq",
+            "token",
+            "txid",
+            "version",
+        ],
+        "{credit}"
+    );
+    assert_eq!(
+        keys(&refund),
+        [
+            "amount_gbp",
+            "amount_xmr",
+            "applied_gbp",
+            "intent",
+            "kind",
+            "note",
+            "paid_until_after",
+            "rail",
+            "rate_at",
+            "rate_quoted",
+            "rate_refund",
+            "rate_source",
+            "received_on",
+            "refund_basis",
+            "refund_of",
+            "seq",
+            "settled_on",
+            "token",
+            "txid",
+            "version",
+        ],
+        "{refund}"
+    );
+    // The nulls are part of the shape: a reader that distinguishes an absent
+    // field from a null one would read these differently.
+    for field in [
+        "rate_quoted",
+        "rate_source",
+        "rate_at",
+        "txid",
+        "settled_on",
+    ] {
+        assert!(refund[field].is_null(), "{field}: {refund}");
+    }
+    assert_eq!(refund["amount_gbp"], json!("-5.00"));
+    assert_eq!(refund["applied_gbp"], json!("-5.00"));
+}

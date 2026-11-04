@@ -2229,29 +2229,23 @@ async fn closure_refund(app: &App, account: &Account) -> Option<String> {
     // member. The line on the page is an estimate, and the drain's
     // `erasure_refund`, which reads as root, is the authoritative answer; a
     // refund it cannot read must not stop the closure being filed.
-    for value in app
-        .store
-        .log("ledger/payments.jsonl")
-        .raw_lines()
+    for value in crate::ledger::Ledger::open(&app.store)
+        .lines()
         .await
         .unwrap_or_default()
-        .iter()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
     {
-        if value.get("token").and_then(|v| v.as_str()) != Some(token.as_str())
-            || value.get("kind").and_then(|v| v.as_str()) != Some("payment")
-        {
+        if value.token != token || value.kind != "payment" {
             continue;
         }
-        let Some(received) = value.get("received_on").and_then(|v| v.as_str()) else {
+        let Some(received) = value.received_on.as_deref() else {
             continue;
         };
         let Ok(received) = crate::requests::parse_date(received) else {
             continue;
         };
         let amount = value
-            .get("amount_gbp")
-            .and_then(|v| v.as_str())
+            .amount_gbp
+            .as_deref()
             .unwrap_or("0.00")
             .trim_start_matches('-')
             .to_string();
