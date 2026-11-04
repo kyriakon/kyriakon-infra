@@ -64,6 +64,10 @@
 
 set -euo pipefail
 
+script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
+
 # The key this file writes is not secret, but the temporary file it is written
 # through is created here, and a 0600 temporary that is chmodded 0644 before the
 # rename is the one shape that cannot leave a readable half-written vhost behind.
@@ -87,13 +91,6 @@ USAGE
 die() {
 	printf 'provision-member-web: %s\n' "$*" >&2
 	exit 1
-}
-
-# The name, and the same charset rule add-user.sh and provision-member.sh apply.
-# It is a subdomain label here, a path component under /home/www and the stem of
-# the generated file, so a name outside that set could not be a member's.
-name_ok() {
-	printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'
 }
 
 # The three paths, as functions rather than variables so the self-test rebinds
@@ -250,8 +247,6 @@ assert_member_tree() {
 # anyone, writes only under TMPDIR.
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	typeset tree conf before
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
@@ -383,7 +378,7 @@ case "${1:-}" in
 --remove)
 	[ "$#" -eq 2 ] || usage
 	user="$2"
-	name_ok "$user" || die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
+	valid_localpart "$user" || die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
 	[ "$(id -u)" -eq 0 ] || die "run this with doas: it rewrites $httpd_d/$user.kyriakon.net.conf to the challenge alone"
 	[ -d "$httpd_d" ] || die "no $httpd_d: doas ksh scripts/deploy-mail.sh creates it"
 	remove_member_conf
@@ -397,7 +392,7 @@ case "${1:-}" in
 *)
 	[ "$#" -eq 1 ] || usage
 	user="$1"
-	name_ok "$user" || die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
+	valid_localpart "$user" || die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
 	[ "$(id -u)" -eq 0 ] || die "run this with doas: it writes $httpd_d"
 	# deploy-mail.sh creates the directory with the empty index httpd.conf includes,
 	# and a member file with no index to list it is a config nobody reads: a box

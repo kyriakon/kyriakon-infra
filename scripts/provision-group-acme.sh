@@ -59,6 +59,8 @@ set -euo pipefail
 umask 077
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
 acme_d=${ACME_D:-/etc/acme-client.d}
 public_root=${PUBLIC_ROOT:-/home/www}
 acme_queue=${ACME_QUEUE:-/root/bin/acme-queue.sh}
@@ -87,11 +89,6 @@ domain_ok() {
 	*) return 1 ;;
 	esac
 	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
-}
-
-# The site owner is a member account: the same charset add-user.sh applies.
-account_ok() {
-	printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'
 }
 
 # The paths, as functions so the self-test rebinds the directory once.
@@ -175,8 +172,6 @@ queue_request() {
 # writes only under TMPDIR.
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$script_dir/lib.sh"
 	typeset tree conf before code calls
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
@@ -275,7 +270,7 @@ case "${1:-}" in
 	domain="$1"
 	account="$2"
 	domain_ok "$domain" || die "not a domain: $domain (lowercase FQDN, at least two labels)"
-	account_ok "$account" || die "not an account name: $account"
+	valid_localpart "$account" || die "not an account name: $account"
 	[ "$(id -u)" -eq 0 ] || die "run this with doas: it writes $acme_d and files a root-only queue request"
 	[ -d "$acme_d" ] || die "no $acme_d: doas ksh scripts/deploy-mail.sh creates it, with the index acme-client.conf includes"
 	assert_site_tree

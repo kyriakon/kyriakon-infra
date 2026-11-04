@@ -146,27 +146,27 @@ dkim_domains_args() {
 # set_virtual <table> <candidate> <name> <entry>
 #
 # Replace the line whose leading localpart is <name> with <entry>, or append it
-# when there is none, and print which happened. Both paths write <candidate> and
-# move it into place. The replacement used to be `cat "$candidate" > "$table"`,
-# and the append went straight at the live file: the first empties the table
-# before filling it, and an append interrupted mid-line leaves a fragment that
-# the next run's match does not recognise, so it writes a second line beside it.
-# This file is the whole answer for local delivery, so either failure leaves
-# addresses under it unreachable. The mode is set on the candidate because a move
-# brings its own, and mktemp's is 0600 where the table is 0644.
+# when there is none, and print which happened. The write itself is lib.sh's
+# table_set, which is also what the signup and removal scripts use: this file is
+# the whole answer for local delivery, so an interrupted write that left a
+# fragment would make addresses under it unreachable.
 set_virtual() {
 	typeset table="$1" candidate="$2" name="$3" entry="$4" how
 	if grep -q "^${name}:" "$table"; then
-		sed "s|^${name}:.*|${entry}|" "$table" > "$candidate"
 		how='set'
 	else
-		cat "$table" > "$candidate"
-		printf '%s\n' "$entry" >> "$candidate"
 		how='added'
 	fi
-	chmod 0644 "$candidate"
-	mv "$candidate" "$table"
+	table_set "$table" "$candidate" "$name" "$entry"
 	printf 'virtual %s %s\n' "$name" "$how"
+}
+
+# mail_domains_seeded <table>: the first line is the platform's own domain, which
+# is what provision-member.sh reads as the domain a new member is addressed on.
+# A restore or a hand edit that reorders the table sends a new member's mail to a
+# body they are not in, and nothing else reads the order.
+mail_domains_seeded() {
+	[ "$(awk 'NR == 1 { print; exit }' "$1")" = "$platform_domain" ]
 }
 
 # mail_from_entries <passwd-file> <virtuals-file>: the mail-from table's lines,
@@ -349,13 +349,24 @@ self_test() {
 		"$(cmp -s "$tree/virtuals" "$tree/expected" && printf same || printf changed)" same
 	check "and says that it failed" "$([ "$code" -ne 0 ] && printf yes || printf no)" yes
 
+	# --- mail_domains ---
+	# provision-member.sh reads the first line as the domain a new member is
+	# addressed on, so the deploy refuses a table whose first line is anything
+	# else rather than seeding over it or leaving it alone.
+	platform_domain=kyriakon.net
+	printf 'parish.example\nkyriakon.net\n' > "$tree/mail_domains"
+	check "a mail_domains table not starting with the platform domain is refused" \
+		"$(mail_domains_seeded "$tree/mail_domains" && printf yes || printf no)" no
+	printf 'kyriakon.net\nparish.example\n' > "$tree/mail_domains"
+	check "and one that starts with it is accepted" \
+		"$(mail_domains_seeded "$tree/mail_domains" && printf yes || printf no)" yes
+
 	# --- the mail-from table ---
 	# The submission rule is only as good as this table: it is a set of allowed
 	# envelope senders, not a per-user mapping. An account's own identity is in it,
 	# and so is a full-address virtuals line that delivers into an account, which
 	# is how a group mailbox sends as the address it publishes. A bare alias and
 	# an address aimed at a service account are not account identities.
-	platform_domain=kyriakon.net
 	printf '%s\n' 'oliver:x:1000:1000::/home/oliver:/bin/ksh' \
 		'alice:x:1001:1001::/home/alice:/bin/ksh' \
 		'_onboard:x:800:800::/var/db/onboard:/sbin/nologin' > "$tree/passwd"
@@ -979,6 +990,12 @@ platform_domain=kyriakon.net
 mail_domains_table=/etc/mail/mail_domains
 virtuals_table=/etc/mail/virtuals
 if [ -s "$mail_domains_table" ]; then
+	mail_domains_seeded "$mail_domains_table" || {
+		printf 'first line of %s is "%s", not "%s": provision-member.sh reads it as the domain a new member is addressed on\n' \
+			"$mail_domains_table" "$(awk 'NR == 1 { print; exit }' "$mail_domains_table")" \
+			"$platform_domain" >&2
+		exit 1
+	}
 	printf 'kept existing %s\n' "$mail_domains_table"
 else
 	printf '%s\n' "$platform_domain" > "$mail_domains_table"
@@ -1073,8 +1090,6 @@ virtuals_tmp=$(mktemp "$virtuals_table.XXXXXX")
 smtpd_tmp=''
 mail_from_tmp=''
 trap 'rm -f "$virtuals_tmp" "${smtpd_tmp:-}" "${mail_from_tmp:-}"' EXIT
-# make sure an append starts on a line of its own
-[ -n "$(tail -c 1 "$virtuals_table")" ] && printf '\n' >> "$virtuals_table"
 while IFS= read -r entry; do
 	set_virtual "$virtuals_table" "$virtuals_tmp" "${entry%%:*}" "$entry"
 done <<EOF
@@ -1108,7 +1123,8 @@ while IFS= read -r acct; do
 	if awk -F: -v k="$acct@$platform_domain" '$1 == k { found = 1 } END { exit !found }' "$virtuals_table"; then
 		continue
 	fi
-	printf '%s\n' "$account_line" >> "$virtuals_table"
+	table_set "$virtuals_table" "$(mktemp "$virtuals_table.XXXXXX")" \
+		"$acct@$platform_domain" "$account_line"
 	awk -F: -v k="$acct@$platform_domain" '$1 == k { found = 1 } END { exit !found }' "$virtuals_table" \
 		|| { printf 'virtual entry did not land in %s: %s\n' "$virtuals_table" "$account_line" >&2; exit 1; }
 	printf 'virtual %s added\n' "$acct@$platform_domain"
@@ -1125,9 +1141,10 @@ EOF
 # It holds an address when an account owns it: the account's login identity, and
 # every full-address virtuals line that delivers into an account with a home
 # under /home. A bare alias and an address aimed at a service account are not
-# account identities and stay out. A member provisioned after this deploy appends
-# their own line in provision-member.sh, because the next deploy may be days away
-# and they have to send before it.
+# account identities and stay out. This deploy is the one step that owns the
+# table: a member provisioned after it submits once the next deploy has run, and
+# no script writes a line here by hand, because a rewritten table would drop it
+# again.
 mail_from_table=/etc/mail/mail_from
 mail_from_tmp=$(mktemp "$mail_from_table.XXXXXX")
 mail_from_entries /etc/passwd "$virtuals_table" > "$mail_from_tmp"

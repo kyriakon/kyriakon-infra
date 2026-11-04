@@ -288,6 +288,71 @@ key_problems() {
 	fi
 }
 
+# --- tables ----------------------------------------------------------------
+#
+# The mail scripts' tables (/etc/mail/virtuals, mail_domains, mail_from,
+# dkim_domains) are read whole by smtpd or by a filter, so a write that leaves
+# half a line behind takes addresses offline until someone notices. These two
+# helpers are the one write shape: a candidate file beside the table, then a
+# rename, so a reader sees the old table or the whole new one.
+
+# valid_localpart <name> — the username and mailbox charset: lowercase letters,
+# digits, dot, underscore and hyphen, starting with a letter or a digit, at most
+# 32 characters. It is a filesystem path component, a subdomain label and a
+# keyring filename, so every script that takes a member name checks it here.
+valid_localpart() {
+	printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'
+}
+
+# table_set <table> <candidate> <name> <entry>
+#
+# Replace the line whose leading key is <name> with <entry>, or append it when
+# there is none. <candidate> must be in <table>'s directory so the rename cannot
+# cross a filesystem; mktemp "$table.XXXXXX" is the shape callers use. A table
+# whose last line lacks a newline gets one before the append: without it the two
+# entries join into one line that matches neither key. The mode is set on the
+# candidate because a rename brings its own, and mktemp's is 0600.
+table_set() {
+	typeset table="$1" candidate="$2" name="$3" entry="$4"
+	if grep -q "^${name}:" "$table"; then
+		sed "s|^${name}:.*|${entry}|" "$table" > "$candidate"
+	else
+		cat "$table" > "$candidate"
+		if [ -n "$(tail -c 1 "$candidate")" ]; then
+			printf '\n' >> "$candidate"
+		fi
+		printf '%s\n' "$entry" >> "$candidate"
+	fi
+	chmod 0644 "$candidate"
+	mv "$candidate" "$table"
+}
+
+# table_drop <table> <pattern> — drop every line whose key (the text before the
+# first colon, trimmed) matches the extended regular expression <pattern>. A
+# table of bare domains, such as mail_domains, has the whole line as its key.
+# Returns 0 when the table changed and 1 when it did not, which is what tells a
+# caller whether smtpd needs a restart. A changed table is copied to
+# <table>.<timestamp>.bak first: deleting a line is the one write here that no
+# later deploy regenerates.
+table_drop() {
+	typeset table="$1" pattern="$2" candidate
+	[ -f "$table" ] || return 1
+	candidate=$(mktemp "$table.XXXXXX") || return 1
+	awk -F: -v re="$pattern" '{
+		key = $1
+		gsub(/^[ \t]+|[ \t]+$/, "", key)
+		if (key !~ re) print
+	}' "$table" > "$candidate"
+	if cmp -s "$table" "$candidate"; then
+		rm -f "$candidate"
+		return 1
+	fi
+	cp -p "$table" "$table.$(date +%Y%m%d%H%M%S).bak"
+	chmod 0644 "$candidate"
+	mv "$candidate" "$table"
+	return 0
+}
+
 # --- self-tests ------------------------------------------------------------
 #
 # A --self-test is the one check a script can run without the box's own state, so
@@ -328,3 +393,53 @@ self_test_end() {
 	printf '\nself-test: every check passed\n'
 	exit 0
 }
+
+# The helpers' own checks. lib.sh is a library, so the guard below runs this only
+# when the file is executed itself; a script that sources it keeps its own
+# --self-test, and its own self_test definition replaces this one.
+self_test() {
+	self_test_begin
+	# shellcheck disable=SC2154 # set by self_test_begin
+	tree=$self_test_work
+
+	check "a plain localpart is accepted" \
+		"$(valid_localpart alice && printf yes || printf no)" yes
+	check "an uppercase name is refused" \
+		"$(valid_localpart Alice && printf yes || printf no)" no
+	check "a leading dot is refused" \
+		"$(valid_localpart .alice && printf yes || printf no)" no
+	check "a name of 33 characters is refused" \
+		"$(valid_localpart aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa && printf yes || printf no)" no
+
+	# The fixture that motivated the helper: the last line has no newline, so a
+	# plain append joins the new entry to it and both keys stop matching.
+	printf 'hello: oliver\nsecretary@parish.example: parish' > "$tree/virtuals"
+	table_set "$tree/virtuals" "$(mktemp "$tree/virtuals.XXXXXX")" \
+		alice "alice@kyriakon.net: alice"
+	check "an append leaves a last line without a newline whole" \
+		"$(grep -c '^secretary@parish.example: parish$' "$tree/virtuals")" 1
+	check "and writes the new entry on its own line" \
+		"$(grep -c '^alice@kyriakon.net: alice$' "$tree/virtuals")" 1
+	check "with one line more than before" \
+		"$(wc -l < "$tree/virtuals" | tr -d ' ')" 3
+	check "at mode 0644" "$(stat -f '%Lp' "$tree/virtuals")" 644
+
+	table_set "$tree/virtuals" "$(mktemp "$tree/virtuals.XXXXXX")" hello "hello: alice"
+	check "an existing entry is replaced" \
+		"$(grep -c '^hello: alice$' "$tree/virtuals")" 1
+	check "and not duplicated" "$(grep -c '^hello:' "$tree/virtuals")" 1
+
+	printf 'alice@kyriakon.net: alice\nhello: oliver\n' > "$tree/drop"
+	check "table_drop says it changed a matching table" \
+		"$(table_drop "$tree/drop" '^alice@' && printf yes || printf no)" yes
+	check "and the line is gone" "$(grep -c '^alice@' "$tree/drop" || true)" 0
+	check "and the rest is intact" "$(grep -c '^hello: oliver$' "$tree/drop")" 1
+	check "table_drop says a table with no match did not change" \
+		"$(table_drop "$tree/drop" '^absent@' && printf yes || printf no)" no
+
+	self_test_end
+}
+
+case "${0##*/}:${1:-}" in
+lib.sh:--self-test) self_test ;;
+esac

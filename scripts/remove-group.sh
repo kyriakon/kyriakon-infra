@@ -63,6 +63,8 @@ PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
 export PATH
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
 
 mail_domains=${MAIL_DOMAINS:-/etc/mail/mail_domains}
 virtuals=${VIRTUALS:-/etc/mail/virtuals}
@@ -97,66 +99,6 @@ domain_ok() {
 # The restart, as a function so the self-test can record it instead of running it.
 reload_smtpd() { ksh "$script_dir/reload-smtpd.sh"; }
 
-# install_table <file> <candidate>: keep a timestamped copy of the table and move
-# the candidate into its place. Root sets the owner explicitly, because a table
-# smtpd reads with the wrong owner is a table that does not load; the self-test
-# runs unprivileged in a throwaway tree, where chown cannot and need not happen.
-install_table() {
-	typeset file="$1" candidate="$2" stamp owner_flags
-	stamp=$(date +%Y%m%d%H%M%S)
-	cp -p "$file" "$file.$stamp.bak"
-	owner_flags=""
-	if [ "$(id -u)" -eq 0 ]; then
-		owner_flags="-o root -g wheel"
-	fi
-	# shellcheck disable=SC2086  # intentional splitting: two flags, or none
-	install -m 0644 $owner_flags "$candidate" "$file"
-	rm -f "$candidate"
-	printf 'kept %s.%s.bak\n' "$file" "$stamp"
-}
-
-# drop_line <file> <line>: remove the whole lines equal to <line>. Returns 0 and
-# says whether it changed the file, which is what decides the smtpd restart.
-drop_line() {
-	typeset file="$1" line="$2" candidate
-	table_changed=no
-	[ -f "$file" ] || return 0
-	candidate="$file.kyriakon.$$"
-	awk -v line="$line" '$0 != line' "$file" >"$candidate"
-	if cmp -s "$file" "$candidate"; then
-		rm -f "$candidate"
-		return 0
-	fi
-	install_table "$file" "$candidate"
-	printf 'removed %s from %s\n' "$line" "$file"
-	table_changed=yes
-}
-
-# drop_domain_addresses <file> <domain>: remove every entry whose address is on
-# the body's domain, both mailboxes and aliases. The key is compared after the
-# colon, trimmed, and only by its suffix, so an address on another domain that
-# merely contains this one is left alone.
-drop_domain_addresses() {
-	typeset file="$1" domain="$2" candidate
-	table_changed=no
-	[ -f "$file" ] || return 0
-	candidate="$file.kyriakon.$$"
-	awk -v suffix="@$domain" -F: '{
-		key = $1
-		gsub(/^[ \t]+|[ \t]+$/, "", key)
-		if (length(key) >= length(suffix) \
-			&& substr(key, length(key) - length(suffix) + 1) == suffix) next
-		print
-	}' "$file" >"$candidate"
-	if cmp -s "$file" "$candidate"; then
-		rm -f "$candidate"
-		return 0
-	fi
-	install_table "$file" "$candidate"
-	printf 'removed the %s entries from %s\n' "$domain" "$file"
-	table_changed=yes
-}
-
 # remove_path <description> <path>: remove one file or symlink, saying so only
 # when it was there.
 remove_path() {
@@ -173,17 +115,22 @@ remove_group() {
 	tables_changed=no
 
 	# 1. The mail tables. mail_domains and dkim_domains carry the domain as a
-	# whole line; virtuals carries one line per address on it.
-	drop_line "$mail_domains" "$domain"
-	if [ "$table_changed" = yes ]; then
+	# whole line; virtuals carries one line per address on it, both mailboxes and
+	# aliases. The address key ends at the colon, so the virtuals pattern is
+	# anchored on the suffix and an address on another domain that merely contains
+	# this one is left alone. A dot in the domain is written as [.] because the
+	# pattern is an extended regular expression.
+	domain_re=$(printf '%s' "$domain" | sed 's/[.]/[.]/g')
+	if table_drop "$mail_domains" "^${domain_re}\$"; then
+		printf 'removed %s from %s\n' "$domain" "$mail_domains"
 		tables_changed=yes
 	fi
-	drop_line "$dkim_domains" "$domain"
-	if [ "$table_changed" = yes ]; then
+	if table_drop "$dkim_domains" "^${domain_re}\$"; then
+		printf 'removed %s from %s\n' "$domain" "$dkim_domains"
 		tables_changed=yes
 	fi
-	drop_domain_addresses "$virtuals" "$domain"
-	if [ "$table_changed" = yes ]; then
+	if table_drop "$virtuals" "@${domain_re}\$"; then
+		printf 'removed the %s entries from %s\n' "$domain" "$virtuals"
 		tables_changed=yes
 	fi
 
@@ -217,8 +164,6 @@ remove_group() {
 # script's own decisions, not the tools'.
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$script_dir/lib.sh"
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work

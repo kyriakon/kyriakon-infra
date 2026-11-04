@@ -86,8 +86,118 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 
 usage() {
 	printf 'usage: %s <username> [public-key-file]\n' "$0" >&2
+	printf '       ksh %s --self-test\n' "$0" >&2
 	exit 2
 }
+
+# --- the member's own address -----------------------------------------------
+#
+# The virtual table is the whole answer for the local dispatcher: a lookup that
+# finds neither <user>@<domain> nor <user> has nothing to expand to, so a member
+# whose address is missing from it is a member mail cannot reach, and the
+# rejection happens at RCPT time where only the sender sees it. deploy-mail.sh
+# seeds one entry per account that exists when it runs, which is every account
+# except the one being provisioned now, so the entry is written here too.
+#
+# The platform's own domain is the first line the deploy writes into
+# mail_domains, and the deploy refuses a table whose first line is anything else.
+# A box that has not run the mail deploy yet has no table to write to, and that is
+# a note rather than a failure: the account is usable for everything but mail
+# until then.
+#
+# mail_from is deliberately not written here. deploy-mail.sh derives it from
+# passwd and this table, so a hand line is regenerated at the next deploy; the
+# deploy is the step that owns it.
+virtuals=${VIRTUALS:-/etc/mail/virtuals}
+mail_domains_table=${MAIL_DOMAINS:-/etc/mail/mail_domains}
+smtpd_conf=${SMTPD_CONF:-/etc/mail/smtpd.conf}
+
+# ensure_mail_address: the address line, and the smtpd restart that makes it
+# live. A function so the self-test drives the same body against a fixture tree.
+ensure_mail_address() {
+	typeset domain key current mail_changed=no
+	if [ ! -f "$virtuals" ]; then
+		printf 'note: no %s yet, so %s has no address until the mail deploy runs\n' \
+			"$virtuals" "$user" >&2
+		return 0
+	fi
+	if [ ! -s "$mail_domains_table" ]; then
+		printf 'note: %s has no domain line, so %s@ was not added anywhere\n' \
+			"$mail_domains_table" "$user" >&2
+		return 0
+	fi
+	domain=$(sed -n '1p' "$mail_domains_table")
+	key="$user@$domain"
+	if awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals"; then
+		# An address aimed somewhere else on purpose is left where it is: this
+		# script provisions an account, it does not overrule a forward.
+		current=$(awk -F: -v k="$key" '$1 == k { sub(/^[^:]*:[ \t]*/, ""); print; exit }' "$virtuals")
+		if [ "$current" != "$user" ]; then
+			printf 'note: %s maps to %s, so mail for this member goes there\n' "$key" "$current" >&2
+		fi
+	else
+		table_set "$virtuals" "$(mktemp "$virtuals.XXXXXX")" "$key" "$key: $user"
+		awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals" \
+			|| { printf 'could not add %s to %s\n' "$key" "$virtuals" >&2; exit 1; }
+		printf 'virtual %s added\n' "$key"
+		changed=yes
+		mail_changed=yes
+	fi
+	# smtpd reads the table when it starts, so a line is not live until it is
+	# restarted: /etc/rc.d/smtpd defines no reload verb, and delete-user.sh restarts
+	# it for the same reason. The configuration is checked first, so a table smtpd
+	# would refuse leaves the running daemon alone, and the restart happens only
+	# when a line was actually added, so a run that finds the line already present
+	# restarts nothing.
+	if [ "$mail_changed" = yes ]; then
+		if [ -f "$smtpd_conf" ] && smtpd -n -f "$smtpd_conf"; then
+			rcctl restart smtpd >/dev/null
+			printf 'restarted smtpd, which reads the table at start\n'
+		else
+			printf 'note: %s added but smtpd was not restarted; restart it before mail is delivered\n' \
+				"$key" >&2
+		fi
+	fi
+}
+
+# The mail write against a fixture tree, on a table whose last line has no
+# newline: that is the state an interrupted append leaves behind and the one the
+# helper has to survive.
+self_test() {
+	self_test_begin
+	# shellcheck disable=SC2154 # set by self_test_begin
+	tree=$self_test_work
+	user=alice
+	changed=no
+	virtuals="$tree/virtuals"
+	mail_domains_table="$tree/mail_domains"
+	smtpd_conf="$tree/smtpd.conf"
+	printf 'kyriakon.net\n' > "$mail_domains_table"
+	printf 'hello: oliver' > "$virtuals"
+
+	ensure_mail_address > "$tree/first.out" 2>&1
+	check "the member's address is added" \
+		"$(grep -c '^alice@kyriakon.net: alice$' "$virtuals")" 1
+	check "the last line it appends to stays whole" \
+		"$(grep -c '^hello: oliver$' "$virtuals")" 1
+	check "and the two are not joined" "$(grep -c 'oliveralice' "$virtuals" || true)" 0
+	check "the table is left 0644" "$(stat -f '%Lp' "$virtuals")" 644
+	check "and the run says what it added" \
+		"$(grep -c '^virtual alice@kyriakon.net added$' "$tree/first.out")" 1
+
+	changed=no
+	ensure_mail_address > "$tree/second.out" 2>&1
+	check "a second run writes nothing" "$(wc -c < "$tree/second.out" | tr -d ' ')" 0
+
+	self_test_end
+}
+
+case "${1:-}" in
+--self-test)
+	[ "$#" -eq 1 ] || usage
+	self_test
+	;;
+esac
 
 if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
 	usage
@@ -100,10 +210,10 @@ key_arg="${2:-}"
 # the tree is.
 changed=no
 
-# Same charset rule as add-user.sh, and for the same reasons: the name is a
-# filesystem path component, a subdomain label (<username>.kyriakon.net) and here
-# also a chroot path component under /home/www.
-if ! printf '%s' "$user" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'; then
+# The name is a filesystem path component, a subdomain label
+# (<username>.kyriakon.net) and here also a chroot path component under
+# /home/www, so the shared charset rule is the guard.
+if ! valid_localpart "$user"; then
 	printf 'invalid username: %s (lowercase [a-z0-9._-], <=32 chars)\n' "$user" >&2
 	exit 1
 fi
@@ -175,84 +285,7 @@ case $rc in
 esac
 
 # --- the member's own address -----------------------------------------------
-#
-# The virtual table is the whole answer for the local dispatcher: a lookup that
-# finds neither <user>@<domain> nor <user> has nothing to expand to, so a member
-# whose address is missing from it is a member mail cannot reach, and the
-# rejection happens at RCPT time where only the sender sees it. deploy-mail.sh
-# seeds one entry per account that exists when it runs, which is every account
-# except the one being provisioned now, so the entry is written here too. The
-# drain that provisions a member will grow this into the store-driven version of
-# the same table.
-#
-# The platform's own domain is the first line the deploy writes into
-# mail_domains. A box that has not run the mail deploy yet has no table to write
-# to, and that is a note rather than a failure: the account is usable for
-# everything but mail until then.
-virtuals=/etc/mail/virtuals
-if [ ! -f "$virtuals" ]; then
-	printf 'note: no %s yet, so %s has no address until the mail deploy runs\n' \
-		"$virtuals" "$user" >&2
-elif [ ! -s /etc/mail/mail_domains ]; then
-	printf 'note: %s has no domain line, so %s@ was not added anywhere\n' \
-		/etc/mail/mail_domains "$user" >&2
-else
-	domain=$(sed -n '1p' /etc/mail/mail_domains)
-	key="$user@$domain"
-	mail_changed=no
-	if awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals"; then
-		# An address aimed somewhere else on purpose is left where it is: this
-		# script provisions an account, it does not overrule a forward.
-		current=$(awk -F: -v k="$key" '$1 == k { sub(/^[^:]*:[ \t]*/, ""); print; exit }' "$virtuals")
-		if [ "$current" != "$user" ]; then
-			printf 'note: %s maps to %s, so mail for this member goes there\n' "$key" "$current" >&2
-		fi
-	else
-		printf '%s: %s\n' "$key" "$user" >> "$virtuals"
-		awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals" \
-			|| { printf 'could not add %s to %s\n' "$key" "$virtuals" >&2; exit 1; }
-		printf 'virtual %s added\n' "$key"
-		changed=yes
-		mail_changed=yes
-	fi
-	# The submission allowlist, in the same pass and for the same reason. The auth
-	# rule refuses a MAIL FROM that is not in /etc/mail/mail_from, so an account
-	# the table does not carry cannot send. It is ensured outside the virtuals
-	# branch so a retried run whose address line already exists still adds the
-	# missing entry, and only when it is absent, so a second run writes nothing. A
-	# box that has not run the mail deploy has no table and is a note rather than
-	# a failure, like the virtuals write.
-	if [ -f /etc/mail/mail_from ]; then
-		if ! awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' /etc/mail/mail_from; then
-			printf '%s: %s\n' "$key" "$user" >> /etc/mail/mail_from
-			awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' /etc/mail/mail_from \
-				|| { printf 'could not add %s to /etc/mail/mail_from\n' "$key" >&2; exit 1; }
-			printf 'mail_from %s added\n' "$key"
-			changed=yes
-			mail_changed=yes
-		fi
-	else
-		printf 'note: no /etc/mail/mail_from yet, so %s cannot submit until the mail deploy writes it\n' \
-			"$key" >&2
-	fi
-	# smtpd reads the table when it starts, so a line is not live until it is
-	# restarted: /etc/rc.d/smtpd defines no reload verb, and delete-user.sh restarts
-	# it for the same reason. This runs for every member, a mail-only member
-	# included, because the address is the account for both; what waits on hosting
-	# is the tree, the upload session and the daemon lanes below. The configuration
-	# is checked first, so a table smtpd would refuse leaves the running daemon
-	# alone, and the restart happens only when a line was actually added, so a run
-	# that finds both lines already present restarts nothing.
-	if [ "$mail_changed" = yes ]; then
-		if [ -f /etc/mail/smtpd.conf ] && smtpd -n -f /etc/mail/smtpd.conf; then
-			rcctl restart smtpd >/dev/null
-			printf 'restarted smtpd, which reads the table at start\n'
-		else
-			printf 'note: %s added but smtpd was not restarted; restart it before mail is delivered\n' \
-				"$key" >&2
-		fi
-	fi
-fi
+ensure_mail_address
 
 # --- the session shell, from the login class --------------------------------
 #

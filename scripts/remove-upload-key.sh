@@ -36,6 +36,10 @@
 
 set -euo pipefail
 
+script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
+
 home_root=${HOME_ROOT:-/home}
 
 usage() {
@@ -61,7 +65,7 @@ is_root() { [ "$(id -u)" -eq 0 ]; }
 remove() {
 	typeset user home key_file
 	user=$1
-	printf '%s' "$user" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$' ||
+	valid_localpart "$user" ||
 		die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
 	is_root || die "run this with doas: the member's home is not yours to change"
 	account_exists "$user" || die "there is no account named $user"
@@ -79,8 +83,6 @@ remove() {
 }
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work

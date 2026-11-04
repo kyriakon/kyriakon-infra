@@ -103,6 +103,21 @@ domains_missing_from() {
 	done < "$list"
 }
 
+# mail_domains_first_problem <mail-domains-file> <platform-domain>
+#
+# Why the first line of mail_domains is not the platform's own domain, one line,
+# or nothing. provision-member.sh reads that line as the domain a new member is
+# addressed on, and deploy-mail.sh refuses a table whose first line is anything
+# else; a restore or a hand edit that reorders the file is silent otherwise, and
+# the new member's mail goes to a body they are not in.
+mail_domains_first_problem() {
+	typeset first
+	first=$(awk 'NR == 1 { print; exit }' "$1")
+	[ "$first" = "$2" ] && return 0
+	printf 'the first line is "%s", not %s; provision-member.sh reads it as the domain a new member is addressed on. Put %s first.\n' \
+		"$first" "$2" "$2"
+}
+
 # tool_remedy <tool>... — one line of remedy per tool cron could not find.
 #
 # Takes the absent list rather than reading a loop variable: a caller's `tool`
@@ -287,6 +302,27 @@ self_test() {
 	[ "$out" = "school.example" ] || {
 		printf 'FAIL: a last line with no trailing newline; expected [school.example], got [%s]\n' \
 			"$out" >&2
+		exit 1
+	}
+
+	# Section 7's first-line rule: provision-member.sh reads the first line as the
+	# platform domain, so a table that names a body's domain first is a finding
+	# even when every domain is in the allow list.
+	printf 'parish.example\nkyriakon.net\n' > "$dir/mail_domains"
+	out=$(mail_domains_first_problem "$dir/mail_domains" kyriakon.net)
+	case "$out" in
+	*parish.example*)
+		;;
+	*)
+		printf 'FAIL: a mail_domains table not starting with the platform domain is a finding; got [%s]\n' \
+			"$out" >&2
+		exit 1
+		;;
+	esac
+	printf 'kyriakon.net\nparish.example\n' > "$dir/mail_domains"
+	out=$(mail_domains_first_problem "$dir/mail_domains" kyriakon.net)
+	[ -z "$out" ] || {
+		printf 'FAIL: the platform domain first is not a finding; got [%s]\n' "$out" >&2
 		exit 1
 	}
 
@@ -701,6 +737,7 @@ fi
 # header says the same, which is what made the pair worth checking rather than
 # trusting.
 mail_domains_table=/etc/mail/mail_domains
+platform_domain=kyriakon.net
 spamd_allowed=/etc/mail/spamd.alloweddomains
 if [ ! -f "$mail_domains_table" ]; then
 	printf 'mail domains: %s is missing; scripts/deploy-mail.sh seeds it with the platform domain\n' \
@@ -711,6 +748,11 @@ elif [ ! -f "$spamd_allowed" ]; then
 		"$spamd_allowed"
 	status=1
 else
+	first_problem=$(mail_domains_first_problem "$mail_domains_table" "$platform_domain")
+	if [ -n "$first_problem" ]; then
+		printf 'mail domains: %s: %s\n' "$mail_domains_table" "$first_problem"
+		status=1
+	fi
 	unwelcome=$(domains_missing_from "$mail_domains_table" "$spamd_allowed")
 	if [ -n "$unwelcome" ]; then
 		printf 'mail domains: %s names these and %s has no line for them, so spamd traps them and blocklists the sender:\n' \

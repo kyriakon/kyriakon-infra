@@ -65,6 +65,10 @@
 
 set -euo pipefail
 
+script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
+
 # The private key half is created under this umask, so a key file that openssl
 # creates is never readable by anyone else even for the moment before the chmod
 # below runs.
@@ -95,11 +99,6 @@ USAGE
 die() {
 	printf 'provision-member-capsule: %s\n' "$*" >&2
 	exit 1
-}
-
-# The name, and the same charset rule add-user.sh and provision-member.sh apply.
-name_ok() {
-	printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'
 }
 
 # The paths, as functions rather than variables so the self-test rebinds the
@@ -296,8 +295,6 @@ assert_member_tree() {
 # TMPDIR.
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	typeset tree conf before out
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
@@ -419,7 +416,7 @@ case "${1:-}" in
 --remove)
 	[ "$#" -eq 2 ] || usage
 	user="$2"
-	name_ok "$user" || die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
+	valid_localpart "$user" || die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
 	[ "$(id -u)" -eq 0 ] || die "run this with doas: it removes $gmid_d/$user.kyriakon.net.conf"
 	[ -d "$gmid_d" ] || die "no $gmid_d: doas ksh scripts/deploy-mail.sh creates it"
 	remove_member_conf
@@ -442,7 +439,7 @@ case "${1:-}" in
 *)
 	[ "$#" -eq 1 ] || usage
 	user="$1"
-	name_ok "$user" || die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
+	valid_localpart "$user" || die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
 	[ "$(id -u)" -eq 0 ] || die "run this with doas: it writes $gmid_d and the pair under $ssl_dir"
 	[ -x "$openssl" ] || die "no $openssl"
 	[ -d "$gmid_d" ] || die "no $gmid_d: doas ksh scripts/deploy-mail.sh creates it, with the index gmid.conf includes"

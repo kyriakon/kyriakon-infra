@@ -63,6 +63,8 @@ set -euo pipefail
 umask 077
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
 acme_d=${ACME_D:-/etc/acme-client.d}
 public_root=${PUBLIC_ROOT:-/home/www}
 acme_queue=${ACME_QUEUE:-/root/bin/acme-queue.sh}
@@ -79,13 +81,6 @@ USAGE
 die() {
 	printf 'provision-member-acme: %s\n' "$*" >&2
 	exit 1
-}
-
-# The name, and the same charset rule add-user.sh and provision-member.sh apply.
-# It is a subdomain label here and the stem of the generated file, so a name
-# outside that set could not be a member's.
-name_ok() {
-	printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'
 }
 
 # The paths, as functions rather than variables so the self-test rebinds the
@@ -170,8 +165,6 @@ queue_request() {
 # stubbed. Runs as anyone, writes only under TMPDIR.
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$script_dir/lib.sh"
 	typeset tree conf before code calls
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
@@ -234,8 +227,8 @@ self_test() {
 
 	# 4. a name that is not a member name is refused at the door
 	check "a name outside the charset is refused" \
-		"$(name_ok 'Alice' && printf yes || printf no)" "no"
-	check "a path is refused" "$(name_ok '../alice' && printf yes || printf no)" "no"
+		"$(valid_localpart 'Alice' && printf yes || printf no)" "no"
+	check "a path is refused" "$(valid_localpart '../alice' && printf yes || printf no)" "no"
 
 	# 5. a missing queue is a refusal, not a silent file with no request
 	acme_queue="$tree/bin/missing.sh"
@@ -265,7 +258,7 @@ case "${1:-}" in
 *)
 	[ "$#" -eq 1 ] || usage
 	user="$1"
-	name_ok "$user" || die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
+	valid_localpart "$user" || die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
 	[ "$(id -u)" -eq 0 ] || die "run this with doas: it writes $acme_d and files a root-only queue request"
 	# deploy-mail.sh creates the directory with the empty index acme-client.conf
 	# includes. A member block with no index to list it is a config acme-client
