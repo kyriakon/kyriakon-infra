@@ -52,6 +52,10 @@ gh pr checks <n> --watch          # green first; "admin" bypasses review, not th
 gh pr merge <n> --squash --admin
 ```
 
+Every required check must be `SUCCESS` before the merge. `QUEUED`, `IN_PROGRESS`,
+`CANCELLED` and `SKIPPED` are not green, and `--admin` does not change that.
+`scripts/merge-pr.sh <n>` checks the states and then runs the same merge.
+
 `--admin` is for the owner's own reviewed-by-agent work. It does not bypass
 `non_fast_forward`: never force-push `main`.
 
