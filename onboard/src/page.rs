@@ -361,10 +361,8 @@ pub fn member_page(
     dns: Option<crate::dns::Recipe>,
     payment: Option<PaymentView>,
 ) -> AccountPage {
-    // A member with an upload key has both lanes written by
-    // provision-member.sh until something turns one off, so an unrecorded lane
-    // is on rather than off.
     let has_hosting = !account.upload_keys.is_empty();
+    let (site, capsule) = account.serving();
     AccountPage {
         services: services(list, Some(&account.username)),
         username: account.username.clone(),
@@ -381,8 +379,8 @@ pub fn member_page(
             })
             .collect(),
         has_hosting,
-        site_served: account.site_served.unwrap_or(has_hosting),
-        capsule_served: account.capsule_served.unwrap_or(has_hosting),
+        site_served: site,
+        capsule_served: capsule,
         mail_key: account.mail_key.clone(),
         rotation: account.rotation.as_ref().map(|rotation| RotationView {
             fingerprint: rotation.fingerprint.clone(),
@@ -431,8 +429,11 @@ pub fn member_page(
 }
 
 /// The space used under the allowance, in the units the quota is set in. Binary
-/// multiples, because 5 GB here is five gibibytes.
-fn space(bytes: u64) -> String {
+/// multiples, because 5 GB here is five gibibytes. The one formatter both
+/// front-ends and the group page call; an unrecorded figure is each renderer's
+/// own sentence, because the capsule and the group page name different
+/// allowances beside it.
+pub fn space(bytes: u64) -> String {
     const GIB: u64 = 1 << 30;
     const MIB: u64 = 1 << 20;
     if bytes >= GIB {
