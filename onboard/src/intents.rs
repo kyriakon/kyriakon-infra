@@ -17,6 +17,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::config::DrainConfig;
+use crate::journal::Journal;
 use crate::sign;
 use crate::store::{GroupAddressIntent, GroupIntent, GroupRemoveIntent, Store};
 use crate::transitions::{
@@ -29,13 +30,17 @@ use crate::transitions::{
 /// process with no listener, so there is no loop inside it; cron runs it again
 /// a minute later.
 pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+    // Read once for the whole pass: every dedup, backoff and recovery query
+    // below asks this index rather than opening the file again, and an
+    // unreadable journal is an error here rather than an empty one (#513).
+    let journal = Journal::load(store).await?;
     // Read once, before anything is done: the review email's links are signed
     // with it. A missing or unreadable key is a misconfigured box, and it is
     // mailed once rather than on every pass.
     let key = match sign::read_key(std::path::Path::new(&cfg.approval_key)) {
         Ok(k) => k,
         Err(e) => {
-            transitions::report_failure(cfg, store, "config", "config", &e).await;
+            transitions::report_failure(cfg, store, &journal, "config", "config", &e).await;
             return Ok(());
         }
     };
@@ -52,11 +57,11 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
         let id = name.trim_end_matches(".json");
         // A failing intent backs off rather than being retried every minute, and
         // its error is mailed once rather than on every pass.
-        if !transitions::due(store, id, OffsetDateTime::now_utc()).await? {
+        if !transitions::due(&journal, id, OffsetDateTime::now_utc()) {
             continue;
         }
-        if let Err(e) = one(cfg, store, &key, &name).await {
-            transitions::report_failure(cfg, store, id, "intent", &e).await;
+        if let Err(e) = one(cfg, store, &journal, &key, &name).await {
+            transitions::report_failure(cfg, store, &journal, id, "intent", &e).await;
         }
     }
     // The login proofs are root's, so this is the half that clears the expired
@@ -68,8 +73,8 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
         OffsetDateTime::now_utc(),
     )
     .await;
-    transitions::purge_declined(cfg, store).await?;
-    transitions::purge_closing(cfg, store).await?;
+    transitions::purge_declined(cfg, store, &journal).await?;
+    transitions::purge_closing(cfg, store, &journal).await?;
     // The free accounts' yearly note, on the same pass: a free account never
     // lapses, and this is the one message it is sent each year.
     transitions::free_anniversaries(cfg, store).await?;
@@ -81,18 +86,18 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     transitions::refresh_space_used(cfg, store).await?;
     // A mail-key replacement whose 72-hour window has closed applies here, on
     // the same pass its record is read.
-    transitions::mail_key_rotations(cfg, store).await?;
+    transitions::mail_key_rotations(cfg, store, &journal).await?;
     // A payment window whose day has passed either finds its credit and stays
     // active, or lapses the account and starts the grace. One sweep, so a
     // member who paid on the last day is not lapsed by a later pass.
     transitions::window_sweep(cfg, store).await?;
     // A lapsed account's grace: the final notice at day 33, and the one
     // deletion transition when the 40 days end.
-    transitions::grace_sweep(cfg, store).await?;
+    transitions::grace_sweep(cfg, store, &journal).await?;
     // The key spool is read after the intents so a filed application is not
     // waiting behind a mailbox pass. The pass handles each message on its own:
     // one that cannot be dealt with is reported and left for the next run.
-    crate::mailbox::run(cfg, store).await?;
+    crate::mailbox::run(cfg, store, &journal).await?;
     // The groups' own zones are watched last: a record that has stopped
     // resolving is the one thing about a body's domain the platform can see and
     // cannot repair, and it must not delay a filed application or a member's
@@ -101,11 +106,17 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     // The card rail's arriving events are settled after everything else: a
     // misconfigured signing secret must not hold up an approval, and an event
     // that cannot be applied yet is left for the next pass.
-    transitions::stripe_webhooks(cfg, store).await
+    transitions::stripe_webhooks(cfg, store, &journal).await
 }
 
 /// One intent file, deserialised once into its variant, proved, then applied.
-async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result<(), String> {
+async fn one(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    key: &[u8],
+    file: &str,
+) -> Result<(), String> {
     // The listing is one snapshot, and a pass can delete a file another name in
     // that snapshot shares: an approval writes and applies its group intent in
     // the same pass, then removes it. A file that is gone reads as done, the
@@ -117,7 +128,7 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
     let value: Value =
         serde_json::from_str(&text).map_err(|e| format!("the intent does not parse: {e}"))?;
     let intent = Intent::parse(&value)?;
-    intent.run(cfg, store, key, file, &value).await
+    intent.run(cfg, store, journal, key, file, &value).await
 }
 
 /// One intent: the variant carries the payload, and the file it was read from
@@ -268,14 +279,15 @@ impl Intent {
         self,
         cfg: &DrainConfig,
         store: &Store,
+        journal: &Journal,
         key: &[u8],
         file: &str,
         value: &Value,
     ) -> Result<(), String> {
-        if !self.verify(cfg, store, key, file, value).await? {
+        if !self.verify(cfg, store, journal, key, file, value).await? {
             return Ok(());
         }
-        self.apply(cfg, store, key, file, value).await
+        self.apply(cfg, store, journal, key, file, value).await
     }
 
     /// Prove the intent is the authenticated party's, before anything is
@@ -293,6 +305,7 @@ impl Intent {
         &self,
         cfg: &DrainConfig,
         store: &Store,
+        journal: &Journal,
         key: &[u8],
         file: &str,
         value: &Value,
@@ -331,11 +344,11 @@ impl Intent {
             Intent::Password(intent) => {
                 // A re-filed copy of a settled intent is settled again, and a
                 // refused one loses its plaintext.
-                if transitions::journal_has(store, &intent.id, "refused").await? {
+                if journal.has(&intent.id, "refused") {
                     transitions::redact_password(store, file, value).await?;
                     return Ok(false);
                 }
-                if transitions::journal_has(store, &intent.id, "applied").await? {
+                if journal.has(&intent.id, "applied") {
                     // A crash between the `applied` line and the remove leaves
                     // the intent re-read on every pass: finish the remove.
                     store.remove("intents", file).await?;
@@ -359,7 +372,8 @@ impl Intent {
                 };
                 match problem {
                     Some(why) => {
-                        transitions::refuse_password(cfg, store, file, value, &why).await?;
+                        transitions::refuse_password(cfg, store, journal, file, value, &why)
+                            .await?;
                         Ok(false)
                     }
                     None => Ok(true),
@@ -409,6 +423,7 @@ impl Intent {
                 session_proved(
                     cfg,
                     store,
+                    journal,
                     &intent.id,
                     &intent.kind,
                     &intent.username,
@@ -446,6 +461,7 @@ impl Intent {
                     transitions::refuse_with(
                         cfg,
                         store,
+                        journal,
                         file,
                         value,
                         "the credit intent's signature does not verify",
@@ -465,6 +481,7 @@ impl Intent {
                     transitions::refuse_with(
                         cfg,
                         store,
+                        journal,
                         file,
                         value,
                         "the window extension's signature does not verify",
@@ -486,6 +503,7 @@ impl Intent {
                     transitions::refuse_with(
                         cfg,
                         store,
+                        journal,
                         file,
                         value,
                         "the reconcile-attribute intent's signature does not verify",
@@ -505,6 +523,7 @@ impl Intent {
                     transitions::refuse_with(
                         cfg,
                         store,
+                        journal,
                         file,
                         value,
                         "the reconcile-return intent's signature does not verify",
@@ -530,6 +549,7 @@ impl Intent {
                     transitions::refuse_with(
                         cfg,
                         store,
+                        journal,
                         file,
                         value,
                         "the refund intent's signature does not verify",
@@ -555,6 +575,7 @@ impl Intent {
                     transitions::refuse_page(
                         cfg,
                         store,
+                        journal,
                         &intent.id,
                         &intent.kind,
                         &intent.username,
@@ -567,6 +588,7 @@ impl Intent {
                 page_proved(
                     cfg,
                     store,
+                    journal,
                     &intent.id,
                     &intent.kind,
                     &intent.username,
@@ -579,6 +601,7 @@ impl Intent {
                 page_proved(
                     cfg,
                     store,
+                    journal,
                     &intent.id,
                     &intent.kind,
                     &intent.username,
@@ -591,6 +614,7 @@ impl Intent {
                 page_proved(
                     cfg,
                     store,
+                    journal,
                     &intent.id,
                     &intent.kind,
                     &intent.username,
@@ -603,6 +627,7 @@ impl Intent {
                 page_proved(
                     cfg,
                     store,
+                    journal,
                     &intent.id,
                     &intent.kind,
                     &intent.username,
@@ -615,6 +640,7 @@ impl Intent {
                 page_proved(
                     cfg,
                     store,
+                    journal,
                     &intent.id,
                     &intent.kind,
                     &intent.username,
@@ -627,6 +653,7 @@ impl Intent {
                 page_proved(
                     cfg,
                     store,
+                    journal,
                     &intent.id,
                     &intent.kind,
                     &intent.username,
@@ -636,7 +663,7 @@ impl Intent {
                 .await
             }
             Intent::Unknown { .. } => {
-                transitions::refuse(cfg, store, file, value).await?;
+                transitions::refuse(cfg, store, journal, file, value).await?;
                 Ok(false)
             }
         }
@@ -648,53 +675,70 @@ impl Intent {
         self,
         cfg: &DrainConfig,
         store: &Store,
+        journal: &Journal,
         key: &[u8],
         file: &str,
         value: &Value,
     ) -> Result<(), String> {
         match self {
             Intent::Application(intent) => {
-                transitions::filed_application(cfg, store, key, intent, file).await
+                transitions::filed_application(cfg, store, journal, key, intent, file).await
             }
-            Intent::Decision(intent) => transitions::decision(cfg, store, key, intent, file).await,
+            Intent::Decision(intent) => {
+                transitions::decision(cfg, store, journal, key, intent, file).await
+            }
             Intent::Password(intent) => {
-                transitions::set_password(cfg, store, intent, file, value).await
+                transitions::set_password(cfg, store, journal, intent, file, value).await
             }
             Intent::ProvisionGroup(intent) => {
-                transitions::provision_group(cfg, store, *intent, file).await
+                transitions::provision_group(cfg, store, journal, *intent, file).await
             }
             Intent::GroupAddress(intent) => {
-                transitions::group_address(cfg, store, intent, file).await
+                transitions::group_address(cfg, store, journal, intent, file).await
             }
             Intent::RemoveGroup(intent) => {
-                transitions::remove_group(cfg, store, intent, file).await
+                transitions::remove_group(cfg, store, journal, intent, file).await
             }
-            Intent::Close(intent) => transitions::close_account(cfg, store, intent, file).await,
-            Intent::Resend(intent) => transitions::resend(cfg, store, intent, file).await,
-            Intent::Credit(intent) => transitions::credit(cfg, store, intent, file, value).await,
+            Intent::Close(intent) => {
+                transitions::close_account(cfg, store, journal, intent, file).await
+            }
+            Intent::Resend(intent) => transitions::resend(cfg, store, journal, intent, file).await,
+            Intent::Credit(intent) => {
+                transitions::credit(cfg, store, journal, intent, file, value).await
+            }
             Intent::WindowExtend(intent) => {
-                transitions::window_extend(cfg, store, intent, file, value).await
+                transitions::window_extend(cfg, store, journal, intent, file, value).await
             }
             Intent::ReconcileAttribute(intent) => {
-                transitions::reconcile_attribute(cfg, store, intent, file, value).await
+                transitions::reconcile_attribute(cfg, store, journal, intent, file, value).await
             }
             Intent::ReconcileReturn(intent) => {
-                transitions::reconcile_return(cfg, store, intent, file, value).await
+                transitions::reconcile_return(cfg, store, journal, intent, file, value).await
             }
-            Intent::Refund(intent) => transitions::refund(cfg, store, intent, file, value).await,
-            Intent::Export(intent) => transitions::export_account(cfg, store, intent, file).await,
+            Intent::Refund(intent) => {
+                transitions::refund(cfg, store, journal, intent, file, value).await
+            }
+            Intent::Export(intent) => {
+                transitions::export_account(cfg, store, journal, intent, file).await
+            }
             Intent::ChangePassword(intent) => {
-                transitions::change_password(cfg, store, intent, file).await
+                transitions::change_password(cfg, store, journal, intent, file).await
             }
-            Intent::UploadKey(intent) => transitions::upload_key(cfg, store, intent, file).await,
+            Intent::UploadKey(intent) => {
+                transitions::upload_key(cfg, store, journal, intent, file).await
+            }
             Intent::OutsideAddress(intent) => {
-                transitions::set_outside_address(cfg, store, intent, file).await
+                transitions::set_outside_address(cfg, store, journal, intent, file).await
             }
-            Intent::Serving(intent) => transitions::set_serving(cfg, store, intent, file).await,
+            Intent::Serving(intent) => {
+                transitions::set_serving(cfg, store, journal, intent, file).await
+            }
             Intent::CancelRenewal(intent) => {
-                transitions::cancel_renewal(cfg, store, intent, file).await
+                transitions::cancel_renewal(cfg, store, journal, intent, file).await
             }
-            Intent::MailKey(intent) => transitions::mail_key(cfg, store, intent, file).await,
+            Intent::MailKey(intent) => {
+                transitions::mail_key(cfg, store, journal, intent, file).await
+            }
             // `verify` refuses an unknown kind before this is reached.
             Intent::Unknown { kind, .. } => {
                 Err(format!("this build does not implement the kind {kind:?}"))
@@ -755,6 +799,7 @@ fn account_name(username: &str) -> Result<(), String> {
 async fn session_proved(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     id: &str,
     kind: &str,
     username: &str,
@@ -774,6 +819,7 @@ async fn session_proved(
             transitions::settle_page(
                 cfg,
                 store,
+                journal,
                 id,
                 kind,
                 username,
@@ -793,6 +839,7 @@ async fn session_proved(
 async fn page_proved(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     id: &str,
     kind: &str,
     username: &str,
@@ -800,10 +847,10 @@ async fn page_proved(
     file: &str,
 ) -> Result<bool, String> {
     if let Err(why) = account_name(username) {
-        transitions::refuse_page(cfg, store, id, kind, username, file, &why).await?;
+        transitions::refuse_page(cfg, store, journal, id, kind, username, file, &why).await?;
         return Ok(false);
     }
-    session_proved(cfg, store, id, kind, username, session, file).await
+    session_proved(cfg, store, journal, id, kind, username, session, file).await
 }
 
 /// Whether `id` names a live page session for `username`. The drain runs as

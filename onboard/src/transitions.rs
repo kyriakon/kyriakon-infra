@@ -17,6 +17,7 @@ use tokio::process::Command;
 
 use crate::config::DrainConfig;
 use crate::dns;
+use crate::journal::Journal;
 use crate::notice;
 use crate::questions;
 use crate::sign;
@@ -644,9 +645,11 @@ async fn save_application(store: &Store, token: &str, record: &Record) -> Result
 
 /// Append one journal line. The caller writes this before the transition, which
 /// is the whole point of the journal, and again on completion so an approval that
-/// finished and one that died midway do not read alike.
-async fn journal(
+/// finished and one that died midway do not read alike. The index takes the line
+/// too, so a query later in the same pass sees it.
+async fn write_journal(
     store: &Store,
+    journal: &Journal,
     release: &str,
     intent: &str,
     kind: &str,
@@ -665,30 +668,7 @@ async fn journal(
         note: note.map(str::to_string),
         credit: None,
     };
-    let encoded =
-        serde_json::to_string(&line).map_err(|e| format!("cannot encode a journal line: {e}"))?;
-    store.log("journal.jsonl").append(encoded.as_bytes()).await
-}
-
-/// Whether the journal already holds a line for this intent id with this
-/// outcome. A refusal is recorded once, and a purge that already released the
-/// name is not released twice.
-pub(crate) async fn journal_has(store: &Store, id: &str, outcome: &str) -> Result<bool, String> {
-    store
-        .log("journal.jsonl")
-        .jsonl_any(|j: &JournalLine| j.intent == id && j.outcome == outcome)
-        .await
-}
-
-/// Whether the journal already holds a line for this intent id, whatever its
-/// outcome.
-async fn intent_seen(store: &Store, id: &str) -> Result<bool, String> {
-    // A failed line is the reason the next pass retries, not a settlement:
-    // counting it would drop the intent after one failure.
-    store
-        .log("journal.jsonl")
-        .jsonl_any(|j: &JournalLine| j.intent == id && j.outcome != "failed")
-        .await
+    journal.append(store, &line).await
 }
 
 /// How long to wait before retrying an id that has failed `failures` times, in
@@ -705,50 +685,22 @@ pub fn retry_after_minutes(failures: u32) -> i64 {
     }
 }
 
-/// The failed passes recorded for an id: how many, when the last was, and what
-/// it said. Read back from the journal, so the count and the last message
-/// survive a restart, which is what makes both the backoff and the dedup hold
-/// across cron runs.
-pub async fn failures(
-    store: &Store,
-    id: &str,
-) -> Result<(u32, Option<OffsetDateTime>, Option<String>), String> {
-    let mut count = 0u32;
-    let mut last: Option<OffsetDateTime> = None;
-    let mut message: Option<String> = None;
-    // Every failed line counts, so this reads the whole journal: one line at a
-    // time, rather than a list of all of them first.
-    store
-        .log("journal.jsonl")
-        .jsonl_each(|_, j: &JournalLine| {
-            if j.intent == id && j.outcome == "failed" {
-                count += 1;
-                if let Ok(at) = OffsetDateTime::parse(&j.at, &Rfc3339) {
-                    last = Some(at);
-                }
-                if j.note.is_some() {
-                    message = j.note.clone();
-                }
-            }
-        })
-        .await?;
-    Ok((count, last, message))
-}
-
 /// Record a failed pass and say whether it is a new one worth mailing. The same
 /// message as the last failure is the same event, so the operator is not mailed
 /// it again; a different message is. This is the notices path's rule, applied to
 /// the drain's own output: record first, and let the record stop the duplicate.
 pub async fn note_failure(
     store: &Store,
+    journal: &Journal,
     release: &str,
     id: &str,
     kind: &str,
     message: &str,
 ) -> Result<bool, String> {
-    let (_, _, previous) = failures(store, id).await?;
-    journal(
+    let (_, _, previous) = journal.failures(id);
+    write_journal(
         store,
+        journal,
         release,
         id,
         kind,
@@ -770,8 +722,15 @@ pub async fn note_failure(
 /// A failure that was mailed is not also printed. cron mails a job's output
 /// under a subject of its own, so printing would be the same news a second time,
 /// and the copy that names neither the component nor the event.
-pub async fn report_failure(cfg: &DrainConfig, store: &Store, id: &str, kind: &str, message: &str) {
-    let fresh = note_failure(store, &cfg.release, id, kind, message)
+pub async fn report_failure(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    id: &str,
+    kind: &str,
+    message: &str,
+) {
+    let fresh = note_failure(store, journal, &cfg.release, id, kind, message)
         .await
         .unwrap_or(true);
     if fresh {
@@ -800,54 +759,12 @@ pub async fn report_failure(cfg: &DrainConfig, store: &Store, id: &str, kind: &s
 
 /// Whether a failing id is due for another attempt, and whether it should be
 /// reported when it fails again. `true` means go ahead.
-pub async fn due(store: &Store, id: &str, now: OffsetDateTime) -> Result<bool, String> {
-    let (failures, last, _) = failures(store, id).await?;
-    Ok(match last {
+pub fn due(journal: &Journal, id: &str, now: OffsetDateTime) -> bool {
+    let (failures, last, _) = journal.failures(id);
+    match last {
         None => true,
         Some(last) => now >= last + Duration::minutes(retry_after_minutes(failures)),
-    })
-}
-
-/// Whether the journal already holds a line of this kind for this application,
-/// written by an intent whose pass has not failed since.
-///
-/// Used for the review email, whose dedup key is the application and not the
-/// intent: a re-filed application must not be mailed twice either.
-///
-/// The line is written before the send on purpose, so that a crash loses an
-/// email rather than sending two. A returned error is not a crash: the pass that
-/// gets one knows the send did not happen, and it leaves a `failed` line for its
-/// own intent, so a marker counted there would have the next pass drop the
-/// intent and lose the review email for good. A crash writes no failed line, so
-/// the direction the marker is written in is unchanged.
-///
-/// A failure counts only when it comes after the marker, so an intent that
-/// failed once and then sent successfully keeps its marker standing. Order is
-/// the file's own: several lines of one pass share a timestamp.
-async fn application_seen(
-    store: &Store,
-    token: &str,
-    kind: &str,
-    outcome: &str,
-) -> Result<bool, String> {
-    let mut marks: Vec<(usize, String)> = Vec::new();
-    let mut failed: Vec<(usize, String)> = Vec::new();
-    // Both lists are needed to compare a mark against any later failure, so the
-    // whole journal is read, one line at a time rather than all of them first.
-    store
-        .log("journal.jsonl")
-        .jsonl_each(|at, j: &JournalLine| {
-            if j.outcome == "failed" {
-                failed.push((at, j.intent.clone()));
-            }
-            if j.application.status_token == token && j.kind == kind && j.outcome == outcome {
-                marks.push((at, j.intent.clone()));
-            }
-        })
-        .await?;
-    Ok(marks
-        .iter()
-        .any(|(at, id)| !failed.iter().any(|(f, fid)| fid == id && f > at)))
+    }
 }
 
 /// Apply a password set through a one-time link.
@@ -867,6 +784,7 @@ async fn application_seen(
 pub async fn set_password(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: PasswordIntent,
     file: &str,
     value: &Value,
@@ -877,9 +795,17 @@ pub async fn set_password(
     let hash = match crate::password::make(&plain) {
         Ok(hash) if crate::password::is_hash(&hash) => hash,
         Ok(_) => {
-            return refuse_password(cfg, store, file, value, "the password did not hash").await;
+            return refuse_password(
+                cfg,
+                store,
+                journal,
+                file,
+                value,
+                "the password did not hash",
+            )
+            .await;
         }
-        Err(e) => return refuse_password(cfg, store, file, value, &e).await,
+        Err(e) => return refuse_password(cfg, store, journal, file, value, &e).await,
     };
     // Overwrite the plaintext in place now it has been hashed; zero bytes are
     // still valid UTF-8, which is what `as_mut_vec` requires. The intent file
@@ -888,7 +814,15 @@ pub async fn set_password(
     unsafe { plain.as_mut_vec().fill(0) };
     let name = format!("{token}.json");
     let Some(text) = store.read_record("applications", &name).await else {
-        return refuse_password(cfg, store, file, value, "the application record is gone").await;
+        return refuse_password(
+            cfg,
+            store,
+            journal,
+            file,
+            value,
+            "the application record is gone",
+        )
+        .await;
     };
     // Read as a Value and edit one key: the record carries fields this build
     // does not model, and writing it back through the typed struct would drop
@@ -896,10 +830,26 @@ pub async fn set_password(
     let mut record: Value = serde_json::from_str(&text)
         .map_err(|e| format!("the application record does not parse: {e}"))?;
     if record.get("username").and_then(Value::as_str) != Some(username) {
-        return refuse_password(cfg, store, file, value, "the intent names another account").await;
+        return refuse_password(
+            cfg,
+            store,
+            journal,
+            file,
+            value,
+            "the intent names another account",
+        )
+        .await;
     }
     if record.get("password_link").is_none_or(Value::is_null) {
-        return refuse_password(cfg, store, file, value, "the link has already been used").await;
+        return refuse_password(
+            cfg,
+            store,
+            journal,
+            file,
+            value,
+            "the link has already been used",
+        )
+        .await;
     }
     run_script(cfg, "set-mail-password.sh", &[username, &hash]).await?;
     // One use: the record keeps no link, so the page stops answering.
@@ -912,8 +862,9 @@ pub async fn set_password(
     store
         .write_record_owned("applications", &name, &bytes, owner)
         .await?;
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -956,6 +907,7 @@ pub(crate) async fn redact_password(
 pub(crate) async fn refuse_password(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     file: &str,
     value: &Value,
     reason: &str,
@@ -964,7 +916,7 @@ pub(crate) async fn refuse_password(
     // the journal its refusal: the refusal is recorded either way, and the
     // write's error is what the pass reports so the plaintext is not forgotten.
     let redacted = redact_password(store, file, value).await;
-    refuse_with(cfg, store, file, value, reason).await?;
+    refuse_with(cfg, store, journal, file, value, reason).await?;
     redacted
 }
 
@@ -973,6 +925,7 @@ pub(crate) async fn refuse_password(
 pub(crate) async fn refuse_with(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     file: &str,
     value: &Value,
     reason: &str,
@@ -989,7 +942,7 @@ pub(crate) async fn refuse_with(
         .to_string();
     // One refusal per intent: a second pass over the same bad file must not
     // append a second line, because every journal read scans the whole file.
-    if journal_has(store, &id, "refused").await? {
+    if journal.has(&id, "refused") {
         return Ok(());
     }
     let application = value
@@ -999,8 +952,9 @@ pub(crate) async fn refuse_with(
             username: String::new(),
             status_token: String::new(),
         });
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &id,
         &kind,
@@ -1017,6 +971,7 @@ pub(crate) async fn refuse_with(
 pub async fn refuse(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     file: &str,
     value: &Value,
 ) -> Result<(), String> {
@@ -1037,11 +992,12 @@ pub async fn refuse(
             username: String::new(),
             status_token: String::new(),
         });
-    if intent_seen(store, &id).await? {
+    if journal.seen(&id) {
         return Ok(());
     }
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &id,
         &kind,
@@ -1058,6 +1014,7 @@ pub async fn refuse(
 pub async fn filed_application(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     key: &[u8],
     intent: Intent,
     file: &str,
@@ -1077,12 +1034,13 @@ pub async fn filed_application(
     // record and it is written before the send, so a crash loses an email
     // rather than sending two.
     let token = &intent.application.status_token;
-    if application_seen(store, token, "application", "review-sent").await? {
+    if journal.application_seen(token, "application", "review-sent") {
         store.remove("intents", file).await?;
         return Ok(());
     }
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         "application",
@@ -1203,14 +1161,15 @@ fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String,
 pub async fn decision(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     key: &[u8],
     intent: DecisionIntent,
     file: &str,
 ) -> Result<(), String> {
     match intent.kind.as_str() {
-        "approve" => approve(cfg, store, key, &intent, false, file).await,
-        "provision" => approve(cfg, store, key, &intent, true, file).await,
-        "decline" => decline(cfg, store, &intent, file).await,
+        "approve" => approve(cfg, store, journal, key, &intent, false, file).await,
+        "provision" => approve(cfg, store, journal, key, &intent, true, file).await,
+        "decline" => decline(cfg, store, journal, &intent, file).await,
         // Unreachable after the kind match the seam makes, kept so the dispatch
         // is total.
         other => Err(format!("kind {other:?} is not a decision")),
@@ -1224,6 +1183,7 @@ pub async fn decision(
 async fn approve(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     key: &[u8],
     intent: &DecisionIntent,
     no_charge: bool,
@@ -1237,8 +1197,9 @@ async fn approve(
     }
     let no_charge = no_charge || record.no_charge;
     if record.decided_at.is_some() {
-        journal(
+        write_journal(
             store,
+            journal,
             &cfg.release,
             &intent.id,
             &intent.kind,
@@ -1255,7 +1216,7 @@ async fn approve(
     // path below would make one account for the accountable person and none of
     // the mailboxes. The whole application is one group intent instead.
     if record.domain.is_some() {
-        return approve_group(cfg, store, key, intent, file, &record, no_charge).await;
+        return approve_group(cfg, store, journal, key, intent, file, &record, no_charge).await;
     }
 
     // The recipient is revalidated before anything is written or journaled, so a
@@ -1266,7 +1227,7 @@ async fn approve(
     // Whether this application's own approval already began. A genuine retry has
     // its own "applying" line; anything else holding this name is not this
     // application's.
-    let begun = approval_started(store, token).await?;
+    let begun = journal.approval_started(token);
     let existing = existing_account(store, username).await;
 
     // An account record that this application never began is a second
@@ -1277,8 +1238,7 @@ async fn approve(
     // disagreeing about what is owed. This is the replay rule for a different
     // reason: the click is recorded and the intent is dropped.
     if existing.is_some() && !begun {
-        journal(
-            store,
+        write_journal(store, journal,
             &cfg.release,
             &intent.id,
             &intent.kind,
@@ -1331,8 +1291,9 @@ async fn approve(
     // agreed exists before the service begins.
     confirm(cfg, store, token, &record).await?;
 
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -1585,8 +1546,9 @@ async fn approve(
         Some(password_link),
     )
     .await?;
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -1610,6 +1572,7 @@ async fn approve(
 pub async fn resend(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: ResendIntent,
     file: &str,
 ) -> Result<(), String> {
@@ -1668,8 +1631,9 @@ pub async fn resend(
             })
         })
         .ok_or_else(|| format!("no application record for {username}"))?;
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -1687,19 +1651,21 @@ pub async fn resend(
 pub async fn window_extend(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: WindowExtendIntent,
     file: &str,
     value: &Value,
 ) -> Result<(), String> {
     // A refusal is journaled once and the intent is left in place, as the credit
     // path does; a new intent is the way to change the answer.
-    if journal_has(store, &intent.id, "refused").await? {
+    if journal.has(&intent.id, "refused") {
         return Ok(());
     }
     if !store::is_payment_token(&intent.token) {
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the window extension's token is not a payment token",
@@ -1710,6 +1676,7 @@ pub async fn window_extend(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "a window extension is fourteen days and no other number",
@@ -1720,6 +1687,7 @@ pub async fn window_extend(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the window extension gives no reason",
@@ -1730,20 +1698,21 @@ pub async fn window_extend(
     // extension under the same rule.
     let join = match token_join(store, &intent.token).await {
         Ok(join) => join,
-        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
     };
     if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
-        return extend_group_window(cfg, store, intent, file, value, &domain).await;
+        return extend_group_window(cfg, store, journal, intent, file, value, &domain).await;
     }
     let (username, mut account, mut payment) = match resolve_payment(store, &intent.token).await {
         Ok(found) => found,
-        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
     };
     let (paid_until, window) = (&payment.paid_until, &mut payment.window);
     let Some(window) = window.as_mut() else {
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the account has no payment window to extend",
@@ -1752,7 +1721,7 @@ pub async fn window_extend(
     };
     let new_close = match extend_open_window(paid_until.as_deref(), window, intent.days) {
         Ok(close) => close,
-        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
     };
     account.payment = Some(payment.clone());
     let bytes = serde_json::to_vec_pretty(&account)
@@ -1788,8 +1757,9 @@ pub async fn window_extend(
             username: username.clone(),
             status_token: String::new(),
         });
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -1809,6 +1779,7 @@ pub async fn window_extend(
 async fn extend_group_window(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: WindowExtendIntent,
     file: &str,
     value: &Value,
@@ -1818,6 +1789,7 @@ async fn extend_group_window(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the token resolves to a group that is gone",
@@ -1831,6 +1803,7 @@ async fn extend_group_window(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the group has no payment window to extend",
@@ -1839,7 +1812,7 @@ async fn extend_group_window(
     };
     let new_close = match extend_open_window(paid_until.as_deref(), window, intent.days) {
         Ok(close) => close,
-        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
     };
     write_group_record(store, &group).await?;
     if let Some(text) = store
@@ -1855,8 +1828,9 @@ async fn extend_group_window(
                 .await?;
         }
     }
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -2185,7 +2159,11 @@ async fn group_final_notice(
 /// deletion transition at `grace_until`. The notice is deduplicated by its
 /// `notices.jsonl` line, and the deletion is due-gated on the transition's own
 /// journal id so a failed erase backs off rather than being retried every minute.
-pub async fn grace_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+pub async fn grace_sweep(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+) -> Result<(), String> {
     let now = OffsetDateTime::now_utc();
     let today = now.date();
     for username in store.list("accounts").await? {
@@ -2210,11 +2188,11 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String>
         };
         if today >= grace {
             let id = format!("delete-{}-{}", username, account.created_at);
-            if !due(store, &id, now).await? {
+            if !due(journal, &id, now) {
                 continue;
             }
-            if let Err(e) = delete_account(cfg, store, &username).await {
-                report_failure(cfg, store, &id, "delete", &e).await;
+            if let Err(e) = delete_account(cfg, store, journal, &username).await {
+                report_failure(cfg, store, journal, &id, "delete", &e).await;
             }
             continue;
         }
@@ -2274,11 +2252,11 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String>
             // removed and re-added gets its own deletion rather than matching
             // the first lifecycle's journal line.
             let id = format!("delete-group-{domain}-{}", group.created_at);
-            if !due(store, &id, now).await? {
+            if !due(journal, &id, now) {
                 continue;
             }
-            if let Err(e) = delete_group(cfg, store, &group, &id).await {
-                report_failure(cfg, store, &id, "delete", &e).await;
+            if let Err(e) = delete_group(cfg, store, journal, &group, &id).await {
+                report_failure(cfg, store, journal, &id, "delete", &e).await;
             }
             continue;
         }
@@ -2343,19 +2321,21 @@ async fn grace_notice(
 async fn delete_group(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     group: &GroupRecord,
     id: &str,
 ) -> Result<(), String> {
-    if journal_has(store, id, "applied").await? {
+    if journal.has(id, "applied") {
         return remove_group_record(store, &group.domain).await;
     }
     let application = ApplicationRef {
         username: group.site_owner.clone(),
         status_token: group.domain.clone(),
     };
-    if !journal_has(store, id, "applying").await? {
-        journal(
+    if !journal.has(id, "applying") {
+        write_journal(
             store,
+            journal,
             &cfg.release,
             id,
             "delete",
@@ -2366,8 +2346,9 @@ async fn delete_group(
         .await?;
     }
     take_group_down(cfg, store, &group.domain).await?;
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         id,
         "delete",
@@ -2493,6 +2474,7 @@ async fn lapse_notice(
 pub async fn credit(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: CreditIntent,
     file: &str,
     value: &Value,
@@ -2502,9 +2484,10 @@ pub async fn credit(
     // queue. A second arrival of the same intent finds its line and stops before
     // any other check, so a replay cannot refuse itself on a rule it already met.
     if ledger_has_intent(store, &intent.id).await? || held_has_intent(store, &intent.id).await? {
-        if !journal_has(store, &intent.id, "applied").await? {
-            journal(
+        if !journal.has(&intent.id, "applied") {
+            write_journal(
                 store,
+                journal,
                 &cfg.release,
                 &intent.id,
                 &intent.kind,
@@ -2522,19 +2505,19 @@ pub async fn credit(
     }
     // A refusal is recorded once; the intent is left in place, as every other
     // refused intent is, and a new intent is the way to change it.
-    if journal_has(store, &intent.id, "refused").await? {
+    if journal.has(&intent.id, "refused") {
         return Ok(());
     }
     let amount = match credit_fields(&intent) {
         Ok(amount) => amount,
-        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
     };
     let received = util::parse_date(&intent.received).expect("the date was validated above");
 
     // A payment with no token cannot be joined to an account, so it is held
     // until `reconcile` joins it or closes it.
     if intent.token.is_empty() {
-        return hold(cfg, store, &intent, file, value, amount, received).await;
+        return hold(cfg, store, journal, &intent, file, value, amount, received).await;
     }
 
     // The token index says which of the two the money pays for: one account, or
@@ -2542,15 +2525,15 @@ pub async fn credit(
     // mailbox in it shares.
     let join = match token_join(store, &intent.token).await {
         Ok(join) => join,
-        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
     };
     if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
-        return group_credit(cfg, store, file, value, &intent, &domain, None).await;
+        return group_credit(cfg, store, journal, file, value, &intent, &domain, None).await;
     }
 
     let (username, account, payment) = match resolve_payment(store, &intent.token).await {
         Ok(found) => found,
-        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
     };
     let app = PaymentApplication {
         intent: &intent,
@@ -2561,7 +2544,7 @@ pub async fn credit(
         received,
         attributed_item: None,
     };
-    if apply_payment(cfg, store, file, value, app).await? {
+    if apply_payment(cfg, store, journal, file, value, app).await? {
         store.remove("intents", file).await?;
     }
     Ok(())
@@ -2677,6 +2660,7 @@ struct PaymentApplication<'a> {
 async fn apply_payment(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     file: &str,
     value: &Value,
     app: PaymentApplication<'_>,
@@ -2696,7 +2680,7 @@ async fn apply_payment(
     // account is the witness: its paid-until date (or, for a shortfall, its
     // balance) is the one this credit computed, so nothing is extended again and
     // no second notice is sent.
-    let progress = credit_progress(store, &intent.id).await?;
+    let progress = journal.credit_progress(&intent.id);
     let written = progress.as_ref().is_some_and(|p| {
         if p.paid {
             payment.paid_until.as_deref() == p.paid_until_after.as_deref()
@@ -2720,10 +2704,11 @@ async fn apply_payment(
         // A crash between the account write and its copies leaves the status
         // page behind; the account is the truth now, so rewrite them from it.
         write_payment_copy(store, username, &payment).await?;
-        if !journal_has(store, &intent.id, "applied").await? {
+        if !journal.has(&intent.id, "applied") {
             journal_credit_applied(
                 cfg,
                 store,
+                journal,
                 intent,
                 username,
                 intent.override_reason.as_deref(),
@@ -2740,6 +2725,7 @@ async fn apply_payment(
                 return refuse_with(
                     cfg,
                     store,
+                    journal,
                     file,
                     value,
                     "the account's paid-until date cannot be read",
@@ -2754,6 +2740,7 @@ async fn apply_payment(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the account's paid-until date has no year in the calendar",
@@ -2770,7 +2757,7 @@ async fn apply_payment(
     {
         return refuse_with(
             cfg,
-            store,
+            store, journal,
             file,
             value,
             "the credit would put paid_until more than 24 months past --received; give --override <reason> to mean it",
@@ -2791,6 +2778,7 @@ async fn apply_payment(
                 return refuse_with(
                     cfg,
                     store,
+                    journal,
                     file,
                     value,
                     &format!("the account's balance cannot be read: {e}"),
@@ -2813,6 +2801,7 @@ async fn apply_payment(
             return refuse_with(
                 cfg,
                 store,
+                journal,
                 file,
                 value,
                 &format!(
@@ -2826,7 +2815,7 @@ async fn apply_payment(
             if attributed_item != Some(id.as_str()) {
                 return refuse_with(
                     cfg,
-                    store,
+                    store, journal,
                     file,
                     value,
                     &format!(
@@ -2852,7 +2841,7 @@ async fn apply_payment(
                 "the token was already credited until {paid_until}; record a renewal with `credit --confirm-double`"
             )
         };
-        return refuse_with(cfg, store, file, value, &problem)
+        return refuse_with(cfg, store, journal, file, value, &problem)
             .await
             .map(|()| false);
     }
@@ -2870,6 +2859,7 @@ async fn apply_payment(
     if progress.is_none() {
         journal_credit_applying(
             store,
+            journal,
             &cfg.release,
             intent,
             username,
@@ -2967,7 +2957,7 @@ async fn apply_payment(
     )
     .await?;
 
-    journal_credit_applied(cfg, store, intent, username, override_reason).await?;
+    journal_credit_applied(cfg, store, journal, intent, username, override_reason).await?;
     Ok(true)
 }
 
@@ -2979,6 +2969,7 @@ async fn apply_payment(
 async fn group_credit(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     file: &str,
     value: &Value,
     intent: &CreditIntent,
@@ -2987,7 +2978,7 @@ async fn group_credit(
 ) -> Result<(), String> {
     let amount = match credit_fields(intent) {
         Ok(amount) => amount,
-        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
     };
     let received = util::parse_date(&intent.received).expect("the date was validated above");
     if let Some(why) = validate::domain(domain) {
@@ -2997,6 +2988,7 @@ async fn group_credit(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the token resolves to a group that is gone",
@@ -3007,6 +2999,7 @@ async fn group_credit(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the group was approved without charge, so it has no payment to record",
@@ -3017,6 +3010,7 @@ async fn group_credit(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the token is not the one the group's payment block holds",
@@ -3027,7 +3021,7 @@ async fn group_credit(
     // A pass that journaled `applying` and wrote the group but crashed before
     // the ledger append is finished here. The group's date is the witness, so
     // nothing is extended twice and no second receipt is sent.
-    let progress = credit_progress(store, &intent.id).await?;
+    let progress = journal.credit_progress(&intent.id);
     let written = progress.as_ref().is_some_and(|p| {
         p.paid && group.payment.paid_until.as_deref() == p.paid_until_after.as_deref()
     });
@@ -3044,10 +3038,11 @@ async fn group_credit(
             )
             .await?;
         }
-        if !journal_has(store, &intent.id, "applied").await? {
+        if !journal.has(&intent.id, "applied") {
             journal_credit_applied(
                 cfg,
                 store,
+                journal,
                 intent,
                 &group.site_owner,
                 intent.override_reason.as_deref(),
@@ -3065,6 +3060,7 @@ async fn group_credit(
                 return refuse_with(
                     cfg,
                     store,
+                    journal,
                     file,
                     value,
                     "the group's paid-until date cannot be read",
@@ -3078,6 +3074,7 @@ async fn group_credit(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the group's paid-until date has no year in the calendar",
@@ -3093,7 +3090,7 @@ async fn group_credit(
     {
         return refuse_with(
             cfg,
-            store,
+            store, journal,
             file,
             value,
             "the credit would put the group's paid_until more than 24 months past --received; give --override <reason> to mean it",
@@ -3112,6 +3109,7 @@ async fn group_credit(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             &format!(
@@ -3126,6 +3124,7 @@ async fn group_credit(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             &format!(
@@ -3144,6 +3143,7 @@ async fn group_credit(
             return refuse_with(
                 cfg,
                 store,
+                journal,
                 file,
                 value,
                 &format!(
@@ -3158,7 +3158,7 @@ async fn group_credit(
             if attributed_item != Some(id.as_str()) {
                 return refuse_with(
                     cfg,
-                    store,
+                    store, journal,
                     file,
                     value,
                     &format!(
@@ -3173,7 +3173,7 @@ async fn group_credit(
         if !intent.confirm_double {
             return refuse_with(
                 cfg,
-                store,
+                store, journal,
                 file,
                 value,
                 &format!(
@@ -3188,6 +3188,7 @@ async fn group_credit(
     let applied = util::gbp(money.applied);
     journal_credit_applying(
         store,
+        journal,
         &cfg.release,
         intent,
         &group.site_owner,
@@ -3244,7 +3245,15 @@ async fn group_credit(
         &body,
     )
     .await?;
-    journal_credit_applied(cfg, store, intent, &group.site_owner, override_reason).await?;
+    journal_credit_applied(
+        cfg,
+        store,
+        journal,
+        intent,
+        &group.site_owner,
+        override_reason,
+    )
+    .await?;
     store.remove("intents", file).await?;
     Ok(())
 }
@@ -3335,6 +3344,7 @@ async fn last_payment_line(store: &Store, token: &str) -> Result<Option<PaymentL
 pub async fn refund(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: RefundIntent,
     file: &str,
     value: &Value,
@@ -3347,6 +3357,7 @@ pub async fn refund(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the refund's token is not the shape of a payment token",
@@ -3367,6 +3378,7 @@ pub async fn refund(
             return refuse_with(
                 cfg,
                 store,
+                journal,
                 file,
                 value,
                 "a settlement names only --settled and the account's token",
@@ -3377,6 +3389,7 @@ pub async fn refund(
             return refuse_with(
                 cfg,
                 store,
+                journal,
                 file,
                 value,
                 "the refund's settled date is not YYYY-MM-DD",
@@ -3384,9 +3397,10 @@ pub async fn refund(
             .await;
         }
         if ledger_settled_by(store, &intent.id).await? {
-            if !journal_has(store, &intent.id, "applied").await? {
-                journal(
+            if !journal.has(&intent.id, "applied") {
+                write_journal(
                     store,
+                    journal,
                     &cfg.release,
                     &intent.id,
                     &intent.kind,
@@ -3402,18 +3416,19 @@ pub async fn refund(
             store.remove("intents", file).await?;
             return Ok(());
         }
-        if journal_has(store, &intent.id, "refused").await? {
+        if journal.has(&intent.id, "refused") {
             return Ok(());
         }
-        return settle_refund(cfg, store, &intent, file, value, settled_text).await;
+        return settle_refund(cfg, store, journal, &intent, file, value, settled_text).await;
     }
 
     // The ledger line is the settlement marker: a second arrival of the same
     // intent finds it and stops before any check it already met.
     if ledger_has_intent(store, &intent.id).await? {
-        if !journal_has(store, &intent.id, "applied").await? {
-            journal(
+        if !journal.has(&intent.id, "applied") {
+            write_journal(
                 store,
+                journal,
                 &cfg.release,
                 &intent.id,
                 &intent.kind,
@@ -3429,7 +3444,7 @@ pub async fn refund(
         store.remove("intents", file).await?;
         return Ok(());
     }
-    if journal_has(store, &intent.id, "refused").await? {
+    if journal.has(&intent.id, "refused") {
         return Ok(());
     }
 
@@ -3445,7 +3460,7 @@ pub async fn refund(
         None
     };
     if let Some(problem) = problem {
-        return refuse_with(cfg, store, file, value, problem).await;
+        return refuse_with(cfg, store, journal, file, value, problem).await;
     }
     let amount = match util::pence(amount_text) {
         Ok(a) if a > 0 => a,
@@ -3453,13 +3468,14 @@ pub async fn refund(
             return refuse_with(
                 cfg,
                 store,
+                journal,
                 file,
                 value,
                 "the refund's amount must be more than zero",
             )
             .await
         }
-        Err(e) => return refuse_with(cfg, store, file, value, &e).await,
+        Err(e) => return refuse_with(cfg, store, journal, file, value, &e).await,
     };
     let rate = match intent.rate.as_deref() {
         None => None,
@@ -3469,13 +3485,14 @@ pub async fn refund(
                 return refuse_with(
                     cfg,
                     store,
+                    journal,
                     file,
                     value,
                     "the refund's rate must be more than zero",
                 )
                 .await
             }
-            Err(e) => return refuse_with(cfg, store, file, value, &e).await,
+            Err(e) => return refuse_with(cfg, store, journal, file, value, &e).await,
         },
     };
 
@@ -3485,18 +3502,20 @@ pub async fn refund(
             return refuse_with(
                 cfg,
                 store,
+                journal,
                 file,
                 value,
                 "the token has no payment line for a refund to reverse",
             )
             .await
         }
-        Err(e) => return refuse_with(cfg, store, file, value, &e).await,
+        Err(e) => return refuse_with(cfg, store, journal, file, value, &e).await,
     };
     if rail != original.rail {
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             &format!(
@@ -3510,6 +3529,7 @@ pub async fn refund(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             &format!(
@@ -3525,6 +3545,7 @@ pub async fn refund(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             &format!(
@@ -3541,12 +3562,13 @@ pub async fn refund(
     // reverses the same way with one less account to write.
     let join = match token_join(store, &intent.token).await {
         Ok(join) => join,
-        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
     };
     if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
         return refund_group(
             cfg,
             store,
+            journal,
             &intent,
             file,
             value,
@@ -3561,7 +3583,7 @@ pub async fn refund(
     }
     let (username, mut account, mut payment) = match resolve_payment(store, &intent.token).await {
         Ok(found) => found,
-        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
     };
 
     // An excess refund gives back held overpayment, so whatever it takes has
@@ -3575,6 +3597,7 @@ pub async fn refund(
                 return refuse_with(
                     cfg,
                     store,
+                    journal,
                     file,
                     value,
                     &format!("the account's balance cannot be read: {e}"),
@@ -3585,7 +3608,7 @@ pub async fn refund(
         None => 0,
     };
     if let Err(problem) = refund_total(store, &intent.token, &original, amount).await {
-        return refuse_with(cfg, store, file, value, &problem).await;
+        return refuse_with(cfg, store, journal, file, value, &problem).await;
     }
 
     let received_on = util::filed_at()[..10].to_string();
@@ -3653,8 +3676,9 @@ pub async fn refund(
     } else {
         format!("recorded at ledger seq {seq}")
     };
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -3731,6 +3755,7 @@ async fn refund_total(
 async fn refund_group(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: &RefundIntent,
     file: &str,
     value: &Value,
@@ -3745,6 +3770,7 @@ async fn refund_group(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the token resolves to a group that is gone",
@@ -3754,7 +3780,7 @@ async fn refund_group(
     if intent.close {
         return refuse_with(
             cfg,
-            store,
+            store, journal,
             file,
             value,
             "a group has no closing state, so --close cannot cancel one; reverse the payment with --excess, and end the group with `onboardctl group remove <domain>`",
@@ -3762,7 +3788,7 @@ async fn refund_group(
         .await;
     }
     if let Err(problem) = refund_total(store, &intent.token, original, amount).await {
-        return refuse_with(cfg, store, file, value, &problem).await;
+        return refuse_with(cfg, store, journal, file, value, &problem).await;
     }
     let received_on = util::filed_at()[..10].to_string();
     let settlement_by = util::date_after_days(14);
@@ -3803,8 +3829,9 @@ async fn refund_group(
     } else {
         format!("recorded at ledger seq {seq}")
     };
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -3948,6 +3975,7 @@ fn unsettled_refund(lines: &[String], token: &str) -> Result<Option<usize>, Stri
 async fn settle_refund(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: &RefundIntent,
     file: &str,
     value: &Value,
@@ -3961,6 +3989,7 @@ async fn settle_refund(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the token has no unsettled refund to record a settlement against",
@@ -3978,6 +4007,7 @@ async fn settle_refund(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the token has no unsettled refund to record a settlement against",
@@ -4001,8 +4031,9 @@ async fn settle_refund(
     // a mail enqueuer.
     drop(guard);
 
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -4028,6 +4059,7 @@ pub const CREDIT_RAILS: [&str; 3] = ["cash", "cash-hand", "monero"];
 async fn hold(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: &CreditIntent,
     file: &str,
     value: &Value,
@@ -4038,6 +4070,7 @@ async fn hold(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "cash in hand is credited against a username; give --username",
@@ -4053,6 +4086,7 @@ async fn hold(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "a payment with no token needs --note so the operator can tell what it is",
@@ -4068,6 +4102,7 @@ async fn hold(
             return refuse_with(
                 cfg,
                 store,
+                journal,
                 file,
                 value,
                 &format!(
@@ -4080,6 +4115,7 @@ async fn hold(
             return refuse_with(
                 cfg,
                 store,
+                journal,
                 file,
                 value,
                 &format!("transaction {txid} is already held as {id}, received on {received_on}"),
@@ -4106,8 +4142,9 @@ async fn hold(
         .log(store::UNATTRIBUTED)
         .append(encoded.as_bytes())
         .await?;
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -4129,6 +4166,7 @@ async fn hold(
 pub async fn reconcile_attribute(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: AttributeIntent,
     file: &str,
     value: &Value,
@@ -4137,6 +4175,7 @@ pub async fn reconcile_attribute(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the held item's id is not the shape of an unattributed payment",
@@ -4147,6 +4186,7 @@ pub async fn reconcile_attribute(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the token is not the shape of a payment token",
@@ -4162,7 +4202,7 @@ pub async fn reconcile_attribute(
         store.remove("intents", file).await?;
         return Ok(());
     }
-    if journal_has(store, &intent.id, "refused").await? {
+    if journal.has(&intent.id, "refused") {
         return Ok(());
     }
 
@@ -4177,6 +4217,7 @@ pub async fn reconcile_attribute(
             return refuse_with(
                 cfg,
                 store,
+                journal,
                 file,
                 value,
                 &format!("no held payment with id {}", intent.item),
@@ -4188,6 +4229,7 @@ pub async fn reconcile_attribute(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             &format!("{} is {}, not held", intent.item, held.state),
@@ -4216,7 +4258,7 @@ pub async fn reconcile_attribute(
     };
     let amount = match credit_fields(&payment_intent) {
         Ok(amount) => amount,
-        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
     };
     let received =
         util::parse_date(&payment_intent.received).expect("the date was validated above");
@@ -4226,12 +4268,13 @@ pub async fn reconcile_attribute(
     // so the held item is attributed only once that line exists.
     let join = match token_join(store, &payment_intent.token).await {
         Ok(join) => join,
-        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
     };
     if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
         group_credit(
             cfg,
             store,
+            journal,
             file,
             value,
             &payment_intent,
@@ -4248,7 +4291,7 @@ pub async fn reconcile_attribute(
 
     let (username, account, payment) = match resolve_payment(store, &payment_intent.token).await {
         Ok(found) => found,
-        Err(problem) => return refuse_with(cfg, store, file, value, &problem).await,
+        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
     };
     let app = PaymentApplication {
         intent: &payment_intent,
@@ -4259,7 +4302,7 @@ pub async fn reconcile_attribute(
         received,
         attributed_item: Some(&intent.item),
     };
-    if !apply_payment(cfg, store, file, value, app).await? {
+    if !apply_payment(cfg, store, journal, file, value, app).await? {
         return Ok(());
     }
     mark_attributed(store, &intent.item, &intent.token).await?;
@@ -4271,6 +4314,7 @@ pub async fn reconcile_attribute(
 pub async fn reconcile_return(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: ReturnIntent,
     file: &str,
     value: &Value,
@@ -4279,13 +4323,14 @@ pub async fn reconcile_return(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the held item's id is not the shape of an unattributed payment",
         )
         .await;
     }
-    if journal_has(store, &intent.id, "refused").await? {
+    if journal.has(&intent.id, "refused") {
         return Ok(());
     }
     let note = intent.note.trim();
@@ -4293,6 +4338,7 @@ pub async fn reconcile_return(
         return refuse_with(
             cfg,
             store,
+            journal,
             file,
             value,
             "the evidence for the return is needed",
@@ -4310,6 +4356,7 @@ pub async fn reconcile_return(
             return refuse_with(
                 cfg,
                 store,
+                journal,
                 file,
                 value,
                 &format!("no held payment with id {}", intent.item),
@@ -4321,6 +4368,7 @@ pub async fn reconcile_return(
             return refuse_with(
                 cfg,
                 store,
+                journal,
                 file,
                 value,
                 &format!("{} is {other}, not held", intent.item),
@@ -4346,8 +4394,9 @@ pub async fn reconcile_return(
         Ok(())
     })
     .await?;
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -4487,24 +4536,11 @@ fn credit_money(price: i64, balance: i64, amount: i64) -> CreditMoney {
     }
 }
 
-/// The values a credit recorded on its `applying` journal line, if it has got
-/// that far. A pass that finds them again is recovering from a crash between the
-/// account write and the ledger append, not applying a new credit.
-async fn credit_progress(store: &Store, id: &str) -> Result<Option<CreditProgress>, String> {
-    for j in store.log("journal.jsonl").jsonl::<JournalLine>().await? {
-        if j.intent == id && j.outcome == "applying" {
-            if let Some(progress) = j.credit {
-                return Ok(Some(progress));
-            }
-        }
-    }
-    Ok(None)
-}
-
 /// Journal a credit's `applying` line with what it is about to write, so the
 /// ledger line can be finished if the write succeeds and the append does not.
 async fn journal_credit_applying(
     store: &Store,
+    journal: &Journal,
     release: &str,
     intent: &CreditIntent,
     username: &str,
@@ -4524,9 +4560,7 @@ async fn journal_credit_applying(
         note: None,
         credit: Some(progress.clone()),
     };
-    let encoded =
-        serde_json::to_string(&line).map_err(|e| format!("cannot encode a journal line: {e}"))?;
-    store.log("journal.jsonl").append(encoded.as_bytes()).await
+    journal.append(store, &line).await
 }
 
 /// Journal a credit's completion, carrying an override's reason when there was
@@ -4534,13 +4568,15 @@ async fn journal_credit_applying(
 async fn journal_credit_applied(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: &CreditIntent,
     username: &str,
     override_reason: Option<&str>,
 ) -> Result<(), String> {
     let note = override_reason.map(|reason| format!("24-month override: {reason}"));
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -4687,6 +4723,7 @@ async fn append_credit_ledger(
 async fn approve_group(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     key: &[u8],
     intent: &DecisionIntent,
     file: &str,
@@ -4710,7 +4747,7 @@ async fn approve_group(
     // application's own approval has its "applying" line, the way the person
     // path's does.
     let existing_group = group_record(store, &domain).await?;
-    if existing_group.is_some() && !approval_started(store, &record.status_token).await? {
+    if existing_group.is_some() && !journal.approval_started(&record.status_token) {
         return Err(format!(
             "the domain {domain} already has a group that this application did not make"
         ));
@@ -4743,8 +4780,9 @@ async fn approve_group(
     // so a refused application still sends nothing.
     confirm(cfg, store, &record.status_token, record).await?;
 
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -4813,10 +4851,12 @@ async fn approve_group(
     let filed = crate::intents::Intent::parse(&value)?;
     // The provision-group arm verifies or fails; it has no refusal of its own,
     // because the signature it checks is the one this pass just made.
-    filed.verify(cfg, store, key, &filename, &value).await?;
+    filed
+        .verify(cfg, store, journal, key, &filename, &value)
+        .await?;
     // Boxed: this file's own approval path reaches `apply`, which reaches the
     // group transition, so the future would otherwise be infinitely sized.
-    Box::pin(filed.apply(cfg, store, key, &filename, &value)).await?;
+    Box::pin(filed.apply(cfg, store, journal, key, &filename, &value)).await?;
 
     // The body's approval notice: the recipe is the whole point of it, because
     // mail and the website do not work until the body has published the records
@@ -4886,8 +4926,9 @@ async fn approve_group(
         None,
     )
     .await?;
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -5063,6 +5104,7 @@ async fn check_group_names(
 pub async fn provision_group(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: GroupIntent,
     file: &str,
 ) -> Result<(), String> {
@@ -5140,8 +5182,9 @@ pub async fn provision_group(
     )
     .await?;
 
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -5316,8 +5359,9 @@ pub async fn provision_group(
         run_script(cfg, "cron-apply.sh", &["--web"]).await?;
     }
 
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -5694,6 +5738,7 @@ async fn close_mailbox(cfg: &DrainConfig, store: &Store, username: &str) -> Resu
 pub async fn suspend(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     username: &str,
     reason: &str,
 ) -> Result<(), String> {
@@ -5714,9 +5759,10 @@ pub async fn suspend(
         username: username.to_string(),
         status_token: String::new(),
     };
-    if !journal_has(store, &id, "applying").await? {
-        journal(
+    if !journal.has(&id, "applying") {
+        write_journal(
             store,
+            journal,
             &cfg.release,
             &id,
             "suspend",
@@ -5737,9 +5783,10 @@ pub async fn suspend(
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
     write_account_record(store, username, &bytes).await?;
-    if !journal_has(store, &id, "applied").await? {
-        journal(
+    if !journal.has(&id, "applied") {
+        write_journal(
             store,
+            journal,
             &cfg.release,
             &id,
             "suspend",
@@ -5782,7 +5829,12 @@ pub async fn suspend(
 /// back through the shared lapse script, the state returns to active, and the
 /// reason and the grace it started are cleared, so a member who answered the
 /// suspension is not deleted on a clock that no longer applies.
-pub async fn resume(cfg: &DrainConfig, store: &Store, username: &str) -> Result<(), String> {
+pub async fn resume(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    username: &str,
+) -> Result<(), String> {
     if let Some(why) = validate::username_shape(username) {
         return Err(format!("the username {username:?}: {why}"));
     }
@@ -5799,8 +5851,9 @@ pub async fn resume(cfg: &DrainConfig, store: &Store, username: &str) -> Result<
         username: username.to_string(),
         status_token: String::new(),
     };
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &id,
         "resume",
@@ -5816,8 +5869,9 @@ pub async fn resume(cfg: &DrainConfig, store: &Store, username: &str) -> Result<
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
     write_account_record(store, username, &bytes).await?;
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &id,
         "resume",
@@ -5850,6 +5904,7 @@ pub async fn resume(cfg: &DrainConfig, store: &Store, username: &str) -> Result<
 pub async fn delete_account(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     username: &str,
 ) -> Result<(), String> {
     if let Some(why) = validate::username_shape(username) {
@@ -5874,16 +5929,17 @@ pub async fn delete_account(
         return Ok(());
     };
     let id = format!("delete-{}-{}", username, account.created_at);
-    if journal_has(store, &id, "applied").await? {
+    if journal.has(&id, "applied") {
         return Ok(());
     }
     let application = ApplicationRef {
         username: username.to_string(),
         status_token: String::new(),
     };
-    if !journal_has(store, &id, "applying").await? {
-        journal(
+    if !journal.has(&id, "applying") {
+        write_journal(
             store,
+            journal,
             &cfg.release,
             &id,
             "delete",
@@ -5902,9 +5958,10 @@ pub async fn delete_account(
     // answer.
     let refund = erasure_refund(store, &account).await?;
     let body = crate::requests::erasure_answer(refund.as_deref());
-    if !journal_has(store, &id, "erasure-answer").await? {
-        journal(
+    if !journal.has(&id, "erasure-answer") {
+        write_journal(
             store,
+            journal,
             &cfg.release,
             &id,
             "delete",
@@ -5935,8 +5992,9 @@ pub async fn delete_account(
     remove_keyring_entry(cfg, username).await?;
     close_group_tokens(store, &[username.to_string()]).await?;
 
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &id,
         "delete",
@@ -5996,6 +6054,7 @@ async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), S
 pub async fn close_account(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: CloseIntent,
     file: &str,
 ) -> Result<(), String> {
@@ -6009,8 +6068,9 @@ pub async fn close_account(
     let Some(mut account) = existing_account(store, &intent.username).await else {
         // The account the handler authenticated has already gone. That is a
         // closed request, not new work.
-        journal(
+        write_journal(
             store,
+            journal,
             &cfg.release,
             &intent.id,
             &intent.kind,
@@ -6042,8 +6102,9 @@ pub async fn close_account(
         }
     }
     if account.state == "closing" {
-        journal(
+        write_journal(
             store,
+            journal,
             &cfg.release,
             &intent.id,
             &intent.kind,
@@ -6059,8 +6120,9 @@ pub async fn close_account(
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
     write_account_record(store, &intent.username, &bytes).await?;
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -6079,6 +6141,7 @@ pub async fn close_account(
 async fn page_account(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     id: &str,
     kind: &str,
     username: &str,
@@ -6090,6 +6153,7 @@ async fn page_account(
             settle_page(
                 cfg,
                 store,
+                journal,
                 id,
                 kind,
                 username,
@@ -6108,6 +6172,7 @@ async fn page_account(
 pub(crate) async fn settle_page(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     id: &str,
     kind: &str,
     username: &str,
@@ -6119,7 +6184,17 @@ pub(crate) async fn settle_page(
         username: username.to_string(),
         status_token: String::new(),
     };
-    journal(store, &cfg.release, id, kind, &application, outcome, note).await?;
+    write_journal(
+        store,
+        journal,
+        &cfg.release,
+        id,
+        kind,
+        &application,
+        outcome,
+        note,
+    )
+    .await?;
     store.remove("intents", file).await?;
     Ok(None)
 }
@@ -6130,6 +6205,7 @@ pub(crate) async fn settle_page(
 pub(crate) async fn refuse_page(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     id: &str,
     kind: &str,
     username: &str,
@@ -6139,6 +6215,7 @@ pub(crate) async fn refuse_page(
     settle_page(
         cfg,
         store,
+        journal,
         id,
         kind,
         username,
@@ -6167,11 +6244,20 @@ async fn save_account(store: &Store, account: &Account) -> Result<(), String> {
 pub async fn change_password(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: ChangePasswordIntent,
     file: &str,
 ) -> Result<(), String> {
-    let Some(account) =
-        page_account(cfg, store, &intent.id, &intent.kind, &intent.username, file).await?
+    let Some(account) = page_account(
+        cfg,
+        store,
+        journal,
+        &intent.id,
+        &intent.kind,
+        &intent.username,
+        file,
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -6184,6 +6270,7 @@ pub async fn change_password(
         return refuse_page(
             cfg,
             store,
+            journal,
             &intent.id,
             &intent.kind,
             &intent.username,
@@ -6200,6 +6287,7 @@ pub async fn change_password(
             return refuse_page(
                 cfg,
                 store,
+                journal,
                 &intent.id,
                 &intent.kind,
                 &intent.username,
@@ -6212,6 +6300,7 @@ pub async fn change_password(
             return refuse_page(
                 cfg,
                 store,
+                journal,
                 &intent.id,
                 &intent.kind,
                 &intent.username,
@@ -6222,8 +6311,9 @@ pub async fn change_password(
         }
     };
     run_script(cfg, "set-mail-password.sh", &[&account.username, &hash]).await?;
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -6245,11 +6335,20 @@ pub async fn change_password(
 pub async fn upload_key(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: UploadKeyIntent,
     file: &str,
 ) -> Result<(), String> {
-    let Some(mut account) =
-        page_account(cfg, store, &intent.id, &intent.kind, &intent.username, file).await?
+    let Some(mut account) = page_account(
+        cfg,
+        store,
+        journal,
+        &intent.id,
+        &intent.kind,
+        &intent.username,
+        file,
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -6260,6 +6359,7 @@ pub async fn upload_key(
                 return refuse_page(
                     cfg,
                     store,
+                    journal,
                     &intent.id,
                     &intent.kind,
                     &intent.username,
@@ -6272,6 +6372,7 @@ pub async fn upload_key(
                 return refuse_page(
                     cfg,
                     store,
+                    journal,
                     &intent.id,
                     &intent.kind,
                     &intent.username,
@@ -6320,6 +6421,7 @@ pub async fn upload_key(
                 return refuse_page(
                     cfg,
                     store,
+                    journal,
                     &intent.id,
                     &intent.kind,
                     &intent.username,
@@ -6338,6 +6440,7 @@ pub async fn upload_key(
             return refuse_page(
                 cfg,
                 store,
+                journal,
                 &intent.id,
                 &intent.kind,
                 &intent.username,
@@ -6348,8 +6451,9 @@ pub async fn upload_key(
         }
     }
     save_account(store, &account).await?;
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -6370,11 +6474,20 @@ pub async fn upload_key(
 pub async fn set_outside_address(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: OutsideAddressIntent,
     file: &str,
 ) -> Result<(), String> {
-    let Some(mut account) =
-        page_account(cfg, store, &intent.id, &intent.kind, &intent.username, file).await?
+    let Some(mut account) = page_account(
+        cfg,
+        store,
+        journal,
+        &intent.id,
+        &intent.kind,
+        &intent.username,
+        file,
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -6386,6 +6499,7 @@ pub async fn set_outside_address(
             return refuse_page(
                 cfg,
                 store,
+                journal,
                 &intent.id,
                 &intent.kind,
                 &intent.username,
@@ -6403,8 +6517,9 @@ pub async fn set_outside_address(
     };
     account.outside_address = outside;
     save_account(store, &account).await?;
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -6425,11 +6540,20 @@ pub async fn set_outside_address(
 pub async fn set_serving(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: ServingIntent,
     file: &str,
 ) -> Result<(), String> {
-    let Some(mut account) =
-        page_account(cfg, store, &intent.id, &intent.kind, &intent.username, file).await?
+    let Some(mut account) = page_account(
+        cfg,
+        store,
+        journal,
+        &intent.id,
+        &intent.kind,
+        &intent.username,
+        file,
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -6471,8 +6595,9 @@ pub async fn set_serving(
     account.site_served = Some(intent.http);
     account.capsule_served = Some(intent.gemini);
     save_account(store, &account).await?;
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -6496,11 +6621,20 @@ pub async fn set_serving(
 pub async fn cancel_renewal(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: CancelRenewalIntent,
     file: &str,
 ) -> Result<(), String> {
-    let Some(mut account) =
-        page_account(cfg, store, &intent.id, &intent.kind, &intent.username, file).await?
+    let Some(mut account) = page_account(
+        cfg,
+        store,
+        journal,
+        &intent.id,
+        &intent.kind,
+        &intent.username,
+        file,
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -6508,6 +6642,7 @@ pub async fn cancel_renewal(
         return refuse_page(
             cfg,
             store,
+            journal,
             &intent.id,
             &intent.kind,
             &intent.username,
@@ -6520,6 +6655,7 @@ pub async fn cancel_renewal(
         return refuse_page(
             cfg,
             store,
+            journal,
             &intent.id,
             &intent.kind,
             &intent.username,
@@ -6538,8 +6674,9 @@ pub async fn cancel_renewal(
         payment.stripe.cancel_at_period_end = true;
         save_account(store, &account).await?;
     }
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -6664,11 +6801,20 @@ async fn apply_rotation(
 pub async fn mail_key(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: MailKeyIntent,
     file: &str,
 ) -> Result<(), String> {
-    let Some(mut account) =
-        page_account(cfg, store, &intent.id, &intent.kind, &intent.username, file).await?
+    let Some(mut account) = page_account(
+        cfg,
+        store,
+        journal,
+        &intent.id,
+        &intent.kind,
+        &intent.username,
+        file,
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -6679,8 +6825,9 @@ pub async fn mail_key(
     match intent.action.as_str() {
         "cancel" => {
             let Some(cancelled) = account.rotation.as_ref().map(|r| r.fingerprint.clone()) else {
-                journal(
+                write_journal(
                     store,
+                    journal,
                     &cfg.release,
                     &intent.id,
                     &intent.kind,
@@ -6706,8 +6853,9 @@ pub async fn mail_key(
                 &body,
             )
             .await?;
-            journal(
+            write_journal(
                 store,
+                journal,
                 &cfg.release,
                 &intent.id,
                 &intent.kind,
@@ -6723,6 +6871,7 @@ pub async fn mail_key(
                 return refuse_page(
                     cfg,
                     store,
+                    journal,
                     &intent.id,
                     &intent.kind,
                     &intent.username,
@@ -6735,6 +6884,7 @@ pub async fn mail_key(
                 return refuse_page(
                     cfg,
                     store,
+                    journal,
                     &intent.id,
                     &intent.kind,
                     &intent.username,
@@ -6747,6 +6897,7 @@ pub async fn mail_key(
                 return refuse_page(
                     cfg,
                     store,
+                    journal,
                     &intent.id,
                     &intent.kind,
                     &intent.username,
@@ -6763,6 +6914,7 @@ pub async fn mail_key(
                     return refuse_page(
                         cfg,
                         store,
+                        journal,
                         &intent.id,
                         &intent.kind,
                         &intent.username,
@@ -6777,6 +6929,7 @@ pub async fn mail_key(
                         return refuse_page(
                             cfg,
                             store,
+                            journal,
                             &intent.id,
                             &intent.kind,
                             &intent.username,
@@ -6822,8 +6975,9 @@ pub async fn mail_key(
                 )
                 .await?;
             }
-            journal(
+            write_journal(
                 store,
+                journal,
                 &cfg.release,
                 &intent.id,
                 &intent.kind,
@@ -6842,6 +6996,7 @@ pub async fn mail_key(
             refuse_page(
                 cfg,
                 store,
+                journal,
                 &intent.id,
                 &intent.kind,
                 &intent.username,
@@ -6856,7 +7011,11 @@ pub async fn mail_key(
 /// Apply every mail-key replacement whose 72 hours have run out. The record's
 /// own `rotation` is the dedup: applying it clears the field, so a pass that
 /// finds nothing pending writes nothing.
-pub async fn mail_key_rotations(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+pub async fn mail_key_rotations(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+) -> Result<(), String> {
     for username in store.list("accounts").await? {
         let Some(mut account) = existing_account(store, &username).await else {
             continue;
@@ -6874,9 +7033,10 @@ pub async fn mail_key_rotations(cfg: &DrainConfig, store: &Store) -> Result<(), 
             username: username.clone(),
             status_token: String::new(),
         };
-        if !journal_has(store, &id, "applying").await? {
-            journal(
+        if !journal.has(&id, "applying") {
+            write_journal(
                 store,
+                journal,
                 &cfg.release,
                 &id,
                 "rotation",
@@ -6887,8 +7047,9 @@ pub async fn mail_key_rotations(cfg: &DrainConfig, store: &Store) -> Result<(), 
             .await?;
         }
         apply_rotation(cfg, store, &mut account, &rotation).await?;
-        journal(
+        write_journal(
             store,
+            journal,
             &cfg.release,
             &id,
             "rotation",
@@ -6937,6 +7098,7 @@ fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, String> {
 pub async fn group_address(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: GroupAddressIntent,
     file: &str,
 ) -> Result<(), String> {
@@ -7089,8 +7251,9 @@ pub async fn group_address(
         username: intent.mailbox.clone(),
         status_token: intent.domain.clone(),
     };
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -7216,8 +7379,9 @@ pub async fn group_address(
         _ => unreachable!("the action was checked against ADDRESS_ACTIONS"),
     }
 
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -7246,6 +7410,7 @@ pub async fn group_address(
 pub async fn remove_group(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: GroupRemoveIntent,
     file: &str,
 ) -> Result<(), String> {
@@ -7261,7 +7426,7 @@ pub async fn remove_group(
 
     // A replay whose transition finished: the domain is already down, so only
     // the record directory and the file can be left, and both may be gone.
-    if journal_has(store, &intent.id, "applied").await? {
+    if journal.has(&intent.id, "applied") {
         remove_group_record(store, &intent.domain).await?;
         return store.remove("intents", file).await;
     }
@@ -7276,9 +7441,10 @@ pub async fn remove_group(
         username: group.site_owner.clone(),
         status_token: intent.domain.clone(),
     };
-    if !journal_has(store, &intent.id, "applying").await? {
-        journal(
+    if !journal.has(&intent.id, "applying") {
+        write_journal(
             store,
+            journal,
             &cfg.release,
             &intent.id,
             &intent.kind,
@@ -7294,8 +7460,9 @@ pub async fn remove_group(
     // relayd keypair line the httpd file carried, which only the reload applies.
     take_group_down(cfg, store, &intent.domain).await?;
 
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -7377,6 +7544,7 @@ async fn close_group_tokens(store: &Store, accounts: &[String]) -> Result<(), St
 async fn decline(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: &DecisionIntent,
     file: &str,
 ) -> Result<(), String> {
@@ -7387,8 +7555,9 @@ async fn decline(
         return Err("the intent's username is not the application's".to_string());
     }
     if record.decided_at.is_some() {
-        journal(
+        write_journal(
             store,
+            journal,
             &cfg.release,
             &intent.id,
             &intent.kind,
@@ -7415,8 +7584,9 @@ async fn decline(
         }
         None => None,
     };
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -7441,8 +7611,9 @@ async fn decline(
     // send leaves one window in which a crash could send twice, between sendmail
     // returning and this write, against the certain loss of the notice before.
     mark_decided(store, token, "declined", &now, None).await?;
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &intent.id,
         &intent.kind,
@@ -8112,6 +8283,7 @@ pub async fn prepaid_renewals(cfg: &DrainConfig, store: &Store) -> Result<(), St
 pub async fn export_account(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: ExportIntent,
     file: &str,
 ) -> Result<(), String> {
@@ -8166,8 +8338,9 @@ pub async fn export_account(
         username: username.to_string(),
         status_token,
     };
-    journal(
+    write_journal(
         store,
+        journal,
         &cfg.release,
         &id,
         "export",
@@ -8182,7 +8355,11 @@ pub async fn export_account(
 /// Clear away every declined application whose week is up, and release the
 /// username. Run once per drain pass, after the intents: this is what carries
 /// the decline's week out without the application being touched again.
-pub async fn purge_declined(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+pub async fn purge_declined(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+) -> Result<(), String> {
     let now = OffsetDateTime::now_utc();
     for name in store.list("applications").await? {
         if !name.ends_with(".json") {
@@ -8221,16 +8398,17 @@ pub async fn purge_declined(cfg: &DrainConfig, store: &Store) -> Result<(), Stri
         let purge_id = format!("purge-{}", record.status_token);
         // A purge that keeps failing backs off, and its error is mailed once,
         // through the same rule the intents use.
-        if !due(store, &purge_id, now).await? {
+        if !due(journal, &purge_id, now) {
             continue;
         }
         // The journal line goes before the transition, as it does for an intent,
         // and once: a pass that already released the name does not release it
         // again, and a crash after the line still clears the record away.
-        if !journal_has(store, &purge_id, "purged").await? {
-            if !journal_has(store, &purge_id, "applying").await? {
-                journal(
+        if !journal.has(&purge_id, "purged") {
+            if !journal.has(&purge_id, "applying") {
+                write_journal(
                     store,
+                    journal,
                     &cfg.release,
                     &purge_id,
                     "decline",
@@ -8251,12 +8429,13 @@ pub async fn purge_declined(cfg: &DrainConfig, store: &Store) -> Result<(), Stri
                 || account_on_box(cfg, &record.username)?;
             if !taken {
                 if let Err(e) = run_script(cfg, "delete-user.sh", &[&record.username]).await {
-                    report_failure(cfg, store, &purge_id, "decline", &e).await;
+                    report_failure(cfg, store, journal, &purge_id, "decline", &e).await;
                     continue;
                 }
             }
-            journal(
+            write_journal(
                 store,
+                journal,
                 &cfg.release,
                 &purge_id,
                 "decline",
@@ -8280,7 +8459,11 @@ pub async fn purge_declined(cfg: &DrainConfig, store: &Store) -> Result<(), Stri
 /// a failed pass backs off and mails the operator once through the same rule the
 /// intents use, and a pass that already erased the account finds no record and
 /// does nothing.
-pub async fn purge_closing(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+pub async fn purge_closing(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+) -> Result<(), String> {
     let today = util::date_after_days(0);
     for username in store.list("accounts").await? {
         if validate::username_shape(&username).is_some() {
@@ -8307,11 +8490,11 @@ pub async fn purge_closing(cfg: &DrainConfig, store: &Store) -> Result<(), Strin
             continue;
         }
         let id = format!("delete-{}-{}", username, account.created_at);
-        if !due(store, &id, OffsetDateTime::now_utc()).await? {
+        if !due(journal, &id, OffsetDateTime::now_utc()) {
             continue;
         }
-        if let Err(e) = delete_account(cfg, store, &username).await {
-            report_failure(cfg, store, &id, "delete", &e).await;
+        if let Err(e) = delete_account(cfg, store, journal, &username).await {
+            report_failure(cfg, store, journal, &id, "delete", &e).await;
         }
     }
     Ok(())
@@ -8372,27 +8555,6 @@ async fn name_allowed(cfg: &DrainConfig, username: &str) -> Result<(), String> {
         None => Ok(()),
         Some(why) => Err(format!("the username {username}: {why}")),
     }
-}
-
-/// Whether this application's approval already began. The journal records
-/// "applying" after the name check and before provisioning, so a name that is on
-/// the box and has that line is one this application made, and the retry
-/// continues with it rather than refusing it as taken.
-///
-/// The kind is matched as well. Three transitions write that word for a token:
-/// the approval, the decline and the purge. Without the kind, a decline that
-/// could not finish would make a later approval of the same application believe
-/// the account on the box was its own, and it would adopt a name this
-/// application never made.
-async fn approval_started(store: &Store, token: &str) -> Result<bool, String> {
-    store
-        .log("journal.jsonl")
-        .jsonl_any(|j: &JournalLine| {
-            j.application.status_token == token
-                && j.outcome == "applying"
-                && (j.kind == "approve" || j.kind == "provision")
-        })
-        .await
 }
 
 /// Write the decision onto the application record. `password_link` is written
@@ -8689,7 +8851,11 @@ const WEBHOOK_TOLERANCE: i64 = 300;
 /// An event that cannot be applied yet — the Stripe API unreachable for an
 /// invoice's subscription — is left in place so the next pass tries again. The
 /// date is never extended on trust.
-pub async fn stripe_webhooks(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+pub async fn stripe_webhooks(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+) -> Result<(), String> {
     // A box whose card rail is not configured yet has no secret, and a pass
     // with nothing to verify must not fail every minute. The first delivery
     // makes the missing secret loud.
@@ -8706,7 +8872,7 @@ pub async fn stripe_webhooks(cfg: &DrainConfig, store: &Store) -> Result<(), Str
     let secret = match sign::read_key(std::path::Path::new(&cfg.stripe_webhook_secret)) {
         Ok(secret) => secret,
         Err(e) => {
-            report_failure(cfg, store, "stripe-secret", "config", &e).await;
+            report_failure(cfg, store, journal, "stripe-secret", "config", &e).await;
             return Ok(());
         }
     };
@@ -9660,7 +9826,7 @@ mod tests {
     use super::*;
     use std::os::unix::io::AsRawFd;
 
-    fn record(answers: &[(&str, &str)]) -> Record {
+    fn write_journal(answers: &[(&str, &str)]) -> Record {
         serde_json::from_value(json!({
             "username": "secretary",
             "status_token": "0123456789abcdefghjkmnpqrst",
@@ -9810,10 +9976,10 @@ mod tests {
 
     #[test]
     fn a_decline_body_names_a_missing_blessing_only_for_a_monastic() {
-        let lay = decline_body(&record(&[("orders", "layman")]));
+        let lay = decline_body(&write_journal(&[("orders", "layman")]));
         assert!(!lay.contains("blessing"), "{lay}");
         assert!(lay.contains("admin@kyriakon.net"), "{lay}");
-        let monk = decline_body(&record(&[("orders", "monk")]));
+        let monk = decline_body(&write_journal(&[("orders", "monk")]));
         assert!(monk.contains("blessing"), "{monk}");
     }
 

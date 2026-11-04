@@ -19,6 +19,7 @@ use time::OffsetDateTime;
 
 use crate::config::DrainConfig;
 use crate::draft::{self, Draft};
+use crate::journal::Journal;
 use crate::keycheck;
 use crate::notice;
 use crate::responder::HOST;
@@ -36,7 +37,7 @@ const REPLY_SUBJECT: &str = "Your Kyriakon application key";
 /// Read the spool and act on every message in it. A failure on one message is
 /// reported and the rest still run; the message that failed is left for the next
 /// pass, so a transient store error loses nothing.
-pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<(), String> {
     let dir = std::path::Path::new(&cfg.mail_dir);
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
@@ -63,6 +64,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
                 crate::transitions::report_failure(
                     cfg,
                     store,
+                    journal,
                     name.as_ref(),
                     "mail",
                     &format!("cannot read {}: {e}", path.display()),
@@ -72,13 +74,15 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
             }
         };
         if let Err(e) = one(cfg, store, &text).await {
-            crate::transitions::report_failure(cfg, store, name.as_ref(), "mail", &e).await;
+            crate::transitions::report_failure(cfg, store, journal, name.as_ref(), "mail", &e)
+                .await;
             continue;
         }
         if let Err(e) = tokio::fs::remove_file(&path).await {
             crate::transitions::report_failure(
                 cfg,
                 store,
+                journal,
                 name.as_ref(),
                 "mail",
                 &format!("cannot remove {}: {e}", path.display()),
