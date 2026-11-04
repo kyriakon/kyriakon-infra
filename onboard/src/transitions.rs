@@ -5720,7 +5720,7 @@ pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlem
         // The account the handler authenticated has already gone. That is a
         // closed request, not new work.
         Ok(account) => account,
-        Err(settled) => return Ok(settled),
+        Err(settled) => return Ok(*settled),
     };
     // Every data-subject request gets one line, whether it arrived from the page
     // or the console. The id is the intent's, so a retry after the state write
@@ -5763,15 +5763,15 @@ pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlem
 
 /// The account a page action acts on. An account that has gone is not work: the
 /// settlement says so and the file goes.
-async fn page_account(store: &Store, username: &str) -> Result<Account, Settlement> {
+async fn page_account(store: &Store, username: &str) -> Result<Account, Box<Settlement>> {
     existing_account(store, username).await.ok_or_else(|| {
-        Settlement::applied(
+        Box::new(Settlement::applied(
             ApplicationRef {
                 username: username.to_string(),
                 status_token: String::new(),
             },
             Some("the account had already gone".to_string()),
-        )
+        ))
     })
 }
 
@@ -5872,7 +5872,7 @@ pub async fn change_password(
 ) -> Result<Settlement, String> {
     let account = match page_account(store, &intent.username).await {
         Ok(account) => account,
-        Err(settled) => return Ok(settled),
+        Err(settled) => return Ok(*settled),
     };
     // The plaintext is checked and hashed here. It is overwritten before any
     // refusal removes the file, so a refusal leaves neither a file nor a buffer
@@ -5917,7 +5917,7 @@ pub async fn upload_key(
 ) -> Result<Settlement, String> {
     let mut account = match page_account(store, &intent.username).await {
         Ok(account) => account,
-        Err(settled) => return Ok(settled),
+        Err(settled) => return Ok(*settled),
     };
     let now = util::filed_at();
     match intent.action.as_str() {
@@ -6009,7 +6009,7 @@ pub async fn set_outside_address(
 ) -> Result<Settlement, String> {
     let mut account = match page_account(store, &intent.username).await {
         Ok(account) => account,
-        Err(settled) => return Ok(settled),
+        Err(settled) => return Ok(*settled),
     };
     let address = intent.address.trim();
     let outside = if address.is_empty() {
@@ -6050,7 +6050,7 @@ pub async fn set_serving(
 ) -> Result<Settlement, String> {
     let mut account = match page_account(store, &intent.username).await {
         Ok(account) => account,
-        Err(settled) => return Ok(settled),
+        Err(settled) => return Ok(*settled),
     };
     // An unrecorded lane on a hosting member is serving: provision-member.sh
     // wrote it and nobody has turned it off. Comparing the effective value keeps
@@ -6113,7 +6113,7 @@ pub async fn cancel_renewal(
 ) -> Result<Settlement, String> {
     let mut account = match page_account(store, &intent.username).await {
         Ok(account) => account,
-        Err(settled) => return Ok(settled),
+        Err(settled) => return Ok(*settled),
     };
     let Some(payment) = account.payment.as_mut() else {
         return Ok(refused_page(
@@ -6261,7 +6261,7 @@ pub async fn mail_key(
 ) -> Result<Settlement, String> {
     let mut account = match page_account(store, &intent.username).await {
         Ok(account) => account,
-        Err(settled) => return Ok(settled),
+        Err(settled) => return Ok(*settled),
     };
     let application = ApplicationRef {
         username: account.username.clone(),
