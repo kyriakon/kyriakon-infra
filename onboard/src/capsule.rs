@@ -216,8 +216,10 @@ pub fn filed(link: &str) -> String {
 /// one function, so the two cannot disagree about what is owed. It is `None` for
 /// a free account, which has no window, no token and no payment block.
 ///
-/// The words for the serving facts are the capsule's own chrome. A fact the
-/// drain has not recorded yet reads as that rather than as a false "no".
+/// The words for the serving facts are the capsule's own chrome, over the
+/// account's one derivation: a lane with no record and no upload key is not
+/// serving. A space figure the drain has not recorded reads as that rather than
+/// as a false zero.
 pub fn account(
     account: &Account,
     notices: &[Notice],
@@ -415,12 +417,13 @@ fn short_hash(hash: &str) -> String {
     }
 }
 
-/// Whether a protocol is being served, as the drain recorded it.
-fn served(flag: Option<bool>) -> &'static str {
-    match flag {
-        Some(true) => "serving",
-        Some(false) => "not serving",
-        None => "not recorded yet",
+/// Whether a protocol is being served, as the drain recorded it and the one
+/// derivation resolved it.
+fn served(flag: bool) -> &'static str {
+    if flag {
+        "serving"
+    } else {
+        "not serving"
     }
 }
 
@@ -608,13 +611,16 @@ mod tests {
         assert!(text.contains("Nothing here changes anything"), "{text}");
     }
 
+    /// A member with no upload key has no lane at all, so an unrecorded lane is
+    /// not serving rather than an unknown one; a space figure the drain has not
+    /// recorded keeps its own sentence.
     #[test]
-    fn an_unrecorded_fact_is_not_a_false_no() {
+    fn an_unrecorded_lane_is_not_serving_and_an_unrecorded_space_is_named() {
         let mut record = member();
         record.site_served = None;
         record.space_used = None;
         let text = account(&record, &[], None, None, None);
-        assert!(text.contains("Site: not recorded yet"), "{text}");
+        assert!(text.contains("Site: not serving"), "{text}");
         assert!(text.contains("Space used: not recorded yet"), "{text}");
         assert!(text.contains("Nothing has been sent yet."), "{text}");
     }

@@ -2035,6 +2035,14 @@ fn a_console_credit_or_refund_by_a_free_groups_mailbox_is_refused() {
         body(&out)
     );
 
+    let out = fix.ctl(&["payment", "show", "--username", "parish-secretary"]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(
+        body(&out).contains("approved without charge"),
+        "{}",
+        body(&out)
+    );
+
     assert!(fix.intents().is_empty(), "{:?}", fix.intents());
 }
 

@@ -589,10 +589,19 @@ async fn a_lapsed_application_says_the_window_closed_on_both_front_ends() {
             "a closed window quotes no amount: {body}"
         );
     }
+    // The token is a code and every link is somewhere else: no `href` in the
+    // page names it, so a pay link carrying it in its query fails here.
     assert!(
-        !html.contains("href=\"KYR"),
-        "the payment token is never a link: {html}"
+        html.contains("<code>KYR-4F2M-9QH7-XT3B</code>"),
+        "the token is shown as a code: {html}"
     );
+    for attribute in html.split("href=\"").skip(1) {
+        let target = attribute.split('"').next().unwrap_or("");
+        assert!(
+            !target.contains("KYR-4F2M-9QH7-XT3B"),
+            "the payment token is never a link: {html}"
+        );
+    }
 }
 
 #[tokio::test]

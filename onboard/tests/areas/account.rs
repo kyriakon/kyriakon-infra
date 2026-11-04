@@ -421,6 +421,64 @@ fn adding_an_upload_key_keeps_a_lane_the_member_turned_off_off() {
     assert_eq!(account["capsule_served"], json!(true));
 }
 
+/// A lane the record says nothing about is on once the account holds an upload
+/// key, because provision-member.sh wrote it. Adding the first key records both
+/// lanes on and removes neither, and a key already on the account with an
+/// unrecorded lane leaves it on.
+#[test]
+fn an_unrecorded_lane_with_an_upload_key_is_on() {
+    let fix = Fix::new("account-upload-key-unrecorded");
+    fix.page_account("alice", json!({}));
+    let log = logging_script(&fix, "provision-member.sh");
+    for script in [
+        "provision-member-web.sh",
+        "provision-member-capsule.sh",
+        "cron-apply.sh",
+    ] {
+        fix.script(
+            script,
+            &format!("#!/bin/sh\necho \"{script} $*\" >> '{log}'\n"),
+        );
+    }
+
+    fix.file_page_action(
+        "upload-key",
+        "alice",
+        json!({"action": "add", "material": UPLOAD_KEY}),
+    );
+    assert!(fix.drain().status.success());
+    let log = fix.scripts_log();
+    assert!(log.contains("provision-member.sh alice"), "{log}");
+    assert!(!log.contains("--remove"), "no lane was recorded off: {log}");
+    let account = fix.account("alice");
+    assert_eq!(account["site_served"], json!(true), "{account}");
+    assert_eq!(account["capsule_served"], json!(true), "{account}");
+
+    // A second key finds an unrecorded lane that already serves: nothing is
+    // removed, and the record keeps saying on.
+    fix.amend_account("alice", |account| {
+        account["site_served"] = Value::Null;
+    });
+    let before = fix.scripts_log().len();
+    fix.file_page_action(
+        "upload-key",
+        "alice",
+        json!({"action": "add", "material": UPLOAD_KEY}),
+    );
+    assert!(fix.drain().status.success());
+    let log = &fix.scripts_log()[before..];
+    assert!(
+        !log.contains("--remove"),
+        "the unrecorded lane stays on: {log}"
+    );
+    assert_eq!(
+        fix.account("alice")["site_served"],
+        json!(true),
+        "{:?}",
+        fix.account("alice")
+    );
+}
+
 /// Stopping the yearly renewal sets `cancel_at_period_end` through the one API
 /// write, and a prepaid or free account, which has no subscription, is refused.
 #[test]

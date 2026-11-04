@@ -2167,9 +2167,7 @@ async fn login(app: &App, request: &Request) -> Reply {
     };
     match session::open(&app.store, username, &proof, OffsetDateTime::now_utc()).await {
         Ok(cookie) => Reply::Http(
-            Http::capability(303, String::new())
-                .with_header("Location", "/account".to_string())
-                .with_header("Set-Cookie", session::cookie(&cookie)),
+            Http::redirect("/account").with_header("Set-Cookie", session::cookie(&cookie)),
         ),
         Err(e) => server_error(&e),
     }
@@ -2181,11 +2179,7 @@ async fn logout(app: &App, request: &Request) -> Reply {
     if let Some(cookie) = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE) {
         session::close(&app.store, &cookie).await;
     }
-    Reply::Http(
-        Http::capability(303, String::new())
-            .with_header("Location", "/account".to_string())
-            .with_header("Set-Cookie", session::clear_cookie()),
-    )
+    Reply::Http(Http::redirect("/account").with_header("Set-Cookie", session::clear_cookie()))
 }
 
 /// The live page session and the account it names. The closure route needs the

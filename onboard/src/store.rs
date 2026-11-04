@@ -1416,15 +1416,14 @@ impl Account {
         }
     }
 
-    /// Whether the site and the capsule are served. A member with an upload key
-    /// had both lanes written by provision-member.sh, so an unrecorded lane is
-    /// on rather than off; `None` is a member with no key at all, which the
-    /// capsule reads as not recorded and the web page reads as off.
-    pub fn serving(&self) -> (Option<bool>, Option<bool>) {
-        let written = (!self.upload_keys.is_empty()).then_some(true);
+    /// Whether the site and the capsule are served. An unrecorded lane on a
+    /// member with an upload key is on, because provision-member.sh wrote it;
+    /// a member with no upload key has no lane at all, so neither is served.
+    pub fn serving(&self) -> (bool, bool) {
+        let written = !self.upload_keys.is_empty();
         (
-            self.site_served.or(written),
-            self.capsule_served.or(written),
+            self.site_served.unwrap_or(written),
+            self.capsule_served.unwrap_or(written),
         )
     }
 

@@ -266,12 +266,12 @@ pub struct Http {
 }
 
 impl Http {
-    /// A page that carries a capability in its URL, or is a capability itself:
-    /// never stored, and its URL never sent as a referrer. The caller adds the
-    /// headers its answer needs, such as a login's `Location`.
-    pub fn capability(status: u16, body: String) -> Http {
+    /// A 303 to `location`, which is what a login and a logout answer with. It
+    /// is a capability in a cookie, so it carries the capability page's headers
+    /// too; the caller adds the cookie header its answer needs.
+    pub fn redirect(location: &str) -> Http {
         Http {
-            status,
+            status: 303,
             headers: vec![
                 (
                     "Content-Type".to_string(),
@@ -279,8 +279,9 @@ impl Http {
                 ),
                 ("Cache-Control".to_string(), "no-store".to_string()),
                 ("Referrer-Policy".to_string(), "no-referrer".to_string()),
+                ("Location".to_string(), location.to_string()),
             ],
-            body,
+            body: String::new(),
         }
     }
 
@@ -308,7 +309,18 @@ impl Reply {
     /// A page that carries a capability in its URL, or is a capability itself:
     /// never stored, and its URL never sent as a referrer.
     pub fn capability(status: u16, body: String) -> Reply {
-        Reply::Http(Http::capability(status, body))
+        Reply::Http(Http {
+            status,
+            headers: vec![
+                (
+                    "Content-Type".to_string(),
+                    "text/html; charset=utf-8".to_string(),
+                ),
+                ("Cache-Control".to_string(), "no-store".to_string()),
+                ("Referrer-Policy".to_string(), "no-referrer".to_string()),
+            ],
+            body,
+        })
     }
 
     /// A gemini page.

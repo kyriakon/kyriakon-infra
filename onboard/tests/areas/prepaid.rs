@@ -128,6 +128,34 @@ fn show_names_a_window_only_when_the_account_has_one() {
     );
 }
 
+/// A record written before the nested payment block keeps its flat
+/// `paid_until`: it folds to a paid block with no token, and `show` prints the
+/// date and `token none` rather than claiming the account was free.
+#[test]
+fn show_reads_a_legacy_paid_record_as_paid_and_tokenless() {
+    let fix = Fix::new("show-legacy");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    assert!(fix.drain().status.success());
+    fix.amend_account("secretary", |account| {
+        let object = account.as_object_mut().unwrap();
+        object.remove("payment");
+        object.insert("paid_until".into(), json!("2027-10-04"));
+    });
+
+    let out = fix.ctl(&["show", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let text = body(&out);
+    assert!(text.contains("  paid     2027-10-04"), "{text}");
+    assert!(text.contains("  token    none"), "{text}");
+    assert!(
+        !text.contains("no charge"),
+        "the account was charged, so no line may say otherwise: {text}"
+    );
+}
+
 /// The token is a bearer secret with a lifetime: the status page and both account
 /// pages show it in full while the account is unpaid, the amount and the window
 /// beside it, and a credit's date replaces it there. The paid state below is
@@ -1231,6 +1259,55 @@ fn the_credit_console_resolves_a_username_and_refuses_what_it_cannot_credit() {
     let line = &payment_lines(&paid)[0];
     assert_eq!(line["token"], json!(token));
     assert_eq!(line["rail"], json!("cash-hand"));
+}
+
+/// A free individual holds no payment token, and the console's one resolver
+/// refuses it in the same words a free group's mailbox gets, rather than saying
+/// a token is merely missing from an account that was never charged.
+#[test]
+fn a_console_credit_or_refund_by_a_free_individual_is_refused() {
+    let fix = Fix::new("credit-free-individual");
+    let record = fix.filed("secretary", "no_charge", &[("rail", "no_charge")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("provision", "secretary");
+    assert!(fix.drain().status.success());
+
+    let cases: [&[&str]; 2] = [
+        &[
+            "credit",
+            "--username",
+            "secretary",
+            "--rail",
+            "cash",
+            "--amount",
+            "20.00",
+            "--received",
+            "2026-10-04",
+        ],
+        &[
+            "refund",
+            "--username",
+            "secretary",
+            "--amount",
+            "10.00",
+            "--rail",
+            "cash",
+            "--reason",
+            "unused",
+            "--close",
+        ],
+    ];
+    for args in cases {
+        let out = fix.ctl(args);
+        assert!(!out.status.success(), "{}", body(&out));
+        assert!(
+            body(&out).contains("approved without charge"),
+            "{}",
+            body(&out)
+        );
+    }
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
 }
 
 /// A credit with no token is held in the unattributed queue: no payment line, no

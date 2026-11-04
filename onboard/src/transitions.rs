@@ -6067,10 +6067,17 @@ pub async fn upload_key(
             };
             write_public_key(store, &account.username, &intent.material).await?;
             run_script(cfg, "provision-member.sh", &[&account.username]).await?;
-            // provision-member.sh writes both daemon lanes. A lane the member
-            // turned off is not turned back on by adding a key, so it is removed
-            // again before the index pass, and the record keeps saying so.
-            if account.site_served == Some(false) {
+            // The record now holds a key, so the one derivation says which lanes
+            // are on. provision-member.sh writes both daemon lanes; a lane the
+            // member turned off is not turned back on by adding a key, so it is
+            // removed again before the index pass, and the record keeps saying
+            // so.
+            account.upload_keys = vec![UploadKey {
+                fingerprint,
+                added_at: now,
+            }];
+            let (site, capsule) = account.serving();
+            if !site {
                 run_script(
                     cfg,
                     "provision-member-web.sh",
@@ -6078,7 +6085,7 @@ pub async fn upload_key(
                 )
                 .await?;
             }
-            if account.capsule_served == Some(false) {
+            if !capsule {
                 run_script(
                     cfg,
                     "provision-member-capsule.sh",
@@ -6086,15 +6093,11 @@ pub async fn upload_key(
                 )
                 .await?;
             }
-            account.site_served = Some(account.site_served != Some(false));
-            account.capsule_served = Some(account.capsule_served != Some(false));
+            account.site_served = Some(site);
+            account.capsule_served = Some(capsule);
             // The first key builds the tree and the two daemon files, so the
             // index and the reload are due exactly as they are at approval.
             run_script(cfg, "cron-apply.sh", &["--web"]).await?;
-            account.upload_keys = vec![UploadKey {
-                fingerprint,
-                added_at: now,
-            }];
         }
         "remove" => {
             if !account
@@ -6185,8 +6188,8 @@ pub async fn set_serving(
     // wrote it and nobody has turned it off. Comparing the effective value keeps
     // a save from removing a lane the page showed as on.
     let (site, capsule) = account.serving();
-    let http_changed = site.unwrap_or(false) != intent.http;
-    let gemini_changed = capsule.unwrap_or(false) != intent.gemini;
+    let http_changed = site != intent.http;
+    let gemini_changed = capsule != intent.gemini;
     if http_changed {
         if intent.http {
             run_script(cfg, "provision-member-web.sh", &[&account.username]).await?;
