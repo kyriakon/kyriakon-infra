@@ -633,11 +633,11 @@ impl Store {
     ///
     /// This is the one exception `CODING_STANDARDS.md` names: a recorded line
     /// that has to be completed later rather than appended again. The three
-    /// callers (`settle_refund`, `rewrite_unattributed`, `requests::rewrite`)
-    /// each hold [`Log::lock`] across the read and this write, and appends take
-    /// the same lock, so a line another process appends in between is either
-    /// seen by the read or lands after the rewrite. Nothing else may call this,
-    /// and the name is the warning.
+    /// callers (`ledger::Ledger::settle_refund`, `rewrite_unattributed`,
+    /// `requests::rewrite`) each hold [`Log::lock`] across the read and this
+    /// write, and appends take the same lock, so a line another process appends
+    /// in between is either seen by the read or lands after the rewrite.
+    /// Nothing else may call this, and the name is the warning.
     pub(crate) async fn rewrite_log(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
         self.place_record(dir, name, bytes, None, 0o600).await
@@ -695,13 +695,21 @@ impl Log<'_> {
         self.store.append_mode(self.path, bytes, owner, mode).await
     }
 
-    /// Append under a lock the caller already holds, from [`Self::lock`].
+    /// Append under a lock the caller already holds, from [`Self::lock`]. The
+    /// descriptor is required: without it, an append that reads before taking
+    /// the lock does not compile.
     ///
-    /// One caller needs it: `requests::record` refuses a request id it has
-    /// already recorded, so its read and its append are one step under one lock.
-    /// Taking the lock twice on two descriptors would deadlock, so this exists
-    /// for that shape and nothing else; every other writer calls [`Self::append`].
-    pub async fn append_while_locked(&self, bytes: &[u8]) -> Result<(), String> {
+    /// Two callers need it: `requests::record` refuses a request id it has
+    /// already recorded, and `ledger::Ledger::append` numbers a line after the
+    /// highest already written, so each does its read and its append as one step
+    /// under one lock. Taking the lock twice on two descriptors would deadlock,
+    /// so this exists for those shapes and nothing else; every other writer
+    /// calls [`Self::append`].
+    pub(crate) async fn append_while_locked(
+        &self,
+        _lock: &tokio::fs::File,
+        bytes: &[u8],
+    ) -> Result<(), String> {
         self.store.append_mode(self.path, bytes, None, 0o600).await
     }
 
