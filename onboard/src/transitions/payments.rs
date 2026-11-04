@@ -5,14 +5,13 @@
 //! record's; every verb here returns a [`Settlement`](super::Settlement) and
 //! leaves the line, the after-line work and the remove to the seam.
 
-use super::groups::{group_record, run_script, write_account_record, write_group_record};
+use super::boxrun::run_script;
+use super::groups::{group_record, write_account_record, write_group_record};
 use super::lifecycle::dns_contact;
-use super::review::{decision_body, decision_subject};
 use super::{AfterLine, Settlement};
 use crate::config::DrainConfig;
 use crate::intents::{
-    AttributeIntent, CreditIntent, RefundIntent, ResendIntent, ReturnIntent, CREDIT_RAILS,
-    REFUND_RAILS,
+    AttributeIntent, CreditIntent, RefundIntent, ReturnIntent, CREDIT_RAILS, REFUND_RAILS,
 };
 use crate::journal::Journal;
 use crate::ledger::Ledger;
@@ -33,75 +32,6 @@ use time::OffsetDateTime;
 /// credit used one.
 fn override_note(reason: Option<&str>) -> Option<String> {
     reason.map(|reason| format!("24-month override: {reason}"))
-}
-
-/// `onboardctl token resend`: the same payment instructions again and nothing
-/// minted. A second token would leave the first one in the ledger as an entry
-/// that no longer resolves to the same member and would orphan a payment already
-/// in flight, so the account's own token is read and re-sent.
-///
-/// The instructions are the approval email's, built by the same function, and
-/// the notice is recorded as a sent one before it leaves. It is sent rather than
-/// deduplicated: the member asking for a second copy is the whole point.
-pub async fn resend(
-    cfg: &DrainConfig,
-    store: &Store,
-    intent: ResendIntent,
-) -> Result<Settlement, String> {
-    let username = intent.username.as_str();
-    let account = store
-        .account(username)
-        .await?
-        .ok_or_else(|| format!("no account for {username}"))?;
-    let Some(payment) = account.payment_state() else {
-        return Err(format!(
-            "{username} was approved without charge, so there is no payment token to resend"
-        ));
-    };
-    if payment.token_ref.as_deref() != Some(intent.token.as_str()) {
-        return Err(format!(
-            "the token the resend names is not the one {username}'s account holds"
-        ));
-    }
-    let body = decision_body(
-        cfg,
-        username,
-        &account.rail,
-        false,
-        payment.token_ref.as_deref(),
-        &payment.window,
-        payment.monero.as_ref(),
-    )?;
-    let to = account
-        .outside_address
-        .clone()
-        .unwrap_or_else(|| format!("{username}@kyriakon.net"));
-    let subject = decision_subject("approved", username);
-    notice::send_again(
-        cfg,
-        store,
-        username,
-        "prepaid.instructions",
-        &subject,
-        &to,
-        &body,
-    )
-    .await?;
-    // Every settling transition journals its outcome, and the line names the
-    // application the account was made from.
-    let application = store
-        .account_application_text(username)
-        .await?
-        .and_then(|copy| serde_json::from_str::<Value>(&copy).ok())
-        .and_then(|copy| {
-            let status_token = copy.get("status_token")?.as_str()?.to_string();
-            Some(ApplicationRef::application(
-                username.to_string(),
-                status_token,
-            ))
-        })
-        .ok_or_else(|| format!("no application record for {username}"))?;
-    Ok(Settlement::line("applied", application, None))
 }
 
 /// Apply a manual credit: one payment, the one date arithmetic, one ledger line.
@@ -1233,7 +1163,7 @@ async fn append_refund_ledger(
 /// `settled_on`, under the ledger's lock, and nothing else on it. This is the
 /// ledger's one non-append write: `--settled` names a line already recorded, and
 /// appending a second line would leave two records of one refund.
-pub(super) async fn settle_refund(
+async fn settle_refund(
     store: &Store,
     intent: &RefundIntent,
     on: &str,
@@ -1589,13 +1519,13 @@ fn valid_xmr(amount: Option<&str>) -> bool {
 /// rounded up to the price, which absorbs the drift and the rounding; a larger
 /// shortfall holds everything received and does not move the date, so the
 /// remainder stays quoted.
-pub(super) struct CreditMoney {
-    pub(super) applied: i64,
-    pub(super) balance: i64,
-    pub(super) paid: bool,
+struct CreditMoney {
+    applied: i64,
+    balance: i64,
+    paid: bool,
 }
 
-pub(super) fn credit_money(price: i64, balance: i64, amount: i64) -> CreditMoney {
+fn credit_money(price: i64, balance: i64, amount: i64) -> CreditMoney {
     let total = balance + amount;
     if total >= price {
         // Anything above the price is held, however small: the band exists for
@@ -1719,27 +1649,264 @@ async fn append_credit_ledger(
     Ok(())
 }
 
-/// Append the ledger line a paid approval opens with: the amount owed and the
-/// window it falls due in, keyed by the token and holding no username. A rerun
-/// finds the line already there and writes none.
-pub(super) async fn append_ledger(
-    store: &Store,
-    token: &str,
-    rail: &str,
-    intent: &str,
-    at: &str,
-    amount_gbp: &str,
-) -> Result<(), String> {
-    let ledger = Ledger::open(store);
-    if ledger.has_window_open(token).await? {
-        return Ok(());
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intents::RefundIntent;
+    use crate::sign;
+    use crate::transitions::test_support::quota_config;
+    use crate::transitions::{settle, Disposition, Envelope, RefusalFile};
+    use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn a_credit_applies_the_price_and_holds_the_rest() {
+        // Within one percent, either side, is the price itself.
+        assert_eq!(
+            (
+                credit_money(2000, 0, 1980).applied,
+                credit_money(2000, 0, 1980).balance
+            ),
+            (2000, 0)
+        );
+        assert!(credit_money(2000, 0, 2020).paid);
+        // Above it: the price is applied and the excess is held.
+        let over = credit_money(2000, 0, 2500);
+        assert_eq!((over.applied, over.balance, over.paid), (2000, 500, true));
+        // A larger shortfall holds what arrived and moves nothing.
+        let short = credit_money(2000, 0, 1979);
+        assert_eq!((short.applied, short.balance, short.paid), (0, 1979, false));
+        // A held balance is spent before the new money is counted.
+        let spends = credit_money(2000, 500, 1500);
+        assert_eq!(
+            (spends.applied, spends.balance, spends.paid),
+            (2000, 0, true)
+        );
+        let short_still = credit_money(2000, 500, 1000);
+        assert_eq!(short_still.balance, 1500);
+        assert!(!short_still.paid);
     }
-    let mut line = LedgerLine::empty(token, "window_open", rail);
-    line.amount_gbp = Some(amount_gbp.to_string());
-    line.applied_gbp = Some("0.00".to_string());
-    line.rate_at = Some(at.to_string());
-    line.intent = Some(intent.to_string());
-    line.note = Some("the window opened at approval; no money has arrived yet".to_string());
-    ledger.append(line).await?;
-    Ok(())
+
+    #[test]
+    fn a_signed_credit_payload_covers_the_reason_and_the_fields_before_it() {
+        let a = sign::credit_payload(
+            "KYR-4F2M-9QH7-XT3B",
+            "cash",
+            "20.00",
+            "2026-10-04",
+            None,
+            None,
+            false,
+            Some("posted twice"),
+            None,
+        );
+        let b = sign::credit_payload(
+            "KYR-4F2M-9QH7-XT3B",
+            "cash",
+            "20.00",
+            "2026-10-04",
+            None,
+            None,
+            false,
+            Some("posted once"),
+            None,
+        );
+        assert_ne!(a, b);
+        assert!(a.contains("posted twice"));
+        // The note is free text and last, so a note that carries a colon cannot
+        // shift the fields before it into agreeing with another intent's.
+        let c = sign::credit_payload(
+            "",
+            "cash",
+            "20.00",
+            "2026-10-04",
+            None,
+            None,
+            false,
+            None,
+            Some("no token: envelope in book"),
+        );
+        assert!(c.contains("no token: envelope in book"));
+        assert_ne!(c, a);
+    }
+
+    /// Whether the ledger lock can be taken without waiting. `false` means a
+    /// descriptor in this process holds it.
+    fn ledger_lock_is_free(path: &std::path::Path) -> bool {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        else {
+            return false;
+        };
+        let fd = file.as_raw_fd();
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A settlement releases the ledger lock with its write. The journal line
+    /// that follows is not part of the ledger, so a second writer must be able
+    /// to take the lock while the line is being appended: here the append blocks
+    /// on a pipe nobody reads yet, which holds the settlement exactly there.
+    #[test]
+    fn a_settlement_journals_with_the_ledger_lock_released() {
+        use std::ffi::CString;
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("onboard-settle-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("store");
+        std::fs::create_dir_all(root.join("ledger")).unwrap();
+        let root_text = root.to_str().unwrap().to_string();
+        let token = "KYR-AAAA-BBBB-CCCC";
+        let ledger = root.join("ledger/payments.jsonl");
+        std::fs::write(
+            &ledger,
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "version": 1,
+                    "seq": 7,
+                    "token": token,
+                    "kind": "refund",
+                    "rail": "cash",
+                    "received_on": "2026-11-04",
+                    "amount_gbp": "-5.00",
+                    "applied_gbp": "-5.00",
+                    "refund_of": 1,
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+        // The journal is a pipe, so its append waits for a reader: the state of
+        // the lock is observable at that point rather than a race. The index is
+        // loaded first, while the file is still missing (an empty journal), so
+        // the settlement's append is what blocks on the pipe.
+        let journal = {
+            let store = Store::new_for_test(&root_text);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(Journal::load(&store)).unwrap()
+        };
+        let journal_path = root.join("journal.jsonl");
+        let c_path = CString::new(journal_path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let value = json!({
+            "id": "01HZZZZZZZZZZZZZZZZZZZZZZZ",
+            "kind": "refund",
+            "token": token,
+            "settled_on": "2026-11-05",
+            "sig": "",
+        });
+        let intent: RefundIntent = serde_json::from_value(value.clone()).unwrap();
+        let thread_dir = dir.clone();
+        let settle = std::thread::spawn(move || {
+            let cfg = quota_config(&thread_dir);
+            let store = Store::new_for_test(&root_text);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(settle(
+                &cfg,
+                &store,
+                &journal,
+                "settle.json",
+                &Envelope::of(&value, "settle.json", "refund"),
+                Disposition::new(AfterLine::Nothing, RefusalFile::Keep),
+                settle_refund(&store, &intent, "2026-11-05"),
+            ))
+        });
+
+        // Wait for the ledger write, which is the step the guard covers.
+        let wrote = || {
+            std::fs::read_to_string(&ledger)
+                .map(|text| text.contains("settled_on"))
+                .unwrap_or(false)
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !wrote() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(wrote(), "the settlement never wrote the ledger");
+
+        // The append is now waiting on the pipe. The lock must be free: a
+        // retry covers the instant between the write and the guard's drop.
+        let lock_path = root.join("ledger/payments.jsonl.lock");
+        let mut free = false;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if ledger_lock_is_free(&lock_path) {
+                free = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Unblock the append and let the settlement finish either way, so a
+        // failure reads as an assertion rather than a hang.
+        let read_journal = {
+            let journal = journal_path.clone();
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                std::fs::File::open(&journal)
+                    .and_then(|mut f| f.read_to_string(&mut text))
+                    .map(|_| text)
+            })
+        };
+        let settled = settle.join().unwrap();
+        read_journal.join().unwrap().unwrap();
+
+        assert!(
+            free,
+            "the ledger lock is still held while the settlement journals"
+        );
+        assert!(settled.is_ok(), "{settled:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A line the settlement cannot read is an error, never a line it skips to
+    /// settle an older refund in its place.
+    #[tokio::test]
+    async fn a_corrupt_ledger_line_is_an_error_on_the_settlement_path() {
+        let dir =
+            std::env::temp_dir().join(format!("onboard-settle-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ledger")).unwrap();
+        let ledger = dir.join("ledger/payments.jsonl");
+        let line = json!({
+            "version": 1,
+            "seq": 7,
+            "token": "KYR-AAAA-BBBB-CCCC",
+            "kind": "refund",
+            "rail": "cash",
+            "received_on": "2026-11-04",
+            "amount_gbp": "-5.00",
+            "refund_of": 1,
+        });
+        std::fs::write(&ledger, format!("{line}\nnot json\n")).unwrap();
+        let store = Store::new_for_test(dir.to_str().unwrap());
+        let intent = RefundIntent {
+            token: "KYR-AAAA-BBBB-CCCC".to_string(),
+            ..Default::default()
+        };
+        let error = settle_refund(&store, &intent, "2026-11-04")
+            .await
+            .expect_err("a line that does not parse must fail the settlement");
+        assert!(error.contains("line 2 does not parse"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&ledger).unwrap(),
+            format!("{line}\nnot json\n")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -11,7 +11,10 @@
 //! root work: [`Intent`]. Its variant carries the payload, [`Intent::verify`]
 //! says how the intent is authenticated, and [`Intent::apply`] carries it out.
 //! `verify`'s match has no catch-all, so a verb cannot ship without answering
-//! how it is proved — the hole `provision-group` came through before #506.
+//! how it is proved, the hole `provision-group` came through before #506.
+//!
+//! The wire payloads, [`DECISIONS`] and the rail constants live here too, beside
+//! [`Intent`]: the enum and the shape it deserialises are one contract.
 
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -973,7 +976,7 @@ impl Intent {
                     transitions::groups::remove_group(cfg, store, journal, intent).await
                 }
                 Intent::Close(intent) => transitions::lifecycle::close_account(store, intent).await,
-                Intent::Resend(intent) => transitions::payments::resend(cfg, store, intent).await,
+                Intent::Resend(intent) => transitions::review::resend(cfg, store, intent).await,
                 Intent::Credit(intent) => {
                     transitions::payments::credit(cfg, store, journal, intent).await
                 }

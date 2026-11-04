@@ -5,10 +5,10 @@
 //! A sweep reports one unreadable record and goes on to the next; an intent's
 //! body returns a [`Settlement`](super::Settlement) and the seam journals it.
 
+use super::boxrun::{outside_address, publish_mail_keys, run_script, write_public_key};
 use super::groups::{
-    account_on_box, close_group_tokens, group_record, hold_name, publish_mail_keys,
-    remove_group_record, run_script, take_group_down, write_account_record, write_group_record,
-    write_group_state, write_public_key,
+    account_on_box, close_group_tokens, group_record, hold_name, remove_group_record,
+    take_group_down, write_account_record, write_group_record, write_group_state,
 };
 use super::payments::{resolve_payment, token_join, write_payment_copy};
 use super::stripe::rail_instructions;
@@ -35,27 +35,6 @@ use time::format_description::well_known::Rfc3339;
 use time::Duration;
 use time::OffsetDateTime;
 use tokio::process::Command;
-
-/// The address the applicant gave outside the platform, revalidated here because
-/// it was written by the unprivileged half and is about to become a mail header.
-/// `None` when none was given.
-pub(super) fn outside_address(record: &Record) -> Result<Option<String>, String> {
-    match record.outside_address.as_deref() {
-        Some(addr) => {
-            if let Some(why) = validate::address(addr) {
-                return Err(format!("the address outside the platform {addr:?}: {why}"));
-            }
-            Ok(Some(addr.to_string()))
-        }
-        None => Ok(None),
-    }
-}
-
-/// The address an approval notice goes to: the applicant's own outside address,
-/// or the mailbox the approval just created.
-pub(super) fn recipient(record: &Record, username: &str) -> Result<String, String> {
-    Ok(outside_address(record)?.unwrap_or_else(|| format!("{username}@kyriakon.net")))
-}
 
 /// The address a body's approval notice goes to. A body has no account of the
 /// applicant's own, so the fallback is the site owner's mailbox on the body's
@@ -2854,4 +2833,180 @@ pub async fn purge_closing(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transitions::test_support::quota_config;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_free_accounts_note_falls_due_on_the_creation_day_clamped() {
+        let leap = time::Date::from_calendar_date(2024, time::Month::February, 29).unwrap();
+        // A common year has no 29 February, so the note falls due a day early
+        // rather than being skipped for the year.
+        assert_eq!(
+            util::anniversary(leap, 2025).unwrap(),
+            time::Date::from_calendar_date(2025, time::Month::February, 28).unwrap()
+        );
+        assert_eq!(
+            util::anniversary(leap, 2028).unwrap(),
+            time::Date::from_calendar_date(2028, time::Month::February, 29).unwrap()
+        );
+    }
+
+    /// OpenBSD `repquota -u` output as the sweep reads it: two header lines and
+    /// one row per uid, with the two over-limit markers between the name and the
+    /// used figure. A `quota -v` block, which uses `Disk quotas for user`, and an
+    /// empty table both yield nothing rather than a guess.
+    #[test]
+    fn a_repquota_report_yields_each_members_used_blocks() {
+        let report = "                        KByte limits               File limits\n\
+                      User            used    soft    hard  grace    used  soft  hard  grace\n\
+                      alice             --   1024 5242880 5767168        --    10     0     0\n\
+                      secretary         --    512 5242880 5767168        --     3     0     0\n";
+        assert_eq!(
+            parse_repquota(report),
+            [("alice".to_string(), 1024), ("secretary".to_string(), 512)]
+        );
+        // A name that fills the ten-column field carries the markers with no
+        // separating space.
+        assert_eq!(
+            parse_repquota(
+                "User used soft hard grace used soft hard grace\n\
+                 averylonguser--   2048 5242880 5767168        --     1     0     0\n"
+            ),
+            [("averylonguser".to_string(), 2048)]
+        );
+        // `quota -v`'s per-user blocks are another report entirely.
+        assert!(parse_repquota(
+            "Disk quotas for user alice (uid 1001):\n\
+             Filesystem blocks quota limit grace files quota limit grace\n\
+             /dev/sd1l 1024 5242880 5767168 10 0 0\n"
+        )
+        .is_empty());
+        assert!(parse_repquota("").is_empty());
+        assert!(parse_repquota("no quota table here\n").is_empty());
+    }
+
+    fn fixture_account(store_dir: &std::path::Path, username: &str) {
+        let dir = store_dir.join(format!("accounts/{username}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("account.json"),
+            serde_json::to_vec_pretty(&json!({
+                "version": 1, "username": username, "state": "active",
+                "decision": "approve", "decided_at": "2026-10-01T09:00:00Z",
+                "rail": "cash", "no_charge": false,
+                "created_at": "2026-10-01T09:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn repquota_stub(dir: &std::path::Path, body: &str) -> String {
+        let path = dir.join("bin/repquota");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{body}",
+                dir.join("repquota.args").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn the_quota_sweep_records_usage_once_an_hour_and_shrugs_at_a_bad_report() {
+        let dir = std::env::temp_dir().join(format!("onboard-quota-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("store")).unwrap();
+        fixture_account(&dir.join("store"), "alice");
+        fixture_account(&dir.join("store"), "secretary");
+        let group_dir = dir.join("store/groups/parish.example");
+        std::fs::create_dir_all(&group_dir).unwrap();
+        std::fs::write(
+            group_dir.join("group.json"),
+            serde_json::to_vec_pretty(&json!({
+                "version": 1, "domain": "parish.example", "name": "Parish",
+                "kind": "parish",
+                "payment": {"rail": "cash", "no_charge": false, "paid_until": null},
+                "accounts": ["alice", "secretary"], "site_owner": "alice"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let cfg = quota_config(&dir);
+        let store = Store::new_for_test(&cfg.store_root);
+        let journal = Journal::load(&store).await.unwrap();
+        // The sweep takes `-u` and the mount the config names.
+        cfg_script(
+            &dir,
+            "printf '%s\\n' 'User used soft hard grace used soft hard grace' 'alice -- 1024 5242880 5767168 -- 10 0 0' 'secretary -- 512 5242880 5767168 -- 3 0 0'\n",
+        );
+
+        refresh_space_used(&cfg, &store, &journal).await.unwrap();
+        assert_eq!(
+            store.account("alice").await.unwrap().unwrap().space_used,
+            Some(1024 * 1024)
+        );
+        assert_eq!(
+            store
+                .account("secretary")
+                .await
+                .unwrap()
+                .unwrap()
+                .space_used,
+            Some(512 * 1024)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("repquota.args")).unwrap(),
+            "-u /home\n"
+        );
+        // The group holds the sum of its mailboxes' figures.
+        let group = group_record(&store, "parish.example")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(group.space_used, Some((1024 + 512) * 1024));
+
+        // The hour's cache: a second pass does not run the report again.
+        cfg_script(
+            &dir,
+            "printf '%s\\n' 'User used soft hard grace used soft hard grace' 'alice -- 2048 5242880 5767168 -- 10 0 0'\n",
+        );
+        refresh_space_used(&cfg, &store, &journal).await.unwrap();
+        assert_eq!(
+            store.account("alice").await.unwrap().unwrap().space_used,
+            Some(1024 * 1024)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("repquota.args"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        // A report the parse cannot follow, on a fresh state, is a no-op rather
+        // than a zero written over a real figure.
+        std::fs::remove_file(store.path("quota-check.json")).unwrap();
+        cfg_script(&dir, "printf 'no quota table here\\n'\n");
+        refresh_space_used(&cfg, &store, &journal).await.unwrap();
+        assert_eq!(
+            store.account("alice").await.unwrap().unwrap().space_used,
+            Some(1024 * 1024)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Overwrite the fixture report without rebuilding the config.
+    fn cfg_script(dir: &std::path::Path, body: &str) {
+        repquota_stub(dir, body);
+    }
 }

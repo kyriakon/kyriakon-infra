@@ -1,15 +1,20 @@
 //! Bodies and the accounts they are made of: group records, provisioning,
-//! address changes and the mail virtual tables, plus the script and key
-//! plumbing every verb that changes the box runs.
+//! address changes and the mail virtual tables.
 //!
-//! Nothing here journals: the caller settles its own intent, and a retry finds
-//! the records this pass already wrote rather than making them twice.
+//! A verb writes its `applying` line through the seam's `write_journal` and
+//! returns a [`Settlement`](super::Settlement); the seam writes the outcome line
+//! and removes the intent. A retry finds the records this pass already wrote
+//! rather than making them twice.
 
-use super::payments::append_ledger;
+use super::boxrun::{
+    publish_mail_keys, publish_mail_keys_publicly, run_script, run_script_tolerating,
+    write_public_key,
+};
 use super::{write_journal, Settlement};
 use crate::config::DrainConfig;
 use crate::intents::ADDRESS_ACTIONS;
 use crate::journal::Journal;
+use crate::ledger::{Ledger, LedgerLine};
 use crate::questions;
 use crate::store::{
     self, Account, ApplicationRef, FlatPayment, GroupAddress, GroupAddressIntent, GroupIntent,
@@ -24,176 +29,6 @@ use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tokio::process::Command;
-
-/// Run one of the repository's privileged scripts by its configured path and
-/// hand back what it wrote. It is called with argv only: there is no shell
-/// anywhere in the drain, and every value that reaches it was validated first.
-pub(super) async fn spawn_script(
-    cfg: &DrainConfig,
-    name: &str,
-    args: &[&str],
-) -> Result<std::process::Output, String> {
-    let path = format!("{}/{}", cfg.scripts.trim_end_matches('/'), name);
-    // The drain runs from root cron, whose PATH is /usr/bin:/bin, and the scripts
-    // it runs reach the packages in /usr/local: without this, a provision's
-    // reload call cannot find gmid, refuses, and fails the whole approval.
-    Command::new(&path)
-        .args(args)
-        .env(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin",
-        )
-        .output()
-        .await
-        .map_err(|e| format!("cannot run {path}: {e}"))
-}
-
-/// Run a script and refuse a non-zero exit, naming what it said.
-pub(super) async fn run_script(cfg: &DrainConfig, name: &str, args: &[&str]) -> Result<(), String> {
-    let out = spawn_script(cfg, name, args).await?;
-    if !out.status.success() {
-        return Err(script_error(cfg, name, &out));
-    }
-    Ok(())
-}
-
-/// Run a script and tolerate one known refusal, named by the message it prints.
-/// `add-user.sh` exits non-zero when the account already exists, which is the
-/// state a run that died after it leaves and the state a retry has to get past.
-pub(super) async fn run_script_tolerating(
-    cfg: &DrainConfig,
-    name: &str,
-    args: &[&str],
-    tolerate: &str,
-) -> Result<(), String> {
-    let out = spawn_script(cfg, name, args).await?;
-    if out.status.success() || String::from_utf8_lossy(&out.stderr).contains(tolerate) {
-        return Ok(());
-    }
-    Err(script_error(cfg, name, &out))
-}
-
-pub(super) fn script_error(cfg: &DrainConfig, name: &str, out: &std::process::Output) -> String {
-    let path = format!("{}/{}", cfg.scripts.trim_end_matches('/'), name);
-    format!(
-        "{path} exited {}: {}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr).trim()
-    )
-}
-
-/// Write the member's upload key where `provision-member.sh` reads it, in the
-/// store's own `keys/` directory, root-owned like the rest of the drain's half.
-pub(super) async fn write_public_key(
-    store: &Store,
-    username: &str,
-    material: &str,
-) -> Result<(), String> {
-    let body = material.trim();
-    if body.is_empty() {
-        return Err("the upload key material is empty".to_string());
-    }
-    store.ensure_dir("keys").await?;
-    let mut bytes = body.as_bytes().to_vec();
-    bytes.push(b'\n');
-    store
-        .write_record("keys", &format!("{username}.pub"), &bytes)
-        .await
-}
-
-/// The localpart a mail key is published and served under: the mailbox when the
-/// application named one, and the account's own name otherwise. The keyring file,
-/// the published file and the branch the change is opened on all take it.
-fn mail_key_localpart<'a>(username: &'a str, key: &'a KeyRecord) -> &'a str {
-    if key.mailbox.is_empty() {
-        username
-    } else {
-        key.mailbox.as_str()
-    }
-}
-
-/// Publish the member's mail keys into the box keyring the encrypting LMTP reads,
-/// one `<localpart>.asc` each, before any path can deliver to the account. The
-/// file is created once and then left alone, so the drift check's age for it is
-/// the moment this service first wrote it. Delivery fails closed without the key,
-/// so an application that carries none is refused rather than made into an
-/// account whose mail bounces.
-pub(super) async fn publish_mail_keys(
-    cfg: &DrainConfig,
-    username: &str,
-    keys: &[KeyRecord],
-) -> Result<(), String> {
-    if keys.is_empty() {
-        return Err(
-            "the application carries no mail key, so the account could not receive mail"
-                .to_string(),
-        );
-    }
-    let dir = std::path::Path::new(&cfg.keyring_dir);
-    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    for key in keys {
-        let localpart = mail_key_localpart(username, key);
-        if let Some(why) = validate::username_shape(localpart) {
-            return Err(format!("the mail key's mailbox {localpart:?}: {why}"));
-        }
-        let body = key.material.trim();
-        if body.is_empty() {
-            return Err(format!("the mail key for {localpart} is empty"));
-        }
-        let path = crate::keycheck::keyring_file(&cfg.keyring_dir, localpart);
-        let mut bytes = body.as_bytes().to_vec();
-        bytes.push(b'\n');
-        // Written only when the bytes differ. The drift check's seven days for an
-        // unpublished key are the age of this file, and the publish runs after
-        // this in the same transition, so a retry whose publish failed must leave
-        // the file, and its mtime, exactly as they are. Rewriting an identical
-        // file would restart that window on every retry and it would never close.
-        let same = std::fs::read(&path)
-            .map(|have| have == bytes)
-            .unwrap_or(false);
-        if !same {
-            std::fs::write(&path, &bytes)
-                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-        }
-        // deploy-mail installs the tracked keys 0644, and the drift check and the
-        // encrypting daemon both read them as they find them.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-            .map_err(|e| format!("cannot set the mode on {}: {e}", path.display()))?;
-    }
-    Ok(())
-}
-
-/// Offer the member's mail keys to the published set, one `keys/<localpart>.asc`
-/// each, by opening a change against the public repository through
-/// scripts/publish-mail-key.sh, which holds the mechanism and the token.
-///
-/// This runs after the keyring write and after the member is built, and before
-/// the account record and the notice. Nothing about the publish may stand between
-/// the member and their mail: the box keyring is what delivers, so a failed
-/// publish costs the member nothing, while its failure is loud and its retry
-/// leaves the keyring file, and the drift check's seven days, untouched. The
-/// window in check-keyring-drift.sh is the backstop for one that never succeeds.
-pub(super) async fn publish_mail_keys_publicly(
-    cfg: &DrainConfig,
-    username: &str,
-    keys: &[KeyRecord],
-) -> Result<(), String> {
-    let dir = cfg.keyring_dir.trim_end_matches('/');
-    for key in keys {
-        let localpart = mail_key_localpart(username, key);
-        let path = crate::keycheck::keyring_file(dir, localpart)
-            .display()
-            .to_string();
-        run_script(
-            cfg,
-            "publish-mail-key.sh",
-            &[localpart, path.as_str(), cfg.keyring_publish_token.as_str()],
-        )
-        .await?;
-    }
-    Ok(())
-}
 
 /// The address table the community block answered, paired with the account
 /// names. An `own` line names a mailbox; an `alias` line points at one already
@@ -771,12 +606,12 @@ pub(super) async fn write_group_state(
 /// table_lock, with the same pid file and the same stale rule, so a drain append
 /// and an operator deploy or delete exclude each other. Releasing is the Drop
 /// impl, so an early return cannot leave it behind.
-pub(super) struct TableLock {
+struct TableLock {
     dir: std::path::PathBuf,
 }
 
 impl TableLock {
-    pub(super) fn acquire(path: &str) -> Result<TableLock, String> {
+    fn acquire(path: &str) -> Result<TableLock, String> {
         let dir = std::path::PathBuf::from(format!("{path}.lock"));
         let mut reaped = false;
         for attempt in 0..5 {
@@ -864,7 +699,7 @@ fn stale_table_lock(dir: &std::path::Path) -> Option<String> {
 /// different value is a refusal, because overruling it would silently redirect
 /// somebody's mail. Written through a temporary in the same directory, so smtpd
 /// never reads half a table.
-pub(super) fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), String> {
+fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), String> {
     let _lock = TableLock::acquire(path)?;
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
@@ -1539,5 +1374,253 @@ pub(super) async fn name_allowed(cfg: &DrainConfig, username: &str) -> Result<()
     match validate::username(username, &reserved) {
         None => Ok(()),
         Some(why) => Err(format!("the username {username}: {why}")),
+    }
+}
+
+/// Append the ledger line a paid approval opens with: the amount owed and the
+/// window it falls due in, keyed by the token and holding no username. A rerun
+/// finds the line already there and writes none.
+pub(super) async fn append_ledger(
+    store: &Store,
+    token: &str,
+    rail: &str,
+    intent: &str,
+    at: &str,
+    amount_gbp: &str,
+) -> Result<(), String> {
+    let ledger = Ledger::open(store);
+    if ledger.has_window_open(token).await? {
+        return Ok(());
+    }
+    let mut line = LedgerLine::empty(token, "window_open", rail);
+    line.amount_gbp = Some(amount_gbp.to_string());
+    line.applied_gbp = Some("0.00".to_string());
+    line.rate_at = Some(at.to_string());
+    line.intent = Some(intent.to_string());
+    line.note = Some("the window opened at approval; no money has arrived yet".to_string());
+    ledger.append(line).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sign;
+    use crate::store::GroupIntent;
+    use serde_json::json;
+
+    /// The `provision-group` payload covers every field the transition acts on:
+    /// changing any one of them changes the payload, so a signature made for one
+    /// body cannot be replayed with another's mailbox, key or payment.
+    #[test]
+    fn a_group_payload_covers_every_field_the_drain_acts_on() {
+        let base = json!({
+            "id": "01HZZZZZZZZZZZZZZZZZZZZZZZ",
+            "kind": "provision-group",
+            "filed_at": "2026-11-01T09:00:00Z",
+            "application": {"username": "warden", "status_token": "abcdefghjkmnpqrstvwxyz0123"},
+            "domain": "parish.example",
+            "name": "Parish of Example",
+            "body_kind": "parish",
+            "payment": {"rail": "cash", "no_charge": false, "paid_until": null},
+            "addresses": [{"address": "secretary", "mailbox": "parish-secretary"}],
+            "mailboxes": ["parish-secretary"],
+            "site_owner": "parish-secretary",
+            "upload_key": "ssh-ed25519 AAAA first@example",
+            "mail_keys": [{"mailbox": "parish-secretary", "fingerprint": "1111 2222",
+                           "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n",
+                           "verdict": "works"}],
+            "sig": "",
+        });
+        let payload = |value: &Value| {
+            let intent: GroupIntent = serde_json::from_value(value.clone()).unwrap();
+            sign::group_provision_payload(&intent)
+        };
+        let original = payload(&base);
+        let changes = [
+            ("domain", json!("other.example")),
+            ("name", json!("Another Parish")),
+            ("body_kind", json!("monastery")),
+            (
+                "payment",
+                json!({"rail": "card", "no_charge": false, "paid_until": null}),
+            ),
+            (
+                "payment",
+                json!({"rail": "cash", "no_charge": true, "paid_until": null}),
+            ),
+            (
+                "payment",
+                json!({"rail": "cash", "no_charge": false, "paid_until": "2027-01-01"}),
+            ),
+            (
+                "addresses",
+                json!([{"address": "office", "mailbox": "parish-secretary"}]),
+            ),
+            ("mailboxes", json!(["parish-office"])),
+            ("site_owner", json!("parish-office")),
+            ("upload_key", json!("ssh-ed25519 AAAA second@example")),
+            (
+                "mail_keys",
+                json!([{"mailbox": "parish-secretary", "fingerprint": "3333 4444",
+                        "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nyy\n",
+                        "verdict": "works"}]),
+            ),
+            (
+                "application",
+                json!({"username": "other", "status_token": "abcdefghjkmnpqrstvwxyz0123"}),
+            ),
+            (
+                "application",
+                json!({"username": "warden", "status_token": "fedcba98765432100123456789"}),
+            ),
+        ];
+        for (field, value) in changes {
+            let mut changed = base.clone();
+            changed[field] = value.clone();
+            assert_ne!(original, payload(&changed), "changing {field} to {value}");
+        }
+
+        // Every payment field the transition copies into the group record: the
+        // token reference, the window's four fields and the Stripe block's
+        // eight. The base payment carries none of them, so a field missing from
+        // the payload leaves these two payloads equal.
+        let with_payment = |payment: Value| {
+            let mut changed = base.clone();
+            changed["payment"] = payment;
+            payload(&changed)
+        };
+        let base_payment = base["payment"].clone();
+        for (label, value) in [
+            ("token_ref", json!("KYR-AAAA-BBBB-CCCC")),
+            ("paid_until", json!("2027-01-01")),
+            ("no_charge", json!(true)),
+            ("rail", json!("card")),
+        ] {
+            let mut payment = base_payment.clone();
+            payment[label] = value;
+            assert_ne!(original, with_payment(payment), "payment.{label}");
+        }
+
+        let window = json!({"opened_at": "2026-11-01T09:00:00Z",
+                            "closes_at": "2026-11-15T09:00:00Z",
+                            "state": "open", "extensions": 0});
+        let mut with_window = base_payment.clone();
+        with_window["window"] = window.clone();
+        let windowed = with_payment(with_window);
+        assert_ne!(original, windowed, "payment.window presence");
+        for (label, value) in [
+            ("opened_at", json!("2026-10-01T09:00:00Z")),
+            ("closes_at", json!("2026-11-20T09:00:00Z")),
+            ("state", json!("paid")),
+            ("extensions", json!(1)),
+        ] {
+            let mut changed = window.clone();
+            changed[label] = value;
+            let mut payment = base_payment.clone();
+            payment["window"] = changed;
+            assert_ne!(windowed, with_payment(payment), "payment.window.{label}");
+        }
+
+        for (label, value) in [
+            ("subscription", json!("sub_example")),
+            ("customer", json!("cus_example")),
+            ("status", json!("active")),
+            ("cancel_at_period_end", json!(true)),
+            ("current_period_end", json!("2027-01-01T00:00:00Z")),
+            ("next_payment_attempt", json!("2026-12-01T00:00:00Z")),
+            ("failed_attempts", json!(2)),
+            ("last_invoice", json!("in_example")),
+        ] {
+            let mut stripe = json!({});
+            stripe[label] = value;
+            let mut payment = base_payment.clone();
+            payment["stripe"] = stripe;
+            assert_ne!(original, with_payment(payment), "payment.stripe.{label}");
+        }
+    }
+
+    /// The lock the shell takes is `<table>.lock` with the owner's pid inside, so
+    /// this asserts the Rust side uses that path and file, and that dropping the
+    /// guard releases it. That shared shape is what lets a drain append and a
+    /// deploy's table_set exclude each other.
+    #[test]
+    fn the_mail_table_lock_is_a_pid_directory_beside_the_table() {
+        let dir = std::env::temp_dir().join(format!("onboard-table-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let table = dir.join("virtuals");
+        std::fs::write(&table, "hello: oliver\n").unwrap();
+        let path = table.to_str().unwrap();
+
+        let lock = TableLock::acquire(path).unwrap();
+        let lock_dir = dir.join("virtuals.lock");
+        assert!(
+            lock_dir.is_dir(),
+            "the lock is a directory beside the table"
+        );
+        assert_eq!(
+            std::fs::read_to_string(lock_dir.join("pid"))
+                .unwrap()
+                .trim(),
+            std::process::id().to_string(),
+            "the owner pid is inside, which is what the shell reads"
+        );
+        drop(lock);
+        assert!(!lock_dir.exists(), "releasing removes the directory");
+        drop(TableLock::acquire(path).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A lock whose owner is gone is reaped rather than left to wedge every
+    /// later writer, which is the shell's rule too.
+    #[test]
+    fn a_stale_mail_table_lock_is_reaped() {
+        let dir = std::env::temp_dir().join(format!("onboard-table-reap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let table = dir.join("mail_domains");
+        std::fs::write(&table, "kyriakon.net\n").unwrap();
+        let lock_dir = dir.join("mail_domains.lock");
+        std::fs::create_dir(&lock_dir).unwrap();
+        std::fs::write(lock_dir.join("pid"), "999999\n").unwrap();
+
+        let lock = TableLock::acquire(table.to_str().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(lock_dir.join("pid"))
+                .unwrap()
+                .trim(),
+            std::process::id().to_string()
+        );
+        drop(lock);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Three writers at once, the case the lock exists for: every appended line
+    /// is in the table afterwards, with no candidate left beside it. The retry is
+    /// in whole seconds, so the count is kept under the five-second wait.
+    #[test]
+    fn concurrent_table_appends_all_land() {
+        let dir = std::env::temp_dir().join(format!("onboard-table-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let table = dir.join("virtuals");
+        std::fs::write(&table, "hello: oliver\n").unwrap();
+        let path = table.to_str().unwrap().to_string();
+
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                ensure_table_line(&path, &format!("user{i}"), Some("mailbox"))
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let text = std::fs::read_to_string(&table).unwrap();
+        assert_eq!(text.lines().count(), 4, "{text}");
+        assert!(!dir.join("virtuals.lock").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,9 +1,9 @@
-//! The card rail: the webhook pass that settles Stripe's events, and the card
-//! link and payment instructions the pages and mails carry for every rail.
+//! The card rail: the webhook pass that settles Stripe's events, plus the card
+//! link and the payment instructions for card, cash and Monero that the account
+//! pages, the approval mail and the renewal note carry.
 
-use super::groups::{
-    group_record, script_error, spawn_script, write_account_record, write_group_record,
-};
+use super::boxrun::{script_error, spawn_script};
+use super::groups::{group_record, write_account_record, write_group_record};
 use super::lifecycle::{dns_contact, report_record};
 use super::payments::{restore_group_mailboxes, token_join, write_payment_copy};
 use super::report_failure;

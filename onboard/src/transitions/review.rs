@@ -1,19 +1,21 @@
 //! The reviewer's half: a filed application's review mail, the three decisions,
-//! the approval (person and body), the decline, and the record lookups a
-//! decision acts on.
+//! the approval (person and body), the decline, the record lookups a decision
+//! acts on, and the paid account's payment instructions re-sent on request.
 
-use super::groups::{
-    account_on_box, check_group_names, group_addresses, group_record, name_allowed, name_held,
-    publish_mail_keys, publish_mail_keys_publicly, run_script, run_script_tolerating, site_owner,
-    write_account_record, write_public_key,
+use super::boxrun::{
+    outside_address, publish_mail_keys, publish_mail_keys_publicly, recipient, run_script,
+    run_script_tolerating, write_public_key,
 };
-use super::lifecycle::{group_recipient, outside_address, recipient};
-use super::payments::append_ledger;
+use super::groups::{
+    account_on_box, append_ledger, check_group_names, group_addresses, group_record, name_allowed,
+    name_held, site_owner, write_account_record,
+};
+use super::lifecycle::group_recipient;
 use super::stripe::{card_link, rail_instructions};
 use super::{write_journal, Settlement};
 use crate::config::DrainConfig;
 use crate::dns;
-use crate::intents::{DecisionIntent, DECISIONS, RAILS};
+use crate::intents::{DecisionIntent, ResendIntent, DECISIONS, RAILS};
 use crate::journal::Journal;
 use crate::notice;
 use crate::questions;
@@ -953,7 +955,7 @@ async fn mark_decided(
         .await
 }
 
-pub(super) fn decision_subject(what: &str, username: &str) -> String {
+fn decision_subject(what: &str, username: &str) -> String {
     format!("Your application to kyriakon.net was {what} ({username})")
 }
 
@@ -992,7 +994,7 @@ fn confirmation_body(record: &Record) -> String {
 /// The decision email for an approval. The words are short because #333 owns
 /// the notice copy; what matters here is that the token and the rail's own
 /// instructions are on it, and that the free path says neither.
-pub(super) fn decision_body(
+fn decision_body(
     cfg: &DrainConfig,
     username: &str,
     rail: &str,
@@ -1040,7 +1042,7 @@ pub(super) fn decision_body(
     Ok(out)
 }
 
-pub(super) fn decline_body(record: &Record) -> String {
+fn decline_body(record: &Record) -> String {
     let monastic = questions::is_monastic(record.answers.get("orders").map(String::as_str));
     let mut out = format!(
         "Your application for {} was not accepted this time.\n\n\
@@ -1056,4 +1058,114 @@ pub(super) fn decline_body(record: &Record) -> String {
         );
     }
     out
+}
+
+/// `onboardctl token resend`: the same payment instructions again and nothing
+/// minted. A second token would leave the first one in the ledger as an entry
+/// that no longer resolves to the same member and would orphan a payment already
+/// in flight, so the account's own token is read and re-sent.
+///
+/// The instructions are the approval email's, built by the same function, and
+/// the notice is recorded as a sent one before it leaves. It is sent rather than
+/// deduplicated: the member asking for a second copy is the whole point.
+pub async fn resend(
+    cfg: &DrainConfig,
+    store: &Store,
+    intent: ResendIntent,
+) -> Result<Settlement, String> {
+    let username = intent.username.as_str();
+    let account = store
+        .account(username)
+        .await?
+        .ok_or_else(|| format!("no account for {username}"))?;
+    let Some(payment) = account.payment_state() else {
+        return Err(format!(
+            "{username} was approved without charge, so there is no payment token to resend"
+        ));
+    };
+    if payment.token_ref.as_deref() != Some(intent.token.as_str()) {
+        return Err(format!(
+            "the token the resend names is not the one {username}'s account holds"
+        ));
+    }
+    let body = decision_body(
+        cfg,
+        username,
+        &account.rail,
+        false,
+        payment.token_ref.as_deref(),
+        &payment.window,
+        payment.monero.as_ref(),
+    )?;
+    let to = account
+        .outside_address
+        .clone()
+        .unwrap_or_else(|| format!("{username}@kyriakon.net"));
+    let subject = decision_subject("approved", username);
+    notice::send_again(
+        cfg,
+        store,
+        username,
+        "prepaid.instructions",
+        &subject,
+        &to,
+        &body,
+    )
+    .await?;
+    // Every settling transition journals its outcome, and the line names the
+    // application the account was made from.
+    let application = store
+        .account_application_text(username)
+        .await?
+        .and_then(|copy| serde_json::from_str::<Value>(&copy).ok())
+        .and_then(|copy| {
+            let status_token = copy.get("status_token")?.as_str()?.to_string();
+            Some(ApplicationRef::application(
+                username.to_string(),
+                status_token,
+            ))
+        })
+        .ok_or_else(|| format!("no application record for {username}"))?;
+    Ok(Settlement::line("applied", application, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Record;
+    use serde_json::json;
+
+    fn record(answers: &[(&str, &str)]) -> Record {
+        serde_json::from_value(json!({
+            "username": "secretary",
+            "status_token": "0123456789abcdefghjkmnpqrst",
+            "filed_at": "2026-10-01T09:00:00Z",
+            "front_end": "web",
+            "stage": "received",
+            "answers": answers.iter().cloned().collect::<std::collections::BTreeMap<_, _>>(),
+            "mail_keys": [],
+            "rail": "cash",
+            "no_charge": false,
+            "acceptances": [],
+            "question_list": "2026-10-01 abc1234"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_decline_body_names_a_missing_blessing_only_for_a_monastic() {
+        let lay = decline_body(&record(&[("orders", "layman")]));
+        assert!(!lay.contains("blessing"), "{lay}");
+        assert!(lay.contains("admin@kyriakon.net"), "{lay}");
+        let monk = decline_body(&record(&[("orders", "monk")]));
+        assert!(monk.contains("blessing"), "{monk}");
+    }
+
+    #[test]
+    fn a_decision_subject_names_the_application_and_the_outcome() {
+        assert_eq!(
+            decision_subject("approved", "secretary"),
+            "Your application to kyriakon.net was approved (secretary)"
+        );
+    }
 }
