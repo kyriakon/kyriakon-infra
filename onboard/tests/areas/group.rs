@@ -2262,6 +2262,163 @@ fn a_group_lapse_takes_every_mailbox_and_one_conversation_of_notices() {
     assert_eq!(notices.matches("group.lapsed").count(), 1, "{notices}");
 }
 
+/// Every group lifecycle notice follows the address the site owner gave outside
+/// the platform, read from the durable account record the ninety-day purge of
+/// the application copy does not touch.
+#[test]
+fn a_group_notice_follows_the_site_owners_outside_address() {
+    let fix = Fix::new("group-notice-outside");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    fix.amend_account("parish-secretary", |account| {
+        account["outside_address"] = json!("warden@example.invalid");
+    });
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["payment"]["window"]["closes_at"] = json!(kyriakon_onboard::util::after_days(-10));
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+
+    let notices = fix.read("accounts/parish-secretary/notices.jsonl");
+    let notice = |kind: &str| {
+        notices
+            .lines()
+            .find(|line| line.contains(kind))
+            .unwrap_or_else(|| panic!("{kind} is not recorded: {notices}"))
+            .to_string()
+    };
+    let lapsed = notice("group.lapsed");
+    assert!(lapsed.contains("warden@example.invalid"), "{lapsed}");
+    assert!(
+        !lapsed.contains("parish-secretary@parish.example"),
+        "{lapsed}"
+    );
+
+    // The grace's midpoint, then its final week, on the same address.
+    for days in [29, 6] {
+        let mut group: Value =
+            serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+        group["grace_until"] = json!(kyriakon_onboard::util::date_after_days(days));
+        std::fs::write(
+            fix.dir.join("store/groups/parish.example/group.json"),
+            serde_json::to_vec_pretty(&group).unwrap(),
+        )
+        .unwrap();
+        assert!(fix.drain().status.success());
+    }
+    let notices = fix.read("accounts/parish-secretary/notices.jsonl");
+    for kind in ["group.grace", "group.final"] {
+        let line = notices
+            .lines()
+            .find(|line| line.contains(kind))
+            .unwrap_or_else(|| panic!("{kind} is not recorded: {notices}"));
+        assert!(line.contains("warden@example.invalid"), "{line}");
+        assert!(!line.contains("parish-secretary@parish.example"), "{line}");
+    }
+}
+
+/// With no address outside the platform the group notices still reach the site
+/// owner at their mailbox on the group's own domain.
+#[test]
+fn a_group_notice_without_an_outside_address_goes_to_the_platform_mailbox() {
+    let fix = Fix::new("group-notice-platform");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    fix.amend_account("parish-secretary", |account| {
+        account["outside_address"] = Value::Null;
+    });
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["payment"]["window"]["closes_at"] = json!(kyriakon_onboard::util::after_days(-10));
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+
+    let notices = fix.read("accounts/parish-secretary/notices.jsonl");
+    let lapsed = notices
+        .lines()
+        .find(|line| line.contains("group.lapsed"))
+        .unwrap_or_else(|| panic!("group.lapsed is not recorded: {notices}"))
+        .to_string();
+    assert!(
+        lapsed.contains("parish-secretary@parish.example"),
+        "{lapsed}"
+    );
+}
+
+/// A site owner's record that cannot be read fails the group notice and says
+/// which record, rather than mailing the platform address as if it were chosen.
+#[test]
+fn an_unreadable_site_owner_record_fails_the_group_notice() {
+    let fix = Fix::new("group-notice-corrupt");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    // The window is already closed, so the pass offers the lapse notice without
+    // stopping the mailboxes first.
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["payment"]["window"]["state"] = json!("closed");
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        fix.dir.join("store/accounts/parish-secretary/account.json"),
+        b"{\"version\": 1, \"username\": \"parish-sec",
+    )
+    .unwrap();
+
+    // The binary, because the failure is the line it prints for cron to mail.
+    let out = fix.drain_binary();
+    assert!(out.status.success(), "{}", body(&out));
+    let printed = body(&out);
+    assert!(
+        printed.contains("the lapse notice for parish.example"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("accounts/parish-secretary/account.json does not parse"),
+        "{printed}"
+    );
+    assert!(
+        !fix.read("accounts/parish-secretary/notices.jsonl")
+            .contains("group.lapsed"),
+        "a notice was recorded for a record it could not read"
+    );
+    assert!(
+        !fix.sent()
+            .contains("payment window for parish.example has closed"),
+        "the notice fell back to the platform address: {}",
+        fix.sent()
+    );
+}
+
 /// The grace's final notice comes once for the body, seven days before the
 /// deletion, and the deletion closes every account in the group and takes the
 /// domain down.

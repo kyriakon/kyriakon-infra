@@ -2223,7 +2223,7 @@ async fn group_lapse_notice(
     group: &GroupRecord,
     window: &Window,
 ) -> Result<(), String> {
-    let to = dns_contact(store, group).await?;
+    let to = group_notice_address(store, group).await?;
     let closes_on = &window.closes_at[..10.min(window.closes_at.len())];
     let token = group.payment.token_ref.as_deref().unwrap_or("");
     let grace = group.grace_until.clone().unwrap_or_default();
@@ -2262,7 +2262,7 @@ async fn group_grace_notice(
     group: &GroupRecord,
     grace: time::Date,
 ) -> Result<(), String> {
-    let to = dns_contact(store, group).await?;
+    let to = group_notice_address(store, group).await?;
     let grace = util::date_string(grace);
     let token = group.payment.token_ref.as_deref().unwrap_or("");
     let subject = format!(
@@ -2298,7 +2298,7 @@ async fn group_final_notice(
     group: &GroupRecord,
     grace: time::Date,
 ) -> Result<(), String> {
-    let to = dns_contact(store, group).await?;
+    let to = group_notice_address(store, group).await?;
     let grace = util::date_string(grace);
     let token = group.payment.token_ref.as_deref().unwrap_or("");
     let subject = format!(
@@ -2448,13 +2448,34 @@ pub async fn grace_sweep(
 }
 
 /// The address a lifecycle notice goes to: the contact the member gave, or the
-/// mailbox otherwise. It is validated again because it becomes a mail header,
-/// and a record that reached it from outside the drain is not trusted.
-fn notice_address(account: &Account, username: &str) -> String {
+/// mailbox that reaches them on the platform. It is validated again because it
+/// becomes a mail header, and a record that reached it from outside the drain
+/// is not trusted.
+fn notice_recipient(account: &Account, mailbox: String) -> String {
     match account.outside_address.as_deref() {
         Some(addr) if validate::address(addr).is_none() => addr.to_string(),
-        _ => format!("{username}@kyriakon.net"),
+        _ => mailbox,
     }
+}
+
+/// A person's notice: their outside address, or `username@kyriakon.net`.
+fn notice_address(account: &Account, username: &str) -> String {
+    notice_recipient(account, format!("{username}@kyriakon.net"))
+}
+
+/// A group's lifecycle notice takes the same rule as a person's, with the site
+/// owner's mailbox on the group's own domain as the fallback. The site owner is
+/// read through the typed accessor, so a record that cannot be read fails the
+/// notice rather than quietly mailing the platform address.
+async fn group_notice_address(store: &Store, group: &GroupRecord) -> Result<String, String> {
+    let account = store
+        .account(&group.site_owner)
+        .await?
+        .ok_or_else(|| format!("no account for the site owner {}", group.site_owner))?;
+    Ok(notice_recipient(
+        &account,
+        format!("{}@{}", group.site_owner, group.domain),
+    ))
 }
 
 /// The grace notice: the midpoint of the forty days, when thirty of them are
