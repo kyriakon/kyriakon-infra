@@ -61,6 +61,7 @@ use std::process::ExitCode;
 use kyriakon_onboard::config::DrainConfig;
 use kyriakon_onboard::export;
 use kyriakon_onboard::intents;
+use kyriakon_onboard::intents::Decision;
 use kyriakon_onboard::journal::Journal;
 use kyriakon_onboard::keycheck;
 use kyriakon_onboard::ledger::{Ledger, LedgerLine};
@@ -68,7 +69,7 @@ use kyriakon_onboard::prepaid;
 use kyriakon_onboard::requests;
 use kyriakon_onboard::sign;
 use kyriakon_onboard::store::{self, free_account_count, Record, Store};
-use kyriakon_onboard::transitions::{self, Decision};
+use kyriakon_onboard::transitions;
 use kyriakon_onboard::util;
 use kyriakon_onboard::validate;
 use serde_json::Value;
@@ -138,7 +139,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         // the drain knows.
         verb => {
             let username = one_username(rest)?;
-            let Some(decision) = transitions::decision_for(verb) else {
+            let Some(decision) = intents::decision_for(verb) else {
                 return Err(usage());
             };
             let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
@@ -261,7 +262,7 @@ async fn token(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), 
         })?;
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::resend_payload(username, &token))?;
-    let id = intents::Intent::Resend(transitions::ResendIntent {
+    let id = intents::Intent::Resend(intents::ResendIntent {
         username: username.to_string(),
         token: token.clone(),
         sig,
@@ -312,10 +313,10 @@ async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
         _ => payment_token(store, &flags).await?,
     };
     let rail = need(&flags, "rail")?;
-    if !transitions::CREDIT_RAILS.contains(&rail) {
+    if !intents::CREDIT_RAILS.contains(&rail) {
         return Err(format!(
             "--rail {rail:?} is not one of {}",
-            transitions::CREDIT_RAILS.join(", ")
+            intents::CREDIT_RAILS.join(", ")
         ));
     }
     // Cash in hand is the one rail keyed by a username: the operator was there
@@ -363,7 +364,7 @@ async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
             note,
         ),
     )?;
-    let id = intents::Intent::Credit(transitions::CreditIntent {
+    let id = intents::Intent::Credit(intents::CreditIntent {
         token: token.clone(),
         rail: rail.to_string(),
         amount_gbp: amount.to_string(),
@@ -415,7 +416,7 @@ async fn window(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::window_extend_payload(token, days, reason))?;
-    let id = intents::Intent::WindowExtend(transitions::WindowExtendIntent {
+    let id = intents::Intent::WindowExtend(intents::WindowExtendIntent {
         token: token.to_string(),
         days,
         reason: reason.to_string(),
@@ -542,7 +543,7 @@ async fn reconcile_attribute(
         &key,
         &sign::reconcile_attribute_payload(item, token, confirm_double, override_reason),
     )?;
-    let id = intents::Intent::ReconcileAttribute(transitions::AttributeIntent {
+    let id = intents::Intent::ReconcileAttribute(intents::AttributeIntent {
         item: item.to_string(),
         token: token.to_string(),
         confirm_double,
@@ -575,7 +576,7 @@ async fn reconcile_return(cfg: &DrainConfig, store: &Store, args: &[String]) -> 
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::reconcile_return_payload(item, note))?;
-    let id = intents::Intent::ReconcileReturn(transitions::ReturnIntent {
+    let id = intents::Intent::ReconcileReturn(intents::ReturnIntent {
         item: item.to_string(),
         note: note.to_string(),
         sig,
@@ -621,7 +622,7 @@ async fn payment_block(store: &Store, username: &str) -> Result<(String, store::
     let Some(domain) = account.group.as_deref() else {
         return Err(format!("{username} has no payment token"));
     };
-    let group = transitions::group_record(store, domain)
+    let group = transitions::groups::group_record(store, domain)
         .await?
         .ok_or_else(|| format!("no group record for {domain}"))?;
     let token = group
@@ -688,7 +689,7 @@ async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
             &key,
             &sign::refund_payload(&token, "", "", false, false, "", settled, ""),
         )?;
-        let id = intents::Intent::Refund(transitions::RefundIntent {
+        let id = intents::Intent::Refund(intents::RefundIntent {
             token: token.clone(),
             settled_on: Some(settled.to_string()),
             sig,
@@ -701,10 +702,10 @@ async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
     }
 
     let rail = need(&flags, "rail")?;
-    if !transitions::REFUND_RAILS.contains(&rail) {
+    if !intents::REFUND_RAILS.contains(&rail) {
         return Err(format!(
             "--rail {rail:?} is not one of {}",
-            transitions::REFUND_RAILS.join(", ")
+            intents::REFUND_RAILS.join(", ")
         ));
     }
     let amount = need(&flags, "amount")?;
@@ -745,7 +746,7 @@ async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
             reason,
         ),
     )?;
-    let id = intents::Intent::Refund(transitions::RefundIntent {
+    let id = intents::Intent::Refund(intents::RefundIntent {
         token: token.clone(),
         amount_gbp: Some(amount.to_string()),
         rail: Some(rail.to_string()),
@@ -997,10 +998,10 @@ async fn address(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<()
         return Err(format!("the domain {domain:?}: {why}"));
     }
     let action = need(&flags, "action")?;
-    if !transitions::ADDRESS_ACTIONS.contains(&action) {
+    if !intents::ADDRESS_ACTIONS.contains(&action) {
         return Err(format!(
             "--action {action:?} is not one of {:?}\n{}",
-            transitions::ADDRESS_ACTIONS,
+            intents::ADDRESS_ACTIONS,
             usage()
         ));
     }
@@ -1388,7 +1389,7 @@ async fn sign_and_file(
 ) -> Result<(), String> {
     let (token, _record) = find_application(store, username).await?;
     let sig = sign::sign(key, &sign::decide_payload(&token, decision.action))?;
-    let id = intents::Intent::Decision(transitions::DecisionIntent {
+    let id = intents::Intent::Decision(intents::DecisionIntent {
         kind: decision.kind.to_string(),
         application: store::ApplicationRef::application(username.to_string(), token.clone()),
         action: decision.action.to_string(),
@@ -1550,7 +1551,7 @@ async fn suspend(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<()
     let flags = flags(args, &["reason"])?;
     let reason = need(&flags, "reason")?;
     let journal = Journal::load(store).await?;
-    transitions::suspend(cfg, store, &journal, username, reason).await?;
+    transitions::lifecycle::suspend(cfg, store, &journal, username, reason).await?;
     println!("suspended {username}");
     Ok(())
 }
@@ -1561,7 +1562,7 @@ async fn suspend(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<()
 async fn resume(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(), String> {
     let username = one_username(rest)?;
     let journal = Journal::load(store).await?;
-    transitions::resume(cfg, store, &journal, username).await?;
+    transitions::lifecycle::resume(cfg, store, &journal, username).await?;
     println!("resumed {username}");
     Ok(())
 }
@@ -1594,7 +1595,7 @@ async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(),
         return Err(format!("no account for {username}"));
     }
     let journal = Journal::load(store).await?;
-    transitions::delete_account(cfg, store, &journal, username).await?;
+    transitions::lifecycle::delete_account(cfg, store, &journal, username).await?;
     println!("deleted {username}");
     Ok(())
 }
@@ -1653,8 +1654,8 @@ async fn monero(store: &Store, args: &[String]) -> Result<(), String> {
     // The same writer the drain uses: the handler reads this record as
     // `_onboard`, so a 0600 root file would leave the page without a payment
     // block.
-    transitions::write_account_record(store, username, &bytes).await?;
-    transitions::write_payment_copy(store, username, &payment).await?;
+    transitions::groups::write_account_record(store, username, &bytes).await?;
+    transitions::payments::write_payment_copy(store, username, &payment).await?;
     println!("recorded Monero subaddress for {username}: {address}");
     Ok(())
 }

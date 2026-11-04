@@ -595,13 +595,11 @@ fn the_page_files_an_export_intent_and_the_drain_records_the_request() {
     let session = session_id(&fix, "secretary");
     let id = runtime()
         .block_on(
-            kyriakon_onboard::intents::Intent::Export(
-                kyriakon_onboard::transitions::ExportIntent {
-                    username: "secretary".to_string(),
-                    session: session.clone(),
-                    ..Default::default()
-                },
-            )
+            kyriakon_onboard::intents::Intent::Export(kyriakon_onboard::intents::ExportIntent {
+                username: "secretary".to_string(),
+                session: session.clone(),
+                ..Default::default()
+            })
             .file(&store),
         )
         .unwrap();
@@ -661,13 +659,11 @@ fn a_forged_or_expired_session_writes_nothing() {
     let wrong = session_id(&fix, "alice");
     let id = runtime()
         .block_on(
-            kyriakon_onboard::intents::Intent::Export(
-                kyriakon_onboard::transitions::ExportIntent {
-                    username: "secretary".to_string(),
-                    session: wrong.clone(),
-                    ..Default::default()
-                },
-            )
+            kyriakon_onboard::intents::Intent::Export(kyriakon_onboard::intents::ExportIntent {
+                username: "secretary".to_string(),
+                session: wrong.clone(),
+                ..Default::default()
+            })
             .file(&store),
         )
         .unwrap();
@@ -699,13 +695,11 @@ fn a_forged_or_expired_session_writes_nothing() {
     expire_session(&fix, &expired);
     let id = runtime()
         .block_on(
-            kyriakon_onboard::intents::Intent::Export(
-                kyriakon_onboard::transitions::ExportIntent {
-                    username: "secretary".to_string(),
-                    session: expired.clone(),
-                    ..Default::default()
-                },
-            )
+            kyriakon_onboard::intents::Intent::Export(kyriakon_onboard::intents::ExportIntent {
+                username: "secretary".to_string(),
+                session: expired.clone(),
+                ..Default::default()
+            })
             .file(&store),
         )
         .unwrap();

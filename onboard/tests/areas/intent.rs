@@ -8,11 +8,10 @@
 use crate::common::*;
 
 use kyriakon_onboard::config::DrainConfig;
-use kyriakon_onboard::intents::Intent;
+use kyriakon_onboard::intents::{self, Intent};
 use kyriakon_onboard::journal::Journal;
 use kyriakon_onboard::sign;
 use kyriakon_onboard::store::{self as st, Store};
-use kyriakon_onboard::transitions as tr;
 
 /// The fixture's config and store, as the drain builds them.
 fn seam(fix: &Fix) -> (DrainConfig, Store, Journal) {
@@ -42,7 +41,7 @@ fn a_variant_proves_itself_before_it_is_applied() {
 
     let id = runtime
         .block_on(
-            Intent::Close(tr::CloseIntent {
+            Intent::Close(intents::CloseIntent {
                 username: "secretary".to_string(),
                 session: session.to_string(),
                 ..Default::default()
@@ -89,7 +88,7 @@ fn a_variant_that_cannot_prove_itself_is_refused() {
     let (cfg, store, journal) = seam(&fix);
     let runtime = driver();
 
-    let intent = Intent::Resend(tr::ResendIntent {
+    let intent = Intent::Resend(intents::ResendIntent {
         username: "secretary".to_string(),
         token: "KYR-0123456789ABCD".to_string(),
         sig: String::new(),
@@ -156,7 +155,7 @@ fn the_one_writer_keeps_the_wire_the_drain_reads() {
     let runtime = driver();
     let id = runtime
         .block_on(
-            Intent::Credit(tr::CreditIntent {
+            Intent::Credit(intents::CreditIntent {
                 token: "KYR-0123456789ABCD".to_string(),
                 rail: "cash".to_string(),
                 amount_gbp: "20.00".to_string(),
@@ -194,28 +193,28 @@ fn every_variant() -> Vec<Intent> {
     let all = vec![
         Intent::Application(st::Intent::default()),
         // The three decisions share one variant and three kinds.
-        Intent::Decision(tr::DecisionIntent {
+        Intent::Decision(intents::DecisionIntent {
             kind: "approve".to_string(),
             ..Default::default()
         }),
-        Intent::Password(tr::PasswordIntent::default()),
+        Intent::Password(intents::PasswordIntent::default()),
         Intent::ProvisionGroup(Box::default()),
         Intent::GroupAddress(st::GroupAddressIntent::default()),
         Intent::RemoveGroup(st::GroupRemoveIntent::default()),
-        Intent::Close(tr::CloseIntent::default()),
-        Intent::Resend(tr::ResendIntent::default()),
-        Intent::Credit(tr::CreditIntent::default()),
-        Intent::WindowExtend(tr::WindowExtendIntent::default()),
-        Intent::ReconcileAttribute(tr::AttributeIntent::default()),
-        Intent::ReconcileReturn(tr::ReturnIntent::default()),
-        Intent::Refund(tr::RefundIntent::default()),
-        Intent::Export(tr::ExportIntent::default()),
-        Intent::ChangePassword(tr::ChangePasswordIntent::default()),
-        Intent::UploadKey(tr::UploadKeyIntent::default()),
-        Intent::OutsideAddress(tr::OutsideAddressIntent::default()),
-        Intent::Serving(tr::ServingIntent::default()),
-        Intent::CancelRenewal(tr::CancelRenewalIntent::default()),
-        Intent::MailKey(tr::MailKeyIntent::default()),
+        Intent::Close(intents::CloseIntent::default()),
+        Intent::Resend(intents::ResendIntent::default()),
+        Intent::Credit(intents::CreditIntent::default()),
+        Intent::WindowExtend(intents::WindowExtendIntent::default()),
+        Intent::ReconcileAttribute(intents::AttributeIntent::default()),
+        Intent::ReconcileReturn(intents::ReturnIntent::default()),
+        Intent::Refund(intents::RefundIntent::default()),
+        Intent::Export(intents::ExportIntent::default()),
+        Intent::ChangePassword(intents::ChangePasswordIntent::default()),
+        Intent::UploadKey(intents::UploadKeyIntent::default()),
+        Intent::OutsideAddress(intents::OutsideAddressIntent::default()),
+        Intent::Serving(intents::ServingIntent::default()),
+        Intent::CancelRenewal(intents::CancelRenewalIntent::default()),
+        Intent::MailKey(intents::MailKeyIntent::default()),
     ];
     for intent in &all {
         match intent {
@@ -300,7 +299,7 @@ fn a_settled_intent_is_not_applied_again() {
 
     let id = runtime
         .block_on(
-            Intent::Close(tr::CloseIntent {
+            Intent::Close(intents::CloseIntent {
                 username: "secretary".to_string(),
                 session: session.to_string(),
                 ..Default::default()

@@ -516,7 +516,7 @@ pub fn payment(
     // A running window carries the rail's instructions. A lapsed one shows the
     // token again but no instructions: the window it would have paid is gone.
     let instructions = if running {
-        crate::transitions::rail_instructions(
+        crate::transitions::stripe::rail_instructions(
             rail,
             postal_address,
             card_link,
