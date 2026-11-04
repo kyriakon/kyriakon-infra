@@ -105,13 +105,16 @@ jobs:
             exit 1
           fi
       # The deploy self-test is the one that scans the crate's source for the
-      # drain's script invocations. It needs only oksh and coreutils, not BSD
-      # stat, so it runs here rather than waiting behind the macOS job.
+      # drain's script invocations. It needs only a pdksh-family shell and
+      # coreutils, not BSD stat, so it runs here rather than waiting behind the
+      # macOS job. Ubuntu has no oksh package; mksh is the same lineage and this
+      # step checks the scan, not the shell's portability. The full suite still
+      # runs under oksh on macOS.
       - name: deploy source-scan self-test
         run: |
           sudo apt-get update
-          sudo apt-get install -y oksh
-          oksh scripts/deploy-onboard.sh --self-test
+          sudo apt-get install -y mksh
+          mksh scripts/deploy-onboard.sh --self-test
 
   # The scripts' own tests are the only automated check most of them have, and
   # they run weekly on the box: without this a break reaches main and stays until
