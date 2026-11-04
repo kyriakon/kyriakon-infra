@@ -216,8 +216,10 @@ pub fn filed(link: &str) -> String {
 /// one function, so the two cannot disagree about what is owed. It is `None` for
 /// a free account, which has no window, no token and no payment block.
 ///
-/// The words for the serving facts are the capsule's own chrome. A fact the
-/// drain has not recorded yet reads as that rather than as a false "no".
+/// The words for the serving facts are the capsule's own chrome, over the
+/// account's one derivation: a lane with no record and no upload key is not
+/// serving. A space figure the drain has not recorded reads as that rather than
+/// as a false zero.
 pub fn account(
     account: &Account,
     notices: &[Notice],
@@ -311,15 +313,22 @@ pub fn account(
             )),
         }
     }
-    // The same effective value the account page shows: an unrecorded lane on a
-    // member with an upload key is one provision-member.sh wrote.
-    let has_hosting = !account.upload_keys.is_empty();
-    let site = account.site_served.or(has_hosting.then_some(true));
-    let capsule = account.capsule_served.or(has_hosting.then_some(true));
+    // The same effective value the account page shows, from the one derivation
+    // on the account: an unrecorded lane on a member with an upload key is one
+    // provision-member.sh wrote.
+    let (site, capsule) = account.serving();
     out.push_str(&format!("State: {}\n", account.state));
     out.push_str(&format!("Site: {}\n", served(site)));
     out.push_str(&format!("Capsule: {}\n", served(capsule)));
-    out.push_str(&format!("Space used: {}\n", space(account.space_used)));
+    match account.space_used {
+        Some(bytes) => out.push_str(&format!(
+            "Space used: {} of the {} soft and {} hard allowance\n",
+            crate::page::space(bytes),
+            crate::page::QUOTA_SOFT,
+            crate::page::QUOTA_HARD
+        )),
+        None => out.push_str("Space used: not recorded yet\n"),
+    };
     if let Some(address) = &account.outside_address {
         out.push_str(&format!("Address outside the platform: {address}\n"));
     } else {
@@ -408,34 +417,13 @@ fn short_hash(hash: &str) -> String {
     }
 }
 
-/// Whether a protocol is being served, as the drain recorded it.
-fn served(flag: Option<bool>) -> &'static str {
-    match flag {
-        Some(true) => "serving",
-        Some(false) => "not serving",
-        None => "not recorded yet",
-    }
-}
-
-/// The space used under the quota, in the units the platform publishes. Binary
-/// multiples, because the quota itself is five gibibytes.
-fn space(bytes: Option<u64>) -> String {
-    const GIB: u64 = 1 << 30;
-    const MIB: u64 = 1 << 20;
-    match bytes {
-        Some(bytes) if bytes >= GIB => format!(
-            "{:.1} GB of the {} soft and {} hard allowance",
-            bytes as f64 / GIB as f64,
-            crate::page::QUOTA_SOFT,
-            crate::page::QUOTA_HARD
-        ),
-        Some(bytes) => format!(
-            "{} MB of the {} soft and {} hard allowance",
-            bytes / MIB,
-            crate::page::QUOTA_SOFT,
-            crate::page::QUOTA_HARD
-        ),
-        None => "not recorded yet".to_string(),
+/// Whether a protocol is being served, as the drain recorded it and the one
+/// derivation resolved it.
+fn served(flag: bool) -> &'static str {
+    if flag {
+        "serving"
+    } else {
+        "not serving"
     }
 }
 
@@ -623,13 +611,16 @@ mod tests {
         assert!(text.contains("Nothing here changes anything"), "{text}");
     }
 
+    /// A member with no upload key has no lane at all, so an unrecorded lane is
+    /// not serving rather than an unknown one; a space figure the drain has not
+    /// recorded keeps its own sentence.
     #[test]
-    fn an_unrecorded_fact_is_not_a_false_no() {
+    fn an_unrecorded_lane_is_not_serving_and_an_unrecorded_space_is_named() {
         let mut record = member();
         record.site_served = None;
         record.space_used = None;
         let text = account(&record, &[], None, None, None);
-        assert!(text.contains("Site: not recorded yet"), "{text}");
+        assert!(text.contains("Site: not serving"), "{text}");
         assert!(text.contains("Space used: not recorded yet"), "{text}");
         assert!(text.contains("Nothing has been sent yet."), "{text}");
     }
@@ -654,17 +645,24 @@ mod tests {
         assert!(!text.contains("SHA256:"), "{text}");
     }
 
+    /// The capsule names the published allowance beside the shared figure, so
+    /// the formatter and the allowance sentence are one fact each.
     #[test]
-    fn the_space_and_the_hash_shorten_for_the_page() {
-        assert_eq!(
-            space(Some(1 << 30)),
-            "1.0 GB of the 5 GB soft and 5.5 GB hard allowance"
+    fn the_capsule_reads_the_space_against_the_published_allowance() {
+        let mut record = member();
+        record.space_used = Some(1 << 30);
+        let text = account(&record, &[], None, None, None);
+        assert!(
+            text.contains("Space used: 1.0 GB of the 5 GB soft and 5.5 GB hard allowance\n"),
+            "{text}"
         );
-        assert_eq!(
-            space(Some(432013312)),
-            "412 MB of the 5 GB soft and 5.5 GB hard allowance"
-        );
-        assert_eq!(space(None), "not recorded yet");
+        record.space_used = None;
+        let text = account(&record, &[], None, None, None);
+        assert!(text.contains("Space used: not recorded yet"), "{text}");
+    }
+
+    #[test]
+    fn the_hash_shortens_for_the_page() {
         assert_eq!(short_hash("SHA256:0123456789abcdef"), "SHA256:01234567");
         assert_eq!(short_hash("0123456789"), "01234567");
     }

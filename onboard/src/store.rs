@@ -1473,6 +1473,17 @@ impl Account {
         }
     }
 
+    /// Whether the site and the capsule are served. An unrecorded lane on a
+    /// member with an upload key is on, because provision-member.sh wrote it;
+    /// a member with no upload key has no lane at all, so neither is served.
+    pub fn serving(&self) -> (bool, bool) {
+        let written = !self.upload_keys.is_empty();
+        (
+            self.site_served.unwrap_or(written),
+            self.capsule_served.unwrap_or(written),
+        )
+    }
+
     /// Approved without charge: no token, no window, nothing that lapses. A
     /// group mailbox carries the flag its group was approved with, but the
     /// group holds the payment, so the mailbox is not a free account itself.

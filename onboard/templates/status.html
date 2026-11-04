@@ -20,6 +20,15 @@
   #}
   {% if let Some(p) = payment %}
   <h3>Paying</h3>
+  {% if let Some(date) = p.lapsed %}
+  <p>Lapsed: the payment window closed on {{ date }}.</p>
+  {% if let Some(note) = p.lapsed_note %}
+  <p>{{ note }}</p>
+  {% endif %}
+  {% if let Some(token) = p.token %}
+  <p>Your payment reference is <code>{{ token }}</code>.</p>
+  {% endif %}
+  {% else %}
   {% if let Some(until) = p.paid_until %}
   <p>Paid until {{ until }}.</p>
   {% else %}
@@ -32,6 +41,7 @@
   {% endif %}
   {% if let Some(window) = p.window %}
   <p>The payment window {{ window }}.</p>
+  {% endif %}
   {% endif %}
   {% endif %}
   {% endif %}

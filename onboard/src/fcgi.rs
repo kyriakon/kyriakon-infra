@@ -245,11 +245,7 @@ pub enum Reply {
     /// the page carries. httpd validates the code against its own table and
     /// silently serves 200 for one that table does not carry, so only codes it
     /// carries are ever sent, and `reason` is that table's own spelling.
-    Http {
-        status: u16,
-        headers: Vec<(String, String)>,
-        body: String,
-    },
+    Http(Http),
     /// gmid's reply, which is gemini's: two digits, a space, the META, CRLF, then
     /// the body. gmid passes a 2x status through and fails the connection on a
     /// malformed header, so the status is the status and never a line in the body.
@@ -260,23 +256,60 @@ pub enum Reply {
     },
 }
 
+/// A reply the web front-end reads. It is its own type so a header can only be
+/// added to the reply that carries headers: a gemini reply has no method for one,
+/// rather than a header silently dropped.
+pub struct Http {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+impl Http {
+    /// A 303 to `location`, which is what a login and a logout answer with. It
+    /// is a capability in a cookie, so it carries the capability page's headers
+    /// too; the caller adds the cookie header its answer needs.
+    pub fn redirect(location: &str) -> Http {
+        Http {
+            status: 303,
+            headers: vec![
+                (
+                    "Content-Type".to_string(),
+                    "text/html; charset=utf-8".to_string(),
+                ),
+                ("Cache-Control".to_string(), "no-store".to_string()),
+                ("Referrer-Policy".to_string(), "no-referrer".to_string()),
+                ("Location".to_string(), location.to_string()),
+            ],
+            body: String::new(),
+        }
+    }
+
+    /// The same reply with one header added, for a `Set-Cookie` or a
+    /// `Location`.
+    pub fn with_header(mut self, name: &str, value: String) -> Http {
+        self.headers.push((name.to_string(), value));
+        self
+    }
+}
+
 impl Reply {
     /// An HTML page, which is every page the web form renders.
     pub fn html(status: u16, body: String) -> Reply {
-        Reply::Http {
+        Reply::Http(Http {
             status,
             headers: vec![(
                 "Content-Type".to_string(),
                 "text/html; charset=utf-8".to_string(),
             )],
             body,
-        }
+        })
     }
 
     /// A page that carries a capability in its URL, or is a capability itself:
     /// never stored, and its URL never sent as a referrer.
     pub fn capability(status: u16, body: String) -> Reply {
-        Reply::Http {
+        Reply::Http(Http {
             status,
             headers: vec![
                 (
@@ -287,7 +320,7 @@ impl Reply {
                 ("Referrer-Policy".to_string(), "no-referrer".to_string()),
             ],
             body,
-        }
+        })
     }
 
     /// A gemini page.
@@ -299,35 +332,10 @@ impl Reply {
         }
     }
 
-    /// The same reply with one header added, for a `Set-Cookie` or a
-    /// `Location`. Only the web front-end has headers; a gemini reply is
-    /// returned unchanged.
-    pub fn with_header(mut self, name: &str, value: String) -> Reply {
-        if let Reply::Http { headers, .. } = &mut self {
-            headers.push((name.to_string(), value));
-        }
-        self
-    }
-
-    /// A redirect with no body, which is what a login and a logout answer with.
-    pub fn redirect(location: &str) -> Reply {
-        Reply::Http {
-            status: 303,
-            headers: vec![
-                (
-                    "Content-Type".to_string(),
-                    "text/html; charset=utf-8".to_string(),
-                ),
-                ("Location".to_string(), location.to_string()),
-            ],
-            body: String::new(),
-        }
-    }
-
     /// The code this reply answers with, for the log line.
     pub fn code(&self) -> u16 {
         match self {
-            Reply::Http { status, .. } => *status,
+            Reply::Http(http) => http.status,
             Reply::Gemini { status, .. } => u16::from(*status),
         }
     }
@@ -343,19 +351,15 @@ impl Reply {
     pub(crate) fn head(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
-            Reply::Http {
-                status,
-                headers,
-                body,
-            } => {
+            Reply::Http(http) => {
                 out.extend_from_slice(
-                    format!("Status: {status} {}\r\n", reason(*status)).as_bytes(),
+                    format!("Status: {} {}\r\n", http.status, reason(http.status)).as_bytes(),
                 );
-                for (name, value) in headers {
+                for (name, value) in &http.headers {
                     out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
                 }
                 out.extend_from_slice(b"\r\n");
-                out.extend_from_slice(body.as_bytes());
+                out.extend_from_slice(http.body.as_bytes());
             }
             Reply::Gemini { status, meta, body } => {
                 out.extend_from_slice(format!("{status} {meta}\r\n").as_bytes());
