@@ -29,17 +29,25 @@ Pointers, so a search starts where the thing is.
   renders the pages as gemtext; `src/portal.rs` is the terminal library (menu, sessions,
   the applicant flow); `src/portal_ipc.rs` is the terminal's one request to the handler;
   `templates/*.html` are the web renderings; `src/transitions.rs` holds the drain's
-  decisions; `src/bin/` holds the three binaries (`kyriakon-onboard-drain`,
+  settlement seam (`Envelope`, `Settlement`, `settle`, `Disposition`), with the verb
+  bodies under `src/transitions/` (`payments`, `groups`, `lifecycle`, `review`,
+  `stripe`, `boxrun`); `src/intents.rs` holds the intent enum and its payloads;
+  `src/journal.rs` loads and indexes the journal once per pass; `src/store.rs` owns
+  paths, locks and typed record reads; `src/ledger.rs` is the typed payment ledger;
+  `src/bin/` holds the three binaries (`kyriakon-onboard-drain`,
   `kyriakon-onboard-tui`, `kyriakon-onboardctl`); `questions.toml` is the application's
-  question list; `tests/drain.rs` is the drain's acceptance suite.
-- `kyriakon-encrypt/`: the daemon that encrypts every saved message to the recipient's
-  key; `src/lib.rs` builds the PGP/MIME wrapper.
-- `dovecot-plugin/`: the C plugin that calls the encryptor on the save path.
+  question list; `tests/drain.rs` is the drain's acceptance suite, split by area under
+  `tests/areas/`.
+- `kyriakon-encrypt/`: the CLI the save path runs to encrypt each message; `src/lib.rs`
+  builds the PGP/MIME wrapper.
+- `dovecot-plugin/`: the C plugin that forks the encryptor for each save and turns its
+  exit status into the save verdict.
 - `keys/`: the published public keys, one `<localpart>.asc` per member: the audit
   surface. `scripts/publish-mail-key.sh` writes one, `scripts/rekey-mail-key.sh`
   rewrites one without the AEAD advert.
 - `scripts/`: every deploy and operator script, each with a `--self-test`; `lib.sh`
-  holds the shared helpers and the self-test harness.
+  holds the shared helpers (staged installs, the mail-table lock, the self-test
+  harness), and `install-set.tsv` is the one table naming what each destination gets.
 - `openbsd/`: what the box runs: `etc/` (smtpd, httpd, relayd, gmid, unbound, nsd,
   spamd, sshd, `login.conf.d/`, `rc.d/`, `kyriakon.env`, and the three onboarding
   configs (`catalogue.toml`, `drain.toml`, `onboard.toml`) under `etc/onboard/`), `dovecot/`, and `restore-template/` for the throwaway box.
@@ -48,7 +56,7 @@ Pointers, so a search starts where the thing is.
   the automation depends on), `operations/`, `threat-model.md`, `terms.md`,
   `privacy.md`, `aup.md`, `transparency.md`, `refusals.md`, `planning/` (specs,
   research, prototypes), `agents/` (issue tracker, triage labels, domain docs).
-- `.github/workflows/`: `checks.yml` (the four CI jobs) and `auto-merge-key.yml` (a
+- `.github/workflows/`: `checks.yml` (the five CI jobs) and `auto-merge-key.yml` (a
   green key publication merges itself, as the machine account).
 - `.githooks/`: commit shape, pre-commit, pre-push.
 - Root: `reserved-usernames.txt` (the held-back names), `CONTEXT.md` (repo vocabulary),
