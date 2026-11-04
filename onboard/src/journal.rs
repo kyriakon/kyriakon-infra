@@ -29,8 +29,6 @@ struct Index {
     lines: usize,
     /// Intent id → the outcomes recorded for it.
     outcomes: HashMap<String, HashSet<String>>,
-    /// Intent ids with at least one line that is not a failure.
-    seen: HashSet<String>,
     /// Intent id → the failed passes recorded against it.
     failures: HashMap<String, Failure>,
     /// Intent id → the positions of its failed lines, in file order.
@@ -57,9 +55,6 @@ impl Index {
             .entry(line.intent.clone())
             .or_default()
             .insert(line.outcome.clone());
-        if line.outcome != "failed" {
-            self.seen.insert(line.intent.clone());
-        }
         if line.outcome == "failed" {
             let failure = self.failures.entry(line.intent.clone()).or_default();
             failure.count += 1;
@@ -75,22 +70,25 @@ impl Index {
                 .push(at);
         }
         if line.outcome == "applying" && (line.kind == "approve" || line.kind == "provision") {
-            self.started.insert(line.application.status_token.clone());
+            if let Some(token) = line.application.status_token.as_deref() {
+                self.started.insert(token.to_string());
+            }
         }
         if line.outcome == "applying" {
             if let Some(credit) = line.credit.clone() {
                 self.credits.entry(line.intent.clone()).or_insert(credit);
             }
         }
-        if !line.application.status_token.is_empty() {
-            self.marks
-                .entry((
-                    line.application.status_token.clone(),
-                    line.kind.clone(),
-                    line.outcome.clone(),
-                ))
-                .or_default()
-                .push((at, line.intent.clone()));
+        // Only a real capability token is a mark's key. An old line that put a
+        // group domain in this field is not one, and indexing it would make the
+        // review mail's dedup hold a name where a token is expected.
+        if let Some(token) = line.application.status_token.as_deref() {
+            if crate::store::is_status_token(token) {
+                self.marks
+                    .entry((token.to_string(), line.kind.clone(), line.outcome.clone()))
+                    .or_default()
+                    .push((at, line.intent.clone()));
+            }
         }
     }
 }
@@ -132,12 +130,6 @@ impl Journal {
             .outcomes
             .get(id)
             .is_some_and(|outcomes| outcomes.contains(outcome))
-    }
-
-    /// Whether this id has any line that is not a failure. A failed line is the
-    /// reason the next pass retries, not a settlement.
-    pub fn seen(&self, id: &str) -> bool {
-        self.lock().seen.contains(id)
     }
 
     /// The failed passes recorded for an id: how many, when the last was, and
@@ -214,17 +206,34 @@ mod tests {
         (Store::new_for_test(dir.to_str().unwrap()), dir)
     }
 
+    /// A capability token from the production alphabet, not a string that only
+    /// looks like one, so the index's shape check is exercised.
+    const TOKEN: &str = "0123456789abcdefghjkmnpqrs";
+
     fn line(id: &str, kind: &str, outcome: &str, note: Option<&str>) -> JournalLine {
+        line_for(
+            id,
+            kind,
+            outcome,
+            note,
+            ApplicationRef::application("member", TOKEN),
+        )
+    }
+
+    fn line_for(
+        id: &str,
+        kind: &str,
+        outcome: &str,
+        note: Option<&str>,
+        application: ApplicationRef,
+    ) -> JournalLine {
         JournalLine {
             version: 1,
             at: "2026-11-04T00:00:00Z".to_string(),
             intent: id.to_string(),
             kind: kind.to_string(),
             release: "test".to_string(),
-            application: ApplicationRef {
-                username: "member".to_string(),
-                status_token: "TOKEN".to_string(),
-            },
+            application,
             outcome: outcome.to_string(),
             note: note.map(str::to_string),
             credit: None,
@@ -251,8 +260,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(journal.has("01H", "applied"));
-            assert!(journal.seen("01H"), "an applied line settles the id");
-            assert!(journal.application_seen("TOKEN", "credit", "applied"));
+            assert!(journal.application_seen(TOKEN, "credit", "applied"));
             journal
                 .append(
                     &store,
@@ -270,7 +278,7 @@ mod tests {
             assert!(last.is_some());
             assert_eq!(message.as_deref(), Some("the ledger would not write"));
             assert!(
-                !journal.application_seen("TOKEN", "credit", "applied"),
+                !journal.application_seen(TOKEN, "credit", "applied"),
                 "a failure after the mark unseats it, as the scan did"
             );
         });
@@ -283,7 +291,7 @@ mod tests {
 
     /// A failed line is the reason the next pass retries, not a settlement.
     #[test]
-    fn a_failed_line_does_not_count_as_seen() {
+    fn a_failed_line_is_not_a_settlement() {
         let (store, dir) = store("failed");
         runtime().block_on(async {
             let journal = Journal::load(&store).await.unwrap();
@@ -291,8 +299,8 @@ mod tests {
                 .append(&store, &line("01H", "credit", "failed", Some("boom")))
                 .await
                 .unwrap();
-            assert!(!journal.seen("01H"));
             assert!(!journal.has("01H", "applied"));
+            assert_eq!(journal.failures("01H").0, 1);
         });
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -309,6 +317,86 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains("journal.jsonl"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An old journal wrote `status_token` as a plain string, sometimes a group
+    /// domain there. Every such line still loads and dedups by intent id, and
+    /// only a real token reaches the marks index.
+    #[test]
+    fn an_old_string_status_token_still_loads_and_only_tokens_are_indexed() {
+        let (store, dir) = store("old-shape");
+        let text = format!(
+            "{{\"version\":1,\"at\":\"2026-11-04T00:00:00Z\",\"intent\":\"01H\",\"kind\":\"application\",\"release\":\"old\",\"application\":{{\"username\":\"warden\",\"status_token\":\"{TOKEN}\"}},\"outcome\":\"review-sent\"}}\n\
+             {{\"version\":1,\"at\":\"2026-11-04T00:00:01Z\",\"intent\":\"01J\",\"kind\":\"provision-group\",\"release\":\"old\",\"application\":{{\"username\":\"warden\",\"status_token\":\"parish.example\"}},\"outcome\":\"applied\"}}\n\
+             {{\"version\":1,\"at\":\"2026-11-04T00:00:02Z\",\"intent\":\"01K\",\"kind\":\"set-password\",\"release\":\"old\",\"application\":{{\"username\":\"secretary\",\"status_token\":\"\"}},\"outcome\":\"refused\"}}\n"
+        );
+        std::fs::write(dir.join("journal.jsonl"), text).unwrap();
+        let journal = runtime().block_on(Journal::load(&store)).unwrap();
+        assert!(
+            journal.has("01H", "review-sent"),
+            "an old string token still dedups"
+        );
+        assert!(journal.application_seen(TOKEN, "application", "review-sent"));
+        assert!(
+            journal.has("01J", "applied"),
+            "a group line that put its domain in the token field still loads"
+        );
+        assert!(
+            !journal.application_seen("parish.example", "provision-group", "applied"),
+            "a domain is not a capability token and is not indexed as one"
+        );
+        assert!(journal.has("01K", "refused"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A group subject and a page subject write their own fields: no domain and
+    /// no blank is ever stored as the token.
+    #[test]
+    fn a_group_and_a_page_subject_store_no_token_field() {
+        let (store, dir) = store("truthful");
+        runtime().block_on(async {
+            let journal = Journal::load(&store).await.unwrap();
+            journal
+                .append(
+                    &store,
+                    &line_for(
+                        "01H",
+                        "provision-group",
+                        "applied",
+                        None,
+                        ApplicationRef::group("warden", "parish.example"),
+                    ),
+                )
+                .await
+                .unwrap();
+            journal
+                .append(
+                    &store,
+                    &line_for(
+                        "01J",
+                        "set-password",
+                        "applied",
+                        None,
+                        ApplicationRef::account("secretary"),
+                    ),
+                )
+                .await
+                .unwrap();
+        });
+        let text = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
+        assert!(
+            !text.contains("status_token"),
+            "a non-token subject wrote a token field: {text}"
+        );
+        assert!(
+            text.contains("\"domain\":\"parish.example\""),
+            "the group's subject lost its domain: {text}"
+        );
+        assert!(
+            text.contains("\"username\":\"secretary\""),
+            "the page's subject lost its account: {text}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

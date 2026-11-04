@@ -855,10 +855,65 @@ pub struct Intent {
     pub question_list: String,
 }
 
+/// The subject a journal line names: the account, and the capability token or
+/// group domain the intent carried, where it carried one. A page action names
+/// neither, which is why both are optional: an absent field says so, where an
+/// empty string or a domain in the token field used to lie about what it was.
+///
+/// Existing journal files wrote `status_token` as a string, sometimes a group
+/// domain, so that shape is still read; only real tokens reach the index.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ApplicationRef {
     pub username: String,
-    pub status_token: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_string"
+    )]
+    pub status_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+
+/// An old journal line wrote `status_token` as a plain string, an empty string
+/// included; both read as the option they always meant.
+fn optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.filter(|s| !s.is_empty()))
+}
+
+impl ApplicationRef {
+    /// The subject of an account with no capability token or domain.
+    pub fn account(username: impl Into<String>) -> Self {
+        ApplicationRef {
+            username: username.into(),
+            ..Default::default()
+        }
+    }
+
+    /// The subject of an application, named by its token. An absent token is
+    /// absent, never an empty string: the journal must not say a field is there
+    /// when it holds nothing.
+    pub fn application(username: impl Into<String>, token: impl Into<String>) -> Self {
+        let token = token.into();
+        ApplicationRef {
+            username: username.into(),
+            status_token: (!token.is_empty()).then_some(token),
+            domain: None,
+        }
+    }
+
+    /// The subject of a group, named by its domain.
+    pub fn group(username: impl Into<String>, domain: impl Into<String>) -> Self {
+        let domain = domain.into();
+        ApplicationRef {
+            username: username.into(),
+            status_token: None,
+            domain: (!domain.is_empty()).then_some(domain),
+        }
+    }
 }
 
 impl Record {
@@ -870,10 +925,10 @@ impl Record {
             kind: "application".to_string(),
             filed_at: self.filed_at.clone(),
             front_end: self.front_end.clone(),
-            application: ApplicationRef {
-                username: self.username.clone(),
-                status_token: self.status_token.clone(),
-            },
+            application: ApplicationRef::application(
+                self.username.clone(),
+                self.status_token.clone(),
+            ),
             domain: self.domain.clone(),
             outside_address: self.outside_address.clone(),
             answers: self.answers.clone(),
@@ -1616,6 +1671,44 @@ mod tests {
         // Crockford leaves out I, L, O and U, so no token can carry one.
         assert!(!t.contains(['i', 'l', 'o', 'u']));
         assert_ne!(t, status_token().await.unwrap());
+    }
+
+    /// A subject writes only the fields it has, and an old line's plain string
+    /// token (a group domain included, an empty string included) still reads.
+    #[test]
+    fn a_subject_writes_only_the_fields_it_has() {
+        let line = JournalLine {
+            version: 1,
+            at: "2026-11-04T00:00:00Z".to_string(),
+            intent: "01H".to_string(),
+            kind: "set-password".to_string(),
+            release: "test".to_string(),
+            application: ApplicationRef::application("secretary", ""),
+            outcome: "refused".to_string(),
+            note: None,
+            credit: None,
+        };
+        let text = serde_json::to_string(&line).unwrap();
+        assert!(!text.contains("status_token"), "{text}");
+
+        let old: JournalLine = serde_json::from_str(
+            r#"{"version":1,"at":"2026-11-04T00:00:00Z","intent":"01H","kind":"provision-group","release":"old","application":{"username":"warden","status_token":"parish.example"},"outcome":"applied"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            old.application.status_token.as_deref(),
+            Some("parish.example"),
+            "an old line's string token no longer reads"
+        );
+
+        let blank: JournalLine = serde_json::from_str(
+            r#"{"version":1,"at":"2026-11-04T00:00:00Z","intent":"01H","kind":"set-password","release":"old","application":{"username":"secretary","status_token":""},"outcome":"refused"}"#,
+        )
+        .unwrap();
+        assert!(
+            blank.application.status_token.is_none(),
+            "an old blank token reads as absent, not as a value"
+        );
     }
 
     #[test]

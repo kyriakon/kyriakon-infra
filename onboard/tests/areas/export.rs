@@ -648,7 +648,8 @@ fn the_page_files_an_export_intent_and_the_drain_records_the_request() {
 }
 
 /// A forged or expired session is refused before root writes anything: no
-/// bundle, no request line, and the intent stays for the operator to see.
+/// bundle, no request line, one refused line, and the intent's file removed.
+/// The refusal is the handler's input, not a pass failure to retry.
 #[test]
 fn a_forged_or_expired_session_writes_nothing() {
     let fix = Fix::new("data-export-session");
@@ -672,20 +673,28 @@ fn a_forged_or_expired_session_writes_nothing() {
         .unwrap();
     assert!(fix.drain().status.success());
     assert!(!export_root(&fix, "secretary").exists());
-    assert!(fix
-        .dir
-        .join("store/intents")
-        .join(format!("{id}.json"))
-        .exists());
     assert!(
-        fix.failed_note().contains("belongs to") && fix.failed_note().contains("alice"),
+        !fix.dir
+            .join("store/intents")
+            .join(format!("{id}.json"))
+            .exists(),
+        "a refused export keeps its file"
+    );
+    assert!(
+        fix.journal().contains("\"outcome\":\"refused\"")
+            && fix.journal().contains("belongs to")
+            && fix.journal().contains("alice"),
         "{}",
-        fix.failed_note()
+        fix.journal()
+    );
+    assert!(
+        !fix.journal().contains("\"outcome\":\"failed\""),
+        "a refused export is a pass failure: {}",
+        fix.journal()
     );
     assert!(fix.read("accounts/secretary/requests.jsonl").is_empty());
 
     // The right account, on a session that has run out.
-    std::fs::remove_file(fix.dir.join("store/intents").join(format!("{id}.json"))).unwrap();
     let expired = session_id(&fix, "secretary");
     expire_session(&fix, &expired);
     let id = runtime()
@@ -702,15 +711,22 @@ fn a_forged_or_expired_session_writes_nothing() {
         .unwrap();
     assert!(fix.drain().status.success());
     assert!(!export_root(&fix, "secretary").exists());
-    assert!(fix
-        .dir
-        .join("store/intents")
-        .join(format!("{id}.json"))
-        .exists());
     assert!(
-        fix.failed_note().contains("expired"),
+        !fix.dir
+            .join("store/intents")
+            .join(format!("{id}.json"))
+            .exists(),
+        "a refused export keeps its file"
+    );
+    assert!(
+        fix.journal().contains("\"outcome\":\"refused\"") && fix.journal().contains("expired"),
         "{}",
-        fix.failed_note()
+        fix.journal()
+    );
+    assert!(
+        !fix.journal().contains("\"outcome\":\"failed\""),
+        "a refused export is a pass failure: {}",
+        fix.journal()
     );
     assert!(fix.read("accounts/secretary/requests.jsonl").is_empty());
 }

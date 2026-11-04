@@ -3048,10 +3048,7 @@ async fn decide_file(app: &App, call: &Call<'_>) -> Reply {
     let sig = form.get("sig").cloned().unwrap_or_default();
     match intents::Intent::Decision(transitions::DecisionIntent {
         kind: decision.kind.to_string(),
-        application: store::ApplicationRef {
-            username: record.username.clone(),
-            status_token: token.to_string(),
-        },
+        application: store::ApplicationRef::application(record.username.clone(), token.to_string()),
         action: decision.action.to_string(),
         sig,
         ..Default::default()
@@ -3175,10 +3172,7 @@ async fn password_file(app: &App, call: &Call<'_>) -> Reply {
         });
     }
     match intents::Intent::Password(transitions::PasswordIntent {
-        application: store::ApplicationRef {
-            username: record.username.clone(),
-            status_token: token.to_string(),
-        },
+        application: store::ApplicationRef::application(record.username.clone(), token.to_string()),
         until: until.clone(),
         sig: sig.clone(),
         password: password.to_string(),
