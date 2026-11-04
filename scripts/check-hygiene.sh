@@ -103,21 +103,6 @@ domains_missing_from() {
 	done < "$list"
 }
 
-# mail_domains_first_problem <mail-domains-file> <platform-domain>
-#
-# Why the first line of mail_domains is not the platform's own domain, one line,
-# or nothing. provision-member.sh reads that line as the domain a new member is
-# addressed on, and deploy-mail.sh refuses a table whose first line is anything
-# else; a restore or a hand edit that reorders the file is silent otherwise, and
-# the new member's mail goes to a body they are not in.
-mail_domains_first_problem() {
-	typeset first
-	first=$(awk 'NR == 1 { print; exit }' "$1")
-	[ "$first" = "$2" ] && return 0
-	printf 'the first line is "%s", not %s; provision-member.sh reads it as the domain a new member is addressed on. Put %s first.\n' \
-		"$first" "$2" "$2"
-}
-
 # tool_remedy <tool>... — one line of remedy per tool cron could not find.
 #
 # Takes the absent list rather than reading a loop variable: a caller's `tool`
@@ -739,30 +724,40 @@ fi
 mail_domains_table=/etc/mail/mail_domains
 platform_domain=kyriakon.net
 spamd_allowed=/etc/mail/spamd.alloweddomains
+mail_domains_ok=yes
 if [ ! -f "$mail_domains_table" ]; then
 	printf 'mail domains: %s is missing; scripts/deploy-mail.sh seeds it with the platform domain\n' \
 		"$mail_domains_table"
 	status=1
-elif [ ! -f "$spamd_allowed" ]; then
-	printf 'mail domains: %s is missing; it is installed from openbsd/etc/spamd.alloweddomains\n' \
-		"$spamd_allowed"
-	status=1
+	mail_domains_ok=no
 else
+	# Independent of the allow list: a missing spamd file must not hide a table
+	# whose first line would address a new member on a body's domain.
 	first_problem=$(mail_domains_first_problem "$mail_domains_table" "$platform_domain")
 	if [ -n "$first_problem" ]; then
 		printf 'mail domains: %s: %s\n' "$mail_domains_table" "$first_problem"
 		status=1
+		mail_domains_ok=no
 	fi
-	unwelcome=$(domains_missing_from "$mail_domains_table" "$spamd_allowed")
-	if [ -n "$unwelcome" ]; then
-		printf 'mail domains: %s names these and %s has no line for them, so spamd traps them and blocklists the sender:\n' \
-			"$mail_domains_table" "$spamd_allowed"
-		printf '%s\n' "$unwelcome" | sed -e 's/^/  /'
-		printf '  the line it wants is @<domain>; add it and reload spamd\n'
+	if [ ! -f "$spamd_allowed" ]; then
+		printf 'mail domains: %s is missing; it is installed from openbsd/etc/spamd.alloweddomains\n' \
+			"$spamd_allowed"
 		status=1
+		mail_domains_ok=no
 	else
-		printf 'mail domains: every domain smtpd accepts is in the greylist pass-through list\n'
+		unwelcome=$(domains_missing_from "$mail_domains_table" "$spamd_allowed")
+		if [ -n "$unwelcome" ]; then
+			printf 'mail domains: %s names these and %s has no line for them, so spamd traps them and blocklists the sender:\n' \
+				"$mail_domains_table" "$spamd_allowed"
+			printf '%s\n' "$unwelcome" | sed -e 's/^/  /'
+			printf '  the line it wants is @<domain>; add it and reload spamd\n'
+			status=1
+			mail_domains_ok=no
+		fi
 	fi
+fi
+if [ "$mail_domains_ok" = yes ]; then
+	printf 'mail domains: every domain smtpd accepts is in the greylist pass-through list\n'
 fi
 
 # --- 8. the address every alert is mailed to ------------------------------

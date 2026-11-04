@@ -126,7 +126,7 @@ ensure_mail_address() {
 			"$mail_domains_table" "$user" >&2
 		return 0
 	fi
-	domain=$(sed -n '1p' "$mail_domains_table")
+	domain=$(mail_domains_first "$mail_domains_table")
 	key="$user@$domain"
 	if awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals"; then
 		# An address aimed somewhere else on purpose is left where it is: this
@@ -136,7 +136,7 @@ ensure_mail_address() {
 			printf 'note: %s maps to %s, so mail for this member goes there\n' "$key" "$current" >&2
 		fi
 	else
-		table_set "$virtuals" "$(mktemp "$virtuals.XXXXXX")" "$key" "$key: $user"
+		table_set "$virtuals" "$key" "$key: $user"
 		awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals" \
 			|| { printf 'could not add %s to %s\n' "$key" "$virtuals" >&2; exit 1; }
 		printf 'virtual %s added\n' "$key"

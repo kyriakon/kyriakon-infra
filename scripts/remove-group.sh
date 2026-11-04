@@ -110,29 +110,39 @@ remove_path() {
 	printf 'removed the %s %s\n' "$description" "$path"
 }
 
+# drop_table <table> <exact|prefix|suffix> <text> <message>
+#
+# One table_drop call and its report, with 2 (failure) kept apart from 1 (no
+# match): a failed write must stop the removal, not read as nothing to do.
+# Sets tables_changed when the table changed, and returns 1 on a failed write.
+drop_table() {
+	typeset table="$1" mode="$2" text="$3" message="$4" rc=0
+	table_drop "$table" "$mode" "$text" || rc=$?
+	case $rc in
+	0)
+		printf '%s\n' "$message"
+		tables_changed=yes
+		;;
+	1) ;;
+	*) return 1 ;;
+	esac
+	return 0
+}
+
 # remove_group: the whole job, in the order the transition's notes give.
 remove_group() {
 	tables_changed=no
 
 	# 1. The mail tables. mail_domains and dkim_domains carry the domain as a
 	# whole line; virtuals carries one line per address on it, both mailboxes and
-	# aliases. The address key ends at the colon, so the virtuals pattern is
-	# anchored on the suffix and an address on another domain that merely contains
-	# this one is left alone. A dot in the domain is written as [.] because the
-	# pattern is an extended regular expression.
-	domain_re=$(printf '%s' "$domain" | sed 's/[.]/[.]/g')
-	if table_drop "$mail_domains" "^${domain_re}\$"; then
-		printf 'removed %s from %s\n' "$domain" "$mail_domains"
-		tables_changed=yes
-	fi
-	if table_drop "$dkim_domains" "^${domain_re}\$"; then
-		printf 'removed %s from %s\n' "$domain" "$dkim_domains"
-		tables_changed=yes
-	fi
-	if table_drop "$virtuals" "@${domain_re}\$"; then
-		printf 'removed the %s entries from %s\n' "$domain" "$virtuals"
-		tables_changed=yes
-	fi
+	# aliases. Every match is literal, so a domain called parish-example.net is
+	# not the same line as parish.example.
+	drop_table "$mail_domains" exact "$domain" \
+		"removed $domain from $mail_domains" || return 1
+	drop_table "$dkim_domains" exact "$domain" \
+		"removed $domain from $dkim_domains" || return 1
+	drop_table "$virtuals" suffix "@$domain" \
+		"removed the $domain entries from $virtuals" || return 1
 
 	# 2. The generated daemon blocks and the certificate material. The order
 	# inside this step does not matter: cron-apply.sh --web runs after this
@@ -186,10 +196,14 @@ self_test() {
 
 	domain=parish.example
 	other=other.example
+	# parish-example.net is the lookalike that a pattern match on the domain
+	# would take with parish.example; every match below is literal.
+	lookalike=parish-example.net
 	{
 		printf 'kyriakon.net\n'
 		printf '%s\n' "$domain"
 		printf '%s\n' "$other"
+		printf '%s\n' "$lookalike"
 	} >"$mail_domains"
 	cp "$mail_domains" "$dkim_domains"
 	{
@@ -197,6 +211,7 @@ self_test() {
 		printf 'office@%s: parish-secretary\n' "$domain"
 		printf 'alice@kyriakon.net: alice\n'
 		printf 'secretary@%s: somebody\n' "$other"
+		printf 'secretary@%s: somebody\n' "$lookalike"
 	} >"$virtuals"
 	for d in "$domain" "$other"; do
 		: >"$httpd_d/$d.conf"
@@ -218,13 +233,18 @@ self_test() {
 		"$(grep -cxF "$domain" "$mail_domains" || true)" 0
 	check "and kept the platform and the other body" \
 		"$(grep -cE '^(kyriakon\.net|other\.example)$' "$mail_domains")" 2
+	check "and kept the domain that merely looks like it" \
+		"$(grep -cxF "$lookalike" "$mail_domains")" 1
 	check "the DKIM list lost the domain" \
 		"$(grep -cxF "$domain" "$dkim_domains" || true)" 0
 	check "and kept the other body" "$(grep -cxF "$other" "$dkim_domains")" 1
+	check "and the lookalike" "$(grep -cxF "$lookalike" "$dkim_domains")" 1
 	check "the virtual table lost every address on the domain" \
-		"$(grep -c "@$domain" "$virtuals" || true)" 0
+		"$(grep -cF "@$domain" "$virtuals" || true)" 0
 	check "and kept the platform's and the other body's" \
 		"$(grep -cE '^(alice@kyriakon\.net|secretary@other\.example)' "$virtuals")" 2
+	check "and the lookalike's address" \
+		"$(grep -c "^secretary@$lookalike:" "$virtuals")" 1
 	check "the vhost went" "$([ -e "$httpd_d/$domain.conf" ] && echo present || echo gone)" gone
 	check "the capsule block went" "$([ -e "$gmid_d/$domain.conf" ] && echo present || echo gone)" gone
 	check "the ACME block went" "$([ -e "$acme_d/$domain.conf" ] && echo present || echo gone)" gone

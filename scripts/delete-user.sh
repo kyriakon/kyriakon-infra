@@ -247,7 +247,14 @@ remove_member() {
 				printf 'would remove the address lines for %s@\n' "$user"
 			fi
 		else
-			if remove_own_addresses; then
+			drop_rc=0
+			remove_own_addresses || drop_rc=$?
+			if [ "$drop_rc" -gt 1 ]; then
+				printf 'the address lines for %s@ were not removed from %s; fix the table, then rerun\n' \
+					"$user" "$virtuals" >&2
+				return 1
+			fi
+			if [ "$drop_rc" -eq 0 ]; then
 				printf 'removed the address lines for %s@ from %s\n' "$user" "$virtuals"
 				restart_smtpd
 				printf 'restarted smtpd, which reads the table at start\n'
@@ -299,11 +306,12 @@ remove_member() {
 }
 
 # remove_own_addresses: drop this member's own lines from the virtual table.
-# Returns 0 when the file changed and 1 when it did not, which is what decides
-# whether smtpd needs restarting. lib.sh's table_drop keeps a copy of the table it
-# replaces, so a deletion can be undone.
+# Returns 0 when the file changed, 1 when it did not, and 2 when the write
+# failed; the caller must keep 2 apart from 1. The key is a literal prefix, so a
+# member named a.b does not take axb@ with them. lib.sh's table_drop keeps a copy
+# of the table it replaces, so a deletion can be undone.
 remove_own_addresses() {
-	table_drop "$virtuals" "^${user}@"
+	table_drop "$virtuals" prefix "$user@"
 }
 
 # --- the self-test ----------------------------------------------------------

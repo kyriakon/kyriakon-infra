@@ -1,9 +1,11 @@
 #!/bin/ksh
 # lib.sh: shared helpers for the scripts that run on the box (backup.sh,
 # restore-test.sh, rehearsal.sh, abuse-monitor.sh, check-hygiene.sh,
-# check-keyring-drift.sh, renew-acme.sh, restore-standup.sh, acme-queue.sh).
-# Source it
-# from the script's own directory:
+# check-keyring-drift.sh, renew-acme.sh, restore-standup.sh, acme-queue.sh,
+# deploy-mail.sh, add-user.sh, provision-member.sh, delete-user.sh,
+# remove-group.sh, publish-mail-key.sh, remove-upload-key.sh, the
+# provision-member-* and provision-group-* lane scripts, and
+# kyriakon-authcheck.sh). Source it from the script's own directory:
 #
 #   . "$(dirname "$0")/lib.sh"
 #
@@ -293,8 +295,33 @@ key_problems() {
 # The mail scripts' tables (/etc/mail/virtuals, mail_domains, mail_from,
 # dkim_domains) are read whole by smtpd or by a filter, so a write that leaves
 # half a line behind takes addresses offline until someone notices. These two
-# helpers are the one write shape: a candidate file beside the table, then a
-# rename, so a reader sees the old table or the whole new one.
+# helpers are the one write shape, and each takes the same lock for its whole
+# read-modify-write: a signup and an operator deploy can overlap, and a rewrite
+# that read before the other's append would move the old table back over it.
+
+# table_lock <table> / table_unlock <table>
+#
+# mkdir(2) is the lock: it fails when the directory exists, and nothing else
+# needs a base tool. A writer waits briefly, then names the lock it found stale
+# rather than hanging a cron pass on a lock nobody will release.
+table_lock() {
+	typeset table="$1" tries=0
+	while ! mkdir "$table.lock" 2>/dev/null; do
+		tries=$((tries + 1))
+		if [ "$tries" -ge 20 ]; then
+			printf 'could not lock %s: %s exists and did not clear; remove it if no writer is running\n' \
+				"$table" "$table.lock" >&2
+			return 2
+		fi
+		sleep 0.05
+	done
+	return 0
+}
+
+table_unlock() {
+	typeset table="$1"
+	rmdir "$table.lock" 2>/dev/null || true
+}
 
 # valid_localpart <name> — the username and mailbox charset: lowercase letters,
 # digits, dot, underscore and hyphen, starting with a letter or a digit, at most
@@ -304,52 +331,162 @@ valid_localpart() {
 	printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'
 }
 
-# table_set <table> <candidate> <name> <entry>
-#
-# Replace the line whose leading key is <name> with <entry>, or append it when
-# there is none. <candidate> must be in <table>'s directory so the rename cannot
-# cross a filesystem; mktemp "$table.XXXXXX" is the shape callers use. A table
-# whose last line lacks a newline gets one before the append: without it the two
-# entries join into one line that matches neither key. The mode is set on the
-# candidate because a rename brings its own, and mktemp's is 0600.
-table_set() {
-	typeset table="$1" candidate="$2" name="$3" entry="$4"
-	if grep -q "^${name}:" "$table"; then
-		sed "s|^${name}:.*|${entry}|" "$table" > "$candidate"
-	else
-		cat "$table" > "$candidate"
-		if [ -n "$(tail -c 1 "$candidate")" ]; then
-			printf '\n' >> "$candidate"
-		fi
-		printf '%s\n' "$entry" >> "$candidate"
-	fi
-	chmod 0644 "$candidate"
-	mv "$candidate" "$table"
+# mail_domains_first <file>: the first line of mail_domains, the platform's own
+# domain. One read, because deploy-mail.sh, check-hygiene.sh and
+# provision-member.sh all depend on that line being the same one.
+mail_domains_first() {
+	awk 'NR == 1 { print; exit }' "$1"
 }
 
-# table_drop <table> <pattern> — drop every line whose key (the text before the
-# first colon, trimmed) matches the extended regular expression <pattern>. A
-# table of bare domains, such as mail_domains, has the whole line as its key.
-# Returns 0 when the table changed and 1 when it did not, which is what tells a
-# caller whether smtpd needs a restart. A changed table is copied to
-# <table>.<timestamp>.bak first: deleting a line is the one write here that no
-# later deploy regenerates.
+# mail_domains_first_problem <file> <platform-domain>: why the first line is not
+# the platform domain, one line, or nothing when it is. A restore or a hand edit
+# that reorders the table is otherwise silent, and provision-member.sh addresses
+# a new member on whatever line it finds first.
+mail_domains_first_problem() {
+	typeset first
+	first=$(mail_domains_first "$1")
+	[ "$first" = "$2" ] && return 0
+	printf 'the first line is "%s", not %s; provision-member.sh reads it as the domain a new member is addressed on. Put %s first.\n' \
+		"$first" "$2" "$2"
+}
+
+# table_set <table> <name> <entry>
+#
+# Replace the line whose key (the text before the first colon) is exactly <name>
+# with <entry>, or append it when there is none. The key is compared literally,
+# not as a pattern: a localpart may contain a dot, and a pattern match would let
+# a.b touch axb. On return table_set_how is "set" or "added". Returns 0 on
+# success and 2 on failure, after naming the failure on stderr.
+#
+# The append is a write to the live table under the lock rather than a rewrite.
+# A missing final newline is added first, which is the interrupted-append state
+# this helper exists to survive. The replace path still goes through a candidate
+# beside the table and a rename, so a reader never sees half a line.
+table_set_how=''
+table_set() {
+	typeset table="$1" name="$2" entry="$3" candidate last
+	table_set_how=''
+	table_lock "$table" || return 2
+	if awk -F: -v k="$name" '$1 == k { found = 1 } END { exit !found }' "$table"; then
+		candidate=$(mktemp "$table.XXXXXX") || {
+			printf 'could not create a candidate beside %s\n' "$table" >&2
+			table_unlock "$table"
+			return 2
+		}
+		if ! awk -F: -v k="$name" -v e="$entry" '{
+			if ($1 == k) { print e; next }
+			print
+		}' "$table" > "$candidate"; then
+			printf 'could not rewrite %s\n' "$table" >&2
+			rm -f "$candidate"
+			table_unlock "$table"
+			return 2
+		fi
+		if ! chmod 0644 "$candidate" || ! mv "$candidate" "$table"; then
+			printf 'could not replace %s\n' "$table" >&2
+			rm -f "$candidate"
+			table_unlock "$table"
+			return 2
+		fi
+		table_set_how='set'
+	else
+		if [ -s "$table" ]; then
+			if ! last=$(tail -c 1 "$table"); then
+				printf 'could not read the end of %s\n' "$table" >&2
+				table_unlock "$table"
+				return 2
+			fi
+			if [ -n "$last" ] && ! printf '\n' >> "$table"; then
+				printf 'could not finish the last line of %s\n' "$table" >&2
+				table_unlock "$table"
+				return 2
+			fi
+		fi
+		if ! printf '%s\n' "$entry" >> "$table" || ! chmod 0644 "$table"; then
+			printf 'could not append to %s\n' "$table" >&2
+			table_unlock "$table"
+			return 2
+		fi
+		table_set_how='added'
+	fi
+	table_unlock "$table"
+	return 0
+}
+
+# table_drop <table> <exact|prefix|suffix> <text>
+#
+# Drop every line whose key matches <text> literally: equal to it, starting with
+# it, or ending with it. Literal on purpose: the caller's value is a localpart
+# or a domain, and an ERE would let a.b drop axb and let parish-example match
+# parish.example. A table of bare domains, such as mail_domains, has the whole
+# line as its key.
+#
+# Returns 0 when the table changed, 1 when it did not, and 2 on failure after
+# naming it on stderr. Callers must not read 2 as "nothing to do". A changed
+# table is copied to <table>.<timestamp>.bak, mode 0600, one per table: the
+# previous backup is removed first so the directory does not accumulate copies
+# that ride every restic snapshot.
 table_drop() {
-	typeset table="$1" pattern="$2" candidate
-	[ -f "$table" ] || return 1
-	candidate=$(mktemp "$table.XXXXXX") || return 1
-	awk -F: -v re="$pattern" '{
+	typeset table="$1" how="$2" text="$3" candidate backup old
+	if [ ! -f "$table" ]; then
+		printf 'no table at %s\n' "$table" >&2
+		return 2
+	fi
+	table_lock "$table" || return 2
+	candidate=$(mktemp "$table.XXXXXX") || {
+		printf 'could not create a candidate beside %s\n' "$table" >&2
+		table_unlock "$table"
+		return 2
+	}
+	if ! awk -F: -v how="$how" -v text="$text" '{
 		key = $1
 		gsub(/^[ \t]+|[ \t]+$/, "", key)
-		if (key !~ re) print
-	}' "$table" > "$candidate"
+		drop = 0
+		if (how == "exact") {
+			drop = (key == text)
+		} else if (how == "prefix") {
+			drop = (length(key) >= length(text) &&
+				substr(key, 1, length(text)) == text)
+		} else if (how == "suffix") {
+			drop = (length(key) >= length(text) &&
+				substr(key, length(key) - length(text) + 1) == text)
+		}
+		if (!drop) print
+	}' "$table" > "$candidate"; then
+		printf 'could not rewrite %s\n' "$table" >&2
+		rm -f "$candidate"
+		table_unlock "$table"
+		return 2
+	fi
 	if cmp -s "$table" "$candidate"; then
 		rm -f "$candidate"
+		table_unlock "$table"
 		return 1
 	fi
-	cp -p "$table" "$table.$(date +%Y%m%d%H%M%S).bak"
-	chmod 0644 "$candidate"
-	mv "$candidate" "$table"
+	for old in "$table".*.bak; do
+		[ -f "$old" ] || continue
+		if ! rm -f "$old"; then
+			printf 'could not remove the old backup %s\n' "$old" >&2
+			rm -f "$candidate"
+			table_unlock "$table"
+			return 2
+		fi
+	done
+	backup="$table.$(date +%Y%m%d%H%M%S).bak"
+	if ! cp -p "$table" "$backup" || ! chmod 0600 "$backup"; then
+		printf 'could not keep a copy of %s at %s\n' "$table" "$backup" >&2
+		rm -f "$candidate"
+		table_unlock "$table"
+		return 2
+	fi
+	if ! chmod 0644 "$candidate" || ! mv "$candidate" "$table"; then
+		printf 'could not replace %s\n' "$table" >&2
+		rm -f "$candidate"
+		table_unlock "$table"
+		return 2
+	fi
+	printf 'kept %s\n' "$backup" >&2
+	table_unlock "$table"
 	return 0
 }
 
@@ -408,14 +545,16 @@ self_test() {
 		"$(valid_localpart Alice && printf yes || printf no)" no
 	check "a leading dot is refused" \
 		"$(valid_localpart .alice && printf yes || printf no)" no
+	check "a dotted localpart is accepted" \
+		"$(valid_localpart a.b && printf yes || printf no)" yes
 	check "a name of 33 characters is refused" \
 		"$(valid_localpart aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa && printf yes || printf no)" no
 
 	# The fixture that motivated the helper: the last line has no newline, so a
 	# plain append joins the new entry to it and both keys stop matching.
 	printf 'hello: oliver\nsecretary@parish.example: parish' > "$tree/virtuals"
-	table_set "$tree/virtuals" "$(mktemp "$tree/virtuals.XXXXXX")" \
-		alice "alice@kyriakon.net: alice"
+	table_set "$tree/virtuals" alice "alice@kyriakon.net: alice"
+	check "table_set reports an append" "$table_set_how" added
 	check "an append leaves a last line without a newline whole" \
 		"$(grep -c '^secretary@parish.example: parish$' "$tree/virtuals")" 1
 	check "and writes the new entry on its own line" \
@@ -424,18 +563,74 @@ self_test() {
 		"$(wc -l < "$tree/virtuals" | tr -d ' ')" 3
 	check "at mode 0644" "$(stat -f '%Lp' "$tree/virtuals")" 644
 
-	table_set "$tree/virtuals" "$(mktemp "$tree/virtuals.XXXXXX")" hello "hello: alice"
+	table_set "$tree/virtuals" hello "hello: alice"
+	check "table_set reports a replacement" "$table_set_how" set
 	check "an existing entry is replaced" \
 		"$(grep -c '^hello: alice$' "$tree/virtuals")" 1
 	check "and not duplicated" "$(grep -c '^hello:' "$tree/virtuals")" 1
+	# The key is literal: a.b must not touch axb.
+	printf 'a.b: one\naxb: two\n' > "$tree/literal"
+	table_set "$tree/literal" a.b "a.b: changed"
+	check "a dotted key is replaced" "$(grep -c '^a.b: changed$' "$tree/literal")" 1
+	check "and the key it would match as a pattern is untouched" \
+		"$(grep -c '^axb: two$' "$tree/literal")" 1
 
-	printf 'alice@kyriakon.net: alice\nhello: oliver\n' > "$tree/drop"
-	check "table_drop says it changed a matching table" \
-		"$(table_drop "$tree/drop" '^alice@' && printf yes || printf no)" yes
-	check "and the line is gone" "$(grep -c '^alice@' "$tree/drop" || true)" 0
-	check "and the rest is intact" "$(grep -c '^hello: oliver$' "$tree/drop")" 1
-	check "table_drop says a table with no match did not change" \
-		"$(table_drop "$tree/drop" '^absent@' && printf yes || printf no)" no
+	# Drops are literal too, in all three shapes.
+	printf 'a.b@kyriakon.net: a\naxb@kyriakon.net: b\nalice@parish.example: alice\nbob@parish-example.net: bob\n' \
+		> "$tree/drop"
+	check "table_drop reports no change when nothing matches" \
+		"$(table_drop "$tree/drop" exact absent@example && printf yes || printf no)" no
+	check "table_drop reports a change" \
+		"$(table_drop "$tree/drop" prefix a.b@ && printf yes || printf no)" yes
+	check "a dotted prefix drops only its own key" \
+		"$(grep -c '^axb@kyriakon.net: b$' "$tree/drop")" 1
+	check "and the dotted key is gone" "$(grep -cF 'a.b@' "$tree/drop" || true)" 0
+	check "a suffix drop is literal" \
+		"$(table_drop "$tree/drop" suffix @parish.example && printf yes || printf no)" yes
+	check "parish.example is gone" "$(grep -cF '@parish.example' "$tree/drop" || true)" 0
+	check "and parish-example.net stays" \
+		"$(grep -c '@parish-example.net' "$tree/drop")" 1
+	check "a backup was kept" \
+		"$(find "$tree" -name 'drop.*.bak' | wc -l | tr -d ' ')" 1
+	check "at mode 0600" "$(stat -f '%Lp' "$(find "$tree" -name 'drop.*.bak' | head -1)")" 600
+	# A second change replaces that backup rather than adding another.
+	printf 'carol@parish.example: carol\n' >> "$tree/drop"
+	table_drop "$tree/drop" suffix @parish.example >/dev/null 2>&1
+	check "only one backup per table is kept" \
+		"$(find "$tree" -name 'drop.*.bak' | wc -l | tr -d ' ')" 1
+
+	# Failures are 2, not 1, and name what went wrong.
+	code=0
+	out=$(table_drop "$tree/absent" exact x 2>&1) || code=$?
+	check "a missing table is a failure, not 'unchanged'" "$code" 2
+	case "$out" in
+	*"$tree/absent"*) ;;
+	*) printf 'FAIL: a missing table names itself; got [%s]\n' "$out" >&2
+	   self_test_fails=$((self_test_fails + 1)) ;;
+	esac
+	mkdir "$tree/stale.lock"
+	code=0
+	out=$(table_set "$tree/stale" x "x: x" 2>&1) || code=$?
+	check "a stale lock is a failure" "$code" 2
+	case "$out" in
+	*"$tree/stale.lock"*) ;;
+	*) printf 'FAIL: a stale lock names the lock; got [%s]\n' "$out" >&2
+	   self_test_fails=$((self_test_fails + 1)) ;;
+	esac
+	rmdir "$tree/stale.lock"
+
+	# Twenty writers at once, the reproduction the lock exists for.
+	touch "$tree/concurrent"
+	i=0
+	while [ "$i" -lt 20 ]; do
+		table_set "$tree/concurrent" "user$i" "user$i: user$i" &
+		i=$((i + 1))
+	done
+	wait
+	check "concurrent appends all land" \
+		"$(wc -l < "$tree/concurrent" | tr -d ' ')" 20
+	check "and the lock is released" \
+		"$([ -d "$tree/concurrent.lock" ] && printf held || printf free)" free
 
 	self_test_end
 }
