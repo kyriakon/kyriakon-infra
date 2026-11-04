@@ -31,7 +31,7 @@ Built on OpenBSD via Hetzner, with Terraform describing the box.
 terraform/            hcloud provider, the live root and the restore template recipe
 openbsd/              every config the box runs, plus the restore template's files
 scripts/              deploys, the drain's scripts, certificates, backups, checks
-onboard/              the signup service: handler, drain, store, pages
+onboard/              the signup service: handler, drain, store, ledger, pages
 kyriakon-encrypt/     the CLI the save path runs to encrypt each message
 dovecot-plugin/       the Dovecot storage hook that hands mail to kyriakon-encrypt
 keys/                 published member mail keys
