@@ -555,6 +555,46 @@ async fn a_page_gmid_asks_for_comes_back_as_gemini() {
     );
 }
 
+/// A closed window is the same fact on both front ends: the handler reads the
+/// record's payment block and the web page and the capsule say the closure, the
+/// lapse's own words, and no amount. The token is a code and never a link.
+#[tokio::test]
+async fn a_lapsed_application_says_the_window_closed_on_both_front_ends() {
+    let (app, dir) = handler("status-lapsed").await;
+    let mut record = decided("approved: an account was made", None, None);
+    record.rail = "cash".into();
+    record.no_charge = false;
+    record.payment = Some(
+        serde_json::from_value(serde_json::json!({
+            "token_ref": "KYR-4F2M-9QH7-XT3B",
+            "window": {"opened_at": "2026-10-02T09:00:00Z",
+                       "closes_at": "2026-10-16T09:00:00Z",
+                       "state": "closed", "extensions": 0}
+        }))
+        .expect("a payment block the record could hold"),
+    );
+    file_application(&dir, &record);
+
+    let (code, html) = answer(&app, &httpd_get(&format!("status/{TOKEN}"), "")).await;
+    assert_eq!(code, 200);
+    let (_, gemtext) = answer(&app, &gmid_get(&format!("status/{TOKEN}"), "")).await;
+    for body in [&html, &gemtext] {
+        assert!(
+            body.contains("Lapsed: the payment window closed on 2026-10-16"),
+            "{body}"
+        );
+        assert!(body.contains(page::LAPSE_NOTE), "{body}");
+        assert!(
+            !body.contains("Amount: GBP"),
+            "a closed window quotes no amount: {body}"
+        );
+    }
+    assert!(
+        !html.contains("href=\"KYR"),
+        "the payment token is never a link: {html}"
+    );
+}
+
 #[tokio::test]
 async fn gmid_asks_for_the_capsule_and_gets_the_catalogue() {
     let (app, _dir) = handler("gmid-catalogue").await;

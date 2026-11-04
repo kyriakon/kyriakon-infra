@@ -1416,6 +1416,18 @@ impl Account {
         }
     }
 
+    /// Whether the site and the capsule are served. A member with an upload key
+    /// had both lanes written by provision-member.sh, so an unrecorded lane is
+    /// on rather than off; `None` is a member with no key at all, which the
+    /// capsule reads as not recorded and the web page reads as off.
+    pub fn serving(&self) -> (Option<bool>, Option<bool>) {
+        let written = (!self.upload_keys.is_empty()).then_some(true);
+        (
+            self.site_served.or(written),
+            self.capsule_served.or(written),
+        )
+    }
+
     /// Approved without charge: no token, no window, nothing that lapses. A
     /// group mailbox carries the flag its group was approved with, but the
     /// group holds the payment, so the mailbox is not a free account itself.

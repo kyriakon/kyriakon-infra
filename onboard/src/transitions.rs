@@ -6184,9 +6184,9 @@ pub async fn set_serving(
     // An unrecorded lane on a hosting member is serving: provision-member.sh
     // wrote it and nobody has turned it off. Comparing the effective value keeps
     // a save from removing a lane the page showed as on.
-    let has_hosting = !account.upload_keys.is_empty();
-    let http_changed = account.site_served.unwrap_or(has_hosting) != intent.http;
-    let gemini_changed = account.capsule_served.unwrap_or(has_hosting) != intent.gemini;
+    let (site, capsule) = account.serving();
+    let http_changed = site.unwrap_or(false) != intent.http;
+    let gemini_changed = capsule.unwrap_or(false) != intent.gemini;
     if http_changed {
         if intent.http {
             run_script(cfg, "provision-member-web.sh", &[&account.username]).await?;

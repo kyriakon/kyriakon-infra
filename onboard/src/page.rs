@@ -361,10 +361,8 @@ pub fn member_page(
     dns: Option<crate::dns::Recipe>,
     payment: Option<PaymentView>,
 ) -> AccountPage {
-    // A member with an upload key has both lanes written by
-    // provision-member.sh until something turns one off, so an unrecorded lane
-    // is on rather than off.
     let has_hosting = !account.upload_keys.is_empty();
+    let (site, capsule) = account.serving();
     AccountPage {
         services: services(list, Some(&account.username)),
         username: account.username.clone(),
@@ -381,8 +379,8 @@ pub fn member_page(
             })
             .collect(),
         has_hosting,
-        site_served: account.site_served.unwrap_or(has_hosting),
-        capsule_served: account.capsule_served.unwrap_or(has_hosting),
+        site_served: site.unwrap_or(false),
+        capsule_served: capsule.unwrap_or(false),
         mail_key: account.mail_key.clone(),
         rotation: account.rotation.as_ref().map(|rotation| RotationView {
             fingerprint: rotation.fingerprint.clone(),
@@ -431,8 +429,11 @@ pub fn member_page(
 }
 
 /// The space used under the allowance, in the units the quota is set in. Binary
-/// multiples, because 5 GB here is five gibibytes.
-fn space(bytes: u64) -> String {
+/// multiples, because 5 GB here is five gibibytes. The one formatter both
+/// front-ends and the group page call; an unrecorded figure is each renderer's
+/// own sentence, because the capsule and the group page name different
+/// allowances beside it.
+pub fn space(bytes: u64) -> String {
     const GIB: u64 = 1 << 30;
     const MIB: u64 = 1 << 20;
     if bytes >= GIB {
@@ -757,6 +758,63 @@ mod tests {
                 "<a href=\"https://signup.kyriakon.net/password/x?until=2026-10-29&#38;sig=abc\">Set your mail password</a>"
             ),
             "{html}"
+        );
+    }
+
+    /// The one fact, rendered by both front ends: a window that closed with
+    /// nothing recorded says so, with the lapse's own words and no amount, and
+    /// the token stays a code and never becomes a link.
+    #[test]
+    fn a_lapsed_status_page_says_the_window_closed_on_both_front_ends() {
+        use crate::store::{Payment, Window};
+        let now = OffsetDateTime::parse(
+            "2026-11-20T09:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let block = Payment {
+            token_ref: Some("KYR-4F2M-9QH7-XT3B".into()),
+            window: Some(Window {
+                opened_at: "2026-10-20T09:00:00Z".into(),
+                closes_at: "2026-11-03T09:00:00Z".into(),
+                state: "closed".into(),
+                extensions: 0,
+            }),
+            ..Payment::default()
+        };
+        let view = payment(
+            "active",
+            "cash",
+            &block,
+            "20.00",
+            "1 Example Street",
+            None,
+            now,
+        );
+        let page = StatusPage {
+            stage: "approved: an account was made".into(),
+            filed_at: "2026-10-01T09:00:00Z".into(),
+            notice: String::new(),
+            password_link: None,
+            payment: Some(view),
+        };
+        let html = page.render().expect("the page renders");
+        let gemtext = crate::capsule::status(&page);
+        for text in [&html, &gemtext] {
+            assert!(
+                text.contains("Lapsed: the payment window closed on 2026-11-03"),
+                "{text}"
+            );
+            assert!(text.contains(LAPSE_NOTE), "the lapse's own words: {text}");
+            assert!(
+                !text.contains("Amount: GBP"),
+                "a closed window quotes no amount: {text}"
+            );
+        }
+        assert!(html.contains("<code>KYR-4F2M-9QH7-XT3B</code>"), "{html}");
+        assert!(
+            !html.contains("href=\"KYR"),
+            "the payment token is never a link: {html}"
         );
     }
 

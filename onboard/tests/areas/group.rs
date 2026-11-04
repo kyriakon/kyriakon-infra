@@ -1986,6 +1986,58 @@ fn a_free_group_has_no_token_no_window_and_never_lapses() {
     );
 }
 
+/// A free group has no token, so the console's one resolver refuses a credit
+/// and a refund by any of its mailboxes' names, and neither files an intent.
+#[test]
+fn a_console_credit_or_refund_by_a_free_groups_mailbox_is_refused() {
+    let fix = Fix::new("group-free-console");
+    let record = fix.filed_body("warden");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("provision", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let out = fix.ctl(&[
+        "credit",
+        "--username",
+        "parish-secretary",
+        "--rail",
+        "cash",
+        "--amount",
+        "40.00",
+        "--received",
+        "2026-10-20",
+    ]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(
+        body(&out).contains("approved without charge"),
+        "{}",
+        body(&out)
+    );
+
+    let out = fix.ctl(&[
+        "refund",
+        "--username",
+        "parish-secretary",
+        "--amount",
+        "10.00",
+        "--rail",
+        "cash",
+        "--reason",
+        "unused",
+        "--close",
+    ]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(
+        body(&out).contains("approved without charge"),
+        "{}",
+        body(&out)
+    );
+
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+}
+
 /// A prepaid credit keyed by the group's token writes exactly one date, on the
 /// group. The ledger line is keyed by the same token and the receipt is one.
 #[test]

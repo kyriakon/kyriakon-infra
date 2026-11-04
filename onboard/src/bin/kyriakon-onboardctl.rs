@@ -307,44 +307,8 @@ async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
             )
         }
         (None, None, Some(_)) => String::new(),
-        (Some(token), None, None) => {
-            if !store::is_payment_token(token) {
-                return Err(format!("the token {token:?} is not a payment token"));
-            }
-            token.clone()
-        }
-        (None, Some(username), None) => {
-            if let Some(why) = validate::username_shape(username) {
-                return Err(format!("the username {username:?}: {why}"));
-            }
-            let account = store
-                .account(username)
-                .await?
-                .ok_or_else(|| format!("no account for {username}"))?;
-            match account.payment_state().and_then(|p| p.token_ref) {
-                Some(token) => token,
-                // A group mailbox holds no payment of its own: its name
-                // resolves to the one token the whole body is credited by, the
-                // same join the group's page and its renewal use.
-                None => match account.group.as_deref() {
-                    Some(domain) => {
-                        let group = transitions::group_record(store, domain)
-                            .await?
-                            .ok_or_else(|| format!("no group record for {domain}"))?;
-                        group.payment.token_ref.ok_or_else(|| {
-                            format!("the group {domain} has no payment token to credit")
-                        })?
-                    }
-                    None => {
-                        return Err(format!("{username} has no payment token to credit"));
-                    }
-                },
-            }
-        }
-        (Some(_), Some(_), None) => {
-            return Err("give either --token or --username, not both".to_string())
-        }
         (None, None, None) => return Err("give --token, --username or --note".to_string()),
+        _ => payment_token(store, &flags).await?,
     };
     let rail = need(&flags, "rail")?;
     if !transitions::CREDIT_RAILS.contains(&rail) {
@@ -646,15 +610,22 @@ async fn payment_token(store: &Store, flags: &BTreeMap<String, String>) -> Resul
                 Some(token) => Ok(token),
                 // A group mailbox holds no payment of its own, so its name
                 // resolves to the one token the whole body paid by, the same
-                // join `credit` uses.
+                // join `credit`, `refund` and the group's page use.
                 None => match account.group.as_deref() {
                     Some(domain) => {
                         let group = transitions::group_record(store, domain)
                             .await?
                             .ok_or_else(|| format!("no group record for {domain}"))?;
-                        group.payment.token_ref.ok_or_else(|| {
-                            format!("the group {domain} has no payment token to refund")
-                        })
+                        if group.payment.no_charge {
+                            return Err(format!(
+                                "the group {domain} was approved without charge, so there is \
+                                 no payment token"
+                            ));
+                        }
+                        group
+                            .payment
+                            .token_ref
+                            .ok_or_else(|| format!("the group {domain} has no payment token"))
                     }
                     None => Err(format!("{username} has no payment token")),
                 },
@@ -1387,6 +1358,40 @@ async fn sign_and_file(
     Ok(())
 }
 
+/// A group's payment block read as an account's: the group holds the one rail,
+/// token, window and date, so the console prints both with one printer.
+fn group_payment(payment: &store::GroupPayment) -> store::Payment {
+    store::Payment {
+        token_ref: payment.token_ref.clone(),
+        paid_until: payment.paid_until.clone(),
+        window: payment.window.clone(),
+        rail: Some(payment.rail.clone()),
+        ..store::Payment::default()
+    }
+}
+
+/// The payment block on the console: the rail, the paid-until date or the
+/// window's own state, the token, and the window's dates. `payment show` and
+/// both branches of `show` print through this, so the three cannot drift.
+fn print_payment(payment: &store::Payment, rail: &str) {
+    println!("  rail     {}", payment.rail.as_deref().unwrap_or(rail));
+    // `paid_until` is null while a window runs, so null alone says nothing
+    // about whether one exists: the window does.
+    let paid = match (&payment.paid_until, &payment.window) {
+        (Some(until), _) => until.as_str(),
+        (None, Some(_)) => "null: the window is open",
+        (None, None) => "null: no window was opened",
+    };
+    println!("  paid     {paid}");
+    println!(
+        "  token    {}",
+        payment.token_ref.as_deref().unwrap_or("none (no charge)")
+    );
+    if let Some(w) = &payment.window {
+        println!("  window   {} to {}", w.opened_at, w.closes_at);
+    }
+}
+
 /// `payment show --username <u>`: the account's rail, paid-until date and every
 /// ledger line keyed by its token. The ledger is read strictly, so a corrupt
 /// record is an error rather than a payment history that looks empty.
@@ -1420,13 +1425,7 @@ async fn payment(store: &Store, args: &[String]) -> Result<(), String> {
                         "{domain} was approved without charge, so there is no payment to show"
                     ));
                 }
-                store::Payment {
-                    token_ref: group.payment.token_ref.clone(),
-                    paid_until: group.payment.paid_until.clone(),
-                    window: group.payment.window.clone(),
-                    rail: Some(group.payment.rail.clone()),
-                    ..store::Payment::default()
-                }
+                group_payment(&group.payment)
             }
             None => {
                 return Err(format!(
@@ -1439,17 +1438,7 @@ async fn payment(store: &Store, args: &[String]) -> Result<(), String> {
         return Err(format!("{username} has no payment token"));
     };
     println!("account {username}");
-    println!(
-        "  rail     {}",
-        payment.rail.as_deref().unwrap_or(&account.rail)
-    );
-    let paid = match (&payment.paid_until, &payment.window) {
-        (Some(until), _) => until.as_str(),
-        (None, Some(_)) => "null: the window is open",
-        (None, None) => "null: no window was opened",
-    };
-    println!("  paid     {paid}");
-    println!("  token    {token}");
+    print_payment(&payment, &account.rail);
 
     println!("ledger for {token}");
     let mut any = false;
@@ -1517,21 +1506,8 @@ async fn show(store: &Store, username: &str) -> Result<(), String> {
                     println!("  payment  no group record at groups/{group}/group.json");
                     return Ok(());
                 };
-                let payment = &record.payment;
-                println!("  rail     {}", payment.rail);
-                let paid = match (&payment.paid_until, &payment.window) {
-                    (Some(until), _) => until.as_str(),
-                    (None, Some(_)) => "null: the window is open",
-                    (None, None) => "null: no window was opened",
-                };
-                println!("  paid     {paid}");
-                println!(
-                    "  token    {}",
-                    payment.token_ref.as_deref().unwrap_or("none (no charge)")
-                );
-                if let Some(w) = &payment.window {
-                    println!("  window   {} to {}", w.opened_at, w.closes_at);
-                }
+                let payment = group_payment(&record.payment);
+                print_payment(&payment, &record.payment.rail);
                 return Ok(());
             }
             // A free account has no payment block at all: no window, no token,
@@ -1541,21 +1517,7 @@ async fn show(store: &Store, username: &str) -> Result<(), String> {
                 println!("  paid     none: no charge was made, so nothing expires");
                 return Ok(());
             };
-            println!(
-                "  token    {}",
-                payment.token_ref.as_deref().unwrap_or("none")
-            );
-            // `paid_until` is null while a window runs, so null alone says
-            // nothing about whether one exists: the window does.
-            let paid = match (&payment.paid_until, &payment.window) {
-                (Some(until), _) => until.as_str(),
-                (None, Some(_)) => "null: the window is open",
-                (None, None) => "null: no window was opened",
-            };
-            println!("  paid     {paid}");
-            if let Some(w) = &payment.window {
-                println!("  window   {} to {}", w.opened_at, w.closes_at);
-            }
+            print_payment(&payment, &account.rail);
         }
         None => println!("account  none yet"),
     }

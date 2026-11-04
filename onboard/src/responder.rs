@@ -52,10 +52,10 @@ use std::sync::Arc;
 
 use askama::Template;
 use time::OffsetDateTime;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 
-use crate::fcgi::{self, Reply, Request};
+use crate::fcgi::{self, Http, Reply, Request};
 use crate::page::{DecidePage, LoginPage, NoticePage, PasswordPage, ReceivedPage, StatusPage};
 use crate::questions::{Branch, Kind, Question, Rule};
 use crate::rate::Key;
@@ -378,13 +378,10 @@ async fn titan_connection(stream: TcpStream, app: &App, peer: &str) -> Result<()
     // The route never carries the token: the token is the capability, and the
     // log line is as long-lived as the rest of the service's.
     eprintln!("kyriakon-onboard: titan /key {} {address}", reply.code());
-    let write = async {
-        writer.write_all(&reply.head()).await?;
-        writer.flush().await
-    };
+    let head = reply.head();
+    let write = say(&mut writer, &head);
     match tokio::time::timeout(TITAN_TIMEOUT, write).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(format!("cannot write the titan reply: {e}")),
+        Ok(result) => result,
         Err(_) => Err("the titan reply timed out".to_string()),
     }
 }
@@ -680,18 +677,29 @@ async fn connection(stream: UnixStream, app: &App) -> Result<(), String> {
             outcome.reply.code(),
             outcome.addr
         );
-        writer
-            .write_all(&fcgi::reply_bytes(&outcome.reply, request.id()))
-            .await
-            .map_err(|e| format!("cannot write the reply: {e}"))?;
-        writer
-            .flush()
-            .await
-            .map_err(|e| format!("cannot flush the reply: {e}"))?;
+        say(
+            &mut writer,
+            &fcgi::reply_bytes(&outcome.reply, request.id()),
+        )
+        .await?;
         if !request.keep_conn {
             return Ok(());
         }
     }
+}
+
+/// Write one reply and flush it, so the front-end reads a whole answer. The
+/// connection, the three portal answers and the Titan reply all write here, so
+/// a write that fails says the same thing everywhere.
+async fn say<W: AsyncWrite + Unpin>(writer: &mut W, bytes: &[u8]) -> Result<(), String> {
+    writer
+        .write_all(bytes)
+        .await
+        .map_err(|e| format!("cannot write the reply: {e}"))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| format!("cannot flush the reply: {e}"))
 }
 
 /// One line from the portal, capped before the buffer grows. `None` is a
@@ -738,14 +746,7 @@ async fn portal_connection(stream: UnixStream, app: &App) -> Result<(), String> 
             // what happened at the end of a long session.
             Err(e) => {
                 let reply = portal_ipc::file_answer(None, &e);
-                writer
-                    .write_all(reply.as_bytes())
-                    .await
-                    .map_err(|e| format!("cannot write the portal answer: {e}"))?;
-                return writer
-                    .flush()
-                    .await
-                    .map_err(|e| format!("cannot flush the portal answer: {e}"));
+                return say(&mut writer, reply.as_bytes()).await;
             }
         };
         let reply = portal_file(app, &address, &body).await;
@@ -754,14 +755,7 @@ async fn portal_connection(stream: UnixStream, app: &App) -> Result<(), String> 
         // because a count of filed applications reads this line.
         let code = if reply.starts_with("OK ") { 200 } else { 422 };
         eprintln!("kyriakon-onboard: portal /apply {code} {address}");
-        writer
-            .write_all(reply.as_bytes())
-            .await
-            .map_err(|e| format!("cannot write the portal answer: {e}"))?;
-        return writer
-            .flush()
-            .await
-            .map_err(|e| format!("cannot flush the portal answer: {e}"));
+        return say(&mut writer, reply.as_bytes()).await;
     }
     let Some((address, token)) = portal_ipc::parse_request(&line) else {
         return Err("the portal sent no status request".to_string());
@@ -770,14 +764,7 @@ async fn portal_connection(stream: UnixStream, app: &App) -> Result<(), String> 
     // The route carries the token and the address, which is the log line every
     // other front-end gets; the answer never does.
     eprintln!("kyriakon-onboard: portal /status/{token} 200 {address}");
-    writer
-        .write_all(answer.line().as_bytes())
-        .await
-        .map_err(|e| format!("cannot write the portal answer: {e}"))?;
-    writer
-        .flush()
-        .await
-        .map_err(|e| format!("cannot flush the portal answer: {e}"))
+    say(&mut writer, answer.line().as_bytes()).await
 }
 
 /// File one completed application the portal checked, through the same builder
@@ -2179,9 +2166,11 @@ async fn login(app: &App, request: &Request) -> Reply {
         }));
     };
     match session::open(&app.store, username, &proof, OffsetDateTime::now_utc()).await {
-        Ok(cookie) => Reply::capability(303, String::new())
-            .with_header("Location", "/account".to_string())
-            .with_header("Set-Cookie", session::cookie(&cookie)),
+        Ok(cookie) => Reply::Http(
+            Http::capability(303, String::new())
+                .with_header("Location", "/account".to_string())
+                .with_header("Set-Cookie", session::cookie(&cookie)),
+        ),
         Err(e) => server_error(&e),
     }
 }
@@ -2192,9 +2181,11 @@ async fn logout(app: &App, request: &Request) -> Reply {
     if let Some(cookie) = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE) {
         session::close(&app.store, &cookie).await;
     }
-    Reply::capability(303, String::new())
-        .with_header("Location", "/account".to_string())
-        .with_header("Set-Cookie", session::clear_cookie())
+    Reply::Http(
+        Http::capability(303, String::new())
+            .with_header("Location", "/account".to_string())
+            .with_header("Set-Cookie", session::clear_cookie()),
+    )
 }
 
 /// The live page session and the account it names. The closure route needs the
