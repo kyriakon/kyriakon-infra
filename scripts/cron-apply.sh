@@ -91,11 +91,33 @@ env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
 install_set="$script_dir/install-set.tsv"
 needed_vars="ALERT_EMAIL HEALTHCHECKS_URL KEYRING_HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL"
 
-# scheduled_scripts <table> — the rows that have a schedule, whatever their
-# destination. A row whose schedule is `-` is a helper the other scripts source,
-# which cron never runs.
+# row_dir <destination> — where the box reads that destination's scripts from at
+# run time. This is the one place the destinations are named: only the two cron
+# runs itself have a directory, because a drain row is installed by
+# scripts/deploy-onboard.sh into the directory the drain's config names.
+row_dir() {
+	case "$1" in
+	/root/bin) printf '/root/bin' ;;
+	checkout) printf '%s/scripts' "$repo_dir" ;;
+	*) return 1 ;;
+	esac
+}
+
+# scheduled_scripts <table> — the rows that have a schedule, one name per line.
+# A row whose schedule is `-` is a helper the other scripts source, which cron
+# never runs. A scheduled row whose destination has no directory is refused here,
+# once, rather than becoming a line that cannot run.
 scheduled_scripts() {
-	awk -F'\t' '!/^#/ && $3 != "-" { print $1 }' "$1"
+	typeset name dest
+	awk -F'\t' '!/^#/ && $3 != "-" { print $1 "\t" $2 }' "$1" |
+		while IFS="$(printf '\t')" read -r name dest; do
+			row_dir "$dest" >/dev/null || {
+				printf 'cron-apply: %s is scheduled for %s, which no cron line can read\n' \
+					"$name" "$dest" >&2
+				exit 1
+			}
+			printf '%s\n' "$name"
+		done
 }
 
 # The onboarding drain is a compiled binary, not one of the /root/bin shell
@@ -127,7 +149,7 @@ repo_dir=/usr/local/src/kyriakon-infra
 # A checkout row is read from the tree, and cron mails only what a job prints, so
 # its line throws a clean run away and names the script when it fails.
 line_for() {
-	typeset name="$1" row dest sched args
+	typeset name="$1" row dest sched args dir
 	case "$name" in
 	# The env file sets PATH, and the drain's scripts need the packages in
 	# /usr/local: without it, cron-apply.sh inside a provision cannot find gmid,
@@ -140,11 +162,18 @@ line_for() {
 		dest=$(printf '%s\n' "$row" | cut -f2)
 		sched=$(printf '%s\n' "$row" | cut -f3)
 		args=$(printf '%s\n' "$row" | cut -f4)
-		case "$dest" in
-		/root/bin) printf '%s . /root/.kyriakon-env; /root/bin/%s%s\n' "$sched" "$name" "${args:+ $args}" ;;
-		checkout) printf '%s . /root/.kyriakon-env; ksh %s/scripts/%s >/dev/null || printf "%s failed; run it as root for the detail\\n"\n' "$sched" "$repo_dir" "$name" "$name" ;;
-		*) return 1 ;;
-		esac
+		dir=$(row_dir "$dest") || return 1
+		if [ "$dest" = checkout ]; then
+			# A checkout script is read from the tree. A passing run says
+			# nothing to cron, so its output is captured and printed only when
+			# it fails, followed by the command that produced it: the mail
+			# carries the finding, not just that there was one.
+			# shellcheck disable=SC2016 # $out is for the cron shell, not this one
+			printf '%s . /root/.kyriakon-env; out=$(ksh %s/%s%s 2>&1) || printf "%%s\\n%%s\\n" "$out" "%s failed; run: ksh %s/%s"\n' \
+				"$sched" "$dir" "$name" "${args:+ $args}" "$name" "$dir" "$name"
+		else
+			printf '%s . /root/.kyriakon-env; %s/%s%s\n' "$sched" "$dir" "$name" "${args:+ $args}"
+		fi
 		;;
 	esac
 }
@@ -154,14 +183,11 @@ line_for() {
 # installed into a directory its own config names, not one this can know, and is
 # not scheduled from the table, so it has no path here.
 script_path() {
-	typeset row
+	typeset row dir
 	row=$(awk -F'\t' -v n="$1" '!/^#/ && $1 == n { print; exit }' "$install_set") || return 1
 	[ -n "$row" ] || return 1
-	case "$(printf '%s\n' "$row" | cut -f2)" in
-	/root/bin) printf '/root/bin/%s\n' "$1" ;;
-	checkout) printf '%s/scripts/%s\n' "$repo_dir" "$1" ;;
-	*) return 1 ;;
-	esac
+	dir=$(row_dir "$(printf '%s\n' "$row" | cut -f2)") || return 1
+	printf '%s/%s\n' "$dir" "$1"
 }
 
 die() {
@@ -177,7 +203,9 @@ die() {
 # files and never reads the table: a missing table must not fail the pass the
 # drain asks for, and the installed copy finds its table beside itself.
 read_scheduled_scripts() {
-	needed_scripts=$(scheduled_scripts "$install_set") || die "cannot read $install_set"
+	[ -f "$install_set" ] || die "cannot read $install_set"
+	needed_scripts=$(scheduled_scripts "$install_set") \
+		|| die "$install_set has a scheduled row no cron line can run"
 	[ -n "$needed_scripts" ] || die "$install_set names no scheduled script"
 }
 
@@ -660,8 +688,14 @@ EOF
 		"$(line_for check-hygiene.sh | grep -c 'scripts/check-hygiene.sh')" 1
 	check "and the self-test runner has one" \
 		"$(line_for self-test-all.sh | grep -c 'scripts/self-test-all.sh')" 1
+	# shellcheck disable=SC2016 # the generated line is what is matched
 	check "a clean weekly run prints nothing to cron" \
-		"$(line_for check-hygiene.sh | grep -c '>/dev/null')" 1
+		"$(line_for check-hygiene.sh | grep -c 'out=$(ksh')" 1
+	# shellcheck disable=SC2016 # as above
+	check "and a failing one keeps its output in the mail" \
+		"$(line_for check-hygiene.sh | grep -cF '"$out"')" 1
+	check "and does not throw the run away" \
+		"$(line_for check-hygiene.sh | grep -c '>/dev/null')" 0
 	# Both are rows rather than arms here, so the table is what decides they are
 	# scheduled and where they are read from.
 	check "the checkout scripts are the table's checkout rows" \
@@ -674,6 +708,25 @@ EOF
 	got=0
 	script_path kyriakon-onboard-drain >/dev/null || got=$?
 	check "a name with no scheduled row has no path" "$got" 1
+
+	# A checkout row with arguments carries them, the same way an installed
+	# row's do, and the failure line names the command that ran.
+	printf 'probe.sh\tcheckout\t0 5 * * 1\t--box\n' > "$tree/checkout-args.tsv"
+	install_set="$tree/checkout-args.tsv"
+	check "a checkout row's arguments reach the line" \
+		"$(line_for probe.sh | grep -cF 'scripts/probe.sh --box')" 1
+	check "and the failure names the command" \
+		"$(line_for probe.sh | grep -cF "ksh $repo_dir/scripts/probe.sh --box")" 1
+	# A row scheduled for a destination no cron line can read is refused here,
+	# rather than becoming a line that cannot run.
+	printf 'probe.sh\tdrain\t0 5 * * 1\n' > "$tree/mixed.tsv"
+	got=0
+	( scheduled_scripts "$tree/mixed.tsv" ) > "$tree/mixed.out" 2>&1 || got=$?
+	check "a scheduled drain row is refused" \
+		"$([ "$got" -ne 0 ] && printf yes || printf no)" yes
+	check "and names the row and its destination" \
+		"$(grep -c 'probe.sh is scheduled for drain' "$tree/mixed.out")" 1
+	install_set="$script_dir/install-set.tsv"
 
 	# An installed script's line is its install-set row, so the row's schedule and
 	# arguments have to reach the crontab unchanged, and a row that has neither a

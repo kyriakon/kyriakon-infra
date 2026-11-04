@@ -111,28 +111,34 @@ need_pkg() {
 # write_generated <target> <body-fn> [<cert> <key>]: write <target> from the
 # body function, atomically, and only when the bytes differ.
 #
-# The body goes to a sibling candidate, is compared with what is there, and only
-# then is renamed into place at 0644; the candidate's own creation is the
-# caller's umask 077, so a half-written file is never readable by a member. A run
-# killed at any point leaves the file the daemon is reading as it was, and a run
-# that would write the same bytes leaves its inode and mtime alone. Sets
-# conf_changed to yes or no, which is what the callers' "next" lines and the
-# --web pass key off.
+# Contract:
+#   - <body-fn> prints the whole file on stdout and nothing else; a non-zero
+#     status means nothing is written and <target> is left as it was.
+#   - the body runs under umask 077, so the candidate it creates is never
+#     readable by a member even before the chmod below.
+#   - the candidate is compared with the existing file and only then renamed
+#     into place, at 0644. A run killed at any point leaves the file the daemon
+#     is reading as it was, and a run that would write the same bytes leaves its
+#     inode and mtime alone.
+#   - sets conf_changed to yes or no, the answer the callers print and the --web
+#     pass keys off, and returns 1 with a message on stderr on any failure.
 #
-# A <cert> with no <key> is a broken pair rather than a state to serve from:
-# relayd would name a key that is not there, its config check would fail, and the
-# reload would take every name on the box down rather than one. The pair is an
-# argument so the refusal is made once, here, and a lane that writes a file
-# naming the pair cannot forget it.
+# <cert> and <key> are for a file that names a relayd pair. The guard trips when
+# the certificate is present and not empty and the key is not, which is the half
+# pair that passes `httpd -n` and fails `relayd -n`; an empty file is an
+# interrupted write, not half a pair. Lanes whose pair is always generated
+# together pass neither and are not guarded by a rule they cannot break.
 write_generated() {
 	typeset gen_target="$1" gen_body="$2" gen_cert="${3:-}" gen_key="${4:-}" gen_candidate
-	if [ -n "$gen_cert" ] && [ -f "$gen_cert" ] && [ ! -f "$gen_key" ]; then
+	if [ -n "$gen_cert" ] && [ -s "$gen_cert" ] && [ ! -s "$gen_key" ]; then
 		printf '%s is there and %s is not, so %s was left alone: the relay needs both halves of the pair\n' \
 			"$gen_cert" "$gen_key" "$gen_target" >&2
 		return 1
 	fi
 	gen_candidate="$gen_target.new.$$"
-	if ! "$gen_body" >"$gen_candidate"; then
+	# The redirection is inside the subshell, because the shell that opens the
+	# file is the one whose umask applies to it; the caller's is untouched.
+	if ! ( umask 077; "$gen_body" >"$gen_candidate" ); then
 		rm -f "$gen_candidate"
 		printf 'could not write %s for %s; %s left as it was\n' \
 			"$gen_body" "$gen_target" "$gen_target" >&2

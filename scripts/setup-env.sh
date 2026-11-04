@@ -51,9 +51,12 @@ env_dst="${KYRIAKON_ENV:-/root/.kyriakon-env}"
 
 # install_staged: the file every cron job sources is written through a sibling
 # and renamed, so a run killed mid-copy leaves the old one rather than a
-# truncated one that takes PATH and ALERT_EMAIL with it.
+# truncated one that takes PATH and ALERT_EMAIL with it. lib.sh sources
+# $KYRIAKON_ENV when it can, and that file is the one this script exists to
+# repair, so it is pointed at /dev/null for the source: a broken line in it must
+# not abort the run that would replace the line.
 # shellcheck disable=SC1091 # resolves at runtime from this script's directory
-. "$script_dir/lib.sh"
+KYRIAKON_ENV=/dev/null . "$script_dir/lib.sh"
 
 # The onboarding TUI's port is a property of the box, not a value an operator
 # can be expected to know, so the box picks it here instead of taking it as an
@@ -130,6 +133,23 @@ merge_env() {
 	rm -f "$tmp"
 }
 
+# append_env <block>: $env_dst with <block> appended, through the same staged
+# write as the merge. These blocks are not a merge, but they land in the same
+# file: a short append is a syntax error in the file every cron line sources.
+append_env() {
+	typeset block="$1" tmp
+	tmp=$(mktemp)
+	{
+		cat "$env_dst"
+		printf '%s\n' "$block"
+	} > "$tmp"
+	install_staged "$tmp" "$env_dst" -m 0600 || {
+		rm -f "$tmp"
+		return 1
+	}
+	rm -f "$tmp"
+}
+
 # --- self-test ---------------------------------------------------------------
 #
 # The merge is the path every later run takes, and it is where a lost comment or
@@ -178,6 +198,7 @@ KYRIAKON_IPV6=2001:db8::10"
 	printf '#!/bin/sh\nexit 1\n' > "$stub/mv"
 	chmod +x "$stub/mv"
 	code=0
+	# shellcheck disable=SC2030,SC2031 # the stub PATH is for this call only
 	( PATH="$stub:$PATH"; merge_env "ALERT_EMAIL=lost@example.invalid" ) \
 		> "$tree/failed.out" 2>&1 || code=$?
 	check "a rename that fails is a failure" "$code" 1
@@ -187,6 +208,55 @@ KYRIAKON_IPV6=2001:db8::10"
 	set -- "$tree"/*.new.*
 	check "and no candidate is left behind" \
 		"$([ -e "$1" ] && printf yes || printf no)" no
+
+	# The two blocks the script appends are the same file and the same hazard.
+	append_env "
+# an appended block
+export TITAN_PORT='1966'"
+	check "an appended block lands" "$(grep -c '^export TITAN_PORT=' "$fixture")" 1
+	check "and the file it joined survives" \
+		"$(grep -c '^# a comment that has to survive the merge$' "$fixture")" 1
+	check "and it stays 0600" "$(stat -f '%Lp' "$fixture")" 600
+	before=$(cat "$fixture")
+	code=0
+	# shellcheck disable=SC2030,SC2031 # the stub PATH is for this call only
+	( PATH="$stub:$PATH"; append_env "export TUI_PORT='2299'" ) \
+		> "$tree/append-failed.out" 2>&1 || code=$?
+	check "an append that cannot be renamed is a failure" "$code" 1
+	check "and leaves the file as it was" "$(cat "$fixture")" "$before"
+
+	# The script itself, over a file it has to repair. The source at the top
+	# points lib.sh at /dev/null, so an unterminated line here cannot abort the
+	# run that replaces it; without that, the box's only env file could not be
+	# fixed by the script that owns it.
+	broken=$tree/broken.env
+	cat > "$broken" <<'EOF'
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
+export PATH
+export KYRIAKON_IPV4='203.0.113.9'
+export KYRIAKON_IPV6='2001:db8::9'
+export KYRIAKON_TSIG_SECRET='not-a-secret'
+export RESTIC_REPOSITORY='sftp://example.invalid/repo'
+export RESTIC_PASSWORD_FILE='/root/.restic-pass'
+export ALERT_EMAIL='unterminated
+export HEALTHCHECKS_URL='https://hc-ping.com/example'
+export KEYRING_HEALTHCHECKS_URL='https://hc-ping.com/example'
+export REHEARSAL_HEALTHCHECKS_URL='https://hc-ping.com/example'
+export HCLOUD_TOKEN='example'
+export RESTORE_TEST_REPOSITORY='sftp://example.invalid/'
+export RESTORE_TEST_HEALTHCHECKS_URL='https://hc-ping.com/example'
+export POSTAL_ADDRESS='1 Example Street'
+EOF
+	code=0
+	KYRIAKON_ENV="$broken" ksh "$script_dir/setup-env.sh" \
+		--alert-email fixed@example.invalid > "$tree/broken.out" 2>&1 || code=$?
+	check "a broken env file does not stop the run that repairs it" "$code" 0
+	check "and the broken line is replaced" \
+		"$(grep -c "^export ALERT_EMAIL='fixed@example.invalid'" "$broken")" 1
+	check "and the PATH block is still there" "$(grep -c '^export PATH$' "$broken")" 1
+	check "and TUI_PORT is appended where it was absent" \
+		"$(grep -c '^export TUI_PORT=' "$broken")" 1
+	check "and TITAN_PORT too" "$(grep -c '^export TITAN_PORT=' "$broken")" 1
 
 	self_test_end
 }
@@ -412,7 +482,10 @@ $kv"
 		if [ -n "$a_rep" ]; then printf "export EU_REPRESENTATIVE='%s'\n" "$a_rep"; fi
 		if [ -n "$a_rep_contact" ]; then printf "export EU_REPRESENTATIVE_CONTACT='%s'\n" "$a_rep_contact"; fi
 	} > "$tmp"
-	install_staged "$tmp" "$env_dst" -m 0600
+	if ! install_staged "$tmp" "$env_dst" -m 0600; then
+		rm -f "$tmp"
+		exit 1
+	fi
 	rm -f "$tmp"
 	printf 'wrote %s from the arguments\n' "$env_dst"
 	fi
@@ -437,14 +510,12 @@ if ! grep -q '^export TUI_PORT=' "$env_dst"; then
 			"$tui_port_first" "$tui_port_last" >&2
 		exit 1
 	fi
-	{
-		printf '\n'
-		printf '# The port the applicant-facing sshd listens on, chosen from the free\n'
-		printf '# ports in 2200-2299. The installed /etc/ssh/sshd_config.onboard carries\n'
-		printf '# it on its Port line. The firewall rule that opens it is a later ticket and\n'
-		printf '# is not built here; it will read this value rather than carry its own.\n'
-		printf "export TUI_PORT='%s'\n" "$tui_port"
-	} >> "$env_dst"
+	append_env "$(printf '
+# The port the applicant-facing sshd listens on, chosen from the free
+# ports in 2200-2299. The installed /etc/ssh/sshd_config.onboard carries
+# it on its Port line. The firewall rule that opens it is a later ticket and
+# is not built here; it will read this value rather than carry its own.
+export TUI_PORT=%s' "'$tui_port'")"
 	printf 'chose %s for the onboarding TUI (TUI_PORT)\n' "$tui_port"
 fi
 
@@ -453,13 +524,11 @@ fi
 # line is absent, so a re-run against a file written before this change gains it
 # and a box that has already chosen a different one keeps what it has.
 if ! grep -q '^export TITAN_PORT=' "$env_dst"; then
-	{
-		printf '\n'
-		printf '# The public port the Titan upload listener is reached on, behind relayd.\n'
-		printf '# scripts/pf-apply.sh proposes the firewall rule for it; the relayd block\n'
-		printf '# stays commented until an operator opens both by hand.\n'
-		printf "export TITAN_PORT='1966'\n"
-	} >> "$env_dst"
+	append_env "
+# The public port the Titan upload listener is reached on, behind relayd.
+# scripts/pf-apply.sh proposes the firewall rule for it; the relayd block
+# stays commented until an operator opens both by hand.
+export TITAN_PORT='1966'"
 	printf 'recorded 1966 for the Titan listener (TITAN_PORT)\n'
 fi
 

@@ -126,8 +126,13 @@ self_test() {
 	mkdir "$work/bin"
 	cat > "$work/bin/pkg_info" <<'STUB'
 #!/bin/sh
-# Args are -q -e <name>; only present.sh is installed.
-[ "${3:-}" = present.sh ]
+# Args are -q -e <pattern>. present.sh is installed under its own name;
+# versioned is installed as versioned-1.2, which only the name-* query matches.
+case "${3:-}" in
+present.sh) exit 0 ;;
+versioned-*) exit 0 ;;
+esac
+exit 1
 STUB
 	cat > "$work/bin/pkg_add" <<'STUB'
 #!/bin/sh
@@ -153,6 +158,20 @@ STUB
 	grep -qx -- '-I absent.sh' "$work/pkg_add.log" || {
 		printf 'self-test: need_pkg did not install without questions: %s\n' \
 			"$(cat "$work/pkg_add.log" 2>/dev/null)" >&2
+		exit 1
+	}
+	# A package installed under a versioned name is what the name-* query is
+	# for: asking only for the bare name would reinstall it on every deploy.
+	# Deleting that fallback fails this check.
+	: >"$work/pkg_add.log"
+	# shellcheck disable=SC2030,SC2031 # the stub PATH is for this call only
+	if ! ( PATH="$work/bin:$PATH"; need_pkg versioned ) >"$work/pkg-version.out" 2>&1; then
+		printf 'self-test: need_pkg failed on a versioned package\n' >&2
+		exit 1
+	fi
+	[ ! -s "$work/pkg_add.log" ] || {
+		printf 'self-test: need_pkg reinstalled a versioned package: %s\n' \
+			"$(cat "$work/pkg_add.log")" >&2
 		exit 1
 	}
 

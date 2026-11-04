@@ -147,7 +147,9 @@ group_conf_body() {
 	# The site and its www redirect, only once the certificate is there: the relay
 	# presents what /etc/relayd.conf names, and a name it has no keypair for is
 	# answered with the default certificate.
-	[ -f "$(cert_file)" ] || return 0
+	# -s, not -f: an empty chain is an interrupted acme-client write, and the
+	# relay cannot present it, so it is no certificate at all.
+	[ -s "$(cert_file)" ] || return 0
 	printf '\n'
 	printf 'server "%s" {\n' "$domain"
 	printf '\tlisten on 127.0.0.1 port 8080\n'
@@ -186,7 +188,7 @@ write_group_conf() {
 	fi
 
 	if [ "$conf_changed" = no ]; then
-		if [ -f "$(cert_file)" ]; then
+		if [ -s "$(cert_file)" ]; then
 			printf '%s: unchanged, the site and the www redirect are in place\n' "$target"
 		else
 			printf '%s: unchanged, port 80 only until %s exists\n' "$target" "$(cert_file)"
@@ -194,7 +196,7 @@ write_group_conf() {
 		return 0
 	fi
 
-	if [ -f "$(cert_file)" ]; then
+	if [ -s "$(cert_file)" ]; then
 		printf 'wrote %s: port 80, the site and the www redirect for %s\n' "$target" "$domain"
 		printf '  next: doas ksh scripts/cron-apply.sh --web   # adds the relayd keypair, checks, reloads\n'
 	else
@@ -270,8 +272,8 @@ self_test() {
 		"$(grep -c 'unchanged, port 80 only until' "$tree/again.out")" 1
 
 	# 3. the certificate lands: the site and the www redirect appear, port 80 stays
-	: > "$(key_file)"
-	: > "$(cert_file)"
+	printf 'key\n' > "$(key_file)"
+	printf 'certificate\n' > "$(cert_file)"
 	write_group_conf > "$tree/certrun.out"
 	check "the apex block is still first" "$(awk 'NR == 1' "$conf")" 'server "parish.example" {'
 	check "both names now have a loopback block" "$(grep -c 'listen on 127.0.0.1 port 8080' "$conf")" 2
