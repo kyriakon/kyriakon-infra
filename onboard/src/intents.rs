@@ -671,6 +671,10 @@ impl Intent {
 
     /// Carry the intent out. Only reached once `verify` has proved it, so the
     /// transitions behind these arms make no second proof of their own.
+    ///
+    /// Every root verb is a body passed to `settle`: the dedup, the outcome
+    /// line and the remove are the combinator's, and a body that refuses says
+    /// so with the line it would have written.
     pub async fn apply(
         self,
         cfg: &DrainConfig,
@@ -680,77 +684,73 @@ impl Intent {
         file: &str,
         value: &Value,
     ) -> Result<(), String> {
-        match self {
-            Intent::Application(intent) => {
-                transitions::filed_application(cfg, store, journal, key, intent, file).await
-            }
-            Intent::Decision(intent) => {
-                transitions::decision(cfg, store, journal, key, intent, file).await
-            }
-            Intent::Password(intent) => {
-                // The one settlement path: the verb supplies its envelope and
-                // its body, and `settle` owns dedup, the outcome line and the
-                // remove.
-                let envelope = transitions::Envelope::of(value, file, "set-password");
-                transitions::settle(cfg, store, journal, file, &envelope, async {
-                    transitions::set_password(cfg, store, intent, file, value).await
-                })
-                .await
-            }
-            Intent::ProvisionGroup(intent) => {
-                transitions::provision_group(cfg, store, journal, *intent, file).await
-            }
-            Intent::GroupAddress(intent) => {
-                transitions::group_address(cfg, store, journal, intent, file).await
-            }
+        let kind = self.kind().to_string();
+        let envelope = transitions::Envelope::of(value, file, &kind);
+        // The two verbs whose line and record cleanup cannot be one write name
+        // that work here, once, and every other verb owes nothing after its line.
+        let after = match &self {
             Intent::RemoveGroup(intent) => {
-                transitions::remove_group(cfg, store, journal, intent, file).await
+                transitions::AfterLine::RemoveGroupRecord(intent.domain.clone())
             }
-            Intent::Close(intent) => {
-                transitions::close_account(cfg, store, journal, intent, file).await
+            Intent::ReconcileAttribute(intent) => transitions::AfterLine::MarkAttributed {
+                item: intent.item.clone(),
+                token: intent.token.clone(),
+            },
+            _ => transitions::AfterLine::Nothing,
+        };
+        transitions::settle_with(cfg, store, journal, file, &envelope, after, async {
+            match self {
+                Intent::Application(intent) => {
+                    transitions::filed_application(cfg, store, journal, key, intent).await
+                }
+                Intent::Decision(intent) => {
+                    transitions::decision(cfg, store, journal, key, intent).await
+                }
+                Intent::Password(intent) => {
+                    transitions::set_password(cfg, store, intent, file, value).await
+                }
+                Intent::ProvisionGroup(intent) => {
+                    transitions::provision_group(cfg, store, journal, *intent).await
+                }
+                Intent::GroupAddress(intent) => {
+                    transitions::group_address(cfg, store, journal, intent).await
+                }
+                Intent::RemoveGroup(intent) => {
+                    transitions::remove_group(cfg, store, journal, intent).await
+                }
+                Intent::Close(intent) => transitions::close_account(store, intent).await,
+                Intent::Resend(intent) => transitions::resend(cfg, store, intent).await,
+                Intent::Credit(intent) => transitions::credit(cfg, store, journal, intent).await,
+                Intent::WindowExtend(intent) => transitions::window_extend(store, intent).await,
+                Intent::ReconcileAttribute(intent) => {
+                    transitions::reconcile_attribute(cfg, store, journal, intent).await
+                }
+                Intent::ReconcileReturn(intent) => {
+                    transitions::reconcile_return(store, intent).await
+                }
+                Intent::Refund(intent) => transitions::refund(cfg, store, intent).await,
+                Intent::Export(intent) => {
+                    transitions::export_account(cfg, store, intent, file).await
+                }
+                Intent::ChangePassword(intent) => {
+                    transitions::change_password(cfg, store, intent).await
+                }
+                Intent::UploadKey(intent) => transitions::upload_key(cfg, store, intent).await,
+                Intent::OutsideAddress(intent) => {
+                    transitions::set_outside_address(store, intent).await
+                }
+                Intent::Serving(intent) => transitions::set_serving(cfg, store, intent).await,
+                Intent::CancelRenewal(intent) => {
+                    transitions::cancel_renewal(cfg, store, intent).await
+                }
+                Intent::MailKey(intent) => transitions::mail_key(cfg, store, intent).await,
+                // `verify` refuses an unknown kind before this is reached.
+                Intent::Unknown { kind, .. } => {
+                    Err(format!("this build does not implement the kind {kind:?}"))
+                }
             }
-            Intent::Resend(intent) => transitions::resend(cfg, store, journal, intent, file).await,
-            Intent::Credit(intent) => {
-                transitions::credit(cfg, store, journal, intent, file, value).await
-            }
-            Intent::WindowExtend(intent) => {
-                transitions::window_extend(cfg, store, journal, intent, file, value).await
-            }
-            Intent::ReconcileAttribute(intent) => {
-                transitions::reconcile_attribute(cfg, store, journal, intent, file, value).await
-            }
-            Intent::ReconcileReturn(intent) => {
-                transitions::reconcile_return(cfg, store, journal, intent, file, value).await
-            }
-            Intent::Refund(intent) => {
-                transitions::refund(cfg, store, journal, intent, file, value).await
-            }
-            Intent::Export(intent) => {
-                transitions::export_account(cfg, store, journal, intent, file).await
-            }
-            Intent::ChangePassword(intent) => {
-                transitions::change_password(cfg, store, journal, intent, file).await
-            }
-            Intent::UploadKey(intent) => {
-                transitions::upload_key(cfg, store, journal, intent, file).await
-            }
-            Intent::OutsideAddress(intent) => {
-                transitions::set_outside_address(cfg, store, journal, intent, file).await
-            }
-            Intent::Serving(intent) => {
-                transitions::set_serving(cfg, store, journal, intent, file).await
-            }
-            Intent::CancelRenewal(intent) => {
-                transitions::cancel_renewal(cfg, store, journal, intent, file).await
-            }
-            Intent::MailKey(intent) => {
-                transitions::mail_key(cfg, store, journal, intent, file).await
-            }
-            // `verify` refuses an unknown kind before this is reached.
-            Intent::Unknown { kind, .. } => {
-                Err(format!("this build does not implement the kind {kind:?}"))
-            }
-        }
+        })
+        .await
     }
 }
 

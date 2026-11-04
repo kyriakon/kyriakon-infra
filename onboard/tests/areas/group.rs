@@ -349,7 +349,8 @@ fn a_group_intent_applied_twice_leaves_one_of_each() {
     );
     assert!(fix.drain().status.success());
 
-    // The same intent again, as a crash before the delete leaves it.
+    // The same intent again, as a crash between the applied line and the
+    // remove leaves it: the second pass finishes the remove and does no work.
     fix.write_group(
         &id,
         "parish.example",
@@ -410,8 +411,9 @@ fn a_group_intent_applied_twice_leaves_one_of_each() {
         fix.scripts_log()
             .matches("provision-member.sh parish-secretary")
             .count(),
-        2,
-        "the builder is idempotent, so a retry runs it again"
+        1,
+        "the intent is settled, so the second pass does no work: {}",
+        fix.scripts_log()
     );
 }
 

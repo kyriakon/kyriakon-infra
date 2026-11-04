@@ -884,7 +884,8 @@ fn a_credit_recovers_a_ledger_line_lost_after_the_account_write() {
     let id = names[0].trim_end_matches(".json").to_string();
 
     // A crash after the account write and before the append leaves the line
-    // missing. The account still carries the credit.
+    // missing and the applied line unwritten, while the account carries the
+    // credit and the journal carries what it was about to write.
     let ledger = fix.read("ledger/payments.jsonl");
     let kept: String = ledger
         .lines()
@@ -893,6 +894,13 @@ fn a_credit_recovers_a_ledger_line_lost_after_the_account_write() {
         .collect();
     std::fs::write(fix.dir.join("store/ledger/payments.jsonl"), kept).unwrap();
     assert!(payment_lines(&fix).is_empty());
+    let journal: String = fix
+        .journal()
+        .lines()
+        .filter(|line| !(line.contains(&id) && line.contains("\"outcome\":\"applied\"")))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    std::fs::write(fix.dir.join("store/journal.jsonl"), journal).unwrap();
 
     std::fs::write(fix.dir.join("store/intents").join(&names[0]), &replay).unwrap();
     let out = fix.drain();
@@ -912,6 +920,27 @@ fn a_credit_recovers_a_ledger_line_lost_after_the_account_write() {
             .count(),
         1,
         "recovery sent a second receipt"
+    );
+
+    // The applied line now exists, so the intent is settled: the same file back
+    // again is finished with the remove alone, and the ledger is not rebuilt a
+    // second time.
+    std::fs::write(fix.dir.join("store/intents").join(&names[0]), &replay).unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert_eq!(
+        payment_lines(&fix).len(),
+        1,
+        "a settled intent rebuilt the ledger line again"
+    );
+    assert_eq!(
+        fix.journal()
+            .matches(&format!("\"intent\":\"{id}\""))
+            .count(),
+        2,
+        "a settled intent appended a line: {}",
+        fix.journal()
     );
 }
 

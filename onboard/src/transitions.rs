@@ -705,62 +705,86 @@ impl Envelope {
     }
 }
 
-/// What a root verb's work settled as: the journal line the intent takes, and
-/// the application it names.
-pub struct Settlement {
-    outcome: &'static str,
-    note: Option<String>,
-    application: ApplicationRef,
+/// What a root verb's body settled as.
+pub enum Settlement {
+    /// The journal line the intent takes, and the application it names. The
+    /// file goes once the line is written.
+    Line {
+        outcome: &'static str,
+        application: ApplicationRef,
+        note: Option<String>,
+    },
+    /// The work left nothing to journal: only the file remained of it, as on a
+    /// replay whose line the crashed pass had already written.
+    Nothing,
+    /// The intent is refused. The journal records it once under the file's own
+    /// envelope, with this reason, and the file stays for the operator. `after`
+    /// is work that failed while refusing: the refusal is still recorded, and
+    /// the pass still reports the failure.
+    Refused {
+        reason: String,
+        after: Option<String>,
+    },
 }
 
 impl Settlement {
     /// The intent was carried out.
     pub fn applied(application: ApplicationRef, note: Option<String>) -> Self {
-        Settlement {
+        Settlement::Line {
             outcome: "applied",
-            note,
             application,
+            note,
         }
     }
 
     /// An outcome of the verb's own, such as a page action whose account has
     /// already gone: the line is still the settlement, and the file goes.
     pub fn line(outcome: &'static str, application: ApplicationRef, note: Option<String>) -> Self {
-        Settlement {
+        Settlement::Line {
             outcome,
-            note,
             application,
+            note,
         }
     }
-}
 
-/// Why a verb's body returned no settlement.
-pub enum Unsettled {
-    /// The intent is refused. The journal records it once with its reason and
-    /// the file stays for the operator, as every refusal leaves it. `after` is
-    /// work that failed while refusing: the refusal is still recorded, and the
-    /// pass still reports the failure.
-    Refused {
-        reason: String,
-        after: Option<String>,
-    },
-    /// The pass failed: the file stays and the next pass retries it.
-    Failed(String),
-}
+    pub fn nothing() -> Self {
+        Settlement::Nothing
+    }
 
-impl Unsettled {
-    pub fn refused(reason: impl Into<String>) -> Self {
-        Unsettled::Refused {
-            reason: reason.into(),
+    pub fn refused(reason: impl ToString) -> Self {
+        Settlement::Refused {
+            reason: reason.to_string(),
             after: None,
         }
     }
 }
 
-impl From<String> for Unsettled {
-    fn from(failure: String) -> Self {
-        Unsettled::Failed(failure)
+/// What a verb still owes after its outcome line: work that must not precede
+/// the line, because a repeat would no longer find what it acts on, and that
+/// must also run on a pass that finds the line and the file a crash left behind.
+pub enum AfterLine {
+    Nothing,
+    /// Take a removed domain's record directory away.
+    RemoveGroupRecord(String),
+    /// Mark a held payment as attributed to its token.
+    MarkAttributed {
+        item: String,
+        token: String,
+    },
+}
+
+async fn finish(store: &Store, after: AfterLine) -> Result<(), String> {
+    match after {
+        AfterLine::Nothing => Ok(()),
+        AfterLine::RemoveGroupRecord(domain) => remove_group_record(store, &domain).await,
+        AfterLine::MarkAttributed { item, token } => mark_attributed(store, &item, &token).await,
     }
+}
+
+/// The note a credit's applied line carries: the override's reason when the
+/// credit used one.
+fn override_note(reason: Option<&str>) -> Option<String> {
+    reason.map(|reason| format!("24-month override: {reason}"))
 }
 
 /// The one settlement path: dedup, the verb's body, its outcome line, the
@@ -770,8 +794,8 @@ impl From<String> for Unsettled {
 /// file survived the crash between the two is finished here by removing the
 /// file; a `refused` line keeps its file for the operator and appends nothing.
 /// The body does the work, writes the `applying` line where the verb has one,
-/// and returns the line the intent settles with. A refusal is appended once,
-/// with its reason, and leaves the file in place.
+/// and returns what the intent settled as. A refusal is appended once, with its
+/// reason, and leaves the file in place.
 pub async fn settle<F>(
     cfg: &DrainConfig,
     store: &Store,
@@ -781,30 +805,65 @@ pub async fn settle<F>(
     body: F,
 ) -> Result<(), String>
 where
-    F: Future<Output = Result<Settlement, Unsettled>>,
+    F: Future<Output = Result<Settlement, String>>,
+{
+    settle_with(
+        cfg,
+        store,
+        journal,
+        file,
+        envelope,
+        AfterLine::Nothing,
+        body,
+    )
+    .await
+}
+
+/// `settle`, with the work a verb owes after its line (see [`AfterLine`]).
+pub async fn settle_with<F>(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    file: &str,
+    envelope: &Envelope,
+    after: AfterLine,
+    body: F,
+) -> Result<(), String>
+where
+    F: Future<Output = Result<Settlement, String>>,
 {
     if journal.has(&envelope.id, "applied") {
+        finish(store, after).await?;
         return store.remove("intents", file).await;
     }
     if journal.has(&envelope.id, "refused") {
         return Ok(());
     }
-    match body.await {
-        Ok(settled) => {
+    match body.await? {
+        Settlement::Line {
+            outcome,
+            application,
+            note,
+        } => {
             write_journal(
                 store,
                 journal,
                 &cfg.release,
                 &envelope.id,
                 &envelope.kind,
-                &settled.application,
-                settled.outcome,
-                settled.note.as_deref(),
+                &application,
+                outcome,
+                note.as_deref(),
             )
             .await?;
+            finish(store, after).await?;
             store.remove("intents", file).await
         }
-        Err(Unsettled::Refused { reason, after }) => {
+        Settlement::Nothing => {
+            finish(store, after).await?;
+            store.remove("intents", file).await
+        }
+        Settlement::Refused { reason, after } => {
             write_journal(
                 store,
                 journal,
@@ -821,7 +880,6 @@ where
                 None => Ok(()),
             }
         }
-        Err(Unsettled::Failed(failure)) => Err(failure),
     }
 }
 
@@ -941,16 +999,16 @@ pub async fn set_password(
     intent: PasswordIntent,
     file: &str,
     value: &Value,
-) -> Result<Settlement, Unsettled> {
+) -> Result<Settlement, String> {
     let token = intent.application.status_token.as_str();
     let username = intent.application.username.as_str();
     let mut plain = intent.password;
     let hash = match crate::password::make(&plain) {
         Ok(hash) if crate::password::is_hash(&hash) => hash,
         Ok(_) => {
-            return Err(password_refusal(store, file, value, "the password did not hash").await);
+            return Ok(password_refusal(store, file, value, "the password did not hash").await);
         }
-        Err(e) => return Err(password_refusal(store, file, value, e).await),
+        Err(e) => return Ok(password_refusal(store, file, value, e).await),
     };
     // Overwrite the plaintext in place now it has been hashed; zero bytes are
     // still valid UTF-8, which is what `as_mut_vec` requires. The intent file
@@ -959,7 +1017,7 @@ pub async fn set_password(
     unsafe { plain.as_mut_vec().fill(0) };
     let name = format!("{token}.json");
     let Some(text) = store.read_record("applications", &name).await else {
-        return Err(password_refusal(store, file, value, "the application record is gone").await);
+        return Ok(password_refusal(store, file, value, "the application record is gone").await);
     };
     // Read as a Value and edit one key: the record carries fields this build
     // does not model, and writing it back through the typed struct would drop
@@ -967,10 +1025,10 @@ pub async fn set_password(
     let mut record: Value = serde_json::from_str(&text)
         .map_err(|e| format!("the application record does not parse: {e}"))?;
     if record.get("username").and_then(Value::as_str) != Some(username) {
-        return Err(password_refusal(store, file, value, "the intent names another account").await);
+        return Ok(password_refusal(store, file, value, "the intent names another account").await);
     }
     if record.get("password_link").is_none_or(Value::is_null) {
-        return Err(password_refusal(store, file, value, "the link has already been used").await);
+        return Ok(password_refusal(store, file, value, "the link has already been used").await);
     }
     run_script(cfg, "set-mail-password.sh", &[username, &hash]).await?;
     // One use: the record keeps no link, so the page stops answering.
@@ -996,12 +1054,12 @@ async fn password_refusal(
     store: &Store,
     file: &str,
     value: &Value,
-    reason: impl Into<String>,
-) -> Unsettled {
-    let reason = reason.into();
+    reason: impl ToString,
+) -> Settlement {
+    let reason = reason.to_string();
     match redact_password(store, file, value).await {
-        Ok(()) => Unsettled::refused(reason),
-        Err(after) => Unsettled::Refused {
+        Ok(()) => Settlement::refused(reason),
+        Err(after) => Settlement::Refused {
             reason,
             after: Some(after),
         },
@@ -1148,8 +1206,7 @@ pub async fn filed_application(
     journal: &Journal,
     key: &[u8],
     intent: Intent,
-    file: &str,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     if intent.kind != "application" {
         return Err(format!("kind {:?} is not an application", intent.kind));
     }
@@ -1166,8 +1223,8 @@ pub async fn filed_application(
     // rather than sending two.
     let token = &intent.application.status_token;
     if journal.application_seen(token, "application", "review-sent") {
-        store.remove("intents", file).await?;
-        return Ok(());
+        // The line is the settlement; a crash left only the file.
+        return Ok(Settlement::nothing());
     }
     write_journal(
         store,
@@ -1194,8 +1251,11 @@ pub async fn filed_application(
     );
     let body = review_body(cfg, key, &intent)?;
     notice::enqueue(cfg, &cfg.reviewer, &subject, &body).await?;
-    store.remove("intents", file).await?;
-    Ok(())
+    Ok(Settlement::line(
+        "review-sent",
+        intent.application.clone(),
+        None,
+    ))
 }
 
 /// The review email's body. Every field the ticket lists, and the three links
@@ -1295,12 +1355,11 @@ pub async fn decision(
     journal: &Journal,
     key: &[u8],
     intent: DecisionIntent,
-    file: &str,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     match intent.kind.as_str() {
-        "approve" => approve(cfg, store, journal, key, &intent, false, file).await,
-        "provision" => approve(cfg, store, journal, key, &intent, true, file).await,
-        "decline" => decline(cfg, store, journal, &intent, file).await,
+        "approve" => approve(cfg, store, journal, key, &intent, false).await,
+        "provision" => approve(cfg, store, journal, key, &intent, true).await,
+        "decline" => decline(cfg, store, journal, &intent).await,
         // Unreachable after the kind match the seam makes, kept so the dispatch
         // is total.
         other => Err(format!("kind {other:?} is not a decision")),
@@ -1318,8 +1377,7 @@ async fn approve(
     key: &[u8],
     intent: &DecisionIntent,
     no_charge: bool,
-    file: &str,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     let token = &intent.application.status_token;
     let username = &intent.application.username;
     let record = application_record(store, token).await?;
@@ -1328,26 +1386,18 @@ async fn approve(
     }
     let no_charge = no_charge || record.no_charge;
     if record.decided_at.is_some() {
-        write_journal(
-            store,
-            journal,
-            &cfg.release,
-            &intent.id,
-            &intent.kind,
-            &intent.application,
+        return Ok(Settlement::line(
             "already-decided",
-            Some("the application was already decided; nothing was carried out"),
-        )
-        .await?;
-        store.remove("intents", file).await?;
-        return Ok(());
+            intent.application.clone(),
+            Some("the application was already decided; nothing was carried out".to_string()),
+        ));
     }
 
     // A body's accounts are the address table's, not the applicant's: the person
     // path below would make one account for the accountable person and none of
     // the mailboxes. The whole application is one group intent instead.
     if record.domain.is_some() {
-        return approve_group(cfg, store, journal, key, intent, file, &record, no_charge).await;
+        return approve_group(cfg, store, journal, key, intent, &record, no_charge).await;
     }
 
     // The recipient is revalidated before anything is written or journaled, so a
@@ -1369,19 +1419,7 @@ async fn approve(
     // disagreeing about what is owed. This is the replay rule for a different
     // reason: the click is recorded and the intent is dropped.
     if existing.is_some() && !begun {
-        write_journal(store, journal,
-            &cfg.release,
-            &intent.id,
-            &intent.kind,
-            &intent.application,
-            "already-member",
-            Some(
-                "this username already has an account that this application did not make; nothing was carried out",
-            ),
-        )
-        .await?;
-        store.remove("intents", file).await?;
-        return Ok(());
+        return Ok(Settlement::line("already-member", intent.application.clone(), Some("this username already has an account that this application did not make; nothing was carried out".to_string())));
     }
 
     // The held-back names are checked here, where the account would be made,
@@ -1677,19 +1715,11 @@ async fn approve(
         Some(password_link),
     )
     .await?;
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &intent.application,
+    Ok(Settlement::line(
         "applied",
+        intent.application.clone(),
         None,
-    )
-    .await?;
-    store.remove("intents", file).await?;
-    Ok(())
+    ))
 }
 
 /// `onboardctl token resend`: the same payment instructions again and nothing
@@ -1703,10 +1733,8 @@ async fn approve(
 pub async fn resend(
     cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
     intent: ResendIntent,
-    file: &str,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     let username = intent.username.as_str();
     let text = store
         .read_record(&format!("accounts/{username}"), "account.json")
@@ -1762,97 +1790,53 @@ pub async fn resend(
             })
         })
         .ok_or_else(|| format!("no application record for {username}"))?;
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &application,
-        "applied",
-        None,
-    )
-    .await?;
-    store.remove("intents", file).await
+    Ok(Settlement::line("applied", application, None))
 }
 
 /// Give an open payment window its one extension, as `onboardctl window extend`
 /// asks. The new close is fourteen days past the old one, and the counter makes
 /// a second extension a refusal: the window is a courtesy, not a free tier.
 pub async fn window_extend(
-    cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
     intent: WindowExtendIntent,
-    file: &str,
-    value: &Value,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     // A refusal is journaled once and the intent is left in place, as the credit
     // path does; a new intent is the way to change the answer.
-    if journal.has(&intent.id, "refused") {
-        return Ok(());
-    }
     if !store::is_payment_token(&intent.token) {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the window extension's token is not a payment token",
-        )
-        .await;
+        ));
     }
     if intent.days != 14 {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "a window extension is fourteen days and no other number",
-        )
-        .await;
+        ));
     }
     if intent.reason.trim().is_empty() {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
-            "the window extension gives no reason",
-        )
-        .await;
+        return Ok(Settlement::refused("the window extension gives no reason"));
     }
     // A group's token names the group's one window, and it takes the same one
     // extension under the same rule.
     let join = match token_join(store, &intent.token).await {
         Ok(join) => join,
-        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
+        Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
-        return extend_group_window(cfg, store, journal, intent, file, value, &domain).await;
+        return extend_group_window(store, intent, &domain).await;
     }
     let (username, mut account, mut payment) = match resolve_payment(store, &intent.token).await {
         Ok(found) => found,
-        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
+        Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     let (paid_until, window) = (&payment.paid_until, &mut payment.window);
     let Some(window) = window.as_mut() else {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the account has no payment window to extend",
-        )
-        .await;
+        ));
     };
     let new_close = match extend_open_window(paid_until.as_deref(), window, intent.days) {
         Ok(close) => close,
-        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
+        Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     account.payment = Some(payment.clone());
     let bytes = serde_json::to_vec_pretty(&account)
@@ -1888,62 +1872,39 @@ pub async fn window_extend(
             username: username.clone(),
             status_token: String::new(),
         });
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &application,
+    Ok(Settlement::line(
         "applied",
-        Some(&format!(
+        application.clone(),
+        Some(format!(
             "the window now closes on {}",
             &new_close[..10.min(new_close.len())]
         )),
-    )
-    .await?;
-    store.remove("intents", file).await
+    ))
 }
 
 /// `window extend` for a group's token: the same fourteen days, the same one
 /// extension, applied to the one window the whole body pays inside.
 async fn extend_group_window(
-    cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
     intent: WindowExtendIntent,
-    file: &str,
-    value: &Value,
     domain: &str,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     let Some(mut group) = group_record(store, domain).await? else {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the token resolves to a group that is gone",
-        )
-        .await;
+        ));
     };
     let GroupPayment {
         paid_until, window, ..
     } = &mut group.payment;
     let Some(window) = window.as_mut() else {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the group has no payment window to extend",
-        )
-        .await;
+        ));
     };
     let new_close = match extend_open_window(paid_until.as_deref(), window, intent.days) {
         Ok(close) => close,
-        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
+        Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     write_group_record(store, &group).await?;
     if let Some(text) = store
@@ -1959,24 +1920,17 @@ async fn extend_group_window(
                 .await?;
         }
     }
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &ApplicationRef {
+    Ok(Settlement::line(
+        "applied",
+        ApplicationRef {
             username: group.site_owner.clone(),
             status_token: domain.to_string(),
         },
-        "applied",
-        Some(&format!(
+        Some(format!(
             "the group's window now closes on {}",
             &new_close[..10.min(new_close.len())]
         )),
-    )
-    .await?;
-    store.remove("intents", file).await
+    ))
 }
 
 /// Move one open window fourteen days on, once. Shared by an account's window
@@ -2607,48 +2561,32 @@ pub async fn credit(
     store: &Store,
     journal: &Journal,
     intent: CreditIntent,
-    file: &str,
-    value: &Value,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     // The ledger line is the settlement marker, and a credit settles in one of
     // two: a payment joined to a token, or a held line in the unattributed
     // queue. A second arrival of the same intent finds its line and stops before
     // any other check, so a replay cannot refuse itself on a rule it already met.
     if ledger_has_intent(store, &intent.id).await? || held_has_intent(store, &intent.id).await? {
-        if !journal.has(&intent.id, "applied") {
-            write_journal(
-                store,
-                journal,
-                &cfg.release,
-                &intent.id,
-                &intent.kind,
-                &ApplicationRef {
-                    username: String::new(),
-                    status_token: String::new(),
-                },
-                "applied",
-                Some("replayed: the ledger already holds this credit"),
-            )
-            .await?;
-        }
-        store.remove("intents", file).await?;
-        return Ok(());
+        return Ok(Settlement::applied(
+            ApplicationRef {
+                username: String::new(),
+                status_token: String::new(),
+            },
+            Some("replayed: the ledger already holds this credit".to_string()),
+        ));
     }
     // A refusal is recorded once; the intent is left in place, as every other
     // refused intent is, and a new intent is the way to change it.
-    if journal.has(&intent.id, "refused") {
-        return Ok(());
-    }
     let amount = match credit_fields(&intent) {
         Ok(amount) => amount,
-        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
+        Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     let received = util::parse_date(&intent.received).expect("the date was validated above");
 
     // A payment with no token cannot be joined to an account, so it is held
     // until `reconcile` joins it or closes it.
     if intent.token.is_empty() {
-        return hold(cfg, store, journal, &intent, file, value, amount, received).await;
+        return hold(store, &intent, amount, received).await;
     }
 
     // The token index says which of the two the money pays for: one account, or
@@ -2656,15 +2594,15 @@ pub async fn credit(
     // mailbox in it shares.
     let join = match token_join(store, &intent.token).await {
         Ok(join) => join,
-        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
+        Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
-        return group_credit(cfg, store, journal, file, value, &intent, &domain, None).await;
+        return group_credit(cfg, store, journal, &intent, &domain, None).await;
     }
 
     let (username, account, payment) = match resolve_payment(store, &intent.token).await {
         Ok(found) => found,
-        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
+        Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     let app = PaymentApplication {
         intent: &intent,
@@ -2675,10 +2613,7 @@ pub async fn credit(
         received,
         attributed_item: None,
     };
-    if apply_payment(cfg, store, journal, file, value, app).await? {
-        store.remove("intents", file).await?;
-    }
-    Ok(())
+    apply_payment(cfg, store, journal, app).await
 }
 
 /// The fields a credit's money arrives with, revalidated here because `intents/`
@@ -2792,10 +2727,8 @@ async fn apply_payment(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-    file: &str,
-    value: &Value,
     app: PaymentApplication<'_>,
-) -> Result<bool, String> {
+) -> Result<Settlement, String> {
     let PaymentApplication {
         intent,
         username,
@@ -2835,49 +2768,30 @@ async fn apply_payment(
         // A crash between the account write and its copies leaves the status
         // page behind; the account is the truth now, so rewrite them from it.
         write_payment_copy(store, username, &payment).await?;
-        if !journal.has(&intent.id, "applied") {
-            journal_credit_applied(
-                cfg,
-                store,
-                journal,
-                intent,
-                username,
-                intent.override_reason.as_deref(),
-            )
-            .await?;
-        }
-        return Ok(true);
+        return Ok(Settlement::applied(
+            ApplicationRef {
+                username: username.to_string(),
+                status_token: String::new(),
+            },
+            override_note(intent.override_reason.as_deref()),
+        ));
     }
 
     let before = match payment.paid_until.as_deref() {
         Some(stamp) => match util::parse_date(stamp) {
             Some(date) => Some(date),
             None => {
-                return refuse_with(
-                    cfg,
-                    store,
-                    journal,
-                    file,
-                    value,
+                return Ok(Settlement::refused(
                     "the account's paid-until date cannot be read",
-                )
-                .await
-                .map(|()| false)
+                ))
             }
         },
         None => None,
     };
     let Some(until) = util::paid_until_after(received, before) else {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the account's paid-until date has no year in the calendar",
-        )
-        .await
-        .map(|()| false);
+        ));
     };
     let override_reason = intent
         .override_reason
@@ -2886,15 +2800,7 @@ async fn apply_payment(
     if util::credit_ceiling(received).is_some_and(|ceiling| until > ceiling)
         && override_reason.is_none()
     {
-        return refuse_with(
-            cfg,
-            store, journal,
-            file,
-            value,
-            "the credit would put paid_until more than 24 months past --received; give --override <reason> to mean it",
-        )
-        .await
-        .map(|()| false);
+        return Ok(Settlement::refused("the credit would put paid_until more than 24 months past --received; give --override <reason> to mean it"));
     }
 
     let price = util::pence(&cfg.price_gbp)
@@ -2906,16 +2812,9 @@ async fn apply_payment(
         Some(text) => match util::pence(text) {
             Ok(pence) => pence,
             Err(e) => {
-                return refuse_with(
-                    cfg,
-                    store,
-                    journal,
-                    file,
-                    value,
-                    &format!("the account's balance cannot be read: {e}"),
-                )
-                .await
-                .map(|()| false)
+                return Ok(Settlement::refused(format!(
+                    "the account's balance cannot be read: {e}"
+                )))
             }
         },
         None => 0,
@@ -2929,32 +2828,15 @@ async fn apply_payment(
     // held item.
     if let Some(txid) = intent.txid.as_deref() {
         if let Some((seq, received_on)) = ledger_txid(store, txid).await? {
-            return refuse_with(
-                cfg,
-                store,
-                journal,
-                file,
-                value,
-                &format!(
-                    "transaction {txid} was already credited on {received_on} at ledger seq {seq}"
-                ),
-            )
-            .await
-            .map(|()| false);
+            return Ok(Settlement::refused(format!(
+                "transaction {txid} was already credited on {received_on} at ledger seq {seq}"
+            )));
         }
         if let Some((id, received_on)) = held_txid(store, txid).await? {
             if attributed_item != Some(id.as_str()) {
-                return refuse_with(
-                    cfg,
-                    store, journal,
-                    file,
-                    value,
-                    &format!(
+                return Ok(Settlement::refused(format!(
                         "transaction {txid} is already held as {id}, received on {received_on}; attribute that item instead"
-                    ),
-                )
-                .await
-                .map(|()| false);
+                    )));
             }
         }
     }
@@ -2972,9 +2854,7 @@ async fn apply_payment(
                 "the token was already credited until {paid_until}; record a renewal with `credit --confirm-double`"
             )
         };
-        return refuse_with(cfg, store, journal, file, value, &problem)
-            .await
-            .map(|()| false);
+        return Ok(Settlement::refused(&problem));
     }
 
     let until_text = util::date_string(until);
@@ -3088,8 +2968,13 @@ async fn apply_payment(
     )
     .await?;
 
-    journal_credit_applied(cfg, store, journal, intent, username, override_reason).await?;
-    Ok(true)
+    Ok(Settlement::applied(
+        ApplicationRef {
+            username: username.to_string(),
+            status_token: String::new(),
+        },
+        override_note(override_reason),
+    ))
 }
 
 /// Apply a prepaid credit to the group its token names. The arithmetic, the
@@ -3102,52 +2987,32 @@ async fn group_credit(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-    file: &str,
-    value: &Value,
     intent: &CreditIntent,
     domain: &str,
     attributed_item: Option<&str>,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     let amount = match credit_fields(intent) {
         Ok(amount) => amount,
-        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
+        Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     let received = util::parse_date(&intent.received).expect("the date was validated above");
     if let Some(why) = validate::domain(domain) {
         return Err(format!("the token's group domain {domain:?}: {why}"));
     }
     let Some(mut group) = group_record(store, domain).await? else {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the token resolves to a group that is gone",
-        )
-        .await;
+        ));
     };
     if group.payment.no_charge {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the group was approved without charge, so it has no payment to record",
-        )
-        .await;
+        ));
     }
     if group.payment.token_ref.as_deref() != Some(intent.token.as_str()) {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the token is not the one the group's payment block holds",
-        )
-        .await;
+        ));
     }
 
     // A pass that journaled `applying` and wrote the group but crashed before
@@ -3170,48 +3035,30 @@ async fn group_credit(
             )
             .await?;
         }
-        if !journal.has(&intent.id, "applied") {
-            journal_credit_applied(
-                cfg,
-                store,
-                journal,
-                intent,
-                &group.site_owner,
-                intent.override_reason.as_deref(),
-            )
-            .await?;
-        }
-        store.remove("intents", file).await?;
-        return Ok(());
+        return Ok(Settlement::applied(
+            ApplicationRef {
+                username: group.site_owner.clone(),
+                status_token: String::new(),
+            },
+            override_note(intent.override_reason.as_deref()),
+        ));
     }
 
     let before = match group.payment.paid_until.as_deref() {
         Some(stamp) => match util::parse_date(stamp) {
             Some(date) => Some(date),
             None => {
-                return refuse_with(
-                    cfg,
-                    store,
-                    journal,
-                    file,
-                    value,
+                return Ok(Settlement::refused(
                     "the group's paid-until date cannot be read",
-                )
-                .await
+                ))
             }
         },
         None => None,
     };
     let Some(until) = util::paid_until_after(received, before) else {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the group's paid-until date has no year in the calendar",
-        )
-        .await;
+        ));
     };
     let override_reason = intent
         .override_reason
@@ -3220,14 +3067,7 @@ async fn group_credit(
     if util::credit_ceiling(received).is_some_and(|ceiling| until > ceiling)
         && override_reason.is_none()
     {
-        return refuse_with(
-            cfg,
-            store, journal,
-            file,
-            value,
-            "the credit would put the group's paid_until more than 24 months past --received; give --override <reason> to mean it",
-        )
-        .await;
+        return Ok(Settlement::refused("the credit would put the group's paid_until more than 24 months past --received; give --override <reason> to mean it"));
     }
     let price = util::pence(&cfg.group_price_gbp)
         .map_err(|e| format!("the drain's configured group_price_gbp: {e}"))?;
@@ -3238,81 +3078,43 @@ async fn group_credit(
     // holds no balance to carry a shortfall or an excess into.
     let money = credit_money(price, 0, amount);
     if !money.paid {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
-            &format!(
-                "a group's year is one payment of GBP {}; GBP {} is not enough",
-                util::gbp(price),
-                util::gbp(amount)
-            ),
-        )
-        .await;
+        return Ok(Settlement::refused(format!(
+            "a group's year is one payment of GBP {}; GBP {} is not enough",
+            util::gbp(price),
+            util::gbp(amount)
+        )));
     }
     if money.balance > 0 {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
-            &format!(
-                "a group's year is one payment of GBP {}; GBP {} is more than the fee",
-                util::gbp(price),
-                util::gbp(amount)
-            ),
-        )
-        .await;
+        return Ok(Settlement::refused(format!(
+            "a group's year is one payment of GBP {}; GBP {} is more than the fee",
+            util::gbp(price),
+            util::gbp(amount)
+        )));
     }
 
     // A transaction already in the ledger is the same payment seen again, and a
     // token already credited is a renewal the operator must have meant.
     if let Some(txid) = intent.txid.as_deref() {
         if let Some((seq, received_on)) = ledger_txid(store, txid).await? {
-            return refuse_with(
-                cfg,
-                store,
-                journal,
-                file,
-                value,
-                &format!(
-                    "transaction {txid} was already credited on {received_on} at ledger seq {seq}"
-                ),
-            )
-            .await;
+            return Ok(Settlement::refused(format!(
+                "transaction {txid} was already credited on {received_on} at ledger seq {seq}"
+            )));
         }
         if let Some((id, received_on)) = held_txid(store, txid).await? {
             // The item this transition is attributing is not a second sighting
             // of the payment, exactly as on the account path.
             if attributed_item != Some(id.as_str()) {
-                return refuse_with(
-                    cfg,
-                    store, journal,
-                    file,
-                    value,
-                    &format!(
+                return Ok(Settlement::refused(format!(
                         "transaction {txid} is already held as {id}, received on {received_on}; attribute that item instead"
-                    ),
-                )
-                .await;
+                    )));
             }
         }
     }
     if let Some(paid_until) = group.payment.paid_until.as_deref() {
         if !intent.confirm_double {
-            return refuse_with(
-                cfg,
-                store, journal,
-                file,
-                value,
-                &format!(
+            return Ok(Settlement::refused(format!(
                     "the group's token was already credited until {paid_until}; give --confirm-double for a renewal"
-                ),
-            )
-            .await;
+                )));
         }
     }
 
@@ -3377,17 +3179,13 @@ async fn group_credit(
         &body,
     )
     .await?;
-    journal_credit_applied(
-        cfg,
-        store,
-        journal,
-        intent,
-        &group.site_owner,
-        override_reason,
-    )
-    .await?;
-    store.remove("intents", file).await?;
-    Ok(())
+    Ok(Settlement::applied(
+        ApplicationRef {
+            username: group.site_owner.clone(),
+            status_token: String::new(),
+        },
+        override_note(override_reason),
+    ))
 }
 
 /// Bring back every mailbox in a group that lapsed with it: the group lapsed as
@@ -3476,25 +3274,16 @@ async fn last_payment_line(store: &Store, token: &str) -> Result<Option<PaymentL
 pub async fn refund(
     cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
     intent: RefundIntent,
-    file: &str,
-    value: &Value,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     let amount_text = intent.amount_gbp.as_deref().unwrap_or("");
     let rail = intent.rail.as_deref().unwrap_or("");
     let reason = intent.reason.as_deref().unwrap_or("");
     let settled_text = intent.settled_on.as_deref().unwrap_or("");
     if !store::is_payment_token(&intent.token) {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the refund's token is not the shape of a payment token",
-        )
-        .await;
+        ));
     }
 
     // The settlement form. It never writes a line of its own, so its dedup is
@@ -3507,77 +3296,37 @@ pub async fn refund(
             || intent.excess
             || intent.rate.is_some()
         {
-            return refuse_with(
-                cfg,
-                store,
-                journal,
-                file,
-                value,
+            return Ok(Settlement::refused(
                 "a settlement names only --settled and the account's token",
-            )
-            .await;
+            ));
         }
         if util::parse_date(settled_text).is_none() {
-            return refuse_with(
-                cfg,
-                store,
-                journal,
-                file,
-                value,
+            return Ok(Settlement::refused(
                 "the refund's settled date is not YYYY-MM-DD",
-            )
-            .await;
+            ));
         }
         if ledger_settled_by(store, &intent.id).await? {
-            if !journal.has(&intent.id, "applied") {
-                write_journal(
-                    store,
-                    journal,
-                    &cfg.release,
-                    &intent.id,
-                    &intent.kind,
-                    &ApplicationRef {
-                        username: String::new(),
-                        status_token: String::new(),
-                    },
-                    "applied",
-                    Some("replayed: the ledger already records this settlement"),
-                )
-                .await?;
-            }
-            store.remove("intents", file).await?;
-            return Ok(());
+            return Ok(Settlement::applied(
+                ApplicationRef {
+                    username: String::new(),
+                    status_token: String::new(),
+                },
+                Some("replayed: the ledger already records this settlement".to_string()),
+            ));
         }
-        if journal.has(&intent.id, "refused") {
-            return Ok(());
-        }
-        return settle_refund(cfg, store, journal, &intent, file, value, settled_text).await;
+        return settle_refund(store, &intent, settled_text).await;
     }
 
     // The ledger line is the settlement marker: a second arrival of the same
     // intent finds it and stops before any check it already met.
     if ledger_has_intent(store, &intent.id).await? {
-        if !journal.has(&intent.id, "applied") {
-            write_journal(
-                store,
-                journal,
-                &cfg.release,
-                &intent.id,
-                &intent.kind,
-                &ApplicationRef {
-                    username: String::new(),
-                    status_token: String::new(),
-                },
-                "applied",
-                Some("replayed: the ledger already holds this refund"),
-            )
-            .await?;
-        }
-        store.remove("intents", file).await?;
-        return Ok(());
-    }
-    if journal.has(&intent.id, "refused") {
-        return Ok(());
+        return Ok(Settlement::applied(
+            ApplicationRef {
+                username: String::new(),
+                status_token: String::new(),
+            },
+            Some("replayed: the ledger already holds this refund".to_string()),
+        ));
     }
 
     let problem = if !REFUND_RAILS.contains(&rail) {
@@ -3592,101 +3341,59 @@ pub async fn refund(
         None
     };
     if let Some(problem) = problem {
-        return refuse_with(cfg, store, journal, file, value, problem).await;
+        return Ok(Settlement::refused(problem));
     }
     let amount = match util::pence(amount_text) {
         Ok(a) if a > 0 => a,
         Ok(_) => {
-            return refuse_with(
-                cfg,
-                store,
-                journal,
-                file,
-                value,
+            return Ok(Settlement::refused(
                 "the refund's amount must be more than zero",
-            )
-            .await
+            ))
         }
-        Err(e) => return refuse_with(cfg, store, journal, file, value, &e).await,
+        Err(e) => return Ok(Settlement::refused(&e)),
     };
     let rate = match intent.rate.as_deref() {
         None => None,
         Some(text) => match util::pence(text) {
             Ok(p) if p > 0 => Some(util::gbp(p)),
             Ok(_) => {
-                return refuse_with(
-                    cfg,
-                    store,
-                    journal,
-                    file,
-                    value,
+                return Ok(Settlement::refused(
                     "the refund's rate must be more than zero",
-                )
-                .await
+                ))
             }
-            Err(e) => return refuse_with(cfg, store, journal, file, value, &e).await,
+            Err(e) => return Ok(Settlement::refused(&e)),
         },
     };
 
     let original = match last_payment_line(store, &intent.token).await {
         Ok(Some(line)) => line,
         Ok(None) => {
-            return refuse_with(
-                cfg,
-                store,
-                journal,
-                file,
-                value,
+            return Ok(Settlement::refused(
                 "the token has no payment line for a refund to reverse",
-            )
-            .await
+            ))
         }
-        Err(e) => return refuse_with(cfg, store, journal, file, value, &e).await,
+        Err(e) => return Ok(Settlement::refused(&e)),
     };
     if rail != original.rail {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
-            &format!(
-                "the payment arrived by {} and a refund never leaves on another rail",
-                original.rail
-            ),
-        )
-        .await;
+        return Ok(Settlement::refused(format!(
+            "the payment arrived by {} and a refund never leaves on another rail",
+            original.rail
+        )));
     }
     if amount > original.amount {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
-            &format!(
-                "the refund is GBP {}, more than the GBP {} that arrived at ledger seq {}",
-                util::gbp(amount),
-                util::gbp(original.amount),
-                original.seq
-            ),
-        )
-        .await;
+        return Ok(Settlement::refused(format!(
+            "the refund is GBP {}, more than the GBP {} that arrived at ledger seq {}",
+            util::gbp(amount),
+            util::gbp(original.amount),
+            original.seq
+        )));
     }
     if intent.close && amount != original.amount {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
-            &format!(
-                "a --close refund must be the full GBP {} that arrived at ledger seq {}",
-                util::gbp(original.amount),
-                original.seq
-            ),
-        )
-        .await;
+        return Ok(Settlement::refused(format!(
+            "a --close refund must be the full GBP {} that arrived at ledger seq {}",
+            util::gbp(original.amount),
+            original.seq
+        )));
     }
     // The token index is the only join, through the same helper the credit
     // path uses, so a refund and a credit cannot disagree about whose token it
@@ -3694,16 +3401,13 @@ pub async fn refund(
     // reverses the same way with one less account to write.
     let join = match token_join(store, &intent.token).await {
         Ok(join) => join,
-        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
+        Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
         return refund_group(
             cfg,
             store,
-            journal,
             &intent,
-            file,
-            value,
             &domain,
             rail,
             amount,
@@ -3715,7 +3419,7 @@ pub async fn refund(
     }
     let (username, mut account, mut payment) = match resolve_payment(store, &intent.token).await {
         Ok(found) => found,
-        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
+        Err(problem) => return Ok(Settlement::refused(&problem)),
     };
 
     // An excess refund gives back held overpayment, so whatever it takes has
@@ -3726,21 +3430,15 @@ pub async fn refund(
         Some(text) => match util::pence(text) {
             Ok(pence) => pence,
             Err(e) => {
-                return refuse_with(
-                    cfg,
-                    store,
-                    journal,
-                    file,
-                    value,
-                    &format!("the account's balance cannot be read: {e}"),
-                )
-                .await
+                return Ok(Settlement::refused(format!(
+                    "the account's balance cannot be read: {e}"
+                )))
             }
         },
         None => 0,
     };
     if let Err(problem) = refund_total(store, &intent.token, &original, amount).await {
-        return refuse_with(cfg, store, journal, file, value, &problem).await;
+        return Ok(Settlement::refused(&problem));
     }
 
     let received_on = util::filed_at()[..10].to_string();
@@ -3808,24 +3506,17 @@ pub async fn refund(
     } else {
         format!("recorded at ledger seq {seq}")
     };
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &ApplicationRef {
+    if rail == "card" {
+        println!("the Stripe refund's Idempotency-Key is refund-{seq}");
+    };
+    Ok(Settlement::line(
+        "applied",
+        ApplicationRef {
             username: username.clone(),
             status_token: String::new(),
         },
-        "applied",
-        Some(&note),
-    )
-    .await?;
-    if rail == "card" {
-        println!("the Stripe refund's Idempotency-Key is refund-{seq}");
-    }
-    store.remove("intents", file).await
+        Some(note.clone()),
+    ))
 }
 
 /// Refunds of one payment sum to no more than that payment, whatever their
@@ -3887,40 +3578,24 @@ async fn refund_total(
 async fn refund_group(
     cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
     intent: &RefundIntent,
-    file: &str,
-    value: &Value,
     domain: &str,
     rail: &str,
     amount: i64,
     reason: &str,
     rate: Option<&str>,
     original: &PaymentLine,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     let Some(group) = group_record(store, domain).await? else {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the token resolves to a group that is gone",
-        )
-        .await;
+        ));
     };
     if intent.close {
-        return refuse_with(
-            cfg,
-            store, journal,
-            file,
-            value,
-            "a group has no closing state, so --close cannot cancel one; reverse the payment with --excess, and end the group with `onboardctl group remove <domain>`",
-        )
-        .await;
+        return Ok(Settlement::refused("a group has no closing state, so --close cannot cancel one; reverse the payment with --excess, and end the group with `onboardctl group remove <domain>`"));
     }
     if let Err(problem) = refund_total(store, &intent.token, original, amount).await {
-        return refuse_with(cfg, store, journal, file, value, &problem).await;
+        return Ok(Settlement::refused(&problem));
     }
     let received_on = util::filed_at()[..10].to_string();
     let settlement_by = util::date_after_days(14);
@@ -3961,24 +3636,17 @@ async fn refund_group(
     } else {
         format!("recorded at ledger seq {seq}")
     };
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &ApplicationRef {
+    if rail == "card" {
+        println!("the Stripe refund's Idempotency-Key is refund-{seq}");
+    };
+    Ok(Settlement::line(
+        "applied",
+        ApplicationRef {
             username: group.site_owner.clone(),
             status_token: group.domain.clone(),
         },
-        "applied",
-        Some(&note),
-    )
-    .await?;
-    if rail == "card" {
-        println!("the Stripe refund's Idempotency-Key is refund-{seq}");
-    }
-    store.remove("intents", file).await
+        Some(note.clone()),
+    ))
 }
 
 /// The refund notice: what was refunded, by which rail, and the date reg 34(4)
@@ -4105,28 +3773,18 @@ fn unsettled_refund(lines: &[String], token: &str) -> Result<Option<usize>, Stri
 /// ledger's one non-append write: `--settled` names a line already recorded, and
 /// appending a second line would leave two records of one refund.
 async fn settle_refund(
-    cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
     intent: &RefundIntent,
-    file: &str,
-    value: &Value,
     on: &str,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     let settled_on = util::date_string(util::parse_date(on).expect("the date was validated"));
     // The refusal is decided before the lock is taken: it journals, which can
     // reach the mail enqueuer, and no append should wait behind that.
     let before_lock = store.log("ledger/payments.jsonl").raw_lines().await?;
     if unsettled_refund(&before_lock, &intent.token)?.is_none() {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the token has no unsettled refund to record a settlement against",
-        )
-        .await;
+        ));
     }
     let guard = store.log("ledger/payments.jsonl").lock().await?;
     // The lines stay as recorded: only the settled one is re-encoded, so a line
@@ -4136,15 +3794,9 @@ async fn settle_refund(
         // The guard goes first: the refusal journals, and no caller should wait
         // behind a lock this one no longer needs.
         drop(guard);
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the token has no unsettled refund to record a settlement against",
-        )
-        .await;
+        ));
     };
     let mut line: Value = serde_json::from_str(&lines[index])
         .map_err(|e| format!("the refund line does not parse: {e}"))?;
@@ -4163,23 +3815,16 @@ async fn settle_refund(
     // a mail enqueuer.
     drop(guard);
 
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &ApplicationRef {
+    Ok(Settlement::line(
+        "applied",
+        ApplicationRef {
             username: String::new(),
             status_token: String::new(),
         },
-        "applied",
-        Some(&format!(
+        Some(format!(
             "refund at ledger seq {seq} settled on {settled_on}"
         )),
-    )
-    .await?;
-    store.remove("intents", file).await
+    ))
 }
 
 pub const CREDIT_RAILS: [&str; 3] = ["cash", "cash-hand", "monero"];
@@ -4190,25 +3835,15 @@ pub const CREDIT_RAILS: [&str; 3] = ["cash", "cash-hand", "monero"];
 /// appended and no notice is sent, because nothing here has a member yet.
 #[allow(clippy::too_many_arguments)]
 async fn hold(
-    cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
     intent: &CreditIntent,
-    file: &str,
-    value: &Value,
     amount: i64,
     received: time::Date,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     if intent.rail == "cash-hand" {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "cash in hand is credited against a username; give --username",
-        )
-        .await;
+        ));
     }
     let Some(note) = intent
         .note
@@ -4216,15 +3851,9 @@ async fn hold(
         .map(str::trim)
         .filter(|note| !note.is_empty())
     else {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "a payment with no token needs --note so the operator can tell what it is",
-        )
-        .await;
+        ));
     };
     // A transaction already seen is the same payment, whether it was held or
     // credited: it must never become a second line the operator could join
@@ -4232,28 +3861,14 @@ async fn hold(
     // are consulted from either side.
     if let Some(txid) = intent.txid.as_deref() {
         if let Some((seq, received_on)) = ledger_txid(store, txid).await? {
-            return refuse_with(
-                cfg,
-                store,
-                journal,
-                file,
-                value,
-                &format!(
-                    "transaction {txid} was already credited on {received_on} at ledger seq {seq}"
-                ),
-            )
-            .await;
+            return Ok(Settlement::refused(format!(
+                "transaction {txid} was already credited on {received_on} at ledger seq {seq}"
+            )));
         }
         if let Some((id, received_on)) = held_txid(store, txid).await? {
-            return refuse_with(
-                cfg,
-                store,
-                journal,
-                file,
-                value,
-                &format!("transaction {txid} is already held as {id}, received on {received_on}"),
-            )
-            .await;
+            return Ok(Settlement::refused(format!(
+                "transaction {txid} is already held as {id}, received on {received_on}"
+            )));
         }
     }
     let line = json!({
@@ -4275,21 +3890,14 @@ async fn hold(
         .log(store::UNATTRIBUTED)
         .append(encoded.as_bytes())
         .await?;
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &ApplicationRef {
+    Ok(Settlement::line(
+        "applied",
+        ApplicationRef {
             username: String::new(),
             status_token: String::new(),
         },
-        "applied",
-        Some("held: the payment carries no token"),
-    )
-    .await?;
-    store.remove("intents", file).await
+        Some("held: the payment carries no token".to_string()),
+    ))
 }
 
 /// Join a held payment to an account: the same arithmetic, account write,
@@ -4301,42 +3909,33 @@ pub async fn reconcile_attribute(
     store: &Store,
     journal: &Journal,
     intent: AttributeIntent,
-    file: &str,
-    value: &Value,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     if !store::is_unattributed_id(&intent.item) {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the held item's id is not the shape of an unattributed payment",
-        )
-        .await;
+        ));
     }
     if !store::is_payment_token(&intent.token) {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the token is not the shape of a payment token",
-        )
-        .await;
+        ));
     }
 
     // The payment line is the settlement marker. A replay of the very intent
     // that attributed the item still has to finish marking the held line, if a
     // crash landed between the two writes.
     if ledger_has_intent(store, &intent.id).await? {
-        mark_attributed(store, &intent.item, &intent.token).await?;
-        store.remove("intents", file).await?;
-        return Ok(());
-    }
-    if journal.has(&intent.id, "refused") {
-        return Ok(());
+        let username = token_join(store, &intent.token)
+            .await?
+            .map(|join| join.username)
+            .unwrap_or_default();
+        return Ok(Settlement::applied(
+            ApplicationRef {
+                username,
+                status_token: String::new(),
+            },
+            override_note(intent.override_reason.as_deref()),
+        ));
     }
 
     let held = match store
@@ -4347,27 +3946,17 @@ pub async fn reconcile_attribute(
     {
         Some(held) => held,
         None => {
-            return refuse_with(
-                cfg,
-                store,
-                journal,
-                file,
-                value,
-                &format!("no held payment with id {}", intent.item),
-            )
-            .await
+            return Ok(Settlement::refused(format!(
+                "no held payment with id {}",
+                intent.item
+            )))
         }
     };
     if held.state != "held" {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
-            &format!("{} is {}, not held", intent.item, held.state),
-        )
-        .await;
+        return Ok(Settlement::refused(format!(
+            "{} is {}, not held",
+            intent.item, held.state
+        )));
     }
 
     // The held line is data the console wrote earlier, so it is revalidated
@@ -4391,7 +3980,7 @@ pub async fn reconcile_attribute(
     };
     let amount = match credit_fields(&payment_intent) {
         Ok(amount) => amount,
-        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
+        Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     let received =
         util::parse_date(&payment_intent.received).expect("the date was validated above");
@@ -4401,30 +3990,24 @@ pub async fn reconcile_attribute(
     // so the held item is attributed only once that line exists.
     let join = match token_join(store, &payment_intent.token).await {
         Ok(join) => join,
-        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
+        Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
-        group_credit(
+        let settled = group_credit(
             cfg,
             store,
             journal,
-            file,
-            value,
             &payment_intent,
             &domain,
             Some(&intent.item),
         )
         .await?;
-        if ledger_has_intent(store, &payment_intent.id).await? {
-            mark_attributed(store, &intent.item, &intent.token).await?;
-            store.remove("intents", file).await?;
-        }
-        return Ok(());
+        return Ok(settled);
     }
 
     let (username, account, payment) = match resolve_payment(store, &payment_intent.token).await {
         Ok(found) => found,
-        Err(problem) => return refuse_with(cfg, store, journal, file, value, &problem).await,
+        Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     let app = PaymentApplication {
         intent: &payment_intent,
@@ -4435,48 +4018,20 @@ pub async fn reconcile_attribute(
         received,
         attributed_item: Some(&intent.item),
     };
-    if !apply_payment(cfg, store, journal, file, value, app).await? {
-        return Ok(());
-    }
-    mark_attributed(store, &intent.item, &intent.token).await?;
-    store.remove("intents", file).await
+    apply_payment(cfg, store, journal, app).await
 }
 
 /// Close a held payment with the evidence it went back or was kept. No payment
 /// line and no notice: no money moved and no account was touched.
-pub async fn reconcile_return(
-    cfg: &DrainConfig,
-    store: &Store,
-    journal: &Journal,
-    intent: ReturnIntent,
-    file: &str,
-    value: &Value,
-) -> Result<(), String> {
+pub async fn reconcile_return(store: &Store, intent: ReturnIntent) -> Result<Settlement, String> {
     if !store::is_unattributed_id(&intent.item) {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
+        return Ok(Settlement::refused(
             "the held item's id is not the shape of an unattributed payment",
-        )
-        .await;
-    }
-    if journal.has(&intent.id, "refused") {
-        return Ok(());
+        ));
     }
     let note = intent.note.trim();
     if note.is_empty() {
-        return refuse_with(
-            cfg,
-            store,
-            journal,
-            file,
-            value,
-            "the evidence for the return is needed",
-        )
-        .await;
+        return Ok(Settlement::refused("the evidence for the return is needed"));
     }
     let state = store
         .held()
@@ -4486,27 +4041,17 @@ pub async fn reconcile_return(
         .map(|line| line.state);
     match state.as_deref() {
         None => {
-            return refuse_with(
-                cfg,
-                store,
-                journal,
-                file,
-                value,
-                &format!("no held payment with id {}", intent.item),
-            )
-            .await
+            return Ok(Settlement::refused(format!(
+                "no held payment with id {}",
+                intent.item
+            )))
         }
         Some("held") => {}
         Some(other) => {
-            return refuse_with(
-                cfg,
-                store,
-                journal,
-                file,
-                value,
-                &format!("{} is {other}, not held", intent.item),
-            )
-            .await
+            return Ok(Settlement::refused(format!(
+                "{} is {other}, not held",
+                intent.item
+            )))
         }
     }
 
@@ -4527,21 +4072,14 @@ pub async fn reconcile_return(
         Ok(())
     })
     .await?;
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &ApplicationRef {
+    Ok(Settlement::line(
+        "applied",
+        ApplicationRef {
             username: String::new(),
             status_token: String::new(),
         },
-        "applied",
         None,
-    )
-    .await?;
-    store.remove("intents", file).await
+    ))
 }
 
 /// Mark one held line attributed to a token. Idempotent for the replay path, and
@@ -4696,33 +4234,6 @@ async fn journal_credit_applying(
     journal.append(store, &line).await
 }
 
-/// Journal a credit's completion, carrying an override's reason when there was
-/// one.
-async fn journal_credit_applied(
-    cfg: &DrainConfig,
-    store: &Store,
-    journal: &Journal,
-    intent: &CreditIntent,
-    username: &str,
-    override_reason: Option<&str>,
-) -> Result<(), String> {
-    let note = override_reason.map(|reason| format!("24-month override: {reason}"));
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &ApplicationRef {
-            username: username.to_string(),
-            status_token: String::new(),
-        },
-        "applied",
-        note.as_deref(),
-    )
-    .await
-}
-
 /// The ledger line carrying this transaction id, with the date it was first
 /// credited and its `seq`, so a second credit can name both.
 async fn ledger_txid(store: &Store, txid: &str) -> Result<Option<(u64, String)>, String> {
@@ -4860,10 +4371,9 @@ async fn approve_group(
     journal: &Journal,
     key: &[u8],
     intent: &DecisionIntent,
-    file: &str,
     record: &Record,
     no_charge: bool,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     let domain = record
         .domain
         .clone()
@@ -5060,19 +4570,11 @@ async fn approve_group(
         None,
     )
     .await?;
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &intent.application,
+    Ok(Settlement::line(
         "applied",
+        intent.application.clone(),
         None,
-    )
-    .await?;
-    store.remove("intents", file).await?;
-    Ok(())
+    ))
 }
 
 /// The address table the community block answered, paired with the account
@@ -5240,8 +4742,7 @@ pub async fn provision_group(
     store: &Store,
     journal: &Journal,
     intent: GroupIntent,
-    file: &str,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     if intent.kind != "provision-group" {
         return Err(format!("kind {:?} is not a group intent", intent.kind));
     }
@@ -5493,19 +4994,11 @@ pub async fn provision_group(
         run_script(cfg, "cron-apply.sh", &["--web"]).await?;
     }
 
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &intent.application,
+    Ok(Settlement::line(
         "applied",
+        intent.application.clone(),
         None,
-    )
-    .await?;
-    store.remove("intents", file).await?;
-    Ok(())
+    ))
 }
 
 /// The application's own copy, written into each mailbox's account so the block's
@@ -6185,13 +5678,7 @@ async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), S
 /// window. The deletion itself is the sweep's, so the account works normally
 /// until the window ends and a replayed intent changes nothing. The session that
 /// proves the request is `Intent::verify`'s.
-pub async fn close_account(
-    cfg: &DrainConfig,
-    store: &Store,
-    journal: &Journal,
-    intent: CloseIntent,
-    file: &str,
-) -> Result<(), String> {
+pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlement, String> {
     if intent.kind != "close" {
         return Err(format!("kind {:?} is not a close intent", intent.kind));
     }
@@ -6202,18 +5689,11 @@ pub async fn close_account(
     let Some(mut account) = existing_account(store, &intent.username).await else {
         // The account the handler authenticated has already gone. That is a
         // closed request, not new work.
-        write_journal(
-            store,
-            journal,
-            &cfg.release,
-            &intent.id,
-            &intent.kind,
-            &application,
+        return Ok(Settlement::line(
             "applied",
-            Some("the account had already gone"),
-        )
-        .await?;
-        return store.remove("intents", file).await;
+            application,
+            Some("the account had already gone".to_string()),
+        ));
     };
     // Every data-subject request gets one line, whether it arrived from the page
     // or the console. The id is the intent's, so a retry after the state write
@@ -6236,68 +5716,36 @@ pub async fn close_account(
         }
     }
     if account.state == "closing" {
-        write_journal(
-            store,
-            journal,
-            &cfg.release,
-            &intent.id,
-            &intent.kind,
-            &application,
+        return Ok(Settlement::line(
             "applied",
-            Some("the account was already closing"),
-        )
-        .await?;
-        return store.remove("intents", file).await;
+            application,
+            Some("the account was already closing".to_string()),
+        ));
     }
     account.state = "closing".to_string();
     account.closing_until = Some(util::date_after_days(7));
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
     write_account_record(store, &intent.username, &bytes).await?;
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &application,
+    Ok(Settlement::line(
         "applied",
-        Some("the account is closing; the deletion runs when the seven days end"),
-    )
-    .await?;
-    store.remove("intents", file).await
+        application.clone(),
+        Some("the account is closing; the deletion runs when the seven days end".to_string()),
+    ))
 }
 
-/// The account a page action acts on. The session and the username's shape are
-/// `Intent::verify`'s, because they are the proof; what is left here is the
-/// account itself, and an account that has gone settles the intent with a
-/// journal line and nothing else.
-async fn page_account(
-    cfg: &DrainConfig,
-    store: &Store,
-    journal: &Journal,
-    id: &str,
-    kind: &str,
-    username: &str,
-    file: &str,
-) -> Result<Option<Account>, String> {
-    match existing_account(store, username).await {
-        Some(account) => Ok(Some(account)),
-        None => {
-            settle_page(
-                cfg,
-                store,
-                journal,
-                id,
-                kind,
-                username,
-                file,
-                "applied",
-                Some("the account had already gone"),
-            )
-            .await
-        }
-    }
+/// A page action's refusal: the handler validated it on the way in, so a
+/// refusal here means the intent's own fields got something wrong, and the file
+/// goes with the line rather than waiting for the operator.
+fn refused_page(username: &str, reason: impl ToString) -> Settlement {
+    Settlement::line(
+        "refused",
+        ApplicationRef {
+            username: username.to_string(),
+            status_token: String::new(),
+        },
+        Some(reason.to_string()),
+    )
 }
 
 /// Journal one page action and remove its file, for the paths with nothing left
@@ -6379,22 +5827,16 @@ async fn save_account(store: &Store, account: &Account) -> Result<(), String> {
 pub async fn change_password(
     cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
     intent: ChangePasswordIntent,
-    file: &str,
-) -> Result<(), String> {
-    let Some(account) = page_account(
-        cfg,
-        store,
-        journal,
-        &intent.id,
-        &intent.kind,
-        &intent.username,
-        file,
-    )
-    .await?
-    else {
-        return Ok(());
+) -> Result<Settlement, String> {
+    let Some(account) = existing_account(store, &intent.username).await else {
+        return Ok(Settlement::applied(
+            ApplicationRef {
+                username: intent.username.clone(),
+                status_token: String::new(),
+            },
+            Some("the account had already gone".to_string()),
+        ));
     };
     // The plaintext is checked and hashed here. It is overwritten before any
     // refusal removes the file, so a refusal leaves neither a file nor a buffer
@@ -6402,65 +5844,30 @@ pub async fn change_password(
     let mut plain = intent.password;
     if let Err(why) = crate::password::validate(&plain) {
         unsafe { plain.as_mut_vec().fill(0) };
-        return refuse_page(
-            cfg,
-            store,
-            journal,
-            &intent.id,
-            &intent.kind,
-            &intent.username,
-            file,
-            &why,
-        )
-        .await;
+        return Ok(refused_page(&intent.username, &why));
     }
     let made = crate::password::make(&plain);
     unsafe { plain.as_mut_vec().fill(0) };
     let hash = match made {
         Ok(hash) if crate::password::is_hash(&hash) => hash,
         Ok(_) => {
-            return refuse_page(
-                cfg,
-                store,
-                journal,
-                &intent.id,
-                &intent.kind,
-                &intent.username,
-                file,
-                "the password did not hash",
-            )
-            .await;
+            return Ok(refused_page(&intent.username, "the password did not hash"));
         }
         Err(e) => {
-            return refuse_page(
-                cfg,
-                store,
-                journal,
-                &intent.id,
-                &intent.kind,
-                &intent.username,
-                file,
-                &e,
-            )
-            .await;
+            return Ok(refused_page(&intent.username, &e));
         }
     };
     run_script(cfg, "set-mail-password.sh", &[&account.username, &hash]).await?;
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &ApplicationRef {
+    Ok(Settlement::line(
+        "applied",
+        ApplicationRef {
             username: account.username.clone(),
             status_token: String::new(),
         },
-        "applied",
-        Some("the stored hash is replaced, so the old password no longer authenticates"),
-    )
-    .await?;
-    store.remove("intents", file).await
+        Some(
+            "the stored hash is replaced, so the old password no longer authenticates".to_string(),
+        ),
+    ))
 }
 
 /// Add or remove the one upload key that serves sftp and git. Adding writes the
@@ -6470,51 +5877,31 @@ pub async fn change_password(
 pub async fn upload_key(
     cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
     intent: UploadKeyIntent,
-    file: &str,
-) -> Result<(), String> {
-    let Some(mut account) = page_account(
-        cfg,
-        store,
-        journal,
-        &intent.id,
-        &intent.kind,
-        &intent.username,
-        file,
-    )
-    .await?
-    else {
-        return Ok(());
+) -> Result<Settlement, String> {
+    let Some(mut account) = existing_account(store, &intent.username).await else {
+        return Ok(Settlement::applied(
+            ApplicationRef {
+                username: intent.username.clone(),
+                status_token: String::new(),
+            },
+            Some("the account had already gone".to_string()),
+        ));
     };
     let now = util::filed_at();
     match intent.action.as_str() {
         "add" => {
             if let Err(why) = crate::keycheck::openssh_public_key(&intent.material) {
-                return refuse_page(
-                    cfg,
-                    store,
-                    journal,
-                    &intent.id,
-                    &intent.kind,
+                return Ok(refused_page(
                     &intent.username,
-                    file,
-                    &format!("the upload key: {why}"),
-                )
-                .await;
+                    format!("the upload key: {why}"),
+                ));
             }
             let Some(fingerprint) = crate::keycheck::openssh_fingerprint(&intent.material) else {
-                return refuse_page(
-                    cfg,
-                    store,
-                    journal,
-                    &intent.id,
-                    &intent.kind,
+                return Ok(refused_page(
                     &intent.username,
-                    file,
                     "the upload key carries no key material",
-                )
-                .await;
+                ));
             };
             write_public_key(store, &account.username, &intent.material).await?;
             run_script(cfg, "provision-member.sh", &[&account.username]).await?;
@@ -6553,17 +5940,10 @@ pub async fn upload_key(
                 .iter()
                 .any(|key| key.fingerprint == intent.fingerprint)
             {
-                return refuse_page(
-                    cfg,
-                    store,
-                    journal,
-                    &intent.id,
-                    &intent.kind,
+                return Ok(refused_page(
                     &intent.username,
-                    file,
                     "that key is not on the account",
-                )
-                .await;
+                ));
             }
             store
                 .remove("keys", &format!("{}.pub", account.username))
@@ -6572,76 +5952,48 @@ pub async fn upload_key(
             account.upload_keys.clear();
         }
         other => {
-            return refuse_page(
-                cfg,
-                store,
-                journal,
-                &intent.id,
-                &intent.kind,
+            return Ok(refused_page(
                 &intent.username,
-                file,
-                &format!("{other:?} is not an upload-key action"),
-            )
-            .await
+                format!("{other:?} is not an upload-key action"),
+            ))
         }
     }
     save_account(store, &account).await?;
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &ApplicationRef {
+    Ok(Settlement::line(
+        "applied",
+        ApplicationRef {
             username: account.username.clone(),
             status_token: String::new(),
         },
-        "applied",
-        Some(&format!("the upload key was {}", intent.action)),
-    )
-    .await?;
-    store.remove("intents", file).await
+        Some(format!("the upload key was {}", intent.action)),
+    ))
 }
 
 /// Change or clear the contact and recovery address. The address is
 /// revalidated here because it becomes a mail header, and the drain's notices
 /// read it before they read anything else.
 pub async fn set_outside_address(
-    cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
     intent: OutsideAddressIntent,
-    file: &str,
-) -> Result<(), String> {
-    let Some(mut account) = page_account(
-        cfg,
-        store,
-        journal,
-        &intent.id,
-        &intent.kind,
-        &intent.username,
-        file,
-    )
-    .await?
-    else {
-        return Ok(());
+) -> Result<Settlement, String> {
+    let Some(mut account) = existing_account(store, &intent.username).await else {
+        return Ok(Settlement::applied(
+            ApplicationRef {
+                username: intent.username.clone(),
+                status_token: String::new(),
+            },
+            Some("the account had already gone".to_string()),
+        ));
     };
     let address = intent.address.trim();
     let outside = if address.is_empty() {
         None
     } else {
         if let Some(why) = validate::address(address) {
-            return refuse_page(
-                cfg,
-                store,
-                journal,
-                &intent.id,
-                &intent.kind,
+            return Ok(refused_page(
                 &intent.username,
-                file,
-                &format!("the address outside the platform {address:?}: {why}"),
-            )
-            .await;
+                format!("the address outside the platform {address:?}: {why}"),
+            ));
         }
         Some(address.to_string())
     };
@@ -6652,21 +6004,14 @@ pub async fn set_outside_address(
     };
     account.outside_address = outside;
     save_account(store, &account).await?;
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &ApplicationRef {
+    Ok(Settlement::line(
+        "applied",
+        ApplicationRef {
             username: account.username.clone(),
             status_token: String::new(),
         },
-        "applied",
-        Some(note),
-    )
-    .await?;
-    store.remove("intents", file).await
+        Some(note.to_string()),
+    ))
 }
 
 /// Turn HTTP or gemini serving on or off. The two are independent: the drain
@@ -6675,22 +6020,16 @@ pub async fn set_outside_address(
 pub async fn set_serving(
     cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
     intent: ServingIntent,
-    file: &str,
-) -> Result<(), String> {
-    let Some(mut account) = page_account(
-        cfg,
-        store,
-        journal,
-        &intent.id,
-        &intent.kind,
-        &intent.username,
-        file,
-    )
-    .await?
-    else {
-        return Ok(());
+) -> Result<Settlement, String> {
+    let Some(mut account) = existing_account(store, &intent.username).await else {
+        return Ok(Settlement::applied(
+            ApplicationRef {
+                username: intent.username.clone(),
+                status_token: String::new(),
+            },
+            Some("the account had already gone".to_string()),
+        ));
     };
     // An unrecorded lane on a hosting member is serving: provision-member.sh
     // wrote it and nobody has turned it off. Comparing the effective value keeps
@@ -6730,24 +6069,17 @@ pub async fn set_serving(
     account.site_served = Some(intent.http);
     account.capsule_served = Some(intent.gemini);
     save_account(store, &account).await?;
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &ApplicationRef {
+    Ok(Settlement::line(
+        "applied",
+        ApplicationRef {
             username: account.username.clone(),
             status_token: String::new(),
         },
-        "applied",
-        Some(&format!(
+        Some(format!(
             "serving is http {} and gemini {}",
             intent.http, intent.gemini
         )),
-    )
-    .await?;
-    store.remove("intents", file).await
+    ))
 }
 
 /// Stop the card subscription's yearly renewal. Stripe's
@@ -6756,48 +6088,28 @@ pub async fn set_serving(
 pub async fn cancel_renewal(
     cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
     intent: CancelRenewalIntent,
-    file: &str,
-) -> Result<(), String> {
-    let Some(mut account) = page_account(
-        cfg,
-        store,
-        journal,
-        &intent.id,
-        &intent.kind,
-        &intent.username,
-        file,
-    )
-    .await?
-    else {
-        return Ok(());
+) -> Result<Settlement, String> {
+    let Some(mut account) = existing_account(store, &intent.username).await else {
+        return Ok(Settlement::applied(
+            ApplicationRef {
+                username: intent.username.clone(),
+                status_token: String::new(),
+            },
+            Some("the account had already gone".to_string()),
+        ));
     };
     let Some(payment) = account.payment.as_mut() else {
-        return refuse_page(
-            cfg,
-            store,
-            journal,
-            &intent.id,
-            &intent.kind,
+        return Ok(refused_page(
             &intent.username,
-            file,
             "the account has no card subscription to cancel",
-        )
-        .await;
+        ));
     };
     let Some(subscription) = payment.stripe.subscription.clone() else {
-        return refuse_page(
-            cfg,
-            store,
-            journal,
-            &intent.id,
-            &intent.kind,
+        return Ok(refused_page(
             &intent.username,
-            file,
             "the account has no card subscription to cancel",
-        )
-        .await;
+        ));
     };
     if !payment.stripe.cancel_at_period_end {
         run_script(
@@ -6809,21 +6121,14 @@ pub async fn cancel_renewal(
         payment.stripe.cancel_at_period_end = true;
         save_account(store, &account).await?;
     }
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &ApplicationRef {
+    Ok(Settlement::line(
+        "applied",
+        ApplicationRef {
             username: account.username.clone(),
             status_token: String::new(),
         },
-        "applied",
-        Some("the subscription stops renewing at the end of the period"),
-    )
-    .await?;
-    store.remove("intents", file).await
+        Some("the subscription stops renewing at the end of the period".to_string()),
+    ))
 }
 
 /// The addresses a notice about this account goes to: its own platform
@@ -6936,22 +6241,16 @@ async fn apply_rotation(
 pub async fn mail_key(
     cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
     intent: MailKeyIntent,
-    file: &str,
-) -> Result<(), String> {
-    let Some(mut account) = page_account(
-        cfg,
-        store,
-        journal,
-        &intent.id,
-        &intent.kind,
-        &intent.username,
-        file,
-    )
-    .await?
-    else {
-        return Ok(());
+) -> Result<Settlement, String> {
+    let Some(mut account) = existing_account(store, &intent.username).await else {
+        return Ok(Settlement::applied(
+            ApplicationRef {
+                username: intent.username.clone(),
+                status_token: String::new(),
+            },
+            Some("the account had already gone".to_string()),
+        ));
     };
     let application = ApplicationRef {
         username: account.username.clone(),
@@ -6960,18 +6259,11 @@ pub async fn mail_key(
     match intent.action.as_str() {
         "cancel" => {
             let Some(cancelled) = account.rotation.as_ref().map(|r| r.fingerprint.clone()) else {
-                write_journal(
-                    store,
-                    journal,
-                    &cfg.release,
-                    &intent.id,
-                    &intent.kind,
-                    &application,
+                return Ok(Settlement::line(
                     "applied",
-                    Some("no replacement was pending"),
-                )
-                .await?;
-                return store.remove("intents", file).await;
+                    application.clone(),
+                    Some("no replacement was pending".to_string()),
+                ));
             };
             account.rotation = None;
             save_account(store, &account).await?;
@@ -6988,90 +6280,48 @@ pub async fn mail_key(
                 &body,
             )
             .await?;
-            write_journal(
-                store,
-                journal,
-                &cfg.release,
-                &intent.id,
-                &intent.kind,
-                &application,
+            Ok(Settlement::line(
                 "applied",
-                Some("the pending replacement was cancelled"),
-            )
-            .await?;
-            store.remove("intents", file).await
+                application.clone(),
+                Some("the pending replacement was cancelled".to_string()),
+            ))
         }
         "replace" => {
             if let Err(why) = crate::keycheck::pgp_public_key(&intent.material) {
-                return refuse_page(
-                    cfg,
-                    store,
-                    journal,
-                    &intent.id,
-                    &intent.kind,
+                return Ok(refused_page(
                     &intent.username,
-                    file,
-                    &format!("the mail key: {why}"),
-                )
-                .await;
+                    format!("the mail key: {why}"),
+                ));
             }
             let Some(fingerprint) = crate::keycheck::pgp_fingerprint(&intent.material) else {
-                return refuse_page(
-                    cfg,
-                    store,
-                    journal,
-                    &intent.id,
-                    &intent.kind,
+                return Ok(refused_page(
                     &intent.username,
-                    file,
                     "the mail key carries no key packet",
-                )
-                .await;
+                ));
             };
             if account.mail_key.as_deref() == Some(fingerprint.as_str()) {
-                return refuse_page(
-                    cfg,
-                    store,
-                    journal,
-                    &intent.id,
-                    &intent.kind,
+                return Ok(refused_page(
                     &intent.username,
-                    file,
                     "that is the key already in use",
-                )
-                .await;
+                ));
             }
             let key_file = crate::keycheck::keyring_file(&cfg.keyring_dir, &account.username);
             let signed = if intent.signature.trim().is_empty() {
                 false
             } else {
                 if !key_file.is_file() {
-                    return refuse_page(
-                        cfg,
-                        store,
-                        journal,
-                        &intent.id,
-                        &intent.kind,
+                    return Ok(refused_page(
                         &intent.username,
-                        file,
                         "the box holds no current key to verify a signature against",
-                    )
-                    .await;
+                    ));
                 }
                 match signed_by_current_key(cfg, &key_file, &fingerprint, &intent.signature).await {
                     Ok(true) => true,
                     Ok(false) => {
-                        return refuse_page(
-                            cfg,
-                            store,
-                            journal,
-                            &intent.id,
-                            &intent.kind,
+                        return Ok(refused_page(
                             &intent.username,
-                            file,
                             "the signature does not verify against the key in use",
-                        )
-                        .await
+                        ))
                     }
                     Err(e) => return Err(e),
                 }
@@ -7110,36 +6360,23 @@ pub async fn mail_key(
                 )
                 .await?;
             }
-            write_journal(
-                store,
-                journal,
-                &cfg.release,
-                &intent.id,
-                &intent.kind,
-                &application,
+            Ok(Settlement::line(
                 "applied",
-                Some(if signed {
-                    "the replacement was signed by the current key and applied at once"
-                } else {
-                    "the replacement waits out the 72-hour window"
-                }),
-            )
-            .await?;
-            store.remove("intents", file).await
+                application.clone(),
+                Some(
+                    (if signed {
+                        "the replacement was signed by the current key and applied at once"
+                    } else {
+                        "the replacement waits out the 72-hour window"
+                    })
+                    .to_string(),
+                ),
+            ))
         }
-        other => {
-            refuse_page(
-                cfg,
-                store,
-                journal,
-                &intent.id,
-                &intent.kind,
-                &intent.username,
-                file,
-                &format!("{other:?} is not a mail-key action"),
-            )
-            .await
-        }
+        other => Ok(refused_page(
+            &intent.username,
+            format!("{other:?} is not a mail-key action"),
+        )),
     }
 }
 
@@ -7235,8 +6472,7 @@ pub async fn group_address(
     store: &Store,
     journal: &Journal,
     intent: GroupAddressIntent,
-    file: &str,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     if intent.kind != "group-address" {
         return Err(format!("kind {:?} is not an address intent", intent.kind));
     }
@@ -7514,18 +6750,7 @@ pub async fn group_address(
         _ => unreachable!("the action was checked against ADDRESS_ACTIONS"),
     }
 
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &application,
-        "applied",
-        None,
-    )
-    .await?;
-    store.remove("intents", file).await
+    Ok(Settlement::line("applied", application, None))
 }
 
 /// Apply one `remove-group` intent: take a body's domain off the box whole.
@@ -7547,8 +6772,7 @@ pub async fn remove_group(
     store: &Store,
     journal: &Journal,
     intent: GroupRemoveIntent,
-    file: &str,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     if intent.kind != "remove-group" {
         return Err(format!(
             "kind {:?} is not a remove-group intent",
@@ -7557,13 +6781,6 @@ pub async fn remove_group(
     }
     if let Some(why) = validate::domain(&intent.domain) {
         return Err(format!("the domain {:?}: {why}", intent.domain));
-    }
-
-    // A replay whose transition finished: the domain is already down, so only
-    // the record directory and the file can be left, and both may be gone.
-    if journal.has(&intent.id, "applied") {
-        remove_group_record(store, &intent.domain).await?;
-        return store.remove("intents", file).await;
     }
 
     let Some(group) = group_record(store, &intent.domain).await? else {
@@ -7595,19 +6812,9 @@ pub async fn remove_group(
     // relayd keypair line the httpd file carried, which only the reload applies.
     take_group_down(cfg, store, &intent.domain).await?;
 
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &application,
-        "applied",
-        None,
-    )
-    .await?;
-    remove_group_record(store, &intent.domain).await?;
-    store.remove("intents", file).await
+    // The record is after-line work: it goes once the line is written, so a
+    // retry after a crash still finds the accounts it has to close.
+    Ok(Settlement::applied(application, None))
 }
 
 /// The host files, the index and reload pass, every mailbox's closure and the
@@ -7681,8 +6888,7 @@ async fn decline(
     store: &Store,
     journal: &Journal,
     intent: &DecisionIntent,
-    file: &str,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     let token = &intent.application.status_token;
     let username = &intent.application.username;
     let record = application_record(store, token).await?;
@@ -7690,19 +6896,11 @@ async fn decline(
         return Err("the intent's username is not the application's".to_string());
     }
     if record.decided_at.is_some() {
-        write_journal(
-            store,
-            journal,
-            &cfg.release,
-            &intent.id,
-            &intent.kind,
-            &intent.application,
+        return Ok(Settlement::line(
             "already-decided",
-            Some("the application was already decided; nothing was carried out"),
-        )
-        .await?;
-        store.remove("intents", file).await?;
-        return Ok(());
+            intent.application.clone(),
+            Some("the application was already decided; nothing was carried out".to_string()),
+        ));
     }
     // The address is validated before the journal line, so a record whose
     // address could inject a header is refused before anything is carried out.
@@ -7746,19 +6944,11 @@ async fn decline(
     // send leaves one window in which a crash could send twice, between sendmail
     // returning and this write, against the certain loss of the notice before.
     mark_decided(store, token, "declined", &now, None).await?;
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &intent.id,
-        &intent.kind,
-        &intent.application,
+    Ok(Settlement::line(
         "applied",
+        intent.application.clone(),
         None,
-    )
-    .await?;
-    store.remove("intents", file).await?;
-    Ok(())
+    ))
 }
 
 /// How often a group's published records are looked at. The drain runs every
@@ -8418,10 +7608,9 @@ pub async fn prepaid_renewals(cfg: &DrainConfig, store: &Store) -> Result<(), St
 pub async fn export_account(
     cfg: &DrainConfig,
     store: &Store,
-    journal: &Journal,
     intent: ExportIntent,
     file: &str,
-) -> Result<(), String> {
+) -> Result<Settlement, String> {
     let username = intent.username.as_str();
     let id = if intent.id.is_empty() {
         file.trim_end_matches(".json").to_string()
@@ -8473,18 +7662,11 @@ pub async fn export_account(
         username: username.to_string(),
         status_token,
     };
-    write_journal(
-        store,
-        journal,
-        &cfg.release,
-        &id,
-        "export",
-        &application,
+    Ok(Settlement::line(
         "applied",
-        Some(&format!("the bundle is at {bundle}")),
-    )
-    .await?;
-    store.remove("intents", file).await
+        application.clone(),
+        Some(format!("the bundle is at {bundle}")),
+    ))
 }
 
 /// Clear away every declined application whose week is up, and release the
@@ -10507,14 +9689,13 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            runtime.block_on(settle_refund(
+            runtime.block_on(settle(
                 &cfg,
                 &store,
                 &journal,
-                &intent,
                 "settle.json",
-                &value,
-                "2026-11-05",
+                &Envelope::of(&value, "settle.json", "refund"),
+                settle_refund(&store, &intent, "2026-11-05"),
             ))
         });
 
@@ -10562,6 +9743,115 @@ mod tests {
             "the ledger lock is still held while the settlement journals"
         );
         assert!(settled.is_ok(), "{settled:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// A refusal is one line however many passes read the file, and the file
+    /// stays for the operator: the dedup and the line are `settle`'s, not each
+    /// verb's.
+    #[test]
+    fn a_refused_intent_is_recorded_once_and_kept() {
+        let dir =
+            std::env::temp_dir().join(format!("onboard-settle-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = quota_config(&dir);
+        std::fs::create_dir_all(dir.join("store/intents")).unwrap();
+        std::fs::write(dir.join("store/intents/settle.json"), "{}").unwrap();
+        let store = Store::new_for_test(&cfg.store_root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let journal = runtime.block_on(Journal::load(&store)).unwrap();
+        let value = json!({ "id": "01HZZZZZZZZZZZZZZZZZZZZZZZ", "kind": "window-extend" });
+        let envelope = Envelope::of(&value, "settle.json", "window-extend");
+
+        for _ in 0..2 {
+            runtime
+                .block_on(settle(
+                    &cfg,
+                    &store,
+                    &journal,
+                    "settle.json",
+                    &envelope,
+                    async { Ok(Settlement::refused("the window extension gives no reason")) },
+                ))
+                .unwrap();
+        }
+
+        let text = std::fs::read_to_string(dir.join("store/journal.jsonl")).unwrap();
+        assert_eq!(
+            text.matches("\"outcome\":\"refused\"").count(),
+            1,
+            "a second pass refused it again: {text}"
+        );
+        assert!(
+            text.contains("the window extension gives no reason"),
+            "{text}"
+        );
+        assert!(
+            dir.join("store/intents/settle.json").exists(),
+            "a refusal keeps its file for the operator"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A crash between the outcome line and the remove leaves the file, and for
+    /// a removal its record too. The next pass finishes both, runs no body, and
+    /// appends nothing.
+    #[test]
+    fn a_line_left_behind_finishes_the_after_work_once() {
+        let dir =
+            std::env::temp_dir().join(format!("onboard-settle-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = quota_config(&dir);
+        std::fs::create_dir_all(dir.join("store/intents")).unwrap();
+        std::fs::create_dir_all(dir.join("store/groups/parish.example")).unwrap();
+        std::fs::write(dir.join("store/groups/parish.example/group.json"), "{}").unwrap();
+        std::fs::write(dir.join("store/intents/settle.json"), "{}").unwrap();
+        std::fs::write(
+            dir.join("store/journal.jsonl"),
+            "{\"version\":1,\"at\":\"2026-11-04T09:00:00Z\",\"intent\":\"01HZZZZZZZZZZZZZZZZZZZZZZZ\",\"kind\":\"remove-group\",\"release\":\"test\",\"application\":{\"username\":\"secretary\",\"status_token\":\"parish.example\"},\"outcome\":\"applied\"}\n",
+        )
+        .unwrap();
+        let store = Store::new_for_test(&cfg.store_root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let journal = runtime.block_on(Journal::load(&store)).unwrap();
+        let value = json!({
+            "id": "01HZZZZZZZZZZZZZZZZZZZZZZZ",
+            "kind": "remove-group",
+            "domain": "parish.example",
+        });
+        let envelope = Envelope::of(&value, "settle.json", "remove-group");
+
+        runtime
+            .block_on(settle_with(
+                &cfg,
+                &store,
+                &journal,
+                "settle.json",
+                &envelope,
+                AfterLine::RemoveGroupRecord("parish.example".to_string()),
+                async { Err("the body ran on a settled intent".to_string()) },
+            ))
+            .unwrap();
+
+        assert!(
+            !dir.join("store/groups/parish.example").exists(),
+            "the record a crashed remove-group left behind was not removed"
+        );
+        assert!(
+            !dir.join("store/intents/settle.json").exists(),
+            "an applied intent was left in place"
+        );
+        let text = std::fs::read_to_string(dir.join("store/journal.jsonl")).unwrap();
+        assert_eq!(
+            text.matches("\"outcome\":\"applied\"").count(),
+            1,
+            "a second applied line was appended: {text}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
