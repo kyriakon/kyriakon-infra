@@ -270,3 +270,66 @@ fn an_unreadable_journal_fails_the_pass() {
     );
     assert!(body(&out).contains("journal.jsonl"), "{}", body(&out));
 }
+
+/// A settled intent is not work again: the same file left behind by a crash
+/// between the outcome line and the remove finishes with the remove and no
+/// second line. The dedup is the combinator's, so every verb has it.
+#[test]
+fn a_settled_intent_is_not_applied_again() {
+    let fix = Fix::new("intent-settled-twice");
+    fix.page_account("secretary", json!({}));
+    let cookie = fix.open_session("secretary");
+    let session = Fix::session_id(&cookie);
+    let (cfg, store, journal) = seam(&fix);
+    let runtime = driver();
+
+    let id = runtime
+        .block_on(
+            Intent::Close(tr::CloseIntent {
+                username: "secretary".to_string(),
+                session: session.to_string(),
+                ..Default::default()
+            })
+            .file(&store),
+        )
+        .unwrap();
+    let file = format!("{id}.json");
+    let value: Value = serde_json::from_str(&fix.read(&format!("intents/{id}.json"))).unwrap();
+    let intent = Intent::parse(&value).unwrap();
+    assert!(runtime
+        .block_on(intent.verify(&cfg, &store, &journal, KEY, &file, &value))
+        .unwrap());
+    runtime
+        .block_on(intent.apply(&cfg, &store, &journal, KEY, &file, &value))
+        .unwrap();
+    let lines = fix
+        .journal()
+        .matches(&format!("\"intent\":\"{id}\""))
+        .count();
+    assert_eq!(lines, 1, "{}", fix.journal());
+
+    // The file back, as a crash between the line and the remove leaves it.
+    std::fs::write(
+        fix.path(&format!("store/intents/{file}")),
+        serde_json::to_vec_pretty(&value).unwrap(),
+    )
+    .unwrap();
+    let intent = Intent::parse(&value).unwrap();
+    runtime
+        .block_on(intent.apply(&cfg, &store, &journal, KEY, &file, &value))
+        .unwrap();
+
+    assert!(
+        !fix.dir.join("store/intents").join(&file).exists(),
+        "the applied intent was left in place"
+    );
+    assert_eq!(
+        fix.journal()
+            .matches(&format!("\"intent\":\"{id}\""))
+            .count(),
+        lines,
+        "a second pass appended a line: {}",
+        fix.journal()
+    );
+    assert_eq!(fix.account("secretary")["state"], "closing");
+}

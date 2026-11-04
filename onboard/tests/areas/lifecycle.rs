@@ -1513,6 +1513,33 @@ fn a_purge_leaves_a_name_the_box_holds_alone() {
     );
 }
 
+/// A filed application journals its one `review-sent` line before the send and
+/// settles with the remove alone; the settlement must not append a second line
+/// for the same application.
+#[test]
+fn a_filed_application_journals_one_review_line() {
+    let fix = Fix::new("review-once");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert_eq!(
+        fix.journal().matches("\"outcome\":\"review-sent\"").count(),
+        1,
+        "the settlement appended the review line a second time: {}",
+        fix.journal()
+    );
+    assert_eq!(
+        fix.sent()
+            .matches("Subject: kyriakon: onboard: application filed")
+            .count(),
+        1,
+        "the review was sent twice: {}",
+        fix.sent()
+    );
+}
+
 /// A decision intent with no signature, and one whose signature is over another
 /// action, are both refused: `intents/` belongs to the unprivileged half, so an
 /// unsigned decision would be root provisioning driven by a file it wrote.
