@@ -2,11 +2,19 @@
 //! the root, and the on-disk shapes the drain reads.
 //!
 //! Two shapes, two APIs. A `.jsonl` file is a log: appended only, through
-//! [`Store::log`], which has no write at all. Everything else is a record:
-//! replaced whole by rename, so a reader never sees half of one. The handler
-//! writes `applications/<token>.json` (the record the status page renders) and
+//! [`Store::log`], whose handle has no write at all, so the natural overwrite of
+//! a log does not compile. Everything else is a record: replaced whole by
+//! rename, so a reader never sees half of one. The handler writes
+//! `applications/<token>.json` (the record the status page renders) and
 //! `intents/<id>.json` (the one filed application). It never writes anything
 //! root-owned.
+//!
+//! The boundary is a type plus a runtime check, not a type alone: a caller that
+//! names a record as a path string can still pass a `.jsonl` name to
+//! [`Store::write_record_mode`], which refuses it rather than writing it. Names
+//! are built at runtime (`format!("{token}.json")`), so no signature can make
+//! that a compile error. The only write that completes a recorded line is
+//! [`Store::rewrite_log`], measured by the name and by `pub(crate)`.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::fchown;
@@ -256,9 +264,10 @@ impl Store {
     }
 
     /// One append-only record: a `.jsonl` file, never rewritten. The type is
-    /// what holds the rule: it has `append` and the readers and no write at all,
-    /// so overwriting a log through it does not compile. [`Store::rewrite_log`]
-    /// is the one named exception.
+    /// what holds the rule: `Log` has the append, the readers and no write, so
+    /// overwriting a log through it does not compile. [`Store::rewrite_log`] is
+    /// the one named exception. Appends and rewrites both take the record's own
+    /// lock, [`Log::lock`].
     pub fn log<'a>(&'a self, path: &'a str) -> Log<'a> {
         Log { store: self, path }
     }
@@ -422,10 +431,10 @@ impl Store {
     /// Open the lock file both of the above take, its directory made if the
     /// store has not been laid out yet.
     async fn open_lock(&self, rel: &str) -> Result<tokio::fs::File, String> {
+        // The record's directory, or the store root for a record at the top: a
+        // store not laid out yet still needs a lock file.
         let dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
-        if !dir.is_empty() {
-            self.ensure_dir(dir).await?;
-        }
+        self.ensure_dir(dir).await?;
         let path = self.root.join(rel);
         let mut opts = tokio::fs::OpenOptions::new();
         // O_NOFOLLOW: the handler owns most of these directories and could
@@ -440,15 +449,14 @@ impl Store {
             .open(&path)
             .await
             .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        if !dir.is_empty() {
+        // chown needs root, and only root ever hands a lock to another owner: a
+        // test runs as the directory's own owner already.
+        if unsafe { libc::geteuid() } == 0 {
             if let Some((uid, gid)) = self.dir_owner(dir) {
-                if unsafe { libc::geteuid() } == 0 {
-                    // The descriptor, after the no-follow open: a `chown` of the
-                    // path would follow whatever the name points at by then.
-                    fchown(&file, Some(uid), Some(gid)).map_err(|e| {
-                        format!("cannot hand {} to the handler: {e}", path.display())
-                    })?;
-                }
+                // The descriptor, after the no-follow open: a `chown` of the
+                // path would follow whatever the name points at by then.
+                fchown(&file, Some(uid), Some(gid))
+                    .map_err(|e| format!("cannot hand {} to its owner: {e}", path.display()))?;
             }
         }
         Ok(file)
@@ -476,6 +484,40 @@ impl Store {
         Ok(out)
     }
 
+    /// Walk a record's lines in order, parsing each and handing it to `walk`,
+    /// which answers whether to go on. One line is parsed at a time, so a caller
+    /// that stops early does not parse the rest of the record.
+    async fn walk_jsonl<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        mut walk: impl FnMut(usize, &T) -> bool,
+    ) -> Result<(), String> {
+        for (i, line) in self.read_lines(path).await?.iter().enumerate() {
+            let value: T = serde_json::from_str(line)
+                .map_err(|e| format!("{path}: line {} does not parse: {e}", i + 1))?;
+            if !walk(i, &value) {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether any line of a record satisfies `pred`, stopping at the first
+    /// that does.
+    async fn read_jsonl_any<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        mut pred: impl FnMut(&T) -> bool,
+    ) -> Result<bool, String> {
+        let mut hit = false;
+        self.walk_jsonl(path, |_, value: &T| {
+            hit = pred(value);
+            !hit
+        })
+        .await?;
+        Ok(hit)
+    }
+
     /// The non-empty lines of a store file, as recorded. A missing file reads as
     /// nothing; an unreadable one is an error.
     async fn read_lines(&self, path: &str) -> Result<Vec<String>, String> {
@@ -494,11 +536,12 @@ impl Store {
     /// Rewrite an append-only record whole, under a lock the caller holds.
     ///
     /// This is the one exception `CODING_STANDARDS.md` names: a recorded line
-    /// that has to be completed later rather than appended again — a refund's
-    /// settlement, a held payment's attribution, a request's close. The three
-    /// callers each hold [`Store::lock`] across the read and this write; a
-    /// rewrite without one drops a line another process appended in between.
-    /// Nothing else may call this, and the name is the warning.
+    /// that has to be completed later rather than appended again. The three
+    /// callers (`settle_refund`, `rewrite_unattributed`, `requests::rewrite`)
+    /// each hold [`Log::lock`] across the read and this write, and appends take
+    /// the same lock, so a line another process appends in between is either
+    /// seen by the read or lands after the rewrite. Nothing else may call this,
+    /// and the name is the warning.
     pub(crate) async fn rewrite_log(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
         self.place_record(dir, name, bytes, None, 0o600).await
@@ -512,7 +555,7 @@ impl Store {
 /// `Store`'s own record writer refuses a name ending `.jsonl`, so the only way
 /// to overwrite a line is to say so by name:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// # async fn f(store: &kyriakon_onboard::store::Store) {
 /// store.log("journal.jsonl").write(b"{}").await;
 /// # }
@@ -523,8 +566,20 @@ pub struct Log<'a> {
 }
 
 impl Log<'_> {
-    /// Append one line, creating the file 0600 and its directory if needed.
+    /// The record's own lock: `<path>.lock`, held until the handle drops.
+    ///
+    /// An append takes it, and a rewrite must hold it across its read and its
+    /// write. A lock on the record itself would be no lock, because the rewrite
+    /// replaces the record by rename; the lock is a file of its own.
+    pub async fn lock(&self) -> Result<tokio::fs::File, String> {
+        self.store.lock(&format!("{}.lock", self.path)).await
+    }
+
+    /// Append one line, creating the file 0600 and its directory if needed. The
+    /// append takes the record's own lock, so it cannot land between a rewrite's
+    /// read and its rename.
     pub async fn append(&self, bytes: &[u8]) -> Result<(), String> {
+        let _guard = self.lock().await?;
         self.store.append_mode(self.path, bytes, None, 0o600).await
     }
 
@@ -533,20 +588,56 @@ impl Log<'_> {
     /// the handler must read: the account page lists every notice sent, so it is
     /// written 0640 with the accounts directory's group rather than the 0600
     /// root-only default. `journal.jsonl` and `requests.jsonl` stay root-only,
-    /// because nothing outside the drain reads them.
+    /// because nothing outside the drain reads them. Takes the record's lock.
     pub async fn append_mode(
         &self,
         bytes: &[u8],
         owner: Option<(u32, u32)>,
         mode: u32,
     ) -> Result<(), String> {
+        let _guard = self.lock().await?;
         self.store.append_mode(self.path, bytes, owner, mode).await
+    }
+
+    /// Append under a lock the caller already holds, from [`Self::lock`].
+    ///
+    /// One caller needs it: `requests::record` refuses a request id it has
+    /// already recorded, so its read and its append are one step under one lock.
+    /// Taking the lock twice on two descriptors would deadlock, so this exists
+    /// for that shape and nothing else; every other writer calls [`Self::append`].
+    pub async fn append_while_locked(&self, bytes: &[u8]) -> Result<(), String> {
+        self.store.append_mode(self.path, bytes, None, 0o600).await
     }
 
     /// The record's lines, typed: a missing record is empty, an unreadable one
     /// or a line that does not parse is an error.
     pub async fn jsonl<T: DeserializeOwned>(&self) -> Result<Vec<T>, String> {
         self.store.read_jsonl(self.path).await
+    }
+
+    /// Whether any line satisfies `pred`, stopping at the first that does. For
+    /// a question about one line in a journal, which [`Self::jsonl`] would
+    /// answer only after parsing every line into a list.
+    pub async fn jsonl_any<T: DeserializeOwned>(
+        &self,
+        pred: impl FnMut(&T) -> bool,
+    ) -> Result<bool, String> {
+        self.store.read_jsonl_any(self.path, pred).await
+    }
+
+    /// Walk the record's lines in order, parsing one at a time, for a reader
+    /// that accumulates over all of them. The `usize` is the line's index, which
+    /// is what a reader comparing the order of two lines needs.
+    pub async fn jsonl_each<T: DeserializeOwned>(
+        &self,
+        mut walk: impl FnMut(usize, &T),
+    ) -> Result<(), String> {
+        self.store
+            .walk_jsonl(self.path, |i, value: &T| {
+                walk(i, value);
+                true
+            })
+            .await
     }
 
     /// The record's lines as written. For the one reader that copies a record
@@ -1876,6 +1967,57 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// An append takes the record's own lock, `<path>.lock`: the same one a
+    /// rewrite holds across its read and its rename. Held, the append waits and
+    /// the record stays as it was; released, it lands and lets the lock go.
+    ///
+    /// The second append runs on its own thread with its own runtime, because
+    /// `flock` blocks the thread that calls it and a current-thread runtime
+    /// cannot time out or drop a future that is parked inside a blocking call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_append_takes_the_records_own_lock() {
+        let dir = std::env::temp_dir().join(format!("onboard-log-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.to_str().unwrap());
+        let log = store.log("ledger/payments.jsonl");
+        let held = log.lock().await.unwrap();
+        // The append is the same lock: a second holder cannot take it.
+        assert!(store
+            .try_lock("ledger/payments.jsonl.lock")
+            .await
+            .unwrap()
+            .is_none());
+
+        let root = dir.to_str().unwrap().to_string();
+        let append = std::thread::spawn(move || {
+            let store = Store::new(&root);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(store.log("ledger/payments.jsonl").append(b"{}\n"))
+        });
+        // Long enough for the thread to reach the lock. If appends did not take
+        // it, the line would be on disk by now.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            log.raw_lines().await.unwrap().is_empty(),
+            "the append wrote without the record's lock"
+        );
+        drop(held);
+        append.join().unwrap().unwrap();
+        assert_eq!(log.raw_lines().await.unwrap(), vec!["{}"]);
+        assert!(
+            store
+                .try_lock("ledger/payments.jsonl.lock")
+                .await
+                .unwrap()
+                .is_some(),
+            "the append left the record's lock held"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// One lock at a time, and the non-blocking form reports the holder rather
     /// than waiting: that is what the drain's pass lock is.
     #[tokio::test]
@@ -1884,18 +2026,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::new(dir.to_str().unwrap());
         let held = store
-            .try_lock("ledger/.payments.lock")
+            .try_lock("ledger/payments.jsonl.lock")
             .await
             .unwrap()
             .expect("the first takes the lock and makes the directory");
         assert!(store
-            .try_lock("ledger/.payments.lock")
+            .try_lock("ledger/payments.jsonl.lock")
             .await
             .unwrap()
             .is_none());
         drop(held);
         assert!(store
-            .try_lock("ledger/.payments.lock")
+            .try_lock("ledger/payments.jsonl.lock")
             .await
             .unwrap()
             .is_some());

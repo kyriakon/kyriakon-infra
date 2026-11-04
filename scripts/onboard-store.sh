@@ -181,6 +181,34 @@ for group in "$store"/groups/*; do
 	share_record "$group/group.json"
 done
 
+# settle_lock <path> <owner> <group>: a lock file the service takes, left by an
+# earlier run or by the other half. Every append and every rewrite takes the
+# record's own lock, `<record>.lock`, and the ones below live in a directory the
+# handler owns: a root-owned one there locks the handler out of that record until
+# root happens to take the same lock again, which is a deploy rather than a
+# request. So the layout settles them here. A regular file is handed to the
+# directory's owner; anything else, which is a name the handler could have
+# planted, is removed, because the deploy has the service stopped.
+settle_lock() {
+	[ -e "$1" ] || [ -L "$1" ] || return 0
+	if [ -L "$1" ] || [ ! -f "$1" ]; then
+		changed=1
+		rm -f "$1"
+		return 0
+	fi
+	if [ "$(stat -f '%Su %Sg %Lp' "$1")" != "$2 $3 600" ]; then
+		changed=1
+		chown "$2:$3" "$1"
+		chmod 0600 "$1"
+	fi
+	assert_mode "$1" "$2" "$3" 600
+}
+
+settle_lock "$store/drafts/.lock" "$onboard_user" "$onboard_user"
+settle_lock "$store/applications/.confirmation.lock" "$onboard_user" "$onboard_user"
+settle_lock "$store/ledger/payments.jsonl.lock" root wheel
+settle_lock "$store/ledger/unattributed.jsonl.lock" root wheel
+
 # mail/ is _onboard's, not the root drain's, and with the Maildir's three
 # subdirectories. The smtpd action for apply@ runs the delivery as _onboard
 # (`user _onboard`), so the account has to be able to write here, and the drain

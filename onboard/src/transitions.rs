@@ -660,12 +660,10 @@ async fn journal(
 /// outcome. A refusal is recorded once, and a purge that already released the
 /// name is not released twice.
 async fn journal_has(store: &Store, id: &str, outcome: &str) -> Result<bool, String> {
-    Ok(store
+    store
         .log("journal.jsonl")
-        .jsonl::<JournalLine>()
-        .await?
-        .iter()
-        .any(|j| j.intent == id && j.outcome == outcome))
+        .jsonl_any(|j: &JournalLine| j.intent == id && j.outcome == outcome)
+        .await
 }
 
 /// Whether the journal already holds a line for this intent id, whatever its
@@ -673,12 +671,10 @@ async fn journal_has(store: &Store, id: &str, outcome: &str) -> Result<bool, Str
 async fn intent_seen(store: &Store, id: &str) -> Result<bool, String> {
     // A failed line is the reason the next pass retries, not a settlement:
     // counting it would drop the intent after one failure.
-    Ok(store
+    store
         .log("journal.jsonl")
-        .jsonl::<JournalLine>()
-        .await?
-        .iter()
-        .any(|j| j.intent == id && j.outcome != "failed"))
+        .jsonl_any(|j: &JournalLine| j.intent == id && j.outcome != "failed")
+        .await
 }
 
 /// How long to wait before retrying an id that has failed `failures` times, in
@@ -704,19 +700,24 @@ pub async fn failures(
     id: &str,
 ) -> Result<(u32, Option<OffsetDateTime>, Option<String>), String> {
     let mut count = 0u32;
-    let mut last = None;
-    let mut message = None;
-    for j in store.log("journal.jsonl").jsonl::<JournalLine>().await? {
-        if j.intent == id && j.outcome == "failed" {
-            count += 1;
-            if let Ok(at) = OffsetDateTime::parse(&j.at, &Rfc3339) {
-                last = Some(at);
+    let mut last: Option<OffsetDateTime> = None;
+    let mut message: Option<String> = None;
+    // Every failed line counts, so this reads the whole journal: one line at a
+    // time, rather than a list of all of them first.
+    store
+        .log("journal.jsonl")
+        .jsonl_each(|_, j: &JournalLine| {
+            if j.intent == id && j.outcome == "failed" {
+                count += 1;
+                if let Ok(at) = OffsetDateTime::parse(&j.at, &Rfc3339) {
+                    last = Some(at);
+                }
+                if j.note.is_some() {
+                    message = j.note.clone();
+                }
             }
-            if j.note.is_some() {
-                message = j.note;
-            }
-        }
-    }
+        })
+        .await?;
     Ok((count, last, message))
 }
 
@@ -817,20 +818,19 @@ async fn application_seen(
 ) -> Result<bool, String> {
     let mut marks: Vec<(usize, String)> = Vec::new();
     let mut failed: Vec<(usize, String)> = Vec::new();
-    for (at, j) in store
+    // Both lists are needed to compare a mark against any later failure, so the
+    // whole journal is read, one line at a time rather than all of them first.
+    store
         .log("journal.jsonl")
-        .jsonl::<JournalLine>()
-        .await?
-        .iter()
-        .enumerate()
-    {
-        if j.outcome == "failed" {
-            failed.push((at, j.intent.clone()));
-        }
-        if j.application.status_token == token && j.kind == kind && j.outcome == outcome {
-            marks.push((at, j.intent.clone()));
-        }
-    }
+        .jsonl_each(|at, j: &JournalLine| {
+            if j.outcome == "failed" {
+                failed.push((at, j.intent.clone()));
+            }
+            if j.application.status_token == token && j.kind == kind && j.outcome == outcome {
+                marks.push((at, j.intent.clone()));
+            }
+        })
+        .await?;
     Ok(marks
         .iter()
         .any(|(at, id)| !failed.iter().any(|(f, fid)| fid == id && f > at)))
@@ -4031,12 +4031,10 @@ async fn append_refund_ledger(
 /// Whether a refund line already records this settlement intent. The settlement
 /// does not append, so `ledger_has_intent` cannot be its dedup key.
 async fn ledger_settled_by(store: &Store, id: &str) -> Result<bool, String> {
-    Ok(store
+    store
         .log("ledger/payments.jsonl")
-        .jsonl::<Value>()
-        .await?
-        .iter()
-        .any(|v| v.get("settled_intent").and_then(Value::as_str) == Some(id)))
+        .jsonl_any(|v: &Value| v.get("settled_intent").and_then(Value::as_str) == Some(id))
+        .await
 }
 
 /// The index of the newest refund line for the token that has no `settled_on`.
@@ -4087,7 +4085,7 @@ async fn settle_refund(
         )
         .await;
     }
-    let guard = store.lock("ledger/.payments.lock").await?;
+    let guard = store.log("ledger/payments.jsonl").lock().await?;
     // The lines stay as recorded: only the settled one is re-encoded, so a line
     // an earlier release wrote keeps its bytes through the rewrite.
     let mut lines = store.log("ledger/payments.jsonl").raw_lines().await?;
@@ -4547,7 +4545,7 @@ async fn rewrite_unattributed(
     id: &str,
     change: impl FnOnce(&mut store::HeldItem) -> Result<(), String>,
 ) -> Result<(), String> {
-    let _guard = store.lock("ledger/.unattributed.lock").await?;
+    let _guard = store.log(store::UNATTRIBUTED).lock().await?;
     let mut items = store.held().await?;
     let at = items
         .iter()
@@ -4568,7 +4566,10 @@ async fn rewrite_unattributed(
 
 /// Whether the unattributed queue already holds this intent's line.
 async fn held_has_intent(store: &Store, id: &str) -> Result<bool, String> {
-    Ok(store.held().await?.iter().any(|line| line.intent == id))
+    store
+        .log(store::UNATTRIBUTED)
+        .jsonl_any(|line: &store::HeldItem| line.intent == id)
+        .await
 }
 
 /// The held line carrying this transaction id, with its id and the date it was
@@ -4727,12 +4728,10 @@ async fn ledger_txid(store: &Store, txid: &str) -> Result<Option<(u64, String)>,
 /// because a line written by a later release may carry fields this one does not
 /// model.
 async fn ledger_has_intent(store: &Store, id: &str) -> Result<bool, String> {
-    Ok(store
+    store
         .log("ledger/payments.jsonl")
-        .jsonl::<Value>()
-        .await?
-        .iter()
-        .any(|v| v.get("intent").and_then(Value::as_str) == Some(id)))
+        .jsonl_any(|v: &Value| v.get("intent").and_then(Value::as_str) == Some(id))
+        .await
 }
 
 /// Rewrite the payment block on the application copy the handler reads, so a
@@ -8726,16 +8725,14 @@ async fn name_allowed(cfg: &DrainConfig, username: &str) -> Result<(), String> {
 /// the account on the box was its own, and it would adopt a name this
 /// application never made.
 async fn approval_started(store: &Store, token: &str) -> Result<bool, String> {
-    Ok(store
+    store
         .log("journal.jsonl")
-        .jsonl::<JournalLine>()
-        .await?
-        .iter()
-        .any(|j| {
+        .jsonl_any(|j: &JournalLine| {
             j.application.status_token == token
                 && j.outcome == "applying"
                 && (j.kind == "approve" || j.kind == "provision")
-        }))
+        })
+        .await
 }
 
 /// Write the decision onto the application record. `password_link` is written
@@ -10563,7 +10560,7 @@ mod tests {
 
         // The append is now waiting on the pipe. The lock must be free: a
         // retry covers the instant between the write and the guard's drop.
-        let lock_path = root.join("ledger/.payments.lock");
+        let lock_path = root.join("ledger/payments.jsonl.lock");
         let mut free = false;
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {

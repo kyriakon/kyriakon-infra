@@ -297,23 +297,20 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
         done_at: None,
         bundle: None,
     };
-    let _guard = store
-        .lock(&format!("{}/.requests.lock", account_dir(request.username)))
-        .await?;
+    let path = record_path(&line.username);
+    let log = store.log(&path);
+    let _guard = log.lock().await?;
     // A retry that carries an id must not write the same request twice. The
-    // read is under the lock, so it sees a record that another process lands
-    // first.
+    // read is under the record's own lock, which the append also takes, so it
+    // sees a record that another process lands first.
     if request.id.is_some() {
-        let existing = read_all(store, request.username).await?;
+        let existing = log.jsonl::<RequestLine>().await?;
         if existing.iter().any(|l| l.id == line.id) {
             return Err(format!("request {} is already recorded", line.id));
         }
     }
     let bytes = serde_json::to_vec(&line).map_err(|e| format!("cannot write the request: {e}"))?;
-    store
-        .log(&record_path(&line.username))
-        .append(&bytes)
-        .await?;
+    log.append_while_locked(&bytes).await?;
     Ok(line)
 }
 
@@ -345,10 +342,10 @@ async fn rewrite(
     change: impl FnOnce(&mut RequestLine) -> Result<(), String>,
 ) -> Result<RequestLine, String> {
     let username = find_account(store, id).await?;
-    let _guard = store
-        .lock(&format!("{}/.requests.lock", account_dir(&username)))
-        .await?;
-    let mut lines = read_all(store, &username).await?;
+    let path = record_path(&username);
+    let log = store.log(&path);
+    let _guard = log.lock().await?;
+    let mut lines = log.jsonl::<RequestLine>().await?;
     let at = lines
         .iter()
         .position(|l| l.id == id)
