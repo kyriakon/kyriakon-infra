@@ -9,14 +9,16 @@ use crate::common::*;
 
 use kyriakon_onboard::config::DrainConfig;
 use kyriakon_onboard::intents::Intent;
+use kyriakon_onboard::journal::Journal;
 use kyriakon_onboard::store::{self as st, Store};
 use kyriakon_onboard::transitions as tr;
 
 /// The fixture's config and store, as the drain builds them.
-fn seam(fix: &Fix) -> (DrainConfig, Store) {
+fn seam(fix: &Fix) -> (DrainConfig, Store, Journal) {
     let cfg = DrainConfig::load(Path::new(&fix.config())).unwrap();
     let store = Store::new_for_test(&cfg.store_root);
-    (cfg, store)
+    let journal = driver().block_on(Journal::load(&store)).unwrap();
+    (cfg, store, journal)
 }
 
 fn driver() -> tokio::runtime::Runtime {
@@ -34,7 +36,7 @@ fn a_variant_proves_itself_before_it_is_applied() {
     fix.page_account("secretary", json!({}));
     let cookie = fix.open_session("secretary");
     let session = Fix::session_id(&cookie);
-    let (cfg, store) = seam(&fix);
+    let (cfg, store, journal) = seam(&fix);
     let runtime = driver();
 
     let id = runtime
@@ -58,13 +60,13 @@ fn a_variant_proves_itself_before_it_is_applied() {
     );
     assert!(
         runtime
-            .block_on(intent.verify(&cfg, &store, KEY, &file, &value))
+            .block_on(intent.verify(&cfg, &store, &journal, KEY, &file, &value))
             .unwrap(),
         "a live session proves the close"
     );
     assert_eq!(fix.account("secretary")["state"], "active");
     runtime
-        .block_on(intent.apply(&cfg, &store, KEY, &file, &value))
+        .block_on(intent.apply(&cfg, &store, &journal, KEY, &file, &value))
         .unwrap();
 
     assert_eq!(fix.account("secretary")["state"], "closing");
@@ -82,7 +84,7 @@ fn a_variant_that_cannot_prove_itself_is_refused() {
     let fix = Fix::new("intent-seam-unsigned");
     fix.page_account("secretary", json!({}));
     let account_before = fix.account("secretary");
-    let (cfg, store) = seam(&fix);
+    let (cfg, store, journal) = seam(&fix);
     let runtime = driver();
 
     let intent = Intent::Resend(tr::ResendIntent {
@@ -93,7 +95,7 @@ fn a_variant_that_cannot_prove_itself_is_refused() {
     });
     let value = serde_json::to_value(&intent).unwrap();
     let refused = runtime
-        .block_on(intent.verify(&cfg, &store, KEY, "unsigned.json", &value))
+        .block_on(intent.verify(&cfg, &store, &journal, KEY, "unsigned.json", &value))
         .unwrap_err();
     assert_eq!(
         refused, "the token resend's signature does not verify",
@@ -112,7 +114,7 @@ fn a_variant_that_cannot_prove_itself_is_refused() {
     assert!(matches!(unknown, Intent::Unknown { .. }));
     assert!(
         !runtime
-            .block_on(unknown.verify(&cfg, &store, KEY, "unknown.json", &raw))
+            .block_on(unknown.verify(&cfg, &store, &journal, KEY, "unknown.json", &raw))
             .unwrap(),
         "an unimplemented kind is settled, not applied"
     );
@@ -135,7 +137,7 @@ fn a_variant_that_cannot_prove_itself_is_refused() {
 #[test]
 fn the_one_writer_keeps_the_wire_the_drain_reads() {
     let fix = Fix::new("intent-seam-wire");
-    let (_cfg, store) = seam(&fix);
+    let (_cfg, store, _journal) = seam(&fix);
     let runtime = driver();
     let id = runtime
         .block_on(
@@ -234,7 +236,7 @@ fn every_variant() -> Vec<Intent> {
 #[test]
 fn every_kind_parses_back_to_its_variant() {
     let fix = Fix::new("intent-seam-round-trip");
-    let (_cfg, store) = seam(&fix);
+    let (_cfg, store, _journal) = seam(&fix);
     let runtime = driver();
     let mut kinds = Vec::new();
     for intent in every_variant() {
@@ -251,4 +253,20 @@ fn every_kind_parses_back_to_its_variant() {
     kinds.sort();
     kinds.dedup();
     assert_eq!(kinds.len(), every_variant().len(), "{kinds:?}");
+}
+
+/// An unreadable journal is the pass's error, not an empty journal: dedup that
+/// read it as empty would fail open (#513).
+#[test]
+fn an_unreadable_journal_fails_the_pass() {
+    let fix = Fix::new("intent-journal-unreadable");
+    // A directory where the record should be: every read of it fails.
+    std::fs::create_dir_all(fix.dir.join("store/journal.jsonl")).unwrap();
+    let out = fix.drain();
+    assert!(
+        !out.status.success(),
+        "the pass ran on an unreadable journal: {}",
+        body(&out)
+    );
+    assert!(body(&out).contains("journal.jsonl"), "{}", body(&out));
 }

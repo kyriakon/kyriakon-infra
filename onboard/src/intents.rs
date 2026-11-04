@@ -836,6 +836,7 @@ async fn session_proved(
 /// A page action's proof: the account name rule, then the session. A refusal
 /// journals its reason and removes the file, the way every page action's
 /// refusal does.
+#[allow(clippy::too_many_arguments)]
 async fn page_proved(
     cfg: &DrainConfig,
     store: &Store,
@@ -876,4 +877,63 @@ pub async fn verify_session(
         .map_err(|e| format!("the session record does not parse: {e}"))?;
     let proof = value.get("proof").and_then(Value::as_str).unwrap_or("");
     crate::session::verify_proof(proof_dir, proof, username, OffsetDateTime::now_utc()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One pass, many intents, one read: the index is loaded once and nothing
+    /// below it opens the file again. A second pass over the same files appends
+    /// nothing, because the index carries the first pass's refusal.
+    #[test]
+    fn a_pass_reads_the_journal_once_however_many_intents_it_carries() {
+        let dir = std::env::temp_dir().join(format!("onboard-journal-pass-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("intents")).unwrap();
+        let mut cfg: DrainConfig =
+            toml::from_str(include_str!("../../openbsd/etc/onboard/drain.toml")).unwrap();
+        cfg.store_root = dir.to_str().unwrap().to_string();
+        let store = Store::new_for_test(&cfg.store_root);
+        for n in 0..5 {
+            std::fs::write(
+                dir.join(format!("intents/01H{n}.json")),
+                format!(r#"{{"id":"intent-{n}","kind":"not-a-verb"}}"#),
+            )
+            .unwrap();
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let journal = Journal::load(&store).await.unwrap();
+            let loaded = store.journal_reads();
+            assert_eq!(loaded, 1, "the load reads the journal once");
+            for pass in 0..2 {
+                for name in store.list("intents").await.unwrap() {
+                    if !name.ends_with(".json") {
+                        continue;
+                    }
+                    let id = name.trim_end_matches(".json");
+                    if !transitions::due(&journal, id, OffsetDateTime::now_utc()) {
+                        continue;
+                    }
+                    one(&cfg, &store, &journal, b"key", &name).await.unwrap();
+                }
+                assert_eq!(
+                    store.journal_reads(),
+                    loaded,
+                    "pass {pass} read the journal again"
+                );
+            }
+        });
+        let text = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            5,
+            "each refusal is written once, not once per pass: {text}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -200,3 +200,115 @@ impl Journal {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::ApplicationRef;
+
+    fn store(name: &str) -> (Store, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("onboard-journal-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        (Store::new_for_test(dir.to_str().unwrap()), dir)
+    }
+
+    fn line(id: &str, kind: &str, outcome: &str, note: Option<&str>) -> JournalLine {
+        JournalLine {
+            version: 1,
+            at: "2026-11-04T00:00:00Z".to_string(),
+            intent: id.to_string(),
+            kind: kind.to_string(),
+            release: "test".to_string(),
+            application: ApplicationRef {
+                username: "member".to_string(),
+                status_token: "TOKEN".to_string(),
+            },
+            outcome: outcome.to_string(),
+            note: note.map(str::to_string),
+            credit: None,
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// The index answers what the six scans answered, and an append is visible
+    /// to the queries that follow it in the same pass.
+    #[test]
+    fn append_updates_the_index_and_the_queries_read_it() {
+        let (store, dir) = store("append");
+        runtime().block_on(async {
+            let journal = Journal::load(&store).await.unwrap();
+            assert!(!journal.has("01H", "applied"));
+            journal
+                .append(&store, &line("01H", "credit", "applied", None))
+                .await
+                .unwrap();
+            assert!(journal.has("01H", "applied"));
+            assert!(journal.seen("01H"), "an applied line settles the id");
+            assert!(journal.application_seen("TOKEN", "credit", "applied"));
+            journal
+                .append(
+                    &store,
+                    &line(
+                        "01H",
+                        "credit",
+                        "failed",
+                        Some("the ledger would not write"),
+                    ),
+                )
+                .await
+                .unwrap();
+            let (count, last, message) = journal.failures("01H");
+            assert_eq!(count, 1);
+            assert!(last.is_some());
+            assert_eq!(message.as_deref(), Some("the ledger would not write"));
+            assert!(
+                !journal.application_seen("TOKEN", "credit", "applied"),
+                "a failure after the mark unseats it, as the scan did"
+            );
+        });
+        // The file is the record: a fresh load answers the same.
+        let reloaded = runtime().block_on(Journal::load(&store)).unwrap();
+        assert!(reloaded.has("01H", "failed"));
+        assert_eq!(reloaded.failures("01H").0, 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A failed line is the reason the next pass retries, not a settlement.
+    #[test]
+    fn a_failed_line_does_not_count_as_seen() {
+        let (store, dir) = store("failed");
+        runtime().block_on(async {
+            let journal = Journal::load(&store).await.unwrap();
+            journal
+                .append(&store, &line("01H", "credit", "failed", Some("boom")))
+                .await
+                .unwrap();
+            assert!(!journal.seen("01H"));
+            assert!(!journal.has("01H", "applied"));
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An unreadable journal is an error at load, not an empty journal: dedup
+    /// that read it as empty would fail open (#513).
+    #[test]
+    fn an_unreadable_journal_is_an_error() {
+        let (store, dir) = store("unreadable");
+        // A directory where the record should be: every read of it fails.
+        std::fs::create_dir_all(dir.join("journal.jsonl")).unwrap();
+        let err = match runtime().block_on(Journal::load(&store)) {
+            Ok(_) => panic!("an unreadable journal loaded as empty"),
+            Err(e) => e,
+        };
+        assert!(err.contains("journal.jsonl"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

@@ -36,6 +36,10 @@ pub struct Store {
     /// lines and APFS fsync is the dominant cost. The bytes and the append
     /// order are identical; only the durability barrier is skipped.
     sync: bool,
+    /// Journals read, so a test can hold a pass to one read: the acceptance of
+    /// #531 is that the count does not grow with the number of intents.
+    #[cfg(test)]
+    reads: std::sync::atomic::AtomicUsize,
 }
 
 impl Store {
@@ -43,6 +47,8 @@ impl Store {
         Store {
             root: PathBuf::from(root),
             sync: true,
+            #[cfg(test)]
+            reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -52,7 +58,16 @@ impl Store {
         Store {
             root: PathBuf::from(root),
             sync: false,
+            #[cfg(test)]
+            reads: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// How many times a journal has been read through this store. Test builds
+    /// only: the string compare below disappears with the field.
+    #[cfg(test)]
+    pub fn journal_reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The absolute path of one store path, for a caller that has to open the
@@ -521,6 +536,11 @@ impl Store {
     /// The non-empty lines of a store file, as recorded. A missing file reads as
     /// nothing; an unreadable one is an error.
     async fn read_lines(&self, path: &str) -> Result<Vec<String>, String> {
+        #[cfg(test)]
+        if path == "journal.jsonl" {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let abs = self.root.join(path);
         match tokio::fs::read_to_string(&abs).await {
             Ok(s) => Ok(s

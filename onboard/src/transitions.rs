@@ -647,6 +647,7 @@ async fn save_application(store: &Store, token: &str, record: &Record) -> Result
 /// is the whole point of the journal, and again on completion so an approval that
 /// finished and one that died midway do not read alike. The index takes the line
 /// too, so a query later in the same pass sees it.
+#[allow(clippy::too_many_arguments)]
 async fn write_journal(
     store: &Store,
     journal: &Journal,
@@ -941,7 +942,7 @@ pub(crate) async fn refuse_with(
         .unwrap_or("")
         .to_string();
     // One refusal per intent: a second pass over the same bad file must not
-    // append a second line, because every journal read scans the whole file.
+    // append a second line, and the index already carries the first.
     if journal.has(&id, "refused") {
         return Ok(());
     }
@@ -2966,6 +2967,7 @@ async fn apply_payment(
 /// are the account path's; what differs is where the one date is written and
 /// who is told. One credit sets one date on the group, restores every mailbox in
 /// it that lapsed, and sends one receipt for the body.
+#[allow(clippy::too_many_arguments)]
 async fn group_credit(
     cfg: &DrainConfig,
     store: &Store,
@@ -4056,6 +4058,7 @@ pub const CREDIT_RAILS: [&str; 3] = ["cash", "cash-hand", "monero"];
 /// validated, dedup it on the intent id and the transaction id, and append one
 /// line to the unattributed queue. No account is written, no payment line is
 /// appended and no notice is sent, because nothing here has a member yet.
+#[allow(clippy::too_many_arguments)]
 async fn hold(
     cfg: &DrainConfig,
     store: &Store,
@@ -4720,6 +4723,7 @@ async fn append_credit_ledger(
 /// Its name is a fresh ULID, so the intent directory's lexical order stays the
 /// order things were filed; a replay files a second intent whose apply finds its
 /// own accounts and makes nothing twice.
+#[allow(clippy::too_many_arguments)]
 async fn approve_group(
     cfg: &DrainConfig,
     store: &Store,
@@ -6202,6 +6206,7 @@ pub(crate) async fn settle_page(
 /// Refuse one page action with its reason, record that it was refused, and
 /// remove it: the handler validated it on the way in, so a refusal here is
 /// something the intent's own fields get wrong rather than a state to retry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn refuse_page(
     cfg: &DrainConfig,
     store: &Store,
@@ -9826,7 +9831,7 @@ mod tests {
     use super::*;
     use std::os::unix::io::AsRawFd;
 
-    fn write_journal(answers: &[(&str, &str)]) -> Record {
+    fn record(answers: &[(&str, &str)]) -> Record {
         serde_json::from_value(json!({
             "username": "secretary",
             "status_token": "0123456789abcdefghjkmnpqrst",
@@ -9976,10 +9981,10 @@ mod tests {
 
     #[test]
     fn a_decline_body_names_a_missing_blessing_only_for_a_monastic() {
-        let lay = decline_body(&write_journal(&[("orders", "layman")]));
+        let lay = decline_body(&record(&[("orders", "layman")]));
         assert!(!lay.contains("blessing"), "{lay}");
         assert!(lay.contains("admin@kyriakon.net"), "{lay}");
-        let monk = decline_body(&write_journal(&[("orders", "monk")]));
+        let monk = decline_body(&record(&[("orders", "monk")]));
         assert!(monk.contains("blessing"), "{monk}");
     }
 
@@ -10341,9 +10346,19 @@ mod tests {
         )
         .unwrap();
         // The journal is a pipe, so its append waits for a reader: the state of
-        // the lock is observable at that point rather than a race.
-        let journal = root.join("journal.jsonl");
-        let c_path = CString::new(journal.to_str().unwrap()).unwrap();
+        // the lock is observable at that point rather than a race. The index is
+        // loaded first, while the file is still missing (an empty journal), so
+        // the settlement's append is what blocks on the pipe.
+        let journal = {
+            let store = Store::new_for_test(&root_text);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(Journal::load(&store)).unwrap()
+        };
+        let journal_path = root.join("journal.jsonl");
+        let c_path = CString::new(journal_path.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 
         let value = json!({
@@ -10365,6 +10380,7 @@ mod tests {
             runtime.block_on(settle_refund(
                 &cfg,
                 &store,
+                &journal,
                 &intent,
                 "settle.json",
                 &value,
@@ -10400,7 +10416,7 @@ mod tests {
         // Unblock the append and let the settlement finish either way, so a
         // failure reads as an assertion rather than a hang.
         let read_journal = {
-            let journal = journal.clone();
+            let journal = journal_path.clone();
             std::thread::spawn(move || {
                 let mut text = String::new();
                 std::fs::File::open(&journal)
