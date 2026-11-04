@@ -32,7 +32,7 @@ terraform/            hcloud provider, the live root and the restore template re
 openbsd/              every config the box runs, plus the restore template's files
 scripts/              deploys, the drain's scripts, certificates, backups, checks
 onboard/              the signup service: handler, drain, store, pages
-kyriakon-encrypt/     the LMTP that encrypts mail as it is delivered
+kyriakon-encrypt/     the CLI the save path runs to encrypt each message
 dovecot-plugin/       the Dovecot storage hook that hands mail to kyriakon-encrypt
 keys/                 published member mail keys
 docs/                 threat model, terms, privacy, runbook; planning under docs/planning/

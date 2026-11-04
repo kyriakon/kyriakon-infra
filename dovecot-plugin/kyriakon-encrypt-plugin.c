@@ -1,23 +1,22 @@
 /* kyriakon-encrypt Dovecot plugin: encrypt every message on the lib-storage
  * save path, covering both LMTP delivery and IMAP APPEND.
  *
- * This is a thin shim. It overrides mailbox_vfuncs.save_begin/save_finish so
- * the raw RFC 5322 message is piped to the kyriakon-encrypt daemon over its
- * unix socket, and the returned whole-message RFC 3156 PGP/MIME ciphertext is
- * handed to the wrapped save_begin in place of the plaintext. No crypto,
- * keyring, parsing, or private key lives here - the daemon owns all of that.
+ * This is a thin shim. It overrides mailbox_vfuncs.save_begin so the raw
+ * RFC 5322 message is run through `kyriakon-encrypt encrypt`, and the
+ * ciphertext that command writes to stdout is handed to the wrapped
+ * save_begin in place of the plaintext. No crypto, keyring, parsing, or
+ * private key lives here - the encryptor owns all of that.
  * See docs/planning/research/zero-access-mail-imap-append.md.
  *
- * Fail-closed: any error (socket, gpg, missing key) aborts the save before
- * anything is written, so plaintext never reaches the Maildir.
+ * Fail-closed: a non-zero exit status (missing key, gpg error, the process
+ * killed mid-write) aborts the save before anything is written, so plaintext
+ * never reaches the Maildir. The encryptor logs the specific reason to stderr,
+ * which the mail process's log picks up.
  *
- * Socket protocol (must match kyriakon-encrypt's handle_conn): connect, write
- * "<localpart>\n" then the raw message, half-close (shutdown SHUT_WR), read
- * the response until EOF. A successful response is framed: a
- * "KYRIAKON-ENCRYPT 1 OK <len>\n" line and then exactly <len> bytes of
- * ciphertext. A body shorter than that is a daemon that died mid-write, and
- * the save fails rather than store half an armour. An empty response means the
- * daemon failed closed.
+ * The encryptor is installed at /usr/local/sbin/kyriakon-encrypt by
+ * deploy-mail.sh and runs as the mailbox user, because that is who saves mail.
+ * It reads the world-readable keyring and is given a scratch gpg homedir of
+ * its own for the life of one save.
  */
 
 #include "lib.h"
@@ -30,20 +29,10 @@
 #include "mail-storage-private.h"
 #include "mail-storage-hooks.h"
 #include "module-context.h"
-#include "frame.h"
+#include "unlink-directory.h"
+#include "encrypt-run.h"
 
-#include <errno.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
-
-/* Must match kyriakon-encrypt's DEFAULT_SOCKET. */
-#define KYRIAKON_SOCKET "/var/run/kyriakon/encrypt.sock"
-/* First line of the RFC 3156 envelope the daemon emits; the save_finish
-   backstop checks the saved mail starts with this. */
-#define KYRIAKON_MARKER \
-	"Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";"
+#include <stdlib.h>
 
 const char *kyriakon_encrypt_plugin_version = DOVECOT_ABI_VERSION;
 
@@ -54,127 +43,59 @@ struct kyriakon_mailbox {
 static MODULE_CONTEXT_DEFINE_INIT(kyriakon_mailbox_module,
 				  &mail_storage_module_register);
 
-/* Write all of data to fd, handling partial writes and EINTR. */
-static bool
-kyriakon_write_all(int fd, const void *data, size_t size)
-{
-	const unsigned char *p = data;
-
-	while (size > 0) {
-		ssize_t ret = write(fd, p, size);
-		if (ret < 0) {
-			if (errno == EINTR)
-				continue;
-			return FALSE;
-		}
-		p += ret;
-		size -= ret;
-	}
-	return TRUE;
-}
-
-/* Pipe the plaintext message to the daemon and return the ciphertext as an
- * istream over a box-pool buffer, or NULL with *error_r set. */
+/* Encrypt the plaintext message and return the ciphertext as an istream over a
+ * box-pool buffer, or NULL with *error_r set. */
 static struct istream *
 kyriakon_encrypt(struct mailbox *box, struct istream *input,
 		 const char **error_r)
 {
-	const char *localpart = t_strcut(box->storage->user->username, '@');
-	struct sockaddr_un sa;
-	buffer_t *resp;
-	int fd;
-	char tmp[8192];
+	const char *user = t_strcut(box->storage->user->username, '@');
+	struct kyriakon_encrypt_result result;
+	buffer_t *plain, *cipher;
 	const unsigned char *data;
+	/* gpg needs a writable, private homedir; mkdtemp creates it 0700 and it
+	   dies with the save. */
+	char scratch[] = "/tmp/kyriakon-encrypt.XXXXXX";
 	size_t size;
-	size_t offset;
 	ssize_t ret;
 
 	*error_r = NULL;
 
-	fd = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (fd < 0) {
-		*error_r = t_strdup_printf("socket(): %m");
-		return NULL;
-	}
-	i_zero(&sa);
-	sa.sun_family = AF_UNIX;
-	strlcpy(sa.sun_path, KYRIAKON_SOCKET, sizeof(sa.sun_path));
-	if (connect(fd, (const struct sockaddr *)&sa, sizeof(sa)) < 0) {
-		*error_r = t_strdup_printf("connect(%s): %m", KYRIAKON_SOCKET);
-		i_close_fd(&fd);
-		return NULL;
-	}
-
-	/* request = "<localpart>\n" + raw message; the daemon splits on the
-	   first newline and reads the message until our EOF. */
-	if (!kyriakon_write_all(fd, localpart, strlen(localpart)) ||
-	    !kyriakon_write_all(fd, "\n", 1)) {
-		*error_r = t_strdup_printf("write(%s): %m", KYRIAKON_SOCKET);
-		i_close_fd(&fd);
-		return NULL;
-	}
+	/* The child gets the message as one buffer. Save inputs are already
+	   materialised by the backend. */
+	plain = buffer_create_dynamic(box->pool, 8192);
 	while ((ret = i_stream_read(input)) != -1) {
 		if (ret == -2) {
 			*error_r = t_strdup_printf("read input: %s",
 						   i_stream_get_error(input));
-			i_close_fd(&fd);
 			return NULL;
 		}
 		if (ret == 0)
-			continue; /* save inputs are already materialized */
+			continue;
 		data = i_stream_get_data(input, &size);
-		if (!kyriakon_write_all(fd, data, size)) {
-			*error_r = t_strdup_printf("write(%s): %m",
-						   KYRIAKON_SOCKET);
-			i_close_fd(&fd);
-			return NULL;
-		}
+		buffer_append(plain, data, size);
 		i_stream_skip(input, size);
 	}
-	if (shutdown(fd, SHUT_WR) < 0) {
-		*error_r = t_strdup_printf("shutdown(%s): %m", KYRIAKON_SOCKET);
-		i_close_fd(&fd);
-		return NULL;
-	}
 
-	/* Read the ciphertext. Empty response = the daemon failed closed
-	   (missing key, gpg error, ...); the daemon logs the specific reason. */
-	resp = buffer_create_dynamic(box->pool, 8192);
-	while ((ret = read(fd, tmp, sizeof(tmp))) > 0)
-		buffer_append(resp, tmp, ret);
-	if (ret < 0) {
-		*error_r = t_strdup_printf("read(%s): %m", KYRIAKON_SOCKET);
-		buffer_free(&resp);
-		i_close_fd(&fd);
+	if (mkdtemp(scratch) == NULL) {
+		*error_r = t_strdup_printf("mkdtemp(/tmp): %m");
 		return NULL;
 	}
-	i_close_fd(&fd);
-	if (resp->used == 0) {
-		*error_r = "no ciphertext returned";
-		buffer_free(&resp);
+	if (!kyriakon_encrypt_message(KYRIAKON_ENCRYPT_BIN, user,
+				      KYRIAKON_KEYRING, scratch, plain->data,
+				      plain->used, &result)) {
+		unlink_directory(scratch, UNLINK_DIRECTORY_FLAG_RMDIR);
+		*error_r = t_strdup_printf("encryptor: %s", result.error);
 		return NULL;
 	}
-	/* A non-empty body is not enough: a daemon restarted mid-write leaves
-	   half an armour that starts with the marker like any other. Only the
-	   frame's own length can tell the two apart. */
-	if (!kyriakon_parse_frame(resp->data, resp->used, &offset, &size)) {
-		*error_r = "truncated or malformed encryptor response";
-		buffer_free(&resp);
-		return NULL;
-	}
-	if (size < sizeof(KYRIAKON_MARKER) - 1 ||
-	    memcmp((const unsigned char *)resp->data + offset,
-		   KYRIAKON_MARKER, sizeof(KYRIAKON_MARKER) - 1) != 0) {
-		*error_r = "encryptor response is not kyriakon ciphertext";
-		buffer_free(&resp);
-		return NULL;
-	}
+	unlink_directory(scratch, UNLINK_DIRECTORY_FLAG_RMDIR);
 
-	/* The buffer lives on box->pool, so it outlives the save. ponytail:
-	   buffers the whole ciphertext per save; spool to a temp file only if
-	   mailbox lifetime/volume makes this measurable. */
-	return i_stream_create_from_data(
-		(const char *)resp->data + offset, size);
+	/* ponytail: buffers the whole ciphertext per save; spool to a temp file
+	   only if mailbox lifetime/volume makes this measurable. */
+	cipher = buffer_create_dynamic(box->pool, result.ciphertext_len);
+	buffer_append(cipher, result.ciphertext, result.ciphertext_len);
+	free(result.ciphertext);
+	return i_stream_create_from_data(cipher->data, cipher->used);
 }
 
 static int
@@ -202,38 +123,6 @@ kyriakon_save_begin(struct mail_save_context *ctx, struct istream *input)
 	return ret;
 }
 
-static int
-kyriakon_save_finish(struct mail_save_context *ctx)
-{
-	struct mailbox *box = ctx->transaction->box;
-	struct kyriakon_mailbox *mbox =
-		MODULE_CONTEXT_REQUIRE(box, kyriakon_mailbox_module);
-	struct istream *input;
-	const unsigned char *data;
-	size_t size;
-	bool ok = FALSE;
-
-	if (mbox->module_ctx.super.save_finish(ctx) < 0)
-		return -1;
-
-	/* Fail-closed backstop: what landed in storage must be our RFC 3156
-	   envelope, never plaintext. */
-	if (mail_get_stream(ctx->dest_mail, NULL, NULL, &input) < 0)
-		return -1;
-	if (i_stream_read(input) > 0) {
-		data = i_stream_get_data(input, &size);
-		ok = size >= sizeof(KYRIAKON_MARKER) - 1 &&
-		     memcmp(data, KYRIAKON_MARKER,
-			    sizeof(KYRIAKON_MARKER) - 1) == 0;
-	}
-	if (!ok) {
-		mail_storage_set_error(box->storage, MAIL_ERROR_NOTPOSSIBLE,
-			"saved mail is not kyriakon ciphertext");
-		return -1;
-	}
-	return 0;
-}
-
 static void
 kyriakon_mailbox_allocated(struct mailbox *box)
 {
@@ -245,7 +134,6 @@ kyriakon_mailbox_allocated(struct mailbox *box)
 	box->vlast = &mbox->module_ctx.super;
 
 	v->save_begin = kyriakon_save_begin;
-	v->save_finish = kyriakon_save_finish;
 	/* copy is intentionally not overridden: phase 1 is single-user, so an
 	   IMAP COPY hardlinks the same user's ciphertext, which is already
 	   correct. Cross-user copy into a shared mailbox would need

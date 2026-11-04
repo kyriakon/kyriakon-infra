@@ -143,7 +143,7 @@ Provisioning is manual today. The service that will take it over is covered in t
 		doas git -C /usr/local/src/kyriakon-infra pull --ff-only
 		doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-mail.sh
 
-   Delivery reads the keyring per message, and the encryptor fails closed when the key is missing. The Dovecot plugin returns `MAIL_ERROR_TEMP` for every encrypt failure, so nothing is bounced at once: the LMTP delivery answers a temporary failure, smtpd keeps the message in its queue and retries for the four-day queue lifetime, and the sender defers it until its own queue expires. What the operator sees is repeated deferrals in `/var/log/maillog`, the message in `doas smtpctl show queue`, and `kyriakon-encrypt: <localpart>: no public key for ... in keyring` in `/var/log/daemon` from the encryptor. Installing the key ends the retries, and the queued mail is delivered on the next pass.
+   Delivery reads the keyring per message, and the encryptor fails closed when the key is missing. The Dovecot plugin returns `MAIL_ERROR_TEMP` for every encrypt failure, so nothing is bounced at once: the LMTP delivery answers a temporary failure, smtpd keeps the message in its queue and retries for the four-day queue lifetime, and the sender defers it until its own queue expires. What the operator sees is repeated deferrals in `/var/log/maillog`, the message in `doas smtpctl show queue`, and `kyriakon-encrypt: no public key for "<localpart>" in keyring` in `/var/log/maillog` from the encryptor. Installing the key ends the retries, and the queued mail is delivered on the next pass.
 
 3. Check the account.
 
@@ -319,13 +319,14 @@ To replace a key by hand, before the service is built:
 
    A key that advertises AEAD makes GnuPG emit packet tag 20, which Thunderbird and RNP cannot read, so delivery would produce mail the member cannot open. The wanted shape is `features: 05` and no `pref-aead-algos` line.
 
-3. Check the encrypt path the daemon uses.
+3. Check the encrypt path a delivery uses.
 
-		echo test | doas gpg --batch --no-tty --no-options --encrypt --armor \
-			--no-encrypt-to --recipient-file /etc/kyriakon/keys/<localpart>.asc \
-			--homedir /var/run/kyriakon/gpg | doas gpg --list-packets | grep -E 'tag=|mdc_method'
+		doas ksh -c 'd=$(mktemp -d); echo test | gpg --batch --no-tty --no-options \
+			--encrypt --armor --no-encrypt-to \
+			--recipient-file /etc/kyriakon/keys/<localpart>.asc \
+			--homedir "$d" | gpg --list-packets | grep -E "tag=|mdc_method"; rm -rf "$d"'
 
-   `tag=18` with `mdc_method: 2` is the pass. `tag=20` or an `aead` line means the old key is still deployed.
+   The save path runs gpg with `--recipient-file` and a fresh scratch homedir per message, so this is the same invocation. `tag=18` with `mdc_method: 2` is the pass. `tag=20` or an `aead` line means the old key is still deployed.
 
 4. Send a message from an address outside the platform and ask the member to open it. Their client failing to decrypt is the signal that the key on the box is not the key they hold, and it arrives within a day.
 
@@ -725,7 +726,7 @@ Work inbound first, then outbound, and stop when you find it. `doas ksh scripts/
 
 1. Are the daemons up?
 
-		doas rcctl check smtpd dovecot kyriakon_encrypt spamd spamlogd httpd gmid inetd
+		doas rcctl check smtpd dovecot spamd spamlogd httpd gmid inetd
 
    `spamlogd` is easy to miss, and greylisting never releases a sender without it, because it is the daemon that writes the whitelist entries spamd reads.
 
@@ -758,10 +759,10 @@ Work inbound first, then outbound, and stop when you find it. `doas ksh scripts/
 		doas ls -l /etc/kyriakon/keys/<localpart>.asc
 		doas gpg --list-packets /etc/kyriakon/keys/<localpart>.asc | grep -E 'tag=|features'
 
-7. Is the encryptor running? Delivery depends on its socket.
+7. Can the mailbox user run the encryptor? Every save execs it, so a binary or keyring it cannot read is a save that fails closed. Its stderr carries the reason.
 
-		doas ls -l /var/run/kyriakon/encrypt.sock
-		doas rcctl restart kyriakon_encrypt
+		doas ls -l /usr/local/sbin/kyriakon-encrypt /etc/kyriakon/keys
+		doas grep kyriakon-encrypt /var/log/maillog | tail -20
 
 8. Does authentication work?
 
@@ -872,7 +873,7 @@ The base system and the packages move on different clocks. `syspatch` carries ba
 
 3. Reboot if the base patches or the upgrade require it, then check that every service came back.
 
-		doas rcctl check smtpd dovecot kyriakon_encrypt spamd spamlogd httpd gmid inetd nsd
+		doas rcctl check smtpd dovecot spamd spamlogd httpd gmid inetd nsd
 
 4. Re-snapshot after a patch cycle, because a stale provisioning image reintroduces what the patch removed. Do not snapshot the live mail box for this: its root disk holds member mail and the DKIM key, and a `kind=gold` image is the source of every future box. Build the new gold image on a throwaway box instead. The image carries its own root `authorized_keys`, so reach the new box with the key it holds.
 

@@ -150,7 +150,6 @@ classify() {
 	openbsd/etc/onboard/*) needs_onboard=yes ;;
 	openbsd/etc/rc.d/kyriakon_onboard) needs_onboard=yes ;;
 	openbsd/etc/rc.d/kyriakon_onboard_sshd) manual_sshd_onboard=yes ;;
-	openbsd/etc/rc.d/kyriakon_encrypt) needs_mail=yes ;;
 	openbsd/etc/httpd.conf | openbsd/etc/gmid.conf | openbsd/etc/acme-client.conf | \
 		openbsd/etc/smtpd.conf | openbsd/etc/unbound.conf | openbsd/etc/newsyslog.conf | \
 		openbsd/etc/spamd.conf | openbsd/etc/spamd.alloweddomains | openbsd/etc/nospamd | \
