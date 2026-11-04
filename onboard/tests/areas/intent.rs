@@ -8,11 +8,11 @@
 use crate::common::*;
 
 use kyriakon_onboard::config::DrainConfig;
+use kyriakon_onboard::intents as tr;
 use kyriakon_onboard::intents::Intent;
 use kyriakon_onboard::journal::Journal;
 use kyriakon_onboard::sign;
 use kyriakon_onboard::store::{self as st, Store};
-use kyriakon_onboard::transitions as tr;
 
 /// The fixture's config and store, as the drain builds them.
 fn seam(fix: &Fix) -> (DrainConfig, Store, Journal) {

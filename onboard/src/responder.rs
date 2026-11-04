@@ -2299,7 +2299,7 @@ async fn account_close(app: &App, request: &Request) -> Reply {
         return refused("Sign in to the account you want to close.");
     };
     let refund = closure_refund(app, &account).await;
-    let intent = intents::Intent::Close(transitions::CloseIntent {
+    let intent = intents::Intent::Close(intents::CloseIntent {
         username: account.username.clone(),
         session: session_id.to_string(),
         ..Default::default()
@@ -2359,7 +2359,7 @@ async fn account_password(app: &App, request: &Request) -> Reply {
     if new != confirm {
         return refused("The two new passwords do not match.");
     }
-    match intents::Intent::ChangePassword(transitions::ChangePasswordIntent {
+    match intents::Intent::ChangePassword(intents::ChangePasswordIntent {
         username: account.username.clone(),
         session: session_id.to_string(),
         password: new.to_string(),
@@ -2403,7 +2403,7 @@ async fn account_upload_key(app: &App, request: &Request) -> Reply {
             if keycheck::openssh_fingerprint(material).is_none() {
                 return refused("That line carries no key material.");
             }
-            match intents::Intent::UploadKey(transitions::UploadKeyIntent {
+            match intents::Intent::UploadKey(intents::UploadKeyIntent {
                 username: account.username.clone(),
                 session: session_id.to_string(),
                 action: "add".to_string(),
@@ -2438,7 +2438,7 @@ async fn account_upload_key(app: &App, request: &Request) -> Reply {
             {
                 return refused("That key is not on the account.");
             }
-            match intents::Intent::UploadKey(transitions::UploadKeyIntent {
+            match intents::Intent::UploadKey(intents::UploadKeyIntent {
                 username: account.username.clone(),
                 session: session_id.to_string(),
                 action: "remove".to_string(),
@@ -2485,7 +2485,7 @@ async fn account_address(app: &App, request: &Request) -> Reply {
             ));
         }
     }
-    match intents::Intent::OutsideAddress(transitions::OutsideAddressIntent {
+    match intents::Intent::OutsideAddress(intents::OutsideAddressIntent {
         username: account.username.clone(),
         session: session_id.to_string(),
         address: address.to_string(),
@@ -2527,7 +2527,7 @@ async fn account_serving(app: &App, request: &Request) -> Reply {
     let form = fields(&String::from_utf8_lossy(&request.body));
     let http = form.contains_key("http");
     let gemini = form.contains_key("gemini");
-    match intents::Intent::Serving(transitions::ServingIntent {
+    match intents::Intent::Serving(intents::ServingIntent {
         username: account.username.clone(),
         session: session_id.to_string(),
         http,
@@ -2578,7 +2578,7 @@ async fn account_renewal(app: &App, request: &Request) -> Reply {
              pay again, and nothing is charged automatically.",
         );
     }
-    match intents::Intent::CancelRenewal(transitions::CancelRenewalIntent {
+    match intents::Intent::CancelRenewal(intents::CancelRenewalIntent {
         username: account.username.clone(),
         session: session_id.to_string(),
         ..Default::default()
@@ -2633,7 +2633,7 @@ async fn account_mail_key(app: &App, request: &Request) -> Reply {
                 .unwrap_or("")
                 .trim();
             let signed = !signature.is_empty();
-            match intents::Intent::MailKey(transitions::MailKeyIntent {
+            match intents::Intent::MailKey(intents::MailKeyIntent {
                 username: account.username.clone(),
                 session: session_id.to_string(),
                 action: "replace".to_string(),
@@ -2666,7 +2666,7 @@ async fn account_mail_key(app: &App, request: &Request) -> Reply {
             if account.rotation.is_none() {
                 return refused("No replacement is waiting to be cancelled.");
             }
-            match intents::Intent::MailKey(transitions::MailKeyIntent {
+            match intents::Intent::MailKey(intents::MailKeyIntent {
                 username: account.username.clone(),
                 session: session_id.to_string(),
                 action: "cancel".to_string(),
@@ -2721,7 +2721,7 @@ async fn account_export(app: &App, request: &Request) -> Reply {
     let Some(session_id) = cookie.as_deref().and_then(session::id) else {
         return refused("Sign in to the account you want to export.");
     };
-    match intents::Intent::Export(transitions::ExportIntent {
+    match intents::Intent::Export(intents::ExportIntent {
         username: account.username.clone(),
         session: session_id.to_string(),
         ..Default::default()
@@ -2944,7 +2944,7 @@ fn payment_for(app: &App, record: Option<&Record>) -> Option<page::PaymentView> 
 /// place to refuse an approval for a placeholder: the approval email already
 /// does, and the page simply shows no link rather than a broken one.
 fn card_link(app: &App, token: Option<&str>) -> Option<String> {
-    transitions::card_link(&app.cfg.stripe_payment_link, token?)
+    transitions::stripe::card_link(&app.cfg.stripe_payment_link, token?)
         .ok()
         .flatten()
 }
@@ -2952,12 +2952,12 @@ fn card_link(app: &App, token: Option<&str>) -> Option<String> {
 /// The decision a link names, with the signature it carries. A link with no
 /// signature, or with one naming an action this build has no decision for, names
 /// no decision.
-fn decision_from(f: &BTreeMap<String, String>) -> Option<&'static transitions::Decision> {
+fn decision_from(f: &BTreeMap<String, String>) -> Option<&'static intents::Decision> {
     let sig = f.get("sig").map(String::as_str).unwrap_or("");
     if sig.is_empty() {
         return None;
     }
-    transitions::decision_for(f.get("action").map(String::as_str).unwrap_or(""))
+    intents::decision_for(f.get("action").map(String::as_str).unwrap_or(""))
 }
 
 /// Why a confirm page cannot name a decision, in the words the reader needs.
@@ -3025,7 +3025,7 @@ async fn decide_file(app: &App, call: &Call<'_>) -> Reply {
         return refused("This link does not name a decision the platform knows.");
     };
     let sig = form.get("sig").cloned().unwrap_or_default();
-    match intents::Intent::Decision(transitions::DecisionIntent {
+    match intents::Intent::Decision(intents::DecisionIntent {
         kind: decision.kind.to_string(),
         application: store::ApplicationRef::application(record.username.clone(), token.to_string()),
         action: decision.action.to_string(),
@@ -3150,7 +3150,7 @@ async fn password_file(app: &App, call: &Call<'_>) -> Reply {
             error: Some(problem),
         });
     }
-    match intents::Intent::Password(transitions::PasswordIntent {
+    match intents::Intent::Password(intents::PasswordIntent {
         application: store::ApplicationRef::application(record.username.clone(), token.to_string()),
         until: until.clone(),
         sig: sig.clone(),

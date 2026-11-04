@@ -64,7 +64,7 @@ pub async fn open_windows(store: &Store, now: OffsetDateTime) -> Result<Vec<Open
     // exactly as worth an email as an account's. The row names the site owner,
     // which is the account the token is indexed under.
     for domain in store.list("groups").await? {
-        let group = match crate::transitions::group_record(store, &domain).await {
+        let group = match crate::transitions::groups::group_record(store, &domain).await {
             Ok(Some(group)) => group,
             Ok(None) => continue,
             Err(e) => {
