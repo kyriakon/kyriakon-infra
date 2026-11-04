@@ -168,8 +168,10 @@ line_for() {
 			# nothing to cron, so its output is captured and printed only when
 			# it fails, followed by the command that produced it: the mail
 			# carries the finding, not just that there was one.
-			# shellcheck disable=SC2016 # $out is for the cron shell, not this one
-			printf '%s . /root/.kyriakon-env; out=$(ksh %s/%s%s 2>&1) || printf "%%s\\n%%s\\n" "$out" "%s failed; run: ksh %s/%s"\n' \
+			# shellcheck disable=SC2016 # $out and the escapes are for the cron
+			# shell; crontab(5) ends the command at an unescaped %, so every one
+			# that must reach printf is written \% here.
+			printf '%s . /root/.kyriakon-env; out=$(ksh %s/%s%s 2>&1) || printf "\\%%s\\n\\%%s\\n" "$out" "%s failed; run: ksh %s/%s"\n' \
 				"$sched" "$dir" "$name" "${args:+ $args}" "$name" "$dir" "$name"
 		else
 			printf '%s . /root/.kyriakon-env; %s/%s%s\n' "$sched" "$dir" "$name" "${args:+ $args}"
@@ -694,6 +696,13 @@ EOF
 	# shellcheck disable=SC2016 # as above
 	check "and a failing one keeps its output in the mail" \
 		"$(line_for check-hygiene.sh | grep -cF '"$out"')" 1
+	# crontab(5) ends the command at the first unescaped %, so every percent
+	# that has to reach printf is rendered as \%. A line with a bare one runs a
+	# truncated printf and the mail is a syntax error instead of a finding.
+	check "no unescaped percent reaches the crontab" \
+		"$(line_for check-hygiene.sh | grep -c '[^\\]%')" 0
+	check "and the percents printf needs are escaped" \
+		"$(line_for check-hygiene.sh | grep -oF '\%s' | wc -l | tr -d ' ')" 2
 	check "and does not throw the run away" \
 		"$(line_for check-hygiene.sh | grep -c '>/dev/null')" 0
 	# Both are rows rather than arms here, so the table is what decides they are
