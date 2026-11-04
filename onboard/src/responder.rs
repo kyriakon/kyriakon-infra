@@ -2215,11 +2215,11 @@ async fn closure_refund(app: &App, account: &Account) -> Option<String> {
     // `erasure_refund`, which reads as root, is the authoritative answer; a
     // refund it cannot read must not stop the closure being filed.
     for value in crate::ledger::Ledger::open(&app.store)
-        .lines()
+        .lines_for(&token)
         .await
         .unwrap_or_default()
     {
-        if value.token != token || value.kind != "payment" {
+        if value.kind != "payment" {
             continue;
         }
         let Some(received) = value.received_on.as_deref() else {

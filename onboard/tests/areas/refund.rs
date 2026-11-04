@@ -816,3 +816,37 @@ fn a_credit_and_a_refund_keep_the_recorded_key_shape() {
     assert_eq!(refund["amount_gbp"], json!("-5.00"));
     assert_eq!(refund["applied_gbp"], json!("-5.00"));
 }
+
+/// A credit and its full refund net to zero in the ledger: the negative line is
+/// the payment reversed, not a second movement of its own.
+#[test]
+fn a_credit_and_a_full_refund_net_to_zero() {
+    let fix = Fix::new("refund-net-zero");
+    let token = approved_paid(&fix, "secretary", "cash");
+    cash_credit(&fix, &token);
+    let out = fix.ctl(&[
+        "refund",
+        "--token",
+        &token,
+        "--amount",
+        "20.00",
+        "--rail",
+        "cash",
+        "--reason",
+        "cancelled inside 14 days",
+        "--close",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+
+    let total: i64 = payment_lines(&fix)
+        .iter()
+        .chain(refund_lines(&fix).iter())
+        .map(|line| {
+            let text = line["amount_gbp"].as_str().unwrap();
+            let sign = if text.starts_with('-') { -1 } else { 1 };
+            sign * kyriakon_onboard::util::pence(text.trim_start_matches('-')).unwrap()
+        })
+        .sum();
+    assert_eq!(total, 0, "the ledger does not net to zero");
+}

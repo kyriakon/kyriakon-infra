@@ -63,7 +63,7 @@ use kyriakon_onboard::export;
 use kyriakon_onboard::intents;
 use kyriakon_onboard::journal::Journal;
 use kyriakon_onboard::keycheck;
-use kyriakon_onboard::ledger::Ledger;
+use kyriakon_onboard::ledger::{Ledger, LedgerLine};
 use kyriakon_onboard::prepaid;
 use kyriakon_onboard::requests;
 use kyriakon_onboard::sign;
@@ -779,24 +779,15 @@ async fn ledger(store: &Store, args: &[String]) -> Result<(), String> {
     if format != "csv" {
         return Err(format!("--format {format:?} is not csv"));
     }
-    let fields = [
-        "seq",
-        "token",
-        "kind",
-        "rail",
-        "received_on",
-        "amount_gbp",
-        "applied_gbp",
-        "paid_until_after",
-        "amount_xmr",
-        "txid",
-        "refund_of",
-        "settled_on",
-        "rate_quoted",
-        "rate_source",
-        "rate_at",
-    ];
-    println!("{}", fields.join(","));
+    let columns = payment_columns();
+    println!(
+        "{}",
+        columns
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
 
     let mut rows = Vec::new();
     for line in Ledger::open(store).lines().await? {
@@ -806,27 +797,10 @@ async fn ledger(store: &Store, args: &[String]) -> Result<(), String> {
     }
     rows.sort_by_key(|line| line.seq);
     for line in rows {
-        let refund_of = line.refund_of().map(|n| n.to_string()).unwrap_or_default();
-        let settled_on = line.settled_on().unwrap_or_default().to_string();
-        let text = |value: &Option<String>| value.clone().unwrap_or_default();
-        let cells = [
-            line.seq.to_string(),
-            line.token,
-            line.kind,
-            line.rail,
-            text(&line.received_on),
-            text(&line.amount_gbp),
-            text(&line.applied_gbp),
-            text(&line.paid_until_after),
-            text(&line.amount_xmr),
-            text(&line.txid),
-            refund_of,
-            settled_on,
-            text(&line.rate_quoted),
-            text(&line.rate_source),
-            text(&line.rate_at),
-        ];
-        let cells: Vec<String> = cells.iter().map(|cell| csv_cell(cell)).collect();
+        let cells: Vec<String> = columns
+            .iter()
+            .map(|(_, value)| csv_cell(&value(&line)))
+            .collect();
         println!("{}", cells.join(","));
     }
 
@@ -944,6 +918,49 @@ fn cell(value: &Value) -> String {
         Value::Number(n) => n.to_string(),
         _ => String::new(),
     }
+}
+
+/// One payment column: the header the accountant reads and how to print it.
+type PaymentColumn = (&'static str, fn(&LedgerLine) -> String);
+
+/// The payments section's columns, in the order the accountant's sheet takes.
+/// The header and the cells both come from this list, so they cannot drift.
+fn payment_columns() -> [PaymentColumn; 15] {
+    [
+        ("seq", |line| line.seq.to_string()),
+        ("token", |line| line.token.clone()),
+        ("kind", |line| line.kind.clone()),
+        ("rail", |line| line.rail.clone()),
+        ("received_on", |line| {
+            line.received_on.clone().unwrap_or_default()
+        }),
+        ("amount_gbp", |line| {
+            line.amount_gbp.clone().unwrap_or_default()
+        }),
+        ("applied_gbp", |line| {
+            line.applied_gbp.clone().unwrap_or_default()
+        }),
+        ("paid_until_after", |line| {
+            line.paid_until_after.clone().unwrap_or_default()
+        }),
+        ("amount_xmr", |line| {
+            line.amount_xmr.clone().unwrap_or_default()
+        }),
+        ("txid", |line| line.txid.clone().unwrap_or_default()),
+        ("refund_of", |line| {
+            line.refund_of().map(|n| n.to_string()).unwrap_or_default()
+        }),
+        ("settled_on", |line| {
+            line.settled_on().unwrap_or_default().to_string()
+        }),
+        ("rate_quoted", |line| {
+            line.rate_quoted.clone().unwrap_or_default()
+        }),
+        ("rate_source", |line| {
+            line.rate_source.clone().unwrap_or_default()
+        }),
+        ("rate_at", |line| line.rate_at.clone().unwrap_or_default()),
+    ]
 }
 
 /// RFC 4180: a comma, a quote or a line break in a cell puts the whole cell in

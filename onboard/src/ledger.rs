@@ -17,45 +17,34 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::store::{Log, Monero, Store};
+use crate::store::{Log, Store};
 use crate::util;
 
 /// The one ledger of money movements.
 pub const PAYMENTS: &str = "ledger/payments.jsonl";
 
 /// One line of the payment ledger as recorded.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct LedgerLine {
     pub version: u64,
     pub seq: u64,
     pub token: String,
     pub kind: String,
     pub rail: String,
-    #[serde(default)]
     pub received_on: Option<String>,
-    #[serde(default)]
     pub amount_gbp: Option<String>,
-    #[serde(default)]
     pub applied_gbp: Option<String>,
-    #[serde(default)]
     pub paid_until_after: Option<String>,
-    #[serde(default)]
     pub amount_xmr: Option<String>,
-    #[serde(default)]
     pub rate_quoted: Option<String>,
-    #[serde(default)]
     pub rate_source: Option<String>,
-    #[serde(default)]
     pub rate_at: Option<String>,
-    #[serde(default)]
     pub txid: Option<String>,
-    #[serde(default)]
     pub intent: Option<String>,
-    #[serde(default)]
     pub note: Option<String>,
     /// The settlement a refund line carries after it is paid out. Absent on
     /// every other line, which is why it is skipped rather than written as null.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub settled_intent: Option<String>,
     /// The refund-only fields, absent on a payment or a window's line.
     #[serde(flatten)]
@@ -77,11 +66,99 @@ pub struct RefundTail {
     pub rate_refund: Option<String>,
 }
 
+/// The fields as they sit on disk. Deserialising through this type is what lets
+/// a payment's absent refund block stay absent: a flattened `Option` would give
+/// every parsed payment an empty tail, and re-serialising it would invent four
+/// null refund keys.
+#[derive(Deserialize)]
+struct LedgerLineRecord {
+    version: u64,
+    seq: u64,
+    token: String,
+    kind: String,
+    rail: String,
+    #[serde(default)]
+    received_on: Option<String>,
+    #[serde(default)]
+    amount_gbp: Option<String>,
+    #[serde(default)]
+    applied_gbp: Option<String>,
+    #[serde(default)]
+    paid_until_after: Option<String>,
+    #[serde(default)]
+    amount_xmr: Option<String>,
+    #[serde(default)]
+    rate_quoted: Option<String>,
+    #[serde(default)]
+    rate_source: Option<String>,
+    #[serde(default)]
+    rate_at: Option<String>,
+    #[serde(default)]
+    txid: Option<String>,
+    #[serde(default)]
+    intent: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    settled_intent: Option<String>,
+    #[serde(default)]
+    refund_of: Option<u64>,
+    #[serde(default)]
+    settled_on: Option<String>,
+    #[serde(default)]
+    refund_basis: Option<String>,
+    #[serde(default)]
+    rate_refund: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for LedgerLine {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = LedgerLineRecord::deserialize(deserializer)?;
+        let refund = if raw.refund_of.is_some()
+            || raw.settled_on.is_some()
+            || raw.refund_basis.is_some()
+            || raw.rate_refund.is_some()
+        {
+            Some(RefundTail {
+                refund_of: raw.refund_of,
+                settled_on: raw.settled_on,
+                refund_basis: raw.refund_basis,
+                rate_refund: raw.rate_refund,
+            })
+        } else {
+            None
+        };
+        Ok(LedgerLine {
+            version: raw.version,
+            seq: raw.seq,
+            token: raw.token,
+            kind: raw.kind,
+            rail: raw.rail,
+            received_on: raw.received_on,
+            amount_gbp: raw.amount_gbp,
+            applied_gbp: raw.applied_gbp,
+            paid_until_after: raw.paid_until_after,
+            amount_xmr: raw.amount_xmr,
+            rate_quoted: raw.rate_quoted,
+            rate_source: raw.rate_source,
+            rate_at: raw.rate_at,
+            txid: raw.txid,
+            intent: raw.intent,
+            note: raw.note,
+            settled_intent: raw.settled_intent,
+            refund,
+        })
+    }
+}
+
 impl LedgerLine {
     /// The fields every kind shares, with the optional ones empty. A caller
-    /// fills what it records; a field it forgets writes as null, the same shape
-    /// its hand-built line had.
-    fn empty(token: &str, kind: &str, rail: &str) -> LedgerLine {
+    /// fills the named fields it records; one it forgets writes as null, the
+    /// same shape its hand-built line had.
+    pub(crate) fn empty(token: &str, kind: &str, rail: &str) -> LedgerLine {
         LedgerLine {
             version: 1,
             seq: 0,
@@ -104,86 +181,6 @@ impl LedgerLine {
         }
     }
 
-    /// A payment line: a prepaid credit or a paid card invoice. Only a Monero
-    /// credit carries the quote that produced its window.
-    #[allow(clippy::too_many_arguments)]
-    pub fn payment(
-        token: &str,
-        rail: &str,
-        received_on: &str,
-        amount_gbp: &str,
-        applied_gbp: &str,
-        paid_until_after: Option<&str>,
-        amount_xmr: Option<&str>,
-        quoted: Option<&Monero>,
-        txid: Option<&str>,
-        intent: &str,
-    ) -> LedgerLine {
-        let mut line = LedgerLine::empty(token, "payment", rail);
-        line.received_on = Some(received_on.to_string());
-        line.amount_gbp = Some(amount_gbp.to_string());
-        line.applied_gbp = Some(applied_gbp.to_string());
-        line.paid_until_after = paid_until_after.map(str::to_string);
-        line.amount_xmr = amount_xmr.map(str::to_string);
-        line.rate_quoted = quoted.and_then(|m| m.rate_gbp_per_xmr.clone());
-        line.rate_source = quoted.and_then(|m| m.rate_source.clone());
-        line.rate_at = quoted.and_then(|m| m.rate_at.clone());
-        line.txid = txid.map(str::to_string);
-        line.intent = Some(intent.to_string());
-        line
-    }
-
-    /// A refund's negative line. The amount is negative in both money fields so
-    /// a sum over the ledger is the year's takings.
-    #[allow(clippy::too_many_arguments)]
-    pub fn refund(
-        token: &str,
-        rail: &str,
-        received_on: &str,
-        amount_gbp: &str,
-        paid_until_after: Option<&str>,
-        amount_xmr: Option<&str>,
-        intent: &str,
-        note: &str,
-        refund_of: u64,
-        refund_basis: Option<&str>,
-        rate_refund: Option<&str>,
-    ) -> LedgerLine {
-        let mut line = LedgerLine::empty(token, "refund", rail);
-        line.received_on = Some(received_on.to_string());
-        line.amount_gbp = Some(amount_gbp.to_string());
-        line.applied_gbp = Some(amount_gbp.to_string());
-        line.paid_until_after = paid_until_after.map(str::to_string);
-        line.amount_xmr = amount_xmr.map(str::to_string);
-        line.intent = Some(intent.to_string());
-        line.note = Some(note.to_string());
-        line.refund = Some(RefundTail {
-            refund_of: Some(refund_of),
-            settled_on: None,
-            refund_basis: refund_basis.map(str::to_string),
-            rate_refund: rate_refund.map(str::to_string),
-        });
-        line
-    }
-
-    /// The window a paid approval opens: the amount owed and the day it falls
-    /// due, before any money has arrived.
-    pub fn window_open(
-        token: &str,
-        rail: &str,
-        amount_gbp: &str,
-        rate_at: &str,
-        intent: &str,
-    ) -> LedgerLine {
-        let mut line = LedgerLine::empty(token, "window_open", rail);
-        line.amount_gbp = Some(amount_gbp.to_string());
-        line.applied_gbp = Some("0.00".to_string());
-        line.rate_at = Some(rate_at.to_string());
-        line.intent = Some(intent.to_string());
-        line.note = Some("the window opened at approval; no money has arrived yet".to_string());
-        line
-    }
-
     /// The payment `seq` a refund reverses, when this is a refund line.
     pub fn refund_of(&self) -> Option<u64> {
         self.refund.as_ref().and_then(|refund| refund.refund_of)
@@ -195,6 +192,14 @@ impl LedgerLine {
             .as_ref()
             .and_then(|refund| refund.settled_on.as_deref())
     }
+}
+
+/// The refunds that reverse one payment, and their total in pence. One read
+/// answers both the identical-refund check and the cap, so the file is parsed
+/// once.
+pub struct RefundSum {
+    pub total: i64,
+    pub lines: Vec<LedgerLine>,
 }
 
 /// The ledger's handle: the one append, the one settlement and the typed
@@ -222,9 +227,16 @@ impl<'a> Ledger<'a> {
             .jsonl_each(|_, seen: &LedgerLine| last = last.max(seen.seq))
             .await?;
         line.seq = last + 1;
+        // Every line on disk was written from a `json!` value, whose object is
+        // sorted. Going through `Value` keeps the key order identical; a struct
+        // serialised directly would write declaration order.
+        let value =
+            serde_json::to_value(&line).map_err(|e| format!("cannot encode the ledger: {e}"))?;
         let encoded =
-            serde_json::to_string(&line).map_err(|e| format!("cannot encode the ledger: {e}"))?;
-        self.log.append_while_locked(encoded.as_bytes()).await?;
+            serde_json::to_string(&value).map_err(|e| format!("cannot encode the ledger: {e}"))?;
+        self.log
+            .append_while_locked(&guard, encoded.as_bytes())
+            .await?;
         drop(guard);
         Ok(line.seq)
     }
@@ -263,23 +275,16 @@ impl<'a> Ledger<'a> {
         Ok(found)
     }
 
-    /// The token's refunds that reverse `original`: the one filter the refund
-    /// cap asks, rather than a copy of it in the caller.
-    pub async fn refunds_of(&self, token: &str, original: u64) -> Result<Vec<LedgerLine>, String> {
-        Ok(self
-            .refunds(token)
-            .await?
-            .into_iter()
-            .filter(|line| line.refund_of() == Some(original))
-            .collect())
-    }
-
-    /// What the token's refunds of `original` total, in pence. An amount this
-    /// cannot read is an error, never zero: counting it as zero would let this
-    /// refund and the unreadable one together exceed the payment.
-    pub async fn refunded_total(&self, token: &str, original: u64) -> Result<i64, String> {
+    /// The token's refunds that reverse `original`, with their total in pence.
+    /// An amount this cannot read is an error, never zero: counting it as zero
+    /// would let this refund and the unreadable one together exceed the payment.
+    pub async fn refunded_total(&self, token: &str, original: u64) -> Result<RefundSum, String> {
         let mut total = 0i64;
-        for line in self.refunds_of(token, original).await? {
+        let mut lines = Vec::new();
+        for line in self.refunds(token).await? {
+            if line.refund_of() != Some(original) {
+                continue;
+            }
             let text = line
                 .amount_gbp
                 .as_deref()
@@ -288,14 +293,9 @@ impl<'a> Ledger<'a> {
                 format!("the refund at ledger seq {} cannot be read: {e}", line.seq)
             })?;
             total += pence;
+            lines.push(line);
         }
-        Ok(total)
-    }
-
-    /// The newest refund line for the token with no `settled_on`.
-    pub async fn unsettled_refund(&self, token: &str) -> Result<Option<LedgerLine>, String> {
-        let lines = self.log.raw_lines().await?;
-        Ok(unsettled_index(&lines, token)?.map(|(_, line)| line))
+        Ok(RefundSum { total, lines })
     }
 
     /// Whether a refund line has already recorded this settlement intent.
@@ -312,11 +312,11 @@ impl<'a> Ledger<'a> {
             .await
     }
 
-    /// Whether the token already has a line of this kind, for the one dedup that
-    /// is not keyed by an intent id.
-    pub async fn has_token_kind(&self, token: &str, kind: &str) -> Result<bool, String> {
+    /// Whether the approval already opened this token's window. Its dedup is
+    /// the token and the kind, not an intent id.
+    pub async fn has_window_open(&self, token: &str) -> Result<bool, String> {
         self.log
-            .jsonl_any(|line: &LedgerLine| line.token == token && line.kind == kind)
+            .jsonl_any(|line: &LedgerLine| line.token == token && line.kind == "window_open")
             .await
     }
 
@@ -334,14 +334,36 @@ impl<'a> Ledger<'a> {
     }
 
     /// The token's lines as recorded, for the export, which copies them rather
-    /// than re-encoding the fields this build models.
+    /// than re-encoding the fields this build models. A line written by an
+    /// earlier release that this build cannot model is not the member's line, so
+    /// it is skipped rather than failing their whole export.
     pub async fn raw_lines_for(&self, token: &str) -> Result<Vec<String>, String> {
         let mut out = Vec::new();
-        for (index, raw) in self.log.raw_lines().await?.iter().enumerate() {
-            let line: LedgerLine = serde_json::from_str(raw)
-                .map_err(|e| format!("{PAYMENTS}: line {} does not parse: {e}", index + 1))?;
-            if line.token == token {
-                out.push(raw.clone());
+        for raw in self.log.raw_lines().await? {
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            if value.get("token").and_then(Value::as_str) == Some(token) {
+                out.push(raw);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The token's lines typed, skipping a line this build cannot model. For the
+    /// display readers, which must not lose a member's whole answer to one
+    /// legacy line; the money readers use [`Self::lines`] and fail instead.
+    pub async fn lines_for(&self, token: &str) -> Result<Vec<LedgerLine>, String> {
+        let mut out = Vec::new();
+        for raw in self.log.raw_lines().await? {
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            if value.get("token").and_then(Value::as_str) != Some(token) {
+                continue;
+            }
+            if let Ok(line) = serde_json::from_value::<LedgerLine>(value) {
+                out.push(line);
             }
         }
         Ok(out)
@@ -362,8 +384,9 @@ impl<'a> Ledger<'a> {
         let Some((index, settled)) = unsettled_index(&lines, token)? else {
             return Ok(None);
         };
-        // The lines stay as recorded: only the settled one is re-encoded, so a
-        // line an earlier release wrote keeps its bytes and its unknown fields.
+        // Only the settled line is re-encoded, through a `Value`, so fields this
+        // build does not model survive the rewrite. Its key order is what the
+        // value held, not the order this struct would declare.
         let mut line: Value = serde_json::from_str(&lines[index])
             .map_err(|e| format!("the refund line does not parse: {e}"))?;
         line["settled_on"] = serde_json::json!(on);
@@ -406,127 +429,85 @@ mod tests {
     }
 
     fn credit(intent: &str) -> LedgerLine {
-        LedgerLine::payment(
-            "KYR-AAAA-BBBB-CCCC",
-            "cash",
-            "2026-10-04",
-            "20.00",
-            "20.00",
-            None,
-            None,
-            None,
-            None,
-            intent,
-        )
+        let mut line = LedgerLine::empty("KYR-AAAA-BBBB-CCCC", "payment", "cash");
+        line.received_on = Some("2026-10-04".to_string());
+        line.amount_gbp = Some("20.00".to_string());
+        line.applied_gbp = Some("20.00".to_string());
+        line.intent = Some(intent.to_string());
+        line
     }
 
-    /// The printed key order is not part of the shape, but the key set and the
-    /// nulls are: a payment omits the refund block, and a refund carries all
-    /// four of its fields, null included.
-    #[test]
-    fn a_credit_and_a_refund_serialise_the_current_key_shape() {
-        let credit = serde_json::to_value(credit("in_credit")).unwrap();
-        assert_eq!(
-            credit
-                .as_object()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
-            [
-                "amount_gbp",
-                "amount_xmr",
-                "applied_gbp",
-                "intent",
-                "kind",
-                "note",
-                "paid_until_after",
-                "rail",
-                "rate_at",
-                "rate_quoted",
-                "rate_source",
-                "received_on",
-                "seq",
-                "token",
-                "txid",
-                "version",
-            ]
-        );
-        for field in [
-            "amount_xmr",
-            "paid_until_after",
-            "note",
-            "rate_quoted",
-            "rate_source",
-            "rate_at",
-            "txid",
-        ] {
-            assert!(credit[field].is_null(), "{field} is not null: {credit}");
-        }
-        assert_eq!(credit["amount_gbp"], "20.00");
-        assert!(credit.get("refund_of").is_none(), "{credit}");
+    fn refund(intent: &str) -> LedgerLine {
+        let mut line = LedgerLine::empty("KYR-AAAA-BBBB-CCCC", "refund", "cash");
+        line.received_on = Some("2026-10-04".to_string());
+        line.amount_gbp = Some("-5.00".to_string());
+        line.applied_gbp = Some("-5.00".to_string());
+        line.intent = Some(intent.to_string());
+        line.note = Some("overpaid".to_string());
+        line.refund = Some(RefundTail {
+            refund_of: Some(3),
+            settled_on: None,
+            refund_basis: None,
+            rate_refund: None,
+        });
+        line
+    }
 
-        let refund = serde_json::to_value(LedgerLine::refund(
-            "KYR-AAAA-BBBB-CCCC",
-            "cash",
-            "2026-10-04",
-            "-5.00",
-            None,
-            None,
-            "in_refund",
-            "overpaid",
-            3,
-            None,
-            None,
-        ))
-        .unwrap();
+    /// The bytes a new line puts on disk are the bytes the `json!` writers put
+    /// there: the same sorted key order and the same nulls. A payment has no
+    /// refund block; a refund has all four of its fields.
+    #[tokio::test]
+    async fn an_appended_line_keeps_the_recorded_key_order_and_nulls() {
+        let dir = temp("bytes");
+        let store = Store::new_for_test(dir.to_str().unwrap());
+        let ledger = Ledger::open(&store);
+        ledger.append(credit("in_credit")).await.unwrap();
+        ledger.append(refund("in_refund")).await.unwrap();
+        let lines = store.log(PAYMENTS).raw_lines().await.unwrap();
         assert_eq!(
-            refund
-                .as_object()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
-            [
-                "amount_gbp",
-                "amount_xmr",
-                "applied_gbp",
-                "intent",
-                "kind",
-                "note",
-                "paid_until_after",
-                "rail",
-                "rate_at",
-                "rate_quoted",
-                "rate_refund",
-                "rate_source",
-                "received_on",
-                "refund_basis",
-                "refund_of",
-                "seq",
-                "settled_on",
-                "token",
-                "txid",
-                "version",
-            ]
+            lines[0],
+            r#"{"amount_gbp":"20.00","amount_xmr":null,"applied_gbp":"20.00","intent":"in_credit","kind":"payment","note":null,"paid_until_after":null,"rail":"cash","rate_at":null,"rate_quoted":null,"rate_source":null,"received_on":"2026-10-04","seq":1,"token":"KYR-AAAA-BBBB-CCCC","txid":null,"version":1}"#
         );
-        for field in [
-            "amount_xmr",
-            "paid_until_after",
-            "rate_quoted",
-            "rate_source",
-            "rate_at",
-            "txid",
-            "settled_on",
-            "refund_basis",
-            "rate_refund",
-        ] {
-            assert!(refund[field].is_null(), "{field} is not null: {refund}");
-        }
-        assert_eq!(refund["refund_of"], 3);
-        assert_eq!(refund["amount_gbp"], "-5.00");
-        assert_eq!(refund["applied_gbp"], "-5.00");
-        assert!(refund.get("settled_intent").is_none(), "{refund}");
+        assert_eq!(
+            lines[1],
+            r#"{"amount_gbp":"-5.00","amount_xmr":null,"applied_gbp":"-5.00","intent":"in_refund","kind":"refund","note":"overpaid","paid_until_after":null,"rail":"cash","rate_at":null,"rate_quoted":null,"rate_refund":null,"rate_source":null,"received_on":"2026-10-04","refund_basis":null,"refund_of":3,"seq":2,"settled_on":null,"token":"KYR-AAAA-BBBB-CCCC","txid":null,"version":1}"#
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Parsing a payment and writing it again must not invent the refund block.
+    #[test]
+    fn parsing_a_payment_does_not_add_a_refund_block() {
+        let raw = r#"{"amount_gbp":"20.00","applied_gbp":"20.00","intent":"in_credit","kind":"payment","rail":"cash","seq":1,"token":"KYR-AAAA-BBBB-CCCC","version":1}"#;
+        let line: LedgerLine = serde_json::from_str(raw).unwrap();
+        assert!(line.refund.is_none());
+        let value = serde_json::to_value(&line).unwrap();
+        assert!(value.get("refund_of").is_none(), "{value}");
+        assert!(value.get("settled_on").is_none(), "{value}");
+    }
+
+    /// A partial line for another token is skipped by the export reader, while
+    /// the settlement still refuses to read past it.
+    #[tokio::test]
+    async fn a_partial_line_for_another_token_does_not_break_the_export() {
+        let dir = temp("partial");
+        let store = Store::new_for_test(dir.to_str().unwrap());
+        let ledger = Ledger::open(&store);
+        ledger.append(credit("in_credit")).await.unwrap();
+        store
+            .log(PAYMENTS)
+            .append(br#"{"token":"KYR-ZZZZ-ZZZZ-ZZZZ","amount_gbp":"5.00"}"#)
+            .await
+            .unwrap();
+
+        let exported = ledger.raw_lines_for("KYR-AAAA-BBBB-CCCC").await.unwrap();
+        assert_eq!(exported.len(), 1, "{exported:?}");
+        let error = ledger
+            .settle_refund("KYR-ZZZZ-ZZZZ-ZZZZ", "in_settle", "2026-11-05")
+            .await
+            .expect_err("a settlement must not skip a line it cannot read");
+        assert!(error.contains("line 2 does not parse"), "{error}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The number is allocated inside the lock every append takes: an append

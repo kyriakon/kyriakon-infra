@@ -695,7 +695,9 @@ impl Log<'_> {
         self.store.append_mode(self.path, bytes, owner, mode).await
     }
 
-    /// Append under a lock the caller already holds, from [`Self::lock`].
+    /// Append under a lock the caller already holds, from [`Self::lock`]. The
+    /// descriptor is required: without it, an append that reads before taking
+    /// the lock does not compile.
     ///
     /// Two callers need it: `requests::record` refuses a request id it has
     /// already recorded, and `ledger::Ledger::append` numbers a line after the
@@ -703,7 +705,11 @@ impl Log<'_> {
     /// under one lock. Taking the lock twice on two descriptors would deadlock,
     /// so this exists for those shapes and nothing else; every other writer
     /// calls [`Self::append`].
-    pub async fn append_while_locked(&self, bytes: &[u8]) -> Result<(), String> {
+    pub(crate) async fn append_while_locked(
+        &self,
+        _lock: &tokio::fs::File,
+        bytes: &[u8],
+    ) -> Result<(), String> {
         self.store.append_mode(self.path, bytes, None, 0o600).await
     }
 

@@ -19,7 +19,7 @@ use tokio::process::Command;
 use crate::config::DrainConfig;
 use crate::dns;
 use crate::journal::Journal;
-use crate::ledger::{Ledger, LedgerLine};
+use crate::ledger::{Ledger, LedgerLine, RefundTail};
 use crate::notice;
 use crate::questions;
 use crate::sign;
@@ -3591,7 +3591,10 @@ async fn refund_total(
 ) -> Result<(), String> {
     let deducted = format!("-{}", util::gbp(amount));
     let ledger = Ledger::open(store);
-    for line in ledger.refunds_of(token, original.seq).await? {
+    // A line this cannot read is not zero: counting it as zero would let this
+    // refund and the unreadable one together exceed the payment.
+    let refunds = ledger.refunded_total(token, original.seq).await?;
+    for line in &refunds.lines {
         let on = line.received_on.as_deref().unwrap_or("an earlier date");
         if line.amount_gbp.as_deref() == Some(deducted.as_str()) {
             return Err(format!(
@@ -3600,14 +3603,11 @@ async fn refund_total(
             ));
         }
     }
-    // A line this cannot read is not zero: counting it as zero would let this
-    // refund and the unreadable one together exceed the payment.
-    let already_refunded = ledger.refunded_total(token, original.seq).await?;
-    if already_refunded + amount > original.amount {
+    if refunds.total + amount > original.amount {
         return Err(format!(
             "refunds of ledger seq {} already total GBP {}; another GBP {} would exceed the GBP {} that arrived",
             original.seq,
-            util::gbp(already_refunded),
+            util::gbp(refunds.total),
             util::gbp(amount),
             util::gbp(original.amount)
         ));
@@ -3753,19 +3753,22 @@ async fn append_refund_ledger(
         }),
         _ => None,
     };
-    let line = LedgerLine::refund(
-        &intent.token,
-        rail,
-        received_on,
-        deducted,
-        paid_until_after.or(original.paid_until_after.as_deref()),
-        original.amount_xmr.as_deref(),
-        &intent.id,
-        reason,
-        original.seq,
-        refund_basis,
-        rate,
-    );
+    let mut line = LedgerLine::empty(&intent.token, "refund", rail);
+    line.received_on = Some(received_on.to_string());
+    line.amount_gbp = Some(deducted.to_string());
+    line.applied_gbp = Some(deducted.to_string());
+    line.paid_until_after = paid_until_after
+        .or(original.paid_until_after.as_deref())
+        .map(str::to_string);
+    line.amount_xmr = original.amount_xmr.clone();
+    line.intent = Some(intent.id.clone());
+    line.note = Some(reason.to_string());
+    line.refund = Some(RefundTail {
+        refund_of: Some(original.seq),
+        settled_on: None,
+        refund_basis: refund_basis.map(str::to_string),
+        rate_refund: rate.map(str::to_string),
+    });
     Ledger::open(store).append(line).await
 }
 
@@ -4246,18 +4249,17 @@ async fn append_credit_ledger(
     paid_until_after: Option<&str>,
 ) -> Result<(), String> {
     let quoted = monero.filter(|_| intent.rail == "monero");
-    let line = LedgerLine::payment(
-        &intent.token,
-        &intent.rail,
-        received_on,
-        amount_gbp,
-        applied_gbp,
-        paid_until_after,
-        intent.amount_xmr.as_deref(),
-        quoted,
-        intent.txid.as_deref(),
-        &intent.id,
-    );
+    let mut line = LedgerLine::empty(&intent.token, "payment", &intent.rail);
+    line.received_on = Some(received_on.to_string());
+    line.amount_gbp = Some(amount_gbp.to_string());
+    line.applied_gbp = Some(applied_gbp.to_string());
+    line.paid_until_after = paid_until_after.map(str::to_string);
+    line.amount_xmr = intent.amount_xmr.clone();
+    line.rate_quoted = quoted.and_then(|m| m.rate_gbp_per_xmr.clone());
+    line.rate_source = quoted.and_then(|m| m.rate_source.clone());
+    line.rate_at = quoted.and_then(|m| m.rate_at.clone());
+    line.txid = intent.txid.clone();
+    line.intent = Some(intent.id.clone());
     Ledger::open(store).append(line).await?;
     Ok(())
 }
@@ -7730,12 +7732,16 @@ async fn append_ledger(
     amount_gbp: &str,
 ) -> Result<(), String> {
     let ledger = Ledger::open(store);
-    if ledger.has_token_kind(token, "window_open").await? {
+    if ledger.has_window_open(token).await? {
         return Ok(());
     }
-    ledger
-        .append(LedgerLine::window_open(token, rail, amount_gbp, at, intent))
-        .await?;
+    let mut line = LedgerLine::empty(token, "window_open", rail);
+    line.amount_gbp = Some(amount_gbp.to_string());
+    line.applied_gbp = Some("0.00".to_string());
+    line.rate_at = Some(at.to_string());
+    line.intent = Some(intent.to_string());
+    line.note = Some("the window opened at approval; no money has arrived yet".to_string());
+    ledger.append(line).await?;
     Ok(())
 }
 
@@ -8664,18 +8670,12 @@ async fn append_invoice_ledger(
     if Ledger::open(store).has_intent(invoice).await? {
         return Ok(());
     }
-    let line = LedgerLine::payment(
-        token,
-        "card",
-        received_on,
-        amount_gbp,
-        amount_gbp,
-        paid_until_after,
-        None,
-        None,
-        None,
-        invoice,
-    );
+    let mut line = LedgerLine::empty(token, "payment", "card");
+    line.received_on = Some(received_on.to_string());
+    line.amount_gbp = Some(amount_gbp.to_string());
+    line.applied_gbp = Some(amount_gbp.to_string());
+    line.paid_until_after = paid_until_after.map(str::to_string);
+    line.intent = Some(invoice.to_string());
     Ledger::open(store).append(line).await?;
     Ok(())
 }

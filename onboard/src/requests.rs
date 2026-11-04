@@ -306,7 +306,7 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
         }
     }
     let bytes = serde_json::to_vec(&line).map_err(|e| format!("cannot write the request: {e}"))?;
-    log.append_while_locked(&bytes).await?;
+    log.append_while_locked(&_guard, &bytes).await?;
     Ok(line)
 }
 
