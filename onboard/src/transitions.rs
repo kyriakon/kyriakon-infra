@@ -87,7 +87,7 @@ pub fn decision_for_kind(kind: &str) -> Option<&'static Decision> {
 /// directory it is read from belongs to the unprivileged half, so an unsigned
 /// decision would be root work driven by a file any writer of `intents/` could
 /// leave. `kyriakon-onboardctl` signs with the same root-only key the links use.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct DecisionIntent {
     pub id: String,
     pub kind: String,
@@ -104,7 +104,7 @@ pub struct DecisionIntent {
 /// A password set through the member's one-time link. Everything the drain needs
 /// to check it is here, including the signature: the handler holds no key, so
 /// the link's signature is the proof and the drain is the half that checks it.
-#[derive(serde::Deserialize)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct PasswordIntent {
     pub id: String,
     pub kind: String,
@@ -127,7 +127,7 @@ pub struct PasswordIntent {
 /// can check the account before it sends, and the console's signature, because
 /// `intents/` belongs to the unprivileged half and a second copy of the
 /// instructions is not the handler's to file.
-#[derive(serde::Deserialize)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct ResendIntent {
     pub id: String,
     pub kind: String,
@@ -142,7 +142,7 @@ pub struct ResendIntent {
 /// after it authenticated them. It names the account and nothing else, because
 /// the drain owns the state write and the seven-day window; the handler holds no
 /// privilege to set either.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct CloseIntent {
     pub id: String,
     pub kind: String,
@@ -156,13 +156,27 @@ pub struct CloseIntent {
     pub session: String,
 }
 
+/// An `export` intent: the page's "Take my data out", filed by the handler with
+/// the account and the session that asked for it and nothing else. The drain
+/// proves the session before it writes the bundle as root.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ExportIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub username: String,
+    #[serde(default)]
+    pub session: String,
+}
+
 /// A `change-password` intent: the new mail password as the member typed it,
 /// hashed by the drain and nowhere else. The handler re-checked the current
 /// password through `doveadm auth test`; the drain re-proves the session before
 /// it writes the hash as root, because `intents/` belongs to the unprivileged
 /// half. A `hash` field is refused: it is the old shape, where the handler chose
 /// what was stored.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ChangePasswordIntent {
     pub id: String,
     pub kind: String,
@@ -177,7 +191,7 @@ pub struct ChangePasswordIntent {
 /// An `upload-key` intent: the one key that serves sftp and git, added or
 /// removed. The fingerprint is the handler's reading of the material, and the
 /// drain recomputes it rather than trusting the intent.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct UploadKeyIntent {
     pub id: String,
     pub kind: String,
@@ -187,16 +201,16 @@ pub struct UploadKeyIntent {
     pub session: String,
     pub action: String,
     /// A bare OpenSSH public key line, for `add`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub material: String,
     /// The key to remove, for `remove`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub fingerprint: String,
 }
 
 /// An `outside-address` intent: the contact and recovery address, changed or
 /// cleared. An empty address removes it.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct OutsideAddressIntent {
     pub id: String,
     pub kind: String,
@@ -211,7 +225,7 @@ pub struct OutsideAddressIntent {
 /// A `serving` intent: the two independent booleans the page's toggles move.
 /// The drain writes the account's state, removes or regenerates the member's
 /// generated include and reloads the daemons.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ServingIntent {
     pub id: String,
     pub kind: String,
@@ -226,7 +240,7 @@ pub struct ServingIntent {
 /// A `cancel-renewal` intent: stop the card subscription's yearly renewal. The
 /// prepaid rails have no processor and nothing to cancel, so the handler only
 /// files this for a card account with an attached subscription.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct CancelRenewalIntent {
     pub id: String,
     pub kind: String,
@@ -239,7 +253,7 @@ pub struct CancelRenewalIntent {
 /// A `mail-key` intent: replace the mail key, or cancel a replacement already
 /// waiting. A replacement signed by the current key applies at once; one that is
 /// not waits out the 72-hour window, which the page can cancel.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct MailKeyIntent {
     pub id: String,
     pub kind: String,
@@ -248,7 +262,7 @@ pub struct MailKeyIntent {
     pub username: String,
     pub session: String,
     pub action: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub material: String,
     /// An armored detached signature over the new key's fingerprint, made with
     /// the current key. Empty means the request is not signed.
@@ -262,7 +276,7 @@ pub struct MailKeyIntent {
 /// override reason when the operator gave one. The signature covers all of it,
 /// because the intent moves a paid-until date and `intents/` belongs to the
 /// unprivileged half.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct CreditIntent {
     pub id: String,
     pub kind: String,
@@ -290,7 +304,7 @@ pub struct CreditIntent {
 /// A `reconcile-attribute` intent: the held item and the token it is joined to.
 /// The console signs it, because the transition writes a paid-until date and
 /// `intents/` belongs to the unprivileged half.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AttributeIntent {
     pub id: String,
     pub kind: String,
@@ -313,7 +327,7 @@ pub struct AttributeIntent {
 
 /// A `reconcile-return` intent: the held item and the evidence it went back or
 /// was kept. The evidence is free text and signed last.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ReturnIntent {
     pub id: String,
     pub kind: String,
@@ -331,7 +345,7 @@ pub struct ReturnIntent {
 /// only `settled_on`. The signature covers all of it, because the intent writes
 /// the ledger and closes an account, and `intents/` belongs to the unprivileged
 /// half.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct RefundIntent {
     pub id: String,
     pub kind: String,
@@ -362,7 +376,7 @@ pub struct RefundIntent {
 /// is given. The token, the days and the operator's reason are signed, because
 /// the intent moves the date the account lapses on and `intents/` belongs to the
 /// unprivileged half.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct WindowExtendIntent {
     pub id: String,
     pub kind: String,
@@ -659,7 +673,7 @@ async fn journal(
 /// Whether the journal already holds a line for this intent id with this
 /// outcome. A refusal is recorded once, and a purge that already released the
 /// name is not released twice.
-async fn journal_has(store: &Store, id: &str, outcome: &str) -> Result<bool, String> {
+pub(crate) async fn journal_has(store: &Store, id: &str, outcome: &str) -> Result<bool, String> {
     store
         .log("journal.jsonl")
         .jsonl_any(|j: &JournalLine| j.intent == id && j.outcome == outcome)
@@ -838,13 +852,12 @@ async fn application_seen(
 
 /// Apply a password set through a one-time link.
 ///
-/// The checks before anything runs are each the half the handler cannot do: the
-/// intent carries a plaintext and not a hash, the signature over the token and
-/// its date (the key is root-only), the date still being ahead, the plaintext
-/// passing the same validation the page applied, the hash this process made
-/// from it being one this build made, and the record still holding the link. The
-/// last is what makes the link one-time:
-/// applying it clears the link, so a replay finds nothing to apply and is
+/// The link's signature, its date, the plaintext's validation and the one-use
+/// replay checks are the seam's: `Intent::verify` refuses a submission that
+/// cannot prove itself before this runs. What is left is the half the handler
+/// cannot do at all: the plaintext is hashed here and nowhere else, the hash is
+/// checked to be one this build made, and the record must still hold the link.
+/// Applying it clears the link, so a replay finds nothing to apply and is
 /// refused like any other spent link.
 ///
 /// The remaining limit: a compromised handler chooses the plaintext it submits,
@@ -854,48 +867,12 @@ async fn application_seen(
 pub async fn set_password(
     cfg: &DrainConfig,
     store: &Store,
-    key: &[u8],
     intent: PasswordIntent,
     file: &str,
     value: &Value,
 ) -> Result<(), String> {
-    if journal_has(store, &intent.id, "refused").await? {
-        // Nothing is retried, and a re-filed copy must not keep its plaintext.
-        return redact_password(store, file, value).await;
-    }
-    if journal_has(store, &intent.id, "applied").await? {
-        // A crash between the `applied` line and the remove leaves the intent
-        // re-read on every pass: finish the remove that pass did not.
-        return store.remove("intents", file).await;
-    }
-    // The handler files the plaintext and the drain hashes it: a `hash` field
-    // is the old shape, where a handler with a valid link chose the stored hash.
-    if value.get("hash").is_some() {
-        return refuse_password(
-            cfg,
-            store,
-            file,
-            value,
-            "the intent carries a hash rather than a plaintext",
-        )
-        .await;
-    }
     let token = intent.application.status_token.as_str();
     let username = intent.application.username.as_str();
-    let problem: Option<String> = if !sign::verify(
-        key,
-        &sign::password_payload(token, &intent.until),
-        &intent.sig,
-    ) {
-        Some("the link's signature does not verify".to_string())
-    } else if intent.until.as_str() < util::date_after_days(0).as_str() {
-        Some("the link's date has passed".to_string())
-    } else {
-        crate::password::validate(&intent.password).err()
-    };
-    if let Some(problem) = problem {
-        return refuse_password(cfg, store, file, value, &problem).await;
-    }
     let mut plain = intent.password;
     let hash = match crate::password::make(&plain) {
         Ok(hash) if crate::password::is_hash(&hash) => hash,
@@ -954,7 +931,11 @@ pub async fn set_password(
 /// a retry is the operator's decision, but the plaintext must not stay in
 /// `intents/` and every backup. The rewrite is the same atomic write, handed to
 /// the directory's owner so the unprivileged handler can still read it.
-async fn redact_password(store: &Store, file: &str, value: &Value) -> Result<(), String> {
+pub(crate) async fn redact_password(
+    store: &Store,
+    file: &str,
+    value: &Value,
+) -> Result<(), String> {
     let mut redacted = value.clone();
     let Some(object) = redacted.as_object_mut() else {
         return Ok(());
@@ -972,7 +953,7 @@ async fn redact_password(store: &Store, file: &str, value: &Value) -> Result<(),
 
 /// Refuse a password intent: redact the plaintext, then journal the refusal and
 /// leave the file in place.
-async fn refuse_password(
+pub(crate) async fn refuse_password(
     cfg: &DrainConfig,
     store: &Store,
     file: &str,
@@ -989,7 +970,7 @@ async fn refuse_password(
 
 /// Journal a refusal with its reason. The intent is left in place, as `refuse`
 /// leaves an unknown kind, and the journal's own line stops it being retried.
-async fn refuse_with(
+pub(crate) async fn refuse_with(
     cfg: &DrainConfig,
     store: &Store,
     file: &str,
@@ -1078,11 +1059,9 @@ pub async fn filed_application(
     cfg: &DrainConfig,
     store: &Store,
     key: &[u8],
-    text: &str,
+    intent: Intent,
     file: &str,
 ) -> Result<(), String> {
-    let intent: Intent =
-        serde_json::from_str(text).map_err(|e| format!("the intent does not parse: {e}"))?;
     if intent.kind != "application" {
         return Err(format!("kind {:?} is not an application", intent.kind));
     }
@@ -1218,9 +1197,9 @@ fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String,
 }
 
 /// A decision intent: an approval with the charge, an approval without it, or a
-/// decline. Revalidates every field and requires a signature over the
-/// application and the action, so an intent is carried out only when the
-/// root-only key signed it, whether by the reviewer or by the reviewer's link.
+/// decline. The signature over the application and the action, and the fields it
+/// covers, are checked by `Intent::verify` before this runs; what is left is the
+/// outcome the decided application takes.
 pub async fn decision(
     cfg: &DrainConfig,
     store: &Store,
@@ -1228,34 +1207,12 @@ pub async fn decision(
     intent: DecisionIntent,
     file: &str,
 ) -> Result<(), String> {
-    if !store::is_status_token(&intent.application.status_token) {
-        return Err("the status token is not 128 bits of Crockford".to_string());
-    }
-    if let Some(why) = validate::username_shape(&intent.application.username) {
-        return Err(format!("the username: {why}"));
-    }
-    let expected = match decision_for_kind(&intent.kind) {
-        Some(d) => d.action,
-        None => return Err(format!("kind {:?} is not a decision", intent.kind)),
-    };
-    if intent.action != expected {
-        return Err(format!(
-            "the action {:?} does not match the kind {:?}",
-            intent.action, intent.kind
-        ));
-    }
-    if !sign::verify(
-        key,
-        &sign::decide_payload(&intent.application.status_token, &intent.action),
-        &intent.sig,
-    ) {
-        return Err("the decision intent's signature does not verify".to_string());
-    }
     match intent.kind.as_str() {
         "approve" => approve(cfg, store, key, &intent, false, file).await,
         "provision" => approve(cfg, store, key, &intent, true, file).await,
         "decline" => decline(cfg, store, &intent, file).await,
-        // Unreachable after the kind match above, kept so the dispatch is total.
+        // Unreachable after the kind match the seam makes, kept so the dispatch
+        // is total.
         other => Err(format!("kind {other:?} is not a decision")),
     }
 }
@@ -1653,17 +1610,9 @@ async fn approve(
 pub async fn resend(
     cfg: &DrainConfig,
     store: &Store,
-    key: &[u8],
     intent: ResendIntent,
     file: &str,
 ) -> Result<(), String> {
-    if !sign::verify(
-        key,
-        &sign::resend_payload(&intent.username, &intent.token),
-        &intent.sig,
-    ) {
-        return Err("the token resend's signature does not verify".to_string());
-    }
     let username = intent.username.as_str();
     let text = store
         .read_record(&format!("accounts/{username}"), "account.json")
@@ -1738,25 +1687,10 @@ pub async fn resend(
 pub async fn window_extend(
     cfg: &DrainConfig,
     store: &Store,
-    key: &[u8],
     intent: WindowExtendIntent,
     file: &str,
     value: &Value,
 ) -> Result<(), String> {
-    if !sign::verify(
-        key,
-        &sign::window_extend_payload(&intent.token, intent.days, &intent.reason),
-        &intent.sig,
-    ) {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            "the window extension's signature does not verify",
-        )
-        .await;
-    }
     // A refusal is journaled once and the intent is left in place, as the credit
     // path does; a new intent is the way to change the answer.
     if journal_has(store, &intent.id, "refused").await? {
@@ -2559,36 +2493,10 @@ async fn lapse_notice(
 pub async fn credit(
     cfg: &DrainConfig,
     store: &Store,
-    key: &[u8],
     intent: CreditIntent,
     file: &str,
     value: &Value,
 ) -> Result<(), String> {
-    if !sign::verify(
-        key,
-        &sign::credit_payload(
-            &intent.token,
-            &intent.rail,
-            &intent.amount_gbp,
-            &intent.received,
-            intent.txid.as_deref(),
-            intent.amount_xmr.as_deref(),
-            intent.confirm_double,
-            intent.override_reason.as_deref(),
-            intent.note.as_deref(),
-        ),
-        &intent.sig,
-    ) {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            "the credit intent's signature does not verify",
-        )
-        .await;
-    }
-
     // The ledger line is the settlement marker, and a credit settles in one of
     // two: a payment joined to a token, or a held line in the unattributed
     // queue. A second arrival of the same intent finds its line and stops before
@@ -3416,8 +3324,8 @@ async fn last_payment_line(store: &Store, token: &str) -> Result<Option<PaymentL
 }
 
 /// Refund one payment, or settle a refund already recorded. The console signs
-/// every field, and the drain checks the signature before anything else because
-/// `intents/` belongs to the unprivileged half.
+/// every field, and `Intent::verify` checks the signature before anything else
+/// because `intents/` belongs to the unprivileged half.
 ///
 /// The refund form appends one negative line naming the `seq` it reverses and,
 /// with `--close`, sets the account closing. The settlement form rewrites the
@@ -3427,7 +3335,6 @@ async fn last_payment_line(store: &Store, token: &str) -> Result<Option<PaymentL
 pub async fn refund(
     cfg: &DrainConfig,
     store: &Store,
-    key: &[u8],
     intent: RefundIntent,
     file: &str,
     value: &Value,
@@ -3435,32 +3342,7 @@ pub async fn refund(
     let amount_text = intent.amount_gbp.as_deref().unwrap_or("");
     let rail = intent.rail.as_deref().unwrap_or("");
     let reason = intent.reason.as_deref().unwrap_or("");
-    let rate_text = intent.rate.as_deref().unwrap_or("");
     let settled_text = intent.settled_on.as_deref().unwrap_or("");
-    if !sign::verify(
-        key,
-        &sign::refund_payload(
-            &intent.token,
-            amount_text,
-            rail,
-            intent.close,
-            intent.excess,
-            rate_text,
-            settled_text,
-            reason,
-        ),
-        &intent.sig,
-    ) {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            "the refund intent's signature does not verify",
-        )
-        .await;
-    }
-
     if !store::is_payment_token(&intent.token) {
         return refuse_with(
             cfg,
@@ -4247,30 +4129,10 @@ async fn hold(
 pub async fn reconcile_attribute(
     cfg: &DrainConfig,
     store: &Store,
-    key: &[u8],
     intent: AttributeIntent,
     file: &str,
     value: &Value,
 ) -> Result<(), String> {
-    if !sign::verify(
-        key,
-        &sign::reconcile_attribute_payload(
-            &intent.item,
-            &intent.token,
-            intent.confirm_double,
-            intent.override_reason.as_deref(),
-        ),
-        &intent.sig,
-    ) {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            "the reconcile-attribute intent's signature does not verify",
-        )
-        .await;
-    }
     if !store::is_unattributed_id(&intent.item) {
         return refuse_with(
             cfg,
@@ -4409,25 +4271,10 @@ pub async fn reconcile_attribute(
 pub async fn reconcile_return(
     cfg: &DrainConfig,
     store: &Store,
-    key: &[u8],
     intent: ReturnIntent,
     file: &str,
     value: &Value,
 ) -> Result<(), String> {
-    if !sign::verify(
-        key,
-        &sign::reconcile_return_payload(&intent.item, &intent.note),
-        &intent.sig,
-    ) {
-        return refuse_with(
-            cfg,
-            store,
-            file,
-            value,
-            "the reconcile-return intent's signature does not verify",
-        )
-        .await;
-    }
     if !store::is_unattributed_id(&intent.item) {
         return refuse_with(
             cfg,
@@ -4907,14 +4754,13 @@ async fn approve_group(
     )
     .await?;
 
-    // A fresh ULID rather than the status token: the intent directory sorts by
-    // name and the loop reads it in that order, so every intent's name has to be
-    // a ULID for a lexical sort to be an age sort.
-    let id = ulid::Ulid::new().to_string();
+    // The one writer draws the ULID (the intent directory sorts by name, so
+    // every name has to be one for a lexical sort to be an age sort) and stamps
+    // the kind and filing time; the payload is built without its envelope.
     let mut group = GroupIntent {
-        id: id.clone(),
-        kind: "provision-group".to_string(),
-        filed_at: util::filed_at(),
+        id: String::new(),
+        kind: String::new(),
+        filed_at: String::new(),
         application: ApplicationRef {
             username: record.username.clone(),
             status_token: record.status_token.clone(),
@@ -4951,13 +4797,26 @@ async fn approve_group(
     // field the transition acts on is in the payload, so a filed intent cannot
     // be edited between this write and the drain's next pass.
     group.sig = sign::sign(key, &sign::group_provision_payload(&group))?;
-    let value =
-        serde_json::to_value(&group).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    let id = crate::intents::Intent::ProvisionGroup(Box::new(group))
+        .file(store)
+        .await?;
     let filename = format!("{id}.json");
-    let bytes =
-        serde_json::to_vec_pretty(&value).map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store.write_record("intents", &filename, &bytes).await?;
-    provision_group(cfg, store, key, &value, &filename).await?;
+    // Carry out the bytes on disk, not the copy in memory: the file is what the
+    // next pass would read, envelope included, so the payload the transition
+    // acts on is the one the writer stamped.
+    let text = store
+        .read_record("intents", &filename)
+        .await
+        .ok_or_else(|| format!("the intent this pass filed at {filename} is gone"))?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("the intent this pass filed does not parse: {e}"))?;
+    let filed = crate::intents::Intent::parse(&value)?;
+    // The provision-group arm verifies or fails; it has no refusal of its own,
+    // because the signature it checks is the one this pass just made.
+    filed.verify(cfg, store, key, &filename, &value).await?;
+    // Boxed: this file's own approval path reaches `apply`, which reaches the
+    // group transition, so the future would otherwise be infinitely sized.
+    Box::pin(filed.apply(cfg, store, key, &filename, &value)).await?;
 
     // The body's approval notice: the recipe is the whole point of it, because
     // mail and the website do not work until the body has published the records
@@ -5204,18 +5063,9 @@ async fn check_group_names(
 pub async fn provision_group(
     cfg: &DrainConfig,
     store: &Store,
-    key: &[u8],
-    value: &Value,
+    intent: GroupIntent,
     file: &str,
 ) -> Result<(), String> {
-    let intent: GroupIntent = serde_json::from_value(value.clone())
-        .map_err(|e| format!("the group intent does not parse: {e}"))?;
-    // First, before any field is trusted: `intents/` is the handler's, and this
-    // transition runs scripts and creates accounts as root. The signature is
-    // over every field the rest of this function acts on.
-    if !sign::verify(key, &sign::group_provision_payload(&intent), &intent.sig) {
-        return Err("the group intent's signature does not verify".to_string());
-    }
     if intent.kind != "provision-group" {
         return Err(format!("kind {:?} is not a group intent", intent.kind));
     }
@@ -6141,48 +5991,21 @@ async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), S
 
 /// Apply one `close` intent: put the account into `closing` with its seven-day
 /// window. The deletion itself is the sweep's, so the account works normally
-/// until the window ends and a replayed intent changes nothing.
+/// until the window ends and a replayed intent changes nothing. The session that
+/// proves the request is `Intent::verify`'s.
 pub async fn close_account(
     cfg: &DrainConfig,
     store: &Store,
-    value: &Value,
+    intent: CloseIntent,
     file: &str,
 ) -> Result<(), String> {
-    let intent: CloseIntent = serde_json::from_value(value.clone())
-        .map_err(|e| format!("the close intent does not parse: {e}"))?;
     if intent.kind != "close" {
         return Err(format!("kind {:?} is not a close intent", intent.kind));
-    }
-    if let Some(why) = validate::username_shape(&intent.username) {
-        return Err(format!("the username {:?}: {why}", intent.username));
     }
     let application = ApplicationRef {
         username: intent.username.clone(),
         status_token: String::new(),
     };
-    // The intent is unsigned, so the session id it carries is the proof that the
-    // page authenticated this account. A mismatched or expired session is
-    // journalled and the intent is settled without touching the account.
-    if let Err(reason) = crate::intents::verify_session(
-        store,
-        std::path::Path::new(&cfg.proof_dir),
-        &intent.session,
-        &intent.username,
-    )
-    .await
-    {
-        journal(
-            store,
-            &cfg.release,
-            &intent.id,
-            &intent.kind,
-            &application,
-            "refused",
-            Some(&reason),
-        )
-        .await?;
-        return store.remove("intents", file).await;
-    }
     let Some(mut account) = existing_account(store, &intent.username).await else {
         // The account the handler authenticated has already gone. That is a
         // closed request, not new work.
@@ -6249,56 +6072,18 @@ pub async fn close_account(
     store.remove("intents", file).await
 }
 
-/// The account a page action acts on. Every action intent carries the page
-/// session that filed it and no signature, because the handler holds no key:
-/// this is the one check that turns an unprivileged half's file into work for
-/// an authenticated account. A mismatched or expired session, and an account
-/// that has gone, both settle the intent with a journal line and nothing else.
+/// The account a page action acts on. The session and the username's shape are
+/// `Intent::verify`'s, because they are the proof; what is left here is the
+/// account itself, and an account that has gone settles the intent with a
+/// journal line and nothing else.
 async fn page_account(
     cfg: &DrainConfig,
     store: &Store,
     id: &str,
     kind: &str,
     username: &str,
-    session: &str,
     file: &str,
 ) -> Result<Option<Account>, String> {
-    // The session record is the handler's own file, so this check cannot stand
-    // on it alone: a name outside the charset is a path component in the store
-    // and below, and only an account name may be one.
-    if let Some(why) = validate::username_shape(username) {
-        refuse_page(
-            cfg,
-            store,
-            id,
-            kind,
-            username,
-            file,
-            &format!("the username {username:?}: {why}"),
-        )
-        .await?;
-        return Ok(None);
-    }
-    if let Err(reason) = crate::intents::verify_session(
-        store,
-        std::path::Path::new(&cfg.proof_dir),
-        session,
-        username,
-    )
-    .await
-    {
-        return settle_page(
-            cfg,
-            store,
-            id,
-            kind,
-            username,
-            file,
-            "refused",
-            Some(&reason),
-        )
-        .await;
-    }
     match existing_account(store, username).await {
         Some(account) => Ok(Some(account)),
         None => {
@@ -6320,7 +6105,7 @@ async fn page_account(
 /// Journal one page action and remove its file, for the paths with nothing left
 /// to do. `None` is the caller's signal that the intent is settled.
 #[allow(clippy::too_many_arguments)]
-async fn settle_page(
+pub(crate) async fn settle_page(
     cfg: &DrainConfig,
     store: &Store,
     id: &str,
@@ -6342,7 +6127,7 @@ async fn settle_page(
 /// Refuse one page action with its reason, record that it was refused, and
 /// remove it: the handler validated it on the way in, so a refusal here is
 /// something the intent's own fields get wrong rather than a state to retry.
-async fn refuse_page(
+pub(crate) async fn refuse_page(
     cfg: &DrainConfig,
     store: &Store,
     id: &str,
@@ -6382,33 +6167,11 @@ async fn save_account(store: &Store, account: &Account) -> Result<(), String> {
 pub async fn change_password(
     cfg: &DrainConfig,
     store: &Store,
-    value: &Value,
+    intent: ChangePasswordIntent,
     file: &str,
 ) -> Result<(), String> {
-    let intent: ChangePasswordIntent = serde_json::from_value(value.clone())
-        .map_err(|e| format!("the password intent does not parse: {e}"))?;
-    if value.get("hash").is_some() {
-        return refuse_page(
-            cfg,
-            store,
-            &intent.id,
-            &intent.kind,
-            &intent.username,
-            file,
-            "the intent carries a hash rather than a plaintext",
-        )
-        .await;
-    }
-    let Some(account) = page_account(
-        cfg,
-        store,
-        &intent.id,
-        &intent.kind,
-        &intent.username,
-        &intent.session,
-        file,
-    )
-    .await?
+    let Some(account) =
+        page_account(cfg, store, &intent.id, &intent.kind, &intent.username, file).await?
     else {
         return Ok(());
     };
@@ -6482,21 +6245,11 @@ pub async fn change_password(
 pub async fn upload_key(
     cfg: &DrainConfig,
     store: &Store,
-    value: &Value,
+    intent: UploadKeyIntent,
     file: &str,
 ) -> Result<(), String> {
-    let intent: UploadKeyIntent = serde_json::from_value(value.clone())
-        .map_err(|e| format!("the upload key intent does not parse: {e}"))?;
-    let Some(mut account) = page_account(
-        cfg,
-        store,
-        &intent.id,
-        &intent.kind,
-        &intent.username,
-        &intent.session,
-        file,
-    )
-    .await?
+    let Some(mut account) =
+        page_account(cfg, store, &intent.id, &intent.kind, &intent.username, file).await?
     else {
         return Ok(());
     };
@@ -6617,21 +6370,11 @@ pub async fn upload_key(
 pub async fn set_outside_address(
     cfg: &DrainConfig,
     store: &Store,
-    value: &Value,
+    intent: OutsideAddressIntent,
     file: &str,
 ) -> Result<(), String> {
-    let intent: OutsideAddressIntent = serde_json::from_value(value.clone())
-        .map_err(|e| format!("the address intent does not parse: {e}"))?;
-    let Some(mut account) = page_account(
-        cfg,
-        store,
-        &intent.id,
-        &intent.kind,
-        &intent.username,
-        &intent.session,
-        file,
-    )
-    .await?
+    let Some(mut account) =
+        page_account(cfg, store, &intent.id, &intent.kind, &intent.username, file).await?
     else {
         return Ok(());
     };
@@ -6682,21 +6425,11 @@ pub async fn set_outside_address(
 pub async fn set_serving(
     cfg: &DrainConfig,
     store: &Store,
-    value: &Value,
+    intent: ServingIntent,
     file: &str,
 ) -> Result<(), String> {
-    let intent: ServingIntent = serde_json::from_value(value.clone())
-        .map_err(|e| format!("the serving intent does not parse: {e}"))?;
-    let Some(mut account) = page_account(
-        cfg,
-        store,
-        &intent.id,
-        &intent.kind,
-        &intent.username,
-        &intent.session,
-        file,
-    )
-    .await?
+    let Some(mut account) =
+        page_account(cfg, store, &intent.id, &intent.kind, &intent.username, file).await?
     else {
         return Ok(());
     };
@@ -6763,21 +6496,11 @@ pub async fn set_serving(
 pub async fn cancel_renewal(
     cfg: &DrainConfig,
     store: &Store,
-    value: &Value,
+    intent: CancelRenewalIntent,
     file: &str,
 ) -> Result<(), String> {
-    let intent: CancelRenewalIntent = serde_json::from_value(value.clone())
-        .map_err(|e| format!("the renewal intent does not parse: {e}"))?;
-    let Some(mut account) = page_account(
-        cfg,
-        store,
-        &intent.id,
-        &intent.kind,
-        &intent.username,
-        &intent.session,
-        file,
-    )
-    .await?
+    let Some(mut account) =
+        page_account(cfg, store, &intent.id, &intent.kind, &intent.username, file).await?
     else {
         return Ok(());
     };
@@ -6941,21 +6664,11 @@ async fn apply_rotation(
 pub async fn mail_key(
     cfg: &DrainConfig,
     store: &Store,
-    value: &Value,
+    intent: MailKeyIntent,
     file: &str,
 ) -> Result<(), String> {
-    let intent: MailKeyIntent = serde_json::from_value(value.clone())
-        .map_err(|e| format!("the mail key intent does not parse: {e}"))?;
-    let Some(mut account) = page_account(
-        cfg,
-        store,
-        &intent.id,
-        &intent.kind,
-        &intent.username,
-        &intent.session,
-        file,
-    )
-    .await?
+    let Some(mut account) =
+        page_account(cfg, store, &intent.id, &intent.kind, &intent.username, file).await?
     else {
         return Ok(());
     };
@@ -7224,33 +6937,11 @@ fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, String> {
 pub async fn group_address(
     cfg: &DrainConfig,
     store: &Store,
-    key: &[u8],
-    value: &Value,
+    intent: GroupAddressIntent,
     file: &str,
 ) -> Result<(), String> {
-    let intent: GroupAddressIntent = serde_json::from_value(value.clone())
-        .map_err(|e| format!("the address intent does not parse: {e}"))?;
     if intent.kind != "group-address" {
         return Err(format!("kind {:?} is not an address intent", intent.kind));
-    }
-    let site_owner = intent.site_owner.as_deref().unwrap_or("");
-    if !sign::verify(
-        key,
-        &sign::address_payload(
-            &intent.domain,
-            &intent.action,
-            &intent.address,
-            &intent.mailbox,
-            site_owner,
-            intent
-                .mail_key
-                .as_ref()
-                .map(|k| k.material.as_str())
-                .unwrap_or(""),
-        ),
-        &intent.sig,
-    ) {
-        return Err("the address intent's signature does not verify".to_string());
     }
     if !ADDRESS_ACTIONS.contains(&intent.action.as_str()) {
         return Err(format!("{:?} is not an address change", intent.action));
@@ -7555,24 +7246,14 @@ pub async fn group_address(
 pub async fn remove_group(
     cfg: &DrainConfig,
     store: &Store,
-    key: &[u8],
-    value: &Value,
+    intent: GroupRemoveIntent,
     file: &str,
 ) -> Result<(), String> {
-    let intent: GroupRemoveIntent = serde_json::from_value(value.clone())
-        .map_err(|e| format!("the remove-group intent does not parse: {e}"))?;
     if intent.kind != "remove-group" {
         return Err(format!(
             "kind {:?} is not a remove-group intent",
             intent.kind
         ));
-    }
-    if !sign::verify(
-        key,
-        &sign::group_remove_payload(&intent.domain),
-        &intent.sig,
-    ) {
-        return Err("the remove-group intent's signature does not verify".to_string());
     }
     if let Some(why) = validate::domain(&intent.domain) {
         return Err(format!("the domain {:?}: {why}", intent.domain));
@@ -8421,7 +8102,8 @@ pub async fn prepaid_renewals(cfg: &DrainConfig, store: &Store) -> Result<(), St
 }
 
 /// Carry out one export intent: the page's "Take my data out", filed by the
-/// handler with the account the session belongs to and nothing else.
+/// handler with the account the session belongs to and nothing else. The session
+/// that proves it is `Intent::verify`'s.
 ///
 /// The bundle is written into the member's own chroot and the ready notice is
 /// appended in the same pass. The journal line names the application the account
@@ -8430,37 +8112,15 @@ pub async fn prepaid_renewals(cfg: &DrainConfig, store: &Store) -> Result<(), St
 pub async fn export_account(
     cfg: &DrainConfig,
     store: &Store,
-    value: &Value,
+    intent: ExportIntent,
     file: &str,
 ) -> Result<(), String> {
-    let username = value
-        .get("username")
-        .and_then(Value::as_str)
-        .ok_or("the export intent names no account")?;
-    if let Some(why) = validate::username_shape(username) {
-        return Err(format!("the export intent's username {username:?}: {why}"));
-    }
-    let id = value
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| file.trim_end_matches(".json").to_string());
-    // The handler is unprivileged and `intents/` is its to write, so the
-    // session it filed is proved here against the server-side record before
-    // root writes anything: the record's account must be this one and the
-    // session must not have expired. A forger who files a name of their own
-    // gets a refusal, never a bundle.
-    let session = value
-        .get("session")
-        .and_then(Value::as_str)
-        .ok_or("the export intent names no session")?;
-    crate::intents::verify_session(
-        store,
-        std::path::Path::new(&cfg.proof_dir),
-        session,
-        username,
-    )
-    .await?;
+    let username = intent.username.as_str();
+    let id = if intent.id.is_empty() {
+        file.trim_end_matches(".json").to_string()
+    } else {
+        intent.id.clone()
+    };
     // The spec records one `requests.jsonl` line per data-subject request, and
     // a page-filed export is one. It is written before the answer, keyed by the
     // intent's own id so a retry after a failed pass does not append a second

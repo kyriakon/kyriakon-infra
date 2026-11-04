@@ -18,6 +18,8 @@ mod erasure;
 mod export;
 #[path = "areas/group.rs"]
 mod group;
+#[path = "areas/intent.rs"]
+mod intent;
 #[path = "areas/lifecycle.rs"]
 mod lifecycle;
 #[path = "areas/monero.rs"]

@@ -1103,9 +1103,16 @@ impl Fix {
             .build()
             .unwrap();
         runtime
-            .block_on(kyriakon_onboard::intents::file_close(
-                &store, username, session_id,
-            ))
+            .block_on(
+                kyriakon_onboard::intents::Intent::Close(
+                    kyriakon_onboard::transitions::CloseIntent {
+                        username: username.to_string(),
+                        session: session_id.to_string(),
+                        ..Default::default()
+                    },
+                )
+                .file(&store),
+            )
             .unwrap()
     }
 

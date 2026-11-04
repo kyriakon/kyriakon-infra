@@ -2285,7 +2285,12 @@ async fn account_close(app: &App, request: &Request) -> Reply {
         return refused("Sign in to the account you want to close.");
     };
     let refund = closure_refund(app, &account).await;
-    match intents::file_close(&app.store, &account.username, session_id).await {
+    let intent = intents::Intent::Close(transitions::CloseIntent {
+        username: account.username.clone(),
+        session: session_id.to_string(),
+        ..Default::default()
+    });
+    match intent.file(&app.store).await {
         Ok(_) => {
             let message = crate::requests::erasure_answer(refund.as_deref());
             Reply::html(200, page_html(&notice("Closing your account", &message)))
@@ -2338,13 +2343,13 @@ async fn account_password(app: &App, request: &Request) -> Reply {
     if new != confirm {
         return refused("The two new passwords do not match.");
     }
-    match intents::file_action(
-        &app.store,
-        "change-password",
-        session_id,
-        &account.username,
-        serde_json::json!({"password": new}),
-    )
+    match intents::Intent::ChangePassword(transitions::ChangePasswordIntent {
+        username: account.username.clone(),
+        session: session_id.to_string(),
+        password: new.to_string(),
+        ..Default::default()
+    })
+    .file(&app.store)
     .await
     {
         Ok(_) => {
@@ -2380,13 +2385,14 @@ async fn account_upload_key(app: &App, request: &Request) -> Reply {
             if keycheck::openssh_fingerprint(material).is_none() {
                 return refused("That line carries no key material.");
             }
-            match intents::file_action(
-                &app.store,
-                "upload-key",
-                session_id,
-                &account.username,
-                serde_json::json!({"action": "add", "material": material}),
-            )
+            match intents::Intent::UploadKey(transitions::UploadKeyIntent {
+                username: account.username.clone(),
+                session: session_id.to_string(),
+                action: "add".to_string(),
+                material: material.to_string(),
+                ..Default::default()
+            })
+            .file(&app.store)
             .await
             {
                 Ok(_) => {
@@ -2414,13 +2420,14 @@ async fn account_upload_key(app: &App, request: &Request) -> Reply {
             {
                 return refused("That key is not on the account.");
             }
-            match intents::file_action(
-                &app.store,
-                "upload-key",
-                session_id,
-                &account.username,
-                serde_json::json!({"action": "remove", "fingerprint": fingerprint}),
-            )
+            match intents::Intent::UploadKey(transitions::UploadKeyIntent {
+                username: account.username.clone(),
+                session: session_id.to_string(),
+                action: "remove".to_string(),
+                fingerprint: fingerprint.to_string(),
+                ..Default::default()
+            })
+            .file(&app.store)
             .await
             {
                 Ok(_) => {
@@ -2458,13 +2465,13 @@ async fn account_address(app: &App, request: &Request) -> Reply {
             ));
         }
     }
-    match intents::file_action(
-        &app.store,
-        "outside-address",
-        session_id,
-        &account.username,
-        serde_json::json!({"address": address}),
-    )
+    match intents::Intent::OutsideAddress(transitions::OutsideAddressIntent {
+        username: account.username.clone(),
+        session: session_id.to_string(),
+        address: address.to_string(),
+        ..Default::default()
+    })
+    .file(&app.store)
     .await
     {
         Ok(_) => {
@@ -2498,13 +2505,14 @@ async fn account_serving(app: &App, request: &Request) -> Reply {
     let form = fields(&String::from_utf8_lossy(&request.body));
     let http = form.contains_key("http");
     let gemini = form.contains_key("gemini");
-    match intents::file_action(
-        &app.store,
-        "serving",
-        session_id,
-        &account.username,
-        serde_json::json!({"http": http, "gemini": gemini}),
-    )
+    match intents::Intent::Serving(transitions::ServingIntent {
+        username: account.username.clone(),
+        session: session_id.to_string(),
+        http,
+        gemini,
+        ..Default::default()
+    })
+    .file(&app.store)
     .await
     {
         Ok(_) => {
@@ -2546,13 +2554,12 @@ async fn account_renewal(app: &App, request: &Request) -> Reply {
              pay again, and nothing is charged automatically.",
         );
     }
-    match intents::file_action(
-        &app.store,
-        "cancel-renewal",
-        session_id,
-        &account.username,
-        serde_json::json!({}),
-    )
+    match intents::Intent::CancelRenewal(transitions::CancelRenewalIntent {
+        username: account.username.clone(),
+        session: session_id.to_string(),
+        ..Default::default()
+    })
+    .file(&app.store)
     .await
     {
         Ok(_) => {
@@ -2600,17 +2607,15 @@ async fn account_mail_key(app: &App, request: &Request) -> Reply {
                 .unwrap_or("")
                 .trim();
             let signed = !signature.is_empty();
-            match intents::file_action(
-                &app.store,
-                "mail-key",
-                session_id,
-                &account.username,
-                serde_json::json!({
-                    "action": "replace",
-                    "material": material,
-                    "signature": signature,
-                }),
-            )
+            match intents::Intent::MailKey(transitions::MailKeyIntent {
+                username: account.username.clone(),
+                session: session_id.to_string(),
+                action: "replace".to_string(),
+                material: material.to_string(),
+                signature: signature.to_string(),
+                ..Default::default()
+            })
+            .file(&app.store)
             .await
             {
                 Ok(_) => {
@@ -2635,13 +2640,13 @@ async fn account_mail_key(app: &App, request: &Request) -> Reply {
             if account.rotation.is_none() {
                 return refused("No replacement is waiting to be cancelled.");
             }
-            match intents::file_action(
-                &app.store,
-                "mail-key",
-                session_id,
-                &account.username,
-                serde_json::json!({"action": "cancel"}),
-            )
+            match intents::Intent::MailKey(transitions::MailKeyIntent {
+                username: account.username.clone(),
+                session: session_id.to_string(),
+                action: "cancel".to_string(),
+                ..Default::default()
+            })
+            .file(&app.store)
             .await
             {
                 Ok(_) => {
@@ -2684,7 +2689,14 @@ async fn account_export(app: &App, request: &Request) -> Reply {
     let Some(session_id) = cookie.as_deref().and_then(session::id) else {
         return refused("Sign in to the account you want to export.");
     };
-    match crate::intents::file_export(&app.store, session_id, &account.username).await {
+    match intents::Intent::Export(transitions::ExportIntent {
+        username: account.username.clone(),
+        session: session_id.to_string(),
+        ..Default::default()
+    })
+    .file(&app.store)
+    .await
+    {
         Ok(_) => {
             let page = notice(
                 "Your data export is on its way",
@@ -2989,14 +3001,17 @@ async fn decide_file(app: &App, call: &Call<'_>) -> Reply {
         return refused("This link does not name a decision the platform knows.");
     };
     let sig = form.get("sig").cloned().unwrap_or_default();
-    match intents::file_decision(
-        &app.store,
-        decision.kind,
-        decision.action,
-        &record.username,
-        token,
-        &sig,
-    )
+    match intents::Intent::Decision(transitions::DecisionIntent {
+        kind: decision.kind.to_string(),
+        application: store::ApplicationRef {
+            username: record.username.clone(),
+            status_token: token.to_string(),
+        },
+        action: decision.action.to_string(),
+        sig,
+        ..Default::default()
+    })
+    .file(&app.store)
     .await
     {
         Ok(_) => capability(&notice(
@@ -3114,7 +3129,19 @@ async fn password_file(app: &App, call: &Call<'_>) -> Reply {
             error: Some(problem),
         });
     }
-    match intents::file_password(&app.store, &record.username, token, until, sig, password).await {
+    match intents::Intent::Password(transitions::PasswordIntent {
+        application: store::ApplicationRef {
+            username: record.username.clone(),
+            status_token: token.to_string(),
+        },
+        until: until.clone(),
+        sig: sig.clone(),
+        password: password.to_string(),
+        ..Default::default()
+    })
+    .file(&app.store)
+    .await
+    {
         Ok(_) => capability(&notice(
             "Password set",
             "The platform sets it on its next pass, within a minute. This link will not work again.",

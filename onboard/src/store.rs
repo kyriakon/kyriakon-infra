@@ -738,7 +738,7 @@ pub struct Record {
 
 /// The application intent, the fields the spec lists under "An application
 /// intent holds". Built from the record and written once, at file time.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Intent {
     pub id: String,
     pub kind: String,
@@ -759,7 +759,7 @@ pub struct Intent {
     pub question_list: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ApplicationRef {
     pub username: String,
     pub status_token: String,
@@ -1067,7 +1067,7 @@ pub struct GroupAddress {
 /// date the group's single renewal sets, and the card rail's subscription once
 /// one is attached. The group holds the payment for every mailbox in it, so one
 /// renewal cannot leave several dates that drift.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GroupPayment {
     pub rail: String,
     pub no_charge: bool,
@@ -1121,7 +1121,7 @@ pub struct GroupRecord {
 
 /// The `provision-group` intent: everything the drain needs to make one body's
 /// domain live, filed by the approval and applied in one idempotent pass.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GroupIntent {
     pub id: String,
     pub kind: String,
@@ -1163,7 +1163,7 @@ pub struct GroupIntent {
 /// It carries a signature over every field the drain acts on, because
 /// `intents/` is writable by the unprivileged handler and this is root work:
 /// without one, a compromised handler could file a mailbox or a removal.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GroupAddressIntent {
     pub id: String,
     pub kind: String,
@@ -1191,7 +1191,7 @@ pub struct GroupAddressIntent {
 /// The `remove-group` intent: take one body's domain down and close every
 /// account in it. The console signs it, because the transition deletes accounts
 /// and `intents/` is writable by the unprivileged handler.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GroupRemoveIntent {
     pub id: String,
     pub kind: String,

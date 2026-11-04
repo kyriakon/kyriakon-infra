@@ -9,6 +9,7 @@ The suite is one test binary, `drain.rs`, with the cases split into modules unde
 | `card` | the Stripe rail: checkout, invoices, subscriptions and card ledger lines |
 | `export` | `onboardctl ledger export` |
 | `group` | the own-domain tier: groups, addresses, aliases and DNS |
+| `intent` | the intent seam: one variant's verify-then-apply, and a refused proof |
 | `lifecycle` | applications, decisions, mail, keys, passwords, purges and free accounts |
 | `prepaid` | credits, windows, tokens, reconcile and `payment show` |
 | `refund` | refunds and settlements |
