@@ -48,8 +48,16 @@ install_set="$script_dir/install-set.tsv"
 
 # The script names the drain's Rust invokes with `run_script(cfg, "…")` and its
 # two siblings, read from the source rather than a second list that can drift.
-drain_invoked() {
-	tr '\n' ' ' < "$1" \
+# The transition bodies live under src/transitions/, so the scan takes either
+# that directory or one file (the self-test's fixture).
+drain_invoked() { # <src dir or .rs file>
+	{
+		if [ -d "$1" ]; then
+			find "$1" -type f -name '*.rs' -exec cat {} +
+		else
+			cat "$1"
+		fi
+	} | tr '\n' ' ' \
 		| grep -oE '(run_script|run_script_tolerating|spawn_script)\([[:space:]]*cfg,[[:space:]]*"[^"]+"' \
 		| sed -E 's/.*"([^"]+)"/\1/' | sort -u
 }
@@ -57,7 +65,7 @@ drain_invoked() {
 # The invoked names the drain's directory does not get. A missing one is a
 # payment or an approval that fails on the box while every test here passes,
 # which is how stripe-api.sh reached a merge.
-missing_drain_scripts() { # <transitions.rs> <install-set table>
+missing_drain_scripts() { # <src dir or .rs file> <install-set table>
 	invoked=$(drain_invoked "$1")
 	# One line per row, which is what the table reader prints; the case below
 	# compares space-separated words.
@@ -72,9 +80,9 @@ missing_drain_scripts() { # <transitions.rs> <install-set table>
 
 self_test() {
 	repo=${1:-$(cd "$script_dir/.." && pwd)}
-	transitions=$repo/onboard/src/transitions.rs
-	[ -f "$transitions" ] || {
-		printf 'self-test: %s is missing\n' "$transitions" >&2
+	src=$repo/onboard/src
+	[ -d "$src" ] || {
+		printf 'self-test: %s is missing\n' "$src" >&2
 		exit 1
 	}
 	[ -f "$install_set" ] || {
@@ -90,7 +98,7 @@ self_test() {
 		exit 1
 	}
 
-	if missing=$(missing_drain_scripts "$transitions" "$install_set") \
+	if missing=$(missing_drain_scripts "$src" "$install_set") \
 		&& [ -n "$missing" ]; then
 		printf 'self-test: the drain invokes scripts this deploy does not install:\n%s\n' \
 			"$missing" >&2
@@ -99,10 +107,9 @@ self_test() {
 
 	# The check has to see a missing name, or it proves nothing: here the source
 	# invokes one the table has no row for.
-	cp "$transitions" "$work/transitions.rs"
-	printf '\nfn fixture(cfg: &DrainConfig) { let _ = spawn_script(cfg, "not-installed.sh", &[]); }\n' \
-		>> "$work/transitions.rs"
-	if ! missing_drain_scripts "$work/transitions.rs" "$install_set" \
+	printf 'fn fixture(cfg: &DrainConfig) { let _ = spawn_script(cfg, "not-installed.sh", &[]); }\n' \
+		> "$work/fixture.rs"
+	if ! missing_drain_scripts "$work/fixture.rs" "$install_set" \
 		| grep -qx 'not-installed.sh'; then
 		printf 'self-test: the check did not see a missing script\n' >&2
 		exit 1
@@ -110,9 +117,9 @@ self_test() {
 
 	# And a table with no drain rows installs nothing, so every invoked name is a
 	# finding rather than a pass on an empty list.
-	invoked_count=$(drain_invoked "$transitions" | grep -c .)
+	invoked_count=$(drain_invoked "$src" | grep -c .)
 	: > "$work/empty.tsv"
-	reported=$(missing_drain_scripts "$transitions" "$work/empty.tsv" | grep -c .)
+	reported=$(missing_drain_scripts "$src" "$work/empty.tsv" | grep -c .)
 	[ "$invoked_count" -gt 0 ] && [ "$reported" -eq "$invoked_count" ] || {
 		printf 'self-test: a table with no drain rows reported %s of %s invoked scripts\n' \
 			"$reported" "$invoked_count" >&2
