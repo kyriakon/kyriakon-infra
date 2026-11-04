@@ -77,20 +77,20 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     transitions::purge_closing(cfg, store, &journal).await?;
     // The free accounts' yearly note, on the same pass: a free account never
     // lapses, and this is the one message it is sent each year.
-    transitions::free_anniversaries(cfg, store).await?;
+    transitions::free_anniversaries(cfg, store, &journal).await?;
     // The prepaid member's own renewal note, thirty days before the date runs
     // out: the rails with no processor have nobody else to send one.
-    transitions::prepaid_renewals(cfg, store).await?;
+    transitions::prepaid_renewals(cfg, store, &journal).await?;
     // The space used, from the filesystem quota the handler cannot read. Due
     // gated to once an hour, so most passes do no quota work.
-    transitions::refresh_space_used(cfg, store).await?;
+    transitions::refresh_space_used(cfg, store, &journal).await?;
     // A mail-key replacement whose 72-hour window has closed applies here, on
     // the same pass its record is read.
     transitions::mail_key_rotations(cfg, store, &journal).await?;
     // A payment window whose day has passed either finds its credit and stays
     // active, or lapses the account and starts the grace. One sweep, so a
     // member who paid on the last day is not lapsed by a later pass.
-    transitions::window_sweep(cfg, store).await?;
+    transitions::window_sweep(cfg, store, &journal).await?;
     // A lapsed account's grace: the final notice at day 33, and the one
     // deletion transition when the 40 days end.
     transitions::grace_sweep(cfg, store, &journal).await?;
@@ -102,7 +102,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     // resolving is the one thing about a body's domain the platform can see and
     // cannot repair, and it must not delay a filed application or a member's
     // mail. It is due-gated, so most passes do no DNS work.
-    transitions::check_group_dns(cfg, store).await?;
+    transitions::check_group_dns(cfg, store, &journal).await?;
     // The card rail's arriving events are settled after everything else: a
     // misconfigured signing secret must not hold up an approval, and an event
     // that cannot be applied yet is left for the next pass.

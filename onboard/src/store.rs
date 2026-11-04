@@ -83,9 +83,11 @@ impl Store {
             .map_err(|e| format!("cannot read {path}: {e}"))
     }
 
-    /// Read a record, `None` when it is not there. A missing record and an
-    /// expired one are the same to the caller, which is what keeps the status
-    /// path from being a token oracle.
+    /// Read a record's bytes when a missing one and a damaged one mean the same
+    /// thing: the status page's token oracle, which answers an unknown token and
+    /// a corrupt record alike, and a console listing that is best effort. A
+    /// caller that has to tell the two apart reads an account, group or
+    /// application record through the typed accessors below.
     pub async fn read_record(&self, dir: &str, name: &str) -> Option<String> {
         tokio::fs::read_to_string(self.root.join(dir).join(name))
             .await
@@ -141,10 +143,10 @@ impl Store {
             .await
     }
 
-    /// The same record as written. Two callers edit one key and write it back,
-    /// and the record carries fields this build does not model, so a round trip
-    /// through [`Record`] would drop them.
-    pub async fn application_text(&self, token: &str) -> Result<Option<String>, String> {
+    /// The filed application as written. Two callers edit one key and write it
+    /// back, and the record carries fields this build does not model, so a
+    /// round trip through [`Record`] would drop them.
+    pub async fn filed_application_text(&self, token: &str) -> Result<Option<String>, String> {
         self.record_text(&format!("applications/{token}.json"))
             .await
     }
@@ -153,9 +155,23 @@ impl Store {
     /// Its callers parse a field or two and copy it whole for the export, so it
     /// is read as text; the miss-versus-damage split is the same as the typed
     /// reads'.
-    pub async fn application_copy(&self, username: &str) -> Result<Option<String>, String> {
+    pub async fn account_application_text(&self, username: &str) -> Result<Option<String>, String> {
         self.record_text(&format!("accounts/{username}/application.json"))
             .await
+    }
+
+    /// One token index entry, `tokens/<reference>.json`. This is the only join
+    /// between a payment and who it pays for, so a record that cannot be read is
+    /// an error rather than a token that names nobody.
+    pub async fn token(&self, reference: &str) -> Result<Option<TokenRecord>, String> {
+        self.typed_record(&format!("tokens/{reference}.json")).await
+    }
+
+    /// One username hold, `holds/<username>.json`, as written. The one field
+    /// read today is `until`, and a damaged file is an error: treating it as no
+    /// hold would release a name the platform is still holding.
+    pub async fn hold(&self, username: &str) -> Result<Option<serde_json::Value>, String> {
+        self.typed_record(&format!("holds/{username}.json")).await
     }
 
     /// Write one record by rename: a temporary file in the same directory, then
@@ -292,23 +308,23 @@ impl Store {
     ///
     /// The scan reads each `account.json` rather than an index beside the pins:
     /// an index would be a second list that can disagree with the account, and
-    /// the account directory is small enough that one read answers it. An
-    /// account that cannot be read is skipped rather than failing the lookup,
-    /// so a damaged record answers anonymously instead of breaking the page
-    /// for everyone.
-    pub async fn account_for_certificate(&self, hash: &str) -> Option<Account> {
+    /// the account directory is small enough that one read answers it. A record
+    /// that cannot be read is an error: skipping it would turn a pinned
+    /// certificate into a stranger's session, and the caller renders the
+    /// failure instead.
+    pub async fn account_for_certificate(&self, hash: &str) -> Result<Option<Account>, String> {
         if hash.is_empty() {
-            return None;
+            return Ok(None);
         }
-        for username in self.list("accounts").await.ok()? {
-            let Ok(Some(account)) = self.account(&username).await else {
+        for username in self.list("accounts").await? {
+            let Some(account) = self.account(&username).await? else {
                 continue;
             };
             if account.certificates.iter().any(|c| c.hash == hash) {
-                return Some(account);
+                return Ok(Some(account));
             }
         }
-        None
+        Ok(None)
     }
 
     /// The names in one directory, sorted. A missing directory reads as empty,
@@ -1608,16 +1624,14 @@ mod tests {
         assert_eq!(crockford128([0xffu8; 16]), format!("7{}", "z".repeat(25)));
     }
 
-    /// The certificate lookup: an empty hash answers nothing, an account whose
-    /// record cannot be read is skipped rather than failing the page, and a
-    /// pinned hash finds its account.
+    /// The certificate lookup: an empty hash answers nothing, a pinned hash
+    /// finds its account, and a record that cannot be read is an error rather
+    /// than a stranger's session.
     #[tokio::test]
-    async fn a_pinned_certificate_is_found_and_a_broken_record_is_skipped() {
+    async fn a_pinned_certificate_is_found_and_a_broken_record_fails_the_lookup() {
         let dir = std::env::temp_dir().join(format!("onboard-store-cert-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("accounts/broken")).unwrap();
         std::fs::create_dir_all(dir.join("accounts/alice")).unwrap();
-        std::fs::write(dir.join("accounts/broken/account.json"), "not json").unwrap();
         let account = serde_json::json!({
             "version": 1,
             "username": "alice",
@@ -1637,21 +1651,139 @@ mod tests {
         let store = Store::new(dir.to_str().unwrap());
 
         assert!(
-            store.account_for_certificate("").await.is_none(),
+            store.account_for_certificate("").await.unwrap().is_none(),
             "an empty hash names no account"
         );
         assert_eq!(
             store
                 .account_for_certificate("SHA256:aa")
                 .await
+                .unwrap()
                 .expect("the pinned account")
                 .username,
             "alice"
         );
         assert!(
-            store.account_for_certificate("SHA256:bb").await.is_none(),
+            store
+                .account_for_certificate("SHA256:bb")
+                .await
+                .unwrap()
+                .is_none(),
             "an unpinned hash answers nothing"
         );
+        // A record the scan has to read before it can answer is damage, not a
+        // pin that was never made.
+        std::fs::create_dir_all(dir.join("accounts/broken")).unwrap();
+        std::fs::write(dir.join("accounts/broken/account.json"), "not json").unwrap();
+        let err = store
+            .account_for_certificate("SHA256:bb")
+            .await
+            .expect_err("a corrupt record fails the scan");
+        assert!(err.contains("accounts/broken/account.json"), "{err}");
+    }
+
+    /// The typed reads split three ways: an absent file is `Ok(None)`, a
+    /// damaged one is an `Err` naming it, and a valid one is `Ok(Some)`.
+    #[tokio::test]
+    async fn a_typed_record_read_separates_missing_damaged_and_valid() {
+        let dir = std::env::temp_dir().join(format!("onboard-store-typed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.to_str().unwrap());
+
+        for (what, result) in [
+            (
+                "account",
+                store.account("alice").await.is_ok_and(|a| a.is_none()),
+            ),
+            (
+                "group",
+                store
+                    .group("parish.example")
+                    .await
+                    .is_ok_and(|g| g.is_none()),
+            ),
+            (
+                "application",
+                store.application("tok").await.is_ok_and(|r| r.is_none()),
+            ),
+        ] {
+            assert!(result, "a missing {what} is not Ok(None)");
+        }
+
+        std::fs::create_dir_all(dir.join("accounts/alice")).unwrap();
+        std::fs::write(
+            dir.join("accounts/alice/account.json"),
+            serde_json::json!({
+                "version": 1, "username": "alice", "state": "active",
+                "decision": "approve", "decided_at": "2026-10-01T09:00:00Z",
+                "rail": "no_charge", "no_charge": true,
+                "created_at": "2026-10-01T09:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.account("alice").await.unwrap().unwrap().username,
+            "alice"
+        );
+
+        std::fs::create_dir_all(dir.join("groups/parish.example")).unwrap();
+        std::fs::write(
+            dir.join("groups/parish.example/group.json"),
+            serde_json::json!({
+                "version": 1, "domain": "parish.example", "name": "Parish",
+                "kind": "parish",
+                "payment": {"rail": "no_charge", "no_charge": true, "paid_until": null},
+                "accounts": ["alice"], "site_owner": "alice"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.group("parish.example").await.unwrap().unwrap().domain,
+            "parish.example"
+        );
+
+        std::fs::create_dir_all(dir.join("applications")).unwrap();
+        std::fs::write(
+            dir.join("applications/tok.json"),
+            serde_json::json!({
+                "username": "alice", "status_token": "tok",
+                "filed_at": "2026-10-01T09:00:00Z", "front_end": "web",
+                "stage": "received", "answers": {}, "mail_keys": [],
+                "rail": "no_charge", "no_charge": true, "acceptances": [],
+                "question_list": "2026-10-01 abc1234"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.application("tok").await.unwrap().unwrap().username,
+            "alice"
+        );
+
+        // Damage in each file is named, not read as absence.
+        std::fs::write(dir.join("accounts/alice/account.json"), b"{not json").unwrap();
+        let err = store.account("alice").await.unwrap_err();
+        assert!(
+            err.contains("accounts/alice/account.json") && err.contains("does not parse"),
+            "{err}"
+        );
+
+        std::fs::write(dir.join("groups/parish.example/group.json"), b"{not json").unwrap();
+        let err = store.group("parish.example").await.unwrap_err();
+        assert!(
+            err.contains("groups/parish.example/group.json") && err.contains("does not parse"),
+            "{err}"
+        );
+
+        std::fs::write(dir.join("applications/tok.json"), b"{not json").unwrap();
+        let err = store.application("tok").await.unwrap_err();
+        assert!(
+            err.contains("applications/tok.json") && err.contains("does not parse"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A record the handler renders cannot be written root-only. The three

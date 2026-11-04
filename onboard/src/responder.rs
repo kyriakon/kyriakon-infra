@@ -1489,7 +1489,13 @@ async fn gemini(app: &App, request: &Request, incoming: &Incoming) -> Reply {
 /// The account page for a gemini client: the member its certificate is pinned
 /// to, or the stranger's page carrying the certificate's own fingerprint.
 async fn capsule_account(app: &App, incoming: &Incoming) -> Reply {
-    let member = member_for(app, incoming).await;
+    let member = match member_for(app, incoming).await {
+        Ok(member) => member,
+        Err(e) => {
+            eprintln!("kyriakon-onboard: {e}");
+            return Reply::gemini(50, "Permanent failure", String::new());
+        }
+    };
     let body = match &member {
         Some(account) => {
             let notices = account_notices(app, &account.username).await;
@@ -1529,7 +1535,13 @@ async fn capsule_account(app: &App, incoming: &Incoming) -> Reply {
 /// certificate earns when no pin matched it. It carries no word for "known" or
 /// "unknown": the client learns its own fingerprint and nothing else.
 async fn capsule_front(app: &App, incoming: &Incoming) -> Reply {
-    let member = member_for(app, incoming).await;
+    let member = match member_for(app, incoming).await {
+        Ok(member) => member,
+        Err(e) => {
+            eprintln!("kyriakon-onboard: {e}");
+            return Reply::gemini(50, "Permanent failure", String::new());
+        }
+    };
     let member_name = member.as_ref().map(|account| account.username.as_str());
     let mut page = capsule::front_page(&app.catalogue, member_name);
     if member.is_none() {
@@ -1565,10 +1577,10 @@ fn acceptances(app: &App) -> Reply {
 /// The account a presented certificate is pinned to. Only the two routes that
 /// read as a member call this: a certificate-bearing request for any other page
 /// pays nothing for a lookup it would throw away.
-async fn member_for(app: &App, incoming: &Incoming) -> Option<Account> {
+async fn member_for(app: &App, incoming: &Incoming) -> Result<Option<Account>, String> {
     match &incoming.certificate {
         Some(certificate) => app.store.account_for_certificate(&certificate.hash).await,
-        None => None,
+        None => Ok(None),
     }
 }
 
@@ -2110,7 +2122,7 @@ async fn account_web(app: &App, request: &Request) -> Reply {
     if validate::username_shape(&member.username).is_some() {
         return Reply::capability(200, page_html(&LoginPage { error: None }));
     }
-    let account = match account_record(app, &member.username).await {
+    let account = match app.store.account(&member.username).await {
         Ok(Some(account)) => account,
         Ok(None) => return Reply::capability(200, page_html(&LoginPage { error: None })),
         Err(e) => return server_error(&e),
@@ -2198,7 +2210,9 @@ async fn session_account(
     let Some(member) = session::lookup(&app.store, &cookie, OffsetDateTime::now_utc()).await else {
         return Ok(None);
     };
-    Ok(account_record(app, &member.username)
+    Ok(app
+        .store
+        .account(&member.username)
         .await?
         .map(|account| (cookie, account)))
 }
@@ -2707,7 +2721,7 @@ async fn session_member(app: &App, request: &Request) -> Result<Option<Account>,
     let Some(member) = session::lookup(&app.store, &cookie, OffsetDateTime::now_utc()).await else {
         return Ok(None);
     };
-    account_record(app, &member.username).await
+    app.store.account(&member.username).await
 }
 
 /// "Take my data out": file the export intent for the account the session names.
@@ -2750,14 +2764,6 @@ async fn account_export(app: &App, request: &Request) -> Reply {
             Reply::html(500, String::new())
         }
     }
-}
-
-/// One account's record, for a name the request or a decided application
-/// already gave. A record that has gone leaves the page as it is for a
-/// stranger; a record that cannot be read or parsed is an error the route
-/// reports rather than a member the handler quietly forgets.
-async fn account_record(app: &App, username: &str) -> Result<Option<Account>, String> {
-    app.store.account(username).await
 }
 
 /// The group a signed-in mailbox belongs to, from the group's own record. The

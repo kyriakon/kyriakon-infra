@@ -1015,6 +1015,76 @@ pub async fn report_failure(
     }
 }
 
+/// One record a sweep could not read: report it through the drain's own failure
+/// path and go on to the next record. `due` backs the report off, so a record
+/// left damaged does not write a journal line every minute, and
+/// [`report_failure`] mails one copy per distinct message.
+async fn report_record(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    kind: &str,
+    name: &str,
+    message: &str,
+) {
+    let id = format!("{kind}:{name}");
+    if !due(journal, &id, OffsetDateTime::now_utc()) {
+        return;
+    }
+    report_failure(cfg, store, journal, &id, "record", message).await;
+}
+
+/// One account a sweep is about, or `None` when it is gone. A record that cannot
+/// be read is reported and skipped, so one damaged account cannot stop another
+/// account's lapse, deletion, rotation or notice.
+async fn sweep_account(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    username: &str,
+) -> Option<Account> {
+    match store.account(username).await {
+        Ok(account) => account,
+        Err(e) => {
+            report_record(cfg, store, journal, "account", username, &e).await;
+            None
+        }
+    }
+}
+
+/// One group a sweep is about, with the same rule as [`sweep_account`].
+async fn sweep_group(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    domain: &str,
+) -> Option<GroupRecord> {
+    match group_record(store, domain).await {
+        Ok(group) => group,
+        Err(e) => {
+            report_record(cfg, store, journal, "group", domain, &e).await;
+            None
+        }
+    }
+}
+
+/// One filed application a sweep is about, with the same rule as
+/// [`sweep_account`].
+async fn sweep_application(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    token: &str,
+) -> Option<Record> {
+    match store.application(token).await {
+        Ok(record) => record,
+        Err(e) => {
+            report_record(cfg, store, journal, "application", token, &e).await;
+            None
+        }
+    }
+}
+
 /// Whether a failing id is due for another attempt, and whether it should be
 /// reported when it fails again. `true` means go ahead.
 pub fn due(journal: &Journal, id: &str, now: OffsetDateTime) -> bool {
@@ -1062,7 +1132,7 @@ pub async fn set_password(
     // pass's last act and runs on the success path only.
     unsafe { plain.as_mut_vec().fill(0) };
     let name = format!("{token}.json");
-    let Some(text) = store.application_text(token).await? else {
+    let Some(text) = store.filed_application_text(token).await? else {
         return Ok(password_refusal(store, file, value, "the application record is gone").await);
     };
     // Read as a Value and edit one key: the record carries fields this build
@@ -1429,7 +1499,7 @@ async fn approve(
     // its own "applying" line; anything else holding this name is not this
     // application's.
     let begun = journal.approval_started(token);
-    let existing = existing_account(store, username).await?;
+    let existing = store.account(username).await?;
 
     // An account record that this application never began is a second
     // application for a username that already has one. Nothing here is this
@@ -1669,7 +1739,7 @@ async fn approve(
     // the status link's own end written on it.
     let mut app_copy: Value = serde_json::from_str(
         &store
-            .application_text(token)
+            .filed_application_text(token)
             .await?
             .ok_or("the application record vanished mid-approval")?,
     )
@@ -1797,7 +1867,7 @@ pub async fn resend(
     // Every settling transition journals its outcome, and the line names the
     // application the account was made from.
     let application = store
-        .application_copy(username)
+        .account_application_text(username)
         .await?
         .and_then(|copy| serde_json::from_str::<Value>(&copy).ok())
         .and_then(|copy| {
@@ -1856,6 +1926,9 @@ pub async fn window_extend(
         Ok(close) => close,
         Err(problem) => return Ok(Settlement::refused(&problem)),
     };
+    // Read the join before the account is written: a token record that cannot
+    // be read fails here, with the window still unchanged for the retry.
+    let mut join = store.token(&intent.token).await?;
     account.payment = Some(payment.clone());
     let bytes = serde_json::to_vec_pretty(&account)
         .map_err(|e| format!("cannot encode the account: {e}"))?;
@@ -1863,21 +1936,16 @@ pub async fn window_extend(
     write_payment_copy(store, &username, &payment).await?;
     // The token index carries the date the operator's list and any later lookup
     // sees, so keep it beside the account.
-    if let Some(text) = store
-        .read_record("tokens", &format!("{}.json", intent.token))
-        .await
-    {
-        if let Ok(mut join) = serde_json::from_str::<TokenRecord>(&text) {
-            join.window_closes_at = new_close.clone();
-            let bytes = serde_json::to_vec_pretty(&join)
-                .map_err(|e| format!("cannot encode the token record: {e}"))?;
-            store
-                .write_record("tokens", &format!("{}.json", intent.token), &bytes)
-                .await?;
-        }
+    if let Some(join) = join.as_mut() {
+        join.window_closes_at = new_close.clone();
+        let bytes = serde_json::to_vec_pretty(&join)
+            .map_err(|e| format!("cannot encode the token record: {e}"))?;
+        store
+            .write_record("tokens", &format!("{}.json", intent.token), &bytes)
+            .await?;
     }
     let application = store
-        .application_copy(&username)
+        .account_application_text(&username)
         .await?
         .and_then(|copy| serde_json::from_str::<Value>(&copy).ok())
         .and_then(|copy| {
@@ -1924,19 +1992,16 @@ async fn extend_group_window(
         Ok(close) => close,
         Err(problem) => return Ok(Settlement::refused(&problem)),
     };
+    // Read the join before the group is written, as the person path does.
+    let mut join = store.token(&intent.token).await?;
     write_group_record(store, &group).await?;
-    if let Some(text) = store
-        .read_record("tokens", &format!("{}.json", intent.token))
-        .await
-    {
-        if let Ok(mut join) = serde_json::from_str::<TokenRecord>(&text) {
-            join.window_closes_at = new_close.clone();
-            let bytes = serde_json::to_vec_pretty(&join)
-                .map_err(|e| format!("cannot encode the token record: {e}"))?;
-            store
-                .write_record("tokens", &format!("{}.json", intent.token), &bytes)
-                .await?;
-        }
+    if let Some(join) = join.as_mut() {
+        join.window_closes_at = new_close.clone();
+        let bytes = serde_json::to_vec_pretty(&join)
+            .map_err(|e| format!("cannot encode the token record: {e}"))?;
+        store
+            .write_record("tokens", &format!("{}.json", intent.token), &bytes)
+            .await?;
     }
     Ok(Settlement::line(
         "applied",
@@ -1989,10 +2054,14 @@ fn extend_open_window(
 ///
 /// A closing or suspended account is left alone: its state is a decision of its
 /// own, and the payment sweep must not overwrite it.
-pub async fn window_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+pub async fn window_sweep(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+) -> Result<(), String> {
     let now = OffsetDateTime::now_utc();
     for username in store.list("accounts").await? {
-        let Some(mut account) = existing_account(store, &username).await? else {
+        let Some(mut account) = sweep_account(cfg, store, journal, &username).await else {
             continue;
         };
         let Some(mut payment) = account.payment_state() else {
@@ -2061,13 +2130,8 @@ pub async fn window_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String
     // stops sending, uploading and pushing, one notice goes to the body, and the
     // date every mailbox is restored from is the group's.
     for domain in store.list("groups").await? {
-        let mut group = match group_record(store, &domain).await {
-            Ok(Some(group)) => group,
-            Ok(None) => continue,
-            Err(e) => {
-                eprintln!("kyriakon-onboard: reading {domain}'s window: {e}");
-                continue;
-            }
+        let Some(mut group) = sweep_group(cfg, store, journal, &domain).await else {
+            continue;
         };
         if group.payment.no_charge {
             continue;
@@ -2115,8 +2179,14 @@ pub async fn window_sweep(cfg: &DrainConfig, store: &Store) -> Result<(), String
                 stopped = false;
                 continue;
             }
-            let Some(mut account) = existing_account(store, mailbox).await? else {
-                continue;
+            let mut account = match store.account(mailbox).await {
+                Ok(Some(account)) => account,
+                Ok(None) => continue,
+                Err(e) => {
+                    report_record(cfg, store, journal, "account", mailbox, &e).await;
+                    stopped = false;
+                    continue;
+                }
             };
             // A closing or suspended mailbox keeps its own state: the group's
             // lapse is not the decision that put it there.
@@ -2270,7 +2340,7 @@ pub async fn grace_sweep(
     let now = OffsetDateTime::now_utc();
     let today = now.date();
     for username in store.list("accounts").await? {
-        let Some(account) = existing_account(store, &username).await? else {
+        let Some(account) = sweep_account(cfg, store, journal, &username).await else {
             continue;
         };
         // A group mailbox's grace is the group's: one conversation and one
@@ -2673,11 +2743,9 @@ fn credit_fields(intent: &CreditIntent) -> Result<i64, String> {
 /// The token index entry a payment token names, when the entry is this token's.
 /// The index is the only join, so a token that is not in it resolves to nothing.
 async fn token_join(store: &Store, token: &str) -> Result<Option<TokenRecord>, String> {
-    let Some(text) = store.read_record("tokens", &format!("{token}.json")).await else {
+    let Some(join) = store.token(token).await? else {
         return Ok(None);
     };
-    let join: TokenRecord =
-        serde_json::from_str(&text).map_err(|e| format!("the token record does not parse: {e}"))?;
     if join.token != token {
         return Err("the token record does not name this token".to_string());
     }
@@ -3210,7 +3278,7 @@ async fn restore_group_mailboxes(
     group: &GroupRecord,
 ) -> Result<(), String> {
     for mailbox in &group.accounts {
-        let Some(mut account) = existing_account(store, mailbox).await? else {
+        let Some(mut account) = store.account(mailbox).await? else {
             continue;
         };
         if account.state != "lapsed" {
@@ -4294,7 +4362,7 @@ pub async fn write_payment_copy(
     username: &str,
     payment: &Payment,
 ) -> Result<(), String> {
-    let Some(text) = store.application_copy(username).await? else {
+    let Some(text) = store.account_application_text(username).await? else {
         return Ok(());
     };
     let mut copy: Value = serde_json::from_str(&text)
@@ -4307,7 +4375,7 @@ pub async fn write_payment_copy(
         .write_record(&format!("accounts/{username}"), "application.json", &bytes)
         .await?;
     if let Some(token) = copy.get("status_token").and_then(Value::as_str) {
-        if store.application_text(token).await?.is_some() {
+        if store.filed_application_text(token).await?.is_some() {
             let owner = store.dir_owner("applications");
             store
                 .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
@@ -4718,7 +4786,7 @@ async fn check_group_names(
         let in_record = record
             .map(|g| g.accounts.iter().any(|a| a == mailbox))
             .unwrap_or(false);
-        let existing = existing_account(store, mailbox).await?;
+        let existing = store.account(mailbox).await?;
         let in_account = existing
             .as_ref()
             .map(|a| a.group.as_deref() == Some(domain))
@@ -5016,7 +5084,7 @@ pub async fn provision_group(
 /// answers sit inside the ninety-day purge with the rest of the application. The
 /// status link's end is stamped the way the person path's copy is.
 async fn application_copy(store: &Store, token: &str) -> Result<Option<String>, String> {
-    let Some(text) = store.application_text(token).await? else {
+    let Some(text) = store.filed_application_text(token).await? else {
         return Ok(None);
     };
     let mut value: Value =
@@ -5057,7 +5125,7 @@ async fn write_group_account(
     payment: &GroupPayment,
     mail_key: Option<&KeyRecord>,
 ) -> Result<(), String> {
-    let existing = existing_account(store, mailbox).await?;
+    let existing = store.account(mailbox).await?;
     let now = util::filed_at();
     let account = Account {
         version: 1,
@@ -5308,16 +5376,11 @@ fn remove_addresses(path: &str, domain: &str, mailbox: &str) -> Result<bool, Str
 }
 
 /// A username's hold, while it still has time to run. The date is the record's;
-/// a record that cannot be dated has no hold, so a broken file does not keep a
-/// name held forever.
+/// a record that cannot be read is an error rather than no hold, because a
+/// broken hold file must not release a name the platform is still holding. A
+/// readable record with no usable date is no hold.
 async fn name_held(store: &Store, username: &str) -> Result<Option<String>, String> {
-    let Some(text) = store
-        .read_record("holds", &format!("{username}.json"))
-        .await
-    else {
-        return Ok(None);
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+    let Some(value) = store.hold(username).await? else {
         return Ok(None);
     };
     let Some(until) = value.get("until").and_then(Value::as_str) else {
@@ -5384,7 +5447,7 @@ pub async fn suspend(
     if reason.is_empty() {
         return Err("a suspension needs a reason, in the words the member will read".to_string());
     }
-    let Some(mut account) = existing_account(store, username).await? else {
+    let Some(mut account) = store.account(username).await? else {
         return Err(format!("no account for {username}"));
     };
     // The id is the account's own, so a retry after a crash finishes the same
@@ -5473,7 +5536,7 @@ pub async fn resume(
     if let Some(why) = validate::username_shape(username) {
         return Err(format!("the username {username:?}: {why}"));
     }
-    let Some(mut account) = existing_account(store, username).await? else {
+    let Some(mut account) = store.account(username).await? else {
         return Err(format!("no account for {username}"));
     };
     if account.state != "suspended" {
@@ -5549,7 +5612,7 @@ pub async fn delete_account(
     // a refund from the token's ledger lines. A record that has already gone is
     // a retry: there is nothing left to answer, and the remaining cleanup below
     // still runs.
-    let account = existing_account(store, username).await?;
+    let account = store.account(username).await?;
     // The id carries the account's creation stamp, so a name reused after the
     // ninety-day hold gets its own deletion rather than matching the first
     // lifecycle's journal line. Without it a second account with the same name
@@ -6369,7 +6432,7 @@ pub async fn mail_key_rotations(
     journal: &Journal,
 ) -> Result<(), String> {
     for username in store.list("accounts").await? {
-        let Some(mut account) = existing_account(store, &username).await? else {
+        let Some(mut account) = sweep_account(cfg, store, journal, &username).await else {
             continue;
         };
         let Some(rotation) = account.rotation.clone() else {
@@ -6583,7 +6646,7 @@ pub async fn group_address(
                     ));
                 }
             }
-            let existing = existing_account(store, &intent.mailbox).await?;
+            let existing = store.account(&intent.mailbox).await?;
             let ours = existing
                 .as_ref()
                 .map(|a| a.group.as_deref() == Some(intent.domain.as_str()))
@@ -6679,7 +6742,7 @@ pub async fn group_address(
             // the group nor on the box closes nothing, so it must not start a
             // ninety-day hold either.
             let closing = in_group(&intent.mailbox)
-                || existing_account(store, &intent.mailbox).await?.is_some()
+                || store.account(&intent.mailbox).await?.is_some()
                 || account_on_box(cfg, &intent.mailbox)?;
             // Only a pass that still sees the departing mailbox owning the site
             // moves the upload key and the lanes. Once the group record names
@@ -6842,10 +6905,7 @@ async fn close_group_tokens(store: &Store, accounts: &[String]) -> Result<(), St
         if !name.ends_with(".json") {
             continue;
         }
-        let Some(text) = store.read_record("tokens", &name).await else {
-            continue;
-        };
-        let Ok(token) = serde_json::from_str::<TokenRecord>(&text) else {
+        let Some(token) = store.token(name.trim_end_matches(".json")).await? else {
             continue;
         };
         // A group's token is indexed under the site owner's name, but it pays
@@ -6945,7 +7005,11 @@ const DNS_CHECK_HOURS: i64 = 6;
 /// one outage is one mail rather than one per pass. It writes nothing outside
 /// `groups/<domain>/dns-check.json`; the group record and the body's zone are
 /// untouched.
-pub async fn check_group_dns(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+pub async fn check_group_dns(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+) -> Result<(), String> {
     let values = dns::Values::from(cfg);
     if let Err(e) = values.check() {
         // The approval already refuses a placeholder; a box that has one has no
@@ -6958,13 +7022,8 @@ pub async fn check_group_dns(cfg: &DrainConfig, store: &Store) -> Result<(), Str
         if name.starts_with('.') {
             continue;
         }
-        let group = match group_record(store, &name).await {
-            Ok(Some(group)) => group,
-            Ok(None) => continue,
-            Err(e) => {
-                eprintln!("kyriakon-onboard: {e}");
-                continue;
-            }
+        let Some(group) = sweep_group(cfg, store, journal, &name).await else {
+            continue;
         };
         // One group's bad record, failed write or refused notice is reported
         // and skipped: the other groups are still watched and the pass goes on.
@@ -7146,7 +7205,7 @@ async fn dns_broken(cfg: &DrainConfig, values: &dns::Values, domain: &str) -> Re
 /// cleared falls back rather than failing the sweep.
 async fn dns_contact(store: &Store, group: &GroupRecord) -> Result<String, String> {
     let copy: Option<Value> = store
-        .application_copy(&group.site_owner)
+        .account_application_text(&group.site_owner)
         .await?
         .and_then(|text| serde_json::from_str(&text).ok());
     if let Some(copy) = &copy {
@@ -7190,7 +7249,11 @@ const QUOTA_CHECK_HOURS: i64 = 1;
 /// text, so the parse is narrow and a report it cannot read changes nothing;
 /// a filesystem with quotas off prints nothing and is the same no-op, which is
 /// the state the research found on the box before quotas were enabled.
-pub async fn refresh_space_used(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+pub async fn refresh_space_used(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+) -> Result<(), String> {
     // A pass with no accounts has nothing to record, so it writes neither the
     // report nor the state. That keeps a store that has never been provisioned
     // byte-identical across a pass, which the sweep tests rely on.
@@ -7242,7 +7305,7 @@ pub async fn refresh_space_used(cfg: &DrainConfig, store: &Store) -> Result<(), 
     let usage = parse_repquota(&String::from_utf8_lossy(&report.stdout));
     let mut recorded: HashSet<String> = HashSet::new();
     for (username, used_kb) in &usage {
-        let Some(mut account) = existing_account(store, username).await? else {
+        let Some(mut account) = sweep_account(cfg, store, journal, username).await else {
             // A uid with no account record is somebody else's, and this sweep
             // writes nothing about it.
             continue;
@@ -7270,13 +7333,8 @@ pub async fn refresh_space_used(cfg: &DrainConfig, store: &Store) -> Result<(), 
     for name in store.list("groups").await? {
         // One bad group record is reported and skipped: the other groups, and
         // the sweeps after this one, still run.
-        let mut group = match group_record(store, &name).await {
-            Ok(Some(group)) => group,
-            Ok(None) => continue,
-            Err(e) => {
-                eprintln!("kyriakon-onboard: reading {name}'s quota: {e}");
-                continue;
-            }
+        let Some(mut group) = sweep_group(cfg, store, journal, &name).await else {
+            continue;
         };
         if !group
             .accounts
@@ -7287,13 +7345,24 @@ pub async fn refresh_space_used(cfg: &DrainConfig, store: &Store) -> Result<(), 
         }
         let mut total = 0u64;
         let mut seen = false;
+        let mut readable = true;
         for mailbox in &group.accounts {
-            if let Some(account) = existing_account(store, mailbox).await? {
-                total = total.saturating_add(account.space_used.unwrap_or(0));
-                seen = true;
+            match store.account(mailbox).await {
+                Ok(Some(account)) => {
+                    total = total.saturating_add(account.space_used.unwrap_or(0));
+                    seen = true;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    report_record(cfg, store, journal, "account", mailbox, &e).await;
+                    readable = false;
+                    break;
+                }
             }
         }
-        if !seen || group.space_used == Some(total) {
+        // A mailbox that could not be read leaves the sum incomplete, so the
+        // group keeps its last figure rather than recording a wrong one.
+        if !readable || !seen || group.space_used == Some(total) {
             continue;
         }
         group.space_used = Some(total);
@@ -7374,10 +7443,14 @@ async fn write_quota_state(store: &Store) -> Result<(), String> {
 /// because a notice is deduplicated on its type and subject. A group mailbox is
 /// skipped: the group holds the payment, and a body's free permanence is the
 /// own-domain tier's own question.
-pub async fn free_anniversaries(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+pub async fn free_anniversaries(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+) -> Result<(), String> {
     let today = OffsetDateTime::now_utc().date();
     for username in store.list("accounts").await? {
-        let Some(account) = existing_account(store, &username).await? else {
+        let Some(account) = sweep_account(cfg, store, journal, &username).await else {
             continue;
         };
         if !account.is_free() {
@@ -7439,10 +7512,14 @@ pub async fn free_anniversaries(cfg: &DrainConfig, store: &Store) -> Result<(), 
 /// the platform has no second copy to add. The notice falls due on the account's
 /// own `paid_until - 30`, at most once per date because the subject carries it.
 /// Only an active account is reminded; one already lapsed is the grace sweep's.
-pub async fn prepaid_renewals(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+pub async fn prepaid_renewals(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+) -> Result<(), String> {
     let today = OffsetDateTime::now_utc().date();
     for username in store.list("accounts").await? {
-        let Some(account) = existing_account(store, &username).await? else {
+        let Some(account) = sweep_account(cfg, store, journal, &username).await else {
             continue;
         };
         if account.state != "active" || account.group.is_some() {
@@ -7620,7 +7697,7 @@ pub async fn export_account(
         .await?;
     }
     let status_token = store
-        .application_copy(username)
+        .account_application_text(username)
         .await?
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|copy| {
@@ -7654,7 +7731,9 @@ pub async fn purge_declined(
         if !name.ends_with(".json") {
             continue;
         }
-        let Some(record) = store.application(name.trim_end_matches(".json")).await? else {
+        let Some(record) =
+            sweep_application(cfg, store, journal, name.trim_end_matches(".json")).await
+        else {
             continue;
         };
         if !record.stage.starts_with("declined") {
@@ -7711,7 +7790,7 @@ pub async fn purge_declined(
             // in use and the purge must not delete what holds it. A failed
             // script leaves the record for the next pass rather than losing the
             // release, and its error is reported once rather than every minute.
-            let taken = existing_account(store, &record.username).await?.is_some()
+            let taken = store.account(&record.username).await?.is_some()
                 || account_on_box(cfg, &record.username)?;
             if !taken {
                 if let Err(e) = run_script(cfg, "delete-user.sh", &[&record.username]).await {
@@ -7755,7 +7834,7 @@ pub async fn purge_closing(
         if validate::username_shape(&username).is_some() {
             continue;
         }
-        let Some(account) = store.account(&username).await? else {
+        let Some(account) = sweep_account(cfg, store, journal, &username).await else {
             continue;
         };
         if account.state != "closing" {
@@ -7788,14 +7867,6 @@ async fn application_record(store: &Store, token: &str) -> Result<Record, String
         .application(token)
         .await?
         .ok_or_else(|| "there is no application for this token".to_string())
-}
-
-/// The account a username already has, when one is there. This is the fast path:
-/// the box itself, read below, is the oracle. A record that cannot be read or
-/// parsed is an error rather than "no account": a sweep that skipped it would
-/// never lapse, notice, renew or alert.
-async fn existing_account(store: &Store, username: &str) -> Result<Option<Account>, String> {
-    store.account(username).await
 }
 
 /// Whether the box itself holds an account for a username, read from the passwd
@@ -8557,17 +8628,12 @@ async fn account_for_payment_reference(
     if !store::is_payment_token(reference) {
         return Ok(None);
     }
-    let Some(join_text) = store
-        .read_record("tokens", &format!("{reference}.json"))
-        .await
-    else {
-        return Ok(None);
-    };
     // A record that is there and does not parse is drift, not a token that
     // names nothing: an `Ok(None)` here would settle the delivery as ignored
     // and delete it, so the caller gets the reason and leaves it for a retry.
-    let join: TokenRecord = serde_json::from_str(&join_text)
-        .map_err(|e| format!("the token record {reference} does not parse: {e}"))?;
+    let Some(join) = store.token(reference).await? else {
+        return Ok(None);
+    };
     if join.token != reference || validate::username_shape(&join.username).is_some() {
         return Ok(None);
     }
@@ -9481,23 +9547,21 @@ mod tests {
         .unwrap();
         let cfg = quota_config(&dir);
         let store = Store::new_for_test(&cfg.store_root);
+        let journal = Journal::load(&store).await.unwrap();
         // The sweep takes `-u` and the mount the config names.
         cfg_script(
             &dir,
             "printf '%s\\n' 'User used soft hard grace used soft hard grace' 'alice -- 1024 5242880 5767168 -- 10 0 0' 'secretary -- 512 5242880 5767168 -- 3 0 0'\n",
         );
 
-        refresh_space_used(&cfg, &store).await.unwrap();
+        refresh_space_used(&cfg, &store, &journal).await.unwrap();
         assert_eq!(
-            existing_account(&store, "alice")
-                .await
-                .unwrap()
-                .unwrap()
-                .space_used,
+            store.account("alice").await.unwrap().unwrap().space_used,
             Some(1024 * 1024)
         );
         assert_eq!(
-            existing_account(&store, "secretary")
+            store
+                .account("secretary")
                 .await
                 .unwrap()
                 .unwrap()
@@ -9520,13 +9584,9 @@ mod tests {
             &dir,
             "printf '%s\\n' 'User used soft hard grace used soft hard grace' 'alice -- 2048 5242880 5767168 -- 10 0 0'\n",
         );
-        refresh_space_used(&cfg, &store).await.unwrap();
+        refresh_space_used(&cfg, &store, &journal).await.unwrap();
         assert_eq!(
-            existing_account(&store, "alice")
-                .await
-                .unwrap()
-                .unwrap()
-                .space_used,
+            store.account("alice").await.unwrap().unwrap().space_used,
             Some(1024 * 1024)
         );
         assert_eq!(
@@ -9541,13 +9601,9 @@ mod tests {
         // than a zero written over a real figure.
         std::fs::remove_file(store.path("quota-check.json")).unwrap();
         cfg_script(&dir, "printf 'no quota table here\\n'\n");
-        refresh_space_used(&cfg, &store).await.unwrap();
+        refresh_space_used(&cfg, &store, &journal).await.unwrap();
         assert_eq!(
-            existing_account(&store, "alice")
-                .await
-                .unwrap()
-                .unwrap()
-                .space_used,
+            store.account("alice").await.unwrap().unwrap().space_used,
             Some(1024 * 1024)
         );
         std::fs::remove_dir_all(&dir).unwrap();

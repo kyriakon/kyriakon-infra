@@ -245,7 +245,7 @@ async fn written(
             util::date_string(day + Duration::days(APPLICATION_PURGE_DAYS))
         )
     };
-    let purge_note = match store.application_copy(username).await? {
+    let purge_note = match store.account_application_text(username).await? {
         Some(text) => match filed_day(&text) {
             Some(filed) if within_purge(filed, now.date()) => {
                 let until = util::date_string(filed + Duration::days(APPLICATION_PURGE_DAYS));

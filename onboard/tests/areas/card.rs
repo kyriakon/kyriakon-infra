@@ -529,10 +529,10 @@ fn a_missing_webhook_secret_is_mailed_once_and_keeps_the_delivery() {
 }
 
 /// An account record that is there and does not parse is drift, not an account
-/// that is gone: the pass names the record and fails, and the checkout is left
-/// for the next pass rather than settled as ignored and deleted.
+/// that is gone: the webhook names the record, the checkout is left for the next
+/// pass, and the sweeps before it carry on with the other accounts.
 #[test]
-fn a_corrupt_account_record_fails_the_pass_and_keeps_the_checkout() {
+fn a_corrupt_account_record_keeps_the_checkout_and_reports() {
     let fix = Fix::new("webhook-corrupt-account");
     fix.card_account("secretary", None);
     let path = fix.dir.join("store/accounts/secretary/account.json");
@@ -548,12 +548,13 @@ fn a_corrupt_account_record_fails_the_pass_and_keeps_the_checkout() {
         }),
     );
 
-    // The binary, because the failure line is what cron mails.
+    // The binary, because the report is the line it prints for cron to mail.
     let out = fix.drain_binary();
-    assert!(!out.status.success(), "{}", body(&out));
+    assert!(out.status.success(), "{}", body(&out));
     assert!(
-        body(&out).contains("accounts/secretary/account.json does not parse"),
-        "the record is not named: {}",
+        body(&out).contains("webhook evt_corrupt (checkout.session.completed)")
+            && body(&out).contains("accounts/secretary/account.json does not parse"),
+        "the delivery is not reported: {}",
         body(&out)
     );
     assert!(
