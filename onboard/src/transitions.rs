@@ -5174,6 +5174,98 @@ async fn write_group_state(store: &Store, domain: &str, bytes: &[u8]) -> Result<
         .await
 }
 
+/// The lock every writer of a mail table holds: a `<table>.lock` directory with
+/// the owner's pid inside. The shell scripts take the same directory in lib.sh's
+/// table_lock, with the same pid file and the same stale rule, so a drain append
+/// and an operator deploy or delete exclude each other. Releasing is the Drop
+/// impl, so an early return cannot leave it behind.
+struct TableLock {
+    dir: std::path::PathBuf,
+}
+
+impl TableLock {
+    fn acquire(path: &str) -> Result<TableLock, String> {
+        let dir = std::path::PathBuf::from(format!("{path}.lock"));
+        let mut reaped = false;
+        for attempt in 0..5 {
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {
+                    if let Err(e) =
+                        std::fs::write(dir.join("pid"), format!("{}\n", std::process::id()))
+                    {
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return Err(format!(
+                            "cannot write the owner pid into {}: {e}",
+                            dir.display()
+                        ));
+                    }
+                    return Ok(TableLock { dir });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !reaped {
+                        if let Some(reason) = stale_table_lock(&dir) {
+                            eprintln!("reaping stale lock {}: {reason}", dir.display());
+                            let _ = std::fs::remove_dir_all(&dir);
+                            reaped = true;
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("cannot lock {path}: {e}"));
+                }
+            }
+            if attempt < 4 {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+        Err(format!(
+            "could not lock {path}: {} exists and did not clear; remove it if no writer is running",
+            dir.display()
+        ))
+    }
+}
+
+impl Drop for TableLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Why `<table>.lock` is not being held by a live writer, or `None` when it
+/// looks live. The pid file is the first answer; a lock old enough that no
+/// legitimate write could still hold it is the second, which also covers a
+/// writer killed between mkdir and the pid write.
+fn stale_table_lock(dir: &std::path::Path) -> Option<String> {
+    if let Ok(text) = std::fs::read_to_string(dir.join("pid")) {
+        let pid = text.trim();
+        if !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) {
+            let alive = std::process::Command::new("/bin/kill")
+                .arg("-0")
+                .arg(pid)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(true);
+            if !alive {
+                return Some(format!("pid {pid} is gone"));
+            }
+            // A live owner is holding it, however long the write is taking.
+            return None;
+        }
+    }
+    let held = std::fs::metadata(dir)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok());
+    if let Some(held) = held {
+        if held.as_secs() > 30 {
+            return Some(format!("it has been held for {} seconds", held.as_secs()));
+        }
+    }
+    None
+}
+
 /// Ensure one line is in a virtual table: a bare value when `value` is `None`
 /// (a `mail_domains` line), and `name: value` otherwise (a `virtuals` entry). A
 /// key already present with the same value is left alone; one present with a
@@ -5181,6 +5273,7 @@ async fn write_group_state(store: &Store, domain: &str, bytes: &[u8]) -> Result<
 /// somebody's mail. Written through a temporary in the same directory, so smtpd
 /// never reads half a table.
 fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), String> {
+    let _lock = TableLock::acquire(path)?;
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
     for line in text.lines() {
@@ -5210,11 +5303,11 @@ fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), 
         None => name.to_string(),
     };
     // Append rather than rewrite. A rewrite reads the whole table and renames a
-    // copy over it, so a line another drain pass appended between the read and
-    // the rename is lost; two passes can overlap (cron does not lock, and one
-    // approval runs subprocesses and a network call). One append cannot lose a
-    // line. The newline guard is the same one deploy-mail.sh uses: a hand edit
-    // may have left the last line unterminated.
+    // copy over it, so a line another writer appended between the read and the
+    // rename is lost; one approval runs subprocesses and a network call, so two
+    // passes overlap. The lock above is what excludes a shell writer, and the
+    // append itself cannot lose a line. The newline guard is the same one
+    // deploy-mail.sh uses: a hand edit may have left the last line unterminated.
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -5261,7 +5354,10 @@ fn address_count(path: &str, domain: &str) -> Result<usize, String> {
 }
 
 /// Rewrite a table through a temporary beside it, then rename it into place.
-fn write_table(path: &str, text: &str) -> Result<(), String> {
+/// The `TableLock` argument is the proof that the caller holds the table's lock
+/// for the read that produced `text` as well as this write: an unlocked rewrite
+/// would drop a line another writer appended between the two.
+fn write_table(path: &str, text: &str, _lock: &TableLock) -> Result<(), String> {
     let candidate = format!("{path}.onboard.{}", std::process::id());
     std::fs::write(&candidate, text).map_err(|e| format!("cannot write {candidate}: {e}"))?;
     std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o644))
@@ -5274,10 +5370,8 @@ fn write_table(path: &str, text: &str) -> Result<(), String> {
 /// nothing. `ensure_table_line` refuses a different value on purpose (it must
 /// not overrule a line somebody else made), so this is the explicit repoint.
 ///
-/// shortcut: a rewrite can drop a line another pass appends between the read and
-/// the rename; only the operator's own upgrade takes this path, and the drain
-/// does not run two address changes at once.
 fn repoint_table_line(path: &str, name: &str, want: &str) -> Result<(), String> {
+    let lock = TableLock::acquire(path)?;
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
     let mut out = String::new();
@@ -5297,15 +5391,16 @@ fn repoint_table_line(path: &str, name: &str, want: &str) -> Result<(), String> 
         out.push('\n');
     }
     if !found {
-        return ensure_table_line(path, name, Some(want));
+        out.push_str(&format!("{name}: {want}\n"));
     }
-    write_table(path, &out)
+    write_table(path, &out, &lock)
 }
 
 /// Drop every line for `domain` that points at `mailbox`. That is the mailbox's
 /// own address and any alias into it, so no entry is left delivering nowhere.
 /// Returns whether the table changed.
 fn remove_addresses(path: &str, domain: &str, mailbox: &str) -> Result<bool, String> {
+    let lock = TableLock::acquire(path)?;
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
     let suffix = format!("@{domain}");
@@ -5324,7 +5419,7 @@ fn remove_addresses(path: &str, domain: &str, mailbox: &str) -> Result<bool, Str
         out.push('\n');
     }
     if changed {
-        write_table(path, &out)?;
+        write_table(path, &out, &lock)?;
     }
     Ok(changed)
 }
@@ -9414,6 +9509,90 @@ mod tests {
         assert_eq!(retry_after_minutes(4), 60);
         // The cap holds, so the drain keeps retrying rather than stopping.
         assert_eq!(retry_after_minutes(40), 60);
+    }
+
+    /// The lock the shell takes is `<table>.lock` with the owner's pid inside, so
+    /// this asserts the Rust side uses that path and file, and that dropping the
+    /// guard releases it. That shared shape is what lets a drain append and a
+    /// deploy's table_set exclude each other.
+    #[test]
+    fn the_mail_table_lock_is_a_pid_directory_beside_the_table() {
+        let dir = std::env::temp_dir().join(format!("onboard-table-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let table = dir.join("virtuals");
+        std::fs::write(&table, "hello: oliver\n").unwrap();
+        let path = table.to_str().unwrap();
+
+        let lock = TableLock::acquire(path).unwrap();
+        let lock_dir = dir.join("virtuals.lock");
+        assert!(
+            lock_dir.is_dir(),
+            "the lock is a directory beside the table"
+        );
+        assert_eq!(
+            std::fs::read_to_string(lock_dir.join("pid"))
+                .unwrap()
+                .trim(),
+            std::process::id().to_string(),
+            "the owner pid is inside, which is what the shell reads"
+        );
+        drop(lock);
+        assert!(!lock_dir.exists(), "releasing removes the directory");
+        drop(TableLock::acquire(path).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A lock whose owner is gone is reaped rather than left to wedge every
+    /// later writer, which is the shell's rule too.
+    #[test]
+    fn a_stale_mail_table_lock_is_reaped() {
+        let dir = std::env::temp_dir().join(format!("onboard-table-reap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let table = dir.join("mail_domains");
+        std::fs::write(&table, "kyriakon.net\n").unwrap();
+        let lock_dir = dir.join("mail_domains.lock");
+        std::fs::create_dir(&lock_dir).unwrap();
+        std::fs::write(lock_dir.join("pid"), "999999\n").unwrap();
+
+        let lock = TableLock::acquire(table.to_str().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(lock_dir.join("pid"))
+                .unwrap()
+                .trim(),
+            std::process::id().to_string()
+        );
+        drop(lock);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Three writers at once, the case the lock exists for: every appended line
+    /// is in the table afterwards, with no candidate left beside it. The retry is
+    /// in whole seconds, so the count is kept under the five-second wait.
+    #[test]
+    fn concurrent_table_appends_all_land() {
+        let dir = std::env::temp_dir().join(format!("onboard-table-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let table = dir.join("virtuals");
+        std::fs::write(&table, "hello: oliver\n").unwrap();
+        let path = table.to_str().unwrap().to_string();
+
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                ensure_table_line(&path, &format!("user{i}"), Some("mailbox"))
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let text = std::fs::read_to_string(&table).unwrap();
+        assert_eq!(text.lines().count(), 4, "{text}");
+        assert!(!dir.join("virtuals.lock").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// OpenBSD `repquota -u` output as the sweep reads it: two header lines and

@@ -34,6 +34,10 @@
 
 set -euo pipefail
 
+script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
+
 # The production proof directory, matching `session::PROOF_DIR` and the
 # `proof_dir` value in both onboarding configs. The handler may pass another
 # only in a test; the drain reads its own configured directory either way.
@@ -52,16 +56,6 @@ die() {
 fail() {
 	printf 'kyriakon-authcheck: %s\n' "$*" >&2
 	exit 1
-}
-
-# The username charset scripts/add-user.sh enforces: lowercase letters, digits,
-# dot, underscore and hyphen, starting with a letter or a digit, at most 32.
-# Anything else is not a member and is refused before doveadm sees it.
-valid_username() {
-	case "$1" in
-	'' | [!a-z0-9]* | *[!a-z0-9._-]*) return 1 ;;
-	esac
-	[ "${#1}" -le 32 ]
 }
 
 # Whether `dir` is the root-owned 0700 directory the deploy makes. A directory
@@ -89,21 +83,19 @@ mint_proof() {
 }
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	work=$self_test_work
 	check "a member shape passes" \
-		"$(valid_username 'theophilus.1' && printf yes || printf no)" yes
+		"$(valid_localpart 'theophilus.1' && printf yes || printf no)" yes
 	check "an uppercase letter is refused" \
-		"$(valid_username 'Theophilus' && printf yes || printf no)" no
+		"$(valid_localpart 'Theophilus' && printf yes || printf no)" no
 	check "a leading dot is refused" \
-		"$(valid_username '.theophilus' && printf yes || printf no)" no
+		"$(valid_localpart '.theophilus' && printf yes || printf no)" no
 	check "a slash is refused" \
-		"$(valid_username 'theo/philus' && printf yes || printf no)" no
+		"$(valid_localpart 'theo/philus' && printf yes || printf no)" no
 	check "33 characters are refused" \
-		"$(valid_username 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' && printf yes || printf no)" no
+		"$(valid_localpart 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' && printf yes || printf no)" no
 
 	token=$(mint_proof "$work" 'theophilus.1')
 	check "a proof token is 64 lowercase hex characters" \
@@ -148,7 +140,7 @@ esac
 	|| die "usage: kyriakon-authcheck <username> [proof-dir] (password on stdin)"
 user=$1
 proof_dir=${2:-$proof_dir_default}
-valid_username "$user" || die "not a member username: $user"
+valid_localpart "$user" || die "not a member username: $user"
 root_proof_dir "$proof_dir" \
 	|| fail "$proof_dir is not the root-owned 0700 login proof directory; run scripts/deploy-onboard.sh"
 

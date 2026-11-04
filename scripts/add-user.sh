@@ -19,6 +19,8 @@
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
 
 if [ "$#" -ne 1 ]; then
 	printf 'usage: %s <username>\n' "$0" >&2
@@ -28,8 +30,8 @@ user="$1"
 
 # Localpart-safe charset: lowercase alnum and a short safe set. Keeps the
 # username valid as a filesystem path and keyring filename, and as the
-# username.kyriakon.net subdomain label.
-if ! printf '%s' "$user" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'; then
+# username.kyriakon.net subdomain label. One rule for every script.
+if ! valid_localpart "$user"; then
 	printf 'invalid username: %s (lowercase [a-z0-9._-], <=32 chars)\n' "$user" >&2
 	exit 1
 fi

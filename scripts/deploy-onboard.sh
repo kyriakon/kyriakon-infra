@@ -313,6 +313,10 @@ install -m 0755 "$repo_dir/openbsd/etc/rc.d/kyriakon_onboard" /etc/rc.d/kyriakon
 # arguments (they are the username), so it names this program, and the program
 # is what keeps the subcommand fixed and mints the login proof.
 install -d -m 0755 -o root -g wheel /usr/local/libexec
+# lib.sh sits beside it because the checker sources valid_localpart from there.
+# It is a 0644 source file, not a program, so it adds nothing the doas rule can
+# run: the rule still names only /usr/local/libexec/kyriakon-authcheck.
+install_staged "$repo_dir/scripts/lib.sh" /usr/local/libexec/lib.sh -m 0644
 install_staged "$repo_dir/scripts/kyriakon-authcheck.sh" /usr/local/libexec/kyriakon-authcheck -m 0755
 
 # The login proofs: one file per admitted login, named by a random token, written

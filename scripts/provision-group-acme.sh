@@ -91,11 +91,6 @@ domain_ok() {
 	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
 }
 
-# The site owner is a member account: the same charset add-user.sh applies.
-account_ok() {
-	printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'
-}
-
 # The paths, as functions so the self-test rebinds the directory once.
 group_conf() { printf '%s/%s.conf' "$acme_d" "$domain"; }
 cert_file() { printf '/etc/ssl/%s.fullchain.pem' "$domain"; }
@@ -264,7 +259,7 @@ case "${1:-}" in
 	domain="$1"
 	account="$2"
 	domain_ok "$domain" || die "not a domain: $domain (lowercase FQDN, at least two labels)"
-	account_ok "$account" || die "not an account name: $account"
+	valid_localpart "$account" || die "not an account name: $account"
 	[ "$(id -u)" -eq 0 ] || die "run this with doas: it writes $acme_d and files a root-only queue request"
 	[ -d "$acme_d" ] || die "no $acme_d: doas ksh scripts/deploy-mail.sh creates it, with the index acme-client.conf includes"
 	assert_site_tree

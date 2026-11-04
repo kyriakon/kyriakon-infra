@@ -60,6 +60,10 @@
 
 set -euo pipefail
 
+script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
+
 # The key this file writes is not secret, but the temporary file is created here,
 # and a 0600 temporary chmodded 0644 before the rename cannot leave a readable
 # half-written vhost behind.
@@ -101,13 +105,7 @@ domain_ok() {
 	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
 }
 
-# The site owner is a member account: the same charset add-user.sh and
-# provision-member.sh apply, because it is a path component under /home/www.
-account_ok() {
-	printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'
-}
-
-# The paths, as functions so the self-test rebinds the directories once.
+# The paths, as functions so the self-test rebinds them once.
 cert_file() { printf '%s/%s.fullchain.pem' "$ssl_dir" "$domain"; }
 key_file() { printf '%s/%s.key' "$ssl_private" "$domain"; }
 group_conf() { printf '%s/%s.conf' "$httpd_d" "$domain"; }
@@ -340,7 +338,7 @@ case "${1:-}" in
 	domain="$1"
 	account="$2"
 	domain_ok "$domain" || die "not a domain: $domain (lowercase FQDN, at least two labels)"
-	account_ok "$account" || die "not an account name: $account"
+	valid_localpart "$account" || die "not an account name: $account"
 	[ "$(id -u)" -eq 0 ] || die "run this with doas: it writes $httpd_d"
 	[ -d "$httpd_d" ] || die "no $httpd_d: doas ksh scripts/deploy-mail.sh creates it, with the index httpd.conf includes"
 	assert_site_tree

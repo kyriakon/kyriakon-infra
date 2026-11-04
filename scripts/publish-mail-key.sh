@@ -228,10 +228,9 @@ publish() {
 	key_file=$2
 	token_file=$3
 
-	# The charset add-user.sh, acme-queue.sh and check-keyring-drift.sh already
-	# carry, because the name is a filename here, a path in the API and half of a
-	# branch name.
-	printf '%s' "$localpart" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$' ||
+	# The shared charset, because the name is a filename here, a path in the API
+	# and half of a branch name.
+	valid_localpart "$localpart" ||
 		die "the localpart $localpart is not a name this platform uses"
 	[ -f "$key_file" ] || die "no key file at $key_file"
 	[ -s "$key_file" ] || die "the key file $key_file is empty"

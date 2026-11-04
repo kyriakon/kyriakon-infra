@@ -22,18 +22,17 @@ set -euo pipefail
 # drift check's children and every other test get a path that does not exist.
 export KYRIAKON_ENV=/dev/null
 
-# Scripts that cannot answer --self-test. A library has no run to make, and the
-# rest need a live box, root or a service this checkout does not have. A script
-# not named here without a self_test() fails the run, so a new script either
-# carries its test or its exemption is a deliberate edit.
+# Scripts that cannot answer --self-test: they need a live box, root or a service
+# this checkout does not have. A script not named here without a self_test()
+# fails the run, so a new script either carries its test or its exemption is a
+# deliberate edit. lib.sh and provision-member.sh are absent because their
+# table-writing helpers have tests of their own.
 self_test_optional="
-lib.sh
 add-user.sh
 backup.sh
 deploy-nsd.sh
 gen-finger-page.sh
 onboard-store.sh
-provision-member.sh
 rehearsal.sh
 rekey-mail-key.sh
 renew-acme.sh

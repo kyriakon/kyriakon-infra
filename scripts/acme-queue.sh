@@ -186,13 +186,6 @@ name_ok() {
 	printf '%s' "$1" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
 }
 
-# owner_ok <name> : a site owner is a member account, the string add-user.sh
-# accepted as a username, and it becomes the account named in the 443 vhost the
-# queue writes when an own-domain certificate lands.
-owner_ok() {
-	printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'
-}
-
 # minutes_until_slot <now> <last_attempt> : 0 when a slot is open, else the whole
 # minutes still to wait. Rounded up, so the wait reported is never shorter than the
 # real one.
@@ -384,7 +377,7 @@ add_request() {
 		# An own-domain name needs the account the 443 vhost will root, and the
 		# queue is where it is kept between provisioning and issuance.
 		[ -n "$owner" ] || die "the own-domain name $name needs its site owner account, so the 443 vhost can be written when the certificate lands"
-		owner_ok "$owner" || die "not an account name: $owner"
+		valid_localpart "$owner" || die "not an account name: $owner"
 		;;
 	esac
 	install -d -m 0700 "$queue_dir" "$pending_dir"
@@ -498,8 +491,8 @@ self_test() {
 	check "a single-label domain is refused" "$(name_ok localhost && printf yes || printf no)" "no"
 	check "a leading hyphen is refused" "$(name_ok -parish.example && printf yes || printf no)" "no"
 	check "a path is refused" "$(name_ok ../etc/passwd.kyriakon.net && printf yes || printf no)" "no"
-	check "a site owner is a member account name" "$(owner_ok parish-secretary && printf yes || printf no)" "yes"
-	check "and a path is not a site owner" "$(owner_ok ../parish && printf yes || printf no)" "no"
+	check "a site owner is a member account name" "$(valid_localpart parish-secretary && printf yes || printf no)" "yes"
+	check "and a path is not a site owner" "$(valid_localpart ../parish && printf yes || printf no)" "no"
 
 	base=2000000000
 	check "no attempt yet means an open slot" "$(minutes_until_slot "$base" 0)" "0"

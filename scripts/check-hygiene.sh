@@ -290,6 +290,46 @@ self_test() {
 		exit 1
 	}
 
+	# Section 7's first-line rule: provision-member.sh reads the first line as the
+	# platform domain, so a table that names a body's domain first is a finding
+	# even when every domain is in the allow list.
+	printf 'parish.example\nkyriakon.net\n' > "$dir/mail_domains"
+	out=$(mail_domains_first_problem "$dir/mail_domains" kyriakon.net)
+	case "$out" in
+	*parish.example*)
+		;;
+	*)
+		printf 'FAIL: a mail_domains table not starting with the platform domain is a finding; got [%s]\n' \
+			"$out" >&2
+		exit 1
+		;;
+	esac
+	printf 'kyriakon.net\nparish.example\n' > "$dir/mail_domains"
+	out=$(mail_domains_first_problem "$dir/mail_domains" kyriakon.net)
+	[ -z "$out" ] || {
+		printf 'FAIL: the platform domain first is not a finding; got [%s]\n' "$out" >&2
+		exit 1
+	}
+
+	# A lock whose owner is gone is a finding; one held by this live shell is not.
+	mkdir "$dir/mail_domains.lock"
+	printf '999999\n' > "$dir/mail_domains.lock/pid"
+	out=$(table_lock_stale "$dir/mail_domains")
+	case "$out" in
+	*'pid 999999 is gone'*) ;;
+	*)
+		printf 'FAIL: a lock whose owner is gone is stale; got [%s]\n' "$out" >&2
+		exit 1
+		;;
+	esac
+	printf '%s\n' "$$" > "$dir/mail_domains.lock/pid"
+	out=$(table_lock_stale "$dir/mail_domains")
+	[ -z "$out" ] || {
+		printf 'FAIL: a lock held by a live pid is not stale; got [%s]\n' "$out" >&2
+		exit 1
+	}
+	rm -rf "$dir/mail_domains.lock"
+
 	# The remedy is per tool, from the absent list. The caller used to print one
 	# line using `$tool`, which after its loop is jq whatever is missing.
 	out=$(tool_remedy hcloud)
@@ -701,27 +741,55 @@ fi
 # header says the same, which is what made the pair worth checking rather than
 # trusting.
 mail_domains_table=/etc/mail/mail_domains
+platform_domain=kyriakon.net
 spamd_allowed=/etc/mail/spamd.alloweddomains
+mail_domains_ok=yes
 if [ ! -f "$mail_domains_table" ]; then
 	printf 'mail domains: %s is missing; scripts/deploy-mail.sh seeds it with the platform domain\n' \
 		"$mail_domains_table"
 	status=1
-elif [ ! -f "$spamd_allowed" ]; then
-	printf 'mail domains: %s is missing; it is installed from openbsd/etc/spamd.alloweddomains\n' \
-		"$spamd_allowed"
-	status=1
+	mail_domains_ok=no
 else
-	unwelcome=$(domains_missing_from "$mail_domains_table" "$spamd_allowed")
-	if [ -n "$unwelcome" ]; then
-		printf 'mail domains: %s names these and %s has no line for them, so spamd traps them and blocklists the sender:\n' \
-			"$mail_domains_table" "$spamd_allowed"
-		printf '%s\n' "$unwelcome" | sed -e 's/^/  /'
-		printf '  the line it wants is @<domain>; add it and reload spamd\n'
+	# Independent of the allow list: a missing spamd file must not hide a table
+	# whose first line would address a new member on a body's domain.
+	first_problem=$(mail_domains_first_problem "$mail_domains_table" "$platform_domain")
+	if [ -n "$first_problem" ]; then
+		printf 'mail domains: %s: %s\n' "$mail_domains_table" "$first_problem"
 		status=1
+		mail_domains_ok=no
+	fi
+	if [ ! -f "$spamd_allowed" ]; then
+		printf 'mail domains: %s is missing; it is installed from openbsd/etc/spamd.alloweddomains\n' \
+			"$spamd_allowed"
+		status=1
+		mail_domains_ok=no
 	else
-		printf 'mail domains: every domain smtpd accepts is in the greylist pass-through list\n'
+		unwelcome=$(domains_missing_from "$mail_domains_table" "$spamd_allowed")
+		if [ -n "$unwelcome" ]; then
+			printf 'mail domains: %s names these and %s has no line for them, so spamd traps them and blocklists the sender:\n' \
+				"$mail_domains_table" "$spamd_allowed"
+			printf '%s\n' "$unwelcome" | sed -e 's/^/  /'
+			printf '  the line it wants is @<domain>; add it and reload spamd\n'
+			status=1
+			mail_domains_ok=no
+		fi
 	fi
 fi
+if [ "$mail_domains_ok" = yes ]; then
+	printf 'mail domains: every domain smtpd accepts is in the greylist pass-through list\n'
+fi
+
+# A writer killed while holding a table lock leaves <table>.lock, and every later
+# writer waits five seconds and then refuses. Report a stale one here rather than
+# letting the next signup be the thing that discovers it.
+for mail_table in "$mail_domains_table" /etc/mail/virtuals /etc/mail/mail_from /etc/mail/dkim_domains; do
+	lock_problem=$(table_lock_stale "$mail_table")
+	if [ -n "$lock_problem" ]; then
+		printf 'mail domains: %s.lock is stale: %s; remove it if no writer is running\n' \
+			"$mail_table" "$lock_problem"
+		status=1
+	fi
+done
 
 # --- 8. the address every alert is mailed to ------------------------------
 # notify_operator in lib.sh mails this address and prints when it cannot. The

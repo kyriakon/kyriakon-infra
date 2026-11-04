@@ -53,6 +53,8 @@ PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
 export PATH
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
 
 # cert_paths: the same three files the relay deploy and the member pass make, so
 # the removal cannot miss one under a name of its own.
@@ -255,7 +257,14 @@ remove_member() {
 				printf 'would remove the address lines for %s@\n' "$user"
 			fi
 		else
-			if remove_own_addresses; then
+			drop_rc=0
+			remove_own_addresses || drop_rc=$?
+			if [ "$drop_rc" -gt 1 ]; then
+				printf 'the address lines for %s@ were not removed from %s; fix the table, then rerun\n' \
+					"$user" "$virtuals" >&2
+				return 1
+			fi
+			if [ "$drop_rc" -eq 0 ]; then
 				printf 'removed the address lines for %s@ from %s\n' "$user" "$virtuals"
 				restart_smtpd
 				printf 'restarted smtpd, which reads the table at start\n'
@@ -307,30 +316,12 @@ remove_member() {
 }
 
 # remove_own_addresses: drop this member's own lines from the virtual table.
-# Returns 0 when the file changed and 1 when it did not, which is what decides
-# whether smtpd needs restarting. The table is rewritten rather than edited in
-# place so a crash cannot leave it half written, a copy of the one it replaces is
-# kept, and the mode and ownership are set explicitly because a file smtpd reads
-# with the wrong owner is a table that does not load.
+# Returns 0 when the file changed, 1 when it did not, and 2 when the write
+# failed; the caller must keep 2 apart from 1. The key is a literal prefix, so a
+# member named a.b does not take axb@ with them. lib.sh's table_drop keeps a copy
+# of the table it replaces, so a deletion can be undone.
 remove_own_addresses() {
-	stamp=$(date +%Y%m%d%H%M%S)
-	# Root sets the owner explicitly, because a table smtpd reads with the wrong
-	# owner is a table that does not load. The self-test runs unprivileged in a
-	# throwaway tree, where chown cannot and need not happen.
-	# shellcheck disable=SC2086  # intentional splitting: two flags, or none
-	owner_flags=$([ "$(id -u)" -eq 0 ] && printf '%s' "-o root -g wheel")
-	candidate="$virtuals.kyriakon.$$"
-	awk -v u="$user" -F: '$1 !~ ("^" u "@")' "$virtuals" >"$candidate"
-	if cmp -s "$virtuals" "$candidate"; then
-		rm -f "$candidate"
-		return 1
-	fi
-	cp -p "$virtuals" "$virtuals.$stamp.bak"
-	# shellcheck disable=SC2086
-	install -m 0644 $owner_flags "$candidate" "$virtuals"
-	rm -f "$candidate"
-	printf 'kept %s.%s.bak\n' "$virtuals" "$stamp"
-	return 0
+	table_drop "$virtuals" prefix "$user@"
 }
 
 # --- the self-test ----------------------------------------------------------
@@ -474,12 +465,11 @@ if [ "$#" -ne 1 ]; then
 fi
 user="$1"
 
-# The same charset rule add-user.sh and provision-member.sh enforce, and for the
-# same reasons: the name is a filesystem path component, a subdomain label and
-# part of three configuration file names. Here it is also the thing standing
-# between this script and an rm -rf somewhere else, which is why the two guards
-# below repeat the work rather than trusting it.
-if ! printf '%s' "$user" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'; then
+# The shared charset rule: the name is a filesystem path component, a subdomain
+# label and part of three configuration file names. Here it is also the thing
+# standing between this script and an rm -rf somewhere else, which is why the two
+# guards below repeat the work rather than trusting it.
+if ! valid_localpart "$user"; then
 	printf 'invalid username: %s (lowercase [a-z0-9._-], <=32 chars)\n' "$user" >&2
 	exit 1
 fi

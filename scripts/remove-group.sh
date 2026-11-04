@@ -63,6 +63,8 @@ PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
 export PATH
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
 
 # cert_paths: the link, chain and key are the same three files the relay deploy
 # and the member pass make, so removing one under a different name is how a
@@ -103,66 +105,6 @@ domain_ok() {
 # The restart, as a function so the self-test can record it instead of running it.
 reload_smtpd() { ksh "$script_dir/reload-smtpd.sh"; }
 
-# install_table <file> <candidate>: keep a timestamped copy of the table and move
-# the candidate into its place. Root sets the owner explicitly, because a table
-# smtpd reads with the wrong owner is a table that does not load; the self-test
-# runs unprivileged in a throwaway tree, where chown cannot and need not happen.
-install_table() {
-	typeset file="$1" candidate="$2" stamp owner_flags
-	stamp=$(date +%Y%m%d%H%M%S)
-	cp -p "$file" "$file.$stamp.bak"
-	owner_flags=""
-	if [ "$(id -u)" -eq 0 ]; then
-		owner_flags="-o root -g wheel"
-	fi
-	# shellcheck disable=SC2086  # intentional splitting: two flags, or none
-	install -m 0644 $owner_flags "$candidate" "$file"
-	rm -f "$candidate"
-	printf 'kept %s.%s.bak\n' "$file" "$stamp"
-}
-
-# drop_line <file> <line>: remove the whole lines equal to <line>. Returns 0 and
-# says whether it changed the file, which is what decides the smtpd restart.
-drop_line() {
-	typeset file="$1" line="$2" candidate
-	table_changed=no
-	[ -f "$file" ] || return 0
-	candidate="$file.kyriakon.$$"
-	awk -v line="$line" '$0 != line' "$file" >"$candidate"
-	if cmp -s "$file" "$candidate"; then
-		rm -f "$candidate"
-		return 0
-	fi
-	install_table "$file" "$candidate"
-	printf 'removed %s from %s\n' "$line" "$file"
-	table_changed=yes
-}
-
-# drop_domain_addresses <file> <domain>: remove every entry whose address is on
-# the body's domain, both mailboxes and aliases. The key is compared after the
-# colon, trimmed, and only by its suffix, so an address on another domain that
-# merely contains this one is left alone.
-drop_domain_addresses() {
-	typeset file="$1" domain="$2" candidate
-	table_changed=no
-	[ -f "$file" ] || return 0
-	candidate="$file.kyriakon.$$"
-	awk -v suffix="@$domain" -F: '{
-		key = $1
-		gsub(/^[ \t]+|[ \t]+$/, "", key)
-		if (length(key) >= length(suffix) \
-			&& substr(key, length(key) - length(suffix) + 1) == suffix) next
-		print
-	}' "$file" >"$candidate"
-	if cmp -s "$file" "$candidate"; then
-		rm -f "$candidate"
-		return 0
-	fi
-	install_table "$file" "$candidate"
-	printf 'removed the %s entries from %s\n' "$domain" "$file"
-	table_changed=yes
-}
-
 # remove_path <description> <path>: remove one file or symlink, saying so only
 # when it was there.
 remove_path() {
@@ -174,25 +116,40 @@ remove_path() {
 	printf 'removed the %s %s\n' "$description" "$path"
 }
 
+# drop_table <table> <exact|prefix|suffix> <text> <message>
+#
+# One table_drop call and its report, with 2 (failure) kept apart from 1 (no
+# match): a failed write must stop the removal, not read as nothing to do.
+# Sets tables_changed when the table changed, and returns 1 on a failed write.
+drop_table() {
+	typeset table="$1" mode="$2" text="$3" message="$4" rc=0
+	table_drop "$table" "$mode" "$text" || rc=$?
+	case $rc in
+	0)
+		printf '%s\n' "$message"
+		tables_changed=yes
+		;;
+	1) ;;
+	*) return 1 ;;
+	esac
+	return 0
+}
+
 # remove_group: the whole job, in the order the transition's notes give.
 # shellcheck disable=SC2154 # the three paths come from cert_paths in lib.sh
 remove_group() {
 	tables_changed=no
 
 	# 1. The mail tables. mail_domains and dkim_domains carry the domain as a
-	# whole line; virtuals carries one line per address on it.
-	drop_line "$mail_domains" "$domain"
-	if [ "$table_changed" = yes ]; then
-		tables_changed=yes
-	fi
-	drop_line "$dkim_domains" "$domain"
-	if [ "$table_changed" = yes ]; then
-		tables_changed=yes
-	fi
-	drop_domain_addresses "$virtuals" "$domain"
-	if [ "$table_changed" = yes ]; then
-		tables_changed=yes
-	fi
+	# whole line; virtuals carries one line per address on it, both mailboxes and
+	# aliases. Every match is literal, so a domain called parish-example.net is
+	# not the same line as parish.example.
+	drop_table "$mail_domains" exact "$domain" \
+		"removed $domain from $mail_domains" || return 1
+	drop_table "$dkim_domains" exact "$domain" \
+		"removed $domain from $dkim_domains" || return 1
+	drop_table "$virtuals" suffix "@$domain" \
+		"removed the $domain entries from $virtuals" || return 1
 
 	# 2. The generated daemon blocks and the certificate material. The order
 	# inside this step does not matter: cron-apply.sh --web runs after this
@@ -247,10 +204,14 @@ self_test() {
 
 	domain=parish.example
 	other=other.example
+	# parish-example.net is the lookalike that a pattern match on the domain
+	# would take with parish.example; every match below is literal.
+	lookalike=parish-example.net
 	{
 		printf 'kyriakon.net\n'
 		printf '%s\n' "$domain"
 		printf '%s\n' "$other"
+		printf '%s\n' "$lookalike"
 	} >"$mail_domains"
 	cp "$mail_domains" "$dkim_domains"
 	{
@@ -258,6 +219,7 @@ self_test() {
 		printf 'office@%s: parish-secretary\n' "$domain"
 		printf 'alice@kyriakon.net: alice\n'
 		printf 'secretary@%s: somebody\n' "$other"
+		printf 'secretary@%s: somebody\n' "$lookalike"
 	} >"$virtuals"
 	for d in "$domain" "$other"; do
 		: >"$httpd_d/$d.conf"
@@ -279,13 +241,18 @@ self_test() {
 		"$(grep -cxF "$domain" "$mail_domains" || true)" 0
 	check "and kept the platform and the other body" \
 		"$(grep -cE '^(kyriakon\.net|other\.example)$' "$mail_domains")" 2
+	check "and kept the domain that merely looks like it" \
+		"$(grep -cxF "$lookalike" "$mail_domains")" 1
 	check "the DKIM list lost the domain" \
 		"$(grep -cxF "$domain" "$dkim_domains" || true)" 0
 	check "and kept the other body" "$(grep -cxF "$other" "$dkim_domains")" 1
+	check "and the lookalike" "$(grep -cxF "$lookalike" "$dkim_domains")" 1
 	check "the virtual table lost every address on the domain" \
-		"$(grep -c "@$domain" "$virtuals" || true)" 0
+		"$(grep -cF "@$domain" "$virtuals" || true)" 0
 	check "and kept the platform's and the other body's" \
 		"$(grep -cE '^(alice@kyriakon\.net|secretary@other\.example)' "$virtuals")" 2
+	check "and the lookalike's address" \
+		"$(grep -c "^secretary@$lookalike:" "$virtuals")" 1
 	check "the vhost went" "$([ -e "$httpd_d/$domain.conf" ] && echo present || echo gone)" gone
 	check "the capsule block went" "$([ -e "$gmid_d/$domain.conf" ] && echo present || echo gone)" gone
 	check "the ACME block went" "$([ -e "$acme_d/$domain.conf" ] && echo present || echo gone)" gone

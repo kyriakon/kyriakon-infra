@@ -53,6 +53,10 @@
 
 set -euo pipefail
 
+script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
+
 # The private key half is created under this umask, so a key file openssl creates
 # is never readable by anyone else even before the chmod below runs.
 umask 077
@@ -97,13 +101,7 @@ domain_ok() {
 	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
 }
 
-# The site owner is a member account: the same charset add-user.sh applies,
-# because it is a path component under /home/www.
-account_ok() {
-	printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'
-}
-
-# The paths, as functions so the self-test rebinds the directories once.
+# The paths, as functions so the self-test rebinds them once.
 capsule_cnf() { printf '%s/capsule-%s.cnf' "$ssl_dir" "$domain"; }
 capsule_cert() { printf '%s/capsule-%s.crt' "$ssl_dir" "$domain"; }
 capsule_key() { printf '%s/capsule-%s.key' "$ssl_private" "$domain"; }
@@ -381,7 +379,7 @@ case "${1:-}" in
 	domain="$1"
 	account="$2"
 	domain_ok "$domain" || die "not a domain: $domain (lowercase FQDN, at least two labels)"
-	account_ok "$account" || die "not an account name: $account"
+	valid_localpart "$account" || die "not an account name: $account"
 	[ "$(id -u)" -eq 0 ] || die "run this with doas: it writes $gmid_d and the pair under $ssl_dir"
 	[ -x "$openssl" ] || die "no $openssl"
 	[ -d "$gmid_d" ] || die "no $gmid_d: doas ksh scripts/deploy-mail.sh creates it, with the index gmid.conf includes"
