@@ -4830,14 +4830,13 @@ async fn approve_group(
     )
     .await?;
 
-    // A fresh ULID rather than the status token: the intent directory sorts by
-    // name and the loop reads it in that order, so every intent's name has to be
-    // a ULID for a lexical sort to be an age sort.
-    let id = ulid::Ulid::new().to_string();
+    // The one writer draws the ULID (the intent directory sorts by name, so
+    // every name has to be one for a lexical sort to be an age sort) and stamps
+    // the kind and filing time; the payload is built without its envelope.
     let mut group = GroupIntent {
-        id: id.clone(),
-        kind: "provision-group".to_string(),
-        filed_at: util::filed_at(),
+        id: String::new(),
+        kind: String::new(),
+        filed_at: String::new(),
         application: ApplicationRef {
             username: record.username.clone(),
             status_token: record.status_token.clone(),
@@ -4874,18 +4873,23 @@ async fn approve_group(
     // field the transition acts on is in the payload, so a filed intent cannot
     // be edited between this write and the drain's next pass.
     group.sig = sign::sign(key, &sign::group_provision_payload(&group))?;
-    let value =
-        serde_json::to_value(&group).map_err(|e| format!("cannot encode the intent: {e}"))?;
+    let id = crate::intents::Intent::ProvisionGroup(Box::new(group))
+        .file(store)
+        .await?;
     let filename = format!("{id}.json");
-    let bytes =
-        serde_json::to_vec_pretty(&value).map_err(|e| format!("cannot encode the intent: {e}"))?;
-    store.write_record("intents", &filename, &bytes).await?;
-    // The drain's own filed intent crosses the same seam the loop uses, so a
-    // verb's proof cannot be skipped by the writer that files it.
-    let filed = crate::intents::Intent::ProvisionGroup(Box::new(group));
-    if !filed.verify(cfg, store, key, &filename, &value).await? {
-        return Err("the group intent this pass filed was refused".to_string());
-    }
+    // Carry out the bytes on disk, not the copy in memory: the file is what the
+    // next pass would read, envelope included, so the payload the transition
+    // acts on is the one the writer stamped.
+    let text = store
+        .read_record("intents", &filename)
+        .await
+        .ok_or_else(|| format!("the intent this pass filed at {filename} is gone"))?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("the intent this pass filed does not parse: {e}"))?;
+    let filed = crate::intents::Intent::parse(&value)?;
+    // The provision-group arm verifies or fails; it has no refusal of its own,
+    // because the signature it checks is the one this pass just made.
+    filed.verify(cfg, store, key, &filename, &value).await?;
     // Boxed: this file's own approval path reaches `apply`, which reaches the
     // group transition, so the future would otherwise be infinitely sized.
     Box::pin(filed.apply(cfg, store, key, &filename, &value)).await?;

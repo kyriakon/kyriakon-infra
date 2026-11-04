@@ -117,8 +117,7 @@ async fn one(cfg: &DrainConfig, store: &Store, key: &[u8], file: &str) -> Result
     let value: Value =
         serde_json::from_str(&text).map_err(|e| format!("the intent does not parse: {e}"))?;
     let intent = Intent::parse(&value)?;
-    intent.run(cfg, store, key, file, &value).await?;
-    Ok(())
+    intent.run(cfg, store, key, file, &value).await
 }
 
 /// One intent: the variant carries the payload, and the file it was read from
@@ -204,9 +203,10 @@ impl Intent {
         Ok(intent)
     }
 
-    /// The `kind` this variant is filed under. The writer stamps it, so a caller
-    /// cannot file a `Close` under a verb it is not.
-    fn kind(&self) -> &str {
+    /// The `kind` this variant is filed under and parsed from. The writer stamps
+    /// it, so a caller cannot file a `Close` under a verb it is not, and the
+    /// round-trip test walks every variant through it.
+    pub fn kind(&self) -> &str {
         match self {
             Intent::Application(_) => "application",
             // The three decisions are kinds of their own: `approve`, `provision`
@@ -238,17 +238,18 @@ impl Intent {
     ///
     /// The id, the kind and the filing time are the writer's: one writer for
     /// every verb keeps the envelope, and the `kind` the drain dispatches on,
-    /// from drifting between twelve builders. The payload's own fields are the
-    /// wire the handler already writes, and the signature, where there is one,
-    /// travels in them.
-    pub async fn file(self, store: &Store) -> Result<String, String> {
+    /// from drifting between builders. The payload's own fields are the wire
+    /// the handler already writes, and the signature, where there is one,
+    /// travels in them. The intent is borrowed so the drain's own approval can
+    /// file it and carry it out through the same seam.
+    pub async fn file(&self, store: &Store) -> Result<String, String> {
         let id = ulid::Ulid::new().to_string();
         let kind = self.kind().to_string();
         if matches!(self, Intent::Unknown { .. }) {
             return Err(format!("this build does not implement the kind {kind:?}"));
         }
         let mut value =
-            serde_json::to_value(&self).map_err(|e| format!("cannot encode the intent: {e}"))?;
+            serde_json::to_value(self).map_err(|e| format!("cannot encode the intent: {e}"))?;
         let object = value.as_object_mut().ok_or("the intent is not an object")?;
         object.insert("id".to_string(), id.clone().into());
         object.insert("kind".to_string(), kind.into());
@@ -261,8 +262,8 @@ impl Intent {
         Ok(id)
     }
 
-    /// Prove then apply, as the pass does. `false` means `verify` settled the
-    /// intent; nothing is applied.
+    /// Prove then apply, as the pass does. A `verify` that settles the intent
+    /// applies nothing.
     pub async fn run(
         self,
         cfg: &DrainConfig,
@@ -270,12 +271,11 @@ impl Intent {
         key: &[u8],
         file: &str,
         value: &Value,
-    ) -> Result<bool, String> {
+    ) -> Result<(), String> {
         if !self.verify(cfg, store, key, file, value).await? {
-            return Ok(false);
+            return Ok(());
         }
-        self.apply(cfg, store, key, file, value).await?;
-        Ok(true)
+        self.apply(cfg, store, key, file, value).await
     }
 
     /// Prove the intent is the authenticated party's, before anything is
@@ -403,26 +403,19 @@ impl Intent {
                 }
             }
             Intent::Close(intent) => {
-                if let Some(why) = crate::validate::username_shape(&intent.username) {
-                    return Err(format!("the username {:?}: {why}", intent.username));
-                }
-                match verify_session(store, proofs, &intent.session, &intent.username).await {
-                    Ok(()) => Ok(true),
-                    Err(reason) => {
-                        transitions::settle_page(
-                            cfg,
-                            store,
-                            &intent.id,
-                            &intent.kind,
-                            &intent.username,
-                            file,
-                            "refused",
-                            Some(&reason),
-                        )
-                        .await?;
-                        Ok(false)
-                    }
-                }
+                // A close reports a name it cannot use as a pass failure, where
+                // a page action refuses it; the session proof is shared.
+                account_name(&intent.username)?;
+                session_proved(
+                    cfg,
+                    store,
+                    &intent.id,
+                    &intent.kind,
+                    &intent.username,
+                    &intent.session,
+                    file,
+                )
+                .await
             }
             Intent::Resend(intent) => {
                 if sign::verify(
@@ -744,11 +737,22 @@ fn export_from(value: &Value) -> Result<ExportIntent, String> {
     })
 }
 
-/// A page action's proof: the account name is a path component in the store and
-/// below, so only an account name may be one, and the session record's proof
-/// names the account. A refusal journals its reason and removes the file, the
-/// way every page action's refusal does.
-async fn page_proved(
+/// The one rule for a name the drain turns into a path: only an account name
+/// may be one, because an intent's username is a path component under the
+/// store. `Err` carries the reason, worded for the journal.
+fn account_name(username: &str) -> Result<(), String> {
+    match crate::validate::username_shape(username) {
+        Some(why) => Err(format!("the username {username:?}: {why}")),
+        None => Ok(()),
+    }
+}
+
+/// The page verbs' and close's one session proof: the record's proof names the
+/// account. A mismatch, an expiry and a session that has gone are journalled as
+/// a refusal and the file is removed; `Ok(false)` tells the caller nothing is
+/// applied.
+#[allow(clippy::too_many_arguments)]
+async fn session_proved(
     cfg: &DrainConfig,
     store: &Store,
     id: &str,
@@ -757,19 +761,6 @@ async fn page_proved(
     session: &str,
     file: &str,
 ) -> Result<bool, String> {
-    if let Some(why) = crate::validate::username_shape(username) {
-        transitions::refuse_page(
-            cfg,
-            store,
-            id,
-            kind,
-            username,
-            file,
-            &format!("the username {username:?}: {why}"),
-        )
-        .await?;
-        return Ok(false);
-    }
     match verify_session(
         store,
         std::path::Path::new(&cfg.proof_dir),
@@ -780,10 +771,39 @@ async fn page_proved(
     {
         Ok(()) => Ok(true),
         Err(reason) => {
-            transitions::refuse_page(cfg, store, id, kind, username, file, &reason).await?;
+            transitions::settle_page(
+                cfg,
+                store,
+                id,
+                kind,
+                username,
+                file,
+                "refused",
+                Some(&reason),
+            )
+            .await?;
             Ok(false)
         }
     }
+}
+
+/// A page action's proof: the account name rule, then the session. A refusal
+/// journals its reason and removes the file, the way every page action's
+/// refusal does.
+async fn page_proved(
+    cfg: &DrainConfig,
+    store: &Store,
+    id: &str,
+    kind: &str,
+    username: &str,
+    session: &str,
+    file: &str,
+) -> Result<bool, String> {
+    if let Err(why) = account_name(username) {
+        transitions::refuse_page(cfg, store, id, kind, username, file, &why).await?;
+        return Ok(false);
+    }
+    session_proved(cfg, store, id, kind, username, session, file).await
 }
 
 /// Whether `id` names a live page session for `username`. The drain runs as
