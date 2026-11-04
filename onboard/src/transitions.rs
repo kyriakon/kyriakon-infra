@@ -708,11 +708,13 @@ impl Envelope {
 /// What a root verb's body settled as.
 pub enum Settlement {
     /// The journal line the intent takes, and the application it names. The
-    /// file goes once the line is written.
+    /// file goes once the line is written. `after` is work the line itself
+    /// owes, beyond what the dispatcher names for the verb.
     Line {
         outcome: &'static str,
         application: ApplicationRef,
         note: Option<String>,
+        after: Option<AfterLine>,
     },
     /// The work left nothing to journal: only the file remained of it, as on a
     /// replay whose line the crashed pass had already written.
@@ -734,6 +736,7 @@ impl Settlement {
             outcome: "applied",
             application,
             note,
+            after: None,
         }
     }
 
@@ -744,6 +747,7 @@ impl Settlement {
             outcome,
             application,
             note,
+            after: None,
         }
     }
 
@@ -755,6 +759,25 @@ impl Settlement {
         Settlement::Refused {
             reason: reason.to_string(),
             after: None,
+        }
+    }
+
+    /// Work this settlement owes after its own line, which the dispatcher
+    /// cannot name because only the body knows what it is.
+    pub fn with_after(self, after: AfterLine) -> Self {
+        match self {
+            Settlement::Line {
+                outcome,
+                application,
+                note,
+                after: None,
+            } => Settlement::Line {
+                outcome,
+                application,
+                note,
+                after: Some(after),
+            },
+            other => other,
         }
     }
 }
@@ -771,6 +794,9 @@ pub enum AfterLine {
         item: String,
         token: String,
     },
+    /// Print a line only once the settlement is journalled, so a retried pass
+    /// that found the line does not print it again.
+    Print(String),
 }
 
 async fn finish(store: &Store, after: AfterLine) -> Result<(), String> {
@@ -778,6 +804,33 @@ async fn finish(store: &Store, after: AfterLine) -> Result<(), String> {
         AfterLine::Nothing => Ok(()),
         AfterLine::RemoveGroupRecord(domain) => remove_group_record(store, &domain).await,
         AfterLine::MarkAttributed { item, token } => mark_attributed(store, &item, &token).await,
+        AfterLine::Print(text) => {
+            println!("{text}");
+            Ok(())
+        }
+    }
+}
+
+/// What a refusal leaves of the intent file. A page action's refusal is the
+/// handler's own input refused in the drain, so its file goes; every other
+/// refusal is kept for the operator to read, as `refuse` leaves an unknown
+/// kind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RefusalFile {
+    Keep,
+    Remove,
+}
+
+/// What the dispatcher names for a verb before its body runs: the work owed
+/// after its line, and what a refusal leaves of its file.
+pub struct Disposition {
+    pub after: AfterLine,
+    pub refusal: RefusalFile,
+}
+
+impl Disposition {
+    pub fn new(after: AfterLine, refusal: RefusalFile) -> Self {
+        Disposition { after, refusal }
     }
 }
 
@@ -788,79 +841,72 @@ fn override_note(reason: Option<&str>) -> Option<String> {
 }
 
 /// The one settlement path: dedup, the verb's body, its outcome line, the
-/// remove.
+/// after-line work, the remove.
 ///
 /// An intent the journal already settled is not work. An `applied` line whose
 /// file survived the crash between the two is finished here by removing the
-/// file; a `refused` line keeps its file for the operator and appends nothing.
-/// The body does the work, writes the `applying` line where the verb has one,
-/// and returns what the intent settled as. A refusal is appended once, with its
-/// reason, and leaves the file in place.
+/// file; any other outcome line the journal already carries is not appended
+/// again, and the file is finished the same way. A `refused` line leaves the
+/// file for the operator, except for a page action, whose refusal is the
+/// handler's own input. The body does the work, writes the `applying` line
+/// where the verb has one, and returns what the intent settled as.
 pub async fn settle<F>(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
     file: &str,
     envelope: &Envelope,
-    body: F,
-) -> Result<(), String>
-where
-    F: Future<Output = Result<Settlement, String>>,
-{
-    settle_with(
-        cfg,
-        store,
-        journal,
-        file,
-        envelope,
-        AfterLine::Nothing,
-        body,
-    )
-    .await
-}
-
-/// `settle`, with the work a verb owes after its line (see [`AfterLine`]).
-pub async fn settle_with<F>(
-    cfg: &DrainConfig,
-    store: &Store,
-    journal: &Journal,
-    file: &str,
-    envelope: &Envelope,
-    after: AfterLine,
+    disposition: Disposition,
     body: F,
 ) -> Result<(), String>
 where
     F: Future<Output = Result<Settlement, String>>,
 {
     if journal.has(&envelope.id, "applied") {
-        finish(store, after).await?;
+        finish(store, disposition.after).await?;
         return store.remove("intents", file).await;
     }
     if journal.has(&envelope.id, "refused") {
-        return Ok(());
+        return match disposition.refusal {
+            RefusalFile::Keep => Ok(()),
+            RefusalFile::Remove => {
+                finish(store, disposition.after).await?;
+                store.remove("intents", file).await
+            }
+        };
     }
     match body.await? {
         Settlement::Line {
             outcome,
             application,
             note,
+            after: more,
         } => {
-            write_journal(
-                store,
-                journal,
-                &cfg.release,
-                &envelope.id,
-                &envelope.kind,
-                &application,
-                outcome,
-                note.as_deref(),
-            )
-            .await?;
-            finish(store, after).await?;
+            // A crash between the line and the remove leaves the file. Any
+            // outcome line already in the journal is that line, so it is not
+            // appended a second time; only the remove and the after-line work
+            // remain.
+            if !journal.has(&envelope.id, outcome) {
+                write_journal(
+                    store,
+                    journal,
+                    &cfg.release,
+                    &envelope.id,
+                    &envelope.kind,
+                    &application,
+                    outcome,
+                    note.as_deref(),
+                )
+                .await?;
+            }
+            finish(store, disposition.after).await?;
+            if let Some(more) = more {
+                finish(store, more).await?;
+            }
             store.remove("intents", file).await
         }
         Settlement::Nothing => {
-            finish(store, after).await?;
+            finish(store, disposition.after).await?;
             store.remove("intents", file).await
         }
         Settlement::Refused { reason, after } => {
@@ -1119,35 +1165,23 @@ pub(crate) async fn refuse_with(
     value: &Value,
     reason: &str,
 ) -> Result<(), String> {
-    let id = value
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| file.trim_end_matches(".json").to_string());
-    let kind = value
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let envelope = Envelope::of(
+        value,
+        file,
+        value.get("kind").and_then(Value::as_str).unwrap_or(""),
+    );
     // One refusal per intent: a second pass over the same bad file must not
     // append a second line, and the index already carries the first.
-    if journal.has(&id, "refused") {
+    if journal.has(&envelope.id, "refused") {
         return Ok(());
     }
-    let application = value
-        .get("application")
-        .and_then(|a| serde_json::from_value::<ApplicationRef>(a.clone()).ok())
-        .unwrap_or_else(|| ApplicationRef {
-            username: String::new(),
-            status_token: String::new(),
-        });
     write_journal(
         store,
         journal,
         &cfg.release,
-        &id,
-        &kind,
-        &application,
+        &envelope.id,
+        &envelope.kind,
+        &envelope.application,
         "refused",
         Some(reason),
     )
@@ -1164,33 +1198,21 @@ pub async fn refuse(
     file: &str,
     value: &Value,
 ) -> Result<(), String> {
-    let id = value
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| file.trim_end_matches(".json").to_string());
-    let kind = value
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let application = value
-        .get("application")
-        .and_then(|a| serde_json::from_value::<ApplicationRef>(a.clone()).ok())
-        .unwrap_or_else(|| ApplicationRef {
-            username: String::new(),
-            status_token: String::new(),
-        });
-    if journal.seen(&id) {
+    let envelope = Envelope::of(
+        value,
+        file,
+        value.get("kind").and_then(Value::as_str).unwrap_or(""),
+    );
+    if journal.seen(&envelope.id) {
         return Ok(());
     }
     write_journal(
         store,
         journal,
         &cfg.release,
-        &id,
-        &kind,
-        &application,
+        &envelope.id,
+        &envelope.kind,
+        &envelope.application,
         "refused",
         Some("this build does not implement this kind; the intent is left in place"),
     )
@@ -1251,11 +1273,9 @@ pub async fn filed_application(
     );
     let body = review_body(cfg, key, &intent)?;
     notice::enqueue(cfg, &cfg.reviewer, &subject, &body).await?;
-    Ok(Settlement::line(
-        "review-sent",
-        intent.application.clone(),
-        None,
-    ))
+    // The `review-sent` line was written before the send, which is what keeps a
+    // crash from sending twice; only the file is left to settle.
+    Ok(Settlement::nothing())
 }
 
 /// The review email's body. Every field the ticket lists, and the three links
@@ -3506,8 +3526,12 @@ pub async fn refund(
     } else {
         format!("recorded at ledger seq {seq}")
     };
-    if rail == "card" {
-        println!("the Stripe refund's Idempotency-Key is refund-{seq}");
+    let printed = if rail == "card" {
+        AfterLine::Print(format!(
+            "the Stripe refund's Idempotency-Key is refund-{seq}"
+        ))
+    } else {
+        AfterLine::Nothing
     };
     Ok(Settlement::line(
         "applied",
@@ -3516,7 +3540,8 @@ pub async fn refund(
             status_token: String::new(),
         },
         Some(note.clone()),
-    ))
+    )
+    .with_after(printed))
 }
 
 /// Refunds of one payment sum to no more than that payment, whatever their
@@ -3636,8 +3661,12 @@ async fn refund_group(
     } else {
         format!("recorded at ledger seq {seq}")
     };
-    if rail == "card" {
-        println!("the Stripe refund's Idempotency-Key is refund-{seq}");
+    let printed = if rail == "card" {
+        AfterLine::Print(format!(
+            "the Stripe refund's Idempotency-Key is refund-{seq}"
+        ))
+    } else {
+        AfterLine::Nothing
     };
     Ok(Settlement::line(
         "applied",
@@ -3646,7 +3675,8 @@ async fn refund_group(
             status_token: group.domain.clone(),
         },
         Some(note.clone()),
-    ))
+    )
+    .with_after(printed))
 }
 
 /// The refund notice: what was refunded, by which rail, and the date reg 34(4)
@@ -5686,14 +5716,11 @@ pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlem
         username: intent.username.clone(),
         status_token: String::new(),
     };
-    let Some(mut account) = existing_account(store, &intent.username).await else {
+    let mut account = match page_account(store, &intent.username).await {
         // The account the handler authenticated has already gone. That is a
         // closed request, not new work.
-        return Ok(Settlement::line(
-            "applied",
-            application,
-            Some("the account had already gone".to_string()),
-        ));
+        Ok(account) => account,
+        Err(settled) => return Ok(settled),
     };
     // Every data-subject request gets one line, whether it arrived from the page
     // or the console. The id is the intent's, so a retry after the state write
@@ -5732,6 +5759,20 @@ pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlem
         application.clone(),
         Some("the account is closing; the deletion runs when the seven days end".to_string()),
     ))
+}
+
+/// The account a page action acts on. An account that has gone is not work: the
+/// settlement says so and the file goes.
+async fn page_account(store: &Store, username: &str) -> Result<Account, Settlement> {
+    existing_account(store, username).await.ok_or_else(|| {
+        Settlement::applied(
+            ApplicationRef {
+                username: username.to_string(),
+                status_token: String::new(),
+            },
+            Some("the account had already gone".to_string()),
+        )
+    })
 }
 
 /// A page action's refusal: the handler validated it on the way in, so a
@@ -5829,14 +5870,9 @@ pub async fn change_password(
     store: &Store,
     intent: ChangePasswordIntent,
 ) -> Result<Settlement, String> {
-    let Some(account) = existing_account(store, &intent.username).await else {
-        return Ok(Settlement::applied(
-            ApplicationRef {
-                username: intent.username.clone(),
-                status_token: String::new(),
-            },
-            Some("the account had already gone".to_string()),
-        ));
+    let account = match page_account(store, &intent.username).await {
+        Ok(account) => account,
+        Err(settled) => return Ok(settled),
     };
     // The plaintext is checked and hashed here. It is overwritten before any
     // refusal removes the file, so a refusal leaves neither a file nor a buffer
@@ -5879,14 +5915,9 @@ pub async fn upload_key(
     store: &Store,
     intent: UploadKeyIntent,
 ) -> Result<Settlement, String> {
-    let Some(mut account) = existing_account(store, &intent.username).await else {
-        return Ok(Settlement::applied(
-            ApplicationRef {
-                username: intent.username.clone(),
-                status_token: String::new(),
-            },
-            Some("the account had already gone".to_string()),
-        ));
+    let mut account = match page_account(store, &intent.username).await {
+        Ok(account) => account,
+        Err(settled) => return Ok(settled),
     };
     let now = util::filed_at();
     match intent.action.as_str() {
@@ -5976,14 +6007,9 @@ pub async fn set_outside_address(
     store: &Store,
     intent: OutsideAddressIntent,
 ) -> Result<Settlement, String> {
-    let Some(mut account) = existing_account(store, &intent.username).await else {
-        return Ok(Settlement::applied(
-            ApplicationRef {
-                username: intent.username.clone(),
-                status_token: String::new(),
-            },
-            Some("the account had already gone".to_string()),
-        ));
+    let mut account = match page_account(store, &intent.username).await {
+        Ok(account) => account,
+        Err(settled) => return Ok(settled),
     };
     let address = intent.address.trim();
     let outside = if address.is_empty() {
@@ -6022,14 +6048,9 @@ pub async fn set_serving(
     store: &Store,
     intent: ServingIntent,
 ) -> Result<Settlement, String> {
-    let Some(mut account) = existing_account(store, &intent.username).await else {
-        return Ok(Settlement::applied(
-            ApplicationRef {
-                username: intent.username.clone(),
-                status_token: String::new(),
-            },
-            Some("the account had already gone".to_string()),
-        ));
+    let mut account = match page_account(store, &intent.username).await {
+        Ok(account) => account,
+        Err(settled) => return Ok(settled),
     };
     // An unrecorded lane on a hosting member is serving: provision-member.sh
     // wrote it and nobody has turned it off. Comparing the effective value keeps
@@ -6090,14 +6111,9 @@ pub async fn cancel_renewal(
     store: &Store,
     intent: CancelRenewalIntent,
 ) -> Result<Settlement, String> {
-    let Some(mut account) = existing_account(store, &intent.username).await else {
-        return Ok(Settlement::applied(
-            ApplicationRef {
-                username: intent.username.clone(),
-                status_token: String::new(),
-            },
-            Some("the account had already gone".to_string()),
-        ));
+    let mut account = match page_account(store, &intent.username).await {
+        Ok(account) => account,
+        Err(settled) => return Ok(settled),
     };
     let Some(payment) = account.payment.as_mut() else {
         return Ok(refused_page(
@@ -6243,14 +6259,9 @@ pub async fn mail_key(
     store: &Store,
     intent: MailKeyIntent,
 ) -> Result<Settlement, String> {
-    let Some(mut account) = existing_account(store, &intent.username).await else {
-        return Ok(Settlement::applied(
-            ApplicationRef {
-                username: intent.username.clone(),
-                status_token: String::new(),
-            },
-            Some("the account had already gone".to_string()),
-        ));
+    let mut account = match page_account(store, &intent.username).await {
+        Ok(account) => account,
+        Err(settled) => return Ok(settled),
     };
     let application = ApplicationRef {
         username: account.username.clone(),
@@ -9695,6 +9706,7 @@ mod tests {
                 &journal,
                 "settle.json",
                 &Envelope::of(&value, "settle.json", "refund"),
+                Disposition::new(AfterLine::Nothing, RefusalFile::Keep),
                 settle_refund(&store, &intent, "2026-11-05"),
             ))
         });
@@ -9773,6 +9785,7 @@ mod tests {
                     &journal,
                     "settle.json",
                     &envelope,
+                    Disposition::new(AfterLine::Nothing, RefusalFile::Keep),
                     async { Ok(Settlement::refused("the window extension gives no reason")) },
                 ))
                 .unwrap();
@@ -9827,13 +9840,16 @@ mod tests {
         let envelope = Envelope::of(&value, "settle.json", "remove-group");
 
         runtime
-            .block_on(settle_with(
+            .block_on(settle(
                 &cfg,
                 &store,
                 &journal,
                 "settle.json",
                 &envelope,
-                AfterLine::RemoveGroupRecord("parish.example".to_string()),
+                Disposition::new(
+                    AfterLine::RemoveGroupRecord("parish.example".to_string()),
+                    RefusalFile::Keep,
+                ),
                 async { Err("the body ran on a settled intent".to_string()) },
             ))
             .unwrap();
@@ -9852,6 +9868,176 @@ mod tests {
             1,
             "a second applied line was appended: {text}"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// A page action's refusal removes its file even when the refusal line is
+    /// all a crashed pass left behind; an operator-kept refusal does not.
+    #[test]
+    fn a_refusal_disposition_decides_the_file() {
+        let dir =
+            std::env::temp_dir().join(format!("onboard-settle-refusal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = quota_config(&dir);
+        std::fs::create_dir_all(dir.join("store/intents")).unwrap();
+        let store = Store::new_for_test(&cfg.store_root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        for (id, refusal) in [
+            ("01J00000000000000000PAGEREFUSED", RefusalFile::Remove),
+            ("01J00000000000000000KEPTREFUSED", RefusalFile::Keep),
+        ] {
+            std::fs::write(dir.join(format!("store/intents/{id}.json")), "{}").unwrap();
+            std::fs::write(
+                dir.join("store/journal.jsonl"),
+                format!(
+                    "{{\"version\":1,\"at\":\"2026-11-04T09:00:00Z\",\"intent\":\"{id}\",\"kind\":\"set-password\",\"release\":\"test\",\"application\":{{\"username\":\"secretary\",\"status_token\":\"\"}},\"outcome\":\"refused\"}}\n"
+                ),
+            )
+            .unwrap();
+            let journal = runtime.block_on(Journal::load(&store)).unwrap();
+            let value = json!({ "id": id, "kind": "set-password" });
+            let envelope = Envelope::of(&value, &format!("{id}.json"), "set-password");
+            runtime
+                .block_on(settle(
+                    &cfg,
+                    &store,
+                    &journal,
+                    &format!("{id}.json"),
+                    &envelope,
+                    Disposition::new(AfterLine::Nothing, refusal),
+                    async { Err("the body ran on a settled intent".to_string()) },
+                ))
+                .unwrap();
+            let left = dir.join(format!("store/intents/{id}.json"));
+            match refusal {
+                RefusalFile::Remove => assert!(
+                    !left.exists(),
+                    "a page refusal left its file for a crashed pass to replay"
+                ),
+                RefusalFile::Keep => {
+                    assert!(left.exists(), "an operator-kept refusal lost its file")
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An outcome other than `applied`/`refused`, left by a crash between its
+    /// line and the remove, is not appended a second time; only the remove
+    /// remains.
+    #[test]
+    fn an_outcome_line_left_behind_is_not_appended_again() {
+        let dir =
+            std::env::temp_dir().join(format!("onboard-settle-outcome-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = quota_config(&dir);
+        std::fs::create_dir_all(dir.join("store/intents")).unwrap();
+        let store = Store::new_for_test(&cfg.store_root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let value = json!({ "id": "01HZZZZZZZZZZZZZZZZZZZZZZZ", "kind": "close" });
+        let envelope = Envelope::of(&value, "settle.json", "close");
+
+        for _ in 0..2 {
+            std::fs::write(dir.join("store/intents/settle.json"), "{}").unwrap();
+            let journal = runtime.block_on(Journal::load(&store)).unwrap();
+            runtime
+                .block_on(settle(
+                    &cfg,
+                    &store,
+                    &journal,
+                    "settle.json",
+                    &envelope,
+                    Disposition::new(AfterLine::Nothing, RefusalFile::Keep),
+                    async {
+                        Ok(Settlement::line(
+                            "already-decided",
+                            ApplicationRef {
+                                username: "secretary".to_string(),
+                                status_token: String::new(),
+                            },
+                            None,
+                        ))
+                    },
+                ))
+                .unwrap();
+        }
+
+        let text = std::fs::read_to_string(dir.join("store/journal.jsonl")).unwrap();
+        assert_eq!(
+            text.matches("\"outcome\":\"already-decided\"").count(),
+            1,
+            "a second outcome line was appended: {text}"
+        );
+        assert!(
+            !dir.join("store/intents/settle.json").exists(),
+            "the settled intent was left in place"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A held payment's attribution is after-line work: a pass that finds the
+    /// applied line and the intent file still marks the held line attributed,
+    /// then removes the file, and appends nothing.
+    #[test]
+    fn a_surviving_line_still_marks_the_held_item() {
+        let dir =
+            std::env::temp_dir().join(format!("onboard-settle-attrib-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = quota_config(&dir);
+        std::fs::create_dir_all(dir.join("store/intents")).unwrap();
+        std::fs::create_dir_all(dir.join("store/ledger")).unwrap();
+        std::fs::write(
+            dir.join("store/ledger/unattributed.jsonl"),
+            "{\"version\":1,\"id\":\"UN-3K7QW2M9\",\"kind\":\"held\",\"state\":\"held\",\"rail\":\"cash\",\"amount_gbp\":\"20.00\",\"received_on\":\"2026-10-04\",\"intent\":\"01HZZZZZZZZZZZZZZZZZZZZZZZ\",\"note\":\"the envelope\"}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("store/intents/settle.json"), "{}").unwrap();
+        std::fs::write(
+            dir.join("store/journal.jsonl"),
+            "{\"version\":1,\"at\":\"2026-11-04T09:00:00Z\",\"intent\":\"01HZZZZZZZZZZZZZZZZZZZZZZZ\",\"kind\":\"reconcile-attribute\",\"release\":\"test\",\"application\":{\"username\":\"secretary\",\"status_token\":\"\"},\"outcome\":\"applied\"}\n",
+        )
+        .unwrap();
+        let store = Store::new_for_test(&cfg.store_root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let journal = runtime.block_on(Journal::load(&store)).unwrap();
+        let value = json!({
+            "id": "01HZZZZZZZZZZZZZZZZZZZZZZZ",
+            "kind": "reconcile-attribute",
+        });
+        let envelope = Envelope::of(&value, "settle.json", "reconcile-attribute");
+
+        runtime
+            .block_on(settle(
+                &cfg,
+                &store,
+                &journal,
+                "settle.json",
+                &envelope,
+                Disposition::new(
+                    AfterLine::MarkAttributed {
+                        item: "UN-3K7QW2M9".to_string(),
+                        token: "KYR-AAAA-BBBB-CCCC".to_string(),
+                    },
+                    RefusalFile::Keep,
+                ),
+                async { Err("the body ran on a settled intent".to_string()) },
+            ))
+            .unwrap();
+
+        let held = runtime.block_on(store.held()).unwrap();
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].state, "attributed", "{held:?}");
+        assert_eq!(held[0].attributed_to.as_deref(), Some("KYR-AAAA-BBBB-CCCC"));
+        assert!(!dir.join("store/intents/settle.json").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
