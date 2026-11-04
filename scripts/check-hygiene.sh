@@ -311,6 +311,25 @@ self_test() {
 		exit 1
 	}
 
+	# A lock whose owner is gone is a finding; one held by this live shell is not.
+	mkdir "$dir/mail_domains.lock"
+	printf '999999\n' > "$dir/mail_domains.lock/pid"
+	out=$(table_lock_stale "$dir/mail_domains")
+	case "$out" in
+	*'pid 999999 is gone'*) ;;
+	*)
+		printf 'FAIL: a lock whose owner is gone is stale; got [%s]\n' "$out" >&2
+		exit 1
+		;;
+	esac
+	printf '%s\n' "$$" > "$dir/mail_domains.lock/pid"
+	out=$(table_lock_stale "$dir/mail_domains")
+	[ -z "$out" ] || {
+		printf 'FAIL: a lock held by a live pid is not stale; got [%s]\n' "$out" >&2
+		exit 1
+	}
+	rm -rf "$dir/mail_domains.lock"
+
 	# The remedy is per tool, from the absent list. The caller used to print one
 	# line using `$tool`, which after its loop is jq whatever is missing.
 	out=$(tool_remedy hcloud)
@@ -759,6 +778,18 @@ fi
 if [ "$mail_domains_ok" = yes ]; then
 	printf 'mail domains: every domain smtpd accepts is in the greylist pass-through list\n'
 fi
+
+# A writer killed while holding a table lock leaves <table>.lock, and every later
+# writer waits five seconds and then refuses. Report a stale one here rather than
+# letting the next signup be the thing that discovers it.
+for mail_table in "$mail_domains_table" /etc/mail/virtuals /etc/mail/mail_from /etc/mail/dkim_domains; do
+	lock_problem=$(table_lock_stale "$mail_table")
+	if [ -n "$lock_problem" ]; then
+		printf 'mail domains: %s.lock is stale: %s; remove it if no writer is running\n' \
+			"$mail_table" "$lock_problem"
+		status=1
+	fi
+done
 
 # --- 8. the address every alert is mailed to ------------------------------
 # notify_operator in lib.sh mails this address and prints when it cannot. The

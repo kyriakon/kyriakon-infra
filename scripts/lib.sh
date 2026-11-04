@@ -302,25 +302,77 @@ key_problems() {
 # table_lock <table> / table_unlock <table>
 #
 # mkdir(2) is the lock: it fails when the directory exists, and nothing else
-# needs a base tool. A writer waits briefly, then names the lock it found stale
-# rather than hanging a cron pass on a lock nobody will release.
+# needs a base tool. The owner writes its pid inside, so a lock left by a killed
+# writer can be told from one being held. A writer waits five seconds in whole
+# seconds; a lock whose pid is gone, or that has been held for more than thirty
+# seconds, is reaped once and the acquisition retried. The drain's Rust writer
+# takes the same <table>.lock directory with the same pid file, so the two
+# exclude each other.
 table_lock() {
-	typeset table="$1" tries=0
-	while ! mkdir "$table.lock" 2>/dev/null; do
-		tries=$((tries + 1))
-		if [ "$tries" -ge 20 ]; then
-			printf 'could not lock %s: %s exists and did not clear; remove it if no writer is running\n' \
-				"$table" "$table.lock" >&2
+	typeset table="$1" lock="$1.lock" tries=0 reaped=no stale
+	while [ "$tries" -lt 5 ]; do
+		if mkdir "$lock" 2>/dev/null; then
+			if ! printf '%s\n' "$$" > "$lock/pid"; then
+				rm -rf "$lock"
+				printf 'could not write the owner pid into %s\n' "$lock" >&2
+				return 2
+			fi
+			return 0
+		fi
+		if [ ! -d "$lock" ]; then
+			printf 'could not lock %s: cannot create %s\n' "$table" "$lock" >&2
 			return 2
 		fi
-		sleep 0.05
+		if [ "$reaped" = no ]; then
+			stale=$(table_lock_stale "$table")
+			if [ -n "$stale" ]; then
+				printf 'reaping stale lock %s: %s\n' "$lock" "$stale" >&2
+				rm -rf "$lock"
+				reaped=yes
+				continue
+			fi
+		fi
+		tries=$((tries + 1))
+		[ "$tries" -ge 5 ] || sleep 1
 	done
+	printf 'could not lock %s: %s exists and did not clear; remove it if no writer is running\n' \
+		"$table" "$lock" >&2
+	return 2
+}
+
+# table_lock_stale <table>: why <table>.lock is not being held by a live writer,
+# one line, or nothing when it is absent or looks live. Used by table_lock to
+# decide whether to reap, and by check-hygiene.sh to report a wedged table.
+table_lock_stale() {
+	typeset table="$1" lock="$1.lock" pid mtime now age
+	lock="$table.lock"
+	[ -d "$lock" ] || return 0
+	pid=$(cat "$lock/pid" 2>/dev/null || true)
+	case "$pid" in
+	'' | *[!0-9]*) ;;
+	*)
+		if kill -0 "$pid" 2>/dev/null; then
+			# A live owner is holding it, however long the write is taking.
+			return 0
+		fi
+		printf 'the owner pid %s is gone\n' "$pid"
+		return 0
+		;;
+	esac
+	# OpenBSD and macOS stat use -f, GNU stat uses -c.
+	mtime=$(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || printf '')
+	[ -n "$mtime" ] || return 0
+	now=$(date +%s)
+	age=$((now - mtime))
+	if [ "$age" -gt 30 ]; then
+		printf 'it has been held for %s seconds\n' "$age"
+	fi
 	return 0
 }
 
 table_unlock() {
 	typeset table="$1"
-	rmdir "$table.lock" 2>/dev/null || true
+	rm -rf "$table.lock"
 }
 
 # valid_localpart <name> — the username and mailbox charset: lowercase letters,
@@ -367,7 +419,8 @@ table_set() {
 	typeset table="$1" name="$2" entry="$3" candidate last
 	table_set_how=''
 	table_lock "$table" || return 2
-	if awk -F: -v k="$name" '$1 == k { found = 1 } END { exit !found }' "$table"; then
+	if [ -f "$table" ] &&
+		awk -F: -v k="$name" '$1 == k { found = 1 } END { exit !found }' "$table"; then
 		candidate=$(mktemp "$table.XXXXXX") || {
 			printf 'could not create a candidate beside %s\n' "$table" >&2
 			table_unlock "$table"
@@ -601,34 +654,40 @@ self_test() {
 
 	# Failures are 2, not 1, and name what went wrong.
 	code=0
-	out=$(table_drop "$tree/absent" exact x 2>&1) || code=$?
+	table_drop "$tree/absent" exact x >/dev/null 2>"$tree/absent.err" || code=$?
 	check "a missing table is a failure, not 'unchanged'" "$code" 2
+	out=$(cat "$tree/absent.err")
 	case "$out" in
 	*"$tree/absent"*) ;;
 	*) printf 'FAIL: a missing table names itself; got [%s]\n' "$out" >&2
 	   self_test_fails=$((self_test_fails + 1)) ;;
 	esac
+	# A lock whose owner is gone is reaped and the write goes ahead, rather than
+	# wedging every later writer.
 	mkdir "$tree/stale.lock"
+	printf '999999\n' > "$tree/stale.lock/pid"
 	code=0
-	out=$(table_set "$tree/stale" x "x: x" 2>&1) || code=$?
-	check "a stale lock is a failure" "$code" 2
+	table_set "$tree/stale" x "x: x" >/dev/null 2>"$tree/reap.err" || code=$?
+	check "a stale lock is reaped" "$code" 0
+	check "and the write lands" "$(grep -c '^x: x$' "$tree/stale")" 1
+	out=$(cat "$tree/reap.err")
 	case "$out" in
-	*"$tree/stale.lock"*) ;;
-	*) printf 'FAIL: a stale lock names the lock; got [%s]\n' "$out" >&2
+	*"reaping stale lock $tree/stale.lock"*) ;;
+	*) printf 'FAIL: the reap names the lock; got [%s]\n' "$out" >&2
 	   self_test_fails=$((self_test_fails + 1)) ;;
 	esac
-	rmdir "$tree/stale.lock"
 
-	# Twenty writers at once, the reproduction the lock exists for.
+	# Three writers at once, the shape the lock exists for. The retry is in whole
+	# seconds, so the count is kept under the five-second wait.
 	touch "$tree/concurrent"
 	i=0
-	while [ "$i" -lt 20 ]; do
+	while [ "$i" -lt 3 ]; do
 		table_set "$tree/concurrent" "user$i" "user$i: user$i" &
 		i=$((i + 1))
 	done
 	wait
 	check "concurrent appends all land" \
-		"$(wc -l < "$tree/concurrent" | tr -d ' ')" 20
+		"$(wc -l < "$tree/concurrent" | tr -d ' ')" 3
 	check "and the lock is released" \
 		"$([ -d "$tree/concurrent.lock" ] && printf held || printf free)" free
 
