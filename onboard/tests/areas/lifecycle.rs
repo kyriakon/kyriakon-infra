@@ -2341,3 +2341,231 @@ fn a_suspension_starts_the_grace_and_resume_clears_it() {
         fix.journal()
     );
 }
+
+/// A corrupt account record is reported and skipped, not read as an account
+/// that has gone: the healthy account beside it still lapses on time, and the
+/// failure is mailed once rather than every minute.
+#[test]
+fn a_corrupt_account_record_is_reported_without_stopping_another_sweep() {
+    let fix = Fix::new("corrupt-account-sweep");
+    approved_paid(&fix, "secretary", "cash");
+    let mut account = fix.account("secretary");
+    account["payment"]["window"]["closes_at"] = json!("2020-01-01T00:00:00Z");
+    std::fs::write(
+        fix.path("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+
+    // A second account whose record a later write damages. The sweep lists it,
+    // so it reaches the broken file before it reaches the healthy window.
+    fix.page_account("broken", json!({}));
+    std::fs::write(
+        fix.path("store/accounts/broken/account.json"),
+        b"{\"version\": 1, \"username\": \"brok",
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(
+        out.status.success(),
+        "one damaged record stopped the pass: {}",
+        body(&out)
+    );
+
+    // The healthy account settles: the closed window lapsed it.
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("lapsed"), "{account}");
+    assert_eq!(
+        account["payment"]["window"]["state"],
+        json!("closed"),
+        "{account}"
+    );
+    assert!(
+        fix.scripts_log().contains("lapse-user.sh secretary"),
+        "{}",
+        fix.scripts_log()
+    );
+
+    // The damaged record is named once, journalled and mailed once.
+    let sent = fix.sent();
+    assert!(
+        sent.contains("accounts/broken/account.json does not parse"),
+        "{sent}"
+    );
+    assert_eq!(
+        sent.matches("accounts/broken/account.json does not parse")
+            .count(),
+        1,
+        "{sent}"
+    );
+    assert!(
+        fix.journal()
+            .contains("accounts/broken/account.json does not parse"),
+        "{}",
+        fix.journal()
+    );
+}
+
+/// `show` and `approve` name the corrupt application record and the parse
+/// error, rather than reporting that there is no application for the name.
+#[test]
+fn a_corrupt_application_record_is_named_by_show_and_approve() {
+    let fix = Fix::new("corrupt-application");
+    fix.filed("alice", "cash", &[("rail", "cash")]);
+    std::fs::write(
+        fix.path(&format!("store/applications/{TOKEN}.json")),
+        b"{\"username\": \"alice\", \"status_to",
+    )
+    .unwrap();
+
+    for args in [["show", "alice"], ["approve", "alice"]] {
+        let out = fix.ctl(&args);
+        let text = body(&out);
+        assert!(!out.status.success(), "{}: {text}", args.join(" "));
+        assert!(
+            text.contains(&format!("applications/{TOKEN}.json does not parse")),
+            "{}: {text}",
+            args.join(" ")
+        );
+        assert!(
+            !text.contains("no application for alice"),
+            "{}: {text}",
+            args.join(" ")
+        );
+    }
+}
+
+/// A corrupt application is reported and skipped; the declined application
+/// beside it still purges on the same pass.
+#[test]
+fn a_corrupt_application_does_not_stop_another_applications_purge() {
+    let fix = Fix::new("corrupt-application-purge");
+    let record = fix.filed_with(
+        "secretary",
+        "cash",
+        &[("rail", "cash")],
+        Some("applicant@example.invalid"),
+        Some((UPLOAD_KEY, "works")),
+    );
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("decline", "secretary");
+    assert!(fix.drain().status.success());
+
+    // Move the decision a week back, as a week of cron would.
+    let mut app: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    app["decided_at"] = json!("2026-09-01T00:00:00Z");
+    std::fs::write(
+        fix.path(&format!("store/applications/{TOKEN}.json")),
+        serde_json::to_vec_pretty(&app).unwrap(),
+    )
+    .unwrap();
+    // An unrelated record that sorts before it and does not parse.
+    std::fs::write(
+        fix.path("store/applications/000-broken.json"),
+        b"{\"username\": \"nobody",
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !std::path::Path::new(&fix.path(&format!("store/applications/{TOKEN}.json"))).exists(),
+        "the healthy decline was not purged"
+    );
+    assert!(
+        fix.scripts_log().contains("delete-user.sh secretary"),
+        "{}",
+        fix.scripts_log()
+    );
+    assert!(
+        fix.sent()
+            .contains("applications/000-broken.json does not parse"),
+        "{}",
+        fix.sent()
+    );
+}
+
+/// The application scan cannot tell a corrupt file's username, so it fails with
+/// the file named rather than reporting that the requested name has none.
+#[test]
+fn a_corrupt_application_beside_the_requested_one_is_named_by_show() {
+    let fix = Fix::new("corrupt-application-sibling");
+    fix.filed("alice", "cash", &[("rail", "cash")]);
+    std::fs::write(fix.path("store/applications/000-broken.json"), b"{not json").unwrap();
+
+    let out = fix.ctl(&["show", "alice"]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(
+        body(&out).contains("applications/000-broken.json does not parse"),
+        "{}",
+        body(&out)
+    );
+    assert!(
+        !body(&out).contains("no application for alice"),
+        "{}",
+        body(&out)
+    );
+}
+
+/// A declinee whose account record is damaged is reported and left for the next
+/// pass; the healthy account whose closing window has ended is still deleted in
+/// the same pass.
+#[test]
+fn a_damaged_declinee_does_not_stop_a_healthy_closing_deletion() {
+    let fix = Fix::new("purge-declined-damaged");
+    fix.page_account(
+        "secretary",
+        json!({
+            "state": "closing",
+            "closing_until": kyriakon_onboard::util::date_after_days(-1),
+        }),
+    );
+    // A declined application whose week is up, for a name whose account record
+    // is damaged: the purge cannot tell whether releasing the name would take an
+    // account with it.
+    let record = fix.filed("broken", "cash", &[("rail", "cash")]);
+    let mut app = record.clone();
+    app["stage"] = json!("declined");
+    app["decided_at"] = json!("2026-09-01T00:00:00Z");
+    fix.rewrite_record(&app);
+    std::fs::create_dir_all(fix.dir.join("store/accounts/broken")).unwrap();
+    std::fs::write(
+        fix.dir.join("store/accounts/broken/account.json"),
+        b"{\"version\": 1, \"username\": \"brok",
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    // The healthy closing account is gone.
+    assert!(
+        !fix.dir.join("store/accounts/secretary").exists(),
+        "the healthy closing account was not deleted"
+    );
+    assert!(
+        fix.scripts_log().contains("delete-user.sh secretary"),
+        "{}",
+        fix.scripts_log()
+    );
+    // The damaged declinee is named once and its application is kept for the
+    // pass after the record is fixed.
+    assert!(
+        std::path::Path::new(&fix.path(&format!("store/applications/{TOKEN}.json"))).exists(),
+        "the damaged declinee's application was purged on a guess"
+    );
+    let sent = fix.sent();
+    assert!(
+        sent.contains("accounts/broken/account.json does not parse"),
+        "{sent}"
+    );
+    assert!(
+        fix.journal()
+            .contains("accounts/broken/account.json does not parse"),
+        "{}",
+        fix.journal()
+    );
+}

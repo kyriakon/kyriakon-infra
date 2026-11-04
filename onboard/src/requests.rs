@@ -248,11 +248,7 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
     }
     // A request is recorded against an account, never into a directory a
     // mistyped name would create.
-    if store
-        .read_record(&account_dir(request.username), "account.json")
-        .await
-        .is_none()
-    {
+    if store.account(request.username).await?.is_none() {
         return Err(format!("no account for {}", request.username));
     }
 
@@ -499,7 +495,13 @@ mod tests {
             std::env::temp_dir().join(format!("onboard-requests-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("accounts/alice")).unwrap();
-        std::fs::write(dir.join("accounts/alice/account.json"), "{}").unwrap();
+        std::fs::write(
+            dir.join("accounts/alice/account.json"),
+            r#"{"version":1,"username":"alice","state":"active","decision":"approve",
+                "decided_at":"2026-01-01T00:00:00Z","rail":"no_charge","no_charge":true,
+                "created_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
         (Store::new(dir.to_str().unwrap()), dir)
     }
 

@@ -8,7 +8,7 @@
 
 use time::OffsetDateTime;
 
-use crate::store::{Account, Store};
+use crate::store::Store;
 use crate::util;
 
 /// One open window, as the console prints it.
@@ -28,21 +28,11 @@ pub struct OpenWindow {
 pub async fn open_windows(store: &Store, now: OffsetDateTime) -> Result<Vec<OpenWindow>, String> {
     let mut out = Vec::new();
     for username in store.list("accounts").await? {
-        let Some(text) = store
-            .read_record(&format!("accounts/{username}"), "account.json")
-            .await
-        else {
-            eprintln!(
-                "kyriakon-onboard: accounts/{username}/account.json is unreadable, not listed"
-            );
-            continue;
-        };
-        let account: Account = match serde_json::from_str(&text) {
-            Ok(account) => account,
+        let account = match store.account(&username).await {
+            Ok(Some(account)) => account,
+            Ok(None) => continue,
             Err(e) => {
-                eprintln!(
-                    "kyriakon-onboard: accounts/{username}/account.json does not parse, not listed: {e}"
-                );
+                eprintln!("kyriakon-onboard: {e}, not listed");
                 continue;
             }
         };

@@ -221,12 +221,11 @@ async fn written(
     now: OffsetDateTime,
     mailed: bool,
 ) -> Result<(Account, String, Vec<(String, Vec<u8>)>), String> {
-    let account_text = store
-        .read_record(&format!("accounts/{username}"), "account.json")
-        .await
-        .ok_or_else(|| format!("no account for {username}"))?;
+    let Some(account_text) = store.account_text(username).await? else {
+        return Err(format!("no account for {username}"));
+    };
     let account: Account = serde_json::from_str(&account_text)
-        .map_err(|e| format!("the account record does not parse: {e}"))?;
+        .map_err(|e| format!("accounts/{username}/account.json does not parse: {e}"))?;
 
     let mut docs: Vec<(String, Vec<u8>)> = Vec::new();
     docs.push(("account.json".to_string(), account_text.into_bytes()));
@@ -246,10 +245,7 @@ async fn written(
             util::date_string(day + Duration::days(APPLICATION_PURGE_DAYS))
         )
     };
-    let purge_note = match store
-        .read_record(&format!("accounts/{username}"), "application.json")
-        .await
-    {
+    let purge_note = match store.account_application_text(username).await? {
         Some(text) => match filed_day(&text) {
             Some(filed) if within_purge(filed, now.date()) => {
                 let until = util::date_string(filed + Duration::days(APPLICATION_PURGE_DAYS));

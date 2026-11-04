@@ -529,8 +529,8 @@ fn a_missing_webhook_secret_is_mailed_once_and_keeps_the_delivery() {
 }
 
 /// An account record that is there and does not parse is drift, not an account
-/// that is gone: the checkout is left for the next pass and the pass says why
-/// rather than settling it as ignored and deleting the delivery.
+/// that is gone: the webhook names the record, the checkout is left for the next
+/// pass, and the sweeps before it carry on with the other accounts.
 #[test]
 fn a_corrupt_account_record_keeps_the_checkout_and_reports() {
     let fix = Fix::new("webhook-corrupt-account");
@@ -553,7 +553,7 @@ fn a_corrupt_account_record_keeps_the_checkout_and_reports() {
     assert!(out.status.success(), "{}", body(&out));
     assert!(
         body(&out).contains("webhook evt_corrupt (checkout.session.completed)")
-            && body(&out).contains("does not parse"),
+            && body(&out).contains("accounts/secretary/account.json does not parse"),
         "the delivery is not reported: {}",
         body(&out)
     );
@@ -561,6 +561,57 @@ fn a_corrupt_account_record_keeps_the_checkout_and_reports() {
         fix.webhooks()
             .iter()
             .any(|n| n.starts_with("evt_corrupt.body")),
+        "the delivery was deleted: {:?}",
+        fix.webhooks()
+    );
+    assert!(
+        fix.read("webhooks/processed.jsonl").is_empty(),
+        "the delivery was recorded as settled"
+    );
+}
+
+/// A subscription scan that meets a damaged account reports the record and
+/// keeps the invoice for the next pass, rather than failing with no journal,
+/// backoff or mail.
+#[test]
+fn a_damaged_account_fails_an_invoice_visibly_and_keeps_it() {
+    let fix = Fix::new("webhook-damaged-scan");
+    fix.card_account("secretary", None);
+    // Sorts before the healthy account, so the scan reaches it first. It could
+    // own the subscription, so the event cannot be settled as ignored.
+    std::fs::create_dir_all(fix.dir.join("store/accounts/aaa-broken")).unwrap();
+    std::fs::write(
+        fix.dir.join("store/accounts/aaa-broken/account.json"),
+        b"{\"version\": 1, \"username\": \"aaa-brok",
+    )
+    .unwrap();
+    fix.webhook("evt_damaged", "invoice.paid", invoice("in_damaged"));
+
+    // The binary, because the per-event report is the line it prints.
+    let out = fix.drain_binary();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        body(&out).contains("webhook evt_damaged (invoice.paid) could not be settled yet")
+            && body(&out).contains("accounts/aaa-broken/account.json does not parse"),
+        "the event is not reported against the record: {}",
+        body(&out)
+    );
+    assert!(
+        fix.sent()
+            .contains("accounts/aaa-broken/account.json does not parse"),
+        "the record failure was not mailed: {}",
+        fix.sent()
+    );
+    assert!(
+        fix.journal()
+            .contains("accounts/aaa-broken/account.json does not parse"),
+        "{}",
+        fix.journal()
+    );
+    assert!(
+        fix.webhooks()
+            .iter()
+            .any(|n| n.starts_with("evt_damaged.body")),
         "the delivery was deleted: {:?}",
         fix.webhooks()
     );

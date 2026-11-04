@@ -1279,7 +1279,17 @@ fn a_group_removal_takes_the_domain_down_and_closes_its_accounts() {
     std::fs::create_dir_all(fix.dir.join("store/accounts/bob")).unwrap();
     std::fs::write(
         fix.dir.join("store/accounts/bob/account.json"),
-        serde_json::to_vec_pretty(&json!({"username": "bob", "state": "active"})).unwrap(),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "username": "bob",
+            "state": "active",
+            "decision": "approve",
+            "decided_at": "2026-10-01T09:00:00Z",
+            "rail": "no_charge",
+            "no_charge": true,
+            "created_at": "2026-10-01T09:00:00Z"
+        }))
+        .unwrap(),
     )
     .unwrap();
     std::fs::write(fix.dir.join("store/keys/bob.pub"), "ssh-ed25519 AAAA bob\n").unwrap();
