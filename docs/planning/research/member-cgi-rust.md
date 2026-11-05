@@ -9,14 +9,14 @@ handful of things that need a box are listed at the end.
 ## The short answer
 
 Build the binary on an OpenBSD/amd64 machine running the same release as the host, using the
-base system's own Rust package, then upload the result. There is no cheaper route. The rustup
-toolchain has no standard library for `x86_64-unknown-openbsd`, and rustc on that target
-ignores `+crt-static`, so the binary is always dynamically linked. Inside `/home/www` it then
-needs the loader and the base libraries, which are the same files a base interpreter needs,
-so one runtime tree serves both. A normal std program fits `stdio rpath exec`, but the current
-`slowcgi` never sets exec promises, so the member's program is not pledged at all. "Base
-interpreters only" does not exclude a compiled binary, because the rule names interpreters
-and a compiled binary is not one.
+base system's own Rust package, then upload the result into the site tree. There is no
+cheaper route. The rustup toolchain has no standard library for `x86_64-unknown-openbsd`,
+and rustc on that target ignores `+crt-static`, so the binary is always dynamically linked.
+Inside `/home/www` it then needs the loader and the base libraries, which are the same files
+a base interpreter needs, so one runtime tree serves both. No pledge applies to the member's
+program, because `slowcgi` never sets exec promises, so the chroot and the member uid are the
+whole boundary. "Base interpreters only" does not exclude a compiled binary, because the rule
+names interpreters and a compiled binary is not one.
 
 ## 1. The target has no prebuilt standard library
 
@@ -27,8 +27,8 @@ ship pre-compiled artifacts for these targets"
 The target metadata agrees, with `tier: Some(3)` and `std: Some(true)` on the spec for
 `x86_64-unknown-openbsd`
 ([`x86_64_unknown_openbsd.rs`](https://github.com/rust-lang/rust/blob/main/compiler/rustc_target/src/spec/targets/x86_64_unknown_openbsd.rs)).
-Tier 3 means the target builds and is supported by maintainers, and that the standard library
-is built from source when someone builds the target, not downloaded.
+Tier 3 means maintainers support the target, and that the standard library is built from
+source when someone builds the target, not downloaded.
 
 That is observable on any rustup machine. On rustc 1.97.1, the command and its output:
 
@@ -40,7 +40,7 @@ note: you can find instructions on that page to build the target support from so
 ```
 
 So `cargo build --target x86_64-unknown-openbsd` from a laptop fails at the first crate that
-needs `std`. Two things are missing at once: the target's `std`, and a linker plus an OpenBSD
+needs `std`. Two things are missing at once, the target's `std` and a linker plus an OpenBSD
 libc to link against.
 
 ## 2. The build story, and the one honest instruction
@@ -69,10 +69,15 @@ another. The member rebuilds when the host is upgraded. The map already puts "ru
 Rust toolchain on the box for members" out of scope, so the OpenBSD machine is the member's,
 not ours.
 
+The artifact is one file. For a page generator that reads files, writes CGI headers and exits,
+that file plus the host's base libraries is the whole upload. Anything that pulls a crate
+linked against `/usr/local/lib` brings a dependency the chroot will not have, which section 4
+covers.
+
 Cross building is the second route, and it is documented but not supported in practice. The
 same book page says the targets "can be cross-compiled, but LLVM might not build out-of-box",
 and shows the configuration knob `cc = "$ARCH-openbsd-cc"`. A cross build needs two things
-this repository has never had: a C toolchain that emits OpenBSD ELF, and an OpenBSD sysroot.
+this repository has never had, a C toolchain that emits OpenBSD ELF and an OpenBSD sysroot.
 The release file sets supply the sysroot pieces, since `comp80.tgz` is "The compiler
 collection, headers and libraries"
 ([OpenBSD FAQ 4](https://www.openbsd.org/faq/faq4.html)), but assembling and maintaining one
@@ -84,8 +89,8 @@ and the `rust-src` component, and the rustup error above points at it. It does n
 linker or an OpenBSD libc, so the sysroot requirement stands. On an OpenBSD box it is also
 redundant, because the port's rustc already carries `std` for the host triple.
 
-Verdict: option 1 is the least-effort honest instruction, and it is honest only if it names
-the requirement to build on the same release.
+Option 1 is the least-effort honest instruction, and it is honest only if it names the
+requirement to build on the same release.
 
 ## 3. Static linking is not available, so the binary is dynamic
 
@@ -113,12 +118,11 @@ carries an interpreter path and library dependencies. Forcing a static link with
 path; it was not attempted here, and would need `libc.a` and the crt objects from the `comp`
 set.
 
-This is the opposite of the usual answer for member binaries, so it decides the chroot
-contents: there is no self-contained binary to upload.
+This decides the chroot contents, because there is no self-contained binary to upload.
 
 ## 4. What has to exist inside /home/www, and the interpreter tree
 
-A dynamically linked Rust binary needs three things at exec time: the loader, its own file,
+A dynamically linked Rust binary needs three things at exec time, the loader, its own file,
 and the shared libraries named in its dynamic section.
 
 The loader is the path recorded in the ELF program header, and `ld.so(1)` describes itself as
@@ -151,71 +155,30 @@ built for `ksh` or `perl` therefore carries most of what Rust needs, and the dif
 most those two files. The tree must be built from the host's own files, not copied from
 another release, and the member needs read and execute on the binary.
 
-One behaviour of `slowcgi` matters for a program that opens files by relative path. Before
-`execve` the child splits `SCRIPT_NAME` and calls `chdir` on the script's directory, falling
-back to `/` for a script at the top level
-([`slowcgi.c`, `exec_cgi`](https://github.com/openbsd/src/blob/master/usr.sbin/slowcgi/slowcgi.c)).
-A Rust page generator therefore starts in its own directory, not in `/`.
+### What the member has to get right
 
-## 5. The pledge question, and the gap underneath it
+The binary lives inside `/home/www`, because that is the chroot, and the path `slowcgi` execs
+is the path the front end sends, relative to the chroot. It must be readable and executable by
+the member, and it must be built on the host's release.
 
-Two answers are needed here, because the premise in the map does not hold as written.
+It is a CGI program, not a FastCGI server. The request arrives as environment variables, the
+body on standard input, and the response is headers followed by the body on standard output.
+A Rust program writes those with `std::io::stdout`, which needs no more than `write`.
 
-### What a std program needs, against the promise set
+The environment is exactly the FastCGI params the front end sent. The child builds `env` only
+from the parameter list and passes it to `execve`
+([`slowcgi.c`, `exec_cgi`](https://github.com/openbsd/src/blob/master/usr.sbin/slowcgi/slowcgi.c)),
+so `HOME`, `TMPDIR` and `PATH` are absent unless a front end sent them. Code that reads them
+should treat `None` as normal. Code that spawns a program should pass an absolute path rather
+than rely on `PATH` being present.
 
-`pledge(2)` starts from a whitelist per promise. The `stdio` set covers `mmap`, `mprotect`,
-`munmap`, `madvise`, `getentropy`, `clock_gettime`, `gettimeofday`, `nanosleep`, `sigaction`,
-`sigprocmask`, `sigaltstack`, `fcntl`, `fstat`, `read`, `write`, `poll`, `pipe`, `dup2`,
-`socketpair`, `wait4`, `kqueue`, `kevent`, `getrlimit`, `issetugid` and `getpid`, among
-others; `rpath` covers path traversal, `stat` and opening files for read; `exec` allows
-`execve` ([pledge(2)](https://man.openbsd.org/pledge.2)). The kernel table that implements it
-agrees on the entries that matter here, with `SYS_mmap`, `SYS_mprotect`, `SYS_getentropy`,
-`SYS_sigaltstack`, `SYS_sigaction`, `SYS_futex` and `SYS___tfork` at `PLEDGE_STDIO`, and
-`SYS___getcwd` at `PLEDGE_RPATH`
-([`kern_pledge.c`](https://github.com/openbsd/src/blob/master/sys/kern/kern_pledge.c)).
+Before `execve` the child splits `SCRIPT_NAME` and calls `chdir` on the binary's directory,
+falling back to `/` for a file at the top level, so relative file reads resolve beside the
+binary rather than in `/`.
 
-What a normal program does at startup stays inside that set. OpenBSD uses the signal based
-stack overflow handler, which installs `sigaction` and `sigaltstack` and fills the alternate
-stack from a mapping
-([`stack_overflow/handler_signal.rs`](https://github.com/rust-lang/rust/blob/main/library/std/src/sys/pal/unix/stack_overflow/handler_signal.rs)).
-The allocator reaches `mmap`, and `getentropy` covers hash seed randomisation. Standard output
-is `write` plus `fcntl`.
-`fs::read` is `open` for read plus `fstat` and `read`, and `fs::read_dir` is `getdents`, both
-under `rpath`. `std::thread::spawn` works, because OpenBSD creates threads with `__tfork` and
-Rust parks on `futex`, and both are `stdio`. Clock and randomness calls are `stdio`.
+## 5. No pledge applies to the member's program
 
-Three things do not fit, all of them routine in a web program:
-
-- `fs::write`, `File::create`, `fs::remove_file` and `fs::create_dir` need `wpath` or `cpath`.
-- `std::process::Command` needs `proc`, because `posix_spawn(3)` calls `fork()` on OpenBSD
-  ([`posix_spawn.c`](https://github.com/openbsd/src/blob/master/lib/libc/gen/posix_spawn.c)),
-  and `fork(2)` is in that promise.
-- `std::net::TcpStream`, `UdpSocket` and DNS resolution need `inet` and `dns`.
-
-Three more are worth naming because they are close to the route's job. `dlopen`, and therefore
-`libloading`, fails after the loader calls `kbind`, because `mmap` with `PROT_EXEC` then
-requires the `prot_exec` promise; the kernel exempts mappings made before `kbind`, which is
-the window `ld.so` uses for the program's own libraries
-([`pledge_protexec`](https://github.com/openbsd/src/blob/master/sys/kern/kern_pledge.c)).
-Stock `std::env::current_exe()` uses `sysctl` with `KERN_PROC_ARGS`, which the kernel allows
-only under the `ps` promise, so it would be fatal under this set; the OpenBSD port patches
-that function to call `getexecpath()` instead
-([port patch](https://github.com/openbsd/ports/blob/master/lang/rust/patches/patch-library_std_src_sys_paths_unix_rs)),
-so a binary built with the packaged rustc does not carry the problem. `IsTerminal` kills the
-process too, because a denied `ioctl` reaches `pledge_fail` with the same effect, and pledge
-allows only `FIONREAD`, `FIONBIO`, `FIOCLEX` and `FIONCLEX` by default
-([pledge(2)](https://man.openbsd.org/pledge.2)).
-
-A promise violation is not an error return. "Subsystems not listed become unavailable, and
-most attempts to use operations in that subsystem result in the process being killed with an
-uncatchable `SIGABRT`, delivering a core file if possible"
-([pledge(2)](https://man.openbsd.org/pledge.2)). So a member's `fs::write` does not get an
-`io::Error`, it aborts the request. The kernel has an `error` promise that turns violations
-into `ENOSYS` instead, by returning early in `pledge_fail` when the flag is set
-([`kern_pledge.c`](https://github.com/openbsd/src/blob/master/sys/kern/kern_pledge.c)), but
-`stdio rpath exec` does not include it.
-
-### The promise is not inherited
+This is the part of the map that does not hold as written, so it is worth stating precisely.
 
 The child in `exec_cgi` calls `pledge("stdio rpath exec", NULL)`, and the parent calls
 `pledge("stdio rpath unix proc exec", NULL)`
@@ -224,7 +187,7 @@ second argument is the exec promise set, and it is `NULL` in both calls, which `
 defines as "do not change the current value". Nothing in `slowcgi` ever passes a non-null
 value, and neither `init` nor any parent of `slowcgi` can set it for it.
 
-`pledge(2)` then states the outcome for the exec promise in as many words:
+`pledge(2)` states the outcome for the exec promise in as many words:
 
 > If *execpromises* has been previously set the new program begins with those promises, unless
 > setuid/setgid bits are set in which case execution is blocked with `EACCES`. Otherwise the
@@ -248,26 +211,32 @@ if (pr->ps_flags & PS_EXECPLEDGE) {
 `sys_pledge` sets that flag only when the argument is non-null
 ([`kern_pledge.c`](https://github.com/openbsd/src/blob/master/sys/kern/kern_pledge.c)).
 
-So the map's "the capability contract is `slowcgi`'s child pledge" is wrong for the current
-base tool. The child's pledge covers the calls `slowcgi` makes between `fork` and `execve`,
+The child's pledge therefore covers the calls `slowcgi` makes between `fork` and `execve`,
 which are `dup2`, `close`, `signal`, `chdir`, `calloc` and `execve`. The member's program
-starts with no promises at all, and can write files, open sockets and fork as the member
-inside the chroot. That is a finding for the sibling ticket on `slowcgi` internals; it is
-recorded here because it changes what this route can promise.
+starts with no promises at all. Inside the chroot, running as the member, it can write files,
+fork, exec and open sockets. The boundary is the chroot and the uid, and the map's "the
+capability contract is `slowcgi`'s child pledge" has to be rewritten before the spec relies
+on it. Confirmed against the same reading in the sibling ticket on `slowcgi` internals.
 
-If the route wants the pledge to hold, the exec path has to pass it explicitly, for example
-`pledge("stdio rpath exec", "stdio rpath exec")`. That is a change to base `slowcgi`, or a
-wrapped launcher, and either way it belongs to the spec, not to this note. Even then the
-control is `stdio rpath exec` over the whole chroot, not over the member's directory, and the
-member can still read every file the chroot exposes.
+If the route later wants a promise, the exec path must pass it explicitly, for example
+`pledge("stdio rpath exec", "stdio rpath exec")`. That is a change to base `slowcgi` or a
+wrapped launcher, and it belongs to the spec. A normal page generator would still run under
+that set, since startup, allocation, standard output and `fs::read` stay inside it. `fs::write`,
+`Command`, sockets, `dlopen` and `IsTerminal` would then kill the process rather than return an
+error, because a promise violation is an uncatchable `SIGABRT` unless the `error` promise is
+also set ([pledge(2)](https://man.openbsd.org/pledge.2)). Even with a promise, the control
+would be over the whole chroot, not over the member's directory.
 
-## 6. Why the FastCGI service is not this route
+## 6. The FastCGI service boundary is lifecycle, not pledging
 
 A long-lived Rust FastCGI service is started once by its own `rc.d` script as the member and
-serves many requests from one process, so it never passes through `slowcgi`'s child: it
-inherits no per-request promise set, has no `-t` deadline, and holds full file access inside
-the chroot for its whole life. Running one needs a supervisor and rlimits, which the map
-explicitly leaves out.
+serves many requests from one process, so `slowcgi` never forks it per request. That makes it
+a different product. It needs supervision and restart policy, because a crash takes the
+service down until something restarts it. It needs its own rlimits and socket handling,
+because there is no per-request child to bound. And it persists state between requests, which
+is the feature a member wants from it and the reason it cannot be treated as a CGI script. The
+map excludes it because that supervision is a service to build and run, not because of
+pledging.
 
 ## 7. Does "base interpreters only" exclude a compiled binary
 
@@ -289,18 +258,19 @@ The route can accept a Rust binary with an instruction that fits in four steps, 
 spec says the build happens on the same OpenBSD release as the host and the member rebuilds
 on upgrade. The chroot needs the loader and the base libraries, which the interpreter tree
 already holds, so this adds at most `libm` and `libpthread` to an existing tree. Static
-uploads are not a thing to plan for, because rustc cannot produce one. The pledge claim in
-the map needs rewriting before the spec relies on it: as `slowcgi` stands, the member's
-program is unpledged, and the honest statement of the route's containment is the chroot, the
-member uid, and whatever limits the per-member service sets, with the pledge available only
-after a change to the exec path. The policy answer is that a prebuilt binary is allowed; the
-constraint is about interpreters.
+uploads are not a thing to plan for, because rustc cannot produce one. The containment claim
+must be restated as the chroot plus the member uid, with no pledge on the member's program; a
+pledge is available only after a change to the exec path, and even then it spans the whole
+chroot. The policy answer is that a prebuilt binary is allowed, because the constraint is
+about interpreters.
 
 ## What is not verified
 
-- No OpenBSD host was available. Nothing was built, linked, uploaded or executed, and the
-  runtime pledge behaviour was not observed. The note is source reading plus one rustup
-  observation.
+- No OpenBSD host was available. Nothing was built, linked, uploaded or executed. The note is
+  source reading plus one rustup observation.
+- The no-pledge conclusion is read from `slowcgi.c`, `pledge(2)`, `kern_pledge.c` and
+  `kern_exec.c`, not observed at runtime. A one-line test on a box (a CGI that writes a file,
+  run through `slowcgi`) would settle it.
 - The `DT_NEEDED` list and the interpreter path for a real binary. `ldd` and `readelf -l` on
   the host settle both, and the library majors quoted here are from `-current` shlib_version
   files, not from the release the host will run.
@@ -309,6 +279,8 @@ constraint is about interpreters.
 - Whether the deployed `slowcgi` matches `-current`. The source read is `-current` as of
   2026-11-05; a release branch should be checked against the code above before the spec
   quotes it.
+- Which environment variables the front ends actually send. The note establishes only that the
+  child passes the FastCGI params and nothing else, so the list depends on `httpd` and `gmid`.
 - Any limit behaviour. The map already notes that `slowcgi` has none beyond `-t`, and this
   note did not test what a spinning Rust program does.
 
@@ -319,9 +291,7 @@ constraint is about interpreters.
 - OpenBSD base target options: <https://github.com/rust-lang/rust/blob/main/compiler/rustc_target/src/spec/base/openbsd.rs>
 - `crt_static` defaults: <https://github.com/rust-lang/rust/blob/main/compiler/rustc_target/src/spec/mod.rs#L2812-L2814>
 - `Session::crt_static`: <https://github.com/rust-lang/rust/blob/main/compiler/rustc_session/src/session.rs#L773-L777>
-- std stack overflow module: <https://github.com/rust-lang/rust/blob/main/library/std/src/sys/pal/unix/stack_overflow/mod.rs>
 - OpenBSD `lang/rust` port: <https://github.com/openbsd/ports/blob/master/lang/rust/Makefile> and <https://github.com/openbsd/ports/blob/master/lang/rust/pkg/PLIST-main>
-- port patch for `current_exe`: <https://github.com/openbsd/ports/blob/master/lang/rust/patches/patch-library_std_src_sys_paths_unix_rs>
 - `pledge(2)`: <https://man.openbsd.org/pledge.2>
 - `slowcgi(8)`: <https://man.openbsd.org/slowcgi.8>
 - `slowcgi.c`: <https://github.com/openbsd/src/blob/master/usr.sbin/slowcgi/slowcgi.c>
