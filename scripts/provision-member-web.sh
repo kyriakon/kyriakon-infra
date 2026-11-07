@@ -334,7 +334,7 @@ self_test() {
 	rm -f "$(cert_file)"
 	write_member_conf > "$tree/keyonly.out"
 	check "a key with no certificate is not refused" \
-		"$(grep -c 'unchanged\|wrote' "$tree/keyonly.out")" 1
+		"$(grep -E -c 'unchanged|wrote' "$tree/keyonly.out")" 1
 	check "and the file is port 80 only" \
 		"$(grep -c '127.0.0.1 port 8080' "$conf")" 0
 	# An empty certificate is an interrupted write, not a certificate: the

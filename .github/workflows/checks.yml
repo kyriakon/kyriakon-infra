@@ -118,26 +118,26 @@ jobs:
 
   # The scripts' own tests are the only automated check most of them have, and
   # they run weekly on the box: without this a break reaches main and stays until
-  # Monday. They assert scripts written for OpenBSD and use BSD `stat -f`, which
-  # the Linux runner's GNU coreutils answers "cannot read file system information
-  # for '%Lp'". macOS carries that stat, and oksh is the portable OpenBSD ksh:
-  # macOS's own /bin/ksh is ksh93, and CONTEXT.md records why a self-test that
-  # passes under it does not count.
+  # Monday. They assert scripts written for OpenBSD's ksh and BSD userland:
+  # Linux's GNU coreutils answers `stat -f` differently, and macOS was only ever
+  # a proxy. This job boots a real OpenBSD 7.9 VM on the Ubuntu runner, so the
+  # shell and tools under test are the ones the box runs.
   self-tests:
     name: script self-tests
-    # Pinned rather than macos-latest: the runner image changing is not a signal
-    # about this repo, and the queue behind a floating label was cancelling this
-    # job at ~15 minutes. The bound turns a hung brew into a fast failure.
-    runs-on: macos-14
-    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - name: pdksh
-        run: brew install oksh
-      - name: self-tests
-        env:
-          SELF_TEST_KSH: oksh
-        run: oksh scripts/self-test-all.sh
+      - name: self-tests on OpenBSD 7.9
+        uses: vmactions/openbsd-vm@v1.4.9
+        with:
+          release: "7.9"
+          prepare: |
+            pkg_add git jq curl gnupg
+          run: |
+            ksh scripts/self-test-all.sh
 
   terraform:
     name: terraform
