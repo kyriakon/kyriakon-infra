@@ -35,6 +35,21 @@ Both changes are propose-only. The relayd listener block stays commented in the 
 
 Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box without changing anything. It reports permission drift against mtree, the blocklist verdict for the box's address, whether a cron job can still reach the tools it needs, whether the finger service is intact, whether the deployed catalogue matches the tracked one, whether the terraform guard and the restore snapshot are still in place, and whether the two files naming the mail domains agree. It exits non-zero when something is wrong.
 
+## Test on the OpenBSD VM
+
+The `script self-tests` job in `.github/workflows/checks.yml` boots a real OpenBSD
+7.9 machine with `vmactions/openbsd-vm` and runs
+`scripts/install-packages.sh --ci`, `scripts/install-packages.sh --check`, and
+`scripts/self-test-all.sh`. This is the authoritative check for the shell and
+tools the box runs; macOS and Linux are only proxies.
+
+Push a branch and open a PR, then read the job's log. To exercise something the
+suite does not cover, add a step to that job on the branch and remove it before
+merge. The VM runs its commands as root, has 30 minutes, and installs only the
+rows marked `yes` in `openbsd/packages.tsv`; a test that needs another tool adds
+a row there. It holds no deployed configuration or credentials for kyriakon.net,
+and `terraform apply`/`destroy` remain human-only.
+
 ## Deploy a merged change
 
 `scripts/deploy.sh` is the normal deploy. It reads the last deployed commit from

@@ -107,9 +107,9 @@ jobs:
       # The deploy self-test is the one that scans the crate's source for the
       # drain's script invocations. It needs only a pdksh-family shell and
       # coreutils, not BSD stat, so it runs here rather than waiting behind the
-      # macOS job. Ubuntu has no oksh package; mksh is the same lineage and this
-      # step checks the scan, not the shell's portability. The full suite still
-      # runs under oksh on macOS.
+      # OpenBSD VM job. Ubuntu has no oksh package; mksh is the same lineage and
+      # this step checks the scan, not the shell's portability. The full suite
+      # runs in the OpenBSD 7.9 VM below.
       - name: deploy source-scan self-test
         run: |
           sudo apt-get update
@@ -135,6 +135,7 @@ jobs:
         with:
           release: "7.9"
           run: |
+            set -eu
             ksh scripts/install-packages.sh --ci
             ksh scripts/install-packages.sh --check
             ksh scripts/self-test-all.sh

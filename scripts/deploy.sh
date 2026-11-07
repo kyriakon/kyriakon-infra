@@ -150,6 +150,8 @@ classify() {
 	onboard/*) needs_onboard=yes ;;
 	kyriakon-encrypt/* | dovecot-plugin/*) needs_mail=yes ;;
 	openbsd/dovecot/*) needs_mail=yes ;;
+	# Both deploys read the package table, and either side's rows can change.
+	openbsd/packages.tsv) needs_mail=yes; needs_onboard=yes ;;
 	openbsd/etc/onboard/*) needs_onboard=yes ;;
 	openbsd/etc/rc.d/kyriakon_onboard) needs_onboard=yes ;;
 	openbsd/etc/rc.d/kyriakon_onboard_sshd) manual_sshd_onboard=yes ;;
@@ -597,6 +599,10 @@ self_test() {
 	classify 'scripts/install-set.tsv'
 	check 'a table change plans both deploys and the cron step' \
 		"$needs_mail $needs_onboard $manual_cron" 'yes yes yes'
+	reset_plan
+	classify 'openbsd/packages.tsv'
+	check 'a package table change plans both deploys' \
+		"$needs_mail $needs_onboard" 'yes yes'
 	reset_plan
 	classify 'scripts/kyriakon-authcheck.sh'
 	check 'the libexec install plans deploy-onboard' "$needs_onboard" yes

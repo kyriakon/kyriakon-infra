@@ -18,7 +18,7 @@
 # not in the table. It is what keeps a new dependency from being installed only
 # on the developer's machine.
 #
-# Run as root on the box; the VM runs it as root in its prepare step.
+# Run as root on the box; the CI VM's run step is root too.
 
 set -euo pipefail
 
@@ -65,17 +65,19 @@ check_calls() {
 	typeset dir=${CHECK_SCRIPTS_DIR:-$script_dir} listed calls missing calls_file listed_file
 	[ -f "$packages" ] || die "no package table at $packages"
 	listed=$(awk -F'\t' '/^[[:space:]]*#/ || NF < 3 { next } { print $1 }' "$packages" | sort -u)
-	calls=$(awk '
+	calls=$(awk -v q="'" '
 		/^[[:space:]]*#/ { next }
 		{
 			line = $0
-			while (match(line, /(^|[;()&|])[[:space:]]*need_pkg[[:space:]]+[A-Za-z0-9][A-Za-z0-9._-]*/)) {
+			gsub(q "[^" q "]*" q, "", line)
+			gsub(/"[^"]*"/, "", line)
+			while (match(line, /(^|[^[:alnum:]_.-])need_pkg[[:space:]]+[A-Za-z0-9][A-Za-z0-9._-]*/)) {
 				s = substr(line, RSTART, RLENGTH)
 				sub(/^.*need_pkg[[:space:]]+/, "", s)
 				print s
 				line = substr(line, RSTART + RLENGTH)
 			}
-		}' "$dir"/*.sh 2>/dev/null | grep -v -E '\.sh$|^versioned$' | sort -u)
+		}' "$dir"/*.sh 2>/dev/null | grep -v -E '^(present|absent)\.sh$|^versioned$' | sort -u)
 	[ -n "$calls" ] || return 0
 	calls_file=$(mktemp "${TMPDIR:-/tmp}/need-pkg-calls.XXXXXX") || return 1
 	listed_file=$(mktemp "${TMPDIR:-/tmp}/listed-packages.XXXXXX") || {
@@ -131,13 +133,18 @@ STUB
 	: > "$work/add.log"
 	install_selected ci >/dev/null
 	check "an installed package is not reinstalled" "$(tr '\n' ' ' < "$work/add.log")" ""
+	: > "$work/installed"
+	: > "$work/add.log"
+	need_packages "$work/packages.tsv" deploy-b.sh >/dev/null
+	check "need_packages pulls the owner's rows" "$(tr '\n' ' ' < "$work/add.log")" "-I bar "
 
 	printf 'need_pkg foo\n' > "$work/scripts/a.sh"
-	printf 'need_pkg missing\n' > "$work/scripts/b.sh"
+	printf 'if true; then need_pkg missing; fi\n' > "$work/scripts/b.sh"
+	printf 'need_pkg fake.sh\n' > "$work/scripts/c.sh"
 	if CHECK_SCRIPTS_DIR="$work/scripts" check_calls >"$work/check.out" 2>&1; then
 		check "an unlisted direct need_pkg is a finding" "passed" "failed"
 	else
-		check "an unlisted direct need_pkg is a finding" "$(grep -c '^missing$' "$work/check.out")" "1"
+		check "an unlisted direct need_pkg is a finding" "$(grep -c -E '^(missing|fake\.sh)$' "$work/check.out")" "2"
 	fi
 	self_test_end
 }
