@@ -1,0 +1,27 @@
+# openbsd/packages.tsv — the packages the box installs.
+#
+# Columns: package, the scripts that install it (comma separated), and whether
+# the CI OpenBSD VM installs it. The deploy scripts read this table through
+# need_packages in lib.sh; scripts/install-packages.sh installs the rows for CI,
+# or the whole table on the box.
+#
+# `box` is the checkout itself: git updates it, and no deploy owns that. The CI
+# column is not "the box has it", it is "the self-test VM needs it", so rust and
+# dovecot stay out even though the mail deploy installs them: the self-tests do
+# not build the plugin or start the mail daemons.
+#
+# curl and jq are the clients the onboarding and keyring scripts use. jq is also
+# the only base64 encoder on the box: OpenBSD ships no base64(1).
+# gmid provides the Gemini server and the _gmid account the capsule sockets use.
+
+curl	deploy-onboard.sh	yes
+dovecot	deploy-mail.sh	no
+git	box	yes
+gmid	deploy-mail.sh,deploy-onboard.sh	yes
+gnupg	deploy-mail.sh	yes
+hcloud	deploy-mail.sh	no
+helix	deploy-mail.sh	no
+jq	deploy-mail.sh,deploy-onboard.sh	yes
+opensmtpd-filter-dkimsign	deploy-mail.sh	yes
+restic	backup.sh	no
+rust	deploy-mail.sh,deploy-onboard.sh	no

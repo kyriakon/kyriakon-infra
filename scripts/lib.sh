@@ -107,6 +107,27 @@ need_pkg() {
 	pkg_add -I "$1"
 }
 
+# need_packages <file> <owner>: install every package the table assigns to owner.
+# The owner is the script that needs it, so a deploy pulls its own rows, a
+# package shared by two deploys is written once, and CI reads the same table.
+need_packages() {
+	typeset file=$1 owner=$2 pkg selected
+	if [ ! -f "$file" ]; then
+		printf '%s: no package table at %s\n' "$0" "$file" >&2
+		return 1
+	fi
+	selected=$(awk -F'\t' -v owner="$owner" '
+		/^[[:space:]]*#/ || NF < 3 { next }
+		index("," $2 ",", "," owner ",") > 0 { print $1 }' "$file" | sort -u)
+	if [ -z "$selected" ]; then
+		printf '%s: no packages for %s in %s\n' "$0" "$owner" "$file" >&2
+		return 1
+	fi
+	for pkg in $selected; do
+		need_pkg "$pkg"
+	done
+}
+
 
 # --- generated files -------------------------------------------------------
 #
