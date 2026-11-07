@@ -1241,9 +1241,6 @@ install -m 0755 "$repo_dir/kyriakon-encrypt/target/release/kyriakon-encrypt" "$e
 
 say "keyring"
 install -d -m 0755 "$keyring_dir"
-# The install reads each account's mail_key, so the package this deploy already
-# needs comes in before the loop rather than after it.
-need_pkg jq
 for k in "$repo_dir"/keys/*.asc; do
 	[ -e "$k" ] || continue
 	install_keyring_key "$k"
@@ -1369,11 +1366,8 @@ for s in $(stale_copies "$root_bin"); do
 done
 printf 'cron scripts installed into /root/bin\n'
 
-# restore-standup.sh creates the weekly test box with the hcloud CLI and reads
-# its answer with jq, which is installed above for the keyring. hcloud cannot
-# install its own, so it comes in here rather than failing at 03:45 on the
-# morning it runs.
-need_pkg hcloud
+# hcloud is installed at the top from openbsd/packages.tsv; restore-standup.sh
+# needs it to create the weekly test box.
 
 # The box's values. setup-env.sh owns the install and is called rather than
 # duplicated here, so a box gets the file whichever deploy runs first: this one
