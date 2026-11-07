@@ -209,11 +209,11 @@ with no OS account) cannot be used to log in; the member is told the account nam
 
 ## 4. The service side
 
-The onboarding service is planned in `kyriakon-onboard` (proposal §5.9, §6.14): a web
+The onboarding service is built in `onboard/` here (proposal §5.9, §6.14): a web
 application, an operator approval, Stripe Checkout, a verified webhook and a narrow
 provisioning privilege. This ticket states that its state is flat files and that a root-run
-drain applies its intents; that design is not written down in this repo yet, and
-`kyriakon-onboard` currently holds only docs. What follows is what an organisation adds to
+drain applies its intents; that design was not written down here when this note was
+taken. What follows is what an organisation adds to
 that shape.
 
 **A group of accounts.** Today one application becomes one account. An organisation is one
@@ -368,7 +368,7 @@ Beyond the individual fields in proposal §5.9.1, an organisation application ne
   that the design's move of their chroot from `/var/www` to the tree holding member homes
   lands as written. Read from the deployed configs and man pages, not exercised.
 - The onboarding service's flat files and root drain. Taken from the ticket; the design is
-  not written in this repo, and `kyriakon-onboard` holds only docs at the time of writing.
+  not written here at the time of writing.
 - The 50-per-registered-domain arithmetic is only as exact as the Public Suffix List. For
   `parish.example` the registered domain is the domain itself; a parish on a suffix such as
   `.co.uk` would be measured at the higher registered domain.

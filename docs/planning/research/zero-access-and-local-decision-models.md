@@ -260,7 +260,7 @@ per question type on real inputs and the resulting buckets are checked against o
 Both are the same shape: a text state, a handful of frozen labels, an action that must be
 cheap to reverse.
 
-**Account applications** (`kyriakon-onboard`, §5.9.1) are the stronger of the two. They are
+**Account applications** (`onboard/`, §5.9.1) are the stronger of the two. They are
 structured data submitted to the platform deliberately, so no zero-access question arises at
 all. The form is internet-facing before any vet, so it is the unbounded-volume surface, and
 the proposal already notes a floodable application form is a DoS on Oliver. It also already
@@ -401,7 +401,7 @@ thresholds in §9, and not enough to reconstruct anyone's mail.
 
 ## 12. Status, and what this does not do
 
-Tracked as `kyriakon` issue #5, and not buildable yet. `kyriakon-onboard` is fast-follow per the
+Tracked as `kyriakon` issue #5, and not buildable yet. The onboarding service is fast-follow per the
 proposal and MVP is dogfooding with one mailbox, so there is no application volume to triage and
 no support queue to drain. This document fixes the boundary and records the model's measured
 ceilings before anything is built against either, in the same spirit as the ingress docs: the
