@@ -135,7 +135,7 @@ jobs:
         with:
           release: "7.9"
           prepare: |
-            pkg_add git jq curl
+            pkg_add git jq curl gnupg
           run: |
             ksh scripts/self-test-all.sh
 
