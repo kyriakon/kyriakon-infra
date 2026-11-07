@@ -134,6 +134,8 @@ jobs:
         uses: vmactions/openbsd-vm@v1.4.9
         with:
           release: "7.9"
+          prepare: |
+            pkg_add git jq curl
           run: |
             ksh scripts/self-test-all.sh
 
