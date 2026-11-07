@@ -7,7 +7,8 @@
 #   2. auth failures: smtpd + dovecot (maillog), sshd (authlog), and the
 #      onboarding instance's admissions per source, which are what the second
 #      public listener adds to authlog
-#      mail-side any; ssh per source address
+#      mail-side: a real member at one, an unknown username above a bound; ssh
+#      per source address
 #   3. quota approach: per-user edquota usage vs soft limit
 #   4. spamd greylist/blocklist: greylist churn + new TRAPPED (blacklisted) hosts
 #   5. senders deferred from several addresses: mail lost to a rotating retry IP
@@ -32,8 +33,16 @@
 # external channel carries them too.
 #
 # Env (all optional; the script degrades to stderr output):
-#   ALERT_EMAIL            address to mail alerts to, off this box, so an alert
-#                          survives this box being the broken thing
+#   ALERT_EMAIL            the one address to mail alerts to, off this box, so an
+#                          alert survives this box being the broken thing. One
+#                          address and not a list: a list mails every name in it,
+#                          which is how an alert about the mail box ends up in a
+#                          mailbox on that same box. check-hygiene flags an
+#                          address at a domain this box accepts.
+#   MAIL_PROBE_MAX         failed SMTP/IMAP logins per run for usernames that do
+#                          not exist here before alerting (default 50). With no
+#                          members there is no mailbox to enter, so a scanner
+#                          probing one is background and a bound is the signal.
 #   HEALTHCHECKS_URL       this box's check: a ping every run, with any finding
 #                          attached to the event log. Not /fail, because a finding
 #                          is not an outage; silence is what marks it down.
@@ -138,6 +147,53 @@ source_tally() {
 			worst = ""; high = 0
 			for (ip in n) if (n[ip] > high) { high = n[ip]; worst = ip }
 			printf "%s %d %d\n", worst, high, t+0
+		}'
+}
+
+# mail_auth_events <member-usernames> — read maillog lines on stdin and print one
+# "<kind>\t<user>\t<source>" per failed SMTP/IMAP login, kind real or unknown.
+#
+# real means the username names a member, which is the case the alert text was
+# written for: a client or phone still sending a password that was changed. It is
+# the only case worth a mail at one, because it has an owner who can fix it.
+# Everything else is a scanner trying a name with no mailbox behind it; a single
+# attempt is background, so those are counted and compared with MAIL_PROBE_MAX.
+#
+# The two log forms differ. smtpd writes "smtp authentication user=X
+# result=permfail|tempfail" and no source address. Dovecot writes "(auth failed,
+# N attempts in M secs)" with user=<X> and rip=<address>.
+mail_auth_events() {
+	awk -v members=" $1 " '
+		function user_of(line,   s) {
+			if (match(line, /user=<[^>]*>/)) {
+				s = substr(line, RSTART + 6, RLENGTH - 7)
+				return s
+			}
+			if (match(line, /user=[^ ,]+/)) {
+				s = substr(line, RSTART + 5, RLENGTH - 5)
+				return s
+			}
+			return ""
+		}
+		function source_of(line,   s) {
+			if (match(line, /rip=[0-9A-Fa-f:.]+/))
+				return substr(line, RSTART + 4, RLENGTH - 4)
+			return ""
+		}
+		{
+			if ($0 ~ /smtp authentication user=.*result=(perm|temp)fail/) {
+				user = user_of($0)
+				source = ""
+			} else if ($0 ~ /auth failed, [0-9]+ attempts in/) {
+				user = user_of($0)
+				source = source_of($0)
+			} else {
+				next
+			}
+			kind = "unknown"
+			if (user != "" && index(members, " " user " ") > 0)
+				kind = "real"
+			printf "%s\t%s\t%s\n", kind, user, source
 		}'
 }
 
@@ -285,6 +341,21 @@ AUTHLOG
 	check "the failure tally still counts the pair as one attempt" \
 		"$(source_tally failures < "$work/authlog")" "192.0.2.5 2 2"
 
+	# The mail-side split: a failure naming a member is the stale-client case and
+	# alerts at one; a name with no member behind it is a scanner and is bounded
+	# instead. The two log forms carry different fields, and smtpd's successful
+	# authentication is in the fixture to prove it is not counted at all.
+	cat > "$work/maillog" <<'MAILLOG'
+Nov  7 11:00:01 mail smtpd[1]: 0000000000000001 smtp authentication user=admin result=permfail
+Nov  7 11:00:02 mail smtpd[1]: 0000000000000002 smtp authentication user=alice result=ok
+Nov  7 11:00:03 mail smtpd[1]: 0000000000000003 smtp authentication user=alice result=permfail
+Nov  7 11:00:04 mail dovecot: imap-login: Info: Disconnection (auth failed, 1 attempts in 0 secs): user=<alice>, method=PLAIN, rip=192.0.2.5, lip=203.0.113.1
+Nov  7 11:00:05 mail dovecot: imap-login: Info: Disconnection (auth failed, 2 attempts in 1 secs): user=<nobody>, method=PLAIN, rip=198.51.100.7, lip=203.0.113.1
+MAILLOG
+	check "a member's failures are told apart from scanner usernames" \
+		"$(mail_auth_events alice < "$work/maillog" | awk -F'\t' '{ printf "%s:%s:%s ", $1, $2, $3 }')" \
+		"unknown:admin: real:alice: real:alice:192.0.2.5 unknown:nobody:198.51.100.7 "
+
 	# A cold resolver must be retried rather than skipped past, which is the
 	# 2026-10-05 alert: the box had just rebooted, the probe gave up, the query fell
 	# through to the system resolver, Spamhaus ignored that by design, and the verdict
@@ -376,6 +447,7 @@ mkdir -p "$state"
 alert_cooldown="${ALERT_COOLDOWN_MINUTES:-60}"
 mail_spike_max="${MAIL_SPIKE_MAX:-50}"
 auth_fail_max="${AUTH_FAIL_MAX:-300}"
+mail_probe_max="${MAIL_PROBE_MAX:-50}"
 quota_warn_pct="${QUOTA_WARN_PCT:-80}"
 grey_max="${GREY_MAX:-100}"
 trapped_rise_min="${TRAPPED_RISE_MIN:-3}"
@@ -490,28 +562,31 @@ if [ "$outbound" -gt "$mail_spike_max" ]; then
 fi
 
 # --- 2. auth failures ----------------------------------------------------
-# Split by kind, because the two mean opposite things. Mail-side failures are rare
-# and each is a real client getting its password wrong, so the first one is worth
-# knowing about. sshd failures are the background noise of any public box: this one
-# takes a steady trickle of dictionary guesses from all over, and a total summed
-# across mail and ssh says nothing except that the internet is on. Twelve guesses
-# from twelve addresses is that background; twelve from one address is somebody
-# working through a list, and that is the one worth waking up for.
-#   smtpd (smtp_session.c): "smtp authentication user=X result=permfail|tempfail"
-#   dovecot: "(auth failed, N attempts in M secs)". This is the line the build
-#     writes and it is in libdovecot-login.so.4.0; the pattern used to look for
-#     "pam_authenticate() failed", which belongs to passdb-pam.c and is in none
-#     of the installed Dovecot objects, because the deployed passdb is bsdauth.
-#     The one real IMAP failure in the retained maillog (2026-09-24, an NTLM
-#     probe from a scanner) is exactly the form above and went unmatched.
-#   sshd (authlog): see the tally below.
-mail_auth=$(printf '%s\n' "$new_maillog" \
-	| awk '
-		/smtp authentication user=.*result=(perm|temp)fail/ { c++ }
-		/auth failed, [0-9]+ attempts in/ { c++ }
-		END { print c+0 }')
-if [ "$mail_auth" -gt 0 ]; then
-	alert mail "auth failures" "$mail_auth failed SMTP/IMAP logins since last run. Each one is a client whose password is wrong, so check the address before assuming a stranger: a phone with a stale password looks exactly like this"
+# Split by kind, because the two mean opposite things. A mail-side failure that
+# names a member is a real client getting its password wrong, and the first one
+# is worth knowing about: it has an owner who can fix it. A failure that names a
+# username with no member behind it cannot enter anything; before the first member
+# exists every one of those is a scanner, and a single attempt is background. So
+# the member case alerts at one and the scanner case only above MAIL_PROBE_MAX.
+#
+# The log forms and the fields they carry are in mail_auth_events above. The
+# member list is the group add-user.sh puts every member in, so an attempt on a
+# system account is a guess like any other and not a stale client.
+members=$(getent group members 2>/dev/null | cut -d: -f4 | tr ',' ' ' || true)
+mail_events=$(printf '%s\n' "$new_maillog" | mail_auth_events "$members")
+real_auth=$(printf '%s\n' "$mail_events" | awk -F'\t' '$1 == "real" { c++ } END { print c + 0 }')
+unknown_auth=$(printf '%s\n' "$mail_events" | awk -F'\t' '$1 == "unknown" { c++ } END { print c + 0 }')
+if [ "$real_auth" -gt 0 ]; then
+	real_names=$(printf '%s\n' "$mail_events" | awk -F'\t' '$1 == "real" && $2 != "" { print $2 }' | sort -u | paste -sd, -)
+	alert mail "auth failures" "$real_auth failed SMTP/IMAP login(s) since last run for $real_names, which is a real address here. The likeliest cause is a mail client or phone still sending an old password, and it stops when that is fixed; a stranger cannot use it"
+fi
+if [ "$unknown_auth" -gt "$mail_probe_max" ]; then
+	probe_sources=$(printf '%s\n' "$mail_events" | awk -F'\t' '$1 == "unknown" && $3 != "" { print $3 }' | sort | uniq -c | sort -rn | head -n 3 | awk '{ printf "%s%s (%s)", sep, $2, $1; sep = ", " }')
+	from_clause=""
+	if [ -n "$probe_sources" ]; then
+		from_clause=", busiest sources $probe_sources"
+	fi
+	alert mail "guesses" "$unknown_auth failed SMTP/IMAP logins since last run for usernames that do not exist here (max $mail_probe_max$from_clause). No mailbox can be entered and no member is affected; this is a scanner working through names, and it is worth a look only if the number keeps climbing"
 fi
 
 # sshd, tallied by source address, reporting the worst one and the total.

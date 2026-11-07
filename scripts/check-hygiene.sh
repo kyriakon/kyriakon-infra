@@ -153,6 +153,13 @@ alert_address_problem() {
 		return 0
 		;;
 	esac
+	case "$value" in
+	*,*|*[[:space:]]*)
+		printf 'ALERT_EMAIL in %s is more than one address (%s): a list mails every one of them, so an alert can land in a mailbox on this box\n' \
+			"$env_file" "$value"
+		return 0
+		;;
+	esac
 	domain=${value##*@}
 	if [ -f "$domains" ] && grep -qxF "$domain" "$domains"; then
 		printf 'ALERT_EMAIL is %s, and this box accepts mail for %s: a mail box cannot report its own mail being broken\n' \
@@ -402,6 +409,19 @@ self_test() {
 		printf 'FAIL: an off-box address is not a finding; got [%s]\n' "$out" >&2
 		exit 1
 	}
+
+	# A list is how an alert reaches the mailbox it is warning about, and how one
+	# arrives twice. The first address is off-box, so only the list check catches it.
+	printf "export ALERT_EMAIL='ops@example.org,ops@kyriakon.net'\n" > "$dir/env"
+	out=$(alert_address_problem "$dir/env" "$dir/domains")
+	case "$out" in
+	*'more than one address'*)
+		;;
+	*)
+		printf 'FAIL: a list of addresses is a finding; got [%s]\n' "$out" >&2
+		exit 1
+		;;
+	esac
 
 	printf 'export HEALTHCHECKS_URL=example\n' > "$dir/env"
 	out=$(alert_address_problem "$dir/env" "$dir/domains")
