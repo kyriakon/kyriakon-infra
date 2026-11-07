@@ -278,19 +278,9 @@ else
 fi
 
 say "build"
-need_pkg rust
-# The publish path is a shell client rather than the binary: publish-mail-key.sh
-# opens the change with curl and encodes the key with jq, so the deploy that
-# installs the drain is what installs them. jq is not a convenience here, it is
-# the only base64 encoder on the box: OpenBSD ships no base64(1).
-need_pkg curl
-need_pkg jq
-# The gemini socket directory below is group _gmid, and that account arrives with
-# the gmid package, not in base. deploy.sh plans this deploy before deploy-mail
-# now, because deploy-mail and deploy-relayd both refuse to finish without the
-# handler, so the package has to be here rather than only in the mail deploy.
-# need_pkg is idempotent, and deploy-mail asks for the same package.
-need_pkg gmid
+# The rows for this deploy are in openbsd/packages.tsv, including rust, curl and
+# jq for the publish path, and gmid for the capsule socket directory.
+need_packages "$repo_dir/openbsd/packages.tsv" deploy-onboard.sh
 cargo build --release --manifest-path "$repo_dir/onboard/Cargo.toml"
 # The handler, the root drain, onboardctl and the portal are one crate and four
 # programs: a build that produced some of them but not the others is half a

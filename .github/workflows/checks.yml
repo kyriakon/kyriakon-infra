@@ -134,9 +134,9 @@ jobs:
         uses: vmactions/openbsd-vm@v1.4.9
         with:
           release: "7.9"
-          prepare: |
-            pkg_add git jq curl gnupg
           run: |
+            ksh scripts/install-packages.sh --ci
+            ksh scripts/install-packages.sh --check
             ksh scripts/self-test-all.sh
 
   terraform:

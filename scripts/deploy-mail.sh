@@ -568,18 +568,9 @@ done
 # --- 1. packages ---------------------------------------------------------
 
 say "packages"
-need_pkg dovecot
-need_pkg gnupg
-need_pkg rust
-need_pkg opensmtpd-filter-dkimsign
-# The Gemini server. C, OpenBSD-native, and the choice the proposal records over
-# Agate for ecosystem fit rather than performance.
-need_pkg gmid
-# Operators' editor, not something a service needs: the mail stack runs without
-# one. helix is what the person running this box edits with, and it needs no
-# config to behave, unlike vim, which starts in compatible mode on a fresh
-# account and looks exactly like the vi nobody wants.
-need_pkg helix
+# The rows for this deploy are in openbsd/packages.tsv. The table is also what
+# CI reads, so a package this deploy needs has one place to be declared.
+need_packages "$repo_dir/openbsd/packages.tsv" deploy-mail.sh
 
 # The blocklist check asks Spamhaus, and Spamhaus refuses to answer any resolver
 # serving more than one machine, which is every resolver a Hetzner box is handed.
