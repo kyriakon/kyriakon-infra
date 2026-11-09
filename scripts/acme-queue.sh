@@ -480,7 +480,11 @@ run() {
 # before any mode reads the live store or runs as root, so it is safe unprivileged
 # on any machine (the same shape as scripts/abuse-monitor.sh --self-test).
 self_test() {
+	# The fixture address stands in for the one cron inherits from
+	# /root/.kyriakon-env; self_test_begin must drop it before any attempt mails.
+	ALERT_EMAIL=fixture@example.invalid
 	self_test_begin
+	check "a self-test drops the operator address" "${ALERT_EMAIL:-}" ""
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	work=$self_test_work
 

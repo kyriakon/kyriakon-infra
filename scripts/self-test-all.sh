@@ -20,7 +20,11 @@ set -euo pipefail
 # can read it. Under cron that file exists, so a test would pick up the operator's
 # address and mail the fixtures it was given instead of printing them. Both the
 # drift check's children and every other test get a path that does not exist.
+# The cron line also sources that file before this script starts, so ALERT_EMAIL
+# is already exported; KYRIAKON_ENV only stops lib.sh reading it a second time.
+# Drop the inherited value so no child can mail a fixture.
 export KYRIAKON_ENV=/dev/null
+unset ALERT_EMAIL
 
 # Scripts that cannot answer --self-test: they need a live box, root or a service
 # this checkout does not have. A script not named here without a self_test()
