@@ -695,6 +695,11 @@ table_drop() {
 
 self_test_begin() {
 	self_test_fails=0
+	# A self-test must not mail the fixtures it runs. The cron line may have
+	# sourced /root/.kyriakon-env before KYRIAKON_ENV=/dev/null was set, so the
+	# operator's address can already be in the environment; drop it here rather
+	# than relying on each test to remember.
+	unset ALERT_EMAIL
 	self_test_work=$(mktemp -d "${TMPDIR:-/tmp}/kyriakon-self-test.XXXXXX") || exit 1
 	# Expanded now rather than at exit: the function's locals are gone by then.
 	# shellcheck disable=SC2064
