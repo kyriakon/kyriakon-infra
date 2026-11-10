@@ -1,8 +1,9 @@
 //! Tests for the status module.
 
-use crate::frontend::page;
+use super::super::UNKNOWN_TOKEN;
+use super::{payment_for, status_page};
+use crate::account::LAPSE_NOTE;
 use crate::frontend::responder::test_support::*;
-use crate::frontend::responder::*;
 use crate::store::Record;
 
 /// A closed window is the same fact on both front ends: the handler reads the
@@ -33,7 +34,7 @@ async fn a_lapsed_application_says_the_window_closed_on_both_front_ends() {
             body.contains("Lapsed: the payment window closed on 2026-10-16"),
             "{body}"
         );
-        assert!(body.contains(page::LAPSE_NOTE), "{body}");
+        assert!(body.contains(LAPSE_NOTE), "{body}");
         assert!(
             !body.contains("Amount: GBP"),
             "a closed window quotes no amount: {body}"

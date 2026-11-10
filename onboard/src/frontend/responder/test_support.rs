@@ -4,6 +4,7 @@
 //! The fixture is a request into `fastcgi::read_request`, through the routes, and
 //! out as the bytes the front-end would read.
 
+use super::connection::respond;
 use super::*;
 use crate::frontend::fastcgi::{self, fixture};
 use std::path::{Path, PathBuf};

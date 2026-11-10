@@ -1,7 +1,8 @@
 //! Tests for the route module.
 
+use super::super::FrontEnd;
+use super::{Fronts, Handler, Method, Resolution, Route, ROUTES};
 use crate::frontend::responder::test_support::*;
-use crate::frontend::responder::*;
 use crate::{flow::rate, frontend::capsule};
 
 #[tokio::test]
@@ -94,7 +95,7 @@ fn every_row_is_reached_by_the_front_ends_it_names() {
         );
         let (path, method) = probe(row);
         for front in [FrontEnd::Httpd, FrontEnd::Gemini] {
-            let reached = match route(front, &path, method) {
+            let reached = match super::route(front, &path, method) {
                 Resolution::Row(found, _) => Some(found),
                 Resolution::WrongMethod | Resolution::Missing => None,
             };

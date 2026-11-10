@@ -2,6 +2,11 @@
 
 use super::*;
 
+use super::connection::say;
+use super::flow::flow_path;
+use super::gemini::capsule_not_found;
+use super::reply::{too_many, Which};
+
 use std::sync::Arc;
 
 use tokio::io::AsyncReadExt;

@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use askama::Template;
 use time::OffsetDateTime;
 
+use crate::account::LAPSE_NOTE;
 use crate::flow::catalogue::{self, Protocol, Row, Service};
 use crate::flow::questions::{self, Kind, Question, Rule};
 
@@ -211,13 +212,6 @@ pub struct StatusPage {
     /// still owes for the year.
     pub payment: Option<PaymentView>,
 }
-
-/// The lapse's own words, shared by the page, the capsule and the notice: mail
-/// stays readable and published work stays up; sending, uploading and pushing
-/// stop; nothing is deleted at that point.
-pub const LAPSE_NOTE: &str = "Mail keeps arriving and stays readable, and everything you \
-published stays up. Sending, uploading and pushing have stopped. Nothing is deleted at \
-this point. If you have posted the money, write to admin@kyriakon.net.";
 
 /// The payment block, built once from the account and rendered by the web page,
 /// the capsule and the status page, so the three cannot disagree about what a
@@ -516,7 +510,7 @@ pub fn payment(
     // A running window carries the rail's instructions. A lapsed one shows the
     // token again but no instructions: the window it would have paid is gone.
     let instructions = if running {
-        crate::drain::transitions::stripe::rail_instructions(
+        crate::payments::rails::rail_instructions(
             rail,
             postal_address,
             card_link,

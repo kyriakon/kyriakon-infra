@@ -11,7 +11,6 @@ use super::groups::{
     take_group_down, write_account_record, write_group_record, write_group_state,
 };
 use super::payments::{resolve_payment, token_join, write_payment_copy};
-use super::stripe::rail_instructions;
 use super::{due, report_failure, write_journal, Settlement};
 use crate::account::dns;
 use crate::config::DrainConfig;
@@ -22,6 +21,7 @@ use crate::drain::{
 use crate::flow::validate;
 use crate::mail::notice;
 use crate::payments::ledger::Ledger;
+use crate::payments::rails::rail_instructions;
 use crate::store::journal::Journal;
 use crate::store::{
     self, Account, ApplicationRef, GroupPayment, GroupRecord, Payment, Record, Store, UploadKey,
@@ -595,7 +595,7 @@ async fn group_lapse_notice(
          The grace runs until {grace}, forty days from the lapse, and a final notice comes\n\
          seven days before every account in the group is deleted.\n",
         group.domain,
-        crate::frontend::page::LAPSE_NOTE
+        crate::account::LAPSE_NOTE
     );
     notice::send_account_notice(
         cfg,
@@ -636,7 +636,7 @@ async fn group_grace_notice(
          account in the group is deleted automatically. Paying restores the whole group.\n\n\
          Your payment reference is {token}.\n",
         group.domain,
-        crate::frontend::page::LAPSE_NOTE
+        crate::account::LAPSE_NOTE
     );
     notice::send_account_notice(
         cfg,
@@ -899,7 +899,7 @@ async fn grace_notice(
          The grace ends on {grace}, thirty days from this notice. After that the account\n\
          is deleted automatically. Paying restores it.\n\n\
          Your payment reference is {token}.\n",
-        crate::frontend::page::LAPSE_NOTE
+        crate::account::LAPSE_NOTE
     );
     notice::send_account_notice(cfg, store, username, "prepaid.grace", &subject, &to, &body)
         .await?;
@@ -1018,7 +1018,7 @@ async fn suspension_final_notice(
 }
 
 /// The lapse notice. The words that say what still works and what stopped are
-/// `page::LAPSE_NOTE`, the same constant both account pages render, so the mail
+/// `account::LAPSE_NOTE`, the same constant both account pages render, so the mail
 /// and the page cannot drift.
 async fn lapse_notice(
     cfg: &DrainConfig,
@@ -1042,7 +1042,7 @@ async fn lapse_notice(
          Your payment reference is {token}.\n\n\
          The grace runs until {grace}, forty days from the lapse, and a final notice comes\n\
          seven days before the end.\n",
-        crate::frontend::page::LAPSE_NOTE
+        crate::account::LAPSE_NOTE
     );
     notice::send_account_notice(cfg, store, username, "prepaid.lapsed", &subject, &to, &body)
         .await?;

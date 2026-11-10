@@ -11,7 +11,6 @@ use super::groups::{
     name_held, site_owner, write_account_record,
 };
 use super::lifecycle::group_recipient;
-use super::stripe::{card_link, rail_instructions};
 use super::{write_journal, Settlement};
 use crate::account::dns;
 use crate::account::sign;
@@ -20,6 +19,7 @@ use crate::drain::{DecisionIntent, ResendIntent, DECISIONS, RAILS};
 use crate::flow::questions;
 use crate::flow::validate;
 use crate::mail::notice;
+use crate::payments::rails::{card_link, rail_instructions};
 use crate::store::journal::Journal;
 use crate::store::{
     self, Account, ApplicationRef, FlatPayment, GroupIntent, GroupPayment, Intent, Monero, Payment,

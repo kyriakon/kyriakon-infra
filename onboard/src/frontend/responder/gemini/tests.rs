@@ -1,9 +1,12 @@
 //! Tests for the gemini module.
 
+use super::super::{FrontEnd, MAX_BODY, UNKNOWN_TOKEN};
+use super::capsule_value;
 use crate::config::HOST;
 use crate::frontend::fastcgi::{self};
+use crate::frontend::responder::connection::read;
+use crate::frontend::responder::flow::flow_path;
 use crate::frontend::responder::test_support::*;
-use crate::frontend::responder::*;
 use crate::{flow::questions, frontend::capsule};
 use std::collections::BTreeMap;
 

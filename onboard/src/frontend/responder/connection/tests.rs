@@ -1,9 +1,11 @@
 //! Tests for the connection module.
 
+use super::super::{FrontEnd, MAX_BODY, OWN_ORIGIN};
+use super::{fields, read};
 use crate::flow::rate::Key;
 use crate::frontend::fastcgi::{self, fixture};
+use crate::frontend::responder::flow::own_origin;
 use crate::frontend::responder::test_support::*;
-use crate::frontend::responder::*;
 use std::net::Ipv4Addr;
 
 #[tokio::test]

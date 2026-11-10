@@ -1,7 +1,7 @@
 //! Tests for the portal module.
 
+use super::{portal_answer, portal_file, portal_line, SLOW_STATUS};
 use crate::frontend::responder::test_support::*;
-use crate::frontend::responder::*;
 use crate::store::Record;
 use crate::{frontend::ipc, store};
 use std::collections::BTreeMap;

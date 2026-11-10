@@ -75,17 +75,8 @@ pub mod status;
 pub(crate) mod test_support;
 mod titan;
 
-pub(in crate::frontend::responder) use account::*;
-pub(in crate::frontend::responder) use apply::*;
-pub(in crate::frontend::responder) use connection::*;
-pub(in crate::frontend::responder) use decide::*;
-pub(in crate::frontend::responder) use flow::*;
-pub(in crate::frontend::responder) use gemini::*;
-pub(in crate::frontend::responder) use portal::*;
-pub(in crate::frontend::responder) use reply::*;
-pub(in crate::frontend::responder) use route::*;
-pub(in crate::frontend::responder) use status::*;
-pub(in crate::frontend::responder) use titan::*;
+use self::connection::accept;
+use self::titan::titan_accept;
 
 /// The only origin a submission may carry. The port-80 vhost redirects, so the
 /// form is served over TLS and nowhere else.
@@ -304,4 +295,43 @@ fn bind(path: &str) -> Result<UnixListener, String> {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::frontend::responder::test_support::*;
+
+    /// A staging run that missed a page stops the handler rather than leaving a
+    /// route that answers 51 for a document the capsule promises.
+    #[tokio::test]
+    async fn the_handler_refuses_to_start_without_a_staged_page() {
+        let dir = fixture_dir("missing-page");
+        for (route, file, _) in capsule::PAGES {
+            if *route == "aup" {
+                continue;
+            }
+            std::fs::write(dir.join("pages").join(file), "# ok\n").unwrap();
+        }
+        let Err(err) = App::load(handler_config(&dir)).await else {
+            panic!("the handler started without a page");
+        };
+        assert!(err.contains("aup.gmi"), "{err}");
+    }
+
+    /// An empty staged file is the same failure as a missing one: the page exists
+    /// and says nothing, which a reader would take for the document.
+    #[tokio::test]
+    async fn the_handler_refuses_an_empty_staged_page() {
+        let dir = fixture_dir("empty-page");
+        for (route, file, _) in capsule::PAGES {
+            let body = if *route == "privacy" {
+                String::new()
+            } else {
+                "# ok\n".to_string()
+            };
+            std::fs::write(dir.join("pages").join(file), body).unwrap();
+        }
+        let Err(err) = App::load(handler_config(&dir)).await else {
+            panic!("the handler started on an empty page");
+        };
+        assert!(err.contains("privacy.gmi"), "{err}");
+    }
+}

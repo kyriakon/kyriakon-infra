@@ -17,7 +17,7 @@
 //!   /usr/local/sbin/kyriakon-onboard-tui -c /usr/local/sbin/kyriakon-onboard-tui
 //!
 //! What is here is the terminal and nothing else. The rows, the screens and the
-//! dispatch are the crate's library (`onboard/src/portal.rs`), because the menu is
+//! dispatch are the crate's library (`onboard/src/frontend/tui/mod.rs`), because the menu is
 //! the shared catalogue's third rendering and the crate is where the front-ends
 //! share one implementation. The unsafe calls that put a terminal into raw mode
 //! are here rather than there for the same reason: the library's session is driven

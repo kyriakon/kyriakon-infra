@@ -1,7 +1,8 @@
 //! Tests for the titan module.
 
+use super::super::{App, MAX_TITAN_BODY};
+use super::{proxy_address, titan_answer, titan_params};
 use crate::frontend::responder::test_support::*;
-use crate::frontend::responder::*;
 
 /// One Titan exchange: the request line (and any PROXY line) and a body, put in
 /// front of the handler together. The leftover count is what the handler did not

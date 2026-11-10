@@ -2,12 +2,15 @@
 
 use super::*;
 
+use super::reply::capability;
+use super::route::Call;
+
 use time::OffsetDateTime;
 
 use crate::frontend::fastcgi::Reply;
 use crate::frontend::page::StatusPage;
 use crate::store::Record;
-use crate::{drain::transitions, frontend::capsule, frontend::page, util};
+use crate::{frontend::capsule, frontend::page, payments::rails, util};
 
 /// The status page for one token, which is the same page over both front-ends: a
 /// capability in the URL is never stored and its URL is never sent as a referrer.
@@ -46,7 +49,7 @@ pub(super) fn payment_for(app: &App, record: Option<&Record>) -> Option<page::Pa
 /// place to refuse an approval for a placeholder: the approval email already
 /// does, and the page simply shows no link rather than a broken one.
 pub(super) fn card_link(app: &App, token: Option<&str>) -> Option<String> {
-    transitions::stripe::card_link(&app.cfg.stripe_payment_link, token?)
+    rails::card_link(&app.cfg.stripe_payment_link, token?)
         .ok()
         .flatten()
 }

@@ -1,9 +1,9 @@
 //! Tests for the flow module.
 
+use super::{body_cross_checks, build_record, label};
 use crate::flow::questions;
 use crate::frontend::fastcgi::fixture;
 use crate::frontend::responder::test_support::*;
-use crate::frontend::responder::*;
 use std::collections::BTreeMap;
 
 #[tokio::test]
@@ -227,4 +227,19 @@ async fn the_second_checkbox_is_recorded_beside_the_documents() {
         3,
         "an unticked box records no acceptance"
     );
+}
+
+#[test]
+fn a_front_end_is_web_tui_or_capsule_and_nothing_else() {
+    let mut form = BTreeMap::new();
+    // The web form posts no such field, so its absence is the web form.
+    assert_eq!(label(&form).unwrap(), "web");
+    for v in ["web", "tui", "capsule"] {
+        form.insert("front_end".to_string(), v.to_string());
+        assert_eq!(label(&form).unwrap(), v);
+    }
+    for v in ["", "Capsule", "capsule ", "ssh", "http"] {
+        form.insert("front_end".to_string(), v.to_string());
+        assert!(label(&form).is_err(), "{v:?} should be refused");
+    }
 }

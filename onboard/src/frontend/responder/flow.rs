@@ -2,6 +2,10 @@
 
 use super::*;
 
+use super::gemini::capsule_front;
+use super::reply::page_html;
+use super::route::Call;
+
 use std::collections::{BTreeMap, HashSet};
 
 use crate::flow::questions::{Branch, Kind, Question, Rule};

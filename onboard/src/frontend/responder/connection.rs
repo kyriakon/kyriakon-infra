@@ -2,6 +2,10 @@
 
 use super::*;
 
+use super::portal::portal_connection;
+use super::reply::{too_many, Which};
+use super::route::{gemini, http};
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
