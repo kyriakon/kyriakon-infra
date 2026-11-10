@@ -1,170 +1,84 @@
 # Acceptable use policy
 
-Draft for Oliver to finalise. This policy governs every account on the platform. The
-hosting page states what the platform sells and what it costs. The privacy policy is
-a separate document. You accept this policy when you apply, on the same checkbox as
-the terms of service and the privacy policy.
+This policy governs every account on kyriakon.net, including individual accounts and own-domain groups, whether paid or free. You accept it when you apply, on the same checkbox as the terms of service and the privacy notice.
 
-**Our position on speech law.** We hold that the current British and Scottish
-restrictions on speech infringe freedom of speech and the law of God. We comply
-with them only because the law currently requires it, and we read every such law
-as narrowly as it can honestly be read. Of the two, Scottish law is the one
-that reaches furthest into religious speech, and it is where the next change is
-being proposed: the Scottish stirring-up offence carries more characteristics
-than the English one, and the conversion-practices consultation, which this
-policy discusses below, is a Scottish one (see §2).
+Sections 1 to 5 state the rules that bind your use of the service and how we enforce them. Section 6 is separate from those rules: it states our own opinion on British and Scottish speech legislation and how we read the law when we assess a complaint against published content.
 
-**Companion documents.** Three documents carry the security claims rather than
-this policy: `threat-model.md`, for what the platform protects against and what
-it does not; `transparency.md`, for what an operator can be made to produce; and
-`refusals.md`, for what the platform will not build and cannot do.
+The technical security claims and their limits sit in the companion documents in our public repository (`threat-model.md`, `transparency.md`, and `refusals.md`), which describe what the platform protects against, what an operator can be compelled to produce, and what the platform refuses to build.
 
-## 1. Mail abuse
+## 1. Mail use
 
-- No sending spam, bulk unsolicited mail, or mail to harvested addresses.
-- No phishing, spoofing, or relaying through third-party servers.
-- Outbound volume is monitored. A sudden spike from one mailbox is treated as
-  compromise or abuse and may trigger enforcement (§5).
+- You must not send spam, bulk unsolicited mail, or mail to harvested addresses.
+- You must not use the service for phishing, spoofing, deceptive sender addresses, or relaying mail for third parties.
+- You may send mail only from addresses assigned to your account or to your group's domain.
+- We monitor aggregate outbound mail volume to protect the server's delivery reputation. A sudden spike from one mailbox is treated as a sign of compromise or abuse and may trigger enforcement under section 5.
 
-## 2. Published content
+## 2. Published content and the zero-access boundary
 
-What you host on `username.kyriakon.net` (HTTP/gemini) is public.
+What you publish on `username.kyriakon.net` or on your own domain over HTTP or Gemini is public. The following are not permitted as published content:
 
-**Content floor.** The following are not permitted as published content:
-
-- content that is illegal under UK law;
+- content that is illegal under the law of the United Kingdom;
 - pornographic content;
 - gambling content.
 
-The first is a legal floor; the latter two are policy floors, not legal ones.
+The first is a legal requirement; the second and third are conditions of the service.
 
-**Illegal content and the Online Safety Act.** We will remove content we know, or are
-told, is illegal under UK law, and we comply with UK law to the extent it applies,
-including the Online Safety Act 2023. Most kyriakon.net services (private mail,
-static hosting) fall outside that Act's "user-to-user service" definition, but we do
-not rely on that to avoid removing illegal content when we become aware of it.
+We remove published content when we know, or are shown, that it is illegal under UK law or breaches the rules above, and we comply with UK law to the extent it applies, including the Online Safety Act 2023. Most kyriakon.net services, including private mail and static hosting, fall outside that Act's definition of a "user-to-user service", but we do not rely on that distinction to leave unlawful published material up once we become aware of it.
 
-**What the law prohibits, and what it does not.** This is our honest reading, not
-legal advice. Checked against legislation.gov.uk on 9 October 2026. The offences that most often bear on published speech are:
+We do not remove published content merely because it is offensive, unpopular, or the subject of a third-party complaint or a recorded non-crime hate incident.
 
-- *Stirring up hatred.* In Scotland the Hate Crime and Public Order (Scotland) Act
-  2021 covers both limbs: section 4(1) reaches behaviour likely to stir up hatred
-  against a group defined by race, and section 4(2) reaches threatening or abusive
-  conduct intended to stir up hatred against a group defined by age, disability,
-  religion, sexual orientation, transgender identity, or variations in sex
-  characteristics. S.S.I. 2026/150, made but not yet in force, adds sex to that
-  list on 5 April 2027.
-
-  In England and Wales the Public Order Act 1986 carries its own offences, which
-  are not identical: sections 18 to 21 cover racial hatred and need no intent where
-  hatred is likely, and Part 3A covers religious hatred and hatred on grounds of
-  sexual orientation. Those provisions never applied in Scotland, and sections 18
-  to 21 were repealed there on 1 April 2024.
-
-  The Scottish section 4(2) offence draws two limits worth noting: the conduct must
-  be *threatening or abusive*, and it must be *intended* to stir up hatred. The
-  Scottish Act expressly protects discussion and criticism of these matters, and
-  expression of religious views, including views that others find offensive.
-- *Threats.* A threat of death or serious harm is illegal under the Online Safety
-  Act 2023, s 181, in England, Wales and Northern Ireland, and under the Criminal
-  Justice and Licensing (Scotland) Act 2010, s 38, in Scotland.
-- *Knowingly false communications.* Sending information you know to be false, with
-  intent to cause non-trivial harm, is illegal under the Online Safety Act 2023,
-  s 179, in England, Wales and Northern Ireland. Scotland keeps the older and
-  narrower offence in the same section: the Communications Act 2003, s 127(2)(a),
-  covers a message known to be false sent to cause annoyance, inconvenience or
-  needless anxiety.
-- *Grossly offensive or indecent communications.* The residual "grossly offensive"
-  offence (Communications Act 2003, s 127) covers the whole of the United Kingdom,
-  and the Malicious Communications Act 1988, s 1, adds an England and Wales offence
-  of sending an indecent or grossly offensive communication with intent to cause
-  distress. This is the vaguest of these and the one most abused in practice.
-
-**What you may say.** Sincere religious teaching, quotation of scripture,
-criticism of belief systems, and disagreement with prevailing views on sexuality,
-gender, or anything else are not, on their own, any of the offences above,
-regardless of how strongly they offend someone. Offence is not a crime. The line
-the law draws for religious speech is *threatening or abusive conduct intended to
-stir up hatred*;
-expressing a position someone dislikes does not cross it.
-
-**Police abuse of the grey area.** The "grossly offensive" and "stirring up
-hatred" offences are deliberately vague, and we have no confidence they are
-applied consistently. Police forces record "hate incidents" that are not crimes,
-and officers have latitude to interpret vagueness against the speaker. We will not
-amplify that. We remove content only when it is illegal, not merely because it is
-offensive, unpopular, or the subject of a complaint or a recorded non-crime hate
-incident. Where the law is genuinely uncertain, we state so rather than guessing
-against you.
-
-**Future concern: conversion practices.** At the time of writing there is no
-"conversion practices" Act in Scotland: it is a consultation proposal, and no Bill
-has yet been introduced. It is a *future* concern, not current law, but it is the
-future concern most likely to bear on the Church, so we address it now rather than
-after the fact.
-
-The proposal would criminalise "conversion practices", acts intended to change or
-suppress a person's sexual orientation or gender identity. The Government's own
-consultation names "requiring a person not to act on their same-sex attraction,
-including through celibacy" as an example of such a practice. We say plainly what
-this means for us: teaching Orthodox sexual ethics, chastity included, is the
-faith of the Church, not abuse, and a law which criminalises teaching it infringes
-the freedom of religion and the law of God.
-
-**The grey area is the point.** The proposal's carve-out for "non-directive"
-guidance sounds reassuring and protects nothing. The operative line it draws,
-between protected "discussion" and criminalised "directive" counsel, runs through
-the very conversations a priest has with a penitent, and there is no stable way to
-tell the two apart on paper. That vagueness is not a drafting accident to be fixed
-in committee; it is the mechanism by which the law would work in practice.
-
-**How this would be used.** We do not expect these laws to be applied to the
-hypothetical "coercive therapy" they claim to target. That already sits under
-existing assault and abuse offences. We expect them to be applied the way the
-"grossly offensive" and "stirring up hatred" offences already are: a complaint or a
-recorded non-crime incident names a sermon, a blog post, or a pastoral conversation,
-and the vagueness of "change or suppress" and of "directive" does the rest. The
-preaching itself never has to say anything coercive; it only has to be *described*
-as an attempt to change or suppress someone, by anyone who wishes it suppressed.
-The priest then has the burden of proving his preaching was "non-directive", a
-burden no preacher can carry, because preaching is directive by its nature.
-
-If such a law is enacted, we will read it as narrowly as it can honestly be read,
-and we will not pre-emptively police preaching as though the proposal were already
-law. But we state now, before a specific person is involved, that we will not be a
-channel for using this law, or any law, to suppress Orthodox teaching that is not
-itself illegal.
-
-**Zero-access boundary.** This floor governs what you *publish*. Your private mail is
-encrypted to your key; the platform cannot read it. That covers message content, not the
-addressing information mail needs to move: sender, recipient, timestamp and size appear in
-the server's logs and in the outer message wrapper. Mail content is therefore not and
-cannot be policed, and this policy makes no claim to the contrary.
+These content rules govern what you publish. Your private mail is PGP ciphertext on our server, encrypted to your public key when it arrives, and the platform holds no private key that can open it. Zero-access covers stored message content and not the addressing information mail needs to move: sender, recipient, timestamp and size appear in the server's logs and in the outer message wrapper. Mail content is therefore not and cannot be policed, and this policy makes no claim to the contrary.
 
 ## 3. Resource use
 
-- 5 GB per account, across mail, web, and git combined, enforced by a per-account filesystem quota.
-- Approaching the quota alerts the operator, so disk exhaustion is caught before it
-  takes the box down.
+- Each account has a 5 GB soft allowance and a 5.5 GB hard limit across mail, web, Gemini, and git repositories combined, enforced by a per-account filesystem quota.
+- Approaching the quota alerts the operator so that disk exhaustion is caught before it degrades the server for other members.
+- You must not use the service to attack, scan, or disrupt other hosts or networks, or to place an unreasonable load on the shared machine.
 
 ## 4. Account security
 
-- Keep your recovery phrase safe. Losing both the phrase and your key means permanent
-  mail loss.
-- Share accounts only via a `pass` repository. Never share raw credentials.
-- Use a PGP-capable mail client. There is no webmail.
-- Your account has no interactive shell.
+- Keep your private keys and your recovery phrase safe. Because the platform holds neither, losing both your mail private key and your recovery phrase means permanent mail loss.
+- Do not share your mail password or raw private keys with another person. Where a group shares access, share credentials through an encrypted `pass` repository.
+- Use a PGP-capable mail client; there is no webmail.
+- Your account has no interactive shell. Access is confined to IMAP and SMTP for mail, SFTP for web and Gemini uploads, and `git-shell` for your repositories.
 
 ## 5. Enforcement
 
-The ladder applies uniformly to every account, with no exception for people the
-operator knows personally.
+The enforcement ladder applies uniformly to every account, with no exception for people the operator knows personally.
 
-1. **Detect.** We use automated monitoring, and we take reports at `abuse@kyriakon.net`.
-2. **Warn.** We notify you, and you have 72 hours to respond.
-3. **Suspend.** Outbound mail stops and the site and capsule go down. Inbound mail
-   keeps arriving, and the account page stays open so you can see the reason and
-   respond.
-4. **Delete.** A suspension that is not resolved starts a 40-day grace period, so answering a warning ends it before this step is reached. We send a final notice 7 days
-   before the end, and the account is then deleted automatically. Copies in the backup
-   repository expire within about seven months.
+1. **Detect.** We use automated volume and health monitoring, and we take abuse reports at `abuse@kyriakon.net`.
+2. **Warn.** We notify you and give you 72 hours to respond, except where outbound mail or hosting must be paused immediately to stop active spam, a compromised credential, or ongoing unlawful conduct.
+3. **Suspend.** Outbound mail, SFTP uploads, and git pushes stop, and the published site and Gemini capsule are taken down. Inbound mail keeps arriving and stays readable, and the account page stays open so you can see the reason and reply at `admin@kyriakon.net`.
+4. **Delete.** A suspension that is not resolved starts a 40-day grace period, so answering a warning and resolving the breach ends the suspension before this step is reached. We send a final notice 7 days before the end of the grace period, and the account is then deleted automatically. Copies in the encrypted backup repository expire within about seven months.
+
+## 6. Statement of position: UK and Scottish speech law
+
+This section states the operator's own views on current and proposed British and Scottish speech laws, and explains how we read those statutes when we evaluate a complaint under section 2. It is a statement of position rather than legal advice, and it adds no contractual restriction beyond sections 1 to 5.
+
+### Our view of current speech restrictions
+
+We hold that current British and Scottish restrictions on speech infringe freedom of speech and the law of God. We comply with them only because the law requires it, and we read every such restriction as narrowly as it can honestly be read. Of the two jurisdictions, Scottish law reaches furthest into religious expression, and it is where the next expansion has been proposed: the Scottish stirring-up offence covers more characteristics than the English one, and the conversion-practices consultation discussed below is a Scottish proposal.
+
+### How we read the offences that bear on published speech
+
+Checked against legislation.gov.uk on 9 October 2026, the offences most often cited against published speech are these:
+
+- Stirring up hatred in Scotland: under the Hate Crime and Public Order (Scotland) Act 2021, section 4(1) covers behaviour that is threatening, abusive, or insulting and intended or likely to stir up hatred against a group defined by race, colour, nationality, or ethnic or national origins. Section 4(2) covers behaviour that is threatening or abusive and intended to stir up hatred against a group defined by age, disability, religion, sexual orientation, transgender identity, or variations in sex characteristics. S.S.I. 2026/150, made but not yet in force, adds sex to that list on 5 April 2027. Section 4(2) requires both that the conduct be threatening or abusive and that it be intended to stir up hatred, and the Act expressly protects discussion, criticism, and expressions of antipathy, dislike, ridicule, or insult concerning religious beliefs and practices and these other matters.
+- Stirring up hatred in England and Wales: under the Public Order Act 1986, sections 18 to 21 cover racial hatred (where likelihood suffices without intent), and Part 3A covers religious hatred and hatred on the grounds of sexual orientation (which require threatening words or behaviour and intent to stir up hatred, with explicit statutory savings for discussion, criticism, and expressions of antipathy or dislike). Those provisions do not extend to Scotland, where sections 18 to 21 were repealed on 1 April 2024.
+- Threats of death or serious harm: illegal in England, Wales, and Northern Ireland under the Online Safety Act 2023, section 181, and covered in Scotland by the general offence of threatening or abusive behaviour under the Criminal Justice and Licensing (Scotland) Act 2010, section 38.
+- Knowingly false communications: sending a message known to be false with intent to cause non-trivial psychological or physical harm without reasonable excuse is an offence in England, Wales, and Northern Ireland under the Online Safety Act 2023, section 179. Scotland retains the older offence under the Communications Act 2003, section 127(2)(a), covering a message known to be false sent for the purpose of causing annoyance, inconvenience, or needless anxiety.
+- Grossly offensive or indecent communications: section 127(1) of the Communications Act 2003 applies across the United Kingdom to sending a message that is grossly offensive or of an indecent, obscene, or menacing character over a public electronic communications network, and the Malicious Communications Act 1988, section 1, applies in England and Wales to sending an indecent or grossly offensive communication with intent to cause distress or anxiety.
+
+Sincere religious teaching, quotation of scripture, criticism of belief systems, and disagreement with prevailing views on sexuality, gender, or morals are not, on their own, any of the offences above, however strongly they offend a reader. Giving offence is not a crime. For religious and moral speech, the statutory threshold is threatening or abusive conduct intended to stir up hatred, and stating a Christian doctrine or moral teaching does not cross it.
+
+The "grossly offensive" and "stirring up hatred" provisions are broad, and police forces also record "non-crime hate incidents" where no offence has been committed. We do not treat a police non-crime record or a complainant's offence as evidence of illegality. Where a complaint is made against published material and the legal position is genuinely uncertain, we tell the member plainly rather than resolving doubt against the speaker.
+
+### Future concern: Scottish conversion-practices proposals
+
+At the time of writing there is no "conversion practices" statute in Scotland; the Scottish Government has run a consultation and no Bill has been enacted. Because it is the legislative proposal most likely to bear on the Church, we state our position on it now.
+
+The consultation proposed criminalising acts intended to change or suppress a person's sexual orientation or gender identity, and gave "requiring a person not to act on their same-sex attraction, including through celibacy" as an example. Teaching Orthodox Christian sexual ethics, including chastity and celibacy outside marriage, is the faith of the Church and not abuse.
+
+A statutory carve-out for "non-directive" guidance does not cure that defect. Preaching, catechesis, and pastoral counsel are directive by their nature: they call the hearer to repentance and to a specific way of life. Drawing the criminal line between permitted "discussion" and forbidden "directive" counsel places the burden on a priest or writer to prove that ordinary pastoral teaching was non-directive whenever a complainant describes it as an attempt to change or suppress someone.
+
+If such a law is enacted, we will read it as narrowly as the text and the European Convention on Human Rights allow, and we will not pre-emptively police sermons, catechesis, or theological writing as though a consultation paper were statute. We will not act as an instrument for suppressing Orthodox Christian teaching that is not itself unlawful.
