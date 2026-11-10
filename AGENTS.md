@@ -24,20 +24,23 @@ written down. This repo has no decisions directory of its own.
 
 Pointers, so a search starts where the thing is.
 
-- `onboard/`: the Rust service. `src/responder.rs` serves the web form and holds the
-  shared applicant flow (`flow_path`, `flow_problem`, `flow_answers`); `src/capsule.rs`
-  renders the pages as gemtext; `src/portal.rs` is the terminal library (menu, sessions,
-  the applicant flow); `src/portal_ipc.rs` is the terminal's one request to the handler;
-  `templates/*.html` are the web renderings; `src/transitions.rs` holds the drain's
-  settlement seam (`Envelope`, `Settlement`, `settle`, `Disposition`), with the verb
-  bodies under `src/transitions/` (`payments`, `groups`, `lifecycle`, `review`,
-  `stripe`, `boxrun`); `src/intents.rs` holds the intent enum and its payloads;
-  `src/journal.rs` loads and indexes the journal once per pass; `src/store.rs` owns
-  paths, locks and typed record reads; `src/ledger.rs` is the typed payment ledger;
-  `src/bin/` holds the three binaries (`kyriakon-onboard-drain`,
-  `kyriakon-onboard-tui`, `kyriakon-onboardctl`); `questions.toml` is the application's
-  question list; `tests/drain.rs` is the drain's acceptance suite, split by area under
-  `tests/areas/`.
+- `onboard/`: the Rust service. `src/frontend/responder/` serves the web form;
+  `responder/flow.rs` holds the shared applicant flow (`flow_path`, `flow_problem`,
+  `flow_answers`); `src/frontend/capsule.rs` renders the pages as gemtext;
+  `src/frontend/tui/mod.rs` is the terminal library (menu, sessions, the applicant
+  flow); `src/frontend/ipc.rs` is the terminal's one request to the handler;
+  `templates/*.html` are the web renderings; `src/drain/transitions.rs` holds the
+  drain's settlement seam (`Envelope`, `Settlement`, `settle`, `Disposition`), with the
+  verb bodies under `src/drain/transitions/` (`payments`, `groups`, `lifecycle`,
+  `review`, `stripe`, `boxrun`); `src/drain/mod.rs` holds the intent enum and its
+  payloads; `src/store/journal.rs` loads and indexes the journal once per pass;
+  `src/store/mod.rs` owns paths, locks and typed record reads; `src/payments/ledger.rs`
+  is the typed payment ledger; `src/bin/` holds the three binaries
+  (`kyriakon-onboard-drain`, `kyriakon-onboard-tui`, `kyriakon-onboardctl`);
+  `questions.toml` is the application's question list; `tests/drain.rs` is the drain's
+  acceptance suite, split by area under `tests/areas/`. Only `lib.rs`, `main.rs`,
+  `config.rs`, and `util.rs` sit at `src/` root; a new module goes in its section
+  directory, or a new directory with a `mod.rs` that names its job.
 - `kyriakon-encrypt/`: the CLI the save path runs to encrypt each message; `src/lib.rs`
   builds the PGP/MIME wrapper.
 - `dovecot-plugin/`: the C plugin that forks the encryptor for each save and turns its
@@ -47,17 +50,21 @@ Pointers, so a search starts where the thing is.
   rewrites one without the AEAD advert.
 - `scripts/`: every deploy and operator script, each with a `--self-test`; `lib.sh`
   holds the shared helpers (staged installs, the mail-table lock, the self-test
-  harness), and `install-set.tsv` is the one table naming what each destination gets.
+  harness); `install-set.tsv` is the one table naming what each destination gets; and
+  `install-packages.sh` installs from `openbsd/packages.tsv`.
 - `openbsd/`: what the box runs: `etc/` (smtpd, httpd, relayd, gmid, unbound, nsd,
   spamd, sshd, `login.conf.d/`, `rc.d/`, `kyriakon.env`, and the three onboarding
-  configs (`catalogue.toml`, `drain.toml`, `onboard.toml`) under `etc/onboard/`), `dovecot/`, and `restore-template/` for the throwaway box.
+  configs (`catalogue.toml`, `drain.toml`, `onboard.toml`) under `etc/onboard/`),
+  `dovecot/`, `restore-template/` for the throwaway box, and `packages.tsv`, the one
+  package list naming each row's owning scripts and whether the CI VM installs it.
 - `terraform/`: the box itself, and the throwaway's stack.
 - `docs/`: `runbook.md` (every operator procedure, including the repository settings
   the automation depends on), `operations/`, `threat-model.md`, `terms.md`,
   `privacy.md`, `aup.md`, `transparency.md`, `refusals.md`, `planning/` (specs,
   research, prototypes), `agents/` (issue tracker, triage labels, domain docs).
-- `.github/workflows/`: `checks.yml` (the five CI jobs) and `auto-merge-key.yml` (a
-  green key publication merges itself, as the machine account).
+- `.github/workflows/`: `checks.yml` (the five CI jobs, including the OpenBSD 7.9
+  self-test VM) and `auto-merge-key.yml` (a green key publication merges itself, as
+  the machine account).
 - `.githooks/`: commit shape, pre-commit, pre-push.
 - Root: `reserved-usernames.txt` (the held-back names), `CONTEXT.md` (repo vocabulary),
   `CODING_STANDARDS.md` (what a review enforces), `README.md`.
@@ -93,10 +100,17 @@ repo's own root. Two terms most likely to matter while working in this repo:
 - Shell scripts (`scripts/`): `shellcheck scripts/*.sh`, and
   `ksh scripts/self-test-all.sh` runs every script's `--self-test` with the arguments
   each one needs. On the box, `ksh scripts/check-hygiene.sh` reports its live state.
-- OpenBSD config syntax checks require an actual OpenBSD host and are not run in CI —
-  e.g. `httpd -n -f openbsd/etc/httpd.conf`, `smtpd -n -f openbsd/etc/smtpd.conf`. If
-  you don't have access to a test OpenBSD instance, say so rather than claiming a
-  config is valid.
+- **OpenBSD has a test VM in CI.** The `script self-tests` job in
+  `.github/workflows/checks.yml` boots OpenBSD 7.9 through `vmactions/openbsd-vm`,
+  installs the `ci=yes` rows of `openbsd/packages.tsv`, then runs
+  `install-packages.sh --check` and `scripts/self-test-all.sh`. It is the
+  authoritative shell and userland; local macOS `/bin/ksh` is ksh93 and proves
+  nothing about pdksh. Push a branch and read that job to run OpenBSD-only commands,
+  including config syntax checks such as `httpd -n -f` and `smtpd -n -f`. Add a
+  temporary step for a one-off check and remove it before merge. A test that needs
+  another tool adds a row to `openbsd/packages.tsv`. The VM is not the live box: it
+  holds no deployed config or credentials, and `terraform apply`/`destroy` remain
+  human-only. See `docs/runbook.md` "Test on the OpenBSD VM".
 - No build step for `docs/` — markdown only.
 
 ## Code style

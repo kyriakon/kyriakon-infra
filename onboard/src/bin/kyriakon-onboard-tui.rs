@@ -17,7 +17,7 @@
 //!   /usr/local/sbin/kyriakon-onboard-tui -c /usr/local/sbin/kyriakon-onboard-tui
 //!
 //! What is here is the terminal and nothing else. The rows, the screens and the
-//! dispatch are the crate's library (`onboard/src/portal.rs`), because the menu is
+//! dispatch are the crate's library (`onboard/src/frontend/tui/mod.rs`), because the menu is
 //! the shared catalogue's third rendering and the crate is where the front-ends
 //! share one implementation. The unsafe calls that put a terminal into raw mode
 //! are here rather than there for the same reason: the library's session is driven
@@ -42,8 +42,10 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use kyriakon_onboard::portal::{Departure, Filing, Input, Key, Mode};
-use kyriakon_onboard::{catalogue, config, portal, portal_ipc, questions, validate};
+use kyriakon_onboard::frontend::tui::{Departure, Filing, Input, Key, Mode};
+use kyriakon_onboard::{
+    config, flow::catalogue, flow::questions, flow::validate, frontend::ipc, frontend::tui,
+};
 
 /// The handler's own configuration, read for the one value the portal needs from
 /// it: the path the catalogue is installed at. Named here rather than derived, the
@@ -67,7 +69,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<Departure, String> {
     let mut cfg_path = PathBuf::from(DEFAULT_CONFIG);
-    let mut state = PathBuf::from(portal::SESSION_DIR);
+    let mut state = PathBuf::from(tui::SESSION_DIR);
     let mut forced: Option<Mode> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -115,18 +117,18 @@ fn run() -> Result<Departure, String> {
     // web page and the capsule do for an anonymous visitor.
     //
     // [#381]: https://github.com/kyriakon/kyriakon-infra/issues/381
-    let rows = portal::entries(&list, None);
+    let rows = tui::entries(&list, None);
 
     // The address is the session's own, and the lock it takes is what bounds an
     // address to the two sessions `PerSourceMaxStartups 2` would let sshd start.
     // A session over the cap gets a screen rather than a dropped connection.
     let address = source_address();
-    let _session = match portal::Sessions::open(&state, address)? {
-        portal::Admission::Busy => {
-            print!("{}", portal::TOO_MANY);
+    let _session = match tui::Sessions::open(&state, address)? {
+        tui::Admission::Busy => {
+            print!("{}", tui::TOO_MANY);
             return Ok(Departure::Quit);
         }
-        portal::Admission::Open(session) => session,
+        tui::Admission::Open(session) => session,
     };
 
     let mut status = HandlerStatus {
@@ -140,11 +142,11 @@ fn run() -> Result<Departure, String> {
     };
     let mode = forced.unwrap_or_else(chosen);
     let mut term = Term::new(mode);
-    let flow = portal::Flow {
+    let flow = tui::Flow {
         questions: &questions,
         reserved: &reserved,
     };
-    let left = portal::run(
+    let left = tui::run(
         &rows,
         &flow,
         mode,
@@ -181,16 +183,16 @@ struct HandlerStatus {
     address: Option<String>,
 }
 
-impl portal::StatusSource for HandlerStatus {
-    fn read(&mut self, token: &str) -> Result<portal_ipc::Answer, String> {
-        match portal_ipc::ask(Path::new(&self.socket), self.address.as_deref(), token)? {
-            portal_ipc::Answer::Stage(stage) => {
+impl tui::StatusSource for HandlerStatus {
+    fn read(&mut self, token: &str) -> Result<ipc::Answer, String> {
+        match ipc::ask(Path::new(&self.socket), self.address.as_deref(), token)? {
+            ipc::Answer::Stage(stage) => {
                 authlog(&format!("status read: {stage}"));
-                Ok(portal_ipc::Answer::Stage(stage))
+                Ok(ipc::Answer::Stage(stage))
             }
-            portal_ipc::Answer::Notice(notice) => {
+            ipc::Answer::Notice(notice) => {
                 authlog("status read: no stage");
-                Ok(portal_ipc::Answer::Notice(notice))
+                Ok(ipc::Answer::Notice(notice))
             }
         }
     }
@@ -206,7 +208,7 @@ struct HandlerFile {
 
 impl Filing for HandlerFile {
     fn file(&mut self, form: &BTreeMap<String, String>) -> Result<String, String> {
-        let token = portal_ipc::file(Path::new(&self.socket), self.address.as_deref(), form)?;
+        let token = ipc::file(Path::new(&self.socket), self.address.as_deref(), form)?;
         self.filed = true;
         authlog("application filed");
         Ok(token)

@@ -125,12 +125,12 @@ fn a_password_link_applies_once_and_only_when_signed() {
     let written = std::fs::read_to_string(&log).unwrap_or_default();
     let installed = written.strip_prefix("secretary ").unwrap_or("").trim();
     assert!(
-        kyriakon_onboard::password::is_hash(installed),
+        kyriakon_onboard::account::password::is_hash(installed),
         "journal: {}",
         std::fs::read_to_string(fix.path("store/journal.jsonl")).unwrap_or_default()
     );
     assert!(
-        kyriakon_onboard::password::matches("correct horse battery", installed),
+        kyriakon_onboard::account::password::matches("correct horse battery", installed),
         "{written}"
     );
     assert!(!written.contains("correct horse"), "{written}");
@@ -205,7 +205,8 @@ fn a_password_intent_carrying_a_hash_is_refused() {
     .unwrap();
 
     let sig = sign::sign(&key, &sign::password_payload(TOKEN, &until)).unwrap();
-    let chosen = kyriakon_onboard::password::make("a password the member never typed").unwrap();
+    let chosen =
+        kyriakon_onboard::account::password::make("a password the member never typed").unwrap();
     let base = json!({
         "kind": "set-password",
         "filed_at": "2026-10-21T09:00:00Z",

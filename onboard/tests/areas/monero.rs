@@ -373,7 +373,7 @@ fn a_part_payment_requotes_the_xmr_for_what_is_still_owed() {
         "the window is still open: {account}"
     );
     let instructions = view(&fix, "secretary").instructions.join("\n");
-    let remaining = kyriakon_onboard::xmr::quote_xmr(1950, "409.44").unwrap();
+    let remaining = kyriakon_onboard::payments::xmr::quote_xmr(1950, "409.44").unwrap();
     assert!(
         instructions.contains(&format!("Send {remaining} XMR for GBP 19.50")),
         "{instructions}"
@@ -405,7 +405,7 @@ fn a_part_payment_requotes_the_xmr_for_what_is_still_owed() {
         json!("15.00")
     );
     let instructions = view(&short, "secretary").instructions.join("\n");
-    let remaining = kyriakon_onboard::xmr::quote_xmr(500, "409.44").unwrap();
+    let remaining = kyriakon_onboard::payments::xmr::quote_xmr(500, "409.44").unwrap();
     assert!(
         instructions.contains(&format!("Send {remaining} XMR for GBP 5.00")),
         "{instructions}"
