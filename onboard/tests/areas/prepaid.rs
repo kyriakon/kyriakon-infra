@@ -208,7 +208,7 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
         None,
         now,
     );
-    let status = responder::status_page(Some(application.clone()), Some(status_view), now);
+    let status = responder::status::status_page(Some(application.clone()), Some(status_view), now);
     let html = status.render().unwrap();
     assert!(html.contains(&token), "{html}");
     assert!(html.contains("GBP 20.00"), "{html}");
@@ -279,7 +279,7 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
         None,
         now,
     );
-    let status = responder::status_page(Some(application), Some(paid), now);
+    let status = responder::status::status_page(Some(application), Some(paid), now);
     let html = status.render().unwrap();
     assert!(html.contains("Paid until 2027-10-04T00:00:00Z"), "{html}");
     assert!(!html.contains(&token), "the token is back: {html}");
@@ -865,7 +865,7 @@ fn a_shortfall_is_shown_and_quoted_back_and_receipted() {
         now,
     );
     assert_eq!(status_view.amount, "5.00");
-    let status = responder::status_page(Some(application), Some(status_view), now);
+    let status = responder::status::status_page(Some(application), Some(status_view), now);
     let html = status.render().unwrap();
     assert!(html.contains("Amount: GBP 5.00"), "{html}");
     assert!(html.contains("Received so far: GBP 15.00"), "{html}");
@@ -1839,8 +1839,8 @@ fn a_status_token_that_resolves_to_nothing_carries_no_payment() {
     // Past the seven days the record's page is the unknown-token page, and the
     // payment block goes with it even when one is handed in.
     let later = now + time::Duration::days(8);
-    let expired = responder::status_page(Some(record), Some(payment), later);
-    let unknown = responder::status_page(None, None, now);
+    let expired = responder::status::status_page(Some(record), Some(payment), later);
+    let unknown = responder::status::status_page(None, None, now);
     assert!(
         expired.payment.is_none(),
         "{:?}",

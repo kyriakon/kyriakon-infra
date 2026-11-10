@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::catalogue::{self, Action, Protocol, Row, Service};
 use crate::portal_ipc::Answer as StatusAnswer;
 use crate::questions::{Kind, Question, Rule};
-use crate::responder::{flow_answers, flow_path, flow_problem, Page};
+use crate::responder::flow::{flow_answers, flow_path, flow_problem, Page};
 use crate::store;
 use crate::{draft, keycheck};
 
@@ -728,7 +728,7 @@ fn application(
                     && draft.answers.contains_key("body_addresses")
                 {
                     let mut errors = Vec::new();
-                    crate::responder::body_cross_checks(&draft.answers, &mut errors);
+                    crate::responder::flow::body_cross_checks(&draft.answers, &mut errors);
                     if !errors.is_empty() {
                         index -= 1;
                         put(
