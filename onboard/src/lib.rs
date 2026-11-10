@@ -9,33 +9,12 @@
 //! reader of the store, a second signer or a second notice path cannot drift
 //! from the first.
 
-pub mod billing;
-pub mod capsule;
-pub mod catalogue;
+pub mod account;
 pub mod config;
-pub mod dns;
-pub mod draft;
-pub mod export;
-pub mod fcgi;
-pub mod intents;
-pub mod journal;
-pub mod keycheck;
-pub mod ledger;
-pub mod mailbox;
-pub mod notice;
-pub mod page;
-pub mod password;
-pub mod portal;
-pub mod portal_ipc;
-pub mod prepaid;
-pub mod questions;
-pub mod rate;
-pub mod requests;
-pub mod responder;
-pub mod session;
-pub mod sign;
+pub mod drain;
+pub mod flow;
+pub mod frontend;
+pub mod mail;
+pub mod payments;
 pub mod store;
-pub mod transitions;
 pub mod util;
-pub mod validate;
-pub mod xmr;

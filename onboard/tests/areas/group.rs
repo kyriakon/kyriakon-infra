@@ -1723,7 +1723,8 @@ fn the_console_files_a_validated_mail_key() {
     let intents = fix.intents();
     assert_eq!(intents.len(), 1, "{intents:?}");
     let filed: Value = serde_json::from_str(&fix.read(&format!("intents/{}", intents[0]))).unwrap();
-    let expected = kyriakon_onboard::keycheck::mail_key("parish-office".to_string(), GOOD_KEY);
+    let expected =
+        kyriakon_onboard::mail::keycheck::mail_key("parish-office".to_string(), GOOD_KEY);
     assert!(!expected.fingerprint.is_empty());
     assert_eq!(
         filed["mail_key"]["fingerprint"],
@@ -2087,7 +2088,8 @@ fn a_group_credit_writes_one_date_on_the_group_alone() {
         .as_str()
         .expect("the credit sets the group's date")
         .to_string();
-    let expected = kyriakon_onboard::billing::extend_paid_until("2026-10-20", None).unwrap();
+    let expected =
+        kyriakon_onboard::payments::billing::extend_paid_until("2026-10-20", None).unwrap();
     assert_eq!(&date[..10], &expected[..10], "{date}");
     assert_eq!(
         group["payment"]["window"]["state"],
@@ -2169,7 +2171,8 @@ fn a_group_credit_writes_one_date_on_the_group_alone() {
     assert!(out.status.success(), "{}", body(&out));
     let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
     let renewed = group["payment"]["paid_until"].as_str().unwrap();
-    let expected = kyriakon_onboard::billing::extend_paid_until("2026-10-21", Some(&date)).unwrap();
+    let expected =
+        kyriakon_onboard::payments::billing::extend_paid_until("2026-10-21", Some(&date)).unwrap();
     assert_eq!(&renewed[..10], &expected[..10], "{renewed}");
     assert_eq!(payment_lines(&fix).len(), 2, "{:?}", payment_lines(&fix));
     for mailbox in ["parish-secretary", "parish-office"] {
@@ -2224,9 +2227,11 @@ fn a_card_renewal_writes_one_date_on_the_group() {
         .as_str()
         .expect("the invoice sets the group's date")
         .to_string();
-    let expected =
-        kyriakon_onboard::billing::extend_paid_until(&kyriakon_onboard::util::filed_at(), None)
-            .unwrap();
+    let expected = kyriakon_onboard::payments::billing::extend_paid_until(
+        &kyriakon_onboard::util::filed_at(),
+        None,
+    )
+    .unwrap();
     assert_eq!(&date[..10], &expected[..10], "one year, not two: {date}");
     assert_eq!(
         group["payment"]["stripe"]["subscription"],

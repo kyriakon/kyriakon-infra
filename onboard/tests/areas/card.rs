@@ -151,9 +151,11 @@ fn a_first_payment_with_a_checkout_and_an_invoice_extends_one_year() {
     assert!(out.status.success(), "{}", body(&out));
 
     let date = paid_until(&fix, "secretary").expect("the payment sets a date");
-    let expected =
-        kyriakon_onboard::billing::extend_paid_until(&kyriakon_onboard::util::filed_at(), None)
-            .unwrap();
+    let expected = kyriakon_onboard::payments::billing::extend_paid_until(
+        &kyriakon_onboard::util::filed_at(),
+        None,
+    )
+    .unwrap();
     assert_eq!(
         &date[..10],
         &expected[..10],
@@ -347,9 +349,11 @@ fn an_invoice_with_no_checkout_repairs_the_attachment_from_the_session() {
 
     let account = fix.account("secretary");
     let date = paid_until(&fix, "secretary").expect("the repaired payment sets a date");
-    let expected =
-        kyriakon_onboard::billing::extend_paid_until(&kyriakon_onboard::util::filed_at(), None)
-            .unwrap();
+    let expected = kyriakon_onboard::payments::billing::extend_paid_until(
+        &kyriakon_onboard::util::filed_at(),
+        None,
+    )
+    .unwrap();
     assert_eq!(
         &date[..10],
         &expected[..10],

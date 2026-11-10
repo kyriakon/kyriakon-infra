@@ -26,7 +26,7 @@ pub use askama::Template;
 
 pub use kyriakon_onboard::store::{self, Record};
 
-pub use kyriakon_onboard::{capsule, page, responder, sign};
+pub use kyriakon_onboard::{account::sign, frontend::capsule, frontend::page, frontend::responder};
 
 pub use serde_json::{json, Value};
 
@@ -1007,7 +1007,7 @@ impl Fix {
         );
     }
 
-    /// One drain pass, in this process. It is the same `intents::run` the
+    /// One drain pass, in this process. It is the same `drain::run` the
     /// binary calls; the process boundary is only under test where a test asks
     /// for `drain_binary`.
     pub fn drain(&self) -> Output {
@@ -1034,7 +1034,7 @@ impl Fix {
             .enable_all()
             .build()
             .map_err(|e| format!("cannot build the runtime: {e}"))?;
-        runtime.block_on(kyriakon_onboard::intents::run(&cfg, &store))
+        runtime.block_on(kyriakon_onboard::drain::run(&cfg, &store))
     }
 
     pub fn ctl(&self, args: &[&str]) -> Output {
@@ -1075,7 +1075,7 @@ impl Fix {
             .build()
             .unwrap();
         runtime
-            .block_on(kyriakon_onboard::session::open(
+            .block_on(kyriakon_onboard::account::session::open(
                 &store, username, &proof, now,
             ))
             .unwrap()
@@ -1104,7 +1104,7 @@ impl Fix {
             .unwrap();
         runtime
             .block_on(
-                kyriakon_onboard::intents::Intent::Close(kyriakon_onboard::intents::CloseIntent {
+                kyriakon_onboard::drain::Intent::Close(kyriakon_onboard::drain::CloseIntent {
                     username: username.to_string(),
                     session: session_id.to_string(),
                     ..Default::default()

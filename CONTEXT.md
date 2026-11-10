@@ -41,7 +41,7 @@ _Avoid_: gemini certificate, TOFU certificate
 **The portal**:
 The onboarding session over ssh: the second sshd instance, the login class naming
 `/usr/local/sbin/kyriakon-onboard-tui` as its shell, and the Rust program that path
-holds, built from `onboard/src/portal.rs`. It is the third front-end beside the web
+holds, built from `onboard/src/frontend/tui/mod.rs`. It is the third front-end beside the web
 form and the capsule, and it reads the same catalogue and asks the same questions
 from the same files. It chooses between its two modes, the drawing and the plain
 one, from the session's own terminal rather than from a flag, so a session with no

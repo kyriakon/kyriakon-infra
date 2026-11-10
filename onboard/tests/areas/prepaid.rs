@@ -2281,7 +2281,7 @@ fn a_window_that_closes_with_nothing_recorded_lapses_the_account() {
         "{sent}"
     );
     assert!(
-        sent.contains(kyriakon_onboard::page::LAPSE_NOTE),
+        sent.contains(kyriakon_onboard::frontend::page::LAPSE_NOTE),
         "the notice uses the pages' own lapse words: {sent}"
     );
     let log = fix.scripts_log();

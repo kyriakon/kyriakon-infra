@@ -127,8 +127,11 @@ fn a_password_change_hashes_the_plaintext_and_refuses_a_hash() {
         .strip_prefix("set-mail-password.sh alice ")
         .unwrap_or("")
         .trim();
-    assert!(kyriakon_onboard::password::is_hash(hash), "{written}");
-    assert!(kyriakon_onboard::password::matches(
+    assert!(
+        kyriakon_onboard::account::password::is_hash(hash),
+        "{written}"
+    );
+    assert!(kyriakon_onboard::account::password::matches(
         "a long new password",
         hash
     ));
@@ -136,7 +139,8 @@ fn a_password_change_hashes_the_plaintext_and_refuses_a_hash() {
     assert!(fix.journal().contains("\"outcome\":\"applied\""));
 
     // The old shape: a hash the handler chose, even a valid one, is refused.
-    let chosen = kyriakon_onboard::password::make("a password the member never typed").unwrap();
+    let chosen =
+        kyriakon_onboard::account::password::make("a password the member never typed").unwrap();
     fix.file_page_action("change-password", "alice", json!({"hash": chosen}));
     assert!(fix.drain().status.success());
     assert_eq!(
@@ -164,7 +168,7 @@ fn an_upload_key_is_added_and_removed_for_both_sessions() {
     logging_script(&fix, "provision-member.sh");
     logging_script(&fix, "cron-apply.sh");
     logging_script(&fix, "remove-upload-key.sh");
-    let fingerprint = kyriakon_onboard::keycheck::openssh_fingerprint(UPLOAD_KEY).unwrap();
+    let fingerprint = kyriakon_onboard::mail::keycheck::openssh_fingerprint(UPLOAD_KEY).unwrap();
 
     fix.file_page_action(
         "upload-key",
@@ -526,7 +530,7 @@ fn a_mail_key_replacement_waits_out_its_window_and_can_be_cancelled() {
         json!({"mail_key": "AAAA", "outside_address": "alice@example.invalid"}),
     );
     let key = replacement_key();
-    let fingerprint = kyriakon_onboard::keycheck::pgp_fingerprint(&key).unwrap();
+    let fingerprint = kyriakon_onboard::mail::keycheck::pgp_fingerprint(&key).unwrap();
 
     fix.file_page_action(
         "mail-key",
@@ -606,10 +610,10 @@ fn a_mail_key_replacement_waits_out_its_window_and_can_be_cancelled() {
 fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
     let fix = Fix::new("account-rotation-signed");
     let key = replacement_key();
-    let fingerprint = kyriakon_onboard::keycheck::pgp_fingerprint(&key).unwrap();
+    let fingerprint = kyriakon_onboard::mail::keycheck::pgp_fingerprint(&key).unwrap();
 
     let (public, signature, _) = signing_key(&fingerprint);
-    let current = kyriakon_onboard::keycheck::pgp_fingerprint(&public).unwrap();
+    let current = kyriakon_onboard::mail::keycheck::pgp_fingerprint(&public).unwrap();
     fix.page_account("alice", json!({"mail_key": current}));
     fix.mail_key("alice", &public);
 
@@ -642,7 +646,7 @@ fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
     // nothing changes.
     let fix = Fix::new("account-rotation-forged");
     let (public, _, _) = signing_key("another fingerprint");
-    let current = kyriakon_onboard::keycheck::pgp_fingerprint(&public).unwrap();
+    let current = kyriakon_onboard::mail::keycheck::pgp_fingerprint(&public).unwrap();
     fix.page_account("alice", json!({"mail_key": current}));
     fix.mail_key("alice", &public);
     let (_, wrong, _) = signing_key("a different fingerprint");
@@ -670,7 +674,7 @@ fn request_verify_accepts_the_keyring_key_over_the_accounts_own_address() {
     let message = "From: Alice <alice@kyriakon.net>\nTo: admin@kyriakon.net\n\
                    Subject: my data\n\nPlease send me a copy.\n";
     let (public, detached, clearsigned) = signing_key(message);
-    let fingerprint = kyriakon_onboard::keycheck::pgp_fingerprint(&public).unwrap();
+    let fingerprint = kyriakon_onboard::mail::keycheck::pgp_fingerprint(&public).unwrap();
     fix.page_account("alice", json!({}));
     fix.mail_key("alice", &public);
 

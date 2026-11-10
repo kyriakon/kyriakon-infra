@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use kyriakon_onboard::{config, responder};
+use kyriakon_onboard::{config, frontend::responder};
 
 #[tokio::main]
 async fn main() {

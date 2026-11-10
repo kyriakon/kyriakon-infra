@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use kyriakon_onboard::config::DrainConfig;
-use kyriakon_onboard::intents;
+use kyriakon_onboard::drain;
 use kyriakon_onboard::store::Store;
 
 const DEFAULT_CONFIG: &str = "/etc/kyriakon/onboard/drain.toml";
@@ -67,5 +67,5 @@ async fn run(cfg_path: &Path) -> Result<(), String> {
         // Another pass is running and will carry this tick's work.
         None => return Ok(()),
     };
-    intents::run(&cfg, &store).await
+    drain::run(&cfg, &store).await
 }

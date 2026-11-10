@@ -7,6 +7,19 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+/// The fixed hostname for the form and the account page, used as itself. It is
+/// public because the terminal front-end hands a reader the same host's status
+/// route, so the address a session gives out cannot name a different service than
+/// the one that answers it.
+pub const HOST: &str = "signup.kyriakon.net";
+
+/// Where the root-side login check writes its proofs: one file per admitted
+/// login, named by a random token, holding the username and the expiry. Root
+/// owns it 0700, so the unprivileged handler can neither read a proof it did
+/// not mint nor write one the drain would trust. `scripts/deploy-onboard.sh`
+/// creates it.
+pub const PROOF_DIR: &str = "/var/db/kyriakon/logins";
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -104,7 +117,7 @@ impl Config {
 /// reads them from. Named once, so the handler and the drain cannot be pointed
 /// at different ones by a default that drifts.
 fn proof_dir() -> String {
-    crate::session::PROOF_DIR.to_string()
+    PROOF_DIR.to_string()
 }
 
 /// The drain's own configuration, read once per run from
@@ -444,7 +457,7 @@ mod tests {
         assert_eq!(c.dkim_selector, "REPLACE_ME");
         assert_eq!(c.dkim_public_key, "REPLACE_ME");
         assert_eq!(c.resolver, "/usr/bin/dig");
-        assert!(crate::dns::Values::from(&c).check().is_err());
+        assert!(crate::account::dns::Values::from(&c).check().is_err());
     }
 
     /// The handler's tracked config is substituted by the same deploy, and the
@@ -458,6 +471,6 @@ mod tests {
         assert_eq!(c.dkim_selector, "REPLACE_ME");
         assert_eq!(c.dkim_public_key, "REPLACE_ME");
         assert_eq!(c.stripe_payment_link, "REPLACE_ME");
-        assert!(crate::dns::Values::from(&c).check().is_err());
+        assert!(crate::account::dns::Values::from(&c).check().is_err());
     }
 }
