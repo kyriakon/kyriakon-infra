@@ -47,17 +47,21 @@ Pointers, so a search starts where the thing is.
   rewrites one without the AEAD advert.
 - `scripts/`: every deploy and operator script, each with a `--self-test`; `lib.sh`
   holds the shared helpers (staged installs, the mail-table lock, the self-test
-  harness), and `install-set.tsv` is the one table naming what each destination gets.
+  harness); `install-set.tsv` is the one table naming what each destination gets; and
+  `install-packages.sh` installs from `openbsd/packages.tsv`.
 - `openbsd/`: what the box runs: `etc/` (smtpd, httpd, relayd, gmid, unbound, nsd,
   spamd, sshd, `login.conf.d/`, `rc.d/`, `kyriakon.env`, and the three onboarding
-  configs (`catalogue.toml`, `drain.toml`, `onboard.toml`) under `etc/onboard/`), `dovecot/`, and `restore-template/` for the throwaway box.
+  configs (`catalogue.toml`, `drain.toml`, `onboard.toml`) under `etc/onboard/`),
+  `dovecot/`, `restore-template/` for the throwaway box, and `packages.tsv`, the one
+  package list naming each row's owning scripts and whether the CI VM installs it.
 - `terraform/`: the box itself, and the throwaway's stack.
 - `docs/`: `runbook.md` (every operator procedure, including the repository settings
   the automation depends on), `operations/`, `threat-model.md`, `terms.md`,
   `privacy.md`, `aup.md`, `transparency.md`, `refusals.md`, `planning/` (specs,
   research, prototypes), `agents/` (issue tracker, triage labels, domain docs).
-- `.github/workflows/`: `checks.yml` (the five CI jobs) and `auto-merge-key.yml` (a
-  green key publication merges itself, as the machine account).
+- `.github/workflows/`: `checks.yml` (the five CI jobs, including the OpenBSD 7.9
+  self-test VM) and `auto-merge-key.yml` (a green key publication merges itself, as
+  the machine account).
 - `.githooks/`: commit shape, pre-commit, pre-push.
 - Root: `reserved-usernames.txt` (the held-back names), `CONTEXT.md` (repo vocabulary),
   `CODING_STANDARDS.md` (what a review enforces), `README.md`.
@@ -93,10 +97,17 @@ repo's own root. Two terms most likely to matter while working in this repo:
 - Shell scripts (`scripts/`): `shellcheck scripts/*.sh`, and
   `ksh scripts/self-test-all.sh` runs every script's `--self-test` with the arguments
   each one needs. On the box, `ksh scripts/check-hygiene.sh` reports its live state.
-- OpenBSD config syntax checks require an actual OpenBSD host and are not run in CI —
-  e.g. `httpd -n -f openbsd/etc/httpd.conf`, `smtpd -n -f openbsd/etc/smtpd.conf`. If
-  you don't have access to a test OpenBSD instance, say so rather than claiming a
-  config is valid.
+- **OpenBSD has a test VM in CI.** The `script self-tests` job in
+  `.github/workflows/checks.yml` boots OpenBSD 7.9 through `vmactions/openbsd-vm`,
+  installs the `ci=yes` rows of `openbsd/packages.tsv`, then runs
+  `install-packages.sh --check` and `scripts/self-test-all.sh`. It is the
+  authoritative shell and userland; local macOS `/bin/ksh` is ksh93 and proves
+  nothing about pdksh. Push a branch and read that job to run OpenBSD-only commands,
+  including config syntax checks such as `httpd -n -f` and `smtpd -n -f`. Add a
+  temporary step for a one-off check and remove it before merge. A test that needs
+  another tool adds a row to `openbsd/packages.tsv`. The VM is not the live box: it
+  holds no deployed config or credentials, and `terraform apply`/`destroy` remain
+  human-only. See `docs/runbook.md` "Test on the OpenBSD VM".
 - No build step for `docs/` — markdown only.
 
 ## Code style
