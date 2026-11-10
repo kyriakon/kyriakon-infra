@@ -24,20 +24,23 @@ written down. This repo has no decisions directory of its own.
 
 Pointers, so a search starts where the thing is.
 
-- `onboard/`: the Rust service. `src/responder.rs` serves the web form and holds the
-  shared applicant flow (`flow_path`, `flow_problem`, `flow_answers`); `src/capsule.rs`
-  renders the pages as gemtext; `src/portal.rs` is the terminal library (menu, sessions,
-  the applicant flow); `src/portal_ipc.rs` is the terminal's one request to the handler;
-  `templates/*.html` are the web renderings; `src/transitions.rs` holds the drain's
-  settlement seam (`Envelope`, `Settlement`, `settle`, `Disposition`), with the verb
-  bodies under `src/transitions/` (`payments`, `groups`, `lifecycle`, `review`,
-  `stripe`, `boxrun`); `src/intents.rs` holds the intent enum and its payloads;
-  `src/journal.rs` loads and indexes the journal once per pass; `src/store.rs` owns
-  paths, locks and typed record reads; `src/ledger.rs` is the typed payment ledger;
-  `src/bin/` holds the three binaries (`kyriakon-onboard-drain`,
-  `kyriakon-onboard-tui`, `kyriakon-onboardctl`); `questions.toml` is the application's
-  question list; `tests/drain.rs` is the drain's acceptance suite, split by area under
-  `tests/areas/`.
+- `onboard/`: the Rust service. `src/frontend/responder/` serves the web form;
+  `responder/flow.rs` holds the shared applicant flow (`flow_path`, `flow_problem`,
+  `flow_answers`); `src/frontend/capsule.rs` renders the pages as gemtext;
+  `src/frontend/tui/mod.rs` is the terminal library (menu, sessions, the applicant
+  flow); `src/frontend/ipc.rs` is the terminal's one request to the handler;
+  `templates/*.html` are the web renderings; `src/drain/transitions.rs` holds the
+  drain's settlement seam (`Envelope`, `Settlement`, `settle`, `Disposition`), with the
+  verb bodies under `src/drain/transitions/` (`payments`, `groups`, `lifecycle`,
+  `review`, `stripe`, `boxrun`); `src/drain/mod.rs` holds the intent enum and its
+  payloads; `src/store/journal.rs` loads and indexes the journal once per pass;
+  `src/store/mod.rs` owns paths, locks and typed record reads; `src/payments/ledger.rs`
+  is the typed payment ledger; `src/bin/` holds the three binaries
+  (`kyriakon-onboard-drain`, `kyriakon-onboard-tui`, `kyriakon-onboardctl`);
+  `questions.toml` is the application's question list; `tests/drain.rs` is the drain's
+  acceptance suite, split by area under `tests/areas/`. Only `lib.rs`, `main.rs`,
+  `config.rs`, and `util.rs` sit at `src/` root; a new module goes in its section
+  directory, or a new directory with a `mod.rs` that names its job.
 - `kyriakon-encrypt/`: the CLI the save path runs to encrypt each message; `src/lib.rs`
   builds the PGP/MIME wrapper.
 - `dovecot-plugin/`: the C plugin that forks the encryptor for each save and turns its
