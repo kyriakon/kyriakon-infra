@@ -8,13 +8,14 @@
 //! until the ticket that understands it lands.
 //!
 //! One type is the contract between the handler's directory and the drain's
-//! root work: [`Intent`]. Its variant carries the payload, [`Intent::verify`]
-//! says how the intent is authenticated, and [`Intent::apply`] carries it out.
+//! root work: [`Intent`]. Its variant carries the payload; [`verify`] and
+//! [`apply`] in this module say how the intent is authenticated and carried out.
 //! `verify`'s match has no catch-all, so a verb cannot ship without answering
 //! how it is proved, the hole `provision-group` came through before #506.
 //!
-//! The wire payloads, [`DECISIONS`] and the rail constants live here too, beside
-//! [`Intent`]: the enum and the shape it deserialises are one contract.
+//! The wire payloads, [`DECISIONS`] and the rail constants live in
+//! [`crate::intent`], beside [`Intent`]: the enum and the shape it deserialises
+//! are one contract.
 
 pub mod mailbox;
 pub mod prepaid;
