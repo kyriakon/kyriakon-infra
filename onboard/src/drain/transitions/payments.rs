@@ -10,10 +10,10 @@ use super::groups::{group_record, write_account_record, write_group_record};
 use super::lifecycle::dns_contact;
 use super::{AfterLine, Settlement};
 use crate::config::DrainConfig;
-use crate::drain::{
+use crate::flow::validate;
+use crate::intent::{
     AttributeIntent, CreditIntent, RefundIntent, ReturnIntent, CREDIT_RAILS, REFUND_RAILS,
 };
-use crate::flow::validate;
 use crate::mail::notice;
 use crate::payments::ledger::Ledger;
 use crate::payments::ledger::LedgerLine;
@@ -1655,7 +1655,7 @@ mod tests {
     use crate::account::sign;
     use crate::drain::transitions::test_support::quota_config;
     use crate::drain::transitions::{settle, Disposition, Envelope, RefusalFile};
-    use crate::drain::RefundIntent;
+    use crate::intent::RefundIntent;
     use std::os::unix::io::AsRawFd;
 
     #[test]

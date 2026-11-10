@@ -14,6 +14,7 @@ pub mod config;
 pub mod drain;
 pub mod flow;
 pub mod frontend;
+pub mod intent;
 pub mod mail;
 pub mod payments;
 pub mod store;

@@ -14,11 +14,11 @@ use super::payments::{resolve_payment, token_join, write_payment_copy};
 use super::{due, report_failure, write_journal, Settlement};
 use crate::account::dns;
 use crate::config::DrainConfig;
-use crate::drain::{
+use crate::flow::validate;
+use crate::intent::{
     CancelRenewalIntent, ChangePasswordIntent, CloseIntent, ExportIntent, MailKeyIntent,
     OutsideAddressIntent, PasswordIntent, ServingIntent, UploadKeyIntent, WindowExtendIntent,
 };
-use crate::flow::validate;
 use crate::mail::notice;
 use crate::payments::ledger::Ledger;
 use crate::payments::rails::rail_instructions;

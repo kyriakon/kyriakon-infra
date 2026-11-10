@@ -1104,7 +1104,7 @@ impl Fix {
             .unwrap();
         runtime
             .block_on(
-                kyriakon_onboard::drain::Intent::Close(kyriakon_onboard::drain::CloseIntent {
+                kyriakon_onboard::intent::Intent::Close(kyriakon_onboard::intent::CloseIntent {
                     username: username.to_string(),
                     session: session_id.to_string(),
                     ..Default::default()

@@ -13,7 +13,7 @@ use time::OffsetDateTime;
 use crate::frontend::fastcgi::{Http, Reply, Request};
 use crate::frontend::page::LoginPage;
 use crate::store::Account;
-use crate::{account::session, drain, flow::validate, frontend::page, mail::keycheck};
+use crate::{account::session, flow::validate, frontend::page, intent, mail::keycheck};
 
 /// The account page, which each front end renders for the identity it has: the
 /// web's session cookie and the capsule's certificate.
@@ -237,7 +237,7 @@ pub(super) async fn account_close(app: &App, request: &Request) -> Reply {
         return refused("Sign in to the account you want to close.");
     };
     let refund = closure_refund(app, &account).await;
-    let intent = drain::Intent::Close(drain::CloseIntent {
+    let intent = intent::Intent::Close(intent::CloseIntent {
         username: account.username.clone(),
         session: session_id.to_string(),
         ..Default::default()
@@ -297,7 +297,7 @@ pub(super) async fn account_password(app: &App, request: &Request) -> Reply {
     if new != confirm {
         return refused("The two new passwords do not match.");
     }
-    match drain::Intent::ChangePassword(drain::ChangePasswordIntent {
+    match intent::Intent::ChangePassword(intent::ChangePasswordIntent {
         username: account.username.clone(),
         session: session_id.to_string(),
         password: new.to_string(),
@@ -341,7 +341,7 @@ pub(super) async fn account_upload_key(app: &App, request: &Request) -> Reply {
             if keycheck::openssh_fingerprint(material).is_none() {
                 return refused("That line carries no key material.");
             }
-            match drain::Intent::UploadKey(drain::UploadKeyIntent {
+            match intent::Intent::UploadKey(intent::UploadKeyIntent {
                 username: account.username.clone(),
                 session: session_id.to_string(),
                 action: "add".to_string(),
@@ -376,7 +376,7 @@ pub(super) async fn account_upload_key(app: &App, request: &Request) -> Reply {
             {
                 return refused("That key is not on the account.");
             }
-            match drain::Intent::UploadKey(drain::UploadKeyIntent {
+            match intent::Intent::UploadKey(intent::UploadKeyIntent {
                 username: account.username.clone(),
                 session: session_id.to_string(),
                 action: "remove".to_string(),
@@ -423,7 +423,7 @@ pub(super) async fn account_address(app: &App, request: &Request) -> Reply {
             ));
         }
     }
-    match drain::Intent::OutsideAddress(drain::OutsideAddressIntent {
+    match intent::Intent::OutsideAddress(intent::OutsideAddressIntent {
         username: account.username.clone(),
         session: session_id.to_string(),
         address: address.to_string(),
@@ -465,7 +465,7 @@ pub(super) async fn account_serving(app: &App, request: &Request) -> Reply {
     let form = fields(&String::from_utf8_lossy(&request.body));
     let http = form.contains_key("http");
     let gemini = form.contains_key("gemini");
-    match drain::Intent::Serving(drain::ServingIntent {
+    match intent::Intent::Serving(intent::ServingIntent {
         username: account.username.clone(),
         session: session_id.to_string(),
         http,
@@ -516,7 +516,7 @@ pub(super) async fn account_renewal(app: &App, request: &Request) -> Reply {
              pay again, and nothing is charged automatically.",
         );
     }
-    match drain::Intent::CancelRenewal(drain::CancelRenewalIntent {
+    match intent::Intent::CancelRenewal(intent::CancelRenewalIntent {
         username: account.username.clone(),
         session: session_id.to_string(),
         ..Default::default()
@@ -571,7 +571,7 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
                 .unwrap_or("")
                 .trim();
             let signed = !signature.is_empty();
-            match drain::Intent::MailKey(drain::MailKeyIntent {
+            match intent::Intent::MailKey(intent::MailKeyIntent {
                 username: account.username.clone(),
                 session: session_id.to_string(),
                 action: "replace".to_string(),
@@ -604,7 +604,7 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
             if account.rotation.is_none() {
                 return refused("No replacement is waiting to be cancelled.");
             }
-            match drain::Intent::MailKey(drain::MailKeyIntent {
+            match intent::Intent::MailKey(intent::MailKeyIntent {
                 username: account.username.clone(),
                 session: session_id.to_string(),
                 action: "cancel".to_string(),
@@ -662,7 +662,7 @@ pub(super) async fn account_export(app: &App, request: &Request) -> Reply {
     let Some(session_id) = cookie.as_deref().and_then(session::id) else {
         return refused("Sign in to the account you want to export.");
     };
-    match drain::Intent::Export(drain::ExportIntent {
+    match intent::Intent::Export(intent::ExportIntent {
         username: account.username.clone(),
         session: session_id.to_string(),
         ..Default::default()

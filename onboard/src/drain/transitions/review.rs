@@ -15,9 +15,9 @@ use super::{write_journal, Settlement};
 use crate::account::dns;
 use crate::account::sign;
 use crate::config::DrainConfig;
-use crate::drain::{DecisionIntent, ResendIntent, DECISIONS, RAILS};
 use crate::flow::questions;
 use crate::flow::validate;
+use crate::intent::{DecisionIntent, ResendIntent, DECISIONS, RAILS};
 use crate::mail::notice;
 use crate::payments::rails::{card_link, rail_instructions};
 use crate::store::journal::Journal;
@@ -749,7 +749,7 @@ async fn approve_group(
     // field the transition acts on is in the payload, so a filed intent cannot
     // be edited between this write and the drain's next pass.
     group.sig = sign::sign(key, &sign::group_provision_payload(&group))?;
-    let id = crate::drain::Intent::ProvisionGroup(Box::new(group))
+    let id = crate::intent::Intent::ProvisionGroup(Box::new(group))
         .file(store)
         .await?;
     let filename = format!("{id}.json");
@@ -762,13 +762,16 @@ async fn approve_group(
         .ok_or_else(|| format!("the intent this pass filed at {filename} is gone"))?;
     let value: Value = serde_json::from_str(&text)
         .map_err(|e| format!("the intent this pass filed does not parse: {e}"))?;
-    let filed = crate::drain::Intent::parse(&value)?;
+    let filed = crate::intent::Intent::parse(&value)?;
     // The provision-group arm verifies or fails; it has no refusal of its own,
-    // because the signature it checks is the one this pass just made. `run` is
-    // the seam the next pass would use, so the line and the remove are its.
+    // because the signature it checks is the one this pass just made. `run_intent`
+    // is the seam the next pass would use, so the line and the remove are its.
     // Boxed: this file's own approval path reaches `apply`, which reaches the
     // group transition, so the future would otherwise be infinitely sized.
-    Box::pin(filed.run(cfg, store, journal, key, &filename, &value)).await?;
+    Box::pin(crate::drain::run_intent(
+        filed, cfg, store, journal, key, &filename, &value,
+    ))
+    .await?;
 
     // The body's approval notice: the recipe is the whole point of it, because
     // mail and the website do not work until the body has published the records
