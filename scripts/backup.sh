@@ -13,18 +13,48 @@
 #                           keep an offline copy (proposal §5.5), never the only
 #                           copy on the box.
 #
-# Payload is /home: Maildir (/home/<u>/Maildir), git repos (/home/<u>/repos),
-# and web roots (/home/<u>/www, /home/<u>/gemini) all live under each user's
-# home (proposal §5.3, §6.9), so one tree covers every user-data path. Config
-# is deliberately NOT backed up — it is the git-tracked public repo, not data.
-# (the research note's /var/www /var/gemini /var/git predates §6.9's
-# per-user-under-/home layout — /home is the authoritative, current path.)
+# Payload is /home plus every piece of state a rebuild from git cannot recreate.
+# /home carries Maildir (/home/<u>/Maildir), git repos (/home/<u>/repos) and web
+# roots (/home/<u>/www, /home/<u>/gemini) under each user's home (proposal
+# §5.3, §6.9), so one tree covers every user-data path. The research note's
+# /var/www /var/gemini /var/git predates §6.9's per-user-under-/home layout, so
+# /home is the authoritative, current path. The rest is named below, each for
+# the reason git does not hold it:
 #
-# /etc/mail is the one exception: it holds the DKIM signing key and smtpd's queue
-# key, which are secrets rather than git-tracked config and exist nowhere else.
-# Without them a rebuild from git plus this repository comes back unable to sign
-# mail or read an existing queue. The whole directory is taken rather than those
-# two files by name, so a rotation cannot silently escape the backup.
+#   /etc/mail             the DKIM signing key and smtpd's queue key. Without them
+#                         a rebuild comes back unable to sign mail or read an
+#                         existing queue. The whole directory is taken rather than
+#                         those two files by name, so a rotation cannot silently
+#                         escape the backup.
+#   /var/db/onboard       the control store: every member's account.json
+#                         (paid_until, payment token, subscription, outside
+#                         address, pinned certificates), every group's group.json,
+#                         the payment ledger (kept for tax accounting), tokens/,
+#                         journal.jsonl, holds/ and applications/.
+#   /etc/kyriakon         the box keyring /etc/kyriakon/keys, including keys
+#                         rotated on the box and not yet merged to git, and the
+#                         drain's root-only secrets under /etc/kyriakon/onboard.
+#   /etc/master.passwd    every account add-user.sh created: its uid and gid, the
+#   /etc/passwd           bcrypt mail password hash set by set-mail-password.sh,
+#   /etc/group            and its member or lapsed login class. Without them a
+#                         restored /home sits under unmapped numeric uids and no
+#                         member can authenticate to IMAP, SMTP, SFTP or git.
+#                         passwd and group are taken with master.passwd because
+#                         pwd_mkdb derives them from it: half a database is a box
+#                         whose login names and whose login classes disagree.
+#   /etc/httpd.d          the generated per-member and per-group vhosts and the
+#   /etc/gmid.d           index each hand-written config includes, which the
+#   /etc/acme-client.d    drain rewrites as members and domains change. git holds
+#                         the empty index only, so the generated files are data.
+#   /var/db/kyriakon-acme-queue
+#                         the certificate request queue: which names were waiting,
+#                         whose site each is for, and when it was filed. Losing
+#                         it forgets the queue and restarts every wait.
+#
+# The hand-written config is deliberately NOT backed up: it is the git-tracked
+# public repo, not data, and a copy in the repository would drift from it. The
+# three generated directories above are the exception, because their contents are
+# written on the box and exist nowhere in git.
 #
 # The ACME TLS keys stay out, but not for the reason once given here.
 # acme-client generates a key only when the file is missing, so a renewal reuses
@@ -100,11 +130,20 @@ fi
 # restore-test.sh, which asserts byte-identity).
 printf '%s\n' "$CANARY_TEXT" > "$CANARY_PATH"
 
-# Whole /home tree (Maildir + git repos + web roots), plus the /etc/mail secrets
-# and any capsule pair, all of which exist nowhere else. See the header for why
-# these paths and no other config. The globs stay literal when no pair exists,
-# so each candidate is tested before it is passed.
+# Whole /home tree (Maildir + git repos + web roots), then the state that exists
+# only on this box: the /etc/mail secrets, the control store, the keyring, the
+# OS account database and the generated daemon directories. See the header for
+# why each is data. The latter exist once the control plane or member hosting is
+# deployed, and restic exits on a path that does not exist, so each is tested
+# before it is passed: a path this box has not created yet is skipped rather than
+# failing the whole night's backup. The capsule globs are tested the same way.
 set -- /home /etc/mail
+for p in /var/db/onboard /var/db/kyriakon-acme-queue /etc/kyriakon \
+	/etc/master.passwd /etc/passwd /etc/group \
+	/etc/httpd.d /etc/gmid.d /etc/acme-client.d; do
+	[ -e "$p" ] || continue
+	set -- "$@" "$p"
+done
 for f in /etc/ssl/capsule-*.crt /etc/ssl/private/capsule-*.key; do
 	[ -f "$f" ] || continue
 	set -- "$@" "$f"

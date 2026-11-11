@@ -11,9 +11,11 @@
 #   RESTIC_PASSWORD_FILE       mode-0600 password file
 #   REHEARSAL_HEALTHCHECKS_URL Healthchecks ping URL for the ~90-day check (optional)
 #
-# The script restores /home into the box's live paths, then prints the manual
-# checklist. Daemon start-up and the round-trip check stay manual on purpose
-# (research §5): they need a real DNS/MX hand-off and a human watching.
+# The script restores the whole snapshot into the box's live paths, /home and the
+# state beside it (/etc/mail, /etc/kyriakon, the account database, the generated
+# daemon configs and the control store), then prints the manual checklist. Daemon
+# start-up and the round-trip check stay manual on purpose (research §5): they
+# need a real DNS/MX hand-off and a human watching.
 #
 # Reminder (the automation, since the run itself is manual): a Healthchecks check
 # with a ~90-day grace. This script pings /fail if the scripted restore fails;

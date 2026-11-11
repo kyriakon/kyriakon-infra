@@ -15,7 +15,8 @@
 #   RESTORE_TARGET_ROOT     scratch root (default /var/restore-test)
 #
 # Verification order (spec §26): snapshot-recency → check → full restore → canary
-# byte-identical + Maildir-is-PGP-ciphertext + git fsck + stats count → HC ping.
+# byte-identical + Maildir-is-PGP-ciphertext + git fsck + stats count + the
+# control store, account database and generated configs present → HC ping.
 
 set -euo pipefail
 
@@ -112,20 +113,33 @@ rm -f "$expected"
 # that only speaks when it fails gives the log nothing to point at.
 printf 'canary byte-identical at %s\n' "$CANARY_PATH"
 
-# --- 5. secrets and the capsule pair -----------------------------------
-# The backup takes /home, /etc/mail, and any capsule certificate pair, and
-# nothing else. /etc/mail carries the DKIM signing key and smtpd's queue key,
-# which exist nowhere else, so a rebuild without them comes back unable to sign
-# mail or read an existing queue. A capsule key is the only copy of its
+# --- 5. secrets, account database and control state ---------------------
+# The backup takes /home, /etc/mail, any capsule certificate pair, and the state
+# a rebuild cannot recreate: the control store, the box keyring and drain
+# secrets, the OS account database, the three generated daemon directories and
+# the certificate queue. /etc/mail carries the DKIM signing key and smtpd's queue
+# key, which exist nowhere else, so a rebuild without them comes back unable to
+# sign mail or read an existing queue. A capsule key is the only copy of its
 # long-lived certificate, so a pair that arrives without its key half is a
 # broken backup. /root carries the box's env file and the restic password; the
 # TSIG key in the former is DNS control for the domain, and the repository this
 # test reads with read-only credentials is no place for it. Asserting both
 # directions means an edit to the backup paths fails here, rather than quietly
-# dropping a key or shipping a secret to the storage box.
+# dropping state or shipping a secret to the storage box.
 for need in /etc/mail/dkim/private.rsa.key /etc/mail/smtpd.conf; do
 	if [ ! -e "$target$need" ]; then
 		die "missing from the snapshot: $need — the backup no longer covers /etc/mail"
+	fi
+done
+# The snapshot is of the mail box, which has carried the control plane and
+# per-member hosting since they landed, so every path here exists on the box the
+# backup runs on. A missing one in the restore is a payload that lost state, not a
+# box that never had any, and it is not allowed to pass vacuously.
+for need in /var/db/onboard /var/db/kyriakon-acme-queue /etc/kyriakon \
+	/etc/master.passwd /etc/passwd /etc/group \
+	/etc/httpd.d /etc/gmid.d /etc/acme-client.d; do
+	if [ ! -e "$target$need" ]; then
+		die "missing from the snapshot: $need — the backup no longer covers the control store, the account database or the generated configs"
 	fi
 done
 for secret in /root/.kyriakon-env /root/.restic-pass; do
@@ -148,7 +162,26 @@ for f in "$target"/etc/ssl/capsule-*.crt "$target"/etc/ssl/private/capsule-*.key
 	[ -f "$target$mate" ] \
 		|| die "capsule pair is split in the snapshot: ${f#"$target"} has no $mate"
 done
-printf 'verified /etc/mail secrets are in the snapshot and /root secrets are not\n'
+# A store account directory and its OS account are two halves of one member: the
+# directory is the record the control plane renders and bills from, and the OS
+# entry is the uid its home is owned by and the password hash it authenticates
+# with. Assert each restored account directory has its entry in both files, so a
+# payload that took one half and not the other fails here rather than restoring
+# homes that nobody can log in to. A store with no accounts passes vacuously, the
+# way the Maildir check does.
+accounts=0
+for d in "$target"/var/db/onboard/accounts/*; do
+	[ -d "$d" ] || continue
+	user=${d##*/}
+	accounts=$(( accounts + 1 ))
+	for db in passwd master.passwd; do
+		awk -F: -v u="$user" '$1 == u { found = 1 } END { exit !found }' \
+			"$target/etc/$db" \
+			|| die "store account $user has no entry in the restored /etc/$db — its home would restore under an unmapped uid, and its mail password with it"
+	done
+done
+printf 'verified %s store accounts have OS accounts in the snapshot\n' "$accounts"
+printf 'verified /etc/mail, control state and the account database are in the snapshot and /root secrets are not\n'
 
 # --- 6. Maildir-is-PGP-ciphertext --------------------------------------
 # Zero-access regression guard: every restored message must carry the ASCII-armor
