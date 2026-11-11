@@ -317,9 +317,9 @@ remove_member() {
 
 # remove_own_addresses: drop this member's own lines from the virtual table.
 # Returns 0 when the file changed, 1 when it did not, and 2 when the write
-# failed; the caller must keep 2 apart from 1. The key is a literal prefix, so a
-# member named a.b does not take axb@ with them. lib.sh's table_drop keeps a copy
-# of the table it replaces, so a deletion can be undone.
+# failed; the caller must keep 2 apart from 1. The key is a literal prefix, so
+# only this member's own addresses go: the name cannot act as a pattern. lib.sh's
+# table_drop keeps a copy of the table it replaces, so a deletion can be undone.
 remove_own_addresses() {
 	table_drop "$virtuals" prefix "$user@"
 }

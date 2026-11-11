@@ -13,8 +13,8 @@
 #
 # The hash is checked before usermod sees it. `usermod -p` takes any line, and a
 # malformed one locks the account instead of failing loudly. The account must
-# already exist: this never creates one, and never touches an account without a
-# dot in its name (root, _onboard and every daemon account are not members).
+# already exist: this never creates one, and never touches an account that has no
+# Maildir (root, _onboard and every daemon account do not).
 
 # The bcrypt fixtures in the self-test are literals, not expansions: shellcheck
 # reads `$2b` as a positional parameter and warns that it will not expand.
@@ -28,8 +28,8 @@ die() {
 
 # is_member <home>: whether this home is a member's. A Maildir is what
 # add-user.sh creates and what Dovecot reads; root, _onboard and every daemon
-# account have none, and the name is not the test because a localpart need not
-# contain a dot.
+# account have none, and the name is not the test because `root` fits the
+# single-label username rule.
 is_member() {
 	[ -d "$1/Maildir" ]
 }
