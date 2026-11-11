@@ -49,13 +49,14 @@ That covers stored content, not the addressing information mail needs to move. S
 | Spam greylist and whitelist entries | about 36 days on the whitelist |
 | Application data for an application that is rejected or abandoned, and the text the triage model saw | 90 days |
 | Your account, mailbox, website, gemini capsule and git repositories | while the account exists, then deleted |
+| The hold on your username, and the transition journal lines that name the account | 90 days after deletion |
 | A suspended account | a 40-day grace, then deletion |
 | An account after a failed renewal | a 40-day grace, then deletion |
 | Copies of deleted data in the encrypted backup repository | up to about 7 months after the data leaves the live tree |
 | Billing and accounting records | 5 years after the 31 January filing deadline for the tax year, and 6 years once we are registered for VAT |
 | Card data | never held by us; held by Stripe |
 
-Deleting an account removes the account and the live data: the mailbox, the git repositories, and the web and gemini roots. It does not remove the copies instantly. The backup repository is content-addressed, so its only deletion mechanism is snapshot expiry, and a copy of a deleted account can survive in it as ciphertext for up to about seven months. This is why we do not say that deletion is immediate, and why the window is stated here rather than shortened in the wording.
+Deleting an account removes the account and the live data: the mailbox, the git repositories, and the web and gemini roots. It does not remove the copies instantly. The backup repository is content-addressed, so its only deletion mechanism is snapshot expiry, and a copy of a deleted account can survive in it as ciphertext for up to about seven months. This is why we do not say that deletion is immediate, and why the window is stated here rather than shortened in the wording. Your username is held for 90 days after deletion so nobody else can take it in that time, then released. The transition journal lines that name the account are released with it.
 
 The billing record outlives the backup repository, because tax law requires it. Its amounts, dates and rails are keyed by your payment token, not by your username. When an account is deleted, the token that joined its payments to it is deleted too, so the surviving record is a dated amount that no longer resolves to a person.
 

@@ -327,3 +327,62 @@ fn the_console_refuses_a_name_with_no_account_and_no_deletion() {
     );
     assert!(!fix.dir.join("store/holds/nobody.json").exists());
 }
+
+/// Once the 90-day hold has run its course, the hold file and the journal lines
+/// that name the released account go, while a live hold and every other
+/// account's lines stay byte for byte.
+#[test]
+fn an_expired_hold_and_its_journal_lines_are_released() {
+    let fix = Fix::new("erasure-hold-release");
+    approved_paid(&fix, "secretary", "cash");
+    approved_paid(&fix, "treasurer", "cash");
+    fake_delete_user(&fix);
+    assert!(fix.ctl(&["delete", "secretary"]).status.success());
+    assert!(fix.ctl(&["delete", "treasurer"]).status.success());
+    assert!(fix.dir.join("store/holds/secretary.json").exists());
+    assert!(fix.dir.join("store/holds/treasurer.json").exists());
+
+    // Ninety days pass for one name: its hold and the lines it bounds are dated
+    // in the past, while the other name's hold keeps today's date.
+    std::fs::write(
+        fix.dir.join("store/holds/secretary.json"),
+        br#"{"username":"secretary","until":"2020-06-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    let mut aged = String::new();
+    for line in fix.journal().lines() {
+        let mut entry: Value = serde_json::from_str(line).unwrap();
+        if entry["application"]["username"] == "secretary" {
+            entry["at"] = json!("2020-01-01T00:00:00Z");
+        }
+        aged.push_str(&serde_json::to_string(&entry).unwrap());
+        aged.push('\n');
+    }
+    std::fs::write(fix.dir.join("store/journal.jsonl"), &aged).unwrap();
+    let kept: Vec<String> = aged
+        .lines()
+        .filter(|line| {
+            let entry: Value = serde_json::from_str(line).unwrap();
+            entry["application"]["username"] != "secretary"
+        })
+        .map(str::to_string)
+        .collect();
+    assert!(!kept.is_empty(), "the fixture has no other account's lines");
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/holds/secretary.json").exists(),
+        "the expired hold stayed"
+    );
+    assert!(
+        fix.dir.join("store/holds/treasurer.json").exists(),
+        "the live hold went"
+    );
+    let after: Vec<String> = fix.journal().lines().map(str::to_string).collect();
+    assert_eq!(after, kept, "a journal line was not kept byte for byte");
+    assert!(
+        fix.journal().ends_with('\n'),
+        "the journal lost its newline"
+    );
+}

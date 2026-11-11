@@ -206,7 +206,7 @@ pub fn erasure_answer(refund: Option<&str>) -> String {
          \n\
          The payment ledger keeps one dated line for each payment: the amount, the date, the rail and the paid-until date, with no username, contact address or name. That line survives, and it no longer resolves to you.\n\
          \n\
-         Your username is held for 90 days and then released, so nobody else can take it in that time.\n\
+         Your username is held for 90 days and then released, so nobody else can take it in that time. The transition journal keeps a line for each change to your account, and those lines name you; they are released with the name at the end of the same 90 days.\n\
          \n\
          {refund}\n"
     )

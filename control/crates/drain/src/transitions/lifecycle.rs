@@ -2674,14 +2674,90 @@ pub async fn prepaid_renewals(
     Ok(())
 }
 
+/// Release every username hold whose ninety days have run, and the journal
+/// lines that name the released account with it. Run once per drain pass, last,
+/// so no append after the rewrite reads the loaded index's stale line
+/// positions.
+///
+/// A line written after the hold ended belongs to a later account that reused
+/// the released name, not to the one being released, so only lines inside the
+/// hold are dropped. A hold that cannot be read is left alone: releasing a name
+/// the platform cannot see the end of is worse than keeping it.
+pub async fn holds_sweep(store: &Store) -> Result<(), Error> {
+    let now = OffsetDateTime::now_utc();
+    let mut expired: Vec<(String, OffsetDateTime)> = Vec::new();
+    for name in store.list("holds").await? {
+        let Some(username) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let value = match store.hold(username).await {
+            Ok(Some(value)) => value,
+            Ok(None) => continue,
+            Err(e) => {
+                e.report(&format!("reading {username}'s hold"));
+                continue;
+            }
+        };
+        let Some(until) = value.get("until").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(at) = OffsetDateTime::parse(until, &Rfc3339) else {
+            continue;
+        };
+        if at > now {
+            continue;
+        }
+        expired.push((username.to_string(), at));
+    }
+    if expired.is_empty() {
+        return Ok(());
+    }
+
+    // The lines go before the hold files: a crash between the two then leaves a
+    // hold the next pass retries, never journal lines with no hold left to
+    // release them.
+    {
+        let log = store.log("journal.jsonl");
+        let _guard = log.lock().await?;
+        let mut kept = String::new();
+        let mut dropped = false;
+        for line in log.raw_lines().await? {
+            let named = serde_json::from_str::<store::JournalLine>(&line)
+                .ok()
+                .is_some_and(|entry| {
+                    expired.iter().any(|(username, until)| {
+                        entry.application.username == username.as_str()
+                            && OffsetDateTime::parse(&entry.at, &Rfc3339)
+                                .is_ok_and(|at| at < *until)
+                    })
+                });
+            if named {
+                dropped = true;
+                continue;
+            }
+            kept.push_str(&line);
+            kept.push('\n');
+        }
+        if dropped {
+            store.rewrite_log("journal.jsonl", kept.as_bytes()).await?;
+        }
+    }
+    for (username, _) in &expired {
+        store.remove("holds", &format!("{username}.json")).await?;
+    }
+    Ok(())
+}
+
 /// Carry out one export intent: the page's "Take my data out", filed by the
 /// handler with the account the session belongs to and nothing else. The session
 /// that proves it is `verify`'s.
 ///
 /// The bundle is written into the member's own chroot and the ready notice is
-/// appended in the same pass. The journal line names the application the account
-/// was approved from when the copy is still inside ADR 0005's purge; an export
-/// after the purge has no status token left to name and journals none.
+/// appended in the same pass, and the request's line is closed with the bundle's
+/// path so the page's own ask does not stay open. The journal line names the
+/// application the account was approved from when the copy is still inside ADR
+/// 0005's purge; an export after the purge has no status token left to name and
+/// journals none.
 pub async fn export_account(
     cfg: &DrainConfig,
     store: &Store,
@@ -2698,16 +2774,24 @@ pub async fn export_account(
     // a page-filed export is one. It is written before the answer, keyed by the
     // intent's own id so a retry after a failed pass does not append a second
     // request for the same ask.
-    let recorded = store
+    let existing = store
         .log(&format!("accounts/{username}/requests.jsonl"))
         .jsonl::<kyriakon_control_core::account::requests::RequestLine>()
         .await?
-        .iter()
-        .any(|line| line.id == id);
-    if !recorded {
-        let received = kyriakon_control_core::util::date_string(
-            kyriakon_control_core::account::requests::today(),
-        );
+        .into_iter()
+        .find(|line| line.id == id);
+    // The day the request is answered. A retry reads the recorded line's own
+    // receipt date, so the same pass that finishes the export closes the same
+    // line on the same day rather than moving the date the answer carries.
+    let received = existing
+        .as_ref()
+        .map(|line| line.received.clone())
+        .unwrap_or_else(|| {
+            kyriakon_control_core::util::date_string(
+                kyriakon_control_core::account::requests::today(),
+            )
+        });
+    if existing.is_none() {
         kyriakon_control_core::account::requests::record(
             store,
             kyriakon_control_core::account::requests::NewRequest {
@@ -2737,6 +2821,21 @@ pub async fn export_account(
         })
         .unwrap_or_default();
     let bundle = kyriakon_control_core::account::export::deliver(cfg, store, username).await?;
+    // Record the delivery and close the line it answers, so the page's own
+    // export is not left open in the operator's docket. A pass that delivered
+    // and closed but crashed before its journal line is replayed by the next
+    // pass: the line is already closed, which is the same fact rather than a
+    // second request.
+    kyriakon_control_core::account::requests::set_bundle(store, &id, username, &bundle).await?;
+    if existing.as_ref().is_none_or(|line| line.done.is_none()) {
+        kyriakon_control_core::account::requests::close(
+            store,
+            &id,
+            &received,
+            "delivered to the member's export directory",
+        )
+        .await?;
+    }
     let application = ApplicationRef::application(username.to_string(), status_token);
     Ok(Settlement::line(
         "applied",
