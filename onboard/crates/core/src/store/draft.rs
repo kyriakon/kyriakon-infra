@@ -70,7 +70,7 @@ pub async fn load(store: &Store, token: &str) -> Result<Option<Draft>, Error> {
         return Ok(None);
     };
     let draft: Draft = serde_json::from_str(&text).map_err(|source| Error::Parse {
-        path: format!("the draft {token}").into(),
+        path: format!("drafts/{token}.json").into(),
         source,
     })?;
     if draft.token != token {

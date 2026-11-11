@@ -345,7 +345,7 @@ impl DrainConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, DrainConfig};
+    use super::{Config, DrainConfig, Error};
 
     #[test]
     fn parses_the_shipped_shape() {
@@ -524,5 +524,38 @@ mod tests {
         assert_eq!(c.dkim_public_key, "REPLACE_ME");
         assert_eq!(c.stripe_payment_link, "REPLACE_ME");
         assert!(crate::account::dns::Values::from(&c).check().is_err());
+    }
+
+    /// A config that is not there and one that does not parse are the two
+    /// failures the loaders can report, and both keep their source.
+    #[test]
+    fn a_missing_config_is_a_read_error() {
+        let path =
+            std::env::temp_dir().join(format!("onboard-config-missing-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let handler = Config::load(&path).expect_err("a missing handler config is an error");
+        assert!(matches!(&handler, Error::Read { path: p, .. } if p == &path));
+        assert!(std::error::Error::source(&handler).is_some());
+
+        let drain = DrainConfig::load(&path).expect_err("a missing drain config is an error");
+        assert!(matches!(&drain, Error::Read { path: p, .. } if p == &path));
+        assert!(std::error::Error::source(&drain).is_some());
+    }
+
+    #[test]
+    fn an_unparsable_config_is_a_parse_error() {
+        let path =
+            std::env::temp_dir().join(format!("onboard-config-parse-{}", std::process::id()));
+        std::fs::write(&path, "this is not toml = [").unwrap();
+
+        let handler = Config::load(&path).expect_err("an unparsable handler config is an error");
+        assert!(matches!(&handler, Error::Parse { path: p, .. } if p == &path));
+        assert!(std::error::Error::source(&handler).is_some());
+
+        let drain = DrainConfig::load(&path).expect_err("an unparsable drain config is an error");
+        assert!(matches!(&drain, Error::Parse { path: p, .. } if p == &path));
+        assert!(std::error::Error::source(&drain).is_some());
+        let _ = std::fs::remove_file(&path);
     }
 }

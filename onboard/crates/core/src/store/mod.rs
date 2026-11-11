@@ -20,7 +20,7 @@ pub mod draft;
 pub mod error;
 pub mod journal;
 
-pub use error::Error;
+pub use error::{Action, Error};
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::fchown;
@@ -82,7 +82,8 @@ impl Store {
     pub async fn read_text(path: &str) -> Result<String, Error> {
         tokio::fs::read_to_string(path)
             .await
-            .map_err(|source| Error::Read {
+            .map_err(|source| Error::Io {
+                action: Action::Read,
                 path: path.into(),
                 source,
             })
@@ -105,7 +106,8 @@ impl Store {
         match tokio::fs::read_to_string(self.root.join(rel)).await {
             Ok(text) => Ok(Some(text)),
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(Error::Read {
+            Err(source) => Err(Error::Io {
+                action: Action::Read,
                 path: rel.into(),
                 source,
             }),
@@ -310,7 +312,11 @@ impl Store {
         .await;
         placed.map_err(|source| {
             let _ = std::fs::remove_file(&tmp);
-            Error::Place { dir: d, source }
+            Error::Io {
+                action: Action::Place,
+                path: d,
+                source,
+            }
         })
     }
 
@@ -347,14 +353,16 @@ impl Store {
             Ok(rd) => rd,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(source) => {
-                return Err(Error::Read {
+                return Err(Error::Io {
+                    action: Action::Read,
                     path: d.clone(),
                     source,
                 })
             }
         };
         let mut out = Vec::new();
-        while let Some(entry) = rd.next_entry().await.map_err(|source| Error::Read {
+        while let Some(entry) = rd.next_entry().await.map_err(|source| Error::Io {
+            action: Action::Read,
             path: d.clone(),
             source,
         })? {
@@ -400,7 +408,8 @@ impl Store {
         if let Some(parent) = p.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(|source| Error::Create {
+                .map_err(|source| Error::Io {
+                    action: Action::Create,
                     path: parent.to_path_buf(),
                     source,
                 })?;
@@ -447,7 +456,11 @@ impl Store {
             }
         }
         .await;
-        placed.map_err(|source| Error::Append { path: p, source })
+        placed.map_err(|source| Error::Io {
+            action: Action::Append,
+            path: p,
+            source,
+        })
     }
 
     /// Create a directory under the root with its parents, 0700. The mode is
@@ -459,10 +472,11 @@ impl Store {
         let mut builder = tokio::fs::DirBuilder::new();
         builder.recursive(true);
         builder.mode(0o700);
-        builder
-            .create(&d)
-            .await
-            .map_err(|source| Error::Create { path: d, source })
+        builder.create(&d).await.map_err(|source| Error::Io {
+            action: Action::Create,
+            path: d,
+            source,
+        })
     }
 
     /// The owner of a directory under the store. The drain uses this to write
@@ -481,8 +495,9 @@ impl Store {
         match tokio::fs::remove_file(&p).await {
             Ok(()) => Ok(()),
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(Error::Remove {
-                dir: self.root.join(dir),
+            Err(source) => Err(Error::Io {
+                action: Action::Remove,
+                path: self.root.join(dir),
                 source,
             }),
         }
@@ -509,7 +524,8 @@ impl Store {
     pub async fn lock(&self, rel: &str) -> Result<tokio::fs::File, Error> {
         let file = self.open_lock(rel).await?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(Error::Lock {
+            return Err(Error::Io {
+                action: Action::Lock,
                 path: self.root.join(rel),
                 source: std::io::Error::last_os_error(),
             });
@@ -530,7 +546,8 @@ impl Store {
         if source.raw_os_error() == Some(libc::EWOULDBLOCK) {
             return Ok(None);
         }
-        Err(Error::Lock {
+        Err(Error::Io {
+            action: Action::Lock,
             path: self.root.join(rel),
             source,
         })
@@ -553,7 +570,8 @@ impl Store {
             .create(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW);
-        let file = opts.open(&path).await.map_err(|source| Error::Open {
+        let file = opts.open(&path).await.map_err(|source| Error::Io {
+            action: Action::Open,
             path: path.clone(),
             source,
         })?;
@@ -563,7 +581,8 @@ impl Store {
             if let Some((uid, gid)) = self.dir_owner(dir) {
                 // The descriptor, after the no-follow open: a `chown` of the
                 // path would follow whatever the name points at by then.
-                fchown(&file, Some(uid), Some(gid)).map_err(|source| Error::Chown {
+                fchown(&file, Some(uid), Some(gid)).map_err(|source| Error::Io {
+                    action: Action::Chown,
                     path: path.clone(),
                     source,
                 })?;
@@ -649,7 +668,11 @@ impl Store {
                 .filter(|l| !l.is_empty())
                 .collect()),
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(source) => Err(Error::Read { path: abs, source }),
+            Err(source) => Err(Error::Io {
+                action: Action::Read,
+                path: abs,
+                source,
+            }),
         }
     }
 
@@ -982,16 +1005,16 @@ pub async fn status_token() -> Result<String, Error> {
     let mut bytes = [0u8; 16];
     let mut f = tokio::fs::File::open("/dev/urandom")
         .await
-        .map_err(|source| Error::Open {
+        .map_err(|source| Error::Io {
+            action: Action::Open,
             path: "/dev/urandom".into(),
             source,
         })?;
-    f.read_exact(&mut bytes)
-        .await
-        .map_err(|source| Error::Read {
-            path: "/dev/urandom".into(),
-            source,
-        })?;
+    f.read_exact(&mut bytes).await.map_err(|source| Error::Io {
+        action: Action::Read,
+        path: "/dev/urandom".into(),
+        source,
+    })?;
     Ok(crockford128(bytes))
 }
 
@@ -1028,16 +1051,16 @@ pub async fn payment_token() -> Result<String, Error> {
     let mut bytes = [0u8; 8];
     let mut f = tokio::fs::File::open("/dev/urandom")
         .await
-        .map_err(|source| Error::Open {
+        .map_err(|source| Error::Io {
+            action: Action::Open,
             path: "/dev/urandom".into(),
             source,
         })?;
-    f.read_exact(&mut bytes)
-        .await
-        .map_err(|source| Error::Read {
-            path: "/dev/urandom".into(),
-            source,
-        })?;
+    f.read_exact(&mut bytes).await.map_err(|source| Error::Io {
+        action: Action::Read,
+        path: "/dev/urandom".into(),
+        source,
+    })?;
     Ok(crockford12(u64::from_be_bytes(bytes) & ((1 << 60) - 1)))
 }
 
@@ -1068,16 +1091,16 @@ pub async fn unattributed_id() -> Result<String, Error> {
     let mut bytes = [0u8; 8];
     let mut f = tokio::fs::File::open("/dev/urandom")
         .await
-        .map_err(|source| Error::Open {
+        .map_err(|source| Error::Io {
+            action: Action::Open,
             path: "/dev/urandom".into(),
             source,
         })?;
-    f.read_exact(&mut bytes)
-        .await
-        .map_err(|source| Error::Read {
-            path: "/dev/urandom".into(),
-            source,
-        })?;
+    f.read_exact(&mut bytes).await.map_err(|source| Error::Io {
+        action: Action::Read,
+        path: "/dev/urandom".into(),
+        source,
+    })?;
     Ok(crockford8(u64::from_be_bytes(bytes) & ((1 << 40) - 1)))
 }
 
@@ -1554,12 +1577,9 @@ pub async fn free_account_count(store: &Store) -> Result<usize, Error> {
                     free += 1;
                 }
             }
-            Ok(None) => {
-                eprintln!(
-                    "kyriakon-onboard: accounts/{username}/account.json is missing, not counted"
-                );
-            }
-            Err(e) => eprintln!("kyriakon-onboard: {e}, not counted"),
+            Ok(None) => Error::Refused("is missing, not counted".into())
+                .report(&format!("accounts/{username}/account.json")),
+            Err(e) => e.report("an account could not be read, not counted"),
         }
     }
     Ok(free)
@@ -2251,7 +2271,7 @@ mod tests {
             .jsonl::<serde_json::Value>()
             .await
             .expect_err("a line that does not parse is an error");
-        assert!(err.contains("line 2"), "{err}");
+        assert!(matches!(&err, Error::ParseLine { line: 2, .. }), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2268,7 +2288,10 @@ mod tests {
             .write_record("ledger", "payments.jsonl", b"{}\n")
             .await
             .expect_err("an append-only record must be refused");
-        assert!(err.contains("rewrite_log"), "{err}");
+        assert!(
+            matches!(&err, Error::Refused(message) if message.contains("rewrite_log")),
+            "{err}"
+        );
         assert!(!store.path("ledger/payments.jsonl").exists());
 
         store

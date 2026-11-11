@@ -13,44 +13,10 @@ pub enum Error {
     /// The store refused a write before touching disk: an append-only name, a
     /// record mode the handler could not read, or a symlink at a temporary.
     Refused(String),
-    /// A read failed. `NotFound` is handled by the caller as an absent record,
-    /// never as this.
-    Read {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    /// A lock file or the kernel pool could not be opened.
-    Open {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    /// A directory or record could not be created.
-    Create {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    /// A record could not be placed by rename.
-    Place {
-        dir: PathBuf,
-        source: std::io::Error,
-    },
-    /// An append could not be written or synced.
-    Append {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    /// A record could not be removed.
-    Remove {
-        dir: PathBuf,
-        source: std::io::Error,
-    },
-    /// An exclusive or non-blocking lock could not be taken.
-    Lock {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    /// A descriptor could not be handed to the directory's owner.
-    Chown {
+    /// An I/O operation failed. `NotFound` is handled by the caller as an
+    /// absent record, never as this.
+    Io {
+        action: Action,
         path: PathBuf,
         source: std::io::Error,
     },
@@ -73,28 +39,44 @@ pub enum Error {
     },
 }
 
+/// What the failed I/O operation was. The caller acts on the operation; the
+/// path and source are the facts it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Read,
+    Open,
+    Create,
+    Place,
+    Append,
+    Remove,
+    Lock,
+    Chown,
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Refused(message) => f.write_str(message),
-            Error::Read { path, source } => write!(f, "cannot read {}: {source}", path.display()),
-            Error::Open { path, source } => write!(f, "cannot open {}: {source}", path.display()),
-            Error::Create { path, source } => {
-                write!(f, "cannot create {}: {source}", path.display())
-            }
-            Error::Place { dir, source } => {
-                write!(f, "cannot place a record in {}: {source}", dir.display())
-            }
-            Error::Append { path, source } => {
-                write!(f, "cannot append to {}: {source}", path.display())
-            }
-            Error::Remove { dir, source } => {
-                write!(f, "cannot remove a record in {}: {source}", dir.display())
-            }
-            Error::Lock { path, source } => write!(f, "cannot lock {}: {source}", path.display()),
-            Error::Chown { path, source } => {
-                write!(f, "cannot hand {} to its owner: {source}", path.display())
-            }
+            Error::Io {
+                action,
+                path,
+                source,
+            } => match action {
+                Action::Read => write!(f, "cannot read {}: {source}", path.display()),
+                Action::Open => write!(f, "cannot open {}: {source}", path.display()),
+                Action::Create => write!(f, "cannot create {}: {source}", path.display()),
+                Action::Place => {
+                    write!(f, "cannot place a record in {}: {source}", path.display())
+                }
+                Action::Append => write!(f, "cannot append to {}: {source}", path.display()),
+                Action::Remove => {
+                    write!(f, "cannot remove a record in {}: {source}", path.display())
+                }
+                Action::Lock => write!(f, "cannot lock {}: {source}", path.display()),
+                Action::Chown => {
+                    write!(f, "cannot hand {} to its owner: {source}", path.display())
+                }
+            },
             Error::Parse { path, source } => {
                 write!(f, "{} does not parse: {source}", path.display())
             }
@@ -112,14 +94,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Refused(_) => None,
-            Error::Read { source, .. }
-            | Error::Open { source, .. }
-            | Error::Create { source, .. }
-            | Error::Place { source, .. }
-            | Error::Append { source, .. }
-            | Error::Remove { source, .. }
-            | Error::Lock { source, .. }
-            | Error::Chown { source, .. } => Some(source),
+            Error::Io { source, .. } => Some(source),
             Error::Parse { source, .. }
             | Error::ParseLine { source, .. }
             | Error::Encode { source, .. } => Some(source),
@@ -138,12 +113,6 @@ impl Error {
             eprintln!("kyriakon-onboard:   caused by: {cause}");
             source = cause.source();
         }
-    }
-
-    /// Whether the message carries a phrase. Temporary while callers that only
-    /// inspected prose are converted to match the variant.
-    pub fn contains(&self, pattern: &str) -> bool {
-        self.to_string().contains(pattern)
     }
 }
 

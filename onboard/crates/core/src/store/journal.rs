@@ -198,7 +198,7 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::ApplicationRef;
+    use crate::store::{Action, ApplicationRef};
 
     fn store(name: &str) -> (Store, std::path::PathBuf) {
         let dir =
@@ -319,7 +319,7 @@ mod tests {
             Err(e) => e,
         };
         assert!(
-            matches!(&err, Error::Read { path, .. } if path.ends_with("journal.jsonl")),
+            matches!(&err, Error::Io { action: Action::Read, path, .. } if path.ends_with("journal.jsonl")),
             "{err}"
         );
         std::fs::remove_dir_all(dir).unwrap();
