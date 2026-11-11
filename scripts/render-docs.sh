@@ -8,7 +8,7 @@
 # renders the output, so the published pages carry the values while the tracked
 # files do not.
 #
-# The trading address is POSTAL_ADDRESS, the same value scripts/deploy-onboard.sh
+# The trading address is POSTAL_ADDRESS, the same value scripts/deploy-control.sh
 # writes into the drain's postal_address for the cash-by-post rail: the operator
 # decided the published trading address and the collection address are one value
 # (#397), so there is one variable and the two cannot disagree. The ICO

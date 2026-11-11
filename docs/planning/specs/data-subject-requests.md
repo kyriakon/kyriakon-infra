@@ -1,4 +1,4 @@
-# Data-subject requests in the onboarding service
+# Data-subject requests in the control plane
 
 > Spec synthesised from [Spec the data-subject request path](https://github.com/kyriakon/kyriakon-infra/issues/241) and the decisions it rests on: [#153](https://github.com/kyriakon/kyriakon-infra/issues/153) (the lifecycle states and the automated deletion), [#156](https://github.com/kyriakon/kyriakon-infra/issues/156) (the handler and drain split, the flat-file state and the operator surface), [#159](https://github.com/kyriakon/kyriakon-infra/issues/159) (the flow and the account page) and [#163](https://github.com/kyriakon/kyriakon-infra/issues/163) (the EU consumer position, which set the requirement that this be a script). ADR 0009 in the sibling meta repository carries the payment-record split the deletion answer depends on, and the retention schedule is section 5 of `docs/planning/research/sole-trader-obligations.md`.
 
@@ -10,7 +10,7 @@ Two facts shape the answer. The mail is ciphertext to a key the platform does no
 
 ## Solution
 
-Two entry points answer everything. The account page carries the member's own export and their own account closure, because those are the two a logged-in member can set going themselves. Everything else, including a request from someone who cannot log in, goes through `onboardctl`, run by the operator, with one written record per request.
+Two entry points answer everything. The account page carries the member's own export and their own account closure, because those are the two a logged-in member can set going themselves. Everything else, including a request from someone who cannot log in, goes through `kyriakon-admin`, run by the operator, with one written record per request.
 
 The export is the platform's record of the member, written into the member's own tree where the sftp they already have can collect it, plus the tree itself, which they pull at the same time. The platform decrypts nothing and copies nothing it does not have to. Deletion reuses the lifecycle's automated deletion from [#153](https://github.com/kyriakon/kyriakon-infra/issues/153) and adds no second path: the account page's closure and an operator's erasure request both end in the same transition, and both say the same things about what survives.
 
@@ -38,13 +38,13 @@ Nothing in the platform's own record is withheld either. The mail the platform c
 
 ## How the bundle reaches the member
 
-A member already has sftp on their own tree, so that is the delivery path. `onboardctl export <username>` writes the written part inside the member's sftp chroot, beside the two directories they already upload to, at `/home/www/<name>.kyriakon.net/export/<timestamp>/`, owned by the member, and records a notice that says it is ready. Over sftp it appears inside the chroot as `export/<timestamp>/`, beside the `www/` and `gemini/` the member already uploads to, and they collect it with the client they already use. Everything else of theirs is already reachable by the protocol that owns it: mail through the IMAP client they read it with, repositories by `git clone`, and the web and capsule roots over sftp. Nothing here needs a terminal, a signing key, or PGP knowledge beyond opening the mail they already read, and the platform does no work proportional to the size of the mailbox.
+A member already has sftp on their own tree, so that is the delivery path. `kyriakon-admin export <username>` writes the written part inside the member's sftp chroot, beside the two directories they already upload to, at `/home/www/<name>.kyriakon.net/export/<timestamp>/`, owned by the member, and records a notice that says it is ready. Over sftp it appears inside the chroot as `export/<timestamp>/`, beside the `www/` and `gemini/` the member already uploads to, and they collect it with the client they already use. Everything else of theirs is already reachable by the protocol that owns it: mail through the IMAP client they read it with, repositories by `git clone`, and the web and capsule roots over sftp. Nothing here needs a terminal, a signing key, or PGP knowledge beyond opening the mail they already read, and the platform does no work proportional to the size of the mailbox.
 
 Where the member cannot log in but still holds the key, the operator can send the small written part the way a notice is sent, as an attachment encrypted to the member's public key with the same encryptor that encrypts their mail, and the member opens it in their own client before the login is restored. Where the member cannot log in and cannot produce the key, the mail is unreadable to them too, and the platform holds no key that would open it. What can still be reached is the written part and the login, through the password path in `docs/runbook.md`, and the answer says which parts are reachable rather than promising the whole.
 
 ## What deletion does
 
-An erasure request goes through the lifecycle's automated deletion and no second path. On the account page, "Close my account" puts the account into the `closing` state; the account works normally for seven days so the member can take the export and their tree, and the day the window ends the drain runs the deletion transition. The operator's `onboardctl delete <username>` runs the same transition and is what an erasure request from anywhere other than the page uses. There is no erasure the page can start that the script cannot, and no second deletion script.
+An erasure request goes through the lifecycle's automated deletion and no second path. On the account page, "Close my account" puts the account into the `closing` state; the account works normally for seven days so the member can take the export and their tree, and the day the window ends the drain runs the deletion transition. The operator's `kyriakon-admin delete <username>` runs the same transition and is what an erasure request from anywhere other than the page uses. There is no erasure the page can start that the script cannot, and no second deletion script.
 
 The transition removes what the runbook's sequence removes: the OS account and its home, which takes the Maildir and the repositories, and the published tree, which takes the site, the capsule and the export bundle with them; the keyring entry on the box and in `keys/`; the per-member vhost files and their include lines; the certificate and its files; the quota entry; the account's store directory with its `account.json`, `notices.jsonl`, `application.json`, `requests.jsonl` and token index entry; and the finger page, regenerated. Reusing the deletion means this path inherits those steps and the tests that prove them.
 
@@ -78,16 +78,16 @@ The record is the member's data, so it goes out with a later export and it is re
 
 The account page carries two controls: "Take my data out", which files an export intent, and "Close my account", which files a close intent, starts the seven-day window, and requires the password re-entered because it is the irreversible one. The handler holds no privilege and does nothing but validate the session and file the intent; the drain does the work on its next run, within a minute.
 
-Everything else is the operator's, through `onboardctl`, in the shape the other commands already use:
+Everything else is the operator's, through `kyriakon-admin`, in the shape the other commands already use:
 
 ```
-onboardctl export <username>
-onboardctl request list
-onboardctl request verify --username <u> --message <file> [--signature <file>]
-onboardctl request record --username <u> --kind <access|erasure|rectification> \
+kyriakon-admin export <username>
+kyriakon-admin request list
+kyriakon-admin request verify --username <u> --message <file> [--signature <file>]
+kyriakon-admin request record --username <u> --kind <access|erasure|rectification> \
   --received <date> --evidence <text> --identity <password|mail-key> --note <text>
-onboardctl request close <id> --done <date> --note <text>
-onboardctl delete <username>
+kyriakon-admin request close <id> --done <date> --note <text>
+kyriakon-admin delete <username>
 ```
 
 `export` writes the bundle into the member's tree. The `request` verbs are the ones this spec defines: `request record` writes the line and prints the date the answer is due, `request close` writes what was done, and `request list` shows what is open and what is nearly due. `delete` is the lifecycle's existing command, and this spec adds no flag to it and no second deletion path.

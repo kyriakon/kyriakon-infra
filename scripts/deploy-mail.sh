@@ -69,14 +69,14 @@ install_set="$script_dir/install-set.tsv"
 
 # stale_copies <installed names>: the pre-split copies in /root/bin that this
 # deploy still sweeps away, less every name the table installs. Before the
-# onboarding service split out of this deploy, the drain's scripts were installed
+# control plane split out of this deploy, the drain's scripts were installed
 # here too, and a box from that time keeps them; they are stale copies of scripts
 # that now run from the drain's directory, and check-hygiene's section 9 reports
 # every one of them for ever otherwise. The installed set is excluded so a row
 # added later for one of these cannot be installed and removed in the same run.
 stale_copies() {
 	for s in add-user.sh check-hygiene.sh cron-apply.sh delete-user.sh deploy-mail.sh \
-		deploy-onboard.sh deploy-relayd.sh onboard-store.sh provision-member.sh \
+		deploy-control.sh deploy-relayd.sh control-store.sh provision-member.sh \
 		provision-member-capsule.sh provision-member-web.sh quota-apply.sh restore-test.sh; do
 		case " $(printf '%s\n' "$1" | tr '\n' ' ') " in
 		*" $s "*) continue ;;
@@ -632,7 +632,7 @@ say "TLS"
 # because sshd checks every component of a member's ChrootDirectory for root
 # ownership and no group or other write bit, and members' directories sit under
 # this one. Owner and group are given rather than defaulted, because
-# deploy-onboard.sh now runs first and creates /home/www as a parent of the
+# deploy-control.sh now runs first and creates /home/www as a parent of the
 # sockets' directories: the mode and owner this line states are the ones the
 # chroot check needs whichever deploy made the directory.
 install -d -m 0755 -o root -g wheel /home/www
@@ -788,14 +788,14 @@ start_service gmid
 # query or the body.
 #
 # The responder is another script's, and the order is stated rather than assumed:
-# scripts/deploy-onboard.sh creates the socket directory inside gmid's chroot,
-# installs the unit and starts kyriakon_onboard, and this script does none of
+# scripts/deploy-control.sh creates the socket directory inside gmid's chroot,
+# installs the unit and starts kyriakon_control, and this script does none of
 # that. With no responder behind the block there is nothing to ask, so this stops
 # here and names the script to run first. A version of this that skipped a
 # missing responder would pass on the one box the check exists for.
-if ! rcctl check kyriakon_onboard >/dev/null 2>&1; then
-	printf 'the capsule: kyriakon_onboard is not running, so the block just installed\n' >&2
-	printf '  answers nothing. Run scripts/deploy-onboard.sh first, which creates the\n' >&2
+if ! rcctl check kyriakon_control >/dev/null 2>&1; then
+	printf 'the capsule: kyriakon_control is not running, so the block just installed\n' >&2
+	printf '  answers nothing. Run scripts/deploy-control.sh first, which creates the\n' >&2
 	printf '  socket directory and starts the responder.\n' >&2
 	exit 1
 fi
@@ -838,7 +838,7 @@ fi
 # daemon_logger is a second process and the line reaches syslog a moment after
 # the reply does. The address is the one gmid saw, which for this request is
 # loopback, and gmid sends the numeric address with no port on it.
-gemini_line="kyriakon-onboard: gemini / $gemini_code 127.0.0.1"
+gemini_line="kyriakon-control: gemini / $gemini_code 127.0.0.1"
 gemini_log=
 gemini_try=0
 while [ "$gemini_try" -lt 5 ]; do
@@ -855,7 +855,7 @@ case "$gemini_log" in
 *)
 	printf 'the capsule: %s answered %s and the handler wrote no line for it.\n' \
 		"$gemini_url" "$gemini_reply" >&2
-	gemini_seen=$(printf '%s\n' "$gemini_log" | grep -F kyriakon-onboard | tail -1)
+	gemini_seen=$(printf '%s\n' "$gemini_log" | grep -F kyriakon-control | tail -1)
 	printf '  wanted %s, where this run holds: %s\n' \
 		"$gemini_line" "${gemini_seen:-nothing from the handler}" >&2
 	exit 1

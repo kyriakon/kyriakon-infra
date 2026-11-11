@@ -49,7 +49,7 @@ added to a message on egress.
 
 A customer list held by a payment processor. Lifecycle state lives on the platform's own machine,
 which makes a processor one of several ways to extend a date rather than the system of record.
-Check: the payment state in the onboarding service, once it lands, with the processor holding no
+Check: the payment state in the control plane, once it lands, with the processor holding no
 member list.
 
 ## What the platform cannot do

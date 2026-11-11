@@ -1,6 +1,6 @@
 # The gemini capsule front-end
 
-> Spec synthesised from [Spec the Gemini capsule front-end](https://github.com/kyriakon/kyriakon-infra/issues/243) and the decisions it points at: [Decide the Gemini onboarding front-end](https://github.com/kyriakon/kyriakon-infra/issues/182), whose resolution this spec implements rather than reopens, [Decide how a member's capsule survives certificate renewal](https://github.com/kyriakon/kyriakon-infra/issues/244), and the research note it rests on, [Research serving a dynamic Gemini capsule alongside gmid](https://github.com/kyriakon/kyriakon-infra/issues/181) (`docs/planning/research/gemini-dynamic-capsule.md`). It takes the application's questions from [Decide the organisation's application questions](https://github.com/kyriakon/kyriakon-infra/issues/233), the key's behaviour from [Decide the member key walkthrough and the browser generator](https://github.com/kyriakon/kyriakon-infra/issues/176), its promises from [Decide what the public release promises, and where](https://github.com/kyriakon/kyriakon-infra/issues/158), and its place in the service from [Decide the onboarding service's architecture and its trust boundary](https://github.com/kyriakon/kyriakon-infra/issues/156). The [gemini protocol specification 0.24.1](https://geminiprotocol.net/docs/protocol-specification.gmi) is the normative source for the flow.
+> Spec synthesised from [Spec the Gemini capsule front-end](https://github.com/kyriakon/kyriakon-infra/issues/243) and the decisions it points at: [Decide the Gemini onboarding front-end](https://github.com/kyriakon/kyriakon-infra/issues/182), whose resolution this spec implements rather than reopens, [Decide how a member's capsule survives certificate renewal](https://github.com/kyriakon/kyriakon-infra/issues/244), and the research note it rests on, [Research serving a dynamic Gemini capsule alongside gmid](https://github.com/kyriakon/kyriakon-infra/issues/181) (`docs/planning/research/gemini-dynamic-capsule.md`). It takes the application's questions from [Decide the organisation's application questions](https://github.com/kyriakon/kyriakon-infra/issues/233), the key's behaviour from [Decide the member key walkthrough and the browser generator](https://github.com/kyriakon/kyriakon-infra/issues/176), its promises from [Decide what the public release promises, and where](https://github.com/kyriakon/kyriakon-infra/issues/158), and its place in the service from [Decide the control plane's architecture and its trust boundary](https://github.com/kyriakon/kyriakon-infra/issues/156). The [gemini protocol specification 0.24.1](https://geminiprotocol.net/docs/protocol-specification.gmi) is the normative source for the flow.
 
 > Amended on 2026-10-14: the block below is installed and the service is a FastCGI
 > responder, because the handler no longer listens on a port at all
@@ -63,10 +63,10 @@ httpd's socket sits in a directory of its own beside it, with group `www` and th
 
 ## The process, its user and its state
 
-The handler is the same binary that answers HTTPS, started by its own `rc.d` unit, `/etc/rc.d/kyriakon_onboard`, kept in the repository at `openbsd/etc/rc.d/kyriakon_onboard`. The name is the binary's own; the SSH TUI's second sshd instance, which would otherwise be the obvious claimant of it, is `kyriakon_onboard_sshd`:
+The handler is the same binary that answers HTTPS, started by its own `rc.d` unit, `/etc/rc.d/kyriakon_control`, kept in the repository at `openbsd/etc/rc.d/kyriakon_control`. The name is the binary's own; the SSH TUI's second sshd instance, which would otherwise be the obvious claimant of it, is `kyriakon_onboard_sshd`:
 
 ```
-daemon="/usr/local/sbin/kyriakon-onboard"
+daemon="/usr/local/sbin/kyriakon-control"
 daemon_flags="serve"
 daemon_user="_onboard"
 
@@ -244,7 +244,7 @@ Trust on first use. The specification recommends it, and it means the capsule re
 | `applications/<token>.json` | handler on file, drain on decision | answers, key fingerprints, verdicts, status | seven days after the decision, inside the 90-day window |
 | `intents/<id>.json` | handler | one filed application | consumed and deleted by the drain |
 | `mail/` | `smtpd` | the Maildir for `apply@kyriakon.net` | drained each run; a message is deleted once acted on |
-| `catalogue.toml` | `scripts/onboard-store.sh` | the shared service catalogue, read by the handler and by the terminal | with the service |
+| `catalogue.toml` | `scripts/control-store.sh` | the shared service catalogue, read by the handler and by the terminal | with the service |
 | `journal.jsonl` | handler and drain | one line per transition | bounded with the service |
 
 The counters are process state and are not on disk.

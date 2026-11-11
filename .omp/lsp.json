@@ -5,7 +5,7 @@
       "settings": {
         "rust-analyzer": {
           "linkedProjects": [
-            "onboard/Cargo.toml",
+            "control/Cargo.toml",
             "kyriakon-encrypt/Cargo.toml"
           ]
         }

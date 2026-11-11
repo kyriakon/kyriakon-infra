@@ -692,7 +692,7 @@ else
 fi
 # --- 5. the shared service catalogue -------------------------------------
 # The catalogue is one file the three front-ends read, and the box's copy is
-# installed from a checkout (scripts/onboard-store.sh). A deployed copy that
+# installed from a checkout (scripts/control-store.sh). A deployed copy that
 # differs from the tracked one is a rendering nobody reviewed, whichever
 # direction it differs in: a hand edit on the box, or a deploy that never ran
 # after the file changed. The comparison is the file's bytes rather than a
@@ -701,12 +701,12 @@ fi
 catalogue="$repo_root/openbsd/etc/onboard/catalogue.toml"
 deployed_catalogue=/var/db/onboard/catalogue.toml
 if [ ! -f "$deployed_catalogue" ]; then
-	printf 'catalogue: %s is missing; scripts/onboard-store.sh installs it\n' "$deployed_catalogue"
+	printf 'catalogue: %s is missing; scripts/control-store.sh installs it\n' "$deployed_catalogue"
 	status=1
 elif cmp -s "$catalogue" "$deployed_catalogue"; then
 	printf 'catalogue: the deployed copy matches the tracked one\n'
 else
-	printf 'catalogue: %s differs from %s, or one of the two is unreadable; the front-ends render the deployed copy, so rerun scripts/onboard-store.sh from this checkout\n' \
+	printf 'catalogue: %s differs from %s, or one of the two is unreadable; the front-ends render the deployed copy, so rerun scripts/control-store.sh from this checkout\n' \
 		"$deployed_catalogue" "$catalogue"
 	status=1
 fi
@@ -872,7 +872,7 @@ $drift_drain"
 		elif [ -n "$drift" ]; then
 			printf 'installed scripts: these do not match the checkout at %s/scripts:\n' "$repo_dir"
 			printf '%s\n' "$drift" | sed -e 's/^/  /'
-			printf '  the fix is the deploy that installs them: deploy-mail.sh for /root/bin, deploy-onboard.sh for the drain\n'
+			printf '  the fix is the deploy that installs them: deploy-mail.sh for /root/bin, deploy-control.sh for the drain\n'
 			status=1
 		else
 			printf 'installed scripts: every copy matches the checkout\n'

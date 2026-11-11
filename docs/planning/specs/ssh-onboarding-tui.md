@@ -12,8 +12,8 @@
 
 > Amended on 2026-10-15: the portal's frame exists, as
 > [#379](https://github.com/kyriakon/kyriakon-infra/issues/379) built it:
-> `onboard/src/bin/kyriakon-onboard-tui.rs` holds the program and both modes, and
-> `onboard/src/portal.rs` holds the rows, the screens and the dispatch, so the menu
+> `control/src/bin/kyriakon-control-tui.rs` holds the program and both modes, and
+> `control/src/portal.rs` holds the rows, the screens and the dispatch, so the menu
 > is the catalogue's third rendering and the check in `catalogue.rs` covers it. The
 > two modes are chosen from the terminal the session arrived on, since no client can
 > supply an argument to a forced command. What each of the four actions ends at is
@@ -35,7 +35,7 @@ What remains is the shape of that program and its session: the config file, port
 
 A second `sshd` instance runs from its own config file on a port chosen when the box is built, and the only account it can serve is a password-less system account named `hello`. The applicant reaches it as `ssh hello@ssh.kyriakon.net`, the instruction the site publishes on the signup page, on an address the portal has of its own, because the applicant path and the member path cannot share one `Match` block and one address therefore carries two ports. The username is part of both instructions, because `AllowUsers hello` refuses every other name before authentication, so the address on its own lands a connection as the caller's own local user and is refused. Nothing is asked once the connection is made: no password, no key, no published credential. The account has no shell and the instance forces one program, a line-oriented TUI, so the connection is a text pipe into an application form.
 
-The program is a portal. It opens on a menu over the shared service catalogue, the same list the web page and the capsule render, and its rows say what the platform offers and what state each service is in. One row starts the application: a first screen that says what this is, the shared question list one question at a time with a counter, the key walkthrough, a pasted public key checked with the same crate the web form uses, a summary to confirm, one intent filed through the onboarding handler, and the status token handed back. Another row reads that status back by token, and the rest show a service's own page. The account section arrives when the drain does. A plain mode ships in the same binary for screen readers and bad links. Its per-address counters answer an over-eager source with a plain screen. It holds no privilege, no secrets and no shell, and the human approval stays the real gate.
+The program is a portal. It opens on a menu over the shared service catalogue, the same list the web page and the capsule render, and its rows say what the platform offers and what state each service is in. One row starts the application: a first screen that says what this is, the shared question list one question at a time with a counter, the key walkthrough, a pasted public key checked with the same crate the web form uses, a summary to confirm, one intent filed through the handler, and the status token handed back. Another row reads that status back by token, and the rest show a service's own page. The account section arrives when the drain does. A plain mode ships in the same binary for screen readers and bad links. Its per-address counters answer an over-eager source with a plain screen. It holds no privilege, no secrets and no shell, and the human approval stays the real gate.
 
 ## The second sshd instance
 
@@ -108,14 +108,14 @@ Match LocalPort 22 User hello
 	PermitUserRC no
 
 	# The one program the account can run, on every path.
-	ForceCommand /usr/local/sbin/kyriakon-onboard-tui
+	ForceCommand /usr/local/sbin/kyriakon-control-tui
 
 # The member's path, on the same address's second port. Every key is admitted,
 # and the key itself is the identity: AuthorizedKeysCommand is never consulted
 # for the none method, which is why this cannot be the same block as above.
 Match LocalPort REPLACE_ME User hello
 	AuthenticationMethods publickey
-	AuthorizedKeysCommand /usr/local/sbin/kyriakon-onboard-keyecho %t %k
+	AuthorizedKeysCommand /usr/local/sbin/kyriakon-control-keyecho %t %k
 	AuthorizedKeysCommandUser hello
 	ExposeAuthInfo yes
 	PermitTTY yes
@@ -124,7 +124,7 @@ Match LocalPort REPLACE_ME User hello
 	PermitOpen none
 	PermitUserRC no
 
-	ForceCommand /usr/local/sbin/kyriakon-onboard-tui
+	ForceCommand /usr/local/sbin/kyriakon-control-tui
 ```
 
 `PermitEmptyPasswords` and `PermitTTY` in the `Match` blocks are inside the subset of keywords `sshd_config(5)` allows after `Match`. `AuthorizedKeysCommand` and `AuthorizedKeysCommandUser` are written there too, and the operator's config test confirms they are accepted where they sit, which the identity research leaves as a check rather than an observation. `PasswordAuthentication` sits at the top level, as the resolution has it, and `PerSourceMaxStartups` sits there too because `sshd_config(5)` does not allow it after `Match`; both are harmless there because `AllowUsers hello` makes the instance serve one account. `Banner none` is the documented default and is written out so a future default change cannot quietly reintroduce a banner; a banner is read by every scanner and by nobody the platform wants. The protocol identification string itself cannot be removed, and its version addendum already defaults to `none`, so it carries no local operating system suffix.
@@ -150,7 +150,7 @@ The shell in the password file stays `/sbin/nologin`, which is the one [#183](ht
 
 ```
 hello:\
-	:shell=/usr/local/sbin/kyriakon-onboard-tui:\
+	:shell=/usr/local/sbin/kyriakon-control-tui:\
 	:tc=default:
 ```
 
@@ -158,7 +158,7 @@ It goes in `/etc/login.conf.d/hello`, the drop-in directory this box already use
 
 ### The rc.d unit
 
-The unit is the stock `sshd` script with the second flag set, kept in the repo at `openbsd/etc/rc.d/kyriakon_onboard_sshd` and installed to `/etc/rc.d/kyriakon_onboard_sshd`. The name says which process it supervises: `kyriakon_onboard` is the onboarding handler's own unit, named after the binary it runs, and this is the second sshd instance beside it, so neither name can be mistaken for the other at an `rcctl` prompt:
+The unit is the stock `sshd` script with the second flag set, kept in the repo at `openbsd/etc/rc.d/kyriakon_onboard_sshd` and installed to `/etc/rc.d/kyriakon_onboard_sshd`. The name says which process it supervises: `kyriakon_control` is the handler's own unit, named after the binary it runs, and this is the second sshd instance beside it, so neither name can be mistaken for the other at an `rcctl` prompt:
 
 ```ksh
 #!/bin/ksh
@@ -276,7 +276,7 @@ The upload key gets a shape check only, not the mail check: it must parse as an 
 
 ## The token and the status path
 
-The confirm screen shows the answers once, with the key fingerprints, and files nothing until the applicant confirms. On confirmation the TUI posts one intent to the onboarding handler, alongside the web form and the capsule, and receives the application token. It prints the token and the status address:
+The confirm screen shows the answers once, with the key fingerprints, and files nothing until the applicant confirms. On confirmation the TUI posts one intent to the handler, alongside the web form and the capsule, and receives the application token. It prints the token and the status address:
 
 ```
 Your application is filed.
@@ -341,9 +341,9 @@ The handoff for the browser generator is one URL in the printed walkthrough. It 
 
 ## The program, its home and what it replaces
 
-The portal is a Rust program in the handler's own crate, `onboard/`, as a second binary beside `kyriakon-onboard`. The crate gains a library so that the catalogue, the question list and the key check have one home, and the terminal front-end links that library rather than carrying a copy of anything, which is what `docs/planning/specs/shared-copy.md` asks of it. The install line and `scripts/deploy-onboard.sh` take both binaries from the same `cargo build`.
+The portal is a Rust program in the handler's own crate, `control/`, as a second binary beside `kyriakon-control`. The crate gains a library so that the catalogue, the question list and the key check have one home, and the terminal front-end links that library rather than carrying a copy of anything, which is what `docs/planning/specs/shared-copy.md` asks of it. The install line and `scripts/deploy-control.sh` take both binaries from the same `cargo build`.
 
-It replaces the ksh program this spec first described, at the same path, `/usr/local/sbin/kyriakon-onboard-tui`, which the login class's `shell` capability already names, so the class, the unit, the port and the deploy keep their shape and only the file changes. The ksh program is retired in the same change: `openbsd/usr/local/sbin/kyriakon-onboard-tui` leaves the repository rather than sitting beside the new program, and no fallback runs it. A full-screen interface is unusable by a screen reader and unhappy over a bad link, which is why the plain mode ships inside the new binary rather than as the old one kept for the purpose.
+It replaces the ksh program this spec first described, at the same path, `/usr/local/sbin/kyriakon-control-tui`, which the login class's `shell` capability already names, so the class, the unit, the port and the deploy keep their shape and only the file changes. The ksh program is retired in the same change: `openbsd/usr/local/sbin/kyriakon-control-tui` leaves the repository rather than sitting beside the new program, and no fallback runs it. A full-screen interface is unusable by a screen reader and unhappy over a bad link, which is why the plain mode ships inside the new binary rather than as the old one kept for the purpose.
 
 ## Testing decisions
 
@@ -359,7 +359,7 @@ The key verdicts are the one place two builds of the shared crate could disagree
 
 ## Out of scope
 
-The web form and the capsule, which have their own specs. The onboarding service's handler, drain, store and account page ([#156](https://github.com/kyriakon/kyriakon-infra/issues/156), [#159](https://github.com/kyriakon/kyriakon-infra/issues/159)). The key generator and the browser check page ([#176](https://github.com/kyriakon/kyriakon-infra/issues/176), [#185](https://github.com/kyriakon/kyriakon-infra/issues/185)). The certificate queue and the pending-certificate state ([#154](https://github.com/kyriakon/kyriakon-infra/issues/154)). The reconciliation of the proposal's section 5.9.2, which is its own ticket. The embedded-in-Kleio experience, which needs terminal emulation on Kleio's side and stays off this map. The shared question list's exact entries and its file format, which are the service workstream's to fix; this spec depends only on the list being one ordered file with the two branches.
+The web form and the capsule, which have their own specs. The control plane's handler, drain, store and account page ([#156](https://github.com/kyriakon/kyriakon-infra/issues/156), [#159](https://github.com/kyriakon/kyriakon-infra/issues/159)). The key generator and the browser check page ([#176](https://github.com/kyriakon/kyriakon-infra/issues/176), [#185](https://github.com/kyriakon/kyriakon-infra/issues/185)). The certificate queue and the pending-certificate state ([#154](https://github.com/kyriakon/kyriakon-infra/issues/154)). The reconciliation of the proposal's section 5.9.2, which is its own ticket. The embedded-in-Kleio experience, which needs terminal emulation on Kleio's side and stays off this map. The shared question list's exact entries and its file format, which are the service workstream's to fix; this spec depends only on the list being one ordered file with the two branches.
 
 ## Sources
 

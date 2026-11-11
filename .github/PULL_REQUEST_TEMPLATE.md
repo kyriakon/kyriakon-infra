@@ -9,7 +9,7 @@ Closes #<n>
 <!-- Each checkbox from the issue, mapped to the test or command that proves it. -->
 
 - [ ] <criterion> — `cargo test ... <test name>`
-- [ ] <criterion> — `onboardctl ...` output:
+- [ ] <criterion> — `kyriakon-admin ...` output:
 
 ## Deploy or manual step
 

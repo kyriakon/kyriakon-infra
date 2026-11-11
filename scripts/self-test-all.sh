@@ -36,7 +36,7 @@ add-user.sh
 backup.sh
 deploy-nsd.sh
 gen-finger-page.sh
-onboard-store.sh
+control-store.sh
 rehearsal.sh
 rekey-mail-key.sh
 renew-acme.sh
@@ -94,7 +94,7 @@ for file in "$here"/*.sh; do
 	fi
 	case "$name" in
 	deploy-mail.sh) args="$repo" ;;
-	deploy-onboard.sh) args="$repo" ;;
+	deploy-control.sh) args="$repo" ;;
 	deploy-relayd.sh) args="$repo/openbsd/etc" ;;
 	*) args='' ;;
 	esac

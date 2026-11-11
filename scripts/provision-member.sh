@@ -422,7 +422,7 @@ fi
 # operator running this by hand. An operator then never retypes key material,
 # which matters because a mistyped key locks the member out of their own upload
 # path with an error only sshd sees, and nothing on the box reports it.
-# The default sits under /var/db/onboard, the onboarding service's own state tree,
+# The default sits under /var/db/onboard, the control plane's own state tree,
 # which the service writes and root reads; this script only ever reads it. That
 # path is this script's convention rather than one any document fixes: the store
 # listing in the signup spec has no keys directory yet, so the drain that applies

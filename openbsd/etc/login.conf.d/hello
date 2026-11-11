@@ -20,5 +20,5 @@
 # cap_mkdb is required after an edit to this file or to /etc/login.conf whenever
 # /etc/login.conf.db exists.
 hello:\
-	:shell=/usr/local/sbin/kyriakon-onboard-tui:\
+	:shell=/usr/local/sbin/kyriakon-control-tui:\
 	:tc=default:

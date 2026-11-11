@@ -86,7 +86,7 @@ done
 
 env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
 # The one list of which scripts the box runs, and where. This script schedules
-# its /root/bin rows; deploy-mail.sh installs them, deploy-onboard.sh installs
+# its /root/bin rows; deploy-mail.sh installs them, deploy-control.sh installs
 # the drain's, and deploy.sh routes a changed script by its row.
 install_set="$script_dir/install-set.tsv"
 needed_vars="ALERT_EMAIL HEALTHCHECKS_URL KEYRING_HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL"
@@ -94,7 +94,7 @@ needed_vars="ALERT_EMAIL HEALTHCHECKS_URL KEYRING_HEALTHCHECKS_URL RESTIC_REPOSI
 # row_dir <destination> — where the box reads that destination's scripts from at
 # run time. This is the one place the destinations are named: only the two cron
 # runs itself have a directory, because a drain row is installed by
-# scripts/deploy-onboard.sh into the directory the drain's config names.
+# scripts/deploy-control.sh into the directory the drain's config names.
 row_dir() {
 	case "$1" in
 	/root/bin) printf '/root/bin' ;;
@@ -120,15 +120,15 @@ scheduled_scripts() {
 		done
 }
 
-# The onboarding drain is a compiled binary, not one of the /root/bin shell
-# scripts above, so it is installed by scripts/deploy-onboard.sh into sbin and
+# The drain is a compiled binary, not one of the /root/bin shell
+# scripts above, so it is installed by scripts/deploy-control.sh into sbin and
 # its existence is checked there rather than in /root/bin. Its line still lives
 # here with the others, so the pull request that changes the schedule is the
 # review, and it is scheduled every minute because that is what makes a filed
 # application move: the handler holds no privilege and only writes an intent,
 # and the drain is the process that reads it, sends the review email and carries
 # the decision out.
-drain_bin=/usr/local/sbin/kyriakon-onboard-drain
+drain_bin=/usr/local/sbin/kyriakon-control-drain
 
 # Where the checkout's own scripts are read from. A `checkout` row is run from
 # there rather than installed: self-test-all.sh runs the scripts beside it and
@@ -154,7 +154,7 @@ line_for() {
 	# The env file sets PATH, and the drain's scripts need the packages in
 	# /usr/local: without it, cron-apply.sh inside a provision cannot find gmid,
 	# refuses to reload, and fails the whole approval.
-	kyriakon-onboard-drain) printf '* * * * * . /root/.kyriakon-env; %s\n' "$drain_bin" ;;
+	kyriakon-control-drain) printf '* * * * * . /root/.kyriakon-env; %s\n' "$drain_bin" ;;
 	*)
 		row=$(awk -F'\t' -v n="$name" \
 			'!/^#/ && $1 == n && $3 != "-" { print; exit }' "$install_set")
@@ -715,7 +715,7 @@ EOF
 	check "and its path is the checkout's scripts" \
 		"$(script_path check-hygiene.sh)" "$repo_dir/scripts/check-hygiene.sh"
 	got=0
-	script_path kyriakon-onboard-drain >/dev/null || got=$?
+	script_path kyriakon-control-drain >/dev/null || got=$?
 	check "a name with no scheduled row has no path" "$got" 1
 
 	# A checkout row with arguments carries them, the same way an installed
@@ -776,7 +776,7 @@ EOF
 	check_only=no
 	install_set="$script_dir/install-set.tsv"
 
-	# The installed layout: deploy-onboard.sh copies the table's drain rows, the
+	# The installed layout: deploy-control.sh copies the table's drain rows, the
 	# table itself and lib.sh into the drain's directory, and that copy reads the
 	# table from its own directory. Its own self-test is the probe, and it covers
 	# both lanes from there. The guard is a file only the checkout has, so the copy
@@ -827,11 +827,11 @@ done
 # never installed is caught here rather than added for cron to fail on in
 # silence.
 if [ ! -x "$drain_bin" ]; then
-	missing_scripts="$missing_scripts kyriakon-onboard-drain"
+	missing_scripts="$missing_scripts kyriakon-control-drain"
 fi
 if ! printf '%s\n' "$current" | grep -qF "$drain_bin"; then
-	to_add="$to_add kyriakon-onboard-drain"
-	line_for kyriakon-onboard-drain >>"$pending"
+	to_add="$to_add kyriakon-control-drain"
+	line_for kyriakon-control-drain >>"$pending"
 fi
 
 if [ -n "$missing_scripts" ]; then
@@ -844,7 +844,7 @@ if [ -z "$to_add" ]; then
 	for s in $needed_scripts; do
 		line_for "$s"
 	done
-	line_for kyriakon-onboard-drain
+	line_for kyriakon-control-drain
 	exit 0
 fi
 printf 'to be added:%s\n' "$to_add"
@@ -861,7 +861,7 @@ block=$(mktemp)
 rm -f "$pending"
 
 if [ -n "$missing_scripts" ]; then
-	die "install the missing scripts first: scripts/deploy-onboard.sh installs the drain and the mail deploy the rest"
+	die "install the missing scripts first: scripts/deploy-control.sh installs the drain and the mail deploy the rest"
 fi
 # A missing or half-filled env is the likely first run, so report which variables
 # are at fault and point at the one script that owns the file.

@@ -1,7 +1,7 @@
 # /etc/kyriakon/onboard/drain.toml
 #
-# The onboarding drain's configuration, installed from
-# openbsd/etc/onboard/drain.toml by scripts/deploy-onboard.sh. Unlike the
+# The drain's configuration, installed from
+# openbsd/etc/onboard/drain.toml by scripts/deploy-control.sh. Unlike the
 # handler's own /etc/onboard/onboard.toml, this file is root-only and sits in
 # the drain's own home: it names the secret files and the privileged scripts the
 # drain runs as root, so nothing about it is for the unprivileged half.
@@ -17,7 +17,7 @@
 store_root = "/var/db/onboard"
 
 # The names the platform holds back, 0644 at the top of the store, installed
-# there by scripts/onboard-store.sh. The handler refuses them when an
+# there by scripts/control-store.sh. The handler refuses them when an
 # application is filed; the drain checks the same file, because it is the half
 # that creates the account, the address and the subdomain, and it must not take
 # the filing half's answer for a rule this one enforces as root. Named here
@@ -30,7 +30,7 @@ reserved = "/var/db/onboard/reserved-usernames.txt"
 # add-user.sh, provision-member.sh and delete-user.sh by their configured paths,
 # and those run quota-apply.sh, provision-member-web.sh,
 # provision-member-capsule.sh and cron-apply.sh in turn, so the whole set lives
-# here. scripts/deploy-onboard.sh installs them, and the tracked login class that
+# here. scripts/deploy-control.sh installs them, and the tracked login class that
 # provision-member.sh reads beside them, and checks every script is executable
 # before the unit starts. A test points this at stubs under a temporary
 # directory.
@@ -116,14 +116,14 @@ group_price_gbp = "40.00"
 
 # The postal address a cash-by-post member is given. It is the operator's own, so
 # it lives in openbsd/etc/kyriakon.env with the other host-specific values and
-# scripts/deploy-onboard.sh substitutes it here from /root/.kyriakon-env. The
+# scripts/deploy-control.sh substitutes it here from /root/.kyriakon-env. The
 # placeholder below is refused rather than installed, and the terms page
 # publishes the same address with the trader's identity at deploy time.
 postal_address = "REPLACE_ME"
 
 # The Maildir smtpd delivers apply@kyriakon.net to. Plaintext on purpose: the
 # drain reads the key to file it, which is why this address is not on the
-# encrypting LMTP path. scripts/onboard-store.sh makes the directory and its
+# encrypting LMTP path. scripts/control-store.sh makes the directory and its
 # _onboard ownership.
 mail_dir = "/var/db/onboard/mail/new"
 
@@ -137,7 +137,7 @@ release = "REPLACE_ME"
 # from. Public values, but the IPs and the DKIM key are placeholders here and are
 # substituted at deploy from /root/.kyriakon-env and the tracked zone. The
 # repository must not hold a second copy: a key restated here would keep
-# publishing after a rotation, and nothing would fail. scripts/deploy-onboard.sh
+# publishing after a rotation, and nothing would fail. scripts/deploy-control.sh
 # refuses a placeholder, and the drain's own recipe reader refuses one too.
 #
 # The MX names the platform's mail host rather than a name of the body's:
@@ -183,7 +183,7 @@ rate_endpoint = "https://api.coingecko.com/api/v3/simple/price?ids=monero&vs_cur
 rates_fetch = "/usr/local/bin/curl"
 
 # Where the login check writes one proof per admitted login, and the drain reads
-# it back. Root-owned 0700, created by scripts/deploy-onboard.sh: the session
+# it back. Root-owned 0700, created by scripts/deploy-control.sh: the session
 # record is the handler's file, so the evidence that a login happened has to be
 # in a directory the handler cannot write. The drain reads a close or export
 # intent's session against this, never against the record's own claims.

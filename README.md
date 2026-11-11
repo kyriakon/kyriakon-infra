@@ -23,7 +23,7 @@ Built on OpenBSD via Hetzner, with Terraform describing the box.
 | TLS | `acme-client`, with `relayd` terminating 443 |
 | Firewall | `pf` |
 | Provisioning | Terraform (`hcloud`) and the `hcloud` CLI for throwaways |
-| Signup service | `onboard`, a Rust FastCGI responder and a root-side drain |
+| Control plane | `control`, a Rust FastCGI responder, a root-side drain and the operator console |
 
 ## Layout
 
@@ -31,7 +31,7 @@ Built on OpenBSD via Hetzner, with Terraform describing the box.
 terraform/            hcloud provider, the live root and the restore template recipe
 openbsd/              every config the box runs, plus the restore template's files
 scripts/              deploys, the drain's scripts, certificates, backups, checks
-onboard/              the signup service: handler, drain, store, ledger, pages
+control/              the control plane: handler, drain, store, ledger, pages, console
 kyriakon-encrypt/     the CLI the save path runs to encrypt each message
 dovecot-plugin/       the Dovecot storage hook that hands mail to kyriakon-encrypt
 keys/                 published member mail keys
@@ -43,9 +43,9 @@ CONTEXT.md            the words this project uses, and what they mean here
 
 ```sh
 # Both crates, because there is no workspace root.
-cargo fmt --manifest-path onboard/Cargo.toml --check
-cargo test --manifest-path onboard/Cargo.toml
-cargo clippy --manifest-path onboard/Cargo.toml --all-targets -- -D warnings
+cargo fmt --manifest-path control/Cargo.toml --check
+cargo test --manifest-path control/Cargo.toml
+cargo clippy --manifest-path control/Cargo.toml --all-targets -- -D warnings
 
 cargo fmt --manifest-path kyriakon-encrypt/Cargo.toml --check
 cargo test --manifest-path kyriakon-encrypt/Cargo.toml
@@ -64,7 +64,7 @@ CI runs these checks on every pull request. `scripts/check-hygiene.sh` runs on t
 
 ## Deploying
 
-`docs/runbook.md` has the order. The deploys are `deploy-onboard.sh`, then `deploy-mail.sh`, then `deploy-relayd.sh`, all run by a human as root. A subset of changes is propose-only: `pf.conf` and `sshd_config` edits, and `terraform apply` or `destroy`, are drafted as a PR diff and run by hand.
+`docs/runbook.md` has the order. The deploys are `deploy-control.sh`, then `deploy-mail.sh`, then `deploy-relayd.sh`, all run by a human as root. A subset of changes is propose-only: `pf.conf` and `sshd_config` edits, and `terraform apply` or `destroy`, are drafted as a PR diff and run by hand.
 
 ## For agents
 

@@ -26,8 +26,8 @@ on:
   pull_request:
 
 jobs:
-  onboard:
-    name: onboard crate
+  control:
+    name: control crate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,23 +39,23 @@ jobs:
       # Hand formatted until now; this is what stops the next drift arriving as a
       # 700-line commit nobody can review.
       - name: fmt
-        run: cargo fmt --manifest-path onboard/Cargo.toml --all --check
+        run: cargo fmt --manifest-path control/Cargo.toml --all --check
       # The acceptance suite runs the installed binaries by path. `cargo test`
       # builds its own targets, not the plain binaries, so build them first.
       - name: build binaries
-        run: cargo build --manifest-path onboard/Cargo.toml --workspace
+        run: cargo build --manifest-path control/Cargo.toml --workspace
       - name: test
-        run: cargo test --manifest-path onboard/Cargo.toml
+        run: cargo test --manifest-path control/Cargo.toml
       # Warnings are errors: the crate is clean at this bar today, so a new one
       # fails the check rather than scrolling past.
       - name: clippy
-        run: cargo clippy --manifest-path onboard/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path control/Cargo.toml --all-targets -- -D warnings
       # The package cut is a rule, not a convention: the unprivileged handler
       # must not link the root drain, and the terminal must not link the handler.
       - name: package boundary
         run: |
-          ! cargo tree --manifest-path onboard/Cargo.toml -p kyriakon-onboard-handler --edges normal | grep -q kyriakon-onboard-drain
-          ! cargo tree --manifest-path onboard/Cargo.toml -p kyriakon-onboard-tui --edges normal | grep -q kyriakon-onboard-handler
+          ! cargo tree --manifest-path control/Cargo.toml -p kyriakon-control-handler --edges normal | grep -q kyriakon-control-drain
+          ! cargo tree --manifest-path control/Cargo.toml -p kyriakon-control-tui --edges normal | grep -q kyriakon-control-handler
       # The handler links the prototype crate's check, so its fixtures, format
       # and lint run here; no other job in this file sees that crate.
       - name: key check fixtures
@@ -124,7 +124,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y mksh
-          mksh scripts/deploy-onboard.sh --self-test
+          mksh scripts/deploy-control.sh --self-test
 
   # The scripts' own tests are the only automated check most of them have, and
   # they run weekly on the box: without this a break reaches main and stays until

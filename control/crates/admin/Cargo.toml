@@ -1,0 +1,16 @@
+[package]
+name = "kyriakon-admin"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kyriakon-admin"
+path = "src/main.rs"
+
+[dependencies]
+kyriakon-control-core = { path = "../core" }
+kyriakon-control-drain = { path = "../drain" }
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true

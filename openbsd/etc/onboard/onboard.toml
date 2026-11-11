@@ -1,13 +1,13 @@
 # /etc/onboard/onboard.toml
 #
-# The onboarding handler's configuration, installed from
+# The handler's configuration, installed from
 # openbsd/etc/onboard/onboard.toml. The handler holds no privilege and no
 # secret, so this file holds none either: unlike the drain's own home under
 # /etc/kyriakon/onboard/, which is 0700 root and holds Stripe's signing secret
 # and the keyring publish token, this file is neither root-only nor secret.
 #
 # No deploy installs it. The unit names it explicitly (openbsd/etc/rc.d/
-# kyriakon_onboard passes /etc/onboard/onboard.toml) rather than relying on a
+# kyriakon_control passes /etc/onboard/onboard.toml) rather than relying on a
 # compiled-in default, so the path is auditable at the rcctl prompt and a second
 # instance cannot silently pick up a different file.
 
@@ -19,7 +19,7 @@
 store_root = "/var/db/onboard"
 
 # The reserved set and the service catalogue the front-ends share, both 0644 at
-# the top of the store (scripts/onboard-store.sh installs them there). Named here
+# the top of the store (scripts/control-store.sh installs them there). Named here
 # rather than derived from the store root, so the handler fails loudly if a later
 # layout moves them instead of reading an empty list and rendering nothing.
 #
@@ -30,7 +30,7 @@ catalogue = "/var/db/onboard/catalogue.toml"
 
 # The mirrored capsule pages: the terms, the acceptable use policy, the privacy
 # notice and the key walkthrough, rendered to gemtext from docs/ by
-# scripts/render-docs.sh --gemini and staged here by scripts/deploy-onboard.sh.
+# scripts/render-docs.sh --gemini and staged here by scripts/deploy-control.sh.
 # Named for the same reason as the catalogue, so a layout moves the directory
 # rather than the handler answering 51 for every page. The files are 0644 and
 # the handler reads them once at start-up, so a page change is a deploy.
@@ -48,7 +48,7 @@ release = "REPLACE_ME"
 # recipe. They are public, and they are still substituted at deploy from
 # /root/.kyriakon-env and the tracked zone rather than restated here: the IPs and
 # the DKIM key are placeholders, so the repository holds no second copy that can
-# drift from what the box publishes. scripts/deploy-onboard.sh refuses a
+# drift from what the box publishes. scripts/deploy-control.sh refuses a
 # placeholder. The MX names the platform's own mail host because the box's
 # reverse record is fixed against that name and cannot be varied per body. The
 # DMARC record starts at p=none, the policy the recipe publishes until every

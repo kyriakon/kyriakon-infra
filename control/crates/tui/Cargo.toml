@@ -1,0 +1,13 @@
+[package]
+name = "kyriakon-control-tui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kyriakon-control-tui"
+path = "src/main.rs"
+
+[dependencies]
+kyriakon-control-core = { path = "../core" }
+libc.workspace = true
