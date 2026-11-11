@@ -81,7 +81,7 @@ missing_drain_scripts() { # <src dir or .rs file> <install-set table>
 
 self_test() {
 	repo=${1:-$(cd "$script_dir/.." && pwd)}
-	src=$repo/onboard/src
+	src=$repo/onboard/crates/drain/src
 	[ -d "$src" ] || {
 		printf 'self-test: %s is missing\n' "$src" >&2
 		exit 1
