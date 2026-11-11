@@ -53,7 +53,7 @@ where
     }
     String::from_utf8(bytes)
         .map(Some)
-        .map_err(|e| Error::Refused(format!("the portal request is not text: {e}")))
+        .map_err(|source| Error::context("the portal request is not text", source))
 }
 
 /// Answer one portal request: a status read is one line in, one line out, and a

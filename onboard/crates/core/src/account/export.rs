@@ -185,17 +185,22 @@ fn filed_day(text: &str) -> Option<Date> {
 /// to the account that owns it, so a member who is not in the file is a
 /// refusal rather than a root-owned directory they can no longer read.
 fn member_owner(passwd: &str, username: &str) -> Result<(u32, u32), Error> {
-    let text = std::fs::read_to_string(passwd)
-        .map_err(|e| format!("cannot read the account list {passwd}: {e}"))?;
+    let text = std::fs::read_to_string(passwd).map_err(|source| {
+        Error::context(format!("cannot read the account list {passwd}"), source)
+    })?;
     for line in text.lines() {
         let fields: Vec<&str> = line.split(':').collect();
         if fields.len() >= 4 && fields[0] == username {
-            let uid = fields[2]
-                .parse()
-                .map_err(|_| format!("the uid for {username} in {passwd} is not a number"))?;
-            let gid = fields[3]
-                .parse()
-                .map_err(|_| format!("the gid for {username} in {passwd} is not a number"))?;
+            let uid = fields[2].parse().map_err(|_| {
+                Error::Failed(format!(
+                    "the uid for {username} in {passwd} is not a number"
+                ))
+            })?;
+            let gid = fields[3].parse().map_err(|_| {
+                Error::Failed(format!(
+                    "the gid for {username} in {passwd} is not a number"
+                ))
+            })?;
             return Ok((uid, gid));
         }
     }
@@ -225,8 +230,12 @@ async fn written(
     let Some(account_text) = store.account_text(username).await? else {
         return Err(Error::from(format!("no account for {username}")));
     };
-    let account: Account = serde_json::from_str(&account_text)
-        .map_err(|e| format!("accounts/{username}/account.json does not parse: {e}"))?;
+    let account: Account = serde_json::from_str(&account_text).map_err(|source| {
+        Error::context(
+            format!("accounts/{username}/account.json does not parse"),
+            source,
+        )
+    })?;
 
     let mut docs: Vec<(String, Vec<u8>)> = Vec::new();
     docs.push(("account.json".to_string(), account_text.into_bytes()));
@@ -285,9 +294,12 @@ async fn written(
 
     let key_path = keycheck::keyring_file(&cfg.keyring_dir, username);
     let key = std::fs::read(&key_path).map_err(|e| {
-        format!(
-            "no mail key for {username} at {}: {e}; the account's own key belongs in the export",
-            key_path.display()
+        Error::context(
+            format!(
+                "no mail key for {username} at {}; the account's own key belongs in the export",
+                key_path.display()
+            ),
+            e,
         )
     })?;
     docs.push((format!("keys/{username}.asc"), key));
@@ -325,7 +337,7 @@ async fn written(
 /// their bundles and cannot place anything where root will write.
 fn check_export_dir(path: &Path, owner: u32) -> Result<(), Error> {
     let md = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        .map_err(|source| Error::context(format!("cannot read {}", path.display()), source))?;
     if !md.file_type().is_dir() {
         return Err(Error::from(format!(
             "{} is not a directory, but a symlink or a file planted in the member's tree;              refusing to write the export",
@@ -353,11 +365,21 @@ fn export_dir(chroot: &Path) -> Result<PathBuf, Error> {
             std::fs::DirBuilder::new()
                 .mode(0o755)
                 .create(&path)
-                .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .map_err(|e| format!("cannot set the mode on {}: {e}", path.display()))?;
+                .map_err(|source| {
+                    Error::context(format!("cannot create {}", path.display()), source)
+                })?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).map_err(
+                |source| {
+                    Error::context(format!("cannot set the mode on {}", path.display()), source)
+                },
+            )?;
         }
-        Err(e) => return Err(Error::from(format!("cannot read {}: {e}", path.display()))),
+        Err(source) => {
+            return Err(Error::context(
+                format!("cannot read {}", path.display()),
+                source,
+            ))
+        }
     }
     check_export_dir(&path, unsafe { libc::geteuid() })?;
     Ok(path)
@@ -376,9 +398,10 @@ fn create_bundle_dir(stamp: &Path, sub: &str) -> Result<PathBuf, Error> {
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&dir)
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("cannot set the mode on {}: {e}", dir.display()))?;
+        .map_err(|source| Error::context(format!("cannot create {}", dir.display()), source))?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
+        Error::context(format!("cannot set the mode on {}", dir.display()), source)
+    })?;
     Ok(dir)
 }
 
@@ -390,30 +413,33 @@ fn write_bundle_file(path: &Path, bytes: &[u8], owner: (u32, u32)) -> Result<(),
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true).mode(0o600);
     opts.custom_flags(libc::O_NOFOLLOW);
-    let mut file = opts.open(path).map_err(|e| {
-        format!(
-            "cannot create {}: {e}; the export does not write over or through an existing name",
-            path.display()
+    let mut file = opts.open(path).map_err(|source| {
+        Error::context(
+            format!(
+                "cannot create {}; the export does not write over or through an existing name",
+                path.display()
+            ),
+            source,
         )
     })?;
     file.write_all(bytes)
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        .map_err(|source| Error::context(format!("cannot write {}", path.display()), source))?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("cannot set the mode on {}: {e}", path.display()))?;
+        .map_err(|source| {
+            Error::context(format!("cannot set the mode on {}", path.display()), source)
+        })?;
     // chown needs root, and only root ever hands a bundle to another owner: a
     // test runs as the tree's own owner already.
     if unsafe { libc::geteuid() } == 0 {
-        fchown(&file, Some(owner.0), Some(owner.1)).map_err(|e| {
-            format!(
-                "cannot hand {} to {}:{}: {e}",
-                path.display(),
-                owner.0,
-                owner.1
+        fchown(&file, Some(owner.0), Some(owner.1)).map_err(|source| {
+            Error::context(
+                format!("cannot hand {} to {}:{}", path.display(), owner.0, owner.1),
+                source,
             )
         })?;
     }
     file.sync_all()
-        .map_err(|e| Error::from(format!("cannot sync {}: {e}", path.display())))
+        .map_err(|source| Error::context(format!("cannot sync {}", path.display()), source))
 }
 
 /// Hand one directory to the member, when this process is root. Path-based and
@@ -423,12 +449,8 @@ fn hand_one(path: &Path, (uid, gid): (u32, u32)) -> Result<(), Error> {
     if unsafe { libc::geteuid() } != 0 {
         return Ok(());
     }
-    std::os::unix::fs::chown(path, Some(uid), Some(gid)).map_err(|e| {
-        Error::from(format!(
-            "cannot hand {} to {uid}:{gid}: {e}",
-            path.display()
-        ))
-    })
+    std::os::unix::fs::chown(path, Some(uid), Some(gid))
+        .map_err(|e| Error::context(format!("cannot hand {} to {uid}:{gid}", path.display()), e))
 }
 
 /// Create the stamp directory and its files, then hand the files and their
@@ -445,13 +467,20 @@ fn write_tree(
         .mode(0o700)
         .create(&stamp)
         .map_err(|e| {
-            format!(
-                "cannot create {}: {e}; the export directory must not already exist",
-                stamp.display()
+            Error::context(
+                format!(
+                    "cannot create {}; the export directory must not already exist",
+                    stamp.display()
+                ),
+                e,
             )
         })?;
-    std::fs::set_permissions(&stamp, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("cannot set the mode on {}: {e}", stamp.display()))?;
+    std::fs::set_permissions(&stamp, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
+        Error::context(
+            format!("cannot set the mode on {}", stamp.display()),
+            source,
+        )
+    })?;
 
     let mut subdirs: Vec<PathBuf> = Vec::new();
     for (name, _) in docs {
@@ -558,7 +587,7 @@ async fn encrypt(program: &str, key: &Path, plain: &[u8]) -> Result<Vec<u8>, Err
     let home = std::env::temp_dir().join(format!("kyriakon-export-gpg-{}", ulid::Ulid::new()));
     tokio::fs::create_dir_all(&home)
         .await
-        .map_err(|e| format!("cannot create {}: {e}", home.display()))?;
+        .map_err(|source| Error::context(format!("cannot create {}", home.display()), source))?;
     let run = async {
         let mut child = tokio::process::Command::new(program)
             .args([
@@ -577,22 +606,22 @@ async fn encrypt(program: &str, key: &Path, plain: &[u8]) -> Result<Vec<u8>, Err
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("cannot spawn {program}: {e}"))?;
+            .map_err(|source| Error::context(format!("cannot spawn {program}"), source))?;
         let mut stdin = child.stdin.take().ok_or("gpg has no stdin")?;
         stdin
             .write_all(plain)
             .await
-            .map_err(|e| format!("cannot write to gpg: {e}"))?;
+            .map_err(|source| Error::context("cannot write to gpg", source))?;
         stdin
             .shutdown()
             .await
-            .map_err(|e| format!("cannot close gpg's stdin: {e}"))?;
+            .map_err(|source| Error::context("cannot close gpg's stdin", source))?;
         // The pipe has to be closed before the wait, or gpg never sees EOF.
         drop(stdin);
         child
             .wait_with_output()
             .await
-            .map_err(|e| format!("cannot wait for gpg: {e}"))
+            .map_err(|source| Error::context("cannot wait for gpg", source))
     }
     .await;
     let _ = tokio::fs::remove_dir_all(&home).await;
@@ -715,13 +744,18 @@ mod tests {
         let euid = unsafe { libc::geteuid() };
         assert!(check_export_dir(&dir, euid).is_ok());
         let err = check_export_dir(&dir, euid + 1).unwrap_err();
-        assert!(err.contains("owned by uid"), "{err}");
+        assert!(
+            matches!(&err, Error::Failed(message) if message.contains("owned by uid")),
+            "{err}"
+        );
 
         let link = dir.join("export");
         std::os::unix::fs::symlink(&dir, &link).unwrap();
         let err = check_export_dir(&link, euid).unwrap_err();
-        assert!(err.contains("not a directory"), "{err}");
-        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            matches!(&err, Error::Failed(message) if message.contains("not a directory") && message.contains("symlink")),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -737,7 +771,10 @@ mod tests {
         let planted = dir.join("account.json");
         std::os::unix::fs::symlink(&target, &planted).unwrap();
         let err = write_bundle_file(&planted, b"export", (0, 0)).unwrap_err();
-        assert!(err.contains("cannot create"), "{err}");
+        assert!(
+            matches!(&err, Error::Context { context, .. } if context.contains("cannot create")),
+            "{err}"
+        );
         assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
         let _ = std::fs::remove_dir_all(&dir);
     }

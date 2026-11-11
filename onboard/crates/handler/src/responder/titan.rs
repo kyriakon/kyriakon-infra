@@ -323,7 +323,7 @@ pub(super) async fn titan_line<R: tokio::io::AsyncRead + Unpin>(
     }
     String::from_utf8(bytes)
         .map(Some)
-        .map_err(|e| Error::Refused(format!("the titan request line is not text: {e}")))
+        .map_err(|source| Error::context("the titan request line is not text", source))
 }
 
 /// The Titan request line's URL and its three parameters. `size` is mandatory;

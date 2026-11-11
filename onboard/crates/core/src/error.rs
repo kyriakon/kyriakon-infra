@@ -37,6 +37,11 @@ pub enum Error {
         line: usize,
         source: serde_json::Error,
     },
+    /// A failure whose context is the value the caller needs, with its source.
+    Context {
+        context: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 impl fmt::Display for Error {
@@ -59,6 +64,7 @@ impl fmt::Display for Error {
             Error::ParseLine { path, line, source } => {
                 write!(f, "{path}: line {line} does not parse: {source}")
             }
+            Error::Context { context, source } => write!(f, "{context}: {source}"),
         }
     }
 }
@@ -72,6 +78,7 @@ impl std::error::Error for Error {
             Error::Io { source, .. } => Some(source),
             Error::Json { source, .. } => Some(source),
             Error::ParseLine { source, .. } => Some(source),
+            Error::Context { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -81,9 +88,14 @@ impl Error {
         crate::util::report(self, context);
     }
 
-    /// Temporary while the remaining tests are converted to variants.
-    pub fn contains(&self, pattern: &str) -> bool {
-        self.to_string().contains(pattern)
+    pub fn context(
+        context: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Error::Context {
+            context: context.into(),
+            source: Box::new(source),
+        }
     }
 }
 

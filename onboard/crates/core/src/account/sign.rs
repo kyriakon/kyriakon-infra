@@ -33,8 +33,8 @@ type HmacSha256 = Hmac<Sha256>;
 /// describe this as a root-only file, and this is the one place that reads it.
 pub fn read_key(path: &std::path::Path) -> Result<Vec<u8>, Error> {
     use std::os::unix::fs::MetadataExt;
-    let meta =
-        std::fs::metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| Error::context(format!("cannot read {}", path.display()), e))?;
     if unsafe { libc::geteuid() } == 0 && meta.uid() != 0 {
         return Err(Error::from(format!(
             "{} is not owned by root",
@@ -47,7 +47,8 @@ pub fn read_key(path: &std::path::Path) -> Result<Vec<u8>, Error> {
             path.display()
         )));
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| Error::context(format!("cannot read {}", path.display()), e))?;
     let end = bytes
         .iter()
         .rposition(|b| !b.is_ascii_whitespace())
@@ -72,7 +73,7 @@ pub fn sign(key: &[u8], payload: &str) -> Result<String, Error> {
 /// not be the bytes Stripe signed.
 pub fn sign_bytes(key: &[u8], payload: &[u8]) -> Result<String, Error> {
     let mut mac =
-        HmacSha256::new_from_slice(key).map_err(|e| format!("cannot key the HMAC: {e}"))?;
+        HmacSha256::new_from_slice(key).map_err(|e| Error::context("cannot key the HMAC", e))?;
     mac.update(payload);
     Ok(hex(&mac.finalize().into_bytes()))
 }

@@ -174,7 +174,7 @@ pub async fn set_password(
     // does not model, and writing it back through the typed struct would drop
     // them.
     let mut record: Value = serde_json::from_str(&text)
-        .map_err(|e| format!("the application record does not parse: {e}"))?;
+        .map_err(|e| Error::context("the application record does not parse", e))?;
     if record.get("username").and_then(Value::as_str) != Some(username) {
         return Ok(password_refusal(store, file, value, "the intent names another account").await);
     }
@@ -1410,7 +1410,8 @@ pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlem
         id: Some(&intent.id),
     };
     if let Err(e) = kyriakon_onboard_core::account::requests::record(store, request).await {
-        if !e.contains("already recorded") {
+        if !matches!(&e, kyriakon_onboard_core::Error::Failed(message) if message.contains("already recorded"))
+        {
             return Err(Error::from(e));
         }
     }
@@ -1906,7 +1907,7 @@ pub async fn mail_key(
                 requested_at: util::filed_at(),
                 applies_at: (OffsetDateTime::now_utc() + Duration::hours(72))
                     .format(&Rfc3339)
-                    .map_err(|e| format!("cannot write the window's end: {e}"))?,
+                    .map_err(|e| Error::context("cannot write the window's end", e))?,
             };
             account.rotation = Some(rotation.clone());
             if signed {
@@ -1968,8 +1969,12 @@ pub async fn mail_key_rotations(
         let Some(rotation) = account.rotation.clone() else {
             continue;
         };
-        let applies = OffsetDateTime::parse(&rotation.applies_at, &Rfc3339)
-            .map_err(|e| format!("the rotation window of {username} does not parse: {e}"))?;
+        let applies = OffsetDateTime::parse(&rotation.applies_at, &Rfc3339).map_err(|e| {
+            Error::context(
+                format!("the rotation window of {username} does not parse"),
+                e,
+            )
+        })?;
         if OffsetDateTime::now_utc() < applies {
             continue;
         }
@@ -2190,7 +2195,9 @@ async fn dns_broken(cfg: &DrainConfig, values: &dns::Values, domain: &str) -> Re
                 ])
                 .output()
                 .await
-                .map_err(|e| format!("cannot run the resolver {}: {e}", cfg.resolver))?;
+                .map_err(|e| {
+                    Error::context(format!("cannot run the resolver {}", cfg.resolver), e)
+                })?;
             if !out.status.success() {
                 // No answer is not the body's zone being broken: dig exits
                 // non-zero when it could not reach a server, and a name that

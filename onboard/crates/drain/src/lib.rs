@@ -133,7 +133,7 @@ async fn one(
         return Ok(());
     };
     let value: Value =
-        serde_json::from_str(&text).map_err(|e| format!("the intent does not parse: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| Error::context("the intent does not parse", e))?;
     let intent = Intent::parse(&value)?;
     run_intent(intent, cfg, store, journal, key, file, &value).await
 }
@@ -667,7 +667,7 @@ pub async fn verify_session(
         ));
     };
     let value: Value = serde_json::from_str(&text)
-        .map_err(|e| Error::from(format!("the session record does not parse: {e}")))?;
+        .map_err(|e| Error::context("the session record does not parse", e))?;
     let proof = value.get("proof").and_then(Value::as_str).unwrap_or("");
     kyriakon_onboard_core::account::session::verify_proof(
         proof_dir,

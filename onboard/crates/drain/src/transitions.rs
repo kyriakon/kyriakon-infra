@@ -45,6 +45,11 @@ pub enum Error {
         context: &'static str,
         source: serde_json::Error,
     },
+    /// A failure whose context is the value the operator needs, with its source.
+    Context {
+        context: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 impl fmt::Display for Error {
@@ -56,6 +61,7 @@ impl fmt::Display for Error {
             Error::Script(error) => error.fmt(f),
             Error::Core(error) => error.fmt(f),
             Error::Json { context, source } => write!(f, "cannot {context}: {source}"),
+            Error::Context { context, source } => write!(f, "{context}: {source}"),
         }
     }
 }
@@ -69,6 +75,7 @@ impl std::error::Error for Error {
             Error::Script(error) => Some(error),
             Error::Core(error) => Some(error),
             Error::Json { source, .. } => Some(source),
+            Error::Context { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -76,6 +83,16 @@ impl std::error::Error for Error {
 impl Error {
     pub fn report(&self, context: &str) {
         kyriakon_onboard_core::util::report(self, context);
+    }
+
+    pub fn context(
+        context: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Error::Context {
+            context: context.into(),
+            source: Box::new(source),
+        }
     }
 }
 

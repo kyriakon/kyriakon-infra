@@ -125,12 +125,16 @@ pub fn parse_file_answer(line: &str) -> Result<String, Error> {
 
 /// Connect to the handler, with the timeouts every request here uses.
 fn connect(socket: &Path, what: &str) -> Result<UnixStream, Error> {
-    let stream = UnixStream::connect(socket)
-        .map_err(|e| format!("cannot reach the {what} at {}: {e}", socket.display()))?;
+    let stream = UnixStream::connect(socket).map_err(|e| {
+        Error::context(
+            format!("cannot reach the {what} at {}", socket.display()),
+            e,
+        )
+    })?;
     stream
         .set_read_timeout(Some(TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(TIMEOUT)))
-        .map_err(|e| format!("cannot set the {what}'s timeout: {e}"))?;
+        .map_err(|e| Error::context(format!("cannot set the {what}'s timeout"), e))?;
     Ok(stream)
 }
 
@@ -141,7 +145,7 @@ fn reply(stream: UnixStream, what: &str) -> Result<String, Error> {
     // handler that is not speaking this protocol.
     BufReader::new(stream.take(MAX_LINE as u64))
         .read_line(&mut line)
-        .map_err(|e| format!("cannot read the {what}'s answer: {e}"))?;
+        .map_err(|e| Error::context(format!("cannot read the {what}'s answer"), e))?;
     if !line.ends_with('\n') {
         return Err(Error::from(format!(
             "the {what} closed the connection before answering"
@@ -156,7 +160,7 @@ pub fn ask(socket: &Path, address: Option<&str>, token: &str) -> Result<Answer, 
     (&stream)
         .write_all(request_line(address, token).as_bytes())
         .and_then(|()| (&stream).flush())
-        .map_err(|e| format!("cannot ask the status service: {e}"))?;
+        .map_err(|e| Error::context("cannot ask the status service", e))?;
     Answer::parse(&reply(stream, "status service")?)
 }
 
@@ -166,8 +170,8 @@ pub fn file(
     address: Option<&str>,
     form: &BTreeMap<String, String>,
 ) -> Result<String, Error> {
-    let body =
-        serde_json::to_string(form).map_err(|e| format!("cannot encode the application: {e}"))?;
+    let body = serde_json::to_string(form)
+        .map_err(|e| Error::context("cannot encode the application", e))?;
     // The handler reads one line and rejects it past this bound, so refuse here
     // where the reader can be told, rather than after a whole session's answers.
     if body.len() >= MAX_BODY {
@@ -183,7 +187,7 @@ pub fn file(
     (&stream)
         .write_all(request.as_bytes())
         .and_then(|()| (&stream).flush())
-        .map_err(|e| format!("cannot file the application: {e}"))?;
+        .map_err(|e| Error::context("cannot file the application", e))?;
     parse_file_answer(&reply(stream, "file service")?)
 }
 
@@ -232,7 +236,10 @@ mod tests {
     fn an_application_over_the_body_bound_is_refused_before_it_is_sent() {
         let form = BTreeMap::from([("anything_else".to_string(), "x".repeat(MAX_BODY))]);
         let why = file(Path::new("/nonexistent/portal.sock"), None, &form).unwrap_err();
-        assert!(why.contains("too large"), "{why}");
+        assert!(
+            matches!(&why, Error::Failed(message) if message.contains("too large")),
+            "{why}"
+        );
     }
 
     #[test]

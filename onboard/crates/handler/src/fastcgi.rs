@@ -111,6 +111,11 @@ pub enum Error {
         what: &'static str,
         source: std::io::Error,
     },
+    /// A failure whose context is the value the caller needs, with its source.
+    Context {
+        context: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -118,6 +123,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Malformed(message) => f.write_str(message),
             Error::Io { what, source } => write!(f, "cannot {what}: {source}"),
+            Error::Context { context, source } => write!(f, "{context}: {source}"),
         }
     }
 }
@@ -127,6 +133,7 @@ impl std::error::Error for Error {
         match self {
             Error::Malformed(_) => None,
             Error::Io { source, .. } => Some(source),
+            Error::Context { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -136,6 +143,18 @@ impl From<std::io::Error> for Error {
         Error::Io {
             what: "read a record",
             source,
+        }
+    }
+}
+
+impl Error {
+    pub fn context(
+        context: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Error::Context {
+            context: context.into(),
+            source: Box::new(source),
         }
     }
 }
@@ -183,7 +202,7 @@ pub async fn read_request<R: AsyncRead + Unpin>(
                     "the connection ended inside a request".to_string(),
                 ))
             }
-            Err(e) => return Err(Error::from(format!("cannot read a record header: {e}"))),
+            Err(e) => return Err(Error::context("cannot read a record header", e)),
         }
         if header[0] != VERSION {
             return Err(Error::from(format!("record version {}", header[0])));
@@ -197,7 +216,7 @@ pub async fn read_request<R: AsyncRead + Unpin>(
         reader
             .read_exact(&mut content)
             .await
-            .map_err(|e| format!("cannot read a record body: {e}"))?;
+            .map_err(|e| Error::context("cannot read a record body", e))?;
         content.truncate(len);
 
         if !begun && kind != BEGIN_REQUEST {

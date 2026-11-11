@@ -76,9 +76,11 @@ pub(crate) async fn request_verify(
 
     let message_path = std::path::Path::new(need(&flags, "message")?);
     let message = std::fs::read(message_path)
-        .map_err(|e| format!("cannot read {}: {e}", message_path.display()))?;
+        .map_err(|e| Error::context(format!("cannot read {}", message_path.display()), e))?;
     let signature = match flags.get("signature") {
-        Some(path) => Some(std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?),
+        Some(path) => Some(
+            std::fs::read(path).map_err(|e| Error::context(format!("cannot read {path}"), e))?,
+        ),
         None => None,
     };
 
@@ -253,7 +255,7 @@ pub(crate) async fn request_list(store: &Store) -> Result<(), Error> {
     for line in open {
         let state = match line
             .state(today)
-            .map_err(|e| format!("request {}: {e}", line.id))?
+            .map_err(|e| Error::context(format!("request {}", line.id), e))?
         {
             account_requests::DueState::Overdue => {
                 overdue += 1;

@@ -53,7 +53,7 @@ pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), Error> 
     }
     account.payment = Some(payment.clone());
     let bytes = serde_json::to_vec_pretty(&account)
-        .map_err(|e| format!("cannot encode the account: {e}"))?;
+        .map_err(|e| Error::context("cannot encode the account", e))?;
     // The same writer the drain uses: the handler reads this record as
     // `_onboard`, so a 0600 root file would leave the page without a payment
     // block.

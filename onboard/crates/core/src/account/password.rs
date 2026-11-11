@@ -38,7 +38,7 @@ pub fn validate(plain: &str) -> Result<(), Error> {
 
 /// The hash the store keeps.
 pub fn make(plain: &str) -> Result<String, Error> {
-    hash(plain, DEFAULT_COST).map_err(|e| Error::from(format!("cannot hash the password: {e}")))
+    hash(plain, DEFAULT_COST).map_err(|e| Error::context("cannot hash the password", e))
 }
 
 /// Whether a stored hash is one this crate made. The drain checks the shape

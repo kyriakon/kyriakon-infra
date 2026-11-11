@@ -51,21 +51,21 @@ async fn enqueue_raw(cfg: &DrainConfig, raw: &str) -> Result<(), Error> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("cannot start {}: {e}", cfg.sendmail))?;
+        .map_err(|e| Error::context(format!("cannot start {}", cfg.sendmail), e))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(raw.as_bytes())
             .await
-            .map_err(|e| format!("cannot write to {}: {e}", cfg.sendmail))?;
+            .map_err(|e| Error::context(format!("cannot write to {}", cfg.sendmail), e))?;
         stdin
             .shutdown()
             .await
-            .map_err(|e| format!("cannot close {}: {e}", cfg.sendmail))?;
+            .map_err(|e| Error::context(format!("cannot close {}", cfg.sendmail), e))?;
     }
     let status = child
         .wait()
         .await
-        .map_err(|e| format!("cannot wait for {}: {e}", cfg.sendmail))?;
+        .map_err(|e| Error::context(format!("cannot wait for {}", cfg.sendmail), e))?;
     if !status.success() {
         return Err(Error::from(format!("{} exited {status}", cfg.sendmail)));
     }
@@ -223,7 +223,7 @@ async fn record(
         to: to.to_string(),
     };
     let encoded =
-        serde_json::to_string(&line).map_err(|e| format!("cannot encode a notice: {e}"))?;
+        serde_json::to_string(&line).map_err(|e| Error::context("cannot encode a notice", e))?;
     store
         .log(&format!("accounts/{username}/notices.jsonl"))
         .append_mode(encoded.as_bytes(), store.dir_owner("accounts"), 0o640)

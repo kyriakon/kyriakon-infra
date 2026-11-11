@@ -112,8 +112,12 @@ impl Sessions {
     /// session with no address to key on: a manual run rather than an sshd
     /// session, which always carries `SSH_CONNECTION`.
     pub fn open(dir: &Path, address: Option<IpAddr>) -> Result<Admission, Error> {
-        fs::create_dir_all(dir)
-            .map_err(|e| format!("cannot open the session directory {}: {e}", dir.display()))?;
+        fs::create_dir_all(dir).map_err(|e| {
+            Error::context(
+                format!("cannot open the session directory {}", dir.display()),
+                e,
+            )
+        })?;
         prune(dir)?;
         let Some(address) = address else {
             return Ok(Admission::Open(Sessions {
@@ -131,14 +135,17 @@ impl Sessions {
             .truncate(false)
             .write(true)
             .open(&count_path)
-            .map_err(|e| format!("cannot open {}: {e}", count_path.display()))?;
+            .map_err(|e| Error::context(format!("cannot open {}", count_path.display()), e))?;
         lock_exclusive(count_lock.as_raw_fd(), &count_path)?;
 
         let prefix = format!("{address}@");
         let mut held = 0;
         let mut total = 0;
-        for entry in fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))? {
-            let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        for entry in fs::read_dir(dir)
+            .map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?
+        {
+            let entry =
+                entry.map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if !name.contains('@') {
@@ -169,7 +176,7 @@ impl Sessions {
             .create_new(true)
             .write(true)
             .open(&path)
-            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            .map_err(|e| Error::context(format!("cannot write {}", path.display()), e))?;
         lock_exclusive(file.as_raw_fd(), &path)?;
         Ok(Admission::Open(Sessions {
             path: Some(path),
@@ -205,8 +212,11 @@ fn lock_exclusive(fd: i32, path: &Path) -> Result<(), Error> {
 /// open is left alone: the directory is the portal's, but a name it did not write
 /// is not evidence of a session.
 fn prune(dir: &Path) -> Result<(), Error> {
-    for entry in fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))? {
-        let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    for entry in fs::read_dir(dir)
+        .map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?
+    {
+        let entry =
+            entry.map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?;
         let name = entry.file_name();
         if !name.to_string_lossy().contains('@') {
             continue;
@@ -999,7 +1009,7 @@ fn paint(mode: Mode, out: &mut dyn Write, text: &str) -> Result<(), Error> {
 fn put(out: &mut dyn Write, text: &str) -> Result<(), Error> {
     out.write_all(text.as_bytes())
         .and_then(|()| out.flush())
-        .map_err(|e| Error::from(format!("cannot write to the session: {e}")))
+        .map_err(|e| Error::context("cannot write to the session", e))
 }
 
 #[cfg(test)]
@@ -2093,7 +2103,10 @@ mod tests {
             &mut out,
         )
         .unwrap_err();
-        assert!(why.contains(catalogue::TRACKED), "{why}");
+        assert!(
+            matches!(&why, Error::Failed(message) if message.contains(catalogue::TRACKED)),
+            "{why}"
+        );
         assert!(out.is_empty(), "the refusal drew a screen");
     }
 

@@ -102,12 +102,12 @@ fn run() -> Result<Departure, Error> {
 
     let cfg = config::Config::load(&cfg_path)?;
     let text = std::fs::read_to_string(&cfg.catalogue)
-        .map_err(|e| format!("cannot read {}: {e}", cfg.catalogue))?;
+        .map_err(|e| Error::context(format!("cannot read {}", cfg.catalogue), e))?;
     let list = catalogue::parse(&text)?;
     let questions = questions::shipped()?;
     let reserved = validate::reserved(
         &std::fs::read_to_string(&cfg.reserved)
-            .map_err(|e| format!("cannot read {}: {e}", cfg.reserved))?,
+            .map_err(|e| Error::context(format!("cannot read {}", cfg.reserved), e))?,
     );
 
     // The session's member, where the key it presented names one: [#381] asks the

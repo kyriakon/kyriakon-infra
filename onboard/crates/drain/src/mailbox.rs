@@ -43,12 +43,12 @@ pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(Error::from(format!("cannot read {}: {e}", dir.display()))),
+        Err(e) => return Err(Error::context(format!("cannot read {}", dir.display()), e)),
     };
     while let Some(entry) = entries
         .next_entry()
         .await
-        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+        .map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?
     {
         let path = entry.path();
         if !entry.file_type().await.is_ok_and(|t| t.is_file()) {
@@ -371,7 +371,7 @@ async fn reply(cfg: &DrainConfig, store: &Store, sender: &str, body: &str) -> Re
     store
         .write_record_owned("mail", "replies.json", &bytes, owner)
         .await
-        .map_err(|e| Error::from(format!("cannot write {}: {e}", path.display())))?;
+        .map_err(|e| Error::context(format!("cannot write {}", path.display()), e))?;
     notice::enqueue(cfg, sender, REPLY_SUBJECT, body)
         .await
         .map_err(Error::from)

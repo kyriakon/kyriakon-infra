@@ -252,15 +252,15 @@ pub async fn open(
             .replace_nanosecond(0)
             .unwrap_or(now)
             .format(&Rfc3339)
-            .map_err(|e| format!("cannot stamp the session: {e}"))?,
+            .map_err(|e| Error::context("cannot stamp the session", e))?,
         expires_at: expires
             .format(&Rfc3339)
-            .map_err(|e| format!("cannot stamp the session: {e}"))?,
+            .map_err(|e| Error::context("cannot stamp the session", e))?,
         secret: secret.clone(),
         proof: proof.to_string(),
     };
     let bytes = serde_json::to_vec_pretty(&record)
-        .map_err(|e| format!("cannot encode the session: {e}"))?;
+        .map_err(|e| Error::context("cannot encode the session", e))?;
     store.ensure_dir("sessions").await?;
     store
         .write_record("sessions", &format!("{id}.json"), &bytes)
@@ -495,16 +495,22 @@ mod tests {
                 .is_err()
         );
         // The file's own username, not the record's.
-        assert!(verify_proof(&proofs(&store), &proof, "bob", now())
+        let err = verify_proof(&proofs(&store), &proof, "bob", now())
             .await
-            .unwrap_err()
-            .contains("belongs to"));
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Failed(message) if message.contains("belongs to")),
+            "{err}"
+        );
         // The file's own expiry.
         let stale = mint(&store, "alice", now().unix_timestamp() - 1);
-        assert!(verify_proof(&proofs(&store), &stale, "alice", now())
+        let err = verify_proof(&proofs(&store), &stale, "alice", now())
             .await
-            .unwrap_err()
-            .contains("expired"));
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Failed(message) if message.contains("expired")),
+            "{err}"
+        );
     }
 
     #[tokio::test]

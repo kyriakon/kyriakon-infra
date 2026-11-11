@@ -61,7 +61,7 @@ pub(crate) async fn address(
     let mail_key = match flags.get("key-file") {
         Some(path) => {
             let material = std::fs::read_to_string(path)
-                .map_err(|e| format!("cannot read the mail key {path}: {e}"))?;
+                .map_err(|e| Error::context(format!("cannot read the mail key {path}"), e))?;
             if material.trim().is_empty() {
                 return Err(Error::from(format!("the mail key {path} is empty")));
             }

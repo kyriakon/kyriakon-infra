@@ -487,7 +487,7 @@ async fn application_copy(store: &Store, token: &str) -> Result<Option<String>, 
         return Ok(None);
     };
     let mut value: Value =
-        serde_json::from_str(&text).map_err(|e| format!("the application record: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| Error::context("the application record", e))?;
     value["status_link_until"] = json!(util::after_days(7));
     let bytes = serde_json::to_string_pretty(&value).map_err(|source| Error::Json {
         context: "encode the application copy",
@@ -733,8 +733,12 @@ fn stale_table_lock(dir: &std::path::Path) -> Option<String> {
 /// never reads half a table.
 fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), Error> {
     let _lock = TableLock::acquire(path)?;
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        Error::context(
+            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
+            e,
+        )
+    })?;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -771,7 +775,7 @@ fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), 
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|e| format!("cannot open {path}: {e}"))?;
+        .map_err(|e| Error::context(format!("cannot open {path}"), e))?;
     let mut entry = String::new();
     if !text.is_empty() && !text.ends_with('\n') {
         entry.push('\n');
@@ -779,13 +783,17 @@ fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), 
     entry.push_str(&line);
     entry.push('\n');
     std::io::Write::write_all(&mut file, entry.as_bytes())
-        .map_err(|e| Error::from(format!("cannot append to {path}: {e}")))
+        .map_err(|e| Error::context(format!("cannot append to {path}"), e))
 }
 
 /// The value a virtual table maps `name` to, or `None` when the key is absent.
 fn table_value(path: &str, name: &str) -> Result<Option<String>, Error> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        Error::context(
+            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
+            e,
+        )
+    })?;
     for line in text.lines() {
         if let Some((key, value)) = line.split_once(':') {
             if key.trim() == name {
@@ -799,8 +807,12 @@ fn table_value(path: &str, name: &str) -> Result<Option<String>, Error> {
 /// How many addresses the body's domain has: every `<localpart>@<domain>` line,
 /// mailboxes and aliases alike, which is the ten-address cap's count.
 fn address_count(path: &str, domain: &str) -> Result<usize, Error> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        Error::context(
+            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
+            e,
+        )
+    })?;
     let suffix = format!("@{domain}");
     Ok(text
         .lines()
@@ -818,11 +830,12 @@ fn address_count(path: &str, domain: &str) -> Result<usize, Error> {
 /// would drop a line another writer appended between the two.
 fn write_table(path: &str, text: &str, _lock: &TableLock) -> Result<(), Error> {
     let candidate = format!("{path}.onboard.{}", std::process::id());
-    std::fs::write(&candidate, text).map_err(|e| format!("cannot write {candidate}: {e}"))?;
+    std::fs::write(&candidate, text)
+        .map_err(|e| Error::context(format!("cannot write {candidate}"), e))?;
     std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o644))
-        .map_err(|e| format!("cannot set the mode on {candidate}: {e}"))?;
+        .map_err(|e| Error::context(format!("cannot set the mode on {candidate}"), e))?;
     std::fs::rename(&candidate, path)
-        .map_err(|e| Error::from(format!("cannot replace {path}: {e}")))
+        .map_err(|e| Error::context(format!("cannot replace {path}"), e))
 }
 
 /// Repoint an existing virtual entry, keeping every other line. A value that is
@@ -832,8 +845,12 @@ fn write_table(path: &str, text: &str, _lock: &TableLock) -> Result<(), Error> {
 ///
 fn repoint_table_line(path: &str, name: &str, want: &str) -> Result<(), Error> {
     let lock = TableLock::acquire(path)?;
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        Error::context(
+            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
+            e,
+        )
+    })?;
     let mut out = String::new();
     let mut found = false;
     for line in text.lines() {
@@ -861,8 +878,12 @@ fn repoint_table_line(path: &str, name: &str, want: &str) -> Result<(), Error> {
 /// Returns whether the table changed.
 fn remove_addresses(path: &str, domain: &str, mailbox: &str) -> Result<bool, Error> {
     let lock = TableLock::acquire(path)?;
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        Error::context(
+            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
+            e,
+        )
+    })?;
     let suffix = format!("@{domain}");
     let mut out = String::new();
     let mut changed = false;
@@ -962,7 +983,7 @@ fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, Error> {
     // SSH key or a truncated block would reach the encryptor's keyring and
     // fail closed, so the shared check refuses it before the journal line.
     let checked = kyriakon_onboard_core::mail::keycheck::pgp_public_key(&key.material)
-        .map_err(|e| format!("the mail key for {}: {e}", intent.mailbox))?;
+        .map_err(|e| Error::context(format!("the mail key for {}", intent.mailbox), e))?;
     let mut key = key.clone();
     key.mailbox = intent.mailbox.clone();
     key.verdict = checked.verdict;
@@ -1408,7 +1429,7 @@ pub(super) async fn close_group_tokens(store: &Store, accounts: &[String]) -> Re
 /// closed instead of acting on a box it cannot see.
 pub(super) fn account_on_box(cfg: &DrainConfig, username: &str) -> Result<bool, Error> {
     let text = std::fs::read_to_string(&cfg.passwd)
-        .map_err(|e| format!("cannot read {}: {e}", cfg.passwd))?;
+        .map_err(|e| Error::context(format!("cannot read {}", cfg.passwd), e))?;
     Ok(text
         .lines()
         .any(|line| line.split(':').next() == Some(username)))

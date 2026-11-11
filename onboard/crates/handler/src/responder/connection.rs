@@ -28,7 +28,7 @@ pub(super) async fn accept(
         let (stream, _) = listener
             .accept()
             .await
-            .map_err(|e| format!("cannot accept: {e}"))?;
+            .map_err(|e| Error::context("cannot accept", e))?;
         let app = app.clone();
         tokio::spawn(async move {
             let outcome = match channel {

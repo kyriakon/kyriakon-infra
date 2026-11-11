@@ -24,9 +24,9 @@ pub(super) async fn file_application(app: &App, record: &Record) -> Result<(), E
     let name = format!("{}.json", record.status_token);
     // Both encodings first: an encoding failure must leave no record either.
     let bytes = serde_json::to_vec_pretty(record)
-        .map_err(|e| format!("cannot encode the application: {e}"))?;
+        .map_err(|e| Error::context("cannot encode the application", e))?;
     let intent = serde_json::to_vec_pretty(&record.intent(&id))
-        .map_err(|e| format!("cannot encode the intent: {e}"))?;
+        .map_err(|e| Error::context("cannot encode the intent", e))?;
     app.store
         .write_record("applications", &name, &bytes)
         .await?;

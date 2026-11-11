@@ -308,7 +308,7 @@ async fn apply_payment(
     }
 
     let price = util::pence(&cfg.price_gbp)
-        .map_err(|e| format!("the drain's configured price_gbp: {e}"))?;
+        .map_err(|e| Error::context("the drain's configured price_gbp", e))?;
     if price <= 0 {
         return Err(Error::from(
             "the drain's configured price_gbp must be more than zero".to_string(),
@@ -574,7 +574,7 @@ async fn group_credit(
         return Ok(Settlement::refused("the credit would put the group's paid_until more than 24 months past --received; give --override <reason> to mean it"));
     }
     let price = util::pence(&cfg.group_price_gbp)
-        .map_err(|e| format!("the drain's configured group_price_gbp: {e}"))?;
+        .map_err(|e| Error::context("the drain's configured group_price_gbp", e))?;
     if price <= 0 {
         return Err(Error::from(
             "the drain's configured group_price_gbp must be more than zero".to_string(),
@@ -741,7 +741,7 @@ async fn last_payment_line(store: &Store, token: &str) -> Result<Option<PaymentL
         seq: line.seq,
         rail: line.rail,
         amount: util::pence(amount)
-            .map_err(|e| format!("the payment line's amount cannot be read: {e}"))?,
+            .map_err(|e| Error::context("the payment line's amount cannot be read", e))?,
         amount_xmr: line.amount_xmr,
         paid_until_after: line.paid_until_after,
     }))
@@ -1643,7 +1643,7 @@ pub async fn write_payment_copy(
         return Ok(());
     };
     let mut copy: Value = serde_json::from_str(&text)
-        .map_err(|e| format!("the application copy does not parse: {e}"))?;
+        .map_err(|e| Error::context("the application copy does not parse", e))?;
     copy["payment"] = serde_json::to_value(payment).map_err(|source| Error::Json {
         context: "encode the payment block",
         source,

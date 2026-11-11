@@ -582,7 +582,7 @@ async fn approve(
             .await?
             .ok_or("the application record vanished mid-approval")?,
     )
-    .map_err(|e| format!("the application record does not parse: {e}"))?;
+    .map_err(|e| Error::context("the application record does not parse", e))?;
     app_copy["status_link_until"] = json!(util::after_days(7));
     // The handler renders the status page as `_onboard` and cannot read the
     // root-owned account, so the payment block it shows is this copy, written
@@ -790,7 +790,7 @@ async fn approve_group(
         .await
         .ok_or_else(|| format!("the intent this pass filed at {filename} is gone"))?;
     let value: Value = serde_json::from_str(&text)
-        .map_err(|e| format!("the intent this pass filed does not parse: {e}"))?;
+        .map_err(|e| Error::context("the intent this pass filed does not parse", e))?;
     let filed = kyriakon_onboard_core::intent::Intent::parse(&value)?;
     // The provision-group arm verifies or fails; it has no refusal of its own,
     // because the signature it checks is the one this pass just made. `run_intent`

@@ -248,14 +248,14 @@ async fn fetch(cfg: &DrainConfig) -> Option<String> {
 fn write(cfg: &DrainConfig, cached: &Cached) -> Result<(), Error> {
     if let Some(dir) = Path::new(&cfg.rates).parent() {
         std::fs::create_dir_all(dir)
-            .map_err(|e| Error::from(format!("cannot make {}: {e}", dir.display())))?;
+            .map_err(|e| Error::context(format!("cannot make {}", dir.display()), e))?;
     }
     let bytes = serde_json::to_vec_pretty(cached)
-        .map_err(|e| Error::from(format!("cannot encode the rate: {e}")))?;
+        .map_err(|e| Error::context("cannot encode the rate", e))?;
     let temp = format!("{}.new", cfg.rates);
-    std::fs::write(&temp, &bytes).map_err(|e| Error::from(format!("cannot write {temp}: {e}")))?;
+    std::fs::write(&temp, &bytes).map_err(|e| Error::context(format!("cannot write {temp}"), e))?;
     std::fs::rename(&temp, &cfg.rates)
-        .map_err(|e| Error::from(format!("cannot rename {temp}: {e}")))
+        .map_err(|e| Error::context(format!("cannot rename {temp}"), e))
 }
 
 fn attempt_path(cfg: &DrainConfig) -> String {
@@ -275,10 +275,10 @@ fn stamp_attempt(cfg: &DrainConfig, now: OffsetDateTime) -> Result<(), Error> {
     let path = attempt_path(cfg);
     if let Some(dir) = Path::new(&path).parent() {
         std::fs::create_dir_all(dir)
-            .map_err(|e| Error::from(format!("cannot make {}: {e}", dir.display())))?;
+            .map_err(|e| Error::context(format!("cannot make {}", dir.display()), e))?;
     }
     std::fs::write(&path, crate::util::stamp(now))
-        .map_err(|e| Error::from(format!("cannot write {path}: {e}")))
+        .map_err(|e| Error::context(format!("cannot write {path}"), e))
 }
 
 fn parse_stamp(text: &str) -> Option<OffsetDateTime> {

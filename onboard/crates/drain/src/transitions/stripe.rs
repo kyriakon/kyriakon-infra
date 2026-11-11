@@ -751,7 +751,7 @@ fn invoice_money(object: &Value) -> Result<(String, String), Error> {
         .or_else(|| object.get("created").and_then(Value::as_i64))
         .ok_or("the paid invoice carries no paid timestamp")?;
     let when = OffsetDateTime::from_unix_timestamp(paid)
-        .map_err(|e| format!("the invoice's paid timestamp cannot be read: {e}"))?;
+        .map_err(|e| Error::context("the invoice's paid timestamp cannot be read", e))?;
     Ok((util::gbp(amount), util::date_string(when.date())))
 }
 

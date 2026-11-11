@@ -18,6 +18,11 @@ pub enum Error {
     Core(kyriakon_onboard_core::Error),
     /// A drain transition refused or failed.
     Drain(kyriakon_onboard_drain::transitions::Error),
+    /// A failure whose context is the value the caller needs, with its source.
+    Context {
+        context: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 impl fmt::Display for Error {
@@ -28,6 +33,7 @@ impl fmt::Display for Error {
             Error::Config(error) => error.fmt(f),
             Error::Core(error) => error.fmt(f),
             Error::Drain(error) => error.fmt(f),
+            Error::Context { context, source } => write!(f, "{context}: {source}"),
         }
     }
 }
@@ -40,6 +46,7 @@ impl std::error::Error for Error {
             Error::Config(error) => Some(error),
             Error::Core(error) => Some(error),
             Error::Drain(error) => Some(error),
+            Error::Context { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -49,10 +56,14 @@ impl Error {
         kyriakon_onboard_core::util::report(self, context);
     }
 
-    /// Temporary while the remaining tests are converted to variants.
-    #[cfg(test)]
-    pub fn contains(&self, pattern: &str) -> bool {
-        self.to_string().contains(pattern)
+    pub fn context(
+        context: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Error::Context {
+            context: context.into(),
+            source: Box::new(source),
+        }
     }
 }
 

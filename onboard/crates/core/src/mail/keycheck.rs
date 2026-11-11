@@ -129,12 +129,12 @@ pub async fn verify_signature(
     let home = std::path::PathBuf::from("/tmp").join(format!("kyriakon-gpg-{}", ulid::Ulid::new()));
     tokio::fs::create_dir_all(&home)
         .await
-        .map_err(|e| format!("cannot create {}: {e}", home.display()))?;
+        .map_err(|e| Error::context(format!("cannot create {}", home.display()), e))?;
     // gpg refuses a homedir another user could read, and the scratch directory
     // is created with the process umask otherwise.
     tokio::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
         .await
-        .map_err(|e| format!("cannot set the mode on {}: {e}", home.display()))?;
+        .map_err(|e| Error::context(format!("cannot set the mode on {}", home.display()), e))?;
     let run = async {
         let import = Command::new(gpg)
             .args(["--batch", "--no-tty", "--no-options", "--homedir"])
@@ -143,19 +143,19 @@ pub async fn verify_signature(
             .arg(key_file)
             .output()
             .await
-            .map_err(|e| format!("cannot run {gpg}: {e}"))?;
+            .map_err(|e| Error::context(format!("cannot run {gpg}"), e))?;
         if !import.status.success() {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "gpg could not read {} ({}): {}",
                 key_file.display(),
                 import.status,
                 String::from_utf8_lossy(&import.stderr).trim()
-            ));
+            )));
         }
         let message = home.join("message");
         tokio::fs::write(&message, payload)
             .await
-            .map_err(|e| format!("cannot write {}: {e}", message.display()))?;
+            .map_err(|e| Error::context(format!("cannot write {}", message.display()), e))?;
         let mut verify = Command::new(gpg);
         verify
             .args(["--batch", "--no-tty", "--no-options", "--homedir"])
@@ -165,14 +165,14 @@ pub async fn verify_signature(
             let sig = home.join("signature.asc");
             tokio::fs::write(&sig, signature)
                 .await
-                .map_err(|e| format!("cannot write {}: {e}", sig.display()))?;
+                .map_err(|e| Error::context(format!("cannot write {}", sig.display()), e))?;
             verify.arg(sig);
         }
         let out = verify
             .arg(&message)
             .output()
             .await
-            .map_err(|e| format!("cannot run {gpg}: {e}"))?;
+            .map_err(|e| Error::context(format!("cannot run {gpg}"), e))?;
         if !out.status.success() {
             return Ok(None);
         }
@@ -187,7 +187,7 @@ pub async fn verify_signature(
     };
     let result = run.await;
     let _ = tokio::fs::remove_dir_all(&home).await;
-    result.map_err(Error::from)
+    result
 }
 
 /// Inspect an OpenSSH public key: the shape sftp and git will accept. A shape
@@ -560,15 +560,24 @@ mod tests {
 
     #[test]
     fn framing_and_base64_are_refused_with_a_reason() {
-        assert!(pgp_public_key("hello").unwrap_err().contains("armoured"));
+        assert!(matches!(
+            pgp_public_key("hello").unwrap_err(),
+            Error::Failed(message) if message.contains("armoured")
+        ));
         let bad = armoured("not base64 !!!");
-        assert!(pgp_public_key(&bad).unwrap_err().contains("base64"));
+        assert!(matches!(
+            pgp_public_key(&bad).unwrap_err(),
+            Error::Failed(message) if message.contains("base64")
+        ));
     }
 
     #[test]
     fn a_block_with_no_public_key_packet_is_refused() {
         let e = pgp_public_key(&armoured(NO_KEY)).unwrap_err();
-        assert!(e.contains("public key packet"), "{e}");
+        assert!(
+            matches!(&e, Error::Failed(message) if message.contains("public key packet")),
+            "{e}"
+        );
     }
 
     #[test]

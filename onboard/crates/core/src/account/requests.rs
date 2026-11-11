@@ -264,7 +264,7 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
 
     let id = match request.id {
         Some(raw) => ulid::Ulid::from_string(raw)
-            .map_err(|e| format!("the id {raw:?}: {e}"))?
+            .map_err(|e| Error::context(format!("the id {raw:?}"), e))?
             .to_string(),
         None => ulid::Ulid::new().to_string(),
     };
@@ -318,7 +318,8 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
             )));
         }
     }
-    let bytes = serde_json::to_vec(&line).map_err(|e| format!("cannot write the request: {e}"))?;
+    let bytes =
+        serde_json::to_vec(&line).map_err(|e| Error::context("cannot write the request", e))?;
     log.append_while_locked(&_guard, &bytes).await?;
     Ok(line)
 }
@@ -367,7 +368,7 @@ async fn rewrite(
     for line in &lines {
         bytes.push_str(
             &serde_json::to_string(line)
-                .map_err(|e| format!("cannot write the request record: {e}"))?,
+                .map_err(|e| Error::context("cannot write the request record", e))?,
         );
         bytes.push('\n');
     }
@@ -624,7 +625,10 @@ mod tests {
             let err = extend(&store, &line.id, "complex", Some(at))
                 .await
                 .unwrap_err();
-            assert!(err.contains("the request runs from"), "{at}: {err}");
+            assert!(
+                matches!(&err, Error::Failed(message) if message.contains("the request runs from")),
+                "{at}: {err}"
+            );
         }
         // The day it is due is still inside the month; the day after is not.
         extend(&store, &line.id, "complex", Some("2026-11-01"))
@@ -649,7 +653,10 @@ mod tests {
         let err = extend(&store, &first.id, "again", Some("2026-10-03"))
             .await
             .unwrap_err();
-        assert!(err.contains("already extended"), "{err}");
+        assert!(
+            matches!(&err, Error::Failed(message) if message.contains("already extended")),
+            "{err}"
+        );
 
         let closed = record(&store, new_request("erasure", "2026-10-01"))
             .await
@@ -660,7 +667,10 @@ mod tests {
         let err = extend(&store, &closed.id, "complex", Some("2026-10-05"))
             .await
             .unwrap_err();
-        assert!(err.contains("is closed"), "{err}");
+        assert!(
+            matches!(&err, Error::Failed(message) if message.contains("is closed")),
+            "{err}"
+        );
 
         let fresh = record(&store, new_request("rectification", "2026-10-01"))
             .await
@@ -668,7 +678,10 @@ mod tests {
         let err = extend(&store, &fresh.id, "  ", Some("2026-10-05"))
             .await
             .unwrap_err();
-        assert!(err.contains("reason"), "{err}");
+        assert!(
+            matches!(&err, Error::Failed(message) if message.contains("reason")),
+            "{err}"
+        );
 
         // No refusal moved a clock or appended a line.
         let lines = read_all(&store, "alice").await.unwrap();
@@ -758,7 +771,10 @@ mod tests {
         let mut request = new_request("access", "2026-10-22");
         request.username = "nobody";
         let err = record(&store, request).await.unwrap_err();
-        assert!(err.contains("no account for nobody"), "{err}");
+        assert!(
+            matches!(&err, Error::Failed(message) if message.contains("no account for nobody")),
+            "{err}"
+        );
         assert!(!dir.join("accounts/nobody").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -769,7 +785,10 @@ mod tests {
         let err = record(&store, new_request("portability", "2026-10-22"))
             .await
             .unwrap_err();
-        assert!(err.contains("access, erasure, rectification"), "{err}");
+        assert!(
+            matches!(&err, Error::Failed(message) if message.contains("access, erasure, rectification")),
+            "{err}"
+        );
         let mut request = new_request("access", "2026-10-22");
         request.evidence = "  ";
         assert!(record(&store, request).await.is_err());
@@ -789,7 +808,10 @@ mod tests {
             let mut request = new_request("access", "2026-10-22");
             request.identity = identity;
             let err = record(&store, request).await.unwrap_err();
-            assert!(err.contains("identity route"), "{identity:?}: {err}");
+            assert!(
+                matches!(&err, Error::Failed(message) if message.contains("identity route")),
+                "{identity:?}: {err}"
+            );
         }
         assert!(store
             .log("accounts/alice/requests.jsonl")
@@ -917,7 +939,7 @@ mod tests {
         // including root, so the test does not depend on file permissions.
         std::fs::create_dir_all(dir.join("accounts/alice/requests.jsonl")).unwrap();
         let err = open(&store).await.unwrap_err();
-        assert!(err.contains("cannot read"), "{err}");
+        assert!(matches!(&err, Error::Store(_)), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -933,7 +955,10 @@ mod tests {
         let mut again = new_request("access", "2026-10-22");
         again.id = Some(id);
         let err = record(&store, again).await.unwrap_err();
-        assert!(err.contains("already recorded"), "{err}");
+        assert!(
+            matches!(&err, Error::Failed(message) if message.contains("already recorded")),
+            "{err}"
+        );
         assert_eq!(read_all(&store, "alice").await.unwrap().len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
