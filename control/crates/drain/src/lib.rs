@@ -81,6 +81,10 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), Error> {
     )
     .await;
     transitions::lifecycle::purge_declined(cfg, store, &journal).await?;
+    // ADR 0005's application answers: the ninety days are counted from filing,
+    // so this clears an approved application's copies and an abandoned record
+    // away on the first pass after the window ends.
+    transitions::lifecycle::purge_applications(cfg, store, &journal).await?;
     transitions::lifecycle::purge_closing(cfg, store, &journal).await?;
     // The free accounts' yearly note, on the same pass: a free account never
     // lapses, and this is the one message it is sent each year.

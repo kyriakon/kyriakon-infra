@@ -30,8 +30,9 @@ use crate::util;
 use crate::Error;
 
 /// The window ADR 0005 gives the application answers: ninety days from the day
-/// they were filed, after which the purge deletes them.
-const APPLICATION_PURGE_DAYS: i64 = 90;
+/// they were filed, after which the purge deletes them. The drain's sweep and
+/// this module's boundary are both read from here, so the two cannot disagree.
+pub const APPLICATION_PURGE_DAYS: i64 = 90;
 
 /// The written answer, the part of the bundle a member reads first. It names
 /// the three exclusions the spec states, because a bundle that stays silent
@@ -166,14 +167,17 @@ fn stamp(now: OffsetDateTime) -> String {
 }
 
 /// Whether an application filed on `filed` is still inside ADR 0005's window on
-/// `today`. The boundary is inclusive: the last held day is the ninetieth.
-fn within_purge(filed: Date, today: Date) -> bool {
+/// `today`. The boundary is inclusive: the last held day is the ninetieth. The
+/// export includes the answers while this holds, and the drain's sweep deletes
+/// them when it does not.
+pub fn within_purge(filed: Date, today: Date) -> bool {
     filed + Duration::days(APPLICATION_PURGE_DAYS) >= today
 }
 
 /// The day an application record was filed, from the RFC 3339 `filed_at` the
-/// record carries.
-fn filed_day(text: &str) -> Option<Date> {
+/// record carries. `None` is a boundary that cannot be proved, which both the
+/// export and the purge fail closed on.
+pub fn filed_day(text: &str) -> Option<Date> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let filed_at = value.get("filed_at")?.as_str()?;
     OffsetDateTime::parse(filed_at, &Rfc3339)
@@ -249,12 +253,10 @@ async fn written(
         ),
     ));
 
-    let purged = |day: Date| {
-        format!(
-            "purged after ADR 0005's 90-day window ended on {}; the platform no longer holds the answers.",
-            util::date_string(day + Duration::days(APPLICATION_PURGE_DAYS))
-        )
-    };
+    // The export says what is on disk. A copy past the window that the purge has
+    // not yet deleted is still held, so it is named and included, and the note
+    // says the purge is due rather than claiming it has run. The "purged"
+    // wording belongs to the case where the file has actually gone.
     let purge_note = match store.account_application_text(username).await? {
         Some(text) => match filed_day(&text) {
             Some(filed) if within_purge(filed, now.date()) => {
@@ -262,11 +264,15 @@ async fn written(
                 docs.push(("application.json".to_string(), text.into_bytes()));
                 format!("included; the answers are held until {until} under ADR 0005's 90-day purge")
             }
-            Some(filed) => purged(filed),
+            Some(filed) => {
+                let ended = util::date_string(filed + Duration::days(APPLICATION_PURGE_DAYS));
+                docs.push(("application.json".to_string(), text.into_bytes()));
+                format!("still held; ADR 0005's 90-day window ended on {ended}, so the purge is due, and the answers are included until the drain clears them away")
+            }
             // No readable filing date means the boundary cannot be proved, and
             // the purge rule fails closed: the answers are left out rather than
             // exported outside the window the record cannot show.
-            None => "purged; the record carries no readable filing date, so ADR 0005's 90-day boundary cannot be established and the answers are not included".to_string(),
+            None => "not included; the record carries no readable filing date, so ADR 0005's 90-day boundary cannot be established".to_string(),
         },
         None => "purged; the platform no longer holds the application answers (ADR 0005's 90-day purge has run)".to_string(),
     };

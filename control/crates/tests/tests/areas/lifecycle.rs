@@ -681,6 +681,165 @@ fn a_decline_purges_after_its_week_and_releases_the_username() {
     let _ = record;
 }
 
+/// Move a stored record's `filed_at` into the past, as the calendar does
+/// between passes.
+fn age_filed_at(fix: &Fix, rel: &str, days: i64) {
+    let path = fix.dir.join("store").join(rel);
+    let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let old = OffsetDateTime::now_utc() - time::Duration::days(days);
+    record["filed_at"] = json!(old
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap());
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+}
+
+/// ADR 0005's ninety days: an approved application's answers are cleared from
+/// the mailbox's copy and the token record on the first pass after the window,
+/// while `account.json` keeps the payment and the outside address. The token is
+/// journalled once, and a second pass adds no line.
+#[test]
+fn an_approved_applications_answers_purge_after_ninety_days() {
+    let fix = Fix::new("purge-approved");
+    let record = fix.filed_with(
+        "secretary",
+        "cash",
+        &[("rail", "cash"), ("cannot_pay", "I have no money")],
+        Some("applicant@example.invalid"),
+        Some((UPLOAD_KEY, "works")),
+    );
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let copy = "accounts/secretary/application.json";
+    let token = format!("applications/{TOKEN}.json");
+    assert!(
+        fix.dir.join("store").join(copy).exists(),
+        "the approval copies the application into the account"
+    );
+    age_filed_at(&fix, copy, 100);
+    age_filed_at(&fix, &token, 100);
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store").join(copy).exists(),
+        "the mailbox's copy still holds the answers"
+    );
+    assert!(
+        !fix.dir.join("store").join(&token).exists(),
+        "the token record still holds the answers"
+    );
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["outside_address"],
+        json!("applicant@example.invalid"),
+        "{account}"
+    );
+    assert!(
+        account["payment"].is_object(),
+        "the payment block stays with the account: {account}"
+    );
+
+    let line = format!("\"intent\":\"purge-{TOKEN}\"");
+    let counted = || fix.journal().matches(&line).count();
+    assert_eq!(counted(), 2, "applying and purged, once: {}", fix.journal());
+    assert!(
+        fix.journal().contains("\"kind\":\"purge\""),
+        "{}",
+        fix.journal()
+    );
+
+    // A retry over the cleared store adds nothing.
+    assert!(fix.drain().status.success());
+    assert_eq!(counted(), 2, "{}", fix.journal());
+}
+
+/// Inside the window the answers stay: the boundary is the ninetieth day, and
+/// nothing is purged before it ends.
+#[test]
+fn an_approved_applications_answers_are_kept_inside_ninety_days() {
+    let fix = Fix::new("purge-inside");
+    approved_paid(&fix, "secretary", "cash");
+    let copy = "accounts/secretary/application.json";
+    let token = format!("applications/{TOKEN}.json");
+    age_filed_at(&fix, copy, 10);
+    age_filed_at(&fix, &token, 10);
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.dir.join("store").join(copy).exists(),
+        "the answers were purged inside the window"
+    );
+    assert!(
+        fix.dir.join("store").join(&token).exists(),
+        "the token record was purged inside the window"
+    );
+    assert!(
+        !fix.journal()
+            .contains(&format!("\"intent\":\"purge-{TOKEN}\"")),
+        "{}",
+        fix.journal()
+    );
+}
+
+/// An application that was never decided is abandoned after the window: its
+/// record goes and its username is released when nothing holds it. A record
+/// whose filing date cannot be read is left alone, because the boundary cannot
+/// be proved.
+#[test]
+fn an_abandoned_application_purges_after_ninety_days_and_releases_the_username() {
+    let fix = Fix::new("purge-abandoned");
+    let record = fix.filed_with("secretary", "cash", &[("rail", "cash")], None, None);
+    let path = fix.dir.join(format!("store/applications/{TOKEN}.json"));
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    age_filed_at(&fix, &format!("applications/{TOKEN}.json"), 100);
+
+    let mut undated = record.clone();
+    undated["status_token"] = json!(OTHER_TOKEN);
+    undated["filed_at"] = json!("last Tuesday");
+    let undated_path = fix
+        .dir
+        .join(format!("store/applications/{OTHER_TOKEN}.json"));
+    std::fs::write(&undated_path, serde_json::to_vec_pretty(&undated).unwrap()).unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(!path.exists(), "the abandoned record was not purged");
+    assert!(
+        undated_path.exists(),
+        "the undated record was purged on a guess"
+    );
+    assert!(
+        fix.scripts_log().contains("delete-user.sh secretary"),
+        "the username is released: {}",
+        fix.scripts_log()
+    );
+    let line = format!("\"intent\":\"purge-{TOKEN}\"");
+    assert_eq!(fix.journal().matches(&line).count(), 2, "{}", fix.journal());
+    assert!(
+        !fix.journal()
+            .contains(&format!("\"intent\":\"purge-{OTHER_TOKEN}\"")),
+        "{}",
+        fix.journal()
+    );
+
+    // A retry adds no line and runs no second release.
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.scripts_log()
+            .matches("delete-user.sh secretary")
+            .count(),
+        1,
+        "{}",
+        fix.scripts_log()
+    );
+    assert_eq!(fix.journal().matches(&line).count(), 2, "{}", fix.journal());
+}
+
 /// Running the drain twice over one `intents/` directory leaves the same store
 /// and sends no notice twice. The second pass is made to re-read the same intent,
 /// the state a run that died before it deleted the file leaves, so the pass

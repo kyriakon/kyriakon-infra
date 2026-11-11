@@ -491,8 +491,9 @@ fn the_bundle_lands_in_the_chroot_and_the_notice_is_recorded() {
 }
 
 /// The application answers are in the bundle only inside ADR 0005's 90 days.
-/// After the window the file is not there and the manifest says where it went,
-/// rather than leaving a silence.
+/// A copy past the window that the sweep has not reached yet is still held, so
+/// the bundle carries it and the manifest says the purge is due; "purged" is
+/// said only once the file has actually gone.
 #[test]
 fn the_application_is_in_the_bundle_only_inside_the_purge() {
     let fix = Fix::new("data-export-purge");
@@ -505,9 +506,8 @@ fn the_application_is_in_the_bundle_only_inside_the_purge() {
     assert!(first.join("application.json").is_file());
     assert!(file(&first, "MANIFEST.txt").contains("included"));
 
-    // Age the retained copy past the window. The purge's own sweep is not what
-    // this test exercises: the export must apply the boundary to the copy it
-    // finds, so a purge that has not run cannot leak the answers.
+    // Age the retained copy past the window. The sweep has not run, so the file
+    // is still on disk: the export must say so rather than claim it is gone.
     let path = fix.dir.join("store/accounts/secretary/application.json");
     let mut copy: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let old = OffsetDateTime::now_utc() - time::Duration::days(100);
@@ -521,11 +521,27 @@ fn the_application_is_in_the_bundle_only_inside_the_purge() {
     let out = fix.ctl(&["export", "secretary"]);
     assert!(out.status.success(), "{}", body(&out));
     let second = bundle(&fix, "secretary");
-    assert!(!second.join("application.json").exists());
+    assert!(
+        second.join("application.json").is_file(),
+        "the answers are still on disk, so the export still holds them"
+    );
     let manifest = file(&second, "MANIFEST.txt");
     let ended = (old.date() + time::Duration::days(90)).to_string();
-    assert!(manifest.contains("purged"), "{manifest}");
+    assert!(manifest.contains("still held"), "{manifest}");
+    assert!(manifest.contains("purge is due"), "{manifest}");
     assert!(manifest.contains(&ended), "{manifest}");
+    assert!(!manifest.contains("no longer holds"), "{manifest}");
+
+    // After the drain's sweep the file is gone, and only then does the same
+    // request say purged.
+    assert!(fix.drain().status.success());
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let out = fix.ctl(&["export", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let third = bundle(&fix, "secretary");
+    assert!(!third.join("application.json").exists());
+    let manifest = file(&third, "MANIFEST.txt");
+    assert!(manifest.contains("no longer holds"), "{manifest}");
 }
 
 /// A filing date that cannot be read fails the purge rule closed: the answers

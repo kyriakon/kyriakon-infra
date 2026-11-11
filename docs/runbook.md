@@ -275,6 +275,22 @@ When the drain is stuck, read in this order: the drain's log, the oldest file in
 
 Do not edit `account.json` by hand. A hand edit that fails validation stops the transition rather than being repaired, and the journal then disagrees with the file.
 
+### The application review mail
+
+`drain.toml` names `admin@kyriakon.net` as the `reviewer`, and every filed
+application is mailed there whole: the answers, the mail-key result, whether an
+upload key was supplied, the rail, the no-charge flag and the three signed links
+(`control/crates/drain/src/transitions/review.rs`). ADR 0005's ninety days cover
+the store, not that mailbox. The drain purges `accounts/<username>/application.json`
+and `applications/<token>.json` when the window ends, and it cannot reach a message
+already delivered as ordinary mail.
+
+Prune the review mail by hand. Delete each `Subject: kyriakon: control: application
+filed (...)` message from `admin@kyriakon.net` once the decision is made, and no
+later than the 90th day after the application was filed. The first exclusion in
+`answer` (`control/crates/core/src/account/export.rs`) says ADR 0005's purge bounds
+the text in the operator's mailbox, and that is only true while this is done.
+
 ### The publish an approval opens
 
 An approval writes the member's key into `/etc/kyriakon/keys/<localpart>.asc` so delivery works, and the same key has to reach the published set, which is `keys/` in this repository. The drain does that itself through `scripts/publish-mail-key.sh`, so no human copies a file and the box publishes without one.
