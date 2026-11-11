@@ -1399,7 +1399,8 @@ pub fn token_is_a_link(page: &str, token: &str) -> bool {
 
 /// The export's keyed header, in the order the accountant's sheet takes.
 pub const EXPORT_HEADER: &str = "seq,token,kind,rail,received_on,amount_gbp,applied_gbp,\
-paid_until_after,amount_xmr,txid,refund_of,settled_on,rate_quoted,rate_source,rate_at";
+paid_until_after,amount_xmr,txid,refund_of,settled_on,refund_basis,rate_refund,rate_quoted,\
+rate_source,rate_at,rate_received,rate_received_source,rate_received_at";
 
 /// An add-user.sh that logs whether the confirmation had already reached the
 /// enqueuer when the first provisioning script ran. `sent` is the enqueuer's

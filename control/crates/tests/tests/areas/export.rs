@@ -104,10 +104,43 @@ fn the_export_prints_a_refund_as_a_negative_row_naming_its_seq() {
     ]);
     assert!(out.status.success(), "{}", body(&out));
     assert!(fix.drain().status.success());
+    let refund_seq = refund_lines(&fix)[0]["seq"].as_u64().unwrap();
+
+    // Filed but not yet paid: the refund is listed apart, never as a deduction
+    // in the year's takings.
+    let out = fix.ctl(&[
+        "ledger",
+        "export",
+        "--tax-year",
+        "2026-27",
+        "--format",
+        "csv",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let csv = String::from_utf8_lossy(&out.stdout).into_owned();
+    let (keyed, rest) = csv
+        .split_once("\n\n# unsettled refunds\n")
+        .expect("the unsettled section is after a blank line");
+    assert!(
+        !keyed
+            .lines()
+            .any(|line| line.starts_with(&format!("{refund_seq},"))),
+        "an unpaid refund was taken as negative revenue: {csv}"
+    );
+    let unsettled = rest
+        .split_once("\n\n# unattributed\n")
+        .expect("the unattributed section follows")
+        .0;
+    assert!(
+        unsettled
+            .lines()
+            .any(|line| line.starts_with(&format!("{refund_seq},"))),
+        "the unpaid refund is not listed apart: {csv}"
+    );
+
     let out = fix.ctl(&["refund", "--token", &token, "--settled", "2026-11-05"]);
     assert!(out.status.success(), "{}", body(&out));
     assert!(fix.drain().status.success());
-    let refund_seq = refund_lines(&fix)[0]["seq"].as_u64().unwrap();
 
     let out = fix.ctl(&[
         "ledger",
@@ -320,7 +353,9 @@ fn the_export_refuses_a_bad_year_and_a_format_that_is_not_csv() {
     assert!(out.status.success(), "{}", body(&out));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        format!("{EXPORT_HEADER}\n\n# unattributed\nid,rail,received_on,amount_gbp\n"),
+        format!(
+            "{EXPORT_HEADER}\n\n# unsettled refunds\nseq,token,rail,received_on,amount_gbp,refund_of\n\n# unattributed\nid,rail,received_on,amount_gbp\n"
+        ),
         "a missing ledger reads as empty"
     );
 }
