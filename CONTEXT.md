@@ -38,10 +38,28 @@ hostname, generated once with a ten-year life; an own-domain capsule gets its ow
 key is held in the backup set because nothing reissues a self-signed pair.
 _Avoid_: gemini certificate, TOFU certificate
 
+**The control plane**:
+The subsystem under `control/`: the handler that serves the web form and the capsule,
+the ssh portal, the root drain that settles intents, and the operator console, built as
+four programs and installed in `/usr/local/sbin`. It is the layer between a public
+front-end and a privileged change on the box: a front-end files one intent and the
+drain carries it out. The name says what the layer does, because only one of its four
+programs is onboarding; the applicant journey keeps that word.
+_Avoid_: onboarding service (names the signup form and misdescribes the drain and the console)
+
+**The console**:
+The operator's CLI, `/usr/local/sbin/kyriakon-admin`, built from
+`control/crates/admin/`. It reviews an application, records money, refunds, exports and
+data-subject requests, and suspends or deletes an account. It is the smallest possible
+writer: a change that belongs to a transition is filed as an intent and applied by the
+drain on its next pass, so a console command and a click on a signed link cannot take
+different paths.
+_Avoid_: onboardctl (the name the console had before the control-plane rename, #633)
+
 **The portal**:
 The onboarding session over ssh: the second sshd instance, the login class naming
-`/usr/local/sbin/kyriakon-onboard-tui` as its shell, and the Rust program that path
-holds, built from `onboard/crates/tui/src/lib.rs`. It is the third front-end beside the web
+`/usr/local/sbin/kyriakon-control-tui` as its shell, and the Rust program that path
+holds, built from `control/crates/tui/src/lib.rs`. It is the third front-end beside the web
 form and the capsule, and it reads the same catalogue and asks the same questions
 from the same files. It chooses between its two modes, the drawing and the plain
 one, from the session's own terminal rather than from a flag, so a session with no

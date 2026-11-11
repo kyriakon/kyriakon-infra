@@ -1,0 +1,444 @@
+//! The signing the review email and the one-time password link rest on.
+//!
+//! Both links are HMAC-SHA256 over a canonical payload, keyed from the
+//! root-only file `scripts/deploy-control.sh` installs as
+//! `/etc/kyriakon/onboard/approval-signing-key`. The drain signs and the drain
+//! verifies: the handler only passes a click through as an intent, so the key
+//! never leaves root and the unprivileged half never holds it.
+//!
+//! HMAC rather than a public-key signature because the verifier is the signer.
+//! The one thing a signature would add is verification by a party that does not
+//! hold the key, and there is no such party here: the links are checked by the
+//! same root process that made them, moments later. An HMAC is one small
+//! dependency pair rather than a keypair to store, rotate and publish, and it
+//! gives exactly the property the links need, which is that a link cannot be
+//! fabricated without the key and that a signature from one application cannot
+//! be replayed against another.
+
+use crate::Error;
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// The key file, as the operator installed it. A trailing newline is the shape
+/// a `printf` or an `install` of a generated secret leaves, and it is not part
+/// of the key: stripping it here is what lets the same secret be written either
+/// way. An empty file is an error rather than an empty key, because an empty
+/// key would sign every application with nothing.
+///
+/// The file must not be readable by group or others, and, when the drain is
+/// running as root, it must be owned by root. Both checks are the operator's
+/// own rule made enforceable: the config, the deploy script and the spec all
+/// describe this as a root-only file, and this is the one place that reads it.
+pub fn read_key(path: &std::path::Path) -> Result<Vec<u8>, Error> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| Error::context(format!("cannot read {}", path.display()), e))?;
+    if unsafe { libc::geteuid() } == 0 && meta.uid() != 0 {
+        return Err(Error::Failed(format!(
+            "{} is not owned by root",
+            path.display()
+        )));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(Error::Failed(format!(
+            "{} is readable by group or others; it must be 0600",
+            path.display()
+        )));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|e| Error::context(format!("cannot read {}", path.display()), e))?;
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let key = bytes[..end].to_vec();
+    if key.is_empty() {
+        return Err(Error::Failed(format!("{} is empty", path.display())));
+    }
+    Ok(key)
+}
+
+/// The signature of one payload, lowercase hex. Infallible in practice: HMAC
+/// accepts a key of any length, and the error path is kept so a caller writes
+/// `?` rather than an `unwrap` on a value the OS randomness feeds.
+pub fn sign(key: &[u8], payload: &str) -> Result<String, Error> {
+    sign_bytes(key, payload.as_bytes())
+}
+
+/// The same signature over bytes, for a payload that is not text: a webhook's
+/// raw body is verified exactly as it arrived, and a lossy reread of it would
+/// not be the bytes Stripe signed.
+pub fn sign_bytes(key: &[u8], payload: &[u8]) -> Result<String, Error> {
+    let mut mac =
+        HmacSha256::new_from_slice(key).map_err(|e| Error::context("cannot key the HMAC", e))?;
+    mac.update(payload);
+    Ok(hex(&mac.finalize().into_bytes()))
+}
+
+/// Whether a signature is the one this key makes for this payload. The compare
+/// is over the recomputed signature byte by byte and not with `==`, so the time
+/// it takes does not tell a caller how much of a guess was right.
+pub fn verify(key: &[u8], payload: &str, sig: &str) -> bool {
+    verify_bytes(key, payload.as_bytes(), sig)
+}
+
+/// Whether a signature is the one this key makes for these bytes. Constant time
+/// for the reason [`verify`] is.
+pub fn verify_bytes(key: &[u8], payload: &[u8], sig: &str) -> bool {
+    match sign_bytes(key, payload) {
+        Ok(want) => constant_eq(want.as_bytes(), sig.as_bytes()),
+        Err(_) => false,
+    }
+}
+
+/// The payload a review link signs: the application it decides and the decision
+/// it carries. Both halves are in it, so a link for one application cannot be
+/// replayed against another even if a token were reused.
+pub fn decide_payload(token: &str, action: &str) -> String {
+    format!("decide:{token}:{action}")
+}
+
+/// The payload the one-time password link signs. The date is in the payload so
+/// the expiry is covered by the signature and not merely beside it. The password
+/// is not, and cannot usefully be: the drain hashes the plaintext the handler
+/// files, so the signature proves the link and not the password. A compromised
+/// handler can therefore still choose the plaintext it submits, and so set a
+/// password it knows; it cannot install a chosen hash without a plaintext that
+/// produces it.
+pub fn password_payload(token: &str, until: &str) -> String {
+    format!("password:{token}:{until}")
+}
+
+/// The payload a group-address intent signs: every field the drain acts on, so
+/// a signature for one address change cannot be replayed as another. The
+/// replacement site owner is empty when the change names none, and a mail key
+/// is covered by its SHA-256 so a handler that holds a valid signature cannot
+/// swap the key the drain installs and publishes.
+pub fn address_payload(
+    domain: &str,
+    action: &str,
+    address: &str,
+    mailbox: &str,
+    site_owner: &str,
+    mail_key: &str,
+) -> String {
+    let key = if mail_key.is_empty() {
+        String::new()
+    } else {
+        hex(Sha256::digest(mail_key.as_bytes()).as_slice())
+    };
+    format!("address:{domain}:{action}:{address}:{mailbox}:{site_owner}:{key}")
+}
+
+/// The payload a remove-group intent signs: the domain the drain is asked to
+/// take down. Nothing else is in the intent for the drain to act on, so a
+/// signature for one body's domain cannot be replayed against another's.
+pub fn group_remove_payload(domain: &str) -> String {
+    format!("remove-group:{domain}")
+}
+
+/// The payload a `provision-group` intent signs: every field the drain acts on.
+/// The approval files it, because `intents/` and `applications/` both belong to
+/// the unprivileged half and this intent creates system accounts as root. The
+/// domain, the body's words, the payment, the address table, the mailboxes, the
+/// site owner, the upload key, the mail keys and the application the intent
+/// claims to come from are all covered, so a signature for one body cannot be
+/// replayed with another's mailbox or key. Every text field is length-prefixed,
+/// so a colon inside one cannot be read as the separator before the next.
+pub fn group_provision_payload(intent: &crate::store::GroupIntent) -> String {
+    let addresses = intent
+        .addresses
+        .iter()
+        .map(|a| format!("{}={}", free_text(&a.address), free_text(&a.mailbox)))
+        .collect::<Vec<_>>()
+        .join(";");
+    let mail_keys = intent
+        .mail_keys
+        .iter()
+        .map(|k| {
+            format!(
+                "{}={}={}={}",
+                free_text(&k.mailbox),
+                free_text(&k.fingerprint),
+                free_text(&k.material),
+                free_text(&k.verdict)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let payment = &intent.payment;
+    let window = payment
+        .window
+        .as_ref()
+        .map(|w| {
+            format!(
+                "{}={}={}={}",
+                free_text(&w.opened_at),
+                free_text(&w.closes_at),
+                free_text(&w.state),
+                w.extensions
+            )
+        })
+        .unwrap_or_default();
+    let stripe = &payment.stripe;
+    let stripe = format!(
+        "{}={}={}={}={}={}={}={}",
+        free_text(stripe.subscription.as_deref().unwrap_or("")),
+        free_text(stripe.customer.as_deref().unwrap_or("")),
+        free_text(stripe.status.as_deref().unwrap_or("")),
+        stripe.cancel_at_period_end,
+        free_text(stripe.current_period_end.as_deref().unwrap_or("")),
+        free_text(stripe.next_payment_attempt.as_deref().unwrap_or("")),
+        stripe.failed_attempts,
+        free_text(stripe.last_invoice.as_deref().unwrap_or("")),
+    );
+    format!(
+        "provision-group:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        free_text(&intent.domain),
+        free_text(&intent.name),
+        free_text(&intent.body_kind),
+        free_text(&payment.rail),
+        payment.no_charge,
+        free_text(payment.paid_until.as_deref().unwrap_or("")),
+        free_text(payment.token_ref.as_deref().unwrap_or("")),
+        free_text(&window),
+        free_text(&stripe),
+        free_text(&addresses),
+        free_text(&intent.mailboxes.join(",")),
+        free_text(&intent.site_owner),
+        free_text(&intent.upload_key),
+        free_text(&mail_keys),
+        free_text(&intent.application.username),
+        free_text(intent.application.status_token.as_deref().unwrap_or("")),
+    )
+}
+
+/// The payload a token-resend intent signs: the account and the token it holds.
+/// The console signs it, because a second copy of the instructions is the
+/// member's to ask for and not the handler's to file.
+pub fn resend_payload(username: &str, token: &str) -> String {
+    format!("resend:{username}:{token}")
+}
+
+/// Free text as one unambiguous field: its byte length, then the text. Two
+/// fields whose text contains the separator cannot shift a colon from one field
+/// into the next, which a plain `:` join would allow when both are free text.
+fn free_text(text: &str) -> String {
+    format!("{}:{text}", text.len())
+}
+
+/// The payload a credit intent signs: every field the drain acts on, because
+/// `intents/` belongs to the unprivileged half and a credit moves a paid-until
+/// date. The token, rail, amount and date are validated shapes; the override
+/// reason and the note are free text, so each is length-prefixed and cannot
+/// shift a colon into the other.
+#[allow(clippy::too_many_arguments)]
+pub fn credit_payload(
+    token: &str,
+    rail: &str,
+    amount_gbp: &str,
+    received: &str,
+    txid: Option<&str>,
+    amount_xmr: Option<&str>,
+    confirm_double: bool,
+    override_reason: Option<&str>,
+    note: Option<&str>,
+) -> String {
+    format!(
+        "credit:{token}:{rail}:{amount_gbp}:{received}:{}:{}:{confirm_double}:{}:{}",
+        txid.unwrap_or(""),
+        amount_xmr.unwrap_or(""),
+        free_text(override_reason.unwrap_or("")),
+        free_text(note.unwrap_or("")),
+    )
+}
+
+/// The payload a `window-extend` intent signs: the token, the number of days and
+/// the reason the operator recorded. The reason is free text and last, so no
+/// earlier field can be shifted into it by a colon.
+pub fn window_extend_payload(token: &str, days: i64, reason: &str) -> String {
+    format!("window-extend:{token}:{days}:{reason}")
+}
+
+/// The payload a `reconcile-attribute` intent signs: the held item, the token it
+/// is joined to, and the two acknowledgements a renewal needs. All are covered,
+/// so a signature for one item cannot be replayed with a different token or a
+/// different acknowledgement. The override reason is free text and
+/// length-prefixed.
+#[allow(clippy::too_many_arguments)]
+pub fn reconcile_attribute_payload(
+    item: &str,
+    token: &str,
+    confirm_double: bool,
+    override_reason: Option<&str>,
+) -> String {
+    format!(
+        "reconcile-attribute:{item}:{token}:{confirm_double}:{}",
+        free_text(override_reason.unwrap_or("")),
+    )
+}
+
+/// The payload a `reconcile-return` intent signs: the held item and the evidence
+/// the operator wrote down, which is free text and last.
+pub fn reconcile_return_payload(item: &str, note: &str) -> String {
+    format!("reconcile-return:{item}:{note}")
+}
+
+/// The payload a refund intent signs: every field the drain acts on. A refund
+/// writes the ledger and can close an account, and `intents/` belongs to the
+/// unprivileged half, so the token, the amount, the rail, the
+/// `--close`/`--excess` choice, the rate and the settlement date are all
+/// covered. The reason is free text and comes last, so no earlier field can be
+/// shifted into it by a colon.
+#[allow(clippy::too_many_arguments)]
+pub fn refund_payload(
+    token: &str,
+    amount_gbp: &str,
+    rail: &str,
+    close: bool,
+    excess: bool,
+    rate: &str,
+    settled_on: &str,
+    reason: &str,
+) -> String {
+    format!("refund:{token}:{amount_gbp}:{rail}:{close}:{excess}:{rate}:{settled_on}:{reason}")
+}
+
+/// One decision link, pointing at the handler's click-through path.
+pub fn decide_link(base: &str, key: &[u8], token: &str, action: &str) -> Result<String, Error> {
+    let sig = sign(key, &decide_payload(token, action))?;
+    Ok(format!("{base}/decide/{token}?action={action}&sig={sig}"))
+}
+
+/// The one-time password link, the same mechanism as the review links.
+pub fn password_link(base: &str, key: &[u8], token: &str, until: &str) -> Result<String, Error> {
+    let sig = sign(key, &password_payload(token, until))?;
+    Ok(format!("{base}/password/{token}?until={until}&sig={sig}"))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const D: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(D[(b >> 4) as usize] as char);
+        out.push(D[(b & 15) as usize] as char);
+    }
+    out
+}
+
+fn constant_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_signature_is_stable_and_keyed() {
+        let a = sign(b"k", "decide:tok:approve").unwrap();
+        let b = sign(b"k", "decide:tok:approve").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64, "{a}");
+        assert!(a
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        // A different key and a different payload each give a different one.
+        assert_ne!(a, sign(b"k2", "decide:tok:approve").unwrap());
+        assert_ne!(a, sign(b"k", "decide:tok:decline").unwrap());
+    }
+
+    #[test]
+    fn a_signature_verifies_only_for_its_own_payload() {
+        let key = b"the approval key";
+        let payload = decide_payload("tok", "approve");
+        let sig = sign(key, &payload).unwrap();
+        assert!(verify(key, &payload, &sig));
+        // A signature for one application does not verify against another, so a
+        // link cannot be replayed across applications.
+        assert!(!verify(key, &decide_payload("tok2", "approve"), &sig));
+        assert!(!verify(key, &decide_payload("tok", "decline"), &sig));
+        assert!(!verify(b"other key", &payload, &sig));
+        // A truncated or padded signature is refused rather than panicking.
+        assert!(!verify(key, &payload, ""));
+        assert!(!verify(key, &payload, &format!("{sig}0")));
+    }
+
+    #[test]
+    fn a_key_file_is_read_without_its_trailing_newline() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("onboard-sign-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key");
+        let write = |bytes: &[u8]| {
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write(b"secret\n");
+        assert_eq!(read_key(&path).unwrap(), b"secret");
+        write(b"secret");
+        assert_eq!(read_key(&path).unwrap(), b"secret");
+        // A key the rest of the machine can read is refused: the file is the
+        // one secret the review and password links depend on.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            read_key(&path).is_err(),
+            "a group/other-readable key is refused"
+        );
+        write(b"\n");
+        assert!(read_key(&path).is_err(), "an empty key is refused");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn free_text_cannot_shift_a_colon_between_two_fields() {
+        let a = credit_payload(
+            "KYR-4F2M-9QH7-XT3B",
+            "cash",
+            "20.00",
+            "2026-10-04",
+            None,
+            None,
+            false,
+            Some("a:b"),
+            Some("c"),
+        );
+        let b = credit_payload(
+            "KYR-4F2M-9QH7-XT3B",
+            "cash",
+            "20.00",
+            "2026-10-04",
+            None,
+            None,
+            false,
+            Some("a"),
+            Some("b:c"),
+        );
+        assert_ne!(a, b, "two field splits signed the same payload");
+    }
+
+    #[test]
+    fn the_links_put_the_token_in_the_path_and_the_signature_in_the_query() {
+        let key = b"k";
+        let link = decide_link("https://signup.kyriakon.net", key, "tok", "approve-free").unwrap();
+        assert_eq!(
+            link,
+            format!(
+                "https://signup.kyriakon.net/decide/tok?action=approve-free&sig={}",
+                sign(key, "decide:tok:approve-free").unwrap()
+            )
+        );
+        let pw = password_link("https://signup.kyriakon.net", key, "tok", "2026-10-20").unwrap();
+        assert!(pw.contains("/password/tok?until=2026-10-20&sig="), "{pw}");
+    }
+}

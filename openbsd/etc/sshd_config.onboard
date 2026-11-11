@@ -63,4 +63,4 @@ Match User hello
 	PermitUserRC no
 
 	# The one program the account can run, on every path.
-	ForceCommand /usr/local/sbin/kyriakon-onboard-tui
+	ForceCommand /usr/local/sbin/kyriakon-control-tui

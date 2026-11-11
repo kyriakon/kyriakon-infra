@@ -5,7 +5,7 @@
 # the certificate queue in issue #288), each tripping a content-rich alert:
 #   1. outbound mail-volume spike: relayed message count (MTA sessions)
 #   2. auth failures: smtpd + dovecot (maillog), sshd (authlog), and the
-#      onboarding instance's admissions per source, which are what the second
+#      applicant sshd's admissions per source, which are what the second
 #      public listener adds to authlog
 #      mail-side: a real member at one, an unknown username above a bound; ssh
 #      per source address
@@ -14,7 +14,7 @@
 #   5. senders deferred from several addresses: mail lost to a rotating retry IP
 #   6. IP reputation blocklist: reversed-IPv4 A lookup on a DNSBL, and whether the
 #      strongest list was the one that answered
-#   7. onboarding drain: intents filed and left unapplied
+#   7. drain: intents filed and left unapplied
 #   8. backup recency: a restic snapshot inside the last 26 hours
 #   9. root filesystem: / filling, and any filesystem with none left
 #  10. certificate queue: the age of the oldest pending certificate request
@@ -50,12 +50,12 @@
 #   DNSBL_ZONES            blocklists to query, strongest first (default in lib.sh:
 #                          zen.spamhaus.org bl.spamcop.net all.s5h.net dnsbl.dronebl.org)
 #   MAIL_SPIKE_MAX         outbound msgs per run that counts as a spike (default 50)
-#   AUTH_FAIL_MAX          failed ssh logins, or onboarding admissions, from one
+#   AUTH_FAIL_MAX          failed ssh logins, or applicant admissions, from one
 #                          address before alert (default 300)
 #   QUOTA_WARN_PCT         quota usage % of soft limit that trips the alert (default 80)
 #   GREY_MAX               spamd greylist entries before "flood" alert (default 100)
 #   DEFER_MIN              distinct addresses one sender may be deferred from before it alerts (default 6)
-#   ONBOARD_DIR            the onboarding store the drain applies intents from
+#   ONBOARD_DIR            the store the drain applies intents from
 #                          (default /var/db/kyriakon-onboard)
 #   DRAIN_INTENT_MAX_MIN   minutes an intent may sit unapplied (default 240)
 #   ACME_QUEUE_DIR         the certificate queue store, whose pending/ directory
@@ -90,12 +90,12 @@ fi
 # A storm keeps a signal true for hours, and telling the operator the same thing
 # every hour is how an alert channel stops being read. These are the ones a
 # stranger can hold true indefinitely: a source working through a list of
-# usernames, one opening onboarding sessions in a loop, and a spamtrap campaign.
+# usernames, one opening applicant sessions in a loop, and a spamtrap campaign.
 # Everything else fires on a condition that has to be dealt with, so the shorter
 # default suits it.
 cooldown_for() {
 	case "$1" in
-	"ssh guesses" | "ssh onboard admissions" | "spamd blocklist")
+	"ssh guesses" | "ssh applicant admissions" | "spamd blocklist")
 		printf '%s' "${STORM_COOLDOWN_MINUTES:-360}"
 		;;
 	*) printf '%s' "${alert_cooldown:-60}" ;;
@@ -118,7 +118,7 @@ cooldown_for() {
 # account.
 #
 # admissions anchors on the "Accepted" line naming hello, which is the account
-# the onboarding instance serves: the applicant's "Accepted none for hello from
+# the applicant sshd serves: the applicant's "Accepted none for hello from
 # <address> port <n> ssh2" and the member port's "Accepted publickey for hello
 # from <address> port <n> ssh2: <type> SHA256:<fingerprint>". It takes neither a
 # member's own login on 22 nor the operator's, which name their own accounts,
@@ -316,10 +316,10 @@ self_test() {
 
 	# The cooldown two signals get for being holdable by a stranger.
 	check "a storm signal waits six hours" "$(cooldown_for "ssh guesses")" "360"
-	check "an admission flood gets the storm cooldown" "$(cooldown_for "ssh onboard admissions")" "360"
+	check "an admission flood gets the storm cooldown" "$(cooldown_for "ssh applicant admissions")" "360"
 	check "an ordinary signal waits the default hour" "$(cooldown_for "quota")" "60"
 
-	# The authlog split: the onboarding instance's two admission forms, a
+	# The authlog split: the applicant sshd's two admission forms, a
 	# member's own login on 22 and the operator's, an unknown username's usual
 	# pair of failure lines, and the hello lines that are not admissions (the
 	# member port's Postponed and Failed publickey, and a failed password). The
@@ -615,7 +615,7 @@ if [ "$ssh_high" -gt "$auth_fail_max" ]; then
 	alert ssh "guesses" "$ssh_ip made $ssh_high failed ssh attempts since last run, out of $ssh_total from all addresses (max per address $auth_fail_max). Password auth is off everywhere, so none of this can succeed; it is worth a look only because one source is working through a list"
 fi
 
-# The onboarding listener's admissions, counted beside the failures and from the
+# The applicant listener's admissions, counted beside the failures and from the
 # same window. Both admitted forms name the account hello, which is what keeps a
 # member's own login on 22 and the operator's out of the count; the applicant's
 # is "Accepted none for hello from", the member port's "Accepted publickey for
@@ -634,7 +634,7 @@ fi
 set -- $(printf '%s\n' "$new_authlog" | source_tally admissions)
 onboard_ip=$1 onboard_high=${2:-0} onboard_total=${3:-0}
 if [ "$onboard_high" -gt "$auth_fail_max" ]; then
-	alert ssh "onboard admissions" "$onboard_ip opened $onboard_high onboarding sessions since last run, out of $onboard_total from all addresses (max per address $auth_fail_max). The applicant port asks for no credential, so a source this busy is a script rather than a person; the TUI's session caps are what stop it filing, and this count is what says they are being reached"
+	alert ssh "applicant admissions" "$onboard_ip opened $onboard_high applicant sessions since last run, out of $onboard_total from all addresses (max per address $auth_fail_max). The applicant port asks for no credential, so a source this busy is a script rather than a person; the TUI's session caps are what stop it filing, and this count is what says they are being reached"
 fi
 
 # --- 3. quota approach ---------------------------------------------------
@@ -837,8 +837,8 @@ if [ -n "$ip" ]; then
 	esac
 fi
 
-# --- 7. onboarding drain: health and backlog -----------------------------
-# The drain is the privileged half of the onboarding service (issue #156): a
+# --- 7. drain: health and backlog -----------------------------
+# The drain is the privileged half of the control plane (issue #156): a
 # root cron job that applies the intents the unprivileged handler files, one
 # file per intent under the store's intents/ directory. It is not built yet, so
 # on a box without the store this check reads nothing and says nothing; it
@@ -868,7 +868,7 @@ if [ -d "$intents_dir" ]; then
 		pending=$(find "$intents_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
 		age_min=$(( ( $(date +%s) - oldest ) / 60 ))
 		if [ "$age_min" -gt "$drain_intent_max_min" ]; then
-			alert onboard "drain backlog" "$pending unapplied intent(s) in the onboarding store, oldest $age_min minutes (max $drain_intent_max_min). The drain is the service's privileged half; an intent this old is a member whose payment or approval was accepted and who still has no account"
+			alert control "drain backlog" "$pending unapplied intent(s) in the store, oldest $age_min minutes (max $drain_intent_max_min). The drain is the service's privileged half; an intent this old is a member whose payment or approval was accepted and who still has no account"
 		fi
 	fi
 fi

@@ -1,4 +1,4 @@
-# Prepaid payment rails in the onboarding service
+# Prepaid payment rails in the control plane
 
 > Spec synthesised from [Spec the prepaid payment rails in the onboarding service](https://github.com/kyriakon/kyriakon-infra/issues/114) and the decisions it points at: [#151](https://github.com/kyriakon/kyriakon-infra/issues/151) (the Stripe rail set), [#152](https://github.com/kyriakon/kyriakon-infra/issues/152) (the agreement set, the refund position and the ledger key), [#153](https://github.com/kyriakon/kyriakon-infra/issues/153) (the lifecycle states), [#156](https://github.com/kyriakon/kyriakon-infra/issues/156) (the service's architecture and trust boundary), [#158](https://github.com/kyriakon/kyriakon-infra/issues/158) (what the site may promise) and [#159](https://github.com/kyriakon/kyriakon-infra/issues/159) (the flow and the account page). ADR 0009 in the sibling meta repository keys the financial ledger by the approval token. Working material: this file lives in `docs/planning/specs/` until its tickets close.
 
@@ -26,7 +26,7 @@ The service keeps its two halves. The internet-facing handler renders the accoun
 
 **Lifetime.** The token is created at a paid approval and the account carries a reference to it for as long as the account exists. The status page answers with it for seven days after the decision, and the account page shows it in full while `paid_until` is null. Once a credit has set a paid-until date, the account page stops showing it, which is the [#114](https://github.com/kyriakon/kyriakon-infra/issues/114) decision that the token is visible again only while the account is unpaid. The string stays in the ledger for the records duty, which runs five years past the filing deadline and six once VAT is registered, and the mapping from the string to the username is deleted with the account.
 
-**Reissue.** There is no reissue. `onboardctl token resend` sends the same token again, because a second token for one account would leave the first one in the ledger as an entry that no longer resolves to the same member, and would orphan a payment already in flight.
+**Reissue.** There is no reissue. `kyriakon-admin token resend` sends the same token again, because a second token for one account would leave the first one in the ledger as an entry that no longer resolves to the same member, and would orphan a payment already in flight.
 
 **Custody.** The token is a bearer secret: anyone holding it can open the status page, and anyone holding it can have a payment attributed to that account. It is never written to a log line, never put in a URL that is logged by `relayd`, and never sent to a third party. The status page is rate-limited per source address in the handler, and a lookup that finds no token returns the same page as an expired application, so the endpoint cannot be used to test whether a token exists.
 
@@ -86,7 +86,7 @@ A paid approval opens the window. `paid_until` is null at that moment, the accou
 
 The window closes and the account lapses. Lapsed is the [#153](https://github.com/kyriakon/kyriakon-infra/issues/153) state, not a new one: mail keeps arriving and stays readable, everything published stays up, and sending, uploading and pushing stop. The account is not deleted. The 40-day grace and the notices that lead to deletion are the same ones the failed-renewal path already uses, and the seven-day final notice runs from the same sweep.
 
-One extension is available. A member who says the money is in the post gets `onboardctl window extend <token> --days 14 --reason "member says posted"`, which moves `closes_at` fourteen days and increments a counter on the window. A second extension is refused. This exists because the post is unreliable in both directions and a lost envelope is not the member's fault; it is capped because the window is a courtesy, not a free tier.
+One extension is available. A member who says the money is in the post gets `kyriakon-admin window extend <token> --days 14 --reason "member says posted"`, which moves `closes_at` fourteen days and increments a counter on the window. A second extension is refused. This exists because the post is unreliable in both directions and a lost envelope is not the member's fault; it is capped because the window is a courtesy, not a free tier.
 
 ## Recording a credit
 
@@ -116,13 +116,13 @@ The ledger line is append-only and looks like this:
 
 Two payments sharing a token, where the first is already credited, are treated as a renewal. The second credit needs `--confirm-double`, because for cash the second envelope may be a stranger's with a copied token, and because the same member paying twice by accident is the likelier case only if they say so. If the second credit is applied it extends the date and lands under the 24-month ceiling; if the operator cannot tell whose money it is, it goes to the unattributed queue and the account keeps the first credit.
 
-A payment that carries no token, or a Monero payment to the wallet's main address rather than a member's subaddress, cannot be joined to anything. It goes to `ledger/unattributed.jsonl` and is held: recorded with the rail, the amount, the date and a free-text note, and marked `held`. A payment to a deleted member's subaddress is held in the unattributed queue like any other and refunded in XMR to an address they give. It is not income until it is attributed or the tax year ends, and it is never silently absorbed into a member's credit. The operator tries the postmark, the date, the amount and any note, and either attributes it with `onboardctl reconcile attribute` or returns it with `onboardctl reconcile return`, which records the postal evidence and nothing about the person. Anything still held at the end of the tax year is recorded in the main ledger as a payment with no token, which is the one line in that file without a token and the only one without an invoice behind it.
+A payment that carries no token, or a Monero payment to the wallet's main address rather than a member's subaddress, cannot be joined to anything. It goes to `ledger/unattributed.jsonl` and is held: recorded with the rail, the amount, the date and a free-text note, and marked `held`. A payment to a deleted member's subaddress is held in the unattributed queue like any other and refunded in XMR to an address they give. It is not income until it is attributed or the tax year ends, and it is never silently absorbed into a member's credit. The operator tries the postmark, the date, the amount and any note, and either attributes it with `kyriakon-admin reconcile attribute` or returns it with `kyriakon-admin reconcile return`, which records the postal evidence and nothing about the person. Anything still held at the end of the tax year is recorded in the main ledger as a payment with no token, which is the one line in that file without a token and the only one without an invoice behind it.
 
 ## Refunds
 
 A cancellation inside the fourteen days is refunded in full, in the rail the member paid, or held against the next year if they would rather (from [#152](https://github.com/kyriakon/kyriakon-infra/issues/152)). A refund under the cancellation right closes the account and starts the seven-day closing window; a refund of an overpayment or a duplicate does not touch the account.
 
-The command is `onboardctl refund (--token <t> | --username <u>) --amount <gbp> --rail <rail> --reason <text>`, with `--close` for a cancellation and `--excess` otherwise. It writes a negative ledger line naming the `seq` it reverses, and it does not move `paid_until` on an `--excess` refund. Reg 34(4) gives fourteen days to pay it back, so the notice that goes with the refund states the date it will be settled.
+The command is `kyriakon-admin refund (--token <t> | --username <u>) --amount <gbp> --rail <rail> --reason <text>`, with `--close` for a cancellation and `--excess` otherwise. It writes a negative ledger line naming the `seq` it reverses, and it does not move `paid_until` on an `--excess` refund. Reg 34(4) gives fourteen days to pay it back, so the notice that goes with the refund states the date it will be settled.
 
 Card refunds go through Stripe with an `Idempotency-Key`, which is the same mechanism the research note describes for the rail's other calls.
 
@@ -139,39 +139,39 @@ Hosting is not a regulated sector under the Money Laundering Regulations 2017. R
 The drain does the automatic work: the window-close sweep, the lapse, the grace and the deletion notices, and applying whatever intents are waiting. The operator's part is a weekly pass during which they read the post, open the envelopes, look at the wallet, and record what they found.
 
 ```
-onboardctl prepaid list --window open --expiring 3
+kyriakon-admin prepaid list --window open --expiring 3
 ```
 
 This is the pass's first command. It lists every open window with the token, the username, the rail, the close date and the days left, and `--expiring 3` narrows it to the ones about to close, which are the ones worth an email before they lapse.
 
 ```
-onboardctl credit --token KYR-4F2M-9QH7-XT3B --rail cash --amount 20.00 --received 2026-10-04
-onboardctl credit --username frseraphim --rail cash-hand --amount 20.00 --received 2026-10-04
-onboardctl credit --token KYR-4F2M-9QH7-XT3B --rail monero --amount 20.00 --received 2026-10-04 \
+kyriakon-admin credit --token KYR-4F2M-9QH7-XT3B --rail cash --amount 20.00 --received 2026-10-04
+kyriakon-admin credit --username frseraphim --rail cash-hand --amount 20.00 --received 2026-10-04
+kyriakon-admin credit --token KYR-4F2M-9QH7-XT3B --rail monero --amount 20.00 --received 2026-10-04 \
   --txid <64 hex> --xmr 0.048847
 ```
 
 The credit is the one action per payment. It writes an intent, and the drain applies it on its next run, so the operator can record four envelopes in a row without waiting for each one.
 
 ```
-onboardctl reconcile list
-onboardctl reconcile attribute UN-3K7QW2M9 --token KYR-4F2M-9QH7-XT3B
-onboardctl reconcile return UN-3K7QW2M9 --note "posted back 2026-10-08, receipt in book"
+kyriakon-admin reconcile list
+kyriakon-admin reconcile attribute UN-3K7QW2M9 --token KYR-4F2M-9QH7-XT3B
+kyriakon-admin reconcile return UN-3K7QW2M9 --note "posted back 2026-10-08, receipt in book"
 ```
 
 The first lists everything held without a token. The second joins one to an account and turns it into an ordinary credit. The third records that it went back or was kept, with the evidence, and closes the item.
 
 ```
-onboardctl window extend --token KYR-4F2M-9QH7-XT3B --days 14 --reason "member says posted 2026-10-02"
-onboardctl refund --username frseraphim --amount 20.00 --rail cash --reason "cancelled inside 14 days" --close
-onboardctl token resend frseraphim
-onboardctl payment show --username frseraphim
-onboardctl ledger export --tax-year 2026-27 --format csv
+kyriakon-admin window extend --token KYR-4F2M-9QH7-XT3B --days 14 --reason "member says posted 2026-10-02"
+kyriakon-admin refund --username frseraphim --amount 20.00 --rail cash --reason "cancelled inside 14 days" --close
+kyriakon-admin token resend frseraphim
+kyriakon-admin payment show --username frseraphim
+kyriakon-admin ledger export --tax-year 2026-27 --format csv
 ```
 
-The window extension is the one case the operator answers on the member's word. The refund is the command; posting the money, or issuing the Stripe refund, or sending the Monero, is the human step that follows it, and the operator records the settlement with `onboardctl refund --settled <date>` on the same line. `token resend` repeats the payment instructions without issuing anything new. The ledger export is the year's file for the accountant, and it contains tokens, amounts and dates, and no usernames.
+The window extension is the one case the operator answers on the member's word. The refund is the command; posting the money, or issuing the Stripe refund, or sending the Monero, is the human step that follows it, and the operator records the settlement with `kyriakon-admin refund --settled <date>` on the same line. `token resend` repeats the payment instructions without issuing anything new. The ledger export is the year's file for the accountant, and it contains tokens, amounts and dates, and no usernames.
 
-The commands that already exist for the lifecycle are unchanged: `onboardctl approve`, `onboardctl decline`, `onboardctl suspend`, `onboardctl delete`. `delete` is the one that matters here, because removing the account's token index entry is what makes the ledger unlinkable, and it happens in the same transition that removes the mailbox.
+The commands that already exist for the lifecycle are unchanged: `kyriakon-admin approve`, `kyriakon-admin decline`, `kyriakon-admin suspend`, `kyriakon-admin delete`. `delete` is the one that matters here, because removing the account's token index entry is what makes the ledger unlinkable, and it happens in the same transition that removes the mailbox.
 
 Two human steps have no command. Opening the post and banking the cash is one, and holding the Monero is the other: the platform receives XMR and does not convert it, so the operator decides when, and whether, to sell. HMRC treats business income paid in cryptoassets as trading income and taxes what the holder does with it, so the ledger's record of the receipt rate is what the eventual disposal is measured against (CRYPTO40350 and CRYPTO40100, read on 2026-10-01). Whether a disposal is taxed as trading or as a capital gain is the accountant's question, and it is out of scope here.
 
@@ -196,7 +196,7 @@ The store is the flat-file one from [#156](https://github.com/kyriakon/kyriakon-
 | `accounts/<username>/account.json` | modified | `payment.rail`, `payment.token_ref`, `payment.token_issued_at`, `payment.paid_until`, `payment.balance_gbp`, `payment.window{opened_at,closes_at,state,extensions}`, `payment.monero{address,quote_xmr,rate_gbp_per_xmr,rate_source,rate_at}` |
 | `accounts/<username>/notices.jsonl` | modified | `prepaid.window_open`, `prepaid.window_closing`, `prepaid.receipt`, `prepaid.lapsed`, `prepaid.refund`, and `free.anniversary` for the yearly note to a member who pays nothing, one line per notice with its date and address |
 | `accounts/<username>/application.json` | modified | `status_link_until`, seven days after the decision; the answers themselves follow the existing 90-day purge (ADR 0005) |
-| `tokens/<token>.json` | new | the join: token, username, `issued_at`, `window_closes_at`, `state`. Created at a paid approval, deleted by `onboardctl delete` |
+| `tokens/<token>.json` | new | the join: token, username, `issued_at`, `window_closes_at`, `state`. Created at a paid approval, deleted by `kyriakon-admin delete` |
 | `ledger/payments.jsonl` | new | append-only, keyed by token, no username. Every credit, every refund |
 | `ledger/unattributed.jsonl` | new | payments with no token, held until attributed, returned or taken as income at the year end |
 | `rates/xmr-gbp.json` | new | the cached XMR/GBP rate, its source and its fetch time; read by the handler, written by the drain |
@@ -227,20 +227,20 @@ Notices are recorded before they are enqueued, and a crash between the record an
 
 | Step | Who | What they run |
 |---|---|---|
-| Approve, approve without charge, or decline | operator | the signed link in the email, or `onboardctl approve <username>`, `onboardctl decline <username>` |
+| Approve, approve without charge, or decline | operator | the signed link in the email, or `kyriakon-admin approve <username>`, `kyriakon-admin decline <username>` |
 | Open the post | operator | no command; the date the envelope was opened is the credit's `--received` |
-| Record a posted cash payment | operator | `onboardctl credit --token <t> --rail cash --amount <gbp> --received <date>` |
-| Record cash handed over | operator | `onboardctl credit --username <u> --rail cash-hand --amount <gbp> --received <date>` |
-| Check the wallet and record Monero | operator | `onboardctl credit --token <t> --rail monero --amount <gbp> --received <date> --txid <id> --xmr <amount>` |
-| Deal with money that arrived with no token | operator | `onboardctl reconcile list`, then `onboardctl reconcile attribute` or `onboardctl reconcile return` |
-| Give a member one more fortnight | operator | `onboardctl window extend --token <t> --days 14 --reason <text>` |
-| Refund | operator | `onboardctl refund ...`, then the Stripe refund, the Monero send, or the postal step, then `--settled <date>`; a posted-cash refund keeps the posting receipt |
+| Record a posted cash payment | operator | `kyriakon-admin credit --token <t> --rail cash --amount <gbp> --received <date>` |
+| Record cash handed over | operator | `kyriakon-admin credit --username <u> --rail cash-hand --amount <gbp> --received <date>` |
+| Check the wallet and record Monero | operator | `kyriakon-admin credit --token <t> --rail monero --amount <gbp> --received <date> --txid <id> --xmr <amount>` |
+| Deal with money that arrived with no token | operator | `kyriakon-admin reconcile list`, then `kyriakon-admin reconcile attribute` or `kyriakon-admin reconcile return` |
+| Give a member one more fortnight | operator | `kyriakon-admin window extend --token <t> --days 14 --reason <text>` |
+| Refund | operator | `kyriakon-admin refund ...`, then the Stripe refund, the Monero send, or the postal step, then `--settled <date>`; a posted-cash refund keeps the posting receipt |
 | Bank the cash, hold or sell the Monero | operator | no command |
-| Create the member's Monero subaddress | operator | `monero-wallet-cli` in the operator's own wallet, then `onboardctl monero address <username> <address>` |
+| Create the member's Monero subaddress | operator | `monero-wallet-cli` in the operator's own wallet, then `kyriakon-admin monero address <username> <address>` |
 | Hold the wallet, its seed and its view key | operator | no command; the seed and the view key stay together off the box, and the view key is what rebuilds watching if the machine is lost |
-| Send the payment instructions again | operator | `onboardctl token resend <username>` |
-| Close the books for the year | operator | `onboardctl ledger export --tax-year <year> --format csv` |
-| Delete an account, which unlinks the ledger entry | operator | `onboardctl delete <username>` |
+| Send the payment instructions again | operator | `kyriakon-admin token resend <username>` |
+| Close the books for the year | operator | `kyriakon-admin ledger export --tax-year <year> --format csv` |
+| Delete an account, which unlinks the ledger entry | operator | `kyriakon-admin delete <username>` |
 | Set the postal address and the price before release | operator | editing `/etc/kyriakon/onboard/`, once, off the repository |
 
 ## Testing decisions

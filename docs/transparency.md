@@ -85,6 +85,6 @@ provider and the devices at either end, is outside this statement.
 ## Status
 
 The mail stack, the backup and restore path, and the published-configuration claims in these
-documents are built and checkable now. The paid tier and the onboarding service that holds payment
+documents are built and checkable now. The paid tier and the control plane that holds payment
 state are specified and not yet live; when they land, this statement and `aup.md` are updated with
 them rather than before them.

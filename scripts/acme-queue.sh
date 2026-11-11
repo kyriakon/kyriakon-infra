@@ -60,7 +60,7 @@
 #
 # Values the spec leaves to the build, chosen boring, stated once here and once
 # where each is read:
-#   store          /var/db/kyriakon-acme-queue      (beside kyriakon-onboard and
+#   store          /var/db/kyriakon-acme-queue      (beside kyriakon-control and
 #                                                    kyriakon-monitor under /var/db)
 #   request file   <store>/pending/<name>           one per name; the mtime is when
 #                                                    the request was filed and so its age
@@ -76,7 +76,7 @@
 # half becoming due: scripts/provision-member-web.sh writes the block behind the
 # relay, and scripts/cron-apply.sh --web rewrites the indexes and the relayd
 # member keypair region, checks the configs and reloads what changed. The pass
-# runs both after it closes the request, from the directory scripts/deploy-onboard.sh
+# runs both after it closes the request, from the directory scripts/deploy-control.sh
 # installs the drain's scripts in. That path is read from the `scripts` key of
 # /etc/kyriakon/onboard/drain.toml, with the compiled-in default and a
 # DRAIN_SCRIPTS override (which the self-test uses). A failure there is mailed and
@@ -100,7 +100,7 @@
 # generated index scripts/cron-apply.sh --web rewrites), the acme-client binary,
 # a resolver command (host(1) from base), and lib.sh installed beside this file,
 # which is where notify_operator comes from. The apply step above needs the drain
-# scripts, installed by scripts/deploy-onboard.sh.
+# scripts, installed by scripts/deploy-control.sh.
 
 set -euo pipefail
 
@@ -286,7 +286,7 @@ apply_member() {
 	fi
 	for step in "$apply_web_lane" "$apply_apply"; do
 		if [ ! -f "$step" ]; then
-			printf 'acme-queue: no %s, so %s has a certificate and still no site: scripts/deploy-onboard.sh installs the drain scripts\n' \
+			printf 'acme-queue: no %s, so %s has a certificate and still no site: scripts/deploy-control.sh installs the drain scripts\n' \
 				"$step" "$apply_name" >&2
 			return 1
 		fi
@@ -651,7 +651,7 @@ apply --web"
 	( apply_member alice.kyriakon.net ) > "$work/attempt-missing.out" 2>&1 || code=$?
 	check "a missing drain script fails the hook" "$code" 1
 	check "and the refusal names the deploy that installs it" \
-		"$(grep -c 'scripts/deploy-onboard.sh' "$work/attempt-missing.out")" 1
+		"$(grep -c 'scripts/deploy-control.sh' "$work/attempt-missing.out")" 1
 
 	self_test_end
 }

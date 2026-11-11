@@ -24,15 +24,17 @@ written down. This repo has no decisions directory of its own.
 
 Pointers, so a search starts where the thing is.
 
-- `onboard/`: the Rust service, a Cargo workspace under `crates/`. `crates/core/`
+- `control/`: the control plane, a Cargo workspace under `crates/`. `crates/core/`
   holds the store, configuration, intent contract, IPC request and the shared
   flow; `crates/handler/` serves the web form and renders the HTML and gemtext
   pages; `crates/tui/` is the terminal library and binary; `crates/drain/` is the
-  root-side intent loop and transition verbs; `crates/ctl/` is the operator
+  root-side intent loop and transition verbs; `crates/admin/` is the operator
   console; `crates/tests/` is the acceptance suite. `templates/*.html` live under
-  `crates/handler/`. The four binaries keep their names (`kyriakon-onboard`,
-  `kyriakon-onboard-drain`, `kyriakon-onboard-tui`, `kyriakon-onboardctl`). A
-  package's `src/` root holds only its crate root, binary roots, and (in core)
+  `crates/handler/`. The four binaries are `kyriakon-control`, `kyriakon-control-drain`,
+  `kyriakon-control-tui` and `kyriakon-admin`. The deployed state paths keep their old
+  names (`/var/db/onboard`, `/etc/onboard`, `/etc/kyriakon/onboard`), the service
+  account is still `_onboard`, and moving either is a data migration rather than a
+  rename. A package's `src/` root holds only its crate root, binary roots, and (in core)
   `config.rs`, `util.rs` and `intent.rs`; a new module goes in its section
   directory, or a new directory with a `mod.rs` that names its job.
 - `kyriakon-encrypt/`: the CLI the save path runs to encrypt each message; `src/lib.rs`
@@ -47,7 +49,7 @@ Pointers, so a search starts where the thing is.
   harness); `install-set.tsv` is the one table naming what each destination gets; and
   `install-packages.sh` installs from `openbsd/packages.tsv`.
 - `openbsd/`: what the box runs: `etc/` (smtpd, httpd, relayd, gmid, unbound, nsd,
-  spamd, sshd, `login.conf.d/`, `rc.d/`, `kyriakon.env`, and the three onboarding
+  spamd, sshd, `login.conf.d/`, `rc.d/`, `kyriakon.env`, and the control plane's three
   configs (`catalogue.toml`, `drain.toml`, `onboard.toml`) under `etc/onboard/`),
   `dovecot/`, `restore-template/` for the throwaway box, and `packages.tsv`, the one
   package list naming each row's owning scripts and whether the CI VM installs it.
@@ -83,13 +85,13 @@ repo's own root. Two terms most likely to matter while working in this repo:
 - Terraform: `terraform fmt -check -recursive` / `terraform validate` — run from
   `terraform/`. **`terraform plan` is fine to run; `terraform apply` and
   `terraform destroy` are never run by an agent** (see "Never" below).
-- Rust: `cargo test --manifest-path onboard/Cargo.toml` and
-  `cargo clippy --manifest-path onboard/Cargo.toml --all-targets -- -D warnings`; the
+- Rust: `cargo test --manifest-path control/Cargo.toml` and
+  `cargo clippy --manifest-path control/Cargo.toml --all-targets -- -D warnings`; the
   same for `kyriakon-encrypt/`. There is no workspace root, so a command without
   `--manifest-path`, run from the repository root, does not find `Cargo.toml` at all.
   `cargo fmt --check` runs in CI.
-- Fast loop while iterating: `cargo test --manifest-path onboard/Cargo.toml --lib`, and
-  `--test drain -- <area>` for one area; the area map is `onboard/tests/README.md`.
+- Fast loop while iterating: `cargo test --manifest-path control/Cargo.toml --lib`, and
+  `--test drain -- <area>` for one area; the area map is `control/crates/tests/tests/README.md`.
   Run the full crate suite once before pushing, or let CI run it.
 - Shell scripts (`scripts/`): `shellcheck scripts/*.sh`, and
   `ksh scripts/self-test-all.sh` runs every script's `--self-test` with the arguments
@@ -152,7 +154,7 @@ issue body alone is a summary, not the full context.
 - Conventional commits, with scope: `type(scope): description`, for example
   `feat(mail): add DKIM key rotation script` or `fix(terraform): correct hcloud image
   reference`. Types: `feat`, `fix`, `chore`, `docs`, `test`. The scope is the area
-  touched; in use are `onboard`, `web`, `scripts`, `mail`, `ssh`, `pf`, `relayd`,
+  touched; in use are `control`, `web`, `scripts`, `mail`, `ssh`, `pf`, `relayd`,
   `hosting`, `gemini`, `terraform`, `ci`, `docs`, `specs`, `research`. The shape is
   enforced by `.githooks/commit-msg`; the scope is a judgement call.
 - Enable the repository's hooks once per clone: `git config core.hooksPath .githooks`.

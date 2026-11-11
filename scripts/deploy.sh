@@ -51,7 +51,7 @@ reset_plan() {
 	needs_nsd=no
 	needs_mail=no
 	needs_relayd=no
-	needs_onboard=no
+	needs_control=no
 	manual_pf=no
 	manual_sshd=no
 	manual_sshd_onboard=no
@@ -73,7 +73,7 @@ install_dests() {
 	for dest in $dests; do
 		case "$dest" in
 		/root/bin) needs_mail=yes ;;
-		drain) needs_onboard=yes ;;
+		drain) needs_control=yes ;;
 		# Run from the checkout, so a change to it is installed by nothing: the
 		# pull that changes it is the whole deploy.
 		checkout) ;;
@@ -98,21 +98,21 @@ classify_script() {
 	# deploys and the manual cron step rather than nothing.
 	scripts/install-set.tsv)
 		needs_mail=yes
-		needs_onboard=yes
+		needs_control=yes
 		manual_cron=yes
 		return 0
 		;;
-	# Installed by deploy-onboard.sh under a name its own row could not carry
+	# Installed by deploy-control.sh under a name its own row could not carry
 	# (/usr/local/libexec/kyriakon-authcheck), so its install is that script's
 	# explicit line and this is its route.
 	scripts/kyriakon-authcheck.sh)
-		needs_onboard=yes
+		needs_control=yes
 		return 0
 		;;
 	# Rendered into the capsule by the deploy and run from the checkout, so there
 	# is no install row: the pages the handler serves are written by a deploy.
 	scripts/render-docs.sh)
-		needs_onboard=yes
+		needs_control=yes
 		return 0
 		;;
 	# A deploy script's own code changed, so run it. `deploy.sh` itself is the
@@ -125,8 +125,8 @@ classify_script() {
 		needs_relayd=yes
 		return 0
 		;;
-	scripts/deploy-onboard.sh)
-		needs_onboard=yes
+	scripts/deploy-control.sh)
+		needs_control=yes
 		return 0
 		;;
 	scripts/deploy-nsd.sh)
@@ -147,13 +147,13 @@ classify_script() {
 # has no rule, so `plan` can refuse the run and name every unclassified path.
 classify() {
 	case "$1" in
-	onboard/*) needs_onboard=yes ;;
+	control/*) needs_control=yes ;;
 	kyriakon-encrypt/* | dovecot-plugin/*) needs_mail=yes ;;
 	openbsd/dovecot/*) needs_mail=yes ;;
 	# Both deploys read the package table, and either side's rows can change.
-	openbsd/packages.tsv) needs_mail=yes; needs_onboard=yes ;;
-	openbsd/etc/onboard/*) needs_onboard=yes ;;
-	openbsd/etc/rc.d/kyriakon_onboard) needs_onboard=yes ;;
+	openbsd/packages.tsv) needs_mail=yes; needs_control=yes ;;
+	openbsd/etc/onboard/*) needs_control=yes ;;
+	openbsd/etc/rc.d/kyriakon_control) needs_control=yes ;;
 	openbsd/etc/rc.d/kyriakon_onboard_sshd) manual_sshd_onboard=yes ;;
 	openbsd/etc/httpd.conf | openbsd/etc/gmid.conf | openbsd/etc/acme-client.conf | \
 		openbsd/etc/smtpd.conf | openbsd/etc/unbound.conf | openbsd/etc/newsyslog.conf | \
@@ -165,11 +165,14 @@ classify() {
 	openbsd/etc/pf.conf) manual_pf=yes ;;
 	openbsd/etc/sshd_config) manual_sshd=yes ;;
 	openbsd/etc/sshd_config.onboard | openbsd/etc/login.conf.d/hello) manual_sshd_onboard=yes ;;
+	# A hand-applied fragment, printed by the control deploy when the rule is
+	# missing from /etc/doas.conf.
+	openbsd/etc/doas.conf.control) needs_control=yes ;;
 	openbsd/etc/login.conf.d/member)
-		needs_onboard=yes
+		needs_control=yes
 		manual_member_class=yes
 		;;
-	reserved-usernames.txt | scripts/onboard-store.sh) needs_onboard=yes ;;
+	reserved-usernames.txt | scripts/control-store.sh) needs_control=yes ;;
 	# The installed set is the table's: a script's row names the deploy that
 	# installs it, so adding one is a row there and not an arm here.
 	scripts/*) classify_script "$1" ;;
@@ -193,7 +196,7 @@ plan() {
 		needs_nsd=yes
 		needs_mail=yes
 		needs_relayd=yes
-		needs_onboard=yes
+		needs_control=yes
 		return 0
 	fi
 	if ! git -C "$plan_repo" cat-file -e "$plan_base^{commit}" 2>/dev/null; then
@@ -214,16 +217,16 @@ EOF
 	[ -z "$unknown" ] || die "no deploy rule for:$unknown"
 }
 
-# The fixed order. The onboarding service goes first because the two deploys
+# The fixed order. The control plane goes first because the two deploys
 # after it check that it is up: deploy-mail refuses to finish unless
-# kyriakon_onboard is running (it gates the capsule the handler answers on), and
+# kyriakon_control is running (it gates the capsule the handler answers on), and
 # deploy-relayd requires the handler to answer signup.kyriakon.net with 200. The
-# handler needs only the store and its socket directories, which deploy-onboard
+# handler needs only the store and its socket directories, which deploy-control
 # creates, so it can come up before either front-end. DNS next, then mail, then
 # the relay that needs both. A second function so the self-test reads the same
 # order the live run uses.
 plan_order() {
-	if [ "$needs_onboard" = yes ]; then printf 'deploy-onboard.sh\n'; fi
+	if [ "$needs_control" = yes ]; then printf 'deploy-control.sh\n'; fi
 	if [ "$needs_nsd" = yes ]; then printf 'deploy-nsd.sh\n'; fi
 	if [ "$needs_mail" = yes ]; then printf 'deploy-mail.sh\n'; fi
 	if [ "$needs_relayd" = yes ]; then printf 'deploy-relayd.sh\n'; fi
@@ -471,10 +474,10 @@ self_test() {
 	git -C "$repo" commit -qm one
 	first=$(git -C "$repo" rev-parse HEAD)
 
-	mkdir -p "$repo/onboard/crates/core/src" "$repo/openbsd/etc/nsd" "$repo/openbsd/etc/onboard" \
+	mkdir -p "$repo/control/crates/core/src" "$repo/openbsd/etc/nsd" "$repo/openbsd/etc/onboard" \
 		"$repo/terraform"
-	printf 'x\n' >"$repo/onboard/Cargo.toml"
-	printf 'x\n' >"$repo/onboard/crates/core/src/lib.rs"
+	printf 'x\n' >"$repo/control/Cargo.toml"
+	printf 'x\n' >"$repo/control/crates/core/src/lib.rs"
 	printf 'x\n' >"$repo/openbsd/etc/nsd/nsd.conf"
 	printf 'x\n' >"$repo/openbsd/etc/httpd.conf"
 	printf 'x\n' >"$repo/openbsd/etc/pf.conf"
@@ -486,14 +489,14 @@ self_test() {
 	second=$(git -C "$repo" rev-parse HEAD)
 
 	plan "$repo" "$first"
-	check 'the onboard change plans deploy-onboard' "$needs_onboard" yes
+	check 'the onboard change plans deploy-control' "$needs_control" yes
 	check 'the mail change plans deploy-mail' "$needs_mail" yes
 	check 'the nsd change plans deploy-nsd' "$needs_nsd" yes
 	check 'the pf change is manual' "$manual_pf" yes
 	check 'the sshd change is manual' "$manual_sshd" yes
 	check 'the relayd change is not planned' "$needs_relayd" no
 	check 'the plan order' "$(plan_order | paste -sd ' ' -)" \
-		'deploy-onboard.sh deploy-nsd.sh deploy-mail.sh'
+		'deploy-control.sh deploy-nsd.sh deploy-mail.sh'
 	check 'a manual step gates the marker' \
 		"$(if manual_any; then printf yes; else printf no; fi)" yes
 
@@ -517,19 +520,19 @@ self_test() {
 	check 'the drift check plans deploy-mail' "$needs_mail" yes
 	reset_plan
 	classify 'scripts/provision-member.sh'
-	check 'a drain script plans deploy-onboard' "$needs_onboard" yes
+	check 'a drain script plans deploy-control' "$needs_control" yes
 	reset_plan
 	classify 'scripts/provision-member-acme.sh'
-	check 'the acme lane plans deploy-onboard' "$needs_onboard" yes
+	check 'the acme lane plans deploy-control' "$needs_control" yes
 	reset_plan
 	classify 'scripts/remove-upload-key.sh'
-	check 'the upload-key removal plans deploy-onboard' "$needs_onboard" yes
+	check 'the upload-key removal plans deploy-control' "$needs_control" yes
 	reset_plan
 	classify 'scripts/provision-group-web.sh'
-	check 'an own-domain hosting lane plans deploy-onboard' "$needs_onboard" yes
+	check 'an own-domain hosting lane plans deploy-control' "$needs_control" yes
 	reset_plan
 	classify 'scripts/provision-group-acme.sh'
-	check 'the own-domain acme lane plans deploy-onboard' "$needs_onboard" yes
+	check 'the own-domain acme lane plans deploy-control' "$needs_control" yes
 	reset_plan
 	classify 'scripts/check-hygiene.sh'
 	check 'a checkout script plans no deploy' "$(plan_order)" ''
@@ -538,13 +541,13 @@ self_test() {
 	reset_plan
 	classify 'scripts/relayd-members.sh'
 	check 'the relayd member helper plans both deploys' \
-		"$needs_relayd $needs_onboard" 'yes yes'
+		"$needs_relayd $needs_control" 'yes yes'
 	reset_plan
 	classify 'scripts/lib.sh'
-	check 'lib.sh plans both deploys' "$needs_mail $needs_onboard" 'yes yes'
+	check 'lib.sh plans both deploys' "$needs_mail $needs_control" 'yes yes'
 	reset_plan
 	classify 'scripts/cron-apply.sh'
-	check 'cron-apply plans onboard and a manual run' "$needs_onboard $manual_cron" 'yes yes'
+	check 'cron-apply plans onboard and a manual run' "$needs_control $manual_cron" 'yes yes'
 	reset_plan
 	classify 'openbsd/etc/kyriakon.env'
 	check 'the env template does not plan a mail deploy' "$needs_mail" no
@@ -562,8 +565,8 @@ self_test() {
 	classify 'scripts/deploy-relayd.sh'
 	check 'the relay deploy plans itself' "$needs_relayd" yes
 	reset_plan
-	classify 'scripts/deploy-onboard.sh'
-	check 'the onboard deploy plans itself' "$needs_onboard" yes
+	classify 'scripts/deploy-control.sh'
+	check 'the onboard deploy plans itself' "$needs_control" yes
 	reset_plan
 	classify 'scripts/deploy-nsd.sh'
 	check 'the nsd deploy plans itself' "$needs_nsd" yes
@@ -572,7 +575,7 @@ self_test() {
 	check 'a pf script change is a manual step' "$manual_pf" yes
 	reset_plan
 	classify 'scripts/reload-smtpd.sh'
-	check 'the smtpd reload script plans deploy-onboard' "$needs_onboard" yes
+	check 'the smtpd reload script plans deploy-control' "$needs_control" yes
 
 	# Every row of the install-set table has to plan the deploy that installs it,
 	# or a fix to that script lands in the checkout and never reaches the box. The
@@ -589,7 +592,7 @@ self_test() {
 	for installed in $drain_rows; do
 		reset_plan
 		classify "scripts/$installed"
-		check "scripts/$installed plans deploy-onboard" "$needs_onboard" yes
+		check "scripts/$installed plans deploy-control" "$needs_control" yes
 	done
 	for installed in $root_bin_rows; do
 		reset_plan
@@ -599,17 +602,17 @@ self_test() {
 	reset_plan
 	classify 'scripts/install-set.tsv'
 	check 'a table change plans both deploys and the cron step' \
-		"$needs_mail $needs_onboard $manual_cron" 'yes yes yes'
+		"$needs_mail $needs_control $manual_cron" 'yes yes yes'
 	reset_plan
 	classify 'openbsd/packages.tsv'
 	check 'a package table change plans both deploys' \
-		"$needs_mail $needs_onboard" 'yes yes'
+		"$needs_mail $needs_control" 'yes yes'
 	reset_plan
 	classify 'scripts/kyriakon-authcheck.sh'
-	check 'the libexec install plans deploy-onboard' "$needs_onboard" yes
+	check 'the libexec install plans deploy-control' "$needs_control" yes
 	reset_plan
 	classify 'scripts/render-docs.sh'
-	check 'the pages renderer plans deploy-onboard' "$needs_onboard" yes
+	check 'the pages renderer plans deploy-control' "$needs_control" yes
 	# A destination nothing installs is refused rather than skipped: a row with a
 	# typo in it would otherwise be a script no deploy puts on the box.
 	printf 'new.sh\tsomewhere-else\t-\n' >"$self_test_work/unknown-dest.tsv"
@@ -672,7 +675,7 @@ self_test() {
 
 	plan "$repo" ''
 	check 'no base plans every script' "$(plan_order | paste -sd ' ' -)" \
-		'deploy-onboard.sh deploy-nsd.sh deploy-mail.sh deploy-relayd.sh'
+		'deploy-control.sh deploy-nsd.sh deploy-mail.sh deploy-relayd.sh'
 
 	all_scripts=no
 	reset_plan

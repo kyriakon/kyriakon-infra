@@ -62,7 +62,7 @@ because `rc.d` has no terminal for `getpass(3)` to prompt on. The key therefore 
 protects against being pulled, so queue encryption closes the walked-away-disk window and not the
 compelled-operator one. This is one of two residual plaintext-at-rest points in the mail path. The
 other is the `apply@` key mailbox, which smtpd delivers to a plaintext Maildir under
-`/var/db/onboard/mail` because the onboarding drain must read the key to file it against the
+`/var/db/onboard/mail` because the drain must read the key to file it against the
 application. `docs/planning/specs/gemini-capsule.md`, "The mail route", states that exception.
 
 The forward secrecy of the archive. Holding ciphertext and no key is a claim about the present.
@@ -108,7 +108,7 @@ retry is whitelisted for about 36 days (`greyexp` and `whiteexp` in spamd(8)). B
 from the anti-spam mechanism rather than from a retention policy, and `scripts/abuse-monitor.sh`
 still keeps counts only.
 
-The Phase 3 onboarding service will emit its own log, and it is to be born bounded by a
+The Phase 3 control plane will emit its own log, and it is to be born bounded by a
 `newsyslog.conf` entry on the day it lands rather than grandfathered in afterwards.
 
 ## The suppression adversary

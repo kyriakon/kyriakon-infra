@@ -15,14 +15,14 @@
 # the only base64 encoder on the box: OpenBSD ships no base64(1).
 # gmid provides the Gemini server and the _gmid account the capsule sockets use.
 
-curl	deploy-mail.sh,deploy-onboard.sh	yes
+curl	deploy-mail.sh,deploy-control.sh	yes
 dovecot	deploy-mail.sh	no
 git	box	yes
-gmid	deploy-mail.sh,deploy-onboard.sh	no
+gmid	deploy-mail.sh,deploy-control.sh	no
 gnupg	deploy-mail.sh	yes
 hcloud	deploy-mail.sh	no
 helix	deploy-mail.sh	no
-jq	deploy-mail.sh,deploy-onboard.sh	yes
+jq	deploy-mail.sh,deploy-control.sh	yes
 opensmtpd-filter-dkimsign	deploy-mail.sh	no
 restic	deploy-mail.sh	no
-rust	deploy-mail.sh,deploy-onboard.sh	no
+rust	deploy-mail.sh,deploy-control.sh	no

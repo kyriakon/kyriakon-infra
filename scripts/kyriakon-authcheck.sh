@@ -2,7 +2,7 @@
 # kyriakon-authcheck: verify one member's mail password, and write the proof a
 # page session is trusted by.
 #
-# This is the whole of the one `doas` rule the onboarding service needs:
+# This is the whole of the one `doas` rule the control plane needs:
 #
 #   permit nopass _onboard as root cmd /usr/local/libexec/kyriakon-authcheck
 #
@@ -18,10 +18,10 @@
 # in the proof directory naming the account and an expiry, and prints the
 # file's random token on stdout. The handler stores the token in the session
 # record and cannot mint one; the drain reads the file back and trusts only it.
-# The directory is root-owned 0700 (scripts/deploy-onboard.sh makes it), so the
+# The directory is root-owned 0700 (scripts/deploy-control.sh makes it), so the
 # handler can neither write a proof nor replace one.
 #
-# Installed by scripts/deploy-onboard.sh at /usr/local/libexec/kyriakon-authcheck,
+# Installed by scripts/deploy-control.sh at /usr/local/libexec/kyriakon-authcheck,
 # mode 0755, root-owned.
 #
 # Usage:
@@ -142,7 +142,7 @@ user=$1
 proof_dir=${2:-$proof_dir_default}
 valid_localpart "$user" || die "not a member username: $user"
 root_proof_dir "$proof_dir" \
-	|| fail "$proof_dir is not the root-owned 0700 login proof directory; run scripts/deploy-onboard.sh"
+	|| fail "$proof_dir is not the root-owned 0700 login proof directory; run scripts/deploy-control.sh"
 
 # The password is read from stdin by doveadm itself, so it is never an argument
 # and never written anywhere. A dovecot that cannot answer exits non-zero, which

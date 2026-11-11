@@ -28,7 +28,7 @@ if [ -n "$scripts" ]; then
 	done
 fi
 if printf '%s\n' "$staged" | grep -q '\.rs$'; then
-	for crate in onboard kyriakon-encrypt; do
+	for crate in control kyriakon-encrypt; do
 		[ -f "$crate/Cargo.toml" ] || continue
 		cargo fmt --manifest-path "$crate/Cargo.toml" --all --check
 	done

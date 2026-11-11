@@ -4,7 +4,7 @@
 # read by the three front-ends and copied by none, which is why it is data and
 # not a page: three drafts of a list drift in a way that is invisible until a
 # member is told about a service the capsule never mentioned. scripts/
-# onboard-store.sh installs it 0644 at the top of the store, and
+# control-store.sh installs it 0644 at the top of the store, and
 # /etc/onboard/onboard.toml names the path the handler reads it from.
 #
 # Hand-written, so it is TOML: the service already parses TOML for its own
@@ -18,7 +18,7 @@
 # scheme, because a hostname is protocol-agnostic and each front-end adds the
 # scheme its own protocol speaks; a host containing <name> is rendered from the
 # session's member where there is one, and as the pattern itself where there is
-# not. onboard/crates/core/src/flow/catalogue.rs holds the word for each state and each action,
+# not. control/crates/core/src/flow/catalogue.rs holds the word for each state and each action,
 # so this file names a value and the crate names what a reader sees for it.
 
 [[service]]

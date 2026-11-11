@@ -2,7 +2,7 @@
 #
 # The one list, read by the four places that used to keep their own.
 # scripts/deploy.sh routes a changed script to the deploy that installs it,
-# scripts/deploy-mail.sh and scripts/deploy-onboard.sh install it,
+# scripts/deploy-mail.sh and scripts/deploy-control.sh install it,
 # scripts/cron-apply.sh schedules it, and scripts/check-hygiene.sh compares the
 # installed copy with the checkout. Adding an installed script is one line here.
 #
@@ -10,7 +10,7 @@
 #
 #   script       the file in scripts/, by name
 #   destination  /root/bin, drain for the directory the drain's own config names
-#                at run time (installed into by scripts/deploy-onboard.sh), or
+#                at run time (installed into by scripts/deploy-control.sh), or
 #                checkout for a script cron runs from the checkout itself, which
 #                nothing installs
 #   schedule     the five cron fields, or - when nothing schedules the script
@@ -18,15 +18,15 @@
 #                some
 #
 # A script installed in two places has one line per place. lib.sh is sourced by
-# the /root/bin scripts and by the drain's, so it is in both. deploy-onboard.sh
+# the /root/bin scripts and by the drain's, so it is in both. deploy-control.sh
 # also installs it beside kyriakon-authcheck in /usr/local/libexec, which has no
 # row here because that deploy owns the directory.
 #
 # Two scripts are not here, because a row is one file installed under its own
 # name:
-#   - kyriakon-authcheck.sh, which deploy-onboard.sh installs as
+#   - kyriakon-authcheck.sh, which deploy-control.sh installs as
 #     /usr/local/libexec/kyriakon-authcheck, with lib.sh beside it;
-#   - render-docs.sh, which deploy-onboard.sh runs from the checkout.
+#   - render-docs.sh, which deploy-control.sh runs from the checkout.
 lib.sh	/root/bin	-
 abuse-monitor.sh	/root/bin	*/15 * * * *
 check-keyring-drift.sh	/root/bin	0 4 * * *	--box

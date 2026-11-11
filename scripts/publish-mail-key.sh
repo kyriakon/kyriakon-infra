@@ -89,7 +89,7 @@ set -euo pipefail
 umask 077
 
 # lib.sh holds key_problems, which is what decides whether a key can serve this
-# platform's mail. deploy-onboard.sh installs the two files together, and the
+# platform's mail. deploy-control.sh installs the two files together, and the
 # repo has them beside each other, so a missing one is a broken install rather
 # than a key to publish.
 script_dir=$(cd "$(dirname "$0")" && pwd)
@@ -242,7 +242,7 @@ publish() {
 	fi
 
 	[ -f "$token_file" ] ||
-		die "no token file at $token_file; scripts/deploy-onboard.sh prints the line that installs one"
+		die "no token file at $token_file; scripts/deploy-control.sh prints the line that installs one"
 	if [ "$(stat -f '%Lp' "$token_file")" != 600 ]; then
 		die "$token_file is not mode 600, and a token another user can read is a token that can write the published set"
 	fi

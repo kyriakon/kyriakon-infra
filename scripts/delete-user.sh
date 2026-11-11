@@ -281,7 +281,7 @@ remove_member() {
 		fi
 	fi
 
-	# The onboarding service's record of the account, last. The note below says the
+	# The control plane's record of the account, last. The note below says the
 	# rest of the store is the drain's and it is right: those are records of money,
 	# publication and retention. This one is not, because the drain reads it to
 	# decide whether a name is taken, so leaving it behind makes the next approval

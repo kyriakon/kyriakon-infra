@@ -54,10 +54,10 @@ and `terraform apply`/`destroy` remain human-only.
 
 `scripts/deploy.sh` is the normal deploy. It reads the last deployed commit from
 `/var/db/kyriakon/deployed`, diffs it to the checkout's `HEAD`, and runs only the
-deploy scripts that diff needs, in this order: `deploy-onboard.sh`,
-`deploy-nsd.sh`, `deploy-mail.sh`, `deploy-relayd.sh`. The onboarding service
+deploy scripts that diff needs, in this order: `deploy-control.sh`,
+`deploy-nsd.sh`, `deploy-mail.sh`, `deploy-relayd.sh`. The control plane
 goes first because `deploy-mail.sh` refuses to finish unless
-`kyriakon_onboard` is running, and `deploy-relayd.sh` refuses unless the handler
+`kyriakon_control` is running, and `deploy-relayd.sh` refuses unless the handler
 answers `signup.kyriakon.net` with 200. Each script is idempotent, so a second
 run after a fix is safe.
 
@@ -95,7 +95,7 @@ command over them and renders the output:
 
 It reads `/root/.kyriakon-env` (override with `--env <file>`). `POSTAL_ADDRESS`
 is both the cash-by-post address and the published trading address, by decision
-(#397), so the two cannot disagree: `scripts/deploy-onboard.sh` writes the same
+(#397), so the two cannot disagree: `scripts/deploy-control.sh` writes the same
 value into `postal_address` in both the drain's config and the handler's, which
 are the two copies the approval email and the account page read it from.
 
@@ -119,9 +119,9 @@ reach the public web.
 Run the script from the site build rather than by hand, so a change to a document
 or to a value cannot leave the served pages stale.
 
-`scripts/deploy-onboard.sh` runs the same script with `--gemini` to stage the
+`scripts/deploy-control.sh` runs the same script with `--gemini` to stage the
 capsule's copies under the directory `/etc/onboard/onboard.toml` names, so the
-same values are required for an onboarding deploy. The deploy refuses when a
+same values are required for a control plane deploy. The deploy refuses when a
 page would carry a placeholder, and the handler refuses to start when a staged
 page is missing.
 
@@ -129,9 +129,9 @@ page is missing.
 
 These procedures name the pieces that exist at this commit, and mark the ones that do not:
 
-- The onboarding service is decided in #156 and partly built: the handler is a FastCGI responder, and the drain, `kyriakon-onboardctl` and the portal (`kyriakon-onboard-tui`, the program an applicant's ssh session runs) are built and installed by `scripts/deploy-onboard.sh`. The portal reads an application's stage from the handler, holds one address to two concurrent sessions and the box to a small total, with its session files under `/var/db/kyriakon-onboard-tui`; a clean exit removes a session's file and a killed one is pruned by the next start. The account page, the portal's application flow and its member path are still to come, so provisioning a member is manual until they land.
+- The control plane is decided in #156 and partly built: the handler is a FastCGI responder, and the drain, `kyriakon-admin` and the portal (`kyriakon-control-tui`, the program an applicant's ssh session runs) are built and installed by `scripts/deploy-control.sh`. The portal reads an application's stage from the handler, holds one address to two concurrent sessions and the box to a small total, with its session files under `/var/db/kyriakon-onboard-tui`; a clean exit removes a session's file and a killed one is pruned by the next start. The account page, the portal's application flow and its member path are still to come, so provisioning a member is manual until they land.
 - The portal's stage events (a status read, an abandoned session) go to `authlog` at facility `AUTH`, and carry no address and no answer. The handler's own line in `/var/log/daemon` carries the route, its token and the address, and no answer.
-- The portal's account is `hello`, as the TUI spec names it. The live box still has it as `onboard`, so rename it before the portal is enabled: `doas usermod -l hello onboard` (the rename leaves the group named `onboard`; `deploy-onboard.sh` uses `id -gn hello`, so no group rename is needed), install `openbsd/etc/login.conf.d/hello`, `doas usermod -L hello hello`, `doas cap_mkdb /etc/login.conf`, remove `/etc/login.conf.d/onboard`, then install the tracked `sshd_config.onboard` with its port substituted and run `doas sshd -t -f /etc/ssh/sshd_config.onboard`. It is locked with `usermod -p '*'` while unreleased; at release restore the empty field with `usermod -p '' hello`.
+- The portal's account is `hello`, as the TUI spec names it. The live box still has it as `onboard`, so rename it before the portal is enabled: `doas usermod -l hello onboard` (the rename leaves the group named `onboard`; `deploy-control.sh` uses `id -gn hello`, so no group rename is needed), install `openbsd/etc/login.conf.d/hello`, `doas usermod -L hello hello`, `doas cap_mkdb /etc/login.conf`, remove `/etc/login.conf.d/onboard`, then install the tracked `sshd_config.onboard` with its port substituted and run `doas sshd -t -f /etc/ssh/sshd_config.onboard`. It is locked with `usermod -p '*'` while unreleased; at release restore the empty field with `usermod -p '' hello`.
 - The per-member hosting configuration is merged into the repository and not applied: the chroot under `/home/www`, the generated vhost indexes, the port split that separates git from the chrooted sftp server. Applying it is a sequence of propose-only steps rather than a script, so it is done once, by hand, and the order is in the pull request that added it (#160).
 - The quota is scripted and has been applied: `scripts/quota-apply.sh --enable` turns quotas on and `--all` applies the 5 GB allowance to the accounts that already exist. `scripts/add-user.sh` sets it at creation.
 
@@ -181,7 +181,7 @@ Provisioning is manual today. The service that will take it over is covered in t
 
    It builds the public root at `/home/www/<username>.kyriakon.net`, hands `www/` and `gemini/` to the member, creates `/home/<username>/repos`, installs the login class that gives port 2222 `git-shell` while the password entry keeps `/sbin/nologin`, and writes `authorized_keys`. It then runs three lanes: `scripts/provision-member-web.sh` writes the member's `httpd` file, `scripts/provision-member-capsule.sh` writes the member's `gmid` file and generates the platform's self-signed capsule pair the first time it runs, and `scripts/provision-member-acme.sh` writes the member's `acme-client` block and files the certificate request with the queue.
 
-   The upload key is the applicant's, so it is a file and only the public half goes in: pass it as the second argument. With none, the script reads `/var/db/onboard/keys/<username>.pub`, where the onboarding drain will put it, and stops before building anything when nothing is there.
+   The upload key is the applicant's, so it is a file and only the public half goes in: pass it as the second argument. With none, the script reads `/var/db/onboard/keys/<username>.pub`, where the drain will put it, and stops before building anything when nothing is there.
 
    The member files are not served until the indexes are rewritten and the daemons reloaded, which is the same command the deploy uses:
 
@@ -194,7 +194,7 @@ Provisioning is manual today. The service that will take it over is covered in t
 
 Do not give the account a shell. `chsh -s /bin/ksh <username>` undoes the platform's central safety property. The operator account is the one exception, and `deploy-mail.sh` flips it back to `/bin/ksh` on every run.
 
-The per-member hosting design in #154 adds three things to this path: membership of the `members` group, the generated `httpd` and `gmid` files for the site, and the quota entry. `add-user.sh` does the group and the quota, and `provision-member.sh` does the rest of the hosting: it writes the member's own `httpd` and `gmid` files through its lanes, queues the certificate, and `scripts/cron-apply.sh --web` rewrites the indexes and the relayd member keypair region and reloads the daemons. Until the onboarding drain lands, this is the whole of provisioning a member.
+The per-member hosting design in #154 adds three things to this path: membership of the `members` group, the generated `httpd` and `gmid` files for the site, and the quota entry. `add-user.sh` does the group and the quota, and `provision-member.sh` does the rest of the hosting: it writes the member's own `httpd` and `gmid` files through its lanes, queues the certificate, and `scripts/cron-apply.sh --web` rewrites the indexes and the relayd member keypair region and reloads the daemons. Until the drain lands, this is the whole of provisioning a member.
 
 ## Provision own-domain hosting
 
@@ -230,44 +230,44 @@ No new environment value is needed. `ACME_D`, `PUBLIC_ROOT` and `ACME_QUEUE` are
 
 To remove a body's domain, close it from the console:
 
-	doas kyriakon-onboardctl group remove <domain>
+	doas kyriakon-admin group remove <domain>
 
 The drain removes the domain's lines from the mail tables, its generated vhosts, capsule block, certificate material and queued order, then closes every account in the group through the deletion path and deletes the group record. The records in the body's own zone stay there, and the body removes them.
 
-## Provision through the onboarding service
+## Provision through the control plane
 
-The service is decided in #156, and the drain it needs is built: `scripts/deploy-onboard.sh` installs it and `scripts/cron-apply.sh` schedules it. This section records the shape an operator will work with, so that the decisions are findable beside the procedures they change.
+The service is decided in #156, and the drain it needs is built: `scripts/deploy-control.sh` installs it and `scripts/cron-apply.sh` schedules it. This section records the shape an operator will work with, so that the decisions are findable beside the procedures they change.
 
 Two halves run with different privilege. The handler is a FastCGI responder, reached by httpd's `signup.kyriakon.net` vhost for the web form and by gmid's signup block for the capsule, with `relayd` terminating TLS ahead of both. It holds no secrets, writes the raw Stripe body and its signature header, files applications, and writes account-page intents. The drain is a one-minute cron job, with a second hourly job for the sweeps, and it owns provisioning, manual payment credits, key publication pull requests, certificate requests, the lifecycle transitions and their notices, the 90-day application purge and the grace sweeps. Notices leave through the local `smtpd` enqueuer, so `filter-dkimsign` signs them the way it signs everything else.
 
 The state is flat files, one directory per account. `account.json` holds the state, the contact and recovery addresses, the upload-key fingerprints and dates, the rail and token reference, the paid-until date and the approval decision. `notices.jsonl` appends each notice with its timestamp. `application.json` holds the application answers and the purge deletes it. An own-domain body has `groups/<domain>/group.json` instead of one account record holding its payment state: it carries the domain, the body's name and kind, the payment block, the mailbox accounts and the site owner, and each mailbox's `account.json` carries a `group` reference and no paid-until date of its own. A top level `intents/` directory holds pending work, one file per item, and `journal.jsonl` records transitions. The drain appends the journal entry before it carries the transition out, so a crash leaves a record it can rerun. The build fixes the store's path, and the drain adds that path to the payload of `scripts/backup.sh`, which today copies `/home`, `/etc/mail` and the capsule certificate pair.
 
-An account approved without charge has no `payment` block at all, so it has no token, no window and no paid-until date, and its approval writes no ledger line. It never lapses and no grace or deletion notice runs for it. The drain sends it one note a year, on the creation anniversary, and `onboardctl free` prints how many such accounts the store holds. It ends by the member's request, a breach of the acceptable use policy, or the operator closing one that has been unreachable and unused for a year, and then takes the ordinary deletion path.
+An account approved without charge has no `payment` block at all, so it has no token, no window and no paid-until date, and its approval writes no ledger line. It never lapses and no grace or deletion notice runs for it. The drain sends it one note a year, on the creation anniversary, and `kyriakon-admin free` prints how many such accounts the store holds. It ends by the member's request, a breach of the acceptable use policy, or the operator closing one that has been unreachable and unused for a year, and then takes the ordinary deletion path.
 
-The account page logs a member in with the mail password and nothing else. `scripts/deploy-onboard.sh` installs `/usr/local/libexec/kyriakon-authcheck`, and the handler runs it through `doas`. The rule cannot name `doveadm auth test` itself, because `doas.conf(5)` matches arguments literally and the username would be refused. It names the checker, which takes one username and one proof directory, reads the password from stdin and runs only that subcommand. On success it writes a proof under `/var/db/kyriakon/logins` and prints its token. The handler stores that token in the session record it writes, and the drain reads the proof file back before it acts on a close or export, so a session the handler invented proves nothing. The deploy creates the proof directory root-owned 0700. Append the tracked line in `openbsd/etc/doas.conf.onboard` to `/etc/doas.conf`, then run `doas -C /etc/doas.conf`. The deploy prints both steps when the line is missing, and until it is there every login is refused. The handler reads only the signed-in member's account record, that member's group record and the notices it renders; every store path is built from the session's validated username, and it never opens another member's record, the journal, a request, the ledger or the mail spool.
+The account page logs a member in with the mail password and nothing else. `scripts/deploy-control.sh` installs `/usr/local/libexec/kyriakon-authcheck`, and the handler runs it through `doas`. The rule cannot name `doveadm auth test` itself, because `doas.conf(5)` matches arguments literally and the username would be refused. It names the checker, which takes one username and one proof directory, reads the password from stdin and runs only that subcommand. On success it writes a proof under `/var/db/kyriakon/logins` and prints its token. The handler stores that token in the session record it writes, and the drain reads the proof file back before it acts on a close or export, so a session the handler invented proves nothing. The deploy creates the proof directory root-owned 0700. Append the tracked line in `openbsd/etc/doas.conf.control` to `/etc/doas.conf`, then run `doas -C /etc/doas.conf`. The deploy prints both steps when the line is missing, and until it is there every login is refused. The handler reads only the signed-in member's account record, that member's group record and the notices it renders; every store path is built from the session's validated username, and it never opens another member's record, the journal, a request, the ledger or the mail spool.
 
-`onboardctl credit (--token <t> | --username <u>) --rail <cash|cash-hand|monero> --amount <gbp> --received <YYYY-MM-DD>` records one payment against the account's token. A body's group holds one token for the whole group, so `--username` naming any mailbox in the group resolves to that group's token and writes the one date every mailbox shares. The drain applies it on its next pass, sets the paid-until date, sends the receipt and appends the ledger line. A second credit on a token already credited needs `--confirm-double`, and a credit reaching more than 24 months past `--received` needs `--override <reason>`, whose reason is journalled. Thirty days before a prepaid account's paid-until date the drain sends the platform's own renewal notice, once for that date. A card account gets Stripe's upcoming-invoice reminder instead, and a body's group gets the same note to the address its application gave, naming the group's own price.
+`kyriakon-admin credit (--token <t> | --username <u>) --rail <cash|cash-hand|monero> --amount <gbp> --received <YYYY-MM-DD>` records one payment against the account's token. A body's group holds one token for the whole group, so `--username` naming any mailbox in the group resolves to that group's token and writes the one date every mailbox shares. The drain applies it on its next pass, sets the paid-until date, sends the receipt and appends the ledger line. A second credit on a token already credited needs `--confirm-double`, and a credit reaching more than 24 months past `--received` needs `--override <reason>`, whose reason is journalled. Thirty days before a prepaid account's paid-until date the drain sends the platform's own renewal notice, once for that date. A card account gets Stripe's upcoming-invoice reminder instead, and a body's group gets the same note to the address its application gave, naming the group's own price.
 
-`onboardctl prepaid list --window open [--expiring <days>]` is the first command of the weekly pass. It lists each open window's token, username, rail, close date and days left, sorted by close date, and `--expiring 3` narrows the list to the windows closing within three days. A body's group window is in the same list, with the site owner the token is indexed under as its username. Only `--window open` is accepted.
+`kyriakon-admin prepaid list --window open [--expiring <days>]` is the first command of the weekly pass. It lists each open window's token, username, rail, close date and days left, sorted by close date, and `--expiring 3` narrows the list to the windows closing within three days. A body's group window is in the same list, with the site owner the token is indexed under as its username. Only `--window open` is accepted.
 
-`onboardctl window extend --token <t> --days 14 --reason <text>` gives an open window its one extension when the member says the money is in the post. The drain moves `closes_at` fourteen days on and increments the window's counter on its next pass. A second extension from the same window is refused and journalled. A window that reaches its close date with no credit recorded lapses the account. The sweep runs `scripts/lapse-user.sh`, so mail stays readable and published pages stay up while sending, uploading and pushing stop, and the forty-day grace starts. With thirty days of the grace left the drain sends the grace notice, at day 33 it sends the final notice, and at the end of the grace it runs the same deletion transition as a closed account. A credit recorded before the sweep reaches the closed window leaves the account active: the date is set, so the window closes as paid and nothing lapses. A body's group window takes the same one extension under the same rule, and a group that reaches its close date lapses whole: every mailbox stops sending, uploading and pushing, one notice goes to the body, and the group's forty-day grace starts from the sweep that lapsed it rather than from the old close date.
+`kyriakon-admin window extend --token <t> --days 14 --reason <text>` gives an open window its one extension when the member says the money is in the post. The drain moves `closes_at` fourteen days on and increments the window's counter on its next pass. A second extension from the same window is refused and journalled. A window that reaches its close date with no credit recorded lapses the account. The sweep runs `scripts/lapse-user.sh`, so mail stays readable and published pages stay up while sending, uploading and pushing stop, and the forty-day grace starts. With thirty days of the grace left the drain sends the grace notice, at day 33 it sends the final notice, and at the end of the grace it runs the same deletion transition as a closed account. A credit recorded before the sweep reaches the closed window leaves the account active: the date is set, so the window closes as paid and nothing lapses. A body's group window takes the same one extension under the same rule, and a group that reaches its close date lapses whole: every mailbox stops sending, uploading and pushing, one notice goes to the body, and the group's forty-day grace starts from the sweep that lapsed it rather than from the old close date.
 
-`onboardctl monero address <username> <address>` records the subaddress the operator's own wallet made for a Monero member: one per account, permanent, never rotated or reused, and a second, different address is refused. Run it after `monero-wallet-cli` prints the address, once per member; until then the account page says the address is not ready rather than showing an empty field. It writes the account and the status page's copy, so both pages carry it at once.
+`kyriakon-admin monero address <username> <address>` records the subaddress the operator's own wallet made for a Monero member: one per account, permanent, never rotated or reused, and a second, different address is refused. Run it after `monero-wallet-cli` prints the address, once per member; until then the account page says the address is not ready rather than showing an empty field. It writes the account and the status page's copy, so both pages carry it at once.
 
-The window opens with one quote, `price ÷ rate` rounded up to six decimal places, and that number is honoured for the window's fourteen days. The rate comes from CoinGecko's public price endpoint and is cached in `rates/xmr-gbp.json`; the drain refreshes it at most once every twenty-four hours and the handler renders the quote recorded on the account without asking the source anything. `doas cat /var/db/onboard/rates/xmr-gbp.json` shows the cached rate, its source and its fetch time. A source that cannot be reached with a cache present gives the cached rate marked stale, and the page shows no Monero block rather than a quote it cannot refresh; with no rate ever fetched the window opens with cash by post as the only prepaid rail. The fetch runs the `curl` named by `rates_fetch` in `drain.toml`, so a box without it logs `cannot run the rate fetch` on each attempt and quotes nothing; `scripts/deploy-onboard.sh` warns when that path is missing.
+The window opens with one quote, `price ÷ rate` rounded up to six decimal places, and that number is honoured for the window's fourteen days. The rate comes from CoinGecko's public price endpoint and is cached in `rates/xmr-gbp.json`; the drain refreshes it at most once every twenty-four hours and the handler renders the quote recorded on the account without asking the source anything. `doas cat /var/db/onboard/rates/xmr-gbp.json` shows the cached rate, its source and its fetch time. A source that cannot be reached with a cache present gives the cached rate marked stale, and the page shows no Monero block rather than a quote it cannot refresh; with no rate ever fetched the window opens with cash by post as the only prepaid rail. The fetch runs the `curl` named by `rates_fetch` in `drain.toml`, so a box without it logs `cannot run the rate fetch` on each attempt and quotes nothing; `scripts/deploy-control.sh` warns when that path is missing.
 
-`onboardctl credit --note <text> --rail <cash|monero> --amount <gbp> --received <YYYY-MM-DD>` records money that cannot be joined to an account: an envelope with no token, or Monero sent to the wallet's main address. The drain holds it in `ledger/unattributed.jsonl` marked `held`, with the rail, amount, date, note and any transaction id, and writes nothing against a member. The money is not income until it is attributed. `cash-hand` is refused with a note, because that rail is keyed by a username. A transaction id already held or credited is refused, naming the first date and id.
+`kyriakon-admin credit --note <text> --rail <cash|monero> --amount <gbp> --received <YYYY-MM-DD>` records money that cannot be joined to an account: an envelope with no token, or Monero sent to the wallet's main address. The drain holds it in `ledger/unattributed.jsonl` marked `held`, with the rail, amount, date, note and any transaction id, and writes nothing against a member. The money is not income until it is attributed. `cash-hand` is refused with a note, because that rail is keyed by a username. A transaction id already held or credited is refused, naming the first date and id.
 
-`onboardctl reconcile list` prints every held item with its id, rail, amount, date and note. `onboardctl reconcile attribute <UN-id> --token <t>` joins one item to an account as an ordinary credit: the next drain sets the paid-until date one year from the held date, sends the receipt and appends the ledger line keyed by the token, then marks the held line `attributed` with the token and never the username. An item that is not held, a token not in the index, and a token already credited are refused; a second payment on a credited token is attributed as a renewal with `onboardctl reconcile attribute <UN-id> --token <t> --confirm-double`, and an old held date that would pass the 24-month ceiling takes `--override <reason>` the same way. `onboardctl reconcile return <UN-id> --note "<evidence>"` closes an item that went back or was kept, appends the evidence to the note and writes no payment line.
+`kyriakon-admin reconcile list` prints every held item with its id, rail, amount, date and note. `kyriakon-admin reconcile attribute <UN-id> --token <t>` joins one item to an account as an ordinary credit: the next drain sets the paid-until date one year from the held date, sends the receipt and appends the ledger line keyed by the token, then marks the held line `attributed` with the token and never the username. An item that is not held, a token not in the index, and a token already credited are refused; a second payment on a credited token is attributed as a renewal with `kyriakon-admin reconcile attribute <UN-id> --token <t> --confirm-double`, and an old held date that would pass the 24-month ceiling takes `--override <reason>` the same way. `kyriakon-admin reconcile return <UN-id> --note "<evidence>"` closes an item that went back or was kept, appends the evidence to the note and writes no payment line.
 
-`onboardctl payment show --username <u>` prints the account's rail, paid-until date and every ledger line keyed by its token, including a refund's `refund_of` and `settled_on`. A group mailbox prints the group's one rail, token and date instead, because that is where the payment lives. It reads the ledger strictly, so a corrupt line is an error rather than a payment history that looks empty.
-`onboardctl reconcile list` prints every held item with its id, rail, amount, date and note. `onboardctl reconcile attribute <UN-id> --token <t>` joins one item to an account as an ordinary credit: the next drain sets the paid-until date one year from the held date, sends the receipt and appends the ledger line keyed by the token, then marks the held line `attributed` with the token and never the username. An item that is not held, a token not in the index, and a token already credited are refused; a second payment on a credited token is recorded as a renewal with `onboardctl credit --confirm-double`. `onboardctl reconcile return <UN-id> --note "<evidence>"` closes an item that went back or was kept, appends the evidence to the note and writes no payment line. A transaction id already held is refused, naming the first date and id.
-`onboardctl refund (--token <t> | --username <u>) --rail <card|cash|cash-hand|monero> --amount <gbp> --reason <text> (--close | --excess) [--rate <gbp-per-xmr>]` records a refund against the most recent payment the token made. The drain appends a negative ledger line naming the `seq` it reverses, and sends the notice that states the date the refund will be settled. It refuses a rail the payment did not arrive on, an amount larger than that payment, and a second identical refund. `--close` is a cancellation inside the fourteen days: it must be the full amount, it sets the account closing, and it starts the seven-day closing window. `--excess` is an overpayment or a duplicate, and it leaves the account state and the paid-until date alone. A group's token refunds the same way with `--excess` only: a group has no closing state, so `--close` is refused with the reason, and the transition that ends a group is `onboardctl group remove <domain>`. A card refund prints the `refund-<seq>` `Idempotency-Key` for the Stripe refund the operator then issues. A Monero refund returns the XMR recorded on the receipt line, or with `--rate` the sterling price at the refund-date rate, and the ledger line records which. A posted-cash refund goes back by post, and no refund path holds a bank detail.
+`kyriakon-admin payment show --username <u>` prints the account's rail, paid-until date and every ledger line keyed by its token, including a refund's `refund_of` and `settled_on`. A group mailbox prints the group's one rail, token and date instead, because that is where the payment lives. It reads the ledger strictly, so a corrupt line is an error rather than a payment history that looks empty.
+`kyriakon-admin reconcile list` prints every held item with its id, rail, amount, date and note. `kyriakon-admin reconcile attribute <UN-id> --token <t>` joins one item to an account as an ordinary credit: the next drain sets the paid-until date one year from the held date, sends the receipt and appends the ledger line keyed by the token, then marks the held line `attributed` with the token and never the username. An item that is not held, a token not in the index, and a token already credited are refused; a second payment on a credited token is recorded as a renewal with `kyriakon-admin credit --confirm-double`. `kyriakon-admin reconcile return <UN-id> --note "<evidence>"` closes an item that went back or was kept, appends the evidence to the note and writes no payment line. A transaction id already held is refused, naming the first date and id.
+`kyriakon-admin refund (--token <t> | --username <u>) --rail <card|cash|cash-hand|monero> --amount <gbp> --reason <text> (--close | --excess) [--rate <gbp-per-xmr>]` records a refund against the most recent payment the token made. The drain appends a negative ledger line naming the `seq` it reverses, and sends the notice that states the date the refund will be settled. It refuses a rail the payment did not arrive on, an amount larger than that payment, and a second identical refund. `--close` is a cancellation inside the fourteen days: it must be the full amount, it sets the account closing, and it starts the seven-day closing window. `--excess` is an overpayment or a duplicate, and it leaves the account state and the paid-until date alone. A group's token refunds the same way with `--excess` only: a group has no closing state, so `--close` is refused with the reason, and the transition that ends a group is `kyriakon-admin group remove <domain>`. A card refund prints the `refund-<seq>` `Idempotency-Key` for the Stripe refund the operator then issues. A Monero refund returns the XMR recorded on the receipt line, or with `--rate` the sterling price at the refund-date rate, and the ledger line records which. A posted-cash refund goes back by post, and no refund path holds a bank detail.
 
 After posting the money, issuing the Stripe refund or sending the Monero, record the settlement against the same line:
 
-`onboardctl refund (--token <t> | --username <u>) --settled <YYYY-MM-DD>` completes the newest unsettled refund line for the token and refuses when there is none.
-`onboardctl ledger export --tax-year <YYYY-YY|YYYY-YYYY> --format csv` prints the year's ledger for the accountant, one row per line in `ledger/payments.jsonl` whose `received_on` falls between 6 April and the next 5 April, ordered by `seq`. Each row carries the token, the kind, the rail, the amount, the date and the rate fields, and none carries a username, an address or a note. A refund prints as a negative row and names the `seq` it reverses in `refund_of`; `settled_on` is empty until the operator records the settlement. After the keyed rows, a blank line and `# unattributed` introduce a second table, `id,rail,received_on,amount_gbp`, holding the payments in `ledger/unattributed.jsonl` still marked `held` and inside the year, because money with no token is not keyed and is not income until it is attributed. A missing ledger exports as headers and no rows. The command prints to stdout and writes nothing to the store, so redirect it where the accountant wants the file. The live files are never purged, so export an earlier year again by re-running the command.
+`kyriakon-admin refund (--token <t> | --username <u>) --settled <YYYY-MM-DD>` completes the newest unsettled refund line for the token and refuses when there is none.
+`kyriakon-admin ledger export --tax-year <YYYY-YY|YYYY-YYYY> --format csv` prints the year's ledger for the accountant, one row per line in `ledger/payments.jsonl` whose `received_on` falls between 6 April and the next 5 April, ordered by `seq`. Each row carries the token, the kind, the rail, the amount, the date and the rate fields, and none carries a username, an address or a note. A refund prints as a negative row and names the `seq` it reverses in `refund_of`; `settled_on` is empty until the operator records the settlement. After the keyed rows, a blank line and `# unattributed` introduce a second table, `id,rail,received_on,amount_gbp`, holding the payments in `ledger/unattributed.jsonl` still marked `held` and inside the year, because money with no token is not keyed and is not income until it is attributed. A missing ledger exports as headers and no rows. The command prints to stdout and writes nothing to the store, so redirect it where the accountant wants the file. The live files are never purged, so export an earlier year again by re-running the command.
 
 Read a member's record by reading their `account.json`. The documents carry a version and the drain validates them on read, so a malformed file stops the drain with an error instead of being skipped.
 
@@ -281,7 +281,7 @@ An approval writes the member's key into `/etc/kyriakon/keys/<localpart>.asc` so
 
 The script opens one branch, `publish-key/<localpart>`, with one commit adding `keys/<localpart>.asc`, and opens a pull request for it. It compares primary fingerprints, never file bytes, so the second run for a member writes nothing and opens no second pull request, and a key already on the default branch makes it exit 0 in silence. It refuses to replace a key that is already published, because that is a rotation, and rotation confirms with the member first (#155).
 
-The credential is a fine-grained token for this repository, scoped to contents and pull requests, at `/etc/kyriakon/onboard/keyring-publish-token`, root-owned and mode 0600. `scripts/deploy-onboard.sh` checks that shape and prints the install line when the file is missing. The script never writes the token to an argument or to its output: it goes into a mode-0600 curl config file.
+The credential is a fine-grained token for this repository, scoped to contents and pull requests, at `/etc/kyriakon/onboard/keyring-publish-token`, root-owned and mode 0600. `scripts/deploy-control.sh` checks that shape and prints the install line when the file is missing. The script never writes the token to an argument or to its output: it goes into a mode-0600 curl config file.
 
 A failed publish is reported by the drain, which names the member and the fingerprint, and the next pass tries again. The seven days `scripts/check-keyring-drift.sh` allows an unpublished key are the backstop: if the pull request is never merged, or the publish never succeeds, the check alerts at the branch name, and the repair is to merge the pull request or fix the credential. Delivery is unaffected either way, because the box keyring is what encrypts.
 
@@ -374,7 +374,7 @@ The lifecycle notices go to the member's platform address and to every other add
 
 2. Read the addresses and the notice history in `account.json` and `notices.jsonl`.
 
-3. Send the notice again over a channel that works and record the send. With the drain built, `kyriakon-onboardctl` re-sends and writes the record. Without it, append one object to `notices.jsonl` in the same shape as the objects already there, because a deletion has to be able to show what was sent and when.
+3. Send the notice again over a channel that works and record the send. With the drain built, `kyriakon-admin` re-sends and writes the record. Without it, append one object to `notices.jsonl` in the same shape as the objects already there, because a deletion has to be able to show what was sent and when.
 
 4. Check the account's grace date. A bounce at every address extends the grace until a channel works, so the date moves out rather than the account being deleted unread.
 
@@ -394,11 +394,11 @@ The AUP ladder is detect, warn with 72 hours to respond, suspend, then delete af
 
 2. Record the reason and the date on the account, stop outbound mail, and send the notice with the reason and how to answer.
 
-		doas onboardctl suspend <username> --reason "<the reason the member reads>"
+		doas kyriakon-admin suspend <username> --reason "<the reason the member reads>"
 
    The command moves the account into the login class that rejects submission through `scripts/lapse-user.sh`, so IMAP keeps working, and it stops the sftp upload and the git push with the same script. It sets the state to suspended, writes the reason where the account page reads it, and sends the suspension notice with the reason and the way to answer it. A second run with the same reason sends no second notice.
 
-   The suspension starts the same forty-day grace as a lapse: the drain sends a final notice seven days before the deletion, naming the reason again, and an unanswered suspension runs the ordinary deletion transition. To lift one, run `doas onboardctl resume <username>`: it restores the three access paths, sets the account active again, and clears the reason and the grace, so the deletion clock stops.
+   The suspension starts the same forty-day grace as a lapse: the drain sends a final notice seven days before the deletion, naming the reason again, and an unanswered suspension runs the ordinary deletion transition. To lift one, run `doas kyriakon-admin resume <username>`: it restores the three access paths, sets the account active again, and clears the reason and the grace, so the deletion clock stops.
 
 3. Check afterwards that submission fails for the account, that IMAP still works, and that the site is down while the certificate is still valid.
 
@@ -406,7 +406,7 @@ A body's site is one generated file per daemon. `httpd` reads `/etc/httpd.d/inde
 
 1. Stop outbound submission for every mailbox in the group with the same step an individual account takes, once per mailbox. IMAP keeps working.
 
-		doas onboardctl suspend <username> --reason "<the reason the member reads>"
+		doas kyriakon-admin suspend <username> --reason "<the reason the member reads>"
 
 2. Remove the domain's two generated files, run the index pass, and reload the daemons after checking their configuration.
 
@@ -417,9 +417,9 @@ A body's site is one generated file per daemon. `httpd` reads `/etc/httpd.d/inde
 
 3. Leave `/etc/mail/mail_domains` and `/etc/mail/virtuals` alone. The domain's line in either table is what makes inbound mail arrive, and the ladder does not refuse a third party's message during a suspension.
 
-4. Each `suspend` in step 1 records the reason where that mailbox's account page reads it and sends the notice with the reason and the way to answer it. The group's own record carries no reason field, so the ticket keeps the date. Lift the suspension with `doas onboardctl resume <username>` once per mailbox before restoring the generated files below.
+4. Each `suspend` in step 1 records the reason where that mailbox's account page reads it and sends the notice with the reason and the way to answer it. The group's own record carries no reason field, so the ticket keeps the date. Lift the suspension with `doas kyriakon-admin resume <username>` once per mailbox before restoring the generated files below.
 
-The port 80 challenge vhosts are written into the same `<domain>.conf` file, so the certificate cannot renew while the site is down. `scripts/provision-group-web.sh <domain> <site-account>` and `scripts/provision-group-capsule.sh <domain> <site-account>` write both files back, and the index pass applies them, so restore a suspension that ends by running `onboardctl resume` for each mailbox, then those two scripts, and then `cron-apply.sh --web`. A suspension that outlasts the certificate's remaining validity needs the renewal settled before it starts.
+The port 80 challenge vhosts are written into the same `<domain>.conf` file, so the certificate cannot renew while the site is down. `scripts/provision-group-web.sh <domain> <site-account>` and `scripts/provision-group-capsule.sh <domain> <site-account>` write both files back, and the index pass applies them, so restore a suspension that ends by running `kyriakon-admin resume` for each mailbox, then those two scripts, and then `cron-apply.sh --web`. A suspension that outlasts the certificate's remaining validity needs the renewal settled before it starts.
 
 The generated include files are written by `scripts/provision-member-web.sh` and `scripts/provision-member-capsule.sh` for a member, and by `scripts/provision-group-web.sh` and `scripts/provision-group-capsule.sh` for a body, with `scripts/cron-apply.sh --web` listing them. The account page is built.
 
@@ -444,7 +444,7 @@ for a message from the account's own platform address, `<username>@<group
 domain>` for a group mailbox and `<username>@kyriakon.net` otherwise, signed with
 the key the platform already encrypts to. Check it here:
 
-	doas onboardctl request verify --username <username> --message <file> \
+	doas kyriakon-admin request verify --username <username> --message <file> \
 	  [--signature <file>]
 
 `--message` is the saved message and `--signature` its detached signature. The
@@ -470,7 +470,7 @@ worked, `password` or `mail-key`. `--received` is the day it arrived, and
 `--identity-at` or `--fee-at` is the day the identity information or a fee
 arrived. The answer is due one calendar month after the latest of the three.
 
-	doas onboardctl request record --username <username> --identity mail-key \
+	doas kyriakon-admin request record --username <username> --identity mail-key \
 	  --kind access --received <YYYY-MM-DD> \
 	  --evidence "signed message from the account address" \
 	  --identity-at <YYYY-MM-DD> --note "export filed"
@@ -480,14 +480,14 @@ recorded as `access`. The command prints the request id and the due date. If the
 connection drops before it prints, run `request list` before recording again:
 the line is there if the write landed.
 
-	doas onboardctl request list
+	doas kyriakon-admin request list
 
 The list prints every open request, earliest due first, and counts the ones
 inside seven days and the overdue ones separately. It names the route each record
 carries, or `unrecorded` on a line written before the field existed. An extended
 request shows its extended date and the date it replaced.
 
-	doas onboardctl request extend <id> --reason "the export spans three mailboxes"
+	doas kyriakon-admin request extend <id> --reason "the export spans three mailboxes"
 
 A complex request may be extended by two further months under Article 12A. The
 extension runs from the current answer date, so the total is at most three
@@ -496,12 +496,12 @@ months from the relevant time, and the command prints the old and the new date.
 to today. The command refuses a closed request, a request extended already, and
 an empty reason.
 
-	doas onboardctl request close <id> --done <YYYY-MM-DD> --note "collected over sftp"
+	doas kyriakon-admin request close <id> --done <YYYY-MM-DD> --note "collected over sftp"
 
 Closing writes what was done onto that request's own line. The record is the
 member's data: it goes out with a later export and is removed with the account.
 
-	doas onboardctl export <username> [--by-mail] [--request <id>]
+	doas kyriakon-admin export <username> [--by-mail] [--request <id>]
 
 The export writes the platform's written record of the account into the member's
 own sftp chroot, at `/home/www/<username>.kyriakon.net/export/<timestamp>/`,
@@ -537,7 +537,7 @@ A member asks for closure from the account page, or a refund opens it. Closing i
 
 Deletion is a sequence, and the order stops access before anything is destroyed, so the window between the decision and the deletion is closed. The sequence is from the research in #168.
 
-The automated path is `doas kyriakon-onboardctl delete <username>`. It runs the sequence below as the lifecycle's one deletion transition, and the page's closing sweep calls the same transition when the seven days end. The numbered steps remain the operator's fallback when the service is not running.
+The automated path is `doas kyriakon-admin delete <username>`. It runs the sequence below as the lifecycle's one deletion transition, and the page's closing sweep calls the same transition when the seven days end. The numbered steps remain the operator's fallback when the service is not running.
 
 1. Close access.
 
@@ -623,11 +623,11 @@ To prove a restored copy becomes a working mail server, rather than merely resto
 2. Work through the checklist the script prints. Start the daemons, clone a test `pass` repository over ssh, send a message from an address outside the platform and read it back over IMAP with a PGP client, confirm MX and PTR point at this box for the window, record the date and the snapshot id, then ping the rehearsal check. The check carries a period of about 90 days, so a skipped quarter alerts on its own.
 
 3. Put the configuration on a replacement box from the repository, in this order.
-   `deploy-onboard.sh` runs first because the mail and relay deploys both check
+   `deploy-control.sh` runs first because the mail and relay deploys both check
    that the handler is up.
 
 		doas ksh scripts/setup-env.sh
-		doas ksh scripts/deploy-onboard.sh
+		doas ksh scripts/deploy-control.sh
 		doas ksh scripts/deploy-nsd.sh
 		doas ksh scripts/deploy-mail.sh
 		doas ksh scripts/deploy-relayd.sh
