@@ -1954,10 +1954,12 @@ pub async fn mail_key(
                     }
                 };
             // Signup warns and proceeds because a heuristic refusal turns a
-            // guarantee into a support queue. A replacement refuses: the account
-            // already receives mail, and a key that stops delivery must not
-            // enter the keyring from `/account`.
-            if checked.verdict != "works" {
+            // guarantee into a support queue. A replacement refuses, because
+            // the account already receives mail and a key that stops delivery
+            // must not enter the keyring from `/account`. A block the parser
+            // could not inspect carries an advisory, not a verdict, so it
+            // proceeds like approval's.
+            if checked.inspected && checked.verdict != "works" {
                 return Ok(Settlement::refused(format!(
                     "the mail key: {}",
                     checked.verdict

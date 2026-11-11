@@ -45,6 +45,11 @@ pub struct Checked {
     /// "works" when the shared check finds nothing, or its findings joined with
     /// "; " when one or more trips.
     pub verdict: String,
+    /// False when the block is well framed but the crate could not read it. The
+    /// verdict is then the advisory that a person will check the key, which
+    /// warns and proceeds; a key is refused only when `inspected` and the
+    /// verdict is not "works".
+    pub inspected: bool,
 }
 
 struct Packet {
@@ -54,15 +59,17 @@ struct Packet {
 
 /// Inspect an armoured PGP public key block. `Err` is the refusal reason; the
 /// verdict is the shared crate's reading of the three conditions, joined when
-/// more than one trips.
+/// more than one trips. `inspected` separates a finding from the advisory that
+/// the parser could not read the block.
 pub fn pgp_public_key(value: &str) -> Result<Checked, Error> {
-    let findings = pgp_findings(value)?;
+    let (findings, inspected) = inspect(value)?;
     Ok(Checked {
         verdict: if findings.is_empty() {
             "works".to_string()
         } else {
             findings.join("; ")
         },
+        inspected,
     })
 }
 
@@ -70,6 +77,18 @@ pub fn pgp_public_key(value: &str) -> Result<Checked, Error> {
 /// the framing check that decides whether the material is a public key block at
 /// all. The conditions themselves are not repeated here.
 pub fn pgp_findings(value: &str) -> Result<Vec<String>, Error> {
+    inspect(value).map(|(findings, _)| findings)
+}
+
+/// The advisory a well-framed block gets when the crate cannot parse it. It is
+/// not a verdict on the key, and a caller that refuses findings must not refuse
+/// this one.
+const UNINSPECTED: &str = "The key could not be inspected automatically, so a person will \
+     check it against the key on the box. The application can still be filed.";
+
+/// The framing checks and the crate's findings, with whether the crate read the
+/// block at all.
+fn inspect(value: &str) -> Result<(Vec<String>, bool), Error> {
     let value = value.trim();
     if value.is_empty() {
         return Err(Error::Failed("a public key is needed".to_string()));
@@ -95,12 +114,8 @@ pub fn pgp_findings(value: &str) -> Result<Vec<String>, Error> {
     // proceeds, because a refusal would turn a support question into a lost
     // application. The warning says what happened so the reviewer reads it.
     match keygen_spike::check_public_key(value, now_secs()) {
-        Ok(findings) => Ok(findings),
-        Err(_) => Ok(vec![
-            "The key could not be inspected automatically, so a person will check it \
-             against the key on the box. The application can still be filed."
-                .to_string(),
-        ]),
+        Ok(findings) => Ok((findings, true)),
+        Err(_) => Ok((vec![UNINSPECTED.to_string()], false)),
     }
 }
 
@@ -590,13 +605,18 @@ mod tests {
     fn a_framed_block_the_parser_cannot_read_warns_and_proceeds() {
         // `GOOD` has the framing and a public key packet, and nothing the
         // parser can understand. A refusal here would lose an application over
-        // a gap in the check, so it is a warning with a reader named.
+        // a gap in the check, so it is a warning with a reader named, and it is
+        // marked uninspected so a caller that refuses findings lets it through.
         let c = pgp_public_key(&armoured(GOOD)).expect("a warning is not a refusal");
         assert!(
             c.verdict.contains("could not be inspected"),
             "{}",
             c.verdict
         );
+        assert!(!c.inspected, "{}", c.verdict);
+
+        let clean = pgp_public_key(CLEAN).unwrap();
+        assert!(clean.inspected);
     }
 
     #[test]

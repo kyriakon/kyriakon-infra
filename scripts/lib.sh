@@ -416,13 +416,14 @@ run: $0 on $(hostname) at $(date '+%F %T')"
 # key_problems <file> — why a public key cannot serve this platform's mail, one
 # line each, and nothing at all when it can. Two faults, both silent at delivery
 # time: gpg encrypts with packet tag 20 whenever the key advertises AEAD, and a
-# client that implements MDC alone cannot open that; an expired key makes the
-# encryptor fail closed, and the drift check compares fingerprints only, so
-# nothing reports it. deploy-mail.sh warns about the first at install and
-# rekey-mail-key.sh fixes it, both on the side of the box; this is the gate the
-# key has to pass before it is published at all.
+# client that implements MDC alone cannot open that; an expiring key, on the
+# primary or on its encryption subkey, makes the encryptor fail closed at the
+# date, and the drift check compares fingerprints only, so nothing reports it.
+# deploy-mail.sh warns about the first at install and rekey-mail-key.sh fixes it,
+# both on the side of the box; this is the gate the key has to pass before it is
+# published at all.
 key_problems() {
-	typeset key_file="$1" packets feat expires
+	typeset key_file="$1" packets feat
 	packets=$(gpg --list-packets "$key_file" 2>/dev/null)
 	if printf '%s\n' "$packets" | grep -q 'pref-aead-algos'; then
 		printf 'it advertises AEAD, so delivery would use a packet a client with MDC alone cannot read (fix on the workstation holding it: scripts/rekey-mail-key.sh)\n'
@@ -436,12 +437,16 @@ key_problems() {
 				printf 'its self-signature sets the AEAD feature bit (features: %s)\n' "$feat"
 			fi
 		done
-	expires=$(gpg --batch --with-colons --show-keys "$key_file" 2>/dev/null |
-		awk -F: '$1 == "pub" { print $7; exit }')
-	if [ -n "$expires" ]; then
-		printf 'it expires on %s, and delivery stops then without a word (a mail key must not expire)\n' \
-			"$(date -r "$expires" +%Y-%m-%d)"
-	fi
+	# The primary and every subkey carry their own expiry in field 7. A primary
+	# that never expires with an encryption subkey that does stops delivery the
+	# same way, so both record types are read.
+	gpg --batch --with-colons --show-keys "$key_file" 2>/dev/null |
+		awk -F: '($1 == "pub" || $1 == "sub") && $7 != "" { print $7 }' |
+		sort -un |
+		while read -r expires; do
+			printf 'it expires on %s, and delivery stops then without a word (a mail key must not expire)\n' \
+				"$(date -r "$expires" +%Y-%m-%d)"
+		done
 }
 
 # --- tables ----------------------------------------------------------------

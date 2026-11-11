@@ -621,6 +621,20 @@ SETPREF
 	assert_has 'the refusal says when it expires' 'expires on' "$out"
 	assert_no_log 'nothing was opened for an expiring key' 'PUT'
 
+	printf '%s\n' '--- a key whose encryption subkey expires is refused'
+	subexp_key="$fix/subexp.asc"
+	gpg --batch --pinentry-mode loopback --passphrase '' \
+		--quick-generate-key 'Sub Exp <subexp@example.invalid>' ed25519 cert never >/dev/null 2>&1
+	subexp=$(gpg --batch --with-colons --list-keys 'subexp@example.invalid' 2>/dev/null |
+		awk -F: '/^fpr:/ { print $10; exit }')
+	gpg --batch --pinentry-mode loopback --passphrase '' \
+		--quick-add-key "$subexp" cv25519 encr 20y >/dev/null 2>&1
+	gpg --batch --armor --export 'subexp@example.invalid' >"$subexp_key" 2>/dev/null
+	run subexp "$subexp_key" "$fix/token"
+	assert_eq 'subkey expiry exit' 1 "$rc"
+	assert_has 'the refusal names the subkey expiry' 'expires on' "$out"
+	assert_no_log 'nothing was opened for a subkey-expiring key' 'PUT'
+
 	printf '%s\n' '--- a different key on the branch is refused'
 	rm -f "$fix/state/main"
 	cp "$fix/bob.asc" "$fix/state/branch"

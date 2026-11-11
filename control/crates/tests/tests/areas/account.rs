@@ -756,7 +756,8 @@ fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
 
 /// A replacement carrying a verdict other than "works" is refused, so a key
 /// that would stop delivery cannot enter the keyring from `/account`. The key
-/// in use and the keyring file stay as they were.
+/// in use and the keyring file stay as they were. A block the parser could not
+/// inspect carries an advisory, so it still starts a window.
 #[test]
 fn a_mail_key_replacement_refuses_an_expiring_or_aead_key() {
     let fix = Fix::new("account-rotation-refused");
@@ -766,14 +767,23 @@ fn a_mail_key_replacement_refuses_an_expiring_or_aead_key() {
     fix.mail_key("alice", &clean);
     let before = std::fs::read_to_string(fix.dir.join("keyring/alice.asc")).unwrap();
 
-    for (name, key) in [
-        ("expiring", fixture("gpg-future-expiry.asc")),
-        ("AEAD", fixture("gpg-aead.asc")),
+    for (name, key, why) in [
+        (
+            "expiring",
+            fixture("gpg-future-expiry.asc"),
+            "The key expires",
+        ),
+        (
+            "subkey expiring",
+            fixture("gpg-future-expiry-subkey.asc"),
+            "encryption subkey expires",
+        ),
+        ("AEAD", fixture("gpg-aead.asc"), "AEAD"),
     ] {
         fix.file_page_action(
             "mail-key",
             "alice",
-            json!({"action": "replace", "material": key, "signature": ""}),
+            json!({"action": "replace", "material": key, "signature": "AAAA"}),
         );
         assert!(fix.drain().status.success());
         let account = fix.account("alice");
@@ -783,8 +793,7 @@ fn a_mail_key_replacement_refuses_an_expiring_or_aead_key() {
             "{name}: a refused key starts no window: {account}"
         );
         assert!(
-            fix.journal().contains("\"outcome\":\"refused\"")
-                && fix.journal().contains("the mail key: The key"),
+            fix.journal().contains("\"outcome\":\"refused\"") && fix.journal().contains(why),
             "{name}: {}",
             fix.journal()
         );
@@ -794,6 +803,23 @@ fn a_mail_key_replacement_refuses_an_expiring_or_aead_key() {
             fix.journal()
         );
     }
+
+    // The parser cannot read this block, so the check is advisory and the
+    // replacement proceeds rather than becoming impossible to start.
+    let uninspected = GOOD_KEY;
+    let fingerprint = kyriakon_control_core::mail::keycheck::pgp_fingerprint(uninspected).unwrap();
+    fix.file_page_action(
+        "mail-key",
+        "alice",
+        json!({"action": "replace", "material": uninspected, "signature": ""}),
+    );
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.account("alice")["rotation"]["fingerprint"],
+        json!(fingerprint),
+        "{}",
+        fix.journal()
+    );
 
     assert_eq!(
         std::fs::read_to_string(fix.dir.join("keyring/alice.asc")).unwrap(),
