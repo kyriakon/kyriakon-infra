@@ -400,7 +400,7 @@ case "${1:-}" in
 --remove)
 	[ "$#" -eq 2 ] || usage
 	user="$2"
-	valid_localpart "$user" || die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
+	valid_localpart "$user" || die "not a member name: $user (lowercase [a-z0-9-], starts and ends alphanumeric, at most 31 characters)"
 	[ "$(id -u)" -eq 0 ] || die "run this with doas: it rewrites $httpd_d/$user.kyriakon.net.conf to the challenge alone"
 	[ -d "$httpd_d" ] || die "no $httpd_d: doas ksh scripts/deploy-mail.sh creates it"
 	remove_member_conf
@@ -414,7 +414,7 @@ case "${1:-}" in
 *)
 	[ "$#" -eq 1 ] || usage
 	user="$1"
-	valid_localpart "$user" || die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
+	valid_localpart "$user" || die "not a member name: $user (lowercase [a-z0-9-], starts and ends alphanumeric, at most 31 characters)"
 	[ "$(id -u)" -eq 0 ] || die "run this with doas: it writes $httpd_d"
 	# deploy-mail.sh creates the directory with the empty index httpd.conf includes,
 	# and a member file with no index to list it is a config nobody reads: a box

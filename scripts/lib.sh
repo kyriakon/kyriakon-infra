@@ -510,12 +510,12 @@ table_unlock() {
 	rm -rf "$table.lock"
 }
 
-# valid_localpart <name> — the username and mailbox charset: lowercase letters,
-# digits, dot, underscore and hyphen, starting with a letter or a digit, at most
-# 32 characters. It is a filesystem path component, a subdomain label and a
+# valid_localpart <name> — the username and mailbox charset: 1-31 lowercase
+# letters, digits and interior hyphens, starting and ending alphanumeric: a
+# single DNS label. It is a filesystem path component, a subdomain label and a
 # keyring filename, so every script that takes a member name checks it here.
 valid_localpart() {
-	printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,31}$'
+	printf '%s' "$1" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,29}[a-z0-9])?$'
 }
 
 # mail_domains_first <file>: the first line of mail_domains, the platform's own
@@ -541,9 +541,10 @@ mail_domains_first_problem() {
 #
 # Replace the line whose key (the text before the first colon) is exactly <name>
 # with <entry>, or append it when there is none. The key is compared literally,
-# not as a pattern: a localpart may contain a dot, and a pattern match would let
-# a.b touch axb. On return table_set_how is "set" or "added". Returns 0 on
-# success and 2 on failure, after naming the failure on stderr.
+# not as a pattern: a key is an address or a domain and contains a dot, and a
+# pattern match would let a.b touch axb. On return table_set_how is "set" or
+# "added". Returns 0 on success and 2 on failure, after naming the failure on
+# stderr.
 #
 # The append is a write to the live table under the lock rather than a rewrite.
 # A missing final newline is added first, which is the interrupted-append state
@@ -604,10 +605,10 @@ table_set() {
 # table_drop <table> <exact|prefix|suffix> <text>
 #
 # Drop every line whose key matches <text> literally: equal to it, starting with
-# it, or ending with it. Literal on purpose: the caller's value is a localpart
-# or a domain, and an ERE would let a.b drop axb and let parish-example match
-# parish.example. A table of bare domains, such as mail_domains, has the whole
-# line as its key.
+# it, or ending with it. Literal on purpose: the caller's value is an address
+# or a domain and contains a dot, and an ERE would let a.b drop axb and let
+# parish-example match parish.example. A table of bare domains, such as
+# mail_domains, has the whole line as its key.
 #
 # Returns 0 when the table changed, 1 when it did not, and 2 on failure after
 # naming it on stderr. Callers must not read 2 as "nothing to do". A changed
@@ -738,10 +739,18 @@ self_test() {
 		"$(valid_localpart Alice && printf yes || printf no)" no
 	check "a leading dot is refused" \
 		"$(valid_localpart .alice && printf yes || printf no)" no
-	check "a dotted localpart is accepted" \
-		"$(valid_localpart a.b && printf yes || printf no)" yes
-	check "a name of 33 characters is refused" \
-		"$(valid_localpart aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa && printf yes || printf no)" no
+	check "an interior hyphen is accepted" \
+		"$(valid_localpart a-b && printf yes || printf no)" yes
+	check "a dotted localpart is refused" \
+		"$(valid_localpart a.b && printf yes || printf no)" no
+	check "an underscore is refused" \
+		"$(valid_localpart a_b && printf yes || printf no)" no
+	check "a trailing hyphen is refused" \
+		"$(valid_localpart a- && printf yes || printf no)" no
+	check "a name of 31 characters is accepted" \
+		"$(valid_localpart aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa && printf yes || printf no)" yes
+	check "a name of 32 characters is refused" \
+		"$(valid_localpart aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa && printf yes || printf no)" no
 
 	# The fixture that motivated the helper: the last line has no newline, so a
 	# plain append joins the new entry to it and both keys stop matching.

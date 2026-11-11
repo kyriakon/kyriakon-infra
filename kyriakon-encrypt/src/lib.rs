@@ -35,8 +35,8 @@ pub const DEFAULT_GPG_HOME: &str = "/var/run/kyriakon/gpg";
 
 #[derive(Debug)]
 pub enum Error {
-    /// Recipient base localpart is empty or contains characters outside
-    /// `[A-Za-z0-9._-]` - anything else could escape the keyring directory.
+    /// Recipient base localpart is not a single DNS label: empty, more than 31
+    /// characters, or outside `[a-z0-9-]` / beginning or ending with a hyphen.
     InvalidUser(String),
     /// No `<base-localpart>.asc` in the keyring.
     MissingKey(String),
@@ -64,15 +64,18 @@ impl From<io::Error> for Error {
     }
 }
 
-/// Strip a `+tag` to the base localpart and validate it. The charset check is
-/// a trust-boundary guard: the user string is joined into a keyring path.
+/// Strip a `+tag` to the base localpart and validate it as a single DNS label:
+/// 1-31 lowercase letters, digits and interior hyphens. The charset check is a
+/// trust-boundary guard: the user string is joined into a keyring path.
 pub fn base_localpart(user: &str) -> Result<&str, Error> {
     let base = user.split('+').next().unwrap_or("");
-    if base.is_empty()
-        || !base
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
-    {
+    let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    let ok = !base.is_empty()
+        && base.len() <= 31
+        && base.bytes().all(|b| alnum(b) || b == b'-')
+        && alnum(base.as_bytes()[0])
+        && alnum(base.as_bytes()[base.len() - 1]);
+    if !ok {
         return Err(Error::InvalidUser(user.to_string()));
     }
     Ok(base)
@@ -624,6 +627,31 @@ mod tests {
 
     fn payload(msg: &[u8]) -> String {
         String::from_utf8_lossy(&protected_payload(msg)).into_owned()
+    }
+
+    #[test]
+    fn base_localpart_is_a_single_dns_label_of_at_most_31_characters() {
+        // The same boundary names as `validate::username_shape` and
+        // `valid_localpart`: the localpart is an account name, a mail localpart
+        // and a DNS label at once.
+        let thirty_one = "a".repeat(31);
+        let thirty_two = "a".repeat(32);
+        for value in ["a", "7", "a-b", "a1-2b", thirty_one.as_str(), "alice+tag"] {
+            assert!(base_localpart(value).is_ok(), "{value}");
+        }
+        assert_eq!(base_localpart("alice+tag").unwrap(), "alice");
+        for value in [
+            "",
+            "+tag",
+            "Alice",
+            "a.b",
+            "a_b",
+            "a-",
+            "-a",
+            thirty_two.as_str(),
+        ] {
+            assert!(base_localpart(value).is_err(), "{value}");
+        }
     }
 
     #[test]

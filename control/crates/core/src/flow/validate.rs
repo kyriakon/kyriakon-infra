@@ -50,8 +50,9 @@ pub fn reason(
     }
 }
 
-/// The username rule: the charset `scripts/add-user.sh` enforces, no longer than
-/// 32 characters, and not a reserved name. Never whether it exists.
+/// The username rule: the single DNS label `scripts/add-user.sh` enforces, 1-31
+/// characters of lowercase letters, digits and interior hyphens, and not a
+/// reserved name. Never whether it exists.
 pub fn username(value: &str, reserved: &HashSet<String>) -> Option<String> {
     if let Some(why) = username_shape(value) {
         return Some(why);
@@ -68,20 +69,19 @@ pub fn username_shape(value: &str) -> Option<String> {
     if value.is_empty() {
         return Some("a username is needed".to_string());
     }
-    if value.chars().count() > 32 {
-        return Some("a username is at most 32 characters".to_string());
+    if value.chars().count() > 31 {
+        return Some("a username is at most 31 characters".to_string());
     }
-    let first = value.as_bytes()[0];
-    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+    let bytes = value.as_bytes();
+    let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    if !alnum(bytes[0]) {
         return Some("a username starts with a lowercase letter or a digit".to_string());
     }
-    if !value
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
-    {
-        return Some(
-            "a username is lowercase letters, digits, dot, underscore and hyphen".to_string(),
-        );
+    if !bytes.iter().all(|&b| alnum(b) || b == b'-') {
+        return Some("a username is lowercase letters, digits and hyphen".to_string());
+    }
+    if !alnum(bytes[bytes.len() - 1]) {
+        return Some("a username ends with a lowercase letter or a digit".to_string());
     }
     None
 }
@@ -222,14 +222,29 @@ mod tests {
         assert!(username("Upper", &r).unwrap().contains("starts with"));
         assert!(username("bad_name!", &r)
             .unwrap()
-            .contains("dot, underscore and hyphen"));
+            .contains("digits and hyphen"));
+        assert!(username("bad.name", &r)
+            .unwrap()
+            .contains("digits and hyphen"));
+        assert!(username("bad-", &r).unwrap().contains("ends with"));
     }
 
     #[test]
-    fn a_username_past_32_characters_is_refused_with_its_reason() {
-        let long = "a".repeat(33);
-        assert!(username(&long, &name()).unwrap().contains("at most 32"));
-        assert!(username(&"a".repeat(32), &name()).is_none());
+    fn a_username_is_a_single_dns_label_of_at_most_31_characters() {
+        // Mirrors `scripts/lib.sh --self-test` and `scripts/acme-queue.sh
+        // --self-test`, which prove the same boundary names against
+        // `valid_localpart` and `name_ok` as `<username>.kyriakon.net`.
+        let r = name();
+        let thirty_one = "a".repeat(31);
+        let thirty_two = "a".repeat(32);
+        for value in ["a", "7", "a-b", "a1-2b", thirty_one.as_str()] {
+            assert!(username(value, &r).is_none(), "{value}");
+        }
+        for value in ["", "a.b", "a_b", "a-", "-a", thirty_two.as_str()] {
+            assert!(username(value, &r).is_some(), "{value}");
+        }
+        assert!(username(&thirty_two, &r).unwrap().contains("at most 31"));
+        assert!(username(&thirty_one, &r).is_none());
     }
 
     #[test]

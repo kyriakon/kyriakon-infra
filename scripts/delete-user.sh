@@ -470,7 +470,7 @@ user="$1"
 # standing between this script and an rm -rf somewhere else, which is why the two
 # guards below repeat the work rather than trusting it.
 if ! valid_localpart "$user"; then
-	printf 'invalid username: %s (lowercase [a-z0-9._-], <=32 chars)\n' "$user" >&2
+	printf 'invalid username: %s (lowercase [a-z0-9-], starts and ends alphanumeric, 1-31 chars)\n' "$user" >&2
 	exit 1
 fi
 

@@ -497,6 +497,23 @@ self_test() {
 	check "a path is refused" "$(name_ok ../etc/passwd.kyriakon.net && printf yes || printf no)" "no"
 	check "a site owner is a member account name" "$(valid_localpart parish-secretary && printf yes || printf no)" "yes"
 	check "and a path is not a site owner" "$(valid_localpart ../parish && printf yes || printf no)" "no"
+	# The cross-language contract: every name valid_localpart accepts must name a
+	# site name_ok accepts. The boundary table mirrors username_shape's Rust test
+	# and lib.sh --self-test.
+	check "a 31-character username names a site" \
+		"$(name_ok aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.kyriakon.net && printf yes || printf no)" yes
+	check "32 characters is not a username" \
+		"$(valid_localpart aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa && printf yes || printf no)" no
+	check "a one-character username names a site" \
+		"$(name_ok a.kyriakon.net && printf yes || printf no)" yes
+	check "a dotted username is not a localpart" \
+		"$(valid_localpart a.b && printf yes || printf no)" no
+	check "an underscore does not name a site" \
+		"$(name_ok a_b.kyriakon.net && printf yes || printf no)" no
+	check "a trailing hyphen does not name a site" \
+		"$(name_ok a-.kyriakon.net && printf yes || printf no)" no
+	check "an empty label does not name a site" \
+		"$(name_ok a..kyriakon.net && printf yes || printf no)" no
 
 	base=2000000000
 	check "no attempt yet means an open slot" "$(minutes_until_slot "$base" 0)" "0"

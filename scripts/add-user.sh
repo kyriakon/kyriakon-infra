@@ -32,7 +32,7 @@ user="$1"
 # username valid as a filesystem path and keyring filename, and as the
 # username.kyriakon.net subdomain label. One rule for every script.
 if ! valid_localpart "$user"; then
-	printf 'invalid username: %s (lowercase [a-z0-9._-], <=32 chars)\n' "$user" >&2
+	printf 'invalid username: %s (lowercase [a-z0-9-], starts and ends alphanumeric, 1-31 chars)\n' "$user" >&2
 	exit 1
 fi
 
