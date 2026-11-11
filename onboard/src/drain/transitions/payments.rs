@@ -715,7 +715,7 @@ async fn last_payment_line(store: &Store, token: &str) -> Result<Option<PaymentL
 }
 
 /// Refund one payment, or settle a refund already recorded. The console signs
-/// every field, and `Intent::verify` checks the signature before anything else
+/// every field, and `verify` checks the signature before anything else
 /// because `intents/` belongs to the unprivileged half.
 ///
 /// The refund form appends one negative line naming the `seq` it reverses and,

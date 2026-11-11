@@ -128,7 +128,7 @@ async fn sweep_application(
 /// Apply a password set through a one-time link.
 ///
 /// The link's signature, its date, the plaintext's validation and the one-use
-/// replay checks are the seam's: `Intent::verify` refuses a submission that
+/// replay checks are the seam's: `verify` refuses a submission that
 /// cannot prove itself before this runs. What is left is the half the handler
 /// cannot do at all: the plaintext is hashed here and nowhere else, the hash is
 /// checked to be one this build made, and the record must still hold the link.
@@ -1357,7 +1357,7 @@ async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), S
 /// Apply one `close` intent: put the account into `closing` with its seven-day
 /// window. The deletion itself is the sweep's, so the account works normally
 /// until the window ends and a replayed intent changes nothing. The session that
-/// proves the request is `Intent::verify`'s.
+/// proves the request is `verify`'s.
 pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlement, String> {
     if intent.kind != "close" {
         return Err(format!("kind {:?} is not a close intent", intent.kind));
@@ -2621,7 +2621,7 @@ pub async fn prepaid_renewals(
 
 /// Carry out one export intent: the page's "Take my data out", filed by the
 /// handler with the account the session belongs to and nothing else. The session
-/// that proves it is `Intent::verify`'s.
+/// that proves it is `verify`'s.
 ///
 /// The bundle is written into the member's own chroot and the ready notice is
 /// appended in the same pass. The journal line names the application the account

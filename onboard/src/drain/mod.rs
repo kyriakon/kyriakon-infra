@@ -31,6 +31,9 @@ use crate::config::DrainConfig;
 use crate::store::journal::Journal;
 use crate::store::Store;
 
+/// One pass: every intent, then the sweeps. The drain is a single short-lived
+/// process with no listener, so there is no loop inside it; cron runs it again
+/// a minute later.
 pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     // Read once for the whole pass: every dedup, backoff and recovery query
     // below asks this index rather than opening the file again, and an
@@ -516,7 +519,7 @@ pub async fn apply(
 /// What this verb's settlement owes beyond its body: the work its line must
 /// precede, and what a refusal leaves of its file. Every variant is listed,
 /// so a new one has to say both.
-pub fn disposition(intent: &Intent) -> transitions::Disposition {
+fn disposition(intent: &Intent) -> transitions::Disposition {
     // The verbs whose line and record cleanup cannot be one write name that
     // work here, once.
     let after = match intent {

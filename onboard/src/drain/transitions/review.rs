@@ -245,7 +245,7 @@ fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String,
 
 /// A decision intent: an approval with the charge, an approval without it, or a
 /// decline. The signature over the application and the action, and the fields it
-/// covers, are checked by `Intent::verify` before this runs; what is left is the
+/// covers, are checked by `verify` before this runs; what is left is the
 /// outcome the decided application takes.
 pub async fn decision(
     cfg: &DrainConfig,
