@@ -1,7 +1,8 @@
-// The four fixtures the ticket names, checked through the same function the CLI
+// The five fixtures the ticket names, checked through the same function the CLI
 // and the page's WASM export call. The generator's key is clean, and each gpg
-// key isolates one of the three conditions: the AEAD advert (subpacket 34 and
-// features 07), no encryption-capable subkey, and an expired encryption subkey.
+// key isolates one of the conditions: the AEAD advert (subpacket 34), no
+// encryption-capable subkey, an expired encryption subkey, and a primary key
+// that expires in the future.
 //
 // Provenance, 2026-10-27, GnuPG 2.5.24:
 //   generated-clean.asc          cargo run -- ed25519 <dir>, public half only
@@ -12,6 +13,10 @@
 //                                gpg --faked-system-time 20200101T000000 --quick-add-key <fpr> cv25519 encr 1d
 //                                gpg exported it; the prototype README's note that gpg refuses an expired
 //                                subkey did not reproduce with this gpg.
+//   gpg-future-expiry.asc        gpg --faked-system-time 20200101T000000 --quick-gen-key 'Future Expiry Fixture
+//                                <future@example.invalid>' ed25519 cert 20y, then --quick-add-key <fpr> cv25519
+//                                encr never, both with a --default-preference-list without AEAD so the expiry is
+//                                the only finding. The primary expires 2040-01-01, after every clock these tests pass.
 // The long-paste fixture is gpg rsa4096 with an encryption subkey, 3216 bytes.
 
 use keygen_spike::check_public_key;
@@ -22,6 +27,7 @@ const CLEAN: &str = include_str!("../fixtures/generated-clean.asc");
 const AEAD: &str = include_str!("../fixtures/gpg-aead.asc");
 const NO_ENCRYPTION: &str = include_str!("../fixtures/gpg-no-encryption-subkey.asc");
 const EXPIRED_SUBKEY: &str = include_str!("../fixtures/gpg-expired-subkey.asc");
+const FUTURE_EXPIRY: &str = include_str!("../fixtures/gpg-future-expiry.asc");
 
 #[test]
 fn the_generators_own_key_is_clean() {
@@ -58,4 +64,21 @@ fn each_gpg_fixture_carries_its_own_verdict() {
         expired[0].contains("Extend the subkey's expiry"),
         "{expired:?}"
     );
+}
+
+/// A future expiry is a finding too: `scripts/lib.sh::key_problems` refuses any
+/// expiring key at approval, and delivery stops at the date. The same key past
+/// its date keeps the distinct already-expired wording.
+#[test]
+fn an_expiry_in_the_future_is_a_finding_and_a_past_one_says_expired() {
+    let future = check_public_key(FUTURE_EXPIRY, NOW).expect("the future-expiry fixture parses");
+    assert_eq!(future.len(), 1, "{future:?}");
+    assert!(future[0].contains("expires at"), "{future:?}");
+    assert!(future[0].contains("Key does not expire"), "{future:?}");
+    assert!(!future[0].contains("expired at"), "{future:?}");
+
+    let past = check_public_key(FUTURE_EXPIRY, 2_300_000_000).expect("it still parses");
+    assert_eq!(past.len(), 1, "{past:?}");
+    assert!(past[0].contains("expired at"), "{past:?}");
+    assert!(!past[0].contains("Key does not expire"), "{past:?}");
 }

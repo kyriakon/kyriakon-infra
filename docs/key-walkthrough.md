@@ -23,7 +23,7 @@ Thunderbird on a desktop is the primary path. It has OpenPGP built in, so you do
 1. Install Thunderbird and open the OpenPGP Key Manager, under Tools.
 2. Choose to generate a new key pair, with the address you applied for as its identity.
 3. Choose a passphrase, and write it down with the recovery phrase.
-4. Set no expiry date, or a date far enough away that you will remember to renew it.
+4. Choose "Key does not expire". A mail key must not expire: delivery stops on its expiry date, without a word, so there is no date to renew.
 5. Export the public key to a file. This is the half you paste into the application.
 6. Keep the private key in Thunderbird's own key store, and keep the recovery phrase somewhere else.
 

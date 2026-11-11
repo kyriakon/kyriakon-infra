@@ -9,7 +9,10 @@
 //  - no encryption-capable subkey, so there is nothing to encrypt to and mail is refused
 //  - an advertised AEAD preference, because gpg then emits an AEAD packet that some mail
 //    clients cannot open, and no flag on the encrypt side overrides it
-//  - the key is expired or revoked, on the primary key or on its encryption subkey
+//  - any expiry at all, on the primary key or on its encryption subkey, because
+//    scripts/lib.sh::key_problems refuses an expiring key at approval and delivery stops
+//    at the date without a word; the clock only decides whether it says "expires" or
+//    "expired". Revocation is flagged too.
 //
 // Still a spike. No error types worth the name, no tests beyond the self-check below.
 
@@ -199,15 +202,27 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
     }
 
     let created = key.primary_key.created_at().as_secs();
-    if let Some(lifetime) = expires_after {
+    // Any expiry is a finding, not only one already past: approval's
+    // key_problems refuses an expiring key and delivery stops at the date. The
+    // clock only chooses the wording. A zero lifetime is OpenPGP's "never".
+    if let Some(lifetime) = expires_after
+        && lifetime > 0
+    {
         let expires_at = created.saturating_add(lifetime);
-        if u64::from(expires_at) <= now_secs {
-            findings.push(format!(
-                "The key expired at {expires_at} seconds since the epoch and cannot be used. \
-                 Make a new key with the generator, or extend the expiry in your mail client \
-                 before it lapses."
-            ));
-        }
+        findings.push(if u64::from(expires_at) <= now_secs {
+            format!(
+                "The key expired at {expires_at} seconds since the epoch and cannot be \
+                 used. Make a new key with the generator, or extend the expiry in your \
+                 mail client before it lapses."
+            )
+        } else {
+            format!(
+                "The key expires at {expires_at} seconds since the epoch, and a mail key \
+                 must not expire: delivery stops at that date without a word. Choose \
+                 \"Key does not expire\" when you make the key, or set its expiry to never \
+                 in your mail client."
+            )
+        });
     }
 
     // A subkey carries its own expiry and its own revocation, in its binding signature.
@@ -237,15 +252,24 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
                 sub.key.fingerprint()
             ));
         }
-        if let (true, Some(lifetime)) = (encrypts, sub_expires) {
+        if let (true, Some(lifetime)) = (encrypts, sub_expires)
+            && lifetime > 0
+        {
             let expires_at = sub_created.saturating_add(lifetime);
-            if u64::from(expires_at) <= now_secs {
-                findings.push(format!(
+            findings.push(if u64::from(expires_at) <= now_secs {
+                format!(
                     "The encryption subkey expired at {expires_at} seconds since the epoch, \
-                     so mail encrypted to this key may not open. Extend the subkey's expiry in \
-                     your mail client, or make a new key with the generator."
-                ));
-            }
+                     so mail encrypted to this key may not open. Extend the subkey's expiry \
+                     in your mail client, or make a new key with the generator."
+                )
+            } else {
+                format!(
+                    "The encryption subkey expires at {expires_at} seconds since the epoch, \
+                     and a mail key must not expire: delivery stops at that date without a \
+                     word. Choose \"Key does not expire\" when you make the key, or set the \
+                     subkey's expiry to never in your mail client."
+                )
+            });
         }
     }
 
