@@ -48,7 +48,7 @@ install_set="$script_dir/install-set.tsv"
 
 # The script names the drain's Rust invokes with `run_script(cfg, "…")` and its
 # two siblings, read from the source rather than a second list that can drift.
-# The transition bodies live under src/drain/transitions/, so the scan takes either
+# The transition bodies live under crates/drain/src/transitions/, so the scan takes either
 # that directory or one file (the self-test's fixture). A new `spawn_script` or
 # `run_script` call needs a row in install-set.tsv, or this self-test fails.
 drain_invoked() { # <src dir or .rs file>

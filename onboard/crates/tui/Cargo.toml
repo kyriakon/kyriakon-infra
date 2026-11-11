@@ -1,0 +1,13 @@
+[package]
+name = "kyriakon-onboard-tui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kyriakon-onboard-tui"
+path = "src/main.rs"
+
+[dependencies]
+kyriakon-onboard-core = { path = "../core" }
+libc.workspace = true

@@ -471,9 +471,10 @@ self_test() {
 	git -C "$repo" commit -qm one
 	first=$(git -C "$repo" rev-parse HEAD)
 
-	mkdir -p "$repo/onboard/src" "$repo/openbsd/etc/nsd" "$repo/openbsd/etc/onboard" \
+	mkdir -p "$repo/onboard/crates/core/src" "$repo/openbsd/etc/nsd" "$repo/openbsd/etc/onboard" \
 		"$repo/terraform"
-	printf 'x\n' >"$repo/onboard/src/lib.rs"
+	printf 'x\n' >"$repo/onboard/Cargo.toml"
+	printf 'x\n' >"$repo/onboard/crates/core/src/lib.rs"
 	printf 'x\n' >"$repo/openbsd/etc/nsd/nsd.conf"
 	printf 'x\n' >"$repo/openbsd/etc/httpd.conf"
 	printf 'x\n' >"$repo/openbsd/etc/pf.conf"

@@ -1,0 +1,21 @@
+[package]
+name = "kyriakon-onboard-tests"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[test]]
+name = "drain"
+path = "tests/drain.rs"
+
+[dev-dependencies]
+askama.workspace = true
+kyriakon-onboard-core = { path = "../core" }
+kyriakon-onboard-drain = { path = "../drain" }
+kyriakon-onboard-handler = { path = "../handler" }
+kyriakon-onboard-tui = { path = "../tui" }
+libc.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
+ulid.workspace = true
