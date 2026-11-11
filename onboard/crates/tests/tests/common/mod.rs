@@ -1048,16 +1048,14 @@ impl Fix {
             .unwrap()
     }
 
-    fn drain_in_process(&self) -> Result<(), String> {
+    fn drain_in_process(&self) -> Result<(), kyriakon_onboard_drain::transitions::Error> {
         let cfg = DrainConfig::load(Path::new(&self.config()))?;
         let store = Store::new_for_test(&cfg.store_root);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("cannot build the runtime: {e}"))?;
-        runtime
-            .block_on(kyriakon_onboard_drain::run(&cfg, &store))
-            .map_err(String::from)
+        runtime.block_on(kyriakon_onboard_drain::run(&cfg, &store))
     }
 
     pub fn ctl(&self, args: &[&str]) -> Output {

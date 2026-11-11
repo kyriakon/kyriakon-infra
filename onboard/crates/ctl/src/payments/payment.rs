@@ -1,17 +1,18 @@
 //! One job of the operator console.
 
 use super::{payment_block, print_payment};
+use crate::Error;
 use crate::*;
 
 /// `payment show --username <u>`: the account's rail, paid-until date and every
 /// ledger line keyed by its token. The ledger is read strictly, so a corrupt
 /// record is an error rather than a payment history that looks empty.
-pub(crate) async fn payment(store: &Store, args: &[String]) -> Result<(), String> {
+pub(crate) async fn payment(store: &Store, args: &[String]) -> Result<(), Error> {
     let [verb, rest @ ..] = args else {
-        return Err(usage());
+        return Err(Error::from(usage()));
     };
     if verb != "show" {
-        return Err(usage());
+        return Err(Error::from(usage()));
     }
     let flags = flags(rest, &["username"])?;
     let username = need(&flags, "username")?;

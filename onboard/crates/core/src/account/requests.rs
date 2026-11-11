@@ -11,6 +11,7 @@ use time::{Date, Month, OffsetDateTime};
 
 use crate::flow::validate;
 use crate::store::Store;
+use crate::Error;
 
 /// The kinds the spec names. A portability request is recorded as `access`,
 /// which is the pair the spec treats as one answer; the other two are separate.
@@ -82,7 +83,7 @@ impl RequestLine {
 
     /// How the request stands, read from the date in force, so `request list`
     /// and its counts cannot use the superseded clock.
-    pub fn state(&self, today: Date) -> Result<DueState, String> {
+    pub fn state(&self, today: Date) -> Result<DueState, Error> {
         Ok(due_state(parse_date(self.effective_due())?, today))
     }
 }
@@ -112,16 +113,16 @@ pub fn today() -> Date {
 }
 
 /// `YYYY-MM-DD`, the form every date in this record takes.
-pub fn parse_date(value: &str) -> Result<Date, String> {
+pub fn parse_date(value: &str) -> Result<Date, Error> {
     let bad = || format!("{value:?} is not a date in YYYY-MM-DD");
     if value.len() != 10 || !value.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
-        return Err(bad());
+        return Err(Error::from(bad()));
     }
     let year: i32 = value[0..4].parse().map_err(|_| bad())?;
     let month: u8 = value[5..7].parse().map_err(|_| bad())?;
     let day: u8 = value[8..10].parse().map_err(|_| bad())?;
     let month = Month::try_from(month).map_err(|_| bad())?;
-    Date::from_calendar_date(year, month, day).map_err(|_| bad())
+    Date::from_calendar_date(year, month, day).map_err(|_| Error::from(bad()))
 }
 
 fn format_date(date: Date) -> String {
@@ -219,41 +220,46 @@ fn record_path(username: &str) -> String {
 /// file is an empty record, and a record that cannot be read or parsed is an
 /// error, because a record the command cannot see must not read as a clear
 /// docket.
-async fn read_all(store: &Store, username: &str) -> Result<Vec<RequestLine>, String> {
+async fn read_all(store: &Store, username: &str) -> Result<Vec<RequestLine>, Error> {
     store
         .log(&record_path(username))
         .jsonl()
         .await
-        .map_err(String::from)
+        .map_err(Error::from)
 }
 
 /// Append one request line and return it, so the caller can print the due date.
-pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLine, String> {
+pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLine, Error> {
     if let Some(why) = validate::username_shape(request.username) {
-        return Err(format!("the username {:?}: {why}", request.username));
+        return Err(Error::from(format!(
+            "the username {:?}: {why}",
+            request.username
+        )));
     }
     if !KINDS.contains(&request.kind) {
-        return Err(format!(
+        return Err(Error::from(format!(
             "the kind {:?} is not one of {}",
             request.kind,
             KINDS.join(", ")
-        ));
+        )));
     }
     let evidence = request.evidence.trim();
     if evidence.is_empty() {
-        return Err("the evidence that established who was asking is needed".to_string());
+        return Err(Error::from(
+            "the evidence that established who was asking is needed".to_string(),
+        ));
     }
     let identity = request.identity.trim();
     if !IDENTITIES.contains(&identity) {
-        return Err(format!(
+        return Err(Error::from(format!(
             "the identity route {identity:?} is not one of {}",
             IDENTITIES.join(", ")
-        ));
+        )));
     }
     // A request is recorded against an account, never into a directory a
     // mistyped name would create.
     if store.account(request.username).await?.is_none() {
-        return Err(format!("no account for {}", request.username));
+        return Err(Error::from(format!("no account for {}", request.username)));
     }
 
     let id = match request.id {
@@ -306,7 +312,10 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
     if request.id.is_some() {
         let existing = log.jsonl::<RequestLine>().await?;
         if existing.iter().any(|l| l.id == line.id) {
-            return Err(format!("request {} is already recorded", line.id));
+            return Err(Error::from(format!(
+                "request {} is already recorded",
+                line.id
+            )));
         }
     }
     let bytes = serde_json::to_vec(&line).map_err(|e| format!("cannot write the request: {e}"))?;
@@ -316,18 +325,20 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
 
 /// The account whose record holds one request id. The read happens before the
 /// lock, and again under it in `rewrite`.
-async fn find_account(store: &Store, id: &str) -> Result<String, String> {
+async fn find_account(store: &Store, id: &str) -> Result<String, Error> {
     let mut found: Option<String> = None;
     for username in store.list("accounts").await? {
         if !read_all(store, &username).await?.iter().any(|l| l.id == id) {
             continue;
         }
         if found.is_some() {
-            return Err(format!("request {id} appears in more than one account"));
+            return Err(Error::from(format!(
+                "request {id} appears in more than one account"
+            )));
         }
         found = Some(username);
     }
-    found.ok_or_else(|| format!("no request with id {id}"))
+    found.ok_or_else(|| Error::from(format!("no request with id {id}")))
 }
 
 /// Rewrite one request's line under the record's lock, through `change`.
@@ -339,8 +350,8 @@ async fn find_account(store: &Store, id: &str) -> Result<String, String> {
 async fn rewrite(
     store: &Store,
     id: &str,
-    change: impl FnOnce(&mut RequestLine) -> Result<(), String>,
-) -> Result<RequestLine, String> {
+    change: impl FnOnce(&mut RequestLine) -> Result<(), Error>,
+) -> Result<RequestLine, Error> {
     let username = find_account(store, id).await?;
     let path = record_path(&username);
     let log = store.log(&path);
@@ -374,13 +385,13 @@ pub async fn set_bundle(
     id: &str,
     username: &str,
     bundle: &str,
-) -> Result<RequestLine, String> {
+) -> Result<RequestLine, Error> {
     rewrite(store, id, |line| {
         if line.username != username {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "the request {id} belongs to {}, not {username}",
                 line.username
-            ));
+            )));
         }
         line.bundle = Some(bundle.to_string());
         Ok(())
@@ -394,15 +405,15 @@ pub async fn close(
     id: &str,
     done_at: &str,
     done: &str,
-) -> Result<RequestLine, String> {
+) -> Result<RequestLine, Error> {
     let done = done.trim().to_string();
     if done.is_empty() {
-        return Err("what was done is needed".to_string());
+        return Err(Error::from("what was done is needed".to_string()));
     }
     let done_at = format_date(parse_date(done_at)?);
     rewrite(store, id, |line| {
         if line.done.is_some() {
-            return Err(format!("request {id} is already closed"));
+            return Err(Error::from(format!("request {id} is already closed")));
         }
         line.done = Some(done);
         line.done_at = Some(done_at);
@@ -421,10 +432,12 @@ pub async fn extend(
     id: &str,
     reason: &str,
     extended_at: Option<&str>,
-) -> Result<RequestLine, String> {
+) -> Result<RequestLine, Error> {
     let reason = reason.trim().to_string();
     if reason.is_empty() {
-        return Err("the reason for the extension is needed".to_string());
+        return Err(Error::from(
+            "the reason for the extension is needed".to_string(),
+        ));
     }
     let decided = match extended_at {
         Some(value) => parse_date(value)?,
@@ -433,10 +446,10 @@ pub async fn extend(
     let at = format_date(decided);
     rewrite(store, id, |line| {
         if line.done.is_some() {
-            return Err(format!("request {id} is closed"));
+            return Err(Error::from(format!("request {id} is closed")));
         }
         if line.extended_until.is_some() {
-            return Err(format!("request {id} is already extended"));
+            return Err(Error::from(format!("request {id} is already extended")));
         }
         // The extension is Article 12A's two further months inside the answer
         // period, so a decision that predates receipt or lands after the answer
@@ -445,12 +458,12 @@ pub async fn extend(
         let received = parse_date(&line.received)?;
         let due = parse_date(&line.due)?;
         if decided < received || decided > due {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "the extension is decided on {}, but the request runs from {} to {}",
                 format_date(decided),
                 line.received,
                 line.due
-            ));
+            )));
         }
         line.extended_until = Some(format_date(months_after(due, 2).ok_or_else(|| {
             format!(
@@ -466,7 +479,7 @@ pub async fn extend(
 }
 
 /// Every request still open, earliest answer due first.
-pub async fn open(store: &Store) -> Result<Vec<RequestLine>, String> {
+pub async fn open(store: &Store) -> Result<Vec<RequestLine>, Error> {
     let mut out = Vec::new();
     for username in store.list("accounts").await? {
         for line in read_all(store, &username).await? {

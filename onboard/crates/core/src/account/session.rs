@@ -24,6 +24,7 @@ use tokio::process::Command;
 
 use crate::account::sign;
 use crate::store::Store;
+use crate::Error;
 
 /// The cookie's name.
 pub const COOKIE: &str = "kyriakon_session";
@@ -81,11 +82,13 @@ impl Authenticator {
             .spawn()
         {
             Ok(child) => child,
-            Err(e) => {
-                eprintln!(
-                    "kyriakon-onboard: cannot run the login check {}: {e}",
-                    self.program.display()
-                );
+            Err(source) => {
+                Error::Io {
+                    what: "run the login check",
+                    path: Some(self.program.clone()),
+                    source,
+                }
+                .report("the login check");
                 return None;
             }
         };
@@ -161,21 +164,27 @@ pub async fn verify_proof(
     token: &str,
     username: &str,
     now: OffsetDateTime,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     if !is_proof_token(token) {
-        return Err("the session carries no proof this box minted".to_string());
-    }
-    let Some(proof) = read_proof(dir, token).await else {
-        return Err("the session's proof is not one this box minted".to_string());
-    };
-    if proof.username != username {
-        return Err(format!(
-            "the session belongs to {:?}, not {username:?}",
-            proof.username
+        return Err(Error::from(
+            "the session carries no proof this box minted".to_string(),
         ));
     }
+    let Some(proof) = read_proof(dir, token).await else {
+        return Err(Error::from(
+            "the session's proof is not one this box minted".to_string(),
+        ));
+    };
+    if proof.username != username {
+        return Err(Error::from(format!(
+            "the session belongs to {:?}, not {username:?}",
+            proof.username
+        )));
+    }
     if now.unix_timestamp() >= proof.expires {
-        return Err("the session named by the intent has expired".to_string());
+        return Err(Error::from(
+            "the session named by the intent has expired".to_string(),
+        ));
     }
     Ok(())
 }
@@ -225,7 +234,7 @@ pub async fn open(
     username: &str,
     proof: &str,
     now: OffsetDateTime,
-) -> Result<String, String> {
+) -> Result<String, Error> {
     // A new login is where the old sessions are cleared. Nothing else walks the
     // directory, and an id is random, so an expired file would never be reused.
     // The proofs are pruned by the drain instead: that directory is root's, and

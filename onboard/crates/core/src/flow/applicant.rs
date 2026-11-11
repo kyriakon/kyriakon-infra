@@ -10,6 +10,7 @@ use crate::flow::questions::{self, Branch, Kind, Question, Rule};
 use crate::flow::validate;
 use crate::mail::keycheck;
 use crate::store::draft;
+use crate::Error;
 
 /// One page of the applicant's path. A mail key is one page per mailbox, with
 /// the mailbox in the prompt: a body's key page would otherwise ask for every
@@ -91,7 +92,9 @@ pub fn flow_problem(
         if blocks.len() != 1 {
             return Some("one key for one mailbox".to_string());
         }
-        return keycheck::pgp_public_key(&blocks[0]).err();
+        return keycheck::pgp_public_key(&blocks[0])
+            .err()
+            .map(|e| e.to_string());
     }
     if let Some(why) = validate::reason(q, value, reserved, required) {
         return Some(why);
@@ -176,12 +179,12 @@ pub fn reading(form: &BTreeMap<String, String>) -> Reading {
 /// one. It is a label and nothing more, so nothing reads it but the reviewer and
 /// the intent: that is also why an unknown value is refused rather than recorded,
 /// because a value no reader recognises is a value that cannot be read at all.
-pub fn label(form: &BTreeMap<String, String>) -> Result<&'static str, String> {
+pub fn label(form: &BTreeMap<String, String>) -> Result<&'static str, Error> {
     match form.get("front_end").map(String::as_str) {
         None | Some("web") => Ok("web"),
         Some("tui") => Ok("tui"),
         Some("capsule") => Ok("capsule"),
-        Some(other) => Err(format!("unknown front_end {other:?}")),
+        Some(other) => Err(Error::from(format!("unknown front_end {other:?}"))),
     }
 }
 
@@ -219,13 +222,14 @@ pub fn mail_key_errors(q: &Question, value: &str, form: &BTreeMap<String, String
         }
         blocks
             .iter()
-            .filter_map(|b| keycheck::pgp_public_key(b).err())
+            .filter_map(|b| keycheck::pgp_public_key(b).err().map(|e| e.to_string()))
             .collect()
     } else if blocks.len() > 1 {
         vec!["one key for one address".to_string()]
     } else {
         keycheck::pgp_public_key(&blocks[0])
             .err()
+            .map(|e| e.to_string())
             .into_iter()
             .collect()
     }

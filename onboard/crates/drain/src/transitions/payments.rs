@@ -1949,7 +1949,10 @@ mod tests {
             .await
             .expect_err("a line that does not parse must fail the settlement");
         assert!(
-            matches!(&error, Error::Failed(message) if message.contains("line 2 does not parse")),
+            matches!(
+                &error,
+                Error::Core(kyriakon_onboard_core::Error::ParseLine { line: 2, .. })
+            ),
             "{error}"
         );
         assert_eq!(

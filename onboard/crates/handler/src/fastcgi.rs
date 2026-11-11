@@ -101,6 +101,57 @@ impl Request {
     }
 }
 
+/// A FastCGI record that does not parse, or a socket read that failed.
+#[derive(Debug)]
+pub enum Error {
+    /// The front end sent a record the protocol does not allow.
+    Malformed(String),
+    /// Reading a record from the socket failed.
+    Io {
+        what: &'static str,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Malformed(message) => f.write_str(message),
+            Error::Io { what, source } => write!(f, "cannot {what}: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Malformed(_) => None,
+            Error::Io { source, .. } => Some(source),
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(source: std::io::Error) -> Self {
+        Error::Io {
+            what: "read a record",
+            source,
+        }
+    }
+}
+
+impl From<String> for Error {
+    fn from(message: String) -> Self {
+        Error::Malformed(message)
+    }
+}
+
+impl From<&str> for Error {
+    fn from(message: &str) -> Self {
+        Error::Malformed(message.to_string())
+    }
+}
+
 /// Read one request, or `None` when the peer closed between requests, which is how
 /// both front-ends finish a connection.
 ///
@@ -111,7 +162,7 @@ impl Request {
 pub async fn read_request<R: AsyncRead + Unpin>(
     reader: &mut R,
     body_cap: usize,
-) -> Result<Option<Request>, String> {
+) -> Result<Option<Request>, Error> {
     let mut env_buf = Vec::new();
     let mut body = Vec::new();
     let mut body_too_large = false;
@@ -128,12 +179,14 @@ pub async fn read_request<R: AsyncRead + Unpin>(
             // rather than a tidy end, and it is reported as that.
             Err(e) if e.kind() == ErrorKind::UnexpectedEof && !begun => return Ok(None),
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                return Err("the connection ended inside a request".to_string())
+                return Err(Error::from(
+                    "the connection ended inside a request".to_string(),
+                ))
             }
-            Err(e) => return Err(format!("cannot read a record header: {e}")),
+            Err(e) => return Err(Error::from(format!("cannot read a record header: {e}"))),
         }
         if header[0] != VERSION {
-            return Err(format!("record version {}", header[0]));
+            return Err(Error::from(format!("record version {}", header[0])));
         }
         let kind = header[1];
         let record_id = u16::from_be_bytes([header[2], header[3]]);
@@ -148,20 +201,25 @@ pub async fn read_request<R: AsyncRead + Unpin>(
         content.truncate(len);
 
         if !begun && kind != BEGIN_REQUEST {
-            return Err("a record arrived before the request began".to_string());
+            return Err(Error::from(
+                "a record arrived before the request began".to_string(),
+            ));
         }
 
         match kind {
             BEGIN_REQUEST => {
                 if content.len() != 8 {
-                    return Err(format!("a begin record of {} bytes", content.len()));
+                    return Err(Error::from(format!(
+                        "a begin record of {} bytes",
+                        content.len()
+                    )));
                 }
                 // Role is big-endian in the first two bytes and is 1 for a
                 // responder. Another role is another conversation, and this one
                 // answers the responder's only.
                 let role = u16::from_be_bytes([content[0], content[1]]);
                 if role != 1 {
-                    return Err(format!("role {role}"));
+                    return Err(Error::from(format!("role {role}")));
                 }
                 id = record_id;
                 keep_conn = content[2] & 1 == 1;
@@ -169,7 +227,9 @@ pub async fn read_request<R: AsyncRead + Unpin>(
             }
             PARAMS => {
                 if env_buf.len() + content.len() > MAX_PARAMS {
-                    return Err("the parameters of one request are too long".to_string());
+                    return Err(Error::from(
+                        "the parameters of one request are too long".to_string(),
+                    ));
                 }
                 env_buf.extend_from_slice(&content);
             }
@@ -183,8 +243,10 @@ pub async fn read_request<R: AsyncRead + Unpin>(
                     body.extend_from_slice(&content);
                 }
             }
-            ABORT_REQUEST => return Err("the front-end aborted the request".to_string()),
-            other => return Err(format!("record type {other}")),
+            ABORT_REQUEST => {
+                return Err(Error::from("the front-end aborted the request".to_string()))
+            }
+            other => return Err(Error::from(format!("record type {other}"))),
         }
     }
 
@@ -204,14 +266,16 @@ pub async fn read_request<R: AsyncRead + Unpin>(
 /// no UTF-8 at all, and a path that decodes to nonsense should miss the route
 /// table rather than fail the request: the alternative is a way to make the
 /// service log an error by asking for a file that does not exist.
-fn params(buf: &[u8]) -> Result<BTreeMap<String, String>, String> {
+fn params(buf: &[u8]) -> Result<BTreeMap<String, String>, Error> {
     let mut out = BTreeMap::new();
     let mut i = 0usize;
     while i < buf.len() {
         let name_len = length(buf, &mut i)?;
         let value_len = length(buf, &mut i)?;
         if name_len + value_len > buf.len() - i {
-            return Err("a parameter runs past the end of its record".to_string());
+            return Err(Error::from(
+                "a parameter runs past the end of its record".to_string(),
+            ));
         }
         let name = String::from_utf8_lossy(&buf[i..i + name_len]).into_owned();
         let value =
@@ -224,7 +288,7 @@ fn params(buf: &[u8]) -> Result<BTreeMap<String, String>, String> {
 
 /// One length field: a byte below 128, four bytes with the high bit of the first
 /// set above it.
-fn length(buf: &[u8], i: &mut usize) -> Result<usize, String> {
+fn length(buf: &[u8], i: &mut usize) -> Result<usize, Error> {
     let first = *buf
         .get(*i)
         .ok_or_else(|| "a parameter record ends inside a length".to_string())?;

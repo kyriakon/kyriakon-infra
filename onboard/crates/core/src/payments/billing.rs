@@ -17,12 +17,13 @@ use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime};
 
 use crate::util;
+use crate::Error;
 
 /// The date a payment takes access to: one calendar year after the later of
 /// `received` and `before`, as `YYYY-MM-DD`. Each may be a store date or an
 /// RFC 3339 stamp, which is how a Stripe event's timestamp meets a record's
 /// date. `before` is `None` for an account that has not been paid yet.
-pub fn extend_paid_until(received: &str, before: Option<&str>) -> Result<String, String> {
+pub fn extend_paid_until(received: &str, before: Option<&str>) -> Result<String, Error> {
     let received = day(received)?;
     let before = before.map(day).transpose()?;
     let until = util::paid_until_after(received, before).ok_or_else(|| {
@@ -36,14 +37,14 @@ pub fn extend_paid_until(received: &str, before: Option<&str>) -> Result<String,
 
 /// The day a stamp names: a store date, or the date part of an RFC 3339 stamp.
 /// Anything else is an error rather than a guess.
-fn day(stamp: &str) -> Result<Date, String> {
+fn day(stamp: &str) -> Result<Date, Error> {
     util::parse_date(stamp)
         .or_else(|| {
             OffsetDateTime::parse(stamp, &Rfc3339)
                 .ok()
                 .map(|t| t.date())
         })
-        .ok_or_else(|| format!("the date {stamp:?} is not YYYY-MM-DD or RFC 3339"))
+        .ok_or_else(|| Error::from(format!("the date {stamp:?} is not YYYY-MM-DD or RFC 3339")))
 }
 
 #[cfg(test)]

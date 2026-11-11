@@ -1,24 +1,25 @@
 //! One job of the operator console.
 
+use crate::Error;
 use crate::*;
 
 /// `prepaid list --window open [--expiring <days>]`: the first command of the
 /// operator's weekly pass. Only an open window is asked for; any other value is
 /// refused rather than answered with a list that means something else.
-pub(crate) async fn prepaid(store: &Store, args: &[String]) -> Result<(), String> {
+pub(crate) async fn prepaid(store: &Store, args: &[String]) -> Result<(), Error> {
     let (verb, rest) = match args {
         [verb, rest @ ..] => (verb.as_str(), rest),
-        _ => return Err(usage()),
+        _ => return Err(Error::from(usage())),
     };
     if verb != "list" {
-        return Err(usage());
+        return Err(Error::from(usage()));
     }
     let flags = flags(rest, &["window", "expiring"])?;
     let window = need(&flags, "window")?;
     if window != "open" {
-        return Err(format!(
+        return Err(Error::from(format!(
             "--window {window:?} is not open; only the open windows are listed"
-        ));
+        )));
     }
     let expiring = match flags.get("expiring") {
         Some(text) => Some(
@@ -49,18 +50,18 @@ pub(crate) async fn reconcile(
     cfg: &DrainConfig,
     store: &Store,
     args: &[String],
-) -> Result<(), String> {
+) -> Result<(), Error> {
     match args {
         [verb] if verb == "list" => reconcile_list(store).await,
         [verb, rest @ ..] if verb == "attribute" => reconcile_attribute(cfg, store, rest).await,
         [verb, rest @ ..] if verb == "return" => reconcile_return(cfg, store, rest).await,
-        _ => Err(usage()),
+        _ => Err(Error::from(usage())),
     }
 }
 
 /// Print every held item: what the operator can still join to an account or
 /// close with the evidence.
-pub(crate) async fn reconcile_list(store: &Store) -> Result<(), String> {
+pub(crate) async fn reconcile_list(store: &Store) -> Result<(), Error> {
     let held: Vec<_> = store
         .held()
         .await?
@@ -92,15 +93,15 @@ pub(crate) async fn reconcile_attribute(
     cfg: &DrainConfig,
     store: &Store,
     args: &[String],
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let (item, rest) = match args {
         [item, rest @ ..] if !item.starts_with("--") => (item.as_str(), rest),
-        _ => return Err(usage()),
+        _ => return Err(Error::from(usage())),
     };
     if !store::is_unattributed_id(item) {
-        return Err(format!(
+        return Err(Error::from(format!(
             "the held item {item:?} is not an unattributed payment id"
-        ));
+        )));
     }
     // `--confirm-double` is a bare switch, which the pair reader does not take.
     let confirm_double = rest.iter().any(|a| a == "--confirm-double");
@@ -112,7 +113,9 @@ pub(crate) async fn reconcile_attribute(
     let flags = flags(&paired, &["token", "override"])?;
     let token = need(&flags, "token")?;
     if !store::is_payment_token(token) {
-        return Err(format!("the token {token:?} is not a payment token"));
+        return Err(Error::from(format!(
+            "the token {token:?} is not a payment token"
+        )));
     }
     let override_reason = flags.get("override").map(String::as_str);
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
@@ -140,20 +143,22 @@ pub(crate) async fn reconcile_return(
     cfg: &DrainConfig,
     store: &Store,
     args: &[String],
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let (item, rest) = match args {
         [item, rest @ ..] if !item.starts_with("--") => (item.as_str(), rest),
-        _ => return Err(usage()),
+        _ => return Err(Error::from(usage())),
     };
     if !store::is_unattributed_id(item) {
-        return Err(format!(
+        return Err(Error::from(format!(
             "the held item {item:?} is not an unattributed payment id"
-        ));
+        )));
     }
     let flags = flags(rest, &["note"])?;
     let note = need(&flags, "note")?;
     if note.trim().is_empty() {
-        return Err("--note is empty; name the evidence the return was made on".to_string());
+        return Err(Error::from(
+            "--note is empty; name the evidence the return was made on".to_string(),
+        ));
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::reconcile_return_payload(item, note))?;

@@ -1,5 +1,6 @@
 //! One job of the operator console.
 
+use crate::Error;
 use crate::*;
 
 pub(crate) mod credit;
@@ -18,9 +19,9 @@ pub(crate) mod refund;
 pub(crate) async fn payment_block(
     store: &Store,
     username: &str,
-) -> Result<(String, store::Payment), String> {
+) -> Result<(String, store::Payment), Error> {
     if let Some(why) = validate::username_shape(username) {
-        return Err(format!("the username {username:?}: {why}"));
+        return Err(Error::from(format!("the username {username:?}: {why}")));
     }
     let account = store
         .account(username)
@@ -29,9 +30,9 @@ pub(crate) async fn payment_block(
     // An individual approved without charge and a free group's mailbox both hold
     // no payment at all, and are refused in the same words.
     if account.no_charge {
-        return Err(format!(
+        return Err(Error::from(format!(
             "{username} was approved without charge, so there is no payment token"
-        ));
+        )));
     }
     if let Some(mut payment) = account.payment_state() {
         let token = payment
@@ -44,7 +45,7 @@ pub(crate) async fn payment_block(
         return Ok((token, payment));
     }
     let Some(domain) = account.group.as_deref() else {
-        return Err(format!("{username} has no payment token"));
+        return Err(Error::from(format!("{username} has no payment token")));
     };
     let group = transitions::groups::group_record(store, domain)
         .await?
@@ -62,17 +63,21 @@ pub(crate) async fn payment_block(
 pub(crate) async fn payment_token(
     store: &Store,
     flags: &BTreeMap<String, String>,
-) -> Result<String, String> {
+) -> Result<String, Error> {
     match (flags.get("token"), flags.get("username")) {
         (Some(token), None) => {
             if !store::is_payment_token(token) {
-                return Err(format!("the token {token:?} is not a payment token"));
+                return Err(Error::from(format!(
+                    "the token {token:?} is not a payment token"
+                )));
             }
             Ok(token.clone())
         }
         (None, Some(username)) => payment_block(store, username).await.map(|(token, _)| token),
-        (Some(_), Some(_)) => Err("give either --token or --username, not both".to_string()),
-        (None, None) => Err("give --token or --username".to_string()),
+        (Some(_), Some(_)) => Err(Error::from(
+            "give either --token or --username, not both".to_string(),
+        )),
+        (None, None) => Err(Error::from("give --token or --username".to_string())),
     }
 }
 

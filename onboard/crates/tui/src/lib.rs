@@ -30,6 +30,9 @@
 //! own addresses the moment something identifies them.
 //!
 //! [#381]: https://github.com/kyriakon/kyriakon-infra/issues/381
+pub mod error;
+
+pub use error::Error;
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -50,14 +53,14 @@ use kyriakon_onboard_core::{mail::keycheck, store::draft};
 /// store, so the answer comes from the handler over its own socket; a test drives
 /// the same trait with an answer instead.
 pub trait StatusSource {
-    fn read(&mut self, token: &str) -> Result<StatusAnswer, String>;
+    fn read(&mut self, token: &str) -> Result<StatusAnswer, Error>;
 }
 
 /// Where a completed application goes. The handler is the only writer and
 /// validates every field again; the portal's job is the answers and the confirm.
 /// A test drives the same trait with a form instead of a socket.
 pub trait Filing {
-    fn file(&mut self, form: &BTreeMap<String, String>) -> Result<String, String>;
+    fn file(&mut self, form: &BTreeMap<String, String>) -> Result<String, Error>;
 }
 
 /// The shared facts the applicant's flow reads: the crate's question list and
@@ -108,7 +111,7 @@ impl Sessions {
     /// Take a slot for `address`, or report that it holds the cap. `None` is a
     /// session with no address to key on: a manual run rather than an sshd
     /// session, which always carries `SSH_CONNECTION`.
-    pub fn open(dir: &Path, address: Option<IpAddr>) -> Result<Admission, String> {
+    pub fn open(dir: &Path, address: Option<IpAddr>) -> Result<Admission, Error> {
         fs::create_dir_all(dir)
             .map_err(|e| format!("cannot open the session directory {}: {e}", dir.display()))?;
         prune(dir)?;
@@ -184,15 +187,15 @@ impl Drop for Sessions {
 }
 
 /// Lock one file, or say which one could not be locked.
-fn lock_exclusive(fd: i32, path: &Path) -> Result<(), String> {
+fn lock_exclusive(fd: i32, path: &Path) -> Result<(), Error> {
     if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
         Ok(())
     } else {
-        Err(format!(
+        Err(Error::from(format!(
             "cannot lock {}: {}",
             path.display(),
             std::io::Error::last_os_error()
-        ))
+        )))
     }
 }
 
@@ -201,7 +204,7 @@ fn lock_exclusive(fd: i32, path: &Path) -> Result<(), String> {
 /// a grant means nobody holds it, so the session is gone. A file this code cannot
 /// open is left alone: the directory is the portal's, but a name it did not write
 /// is not evidence of a session.
-fn prune(dir: &Path) -> Result<(), String> {
+fn prune(dir: &Path) -> Result<(), Error> {
     for entry in fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))? {
         let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
         let name = entry.file_name();
@@ -300,10 +303,10 @@ pub trait Input {
     /// A word the reader typed and ended with Enter. The terminal is in its
     /// ordinary state for this, so the reader sees what they type and backspace
     /// works.
-    fn word(&mut self) -> Result<Option<String>, String>;
+    fn word(&mut self) -> Result<Option<String>, Error>;
 
     /// One key, with a screen being drawn.
-    fn key(&mut self) -> Result<Option<Key>, String>;
+    fn key(&mut self) -> Result<Option<Key>, Error>;
 }
 
 /// The menu's rows: the catalogue as this front-end shows it, one per entry, in
@@ -332,12 +335,12 @@ pub fn run(
     status: &mut dyn StatusSource,
     filing: &mut dyn Filing,
     out: &mut dyn Write,
-) -> Result<Departure, String> {
+) -> Result<Departure, Error> {
     if rows.is_empty() {
-        return Err(format!(
+        return Err(Error::from(format!(
             "{} names no services, so there is nothing to show",
             catalogue::TRACKED
-        ));
+        )));
     }
 
     put(out, OPENING)?;
@@ -426,7 +429,7 @@ fn answer(
     mode: Mode,
     selected: usize,
     input: &mut dyn Input,
-) -> Result<Option<Answer>, String> {
+) -> Result<Option<Answer>, Error> {
     match mode {
         Mode::Full => Ok(match input.key()? {
             None => None,
@@ -460,7 +463,7 @@ fn answer(
 /// so this reads until one of those arrives; a key no screen uses leaves the page
 /// up rather than swallowing it, because a page the reader did not read is worse
 /// than a keystroke that did nothing. `None` is a connection that closed.
-fn back(mode: Mode, input: &mut dyn Input) -> Result<Option<Answer>, String> {
+fn back(mode: Mode, input: &mut dyn Input) -> Result<Option<Answer>, Error> {
     loop {
         match mode {
             Mode::Full => match input.key()? {
@@ -634,7 +637,7 @@ fn application(
     input: &mut dyn Input,
     filing: &mut dyn Filing,
     out: &mut dyn Write,
-) -> Result<Departure, String> {
+) -> Result<Departure, Error> {
     let mut draft = draft::Draft::new(String::new());
     let mut index = 0;
     paint(mode, out, APPLY_INTRO)?;
@@ -760,7 +763,7 @@ enum Entered {
 /// are read before a free-text answer starts, and on any line of a key, because
 /// neither word can appear in an armoured block and a mistaken paste otherwise
 /// has no way out.
-fn read_answer(page: &Page, input: &mut dyn Input) -> Result<Entered, String> {
+fn read_answer(page: &Page, input: &mut dyn Input) -> Result<Entered, Error> {
     let key = page.q.kind == Kind::Key;
     let multiline = matches!(page.q.kind, Kind::Multiline | Kind::Addresses);
     let mut lines = Vec::new();
@@ -950,7 +953,7 @@ https://{}.\n",
 
 /// The token the reader pasted, or `None` when they left the prompt empty and
 /// want the first screen back.
-fn token_word(input: &mut dyn Input, out: &mut dyn Write) -> Result<Option<String>, String> {
+fn token_word(input: &mut dyn Input, out: &mut dyn Write) -> Result<Option<String>, Error> {
     put(
         out,
         "\nPaste the token from your status link, or press Enter to go back.\n",
@@ -969,7 +972,7 @@ fn show_status(
     status: &mut dyn StatusSource,
     token: &str,
     out: &mut dyn Write,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     // A handler that is not answering is a screen, not the end of the session: the
     // reader can still use the menu, and a restart is the operator's repair. The
     // read is the only thing here that can fail for a reason outside this process.
@@ -984,7 +987,7 @@ fn show_status(
 /// Paint a screen: the drawing mode clears the terminal first, because every
 /// screen here is a whole one. The line mode writes nothing but the screen's own
 /// words.
-fn paint(mode: Mode, out: &mut dyn Write, text: &str) -> Result<(), String> {
+fn paint(mode: Mode, out: &mut dyn Write, text: &str) -> Result<(), Error> {
     if mode == Mode::Full {
         put(out, CLEAR)?;
     }
@@ -993,10 +996,10 @@ fn paint(mode: Mode, out: &mut dyn Write, text: &str) -> Result<(), String> {
 
 /// Write a screen and flush, because the next thing this program does is wait for
 /// a reader to answer it.
-fn put(out: &mut dyn Write, text: &str) -> Result<(), String> {
+fn put(out: &mut dyn Write, text: &str) -> Result<(), Error> {
     out.write_all(text.as_bytes())
         .and_then(|()| out.flush())
-        .map_err(|e| format!("cannot write to the session: {e}"))
+        .map_err(|e| Error::from(format!("cannot write to the session: {e}")))
 }
 
 #[cfg(test)]
@@ -1049,11 +1052,11 @@ mod tests {
     }
 
     impl Input for Script {
-        fn word(&mut self) -> Result<Option<String>, String> {
+        fn word(&mut self) -> Result<Option<String>, Error> {
             Ok(self.words.pop_front().unwrap_or(None))
         }
 
-        fn key(&mut self) -> Result<Option<Key>, String> {
+        fn key(&mut self) -> Result<Option<Key>, Error> {
             Ok(self.keys.pop_front().unwrap_or(None))
         }
     }
@@ -1062,7 +1065,7 @@ mod tests {
     /// than a default, so a screen that asks when it should not is caught.
     #[derive(Default)]
     struct Statuses {
-        answers: VecDeque<Result<StatusAnswer, String>>,
+        answers: VecDeque<Result<StatusAnswer, Error>>,
     }
 
     impl Statuses {
@@ -1074,7 +1077,7 @@ mod tests {
     }
 
     impl StatusSource for Statuses {
-        fn read(&mut self, _token: &str) -> Result<StatusAnswer, String> {
+        fn read(&mut self, _token: &str) -> Result<StatusAnswer, Error> {
             self.answers
                 .pop_front()
                 .unwrap_or_else(|| Err("no status was scripted".into()))
@@ -1085,7 +1088,7 @@ mod tests {
     struct NoStatus;
 
     impl StatusSource for NoStatus {
-        fn read(&mut self, _token: &str) -> Result<StatusAnswer, String> {
+        fn read(&mut self, _token: &str) -> Result<StatusAnswer, Error> {
             Err("this session asks no status".into())
         }
     }
@@ -1098,7 +1101,7 @@ mod tests {
     }
 
     impl Filing for Files {
-        fn file(&mut self, form: &BTreeMap<String, String>) -> Result<String, String> {
+        fn file(&mut self, form: &BTreeMap<String, String>) -> Result<String, Error> {
             self.forms.push(form.clone());
             Ok("abcdefghjkmnpqrstvwxyz0123".to_string())
         }
@@ -1108,7 +1111,7 @@ mod tests {
     struct NoFiles;
 
     impl Filing for NoFiles {
-        fn file(&mut self, _form: &BTreeMap<String, String>) -> Result<String, String> {
+        fn file(&mut self, _form: &BTreeMap<String, String>) -> Result<String, Error> {
             Err("this session files nothing".into())
         }
     }
@@ -1373,7 +1376,7 @@ mod tests {
     fn a_status_read_that_fails_leaves_the_session_open() {
         let rows = rows(None);
         let mut statuses = Statuses {
-            answers: VecDeque::from([Err("connection refused".to_string())]),
+            answers: VecDeque::from([Err(Error::from("connection refused".to_string()))]),
         };
         let mut script = Script::lines(&["status", "abcdefghjkmnpqrstvwxyz0123", "", "quit"]);
         let (left, seen) =

@@ -2,6 +2,7 @@
 //! when its status link stops answering. One module, so the timestamp crate can
 //! move without touching anything else.
 
+use crate::Error;
 use time::format_description::well_known::Rfc3339;
 use time::{Date, Duration, OffsetDateTime};
 
@@ -158,7 +159,7 @@ pub fn date_string(date: Date) -> String {
 /// money is added and compared in pence, and this is the one parser both the
 /// console and the drain use. At most two decimal places, because a penny is the
 /// smallest unit of the ledger.
-pub fn pence(s: &str) -> Result<i64, String> {
+pub fn pence(s: &str) -> Result<i64, Error> {
     let (pounds, fraction) = s.split_once('.').unwrap_or((s, ""));
     if pounds.is_empty()
         || pounds.len() > 9
@@ -166,7 +167,7 @@ pub fn pence(s: &str) -> Result<i64, String> {
         || fraction.len() > 2
         || !fraction.bytes().all(|b| b.is_ascii_digit())
     {
-        return Err(format!("{s:?} is not an amount in pounds"));
+        return Err(Error::from(format!("{s:?} is not an amount in pounds")));
     }
     let whole: i64 = pounds
         .parse()
@@ -334,10 +335,10 @@ mod tests {
 
     #[test]
     fn pounds_are_parsed_and_written_as_pence() {
-        assert_eq!(super::pence("20.00"), Ok(2000));
-        assert_eq!(super::pence("20"), Ok(2000));
-        assert_eq!(super::pence("0.05"), Ok(5));
-        assert_eq!(super::pence("19.8"), Ok(1980));
+        assert_eq!(super::pence("20.00").unwrap(), 2000);
+        assert_eq!(super::pence("20").unwrap(), 2000);
+        assert_eq!(super::pence("0.05").unwrap(), 5);
+        assert_eq!(super::pence("19.8").unwrap(), 1980);
         assert!(super::pence("20.001").is_err());
         assert!(super::pence("-20.00").is_err());
         assert!(super::pence("twenty").is_err());

@@ -1,6 +1,7 @@
 //! One job of the operator console.
 
 use crate::account::find_application;
+use crate::Error;
 use crate::*;
 
 /// Sign one decision and file it as an intent. The application it names is
@@ -13,7 +14,7 @@ pub(crate) async fn sign_and_file(
     key: &[u8],
     decision: &Decision,
     username: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let (token, _record) = find_application(store, username).await?;
     let sig = sign::sign(key, &sign::decide_payload(&token, decision.action))?;
     let id = intent::Intent::Decision(intent::DecisionIntent {

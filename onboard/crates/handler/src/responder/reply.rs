@@ -96,25 +96,64 @@ pub(super) fn page_html<T: Template>(t: &T) -> String {
 mod tests {
     use super::*;
 
+    fn store_failure() -> Error {
+        Error::Store(kyriakon_onboard_core::store::Error::Refused(
+            "boom".to_string(),
+        ))
+    }
+
     #[test]
     fn a_refusal_is_a_client_error_and_a_store_failure_is_a_server_error() {
+        assert_eq!(
+            respond(
+                &Error::Refused("not this request".to_string()),
+                FrontEnd::Httpd
+            )
+            .code(),
+            403
+        );
+        assert_eq!(
+            respond(
+                &Error::Line {
+                    what: "the request",
+                    limit: 10
+                },
+                FrontEnd::Httpd
+            )
+            .code(),
+            403
+        );
+        assert_eq!(respond(&store_failure(), FrontEnd::Httpd).code(), 500);
+        assert_eq!(respond(&store_failure(), FrontEnd::Gemini).code(), 40);
+        assert_eq!(
+            respond(
+                &Error::Lookup(kyriakon_onboard_core::store::Error::Refused(
+                    "boom".to_string()
+                )),
+                FrontEnd::Gemini
+            )
+            .code(),
+            50
+        );
         let refusal = respond(
             &Error::Refused("not this request".to_string()),
-            FrontEnd::Httpd,
-        );
-        assert!(matches!(refusal, Reply::Http(_)));
-        let failure = respond(
-            &Error::Lookup(kyriakon_onboard_core::store::Error::Refused(
-                "boom".to_string(),
-            )),
             FrontEnd::Gemini,
         );
-        match failure {
-            Reply::Gemini { status, meta, .. } => {
-                assert_eq!(status, 50);
-                assert_eq!(meta, "Permanent failure");
-            }
+        assert_eq!(refusal.code(), 59);
+        match refusal {
+            Reply::Gemini { meta, .. } => assert_eq!(meta, "not this request"),
             Reply::Http(_) => panic!("a gemini request got an http reply"),
         }
+        assert_eq!(
+            respond(
+                &Error::Line {
+                    what: "the request",
+                    limit: 10
+                },
+                FrontEnd::Gemini
+            )
+            .code(),
+            59
+        );
     }
 }

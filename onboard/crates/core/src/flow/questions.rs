@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::Error;
 use serde::Deserialize;
 
 /// The tracked file this module parses, named in the refusals so a failure says
@@ -26,7 +27,7 @@ pub const TRACKED: &str = "onboard/questions.toml";
 /// into the binary, so no path is read at startup and no copy of it can differ
 /// from the one the service was built with. A list that does not parse is a
 /// service that will not start, and the check above is the build failing first.
-pub fn shipped() -> Result<Vec<Question>, String> {
+pub fn shipped() -> Result<Vec<Question>, Error> {
     parse(include_str!("../../../../questions.toml"))
 }
 
@@ -56,7 +57,7 @@ impl Kind {
         }
     }
 
-    fn parse(s: &str) -> Result<Kind, String> {
+    fn parse(s: &str) -> Result<Kind, Error> {
         Ok(match s {
             "text" => Kind::Text,
             "choice" => Kind::Choice,
@@ -65,7 +66,7 @@ impl Kind {
             "addresses" => Kind::Addresses,
             "key" => Kind::Key,
             "acceptance" => Kind::Acceptance,
-            other => return Err(format!("unknown answer type {other:?}")),
+            other => return Err(Error::from(format!("unknown answer type {other:?}"))),
         })
     }
 }
@@ -83,13 +84,13 @@ pub enum Branch {
 }
 
 impl Branch {
-    fn parse(s: &str) -> Result<Branch, String> {
+    fn parse(s: &str) -> Result<Branch, Error> {
         Ok(match s {
             "all" => Branch::All,
             "person" => Branch::Person,
             "body" => Branch::Body,
             "monastic" => Branch::Monastic,
-            other => return Err(format!("unknown branch {other:?}")),
+            other => return Err(Error::from(format!("unknown branch {other:?}"))),
         })
     }
 }
@@ -121,7 +122,7 @@ pub enum Rule {
 }
 
 impl Rule {
-    fn parse(s: &str) -> Result<Rule, String> {
+    fn parse(s: &str) -> Result<Rule, Error> {
         Ok(match s {
             "none" => Rule::None,
             "username" => Rule::Username,
@@ -135,7 +136,7 @@ impl Rule {
                     n.parse()
                         .map_err(|_| format!("maxlen needs a number, got {n:?}"))?,
                 ),
-                None => return Err(format!("unknown validation {other:?}")),
+                None => return Err(Error::from(format!("unknown validation {other:?}"))),
             },
         })
     }
@@ -183,7 +184,7 @@ pub struct Question {
 /// Parse the file. A question that is malformed, or that names a token outside
 /// its vocabulary, is refused by name rather than skipped: a question that
 /// disappears silently is a question no front-end asks.
-pub fn parse(text: &str) -> Result<Vec<Question>, String> {
+pub fn parse(text: &str) -> Result<Vec<Question>, Error> {
     let file: File = toml::from_str(text).map_err(|e| format!("the question list: {e}"))?;
 
     let mut out = Vec::with_capacity(file.question.len());
@@ -213,33 +214,37 @@ fn rule(
     kind: Kind,
     choices: Vec<Choice>,
     validation: Option<String>,
-) -> Result<Rule, String> {
+) -> Result<Rule, Error> {
     if kind == Kind::Choice {
         if choices.is_empty() {
-            return Err(format!("the question {id:?} is a choice with no choices"));
+            return Err(Error::from(format!(
+                "the question {id:?} is a choice with no choices"
+            )));
         }
         if validation.is_some() {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "the question {id:?} is a choice, so its validation is its choices"
-            ));
+            )));
         }
         for c in &choices {
             if c.value.is_empty() || c.label.is_empty() {
-                return Err(format!(
+                return Err(Error::from(format!(
                     "the question {id:?} has a choice with an empty value or label"
-                ));
+                )));
             }
         }
         return Ok(Rule::Choice(choices));
     }
     if !choices.is_empty() {
-        return Err(format!(
+        return Err(Error::from(format!(
             "the question {id:?} is a {} carrying choices",
             kind.token()
-        ));
+        )));
     }
     match validation {
-        Some(v) => Rule::parse(&v).map_err(|why| format!("the question {id:?}: {why}")),
+        Some(v) => {
+            Rule::parse(&v).map_err(|why| Error::from(format!("the question {id:?}: {why}")))
+        }
         None => Ok(Rule::None),
     }
 }

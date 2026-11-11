@@ -15,6 +15,7 @@
 //! fabricated without the key and that a signature from one application cannot
 //! be replayed against another.
 
+use crate::Error;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
@@ -30,18 +31,21 @@ type HmacSha256 = Hmac<Sha256>;
 /// running as root, it must be owned by root. Both checks are the operator's
 /// own rule made enforceable: the config, the deploy script and the spec all
 /// describe this as a root-only file, and this is the one place that reads it.
-pub fn read_key(path: &std::path::Path) -> Result<Vec<u8>, String> {
+pub fn read_key(path: &std::path::Path) -> Result<Vec<u8>, Error> {
     use std::os::unix::fs::MetadataExt;
     let meta =
         std::fs::metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     if unsafe { libc::geteuid() } == 0 && meta.uid() != 0 {
-        return Err(format!("{} is not owned by root", path.display()));
+        return Err(Error::from(format!(
+            "{} is not owned by root",
+            path.display()
+        )));
     }
     if meta.mode() & 0o077 != 0 {
-        return Err(format!(
+        return Err(Error::from(format!(
             "{} is readable by group or others; it must be 0600",
             path.display()
-        ));
+        )));
     }
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let end = bytes
@@ -51,7 +55,7 @@ pub fn read_key(path: &std::path::Path) -> Result<Vec<u8>, String> {
         .unwrap_or(0);
     let key = bytes[..end].to_vec();
     if key.is_empty() {
-        return Err(format!("{} is empty", path.display()));
+        return Err(Error::from(format!("{} is empty", path.display())));
     }
     Ok(key)
 }
@@ -59,14 +63,14 @@ pub fn read_key(path: &std::path::Path) -> Result<Vec<u8>, String> {
 /// The signature of one payload, lowercase hex. Infallible in practice: HMAC
 /// accepts a key of any length, and the error path is kept so a caller writes
 /// `?` rather than an `unwrap` on a value the OS randomness feeds.
-pub fn sign(key: &[u8], payload: &str) -> Result<String, String> {
+pub fn sign(key: &[u8], payload: &str) -> Result<String, Error> {
     sign_bytes(key, payload.as_bytes())
 }
 
 /// The same signature over bytes, for a payload that is not text: a webhook's
 /// raw body is verified exactly as it arrived, and a lossy reread of it would
 /// not be the bytes Stripe signed.
-pub fn sign_bytes(key: &[u8], payload: &[u8]) -> Result<String, String> {
+pub fn sign_bytes(key: &[u8], payload: &[u8]) -> Result<String, Error> {
     let mut mac =
         HmacSha256::new_from_slice(key).map_err(|e| format!("cannot key the HMAC: {e}"))?;
     mac.update(payload);
@@ -303,13 +307,13 @@ pub fn refund_payload(
 }
 
 /// One decision link, pointing at the handler's click-through path.
-pub fn decide_link(base: &str, key: &[u8], token: &str, action: &str) -> Result<String, String> {
+pub fn decide_link(base: &str, key: &[u8], token: &str, action: &str) -> Result<String, Error> {
     let sig = sign(key, &decide_payload(token, action))?;
     Ok(format!("{base}/decide/{token}?action={action}&sig={sig}"))
 }
 
 /// The one-time password link, the same mechanism as the review links.
-pub fn password_link(base: &str, key: &[u8], token: &str, until: &str) -> Result<String, String> {
+pub fn password_link(base: &str, key: &[u8], token: &str, until: &str) -> Result<String, Error> {
     let sig = sign(key, &password_payload(token, until))?;
     Ok(format!("{base}/password/{token}?until={until}&sig={sig}"))
 }

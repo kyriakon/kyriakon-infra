@@ -1,5 +1,6 @@
 //! One job of the operator console.
 
+use crate::Error;
 use crate::*;
 
 /// `ledger export --tax-year <year> --format csv`: the year's lines for the
@@ -8,16 +9,16 @@ use crate::*;
 /// held money in `ledger/unattributed.jsonl` is not income until it is
 /// attributed, so it follows the keyed rows in a section of its own rather than
 /// as a row without a token.
-pub(crate) async fn ledger(store: &Store, args: &[String]) -> Result<(), String> {
+pub(crate) async fn ledger(store: &Store, args: &[String]) -> Result<(), Error> {
     let rest = match args {
         [verb, rest @ ..] if verb == "export" => rest,
-        _ => return Err(usage()),
+        _ => return Err(Error::from(usage())),
     };
     let flags = flags(rest, &["tax-year", "format"])?;
     let (start, end) = tax_year(need(&flags, "tax-year")?)?;
     let format = need(&flags, "format")?;
     if format != "csv" {
-        return Err(format!("--format {format:?} is not csv"));
+        return Err(Error::from(format!("--format {format:?} is not csv")));
     }
     let columns = payment_columns();
     println!(
@@ -78,13 +79,13 @@ pub(crate) fn in_tax_year(received_on: Option<&str>, start: time::Date, end: tim
 /// A tax year's bounds: the `YYYY-YY` or `YYYY-YYYY` spelling, 6 April to the
 /// following 5 April inclusive. The second year is not accepted on trust: a
 /// mistyped pair would quietly export a different year's money.
-pub(crate) fn tax_year(s: &str) -> Result<(time::Date, time::Date), String> {
+pub(crate) fn tax_year(s: &str) -> Result<(time::Date, time::Date), Error> {
     let refuse = || {
         format!("--tax-year {s:?} is not YYYY-YY or YYYY-YYYY, or its years are not consecutive")
     };
     let (first, second) = s.split_once('-').ok_or_else(refuse)?;
     if first.len() != 4 || !first.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(refuse());
+        return Err(Error::from(refuse()));
     }
     let year: i32 = first.parse().map_err(|_| refuse())?;
     let next = year.checked_add(1).ok_or_else(refuse)?;
@@ -97,10 +98,10 @@ pub(crate) fn tax_year(s: &str) -> Result<(time::Date, time::Date), String> {
             second.bytes().all(|b| b.is_ascii_digit())
                 && second.parse::<i32>().map_err(|_| refuse())? == next
         }
-        _ => return Err(refuse()),
+        _ => return Err(Error::from(refuse())),
     };
     if !second_ok {
-        return Err(refuse());
+        return Err(Error::from(refuse()));
     }
     let start =
         time::Date::from_calendar_date(year, time::Month::April, 6).map_err(|_| refuse())?;

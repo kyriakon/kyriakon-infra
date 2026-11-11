@@ -38,6 +38,8 @@ pub enum Error {
     Config(config::Error),
     /// A privileged script failed.
     Script(boxrun::Error),
+    /// A core read or parse failed.
+    Core(kyriakon_onboard_core::Error),
     /// A JSON record did not encode or parse.
     Json {
         context: &'static str,
@@ -52,6 +54,7 @@ impl fmt::Display for Error {
             Error::Store(error) => error.fmt(f),
             Error::Config(error) => error.fmt(f),
             Error::Script(error) => error.fmt(f),
+            Error::Core(error) => error.fmt(f),
             Error::Json { context, source } => write!(f, "cannot {context}: {source}"),
         }
     }
@@ -64,6 +67,7 @@ impl std::error::Error for Error {
             Error::Store(error) => Some(error),
             Error::Config(error) => Some(error),
             Error::Script(error) => Some(error),
+            Error::Core(error) => Some(error),
             Error::Json { source, .. } => Some(source),
         }
     }
@@ -93,6 +97,12 @@ impl From<boxrun::Error> for Error {
     }
 }
 
+impl From<kyriakon_onboard_core::Error> for Error {
+    fn from(error: kyriakon_onboard_core::Error) -> Self {
+        Error::Core(error)
+    }
+}
+
 impl From<String> for Error {
     fn from(message: String) -> Self {
         Error::Failed(message)
@@ -102,13 +112,6 @@ impl From<String> for Error {
 impl From<&str> for Error {
     fn from(message: &str) -> Self {
         Error::Failed(message.to_string())
-    }
-}
-
-/// Bridge for the binaries and callers not converted yet; step 5 removes it.
-impl From<Error> for String {
-    fn from(error: Error) -> String {
-        error.to_string()
     }
 }
 

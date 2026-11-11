@@ -43,8 +43,8 @@ pub fn reason(
         Rule::Usernames => usernames(v, reserved),
         Rule::Address => address(v),
         Rule::Domain => domain(v),
-        Rule::MailKey => keycheck::pgp_public_key(v).err(),
-        Rule::UploadKey => keycheck::openssh_public_key(v).err(),
+        Rule::MailKey => keycheck::pgp_public_key(v).err().map(|e| e.to_string()),
+        Rule::UploadKey => keycheck::openssh_public_key(v).err().map(|e| e.to_string()),
         Rule::Choice(opts) => choice(opts, v),
         Rule::MaxLen(n) => (v.chars().count() > *n).then(|| format!("at most {n} characters")),
     }

@@ -19,6 +19,7 @@ use serde_json::Value;
 
 use crate::store::{Log, Store};
 use crate::util;
+use crate::Error;
 
 /// The one ledger of money movements.
 pub const PAYMENTS: &str = "ledger/payments.jsonl";
@@ -220,7 +221,7 @@ impl<'a> Ledger<'a> {
 
     /// Append one line, allocating its `seq` as one past the highest already
     /// recorded, inside the ledger's lock. Returns the number it wrote.
-    pub async fn append(&self, mut line: LedgerLine) -> Result<u64, String> {
+    pub async fn append(&self, mut line: LedgerLine) -> Result<u64, Error> {
         let guard = self.log.lock().await?;
         let mut last = 0u64;
         self.log
@@ -242,19 +243,19 @@ impl<'a> Ledger<'a> {
     }
 
     /// Every line, typed. A line that does not parse is an error.
-    pub async fn lines(&self) -> Result<Vec<LedgerLine>, String> {
-        self.log.jsonl().await.map_err(String::from)
+    pub async fn lines(&self) -> Result<Vec<LedgerLine>, Error> {
+        self.log.jsonl().await.map_err(Error::from)
     }
 
     /// The token's most recent payment line: what a refund reverses. Every
     /// payment line for the token must carry an amount, because a refund cannot
     /// reverse one it cannot read.
-    pub async fn last_payment(&self, token: &str) -> Result<Option<LedgerLine>, String> {
+    pub async fn last_payment(&self, token: &str) -> Result<Option<LedgerLine>, Error> {
         let mut found = None;
         for line in self.lines().await? {
             if line.token == token && line.kind == "payment" {
                 if line.amount_gbp.is_none() {
-                    return Err("a payment line carries no amount".to_string());
+                    return Err(Error::from("a payment line carries no amount".to_string()));
                 }
                 found = Some(line);
             }
@@ -263,7 +264,7 @@ impl<'a> Ledger<'a> {
     }
 
     /// The token's refund lines, oldest first.
-    pub async fn refunds(&self, token: &str) -> Result<Vec<LedgerLine>, String> {
+    pub async fn refunds(&self, token: &str) -> Result<Vec<LedgerLine>, Error> {
         let mut found = Vec::new();
         self.log
             .jsonl_each(|_, line: &LedgerLine| {
@@ -278,7 +279,7 @@ impl<'a> Ledger<'a> {
     /// The token's refunds that reverse `original`, with their total in pence.
     /// An amount this cannot read is an error, never zero: counting it as zero
     /// would let this refund and the unreadable one together exceed the payment.
-    pub async fn refunded_total(&self, token: &str, original: u64) -> Result<RefundSum, String> {
+    pub async fn refunded_total(&self, token: &str, original: u64) -> Result<RefundSum, Error> {
         let mut total = 0i64;
         let mut lines = Vec::new();
         for line in self.refunds(token).await? {
@@ -299,32 +300,32 @@ impl<'a> Ledger<'a> {
     }
 
     /// Whether a refund line has already recorded this settlement intent.
-    pub async fn settled_by(&self, intent: &str) -> Result<bool, String> {
+    pub async fn settled_by(&self, intent: &str) -> Result<bool, Error> {
         self.log
             .jsonl_any(|line: &LedgerLine| line.settled_intent.as_deref() == Some(intent))
             .await
-            .map_err(String::from)
+            .map_err(Error::from)
     }
 
     /// Whether the ledger already holds this intent's line.
-    pub async fn has_intent(&self, intent: &str) -> Result<bool, String> {
+    pub async fn has_intent(&self, intent: &str) -> Result<bool, Error> {
         self.log
             .jsonl_any(|line: &LedgerLine| line.intent.as_deref() == Some(intent))
             .await
-            .map_err(String::from)
+            .map_err(Error::from)
     }
 
     /// Whether the approval already opened this token's window. Its dedup is
     /// the token and the kind, not an intent id.
-    pub async fn has_window_open(&self, token: &str) -> Result<bool, String> {
+    pub async fn has_window_open(&self, token: &str) -> Result<bool, Error> {
         self.log
             .jsonl_any(|line: &LedgerLine| line.token == token && line.kind == "window_open")
             .await
-            .map_err(String::from)
+            .map_err(Error::from)
     }
 
     /// The first line carrying this transaction id.
-    pub async fn by_txid(&self, txid: &str) -> Result<Option<LedgerLine>, String> {
+    pub async fn by_txid(&self, txid: &str) -> Result<Option<LedgerLine>, Error> {
         let mut found = None;
         self.log
             .jsonl_each(|_, line: &LedgerLine| {
@@ -340,7 +341,7 @@ impl<'a> Ledger<'a> {
     /// than re-encoding the fields this build models. A line written by an
     /// earlier release that this build cannot model is not the member's line, so
     /// it is skipped rather than failing their whole export.
-    pub async fn raw_lines_for(&self, token: &str) -> Result<Vec<String>, String> {
+    pub async fn raw_lines_for(&self, token: &str) -> Result<Vec<String>, Error> {
         let mut out = Vec::new();
         for raw in self.log.raw_lines().await? {
             let Ok(value) = serde_json::from_str::<Value>(&raw) else {
@@ -356,7 +357,7 @@ impl<'a> Ledger<'a> {
     /// The token's lines typed, skipping a line this build cannot model. For the
     /// display readers, which must not lose a member's whole answer to one
     /// legacy line; the money readers use [`Self::lines`] and fail instead.
-    pub async fn lines_for(&self, token: &str) -> Result<Vec<LedgerLine>, String> {
+    pub async fn lines_for(&self, token: &str) -> Result<Vec<LedgerLine>, Error> {
         let mut out = Vec::new();
         for raw in self.log.raw_lines().await? {
             let Ok(value) = serde_json::from_str::<Value>(&raw) else {
@@ -381,7 +382,7 @@ impl<'a> Ledger<'a> {
         token: &str,
         intent: &str,
         on: &str,
-    ) -> Result<Option<u64>, String> {
+    ) -> Result<Option<u64>, Error> {
         let guard = self.log.lock().await?;
         let mut lines = self.log.raw_lines().await?;
         let Some((index, settled)) = unsettled_index(&lines, token)? else {
@@ -407,11 +408,14 @@ impl<'a> Ledger<'a> {
 /// The index and line of the newest refund for `token` without `settled_on`. A
 /// line that does not parse is an error: a settlement must not skip a line it
 /// cannot read and settle an older one in its place.
-fn unsettled_index(lines: &[String], token: &str) -> Result<Option<(usize, LedgerLine)>, String> {
+fn unsettled_index(lines: &[String], token: &str) -> Result<Option<(usize, LedgerLine)>, Error> {
     let mut found = None;
     for (index, raw) in lines.iter().enumerate() {
-        let line: LedgerLine = serde_json::from_str(raw)
-            .map_err(|e| format!("{PAYMENTS}: line {} does not parse: {e}", index + 1))?;
+        let line: LedgerLine = serde_json::from_str(raw).map_err(|source| Error::ParseLine {
+            path: PAYMENTS,
+            line: index + 1,
+            source,
+        })?;
         if line.token == token && line.kind == "refund" && line.settled_on().is_none() {
             found = Some((index, line));
         }

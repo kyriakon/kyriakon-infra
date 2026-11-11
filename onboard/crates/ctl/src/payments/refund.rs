@@ -1,6 +1,7 @@
 //! One job of the operator console.
 
 use super::payment_token;
+use crate::Error;
 use crate::*;
 
 /// `refund`: either record a refund against the payment its token last made, or
@@ -8,11 +9,7 @@ use crate::*;
 /// and whether the account closes; the settlement form names only the day. A
 /// `--username` is resolved to the account's token here, as `credit` does, and
 /// the signature covers every field the drain acts on.
-pub(crate) async fn refund(
-    cfg: &DrainConfig,
-    store: &Store,
-    args: &[String],
-) -> Result<(), String> {
+pub(crate) async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), Error> {
     // `--close` and `--excess` are bare switches, which the pair reader does not
     // take.
     let close = args.iter().any(|a| a == "--close");
@@ -33,14 +30,18 @@ pub(crate) async fn refund(
     if let Some(settled) = flags.get("settled").map(String::as_str) {
         for name in ["amount", "rail", "reason", "rate"] {
             if flags.contains_key(name) {
-                return Err(format!("--settled takes no --{name}"));
+                return Err(Error::from(format!("--settled takes no --{name}")));
             }
         }
         if close || excess {
-            return Err("--settled takes no --close or --excess".to_string());
+            return Err(Error::from(
+                "--settled takes no --close or --excess".to_string(),
+            ));
         }
         if util::parse_date(settled).is_none() {
-            return Err(format!("--settled {settled:?} is not YYYY-MM-DD"));
+            return Err(Error::from(format!(
+                "--settled {settled:?} is not YYYY-MM-DD"
+            )));
         }
         let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
         let sig = sign::sign(
@@ -61,33 +62,39 @@ pub(crate) async fn refund(
 
     let rail = need(&flags, "rail")?;
     if !intent::REFUND_RAILS.contains(&rail) {
-        return Err(format!(
+        return Err(Error::from(format!(
             "--rail {rail:?} is not one of {}",
             intent::REFUND_RAILS.join(", ")
-        ));
+        )));
     }
     let amount = need(&flags, "amount")?;
     match util::pence(amount) {
         Ok(pence) if pence > 0 => {}
-        Ok(_) => return Err("--amount must be more than zero".to_string()),
-        Err(e) => return Err(format!("--amount: {e}")),
+        Ok(_) => return Err(Error::from("--amount must be more than zero".to_string())),
+        Err(e) => return Err(Error::from(format!("--amount: {e}"))),
     }
     let reason = need(&flags, "reason")?;
     if reason.trim().is_empty() {
-        return Err("--reason must say why the money is going back".to_string());
+        return Err(Error::from(
+            "--reason must say why the money is going back".to_string(),
+        ));
     }
     if close == excess {
-        return Err("give exactly one of --close or --excess".to_string());
+        return Err(Error::from(
+            "give exactly one of --close or --excess".to_string(),
+        ));
     }
     let rate = flags.get("rate").map(String::as_str);
     if let Some(rate) = rate {
         if rail != "monero" {
-            return Err("--rate is only a monero refund paid in sterling".to_string());
+            return Err(Error::from(
+                "--rate is only a monero refund paid in sterling".to_string(),
+            ));
         }
         match util::pence(rate) {
             Ok(pence) if pence > 0 => {}
-            Ok(_) => return Err("--rate must be more than zero".to_string()),
-            Err(e) => return Err(format!("--rate: {e}")),
+            Ok(_) => return Err(Error::from("--rate must be more than zero".to_string())),
+            Err(e) => return Err(Error::from(format!("--rate: {e}"))),
         }
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
