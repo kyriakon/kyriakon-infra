@@ -161,7 +161,6 @@ impl Fix {
             "publish-mail-key.sh",
             "reload-smtpd.sh",
             "reload-spamd.sh",
-            "stripe-api.sh",
         ] {
             let log = fix.path("scripts.log");
             fix.script(s, &format!("#!/bin/sh\necho \"{s} $*\" >> '{log}'\n"));
@@ -403,12 +402,14 @@ impl Fix {
 
     /// The subscription the Stripe API stub answers with. `status` is what the
     /// retrieval returns, which is the fact `invoice.paid` checks before it
-    /// extends anything.
+    /// extends anything. Every call is logged with its arguments, so a test can
+    /// see the `cancel` a transition sends as well as the retrieval it makes.
     pub fn stripe_subscription(&self, status: &str, period_end: i64) {
+        let log = self.path("scripts.log");
         self.script(
             "stripe-api.sh",
             &format!(
-                "#!/bin/sh\ncat <<'JSON'\n{{\"id\":\"{SUBSCRIPTION}\",\"status\":\"{status}\",\"current_period_end\":{period_end},\"customer\":\"cus_example\"}}\nJSON\n"
+                "#!/bin/sh\necho \"stripe-api.sh $*\" >> '{log}'\ncat <<'JSON'\n{{\"id\":\"{SUBSCRIPTION}\",\"status\":\"{status}\",\"current_period_end\":{period_end},\"customer\":\"cus_example\"}}\nJSON\n"
             ),
         );
     }
