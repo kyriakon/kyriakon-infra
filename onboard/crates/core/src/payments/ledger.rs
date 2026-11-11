@@ -243,7 +243,7 @@ impl<'a> Ledger<'a> {
 
     /// Every line, typed. A line that does not parse is an error.
     pub async fn lines(&self) -> Result<Vec<LedgerLine>, String> {
-        self.log.jsonl().await
+        self.log.jsonl().await.map_err(String::from)
     }
 
     /// The token's most recent payment line: what a refund reverses. Every
@@ -303,6 +303,7 @@ impl<'a> Ledger<'a> {
         self.log
             .jsonl_any(|line: &LedgerLine| line.settled_intent.as_deref() == Some(intent))
             .await
+            .map_err(String::from)
     }
 
     /// Whether the ledger already holds this intent's line.
@@ -310,6 +311,7 @@ impl<'a> Ledger<'a> {
         self.log
             .jsonl_any(|line: &LedgerLine| line.intent.as_deref() == Some(intent))
             .await
+            .map_err(String::from)
     }
 
     /// Whether the approval already opened this token's window. Its dedup is
@@ -318,6 +320,7 @@ impl<'a> Ledger<'a> {
         self.log
             .jsonl_any(|line: &LedgerLine| line.token == token && line.kind == "window_open")
             .await
+            .map_err(String::from)
     }
 
     /// The first line carrying this transaction id.

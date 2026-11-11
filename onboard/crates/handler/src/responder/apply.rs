@@ -115,7 +115,7 @@ pub(super) async fn apply_web(app: &App, request: &Request, incoming: &Incoming)
 
     let token = match store::status_token().await {
         Ok(t) => t,
-        Err(e) => return server_error(&e),
+        Err(e) => return server_error(&e.to_string()),
     };
     let record = match build_record(app, &form, body, &token, label) {
         Ok(r) => r,

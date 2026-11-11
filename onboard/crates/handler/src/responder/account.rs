@@ -51,7 +51,7 @@ pub(super) async fn account_web(app: &App, request: &Request) -> Reply {
     let account = match app.store.account(&member.username).await {
         Ok(Some(account)) => account,
         Ok(None) => return Reply::capability(200, page_html(&LoginPage { error: None })),
-        Err(e) => return server_error(&e),
+        Err(e) => return server_error(&e.to_string()),
     };
     let notices = account_notices(app, &account.username).await;
     let group = match group_state(app, account.group.as_deref()).await {
@@ -643,7 +643,10 @@ pub(super) async fn session_member(
     let Some(member) = session::lookup(&app.store, &cookie, OffsetDateTime::now_utc()).await else {
         return Ok(None);
     };
-    app.store.account(&member.username).await
+    app.store
+        .account(&member.username)
+        .await
+        .map_err(String::from)
 }
 
 /// "Take my data out": file the export intent for the account the session names.

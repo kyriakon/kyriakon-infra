@@ -1473,6 +1473,7 @@ async fn rewrite_unattributed(
     store
         .rewrite_log(store::UNATTRIBUTED, bytes.as_bytes())
         .await
+        .map_err(String::from)
 }
 
 /// Whether the unattributed queue already holds this intent's line.
@@ -1481,6 +1482,7 @@ async fn held_has_intent(store: &Store, id: &str) -> Result<bool, String> {
         .log(store::UNATTRIBUTED)
         .jsonl_any(|line: &store::HeldItem| line.intent == id)
         .await
+        .map_err(String::from)
 }
 
 /// The held line carrying this transaction id, with its id and the date it was
@@ -1572,7 +1574,7 @@ async fn journal_credit_applying(
         note: None,
         credit: Some(progress.clone()),
     };
-    journal.append(store, &line).await
+    journal.append(store, &line).await.map_err(String::from)
 }
 
 /// The ledger line carrying this transaction id, with the date it was first

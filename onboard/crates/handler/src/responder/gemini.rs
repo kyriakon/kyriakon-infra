@@ -114,7 +114,11 @@ pub(super) fn acceptances(app: &App) -> Reply {
 /// pays nothing for a lookup it would throw away.
 pub(super) async fn member_for(app: &App, incoming: &Incoming) -> Result<Option<Account>, String> {
     match &incoming.certificate {
-        Some(certificate) => app.store.account_for_certificate(&certificate.hash).await,
+        Some(certificate) => app
+            .store
+            .account_for_certificate(&certificate.hash)
+            .await
+            .map_err(String::from),
         None => Ok(None),
     }
 }

@@ -227,6 +227,7 @@ async fn record(
         .log(&format!("accounts/{username}/notices.jsonl"))
         .append_mode(encoded.as_bytes(), store.dir_owner("accounts"), 0o640)
         .await
+        .map_err(String::from)
 }
 
 async fn record_and_enqueue(

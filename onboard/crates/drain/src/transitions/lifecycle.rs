@@ -86,7 +86,7 @@ async fn sweep_account(
     match store.account(username).await {
         Ok(account) => account,
         Err(e) => {
-            report_record(cfg, store, journal, "account", username, &e).await;
+            report_record(cfg, store, journal, "account", username, &e.to_string()).await;
             None
         }
     }
@@ -119,7 +119,7 @@ async fn sweep_application(
     match store.application(token).await {
         Ok(record) => record,
         Err(e) => {
-            report_record(cfg, store, journal, "application", token, &e).await;
+            report_record(cfg, store, journal, "application", token, &e.to_string()).await;
             None
         }
     }
@@ -239,6 +239,7 @@ pub(crate) async fn redact_password(
     store
         .write_record_owned("intents", file, &bytes, owner)
         .await
+        .map_err(String::from)
 }
 
 /// Give an open payment window its one extension, as `onboardctl window extend`
@@ -537,7 +538,7 @@ pub async fn window_sweep(
                 Ok(Some(account)) => account,
                 Ok(None) => continue,
                 Err(e) => {
-                    report_record(cfg, store, journal, "account", mailbox, &e).await;
+                    report_record(cfg, store, journal, "account", mailbox, &e.to_string()).await;
                     stopped = false;
                     continue;
                 }
@@ -2120,6 +2121,7 @@ async fn write_dns_state(
     store
         .write_record(&format!("groups/{domain}"), "dns-check.json", &bytes)
         .await
+        .map_err(String::from)
 }
 
 /// Whether any row the recipe names has stopped resolving, or a TXT answer no
@@ -2337,7 +2339,7 @@ pub async fn refresh_space_used(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    report_record(cfg, store, journal, "account", mailbox, &e).await;
+                    report_record(cfg, store, journal, "account", mailbox, &e.to_string()).await;
                     readable = false;
                     break;
                 }
@@ -2417,7 +2419,10 @@ async fn write_quota_state(store: &Store) -> Result<(), String> {
     let state = json!({ "version": 1, "checked_at": util::filed_at() });
     let bytes = serde_json::to_vec_pretty(&state)
         .map_err(|e| format!("cannot encode the quota state: {e}"))?;
-    store.write_record("", "quota-check.json", &bytes).await
+    store
+        .write_record("", "quota-check.json", &bytes)
+        .await
+        .map_err(String::from)
 }
 
 /// The yearly note to an account approved without charge: nothing is due, and
@@ -2777,7 +2782,15 @@ pub async fn purge_declined(
                     // cannot tell whether releasing the name would take an
                     // account with it. Report and leave the application for the
                     // next pass rather than release on a guess.
-                    report_record(cfg, store, journal, "account", &record.username, &e).await;
+                    report_record(
+                        cfg,
+                        store,
+                        journal,
+                        "account",
+                        &record.username,
+                        &e.to_string(),
+                    )
+                    .await;
                     continue;
                 }
             };

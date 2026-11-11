@@ -3,9 +3,51 @@
 //! three sockets this responder answers on and the release the acceptances
 //! record.
 
-use std::path::Path;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+/// A configuration file that could not be read or parsed. The path is the
+/// fact a startup message needs; the source is the parser's own error.
+#[derive(Debug)]
+pub enum Error {
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Read { path, source } => write!(f, "cannot read {}: {source}", path.display()),
+            Error::Parse { path, source } => {
+                write!(f, "cannot parse {}: {source}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Read { source, .. } => Some(source),
+            Error::Parse { source, .. } => Some(source),
+        }
+    }
+}
+
+/// Bridge for callers that still return `Result<_, String>`; step 5 removes it.
+impl From<Error> for String {
+    fn from(error: Error) -> String {
+        error.to_string()
+    }
+}
 
 /// The fixed hostname for the form and the account page, used as itself. It is
 /// public because the terminal front-end hands a reader the same host's status
@@ -106,10 +148,15 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Config, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        toml::from_str(&text).map_err(|e| format!("cannot parse {}: {e}", path.display()))
+    pub fn load(path: &Path) -> Result<Config, Error> {
+        let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        toml::from_str(&text).map_err(|source| Error::Parse {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 }
 
@@ -284,10 +331,15 @@ fn public_root() -> String {
 }
 
 impl DrainConfig {
-    pub fn load(path: &Path) -> Result<DrainConfig, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        toml::from_str(&text).map_err(|e| format!("cannot parse {}: {e}", path.display()))
+    pub fn load(path: &Path) -> Result<DrainConfig, Error> {
+        let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        toml::from_str(&text).map_err(|source| Error::Parse {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 }
 

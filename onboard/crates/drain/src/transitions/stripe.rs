@@ -219,7 +219,10 @@ pub fn verify_webhook(secret: &[u8], header: &str, body: &[u8], now: i64) -> Res
 
 async fn remove_webhook(store: &Store, id: &str) -> Result<(), String> {
     store.remove("webhooks", &format!("{id}.body")).await?;
-    store.remove("webhooks", &format!("{id}.sig")).await
+    store
+        .remove("webhooks", &format!("{id}.sig"))
+        .await
+        .map_err(String::from)
 }
 
 /// The one pair key the dedup uses: an invoice is one payment, so a second
@@ -414,8 +417,8 @@ async fn target_for_subscription(
                 // A corrupt account could own the subscription, so the scan
                 // cannot skip it. Report the record and fail this event; the
                 // delivery stays queued for the pass after the record is fixed.
-                report_record(cfg, store, journal, "account", &username, &e).await;
-                return Err(e);
+                report_record(cfg, store, journal, "account", &username, &e.to_string()).await;
+                return Err(e.to_string());
             }
         };
         let Some(account) = account else {

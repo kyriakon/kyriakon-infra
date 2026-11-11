@@ -50,7 +50,7 @@ async fn write_journal(
         note: note.map(str::to_string),
         credit: None,
     };
-    journal.append(store, &line).await
+    journal.append(store, &line).await.map_err(String::from)
 }
 
 /// The intent file's own words: the id and kind the journal line carries, and
@@ -253,14 +253,14 @@ where
 {
     if journal.has(&envelope.id, "applied") {
         finish(store, disposition.after).await?;
-        return store.remove("intents", file).await;
+        return store.remove("intents", file).await.map_err(String::from);
     }
     if journal.has(&envelope.id, "refused") {
         // A refusal ran no after-line work when it was written, so a replay
         // runs none either. The file disposition still applies.
         return match disposition.refusal {
             RefusalFile::Keep => Ok(()),
-            RefusalFile::Remove => store.remove("intents", file).await,
+            RefusalFile::Remove => store.remove("intents", file).await.map_err(String::from),
         };
     }
     match body.await? {
@@ -291,11 +291,11 @@ where
             if let Some(more) = more {
                 finish(store, more).await?;
             }
-            store.remove("intents", file).await
+            store.remove("intents", file).await.map_err(String::from)
         }
         Settlement::Nothing => {
             finish(store, disposition.after).await?;
-            store.remove("intents", file).await
+            store.remove("intents", file).await.map_err(String::from)
         }
         Settlement::Refused { reason, failure } => {
             // The prologue has already returned on a refused line, so this one
