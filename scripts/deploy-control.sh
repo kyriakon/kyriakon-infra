@@ -375,8 +375,9 @@ kept=$(settle_old_names /usr/local/sbin "$settled")
 if [ -n "$kept" ]; then
 	printf 'the old program names stay as symlinks until all three are done:\n'
 	printf '  install openbsd/etc/login.conf.d/hello and run doas cap_mkdb /etc/login.conf\n'
-	printf '  apply openbsd/etc/sshd_config.onboard and reload kyriakon_onboard_sshd\n'
-	printf '  run scripts/cron-apply.sh --drain so cron runs kyriakon-control-drain\n'
+	printf '  install the rendered sshd_config.onboard (scripts/deploy.sh prints the\n'
+	printf '  install line) and reload kyriakon_onboard_sshd\n'
+	printf '  run scripts/cron-apply.sh so cron runs kyriakon-control-drain\n'
 	printf 'then run this deploy again to remove the links\n'
 fi
 

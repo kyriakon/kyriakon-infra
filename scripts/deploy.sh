@@ -165,6 +165,9 @@ classify() {
 	openbsd/etc/pf.conf) manual_pf=yes ;;
 	openbsd/etc/sshd_config) manual_sshd=yes ;;
 	openbsd/etc/sshd_config.onboard | openbsd/etc/login.conf.d/hello) manual_sshd_onboard=yes ;;
+	# A hand-applied fragment, printed by the control deploy when the rule is
+	# missing from /etc/doas.conf.
+	openbsd/etc/doas.conf.control) needs_control=yes ;;
 	openbsd/etc/login.conf.d/member)
 		needs_control=yes
 		manual_member_class=yes

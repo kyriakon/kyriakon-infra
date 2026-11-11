@@ -180,6 +180,14 @@ line_for() {
 	esac
 }
 
+# drop_old_drain_line: the crontab without the drain line the rename left behind.
+# A box that has run the drain has that line, and this script only appends, so
+# dropping it here is what lets the deploy's settled check remove the old binary
+# names without cron failing on them every minute.
+drop_old_drain_line() {
+	grep -vF '/usr/local/sbin/kyriakon-onboard-drain' || true
+}
+
 # script_path <name> — where the box reads that script from at run time, which is
 # what the install check and the crontab dedupe compare against. A drain row is
 # installed into a directory its own config names, not one this can know, and is
@@ -795,6 +803,18 @@ EOF
 			"$([ "$code" -eq 0 ] && printf yes || printf no)" yes
 	fi
 
+	# The rename's stale line: dropped, every other line kept. A pattern that is
+	# too broad unschedules the box; too narrow leaves cron failing on a path the
+	# deploy has removed.
+	got=$(printf '%s\n' \
+		'* * * * * /usr/local/sbin/kyriakon-onboard-drain' \
+		'0 3 * * * /root/bin/backup.sh' \
+		'@reboot /root/bin/setup.sh' |
+		drop_old_drain_line)
+	check "the old drain line is dropped" \
+		"$(printf '%s\n' "$got" | grep -c 'kyriakon-onboard-drain')" 0
+	check "and every other line is kept" "$(printf '%s\n' "$got" | grep -c .)" 2
+
 	self_test_end
 }
 
@@ -896,7 +916,7 @@ printf '%s\n' "$current" > "$before"
 # crontab is clean; a line cron cannot run mails the operator every minute.
 # `before` keeps the real old crontab, so the backup and the --check diff show
 # the removal.
-printf '%s\n' "$current" | grep -vF '/usr/local/sbin/kyriakon-onboard-drain' > "$work" || true
+printf '%s\n' "$current" | drop_old_drain_line > "$work"
 cat "$block" >> "$work"
 rm -f "$block"
 
