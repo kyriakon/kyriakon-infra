@@ -6,6 +6,7 @@
 //! keeps the three from disagreeing about a value only the body can publish.
 
 use crate::config::{Config, DrainConfig};
+use crate::Error;
 
 /// One row of the recipe: what the record is for, the name it is published at,
 /// its type and its value.
@@ -69,7 +70,7 @@ impl Values {
     /// carry `REPLACE_ME` placeholders, so a box that was never substituted is
     /// announced rather than sent a recipe naming an address that answers
     /// nothing.
-    pub fn check(&self) -> Result<(), String> {
+    pub fn check(&self) -> Result<(), Error> {
         for (name, value) in [
             ("mail_host", &self.mail_host),
             ("ipv4", &self.ipv4),
@@ -79,12 +80,12 @@ impl Values {
             ("dmarc_rua", &self.dmarc_rua),
         ] {
             if value.trim().is_empty() {
-                return Err(format!("the DNS recipe's {name} is empty"));
+                return Err(Error::from(format!("the DNS recipe's {name} is empty")));
             }
             if value.contains("REPLACE_ME") {
-                return Err(format!(
+                return Err(Error::from(format!(
                     "the DNS recipe's {name} is still the placeholder {value:?}"
-                ));
+                )));
             }
         }
         Ok(())

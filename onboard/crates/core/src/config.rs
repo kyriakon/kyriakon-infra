@@ -42,13 +42,6 @@ impl std::error::Error for Error {
     }
 }
 
-/// Bridge for callers that still return `Result<_, String>`; step 5 removes it.
-impl From<Error> for String {
-    fn from(error: Error) -> String {
-        error.to_string()
-    }
-}
-
 /// The fixed hostname for the form and the account page, used as itself. It is
 /// public because the terminal front-end hands a reader the same host's status
 /// route, so the address a session gives out cannot name a different service than

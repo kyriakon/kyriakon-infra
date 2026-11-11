@@ -40,6 +40,10 @@ pub enum Error {
         what: &'static str,
         source: serde_json::Error,
     },
+    /// A core read or parse failed.
+    Core(kyriakon_onboard_core::Error),
+    /// The FastCGI record did not parse.
+    Fastcgi(crate::fastcgi::Error),
     /// A failure from a boundary that has not converted yet.
     Failed(String),
 }
@@ -51,6 +55,8 @@ impl fmt::Display for Error {
                 f.write_str(message)
             }
             Error::Store(error) => error.fmt(f),
+            Error::Core(error) => error.fmt(f),
+            Error::Fastcgi(error) => error.fmt(f),
             Error::Config(error) => error.fmt(f),
             Error::Lookup(error) => error.fmt(f),
             Error::Line { what, limit } => write!(f, "{what} is longer than {limit} bytes"),
@@ -74,6 +80,8 @@ impl std::error::Error for Error {
         match self {
             Error::Startup(_) | Error::Refused(_) | Error::Failed(_) | Error::Line { .. } => None,
             Error::Store(error) | Error::Lookup(error) => Some(error),
+            Error::Core(error) => Some(error),
+            Error::Fastcgi(error) => Some(error),
             Error::Config(error) => Some(error),
             Error::Io { source, .. } => Some(source),
             Error::Encode { source, .. } => Some(source),
@@ -109,6 +117,18 @@ impl From<std::io::Error> for Error {
     }
 }
 
+impl From<crate::fastcgi::Error> for Error {
+    fn from(error: crate::fastcgi::Error) -> Self {
+        Error::Fastcgi(error)
+    }
+}
+
+impl From<kyriakon_onboard_core::Error> for Error {
+    fn from(error: kyriakon_onboard_core::Error) -> Self {
+        Error::Core(error)
+    }
+}
+
 impl From<String> for Error {
     fn from(message: String) -> Self {
         Error::Failed(message)
@@ -118,12 +138,5 @@ impl From<String> for Error {
 impl From<&str> for Error {
     fn from(message: &str) -> Self {
         Error::Failed(message.to_string())
-    }
-}
-
-/// Bridge for the binary and the test helpers; step 5 removes it.
-impl From<Error> for String {
-    fn from(error: Error) -> String {
-        error.to_string()
     }
 }

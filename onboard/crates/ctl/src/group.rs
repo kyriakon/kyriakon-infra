@@ -1,19 +1,20 @@
 //! One job of the operator console.
 
+use crate::Error;
 use crate::*;
 
 /// `group remove <domain>`: take a body's domain down and close every account
 /// in it. Signed here, because the transition deletes accounts, and the drain
 /// refuses a domain that has no group record.
-pub(crate) async fn group(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), String> {
+pub(crate) async fn group(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), Error> {
     let [verb, domain] = args else {
-        return Err(usage());
+        return Err(Error::from(usage()));
     };
     if verb != "remove" {
-        return Err(usage());
+        return Err(Error::from(usage()));
     }
     if let Some(why) = validate::domain(domain) {
-        return Err(format!("the domain {domain:?}: {why}"));
+        return Err(Error::from(format!("the domain {domain:?}: {why}")));
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::group_remove_payload(domain))?;

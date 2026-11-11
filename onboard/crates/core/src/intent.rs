@@ -7,6 +7,7 @@
 use serde_json::Value;
 
 use crate::store::{ApplicationRef, GroupAddressIntent, GroupIntent, GroupRemoveIntent, Store};
+use crate::Error;
 
 /// The rails an application may name. `no_charge` is the fourth, and it is a
 /// rail rather than a flag because it is one of the four buttons on the form.
@@ -418,7 +419,7 @@ impl Intent {
     ///
     /// The parse error keeps the message the verb's own reader used, so a
     /// malformed intent is reported with the same words it always was.
-    pub fn parse(value: &Value) -> Result<Intent, String> {
+    pub fn parse(value: &Value) -> Result<Intent, Error> {
         let kind = value.get("kind").and_then(Value::as_str).unwrap_or("");
         let intent = match kind {
             "application" => Intent::Application(parsed(value, "the intent")?),
@@ -496,11 +497,13 @@ impl Intent {
     /// the handler already writes, and the signature, where there is one,
     /// travels in them. The intent is borrowed so the drain's own approval can
     /// file it and carry it out through the same seam.
-    pub async fn file(&self, store: &Store) -> Result<String, String> {
+    pub async fn file(&self, store: &Store) -> Result<String, Error> {
         let id = ulid::Ulid::new().to_string();
         let kind = self.kind().to_string();
         if matches!(self, Intent::Unknown { .. }) {
-            return Err(format!("this build does not implement the kind {kind:?}"));
+            return Err(Error::from(format!(
+                "this build does not implement the kind {kind:?}"
+            )));
         }
         let mut value =
             serde_json::to_value(self).map_err(|e| format!("cannot encode the intent: {e}"))?;
@@ -517,14 +520,15 @@ impl Intent {
     }
 }
 
-fn parsed<T: serde::de::DeserializeOwned>(value: &Value, what: &str) -> Result<T, String> {
-    serde_json::from_value(value.clone()).map_err(|e| format!("{what} does not parse: {e}"))
+fn parsed<T: serde::de::DeserializeOwned>(value: &Value, what: &str) -> Result<T, Error> {
+    serde_json::from_value(value.clone())
+        .map_err(|e| Error::from(format!("{what} does not parse: {e}")))
 }
 
 /// The export intent, read with the words its transition always used: the
 /// account and the session are its claim, and a file missing either is refused
 /// by name rather than as a serde object error.
-fn export_from(value: &Value) -> Result<ExportIntent, String> {
+fn export_from(value: &Value) -> Result<ExportIntent, Error> {
     Ok(ExportIntent {
         id: value
             .get("id")

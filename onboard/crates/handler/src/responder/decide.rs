@@ -211,7 +211,9 @@ pub(super) async fn password_file(app: &App, call: &Call<'_>) -> Reply {
     let problem = if password != confirm {
         Some("The two passwords do not match.".to_string())
     } else {
-        kyriakon_onboard_core::account::password::validate(password).err()
+        kyriakon_onboard_core::account::password::validate(password)
+            .err()
+            .map(|e| e.to_string())
     };
     if let Some(problem) = problem {
         return capability(&PasswordPage {

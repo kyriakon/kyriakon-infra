@@ -44,6 +44,7 @@ use std::process::ExitCode;
 
 use kyriakon_onboard_core::{config, flow::catalogue, flow::questions, flow::validate, ipc};
 use kyriakon_onboard_tui as tui;
+use kyriakon_onboard_tui::Error;
 use kyriakon_onboard_tui::{Departure, Filing, Input, Key, Mode};
 
 /// The handler's own configuration, read for the one value the portal needs from
@@ -66,7 +67,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<Departure, String> {
+fn run() -> Result<Departure, Error> {
     let mut cfg_path = PathBuf::from(DEFAULT_CONFIG);
     let mut state = PathBuf::from(tui::SESSION_DIR);
     let mut forced: Option<Mode> = None;
@@ -91,10 +92,10 @@ fn run() -> Result<Departure, String> {
             "--plain" => forced = Some(Mode::Plain),
             "--full" => forced = Some(Mode::Full),
             other => {
-                return Err(format!(
+                return Err(Error::from(format!(
                     "unknown argument {other:?}; usage: kyriakon-onboard-tui \
                      [-c COMMAND] [--config PATH] [--state PATH] [--plain | --full]"
-                ))
+                )))
             }
         }
     }
@@ -183,7 +184,7 @@ struct HandlerStatus {
 }
 
 impl tui::StatusSource for HandlerStatus {
-    fn read(&mut self, token: &str) -> Result<ipc::Answer, String> {
+    fn read(&mut self, token: &str) -> Result<ipc::Answer, Error> {
         match ipc::ask(Path::new(&self.socket), self.address.as_deref(), token)? {
             ipc::Answer::Stage(stage) => {
                 authlog(&format!("status read: {stage}"));
@@ -206,7 +207,7 @@ struct HandlerFile {
 }
 
 impl Filing for HandlerFile {
-    fn file(&mut self, form: &BTreeMap<String, String>) -> Result<String, String> {
+    fn file(&mut self, form: &BTreeMap<String, String>) -> Result<String, Error> {
         let token = ipc::file(Path::new(&self.socket), self.address.as_deref(), form)?;
         self.filed = true;
         authlog("application filed");
@@ -266,30 +267,30 @@ impl Term {
     }
 
     /// Take the terminal's own settings, before anything is changed.
-    fn save(&mut self) -> Result<(), String> {
+    fn save(&mut self) -> Result<(), Error> {
         if self.saved.is_some() {
             return Ok(());
         }
         let mut now = std::mem::MaybeUninit::<libc::termios>::uninit();
         if unsafe { libc::tcgetattr(libc::STDIN_FILENO, now.as_mut_ptr()) } != 0 {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "cannot read the terminal's settings: {}",
                 std::io::Error::last_os_error()
-            ));
+            )));
         }
         self.saved = Some(unsafe { now.assume_init() });
         Ok(())
     }
 
     /// Draw on the terminal: canonical input, echo and signals off.
-    fn drawing(&mut self) -> Result<(), String> {
+    fn drawing(&mut self) -> Result<(), Error> {
         self.save()?;
         let mut raw = std::mem::MaybeUninit::<libc::termios>::uninit();
         if unsafe { libc::tcgetattr(libc::STDIN_FILENO, raw.as_mut_ptr()) } != 0 {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "cannot read the terminal's settings: {}",
                 std::io::Error::last_os_error()
-            ));
+            )));
         }
         let mut raw = unsafe { raw.assume_init() };
         raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
@@ -313,19 +314,19 @@ impl Term {
     }
 
     /// One byte, or `None` when the connection closed.
-    fn byte(&mut self) -> Result<Option<u8>, String> {
+    fn byte(&mut self) -> Result<Option<u8>, Error> {
         let mut b = [0u8; 1];
         match std::io::stdin().lock().read(&mut b) {
             Ok(0) => Ok(None),
             Ok(_) => Ok(Some(b[0])),
-            Err(e) => Err(format!("cannot read the session's input: {e}")),
+            Err(e) => Err(Error::from(format!("cannot read the session's input: {e}"))),
         }
     }
 
     /// One key. The arrows arrive as `ESC [ A` and `ESC [ B`, or with `O` in
     /// place of `[` from a terminal in cursor-key mode; nothing else this screen
     /// reads is a sequence.
-    fn key_of(&mut self, first: u8) -> Result<Option<Key>, String> {
+    fn key_of(&mut self, first: u8) -> Result<Option<Key>, Error> {
         Ok(Some(match first {
             b'\r' | b'\n' => Key::Enter,
             b'q' | b'Q' => Key::Quit,
@@ -352,17 +353,17 @@ impl Term {
 }
 
 impl Input for Term {
-    fn word(&mut self) -> Result<Option<String>, String> {
+    fn word(&mut self) -> Result<Option<String>, Error> {
         self.cooked();
         let mut line = String::new();
         match std::io::stdin().lock().read_line(&mut line) {
             Ok(0) => Ok(None),
             Ok(_) => Ok(Some(line)),
-            Err(e) => Err(format!("cannot read the session's input: {e}")),
+            Err(e) => Err(Error::from(format!("cannot read the session's input: {e}"))),
         }
     }
 
-    fn key(&mut self) -> Result<Option<Key>, String> {
+    fn key(&mut self) -> Result<Option<Key>, Error> {
         if self.mode == Mode::Plain {
             // A line terminal's one key is the line's own meaning, which is what
             // the plain session asks for at the one screen that waits for Enter.
@@ -387,12 +388,12 @@ impl Drop for Term {
 }
 
 /// Put the terminal into `want`.
-fn set(want: &libc::termios) -> Result<(), String> {
+fn set(want: &libc::termios) -> Result<(), Error> {
     if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, want) } != 0 {
-        return Err(format!(
+        return Err(Error::from(format!(
             "cannot set the terminal's settings: {}",
             std::io::Error::last_os_error()
-        ));
+        )));
     }
     Ok(())
 }

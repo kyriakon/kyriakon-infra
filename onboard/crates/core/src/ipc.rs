@@ -13,6 +13,7 @@
 //! took from `SSH_CONNECTION`, which the handler uses as the counter key and logs
 //! as the front-ends' own log line already does.
 
+use crate::Error;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -54,7 +55,7 @@ impl Answer {
         format!("{word} {}\n", single_line(text))
     }
 
-    pub fn parse(line: &str) -> Result<Answer, String> {
+    pub fn parse(line: &str) -> Result<Answer, Error> {
         let line = line.trim_end_matches(['\r', '\n']);
         let (word, text) = line
             .split_once(' ')
@@ -62,7 +63,9 @@ impl Answer {
         match word {
             "stage" => Ok(Answer::Stage(text.to_string())),
             "notice" => Ok(Answer::Notice(text.to_string())),
-            _ => Err(format!("the status service sent no answer: {line:?}")),
+            _ => Err(Error::from(format!(
+                "the status service sent no answer: {line:?}"
+            ))),
         }
     }
 }
@@ -107,19 +110,21 @@ pub fn file_answer(token: Option<&str>, why: &str) -> String {
 }
 
 /// The token in a file reply, or the refusal the handler sent.
-pub fn parse_file_answer(line: &str) -> Result<String, String> {
+pub fn parse_file_answer(line: &str) -> Result<String, Error> {
     let line = line.trim_end_matches(['\r', '\n']);
     if let Some(token) = line.strip_prefix("OK ") {
         Ok(token.to_string())
     } else if let Some(why) = line.strip_prefix("ERR ") {
-        Err(why.to_string())
+        Err(Error::from(why.to_string()))
     } else {
-        Err(format!("the file service sent no answer: {line:?}"))
+        Err(Error::from(format!(
+            "the file service sent no answer: {line:?}"
+        )))
     }
 }
 
 /// Connect to the handler, with the timeouts every request here uses.
-fn connect(socket: &Path, what: &str) -> Result<UnixStream, String> {
+fn connect(socket: &Path, what: &str) -> Result<UnixStream, Error> {
     let stream = UnixStream::connect(socket)
         .map_err(|e| format!("cannot reach the {what} at {}: {e}", socket.display()))?;
     stream
@@ -130,7 +135,7 @@ fn connect(socket: &Path, what: &str) -> Result<UnixStream, String> {
 }
 
 /// Read one bounded reply line, or say the handler closed first.
-fn reply(stream: UnixStream, what: &str) -> Result<String, String> {
+fn reply(stream: UnixStream, what: &str) -> Result<String, Error> {
     let mut line = String::new();
     // The cap is on the wire, before the buffer grows: a reply past it is a
     // handler that is not speaking this protocol.
@@ -138,13 +143,15 @@ fn reply(stream: UnixStream, what: &str) -> Result<String, String> {
         .read_line(&mut line)
         .map_err(|e| format!("cannot read the {what}'s answer: {e}"))?;
     if !line.ends_with('\n') {
-        return Err(format!("the {what} closed the connection before answering"));
+        return Err(Error::from(format!(
+            "the {what} closed the connection before answering"
+        )));
     }
     Ok(line)
 }
 
 /// Ask the handler for one token's stage.
-pub fn ask(socket: &Path, address: Option<&str>, token: &str) -> Result<Answer, String> {
+pub fn ask(socket: &Path, address: Option<&str>, token: &str) -> Result<Answer, Error> {
     let stream = connect(socket, "status service")?;
     (&stream)
         .write_all(request_line(address, token).as_bytes())
@@ -158,16 +165,16 @@ pub fn file(
     socket: &Path,
     address: Option<&str>,
     form: &BTreeMap<String, String>,
-) -> Result<String, String> {
+) -> Result<String, Error> {
     let body =
         serde_json::to_string(form).map_err(|e| format!("cannot encode the application: {e}"))?;
     // The handler reads one line and rejects it past this bound, so refuse here
     // where the reader can be told, rather than after a whole session's answers.
     if body.len() >= MAX_BODY {
-        return Err(format!(
+        return Err(Error::from(format!(
             "the application is too large to send ({} bytes, the limit is {MAX_BODY}); shorten an answer",
             body.len()
-        ));
+        )));
     }
     let stream = connect(socket, "file service")?;
     let mut request = file_request(address);
@@ -209,7 +216,9 @@ mod tests {
             "abcdefghjkmnpqrstvwxyz0123"
         );
         assert_eq!(
-            parse_file_answer("ERR this is needed\n").unwrap_err(),
+            parse_file_answer("ERR this is needed\n")
+                .unwrap_err()
+                .to_string(),
             "this is needed"
         );
         assert_eq!(

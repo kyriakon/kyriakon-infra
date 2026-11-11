@@ -1,5 +1,6 @@
 //! One job of the operator console.
 
+use crate::Error;
 use crate::*;
 
 /// `monero address <username> <address>`: record the subaddress the operator's
@@ -11,31 +12,31 @@ use crate::*;
 /// so, and a different one is refused rather than rotated, because the first
 /// may already have been sent a payment and reusing it for somebody else would
 /// join money to the wrong account.
-pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), String> {
+pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), Error> {
     let (username, address) = match args {
         [verb, username, address] if verb == "address" => (username.as_str(), address.as_str()),
-        _ => return Err(usage()),
+        _ => return Err(Error::from(usage())),
     };
     if let Some(why) = validate::username_shape(username) {
-        return Err(format!("the username {username:?}: {why}"));
+        return Err(Error::from(format!("the username {username:?}: {why}")));
     }
     if let Some(why) = monero_address_shape(address) {
-        return Err(format!("the address {address:?} {why}"));
+        return Err(Error::from(format!("the address {address:?} {why}")));
     }
     let mut account = store
         .account(username)
         .await?
         .ok_or_else(|| format!("no account for {username}"))?;
     let Some(mut payment) = account.payment_state() else {
-        return Err(format!(
+        return Err(Error::from(format!(
             "{username} was approved without charge, so it has no Monero rail"
-        ));
+        )));
     };
     if account.rail != "monero" {
-        return Err(format!(
+        return Err(Error::from(format!(
             "{username} chose the {} rail, so it has no Monero subaddress to record",
             account.rail
-        ));
+        )));
     }
     let block = payment.monero.get_or_insert_with(Default::default);
     match block.address.as_deref() {
@@ -44,9 +45,9 @@ pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), String>
             return Ok(());
         }
         Some(existing) => {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "{username}'s Monero subaddress is already {existing}; a subaddress is never rotated or reused"
-            ))
+            )))
         }
         None => block.address = Some(address.to_string()),
     }

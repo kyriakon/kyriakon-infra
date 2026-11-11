@@ -29,6 +29,7 @@ use sha2::Sha256;
 use tokio::process::Command;
 
 use crate::store::KeyRecord;
+use crate::Error;
 
 const BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
 const END: &str = "-----END PGP PUBLIC KEY BLOCK-----";
@@ -54,7 +55,7 @@ struct Packet {
 /// Inspect an armoured PGP public key block. `Err` is the refusal reason; the
 /// verdict is the shared crate's reading of the three conditions, joined when
 /// more than one trips.
-pub fn pgp_public_key(value: &str) -> Result<Checked, String> {
+pub fn pgp_public_key(value: &str) -> Result<Checked, Error> {
     let findings = pgp_findings(value)?;
     Ok(Checked {
         verdict: if findings.is_empty() {
@@ -68,19 +69,23 @@ pub fn pgp_public_key(value: &str) -> Result<Checked, String> {
 /// The three-condition inspection, from the crate the page builds to WASM, with
 /// the framing check that decides whether the material is a public key block at
 /// all. The conditions themselves are not repeated here.
-pub fn pgp_findings(value: &str) -> Result<Vec<String>, String> {
+pub fn pgp_findings(value: &str) -> Result<Vec<String>, Error> {
     let value = value.trim();
     if value.is_empty() {
-        return Err("a public key is needed".to_string());
+        return Err(Error::from("a public key is needed".to_string()));
     }
     if !value.contains(BEGIN) || !value.contains(END) {
-        return Err("this is not an armoured PGP public key block".to_string());
+        return Err(Error::from(
+            "this is not an armoured PGP public key block".to_string(),
+        ));
     }
     let body = armour_body(value)?;
     let raw = base64_decode(&body).ok_or("the key's base64 does not decode")?;
     let packets = packets(&raw).ok_or("the key's packet structure cannot be read")?;
     if !packets.iter().any(|p| p.tag == 6) {
-        return Err("the block carries no public key packet".to_string());
+        return Err(Error::from(
+            "the block carries no public key packet".to_string(),
+        ));
     }
     // The framing above is the only thing that may refuse a key. A parser that
     // cannot read a well-framed block is a gap in this check, not a verdict on
@@ -117,7 +122,7 @@ pub async fn verify_signature(
     key_file: &Path,
     payload: &[u8],
     signature: Option<&[u8]>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, Error> {
     // gpg's agent socket lives under the homedir, and a UNIX socket path is
     // bounded: a long per-user temp directory fails to connect the agent rather
     // than failing to read the key. /tmp is short on every box this runs on.
@@ -182,7 +187,7 @@ pub async fn verify_signature(
     };
     let result = run.await;
     let _ = tokio::fs::remove_dir_all(&home).await;
-    result
+    result.map_err(Error::from)
 }
 
 /// Inspect an OpenSSH public key: the shape sftp and git will accept. A shape
@@ -194,10 +199,10 @@ pub async fn verify_signature(
 /// beginning `ssh-`, so a line the box refuses at provisioning time passed the
 /// form, and the approval was half applied, leaving an account with no sftp and
 /// no git.
-pub fn openssh_public_key(value: &str) -> Result<(), String> {
+pub fn openssh_public_key(value: &str) -> Result<(), Error> {
     let value = value.trim();
     if value.is_empty() {
-        return Err("an upload key is needed".to_string());
+        return Err(Error::from("an upload key is needed".to_string()));
     }
     let mut parts = value.split_whitespace();
     let kind = parts.next().unwrap_or("");
@@ -216,11 +221,13 @@ pub fn openssh_public_key(value: &str) -> Result<(), String> {
                         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
             });
     if !known {
-        return Err("this is not an OpenSSH public key".to_string());
+        return Err(Error::from("this is not an OpenSSH public key".to_string()));
     }
     let blob = parts.next().ok_or("the upload key has no key material")?;
     if base64_decode(blob).is_none_or(|b| b.is_empty()) {
-        return Err("the upload key's material does not decode".to_string());
+        return Err(Error::from(
+            "the upload key's material does not decode".to_string(),
+        ));
     }
     Ok(())
 }
@@ -351,7 +358,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 /// The base64 body of an armoured block: everything between the armour headers
 /// (and the blank line after them) and the checksum or END line.
-fn armour_body(value: &str) -> Result<String, String> {
+fn armour_body(value: &str) -> Result<String, Error> {
     let mut out = String::new();
     let mut started = false;
     for line in value.lines() {
@@ -372,7 +379,9 @@ fn armour_body(value: &str) -> Result<String, String> {
         out.push_str(t);
     }
     if out.is_empty() {
-        return Err("the armoured block carries no key material".to_string());
+        return Err(Error::from(
+            "the armoured block carries no key material".to_string(),
+        ));
     }
     Ok(out)
 }

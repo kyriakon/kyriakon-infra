@@ -18,6 +18,7 @@ use std::path::Path;
 
 use crate::config::DrainConfig;
 use crate::store::Monero;
+use crate::Error;
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -86,13 +87,13 @@ pub async fn current(cfg: &DrainConfig, now: OffsetDateTime) -> Option<(Cached, 
                 fetched_at: crate::util::stamp(now),
             };
             if let Err(e) = write(cfg, &refreshed) {
-                eprintln!("kyriakon-onboard: cannot write {}: {e}", cfg.rates);
+                e.report("writing the rate cache");
             }
             Some((refreshed, false))
         }
         None => {
             if let Err(e) = stamp_attempt(cfg, now) {
-                eprintln!("kyriakon-onboard: cannot write {}: {e}", attempt_path(cfg));
+                e.report("writing the rate attempt");
             }
             cached.map(|cached| (cached, true))
         }
@@ -125,7 +126,7 @@ pub async fn quote(cfg: &DrainConfig, now: OffsetDateTime, price_gbp: &str) -> O
 ///
 /// Integer arithmetic throughout: `xmr = pence × 10^(4+d) / R` where the rate is
 /// `R / 10^d`, and the ceiling is taken on that quotient.
-pub fn quote_xmr(price_pence: i64, rate: &str) -> Result<String, String> {
+pub fn quote_xmr(price_pence: i64, rate: &str) -> Result<String, Error> {
     let (value, places) = parse_rate(rate)
         .ok_or_else(|| format!("the rate {rate:?} is not a positive decimal amount"))?;
     // `xmr × 1e6`, in millionths of a coin.
@@ -184,53 +185,59 @@ async fn fetch(cfg: &DrainConfig) -> Option<String> {
     let out = match out {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
-            eprintln!(
-                "kyriakon-onboard: cannot run the rate fetch {}: {e}; is it installed?",
-                cfg.rates_fetch
-            );
+            Error::Io {
+                what: "run the rate fetch",
+                path: Some(cfg.rates_fetch.clone().into()),
+                source: e,
+            }
+            .report("the rate fetch");
             return None;
         }
         Err(e) => {
-            eprintln!("kyriakon-onboard: the rate fetch did not finish: {e}");
+            Error::Failed(format!("the rate fetch did not finish: {e}")).report("the rate fetch");
             return None;
         }
     };
     if !out.status.success() {
         let reason = String::from_utf8_lossy(&out.stderr);
-        eprintln!(
-            "kyriakon-onboard: {} {} exited {}: {}",
+        Error::Failed(format!(
+            "{} {} exited {}: {}",
             cfg.rates_fetch,
             cfg.rate_endpoint,
             out.status,
             reason.trim()
-        );
+        ))
+        .report("the rate fetch");
         return None;
     }
     let body: serde_json::Value = match serde_json::from_slice(&out.stdout) {
         Ok(body) => body,
         Err(e) => {
-            eprintln!(
-                "kyriakon-onboard: {} answered something that is not the price JSON: {e}",
-                cfg.rate_endpoint
-            );
+            Error::Json {
+                what: "parse the rate answer",
+                source: e,
+            }
+            .report(&cfg.rate_endpoint);
             return None;
         }
     };
     // `{"monero":{"gbp":409.44,"last_updated_at":1790857880}}`. The number's
     // own text is kept, so no float ever reaches the quote's arithmetic.
     let Some(rate) = body.get("monero").and_then(|m| m.get("gbp")) else {
-        eprintln!(
-            "kyriakon-onboard: {} answered no monero.gbp price",
+        Error::Refused(format!(
+            "{} answered no monero.gbp price",
             cfg.rate_endpoint
-        );
+        ))
+        .report("the rate fetch");
         return None;
     };
     let rate = rate.to_string();
     if !valid_rate(&rate) {
-        eprintln!(
-            "kyriakon-onboard: {} answered a rate that is not a decimal: {rate}",
+        Error::Refused(format!(
+            "{} answered a rate that is not a decimal: {rate}",
             cfg.rate_endpoint
-        );
+        ))
+        .report("the rate fetch");
         return None;
     }
     Some(rate)
@@ -238,15 +245,17 @@ async fn fetch(cfg: &DrainConfig) -> Option<String> {
 
 /// Write the cache. The temporary file and the rename are what keeps a reader
 /// from seeing half a file if the drain dies mid-write.
-fn write(cfg: &DrainConfig, cached: &Cached) -> Result<(), String> {
+fn write(cfg: &DrainConfig, cached: &Cached) -> Result<(), Error> {
     if let Some(dir) = Path::new(&cfg.rates).parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| Error::from(format!("cannot make {}: {e}", dir.display())))?;
     }
-    let bytes =
-        serde_json::to_vec_pretty(cached).map_err(|e| format!("cannot encode the rate: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(cached)
+        .map_err(|e| Error::from(format!("cannot encode the rate: {e}")))?;
     let temp = format!("{}.new", cfg.rates);
-    std::fs::write(&temp, &bytes).map_err(|e| format!("cannot write {temp}: {e}"))?;
-    std::fs::rename(&temp, &cfg.rates).map_err(|e| format!("cannot rename {temp}: {e}"))
+    std::fs::write(&temp, &bytes).map_err(|e| Error::from(format!("cannot write {temp}: {e}")))?;
+    std::fs::rename(&temp, &cfg.rates)
+        .map_err(|e| Error::from(format!("cannot rename {temp}: {e}")))
 }
 
 fn attempt_path(cfg: &DrainConfig) -> String {
@@ -262,12 +271,14 @@ fn attempted_recently(cfg: &DrainConfig, now: OffsetDateTime) -> bool {
         .is_some_and(|at| now - at < RETRY)
 }
 
-fn stamp_attempt(cfg: &DrainConfig, now: OffsetDateTime) -> Result<(), String> {
+fn stamp_attempt(cfg: &DrainConfig, now: OffsetDateTime) -> Result<(), Error> {
     let path = attempt_path(cfg);
     if let Some(dir) = Path::new(&path).parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| Error::from(format!("cannot make {}: {e}", dir.display())))?;
     }
-    std::fs::write(&path, crate::util::stamp(now)).map_err(|e| format!("cannot write {path}: {e}"))
+    std::fs::write(&path, crate::util::stamp(now))
+        .map_err(|e| Error::from(format!("cannot write {path}: {e}")))
 }
 
 fn parse_stamp(text: &str) -> Option<OffsetDateTime> {

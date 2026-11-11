@@ -7,6 +7,7 @@
 
 pub mod account;
 pub mod config;
+pub mod error;
 pub mod flow;
 pub mod intent;
 pub mod ipc;
@@ -14,3 +15,5 @@ pub mod mail;
 pub mod payments;
 pub mod store;
 pub mod util;
+
+pub use error::Error;

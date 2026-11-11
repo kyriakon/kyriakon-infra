@@ -1,5 +1,6 @@
 //! One job of the operator console.
 
+use crate::Error;
 use crate::*;
 use kyriakon_onboard_core::account::requests as account_requests;
 
@@ -7,18 +8,18 @@ pub(crate) async fn request(
     cfg: &DrainConfig,
     store: &Store,
     args: &[String],
-) -> Result<(), String> {
+) -> Result<(), Error> {
     match args.first().map(String::as_str) {
         Some("record") => request_record(store, &args[1..]).await,
         Some("verify") => request_verify(cfg, store, &args[1..]).await,
         Some("extend") => request_extend(store, &args[1..]).await,
         Some("close") => request_close(store, &args[1..]).await,
         Some("list") => request_list(store).await,
-        _ => Err(usage()),
+        _ => Err(Error::from(usage())),
     }
 }
 
-pub(crate) async fn request_record(store: &Store, args: &[String]) -> Result<(), String> {
+pub(crate) async fn request_record(store: &Store, args: &[String]) -> Result<(), Error> {
     let flags = flags(
         args,
         &[
@@ -61,11 +62,11 @@ pub(crate) async fn request_verify(
     cfg: &DrainConfig,
     store: &Store,
     args: &[String],
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let flags = flags(args, &["username", "message", "signature"])?;
     let username = need(&flags, "username")?;
     if let Some(why) = validate::username_shape(username) {
-        return Err(format!("the username {username:?}: {why}"));
+        return Err(Error::from(format!("the username {username:?}: {why}")));
     }
     let account = store
         .account(username)
@@ -87,7 +88,7 @@ pub(crate) async fn request_verify(
             .outside_address
             .as_deref()
             .is_some_and(|address| address.eq_ignore_ascii_case(&from));
-        return Err(if outside {
+        return Err(Error::from(if outside {
             format!(
                 "the message is from {from}, the account's outside contact address; \
                  ask for a message from {own} signed with the mail key, or for the \
@@ -95,27 +96,29 @@ pub(crate) async fn request_verify(
             )
         } else {
             format!("the message is from {from}, not the account's own address {own}")
-        });
+        }));
     }
     let key_file = keycheck::keyring_file(&cfg.keyring_dir, username);
     if !key_file.is_file() {
-        return Err(format!(
+        return Err(Error::from(format!(
             "the box holds no key for {username} at {}",
             key_file.display()
-        ));
+        )));
     }
     if signature.is_none() && !String::from_utf8_lossy(&message).contains(CLEARSIGNED) {
-        return Err(
+        return Err(Error::from(
             "the message is not clearsigned; pass --signature with its detached signature \
              or export the message clearsigned from the client"
                 .to_string(),
-        );
+        ));
     }
     let fingerprint =
         keycheck::verify_signature(&cfg.gpg, &key_file, &message, signature.as_deref())
             .await?
             .ok_or_else(|| {
-                format!("the signature does not verify against {username}'s keyring entry")
+                Error::from(format!(
+                    "the signature does not verify against {username}'s keyring entry"
+                ))
             })?;
     println!("verified {fingerprint}; From: {own}");
     Ok(())
@@ -126,7 +129,7 @@ pub(crate) async fn request_verify(
 /// them inside it. The outer block is read first and the armour's is the
 /// fallback, and a `From:` in both that disagrees is refused: the signature is
 /// the proof, so the outer header adds no forgeable path.
-pub(crate) fn message_from(message: &str) -> Result<String, String> {
+pub(crate) fn message_from(message: &str) -> Result<String, Error> {
     let message = message.replace("\r\n", "\n");
     let (outer, armour) = match message.split_once(CLEARSIGNED) {
         Some((outer, rest)) => {
@@ -148,18 +151,18 @@ pub(crate) fn message_from(message: &str) -> Result<String, String> {
         None => None,
     };
     match (outer, armour) {
-        (Some(outer), Some(armour)) if !outer.eq_ignore_ascii_case(&armour) => Err(format!(
-            "the message's own From: is {outer} but the clearsigned one is {armour}"
+        (Some(outer), Some(armour)) if !outer.eq_ignore_ascii_case(&armour) => Err(Error::from(
+            format!("the message's own From: is {outer} but the clearsigned one is {armour}"),
         )),
         (Some(outer), _) => Ok(outer),
         (None, Some(armour)) => Ok(armour),
-        (None, None) => Err("the message has no From: header".to_string()),
+        (None, None) => Err(Error::from("the message has no From: header".to_string())),
     }
 }
 
 /// The address in one header block's `From:`, with RFC 5322 continuation lines
 /// unfolded first. `None` when the block carries no `From:`.
-pub(crate) fn header_from(block: &str) -> Result<Option<String>, String> {
+pub(crate) fn header_from(block: &str) -> Result<Option<String>, Error> {
     let mut headers: Vec<String> = Vec::new();
     for line in block.lines() {
         if line.is_empty() {
@@ -183,22 +186,26 @@ pub(crate) fn header_from(block: &str) -> Result<Option<String>, String> {
         return Ok(None);
     };
     if values.next().is_some() {
-        return Err("the message has more than one From: header".to_string());
+        return Err(Error::from(
+            "the message has more than one From: header".to_string(),
+        ));
     }
     let address = match (value.rfind('<'), value.rfind('>')) {
         (Some(open), Some(close)) if open < close => &value[open + 1..close],
         _ => value.as_str(),
     };
     if address.trim().is_empty() {
-        return Err("the message's From: header holds no address".to_string());
+        return Err(Error::from(
+            "the message's From: header holds no address".to_string(),
+        ));
     }
     Ok(Some(address.trim().to_string()))
 }
 
-pub(crate) async fn request_extend(store: &Store, args: &[String]) -> Result<(), String> {
+pub(crate) async fn request_extend(store: &Store, args: &[String]) -> Result<(), Error> {
     let (id, rest) = match args {
         [id, rest @ ..] if !id.starts_with("--") => (id.as_str(), rest),
-        _ => return Err(usage()),
+        _ => return Err(Error::from(usage())),
     };
     let flags = flags(rest, &["reason", "extended-on"])?;
     let line = account_requests::extend(
@@ -217,10 +224,10 @@ pub(crate) async fn request_extend(store: &Store, args: &[String]) -> Result<(),
     Ok(())
 }
 
-pub(crate) async fn request_close(store: &Store, args: &[String]) -> Result<(), String> {
+pub(crate) async fn request_close(store: &Store, args: &[String]) -> Result<(), Error> {
     let (id, rest) = match args {
         [id, rest @ ..] if !id.starts_with("--") => (id.as_str(), rest),
-        _ => return Err(usage()),
+        _ => return Err(Error::from(usage())),
     };
     let flags = flags(rest, &["done", "note"])?;
     let line =
@@ -233,7 +240,7 @@ pub(crate) async fn request_close(store: &Store, args: &[String]) -> Result<(), 
     Ok(())
 }
 
-pub(crate) async fn request_list(store: &Store) -> Result<(), String> {
+pub(crate) async fn request_list(store: &Store) -> Result<(), Error> {
     let open = account_requests::open(store).await?;
     if open.is_empty() {
         println!("no open requests");

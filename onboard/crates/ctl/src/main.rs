@@ -77,6 +77,9 @@ use time::OffsetDateTime;
 
 const DEFAULT_CONFIG: &str = "/etc/kyriakon/onboard/drain.toml";
 
+mod error;
+pub(crate) use error::Error;
+
 mod account;
 mod address;
 mod decisions;
@@ -125,11 +128,11 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> {
+async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), Error> {
     let cfg = DrainConfig::load(cfg_path)?;
     let store = Store::new(&cfg.store_root);
     let Some(verb) = rest.first().map(String::as_str) else {
-        return Err(usage());
+        return Err(Error::from(usage()));
     };
     match verb {
         "request" => request(&cfg, &store, &rest[1..]).await,
@@ -159,7 +162,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         verb => {
             let username = one_username(rest)?;
             let Some(decision) = intent::decision_for(verb) else {
-                return Err(usage());
+                return Err(Error::from(usage()));
             };
             let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
             sign_and_file(&store, &key, decision, username).await
@@ -210,13 +213,13 @@ fn usage() -> String {
 }
 
 /// The one username a verb that takes one reads. `request` and `free` take none.
-fn one_username(rest: &[String]) -> Result<&str, String> {
+fn one_username(rest: &[String]) -> Result<&str, Error> {
     let username = match rest {
         [_, username] => username.as_str(),
-        _ => return Err(usage()),
+        _ => return Err(Error::from(usage())),
     };
     if let Some(why) = validate::username_shape(username) {
-        return Err(format!("the username {username:?}: {why}"));
+        return Err(Error::from(format!("the username {username:?}: {why}")));
     }
     Ok(username)
 }
@@ -224,33 +227,36 @@ fn one_username(rest: &[String]) -> Result<&str, String> {
 /// `--flag value` pairs for one subcommand. A repeated flag is refused rather
 /// than letting the last one win: this record is evidence, and a typo that
 /// silently replaced a date would be a wrong clock.
-fn flags(args: &[String], known: &[&str]) -> Result<BTreeMap<String, String>, String> {
+fn flags(args: &[String], known: &[&str]) -> Result<BTreeMap<String, String>, Error> {
     let mut out = BTreeMap::new();
     let mut i = 0;
     while i < args.len() {
         let flag = &args[i];
         let Some(name) = flag.strip_prefix("--") else {
-            return Err(format!("unexpected argument {flag:?}\n{}", usage()));
+            return Err(Error::from(format!(
+                "unexpected argument {flag:?}\n{}",
+                usage()
+            )));
         };
         if !known.contains(&name) {
-            return Err(format!("unknown flag {flag:?}\n{}", usage()));
+            return Err(Error::from(format!("unknown flag {flag:?}\n{}", usage())));
         }
         let Some(value) = args.get(i + 1) else {
-            return Err(format!("{flag} needs a value"));
+            return Err(Error::from(format!("{flag} needs a value")));
         };
         if out.insert(name.to_string(), value.clone()).is_some() {
-            return Err(format!("{flag} is given twice"));
+            return Err(Error::from(format!("{flag} is given twice")));
         }
         i += 2;
     }
     Ok(out)
 }
 
-fn need<'a>(flags: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str, String> {
+fn need<'a>(flags: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str, Error> {
     flags
         .get(name)
         .map(String::as_str)
-        .ok_or_else(|| format!("--{name} is needed"))
+        .ok_or_else(|| Error::from(format!("--{name} is needed")))
 }
 
 /// `export <username>`: the written part of the member's data export.
@@ -264,15 +270,15 @@ fn need<'a>(flags: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str, 
 /// Root's, like the request verbs: it reads one account's directory and writes
 /// into the member's home. It never reads the Maildir, which it could not read
 /// anyway.
-async fn export(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), String> {
+async fn export(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), Error> {
     let Some(username) = args.first().map(String::as_str) else {
-        return Err(usage());
+        return Err(Error::from(usage()));
     };
     if username.starts_with("--") {
-        return Err(usage());
+        return Err(Error::from(usage()));
     }
     if let Some(why) = validate::username_shape(username) {
-        return Err(format!("the username {username:?}: {why}"));
+        return Err(Error::from(format!("the username {username:?}: {why}")));
     }
     let rest = &args[1..];
     let by_mail = rest.iter().any(|arg| arg == "--by-mail");

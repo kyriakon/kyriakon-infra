@@ -19,6 +19,7 @@ use tokio::process::Command;
 use crate::config::DrainConfig;
 use crate::store::{Notice, Store};
 use crate::util;
+use crate::Error;
 
 /// The RFC 5322 message: the headers the enqueuer reads and a plain-text body.
 ///
@@ -35,14 +36,14 @@ fn message(from: &str, to: &str, subject: &str, body: &str) -> String {
 }
 
 /// Enqueue one message through the enqueuer the config names.
-pub async fn enqueue(cfg: &DrainConfig, to: &str, subject: &str, body: &str) -> Result<(), String> {
+pub async fn enqueue(cfg: &DrainConfig, to: &str, subject: &str, body: &str) -> Result<(), Error> {
     enqueue_raw(cfg, &message(&cfg.from, to, subject, body)).await
 }
 
 /// Enqueue an already-built message. The plain path builds one through
 /// [`message`]; the export's encrypted attachment needs the whole MIME body,
 /// which is not a thing `message` can say.
-async fn enqueue_raw(cfg: &DrainConfig, raw: &str) -> Result<(), String> {
+async fn enqueue_raw(cfg: &DrainConfig, raw: &str) -> Result<(), Error> {
     let mut child = Command::new(&cfg.sendmail)
         .arg("-i")
         .arg("-t")
@@ -66,7 +67,7 @@ async fn enqueue_raw(cfg: &DrainConfig, raw: &str) -> Result<(), String> {
         .await
         .map_err(|e| format!("cannot wait for {}: {e}", cfg.sendmail))?;
     if !status.success() {
-        return Err(format!("{} exited {status}", cfg.sendmail));
+        return Err(Error::from(format!("{} exited {status}", cfg.sendmail)));
     }
     Ok(())
 }
@@ -113,7 +114,7 @@ pub async fn already_sent(
     username: &str,
     notice_type: &str,
     subject: &str,
-) -> Result<bool, String> {
+) -> Result<bool, Error> {
     Ok(store
         .log(&format!("accounts/{username}/notices.jsonl"))
         .jsonl::<Notice>()
@@ -133,7 +134,7 @@ pub async fn send_account_notice(
     subject: &str,
     to: &str,
     body: &str,
-) -> Result<bool, String> {
+) -> Result<bool, Error> {
     if already_sent(store, username, notice_type, subject).await? {
         return Ok(false);
     }
@@ -153,7 +154,7 @@ pub async fn send_again(
     subject: &str,
     to: &str,
     body: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     record_and_enqueue(cfg, store, username, notice_type, subject, to, body).await
 }
 
@@ -173,7 +174,7 @@ pub async fn send_account_notice_attachment(
     body: &str,
     filename: &str,
     attachment: &[u8],
-) -> Result<(), String> {
+) -> Result<(), Error> {
     record(store, username, notice_type, subject, to).await?;
     enqueue_raw(
         cfg,
@@ -213,7 +214,7 @@ async fn record(
     notice_type: &str,
     subject: &str,
     to: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let line = Notice {
         version: 1,
         at: crate::util::filed_at(),
@@ -227,7 +228,7 @@ async fn record(
         .log(&format!("accounts/{username}/notices.jsonl"))
         .append_mode(encoded.as_bytes(), store.dir_owner("accounts"), 0o640)
         .await
-        .map_err(String::from)
+        .map_err(Error::from)
 }
 
 async fn record_and_enqueue(
@@ -238,7 +239,7 @@ async fn record_and_enqueue(
     subject: &str,
     to: &str,
     body: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     record(store, username, notice_type, subject, to).await?;
     enqueue(cfg, to, subject, body).await
 }

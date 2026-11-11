@@ -20,16 +20,20 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<(), String> {
+async fn run() -> Result<(), responder::Error> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("serve") => {}
         Some(other) => {
-            return Err(format!(
+            return Err(responder::Error::Startup(format!(
                 "unknown command {other:?}; usage: kyriakon-onboard serve [--config PATH]"
+            )))
+        }
+        None => {
+            return Err(responder::Error::Startup(
+                "usage: kyriakon-onboard serve [--config PATH]".to_string(),
             ))
         }
-        None => return Err("usage: kyriakon-onboard serve [--config PATH]".to_string()),
     }
     let mut cfg_path = PathBuf::from("/etc/onboard/onboard.toml");
     while let Some(a) = args.next() {
@@ -37,11 +41,13 @@ async fn run() -> Result<(), String> {
             "--config" => {
                 cfg_path = PathBuf::from(args.next().ok_or("--config needs a path")?);
             }
-            other => return Err(format!("unknown argument {other:?}")),
+            other => {
+                return Err(responder::Error::Startup(format!(
+                    "unknown argument {other:?}"
+                )))
+            }
         }
     }
 
-    responder::serve(config::Config::load(&cfg_path)?)
-        .await
-        .map_err(String::from)
+    responder::serve(config::Config::load(&cfg_path)?).await
 }

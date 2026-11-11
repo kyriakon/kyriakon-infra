@@ -250,7 +250,9 @@ pub async fn verify(
             {
                 Some("the link's date has passed".to_string())
             } else {
-                kyriakon_onboard_core::account::password::validate(&intent.password).err()
+                kyriakon_onboard_core::account::password::validate(&intent.password)
+                    .err()
+                    .map(|e| e.to_string())
             };
             match problem {
                 Some(why) => {

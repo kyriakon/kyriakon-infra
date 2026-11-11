@@ -1,5 +1,6 @@
 //! One job of the operator console.
 
+use crate::Error;
 use crate::*;
 
 /// File one address change in a group. The signature is the console's, over
@@ -12,7 +13,7 @@ pub(crate) async fn address(
     cfg: &DrainConfig,
     store: &Store,
     args: &[String],
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let flags = flags(
         args,
         &[
@@ -26,33 +27,35 @@ pub(crate) async fn address(
     )?;
     let domain = need(&flags, "domain")?;
     if let Some(why) = validate::domain(domain) {
-        return Err(format!("the domain {domain:?}: {why}"));
+        return Err(Error::from(format!("the domain {domain:?}: {why}")));
     }
     let action = need(&flags, "action")?;
     if !intent::ADDRESS_ACTIONS.contains(&action) {
-        return Err(format!(
+        return Err(Error::from(format!(
             "--action {action:?} is not one of {:?}\n{}",
             intent::ADDRESS_ACTIONS,
             usage()
-        ));
+        )));
     }
     let mailbox = need(&flags, "mailbox")?;
     if let Some(why) = validate::username_shape(mailbox) {
-        return Err(format!("the mailbox {mailbox:?}: {why}"));
+        return Err(Error::from(format!("the mailbox {mailbox:?}: {why}")));
     }
     let address = flags.get("address").map(String::as_str).unwrap_or("");
     if action != "remove" {
         if address.is_empty() {
-            return Err("--address is needed for this change".to_string());
+            return Err(Error::from(
+                "--address is needed for this change".to_string(),
+            ));
         }
         if let Some(why) = validate::username_shape(address) {
-            return Err(format!("the address {address:?}: {why}"));
+            return Err(Error::from(format!("the address {address:?}: {why}")));
         }
     }
     let site_owner = flags.get("site-owner").map(String::as_str);
     if let Some(owner) = site_owner {
         if let Some(why) = validate::username_shape(owner) {
-            return Err(format!("the site owner {owner:?}: {why}"));
+            return Err(Error::from(format!("the site owner {owner:?}: {why}")));
         }
     }
     let mail_key = match flags.get("key-file") {
@@ -60,7 +63,7 @@ pub(crate) async fn address(
             let material = std::fs::read_to_string(path)
                 .map_err(|e| format!("cannot read the mail key {path}: {e}"))?;
             if material.trim().is_empty() {
-                return Err(format!("the mail key {path} is empty"));
+                return Err(Error::from(format!("the mail key {path} is empty")));
             }
             // The same check the responder and the portal run, so a console
             // submission cannot file a mailbox the pages would have refused:
@@ -70,15 +73,19 @@ pub(crate) async fn address(
             if record.fingerprint.is_empty() {
                 let why = keycheck::pgp_public_key(&material)
                     .err()
-                    .unwrap_or_else(|| "it carries no key packet".to_string());
-                return Err(format!("the mail key {path}: {why}"));
+                    .unwrap_or_else(|| {
+                        kyriakon_onboard_core::Error::from("it carries no key packet".to_string())
+                    });
+                return Err(Error::from(format!("the mail key {path}: {why}")));
             }
             Some(record)
         }
         None => None,
     };
     if matches!(action, "add-mailbox" | "upgrade") && mail_key.is_none() {
-        return Err("--key-file is needed for a new mailbox".to_string());
+        return Err(Error::from(
+            "--key-file is needed for a new mailbox".to_string(),
+        ));
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(

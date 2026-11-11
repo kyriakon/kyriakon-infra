@@ -1,11 +1,12 @@
 //! One job of the operator console.
 
 use crate::payments::{group_payment, print_payment};
+use crate::Error;
 use crate::*;
 
 /// Print what the store holds for a username: the application and, once an
 /// approval has made one, the account.
-pub(crate) async fn show(store: &Store, username: &str) -> Result<(), String> {
+pub(crate) async fn show(store: &Store, username: &str) -> Result<(), Error> {
     let (token, record) = find_application(store, username).await?;
     println!("application {username} (token {token})");
     println!("  filed    {}", record.filed_at);
@@ -55,13 +56,13 @@ pub(crate) async fn suspend(
     cfg: &DrainConfig,
     store: &Store,
     rest: &[String],
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let (username, args) = match rest {
         [username, args @ ..] => (username.as_str(), args),
-        _ => return Err(usage()),
+        _ => return Err(Error::from(usage())),
     };
     if let Some(why) = validate::username_shape(username) {
-        return Err(format!("the username {username:?}: {why}"));
+        return Err(Error::from(format!("the username {username:?}: {why}")));
     }
     let flags = flags(args, &["reason"])?;
     let reason = need(&flags, "reason")?;
@@ -74,11 +75,7 @@ pub(crate) async fn suspend(
 /// `resume`: lift a suspension, the inverse of `suspend`. The three access
 /// paths come back, the state returns to active, and the reason and grace the
 /// suspension started are cleared.
-pub(crate) async fn resume(
-    cfg: &DrainConfig,
-    store: &Store,
-    rest: &[String],
-) -> Result<(), String> {
+pub(crate) async fn resume(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(), Error> {
     let username = one_username(rest)?;
     let journal = Journal::load(store).await?;
     transitions::lifecycle::resume(cfg, store, &journal, username).await?;
@@ -91,11 +88,7 @@ pub(crate) async fn resume(
 /// erasure from the console and one from the page cannot differ. No flag: a
 /// deletion erases the account it names and nothing about the deletion is
 /// optional.
-pub(crate) async fn delete(
-    cfg: &DrainConfig,
-    store: &Store,
-    rest: &[String],
-) -> Result<(), String> {
+pub(crate) async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(), Error> {
     let username = one_username(rest)?;
     // A name with no record and no deletion journal line is not an account this
     // service made. Refusing here keeps a typo from printing "deleted" and from
@@ -115,7 +108,7 @@ pub(crate) async fn delete(
                 .is_some_and(|id| id.starts_with(&prefix))
         });
     if !recorded && !interrupted {
-        return Err(format!("no account for {username}"));
+        return Err(Error::from(format!("no account for {username}")));
     }
     let journal = Journal::load(store).await?;
     transitions::lifecycle::delete_account(cfg, store, &journal, username).await?;
@@ -126,9 +119,9 @@ pub(crate) async fn delete(
 /// `free`: how many accounts were approved without charge. The count is read
 /// from the accounts themselves rather than kept beside them, so it cannot
 /// drift; a group mailbox is not counted, because the group holds the payment.
-pub(crate) async fn free(store: &Store, rest: &[String]) -> Result<(), String> {
+pub(crate) async fn free(store: &Store, rest: &[String]) -> Result<(), Error> {
     if !rest.is_empty() {
-        return Err(usage());
+        return Err(Error::from(usage()));
     }
     match free_account_count(store).await? {
         1 => println!("1 account without charge"),
@@ -143,7 +136,7 @@ pub(crate) async fn free(store: &Store, rest: &[String]) -> Result<(), String> {
 pub(crate) async fn find_application(
     store: &Store,
     username: &str,
-) -> Result<(String, Record), String> {
+) -> Result<(String, Record), Error> {
     let mut best: Option<(String, Record)> = None;
     for name in store.list("applications").await? {
         if !name.ends_with(".json") {
@@ -163,5 +156,5 @@ pub(crate) async fn find_application(
             best = Some((record.status_token.clone(), record));
         }
     }
-    best.ok_or_else(|| format!("no application for {username}"))
+    best.ok_or_else(|| Error::from(format!("no application for {username}")))
 }

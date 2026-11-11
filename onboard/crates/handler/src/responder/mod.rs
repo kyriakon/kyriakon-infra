@@ -77,7 +77,7 @@ pub(crate) mod test_support;
 mod titan;
 
 use self::connection::accept;
-use self::error::Error;
+pub use self::error::Error;
 use self::titan::titan_accept;
 
 /// The only origin a submission may carry. The port-80 vhost redirects, so the
@@ -139,7 +139,7 @@ impl App {
     /// crate's own, read at build time, so a wording change is a rebuild and the
     /// store holds no copy of it to drift from.
     async fn load(cfg: config::Config) -> Result<App, Error> {
-        let list = questions::shipped().map_err(Error::Startup)?;
+        let list = questions::shipped().map_err(|e| Error::Startup(e.to_string()))?;
         if list.is_empty() {
             return Err(Error::Startup(format!(
                 "{} has no questions",
@@ -150,8 +150,8 @@ impl App {
         // that came up with no services would render an application page that
         // promises nothing, which is the failure the config path exists to
         // prevent.
-        let services =
-            catalogue::parse(&Store::read_text(&cfg.catalogue).await?).map_err(Error::Startup)?;
+        let services = catalogue::parse(&Store::read_text(&cfg.catalogue).await?)
+            .map_err(|e| Error::Startup(e.to_string()))?;
         if services.is_empty() {
             return Err(Error::Startup(format!(
                 "{} has no services",

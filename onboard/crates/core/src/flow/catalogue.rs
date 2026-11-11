@@ -12,6 +12,7 @@
 //! between this file and every front-end's renderer rather than something this
 //! module owns.
 
+use crate::Error;
 use serde::Deserialize;
 
 /// The tracked file, named in the refusals so a failing check says which file to
@@ -29,12 +30,12 @@ pub enum State {
 }
 
 impl State {
-    fn parse(token: &str) -> Result<State, String> {
+    fn parse(token: &str) -> Result<State, Error> {
         match token {
             "live" => Ok(State::Live),
             "by_request" => Ok(State::ByRequest),
             "planned" => Ok(State::Planned),
-            other => Err(format!("unknown state {other:?}")),
+            other => Err(Error::from(format!("unknown state {other:?}"))),
         }
     }
 
@@ -60,13 +61,13 @@ pub enum Action {
 }
 
 impl Action {
-    fn parse(token: &str) -> Result<Action, String> {
+    fn parse(token: &str) -> Result<Action, Error> {
         match token {
             "read" => Ok(Action::Read),
             "apply" => Ok(Action::Apply),
             "account" => Ok(Action::Account),
             "pay" => Ok(Action::Pay),
-            other => Err(format!("unknown action {other:?}")),
+            other => Err(Error::from(format!("unknown action {other:?}"))),
         }
     }
 
@@ -209,16 +210,16 @@ struct Entry {
 /// action outside its vocabulary, is refused by name rather than skipped: an
 /// entry that disappears silently is a service no front-end mentions, and a
 /// value with no word is one a front-end would render blank.
-pub fn parse(text: &str) -> Result<Vec<Service>, String> {
+pub fn parse(text: &str) -> Result<Vec<Service>, Error> {
     let file: File = toml::from_str(text).map_err(|e| format!("the catalogue: {e}"))?;
 
     let mut out = Vec::with_capacity(file.service.len());
     for e in file.service {
         let id = e.id;
         if id.is_empty() || e.name.is_empty() || e.summary.is_empty() || e.host.is_empty() {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "the service {id:?} has an empty id, name, summary or host"
-            ));
+            )));
         }
         let state = State::parse(&e.state).map_err(|why| format!("the service {id:?}: {why}"))?;
         let action =

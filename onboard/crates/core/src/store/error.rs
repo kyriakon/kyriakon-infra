@@ -110,11 +110,3 @@ impl Error {
         crate::util::report(self, context);
     }
 }
-
-/// A caller that has not converted yet still returns `Result<_, String>`. The
-/// bridge keeps the tree compiling; step 5 deletes it and converts the callers.
-impl From<Error> for String {
-    fn from(error: Error) -> String {
-        error.to_string()
-    }
-}

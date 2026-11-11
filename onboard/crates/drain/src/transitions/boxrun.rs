@@ -78,13 +78,6 @@ impl From<store::Error> for Error {
     }
 }
 
-/// Bridge for callers not converted yet; step 5 removes it.
-impl From<Error> for String {
-    fn from(error: Error) -> String {
-        error.to_string()
-    }
-}
-
 /// Run one of the repository's privileged scripts by its configured path and
 /// hand back what it wrote. It is called with argv only: there is no shell
 /// anywhere in the drain, and every value that reaches it was validated first.

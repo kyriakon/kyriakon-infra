@@ -297,7 +297,7 @@ pub(super) async fn account_password(app: &App, request: &Request) -> Reply {
         );
     }
     if let Err(why) = kyriakon_onboard_core::account::password::validate(new) {
-        return refused(&why);
+        return refused(&why.to_string());
     }
     if new != confirm {
         return refused("The two new passwords do not match.");
@@ -344,7 +344,7 @@ pub(super) async fn account_upload_key(app: &App, request: &Request) -> Reply {
         Some("add") => {
             let material = form.get("key").map(String::as_str).unwrap_or("").trim();
             if let Err(why) = keycheck::openssh_public_key(material) {
-                return refused(&why);
+                return refused(&why.to_string());
             }
             if keycheck::openssh_fingerprint(material).is_none() {
                 return refused("That line carries no key material.");
@@ -580,7 +580,7 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
         Some("replace") => {
             let material = form.get("key").map(String::as_str).unwrap_or("").trim();
             if let Err(why) = keycheck::pgp_public_key(material) {
-                return refused(&why);
+                return refused(&why.to_string());
             }
             let Some(fingerprint) = keycheck::pgp_fingerprint(material) else {
                 return refused("That block carries no public key packet.");

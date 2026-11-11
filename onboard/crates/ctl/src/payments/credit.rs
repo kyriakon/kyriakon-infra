@@ -1,6 +1,7 @@
 //! One job of the operator console.
 
 use super::payment_token;
+use crate::Error;
 use crate::*;
 
 /// `token resend <username>`: the member's payment instructions again, with the
@@ -11,13 +12,13 @@ use crate::*;
 /// The account is read here, at the terminal, so a member who was approved
 /// without charge, or one with no account yet, is a refusal the operator sees
 /// now rather than an intent the drain refuses a minute later.
-pub(crate) async fn token(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), String> {
+pub(crate) async fn token(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), Error> {
     let (verb, username) = match args {
         [verb, username] if verb == "resend" => (verb.as_str(), username.as_str()),
-        _ => return Err(usage()),
+        _ => return Err(Error::from(usage())),
     };
     if let Some(why) = validate::username_shape(username) {
-        return Err(format!("the username {username:?}: {why}"));
+        return Err(Error::from(format!("the username {username:?}: {why}")));
     }
     let account = store
         .account(username)
@@ -51,11 +52,7 @@ pub(crate) async fn token(cfg: &DrainConfig, store: &Store, args: &[String]) -> 
 ///
 /// `--note` is for money that cannot be joined to an account: it is the only
 /// reference the queue has, so it comes with no token and no username.
-pub(crate) async fn credit(
-    cfg: &DrainConfig,
-    store: &Store,
-    args: &[String],
-) -> Result<(), String> {
+pub(crate) async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), Error> {
     // `--confirm-double` is a bare switch, which the pair reader does not take.
     let confirm_double = args.iter().any(|a| a == "--confirm-double");
     let paired: Vec<String> = args
@@ -70,54 +67,64 @@ pub(crate) async fn credit(
         ],
     )?;
     let note = match flags.get("note") {
-        Some(text) if text.trim().is_empty() => return Err("--note is empty".to_string()),
+        Some(text) if text.trim().is_empty() => {
+            return Err(Error::from("--note is empty".to_string()))
+        }
         Some(text) => Some(text.as_str()),
         None => None,
     };
     let token = match (flags.get("token"), flags.get("username"), note) {
         (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
-            return Err(
+            return Err(Error::from(
                 "--note is for a payment with no token: give neither --token nor --username"
                     .to_string(),
-            )
+            ))
         }
         (None, None, Some(_)) => String::new(),
-        (None, None, None) => return Err("give --token, --username or --note".to_string()),
+        (None, None, None) => {
+            return Err(Error::from(
+                "give --token, --username or --note".to_string(),
+            ))
+        }
         _ => payment_token(store, &flags).await?,
     };
     let rail = need(&flags, "rail")?;
     if !intent::CREDIT_RAILS.contains(&rail) {
-        return Err(format!(
+        return Err(Error::from(format!(
             "--rail {rail:?} is not one of {}",
             intent::CREDIT_RAILS.join(", ")
-        ));
+        )));
     }
     // Cash in hand is the one rail keyed by a username: the operator was there
     // and the drain resolves the name to a token before it writes anything. A
     // hand payment with no name has nothing to be joined to, by construction.
     if note.is_some() && rail == "cash-hand" {
-        return Err(
+        return Err(Error::from(
             "cash in hand is credited against a username; give --username, not --note".to_string(),
-        );
+        ));
     }
     let amount = need(&flags, "amount")?;
     match util::pence(amount) {
         Ok(pence) if pence > 0 => {}
-        Ok(_) => return Err("--amount must be more than zero".to_string()),
-        Err(e) => return Err(format!("--amount: {e}")),
+        Ok(_) => return Err(Error::from("--amount must be more than zero".to_string())),
+        Err(e) => return Err(Error::from(format!("--amount: {e}"))),
     }
     let received = need(&flags, "received")?;
     let received_date = match util::parse_date(received) {
         Some(date) => date,
-        None => return Err(format!("--received {received:?} is not YYYY-MM-DD")),
+        None => {
+            return Err(Error::from(format!(
+                "--received {received:?} is not YYYY-MM-DD"
+            )))
+        }
     };
     // The drain measures the ceiling from this date, and a year it cannot hold
     // has no paid-until date: refuse it here rather than file an intent the
     // drain will only refuse later.
     if util::received_beyond_window(received_date, crate::account_requests::today()) {
-        return Err(format!(
+        return Err(Error::from(format!(
             "--received {received:?} is more than two years ahead"
-        ));
+        )));
     }
     let txid = flags.get("txid").map(String::as_str);
     let xmr = flags.get("xmr").map(String::as_str);
@@ -164,32 +171,34 @@ pub(crate) async fn credit(
 /// `window extend --token <t> --days 14 --reason <text>`: the one extension a
 /// member whose money is in the post is given. The console signs every field the
 /// drain acts on, because the intent moves the date the account lapses on.
-pub(crate) async fn window(
-    cfg: &DrainConfig,
-    store: &Store,
-    args: &[String],
-) -> Result<(), String> {
+pub(crate) async fn window(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), Error> {
     let (verb, rest) = match args {
         [verb, rest @ ..] => (verb.as_str(), rest),
-        _ => return Err(usage()),
+        _ => return Err(Error::from(usage())),
     };
     if verb != "extend" {
-        return Err(usage());
+        return Err(Error::from(usage()));
     }
     let flags = flags(rest, &["token", "days", "reason"])?;
     let token = need(&flags, "token")?;
     if !store::is_payment_token(token) {
-        return Err(format!("the token {token:?} is not a payment token"));
+        return Err(Error::from(format!(
+            "the token {token:?} is not a payment token"
+        )));
     }
     let days = need(&flags, "days")?
         .parse::<i64>()
         .map_err(|_| "--days is not a whole number".to_string())?;
     if days != 14 {
-        return Err("a window extension is fourteen days and no other number".to_string());
+        return Err(Error::from(
+            "a window extension is fourteen days and no other number".to_string(),
+        ));
     }
     let reason = need(&flags, "reason")?;
     if reason.trim().is_empty() {
-        return Err("--reason must say why the window is being extended".to_string());
+        return Err(Error::from(
+            "--reason must say why the window is being extended".to_string(),
+        ));
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::window_extend_payload(token, days, reason))?;

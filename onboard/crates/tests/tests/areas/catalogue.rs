@@ -51,16 +51,21 @@ fn renderings(list: &[Service], member: Option<&str>) -> Vec<(&'static str, Vec<
 /// The check the spec asks for, on the file's own text: every entry the file
 /// carries appears in every rendering that exists, compared as rows, and no
 /// rendering shows one the file does not.
-fn check(text: &str, member: Option<&str>) -> Result<(), String> {
+fn check(text: &str, member: Option<&str>) -> Result<(), kyriakon_onboard_core::Error> {
     let list = parse(text)?;
     if list.is_empty() {
-        return Err(format!("{TRACKED} has no services"));
+        return Err(kyriakon_onboard_core::Error::from(format!(
+            "{TRACKED} has no services"
+        )));
     }
     compare(&list, &renderings(&list, member))
 }
 
 /// Compare what each front-end shows against the file it was rendered from.
-fn compare(list: &[Service], rendered: &[(&str, Vec<Row>)]) -> Result<(), String> {
+fn compare(
+    list: &[Service],
+    rendered: &[(&str, Vec<Row>)],
+) -> Result<(), kyriakon_onboard_core::Error> {
     for (front_end, rows) in rendered {
         if rows.len() != list.len() {
             let missing: Vec<&str> = list
@@ -73,28 +78,28 @@ fn compare(list: &[Service], rendered: &[(&str, Vec<Row>)]) -> Result<(), String
                 .filter(|r| !list.iter().any(|s| s.id == r.id))
                 .map(|r| r.id.as_str())
                 .collect();
-            return Err(format!(
+            return Err(kyriakon_onboard_core::Error::from(format!(
                 "{front_end} shows {} entries where {TRACKED} carries {}: missing {missing:?}, invented {invented:?}",
                 rows.len(),
                 list.len()
-            ));
+            )));
         }
         for (s, r) in list.iter().zip(rows) {
             if r.id != s.id {
-                return Err(format!(
+                return Err(kyriakon_onboard_core::Error::from(format!(
                     "{front_end} shows {:?} where {TRACKED} has {:?}: the file's order is the display order",
                     r.id, s.id
-                ));
+                )));
             }
             if r.name != s.name
                 || r.summary != s.summary
                 || r.state != s.state.word()
                 || r.action != s.action.word()
             {
-                return Err(format!(
+                return Err(kyriakon_onboard_core::Error::from(format!(
                     "{front_end} shows {:?} other than as {TRACKED} has it, so the rendering is not the file",
                     s.id
-                ));
+                )));
             }
         }
     }

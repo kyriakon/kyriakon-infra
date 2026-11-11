@@ -7,6 +7,7 @@
 use crate::payments::xmr;
 use crate::store::Monero;
 use crate::util;
+use crate::Error;
 
 /// The rail's own payment instructions, one line each, in the words the
 /// approval email and both account pages carry. Monero has no subaddress until
@@ -103,16 +104,16 @@ pub fn rail_instructions(
 /// `checkout.session.completed` names the account by. A placeholder that
 /// reached the box is refused rather than mailed, because a member cannot pay
 /// at REPLACE_ME.
-pub fn card_link(payment_link: &str, token: &str) -> Result<Option<String>, String> {
+pub fn card_link(payment_link: &str, token: &str) -> Result<Option<String>, Error> {
     if token.is_empty() {
         return Ok(None);
     }
     let link = payment_link.trim_end_matches(['&', '?']);
     if link.is_empty() || link.contains("REPLACE_ME") {
-        return Err(
+        return Err(Error::from(
             "stripe_payment_link is not configured, so a card approval has no link to send"
                 .to_string(),
-        );
+        ));
     }
     let joiner = if link.contains('?') { '&' } else { '?' };
     Ok(Some(format!("{link}{joiner}client_reference_id={token}")))
