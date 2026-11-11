@@ -76,7 +76,7 @@ install_set="$script_dir/install-set.tsv"
 # added later for one of these cannot be installed and removed in the same run.
 stale_copies() {
 	for s in add-user.sh check-hygiene.sh cron-apply.sh delete-user.sh deploy-mail.sh \
-		deploy-control.sh deploy-relayd.sh control-store.sh provision-member.sh \
+		deploy-onboard.sh deploy-relayd.sh onboard-store.sh provision-member.sh \
 		provision-member-capsule.sh provision-member-web.sh quota-apply.sh restore-test.sh; do
 		case " $(printf '%s\n' "$1" | tr '\n' ' ') " in
 		*" $s "*) continue ;;

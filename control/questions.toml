@@ -4,7 +4,7 @@
 # file is the only place the list exists, so a prompt or an answer option moves
 # here rather than in three renderings.
 #
-# The crate carries it, read at build time by control/src/flow/questions.rs, which is
+# The crate carries it, read at build time by control/crates/core/src/flow/questions.rs, which is
 # why it sits beside the crate rather than in the deployment tree: the structure
 # is the service's and ships with the service. The store holds no copy and
 # /etc/onboard/onboard.toml names no path for it, so a wording change is a rebuild

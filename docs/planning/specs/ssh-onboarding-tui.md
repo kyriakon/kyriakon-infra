@@ -12,8 +12,8 @@
 
 > Amended on 2026-10-15: the portal's frame exists, as
 > [#379](https://github.com/kyriakon/kyriakon-infra/issues/379) built it:
-> `control/src/bin/kyriakon-control-tui.rs` holds the program and both modes, and
-> `control/src/portal.rs` holds the rows, the screens and the dispatch, so the menu
+> `control/crates/tui/src/main.rs` holds the program and both modes, and
+> `control/crates/tui/src/lib.rs` holds the rows, the screens and the dispatch, so the menu
 > is the catalogue's third rendering and the check in `catalogue.rs` covers it. The
 > two modes are chosen from the terminal the session arrived on, since no client can
 > supply an argument to a forced command. What each of the four actions ends at is

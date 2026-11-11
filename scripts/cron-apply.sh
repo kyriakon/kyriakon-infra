@@ -891,7 +891,12 @@ work=$(mktemp)
 before=$(mktemp)
 bak=/root/crontab.bak.$(date +%Y%m%d%H%M%S)
 printf '%s\n' "$current" > "$before"
-printf '%s\n' "$current" > "$work"
+# The rename in #633 moved the drain's binary. This script only ever adds lines,
+# so the old one would stay and point at a path the deploy removes once the
+# crontab is clean; a line cron cannot run mails the operator every minute.
+# `before` keeps the real old crontab, so the backup and the --check diff show
+# the removal.
+printf '%s\n' "$current" | grep -vF '/usr/local/sbin/kyriakon-onboard-drain' > "$work" || true
 cat "$block" >> "$work"
 rm -f "$block"
 

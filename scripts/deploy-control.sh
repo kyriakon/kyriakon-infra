@@ -79,6 +79,31 @@ missing_drain_scripts() { # <src dir or .rs file> <install-set table>
 	done
 }
 
+# The four names a box may still carry from before the control rename, each with
+# the program that owns it now. Applied by hand are the login class's shell, the
+# applicant sshd's ForceCommand and the crontab's drain line; until all three
+# name the new paths these stay as symlinks.
+old_names="kyriakon-onboard:kyriakon-control
+kyriakon-onboard-drain:kyriakon-control-drain
+kyriakon-onboardctl:kyriakon-admin
+kyriakon-onboard-tui:kyriakon-control-tui"
+
+# settle_old_names <bin dir> <yes|no>: with `no`, relink each old name that is
+# present to its new program and print it, so the caller can say what is still
+# pinned; with `yes`, remove every old name. A name absent already is left alone,
+# so a fresh box gets no symlinks.
+settle_old_names() { # <dir> <yes|no>
+	for pair in $old_names; do
+		old=${pair%%:*} new=${pair#*:}
+		if [ "$2" = yes ]; then
+			rm -f "$1/$old"
+		elif [ -e "$1/$old" ]; then
+			ln -sfn "$1/$new" "$1/$old"
+			printf '%s\n' "$old"
+		fi
+	done
+}
+
 self_test() {
 	repo=${1:-$(cd "$script_dir/.." && pwd)}
 	src=$repo/control/crates/drain/src
@@ -182,6 +207,35 @@ STUB
 			"$(cat "$work/pkg_add.log")" >&2
 		exit 1
 	}
+
+	# The rename's compatibility step. A box with the old names still linked must
+	# keep them until the three hand-applied paths are updated, and a settled box
+	# must lose them; getting the direction wrong takes the portal down for a live
+	# session or leaves the old names forever.
+	mkdir "$work/sbin"
+	for new in kyriakon-control kyriakon-control-drain kyriakon-admin kyriakon-control-tui; do
+		printf '#!/bin/sh\n' >"$work/sbin/$new"
+	done
+	for old in kyriakon-onboard kyriakon-onboard-drain kyriakon-onboardctl kyriakon-onboard-tui; do
+		printf 'old\n' >"$work/sbin/$old"
+	done
+	kept=$(settle_old_names "$work/sbin" no)
+	[ "$(printf '%s\n' "$kept" | grep -c .)" -eq 4 ] || {
+		printf 'self-test: the unsettled deploy kept %s of 4 old names\n' \
+			"$(printf '%s\n' "$kept" | grep -c .)" >&2
+		exit 1
+	}
+	[ "$(readlink "$work/sbin/kyriakon-onboard-drain")" = "$work/sbin/kyriakon-control-drain" ] || {
+		printf 'self-test: an old name does not point at its new program\n' >&2
+		exit 1
+	}
+	settle_old_names "$work/sbin" yes >/dev/null
+	for old in kyriakon-onboard kyriakon-onboard-drain kyriakon-onboardctl kyriakon-onboard-tui; do
+		[ ! -e "$work/sbin/$old" ] && [ ! -L "$work/sbin/$old" ] || {
+			printf 'self-test: a settled deploy left %s behind\n' "$old" >&2
+			exit 1
+		}
+	done
 
 	printf 'self-test: ok\n'
 }
@@ -317,24 +371,13 @@ if grep -q kyriakon-control-tui /etc/login.conf.d/hello 2>/dev/null &&
 	crontab -l 2>/dev/null | grep -q kyriakon-control-drain; then
 	settled=yes
 fi
-linked=no
-for pair in \
-	kyriakon-onboard:kyriakon-control \
-	kyriakon-onboard-drain:kyriakon-control-drain \
-	kyriakon-onboardctl:kyriakon-admin \
-	kyriakon-onboard-tui:kyriakon-control-tui; do
-	old=${pair%%:*} new=${pair#*:}
-	if [ "$settled" = yes ]; then
-		rm -f "/usr/local/sbin/$old"
-	elif [ -e "/usr/local/sbin/$old" ]; then
-		ln -sfn "/usr/local/sbin/$new" "/usr/local/sbin/$old"
-		linked=yes
-	fi
-done
-if [ "$linked" = yes ]; then
-	printf 'the old program names stay as symlinks until /etc/login.conf.d/hello and\n'
-	printf '/etc/ssh/sshd_config.onboard name kyriakon-control-tui and cron runs\n'
-	printf 'kyriakon-control-drain; run this deploy again to remove the links\n'
+kept=$(settle_old_names /usr/local/sbin "$settled")
+if [ -n "$kept" ]; then
+	printf 'the old program names stay as symlinks until all three are done:\n'
+	printf '  install openbsd/etc/login.conf.d/hello and run doas cap_mkdb /etc/login.conf\n'
+	printf '  apply openbsd/etc/sshd_config.onboard and reload kyriakon_onboard_sshd\n'
+	printf '  run scripts/cron-apply.sh --drain so cron runs kyriakon-control-drain\n'
+	printf 'then run this deploy again to remove the links\n'
 fi
 
 # The old unit is the one running, and the new one binds the same sockets, so it
