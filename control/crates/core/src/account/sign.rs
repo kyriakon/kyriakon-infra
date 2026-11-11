@@ -433,6 +433,29 @@ mod tests {
         assert_ne!(a, b, "two field splits signed the same payload");
     }
 
+    /// The receipt-date rate is one of the fields the credit signs, so editing
+    /// it in `intents/` invalidates the signature.
+    #[test]
+    fn a_credit_rate_is_part_of_the_signed_payload() {
+        let payload = |rate: Option<&str>| {
+            credit_payload(
+                "KYR-4F2M-9QH7-XT3B",
+                "monero",
+                "20.00",
+                "2026-10-04",
+                None,
+                Some("0.048848"),
+                rate,
+                false,
+                None,
+                None,
+            )
+        };
+        assert_ne!(payload(Some("409.44")), payload(Some("410.00")));
+        assert!(payload(Some("409.44")).contains(":409.44:"));
+        assert!(!payload(None).contains("409.44"));
+    }
+
     #[test]
     fn the_links_put_the_token_in_the_path_and_the_signature_in_the_query() {
         let key = b"k";

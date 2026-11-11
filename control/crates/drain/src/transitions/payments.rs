@@ -278,7 +278,7 @@ async fn apply_payment(
                 cfg,
                 store,
                 intent,
-                payment_quote(&payment),
+                payment.monero.as_ref().filter(|_| progress.quoted),
                 &util::date_string(received),
                 &util::gbp(amount),
                 &progress.applied_gbp,
@@ -384,6 +384,10 @@ async fn apply_payment(
         before.map(util::date_string)
     };
     let balance_text = (applied.balance > 0).then(|| util::gbp(applied.balance));
+    // Read before the write: a renewal's block still holds the year-one quote,
+    // and the row must not carry it into year two. The recovery branch reads
+    // the same decision back from the journal.
+    let quote = payment_quote(&payment).cloned();
 
     // The values the account write is about to set, recorded before the write so
     // a crash leaves enough to finish the ledger line.
@@ -399,6 +403,7 @@ async fn apply_payment(
                 paid_until_after: paid_until_after.clone(),
                 applied_gbp: util::gbp(applied.applied),
                 balance_gbp: balance_text.clone(),
+                quoted: quote.is_some(),
             },
         )
         .await?;
@@ -411,9 +416,6 @@ async fn apply_payment(
     if applied.paid && account.state == "lapsed" {
         run_script(cfg, "lapse-user.sh", &["--restore", username]).await?;
     }
-    // Read before the write: a renewal's block still holds the year-one quote,
-    // and the row must not carry it into year two.
-    let quote = payment_quote(&payment).cloned();
     payment.rail = Some(intent.rail.clone());
     payment.balance_gbp = balance_text;
     if applied.paid {
@@ -656,6 +658,7 @@ async fn group_credit(
             paid_until_after: Some(until_text.clone()),
             applied_gbp: applied.clone(),
             balance_gbp: None,
+            quoted: false,
         },
     )
     .await?;
@@ -1698,9 +1701,10 @@ fn payment_quote(payment: &Payment) -> Option<&Monero> {
 }
 
 /// The XMR/GBP rate in force on the receipt date: the operator's `--rate` when
-/// given, otherwise the cache when it is fresh. A stale cache is not the rate on
-/// the receipt date, so it is no rate at all; the caller records the absence
-/// rather than a number that was true days earlier.
+/// given, otherwise the cache only when it was fetched on that very day. The
+/// cache is refreshed every pass, so a backdated credit must not stamp today's
+/// market rate as the receipt-date valuation; with no same-day cache the row
+/// carries no rate and the operator supplies `--rate`.
 fn receipt_rate(
     cfg: &DrainConfig,
     intent: &CreditIntent,
@@ -1717,7 +1721,8 @@ fn receipt_rate(
         ));
     }
     let cached = xmr::cached(cfg)?;
-    if !xmr::fresh(&cached, OffsetDateTime::now_utc()) {
+    let fetched_on = cached.fetched_at.get(..10)?;
+    if fetched_on != received_on || !xmr::fresh(&cached, OffsetDateTime::now_utc()) {
         return None;
     }
     Some((cached.rate_gbp_per_xmr, cached.source, cached.fetched_at))
@@ -1905,7 +1910,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = quota_config(&dir);
         std::fs::create_dir_all(&cfg.store_root).unwrap();
-        write_rate_cache(&cfg, &util::stamp(OffsetDateTime::now_utc()));
+        let now = OffsetDateTime::now_utc();
+        let received = util::date_string(now.date());
+        write_rate_cache(&cfg, &util::stamp(now));
         let store = Store::new_for_test(&cfg.store_root);
         let quote = year_one_quote();
         for (id, quote) in [("person", Some(&quote)), ("renewal", None), ("group", None)] {
@@ -1914,7 +1921,7 @@ mod tests {
                 &store,
                 &monero_intent(id, "KYR-AAAA-BBBB-CCCC", None),
                 quote,
-                "2026-10-04",
+                &received,
                 "20.00",
                 "20.00",
                 Some("2027-10-04"),
@@ -1935,6 +1942,43 @@ mod tests {
         assert_eq!(lines[0].rate_quoted.as_deref(), Some("300.00"));
         assert!(lines[1].rate_quoted.is_none(), "{:?}", lines[1]);
         assert!(lines[2].rate_quoted.is_none(), "{:?}", lines[2]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A cache fetched the next day is not the rate on the receipt day: a
+    /// backdated credit must not stamp today's market rate on yesterday's money.
+    #[tokio::test]
+    async fn a_cache_fetched_on_another_day_is_not_the_receipt_rate() {
+        let dir = std::env::temp_dir().join(format!("onboard-xmr-nextday-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = quota_config(&dir);
+        std::fs::create_dir_all(&cfg.store_root).unwrap();
+        let now = OffsetDateTime::now_utc();
+        let today = util::date_string(now.date());
+        let yesterday = util::date_string((now - time::Duration::days(1)).date());
+        write_rate_cache(&cfg, &util::stamp(now));
+        let store = Store::new_for_test(&cfg.store_root);
+        for received in [&yesterday, &today] {
+            append_credit_ledger(
+                &cfg,
+                &store,
+                &monero_intent("day", "KYR-AAAA-BBBB-CCCC", None),
+                None,
+                received,
+                "20.00",
+                "20.00",
+                Some("2027-10-04"),
+            )
+            .await
+            .unwrap();
+        }
+        let lines = Ledger::open(&store).lines().await.unwrap();
+        assert!(
+            lines[0].rate_received.is_none(),
+            "a next-day cache was stamped on the receipt day: {:?}",
+            lines[0]
+        );
+        assert_eq!(lines[1].rate_received.as_deref(), Some("409.44"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
