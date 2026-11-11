@@ -232,7 +232,7 @@ To remove a body's domain, close it from the console:
 
 	doas kyriakon-admin group remove <domain>
 
-The drain removes the domain's lines from the mail tables, its generated vhosts, capsule block, certificate material and queued order, then closes every account in the group through the deletion path and deletes the group record. The records in the body's own zone stay there, and the body removes them.
+The drain removes the domain's lines from the mail tables, its generated vhosts, capsule block, certificate material and queued order, then closes every account in the group through the deletion path and deletes the group record. A card-paying group's subscription is stopped with `scripts/stripe-api.sh cancel <subscription-id> <key-file>` before its token goes, so the body is not billed again. The records in the body's own zone stay there, and the body removes them.
 
 ## Provision through the control plane
 
@@ -554,6 +554,8 @@ A member asks for closure from the account page, or a refund opens it. Closing i
 Deletion is a sequence, and the order stops access before anything is destroyed, so the window between the decision and the deletion is closed. The sequence is from the research in #168.
 
 The automated path is `doas kyriakon-admin delete <username>`. It runs the sequence below as the lifecycle's one deletion transition, and the page's closing sweep calls the same transition when the seven days end. The numbered steps remain the operator's fallback when the service is not running.
+
+A card payer's subscription is stopped first, before the token and the record that name it are removed. The drain calls `scripts/stripe-api.sh cancel <subscription-id> <key-file>` with the id in `accounts/<username>/account.json`, or in `groups/<domain>/group.json` for a body, which sets `cancel_at_period_end` so the member keeps the year they paid for and nothing is charged again. A failed call fails the pass and leaves the intent for the retry. In the fallback below, cancel the subscription the same way before step 1. Accounts closed or deleted before this behaviour existed still have a live subscription, so check each one in the Stripe dashboard and cancel it there.
 
 1. Close access.
 
