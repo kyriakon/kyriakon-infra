@@ -223,3 +223,121 @@ async fn the_counters_refuse_the_sixty_first_request_and_the_sixth_draft() {
     assert_eq!(code, 44, "gemini's own slow down");
     assert!(body.starts_with("44 Too many requests"), "{body}");
 }
+
+/// Every route the httpd front end serves has a FastCGI location ahead of the
+/// static catch-all. httpd takes the first matching location and ignores the
+/// rest, so a route with no location lands on the static root and answers 404.
+/// This reads the repo's own `httpd.conf`: it is a static consistency check and
+/// needs no box.
+#[test]
+fn every_httpd_route_has_a_fastcgi_location_before_the_catch_all() {
+    let config = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../openbsd/etc/httpd.conf")
+        .canonicalize()
+        .expect("openbsd/etc/httpd.conf is beside the control workspace");
+    let text = std::fs::read_to_string(&config)
+        .unwrap_or_else(|err| panic!("read {}: {err}", config.display()));
+    let locations = signup_locations(&text);
+
+    for row in ROUTES
+        .iter()
+        .filter(|row| row.fronts.serves(FrontEnd::Httpd))
+    {
+        // A subtree row owns the paths under it, so a made-up path under the
+        // prefix stands for the row; an exact row is its own path.
+        let request = match row.path {
+            "" => "/".to_string(),
+            path if path.ends_with('/') => format!("/{path}probe"),
+            path => format!("/{path}"),
+        };
+        let (pattern, fastcgi) = locations
+            .iter()
+            .find(|(pattern, _)| location_matches(pattern, &request))
+            .unwrap_or_else(|| {
+                panic!(
+                    "route {:?} has no location covering {request} before \
+                     location \"/*\" in {}; httpd would answer it from the static \
+                     root and 404",
+                    row.path,
+                    config.display()
+                )
+            });
+        assert!(
+            *fastcgi,
+            "route {:?} first matches location {pattern:?} for {request}, which \
+             does not hand the request to the FastCGI responder",
+            row.path
+        );
+    }
+}
+
+/// The locations of the loopback `signup.kyriakon.net` server, in file order,
+/// each with whether it hands the request to the FastCGI responder. Stops at
+/// the static catch-all, because a location after it is unreachable.
+fn signup_locations(conf: &str) -> Vec<(String, bool)> {
+    let lines: Vec<&str> = conf.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| {
+            line.trim_start()
+                .starts_with("server \"signup.kyriakon.net\"")
+        })
+        .expect("a server block for signup.kyriakon.net");
+    let mut depth = 0usize;
+    let mut block = Vec::new();
+    for line in &lines[start..] {
+        depth += line.matches('{').count();
+        depth = depth.saturating_sub(line.matches('}').count());
+        block.push(*line);
+        if depth == 0 {
+            break;
+        }
+    }
+    assert!(
+        block
+            .iter()
+            .any(|line| line.contains("listen on 127.0.0.1 port 8080")),
+        "the signup.kyriakon.net block found is not the loopback one"
+    );
+
+    let mut locations = Vec::new();
+    for (i, line) in block.iter().enumerate() {
+        let line = line.trim();
+        if line.starts_with("location \"/*\"") {
+            break;
+        }
+        let Some(pattern) = line
+            .strip_prefix("location \"")
+            .and_then(|rest| rest.split('"').next())
+        else {
+            continue;
+        };
+        let mut fastcgi = false;
+        let mut inner = 0usize;
+        for body in &block[i..] {
+            inner += body.matches('{').count();
+            inner = inner.saturating_sub(body.matches('}').count());
+            if body.contains("fastcgi socket") {
+                fastcgi = true;
+            }
+            if inner == 0 {
+                break;
+            }
+        }
+        locations.push((pattern.to_string(), fastcgi));
+    }
+    assert!(
+        !locations.is_empty(),
+        "the signup.kyriakon.net block has no locations"
+    );
+    locations
+}
+
+/// httpd's location match for the patterns this file uses: a trailing `*`
+/// matches the rest of the path, and a pattern without one is exact.
+fn location_matches(pattern: &str, path: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => path.starts_with(prefix),
+        None => path == pattern,
+    }
+}
