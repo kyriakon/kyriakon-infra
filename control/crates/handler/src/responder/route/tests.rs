@@ -243,12 +243,13 @@ fn every_httpd_route_has_a_fastcgi_location_before_the_catch_all() {
         .iter()
         .filter(|row| row.fronts.serves(FrontEnd::Httpd))
     {
-        // A subtree row owns the paths under it, so a made-up path under the
-        // prefix stands for the row; an exact row is its own path.
-        let request = match row.path {
-            "" => "/".to_string(),
-            path if path.ends_with('/') => format!("/{path}probe"),
-            path => format!("/{path}"),
+        // `probe` already names a concrete path under a subtree row and the
+        // row's own path otherwise; httpd compares against the leading slash.
+        let (path, _) = probe(row);
+        let request = if path.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{path}")
         };
         let (pattern, fastcgi) = locations
             .iter()
@@ -275,6 +276,7 @@ fn every_httpd_route_has_a_fastcgi_location_before_the_catch_all() {
 /// each with whether it hands the request to the FastCGI responder. Stops at
 /// the static catch-all, because a location after it is unreachable.
 fn signup_locations(conf: &str) -> Vec<(String, bool)> {
+    // Comments can hold braces; count structure on the code half only.
     let lines: Vec<&str> = conf.lines().collect();
     let start = lines
         .iter()
@@ -286,8 +288,9 @@ fn signup_locations(conf: &str) -> Vec<(String, bool)> {
     let mut depth = 0usize;
     let mut block = Vec::new();
     for line in &lines[start..] {
-        depth += line.matches('{').count();
-        depth = depth.saturating_sub(line.matches('}').count());
+        let code = code_of(line);
+        depth += code.matches('{').count();
+        depth = depth.saturating_sub(code.matches('}').count());
         block.push(*line);
         if depth == 0 {
             break;
@@ -296,13 +299,13 @@ fn signup_locations(conf: &str) -> Vec<(String, bool)> {
     assert!(
         block
             .iter()
-            .any(|line| line.contains("listen on 127.0.0.1 port 8080")),
+            .any(|line| code_of(line).contains("listen on 127.0.0.1 port 8080")),
         "the signup.kyriakon.net block found is not the loopback one"
     );
 
     let mut locations = Vec::new();
     for (i, line) in block.iter().enumerate() {
-        let line = line.trim();
+        let line = code_of(line).trim();
         if line.starts_with("location \"/*\"") {
             break;
         }
@@ -315,9 +318,10 @@ fn signup_locations(conf: &str) -> Vec<(String, bool)> {
         let mut fastcgi = false;
         let mut inner = 0usize;
         for body in &block[i..] {
+            let body = code_of(body);
             inner += body.matches('{').count();
             inner = inner.saturating_sub(body.matches('}').count());
-            if body.contains("fastcgi socket") {
+            if body.contains("fastcgi socket \"/run/onboard-httpd/httpd.sock\"") {
                 fastcgi = true;
             }
             if inner == 0 {
@@ -340,4 +344,36 @@ fn location_matches(pattern: &str, path: &str) -> bool {
         Some(prefix) => path.starts_with(prefix),
         None => path == pattern,
     }
+}
+
+/// A config line with its comment removed, so a brace in a comment is not read
+/// as structure.
+fn code_of(line: &str) -> &str {
+    line.split('#').next().unwrap_or("")
+}
+
+/// A lone brace in a comment is a comment, not structure, and a location
+/// pointing at another daemon is not the responder.
+#[test]
+fn location_parsing_ignores_braces_in_comments_and_reads_the_socket() {
+    let conf = r#"
+server "signup.kyriakon.net" {
+	listen on 127.0.0.1 port 8080
+	# a lone } here must not end the block
+	location "/a" {
+		# a lone { here must not extend the location
+		fastcgi socket "/run/onboard-httpd/httpd.sock"
+	}
+	location "/b" {
+		fastcgi socket "/other.sock"
+	}
+	location "/*" {
+		root "/x"
+	}
+}
+"#;
+    assert_eq!(
+        signup_locations(conf),
+        vec![("/a".to_string(), true), ("/b".to_string(), false)]
+    );
 }
