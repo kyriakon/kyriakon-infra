@@ -1948,7 +1948,10 @@ mod tests {
         let error = settle_refund(&store, &intent, "2026-11-04")
             .await
             .expect_err("a line that does not parse must fail the settlement");
-        assert!(error.contains("line 2 does not parse"), "{error}");
+        assert!(
+            matches!(&error, Error::Failed(message) if message.contains("line 2 does not parse")),
+            "{error}"
+        );
         assert_eq!(
             std::fs::read_to_string(&ledger).unwrap(),
             format!("{line}\nnot json\n")

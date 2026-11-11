@@ -71,18 +71,7 @@ impl std::error::Error for Error {
 
 impl Error {
     pub fn report(&self, context: &str) {
-        eprintln!("kyriakon-onboard: {context}: {self}");
-        let mut source = std::error::Error::source(self);
-        while let Some(cause) = source {
-            eprintln!("kyriakon-onboard:   caused by: {cause}");
-            source = cause.source();
-        }
-    }
-
-    /// Temporary while the transition tests still inspect prose; step 5
-    /// replaces those assertions with variants.
-    pub fn contains(&self, pattern: &str) -> bool {
-        self.to_string().contains(pattern)
+        kyriakon_onboard_core::util::report(self, context);
     }
 }
 
