@@ -2084,7 +2084,7 @@ fn a_second_application_does_not_reuse_the_first_approvals_payment() {
     let second = json!({
         "username": "secretary",
         "status_token": OTHER_TOKEN,
-        "filed_at": "2026-10-05T09:00:00Z",
+        "filed_at": kyriakon_control_core::util::after_days(-40),
         "front_end": "web",
         "stage": "received",
         "outside_address": null,
