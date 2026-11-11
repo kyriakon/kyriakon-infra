@@ -2081,10 +2081,12 @@ fn a_second_application_does_not_reuse_the_first_approvals_payment() {
     );
 
     // The same person applies again, later, and that application is approved.
+    // One day later than the fixture's first application, so the console's
+    // newest-wins lookup reaches this one, and still inside the purge window.
     let second = json!({
         "username": "secretary",
         "status_token": OTHER_TOKEN,
-        "filed_at": kyriakon_control_core::util::after_days(-40),
+        "filed_at": kyriakon_control_core::util::after_days(-39),
         "front_end": "web",
         "stage": "received",
         "outside_address": null,
