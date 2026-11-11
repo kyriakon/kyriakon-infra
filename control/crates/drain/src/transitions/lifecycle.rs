@@ -3090,10 +3090,6 @@ pub async fn purge_applications(
             continue;
         }
         let purge_id = format!("purge-{token}");
-        // A purge that keeps failing backs off, through the intents' own rule.
-        if !due(journal, &purge_id, now) {
-            continue;
-        }
         let app = ApplicationRef::application(mailbox.clone(), token.clone());
         if !journal.has(&purge_id, "purged") && !journal.has(&purge_id, "applying") {
             write_journal(
