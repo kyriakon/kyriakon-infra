@@ -160,6 +160,7 @@ impl Fix {
             "cron-apply.sh",
             "publish-mail-key.sh",
             "reload-smtpd.sh",
+            "reload-spamd.sh",
         ] {
             let log = fix.path("scripts.log");
             fix.script(s, &format!("#!/bin/sh\necho \"{s} $*\" >> '{log}'\n"));

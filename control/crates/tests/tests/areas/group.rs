@@ -320,6 +320,10 @@ fn a_group_intent_provisions_its_record_accounts_and_addresses() {
     assert!(key.contains(UPLOAD_KEY), "{key}");
 
     let log = fix.scripts_log();
+    assert!(
+        log.contains("reload-spamd.sh"),
+        "spamd was not restarted for the new allow list line: {log}"
+    );
     assert!(log.contains("add-user.sh parish-secretary"), "{log}");
     assert!(
         log.contains("provision-member.sh parish-secretary"),

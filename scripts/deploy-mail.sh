@@ -167,9 +167,11 @@ merge_spamd_allowed() {
 	typeset seed="$1" domains="$2" dst="$3" domain
 	[ -f "$dst" ] || install -m 0644 "$seed" "$dst"
 	while IFS= read -r domain; do
-		case "$domain" in
-		'' | '#'*) continue ;;
-		esac
+		# The same normalisation check-hygiene.sh compares with: a comment and
+		# the spaces around a hand-edited line would otherwise become part of the
+		# line this appends, and the next hygiene run would call that drift.
+		domain=$(printf '%s' "$domain" | sed -e 's/#.*//' -e 's/[[:space:]]//g')
+		[ -n "$domain" ] || continue
 		table_set "$dst" "@$domain" "@$domain" || return 1
 	done <"$domains"
 }
@@ -399,6 +401,18 @@ self_test() {
 		"$tree/mail_domains" "$tree/spamd.alloweddomains"
 	check "a hand-written line and its comment survive a deploy" \
 		"$(grep -cx -e '# a hand edit' -e '@manual.example' "$tree/spamd.alloweddomains")" 2
+
+	# A hand edit in mail_domains can carry a comment or trailing spaces.
+	# check-hygiene.sh compares the two files after stripping both, so the line
+	# this appends must be the bare domain or the next hygiene run reports drift.
+	printf 'kyriakon.net\n  parish.example  # the parish\n# a note, not a domain\n' \
+		>"$tree/mail_domains"
+	merge_spamd_allowed "$repo_dir/openbsd/etc/spamd.alloweddomains" \
+		"$tree/mail_domains" "$tree/spamd.alloweddomains"
+	check "a commented mail_domains line is appended as the bare domain" \
+		"$(grep -cxF '@parish.example' "$tree/spamd.alloweddomains")" 1
+	check "and nothing carrying the comment or the spaces is appended" \
+		"$(grep -c -e '@parish.example ' -e '@parish.example#' "$tree/spamd.alloweddomains")" 0
 
 	# --- the mail-from table ---
 	# The submission rule is only as good as this table: it is a set of allowed

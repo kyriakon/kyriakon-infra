@@ -789,7 +789,7 @@ else
 			printf 'mail domains: %s names these and %s has no line for them, so spamd traps them and blocklists the sender:\n' \
 				"$mail_domains_table" "$spamd_allowed"
 			printf '%s\n' "$unwelcome" | sed -e 's/^/  /'
-			printf '  the line it wants is @<domain>; add it and reload spamd\n'
+			printf '  the line it wants is @<domain>; add it and restart spamd\n'
 			status=1
 			mail_domains_ok=no
 		fi

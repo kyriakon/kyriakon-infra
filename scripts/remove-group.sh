@@ -46,6 +46,10 @@
 # the configuration first, and it is skipped when no table changed, because a
 # restart that changes nothing is a service blip for no reason.
 #
+# spamd reads its allow list at start and has no reload verb either, so it is
+# restarted by reload-spamd.sh when the domain's `@<domain>` line was there to
+# remove. A line that was already gone restarts nothing.
+#
 # Idempotent: a second run, or a run after one that stopped partway, removes what
 # is left and prints nothing when there is nothing. A table is rewritten through
 # a temporary beside it and moved into place, with a timestamped copy of the old
@@ -106,8 +110,10 @@ domain_ok() {
 	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
 }
 
-# The restart, as a function so the self-test can record it instead of running it.
+# The restarts, as functions so the self-test can record them instead of running
+# them.
 reload_smtpd() { ksh "$script_dir/reload-smtpd.sh"; }
+reload_spamd() { ksh "$script_dir/reload-spamd.sh"; }
 
 # remove_path <description> <path>: remove one file or symlink, saying so only
 # when it was there.
@@ -152,6 +158,12 @@ remove_group() {
 		"removed $domain from $mail_domains" || return 1
 	drop_table "$dkim_domains" exact "$domain" \
 		"removed $domain from $dkim_domains" || return 1
+	# spamd is a separate daemon with its own restart, so whether its line was
+	# there is recorded before the drop: a second run restarts nothing.
+	spamd_changed=no
+	if [ -f "$spamd_alloweddomains" ] && grep -qxF "@$domain" "$spamd_alloweddomains"; then
+		spamd_changed=yes
+	fi
 	drop_table "$spamd_alloweddomains" exact "@$domain" \
 		"removed @$domain from $spamd_alloweddomains" || return 1
 	drop_table "$virtuals" suffix "@$domain" \
@@ -172,11 +184,15 @@ remove_group() {
 	remove_path "capsule key" "$ssl_private/capsule-$domain.key"
 	remove_path "queued certificate request" "$acme_queue_dir/pending/$domain"
 
-	# 3. smtpd, once, and only if a table changed. The tables were already
-	# rewritten, so this makes both live together.
+	# 3. The two daemons, once each, and only when their own files changed. The
+	# files were already rewritten, so each restart makes what is on disk live.
 	if [ "$tables_changed" = yes ]; then
 		reload_smtpd
 		printf 'restarted smtpd, which reads the tables at start\n'
+	fi
+	if [ "$spamd_changed" = yes ]; then
+		reload_spamd
+		printf 'restarted spamd, which reads the allow list at start\n'
 	fi
 	return 0
 }
@@ -208,6 +224,7 @@ self_test() {
 		"$acme_d" "$ssl_private" "$acme_queue_dir/pending"
 
 	reload_smtpd() { printf 'reload-smtpd\n' >>"$calls"; }
+	reload_spamd() { printf 'reload-spamd\n' >>"$calls"; }
 
 	domain=parish.example
 	other=other.example
@@ -299,6 +316,8 @@ self_test() {
 	check "a copy of the old table was kept" \
 		"$(find "$(dirname "$mail_domains")" -name 'mail_domains.*.bak' | wc -l | tr -d ' ')" 1
 	check "smtpd was restarted once" "$(grep -c '^reload-smtpd$' "$calls")" 1
+	check "and spamd, whose allow list lost the line" \
+		"$(grep -c '^reload-spamd$' "$calls")" 1
 	check "and the first run said what it did" \
 		"$(grep -c '^removed ' "$tree/first.out")" 14
 

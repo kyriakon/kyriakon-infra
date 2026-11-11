@@ -66,10 +66,11 @@ dkim_domains = "/etc/mail/dkim_domains"
 # line here is treated as a spamtrap hit and its address is blocklisted for 24
 # hours, which is what happened to every external sender writing to a body's
 # domain while this file named only the platform's. The drain adds a body's
-# domain when its group is provisioned, scripts/remove-group.sh takes it out
-# again, and scripts/deploy-mail.sh merges /etc/mail/mail_domains into it on
-# every deploy rather than installing the tracked copy over the live one. A
-# value rather than a compiled-in path because a test points it at a fixture.
+# domain when its group is provisioned and restarts spamd, which reads this file
+# only at start; scripts/remove-group.sh takes it out and restarts spamd again;
+# and scripts/deploy-mail.sh merges /etc/mail/mail_domains into it on every
+# deploy rather than installing the tracked copy over the live one. A value
+# rather than a compiled-in path because a test points it at a fixture.
 spamd_alloweddomains = "/etc/mail/spamd.alloweddomains"
 
 # The root-only HMAC-SHA256 key the review email's three links and the one-time

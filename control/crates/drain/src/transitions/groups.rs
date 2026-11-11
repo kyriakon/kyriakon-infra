@@ -365,6 +365,10 @@ pub async fn provision_group(
     // when it adds a new account's platform address, and that restart is what
     // makes these lines live.
     ensure_group_domain(cfg, &intent.domain)?;
+    // spamd reads the pass-through list at start and has no reload verb, so the
+    // body's line is not live until it restarts. Without this, mail to a group
+    // provisioned between deploys is still trapped and its senders blocklisted.
+    run_script(cfg, "reload-spamd.sh", &[]).await?;
     for address in &intent.addresses {
         ensure_table_line(
             &cfg.virtuals,
