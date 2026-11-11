@@ -494,6 +494,7 @@ async fn write_group_application(
             copy.as_bytes(),
         )
         .await
+        .map_err(String::from)
 }
 
 /// The mailbox's account record: a reference to its group and no payment block
@@ -584,6 +585,7 @@ pub async fn write_account_record(
             0o640,
         )
         .await
+        .map_err(String::from)
 }
 
 /// The same for a group's record, for the same reason: the account page of any
@@ -603,6 +605,7 @@ pub(super) async fn write_group_state(
             0o640,
         )
         .await
+        .map_err(String::from)
 }
 
 /// The lock every writer of a mail table holds: a `<table>.lock` directory with
@@ -888,6 +891,7 @@ pub(super) async fn hold_name(store: &Store, username: &str) -> Result<(), Strin
     store
         .write_record("holds", &format!("{username}.json"), &bytes)
         .await
+        .map_err(String::from)
 }
 
 /// The three steps that close one mailbox: its name held for ninety days, its

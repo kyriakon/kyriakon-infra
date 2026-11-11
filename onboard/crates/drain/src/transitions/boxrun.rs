@@ -86,6 +86,7 @@ pub(super) async fn write_public_key(
     store
         .write_record("keys", &format!("{username}.pub"), &bytes)
         .await
+        .map_err(String::from)
 }
 
 /// The localpart a mail key is published and served under: the mailbox when the

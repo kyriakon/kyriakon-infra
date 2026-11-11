@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::store::Error;
 use crate::store::{self, KeyRecord, Store};
 use crate::util;
 
@@ -61,15 +62,17 @@ pub fn valid_token(token: &str) -> bool {
 /// Read a draft, or `None` when the token names nothing that parses. A missing
 /// draft and an expired one are the same to the caller, which is what keeps the
 /// route from being a token oracle.
-pub async fn load(store: &Store, token: &str) -> Result<Option<Draft>, String> {
+pub async fn load(store: &Store, token: &str) -> Result<Option<Draft>, Error> {
     if !valid_token(token) {
         return Ok(None);
     }
     let Some(text) = store.read_record("drafts", &format!("{token}.json")).await else {
         return Ok(None);
     };
-    let draft: Draft = serde_json::from_str(&text)
-        .map_err(|e| format!("the draft {token} does not parse: {e}"))?;
+    let draft: Draft = serde_json::from_str(&text).map_err(|source| Error::Parse {
+        path: format!("drafts/{token}.json").into(),
+        source,
+    })?;
     if draft.token != token {
         return Ok(None);
     }
@@ -85,11 +88,13 @@ pub async fn load(store: &Store, token: &str) -> Result<Option<Draft>, String> {
 /// A caller that reads and then writes must hold `Store::lock("drafts/.lock")`
 /// across both: the handler advances a draft while the drain files a mailed key
 /// into it, and one of the two saves would otherwise overwrite the other.
-pub async fn save(store: &Store, draft: &mut Draft) -> Result<(), String> {
+pub async fn save(store: &Store, draft: &mut Draft) -> Result<(), Error> {
     draft.updated_at = util::filed_at();
     store.ensure_dir("drafts").await?;
-    let bytes =
-        serde_json::to_vec_pretty(draft).map_err(|e| format!("cannot encode the draft: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(draft).map_err(|source| Error::Encode {
+        what: "the draft",
+        source,
+    })?;
     let owner = store.dir_owner("drafts");
     store
         .write_record_owned("drafts", &format!("{}.json", draft.token), &bytes, owner)
@@ -97,7 +102,7 @@ pub async fn save(store: &Store, draft: &mut Draft) -> Result<(), String> {
 }
 
 /// Remove a draft once it has become an application.
-pub async fn remove(store: &Store, token: &str) -> Result<(), String> {
+pub async fn remove(store: &Store, token: &str) -> Result<(), Error> {
     store.remove("drafts", &format!("{token}.json")).await
 }
 

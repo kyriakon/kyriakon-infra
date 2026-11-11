@@ -220,7 +220,11 @@ fn record_path(username: &str) -> String {
 /// error, because a record the command cannot see must not read as a clear
 /// docket.
 async fn read_all(store: &Store, username: &str) -> Result<Vec<RequestLine>, String> {
-    store.log(&record_path(username)).jsonl().await
+    store
+        .log(&record_path(username))
+        .jsonl()
+        .await
+        .map_err(String::from)
 }
 
 /// Append one request line and return it, so the caller can print the due date.

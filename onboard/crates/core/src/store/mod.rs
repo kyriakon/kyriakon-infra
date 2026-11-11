@@ -17,7 +17,10 @@
 //! [`Store::rewrite_log`], measured by the name and by `pub(crate)`.
 
 pub mod draft;
+pub mod error;
 pub mod journal;
+
+pub use error::{Action, Error};
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::fchown;
@@ -76,10 +79,14 @@ impl Store {
         self.root.join(rel)
     }
 
-    pub async fn read_text(path: &str) -> Result<String, String> {
+    pub async fn read_text(path: &str) -> Result<String, Error> {
         tokio::fs::read_to_string(path)
             .await
-            .map_err(|e| format!("cannot read {path}: {e}"))
+            .map_err(|source| Error::Io {
+                action: Action::Read,
+                path: path.into(),
+                source,
+            })
     }
 
     /// Read a record's bytes when a missing one and a damaged one mean the same
@@ -95,11 +102,15 @@ impl Store {
 
     /// One record's bytes, `Ok(None)` only when the file is absent. An IO error
     /// other than not-found is an error naming the file.
-    async fn record_text(&self, rel: &str) -> Result<Option<String>, String> {
+    async fn record_text(&self, rel: &str) -> Result<Option<String>, Error> {
         match tokio::fs::read_to_string(self.root.join(rel)).await {
             Ok(text) => Ok(Some(text)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("cannot read {rel}: {e}")),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(Error::Io {
+                action: Action::Read,
+                path: rel.into(),
+                source,
+            }),
         }
     }
 
@@ -108,36 +119,39 @@ impl Store {
     /// caller that has to tell a record that has gone from one that is damaged
     /// reads through this, not [`Store::read_record`], where both are "not
     /// there".
-    async fn typed_record<T: DeserializeOwned>(&self, rel: &str) -> Result<Option<T>, String> {
+    async fn typed_record<T: DeserializeOwned>(&self, rel: &str) -> Result<Option<T>, Error> {
         let Some(text) = self.record_text(rel).await? else {
             return Ok(None);
         };
         serde_json::from_str(&text)
             .map(Some)
-            .map_err(|e| format!("{rel} does not parse: {e}"))
+            .map_err(|source| Error::Parse {
+                path: rel.into(),
+                source,
+            })
     }
 
     /// One account record, `accounts/<username>/account.json`.
-    pub async fn account(&self, username: &str) -> Result<Option<Account>, String> {
+    pub async fn account(&self, username: &str) -> Result<Option<Account>, Error> {
         self.typed_record(&format!("accounts/{username}/account.json"))
             .await
     }
 
     /// The same record as written, for the export, which copies it as recorded
     /// rather than re-encoding the fields this build models.
-    pub async fn account_text(&self, username: &str) -> Result<Option<String>, String> {
+    pub async fn account_text(&self, username: &str) -> Result<Option<String>, Error> {
         self.record_text(&format!("accounts/{username}/account.json"))
             .await
     }
 
     /// One group record, `groups/<domain>/group.json`.
-    pub async fn group(&self, domain: &str) -> Result<Option<GroupRecord>, String> {
+    pub async fn group(&self, domain: &str) -> Result<Option<GroupRecord>, Error> {
         self.typed_record(&format!("groups/{domain}/group.json"))
             .await
     }
 
     /// One filed application, `applications/<token>.json`.
-    pub async fn application(&self, token: &str) -> Result<Option<Record>, String> {
+    pub async fn application(&self, token: &str) -> Result<Option<Record>, Error> {
         self.typed_record(&format!("applications/{token}.json"))
             .await
     }
@@ -145,7 +159,7 @@ impl Store {
     /// The filed application as written. Two callers edit one key and write it
     /// back, and the record carries fields this build does not model, so a
     /// round trip through [`Record`] would drop them.
-    pub async fn filed_application_text(&self, token: &str) -> Result<Option<String>, String> {
+    pub async fn filed_application_text(&self, token: &str) -> Result<Option<String>, Error> {
         self.record_text(&format!("applications/{token}.json"))
             .await
     }
@@ -154,7 +168,7 @@ impl Store {
     /// Its callers parse a field or two and copy it whole for the export, so it
     /// is read as text; the miss-versus-damage split is the same as the typed
     /// reads'.
-    pub async fn account_application_text(&self, username: &str) -> Result<Option<String>, String> {
+    pub async fn account_application_text(&self, username: &str) -> Result<Option<String>, Error> {
         self.record_text(&format!("accounts/{username}/application.json"))
             .await
     }
@@ -162,14 +176,14 @@ impl Store {
     /// One token index entry, `tokens/<reference>.json`. This is the only join
     /// between a payment and who it pays for, so a record that cannot be read is
     /// an error rather than a token that names nobody.
-    pub async fn token(&self, reference: &str) -> Result<Option<TokenRecord>, String> {
+    pub async fn token(&self, reference: &str) -> Result<Option<TokenRecord>, Error> {
         self.typed_record(&format!("tokens/{reference}.json")).await
     }
 
     /// One username hold, `holds/<username>.json`, as written. The one field
     /// read today is `until`, and a damaged file is an error: treating it as no
     /// hold would release a name the platform is still holding.
-    pub async fn hold(&self, username: &str) -> Result<Option<serde_json::Value>, String> {
+    pub async fn hold(&self, username: &str) -> Result<Option<serde_json::Value>, Error> {
         self.typed_record(&format!("holds/{username}.json")).await
     }
 
@@ -178,7 +192,7 @@ impl Store {
     /// temporary file rather than a truncated record. The file is created 0600,
     /// so the umask cannot widen the applicant's own words, keys and outside
     /// address beyond the account that wrote them and root.
-    pub async fn write_record(&self, dir: &str, name: &str, bytes: &[u8]) -> Result<(), String> {
+    pub async fn write_record(&self, dir: &str, name: &str, bytes: &[u8]) -> Result<(), Error> {
         self.write_record_owned(dir, name, bytes, None).await
     }
 
@@ -200,7 +214,7 @@ impl Store {
         name: &str,
         bytes: &[u8],
         owner: Option<(u32, u32)>,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         self.write_record_mode(dir, name, bytes, owner, 0o600).await
     }
 
@@ -215,25 +229,25 @@ impl Store {
         bytes: &[u8],
         owner: Option<(u32, u32)>,
         mode: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         // The handler renders account and group records and runs as `_onboard`,
         // so a root-only mode here is a page that reads as missing. Refuse it
         // rather than letting three call sites rediscover the rule.
         if matches!(name, "account.json" | "group.json") && mode & 0o040 == 0 {
-            return Err(format!(
+            return Err(Error::Refused(format!(
                 "{name} is read by the unprivileged handler; write it 0640 through \
                  write_account_record or write_group_state"
-            ));
+            )));
         }
         // An append-only record is not replaced whole. The type already refuses
         // it through `Store::log`; this is the same rule for a caller that names
         // the file as a path, and the error says the name of the write that is
         // allowed to.
         if name.ends_with(".jsonl") {
-            return Err(format!(
+            return Err(Error::Refused(format!(
                 "{name} is an append-only record; Store::rewrite_log is the one write \
                  that completes a line already recorded"
-            ));
+            )));
         }
         self.place_record(dir, name, bytes, owner, mode).await
     }
@@ -247,7 +261,7 @@ impl Store {
         bytes: &[u8],
         owner: Option<(u32, u32)>,
         mode: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         let d = self.root.join(dir);
         let tmp = d.join(format!(".{name}.tmp"));
         let target = d.join(name);
@@ -257,10 +271,10 @@ impl Store {
         // one the handler can redirect. Refuse it rather than unlink it.
         if let Ok(md) = tokio::fs::symlink_metadata(&tmp).await {
             if md.file_type().is_symlink() {
-                return Err(format!(
+                return Err(Error::Refused(format!(
                     "a symlink is planted at {}; a record is not written through it",
                     tmp.display()
-                ));
+                )));
             }
             let _ = tokio::fs::remove_file(&tmp).await;
         }
@@ -296,9 +310,13 @@ impl Store {
             tokio::fs::rename(&tmp, &target).await
         }
         .await;
-        placed.map_err(|e| {
+        placed.map_err(|source| {
             let _ = std::fs::remove_file(&tmp);
-            format!("cannot place a record in {}: {e}", d.display())
+            Error::Io {
+                action: Action::Place,
+                path: d,
+                source,
+            }
         })
     }
 
@@ -311,7 +329,7 @@ impl Store {
     /// that cannot be read is an error: skipping it would turn a pinned
     /// certificate into a stranger's session, and the caller renders the
     /// failure instead.
-    pub async fn account_for_certificate(&self, hash: &str) -> Result<Option<Account>, String> {
+    pub async fn account_for_certificate(&self, hash: &str) -> Result<Option<Account>, Error> {
         if hash.is_empty() {
             return Ok(None);
         }
@@ -329,19 +347,25 @@ impl Store {
     /// The names in one directory, sorted. A missing directory reads as empty,
     /// which is what a first run against a fresh store is: no intents, no
     /// journal, no notices, and none of those is an error to a reader.
-    pub async fn list(&self, dir: &str) -> Result<Vec<String>, String> {
+    pub async fn list(&self, dir: &str) -> Result<Vec<String>, Error> {
         let d = self.root.join(dir);
         let mut rd = match tokio::fs::read_dir(&d).await {
             Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(format!("cannot read {}: {e}", d.display())),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(Error::Io {
+                    action: Action::Read,
+                    path: d.clone(),
+                    source,
+                })
+            }
         };
         let mut out = Vec::new();
-        while let Some(entry) = rd
-            .next_entry()
-            .await
-            .map_err(|e| format!("cannot read {}: {e}", d.display()))?
-        {
+        while let Some(entry) = rd.next_entry().await.map_err(|source| Error::Io {
+            action: Action::Read,
+            path: d.clone(),
+            source,
+        })? {
             let name = entry.file_name().to_string_lossy().into_owned();
             // A temporary left by an interrupted write is not a record.
             if name.starts_with('.') {
@@ -371,20 +395,24 @@ impl Store {
         bytes: &[u8],
         owner: Option<(u32, u32)>,
         mode: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         // The account page lists every notice, so the handler reads this one
         // append file; a root-only line is a notice the member cannot see.
         if path.ends_with("notices.jsonl") && mode & 0o040 == 0 {
-            return Err(
+            return Err(Error::Refused(
                 "notices.jsonl is read by the unprivileged handler; append it 0640".to_string(),
-            );
+            ));
         }
         use std::os::unix::fs::PermissionsExt;
         let p = self.root.join(path);
         if let Some(parent) = p.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+                .map_err(|source| Error::Io {
+                    action: Action::Create,
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
         }
         let mut line = bytes.to_vec();
         if !line.ends_with(b"\n") {
@@ -428,22 +456,27 @@ impl Store {
             }
         }
         .await;
-        placed.map_err(|e| format!("cannot append to {}: {e}", p.display()))
+        placed.map_err(|source| Error::Io {
+            action: Action::Append,
+            path: p,
+            source,
+        })
     }
 
     /// Create a directory under the root with its parents, 0700. The mode is
     /// passed to `DirBuilder` rather than left to the umask, so the comment and
     /// the code cannot disagree; an existing directory keeps the mode
     /// `scripts/onboard-store.sh` gave it.
-    pub async fn ensure_dir(&self, dir: &str) -> Result<(), String> {
+    pub async fn ensure_dir(&self, dir: &str) -> Result<(), Error> {
         let d = self.root.join(dir);
         let mut builder = tokio::fs::DirBuilder::new();
         builder.recursive(true);
         builder.mode(0o700);
-        builder
-            .create(&d)
-            .await
-            .map_err(|e| format!("cannot create {}: {e}", d.display()))
+        builder.create(&d).await.map_err(|source| Error::Io {
+            action: Action::Create,
+            path: d,
+            source,
+        })
     }
 
     /// The owner of a directory under the store. The drain uses this to write
@@ -457,15 +490,16 @@ impl Store {
     /// Remove one record. A record that is not there reads as done, so a purge
     /// that is interrupted and rerun completes rather than failing on the files
     /// it already cleared.
-    pub async fn remove(&self, dir: &str, name: &str) -> Result<(), String> {
+    pub async fn remove(&self, dir: &str, name: &str) -> Result<(), Error> {
         let p = self.root.join(dir).join(name);
         match tokio::fs::remove_file(&p).await {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!(
-                "cannot remove a record in {}: {e}",
-                self.root.join(dir).display()
-            )),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(Error::Io {
+                action: Action::Remove,
+                path: self.root.join(dir),
+                source,
+            }),
         }
     }
 
@@ -487,14 +521,14 @@ impl Store {
     /// then handed to the directory's owner, because the drain takes some of
     /// these locks as root and a root-owned 0600 lock in the handler's directory
     /// is one the handler can no longer take.
-    pub async fn lock(&self, rel: &str) -> Result<tokio::fs::File, String> {
+    pub async fn lock(&self, rel: &str) -> Result<tokio::fs::File, Error> {
         let file = self.open_lock(rel).await?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(format!(
-                "cannot lock {}: {}",
-                self.root.join(rel).display(),
-                std::io::Error::last_os_error()
-            ));
+            return Err(Error::Io {
+                action: Action::Lock,
+                path: self.root.join(rel),
+                source: std::io::Error::last_os_error(),
+            });
         }
         Ok(file)
     }
@@ -503,24 +537,25 @@ impl Store {
     /// The drain's pass lock takes this, because an overlapping tick is one to
     /// skip rather than one to queue behind, and holds it for the process's
     /// life: the kernel releases it however the process exits.
-    pub async fn try_lock(&self, rel: &str) -> Result<Option<tokio::fs::File>, String> {
+    pub async fn try_lock(&self, rel: &str) -> Result<Option<tokio::fs::File>, Error> {
         let file = self.open_lock(rel).await?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(Some(file));
         }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        let source = std::io::Error::last_os_error();
+        if source.raw_os_error() == Some(libc::EWOULDBLOCK) {
             return Ok(None);
         }
-        Err(format!(
-            "cannot lock {}: {error}",
-            self.root.join(rel).display()
-        ))
+        Err(Error::Io {
+            action: Action::Lock,
+            path: self.root.join(rel),
+            source,
+        })
     }
 
     /// Open the lock file both of the above take, its directory made if the
     /// store has not been laid out yet.
-    async fn open_lock(&self, rel: &str) -> Result<tokio::fs::File, String> {
+    async fn open_lock(&self, rel: &str) -> Result<tokio::fs::File, Error> {
         // The record's directory, or the store root for a record at the top: a
         // store not laid out yet still needs a lock file.
         let dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
@@ -535,18 +570,22 @@ impl Store {
             .create(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW);
-        let file = opts
-            .open(&path)
-            .await
-            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        let file = opts.open(&path).await.map_err(|source| Error::Io {
+            action: Action::Open,
+            path: path.clone(),
+            source,
+        })?;
         // chown needs root, and only root ever hands a lock to another owner: a
         // test runs as the directory's own owner already.
         if unsafe { libc::geteuid() } == 0 {
             if let Some((uid, gid)) = self.dir_owner(dir) {
                 // The descriptor, after the no-follow open: a `chown` of the
                 // path would follow whatever the name points at by then.
-                fchown(&file, Some(uid), Some(gid))
-                    .map_err(|e| format!("cannot hand {} to its owner: {e}", path.display()))?;
+                fchown(&file, Some(uid), Some(gid)).map_err(|source| Error::Io {
+                    action: Action::Chown,
+                    path: path.clone(),
+                    source,
+                })?;
             }
         }
         Ok(file)
@@ -555,7 +594,7 @@ impl Store {
     /// The unattributed queue, one held payment per line. A missing file reads
     /// as empty; a read error or a line that does not parse is an error, because
     /// `reconcile list` must not report a clear queue it cannot read.
-    pub async fn held(&self) -> Result<Vec<HeldItem>, String> {
+    pub async fn held(&self) -> Result<Vec<HeldItem>, Error> {
         self.log(UNATTRIBUTED).jsonl().await
     }
 
@@ -563,12 +602,15 @@ impl Store {
     /// unreadable file or a line that does not parse is an error rather than an
     /// empty result. A reader that reports "nothing" for a record it could not
     /// read is a check that cannot see what it is checking.
-    async fn read_jsonl<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, String> {
+    async fn read_jsonl<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, Error> {
         let mut out = Vec::new();
         for (i, line) in self.read_lines(path).await?.iter().enumerate() {
             out.push(
-                serde_json::from_str(line)
-                    .map_err(|e| format!("{path}: line {} does not parse: {e}", i + 1))?,
+                serde_json::from_str(line).map_err(|source| Error::ParseLine {
+                    path: path.into(),
+                    line: i + 1,
+                    source,
+                })?,
             );
         }
         Ok(out)
@@ -581,10 +623,13 @@ impl Store {
         &self,
         path: &str,
         mut walk: impl FnMut(usize, &T) -> bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         for (i, line) in self.read_lines(path).await?.iter().enumerate() {
-            let value: T = serde_json::from_str(line)
-                .map_err(|e| format!("{path}: line {} does not parse: {e}", i + 1))?;
+            let value: T = serde_json::from_str(line).map_err(|source| Error::ParseLine {
+                path: path.into(),
+                line: i + 1,
+                source,
+            })?;
             if !walk(i, &value) {
                 return Ok(());
             }
@@ -598,7 +643,7 @@ impl Store {
         &self,
         path: &str,
         mut pred: impl FnMut(&T) -> bool,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, Error> {
         let mut hit = false;
         self.walk_jsonl(path, |_, value: &T| {
             hit = pred(value);
@@ -610,7 +655,7 @@ impl Store {
 
     /// The non-empty lines of a store file, as recorded. A missing file reads as
     /// nothing; an unreadable one is an error.
-    async fn read_lines(&self, path: &str) -> Result<Vec<String>, String> {
+    async fn read_lines(&self, path: &str) -> Result<Vec<String>, Error> {
         if path == "journal.jsonl" {
             self.reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -622,8 +667,12 @@ impl Store {
                 .map(|l| l.trim_end().to_string())
                 .filter(|l| !l.is_empty())
                 .collect()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(format!("cannot read {}: {e}", abs.display())),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(source) => Err(Error::Io {
+                action: Action::Read,
+                path: abs,
+                source,
+            }),
         }
     }
 
@@ -636,7 +685,7 @@ impl Store {
     /// write, and appends take the same lock, so a line another process appends
     /// in between is either seen by the read or lands after the rewrite.
     /// Nothing else may call this, and the name is the warning.
-    pub async fn rewrite_log(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
+    pub async fn rewrite_log(&self, path: &str, bytes: &[u8]) -> Result<(), Error> {
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
         self.place_record(dir, name, bytes, None, 0o600).await
     }
@@ -665,14 +714,14 @@ impl Log<'_> {
     /// An append takes it, and a rewrite must hold it across its read and its
     /// write. A lock on the record itself would be no lock, because the rewrite
     /// replaces the record by rename; the lock is a file of its own.
-    pub async fn lock(&self) -> Result<tokio::fs::File, String> {
+    pub async fn lock(&self) -> Result<tokio::fs::File, Error> {
         self.store.lock(&format!("{}.lock", self.path)).await
     }
 
     /// Append one line, creating the file 0600 and its directory if needed. The
     /// append takes the record's own lock, so it cannot land between a rewrite's
     /// read and its rename.
-    pub async fn append(&self, bytes: &[u8]) -> Result<(), String> {
+    pub async fn append(&self, bytes: &[u8]) -> Result<(), Error> {
         let _guard = self.lock().await?;
         self.store.append_mode(self.path, bytes, None, 0o600).await
     }
@@ -688,7 +737,7 @@ impl Log<'_> {
         bytes: &[u8],
         owner: Option<(u32, u32)>,
         mode: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         let _guard = self.lock().await?;
         self.store.append_mode(self.path, bytes, owner, mode).await
     }
@@ -707,13 +756,13 @@ impl Log<'_> {
         &self,
         _lock: &tokio::fs::File,
         bytes: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         self.store.append_mode(self.path, bytes, None, 0o600).await
     }
 
     /// The record's lines, typed: a missing record is empty, an unreadable one
     /// or a line that does not parse is an error.
-    pub async fn jsonl<T: DeserializeOwned>(&self) -> Result<Vec<T>, String> {
+    pub async fn jsonl<T: DeserializeOwned>(&self) -> Result<Vec<T>, Error> {
         self.store.read_jsonl(self.path).await
     }
 
@@ -723,7 +772,7 @@ impl Log<'_> {
     pub async fn jsonl_any<T: DeserializeOwned>(
         &self,
         pred: impl FnMut(&T) -> bool,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, Error> {
         self.store.read_jsonl_any(self.path, pred).await
     }
 
@@ -733,7 +782,7 @@ impl Log<'_> {
     pub async fn jsonl_each<T: DeserializeOwned>(
         &self,
         mut walk: impl FnMut(usize, &T),
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         self.store
             .walk_jsonl(self.path, |i, value: &T| {
                 walk(i, value);
@@ -744,7 +793,7 @@ impl Log<'_> {
 
     /// The record's lines as written. For the one reader that copies a record
     /// into an artefact verbatim — the export — rather than reading it.
-    pub async fn raw_lines(&self) -> Result<Vec<String>, String> {
+    pub async fn raw_lines(&self) -> Result<Vec<String>, Error> {
         self.store.read_lines(self.path).await
     }
 }
@@ -952,14 +1001,20 @@ impl Record {
 /// kernel pool. It is a bearer capability, so it is 128 real bits of randomness
 /// and not a ULID: a ULID spends 48 of its bits on a timestamp, which a
 /// capability must not do.
-pub async fn status_token() -> Result<String, String> {
+pub async fn status_token() -> Result<String, Error> {
     let mut bytes = [0u8; 16];
     let mut f = tokio::fs::File::open("/dev/urandom")
         .await
-        .map_err(|e| format!("cannot open /dev/urandom: {e}"))?;
-    f.read_exact(&mut bytes)
-        .await
-        .map_err(|e| format!("cannot read /dev/urandom: {e}"))?;
+        .map_err(|source| Error::Io {
+            action: Action::Open,
+            path: "/dev/urandom".into(),
+            source,
+        })?;
+    f.read_exact(&mut bytes).await.map_err(|source| Error::Io {
+        action: Action::Read,
+        path: "/dev/urandom".into(),
+        source,
+    })?;
     Ok(crockford128(bytes))
 }
 
@@ -992,14 +1047,20 @@ pub fn is_status_token(token: &str) -> bool {
 ///
 /// The masking is bias-free because 2^60 is an exact multiple of 32, so every
 /// five-bit group of the low 60 bits of a uniform 64-bit draw is uniform.
-pub async fn payment_token() -> Result<String, String> {
+pub async fn payment_token() -> Result<String, Error> {
     let mut bytes = [0u8; 8];
     let mut f = tokio::fs::File::open("/dev/urandom")
         .await
-        .map_err(|e| format!("cannot open /dev/urandom: {e}"))?;
-    f.read_exact(&mut bytes)
-        .await
-        .map_err(|e| format!("cannot read /dev/urandom: {e}"))?;
+        .map_err(|source| Error::Io {
+            action: Action::Open,
+            path: "/dev/urandom".into(),
+            source,
+        })?;
+    f.read_exact(&mut bytes).await.map_err(|source| Error::Io {
+        action: Action::Read,
+        path: "/dev/urandom".into(),
+        source,
+    })?;
     Ok(crockford12(u64::from_be_bytes(bytes) & ((1 << 60) - 1)))
 }
 
@@ -1026,14 +1087,20 @@ fn crockford12(v: u64) -> String {
 /// Eight characters at five bits each are 40 bits, and 2^40 is an exact
 /// multiple of 32, so masking the low 40 bits of a uniform 64-bit draw is
 /// bias-free.
-pub async fn unattributed_id() -> Result<String, String> {
+pub async fn unattributed_id() -> Result<String, Error> {
     let mut bytes = [0u8; 8];
     let mut f = tokio::fs::File::open("/dev/urandom")
         .await
-        .map_err(|e| format!("cannot open /dev/urandom: {e}"))?;
-    f.read_exact(&mut bytes)
-        .await
-        .map_err(|e| format!("cannot read /dev/urandom: {e}"))?;
+        .map_err(|source| Error::Io {
+            action: Action::Open,
+            path: "/dev/urandom".into(),
+            source,
+        })?;
+    f.read_exact(&mut bytes).await.map_err(|source| Error::Io {
+        action: Action::Read,
+        path: "/dev/urandom".into(),
+        source,
+    })?;
     Ok(crockford8(u64::from_be_bytes(bytes) & ((1 << 40) - 1)))
 }
 
@@ -1500,7 +1567,7 @@ impl Account {
 /// that cannot be listed is an error rather than an empty one, and an account
 /// that cannot be read is named on stderr and left out, so the number the
 /// operator sees is never quietly wrong.
-pub async fn free_account_count(store: &Store) -> Result<usize, String> {
+pub async fn free_account_count(store: &Store) -> Result<usize, Error> {
     let names = store.list("accounts").await?;
     let mut free = 0;
     for username in names {
@@ -1510,12 +1577,9 @@ pub async fn free_account_count(store: &Store) -> Result<usize, String> {
                     free += 1;
                 }
             }
-            Ok(None) => {
-                eprintln!(
-                    "kyriakon-onboard: accounts/{username}/account.json is missing, not counted"
-                );
-            }
-            Err(e) => eprintln!("kyriakon-onboard: {e}, not counted"),
+            Ok(None) => Error::Refused("is missing, not counted".into())
+                .report(&format!("accounts/{username}/account.json")),
+            Err(e) => e.report("an account could not be read, not counted"),
         }
     }
     Ok(free)
@@ -1789,7 +1853,10 @@ mod tests {
             .account_for_certificate("SHA256:bb")
             .await
             .expect_err("a corrupt record fails the scan");
-        assert!(err.contains("accounts/broken/account.json"), "{err}");
+        assert!(
+            matches!(&err, Error::Parse { path, .. } if path.ends_with("accounts/broken/account.json")),
+            "{err}"
+        );
     }
 
     /// The typed reads split three ways: an absent file is `Ok(None)`, a
@@ -1876,21 +1943,21 @@ mod tests {
         std::fs::write(dir.join("accounts/alice/account.json"), b"{not json").unwrap();
         let err = store.account("alice").await.unwrap_err();
         assert!(
-            err.contains("accounts/alice/account.json") && err.contains("does not parse"),
+            matches!(&err, Error::Parse { path, .. } if path.ends_with("accounts/alice/account.json")),
             "{err}"
         );
 
         std::fs::write(dir.join("groups/parish.example/group.json"), b"{not json").unwrap();
         let err = store.group("parish.example").await.unwrap_err();
         assert!(
-            err.contains("groups/parish.example/group.json") && err.contains("does not parse"),
+            matches!(&err, Error::Parse { path, .. } if path.ends_with("groups/parish.example/group.json")),
             "{err}"
         );
 
         std::fs::write(dir.join("applications/tok.json"), b"{not json").unwrap();
         let err = store.application("tok").await.unwrap_err();
         assert!(
-            err.contains("applications/tok.json") && err.contains("does not parse"),
+            matches!(&err, Error::Parse { path, .. } if path.ends_with("applications/tok.json")),
             "{err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1912,7 +1979,10 @@ mod tests {
             .write_record("accounts/alice", "account.json", b"{}")
             .await
             .expect_err("a root-only account record must be refused");
-        assert!(err.contains("0640"), "{err}");
+        assert!(
+            matches!(&err, Error::Refused(message) if message.contains("0640")),
+            "{err}"
+        );
         assert!(store
             .write_record_mode("accounts/alice", "account.json", b"{}", None, 0o600)
             .await
@@ -2201,7 +2271,7 @@ mod tests {
             .jsonl::<serde_json::Value>()
             .await
             .expect_err("a line that does not parse is an error");
-        assert!(err.contains("line 2"), "{err}");
+        assert!(matches!(&err, Error::ParseLine { line: 2, .. }), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2218,7 +2288,10 @@ mod tests {
             .write_record("ledger", "payments.jsonl", b"{}\n")
             .await
             .expect_err("an append-only record must be refused");
-        assert!(err.contains("rewrite_log"), "{err}");
+        assert!(
+            matches!(&err, Error::Refused(message) if message.contains("rewrite_log")),
+            "{err}"
+        );
         assert!(!store.path("ledger/payments.jsonl").exists());
 
         store

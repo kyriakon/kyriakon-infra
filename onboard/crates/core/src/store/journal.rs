@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::store::{CreditProgress, JournalLine, Store};
+use crate::store::{CreditProgress, Error, JournalLine, Store};
 
 /// The journal's lines, indexed by intent id. The index is behind a lock only
 /// because [`Journal::append`] takes `&self`; it is never held across an await.
@@ -97,7 +97,7 @@ impl Journal {
     /// Read the journal once. A missing file is an empty journal; an unreadable
     /// one, or a line that does not parse, is an error: dedup that read an
     /// unreadable record as empty would fail open, which is #513.
-    pub async fn load(store: &Store) -> Result<Journal, String> {
+    pub async fn load(store: &Store) -> Result<Journal, Error> {
         let mut index = Index::default();
         store
             .log("journal.jsonl")
@@ -110,9 +110,11 @@ impl Journal {
 
     /// Append one line, then index it so a query later in the same pass sees
     /// it. The file is written first: the record is the truth.
-    pub async fn append(&self, store: &Store, line: &JournalLine) -> Result<(), String> {
-        let encoded = serde_json::to_string(line)
-            .map_err(|e| format!("cannot encode a journal line: {e}"))?;
+    pub async fn append(&self, store: &Store, line: &JournalLine) -> Result<(), Error> {
+        let encoded = serde_json::to_string(line).map_err(|source| Error::Encode {
+            what: "a journal line",
+            source,
+        })?;
         store
             .log("journal.jsonl")
             .append(encoded.as_bytes())
@@ -196,7 +198,7 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::ApplicationRef;
+    use crate::store::{Action, ApplicationRef};
 
     fn store(name: &str) -> (Store, std::path::PathBuf) {
         let dir =
@@ -316,7 +318,10 @@ mod tests {
             Ok(_) => panic!("an unreadable journal loaded as empty"),
             Err(e) => e,
         };
-        assert!(err.contains("journal.jsonl"), "{err}");
+        assert!(
+            matches!(&err, Error::Io { action: Action::Read, path, .. } if path.ends_with("journal.jsonl")),
+            "{err}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

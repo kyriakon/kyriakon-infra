@@ -88,6 +88,7 @@ async fn save_application(store: &Store, token: &str, record: &Record) -> Result
     store
         .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
         .await
+        .map_err(String::from)
 }
 
 /// A filed application: one review email to the reviewer, carrying every answer,
@@ -963,6 +964,7 @@ async fn mark_decided(
     store
         .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
         .await
+        .map_err(String::from)
 }
 
 fn decision_subject(what: &str, username: &str) -> String {

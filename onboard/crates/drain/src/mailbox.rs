@@ -144,7 +144,7 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), String> 
     }
     let saved = draft::save(store, &mut draft).await;
     drop(lock);
-    saved
+    saved.map_err(String::from)
 }
 
 /// Answer the sender when there is one to answer. A message with no usable From

@@ -42,7 +42,7 @@ pub(super) async fn file_application(app: &App, record: &Record) -> Result<(), S
         if let Err(remove) = app.store.remove("applications", &name).await {
             eprintln!("kyriakon-onboard: the orphaned application record {name} stays: {remove}");
         }
-        return Err(e);
+        return Err(e.into());
     }
     Ok(())
 }
