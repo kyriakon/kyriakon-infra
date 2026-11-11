@@ -739,6 +739,8 @@ self_test() {
 		"$(valid_localpart Alice && printf yes || printf no)" no
 	check "a leading dot is refused" \
 		"$(valid_localpart .alice && printf yes || printf no)" no
+	check "a leading hyphen is refused" \
+		"$(valid_localpart -alice && printf yes || printf no)" no
 	check "an interior hyphen is accepted" \
 		"$(valid_localpart a-b && printf yes || printf no)" yes
 	check "a dotted localpart is refused" \

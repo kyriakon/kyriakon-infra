@@ -128,10 +128,35 @@ pub fn domain(value: &str) -> Option<String> {
         .then(|| "a domain has at least two labels, like theirparish.example".to_string())
 }
 
+/// The localpart of an own-domain address, the key written before `@` in the
+/// virtual table. It is not an account name, a keyring filename or a DNS label,
+/// so it keeps the wider address charset and the 32 character bound.
+pub fn address_localpart_shape(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return Some("an address localpart is needed".to_string());
+    }
+    if value.chars().count() > 32 {
+        return Some("an address localpart is at most 32 characters".to_string());
+    }
+    let first = value.as_bytes()[0];
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return Some("an address localpart starts with a lowercase letter or a digit".to_string());
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Some(
+            "an address localpart is lowercase letters, digits, dot, underscore and hyphen"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// The body's addresses, one per line, each `localpart: own` or
-/// `localpart: alias localpart`, at most ten. The localpart is the shape a
-/// username has, without the reserved set: it names an address on the body's own
-/// domain, not a name in the platform's namespace.
+/// `localpart: alias localpart`, at most ten. The localpart is an address on the
+/// body's own domain, not an account name, so dots and underscores stay legal.
 pub fn address_lines(value: &str) -> Option<String> {
     let lines: Vec<&str> = value
         .lines()
@@ -157,13 +182,13 @@ fn address_line(line: &str) -> Option<String> {
         None => return Some(malformed()),
     };
     let (local, rest) = (local.trim(), rest.trim());
-    if let Some(why) = username_shape(local) {
+    if let Some(why) = address_localpart_shape(local) {
         return Some(format!("the address line {line:?}: {why}"));
     }
     let mut words = rest.split_whitespace();
     match (words.next(), words.next(), words.next()) {
         (Some("own"), None, None) => None,
-        (Some("alias"), Some(target), None) => username_shape(target)
+        (Some("alias"), Some(target), None) => address_localpart_shape(target)
             .map(|why| format!("the address line {line:?}: the alias target {target:?} {why}")),
         _ => Some(malformed()),
     }
@@ -347,6 +372,8 @@ mod tests {
     #[test]
     fn the_body_addresses_are_checked_line_by_line() {
         assert!(address_lines("secretary: own\nhall: alias secretary").is_none());
+        assert!(address_lines("first.last: own\nhall: alias first.last").is_none());
+        assert!(address_lines("first_last: own").is_none());
         assert!(address_lines("secretary: own").is_none());
         assert!(address_lines("secretary")
             .unwrap()

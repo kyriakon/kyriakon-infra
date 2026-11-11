@@ -636,10 +636,20 @@ mod tests {
         // and a DNS label at once.
         let thirty_one = "a".repeat(31);
         let thirty_two = "a".repeat(32);
-        for value in ["a", "7", "a-b", "a1-2b", thirty_one.as_str(), "alice+tag"] {
+        let tagged = format!("{thirty_one}+tag");
+        for value in [
+            "a",
+            "7",
+            "a-b",
+            "a1-2b",
+            thirty_one.as_str(),
+            "alice+tag",
+            tagged.as_str(),
+        ] {
             assert!(base_localpart(value).is_ok(), "{value}");
         }
         assert_eq!(base_localpart("alice+tag").unwrap(), "alice");
+        assert_eq!(base_localpart(&tagged).unwrap(), thirty_one.as_str());
         for value in [
             "",
             "+tag",

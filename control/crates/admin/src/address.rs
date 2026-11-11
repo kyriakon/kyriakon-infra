@@ -48,7 +48,7 @@ pub(crate) async fn address(
                 "--address is needed for this change".to_string(),
             ));
         }
-        if let Some(why) = validate::username_shape(address) {
+        if let Some(why) = validate::address_localpart_shape(address) {
             return Err(Error::Failed(format!("the address {address:?}: {why}")));
         }
     }
