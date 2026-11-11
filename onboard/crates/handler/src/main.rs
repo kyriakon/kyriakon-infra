@@ -39,7 +39,9 @@ async fn run() -> Result<(), responder::Error> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--config" => {
-                cfg_path = PathBuf::from(args.next().ok_or("--config needs a path")?);
+                cfg_path = PathBuf::from(args.next().ok_or_else(|| {
+                    responder::Error::Failed("--config needs a path".to_string())
+                })?);
             }
             other => {
                 return Err(responder::Error::Startup(format!(

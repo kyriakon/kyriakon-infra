@@ -86,7 +86,9 @@ pub(super) async fn portal_connection(stream: UnixStream, app: &App) -> Result<(
         // answers and the token never are. The code a refusal gets is not 200,
         // because a count of filed applications reads this line.
         let code = if reply.starts_with("OK ") { 200 } else { 422 };
-        eprintln!("kyriakon-onboard: portal /apply {code} {address}");
+        kyriakon_onboard_core::util::log(&format!(
+            "kyriakon-onboard: portal /apply {code} {address}"
+        ));
         return say(&mut writer, reply.as_bytes()).await;
     }
     let Some((address, token)) = ipc::parse_request(&line) else {
@@ -97,7 +99,9 @@ pub(super) async fn portal_connection(stream: UnixStream, app: &App) -> Result<(
     let answer = portal_answer(app, address, token).await;
     // The route carries the token and the address, which is the log line every
     // other front-end gets; the answer never does.
-    eprintln!("kyriakon-onboard: portal /status/{token} 200 {address}");
+    kyriakon_onboard_core::util::log(&format!(
+        "kyriakon-onboard: portal /status/{token} 200 {address}"
+    ));
     say(&mut writer, answer.line().as_bytes()).await
 }
 

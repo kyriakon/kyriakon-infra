@@ -36,13 +36,13 @@ pub fn read_key(path: &std::path::Path) -> Result<Vec<u8>, Error> {
     let meta = std::fs::metadata(path)
         .map_err(|e| Error::context(format!("cannot read {}", path.display()), e))?;
     if unsafe { libc::geteuid() } == 0 && meta.uid() != 0 {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "{} is not owned by root",
             path.display()
         )));
     }
     if meta.mode() & 0o077 != 0 {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "{} is readable by group or others; it must be 0600",
             path.display()
         )));
@@ -56,7 +56,7 @@ pub fn read_key(path: &std::path::Path) -> Result<Vec<u8>, Error> {
         .unwrap_or(0);
     let key = bytes[..end].to_vec();
     if key.is_empty() {
-        return Err(Error::from(format!("{} is empty", path.display())));
+        return Err(Error::Failed(format!("{} is empty", path.display())));
     }
     Ok(key)
 }

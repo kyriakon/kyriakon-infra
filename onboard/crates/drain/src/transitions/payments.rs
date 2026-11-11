@@ -110,17 +110,17 @@ pub async fn credit(
 /// checked only when there is one: a payment with none is held, not refused.
 fn credit_fields(intent: &CreditIntent) -> Result<i64, Error> {
     if !CREDIT_RAILS.contains(&intent.rail.as_str()) {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the credit names a rail that is not cash, cash-hand or monero".to_string(),
         ));
     }
     if !intent.token.is_empty() && !store::is_payment_token(&intent.token) {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the credit's token is not the shape of a payment token".to_string(),
         ));
     }
     let Some(received) = util::parse_date(&intent.received) else {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the credit's received date is not YYYY-MM-DD".to_string(),
         ));
     };
@@ -129,24 +129,24 @@ fn credit_fields(intent: &CreditIntent) -> Result<i64, Error> {
     // the difference between a refused intent and a pass that panics and starves
     // every intent behind it.
     if util::received_beyond_window(received, OffsetDateTime::now_utc().date()) {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the credit's received date {} is more than two years ahead",
             intent.received
         )));
     }
     if !valid_txid(intent.txid.as_deref()) {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the credit's transaction id is not 64 hexadecimal characters".to_string(),
         ));
     }
     if !valid_xmr(intent.amount_xmr.as_deref()) {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the credit's XMR amount is not a decimal amount".to_string(),
         ));
     }
     match util::pence(&intent.amount_gbp) {
         Ok(amount) if amount > 0 => Ok(amount),
-        Ok(_) => Err(Error::from(
+        Ok(_) => Err(Error::Failed(
             "the credit's amount must be more than zero".to_string(),
         )),
         Err(e) => Err(Error::from(e)),
@@ -160,7 +160,7 @@ pub(super) async fn token_join(store: &Store, token: &str) -> Result<Option<Toke
         return Ok(None);
     };
     if join.token != token {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the token record does not name this token".to_string(),
         ));
     }
@@ -176,34 +176,34 @@ pub(super) async fn resolve_payment(
     token: &str,
 ) -> Result<(String, Account, Payment), Error> {
     let Some(join) = token_join(store, token).await? else {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the token is not in the index; an unattributed payment belongs in the queue"
                 .to_string(),
         ));
     };
     if join.group.is_some() {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the token belongs to a group, whose payment is held on the group's record".to_string(),
         ));
     }
     if validate::username_shape(&join.username).is_some() {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the token record does not name this token".to_string(),
         ));
     }
     let username = join.username;
     let Some(account) = store.account(&username).await? else {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the token resolves to an account that is gone".to_string(),
         ));
     };
     let Some(payment) = account.payment_state() else {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the account carries no payment block".to_string(),
         ));
     };
     if payment.token_ref.as_deref() != Some(token) {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the token is not the one the account's payment block holds".to_string(),
         ));
     }
@@ -310,7 +310,7 @@ async fn apply_payment(
     let price = util::pence(&cfg.price_gbp)
         .map_err(|e| Error::context("the drain's configured price_gbp", e))?;
     if price <= 0 {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the drain's configured price_gbp must be more than zero".to_string(),
         ));
     }
@@ -502,7 +502,7 @@ async fn group_credit(
     };
     let received = util::parse_date(&intent.received).expect("the date was validated above");
     if let Some(why) = validate::domain(domain) {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the token's group domain {domain:?}: {why}"
         )));
     }
@@ -576,7 +576,7 @@ async fn group_credit(
     let price = util::pence(&cfg.group_price_gbp)
         .map_err(|e| Error::context("the drain's configured group_price_gbp", e))?;
     if price <= 0 {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the drain's configured group_price_gbp must be more than zero".to_string(),
         ));
     }
@@ -736,7 +736,7 @@ async fn last_payment_line(store: &Store, token: &str) -> Result<Option<PaymentL
     let amount = line
         .amount_gbp
         .as_deref()
-        .ok_or("a payment line carries no amount")?;
+        .ok_or_else(|| Error::Failed("a payment line carries no amount".to_string()))?;
     Ok(Some(PaymentLine {
         seq: line.seq,
         rail: line.rail,
@@ -1019,14 +1019,14 @@ async fn refund_total(
     for line in &refunds.lines {
         let on = line.received_on.as_deref().unwrap_or("an earlier date");
         if line.amount_gbp.as_deref() == Some(deducted.as_str()) {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "an identical refund is already recorded at ledger seq {} on {on}",
                 line.seq
             )));
         }
     }
     if refunds.total + amount > original.amount {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "refunds of ledger seq {} already total GBP {}; another GBP {} would exceed the GBP {} that arrived",
             original.seq,
             util::gbp(refunds.total),
@@ -1447,7 +1447,7 @@ pub async fn reconcile_return(store: &Store, intent: ReturnIntent) -> Result<Set
     let item = intent.item.clone();
     rewrite_unattributed(store, &item, |line| {
         if line.state != "held" {
-            return Err(Error::from(format!("{item} is {}, not held", line.state)));
+            return Err(Error::Failed(format!("{item} is {}, not held", line.state)));
         }
         line.state = "returned".to_string();
         line.returned_at = Some(util::filed_at());
@@ -1470,7 +1470,7 @@ pub(super) async fn mark_attributed(store: &Store, item: &str, token: &str) -> R
     let token = token.to_string();
     rewrite_unattributed(store, item, move |line| {
         if line.state == "returned" {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "{id} was returned, so it cannot be attributed"
             )));
         }
@@ -1500,7 +1500,7 @@ async fn rewrite_unattributed(
     let at = items
         .iter()
         .position(|line| line.id == id)
-        .ok_or_else(|| format!("no held payment with id {id}"))?;
+        .ok_or_else(|| Error::Failed(format!("no held payment with id {id}")))?;
     change(&mut items[at])?;
     let mut bytes = String::new();
     for item in &items {

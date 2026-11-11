@@ -25,13 +25,13 @@ const MAX_LEN: usize = 72;
 pub fn validate(plain: &str) -> Result<(), Error> {
     let len = plain.chars().count();
     if len < MIN_LEN {
-        return Err(Error::from(format!("Use at least {MIN_LEN} characters.")));
+        return Err(Error::Failed(format!("Use at least {MIN_LEN} characters.")));
     }
     if plain.len() > MAX_LEN {
-        return Err(Error::from(format!("Use at most {MAX_LEN} characters.")));
+        return Err(Error::Failed(format!("Use at most {MAX_LEN} characters.")));
     }
     if plain.chars().any(char::is_control) {
-        return Err(Error::from("Use printable characters only.".to_string()));
+        return Err(Error::Failed("Use printable characters only.".to_string()));
     }
     Ok(())
 }

@@ -255,7 +255,9 @@ impl<'a> Ledger<'a> {
         for line in self.lines().await? {
             if line.token == token && line.kind == "payment" {
                 if line.amount_gbp.is_none() {
-                    return Err(Error::from("a payment line carries no amount".to_string()));
+                    return Err(Error::Failed(
+                        "a payment line carries no amount".to_string(),
+                    ));
                 }
                 found = Some(line);
             }
@@ -286,10 +288,12 @@ impl<'a> Ledger<'a> {
             if line.refund_of() != Some(original) {
                 continue;
             }
-            let text = line
-                .amount_gbp
-                .as_deref()
-                .ok_or_else(|| format!("the refund at ledger seq {} has no amount", line.seq))?;
+            let text = line.amount_gbp.as_deref().ok_or_else(|| {
+                Error::Failed(format!(
+                    "the refund at ledger seq {} has no amount",
+                    line.seq
+                ))
+            })?;
             let pence = util::pence(text.strip_prefix('-').unwrap_or(text)).map_err(|e| {
                 Error::context(
                     format!("the refund at ledger seq {} cannot be read", line.seq),

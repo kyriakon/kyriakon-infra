@@ -114,7 +114,7 @@ pub enum Error {
     /// A failure whose context is the value the caller needs, with its source.
     Context {
         context: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: Box<kyriakon_onboard_core::Source>,
     },
 }
 
@@ -150,24 +150,12 @@ impl From<std::io::Error> for Error {
 impl Error {
     pub fn context(
         context: impl Into<String>,
-        source: impl std::error::Error + Send + Sync + 'static,
+        source: impl Into<kyriakon_onboard_core::Source>,
     ) -> Self {
         Error::Context {
             context: context.into(),
-            source: Box::new(source),
+            source: Box::new(source.into()),
         }
-    }
-}
-
-impl From<String> for Error {
-    fn from(message: String) -> Self {
-        Error::Malformed(message)
-    }
-}
-
-impl From<&str> for Error {
-    fn from(message: &str) -> Self {
-        Error::Malformed(message.to_string())
     }
 }
 
@@ -198,14 +186,14 @@ pub async fn read_request<R: AsyncRead + Unpin>(
             // rather than a tidy end, and it is reported as that.
             Err(e) if e.kind() == ErrorKind::UnexpectedEof && !begun => return Ok(None),
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                return Err(Error::from(
+                return Err(Error::Malformed(
                     "the connection ended inside a request".to_string(),
                 ))
             }
             Err(e) => return Err(Error::context("cannot read a record header", e)),
         }
         if header[0] != VERSION {
-            return Err(Error::from(format!("record version {}", header[0])));
+            return Err(Error::Malformed(format!("record version {}", header[0])));
         }
         let kind = header[1];
         let record_id = u16::from_be_bytes([header[2], header[3]]);
@@ -220,7 +208,7 @@ pub async fn read_request<R: AsyncRead + Unpin>(
         content.truncate(len);
 
         if !begun && kind != BEGIN_REQUEST {
-            return Err(Error::from(
+            return Err(Error::Malformed(
                 "a record arrived before the request began".to_string(),
             ));
         }
@@ -228,7 +216,7 @@ pub async fn read_request<R: AsyncRead + Unpin>(
         match kind {
             BEGIN_REQUEST => {
                 if content.len() != 8 {
-                    return Err(Error::from(format!(
+                    return Err(Error::Malformed(format!(
                         "a begin record of {} bytes",
                         content.len()
                     )));
@@ -238,7 +226,7 @@ pub async fn read_request<R: AsyncRead + Unpin>(
                 // answers the responder's only.
                 let role = u16::from_be_bytes([content[0], content[1]]);
                 if role != 1 {
-                    return Err(Error::from(format!("role {role}")));
+                    return Err(Error::Malformed(format!("role {role}")));
                 }
                 id = record_id;
                 keep_conn = content[2] & 1 == 1;
@@ -246,7 +234,7 @@ pub async fn read_request<R: AsyncRead + Unpin>(
             }
             PARAMS => {
                 if env_buf.len() + content.len() > MAX_PARAMS {
-                    return Err(Error::from(
+                    return Err(Error::Malformed(
                         "the parameters of one request are too long".to_string(),
                     ));
                 }
@@ -263,9 +251,11 @@ pub async fn read_request<R: AsyncRead + Unpin>(
                 }
             }
             ABORT_REQUEST => {
-                return Err(Error::from("the front-end aborted the request".to_string()))
+                return Err(Error::Malformed(
+                    "the front-end aborted the request".to_string(),
+                ))
             }
-            other => return Err(Error::from(format!("record type {other}"))),
+            other => return Err(Error::Malformed(format!("record type {other}"))),
         }
     }
 
@@ -285,14 +275,16 @@ pub async fn read_request<R: AsyncRead + Unpin>(
 /// no UTF-8 at all, and a path that decodes to nonsense should miss the route
 /// table rather than fail the request: the alternative is a way to make the
 /// service log an error by asking for a file that does not exist.
-fn params(buf: &[u8]) -> Result<BTreeMap<String, String>, Error> {
+type Params = BTreeMap<String, String>;
+
+fn params(buf: &[u8]) -> Result<Params, Error> {
     let mut out = BTreeMap::new();
     let mut i = 0usize;
     while i < buf.len() {
         let name_len = length(buf, &mut i)?;
         let value_len = length(buf, &mut i)?;
         if name_len + value_len > buf.len() - i {
-            return Err(Error::from(
+            return Err(Error::Malformed(
                 "a parameter runs past the end of its record".to_string(),
             ));
         }
@@ -310,14 +302,14 @@ fn params(buf: &[u8]) -> Result<BTreeMap<String, String>, Error> {
 fn length(buf: &[u8], i: &mut usize) -> Result<usize, Error> {
     let first = *buf
         .get(*i)
-        .ok_or_else(|| "a parameter record ends inside a length".to_string())?;
+        .ok_or_else(|| Error::Malformed("a parameter record ends inside a length".to_string()))?;
     if first & 0x80 == 0 {
         *i += 1;
         return Ok(first as usize);
     }
     let four = buf
         .get(*i..*i + 4)
-        .ok_or_else(|| "a parameter record ends inside a length".to_string())?;
+        .ok_or_else(|| Error::Malformed("a parameter record ends inside a length".to_string()))?;
     *i += 4;
     Ok(u32::from_be_bytes([four[0] & 0x7f, four[1], four[2], four[3]]) as usize)
 }

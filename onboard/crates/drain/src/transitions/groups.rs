@@ -46,7 +46,7 @@ pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec
         .map(String::as_str)
         .unwrap_or("");
     if let Some(why) = validate::address_lines(text) {
-        return Err(Error::from(format!("the address table: {why}")));
+        return Err(Error::Failed(format!("the address table: {why}")));
     }
     let lines: Vec<&str> = text
         .lines()
@@ -55,7 +55,7 @@ pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec
         .collect();
     let names = questions::account_names(&record.answers);
     if names.len() != lines.len() {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "{} addresses and {} account names; there is one name per address",
             lines.len(),
             names.len()
@@ -67,17 +67,19 @@ pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec
     let mut mailboxes: Vec<String> = Vec::new();
     for (line, name) in lines.iter().zip(&names) {
         let (local, rest) = line.split_once(':').ok_or_else(|| {
-            format!("the address line {line:?} is not localpart: own or localpart: alias localpart")
+            Error::Failed(format!(
+                "the address line {line:?} is not localpart: own or localpart: alias localpart"
+            ))
         })?;
         let local = local.trim();
         if !seen.insert(local) {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the address {local} is in the table twice"
             )));
         }
         if rest.trim() == "own" {
             if mailboxes.iter().any(|m| m == name) {
-                return Err(Error::from(format!(
+                return Err(Error::Failed(format!(
                     "the mailbox {name} is named by two mailboxes; an alias shares a mailbox instead"
                 )));
             }
@@ -89,7 +91,9 @@ pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec
     let mut addresses = Vec::new();
     for (line, name) in lines.iter().zip(&names) {
         let (local, rest) = line.split_once(':').ok_or_else(|| {
-            format!("the address line {line:?} is not localpart: own or localpart: alias localpart")
+            Error::Failed(format!(
+                "the address line {line:?} is not localpart: own or localpart: alias localpart"
+            ))
         })?;
         let local = local.trim();
         if rest.trim() != "own" {
@@ -99,7 +103,9 @@ pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec
                 .map(str::trim)
                 .unwrap_or_default();
             let shared = own.get(target).ok_or_else(|| {
-                format!("the address {local} is an alias into {target}, which is not a mailbox in the table")
+                Error::Failed(format!(
+                    "the address {local} is an alias into {target}, which is not a mailbox in the table"
+                ))
             })?;
             addresses.push(GroupAddress {
                 address: local.to_string(),
@@ -127,7 +133,7 @@ pub(super) fn site_owner(record: &Record, mailboxes: &[String]) -> Result<String
         return Ok(record.username.clone());
     }
     mailboxes.first().cloned().ok_or_else(|| {
-        Error::from("the address table names no mailbox, so no account owns the site".to_string())
+        Error::Failed("the address table names no mailbox, so no account owns the site".to_string())
     })
 }
 
@@ -139,7 +145,7 @@ pub async fn group_record(store: &Store, domain: &str) -> Result<Option<GroupRec
         return Ok(None);
     };
     if record.version != 1 {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "groups/{domain}/group.json has version {}, which this build does not read",
             record.version
         )));
@@ -173,17 +179,17 @@ pub(super) async fn check_group_names(
         // A name a removed mailbox left is held for ninety days before the
         // group can reuse it. Both the approval and an add-mailbox pass here.
         if let Some(until) = name_held(store, mailbox).await? {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the account name {mailbox} is held until {until}, so it cannot be reused yet"
             )));
         }
         if existing.is_some() {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the account name {mailbox} is already taken"
             )));
         }
         if account_on_box(cfg, mailbox)? {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the account name {mailbox} is already in use on this box"
             )));
         }
@@ -201,24 +207,24 @@ pub async fn provision_group(
     intent: GroupIntent,
 ) -> Result<Settlement, Error> {
     if intent.kind != "provision-group" {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "kind {:?} is not a group intent",
             intent.kind
         )));
     }
     if let Some(why) = validate::domain(&intent.domain) {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the domain {:?}: {why}",
             intent.domain
         )));
     }
     if intent.mailboxes.is_empty() {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the intent names no mailbox, so there is nothing to provision".to_string(),
         ));
     }
     if !intent.mailboxes.iter().any(|m| m == &intent.site_owner) {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the site owner {} is not one of the mailboxes",
             intent.site_owner
         )));
@@ -226,18 +232,20 @@ pub async fn provision_group(
     let mut mailboxes = HashSet::new();
     for mailbox in &intent.mailboxes {
         if !mailboxes.insert(mailbox.as_str()) {
-            return Err(Error::from(format!("the mailbox {mailbox} is named twice")));
+            return Err(Error::Failed(format!(
+                "the mailbox {mailbox} is named twice"
+            )));
         }
     }
     for address in &intent.addresses {
         if let Some(why) = validate::username_shape(&address.address) {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the address {:?}: {why}",
                 address.address
             )));
         }
         if !intent.mailboxes.iter().any(|m| m == &address.mailbox) {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the address {}@{} points at {}, which is not a mailbox",
                 address.address, intent.domain, address.mailbox
             )));
@@ -246,7 +254,7 @@ pub async fn provision_group(
     let mut seen = HashSet::new();
     for address in &intent.addresses {
         if !seen.insert(address.address.as_str()) {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the address {} is in the table twice",
                 address.address
             )));
@@ -264,7 +272,7 @@ pub async fn provision_group(
             .cloned()
             .collect();
         if mine.is_empty() {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the mailbox {mailbox} has no mail key, so its mail would bounce"
             )));
         }
@@ -368,11 +376,9 @@ pub async fn provision_group(
 
     let app_copy = application_copy(
         store,
-        intent
-            .application
-            .status_token
-            .as_deref()
-            .ok_or("the group intent names no application token")?,
+        intent.application.status_token.as_deref().ok_or_else(|| {
+            Error::Failed("the group intent names no application token".to_string())
+        })?,
     )
     .await?;
 
@@ -652,7 +658,7 @@ impl TableLock {
                         std::fs::write(dir.join("pid"), format!("{}\n", std::process::id()))
                     {
                         let _ = std::fs::remove_dir_all(&dir);
-                        return Err(Error::from(format!(
+                        return Err(Error::Failed(format!(
                             "cannot write the owner pid into {}: {e}",
                             dir.display()
                         )));
@@ -662,7 +668,7 @@ impl TableLock {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if !reaped {
                         if let Some(reason) = stale_table_lock(&dir) {
-                            Error::from(reason)
+                            Error::Failed(reason)
                                 .report(&format!("reaping stale lock {}", dir.display()));
                             let _ = std::fs::remove_dir_all(&dir);
                             reaped = true;
@@ -671,14 +677,14 @@ impl TableLock {
                     }
                 }
                 Err(e) => {
-                    return Err(Error::from(format!("cannot lock {path}: {e}")));
+                    return Err(Error::Failed(format!("cannot lock {path}: {e}")));
                 }
             }
             if attempt < 4 {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
-        Err(Error::from(format!(
+        Err(Error::Failed(format!(
             "could not lock {path}: {} exists and did not clear; remove it if no writer is running",
             dir.display()
         )))
@@ -753,7 +759,7 @@ fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), 
                     if have.trim() == want {
                         return Ok(());
                     }
-                    return Err(Error::from(format!(
+                    return Err(Error::Failed(format!(
                         "{path} already maps {name} to {}, not {want}",
                         have.trim()
                     )));
@@ -962,19 +968,19 @@ async fn close_mailbox(cfg: &DrainConfig, store: &Store, username: &str) -> Resu
 /// material must be there and must be the mailbox's own key.
 fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, Error> {
     let Some(key) = intent.mail_key.as_ref() else {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the mailbox {} has no mail key, so its mail would bounce",
             intent.mailbox
         )));
     };
     if !key.mailbox.is_empty() && key.mailbox != intent.mailbox {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the mail key names {}, not {}",
             key.mailbox, intent.mailbox
         )));
     }
     if key.material.trim().is_empty() {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the mail key for {} is empty",
             intent.mailbox
         )));
@@ -1001,38 +1007,38 @@ pub async fn group_address(
     intent: GroupAddressIntent,
 ) -> Result<Settlement, Error> {
     if intent.kind != "group-address" {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "kind {:?} is not an address intent",
             intent.kind
         )));
     }
     if !ADDRESS_ACTIONS.contains(&intent.action.as_str()) {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "{:?} is not an address change",
             intent.action
         )));
     }
     if let Some(why) = validate::domain(&intent.domain) {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the domain {:?}: {why}",
             intent.domain
         )));
     }
     let Some(mut group) = group_record(store, &intent.domain).await? else {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "there is no group for {}, so there is no address to change",
             intent.domain
         )));
     };
     if let Some(why) = validate::username_shape(&intent.mailbox) {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the mailbox {:?}: {why}",
             intent.mailbox
         )));
     }
     if intent.action != "remove" {
         if let Some(why) = validate::username_shape(&intent.address) {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the address {:?}: {why}",
                 intent.address
             )));
@@ -1049,7 +1055,7 @@ pub async fn group_address(
     match intent.action.as_str() {
         "add-alias" => {
             if !in_group(&intent.mailbox) {
-                return Err(Error::from(format!(
+                return Err(Error::Failed(format!(
                     "the alias {}@{} points at {}, which is not a mailbox in the group",
                     intent.address, intent.domain, intent.mailbox
                 )));
@@ -1057,13 +1063,13 @@ pub async fn group_address(
             match &current {
                 Some(have) if have == &intent.mailbox => {}
                 Some(have) => {
-                    return Err(Error::from(format!(
+                    return Err(Error::Failed(format!(
                         "{} already maps {entry} to {have}, not {}",
                         cfg.virtuals, intent.mailbox
                     )))
                 }
                 None if address_count(&cfg.virtuals, &intent.domain)? >= 10 => {
-                    return Err(Error::from(format!(
+                    return Err(Error::Failed(format!(
                         "{} already carries ten addresses, so {entry} cannot be added",
                         intent.domain
                     )))
@@ -1075,7 +1081,7 @@ pub async fn group_address(
             address_key(&intent)?;
             if let Some(have) = &current {
                 if have != &intent.mailbox {
-                    return Err(Error::from(format!(
+                    return Err(Error::Failed(format!(
                         "{} already maps {entry} to {have}, not {}",
                         cfg.virtuals, intent.mailbox
                     )));
@@ -1095,7 +1101,7 @@ pub async fn group_address(
             // already in the group: a second address into an existing mailbox
             // still costs one of the ten.
             if current.is_none() && address_count(&cfg.virtuals, &intent.domain)? >= 10 {
-                return Err(Error::from(format!(
+                return Err(Error::Failed(format!(
                     "{} already carries ten addresses, so {} cannot be added",
                     intent.domain, entry
                 )));
@@ -1105,7 +1111,7 @@ pub async fn group_address(
             address_key(&intent)?;
             match &current {
                 None => {
-                    return Err(Error::from(format!(
+                    return Err(Error::Failed(format!(
                         "{} is not an address in {}, so there is no alias to upgrade",
                         entry, intent.domain
                     )))
@@ -1113,7 +1119,7 @@ pub async fn group_address(
                 Some(have) if have == &intent.mailbox => {}
                 Some(have) => {
                     if !in_group(have) {
-                        return Err(Error::from(format!(
+                        return Err(Error::Failed(format!(
                             "{} points at {have}, which is not a mailbox in the group",
                             entry
                         )));
@@ -1134,13 +1140,13 @@ pub async fn group_address(
         "remove" => {
             if group.site_owner == intent.mailbox {
                 let Some(replacement) = intent.site_owner.as_deref() else {
-                    return Err(Error::from(format!(
+                    return Err(Error::Failed(format!(
                         "{} owns the site, so the intent must name the account that takes it",
                         intent.mailbox
                     )));
                 };
                 if replacement == intent.mailbox || !in_group(replacement) {
-                    return Err(Error::from(format!(
+                    return Err(Error::Failed(format!(
                         "the replacement site owner {replacement} is not another mailbox in the group"
                     )));
                 }
@@ -1151,7 +1157,7 @@ pub async fn group_address(
                 .map(|a| a.group.as_deref() == Some(intent.domain.as_str()))
                 .unwrap_or(false);
             if !in_group(&intent.mailbox) && !ours && account_on_box(cfg, &intent.mailbox)? {
-                return Err(Error::from(format!(
+                return Err(Error::Failed(format!(
                     "the account {} is not a mailbox in {}",
                     intent.mailbox, intent.domain
                 )));
@@ -1247,10 +1253,9 @@ pub async fn group_address(
             // otherwise hand that member's key to the site.
             let site_owner_leaving = group.site_owner == intent.mailbox;
             if site_owner_leaving {
-                let replacement = intent
-                    .site_owner
-                    .as_deref()
-                    .ok_or("the site owner is leaving without a replacement")?;
+                let replacement = intent.site_owner.as_deref().ok_or_else(|| {
+                    Error::Failed("the site owner is leaving without a replacement".to_string())
+                })?;
                 let old_key = store
                     .read_record("keys", &format!("{}.pub", intent.mailbox))
                     .await;
@@ -1313,20 +1318,20 @@ pub async fn remove_group(
     intent: GroupRemoveIntent,
 ) -> Result<Settlement, Error> {
     if intent.kind != "remove-group" {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "kind {:?} is not a remove-group intent",
             intent.kind
         )));
     }
     if let Some(why) = validate::domain(&intent.domain) {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the domain {:?}: {why}",
             intent.domain
         )));
     }
 
     let Some(group) = group_record(store, &intent.domain).await? else {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "there is no group for {}, so there is no domain to remove",
             intent.domain
         )));
@@ -1391,7 +1396,10 @@ pub(super) async fn remove_group_record(store: &Store, domain: &str) -> Result<(
     match tokio::fs::remove_dir_all(&dir).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(Error::from(format!("cannot remove {}: {e}", dir.display()))),
+        Err(e) => Err(Error::Failed(format!(
+            "cannot remove {}: {e}",
+            dir.display()
+        ))),
     }
 }
 
@@ -1454,7 +1462,7 @@ pub(super) async fn name_allowed(cfg: &DrainConfig, username: &str) -> Result<()
     let reserved = reserved_names(cfg).await?;
     match validate::username(username, &reserved) {
         None => Ok(()),
-        Some(why) => Err(Error::from(format!("the username {username}: {why}"))),
+        Some(why) => Err(Error::Failed(format!("the username {username}: {why}"))),
     }
 }
 

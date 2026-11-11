@@ -166,23 +166,23 @@ pub async fn verify_proof(
     now: OffsetDateTime,
 ) -> Result<(), Error> {
     if !is_proof_token(token) {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the session carries no proof this box minted".to_string(),
         ));
     }
     let Some(proof) = read_proof(dir, token).await else {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the session's proof is not one this box minted".to_string(),
         ));
     };
     if proof.username != username {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the session belongs to {:?}, not {username:?}",
             proof.username
         )));
     }
     if now.unix_timestamp() >= proof.expires {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the session named by the intent has expired".to_string(),
         ));
     }

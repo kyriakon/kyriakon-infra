@@ -16,4 +16,4 @@ pub mod payments;
 pub mod store;
 pub mod util;
 
-pub use error::Error;
+pub use error::{Error, Source};

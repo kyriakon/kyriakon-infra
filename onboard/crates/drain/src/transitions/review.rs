@@ -105,24 +105,24 @@ pub async fn filed_application(
     intent: Intent,
 ) -> Result<Settlement, Error> {
     if intent.kind != "application" {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "kind {:?} is not an application",
             intent.kind
         )));
     }
     name_allowed(cfg, &intent.application.username).await?;
     let Some(token) = intent.application.status_token.as_deref() else {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the status token is not 128 bits of Crockford".to_string(),
         ));
     };
     if !store::is_status_token(token) {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the status token is not 128 bits of Crockford".to_string(),
         ));
     }
     if !RAILS.contains(&intent.rail.as_str()) {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the rail {:?} is not one of the four",
             intent.rail
         )));
@@ -169,11 +169,10 @@ pub async fn filed_application(
 /// The review email's body. Every field the ticket lists, and the three links
 /// beside their `kyriakon-onboardctl` equivalents.
 fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String, Error> {
-    let token = intent
-        .application
-        .status_token
-        .as_deref()
-        .ok_or("the application intent names no status token")?;
+    let token =
+        intent.application.status_token.as_deref().ok_or_else(|| {
+            Error::Failed("the application intent names no status token".to_string())
+        })?;
     let mut out = String::new();
     out.push_str(&format!("Application {}\n", intent.application.username));
     out.push_str(&format!(
@@ -274,7 +273,7 @@ pub async fn decision(
         "decline" => decline(cfg, store, journal, &intent).await,
         // Unreachable after the kind match the seam makes, kept so the dispatch
         // is total.
-        other => Err(Error::from(format!("kind {other:?} is not a decision"))),
+        other => Err(Error::Failed(format!("kind {other:?} is not a decision"))),
     }
 }
 
@@ -294,11 +293,11 @@ async fn approve(
         .application
         .status_token
         .as_deref()
-        .ok_or("the decision names no status token")?;
+        .ok_or_else(|| Error::Failed("the decision names no status token".to_string()))?;
     let username = &intent.application.username;
     let record = application_record(store, token).await?;
     if record.username != *username {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the intent's username is not the application's".to_string(),
         ));
     }
@@ -352,7 +351,7 @@ async fn approve(
         // this is the other gate that can create an account. Without it a person
         // could take a name a removal had just held.
         if let Some(until) = name_held(store, username).await? {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the username {username} is held until {until}, so it cannot be reused yet"
             )));
         }
@@ -367,7 +366,7 @@ async fn approve(
     if existing.is_none() {
         on_box = account_on_box(cfg, username)?;
         if on_box && !begun {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the username {username} is already in use on this box and this application did not create it; the intent is left in place"
             )));
         }
@@ -576,13 +575,11 @@ async fn approve(
 
     // The account's own copy of the application, inside the 90-day purge, with
     // the status link's own end written on it.
-    let mut app_copy: Value = serde_json::from_str(
-        &store
-            .filed_application_text(token)
-            .await?
-            .ok_or("the application record vanished mid-approval")?,
-    )
-    .map_err(|e| Error::context("the application record does not parse", e))?;
+    let mut app_copy: Value =
+        serde_json::from_str(&store.filed_application_text(token).await?.ok_or_else(|| {
+            Error::Failed("the application record vanished mid-approval".to_string())
+        })?)
+        .map_err(|e| Error::context("the application record does not parse", e))?;
     app_copy["status_link_until"] = json!(util::after_days(7));
     // The handler renders the status page as `_onboard` and cannot read the
     // root-owned account, so the payment block it shows is this copy, written
@@ -676,9 +673,9 @@ async fn approve_group(
     let domain = record
         .domain
         .clone()
-        .ok_or("the application names no domain")?;
+        .ok_or_else(|| Error::Failed("the application names no domain".to_string()))?;
     if let Some(why) = validate::domain(&domain) {
-        return Err(Error::from(format!("the domain {domain:?}: {why}")));
+        return Err(Error::Failed(format!("the domain {domain:?}: {why}")));
     }
     // The recipe is part of this approval, so a config the deploy never
     // substituted refuses before the group check, the journal line or any
@@ -691,7 +688,7 @@ async fn approve_group(
     // path's does.
     let existing_group = group_record(store, &domain).await?;
     if existing_group.is_some() && !journal.approval_started(&record.status_token) {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the domain {domain} already has a group that this application did not make"
         )));
     }
@@ -702,7 +699,7 @@ async fn approve_group(
     // applicant has to change.
     for mailbox in &mailboxes {
         if !record.mail_keys.iter().any(|k| &k.mailbox == mailbox) {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the mailbox {mailbox} has no mail key, so its mail would bounce"
             )));
         }
@@ -788,7 +785,9 @@ async fn approve_group(
     let text = store
         .read_record("intents", &filename)
         .await
-        .ok_or_else(|| format!("the intent this pass filed at {filename} is gone"))?;
+        .ok_or_else(|| {
+            Error::Failed(format!("the intent this pass filed at {filename} is gone"))
+        })?;
     let value: Value = serde_json::from_str(&text)
         .map_err(|e| Error::context("the intent this pass filed does not parse", e))?;
     let filed = kyriakon_onboard_core::intent::Intent::parse(&value)?;
@@ -810,7 +809,7 @@ async fn approve_group(
     // rail's own instructions and the date the money must arrive by.
     let written = group_record(store, &domain)
         .await?
-        .ok_or("the group record vanished mid-approval")?;
+        .ok_or_else(|| Error::Failed("the group record vanished mid-approval".to_string()))?;
     let price = cfg.group_price_gbp.as_str();
     // A group on a cash rail has no Stripe link, and asking for one would fail
     // the approval of a body that never chose the card rail.
@@ -889,11 +888,11 @@ async fn decline(
         .application
         .status_token
         .as_deref()
-        .ok_or("the decision names no status token")?;
+        .ok_or_else(|| Error::Failed("the decision names no status token".to_string()))?;
     let username = &intent.application.username;
     let record = application_record(store, token).await?;
     if record.username != *username {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the intent's username is not the application's".to_string(),
         ));
     }
@@ -913,7 +912,7 @@ async fn decline(
     let outside = match record.outside_address.as_deref() {
         Some(addr) => {
             if let Some(why) = validate::address(addr) {
-                return Err(Error::from(format!(
+                return Err(Error::Failed(format!(
                     "the address outside the platform {addr:?}: {why}"
                 )));
             }
@@ -962,7 +961,7 @@ async fn application_record(store: &Store, token: &str) -> Result<Record, Error>
     store
         .application(token)
         .await?
-        .ok_or_else(|| Error::from("there is no application for this token".to_string()))
+        .ok_or_else(|| Error::Failed("there is no application for this token".to_string()))
 }
 
 /// Write the decision onto the application record. `password_link` is written
@@ -974,10 +973,9 @@ async fn mark_decided(
     decided_at: &str,
     password_link: Option<String>,
 ) -> Result<(), Error> {
-    let mut record = store
-        .application(token)
-        .await?
-        .ok_or("the application record vanished before it could be decided")?;
+    let mut record = store.application(token).await?.ok_or_else(|| {
+        Error::Failed("the application record vanished before it could be decided".to_string())
+    })?;
     record.stage = stage.to_string();
     record.decided_at = Some(decided_at.to_string());
     record.password_link = password_link;
@@ -1050,8 +1048,11 @@ fn decision_body(
              There is nothing to pay and no payment window. The account does not lapse.\n"
         ));
     }
-    let token = token.ok_or("a charged approval has no token")?;
-    let window = window.as_ref().ok_or("a charged approval has no window")?;
+    let token =
+        token.ok_or_else(|| Error::Failed("a charged approval has no token".to_string()))?;
+    let window = window
+        .as_ref()
+        .ok_or_else(|| Error::Failed("a charged approval has no window".to_string()))?;
     let card_link = if rail == "card" {
         card_link(&cfg.stripe_payment_link, token)?
     } else {
@@ -1118,14 +1119,14 @@ pub async fn resend(
     let account = store
         .account(username)
         .await?
-        .ok_or_else(|| format!("no account for {username}"))?;
+        .ok_or_else(|| Error::Failed(format!("no account for {username}")))?;
     let Some(payment) = account.payment_state() else {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "{username} was approved without charge, so there is no payment token to resend"
         )));
     };
     if payment.token_ref.as_deref() != Some(intent.token.as_str()) {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the token the resend names is not the one {username}'s account holds"
         )));
     }
@@ -1166,7 +1167,7 @@ pub async fn resend(
                 status_token,
             ))
         })
-        .ok_or_else(|| format!("no application record for {username}"))?;
+        .ok_or_else(|| Error::Failed(format!("no application record for {username}")))?;
     Ok(Settlement::line("applied", application, None))
 }
 

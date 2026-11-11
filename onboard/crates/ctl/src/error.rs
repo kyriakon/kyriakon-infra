@@ -18,11 +18,6 @@ pub enum Error {
     Core(kyriakon_onboard_core::Error),
     /// A drain transition refused or failed.
     Drain(kyriakon_onboard_drain::transitions::Error),
-    /// A failure whose context is the value the caller needs, with its source.
-    Context {
-        context: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 impl fmt::Display for Error {
@@ -33,7 +28,6 @@ impl fmt::Display for Error {
             Error::Config(error) => error.fmt(f),
             Error::Core(error) => error.fmt(f),
             Error::Drain(error) => error.fmt(f),
-            Error::Context { context, source } => write!(f, "{context}: {source}"),
         }
     }
 }
@@ -46,7 +40,6 @@ impl std::error::Error for Error {
             Error::Config(error) => Some(error),
             Error::Core(error) => Some(error),
             Error::Drain(error) => Some(error),
-            Error::Context { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -58,12 +51,9 @@ impl Error {
 
     pub fn context(
         context: impl Into<String>,
-        source: impl std::error::Error + Send + Sync + 'static,
+        source: impl Into<kyriakon_onboard_core::Source>,
     ) -> Self {
-        Error::Context {
-            context: context.into(),
-            source: Box::new(source),
-        }
+        Error::Core(kyriakon_onboard_core::Error::context(context, source))
     }
 }
 
@@ -88,17 +78,5 @@ impl From<kyriakon_onboard_core::Error> for Error {
 impl From<kyriakon_onboard_drain::transitions::Error> for Error {
     fn from(error: kyriakon_onboard_drain::transitions::Error) -> Self {
         Error::Drain(error)
-    }
-}
-
-impl From<String> for Error {
-    fn from(message: String) -> Self {
-        Error::Failed(message)
-    }
-}
-
-impl From<&str> for Error {
-    fn from(message: &str) -> Self {
-        Error::Failed(message.to_string())
     }
 }

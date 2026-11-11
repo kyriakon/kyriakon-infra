@@ -59,11 +59,11 @@ impl Answer {
         let line = line.trim_end_matches(['\r', '\n']);
         let (word, text) = line
             .split_once(' ')
-            .ok_or_else(|| format!("the status service sent no answer: {line:?}"))?;
+            .ok_or_else(|| Error::Failed(format!("the status service sent no answer: {line:?}")))?;
         match word {
             "stage" => Ok(Answer::Stage(text.to_string())),
             "notice" => Ok(Answer::Notice(text.to_string())),
-            _ => Err(Error::from(format!(
+            _ => Err(Error::Failed(format!(
                 "the status service sent no answer: {line:?}"
             ))),
         }
@@ -115,9 +115,9 @@ pub fn parse_file_answer(line: &str) -> Result<String, Error> {
     if let Some(token) = line.strip_prefix("OK ") {
         Ok(token.to_string())
     } else if let Some(why) = line.strip_prefix("ERR ") {
-        Err(Error::from(why.to_string()))
+        Err(Error::Failed(why.to_string()))
     } else {
-        Err(Error::from(format!(
+        Err(Error::Failed(format!(
             "the file service sent no answer: {line:?}"
         )))
     }
@@ -147,7 +147,7 @@ fn reply(stream: UnixStream, what: &str) -> Result<String, Error> {
         .read_line(&mut line)
         .map_err(|e| Error::context(format!("cannot read the {what}'s answer"), e))?;
     if !line.ends_with('\n') {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the {what} closed the connection before answering"
         )));
     }
@@ -175,7 +175,7 @@ pub fn file(
     // The handler reads one line and rejects it past this bound, so refuse here
     // where the reader can be told, rather than after a whole session's answers.
     if body.len() >= MAX_BODY {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the application is too large to send ({} bytes, the limit is {MAX_BODY}); shorten an answer",
             body.len()
         )));

@@ -198,7 +198,7 @@ fn lock_exclusive(fd: i32, path: &Path) -> Result<(), Error> {
     if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
         Ok(())
     } else {
-        Err(Error::from(format!(
+        Err(Error::Failed(format!(
             "cannot lock {}: {}",
             path.display(),
             std::io::Error::last_os_error()
@@ -347,7 +347,7 @@ pub fn run(
     out: &mut dyn Write,
 ) -> Result<Departure, Error> {
     if rows.is_empty() {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "{} names no services, so there is nothing to show",
             catalogue::TRACKED
         )));
@@ -1090,7 +1090,7 @@ mod tests {
         fn read(&mut self, _token: &str) -> Result<StatusAnswer, Error> {
             self.answers
                 .pop_front()
-                .unwrap_or_else(|| Err("no status was scripted".into()))
+                .unwrap_or_else(|| Err(Error::Failed("no status was scripted".to_string())))
         }
     }
 
@@ -1099,7 +1099,7 @@ mod tests {
 
     impl StatusSource for NoStatus {
         fn read(&mut self, _token: &str) -> Result<StatusAnswer, Error> {
-            Err("this session asks no status".into())
+            Err(Error::Failed("this session asks no status".to_string()))
         }
     }
 
@@ -1122,7 +1122,7 @@ mod tests {
 
     impl Filing for NoFiles {
         fn file(&mut self, _form: &BTreeMap<String, String>) -> Result<String, Error> {
-            Err("this session files nothing".into())
+            Err(Error::Failed("this session files nothing".to_string()))
         }
     }
 
@@ -1348,7 +1348,8 @@ mod tests {
     #[test]
     fn the_status_word_reads_the_stage_and_nothing_else() {
         let rows = rows(None);
-        let mut statuses = Statuses::new(vec![StatusAnswer::Stage("with the reviewer".into())]);
+        let mut statuses =
+            Statuses::new(vec![StatusAnswer::Stage("with the reviewer".to_string())]);
         let mut script = Script::lines(&["status", "abcdefghjkmnpqrstvwxyz0123", "", "quit"]);
         let (left, seen) =
             session_with(&rows, Mode::Plain, &mut script, &mut statuses, &mut NoFiles);
@@ -1386,7 +1387,7 @@ mod tests {
     fn a_status_read_that_fails_leaves_the_session_open() {
         let rows = rows(None);
         let mut statuses = Statuses {
-            answers: VecDeque::from([Err(Error::from("connection refused".to_string()))]),
+            answers: VecDeque::from([Err(Error::Failed("connection refused".to_string()))]),
         };
         let mut script = Script::lines(&["status", "abcdefghjkmnpqrstvwxyz0123", "", "quit"]);
         let (left, seen) =

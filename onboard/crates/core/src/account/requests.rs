@@ -116,13 +116,13 @@ pub fn today() -> Date {
 pub fn parse_date(value: &str) -> Result<Date, Error> {
     let bad = || format!("{value:?} is not a date in YYYY-MM-DD");
     if value.len() != 10 || !value.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
-        return Err(Error::from(bad()));
+        return Err(Error::Failed(bad()));
     }
-    let year: i32 = value[0..4].parse().map_err(|_| bad())?;
-    let month: u8 = value[5..7].parse().map_err(|_| bad())?;
-    let day: u8 = value[8..10].parse().map_err(|_| bad())?;
-    let month = Month::try_from(month).map_err(|_| bad())?;
-    Date::from_calendar_date(year, month, day).map_err(|_| Error::from(bad()))
+    let year: i32 = value[0..4].parse().map_err(|_| Error::Failed(bad()))?;
+    let month: u8 = value[5..7].parse().map_err(|_| Error::Failed(bad()))?;
+    let day: u8 = value[8..10].parse().map_err(|_| Error::Failed(bad()))?;
+    let month = Month::try_from(month).map_err(|_| Error::Failed(bad()))?;
+    Date::from_calendar_date(year, month, day).map_err(|_| Error::Failed(bad()))
 }
 
 fn format_date(date: Date) -> String {
@@ -231,13 +231,13 @@ async fn read_all(store: &Store, username: &str) -> Result<Vec<RequestLine>, Err
 /// Append one request line and return it, so the caller can print the due date.
 pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLine, Error> {
     if let Some(why) = validate::username_shape(request.username) {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the username {:?}: {why}",
             request.username
         )));
     }
     if !KINDS.contains(&request.kind) {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the kind {:?} is not one of {}",
             request.kind,
             KINDS.join(", ")
@@ -245,13 +245,13 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
     }
     let evidence = request.evidence.trim();
     if evidence.is_empty() {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the evidence that established who was asking is needed".to_string(),
         ));
     }
     let identity = request.identity.trim();
     if !IDENTITIES.contains(&identity) {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the identity route {identity:?} is not one of {}",
             IDENTITIES.join(", ")
         )));
@@ -259,7 +259,10 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
     // A request is recorded against an account, never into a directory a
     // mistyped name would create.
     if store.account(request.username).await?.is_none() {
-        return Err(Error::from(format!("no account for {}", request.username)));
+        return Err(Error::Failed(format!(
+            "no account for {}",
+            request.username
+        )));
     }
 
     let id = match request.id {
@@ -273,10 +276,10 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
     let fee_at = request.fee_at.map(parse_date).transpose()?;
     let relevant = relevant_time(received, identity_at, fee_at);
     let due = one_month_after(relevant).ok_or_else(|| {
-        format!(
+        Error::Failed(format!(
             "the answer due after {} has no date in the calendar",
             format_date(relevant)
-        )
+        ))
     })?;
 
     let line = RequestLine {
@@ -312,7 +315,7 @@ pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLin
     if request.id.is_some() {
         let existing = log.jsonl::<RequestLine>().await?;
         if existing.iter().any(|l| l.id == line.id) {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "request {} is already recorded",
                 line.id
             )));
@@ -333,13 +336,13 @@ async fn find_account(store: &Store, id: &str) -> Result<String, Error> {
             continue;
         }
         if found.is_some() {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "request {id} appears in more than one account"
             )));
         }
         found = Some(username);
     }
-    found.ok_or_else(|| Error::from(format!("no request with id {id}")))
+    found.ok_or_else(|| Error::Failed(format!("no request with id {id}")))
 }
 
 /// Rewrite one request's line under the record's lock, through `change`.
@@ -361,7 +364,7 @@ async fn rewrite(
     let at = lines
         .iter()
         .position(|l| l.id == id)
-        .ok_or_else(|| format!("no request with id {id}"))?;
+        .ok_or_else(|| Error::Failed(format!("no request with id {id}")))?;
     change(&mut lines[at])?;
 
     let mut bytes = String::new();
@@ -389,7 +392,7 @@ pub async fn set_bundle(
 ) -> Result<RequestLine, Error> {
     rewrite(store, id, |line| {
         if line.username != username {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the request {id} belongs to {}, not {username}",
                 line.username
             )));
@@ -409,12 +412,12 @@ pub async fn close(
 ) -> Result<RequestLine, Error> {
     let done = done.trim().to_string();
     if done.is_empty() {
-        return Err(Error::from("what was done is needed".to_string()));
+        return Err(Error::Failed("what was done is needed".to_string()));
     }
     let done_at = format_date(parse_date(done_at)?);
     rewrite(store, id, |line| {
         if line.done.is_some() {
-            return Err(Error::from(format!("request {id} is already closed")));
+            return Err(Error::Failed(format!("request {id} is already closed")));
         }
         line.done = Some(done);
         line.done_at = Some(done_at);
@@ -436,7 +439,7 @@ pub async fn extend(
 ) -> Result<RequestLine, Error> {
     let reason = reason.trim().to_string();
     if reason.is_empty() {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the reason for the extension is needed".to_string(),
         ));
     }
@@ -447,10 +450,10 @@ pub async fn extend(
     let at = format_date(decided);
     rewrite(store, id, |line| {
         if line.done.is_some() {
-            return Err(Error::from(format!("request {id} is closed")));
+            return Err(Error::Failed(format!("request {id} is closed")));
         }
         if line.extended_until.is_some() {
-            return Err(Error::from(format!("request {id} is already extended")));
+            return Err(Error::Failed(format!("request {id} is already extended")));
         }
         // The extension is Article 12A's two further months inside the answer
         // period, so a decision that predates receipt or lands after the answer
@@ -459,7 +462,7 @@ pub async fn extend(
         let received = parse_date(&line.received)?;
         let due = parse_date(&line.due)?;
         if decided < received || decided > due {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the extension is decided on {}, but the request runs from {} to {}",
                 format_date(decided),
                 line.received,
@@ -467,10 +470,10 @@ pub async fn extend(
             )));
         }
         line.extended_until = Some(format_date(months_after(due, 2).ok_or_else(|| {
-            format!(
+            Error::Failed(format!(
                 "the extension of {} has no date in the calendar",
                 format_date(due)
-            )
+            ))
         })?));
         line.extended_at = Some(at);
         line.extended_reason = Some(reason);

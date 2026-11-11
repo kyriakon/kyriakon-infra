@@ -35,7 +35,7 @@ impl State {
             "live" => Ok(State::Live),
             "by_request" => Ok(State::ByRequest),
             "planned" => Ok(State::Planned),
-            other => Err(Error::from(format!("unknown state {other:?}"))),
+            other => Err(Error::Failed(format!("unknown state {other:?}"))),
         }
     }
 
@@ -67,7 +67,7 @@ impl Action {
             "apply" => Ok(Action::Apply),
             "account" => Ok(Action::Account),
             "pay" => Ok(Action::Pay),
-            other => Err(Error::from(format!("unknown action {other:?}"))),
+            other => Err(Error::Failed(format!("unknown action {other:?}"))),
         }
     }
 
@@ -217,7 +217,7 @@ pub fn parse(text: &str) -> Result<Vec<Service>, Error> {
     for e in file.service {
         let id = e.id;
         if id.is_empty() || e.name.is_empty() || e.summary.is_empty() || e.host.is_empty() {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the service {id:?} has an empty id, name, summary or host"
             )));
         }

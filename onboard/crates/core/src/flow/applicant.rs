@@ -184,7 +184,7 @@ pub fn label(form: &BTreeMap<String, String>) -> Result<&'static str, Error> {
         None | Some("web") => Ok("web"),
         Some("tui") => Ok("tui"),
         Some("capsule") => Ok("capsule"),
-        Some(other) => Err(Error::from(format!("unknown front_end {other:?}"))),
+        Some(other) => Err(Error::Failed(format!("unknown front_end {other:?}"))),
     }
 }
 

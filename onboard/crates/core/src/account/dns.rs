@@ -80,10 +80,10 @@ impl Values {
             ("dmarc_rua", &self.dmarc_rua),
         ] {
             if value.trim().is_empty() {
-                return Err(Error::from(format!("the DNS recipe's {name} is empty")));
+                return Err(Error::Failed(format!("the DNS recipe's {name} is empty")));
             }
             if value.contains("REPLACE_ME") {
-                return Err(Error::from(format!(
+                return Err(Error::Failed(format!(
                     "the DNS recipe's {name} is still the placeholder {value:?}"
                 )));
             }

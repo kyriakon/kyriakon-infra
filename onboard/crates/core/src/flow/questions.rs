@@ -66,7 +66,7 @@ impl Kind {
             "addresses" => Kind::Addresses,
             "key" => Kind::Key,
             "acceptance" => Kind::Acceptance,
-            other => return Err(Error::from(format!("unknown answer type {other:?}"))),
+            other => return Err(Error::Failed(format!("unknown answer type {other:?}"))),
         })
     }
 }
@@ -90,7 +90,7 @@ impl Branch {
             "person" => Branch::Person,
             "body" => Branch::Body,
             "monastic" => Branch::Monastic,
-            other => return Err(Error::from(format!("unknown branch {other:?}"))),
+            other => return Err(Error::Failed(format!("unknown branch {other:?}"))),
         })
     }
 }
@@ -136,7 +136,7 @@ impl Rule {
                     n.parse()
                         .map_err(|_| Error::Failed(format!("maxlen needs a number, got {n:?}")))?,
                 ),
-                None => return Err(Error::from(format!("unknown validation {other:?}"))),
+                None => return Err(Error::Failed(format!("unknown validation {other:?}"))),
             },
         })
     }
@@ -218,18 +218,18 @@ fn rule(
 ) -> Result<Rule, Error> {
     if kind == Kind::Choice {
         if choices.is_empty() {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the question {id:?} is a choice with no choices"
             )));
         }
         if validation.is_some() {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the question {id:?} is a choice, so its validation is its choices"
             )));
         }
         for c in &choices {
             if c.value.is_empty() || c.label.is_empty() {
-                return Err(Error::from(format!(
+                return Err(Error::Failed(format!(
                     "the question {id:?} has a choice with an empty value or label"
                 )));
             }
@@ -237,7 +237,7 @@ fn rule(
         return Ok(Rule::Choice(choices));
     }
     if !choices.is_empty() {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the question {id:?} is a {} carrying choices",
             kind.token()
         )));
@@ -352,28 +352,19 @@ required = true
         // A token outside its vocabulary names the question it came from.
         let unknown_type = SAMPLE.replace("type = \"text\"", "type = \"widget\"");
         let e = parse(&unknown_type).unwrap_err();
-        assert!(
-            matches!(&e, Error::Context { .. } | Error::Failed(_)),
-            "{e}"
-        );
+        assert!(matches!(&e, Error::Context { .. }), "{e}");
         assert!(e.to_string().contains("username"), "{e}");
         assert!(e.to_string().contains("unknown answer type"), "{e}");
 
         let unknown_branch = SAMPLE.replace("branch = \"body\"", "branch = \"everyone\"");
         let e = parse(&unknown_branch).unwrap_err();
-        assert!(
-            matches!(&e, Error::Context { .. } | Error::Failed(_)),
-            "{e}"
-        );
+        assert!(matches!(&e, Error::Context { .. }), "{e}");
         assert!(e.to_string().contains("body_name"), "{e}");
         assert!(e.to_string().contains("unknown branch"), "{e}");
 
         let unknown_rule = SAMPLE.replace("validation = \"mail-key\"", "validation = \"exists\"");
         let e = parse(&unknown_rule).unwrap_err();
-        assert!(
-            matches!(&e, Error::Context { .. } | Error::Failed(_)),
-            "{e}"
-        );
+        assert!(matches!(&e, Error::Context { .. }), "{e}");
         assert!(e.to_string().contains("mail_key"), "{e}");
         assert!(e.to_string().contains("exists"), "{e}");
 
@@ -441,10 +432,7 @@ choices = [
             "",
         );
         let e = parse(&bare).unwrap_err();
-        assert!(
-            matches!(&e, Error::Context { .. } | Error::Failed(_)),
-            "{e}"
-        );
+        assert!(matches!(&e, Error::Failed(_)), "{e}");
         assert!(e.to_string().contains("whose"), "{e}");
         assert!(e.to_string().contains("no choices"), "{e}");
 
@@ -453,10 +441,7 @@ choices = [
             "{ value = \"\", label = \"Just me\" },",
         );
         let e = parse(&empty).unwrap_err();
-        assert!(
-            matches!(&e, Error::Context { .. } | Error::Failed(_)),
-            "{e}"
-        );
+        assert!(matches!(&e, Error::Failed(_)), "{e}");
         assert!(e.to_string().contains("empty value or label"), "{e}");
     }
 
@@ -467,10 +452,7 @@ choices = [
             "prompt = \"Username\"\nchoices = [\n\t{ value = \"a\", label = \"A\" },\n]",
         );
         let e = parse(&on_a_text).unwrap_err();
-        assert!(
-            matches!(&e, Error::Context { .. } | Error::Failed(_)),
-            "{e}"
-        );
+        assert!(matches!(&e, Error::Failed(_)), "{e}");
         assert!(e.to_string().contains("username"), "{e}");
         assert!(e.to_string().contains("carrying choices"), "{e}");
 
@@ -481,10 +463,7 @@ choices = [
             "{ value = \"body\", label = \"A body\" },\n]\nvalidation = \"domain\"",
         );
         let e = parse(&both).unwrap_err();
-        assert!(
-            matches!(&e, Error::Context { .. } | Error::Failed(_)),
-            "{e}"
-        );
+        assert!(matches!(&e, Error::Failed(_)), "{e}");
         assert!(e.to_string().contains("its choices"), "{e}");
     }
 

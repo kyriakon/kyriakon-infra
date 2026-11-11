@@ -67,7 +67,7 @@ async fn enqueue_raw(cfg: &DrainConfig, raw: &str) -> Result<(), Error> {
         .await
         .map_err(|e| Error::context(format!("cannot wait for {}", cfg.sendmail), e))?;
     if !status.success() {
-        return Err(Error::from(format!("{} exited {status}", cfg.sendmail)));
+        return Err(Error::Failed(format!("{} exited {status}", cfg.sendmail)));
     }
     Ok(())
 }

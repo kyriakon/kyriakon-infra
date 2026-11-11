@@ -12,13 +12,13 @@ use crate::*;
 pub(crate) async fn ledger(store: &Store, args: &[String]) -> Result<(), Error> {
     let rest = match args {
         [verb, rest @ ..] if verb == "export" => rest,
-        _ => return Err(Error::from(usage())),
+        _ => return Err(Error::Failed(usage())),
     };
     let flags = flags(rest, &["tax-year", "format"])?;
     let (start, end) = tax_year(need(&flags, "tax-year")?)?;
     let format = need(&flags, "format")?;
     if format != "csv" {
-        return Err(Error::from(format!("--format {format:?} is not csv")));
+        return Err(Error::Failed(format!("--format {format:?} is not csv")));
     }
     let columns = payment_columns();
     println!(
@@ -81,11 +81,13 @@ pub(crate) fn in_tax_year(received_on: Option<&str>, start: time::Date, end: tim
 /// mistyped pair would quietly export a different year's money.
 pub(crate) fn tax_year(s: &str) -> Result<(time::Date, time::Date), Error> {
     let refuse = || {
-        format!("--tax-year {s:?} is not YYYY-YY or YYYY-YYYY, or its years are not consecutive")
+        Error::Failed(format!(
+            "--tax-year {s:?} is not YYYY-YY or YYYY-YYYY, or its years are not consecutive"
+        ))
     };
     let (first, second) = s.split_once('-').ok_or_else(refuse)?;
     if first.len() != 4 || !first.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(Error::from(refuse()));
+        return Err(refuse());
     }
     let year: i32 = first.parse().map_err(|_| refuse())?;
     let next = year.checked_add(1).ok_or_else(refuse)?;
@@ -98,10 +100,10 @@ pub(crate) fn tax_year(s: &str) -> Result<(time::Date, time::Date), Error> {
             second.bytes().all(|b| b.is_ascii_digit())
                 && second.parse::<i32>().map_err(|_| refuse())? == next
         }
-        _ => return Err(Error::from(refuse())),
+        _ => return Err(refuse()),
     };
     if !second_ok {
-        return Err(Error::from(refuse()));
+        return Err(refuse());
     }
     let start =
         time::Date::from_calendar_date(year, time::Month::April, 6).map_err(|_| refuse())?;

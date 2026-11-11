@@ -54,6 +54,13 @@ pub fn report(error: &(dyn std::error::Error + 'static), context: &str) {
     }
 }
 
+/// Print one access or startup line. The same one place writes the service's
+/// stderr, so a log line and a failure report cannot drift onto different
+/// streams.
+pub fn log(line: &str) {
+    eprintln!("{line}");
+}
+
 /// A timestamp `days` from now, RFC 3339 UTC to the second. The window's close,
 /// the status link's end and the one-time password link's expiry all come from
 /// here, so there is one arithmetic and one format for the three.
@@ -167,17 +174,17 @@ pub fn pence(s: &str) -> Result<i64, Error> {
         || fraction.len() > 2
         || !fraction.bytes().all(|b| b.is_ascii_digit())
     {
-        return Err(Error::from(format!("{s:?} is not an amount in pounds")));
+        return Err(Error::Failed(format!("{s:?} is not an amount in pounds")));
     }
     let whole: i64 = pounds
         .parse()
-        .map_err(|_| format!("{s:?} is not an amount in pounds"))?;
+        .map_err(|source| Error::context(format!("{s:?} is not an amount in pounds"), source))?;
     let pennies: i64 = if fraction.is_empty() {
         0
     } else {
         format!("{fraction:0<2}")
             .parse()
-            .map_err(|_| format!("{s:?} is not an amount in pounds"))?
+            .map_err(|source| Error::context(format!("{s:?} is not an amount in pounds"), source))?
     };
     Ok(whole * 100 + pennies)
 }

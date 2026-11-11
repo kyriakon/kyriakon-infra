@@ -204,7 +204,7 @@ fn member_owner(passwd: &str, username: &str) -> Result<(u32, u32), Error> {
             return Ok((uid, gid));
         }
     }
-    Err(Error::from(format!(
+    Err(Error::Failed(format!(
         "{username} is not in {passwd}, so the export has no owner to hand the bundle to"
     )))
 }
@@ -228,7 +228,7 @@ async fn written(
     mailed: bool,
 ) -> Result<(Account, String, Vec<(String, Vec<u8>)>), Error> {
     let Some(account_text) = store.account_text(username).await? else {
-        return Err(Error::from(format!("no account for {username}")));
+        return Err(Error::Failed(format!("no account for {username}")));
     };
     let account: Account = serde_json::from_str(&account_text).map_err(|source| {
         Error::context(
@@ -294,12 +294,10 @@ async fn written(
 
     let key_path = keycheck::keyring_file(&cfg.keyring_dir, username);
     let key = std::fs::read(&key_path).map_err(|e| {
-        Error::context(
-            format!(
-                "no mail key for {username} at {}; the account's own key belongs in the export",
-                key_path.display()
-            ),
+        Error::context_with_suffix(
+            format!("no mail key for {username} at {}", key_path.display()),
             e,
+            "; the account's own key belongs in the export",
         )
     })?;
     docs.push((format!("keys/{username}.asc"), key));
@@ -339,13 +337,13 @@ fn check_export_dir(path: &Path, owner: u32) -> Result<(), Error> {
     let md = std::fs::symlink_metadata(path)
         .map_err(|source| Error::context(format!("cannot read {}", path.display()), source))?;
     if !md.file_type().is_dir() {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "{} is not a directory, but a symlink or a file planted in the member's tree;              refusing to write the export",
             path.display()
         )));
     }
     if md.uid() != owner {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "{} is owned by uid {}, not uid {owner}, the process writing the export; refusing",
             path.display(),
             md.uid()
@@ -390,7 +388,7 @@ fn export_dir(chroot: &Path) -> Result<PathBuf, Error> {
 /// a refusal rather than a place to follow.
 fn create_bundle_dir(stamp: &Path, sub: &str) -> Result<PathBuf, Error> {
     if sub.is_empty() || sub.contains('/') {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the bundle path component {sub:?} is not one directory"
         )));
     }
@@ -414,12 +412,10 @@ fn write_bundle_file(path: &Path, bytes: &[u8], owner: (u32, u32)) -> Result<(),
     opts.write(true).create_new(true).mode(0o600);
     opts.custom_flags(libc::O_NOFOLLOW);
     let mut file = opts.open(path).map_err(|source| {
-        Error::context(
-            format!(
-                "cannot create {}; the export does not write over or through an existing name",
-                path.display()
-            ),
+        Error::context_with_suffix(
+            format!("cannot create {}", path.display()),
             source,
+            "; the export does not write over or through an existing name",
         )
     })?;
     file.write_all(bytes)
@@ -467,12 +463,10 @@ fn write_tree(
         .mode(0o700)
         .create(&stamp)
         .map_err(|e| {
-            Error::context(
-                format!(
-                    "cannot create {}; the export directory must not already exist",
-                    stamp.display()
-                ),
+            Error::context_with_suffix(
+                format!("cannot create {}", stamp.display()),
                 e,
+                "; the export directory must not already exist",
             )
         })?;
     std::fs::set_permissions(&stamp, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
@@ -517,7 +511,7 @@ fn member_address(account: &Account, username: &str) -> String {
 /// the request record's `bundle` field carries.
 pub async fn deliver(cfg: &DrainConfig, store: &Store, username: &str) -> Result<String, Error> {
     if let Some(why) = crate::flow::validate::username_shape(username) {
-        return Err(Error::from(format!("the username {username:?}: {why}")));
+        return Err(Error::Failed(format!("the username {username:?}: {why}")));
     }
     let now = OffsetDateTime::now_utc();
     let (account, answer, docs) = written(cfg, store, username, now, false).await?;
@@ -525,13 +519,13 @@ pub async fn deliver(cfg: &DrainConfig, store: &Store, username: &str) -> Result
     match std::fs::symlink_metadata(&chroot) {
         Ok(md) if md.file_type().is_dir() => {}
         Ok(_) => {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the member's tree {} is not a directory; refusing to write the export",
                 chroot.display()
             )))
         }
         Err(e) => {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the member's tree {} is not there: {e}",
                 chroot.display()
             )))
@@ -607,7 +601,10 @@ async fn encrypt(program: &str, key: &Path, plain: &[u8]) -> Result<Vec<u8>, Err
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|source| Error::context(format!("cannot spawn {program}"), source))?;
-        let mut stdin = child.stdin.take().ok_or("gpg has no stdin")?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Failed("gpg has no stdin".to_string()))?;
         stdin
             .write_all(plain)
             .await
@@ -627,7 +624,7 @@ async fn encrypt(program: &str, key: &Path, plain: &[u8]) -> Result<Vec<u8>, Err
     let _ = tokio::fs::remove_dir_all(&home).await;
     let out = run?;
     if !out.status.success() {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "gpg refused to encrypt to {}: {}",
             key.display(),
             String::from_utf8_lossy(&out.stderr).trim()
@@ -645,11 +642,11 @@ pub async fn deliver_by_mail(
     username: &str,
 ) -> Result<String, Error> {
     if let Some(why) = crate::flow::validate::username_shape(username) {
-        return Err(Error::from(format!("the username {username:?}: {why}")));
+        return Err(Error::Failed(format!("the username {username:?}: {why}")));
     }
     let key = keycheck::keyring_file(&cfg.keyring_dir, username);
     if !key.is_file() {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "no public key for {username} at {}, so the written part cannot be sent encrypted.\n\n{}",
             key.display(),
             reachable()

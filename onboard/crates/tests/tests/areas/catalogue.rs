@@ -54,7 +54,7 @@ fn renderings(list: &[Service], member: Option<&str>) -> Vec<(&'static str, Vec<
 fn check(text: &str, member: Option<&str>) -> Result<(), kyriakon_onboard_core::Error> {
     let list = parse(text)?;
     if list.is_empty() {
-        return Err(kyriakon_onboard_core::Error::from(format!(
+        return Err(kyriakon_onboard_core::Error::Failed(format!(
             "{TRACKED} has no services"
         )));
     }
@@ -78,7 +78,7 @@ fn compare(
                 .filter(|r| !list.iter().any(|s| s.id == r.id))
                 .map(|r| r.id.as_str())
                 .collect();
-            return Err(kyriakon_onboard_core::Error::from(format!(
+            return Err(kyriakon_onboard_core::Error::Failed(format!(
                 "{front_end} shows {} entries where {TRACKED} carries {}: missing {missing:?}, invented {invented:?}",
                 rows.len(),
                 list.len()
@@ -86,7 +86,7 @@ fn compare(
         }
         for (s, r) in list.iter().zip(rows) {
             if r.id != s.id {
-                return Err(kyriakon_onboard_core::Error::from(format!(
+                return Err(kyriakon_onboard_core::Error::Failed(format!(
                     "{front_end} shows {:?} where {TRACKED} has {:?}: the file's order is the display order",
                     r.id, s.id
                 )));
@@ -96,7 +96,7 @@ fn compare(
                 || r.state != s.state.word()
                 || r.action != s.action.word()
             {
-                return Err(kyriakon_onboard_core::Error::from(format!(
+                return Err(kyriakon_onboard_core::Error::Failed(format!(
                     "{front_end} shows {:?} other than as {TRACKED} has it, so the rendering is not the file",
                     s.id
                 )));

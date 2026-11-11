@@ -19,11 +19,6 @@ pub enum Error {
     Config(config::Error),
     /// A core read or parse failed.
     Core(CoreError),
-    /// A failure whose context is the value the caller needs, with its source.
-    Context {
-        context: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 impl fmt::Display for Error {
@@ -33,7 +28,6 @@ impl fmt::Display for Error {
             Error::Store(error) => error.fmt(f),
             Error::Config(error) => error.fmt(f),
             Error::Core(error) => error.fmt(f),
-            Error::Context { context, source } => write!(f, "{context}: {source}"),
         }
     }
 }
@@ -45,7 +39,6 @@ impl std::error::Error for Error {
             Error::Store(error) => Some(error),
             Error::Config(error) => Some(error),
             Error::Core(error) => Some(error),
-            Error::Context { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -57,12 +50,9 @@ impl Error {
 
     pub fn context(
         context: impl Into<String>,
-        source: impl std::error::Error + Send + Sync + 'static,
+        source: impl Into<kyriakon_onboard_core::Source>,
     ) -> Self {
-        Error::Context {
-            context: context.into(),
-            source: Box::new(source),
-        }
+        Error::Core(CoreError::context(context, source))
     }
 }
 
@@ -81,17 +71,5 @@ impl From<config::Error> for Error {
 impl From<CoreError> for Error {
     fn from(error: CoreError) -> Self {
         Error::Core(error)
-    }
-}
-
-impl From<String> for Error {
-    fn from(message: String) -> Self {
-        Error::Failed(message)
-    }
-}
-
-impl From<&str> for Error {
-    fn from(message: &str) -> Self {
-        Error::Failed(message.to_string())
     }
 }

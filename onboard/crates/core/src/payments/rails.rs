@@ -110,7 +110,7 @@ pub fn card_link(payment_link: &str, token: &str) -> Result<Option<String>, Erro
     }
     let link = payment_link.trim_end_matches(['&', '?']);
     if link.is_empty() || link.contains("REPLACE_ME") {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "stripe_payment_link is not configured, so a card approval has no link to send"
                 .to_string(),
         ));

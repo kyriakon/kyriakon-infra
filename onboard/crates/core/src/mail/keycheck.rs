@@ -72,18 +72,20 @@ pub fn pgp_public_key(value: &str) -> Result<Checked, Error> {
 pub fn pgp_findings(value: &str) -> Result<Vec<String>, Error> {
     let value = value.trim();
     if value.is_empty() {
-        return Err(Error::from("a public key is needed".to_string()));
+        return Err(Error::Failed("a public key is needed".to_string()));
     }
     if !value.contains(BEGIN) || !value.contains(END) {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "this is not an armoured PGP public key block".to_string(),
         ));
     }
     let body = armour_body(value)?;
-    let raw = base64_decode(&body).ok_or("the key's base64 does not decode")?;
-    let packets = packets(&raw).ok_or("the key's packet structure cannot be read")?;
+    let raw = base64_decode(&body)
+        .ok_or_else(|| Error::Failed("the key's base64 does not decode".to_string()))?;
+    let packets = packets(&raw)
+        .ok_or_else(|| Error::Failed("the key's packet structure cannot be read".to_string()))?;
     if !packets.iter().any(|p| p.tag == 6) {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the block carries no public key packet".to_string(),
         ));
     }
@@ -145,7 +147,7 @@ pub async fn verify_signature(
             .await
             .map_err(|e| Error::context(format!("cannot run {gpg}"), e))?;
         if !import.status.success() {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "gpg could not read {} ({}): {}",
                 key_file.display(),
                 import.status,
@@ -202,7 +204,7 @@ pub async fn verify_signature(
 pub fn openssh_public_key(value: &str) -> Result<(), Error> {
     let value = value.trim();
     if value.is_empty() {
-        return Err(Error::from("an upload key is needed".to_string()));
+        return Err(Error::Failed("an upload key is needed".to_string()));
     }
     let mut parts = value.split_whitespace();
     let kind = parts.next().unwrap_or("");
@@ -221,11 +223,15 @@ pub fn openssh_public_key(value: &str) -> Result<(), Error> {
                         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
             });
     if !known {
-        return Err(Error::from("this is not an OpenSSH public key".to_string()));
+        return Err(Error::Failed(
+            "this is not an OpenSSH public key".to_string(),
+        ));
     }
-    let blob = parts.next().ok_or("the upload key has no key material")?;
+    let blob = parts
+        .next()
+        .ok_or_else(|| Error::Failed("the upload key has no key material".to_string()))?;
     if base64_decode(blob).is_none_or(|b| b.is_empty()) {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the upload key's material does not decode".to_string(),
         ));
     }
@@ -379,7 +385,7 @@ fn armour_body(value: &str) -> Result<String, Error> {
         out.push_str(t);
     }
     if out.is_empty() {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the armoured block carries no key material".to_string(),
         ));
     }

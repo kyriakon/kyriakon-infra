@@ -45,11 +45,6 @@ pub enum Error {
         context: &'static str,
         source: serde_json::Error,
     },
-    /// A failure whose context is the value the operator needs, with its source.
-    Context {
-        context: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 impl fmt::Display for Error {
@@ -61,7 +56,6 @@ impl fmt::Display for Error {
             Error::Script(error) => error.fmt(f),
             Error::Core(error) => error.fmt(f),
             Error::Json { context, source } => write!(f, "cannot {context}: {source}"),
-            Error::Context { context, source } => write!(f, "{context}: {source}"),
         }
     }
 }
@@ -75,7 +69,6 @@ impl std::error::Error for Error {
             Error::Script(error) => Some(error),
             Error::Core(error) => Some(error),
             Error::Json { source, .. } => Some(source),
-            Error::Context { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -87,12 +80,9 @@ impl Error {
 
     pub fn context(
         context: impl Into<String>,
-        source: impl std::error::Error + Send + Sync + 'static,
+        source: impl Into<kyriakon_onboard_core::Source>,
     ) -> Self {
-        Error::Context {
-            context: context.into(),
-            source: Box::new(source),
-        }
+        Error::Core(kyriakon_onboard_core::Error::context(context, source))
     }
 }
 
@@ -117,18 +107,6 @@ impl From<boxrun::Error> for Error {
 impl From<kyriakon_onboard_core::Error> for Error {
     fn from(error: kyriakon_onboard_core::Error) -> Self {
         Error::Core(error)
-    }
-}
-
-impl From<String> for Error {
-    fn from(message: String) -> Self {
-        Error::Failed(message)
-    }
-}
-
-impl From<&str> for Error {
-    fn from(message: &str) -> Self {
-        Error::Failed(message.to_string())
     }
 }
 
@@ -639,7 +617,11 @@ mod tests {
                     AfterLine::RemoveGroupRecord("parish.example".to_string()),
                     RefusalFile::Keep,
                 ),
-                async { Err(Error::from("the body ran on a settled intent".to_string())) },
+                async {
+                    Err(Error::Failed(
+                        "the body ran on a settled intent".to_string(),
+                    ))
+                },
             ))
             .unwrap();
 
@@ -698,7 +680,11 @@ mod tests {
                     &format!("{id}.json"),
                     &envelope,
                     Disposition::new(AfterLine::Nothing, refusal),
-                    async { Err(Error::from("the body ran on a settled intent".to_string())) },
+                    async {
+                        Err(Error::Failed(
+                            "the body ran on a settled intent".to_string(),
+                        ))
+                    },
                 ))
                 .unwrap();
             let left = dir.join(format!("store/intents/{id}.json"));
@@ -816,7 +802,11 @@ mod tests {
                     },
                     RefusalFile::Keep,
                 ),
-                async { Err(Error::from("the body ran on a settled intent".to_string())) },
+                async {
+                    Err(Error::Failed(
+                        "the body ran on a settled intent".to_string(),
+                    ))
+                },
             ))
             .unwrap();
 

@@ -127,16 +127,19 @@ pub async fn quote(cfg: &DrainConfig, now: OffsetDateTime, price_gbp: &str) -> O
 /// Integer arithmetic throughout: `xmr = pence × 10^(4+d) / R` where the rate is
 /// `R / 10^d`, and the ceiling is taken on that quotient.
 pub fn quote_xmr(price_pence: i64, rate: &str) -> Result<String, Error> {
-    let (value, places) = parse_rate(rate)
-        .ok_or_else(|| format!("the rate {rate:?} is not a positive decimal amount"))?;
+    let (value, places) = parse_rate(rate).ok_or_else(|| {
+        Error::Failed(format!(
+            "the rate {rate:?} is not a positive decimal amount"
+        ))
+    })?;
     // `xmr × 1e6`, in millionths of a coin.
     let numerator = (price_pence as u128)
         .checked_mul(
             10u128
                 .checked_pow(places + 4)
-                .ok_or("the rate has too many decimals")?,
+                .ok_or_else(|| Error::Failed("the rate has too many decimals".to_string()))?,
         )
-        .ok_or("the price and rate overflow the quote")?;
+        .ok_or_else(|| Error::Failed("the price and rate overflow the quote".to_string()))?;
     let millionths = numerator.div_ceil(value);
     let whole = millionths / 1_000_000;
     let fraction = millionths % 1_000_000;
