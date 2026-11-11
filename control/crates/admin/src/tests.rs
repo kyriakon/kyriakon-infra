@@ -1,8 +1,9 @@
 //! The console parsing and formatting tests.
 
 use super::*;
-use crate::payments::ledger::{csv_cell, tax_year};
+use crate::payments::ledger::{csv_cell, export_section, payment_columns, tax_year, Section};
 use crate::requests::message_from;
+use kyriakon_control_core::payments::ledger::RefundTail;
 
 fn args(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
@@ -78,6 +79,84 @@ fn a_tax_year_is_six_april_to_five_april_in_either_spelling() {
     ] {
         assert!(tax_year(bad).is_err(), "{bad:?} was accepted");
     }
+}
+
+fn export_refund(received_on: &str, settled_on: Option<&str>) -> LedgerLine {
+    let mut line = LedgerLine::empty("KYR-AAAA-BBBB-CCCC", "refund", "cash");
+    line.received_on = Some(received_on.to_string());
+    line.amount_gbp = Some("-20.00".to_string());
+    line.applied_gbp = Some("-20.00".to_string());
+    line.refund = Some(RefundTail {
+        refund_of: Some(3),
+        settled_on: settled_on.map(str::to_string),
+        refund_basis: Some("recorded_xmr".to_string()),
+        rate_refund: Some("410.00".to_string()),
+    });
+    line
+}
+
+#[test]
+fn a_refund_is_taxed_in_the_year_it_was_paid_not_the_year_it_was_filed() {
+    let refund = export_refund("2026-04-01", Some("2026-04-08"));
+    let (start, end) = tax_year("2025-26").unwrap();
+    assert_eq!(
+        export_section(&refund, start, end),
+        Section::Elsewhere,
+        "a refund paid after 5 April is not a deduction in the closing year"
+    );
+    let (start, end) = tax_year("2026-27").unwrap();
+    assert_eq!(export_section(&refund, start, end), Section::Takings);
+}
+
+#[test]
+fn an_unsettled_refund_is_listed_apart_and_never_counts_as_takings() {
+    let unsettled = export_refund("2026-04-01", None);
+    for year in ["2025-26", "2026-27"] {
+        let (start, end) = tax_year(year).unwrap();
+        assert_ne!(
+            export_section(&unsettled, start, end),
+            Section::Takings,
+            "{year} took an unpaid refund as a negative row"
+        );
+    }
+    let (start, end) = tax_year("2025-26").unwrap();
+    assert_eq!(
+        export_section(&unsettled, start, end),
+        Section::UnsettledRefund
+    );
+}
+
+#[test]
+fn the_export_carries_the_refund_basis_and_both_rates() {
+    let columns = payment_columns();
+    let names: Vec<&str> = columns.iter().map(|(name, _)| *name).collect();
+    for name in [
+        "refund_basis",
+        "rate_refund",
+        "rate_received",
+        "rate_received_source",
+        "rate_received_at",
+    ] {
+        assert!(names.contains(&name), "{name} is not an export column");
+    }
+    let value = |name: &str, line: &LedgerLine| {
+        (columns
+            .iter()
+            .find(|(column, _)| *column == name)
+            .unwrap()
+            .1)(line)
+    };
+    let refund = export_refund("2026-04-01", Some("2026-04-08"));
+    assert_eq!(value("refund_basis", &refund), "recorded_xmr");
+    assert_eq!(value("rate_refund", &refund), "410.00");
+
+    let mut payment = LedgerLine::empty("KYR-AAAA-BBBB-CCCC", "payment", "monero");
+    payment.rate_received = Some("409.44".to_string());
+    payment.rate_received_source = Some("coingecko".to_string());
+    payment.rate_received_at = Some("2026-10-01T09:00:00Z".to_string());
+    assert_eq!(value("rate_received", &payment), "409.44");
+    assert_eq!(value("rate_received_source", &payment), "coingecko");
+    assert_eq!(value("rate_received_at", &payment), "2026-10-01T09:00:00Z");
 }
 
 #[test]

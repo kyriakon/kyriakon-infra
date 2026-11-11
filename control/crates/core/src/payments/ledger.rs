@@ -40,6 +40,16 @@ pub struct LedgerLine {
     pub rate_quoted: Option<String>,
     pub rate_source: Option<String>,
     pub rate_at: Option<String>,
+    /// The XMR/GBP rate in force on `received_on`, and its source and the day
+    /// it is struck. A Monero payment records it beside the window's quote,
+    /// because the income is valued at the receipt date. Absent on every other
+    /// rail and on a Monero row whose receipt-date rate is not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_received: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_received_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_received_at: Option<String>,
     pub txid: Option<String>,
     pub intent: Option<String>,
     pub note: Option<String>,
@@ -95,6 +105,12 @@ struct LedgerLineRecord {
     #[serde(default)]
     rate_at: Option<String>,
     #[serde(default)]
+    rate_received: Option<String>,
+    #[serde(default)]
+    rate_received_source: Option<String>,
+    #[serde(default)]
+    rate_received_at: Option<String>,
+    #[serde(default)]
     txid: Option<String>,
     #[serde(default)]
     intent: Option<String>,
@@ -146,6 +162,9 @@ impl<'de> Deserialize<'de> for LedgerLine {
             rate_quoted: raw.rate_quoted,
             rate_source: raw.rate_source,
             rate_at: raw.rate_at,
+            rate_received: raw.rate_received,
+            rate_received_source: raw.rate_received_source,
+            rate_received_at: raw.rate_received_at,
             txid: raw.txid,
             intent: raw.intent,
             note: raw.note,
@@ -174,6 +193,9 @@ impl LedgerLine {
             rate_quoted: None,
             rate_source: None,
             rate_at: None,
+            rate_received: None,
+            rate_received_source: None,
+            rate_received_at: None,
             txid: None,
             intent: None,
             note: None,
@@ -192,6 +214,20 @@ impl LedgerLine {
         self.refund
             .as_ref()
             .and_then(|refund| refund.settled_on.as_deref())
+    }
+
+    /// What a refund gives back: the recorded XMR or the sterling price.
+    pub fn refund_basis(&self) -> Option<&str> {
+        self.refund
+            .as_ref()
+            .and_then(|refund| refund.refund_basis.as_deref())
+    }
+
+    /// The refund-date rate, when the refund was paid in sterling.
+    pub fn rate_refund(&self) -> Option<&str> {
+        self.refund
+            .as_ref()
+            .and_then(|refund| refund.rate_refund.as_deref())
     }
 }
 
@@ -487,6 +523,31 @@ mod tests {
             r#"{"amount_gbp":"-5.00","amount_xmr":null,"applied_gbp":"-5.00","intent":"in_refund","kind":"refund","note":"overpaid","paid_until_after":null,"rail":"cash","rate_at":null,"rate_quoted":null,"rate_refund":null,"rate_source":null,"received_on":"2026-10-04","refund_basis":null,"refund_of":3,"seq":2,"settled_on":null,"token":"KYR-AAAA-BBBB-CCCC","txid":null,"version":1}"#
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A Monero row records the receipt-date rate beside the window quote, and
+    /// a line written before those fields existed still parses with them absent.
+    #[test]
+    fn a_receipt_rate_round_trips_and_an_old_line_parses_without_it() {
+        let raw = r#"{"amount_gbp":"20.00","applied_gbp":"20.00","intent":"in_credit","kind":"payment","rail":"monero","seq":1,"token":"KYR-AAAA-BBBB-CCCC","version":1}"#;
+        let old: LedgerLine = serde_json::from_str(raw).unwrap();
+        assert!(old.rate_received.is_none());
+        let value = serde_json::to_value(&old).unwrap();
+        assert!(value.get("rate_received").is_none(), "{value}");
+
+        let mut line = credit("in_credit");
+        line.rail = "monero".to_string();
+        line.rate_received = Some("409.44".to_string());
+        line.rate_received_source = Some("coingecko".to_string());
+        line.rate_received_at = Some("2026-10-01T09:00:00Z".to_string());
+        let parsed: LedgerLine =
+            serde_json::from_str(&serde_json::to_string(&line).unwrap()).unwrap();
+        assert_eq!(parsed.rate_received.as_deref(), Some("409.44"));
+        assert_eq!(parsed.rate_received_source.as_deref(), Some("coingecko"));
+        assert_eq!(
+            parsed.rate_received_at.as_deref(),
+            Some("2026-10-01T09:00:00Z")
+        );
     }
 
     /// Parsing a payment and writing it again must not invent the refund block.

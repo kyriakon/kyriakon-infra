@@ -149,7 +149,7 @@ pub fn quote_xmr(price_pence: i64, rate: &str) -> Result<String, Error> {
 /// A positive decimal with at most twelve decimal places, the coin's atomic
 /// unit. It is the shape the cache and the endpoint both have to produce before
 /// either is used.
-fn valid_rate(rate: &str) -> bool {
+pub fn valid_rate(rate: &str) -> bool {
     parse_rate(rate).is_some()
 }
 

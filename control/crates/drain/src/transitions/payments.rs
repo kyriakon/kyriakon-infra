@@ -19,6 +19,7 @@ use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::payments::ledger::Ledger;
 use kyriakon_control_core::payments::ledger::LedgerLine;
 use kyriakon_control_core::payments::ledger::RefundTail;
+use kyriakon_control_core::payments::xmr;
 use kyriakon_control_core::store::journal::Journal;
 use kyriakon_control_core::store::{
     self, Account, ApplicationRef, CreditProgress, GroupRecord, JournalLine, Monero, Payment,
@@ -144,6 +145,18 @@ fn credit_fields(intent: &CreditIntent) -> Result<i64, Error> {
             "the credit's XMR amount is not a decimal amount".to_string(),
         ));
     }
+    if intent.rate.is_some() && intent.rail != "monero" {
+        return Err(Error::Failed(
+            "a --rate is only a monero credit's receipt-date rate".to_string(),
+        ));
+    }
+    if let Some(rate) = intent.rate.as_deref() {
+        if !xmr::valid_rate(rate) {
+            return Err(Error::Failed(format!(
+                "the credit's rate {rate:?} is not a positive decimal amount"
+            )));
+        }
+    }
     match util::pence(&intent.amount_gbp) {
         Ok(amount) if amount > 0 => Ok(amount),
         Ok(_) => Err(Error::Failed(
@@ -262,9 +275,10 @@ async fn apply_payment(
     if let Some(progress) = progress.as_ref().filter(|_| written) {
         if !Ledger::open(store).has_intent(&intent.id).await? {
             append_credit_ledger(
+                cfg,
                 store,
                 intent,
-                payment.monero.as_ref(),
+                payment_quote(&payment),
                 &util::date_string(received),
                 &util::gbp(amount),
                 &progress.applied_gbp,
@@ -397,6 +411,9 @@ async fn apply_payment(
     if applied.paid && account.state == "lapsed" {
         run_script(cfg, "lapse-user.sh", &["--restore", username]).await?;
     }
+    // Read before the write: a renewal's block still holds the year-one quote,
+    // and the row must not carry it into year two.
+    let quote = payment_quote(&payment).cloned();
     payment.rail = Some(intent.rail.clone());
     payment.balance_gbp = balance_text;
     if applied.paid {
@@ -422,9 +439,10 @@ async fn apply_payment(
     write_account_record(store, username, &bytes).await?;
     write_payment_copy(store, username, &payment).await?;
     append_credit_ledger(
+        cfg,
         store,
         intent,
-        payment.monero.as_ref(),
+        quote.as_ref(),
         &util::date_string(received),
         &util::gbp(amount),
         &util::gbp(applied.applied),
@@ -532,6 +550,7 @@ async fn group_credit(
     if let Some(progress) = progress.as_ref().filter(|_| written) {
         if !Ledger::open(store).has_intent(&intent.id).await? {
             append_credit_ledger(
+                cfg,
                 store,
                 intent,
                 None,
@@ -652,6 +671,7 @@ async fn group_credit(
     }
     write_group_record(store, &group).await?;
     append_credit_ledger(
+        cfg,
         store,
         intent,
         None,
@@ -1361,6 +1381,7 @@ pub async fn reconcile_attribute(
         received: held.received_on.clone(),
         txid: held.txid.clone(),
         amount_xmr: held.amount_xmr.clone(),
+        rate: None,
         confirm_double: intent.confirm_double,
         override_reason: intent.override_reason.clone(),
         note: held.note.clone(),
@@ -1666,20 +1687,62 @@ pub async fn write_payment_copy(
     Ok(())
 }
 
+/// The window quote a payment row may carry. A renewal's account block still
+/// holds the year-one quote, so only a first credit records it: stamping it on
+/// year two would record a rate that was never in force for that payment.
+fn payment_quote(payment: &Payment) -> Option<&Monero> {
+    payment
+        .monero
+        .as_ref()
+        .filter(|_| payment.paid_until.is_none())
+}
+
+/// The XMR/GBP rate in force on the receipt date: the operator's `--rate` when
+/// given, otherwise the cache when it is fresh. A stale cache is not the rate on
+/// the receipt date, so it is no rate at all; the caller records the absence
+/// rather than a number that was true days earlier.
+fn receipt_rate(
+    cfg: &DrainConfig,
+    intent: &CreditIntent,
+    received_on: &str,
+) -> Option<(String, String, String)> {
+    if intent.rail != "monero" {
+        return None;
+    }
+    if let Some(rate) = intent.rate.as_deref() {
+        return Some((
+            rate.to_string(),
+            "operator".to_string(),
+            received_on.to_string(),
+        ));
+    }
+    let cached = xmr::cached(cfg)?;
+    if !xmr::fresh(&cached, OffsetDateTime::now_utc()) {
+        return None;
+    }
+    Some((cached.rate_gbp_per_xmr, cached.source, cached.fetched_at))
+}
+
 /// Append the credit's line, keyed by the token, with no username. A Monero
-/// credit carries the rate that produced the window's quote, its source and
-/// when it was fetched; every other rail's rate fields stay null. The XMR amount
-/// and the transaction id are recorded when the operator gave them.
+/// credit carries the rate in force on the receipt date beside the rate that
+/// produced the window's quote; every other rail's rate fields stay null. The
+/// XMR amount and the transaction id are recorded when the operator gave them.
+///
+/// A Monero row with no receipt-date rate leaves those fields absent and says so
+/// in its note: the accountant values it from the market on that date, and the
+/// row never pretends a stale cache was in force.
+#[allow(clippy::too_many_arguments)]
 async fn append_credit_ledger(
+    cfg: &DrainConfig,
     store: &Store,
     intent: &CreditIntent,
-    monero: Option<&Monero>,
+    quote: Option<&Monero>,
     received_on: &str,
     amount_gbp: &str,
     applied_gbp: &str,
     paid_until_after: Option<&str>,
 ) -> Result<(), Error> {
-    let quoted = monero.filter(|_| intent.rail == "monero");
+    let quoted = quote.filter(|_| intent.rail == "monero");
     let mut line = LedgerLine::empty(&intent.token, "payment", &intent.rail);
     line.received_on = Some(received_on.to_string());
     line.amount_gbp = Some(amount_gbp.to_string());
@@ -1689,6 +1752,21 @@ async fn append_credit_ledger(
     line.rate_quoted = quoted.and_then(|m| m.rate_gbp_per_xmr.clone());
     line.rate_source = quoted.and_then(|m| m.rate_source.clone());
     line.rate_at = quoted.and_then(|m| m.rate_at.clone());
+    if intent.rail == "monero" {
+        match receipt_rate(cfg, intent, received_on) {
+            Some((rate, source, at)) => {
+                line.rate_received = Some(rate);
+                line.rate_received_source = Some(source);
+                line.rate_received_at = Some(at);
+            }
+            None => {
+                line.note = Some(
+                    "no receipt-date XMR rate available; value this row at the rate on its date"
+                        .to_string(),
+                )
+            }
+        }
+    }
     line.txid = intent.txid.clone();
     line.intent = Some(intent.id.clone());
     Ledger::open(store).append(line).await?;
@@ -1741,6 +1819,7 @@ mod tests {
             "2026-10-04",
             None,
             None,
+            None,
             false,
             Some("posted twice"),
             None,
@@ -1750,6 +1829,7 @@ mod tests {
             "cash",
             "20.00",
             "2026-10-04",
+            None,
             None,
             None,
             false,
@@ -1767,12 +1847,158 @@ mod tests {
             "2026-10-04",
             None,
             None,
+            None,
             false,
             None,
             Some("no token: envelope in book"),
         );
         assert!(c.contains("no token: envelope in book"));
         assert_ne!(c, a);
+    }
+
+    fn monero_intent(id: &str, token: &str, rate: Option<&str>) -> CreditIntent {
+        CreditIntent {
+            id: id.to_string(),
+            token: token.to_string(),
+            rail: "monero".to_string(),
+            amount_gbp: "20.00".to_string(),
+            received: "2026-10-04".to_string(),
+            amount_xmr: Some("0.048848".to_string()),
+            rate: rate.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn year_one_quote() -> Monero {
+        Monero {
+            address: None,
+            quote_xmr: Some("0.066667".to_string()),
+            rate_gbp_per_xmr: Some("300.00".to_string()),
+            rate_source: Some("coingecko".to_string()),
+            rate_at: Some("2025-10-01T09:00:00Z".to_string()),
+            stale: false,
+        }
+    }
+
+    fn write_rate_cache(cfg: &DrainConfig, fetched_at: &str) {
+        let path = std::path::Path::new(&cfg.rates);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "rate_gbp_per_xmr": "409.44",
+                "source": "coingecko",
+                "fetched_at": fetched_at,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A person's first credit, a renewal and a group payment all record the
+    /// rate in force on the receipt date; only the first credit carries the
+    /// window's quote, so a renewal never stamps the year-one rate on year two.
+    #[tokio::test]
+    async fn monero_rows_carry_the_receipt_rate_and_a_renewal_drops_the_year_one_quote() {
+        let dir = std::env::temp_dir().join(format!("onboard-xmr-rate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = quota_config(&dir);
+        std::fs::create_dir_all(&cfg.store_root).unwrap();
+        write_rate_cache(&cfg, &util::stamp(OffsetDateTime::now_utc()));
+        let store = Store::new_for_test(&cfg.store_root);
+        let quote = year_one_quote();
+        for (id, quote) in [("person", Some(&quote)), ("renewal", None), ("group", None)] {
+            append_credit_ledger(
+                &cfg,
+                &store,
+                &monero_intent(id, "KYR-AAAA-BBBB-CCCC", None),
+                quote,
+                "2026-10-04",
+                "20.00",
+                "20.00",
+                Some("2027-10-04"),
+            )
+            .await
+            .unwrap();
+        }
+        let lines = Ledger::open(&store).lines().await.unwrap();
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            assert_eq!(line.rate_received.as_deref(), Some("409.44"), "{line:?}");
+            assert_eq!(
+                line.rate_received_source.as_deref(),
+                Some("coingecko"),
+                "{line:?}"
+            );
+        }
+        assert_eq!(lines[0].rate_quoted.as_deref(), Some("300.00"));
+        assert!(lines[1].rate_quoted.is_none(), "{:?}", lines[1]);
+        assert!(lines[2].rate_quoted.is_none(), "{:?}", lines[2]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `--rate` is the operator's receipt-date rate; a cache older than the
+    /// twenty-four-hour window is no rate, and the row says so instead of
+    /// writing a number that was true days earlier.
+    #[tokio::test]
+    async fn an_operator_rate_wins_and_a_stale_cache_is_not_written() {
+        let dir = std::env::temp_dir().join(format!("onboard-xmr-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = quota_config(&dir);
+        std::fs::create_dir_all(&cfg.store_root).unwrap();
+        let store = Store::new_for_test(&cfg.store_root);
+        append_credit_ledger(
+            &cfg,
+            &store,
+            &monero_intent("operator", "KYR-AAAA-BBBB-CCCC", Some("410.00")),
+            None,
+            "2026-10-04",
+            "20.00",
+            "20.00",
+            Some("2027-10-04"),
+        )
+        .await
+        .unwrap();
+        write_rate_cache(&cfg, "2020-01-01T00:00:00Z");
+        append_credit_ledger(
+            &cfg,
+            &store,
+            &monero_intent("stale", "KYR-AAAA-BBBB-CCCC", None),
+            None,
+            "2026-10-04",
+            "20.00",
+            "20.00",
+            Some("2027-10-04"),
+        )
+        .await
+        .unwrap();
+
+        let lines = Ledger::open(&store).lines().await.unwrap();
+        assert_eq!(lines[0].rate_received.as_deref(), Some("410.00"));
+        assert_eq!(lines[0].rate_received_source.as_deref(), Some("operator"));
+        assert_eq!(lines[0].rate_received_at.as_deref(), Some("2026-10-04"));
+        assert!(lines[1].rate_received.is_none(), "{:?}", lines[1]);
+        assert!(
+            lines[1]
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("rate")),
+            "the row does not say the rate is missing: {:?}",
+            lines[1]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_renewal_does_not_reuse_the_year_one_quote() {
+        let mut payment = Payment {
+            monero: Some(year_one_quote()),
+            ..Default::default()
+        };
+        assert!(payment_quote(&payment).is_some());
+        payment.paid_until = Some("2027-10-04".to_string());
+        assert!(payment_quote(&payment).is_none());
     }
 
     /// Whether the ledger lock can be taken without waiting. `false` means a

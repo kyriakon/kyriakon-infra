@@ -271,6 +271,10 @@ pub struct CreditIntent {
     pub txid: Option<String>,
     #[serde(default)]
     pub amount_xmr: Option<String>,
+    /// `--rate`, the GBP price of one XMR on the receipt date, when the operator
+    /// read it from the market rather than the drain's cache.
+    #[serde(default)]
+    pub rate: Option<String>,
     #[serde(default)]
     pub confirm_double: bool,
     #[serde(default)]

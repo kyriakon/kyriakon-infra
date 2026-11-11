@@ -3,6 +3,7 @@
 use super::payment_token;
 use crate::Error;
 use crate::*;
+use kyriakon_control_core::payments::xmr;
 
 /// `token resend <username>`: the member's payment instructions again, with the
 /// token their account already holds. Nothing is minted, because a second token
@@ -65,7 +66,8 @@ pub(crate) async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) ->
     let flags = flags(
         &paired,
         &[
-            "token", "username", "rail", "amount", "received", "txid", "xmr", "override", "note",
+            "token", "username", "rail", "amount", "received", "txid", "xmr", "rate", "override",
+            "note",
         ],
     )?;
     let note = match flags.get("note") {
@@ -130,6 +132,19 @@ pub(crate) async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) ->
     }
     let txid = flags.get("txid").map(String::as_str);
     let xmr = flags.get("xmr").map(String::as_str);
+    let rate = flags.get("rate").map(String::as_str);
+    if let Some(rate) = rate {
+        if rail != "monero" {
+            return Err(Error::Failed(
+                "--rate is only a monero credit's receipt-date rate".to_string(),
+            ));
+        }
+        if !xmr::valid_rate(rate) {
+            return Err(Error::Failed(format!(
+                "--rate {rate:?} is not a positive decimal amount"
+            )));
+        }
+    }
     let override_reason = flags.get("override").map(String::as_str);
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(
@@ -141,6 +156,7 @@ pub(crate) async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) ->
             received,
             txid,
             xmr,
+            rate,
             confirm_double,
             override_reason,
             note,
@@ -153,6 +169,7 @@ pub(crate) async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) ->
         received: received.to_string(),
         txid: txid.map(str::to_string),
         amount_xmr: xmr.map(str::to_string),
+        rate: rate.map(str::to_string),
         confirm_double,
         override_reason: override_reason.map(str::to_string),
         note: note.map(str::to_string),
