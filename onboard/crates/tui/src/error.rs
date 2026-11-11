@@ -2,8 +2,6 @@
 //! IPC calls, kept apart from the text the reader sees.
 
 use std::fmt;
-use std::io;
-use std::path::PathBuf;
 
 use kyriakon_onboard_core::config;
 use kyriakon_onboard_core::store;
@@ -11,12 +9,6 @@ use kyriakon_onboard_core::Error as CoreError;
 
 #[derive(Debug)]
 pub enum Error {
-    /// A file, lock or terminal operation failed.
-    Io {
-        what: &'static str,
-        path: Option<PathBuf>,
-        source: io::Error,
-    },
     /// The portal refuses the session for the reason the reader sees.
     Refused(String),
     /// A failure with no more specific case yet.
@@ -36,16 +28,6 @@ impl fmt::Display for Error {
             Error::Store(error) => error.fmt(f),
             Error::Config(error) => error.fmt(f),
             Error::Core(error) => error.fmt(f),
-            Error::Io {
-                what,
-                path: Some(path),
-                source,
-            } => write!(f, "cannot {what} {}: {source}", path.display()),
-            Error::Io {
-                what,
-                path: None,
-                source,
-            } => write!(f, "cannot {what}: {source}"),
         }
     }
 }
@@ -57,7 +39,6 @@ impl std::error::Error for Error {
             Error::Store(error) => Some(error),
             Error::Config(error) => Some(error),
             Error::Core(error) => Some(error),
-            Error::Io { source, .. } => Some(source),
         }
     }
 }
@@ -88,16 +69,6 @@ impl From<config::Error> for Error {
 impl From<CoreError> for Error {
     fn from(error: CoreError) -> Self {
         Error::Core(error)
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(source: io::Error) -> Self {
-        Error::Io {
-            what: "the terminal",
-            path: None,
-            source,
-        }
     }
 }
 

@@ -107,16 +107,6 @@ impl From<config::Error> for Error {
     }
 }
 
-impl From<std::io::Error> for Error {
-    fn from(source: std::io::Error) -> Self {
-        Error::Io {
-            what: "the socket",
-            path: None,
-            source,
-        }
-    }
-}
-
 impl From<crate::fastcgi::Error> for Error {
     fn from(error: crate::fastcgi::Error) -> Self {
         Error::Fastcgi(error)

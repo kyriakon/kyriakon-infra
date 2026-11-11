@@ -15,7 +15,7 @@ use kyriakon_onboard_handler::responder;
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
-        eprintln!("kyriakon-onboard: {e}");
+        e.report("starting the responder");
         std::process::exit(1);
     }
 }

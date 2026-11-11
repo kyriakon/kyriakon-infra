@@ -122,7 +122,7 @@ async fn main() -> ExitCode {
     match run(&cfg_path, &rest).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("kyriakon-onboardctl: {e}");
+            e.report("the console");
             ExitCode::FAILURE
         }
     }

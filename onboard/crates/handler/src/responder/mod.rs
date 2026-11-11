@@ -139,7 +139,7 @@ impl App {
     /// crate's own, read at build time, so a wording change is a rebuild and the
     /// store holds no copy of it to drift from.
     async fn load(cfg: config::Config) -> Result<App, Error> {
-        let list = questions::shipped().map_err(|e| Error::Startup(e.to_string()))?;
+        let list = questions::shipped()?;
         if list.is_empty() {
             return Err(Error::Startup(format!(
                 "{} has no questions",
@@ -150,8 +150,7 @@ impl App {
         // that came up with no services would render an application page that
         // promises nothing, which is the failure the config path exists to
         // prevent.
-        let services = catalogue::parse(&Store::read_text(&cfg.catalogue).await?)
-            .map_err(|e| Error::Startup(e.to_string()))?;
+        let services = catalogue::parse(&Store::read_text(&cfg.catalogue).await?)?;
         if services.is_empty() {
             return Err(Error::Startup(format!(
                 "{} has no services",
@@ -250,7 +249,11 @@ pub async fn serve(cfg: config::Config) -> Result<(), Error> {
     let portal = bind(&app.cfg.portal_socket)?;
     let titan = TcpListener::bind(&app.cfg.titan_listener)
         .await
-        .map_err(|e| format!("cannot listen on {}: {e}", app.cfg.titan_listener))?;
+        .map_err(|source| Error::Io {
+            what: "listen on",
+            path: Some(app.cfg.titan_listener.clone().into()),
+            source,
+        })?;
     eprintln!(
         "kyriakon-onboard: httpd {}, gemini {}, portal {}, titan {}, store {}, {} questions",
         app.cfg.httpd_socket,
@@ -292,14 +295,25 @@ fn bind(path: &str) -> Result<UnixListener, Error> {
     let path = Path::new(path);
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.file_type().is_socket() {
-            std::fs::remove_file(path)
-                .map_err(|e| format!("cannot remove the socket {}: {e}", path.display()))?;
+            std::fs::remove_file(path).map_err(|source| Error::Io {
+                what: "remove the socket",
+                path: Some(path.into()),
+                source,
+            })?;
         }
     }
-    let listener = UnixListener::bind(path)
-        .map_err(|e| format!("cannot listen on {}: {e}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
-        .map_err(|e| format!("cannot set the mode on {}: {e}", path.display()))?;
+    let listener = UnixListener::bind(path).map_err(|source| Error::Io {
+        what: "listen on",
+        path: Some(path.into()),
+        source,
+    })?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660)).map_err(|source| {
+        Error::Io {
+            what: "set the mode on",
+            path: Some(path.into()),
+            source,
+        }
+    })?;
     Ok(listener)
 }
 

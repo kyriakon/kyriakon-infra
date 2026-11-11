@@ -47,7 +47,7 @@ async fn main() -> ExitCode {
     match run(&cfg_path).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("kyriakon-onboard-drain: {e}");
+            e.report("the drain");
             ExitCode::FAILURE
         }
     }

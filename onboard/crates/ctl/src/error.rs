@@ -2,8 +2,6 @@
 //! operator sees.
 
 use std::fmt;
-use std::io;
-use std::path::PathBuf;
 
 use kyriakon_onboard_core::config;
 use kyriakon_onboard_core::store;
@@ -20,17 +18,6 @@ pub enum Error {
     Core(kyriakon_onboard_core::Error),
     /// A drain transition refused or failed.
     Drain(kyriakon_onboard_drain::transitions::Error),
-    /// A file or socket operation failed.
-    Io {
-        what: &'static str,
-        path: Option<PathBuf>,
-        source: io::Error,
-    },
-    /// A JSON record did not encode or parse.
-    Json {
-        what: &'static str,
-        source: serde_json::Error,
-    },
 }
 
 impl fmt::Display for Error {
@@ -41,17 +28,6 @@ impl fmt::Display for Error {
             Error::Config(error) => error.fmt(f),
             Error::Core(error) => error.fmt(f),
             Error::Drain(error) => error.fmt(f),
-            Error::Io {
-                what,
-                path: Some(path),
-                source,
-            } => write!(f, "cannot {what} {}: {source}", path.display()),
-            Error::Io {
-                what,
-                path: None,
-                source,
-            } => write!(f, "cannot {what}: {source}"),
-            Error::Json { what, source } => write!(f, "cannot {what}: {source}"),
         }
     }
 }
@@ -64,13 +40,15 @@ impl std::error::Error for Error {
             Error::Config(error) => Some(error),
             Error::Core(error) => Some(error),
             Error::Drain(error) => Some(error),
-            Error::Io { source, .. } => Some(source),
-            Error::Json { source, .. } => Some(source),
         }
     }
 }
 
 impl Error {
+    pub fn report(&self, context: &str) {
+        kyriakon_onboard_core::util::report(self, context);
+    }
+
     /// Temporary while the remaining tests are converted to variants.
     #[cfg(test)]
     pub fn contains(&self, pattern: &str) -> bool {
@@ -99,25 +77,6 @@ impl From<kyriakon_onboard_core::Error> for Error {
 impl From<kyriakon_onboard_drain::transitions::Error> for Error {
     fn from(error: kyriakon_onboard_drain::transitions::Error) -> Self {
         Error::Drain(error)
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(source: io::Error) -> Self {
-        Error::Io {
-            what: "the file",
-            path: None,
-            source,
-        }
-    }
-}
-
-impl From<serde_json::Error> for Error {
-    fn from(source: serde_json::Error) -> Self {
-        Error::Json {
-            what: "the record",
-            source,
-        }
     }
 }
 

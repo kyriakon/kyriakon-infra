@@ -99,16 +99,6 @@ impl From<config::Error> for Error {
     }
 }
 
-impl From<io::Error> for Error {
-    fn from(source: io::Error) -> Self {
-        Error::Io {
-            what: "the file",
-            path: None,
-            source,
-        }
-    }
-}
-
 impl From<serde_json::Error> for Error {
     fn from(source: serde_json::Error) -> Self {
         Error::Json {

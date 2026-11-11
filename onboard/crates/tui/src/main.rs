@@ -61,7 +61,7 @@ fn main() -> ExitCode {
         Ok(Departure::Quit) => ExitCode::SUCCESS,
         Ok(Departure::Gone) => ExitCode::FAILURE,
         Err(why) => {
-            eprintln!("kyriakon-onboard-tui: {why}");
+            why.report("the terminal");
             ExitCode::FAILURE
         }
     }
@@ -309,7 +309,7 @@ impl Term {
             // Nothing better is available here: the session is ending, or a prompt
             // is about to be read with the terminal in whatever state it is in,
             // and neither is something this program can act on.
-            eprintln!("kyriakon-onboard-tui: {why}");
+            Error::from(format!("cannot restore the terminal: {why}")).report("the terminal");
         }
     }
 

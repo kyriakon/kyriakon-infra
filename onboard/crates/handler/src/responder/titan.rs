@@ -30,7 +30,12 @@ pub(super) async fn titan_accept(listener: TcpListener, app: Arc<App>) -> Result
         let (stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
-                Error::from(e).report("accepting a titan connection");
+                Error::Io {
+                    what: "accept a titan connection",
+                    path: None,
+                    source: e,
+                }
+                .report("accepting a titan connection");
                 // A short pause keeps a hard failure from spinning the loop.
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
