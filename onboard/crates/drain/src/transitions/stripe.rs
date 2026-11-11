@@ -194,29 +194,30 @@ pub fn verify_webhook(secret: &[u8], header: &str, body: &[u8], now: i64) -> Res
         if part.is_empty() {
             continue;
         }
-        let (name, value) = part
-            .split_once('=')
-            .ok_or_else(|| format!("the signature header carries {part:?} without a value"))?;
+        let (name, value) = part.split_once('=').ok_or_else(|| {
+            Error::Failed(format!(
+                "the signature header carries {part:?} without a value"
+            ))
+        })?;
         match name {
             "t" => {
-                timestamp = Some(
-                    value
-                        .parse::<i64>()
-                        .map_err(|_| format!("the timestamp {value:?} is not a number"))?,
-                );
+                timestamp = Some(value.parse::<i64>().map_err(|source| {
+                    Error::context(format!("the timestamp {value:?} is not a number"), source)
+                })?);
             }
             "v1" => signatures.push(value),
             _ => {}
         }
     }
-    let timestamp = timestamp.ok_or("the signature header carries no t=")?;
+    let timestamp =
+        timestamp.ok_or_else(|| Error::Failed("the signature header carries no t=".to_string()))?;
     if signatures.is_empty() {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the signature header carries no v1 signature".to_string(),
         ));
     }
     if (now - timestamp).abs() > WEBHOOK_TOLERANCE {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the timestamp {timestamp} is more than five minutes from {now}"
         )));
     }
@@ -229,7 +230,9 @@ pub fn verify_webhook(secret: &[u8], header: &str, body: &[u8], now: i64) -> Res
     {
         Ok(())
     } else {
-        Err(Error::from("no v1 signature matches the body".to_string()))
+        Err(Error::Failed(
+            "no v1 signature matches the body".to_string(),
+        ))
     }
 }
 
@@ -330,7 +333,7 @@ impl BillingTarget {
                 let payment = a
                     .payment
                     .as_mut()
-                    .ok_or("the account has no payment block")?;
+                    .ok_or_else(|| Error::Failed("the account has no payment block".to_string()))?;
                 payment.paid_until = Some(date);
                 if let Some(window) = payment.window.as_mut() {
                     window.state = "paid".to_string();
@@ -488,7 +491,7 @@ async fn settle_event(
 ) -> Result<Settled, Error> {
     let object = event
         .pointer("/data/object")
-        .ok_or("the event carries no data.object")?;
+        .ok_or_else(|| Error::Failed("the event carries no data.object".to_string()))?;
     match kind {
         "checkout.session.completed" => checkout_completed(store, object).await,
         "invoice.paid" => invoice_paid(cfg, store, journal, object).await,
@@ -744,14 +747,14 @@ fn invoice_money(object: &Value) -> Result<(String, String), Error> {
     let amount = object
         .get("amount_paid")
         .and_then(Value::as_i64)
-        .ok_or("the paid invoice carries no amount_paid")?;
+        .ok_or_else(|| Error::Failed("the paid invoice carries no amount_paid".to_string()))?;
     let paid = object
         .pointer("/status_transitions/paid_at")
         .and_then(Value::as_i64)
         .or_else(|| object.get("created").and_then(Value::as_i64))
-        .ok_or("the paid invoice carries no paid timestamp")?;
+        .ok_or_else(|| Error::Failed("the paid invoice carries no paid timestamp".to_string()))?;
     let when = OffsetDateTime::from_unix_timestamp(paid)
-        .map_err(|e| format!("the invoice's paid timestamp cannot be read: {e}"))?;
+        .map_err(|e| Error::context("the invoice's paid timestamp cannot be read", e))?;
     Ok((util::gbp(amount), util::date_string(when.date())))
 }
 
@@ -793,7 +796,7 @@ async fn retrieve_subscription(cfg: &DrainConfig, subscription: &str) -> Result<
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'_')
     {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the subscription id {subscription:?} is not an id"
         )));
     }
@@ -807,7 +810,7 @@ async fn retrieve_subscription(cfg: &DrainConfig, subscription: &str) -> Result<
         return Err(Error::from(script_error(cfg, "stripe-api.sh", &out)));
     }
     serde_json::from_slice(&out.stdout).map_err(|e| {
-        Error::from(format!(
+        Error::Failed(format!(
             "stripe-api.sh did not answer with a subscription: {e}"
         ))
     })
@@ -821,7 +824,7 @@ async fn retrieve_session(cfg: &DrainConfig, subscription: &str) -> Result<Value
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'_')
     {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the subscription id {subscription:?} is not an id"
         )));
     }
@@ -835,7 +838,7 @@ async fn retrieve_session(cfg: &DrainConfig, subscription: &str) -> Result<Value
         return Err(Error::from(script_error(cfg, "stripe-api.sh", &out)));
     }
     serde_json::from_slice(&out.stdout).map_err(|e| {
-        Error::from(format!(
+        Error::Failed(format!(
             "stripe-api.sh did not answer with a checkout session: {e}"
         ))
     })

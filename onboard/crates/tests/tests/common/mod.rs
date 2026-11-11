@@ -1054,7 +1054,7 @@ impl Fix {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| format!("cannot build the runtime: {e}"))?;
+            .map_err(|e| kyriakon_onboard_core::Error::context("cannot build the runtime", e))?;
         runtime.block_on(kyriakon_onboard_drain::run(&cfg, &store))
     }
 

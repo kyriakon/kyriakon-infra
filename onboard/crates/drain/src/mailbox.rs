@@ -43,12 +43,12 @@ pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(Error::from(format!("cannot read {}: {e}", dir.display()))),
+        Err(e) => return Err(Error::context(format!("cannot read {}", dir.display()), e)),
     };
     while let Some(entry) = entries
         .next_entry()
         .await
-        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+        .map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?
     {
         let path = entry.path();
         if !entry.file_type().await.is_ok_and(|t| t.is_file()) {
@@ -68,7 +68,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<
                     journal,
                     name.as_ref(),
                     "mail",
-                    &Error::from(format!("cannot read {}: {e}", path.display())),
+                    &Error::Failed(format!("cannot read {}: {e}", path.display())),
                 )
                 .await;
                 continue;
@@ -86,7 +86,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<
                 journal,
                 name.as_ref(),
                 "mail",
-                &Error::from(format!("cannot remove {}: {e}", path.display())),
+                &Error::Failed(format!("cannot remove {}: {e}", path.display())),
             )
             .await;
         }
@@ -136,7 +136,7 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
         Ok(keys) => keys,
         Err(missing) => {
             drop(lock);
-            return reply_or_drop(cfg, store, &message, &missing_body(&missing)).await;
+            return reply_or_drop(cfg, store, &message, &missing_body(&missing.0)).await;
         }
     };
     for (mailbox, material) in keys {
@@ -275,13 +275,26 @@ pub fn labelled_blocks(text: &str) -> Vec<(Option<String>, String)> {
     out
 }
 
+/// The mailboxes a multi-mailbox message failed to label, which is what the
+/// reply names.
+#[derive(Debug, PartialEq, Eq)]
+struct Unlabelled(Vec<String>);
+
+impl std::fmt::Display for Unlabelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unlabelled mailboxes: {}", self.0.join(", "))
+    }
+}
+
+impl std::error::Error for Unlabelled {}
+
 /// Pair each block with the draft's mailbox. A body with more than one mailbox
 /// needs a label above each block; a person's single key does not. `Err` names
 /// the mailboxes the message failed to label, which is what the reply says.
 fn assign(
     blocks: &[(Option<String>, String)],
     draft: &Draft,
-) -> Result<Vec<(String, String)>, Vec<String>> {
+) -> Result<Vec<(String, String)>, Unlabelled> {
     let body = draft.answers.get("whose").map(String::as_str) == Some("body");
     let domain = draft
         .answers
@@ -331,7 +344,7 @@ fn assign(
             .zip(covered)
             .filter_map(|(name, seen)| (!seen).then_some(name))
             .collect();
-        return Err(missing);
+        return Err(Unlabelled(missing));
     }
     Ok(assigned)
 }
@@ -371,7 +384,7 @@ async fn reply(cfg: &DrainConfig, store: &Store, sender: &str, body: &str) -> Re
     store
         .write_record_owned("mail", "replies.json", &bytes, owner)
         .await
-        .map_err(|e| Error::from(format!("cannot write {}: {e}", path.display())))?;
+        .map_err(|e| Error::context(format!("cannot write {}", path.display()), e))?;
     notice::enqueue(cfg, sender, REPLY_SUBJECT, body)
         .await
         .map_err(Error::from)
@@ -644,7 +657,7 @@ aGVsbG8=\n--line--\n";
         let blocks = labelled_blocks(KEY);
         assert_eq!(
             assign(&blocks, &draft).unwrap_err(),
-            vec!["secretary".to_string(), "hall".to_string()]
+            Unlabelled(vec!["secretary".to_string(), "hall".to_string()])
         );
         let blocks = labelled_blocks(&format!("secretary@parish.example\n{KEY}"));
         let assigned = assign(&blocks, &draft).unwrap();

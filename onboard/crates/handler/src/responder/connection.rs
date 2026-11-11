@@ -28,7 +28,7 @@ pub(super) async fn accept(
         let (stream, _) = listener
             .accept()
             .await
-            .map_err(|e| format!("cannot accept: {e}"))?;
+            .map_err(|e| Error::context("cannot accept", e))?;
         let app = app.clone();
         tokio::spawn(async move {
             let outcome = match channel {
@@ -53,13 +53,13 @@ pub(super) async fn connection(stream: UnixStream, app: &App) -> Result<(), Erro
             None => return Ok(()),
         };
         let outcome = respond(app, &request).await;
-        eprintln!(
+        kyriakon_onboard_core::util::log(&format!(
             "kyriakon-onboard: {} {} {} {}",
             front_end(&request).word(),
             outcome.route,
             outcome.reply.code(),
             outcome.addr
-        );
+        ));
         say(
             &mut writer,
             &fastcgi::reply_bytes(&outcome.reply, request.id()),

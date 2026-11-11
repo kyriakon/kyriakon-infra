@@ -59,10 +59,10 @@ pub(crate) async fn suspend(
 ) -> Result<(), Error> {
     let (username, args) = match rest {
         [username, args @ ..] => (username.as_str(), args),
-        _ => return Err(Error::from(usage())),
+        _ => return Err(Error::Failed(usage())),
     };
     if let Some(why) = validate::username_shape(username) {
-        return Err(Error::from(format!("the username {username:?}: {why}")));
+        return Err(Error::Failed(format!("the username {username:?}: {why}")));
     }
     let flags = flags(args, &["reason"])?;
     let reason = need(&flags, "reason")?;
@@ -108,7 +108,7 @@ pub(crate) async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) ->
                 .is_some_and(|id| id.starts_with(&prefix))
         });
     if !recorded && !interrupted {
-        return Err(Error::from(format!("no account for {username}")));
+        return Err(Error::Failed(format!("no account for {username}")));
     }
     let journal = Journal::load(store).await?;
     transitions::lifecycle::delete_account(cfg, store, &journal, username).await?;
@@ -121,7 +121,7 @@ pub(crate) async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) ->
 /// drift; a group mailbox is not counted, because the group holds the payment.
 pub(crate) async fn free(store: &Store, rest: &[String]) -> Result<(), Error> {
     if !rest.is_empty() {
-        return Err(Error::from(usage()));
+        return Err(Error::Failed(usage()));
     }
     match free_account_count(store).await? {
         1 => println!("1 account without charge"),
@@ -156,5 +156,5 @@ pub(crate) async fn find_application(
             best = Some((record.status_token.clone(), record));
         }
     }
-    best.ok_or_else(|| Error::from(format!("no application for {username}")))
+    best.ok_or_else(|| Error::Failed(format!("no application for {username}")))
 }

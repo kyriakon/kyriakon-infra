@@ -254,7 +254,7 @@ pub async fn serve(cfg: config::Config) -> Result<(), Error> {
             path: Some(app.cfg.titan_listener.clone().into()),
             source,
         })?;
-    eprintln!(
+    kyriakon_onboard_core::util::log(&format!(
         "kyriakon-onboard: httpd {}, gemini {}, portal {}, titan {}, store {}, {} questions",
         app.cfg.httpd_socket,
         app.cfg.gemini_socket,
@@ -262,7 +262,7 @@ pub async fn serve(cfg: config::Config) -> Result<(), Error> {
         app.cfg.titan_listener,
         app.cfg.store_root,
         app.questions.len()
-    );
+    ));
     tokio::try_join!(
         accept(httpd, app.clone(), Channel::FrontEnd),
         accept(gemini, app.clone(), Channel::FrontEnd),

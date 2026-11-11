@@ -82,7 +82,10 @@ pub(super) async fn titan_connection(
         };
     // The route never carries the token: the token is the capability, and the
     // log line is as long-lived as the rest of the service's.
-    eprintln!("kyriakon-onboard: titan /key {} {address}", reply.code());
+    kyriakon_onboard_core::util::log(&format!(
+        "kyriakon-onboard: titan /key {} {address}",
+        reply.code()
+    ));
     let head = reply.head();
     let write = say(&mut writer, &head);
     match tokio::time::timeout(TITAN_TIMEOUT, write).await {
@@ -323,7 +326,7 @@ pub(super) async fn titan_line<R: tokio::io::AsyncRead + Unpin>(
     }
     String::from_utf8(bytes)
         .map(Some)
-        .map_err(|e| Error::Refused(format!("the titan request line is not text: {e}")))
+        .map_err(|source| Error::context("the titan request line is not text", source))
 }
 
 /// The Titan request line's URL and its three parameters. `size` is mandatory;

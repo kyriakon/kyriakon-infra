@@ -8,13 +8,13 @@ use crate::*;
 /// refuses a domain that has no group record.
 pub(crate) async fn group(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), Error> {
     let [verb, domain] = args else {
-        return Err(Error::from(usage()));
+        return Err(Error::Failed(usage()));
     };
     if verb != "remove" {
-        return Err(Error::from(usage()));
+        return Err(Error::Failed(usage()));
     }
     if let Some(why) = validate::domain(domain) {
-        return Err(Error::from(format!("the domain {domain:?}: {why}")));
+        return Err(Error::Failed(format!("the domain {domain:?}: {why}")));
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::group_remove_payload(domain))?;

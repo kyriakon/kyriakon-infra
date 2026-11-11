@@ -15,25 +15,25 @@ use crate::*;
 pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), Error> {
     let (username, address) = match args {
         [verb, username, address] if verb == "address" => (username.as_str(), address.as_str()),
-        _ => return Err(Error::from(usage())),
+        _ => return Err(Error::Failed(usage())),
     };
     if let Some(why) = validate::username_shape(username) {
-        return Err(Error::from(format!("the username {username:?}: {why}")));
+        return Err(Error::Failed(format!("the username {username:?}: {why}")));
     }
     if let Some(why) = monero_address_shape(address) {
-        return Err(Error::from(format!("the address {address:?} {why}")));
+        return Err(Error::Failed(format!("the address {address:?} {why}")));
     }
     let mut account = store
         .account(username)
         .await?
-        .ok_or_else(|| format!("no account for {username}"))?;
+        .ok_or_else(|| Error::Failed(format!("no account for {username}")))?;
     let Some(mut payment) = account.payment_state() else {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "{username} was approved without charge, so it has no Monero rail"
         )));
     };
     if account.rail != "monero" {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "{username} chose the {} rail, so it has no Monero subaddress to record",
             account.rail
         )));
@@ -45,7 +45,7 @@ pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), Error> 
             return Ok(());
         }
         Some(existing) => {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "{username}'s Monero subaddress is already {existing}; a subaddress is never rotated or reused"
             )))
         }
@@ -53,7 +53,7 @@ pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), Error> 
     }
     account.payment = Some(payment.clone());
     let bytes = serde_json::to_vec_pretty(&account)
-        .map_err(|e| format!("cannot encode the account: {e}"))?;
+        .map_err(|e| Error::context("cannot encode the account", e))?;
     // The same writer the drain uses: the handler reads this record as
     // `_onboard`, so a 0600 root file would leave the page without a payment
     // block.

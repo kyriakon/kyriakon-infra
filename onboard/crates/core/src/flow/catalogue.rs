@@ -35,7 +35,7 @@ impl State {
             "live" => Ok(State::Live),
             "by_request" => Ok(State::ByRequest),
             "planned" => Ok(State::Planned),
-            other => Err(Error::from(format!("unknown state {other:?}"))),
+            other => Err(Error::Failed(format!("unknown state {other:?}"))),
         }
     }
 
@@ -67,7 +67,7 @@ impl Action {
             "apply" => Ok(Action::Apply),
             "account" => Ok(Action::Account),
             "pay" => Ok(Action::Pay),
-            other => Err(Error::from(format!("unknown action {other:?}"))),
+            other => Err(Error::Failed(format!("unknown action {other:?}"))),
         }
     }
 
@@ -211,19 +211,20 @@ struct Entry {
 /// entry that disappears silently is a service no front-end mentions, and a
 /// value with no word is one a front-end would render blank.
 pub fn parse(text: &str) -> Result<Vec<Service>, Error> {
-    let file: File = toml::from_str(text).map_err(|e| format!("the catalogue: {e}"))?;
+    let file: File = toml::from_str(text).map_err(|e| Error::context("the catalogue", e))?;
 
     let mut out = Vec::with_capacity(file.service.len());
     for e in file.service {
         let id = e.id;
         if id.is_empty() || e.name.is_empty() || e.summary.is_empty() || e.host.is_empty() {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the service {id:?} has an empty id, name, summary or host"
             )));
         }
-        let state = State::parse(&e.state).map_err(|why| format!("the service {id:?}: {why}"))?;
-        let action =
-            Action::parse(&e.action).map_err(|why| format!("the service {id:?}: {why}"))?;
+        let state = State::parse(&e.state)
+            .map_err(|why| Error::context(format!("the service {id:?}"), why))?;
+        let action = Action::parse(&e.action)
+            .map_err(|why| Error::context(format!("the service {id:?}"), why))?;
         out.push(Service {
             id,
             name: e.name,
@@ -330,13 +331,15 @@ mod tests {
     fn a_value_outside_the_vocabulary_is_refused_by_name() {
         let unknown_state = SHIPPED.replace("state = \"live\"", "state = \"retired\"");
         let e = parse(&unknown_state).unwrap_err();
-        assert!(e.contains("mail"), "{e}");
-        assert!(e.contains("retired"), "{e}");
+        assert!(matches!(&e, Error::Context { .. }), "{e}");
+        assert!(e.to_string().contains("mail"), "{e}");
+        assert!(e.to_string().contains("retired"), "{e}");
 
         let unknown_action = SHIPPED.replace("action = \"read\"", "action = \"download\"");
         let e = parse(&unknown_action).unwrap_err();
-        assert!(e.contains("mail"), "{e}");
-        assert!(e.contains("download"), "{e}");
+        assert!(matches!(&e, Error::Context { .. }), "{e}");
+        assert!(e.to_string().contains("mail"), "{e}");
+        assert!(e.to_string().contains("download"), "{e}");
 
         // A column of the wrong type, a column that is not one, and an entry
         // with nothing in a column are all build errors rather than a blank card.

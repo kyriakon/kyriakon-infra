@@ -72,18 +72,20 @@ pub fn pgp_public_key(value: &str) -> Result<Checked, Error> {
 pub fn pgp_findings(value: &str) -> Result<Vec<String>, Error> {
     let value = value.trim();
     if value.is_empty() {
-        return Err(Error::from("a public key is needed".to_string()));
+        return Err(Error::Failed("a public key is needed".to_string()));
     }
     if !value.contains(BEGIN) || !value.contains(END) {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "this is not an armoured PGP public key block".to_string(),
         ));
     }
     let body = armour_body(value)?;
-    let raw = base64_decode(&body).ok_or("the key's base64 does not decode")?;
-    let packets = packets(&raw).ok_or("the key's packet structure cannot be read")?;
+    let raw = base64_decode(&body)
+        .ok_or_else(|| Error::Failed("the key's base64 does not decode".to_string()))?;
+    let packets = packets(&raw)
+        .ok_or_else(|| Error::Failed("the key's packet structure cannot be read".to_string()))?;
     if !packets.iter().any(|p| p.tag == 6) {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the block carries no public key packet".to_string(),
         ));
     }
@@ -129,12 +131,12 @@ pub async fn verify_signature(
     let home = std::path::PathBuf::from("/tmp").join(format!("kyriakon-gpg-{}", ulid::Ulid::new()));
     tokio::fs::create_dir_all(&home)
         .await
-        .map_err(|e| format!("cannot create {}: {e}", home.display()))?;
+        .map_err(|e| Error::context(format!("cannot create {}", home.display()), e))?;
     // gpg refuses a homedir another user could read, and the scratch directory
     // is created with the process umask otherwise.
     tokio::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
         .await
-        .map_err(|e| format!("cannot set the mode on {}: {e}", home.display()))?;
+        .map_err(|e| Error::context(format!("cannot set the mode on {}", home.display()), e))?;
     let run = async {
         let import = Command::new(gpg)
             .args(["--batch", "--no-tty", "--no-options", "--homedir"])
@@ -143,19 +145,19 @@ pub async fn verify_signature(
             .arg(key_file)
             .output()
             .await
-            .map_err(|e| format!("cannot run {gpg}: {e}"))?;
+            .map_err(|e| Error::context(format!("cannot run {gpg}"), e))?;
         if !import.status.success() {
-            return Err(format!(
+            return Err(Error::Failed(format!(
                 "gpg could not read {} ({}): {}",
                 key_file.display(),
                 import.status,
                 String::from_utf8_lossy(&import.stderr).trim()
-            ));
+            )));
         }
         let message = home.join("message");
         tokio::fs::write(&message, payload)
             .await
-            .map_err(|e| format!("cannot write {}: {e}", message.display()))?;
+            .map_err(|e| Error::context(format!("cannot write {}", message.display()), e))?;
         let mut verify = Command::new(gpg);
         verify
             .args(["--batch", "--no-tty", "--no-options", "--homedir"])
@@ -165,14 +167,14 @@ pub async fn verify_signature(
             let sig = home.join("signature.asc");
             tokio::fs::write(&sig, signature)
                 .await
-                .map_err(|e| format!("cannot write {}: {e}", sig.display()))?;
+                .map_err(|e| Error::context(format!("cannot write {}", sig.display()), e))?;
             verify.arg(sig);
         }
         let out = verify
             .arg(&message)
             .output()
             .await
-            .map_err(|e| format!("cannot run {gpg}: {e}"))?;
+            .map_err(|e| Error::context(format!("cannot run {gpg}"), e))?;
         if !out.status.success() {
             return Ok(None);
         }
@@ -187,7 +189,7 @@ pub async fn verify_signature(
     };
     let result = run.await;
     let _ = tokio::fs::remove_dir_all(&home).await;
-    result.map_err(Error::from)
+    result
 }
 
 /// Inspect an OpenSSH public key: the shape sftp and git will accept. A shape
@@ -202,7 +204,7 @@ pub async fn verify_signature(
 pub fn openssh_public_key(value: &str) -> Result<(), Error> {
     let value = value.trim();
     if value.is_empty() {
-        return Err(Error::from("an upload key is needed".to_string()));
+        return Err(Error::Failed("an upload key is needed".to_string()));
     }
     let mut parts = value.split_whitespace();
     let kind = parts.next().unwrap_or("");
@@ -221,11 +223,15 @@ pub fn openssh_public_key(value: &str) -> Result<(), Error> {
                         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
             });
     if !known {
-        return Err(Error::from("this is not an OpenSSH public key".to_string()));
+        return Err(Error::Failed(
+            "this is not an OpenSSH public key".to_string(),
+        ));
     }
-    let blob = parts.next().ok_or("the upload key has no key material")?;
+    let blob = parts
+        .next()
+        .ok_or_else(|| Error::Failed("the upload key has no key material".to_string()))?;
     if base64_decode(blob).is_none_or(|b| b.is_empty()) {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the upload key's material does not decode".to_string(),
         ));
     }
@@ -379,7 +385,7 @@ fn armour_body(value: &str) -> Result<String, Error> {
         out.push_str(t);
     }
     if out.is_empty() {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the armoured block carries no key material".to_string(),
         ));
     }
@@ -560,15 +566,24 @@ mod tests {
 
     #[test]
     fn framing_and_base64_are_refused_with_a_reason() {
-        assert!(pgp_public_key("hello").unwrap_err().contains("armoured"));
+        assert!(matches!(
+            pgp_public_key("hello").unwrap_err(),
+            Error::Failed(message) if message.contains("armoured")
+        ));
         let bad = armoured("not base64 !!!");
-        assert!(pgp_public_key(&bad).unwrap_err().contains("base64"));
+        assert!(matches!(
+            pgp_public_key(&bad).unwrap_err(),
+            Error::Failed(message) if message.contains("base64")
+        ));
     }
 
     #[test]
     fn a_block_with_no_public_key_packet_is_refused() {
         let e = pgp_public_key(&armoured(NO_KEY)).unwrap_err();
-        assert!(e.contains("public key packet"), "{e}");
+        assert!(
+            matches!(&e, Error::Failed(message) if message.contains("public key packet")),
+            "{e}"
+        );
     }
 
     #[test]

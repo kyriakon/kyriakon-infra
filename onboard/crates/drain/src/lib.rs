@@ -133,7 +133,7 @@ async fn one(
         return Ok(());
     };
     let value: Value =
-        serde_json::from_str(&text).map_err(|e| format!("the intent does not parse: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| Error::context("the intent does not parse", e))?;
     let intent = Intent::parse(&value)?;
     run_intent(intent, cfg, store, journal, key, file, &value).await
 }
@@ -193,29 +193,27 @@ pub async fn verify(
         // `Decision` arm proves.
         Intent::Application(_) => Ok(None),
         Intent::Decision(intent) => {
-            let token = intent
-                .application
-                .status_token
-                .as_deref()
-                .ok_or_else(|| "the status token is not 128 bits of Crockford".to_string())?;
+            let token = intent.application.status_token.as_deref().ok_or_else(|| {
+                Error::Failed("the status token is not 128 bits of Crockford".to_string())
+            })?;
             if !kyriakon_onboard_core::store::is_status_token(token) {
-                return Err(Error::from(
+                return Err(Error::Failed(
                     "the status token is not 128 bits of Crockford".to_string(),
                 ));
             }
             if let Some(why) =
                 kyriakon_onboard_core::flow::validate::username_shape(&intent.application.username)
             {
-                return Err(Error::from(format!("the username: {why}")));
+                return Err(Error::Failed(format!("the username: {why}")));
             }
             let Some(decision) = decision_for_kind(&intent.kind) else {
-                return Err(Error::from(format!(
+                return Err(Error::Failed(format!(
                     "kind {:?} is not a decision",
                     intent.kind
                 )));
             };
             if intent.action != decision.action {
-                return Err(Error::from(format!(
+                return Err(Error::Failed(format!(
                     "the action {:?} does not match the kind {:?}",
                     intent.action, intent.kind
                 )));
@@ -225,7 +223,7 @@ pub async fn verify(
                 &sign::decide_payload(token, &intent.action),
                 &intent.sig,
             ) {
-                return Err(Error::from(
+                return Err(Error::Failed(
                     "the decision intent's signature does not verify".to_string(),
                 ));
             }
@@ -277,7 +275,7 @@ pub async fn verify(
             if sign::verify(key, &sign::group_provision_payload(intent), &intent.sig) {
                 Ok(None)
             } else {
-                Err(Error::from(
+                Err(Error::Failed(
                     "the group intent's signature does not verify".to_string(),
                 ))
             }
@@ -298,7 +296,7 @@ pub async fn verify(
             if sign::verify(key, &payload, &intent.sig) {
                 Ok(None)
             } else {
-                Err(Error::from(
+                Err(Error::Failed(
                     "the address intent's signature does not verify".to_string(),
                 ))
             }
@@ -311,7 +309,7 @@ pub async fn verify(
             ) {
                 Ok(None)
             } else {
-                Err(Error::from(
+                Err(Error::Failed(
                     "the remove-group intent's signature does not verify".to_string(),
                 ))
             }
@@ -330,7 +328,7 @@ pub async fn verify(
             ) {
                 Ok(None)
             } else {
-                Err(Error::from(
+                Err(Error::Failed(
                     "the token resend's signature does not verify".to_string(),
                 ))
             }
@@ -533,7 +531,7 @@ pub async fn apply(
             }
             Intent::MailKey(intent) => transitions::lifecycle::mail_key(cfg, store, intent).await,
             // `verify` refuses an unknown kind before this is reached.
-            Intent::Unknown { kind, .. } => Err(Error::from(format!(
+            Intent::Unknown { kind, .. } => Err(Error::Failed(format!(
                 "this build does not implement the kind {kind:?}"
             ))),
         }
@@ -609,7 +607,7 @@ fn disposition(intent: &Intent) -> transitions::Disposition {
 /// store. `Err` carries the reason, worded for the journal.
 fn account_name(username: &str) -> Result<(), Error> {
     match kyriakon_onboard_core::flow::validate::username_shape(username) {
-        Some(why) => Err(Error::from(format!("the username {username:?}: {why}"))),
+        Some(why) => Err(Error::Failed(format!("the username {username:?}: {why}"))),
         None => Ok(()),
     }
 }
@@ -657,17 +655,17 @@ pub async fn verify_session(
     username: &str,
 ) -> Result<(), Error> {
     if !kyriakon_onboard_core::store::is_status_token(id) {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the intent carries no usable session id".to_string(),
         ));
     }
     let Some(text) = store.read_record("sessions", &format!("{id}.json")).await else {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the session named by the intent has gone".to_string(),
         ));
     };
     let value: Value = serde_json::from_str(&text)
-        .map_err(|e| Error::from(format!("the session record does not parse: {e}")))?;
+        .map_err(|e| Error::context("the session record does not parse", e))?;
     let proof = value.get("proof").and_then(Value::as_str).unwrap_or("");
     kyriakon_onboard_core::account::session::verify_proof(
         proof_dir,

@@ -501,18 +501,20 @@ impl Intent {
         let id = ulid::Ulid::new().to_string();
         let kind = self.kind().to_string();
         if matches!(self, Intent::Unknown { .. }) {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "this build does not implement the kind {kind:?}"
             )));
         }
-        let mut value =
-            serde_json::to_value(self).map_err(|e| format!("cannot encode the intent: {e}"))?;
-        let object = value.as_object_mut().ok_or("the intent is not an object")?;
+        let mut value = serde_json::to_value(self)
+            .map_err(|e| Error::context("cannot encode the intent", e))?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| Error::Failed("the intent is not an object".to_string()))?;
         object.insert("id".to_string(), id.clone().into());
         object.insert("kind".to_string(), kind.into());
         object.insert("filed_at".to_string(), crate::util::filed_at().into());
         let bytes = serde_json::to_vec_pretty(&value)
-            .map_err(|e| format!("cannot encode the intent: {e}"))?;
+            .map_err(|e| Error::context("cannot encode the intent", e))?;
         store
             .write_record("intents", &format!("{id}.json"), &bytes)
             .await?;
@@ -522,7 +524,7 @@ impl Intent {
 
 fn parsed<T: serde::de::DeserializeOwned>(value: &Value, what: &str) -> Result<T, Error> {
     serde_json::from_value(value.clone())
-        .map_err(|e| Error::from(format!("{what} does not parse: {e}")))
+        .map_err(|e| Error::context(format!("{what} does not parse"), e))
 }
 
 /// The export intent, read with the words its transition always used: the
@@ -544,12 +546,12 @@ fn export_from(value: &Value) -> Result<ExportIntent, Error> {
         username: value
             .get("username")
             .and_then(Value::as_str)
-            .ok_or("the export intent names no account")?
+            .ok_or_else(|| Error::Failed("the export intent names no account".to_string()))?
             .to_string(),
         session: value
             .get("session")
             .and_then(Value::as_str)
-            .ok_or("the export intent names no session")?
+            .ok_or_else(|| Error::Failed("the export intent names no session".to_string()))?
             .to_string(),
     })
 }

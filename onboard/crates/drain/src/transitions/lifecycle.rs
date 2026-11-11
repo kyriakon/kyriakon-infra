@@ -147,11 +147,10 @@ pub async fn set_password(
     file: &str,
     value: &Value,
 ) -> Result<Settlement, Error> {
-    let token = intent
-        .application
-        .status_token
-        .as_deref()
-        .ok_or("the password intent names no status token")?;
+    let token =
+        intent.application.status_token.as_deref().ok_or_else(|| {
+            Error::Failed("the password intent names no status token".to_string())
+        })?;
     let username = intent.application.username.as_str();
     let mut plain = intent.password;
     let hash = match kyriakon_onboard_core::account::password::make(&plain) {
@@ -174,7 +173,7 @@ pub async fn set_password(
     // does not model, and writing it back through the typed struct would drop
     // them.
     let mut record: Value = serde_json::from_str(&text)
-        .map_err(|e| format!("the application record does not parse: {e}"))?;
+        .map_err(|e| Error::context("the application record does not parse", e))?;
     if record.get("username").and_then(Value::as_str) != Some(username) {
         return Ok(password_refusal(store, file, value, "the intent names another account").await);
     }
@@ -383,18 +382,18 @@ fn extend_open_window(
     days: i64,
 ) -> Result<String, Error> {
     if paid_until.is_some() || window.state != "open" {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the payment window is not open, so it has nothing to extend".to_string(),
         ));
     }
     if window.extensions >= 1 {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the payment window has already been extended once; a second extension is refused"
                 .to_string(),
         ));
     }
     let Ok(closes) = OffsetDateTime::parse(&window.closes_at, &Rfc3339) else {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "the window's close date cannot be read".to_string(),
         ));
     };
@@ -847,7 +846,7 @@ async fn group_notice_address(store: &Store, group: &GroupRecord) -> Result<Stri
     let account = store
         .account(&group.site_owner)
         .await?
-        .ok_or_else(|| format!("{path} is missing"))?;
+        .ok_or_else(|| Error::Failed(format!("{path} is missing")))?;
     if let Some(to) = valid_contact(account.outside_address.as_deref()) {
         return Ok(to);
     }
@@ -879,7 +878,7 @@ async fn group_notice_recipient(
                 journal,
                 "account",
                 &group.site_owner,
-                &Error::from(format!(
+                &Error::Failed(format!(
                     "{e}, so {}'s group notice has no addressee",
                     group.domain
                 )),
@@ -1044,7 +1043,7 @@ async fn lapse_notice(
     let window = payment
         .window
         .as_ref()
-        .ok_or("a lapsed account has no window")?;
+        .ok_or_else(|| Error::Failed("a lapsed account has no window".to_string()))?;
     let closes_on = &window.closes_at[..10.min(window.closes_at.len())];
     let token = payment.token_ref.as_deref().unwrap_or("");
     let grace = account.grace_until.as_deref().unwrap_or("");
@@ -1082,16 +1081,16 @@ pub async fn suspend(
     reason: &str,
 ) -> Result<(), Error> {
     if let Some(why) = validate::username_shape(username) {
-        return Err(Error::from(format!("the username {username:?}: {why}")));
+        return Err(Error::Failed(format!("the username {username:?}: {why}")));
     }
     let reason = reason.trim();
     if reason.is_empty() {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "a suspension needs a reason, in the words the member will read".to_string(),
         ));
     }
     let Some(mut account) = store.account(username).await? else {
-        return Err(Error::from(format!("no account for {username}")));
+        return Err(Error::Failed(format!("no account for {username}")));
     };
     // The id is the account's own, so a retry after a crash finishes the same
     // suspension rather than starting a second one.
@@ -1176,13 +1175,13 @@ pub async fn resume(
     username: &str,
 ) -> Result<(), Error> {
     if let Some(why) = validate::username_shape(username) {
-        return Err(Error::from(format!("the username {username:?}: {why}")));
+        return Err(Error::Failed(format!("the username {username:?}: {why}")));
     }
     let Some(mut account) = store.account(username).await? else {
-        return Err(Error::from(format!("no account for {username}")));
+        return Err(Error::Failed(format!("no account for {username}")));
     };
     if account.state != "suspended" {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "{username} is not suspended, so there is nothing to resume"
         )));
     }
@@ -1247,7 +1246,7 @@ pub async fn delete_account(
     username: &str,
 ) -> Result<(), Error> {
     if let Some(why) = validate::username_shape(username) {
-        return Err(Error::from(format!("the username {username}: {why}")));
+        return Err(Error::Failed(format!("the username {username}: {why}")));
     }
     // The account record is read before the journal line so the answer can name
     // a refund from the token's ledger lines. A record that has already gone is
@@ -1370,7 +1369,7 @@ async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), E
     match tokio::fs::remove_file(&path).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(Error::from(format!(
+        Err(e) => Err(Error::Failed(format!(
             "cannot remove {}: {e}",
             path.display()
         ))),
@@ -1383,7 +1382,7 @@ async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), E
 /// proves the request is `verify`'s.
 pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlement, Error> {
     if intent.kind != "close" {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "kind {:?} is not a close intent",
             intent.kind
         )));
@@ -1410,7 +1409,8 @@ pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlem
         id: Some(&intent.id),
     };
     if let Err(e) = kyriakon_onboard_core::account::requests::record(store, request).await {
-        if !e.contains("already recorded") {
+        if !matches!(&e, kyriakon_onboard_core::Error::Failed(message) if message.contains("already recorded"))
+        {
             return Err(Error::from(e));
         }
     }
@@ -1794,7 +1794,7 @@ async fn apply_rotation(
 ) -> Result<(), Error> {
     let key = kyriakon_onboard_core::mail::keycheck::mail_key(String::new(), &rotation.material);
     if key.fingerprint != rotation.fingerprint {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the pending key's fingerprint is {} and the key reads as {}",
             rotation.fingerprint, key.fingerprint
         )));
@@ -1906,7 +1906,7 @@ pub async fn mail_key(
                 requested_at: util::filed_at(),
                 applies_at: (OffsetDateTime::now_utc() + Duration::hours(72))
                     .format(&Rfc3339)
-                    .map_err(|e| format!("cannot write the window's end: {e}"))?,
+                    .map_err(|e| Error::context("cannot write the window's end", e))?,
             };
             account.rotation = Some(rotation.clone());
             if signed {
@@ -1968,8 +1968,12 @@ pub async fn mail_key_rotations(
         let Some(rotation) = account.rotation.clone() else {
             continue;
         };
-        let applies = OffsetDateTime::parse(&rotation.applies_at, &Rfc3339)
-            .map_err(|e| format!("the rotation window of {username} does not parse: {e}"))?;
+        let applies = OffsetDateTime::parse(&rotation.applies_at, &Rfc3339).map_err(|e| {
+            Error::context(
+                format!("the rotation window of {username} does not parse"),
+                e,
+            )
+        })?;
         if OffsetDateTime::now_utc() < applies {
             continue;
         }
@@ -2190,13 +2194,15 @@ async fn dns_broken(cfg: &DrainConfig, values: &dns::Values, domain: &str) -> Re
                 ])
                 .output()
                 .await
-                .map_err(|e| format!("cannot run the resolver {}: {e}", cfg.resolver))?;
+                .map_err(|e| {
+                    Error::context(format!("cannot run the resolver {}", cfg.resolver), e)
+                })?;
             if !out.status.success() {
                 // No answer is not the body's zone being broken: dig exits
                 // non-zero when it could not reach a server, and a name that
                 // does not resolve answers successfully with nothing. Only the
                 // second is an outage, so this is the platform's own failure.
-                return Err(Error::from(format!(
+                return Err(Error::Failed(format!(
                     "the resolver {} could not answer {name} {}: {}",
                     cfg.resolver,
                     row.record_type,

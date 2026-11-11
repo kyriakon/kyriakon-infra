@@ -66,7 +66,7 @@ impl Kind {
             "addresses" => Kind::Addresses,
             "key" => Kind::Key,
             "acceptance" => Kind::Acceptance,
-            other => return Err(Error::from(format!("unknown answer type {other:?}"))),
+            other => return Err(Error::Failed(format!("unknown answer type {other:?}"))),
         })
     }
 }
@@ -90,7 +90,7 @@ impl Branch {
             "person" => Branch::Person,
             "body" => Branch::Body,
             "monastic" => Branch::Monastic,
-            other => return Err(Error::from(format!("unknown branch {other:?}"))),
+            other => return Err(Error::Failed(format!("unknown branch {other:?}"))),
         })
     }
 }
@@ -134,9 +134,9 @@ impl Rule {
             other => match other.strip_prefix("maxlen:") {
                 Some(n) => Rule::MaxLen(
                     n.parse()
-                        .map_err(|_| format!("maxlen needs a number, got {n:?}"))?,
+                        .map_err(|_| Error::Failed(format!("maxlen needs a number, got {n:?}")))?,
                 ),
-                None => return Err(Error::from(format!("unknown validation {other:?}"))),
+                None => return Err(Error::Failed(format!("unknown validation {other:?}"))),
             },
         })
     }
@@ -185,14 +185,15 @@ pub struct Question {
 /// its vocabulary, is refused by name rather than skipped: a question that
 /// disappears silently is a question no front-end asks.
 pub fn parse(text: &str) -> Result<Vec<Question>, Error> {
-    let file: File = toml::from_str(text).map_err(|e| format!("the question list: {e}"))?;
+    let file: File = toml::from_str(text).map_err(|e| Error::context("the question list", e))?;
 
     let mut out = Vec::with_capacity(file.question.len());
     for e in file.question {
         let id = e.id;
-        let kind = Kind::parse(&e.kind).map_err(|why| format!("the question {id:?}: {why}"))?;
-        let branch =
-            Branch::parse(&e.branch).map_err(|why| format!("the question {id:?}: {why}"))?;
+        let kind = Kind::parse(&e.kind)
+            .map_err(|why| Error::context(format!("the question {id:?}"), why))?;
+        let branch = Branch::parse(&e.branch)
+            .map_err(|why| Error::context(format!("the question {id:?}"), why))?;
         let rule = rule(&id, kind, e.choices, e.validation)?;
         out.push(Question {
             id,
@@ -217,18 +218,18 @@ fn rule(
 ) -> Result<Rule, Error> {
     if kind == Kind::Choice {
         if choices.is_empty() {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the question {id:?} is a choice with no choices"
             )));
         }
         if validation.is_some() {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "the question {id:?} is a choice, so its validation is its choices"
             )));
         }
         for c in &choices {
             if c.value.is_empty() || c.label.is_empty() {
-                return Err(Error::from(format!(
+                return Err(Error::Failed(format!(
                     "the question {id:?} has a choice with an empty value or label"
                 )));
             }
@@ -236,14 +237,14 @@ fn rule(
         return Ok(Rule::Choice(choices));
     }
     if !choices.is_empty() {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "the question {id:?} is a {} carrying choices",
             kind.token()
         )));
     }
     match validation {
         Some(v) => {
-            Rule::parse(&v).map_err(|why| Error::from(format!("the question {id:?}: {why}")))
+            Rule::parse(&v).map_err(|why| Error::context(format!("the question {id:?}"), why))
         }
         None => Ok(Rule::None),
     }
@@ -351,18 +352,21 @@ required = true
         // A token outside its vocabulary names the question it came from.
         let unknown_type = SAMPLE.replace("type = \"text\"", "type = \"widget\"");
         let e = parse(&unknown_type).unwrap_err();
-        assert!(e.contains("username"), "{e}");
-        assert!(e.contains("unknown answer type"), "{e}");
+        assert!(matches!(&e, Error::Context { .. }), "{e}");
+        assert!(e.to_string().contains("username"), "{e}");
+        assert!(e.to_string().contains("unknown answer type"), "{e}");
 
         let unknown_branch = SAMPLE.replace("branch = \"body\"", "branch = \"everyone\"");
         let e = parse(&unknown_branch).unwrap_err();
-        assert!(e.contains("body_name"), "{e}");
-        assert!(e.contains("unknown branch"), "{e}");
+        assert!(matches!(&e, Error::Context { .. }), "{e}");
+        assert!(e.to_string().contains("body_name"), "{e}");
+        assert!(e.to_string().contains("unknown branch"), "{e}");
 
         let unknown_rule = SAMPLE.replace("validation = \"mail-key\"", "validation = \"exists\"");
         let e = parse(&unknown_rule).unwrap_err();
-        assert!(e.contains("mail_key"), "{e}");
-        assert!(e.contains("exists"), "{e}");
+        assert!(matches!(&e, Error::Context { .. }), "{e}");
+        assert!(e.to_string().contains("mail_key"), "{e}");
+        assert!(e.to_string().contains("exists"), "{e}");
 
         // A column of the wrong type is a build error rather than a skipped
         // question: `required` is a real boolean, which is one of the reasons
@@ -428,15 +432,17 @@ choices = [
             "",
         );
         let e = parse(&bare).unwrap_err();
-        assert!(e.contains("whose"), "{e}");
-        assert!(e.contains("no choices"), "{e}");
+        assert!(matches!(&e, Error::Failed(_)), "{e}");
+        assert!(e.to_string().contains("whose"), "{e}");
+        assert!(e.to_string().contains("no choices"), "{e}");
 
         let empty = SAMPLE.replace(
             "{ value = \"person\", label = \"Just me\" },",
             "{ value = \"\", label = \"Just me\" },",
         );
         let e = parse(&empty).unwrap_err();
-        assert!(e.contains("empty value or label"), "{e}");
+        assert!(matches!(&e, Error::Failed(_)), "{e}");
+        assert!(e.to_string().contains("empty value or label"), "{e}");
     }
 
     #[test]
@@ -446,8 +452,9 @@ choices = [
             "prompt = \"Username\"\nchoices = [\n\t{ value = \"a\", label = \"A\" },\n]",
         );
         let e = parse(&on_a_text).unwrap_err();
-        assert!(e.contains("username"), "{e}");
-        assert!(e.contains("carrying choices"), "{e}");
+        assert!(matches!(&e, Error::Failed(_)), "{e}");
+        assert!(e.to_string().contains("username"), "{e}");
+        assert!(e.to_string().contains("carrying choices"), "{e}");
 
         // A choice's rule is its choices, so a validation string beside them is
         // a question that says two things about the same answer.
@@ -456,7 +463,8 @@ choices = [
             "{ value = \"body\", label = \"A body\" },\n]\nvalidation = \"domain\"",
         );
         let e = parse(&both).unwrap_err();
-        assert!(e.contains("its choices"), "{e}");
+        assert!(matches!(&e, Error::Failed(_)), "{e}");
+        assert!(e.to_string().contains("its choices"), "{e}");
     }
 
     #[test]

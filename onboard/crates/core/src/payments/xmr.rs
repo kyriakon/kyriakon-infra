@@ -127,16 +127,19 @@ pub async fn quote(cfg: &DrainConfig, now: OffsetDateTime, price_gbp: &str) -> O
 /// Integer arithmetic throughout: `xmr = pence × 10^(4+d) / R` where the rate is
 /// `R / 10^d`, and the ceiling is taken on that quotient.
 pub fn quote_xmr(price_pence: i64, rate: &str) -> Result<String, Error> {
-    let (value, places) = parse_rate(rate)
-        .ok_or_else(|| format!("the rate {rate:?} is not a positive decimal amount"))?;
+    let (value, places) = parse_rate(rate).ok_or_else(|| {
+        Error::Failed(format!(
+            "the rate {rate:?} is not a positive decimal amount"
+        ))
+    })?;
     // `xmr × 1e6`, in millionths of a coin.
     let numerator = (price_pence as u128)
         .checked_mul(
             10u128
                 .checked_pow(places + 4)
-                .ok_or("the rate has too many decimals")?,
+                .ok_or_else(|| Error::Failed("the rate has too many decimals".to_string()))?,
         )
-        .ok_or("the price and rate overflow the quote")?;
+        .ok_or_else(|| Error::Failed("the price and rate overflow the quote".to_string()))?;
     let millionths = numerator.div_ceil(value);
     let whole = millionths / 1_000_000;
     let fraction = millionths % 1_000_000;
@@ -248,14 +251,14 @@ async fn fetch(cfg: &DrainConfig) -> Option<String> {
 fn write(cfg: &DrainConfig, cached: &Cached) -> Result<(), Error> {
     if let Some(dir) = Path::new(&cfg.rates).parent() {
         std::fs::create_dir_all(dir)
-            .map_err(|e| Error::from(format!("cannot make {}: {e}", dir.display())))?;
+            .map_err(|e| Error::context(format!("cannot make {}", dir.display()), e))?;
     }
     let bytes = serde_json::to_vec_pretty(cached)
-        .map_err(|e| Error::from(format!("cannot encode the rate: {e}")))?;
+        .map_err(|e| Error::context("cannot encode the rate", e))?;
     let temp = format!("{}.new", cfg.rates);
-    std::fs::write(&temp, &bytes).map_err(|e| Error::from(format!("cannot write {temp}: {e}")))?;
+    std::fs::write(&temp, &bytes).map_err(|e| Error::context(format!("cannot write {temp}"), e))?;
     std::fs::rename(&temp, &cfg.rates)
-        .map_err(|e| Error::from(format!("cannot rename {temp}: {e}")))
+        .map_err(|e| Error::context(format!("cannot rename {temp}"), e))
 }
 
 fn attempt_path(cfg: &DrainConfig) -> String {
@@ -275,10 +278,10 @@ fn stamp_attempt(cfg: &DrainConfig, now: OffsetDateTime) -> Result<(), Error> {
     let path = attempt_path(cfg);
     if let Some(dir) = Path::new(&path).parent() {
         std::fs::create_dir_all(dir)
-            .map_err(|e| Error::from(format!("cannot make {}: {e}", dir.display())))?;
+            .map_err(|e| Error::context(format!("cannot make {}", dir.display()), e))?;
     }
     std::fs::write(&path, crate::util::stamp(now))
-        .map_err(|e| Error::from(format!("cannot write {path}: {e}")))
+        .map_err(|e| Error::context(format!("cannot write {path}"), e))
 }
 
 fn parse_stamp(text: &str) -> Option<OffsetDateTime> {

@@ -30,16 +30,16 @@ pub(crate) async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) ->
     if let Some(settled) = flags.get("settled").map(String::as_str) {
         for name in ["amount", "rail", "reason", "rate"] {
             if flags.contains_key(name) {
-                return Err(Error::from(format!("--settled takes no --{name}")));
+                return Err(Error::Failed(format!("--settled takes no --{name}")));
             }
         }
         if close || excess {
-            return Err(Error::from(
+            return Err(Error::Failed(
                 "--settled takes no --close or --excess".to_string(),
             ));
         }
         if util::parse_date(settled).is_none() {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "--settled {settled:?} is not YYYY-MM-DD"
             )));
         }
@@ -62,7 +62,7 @@ pub(crate) async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) ->
 
     let rail = need(&flags, "rail")?;
     if !intent::REFUND_RAILS.contains(&rail) {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "--rail {rail:?} is not one of {}",
             intent::REFUND_RAILS.join(", ")
         )));
@@ -70,31 +70,31 @@ pub(crate) async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) ->
     let amount = need(&flags, "amount")?;
     match util::pence(amount) {
         Ok(pence) if pence > 0 => {}
-        Ok(_) => return Err(Error::from("--amount must be more than zero".to_string())),
-        Err(e) => return Err(Error::from(format!("--amount: {e}"))),
+        Ok(_) => return Err(Error::Failed("--amount must be more than zero".to_string())),
+        Err(e) => return Err(Error::Failed(format!("--amount: {e}"))),
     }
     let reason = need(&flags, "reason")?;
     if reason.trim().is_empty() {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "--reason must say why the money is going back".to_string(),
         ));
     }
     if close == excess {
-        return Err(Error::from(
+        return Err(Error::Failed(
             "give exactly one of --close or --excess".to_string(),
         ));
     }
     let rate = flags.get("rate").map(String::as_str);
     if let Some(rate) = rate {
         if rail != "monero" {
-            return Err(Error::from(
+            return Err(Error::Failed(
                 "--rate is only a monero refund paid in sterling".to_string(),
             ));
         }
         match util::pence(rate) {
             Ok(pence) if pence > 0 => {}
-            Ok(_) => return Err(Error::from("--rate must be more than zero".to_string())),
-            Err(e) => return Err(Error::from(format!("--rate: {e}"))),
+            Ok(_) => return Err(Error::Failed("--rate must be more than zero".to_string())),
+            Err(e) => return Err(Error::Failed(format!("--rate: {e}"))),
         }
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;

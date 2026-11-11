@@ -78,21 +78,29 @@ fn run() -> Result<Departure, Error> {
             // program's own path, so there is nothing in it the program does not
             // already know.
             "-c" => {
-                args.next().ok_or("-c needs the command sshd supplied")?;
+                args.next().ok_or_else(|| {
+                    Error::Failed("-c needs the command sshd supplied".to_string())
+                })?;
             }
             "--config" => {
-                cfg_path = PathBuf::from(args.next().ok_or("--config needs a path")?);
+                cfg_path = PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| Error::Failed("--config needs a path".to_string()))?,
+                );
             }
             // The session-lock directory, the same testing seam as --plain: the
             // live path is the fixed one, and sshd sets no AcceptEnv, so no client
             // can reach either.
             "--state" => {
-                state = PathBuf::from(args.next().ok_or("--state needs a path")?);
+                state = PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| Error::Failed("--state needs a path".to_string()))?,
+                );
             }
             "--plain" => forced = Some(Mode::Plain),
             "--full" => forced = Some(Mode::Full),
             other => {
-                return Err(Error::from(format!(
+                return Err(Error::Failed(format!(
                     "unknown argument {other:?}; usage: kyriakon-onboard-tui \
                      [-c COMMAND] [--config PATH] [--state PATH] [--plain | --full]"
                 )))
@@ -102,12 +110,12 @@ fn run() -> Result<Departure, Error> {
 
     let cfg = config::Config::load(&cfg_path)?;
     let text = std::fs::read_to_string(&cfg.catalogue)
-        .map_err(|e| format!("cannot read {}: {e}", cfg.catalogue))?;
+        .map_err(|e| Error::context(format!("cannot read {}", cfg.catalogue), e))?;
     let list = catalogue::parse(&text)?;
     let questions = questions::shipped()?;
     let reserved = validate::reserved(
         &std::fs::read_to_string(&cfg.reserved)
-            .map_err(|e| format!("cannot read {}: {e}", cfg.reserved))?,
+            .map_err(|e| Error::context(format!("cannot read {}", cfg.reserved), e))?,
     );
 
     // The session's member, where the key it presented names one: [#381] asks the
@@ -273,7 +281,7 @@ impl Term {
         }
         let mut now = std::mem::MaybeUninit::<libc::termios>::uninit();
         if unsafe { libc::tcgetattr(libc::STDIN_FILENO, now.as_mut_ptr()) } != 0 {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "cannot read the terminal's settings: {}",
                 std::io::Error::last_os_error()
             )));
@@ -287,7 +295,7 @@ impl Term {
         self.save()?;
         let mut raw = std::mem::MaybeUninit::<libc::termios>::uninit();
         if unsafe { libc::tcgetattr(libc::STDIN_FILENO, raw.as_mut_ptr()) } != 0 {
-            return Err(Error::from(format!(
+            return Err(Error::Failed(format!(
                 "cannot read the terminal's settings: {}",
                 std::io::Error::last_os_error()
             )));
@@ -309,7 +317,7 @@ impl Term {
             // Nothing better is available here: the session is ending, or a prompt
             // is about to be read with the terminal in whatever state it is in,
             // and neither is something this program can act on.
-            Error::from(format!("cannot restore the terminal: {why}")).report("the terminal");
+            Error::Failed(format!("cannot restore the terminal: {why}")).report("the terminal");
         }
     }
 
@@ -319,7 +327,9 @@ impl Term {
         match std::io::stdin().lock().read(&mut b) {
             Ok(0) => Ok(None),
             Ok(_) => Ok(Some(b[0])),
-            Err(e) => Err(Error::from(format!("cannot read the session's input: {e}"))),
+            Err(e) => Err(Error::Failed(format!(
+                "cannot read the session's input: {e}"
+            ))),
         }
     }
 
@@ -359,7 +369,9 @@ impl Input for Term {
         match std::io::stdin().lock().read_line(&mut line) {
             Ok(0) => Ok(None),
             Ok(_) => Ok(Some(line)),
-            Err(e) => Err(Error::from(format!("cannot read the session's input: {e}"))),
+            Err(e) => Err(Error::Failed(format!(
+                "cannot read the session's input: {e}"
+            ))),
         }
     }
 
@@ -390,7 +402,7 @@ impl Drop for Term {
 /// Put the terminal into `want`.
 fn set(want: &libc::termios) -> Result<(), Error> {
     if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, want) } != 0 {
-        return Err(Error::from(format!(
+        return Err(Error::Failed(format!(
             "cannot set the terminal's settings: {}",
             std::io::Error::last_os_error()
         )));

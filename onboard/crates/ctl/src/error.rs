@@ -49,10 +49,11 @@ impl Error {
         kyriakon_onboard_core::util::report(self, context);
     }
 
-    /// Temporary while the remaining tests are converted to variants.
-    #[cfg(test)]
-    pub fn contains(&self, pattern: &str) -> bool {
-        self.to_string().contains(pattern)
+    pub fn context(
+        context: impl Into<String>,
+        source: impl Into<kyriakon_onboard_core::Source>,
+    ) -> Self {
+        Error::Core(kyriakon_onboard_core::Error::context(context, source))
     }
 }
 
@@ -77,17 +78,5 @@ impl From<kyriakon_onboard_core::Error> for Error {
 impl From<kyriakon_onboard_drain::transitions::Error> for Error {
     fn from(error: kyriakon_onboard_drain::transitions::Error) -> Self {
         Error::Drain(error)
-    }
-}
-
-impl From<String> for Error {
-    fn from(message: String) -> Self {
-        Error::Failed(message)
-    }
-}
-
-impl From<&str> for Error {
-    fn from(message: &str) -> Self {
-        Error::Failed(message.to_string())
     }
 }

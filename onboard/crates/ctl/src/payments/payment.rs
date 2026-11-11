@@ -9,10 +9,10 @@ use crate::*;
 /// record is an error rather than a payment history that looks empty.
 pub(crate) async fn payment(store: &Store, args: &[String]) -> Result<(), Error> {
     let [verb, rest @ ..] = args else {
-        return Err(Error::from(usage()));
+        return Err(Error::Failed(usage()));
     };
     if verb != "show" {
-        return Err(Error::from(usage()));
+        return Err(Error::Failed(usage()));
     }
     let flags = flags(rest, &["username"])?;
     let username = need(&flags, "username")?;

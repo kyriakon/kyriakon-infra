@@ -46,6 +46,11 @@ pub enum Error {
     Fastcgi(crate::fastcgi::Error),
     /// A failure from a boundary that has not converted yet.
     Failed(String),
+    /// A failure whose context is what the operator needs, with its source.
+    Context {
+        context: String,
+        source: Box<kyriakon_onboard_core::Source>,
+    },
 }
 
 impl fmt::Display for Error {
@@ -71,6 +76,7 @@ impl fmt::Display for Error {
                 source,
             } => write!(f, "cannot {what}: {source}"),
             Error::Encode { what, source } => write!(f, "cannot {what}: {source}"),
+            Error::Context { context, source } => write!(f, "{context}: {source}"),
         }
     }
 }
@@ -85,6 +91,7 @@ impl std::error::Error for Error {
             Error::Config(error) => Some(error),
             Error::Io { source, .. } => Some(source),
             Error::Encode { source, .. } => Some(source),
+            Error::Context { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -92,6 +99,16 @@ impl std::error::Error for Error {
 impl Error {
     pub fn report(&self, context: &str) {
         kyriakon_onboard_core::util::report(self, context);
+    }
+
+    pub fn context(
+        context: impl Into<String>,
+        source: impl Into<kyriakon_onboard_core::Source>,
+    ) -> Self {
+        Error::Context {
+            context: context.into(),
+            source: Box::new(source.into()),
+        }
     }
 }
 
@@ -116,17 +133,5 @@ impl From<crate::fastcgi::Error> for Error {
 impl From<kyriakon_onboard_core::Error> for Error {
     fn from(error: kyriakon_onboard_core::Error) -> Self {
         Error::Core(error)
-    }
-}
-
-impl From<String> for Error {
-    fn from(message: String) -> Self {
-        Error::Failed(message)
-    }
-}
-
-impl From<&str> for Error {
-    fn from(message: &str) -> Self {
-        Error::Failed(message.to_string())
     }
 }

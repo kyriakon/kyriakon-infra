@@ -54,7 +54,7 @@ fn renderings(list: &[Service], member: Option<&str>) -> Vec<(&'static str, Vec<
 fn check(text: &str, member: Option<&str>) -> Result<(), kyriakon_onboard_core::Error> {
     let list = parse(text)?;
     if list.is_empty() {
-        return Err(kyriakon_onboard_core::Error::from(format!(
+        return Err(kyriakon_onboard_core::Error::Failed(format!(
             "{TRACKED} has no services"
         )));
     }
@@ -78,7 +78,7 @@ fn compare(
                 .filter(|r| !list.iter().any(|s| s.id == r.id))
                 .map(|r| r.id.as_str())
                 .collect();
-            return Err(kyriakon_onboard_core::Error::from(format!(
+            return Err(kyriakon_onboard_core::Error::Failed(format!(
                 "{front_end} shows {} entries where {TRACKED} carries {}: missing {missing:?}, invented {invented:?}",
                 rows.len(),
                 list.len()
@@ -86,7 +86,7 @@ fn compare(
         }
         for (s, r) in list.iter().zip(rows) {
             if r.id != s.id {
-                return Err(kyriakon_onboard_core::Error::from(format!(
+                return Err(kyriakon_onboard_core::Error::Failed(format!(
                     "{front_end} shows {:?} where {TRACKED} has {:?}: the file's order is the display order",
                     r.id, s.id
                 )));
@@ -96,7 +96,7 @@ fn compare(
                 || r.state != s.state.word()
                 || r.action != s.action.word()
             {
-                return Err(kyriakon_onboard_core::Error::from(format!(
+                return Err(kyriakon_onboard_core::Error::Failed(format!(
                     "{front_end} shows {:?} other than as {TRACKED} has it, so the rendering is not the file",
                     s.id
                 )));
@@ -120,8 +120,10 @@ fn a_renderer_that_drops_an_entry_is_caught() {
     let mut rows = renderings(&list, None);
     rows[1].1.retain(|r| r.id != "shop");
     let e = compare(&list, &rows).unwrap_err();
-    assert!(e.contains("the account page"), "{e}");
-    assert!(e.contains("shop"), "{e}");
+    assert!(
+        matches!(&e, kyriakon_onboard_core::Error::Failed(message) if message.contains("the account page") && message.contains("shop")),
+        "{e}"
+    );
 }
 
 /// A renderer that invents an entry is caught the same way.
@@ -133,8 +135,10 @@ fn a_renderer_that_invents_an_entry_is_caught() {
     invented.id = "newsletter".to_string();
     rows[2].1.push(invented);
     let e = compare(&list, &rows).unwrap_err();
-    assert!(e.contains("the capsule"), "{e}");
-    assert!(e.contains("newsletter"), "{e}");
+    assert!(
+        matches!(&e, kyriakon_onboard_core::Error::Failed(message) if message.contains("the capsule") && message.contains("newsletter")),
+        "{e}"
+    );
 }
 
 /// Every renderer rendered from a fixture follows the fixture, and a
@@ -158,13 +162,20 @@ fn every_renderer_follows_a_fixture_rather_than_a_list_of_its_own() {
     // fails even though it shows the shipped file faithfully.
     let ignoring = renderings(&shipped, None);
     let e = compare(&fixture, &ignoring).unwrap_err();
-    assert!(e.contains("orchard"), "{e}");
+    assert!(
+        matches!(&e, kyriakon_onboard_core::Error::Failed(message) if message.contains("orchard")),
+        "{e}"
+    );
 
     // And a value the crate has no word for fails the check on the text,
     // before any rendering is built.
     let soon = FIXTURE.replace("state = \"planned\"", "state = \"soon\"");
     let e = check(&soon, None).unwrap_err();
-    assert!(e.contains("soon"), "{e}");
+    assert!(
+        matches!(&e, kyriakon_onboard_core::Error::Context { .. }),
+        "{e}"
+    );
+    assert!(e.to_string().contains("soon"), "{e}");
 }
 
 /// The terminal's menu is one of the renderings the check compares. That the

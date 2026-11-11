@@ -77,6 +77,13 @@ impl Error {
     pub fn report(&self, context: &str) {
         kyriakon_onboard_core::util::report(self, context);
     }
+
+    pub fn context(
+        context: impl Into<String>,
+        source: impl Into<kyriakon_onboard_core::Source>,
+    ) -> Self {
+        Error::Core(kyriakon_onboard_core::Error::context(context, source))
+    }
 }
 
 impl From<store::Error> for Error {
@@ -100,18 +107,6 @@ impl From<boxrun::Error> for Error {
 impl From<kyriakon_onboard_core::Error> for Error {
     fn from(error: kyriakon_onboard_core::Error) -> Self {
         Error::Core(error)
-    }
-}
-
-impl From<String> for Error {
-    fn from(message: String) -> Self {
-        Error::Failed(message)
-    }
-}
-
-impl From<&str> for Error {
-    fn from(message: &str) -> Self {
-        Error::Failed(message.to_string())
     }
 }
 
@@ -622,7 +617,11 @@ mod tests {
                     AfterLine::RemoveGroupRecord("parish.example".to_string()),
                     RefusalFile::Keep,
                 ),
-                async { Err(Error::from("the body ran on a settled intent".to_string())) },
+                async {
+                    Err(Error::Failed(
+                        "the body ran on a settled intent".to_string(),
+                    ))
+                },
             ))
             .unwrap();
 
@@ -681,7 +680,11 @@ mod tests {
                     &format!("{id}.json"),
                     &envelope,
                     Disposition::new(AfterLine::Nothing, refusal),
-                    async { Err(Error::from("the body ran on a settled intent".to_string())) },
+                    async {
+                        Err(Error::Failed(
+                            "the body ran on a settled intent".to_string(),
+                        ))
+                    },
                 ))
                 .unwrap();
             let left = dir.join(format!("store/intents/{id}.json"));
@@ -799,7 +802,11 @@ mod tests {
                     },
                     RefusalFile::Keep,
                 ),
-                async { Err(Error::from("the body ran on a settled intent".to_string())) },
+                async {
+                    Err(Error::Failed(
+                        "the body ran on a settled intent".to_string(),
+                    ))
+                },
             ))
             .unwrap();
 

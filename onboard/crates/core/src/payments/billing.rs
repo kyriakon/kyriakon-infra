@@ -27,10 +27,10 @@ pub fn extend_paid_until(received: &str, before: Option<&str>) -> Result<String,
     let received = day(received)?;
     let before = before.map(day).transpose()?;
     let until = util::paid_until_after(received, before).ok_or_else(|| {
-        format!(
+        Error::Failed(format!(
             "the year after {} has no date in the calendar",
             util::date_string(received)
-        )
+        ))
     })?;
     Ok(util::date_string(until))
 }
@@ -44,7 +44,7 @@ fn day(stamp: &str) -> Result<Date, Error> {
                 .ok()
                 .map(|t| t.date())
         })
-        .ok_or_else(|| Error::from(format!("the date {stamp:?} is not YYYY-MM-DD or RFC 3339")))
+        .ok_or_else(|| Error::Failed(format!("the date {stamp:?} is not YYYY-MM-DD or RFC 3339")))
 }
 
 #[cfg(test)]

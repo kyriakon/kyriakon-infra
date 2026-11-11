@@ -18,21 +18,26 @@ fn flags_read_pairs_and_refuse_a_bad_shape() {
     assert_eq!(map["username"], "alice");
     assert_eq!(map["kind"], "access");
 
-    assert!(flags(&args(&["--nope", "x"]), &["username"])
-        .unwrap_err()
-        .contains("unknown flag"));
-    assert!(flags(
-        &args(&["--username", "a", "--username", "b"]),
-        &["username"]
-    )
-    .unwrap_err()
-    .contains("given twice"));
-    assert!(flags(&args(&["--username"]), &["username"])
-        .unwrap_err()
-        .contains("needs a value"));
-    assert!(flags(&args(&["alice"]), &["username"])
-        .unwrap_err()
-        .contains("unexpected argument"));
+    assert!(matches!(
+        flags(&args(&["--nope", "x"]), &["username"]).unwrap_err(),
+        Error::Failed(message) if message.contains("unknown flag")
+    ));
+    assert!(matches!(
+        flags(
+            &args(&["--username", "a", "--username", "b"]),
+            &["username"]
+        )
+        .unwrap_err(),
+        Error::Failed(message) if message.contains("given twice")
+    ));
+    assert!(matches!(
+        flags(&args(&["--username"]), &["username"]).unwrap_err(),
+        Error::Failed(message) if message.contains("needs a value")
+    ));
+    assert!(matches!(
+        flags(&args(&["alice"]), &["username"]).unwrap_err(),
+        Error::Failed(message) if message.contains("unexpected argument")
+    ));
 }
 
 #[test]
@@ -41,9 +46,10 @@ fn one_username_takes_exactly_one_valid_name() {
     assert_eq!(one_username(&show).unwrap(), "alice");
     assert!(one_username(&args(&["show"])).is_err());
     assert!(one_username(&args(&["show", "alice", "extra"])).is_err());
-    assert!(one_username(&args(&["show", "Alice"]))
-        .unwrap_err()
-        .contains("starts with"));
+    assert!(matches!(
+        one_username(&args(&["show", "Alice"])).unwrap_err(),
+        Error::Failed(message) if message.contains("starts with")
+    ));
 }
 
 #[test]
@@ -109,8 +115,10 @@ fn a_folded_from_header_is_unfolded() {
 fn an_outer_from_that_differs_from_the_armour_is_refused() {
     let message = format!("From: attacker@evil.example\nTo: admin@kyriakon.net\n\n{SIGNED}");
     let err = message_from(&message).unwrap_err();
-    assert!(err.contains("attacker@evil.example"), "{err}");
-    assert!(err.contains("alice@kyriakon.net"), "{err}");
+    assert!(
+        matches!(&err, Error::Failed(message) if message.contains("attacker@evil.example") && message.contains("alice@kyriakon.net")),
+        "{err}"
+    );
 }
 
 #[test]
@@ -119,7 +127,9 @@ fn a_quoted_signed_request_under_another_from_is_refused() {
         "From: attacker@evil.example\nTo: admin@kyriakon.net\nSubject: fwd\n\n\
              Here is their signed request:\n\n{SIGNED}"
     );
-    assert!(message_from(&message)
-        .unwrap_err()
-        .contains("but the clearsigned one is alice@kyriakon.net"));
+    let err = message_from(&message).unwrap_err();
+    assert!(
+        matches!(&err, Error::Failed(message) if message.contains("but the clearsigned one is alice@kyriakon.net")),
+        "{err}"
+    );
 }

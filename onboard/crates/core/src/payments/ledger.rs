@@ -231,10 +231,10 @@ impl<'a> Ledger<'a> {
         // Every line on disk was written from a `json!` value, whose object is
         // sorted. Going through `Value` keeps the key order identical; a struct
         // serialised directly would write declaration order.
-        let value =
-            serde_json::to_value(&line).map_err(|e| format!("cannot encode the ledger: {e}"))?;
-        let encoded =
-            serde_json::to_string(&value).map_err(|e| format!("cannot encode the ledger: {e}"))?;
+        let value = serde_json::to_value(&line)
+            .map_err(|e| Error::context("cannot encode the ledger", e))?;
+        let encoded = serde_json::to_string(&value)
+            .map_err(|e| Error::context("cannot encode the ledger", e))?;
         self.log
             .append_while_locked(&guard, encoded.as_bytes())
             .await?;
@@ -255,7 +255,9 @@ impl<'a> Ledger<'a> {
         for line in self.lines().await? {
             if line.token == token && line.kind == "payment" {
                 if line.amount_gbp.is_none() {
-                    return Err(Error::from("a payment line carries no amount".to_string()));
+                    return Err(Error::Failed(
+                        "a payment line carries no amount".to_string(),
+                    ));
                 }
                 found = Some(line);
             }
@@ -286,12 +288,17 @@ impl<'a> Ledger<'a> {
             if line.refund_of() != Some(original) {
                 continue;
             }
-            let text = line
-                .amount_gbp
-                .as_deref()
-                .ok_or_else(|| format!("the refund at ledger seq {} has no amount", line.seq))?;
+            let text = line.amount_gbp.as_deref().ok_or_else(|| {
+                Error::Failed(format!(
+                    "the refund at ledger seq {} has no amount",
+                    line.seq
+                ))
+            })?;
             let pence = util::pence(text.strip_prefix('-').unwrap_or(text)).map_err(|e| {
-                format!("the refund at ledger seq {} cannot be read: {e}", line.seq)
+                Error::context(
+                    format!("the refund at ledger seq {} cannot be read", line.seq),
+                    e,
+                )
             })?;
             total += pence;
             lines.push(line);
@@ -392,11 +399,11 @@ impl<'a> Ledger<'a> {
         // build does not model survive the rewrite. Its key order is what the
         // value held, not the order this struct would declare.
         let mut line: Value = serde_json::from_str(&lines[index])
-            .map_err(|e| format!("the refund line does not parse: {e}"))?;
+            .map_err(|e| Error::context("the refund line does not parse", e))?;
         line["settled_on"] = serde_json::json!(on);
         line["settled_intent"] = serde_json::json!(intent);
-        lines[index] =
-            serde_json::to_string(&line).map_err(|e| format!("cannot encode the ledger: {e}"))?;
+        lines[index] = serde_json::to_string(&line)
+            .map_err(|e| Error::context("cannot encode the ledger", e))?;
         let mut text = lines.join("\n");
         text.push('\n');
         self.store.rewrite_log(PAYMENTS, text.as_bytes()).await?;
@@ -513,7 +520,10 @@ mod tests {
             .settle_refund("KYR-ZZZZ-ZZZZ-ZZZZ", "in_settle", "2026-11-05")
             .await
             .expect_err("a settlement must not skip a line it cannot read");
-        assert!(error.contains("line 2 does not parse"), "{error}");
+        assert!(
+            matches!(&error, Error::ParseLine { line: 2, .. }),
+            "{error}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
