@@ -3044,13 +3044,15 @@ fn purge_due(filed_at: &str, today: time::Date) -> bool {
 /// Clear away the application answers ADR 0005 gives ninety days. Run once per
 /// drain pass, beside [`purge_declined`].
 ///
-/// Two shapes outlive their decision: the copy in each mailbox's
+/// Three shapes outlive their decision: the copy in each mailbox's
 /// `accounts/<username>/application.json`, which an approval and a group's
-/// provisioning write (a group's copy is in every mailbox), and an abandoned
-/// `applications/<token>.json` still in `received`. The journal line is the
-/// token's own, `purge-<token>`, so a retry that has already cleared one copy
-/// does not journal a second line. `account.json` is untouched: the payment and
-/// the outside address stay with the account.
+/// provisioning write (a group's copy is in every mailbox); an abandoned
+/// `applications/<token>.json` still in `received`; and a decided record whose
+/// mailbox copies are already gone, which no account reaches. The journal line
+/// is the token's own, `purge-<token>`, so a retry that has already cleared one
+/// copy does not journal a second line. `account.json` is untouched: the payment
+/// and the outside address stay with the account, and only an abandoned name is
+/// released. A declined record belongs to [`purge_declined`].
 pub async fn purge_applications(
     cfg: &DrainConfig,
     store: &Store,
@@ -3139,14 +3141,25 @@ pub async fn purge_applications(
         else {
             continue;
         };
-        // Only an undecided application is abandoned here; a decided one is
-        // reached through its account's copy above, which a group shares.
-        if record.stage != "received" || !purge_due(&record.filed_at, today) {
+        if !purge_due(&record.filed_at, today) {
             continue;
         }
+        // A declined record belongs to [`purge_declined`], which owns its
+        // seven-day window and its release; one still here after ninety days is
+        // a release that keeps failing, and clearing it here would lose the
+        // release rather than complete it.
+        if record.stage.starts_with("declined") {
+            continue;
+        }
+        // `received` is the abandoned shape, whose name is released. Anything
+        // else is decided: its mailbox copies would normally have carried it
+        // out through the loop above, so a record still here has none left (an
+        // account deleted before the window, or a group's mailboxes removed).
+        // Its name belongs to an account or to a hold, and is not released.
+        let abandoned = record.stage == "received";
         // The record was written by the unprivileged half, so the username is
         // revalidated before it can reach a root script's argv.
-        if validate::username_shape(&record.username).is_some() {
+        if abandoned && validate::username_shape(&record.username).is_some() {
             Error::Failed(format!(
                 "application {name} has no usable username; skipped"
             ))
@@ -3160,7 +3173,14 @@ pub async fn purge_applications(
         if !journal.has(&purge_id, "purged") {
             let app =
                 ApplicationRef::application(record.username.clone(), record.status_token.clone());
+            let what = if abandoned {
+                "abandoned application"
+            } else {
+                "application record"
+            };
             if !journal.has(&purge_id, "applying") {
+                let note =
+                    format!("ADR 0005's ninety days are up; the {what} is being cleared away");
                 write_journal(
                     store,
                     journal,
@@ -3169,13 +3189,17 @@ pub async fn purge_applications(
                     "purge",
                     &app,
                     "applying",
-                    Some("ADR 0005's ninety days are up; the abandoned application is being cleared away"),
+                    Some(&note),
                 )
                 .await?;
             }
-            if !release_username(cfg, store, journal, &purge_id, "purge", &record.username).await? {
+            if abandoned
+                && !release_username(cfg, store, journal, &purge_id, "purge", &record.username)
+                    .await?
+            {
                 continue;
             }
+            let note = format!("the {what} was cleared away");
             write_journal(
                 store,
                 journal,
@@ -3184,7 +3208,7 @@ pub async fn purge_applications(
                 "purge",
                 &app,
                 "purged",
-                Some("the abandoned application was cleared away"),
+                Some(&note),
             )
             .await?;
         }

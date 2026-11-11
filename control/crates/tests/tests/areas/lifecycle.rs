@@ -840,6 +840,61 @@ fn an_abandoned_application_purges_after_ninety_days_and_releases_the_username()
     assert_eq!(fix.journal().matches(&line).count(), 2, "{}", fix.journal());
 }
 
+/// A decided application whose mailbox copy is gone (the account was deleted
+/// before the window) is purged from the token directory too, without releasing
+/// its name: a release is the abandoned record's. A decided record inside the
+/// window stays.
+#[test]
+fn a_decided_application_with_no_mailbox_copy_purges_after_ninety_days() {
+    let fix = Fix::new("purge-decided");
+    approved_paid(&fix, "secretary", "cash");
+    // The account goes before the window, leaving the token record with no
+    // mailbox copy to reach it.
+    std::fs::remove_dir_all(fix.dir.join("store/accounts/secretary")).unwrap();
+    age_filed_at(&fix, &format!("applications/{TOKEN}.json"), 100);
+
+    // A decided record inside the window, for a name no account holds.
+    let mut young = fix.filed("almoner", "no_charge", &[("rail", "no_charge")]);
+    young["status_token"] = json!(OTHER_TOKEN);
+    young["stage"] = json!("decided: an account without charge");
+    young["decided_at"] = json!("2026-10-01T09:00:00Z");
+    std::fs::write(
+        fix.dir
+            .join(format!("store/applications/{OTHER_TOKEN}.json")),
+        serde_json::to_vec_pretty(&young).unwrap(),
+    )
+    .unwrap();
+    age_filed_at(&fix, &format!("applications/{OTHER_TOKEN}.json"), 10);
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir
+            .join(format!("store/applications/{TOKEN}.json"))
+            .exists(),
+        "the decided record with no mailbox copy was not purged"
+    );
+    assert!(
+        fix.dir
+            .join(format!("store/applications/{OTHER_TOKEN}.json"))
+            .exists(),
+        "a decided record inside the window was purged"
+    );
+    let line = format!("\"intent\":\"purge-{TOKEN}\"");
+    assert_eq!(fix.journal().matches(&line).count(), 2, "{}", fix.journal());
+    assert!(
+        !fix.scripts_log().contains("delete-user.sh secretary"),
+        "a decided record's name was released: {}",
+        fix.scripts_log()
+    );
+    assert!(
+        !fix.journal()
+            .contains(&format!("\"intent\":\"purge-{OTHER_TOKEN}\"")),
+        "{}",
+        fix.journal()
+    );
+}
+
 /// Running the drain twice over one `intents/` directory leaves the same store
 /// and sends no notice twice. The second pass is made to re-read the same intent,
 /// the state a run that died before it deleted the file leaves, so the pass
