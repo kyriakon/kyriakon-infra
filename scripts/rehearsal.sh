@@ -50,6 +50,12 @@ trap 'hc_fail "${REHEARSAL_HEALTHCHECKS_URL:-}"' ERR
 # --target / puts /home/... back under the box's real /home paths.
 restic restore latest --target / --no-lock
 
+# libc reads /etc/pwd.db and /etc/spwd.db, not /etc/master.passwd, so the restored
+# account database is invisible to sshd, dovecot and smtpd until it is rebuilt.
+# -p writes the /etc/passwd that carries no password hashes.
+pwd_mkdb -p /etc/master.passwd
+printf 'password databases rebuilt from the restored /etc/master.passwd\n'
+
 printf '\nrestore complete — now the manual full-dress steps:\n'
 cat <<'EOF'
 1. start daemons:  rcctl start smtpd dovecot httpd gmid

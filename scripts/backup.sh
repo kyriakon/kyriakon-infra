@@ -18,8 +18,9 @@
 # roots (/home/<u>/www, /home/<u>/gemini) under each user's home (proposal
 # §5.3, §6.9), so one tree covers every user-data path. The research note's
 # /var/www /var/gemini /var/git predates §6.9's per-user-under-/home layout, so
-# /home is the authoritative, current path. The rest is named below, each for
-# the reason git does not hold it:
+# /home is the authoritative, current path. The rest is the list BACKUP_PATHS in
+# lib.sh, which restore-test.sh reads too, and each is there for the reason git
+# does not hold it:
 #
 #   /etc/mail             the DKIM signing key and smtpd's queue key. Without them
 #                         a rebuild comes back unable to sign mail or read an
@@ -132,18 +133,19 @@ printf '%s\n' "$CANARY_TEXT" > "$CANARY_PATH"
 
 # Whole /home tree (Maildir + git repos + web roots), then the state that exists
 # only on this box: the /etc/mail secrets, the control store, the keyring, the
-# OS account database and the generated daemon directories. See the header for
-# why each is data. The latter exist once the control plane or member hosting is
-# deployed, and restic exits on a path that does not exist, so each is tested
-# before it is passed: a path this box has not created yet is skipped rather than
-# failing the whole night's backup. The capsule globs are tested the same way.
-set -- /home /etc/mail
-for p in /var/db/onboard /var/db/kyriakon-acme-queue /etc/kyriakon \
-	/etc/master.passwd /etc/passwd /etc/group \
-	/etc/httpd.d /etc/gmid.d /etc/acme-client.d; do
+# OS account database and the generated daemon directories. The list is
+# BACKUP_PATHS in lib.sh, so the restore test asserts the same set. A path the
+# box has not created yet is skipped rather than failing the whole night's
+# backup, because restic exits on a path that does not exist. The here-doc keeps
+# the loop in this shell, which a pipeline would not: `set --` has to accumulate
+# outside a subshell.
+set --
+while read -r p; do
 	[ -e "$p" ] || continue
 	set -- "$@" "$p"
-done
+done <<EOF
+$BACKUP_PATHS
+EOF
 for f in /etc/ssl/capsule-*.crt /etc/ssl/private/capsule-*.key; do
 	[ -f "$f" ] || continue
 	set -- "$@" "$f"

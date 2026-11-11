@@ -605,7 +605,7 @@ Do not delete an account before its window ends, and do not delete by hand anyth
 
 `scripts/backup.sh` writes an encrypted restic snapshot to the storage box every night, with retention of 30 daily, 8 weekly and 6 monthly snapshots. `scripts/cron-apply.sh` installs its cron line.
 
-The snapshot holds `/home`, `/etc/mail`, the capsule certificate pairs, the control store at `/var/db/onboard`, the box keyring and the drain secrets under `/etc/kyriakon`, the account database (`/etc/master.passwd`, `/etc/passwd`, `/etc/group`), the generated daemon directories (`/etc/httpd.d`, `/etc/gmid.d`, `/etc/acme-client.d`) and the certificate queue at `/var/db/kyriakon-acme-queue`. A path that does not exist on the box is skipped rather than failing the run, because restic exits on a missing path. Hand-written config stays out: it is the git-tracked repository.
+The snapshot holds the paths `BACKUP_PATHS` in `scripts/lib.sh` lists, plus the capsule certificate pairs. That is the user data under `/home`, the mail secrets, and the state a rebuild cannot recreate: the control store, the box keyring and drain secrets, the account database, the generated daemon directories and the certificate queue. `scripts/restore-test.sh` reads the same list, so the payload and its assertion cannot drift. A path that does not exist on the box is skipped rather than failing the run, because restic exits on a missing path. Hand-written config stays out: it is the git-tracked repository.
 
 The weekly test runs on a box that exists for the length of the run. From the mail box:
 
@@ -614,7 +614,7 @@ The weekly test runs on a box that exists for the length of the run. From the ma
 
 The first form creates a throwaway box from the snapshot labelled `kind=restore`, runs `scripts/restore-test.sh` on it over ssh, and destroys it on every exit path. The second prints what it would run and touches nothing. The test restores with a read-only storage sub-account, so a fault on the throwaway box cannot damage the repository it is testing.
 
-The test already runs these checks, in this order: the newest snapshot is less than 30 hours old, which catches a backup that silently stopped; `restic check` for repository structure and pack integrity; a full restore; the canary byte-identical, which catches a backup that stopped including `/home`; that `/etc/mail/dkim/private.rsa.key` and `/etc/mail/smtpd.conf` are in the snapshot while `/root/.kyriakon-env` and `/root/.restic-pass` are not; that the control store, the keyring, the account database, the generated daemon directories and the certificate queue restored, and that every store account under `/var/db/onboard/accounts` has its entry in the restored `/etc/passwd` and `/etc/master.passwd`; that every restored Maildir message is PGP ciphertext; `git fsck` on every restored repository; and that the restored node count matches the snapshot's. It pings its Healthchecks check on success and its failure URL on error, so a run that never happens alerts on its own.
+The test already runs these checks, in this order: the newest snapshot is less than 30 hours old, which catches a backup that silently stopped; `restic check` for repository structure and pack integrity; a full restore; the canary byte-identical, which catches a backup that stopped including `/home`; that `/etc/mail/dkim/private.rsa.key` and `/etc/mail/smtpd.conf` are in the snapshot while `/root/.kyriakon-env` and `/root/.restic-pass` are not; that the control store, the keyring, the account database, the generated daemon directories and the certificate queue restored; that every restored Maildir message is PGP ciphertext; `git fsck` on every restored repository; and that the restored node count matches the snapshot's. It pings its Healthchecks check on success and its failure URL on error, so a run that never happens alerts on its own.
 
 To prove a restored copy becomes a working mail server, rather than merely restoring, run the rehearsal on a throwaway box provisioned from the template.
 
@@ -622,9 +622,17 @@ To prove a restored copy becomes a working mail server, rather than merely resto
 
 		doas env RESTIC_REPOSITORY=... RESTIC_PASSWORD_FILE=... ksh scripts/rehearsal.sh
 
-2. Work through the checklist the script prints. Start the daemons, clone a test `pass` repository over ssh, send a message from an address outside the platform and read it back over IMAP with a PGP client, confirm MX and PTR point at this box for the window, record the date and the snapshot id, then ping the rehearsal check. The check carries a period of about 90 days, so a skipped quarter alerts on its own.
+2. Rebuild the password databases. OpenBSD's libc reads `/etc/pwd.db` and
+   `/etc/spwd.db`, not `/etc/master.passwd`, so a restored account database
+   changes nothing for sshd, dovecot or smtpd until `pwd_mkdb` writes them.
+   `scripts/rehearsal.sh` runs this itself after its restore, and a hand restore
+   needs it before any service starts.
 
-3. Put the configuration on a replacement box from the repository, in this order.
+		doas pwd_mkdb -p /etc/master.passwd
+
+3. Work through the checklist the script prints. Start the daemons, clone a test `pass` repository over ssh, send a message from an address outside the platform and read it back over IMAP with a PGP client, confirm MX and PTR point at this box for the window, record the date and the snapshot id, then ping the rehearsal check. The check carries a period of about 90 days, so a skipped quarter alerts on its own.
+
+4. Put the configuration on a replacement box from the repository, in this order.
    `deploy-control.sh` runs first because the mail and relay deploys both check
    that the handler is up.
 
@@ -932,7 +940,7 @@ These are operator actions, not code. They are tracked as a checklist in #175, a
 
 4. Create the Stripe objects and set the dashboard items listed in `docs/planning/research/stripe-rail-set.md`, section 6, and confirm the account verification before signup opens. The load-bearing ones are the live Product and yearly Price, the webhook endpoint with the named event list and its signing secret on the box, the restricted API key, the Payment Link, automatic receipts, the revenue recovery emails and the retry policy. The note records fifteen items and which of them are optional until a VAT registration exists.
 
-5. Confirm the payment state store is inside the backup set and that the restore test's canary comes back. `scripts/backup.sh` copies `/var/db/onboard` with the rest of the payload, and `scripts/restore-test.sh` asserts that it restored and that each store account has its OS account in `/etc/passwd` and `/etc/master.passwd`. The canary is `/home/.kyriakon-backup-canary`, and the weekly test asserts it returns byte-identical.
+5. Confirm the payment state store is inside the backup set and that the restore test's canary comes back. `/var/db/onboard` is in `BACKUP_PATHS`, and `scripts/restore-test.sh` asserts that it restored. The canary is `/home/.kyriakon-backup-canary`, and the weekly test asserts it returns byte-identical.
 
 ## Run the quarterly indirect-tax check
 
