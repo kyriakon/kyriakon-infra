@@ -19,7 +19,7 @@ use kyriakon_onboard_core::{flow::questions, flow::validate, mail::keycheck, uti
 /// goes first, so the drain never sees an intent whose application is not on
 /// disk. One writer for the web form and the capsule, so the order cannot drift
 /// between them.
-pub(super) async fn file_application(app: &App, record: &Record) -> Result<(), String> {
+pub(super) async fn file_application(app: &App, record: &Record) -> Result<(), Error> {
     let id = ulid::Ulid::new().to_string();
     let name = format!("{}.json", record.status_token);
     // Both encodings first: an encoding failure must leave no record either.
@@ -40,7 +40,7 @@ pub(super) async fn file_application(app: &App, record: &Record) -> Result<(), S
         // the retry starts clean; a failure to remove is reported beside the
         // original error rather than replacing it.
         if let Err(remove) = app.store.remove("applications", &name).await {
-            eprintln!("kyriakon-onboard: the orphaned application record {name} stays: {remove}");
+            remove.report(&format!("the orphaned application record {name} stays"));
         }
         return Err(e.into());
     }
@@ -140,7 +140,7 @@ pub(super) fn build_record(
     body: bool,
     token: &str,
     front_end: &str,
-) -> Result<Record, String> {
+) -> Result<Record, Error> {
     let answers: BTreeMap<String, String> = questions::shown(&app.questions, !body)
         .iter()
         .map(|q| (q.id.clone(), form.get(&q.id).cloned().unwrap_or_default()))

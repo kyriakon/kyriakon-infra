@@ -5,7 +5,7 @@ use super::*;
 use super::connection::fields;
 use super::flow::{application_problems, build_record, file_application, render_applicant};
 use super::gemini::capsule_new;
-use super::reply::{capability, page_html, refused, server_error, too_many, Which};
+use super::reply::{capability, page_html, refused, respond, too_many, Which};
 use super::route::Call;
 use kyriakon_onboard_core::flow::applicant::{label, reading, Reading};
 
@@ -49,7 +49,7 @@ pub(super) async fn webhook(app: &App, request: &Request) -> Reply {
         Err(e) => {
             // The front-end is mid-request, so the failure is answered rather
             // than the connection dropped; Stripe retries a non-2xx.
-            eprintln!("kyriakon-onboard: cannot store a webhook: {e}");
+            e.report("storing a webhook");
             Reply::html(500, String::new())
         }
     }
@@ -78,7 +78,7 @@ pub(super) async fn apply_web(app: &App, request: &Request, incoming: &Incoming)
     let label = match label(&form) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("kyriakon-onboard: {e}");
+            Error::from(e).report("the application form");
             return refused("A submission has to name its front end as web, tui or capsule.");
         }
     };
@@ -115,14 +115,14 @@ pub(super) async fn apply_web(app: &App, request: &Request, incoming: &Incoming)
 
     let token = match store::status_token().await {
         Ok(t) => t,
-        Err(e) => return server_error(&e.to_string()),
+        Err(e) => return respond(&Error::from(e), FrontEnd::Httpd),
     };
     let record = match build_record(app, &form, body, &token, label) {
         Ok(r) => r,
-        Err(e) => return server_error(&e),
+        Err(e) => return respond(&e, FrontEnd::Httpd),
     };
     if let Err(e) = file_application(app, &record).await {
-        return server_error(&e);
+        return respond(&e, FrontEnd::Httpd);
     }
 
     capability(&ReceivedPage {

@@ -108,7 +108,7 @@ pub(super) async fn record_for(app: &App, token: &str) -> Option<Record> {
         // The status path is not a token oracle: a damaged record answers the
         // same as an unknown token, and the operator gets the reason on stderr.
         Err(e) => {
-            eprintln!("kyriakon-onboard: {e}");
+            e.report("the status page");
             None
         }
     }

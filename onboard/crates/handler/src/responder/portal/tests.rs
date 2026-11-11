@@ -2,6 +2,7 @@
 
 use super::{portal_answer, portal_file, portal_line, SLOW_STATUS};
 use crate::responder::test_support::*;
+use crate::responder::Error;
 use kyriakon_onboard_core::store::Record;
 use kyriakon_onboard_core::{ipc, store};
 use std::collections::BTreeMap;
@@ -72,7 +73,7 @@ async fn portal_lines_are_bounded_and_a_close_is_not_an_error() {
 
     let mut reader = tokio::io::BufReader::new(&b"abcdefg\n"[..]);
     let why = portal_line(&mut reader, 6).await.unwrap_err();
-    assert!(why.contains("longer than 6"), "{why}");
+    assert!(matches!(&why, Error::Line { limit: 6, .. }), "{why}");
 
     let mut reader = tokio::io::BufReader::new(&b"abc"[..]);
     assert_eq!(portal_line(&mut reader, 6).await.unwrap(), None);

@@ -23,7 +23,7 @@ pub(super) async fn accept(
     listener: UnixListener,
     app: Arc<App>,
     channel: Channel,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     loop {
         let (stream, _) = listener
             .accept()
@@ -36,7 +36,7 @@ pub(super) async fn accept(
                 Channel::Portal => portal_connection(stream, &app).await,
             };
             if let Err(e) = outcome {
-                eprintln!("kyriakon-onboard: {e}");
+                e.report("serving a connection");
             }
         });
     }
@@ -45,7 +45,7 @@ pub(super) async fn accept(
 /// Answer the requests on one connection. Both front-ends connect for one request
 /// and close, and gmid asks for the connection to be kept in case it has another,
 /// so the loop runs until the peer closes or a record cannot be read.
-pub(super) async fn connection(stream: UnixStream, app: &App) -> Result<(), String> {
+pub(super) async fn connection(stream: UnixStream, app: &App) -> Result<(), Error> {
     let (mut reader, mut writer) = stream.into_split();
     loop {
         let request = match fastcgi::read_request(&mut reader, MAX_BODY).await? {
@@ -74,15 +74,17 @@ pub(super) async fn connection(stream: UnixStream, app: &App) -> Result<(), Stri
 /// Write one reply and flush it, so the front-end reads a whole answer. The
 /// connection, the three portal answers and the Titan reply all write here, so
 /// a write that fails says the same thing everywhere.
-pub(super) async fn say<W: AsyncWrite + Unpin>(writer: &mut W, bytes: &[u8]) -> Result<(), String> {
-    writer
-        .write_all(bytes)
-        .await
-        .map_err(|e| format!("cannot write the reply: {e}"))?;
-    writer
-        .flush()
-        .await
-        .map_err(|e| format!("cannot flush the reply: {e}"))
+pub(super) async fn say<W: AsyncWrite + Unpin>(writer: &mut W, bytes: &[u8]) -> Result<(), Error> {
+    writer.write_all(bytes).await.map_err(|source| Error::Io {
+        what: "write the reply",
+        path: None,
+        source,
+    })?;
+    writer.flush().await.map_err(|source| Error::Io {
+        what: "flush the reply",
+        path: None,
+        source,
+    })
 }
 
 /// Answer one request.

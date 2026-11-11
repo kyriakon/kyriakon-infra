@@ -5,7 +5,7 @@ use super::*;
 use super::account::{group_recipe, group_state};
 use super::connection::decode;
 use super::flow::{build_record, file_application};
-use super::reply::{too_many, Which};
+use super::reply::{respond, too_many, Which};
 use super::route::Call;
 use super::status::card_link;
 use kyriakon_onboard_core::flow::applicant::{
@@ -26,10 +26,7 @@ use kyriakon_onboard_core::{mail::keycheck, store, store::draft};
 pub(super) async fn capsule_account(app: &App, incoming: &Incoming) -> Reply {
     let member = match member_for(app, incoming).await {
         Ok(member) => member,
-        Err(e) => {
-            eprintln!("kyriakon-onboard: {e}");
-            return Reply::gemini(50, "Permanent failure", String::new());
-        }
+        Err(e) => return respond(&e, FrontEnd::Gemini),
     };
     let body = match &member {
         Some(account) => {
@@ -37,10 +34,7 @@ pub(super) async fn capsule_account(app: &App, incoming: &Incoming) -> Reply {
             let recipe = group_recipe(app, account);
             let group = match group_state(app, account.group.as_deref()).await {
                 Ok(group) => group,
-                Err(e) => {
-                    eprintln!("kyriakon-onboard: {e}");
-                    return Reply::gemini(50, "Permanent failure", String::new());
-                }
+                Err(e) => return respond(&e, FrontEnd::Gemini),
             };
             let payment = account.payment_state().map(|block| {
                 page::payment(
@@ -72,10 +66,7 @@ pub(super) async fn capsule_account(app: &App, incoming: &Incoming) -> Reply {
 pub(super) async fn capsule_front(app: &App, incoming: &Incoming) -> Reply {
     let member = match member_for(app, incoming).await {
         Ok(member) => member,
-        Err(e) => {
-            eprintln!("kyriakon-onboard: {e}");
-            return Reply::gemini(50, "Permanent failure", String::new());
-        }
+        Err(e) => return respond(&e, FrontEnd::Gemini),
     };
     let member_name = member.as_ref().map(|account| account.username.as_str());
     let mut page = capsule::front_page(&app.catalogue, member_name);
@@ -112,13 +103,13 @@ pub(super) fn acceptances(app: &App) -> Reply {
 /// The account a presented certificate is pinned to. Only the two routes that
 /// read as a member call this: a certificate-bearing request for any other page
 /// pays nothing for a lookup it would throw away.
-pub(super) async fn member_for(app: &App, incoming: &Incoming) -> Result<Option<Account>, String> {
+pub(super) async fn member_for(app: &App, incoming: &Incoming) -> Result<Option<Account>, Error> {
     match &incoming.certificate {
         Some(certificate) => app
             .store
             .account_for_certificate(&certificate.hash)
             .await
-            .map_err(String::from),
+            .map_err(Error::Lookup),
         None => Ok(None),
     }
 }
@@ -158,15 +149,11 @@ pub(super) async fn capsule_new(app: &App, incoming: &Incoming) -> Reply {
     }
     let token = match store::status_token().await {
         Ok(token) => token,
-        Err(e) => {
-            eprintln!("kyriakon-onboard: {e}");
-            return Reply::gemini(40, "Temporary failure", String::new());
-        }
+        Err(e) => return respond(&Error::from(e), FrontEnd::Gemini),
     };
     let mut record = draft::Draft::new(token.clone());
     if let Err(e) = draft::save(&app.store, &mut record).await {
-        eprintln!("kyriakon-onboard: {e}");
-        return Reply::gemini(40, "Temporary failure", String::new());
+        return respond(&Error::from(e), FrontEnd::Gemini);
     }
     capsule_redirect(&token, 1)
 }
@@ -194,18 +181,12 @@ pub(super) async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) ->
     // would lose one of them.
     let _lock = match app.store.lock("drafts/.lock").await {
         Ok(lock) => lock,
-        Err(e) => {
-            eprintln!("kyriakon-onboard: {e}");
-            return Reply::gemini(40, "Temporary failure", String::new());
-        }
+        Err(e) => return respond(&Error::from(e), FrontEnd::Gemini),
     };
     let mut record = match draft::load(&app.store, token).await {
         Ok(Some(d)) => d,
         Ok(None) => return capsule_not_found(),
-        Err(e) => {
-            eprintln!("kyriakon-onboard: {e}");
-            return Reply::gemini(40, "Temporary failure", String::new());
-        }
+        Err(e) => return respond(&Error::from(e), FrontEnd::Gemini),
     };
     let path = flow_path(&app.questions, &record.answers);
     if record.cursor >= path.len() {
@@ -219,8 +200,7 @@ pub(super) async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) ->
     // page rather than asking for a key the applicant has sent.
     if capsule_skip_mailed(&path, &mut record) {
         if let Err(e) = draft::save(&app.store, &mut record).await {
-            eprintln!("kyriakon-onboard: {e}");
-            return Reply::gemini(40, "Temporary failure", String::new());
+            return respond(&Error::from(e), FrontEnd::Gemini);
         }
         if record.cursor >= path.len() {
             return capsule_file(app, &record).await;
@@ -288,8 +268,7 @@ pub(super) async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) ->
         return capsule_file(app, &record).await;
     }
     if let Err(e) = draft::save(&app.store, &mut record).await {
-        eprintln!("kyriakon-onboard: {e}");
-        return Reply::gemini(40, "Temporary failure", String::new());
+        return respond(&Error::from(e), FrontEnd::Gemini);
     }
     capsule_redirect(token, record.cursor + 1)
 }
@@ -418,17 +397,13 @@ pub(super) async fn capsule_file(app: &App, record: &draft::Draft) -> Reply {
     let answers = flow_answers(record, body);
     let application = match build_record(app, &answers, body, &record.token, "capsule") {
         Ok(application) => application,
-        Err(e) => {
-            eprintln!("kyriakon-onboard: {e}");
-            return Reply::gemini(40, "Temporary failure", String::new());
-        }
+        Err(e) => return respond(&e, FrontEnd::Gemini),
     };
     if let Err(e) = file_application(app, &application).await {
-        eprintln!("kyriakon-onboard: {e}");
-        return Reply::gemini(40, "Temporary failure", String::new());
+        return respond(&e, FrontEnd::Gemini);
     }
     if let Err(e) = draft::remove(&app.store, &record.token).await {
-        eprintln!("kyriakon-onboard: {e}");
+        e.report("removing the draft");
     }
     let link = format!("gemini://{HOST}/status/{}", record.token);
     Reply::gemini(20, "text/gemini", capsule::filed(&link))
