@@ -7,8 +7,9 @@
 
 use super::boxrun::{outside_address, publish_mail_keys, run_script, write_public_key};
 use super::groups::{
-    account_on_box, close_group_tokens, group_record, hold_name, remove_group_record,
-    take_group_down, write_account_record, write_group_record, write_group_state,
+    account_on_box, application_token, close_group_tokens, group_record, hold_name,
+    remove_group_record, take_group_down, write_account_record, write_group_record,
+    write_group_state,
 };
 use super::payments::{resolve_payment, token_join, write_payment_copy};
 use super::Error;
@@ -2688,13 +2689,15 @@ impl Released {
     /// The account's own lines carry its application token, or no token where
     /// the transition is account-scoped. A line naming the same username with
     /// another applicant's token is that applicant's record and is kept. A hold
-    /// written before the token was recorded cannot tell whose token is whose,
-    /// so it keeps every token-bearing line rather than guessing.
+    /// written before the token was recorded is completed from the account's
+    /// application copy where it survives, and where it does not every
+    /// token-bearing line is kept rather than guessed at.
     fn owns(&self, entry: &store::JournalLine) -> bool {
         let own_id = entry.intent == format!("account:{}", self.username)
             || entry
                 .intent
-                .starts_with(&format!("delete-{}-", self.username))
+                .strip_prefix(&format!("delete-{}-", self.username))
+                .is_some_and(|created| OffsetDateTime::parse(created, &Rfc3339).is_ok())
             || self.token.as_ref().is_some_and(|token| {
                 entry.intent == format!("purge-{token}")
                     || entry.intent == format!("application:{token}")
@@ -2748,14 +2751,22 @@ pub async fn holds_sweep(store: &Store) -> Result<(), Error> {
         if at > now {
             continue;
         }
+        let token = match value
+            .get("token")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+        {
+            Some(token) => Some(token.to_string()),
+            // A hold written before the token was recorded is completed from
+            // the account's application copy where it still exists. Where that
+            // copy is gone, its token-bearing lines are kept rather than
+            // guessed at, which is the exception the notice names.
+            None => application_token(store, username).await,
+        };
         expired.push(Released {
             username: username.to_string(),
             until: at,
-            token: value
-                .get("token")
-                .and_then(Value::as_str)
-                .filter(|token| !token.is_empty())
-                .map(str::to_string),
+            token,
         });
     }
     if expired.is_empty() {

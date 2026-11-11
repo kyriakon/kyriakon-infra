@@ -447,3 +447,129 @@ fn an_expired_hold_and_its_journal_lines_are_released() {
         "the journal lost its newline"
     );
 }
+
+/// Releasing `parish` must not take `parish-secretary`'s deletion lines with
+/// it: the id after `delete-<username>-` has to be its RFC 3339 creation stamp.
+#[test]
+fn releasing_a_username_leaves_a_longer_username_alone() {
+    let fix = Fix::new("erasure-prefix-hold");
+    approved_paid(&fix, "parish", "cash");
+    approved_paid(&fix, "parish-secretary", "cash");
+    fake_delete_user(&fix);
+    assert!(fix.ctl(&["delete", "parish"]).status.success());
+    assert!(fix.ctl(&["delete", "parish-secretary"]).status.success());
+    let parish_delete = fix
+        .journal()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|entry| entry["kind"] == "delete" && entry["application"]["username"] == "parish")
+        .and_then(|entry| entry["intent"].as_str().map(str::to_string))
+        .expect("parish's deletion id");
+
+    // Ninety days pass for `parish`, and the longer name's deletion line is
+    // dated inside that window too, so only the exact-id match can save it.
+    std::fs::write(
+        fix.dir.join("store/holds/parish.json"),
+        br#"{"username":"parish","until":"2020-06-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    let mut aged = String::new();
+    for line in fix.journal().lines() {
+        let mut entry: Value = serde_json::from_str(line).unwrap();
+        let longer = entry["intent"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("delete-parish-"));
+        if entry["application"]["username"] == "parish" || longer {
+            entry["at"] = json!("2020-01-01T00:00:00Z");
+        }
+        aged.push_str(&serde_json::to_string(&entry).unwrap());
+        aged.push('\n');
+    }
+    std::fs::write(fix.dir.join("store/journal.jsonl"), &aged).unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(!fix.dir.join("store/holds/parish.json").exists());
+    let after = fix.journal();
+    assert!(
+        !after.lines().any(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["intent"] == parish_delete.as_str()
+        }),
+        "parish's own deletion line stayed: {after}"
+    );
+    assert!(
+        after.contains("delete-parish-secretary-"),
+        "the longer name's deletion line was removed: {after}"
+    );
+}
+
+/// A hold written before the token was recorded keeps its token-bearing lines
+/// where the account copy is gone, which is the exception the notice names, and
+/// still releases the account-scoped lines it can identify.
+#[test]
+fn a_tokenless_hold_keeps_token_bearing_lines_where_the_copy_is_gone() {
+    let fix = Fix::new("erasure-hold-no-token");
+    approved_paid(&fix, "secretary", "cash");
+    fake_delete_user(&fix);
+    let application: Value =
+        serde_json::from_str(&fix.read("accounts/secretary/application.json")).unwrap();
+    let own_token = application["status_token"].as_str().unwrap().to_string();
+    assert!(fix.ctl(&["delete", "secretary"]).status.success());
+    let delete_id = fix
+        .journal()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|entry| entry["kind"] == "delete" && entry["application"]["username"] == "secretary")
+        .and_then(|entry| entry["intent"].as_str().map(str::to_string))
+        .expect("the deletion journalled an intent id");
+
+    // A build before this release wrote no token, and the account copy has gone
+    // with the deletion.
+    std::fs::write(
+        fix.dir.join("store/holds/secretary.json"),
+        br#"{"username":"secretary","until":"2020-06-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    let failed = json!({
+        "version": 1,
+        "at": "2020-01-01T00:00:00Z",
+        "intent": delete_id,
+        "kind": "delete",
+        "release": "test",
+        "application": {"username": ""},
+        "outcome": "failed",
+        "note": "delete-user.sh failed",
+    });
+    let mut aged = String::new();
+    for line in fix.journal().lines() {
+        let mut entry: Value = serde_json::from_str(line).unwrap();
+        if entry["application"]["username"] == "secretary" {
+            entry["at"] = json!("2020-01-01T00:00:00Z");
+        }
+        aged.push_str(&serde_json::to_string(&entry).unwrap());
+        aged.push('\n');
+    }
+    aged.push_str(&serde_json::to_string(&failed).unwrap());
+    aged.push('\n');
+    std::fs::write(fix.dir.join("store/journal.jsonl"), &aged).unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(!fix.dir.join("store/holds/secretary.json").exists());
+    let after = fix.journal();
+    assert!(
+        after.lines().any(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["application"]["status_token"]
+                == own_token.as_str()
+        }),
+        "the token-bearing line went although the copy is gone: {after}"
+    );
+    assert!(
+        !after.contains("delete-user.sh failed"),
+        "the account's delete failure survived: {after}"
+    );
+    assert!(
+        !after.contains("about seven months"),
+        "the account-scoped erasure answer survived: {after}"
+    );
+}
