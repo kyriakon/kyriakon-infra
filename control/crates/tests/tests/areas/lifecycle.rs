@@ -853,18 +853,29 @@ fn a_decided_application_with_no_mailbox_copy_purges_after_ninety_days() {
     std::fs::remove_dir_all(fix.dir.join("store/accounts/secretary")).unwrap();
     age_filed_at(&fix, &format!("applications/{TOKEN}.json"), 100);
 
-    // A decided record inside the window, for a name no account holds.
-    let mut young = fix.filed("almoner", "no_charge", &[("rail", "no_charge")]);
-    young["status_token"] = json!(OTHER_TOKEN);
-    young["stage"] = json!("decided: an account without charge");
-    young["decided_at"] = json!("2026-10-01T09:00:00Z");
+    // A decided record inside the window, for a name no account holds. Written
+    // directly: `Fix::filed` also writes the fixture to `applications/<TOKEN>`,
+    // which would replace the aged record above.
+    let young = json!({
+        "username": "almoner",
+        "status_token": OTHER_TOKEN,
+        "filed_at": kyriakon_control_core::util::after_days(-10),
+        "front_end": "web",
+        "stage": "decided: an account without charge",
+        "decided_at": kyriakon_control_core::util::after_days(-10),
+        "answers": {},
+        "mail_keys": [],
+        "rail": "no_charge",
+        "no_charge": true,
+        "acceptances": [],
+        "question_list": "2026-08-01 abc1234",
+    });
     std::fs::write(
         fix.dir
             .join(format!("store/applications/{OTHER_TOKEN}.json")),
         serde_json::to_vec_pretty(&young).unwrap(),
     )
     .unwrap();
-    age_filed_at(&fix, &format!("applications/{OTHER_TOKEN}.json"), 10);
 
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
@@ -890,6 +901,137 @@ fn a_decided_application_with_no_mailbox_copy_purges_after_ninety_days() {
     assert!(
         !fix.journal()
             .contains(&format!("\"intent\":\"purge-{OTHER_TOKEN}\"")),
+        "{}",
+        fix.journal()
+    );
+}
+
+/// An approval writes `mark_decided` last, so a failed pass leaves the record at
+/// `received` with its intent still queued. The purge must leave it alone and
+/// let the retry finish, and take it once the intent is gone.
+#[test]
+fn a_received_application_with_a_queued_decision_is_kept() {
+    let fix = Fix::new("purge-queued");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    // The approval fails at provisioning, so its intent backs off in place and
+    // the record is still `received`.
+    fix.provision_fails();
+    let intent = fix.decide("approve", "secretary");
+    assert!(fix.drain().status.success());
+    assert!(
+        fix.intents().contains(&format!("{intent}.json")),
+        "{:?}",
+        fix.intents()
+    );
+
+    age_filed_at(&fix, &format!("applications/{TOKEN}.json"), 100);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.dir
+            .join(format!("store/applications/{TOKEN}.json"))
+            .exists(),
+        "the record was purged from under a queued approval"
+    );
+    assert!(
+        !fix.journal()
+            .contains(&format!("\"intent\":\"purge-{TOKEN}\"")),
+        "{}",
+        fix.journal()
+    );
+
+    // The intent gone, the abandoned record purges.
+    std::fs::remove_file(fix.dir.join("store/intents").join(format!("{intent}.json"))).unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir
+            .join(format!("store/applications/{TOKEN}.json"))
+            .exists(),
+        "the abandoned record was kept after its intent went"
+    );
+}
+
+/// `kyriakon-admin show` still reports an account once the ninety-day sweep has
+/// taken its application record: the application is optional, the state and
+/// payment are not.
+#[test]
+fn show_reports_an_account_whose_application_was_purged() {
+    let fix = Fix::new("show-purged");
+    let token_ref = approved_paid(&fix, "secretary", "cash");
+    age_filed_at(&fix, "accounts/secretary/application.json", 100);
+    age_filed_at(&fix, &format!("applications/{TOKEN}.json"), 100);
+    assert!(fix.drain().status.success());
+    assert!(!fix
+        .dir
+        .join(format!("store/applications/{TOKEN}.json"))
+        .exists());
+
+    let out = fix.ctl(&["show", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let text = body(&out);
+    assert!(text.contains("application secretary purged"), "{text}");
+    assert!(text.contains("account secretary"), "{text}");
+    assert!(text.contains("state    active"), "{text}");
+    assert!(text.contains(&token_ref), "{text}");
+}
+
+/// A group's application copy is written into every mailbox. The purge clears
+/// all of them and the shared token record, journaling the token once, and
+/// leaves the group and mailbox records alone.
+#[test]
+fn a_groups_application_copy_in_every_mailbox_purges_once() {
+    let fix = Fix::new("purge-group");
+    let mut record = fix.filed_body("warden");
+    record["answers"]["body_addresses"] = json!("secretary: own\nrector: own");
+    record["answers"]["body_account_names"] = json!("parish-secretary\nparish-office");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    for mailbox in ["parish-secretary", "parish-office"] {
+        let copy = format!("accounts/{mailbox}/application.json");
+        assert!(
+            fix.dir.join("store").join(&copy).exists(),
+            "{mailbox} has no copy"
+        );
+        age_filed_at(&fix, &copy, 100);
+    }
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    for mailbox in ["parish-secretary", "parish-office"] {
+        assert!(
+            !fix.dir
+                .join("store")
+                .join(format!("accounts/{mailbox}/application.json"))
+                .exists(),
+            "{mailbox}'s copy survived the purge"
+        );
+        assert!(
+            fix.dir
+                .join("store")
+                .join(format!("accounts/{mailbox}/account.json"))
+                .exists(),
+            "{mailbox}'s account was touched"
+        );
+    }
+    assert!(!fix
+        .dir
+        .join(format!("store/applications/{TOKEN}.json"))
+        .exists());
+    assert!(fix
+        .dir
+        .join("store/groups/parish.example/group.json")
+        .exists());
+    assert_eq!(
+        fix.journal()
+            .matches(&format!("\"intent\":\"purge-{TOKEN}\""))
+            .count(),
+        2,
         "{}",
         fix.journal()
     );

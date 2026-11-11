@@ -3041,6 +3041,30 @@ fn purge_due(filed_at: &str, today: time::Date) -> bool {
         .is_some_and(|filed| !export::within_purge(filed.date(), today))
 }
 
+/// The status tokens queued intents name. An approval writes `mark_decided`
+/// last, so a failure or a backoff leaves the record at `received` with its
+/// intent still in `intents/`; the purge must not take the record out from under
+/// that retry.
+async fn queued_tokens(store: &Store) -> Result<HashSet<String>, Error> {
+    let mut queued = HashSet::new();
+    for name in store.list("intents").await? {
+        let Some(text) = store.read_record("intents", &name).await else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if let Some(token) = value
+            .get("application")
+            .and_then(|application| application.get("status_token"))
+            .and_then(Value::as_str)
+        {
+            queued.insert(token.to_string());
+        }
+    }
+    Ok(queued)
+}
+
 /// Clear away the application answers ADR 0005 gives ninety days. Run once per
 /// drain pass, beside [`purge_declined`].
 ///
@@ -3132,6 +3156,7 @@ pub async fn purge_applications(
         }
     }
 
+    let queued = queued_tokens(store).await?;
     for name in store.list("applications").await? {
         if !name.ends_with(".json") {
             continue;
@@ -3142,6 +3167,12 @@ pub async fn purge_applications(
             continue;
         };
         if !purge_due(&record.filed_at, today) {
+            continue;
+        }
+        // A received record with its decision still queued is mid-approval, not
+        // abandoned: skipping the purge lets the retry finish rather than
+        // stranding an intent whose record has gone.
+        if record.stage == "received" && queued.contains(&record.status_token) {
             continue;
         }
         // A declined record belongs to [`purge_declined`], which owns its

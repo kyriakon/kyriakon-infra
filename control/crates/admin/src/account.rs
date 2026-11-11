@@ -4,19 +4,29 @@ use crate::payments::{group_payment, print_payment};
 use crate::Error;
 use crate::*;
 
-/// Print what the store holds for a username: the application and, once an
-/// approval has made one, the account.
+/// Print what the store holds for a username: the application, while it is
+/// inside ADR 0005's window, and the account once an approval has made one. The
+/// purge deletes the application after ninety days, so it is optional here and
+/// an account with none still prints its state and payment.
 pub(crate) async fn show(store: &Store, username: &str) -> Result<(), Error> {
-    let (token, record) = find_application(store, username).await?;
-    println!("application {username} (token {token})");
-    println!("  filed    {}", record.filed_at);
-    println!("  stage    {}", record.stage);
-    println!("  rail     {}", record.rail);
-    println!(
-        "  decided  {}",
-        record.decided_at.as_deref().unwrap_or("not yet")
-    );
-    match store.account(username).await? {
+    let account = store.account(username).await?;
+    match find_application(store, username).await? {
+        Some((token, record)) => {
+            println!("application {username} (token {token})");
+            println!("  filed    {}", record.filed_at);
+            println!("  stage    {}", record.stage);
+            println!("  rail     {}", record.rail);
+            println!(
+                "  decided  {}",
+                record.decided_at.as_deref().unwrap_or("not yet")
+            );
+        }
+        None if account.is_some() => {
+            println!("application {username} purged (ADR 0005's 90-day window)");
+        }
+        None => return Err(Error::Failed(format!("no application for {username}"))),
+    }
+    match account {
         Some(account) => {
             println!("account {username}");
             println!("  state    {}", account.state);
@@ -130,13 +140,15 @@ pub(crate) async fn free(store: &Store, rest: &[String]) -> Result<(), Error> {
     Ok(())
 }
 
-/// The newest application filed for a username. The front-end never checks
-/// whether a name exists, so more than one can be on disk; the one the reviewer
-/// means is the one filed last.
+/// The newest application filed for a username, or `None` when the store holds
+/// none. The front-end never checks whether a name exists, so more than one can
+/// be on disk; the one the reviewer means is the one filed last. A record that
+/// cannot be read is an error, not an absence: the purge leaves no file, and
+/// damage is a different thing.
 pub(crate) async fn find_application(
     store: &Store,
     username: &str,
-) -> Result<(String, Record), Error> {
+) -> Result<Option<(String, Record)>, Error> {
     let mut best: Option<(String, Record)> = None;
     for name in store.list("applications").await? {
         if !name.ends_with(".json") {
@@ -156,5 +168,5 @@ pub(crate) async fn find_application(
             best = Some((record.status_token.clone(), record));
         }
     }
-    best.ok_or_else(|| Error::Failed(format!("no application for {username}")))
+    Ok(best)
 }

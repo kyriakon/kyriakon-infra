@@ -604,10 +604,13 @@ impl Fix {
                 "verdict": verdict,
             });
         }
+        // Relative, so a fixture filed today is inside ADR 0005's window
+        // whenever the suite runs; a fixed date would be purged after it.
+        let filed_at = kyriakon_control_core::util::after_days(-40);
         let record = json!({
             "username": username,
             "status_token": TOKEN,
-            "filed_at": "2026-10-01T09:00:00Z",
+            "filed_at": filed_at,
             "front_end": "web",
             "stage": "received",
             "outside_address": outside_address,
@@ -882,10 +885,11 @@ impl Fix {
             "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n-----END PGP PUBLIC KEY BLOCK-----",
             "verdict": "works",
         })];
+        let filed_at = kyriakon_control_core::util::after_days(-40);
         let record = json!({
             "username": applicant,
             "status_token": TOKEN,
-            "filed_at": "2026-10-01T09:00:00Z",
+            "filed_at": filed_at,
             "front_end": "web",
             "stage": "received",
             "domain": "parish.example",

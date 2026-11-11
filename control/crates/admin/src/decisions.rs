@@ -15,7 +15,9 @@ pub(crate) async fn sign_and_file(
     decision: &Decision,
     username: &str,
 ) -> Result<(), Error> {
-    let (token, _record) = find_application(store, username).await?;
+    let Some((token, _record)) = find_application(store, username).await? else {
+        return Err(Error::Failed(format!("no application for {username}")));
+    };
     let sig = sign::sign(key, &sign::decide_payload(&token, decision.action))?;
     let id = intent::Intent::Decision(intent::DecisionIntent {
         kind: decision.kind.to_string(),
