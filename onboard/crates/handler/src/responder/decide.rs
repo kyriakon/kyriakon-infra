@@ -2,7 +2,7 @@
 
 use super::*;
 
-use super::reply::{capability, notice, refused, server_error};
+use super::reply::{capability, notice, refused, respond};
 use super::route::Call;
 use super::status::{record_for, status_page};
 
@@ -104,7 +104,10 @@ pub(super) async fn decide_file(app: &App, call: &Call<'_>) -> Reply {
             "Filed",
             "The decision is filed. The platform carries it out on its next pass, within a minute.",
         )),
-        Err(e) => server_error(&format!("the decision could not be filed: {e}")),
+        Err(e) => respond(
+            &Error::from(format!("the decision could not be filed: {e}")),
+            FrontEnd::Httpd,
+        ),
     }
 }
 
@@ -233,7 +236,7 @@ pub(super) async fn password_file(app: &App, call: &Call<'_>) -> Reply {
             "Password set",
             "The platform sets it on its next pass, within a minute. This link will not work again.",
         )),
-        Err(e) => server_error(&format!("the password could not be filed: {e}")),
+        Err(e) => respond(&Error::from(format!("the password could not be filed: {e}")), FrontEnd::Httpd),
     }
 }
 

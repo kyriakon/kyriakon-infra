@@ -41,5 +41,7 @@ async fn run() -> Result<(), String> {
         }
     }
 
-    responder::serve(config::Config::load(&cfg_path)?).await
+    responder::serve(config::Config::load(&cfg_path)?)
+        .await
+        .map_err(String::from)
 }

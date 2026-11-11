@@ -56,23 +56,65 @@ pub(super) fn notice(title: &str, message: &str) -> NoticePage {
     }
 }
 
-pub(super) fn server_error(why: &str) -> Reply {
-    eprintln!("kyriakon-onboard: {why}");
-    Reply::html(
-        500,
-        page_html(&notice(
-            "Something went wrong",
-            "This is our fault, not yours. Try again in a moment.",
-        )),
-    )
+/// The one place an error becomes a reply. The front end decides the framing;
+/// the error kind decides whether the client may retry. The wording is the
+/// page and the meta line the handlers already served.
+pub(super) fn respond(error: &Error, front_end: FrontEnd) -> Reply {
+    error.report("the request failed");
+    match front_end {
+        FrontEnd::Httpd => match error {
+            Error::Refused(message) => refused(message),
+            Error::Line { .. } => refused(&error.to_string()),
+            _ => Reply::html(
+                500,
+                page_html(&notice(
+                    "Something went wrong",
+                    "This is our fault, not yours. Try again in a moment.",
+                )),
+            ),
+        },
+        FrontEnd::Gemini => match error {
+            Error::Lookup(_) => Reply::gemini(50, "Permanent failure", String::new()),
+            Error::Refused(message) => Reply::gemini(59, message, String::new()),
+            Error::Line { .. } => Reply::gemini(59, &error.to_string(), String::new()),
+            _ => Reply::gemini(40, TEMP_FAILURE, String::new()),
+        },
+    }
 }
 
 pub(super) fn page_html<T: Template>(t: &T) -> String {
     match t.render() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("kyriakon-onboard: cannot render a page: {e}");
+            kyriakon_onboard_core::util::report(&e, "rendering a page");
             RENDER_FALLBACK.to_string()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_is_a_client_error_and_a_store_failure_is_a_server_error() {
+        let refusal = respond(
+            &Error::Refused("not this request".to_string()),
+            FrontEnd::Httpd,
+        );
+        assert!(matches!(refusal, Reply::Http(_)));
+        let failure = respond(
+            &Error::Lookup(kyriakon_onboard_core::store::Error::Refused(
+                "boom".to_string(),
+            )),
+            FrontEnd::Gemini,
+        );
+        match failure {
+            Reply::Gemini { status, meta, .. } => {
+                assert_eq!(status, 50);
+                assert_eq!(meta, "Permanent failure");
+            }
+            Reply::Http(_) => panic!("a gemini request got an http reply"),
         }
     }
 }

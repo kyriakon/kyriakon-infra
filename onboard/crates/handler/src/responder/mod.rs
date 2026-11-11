@@ -65,6 +65,7 @@ mod account;
 mod apply;
 mod connection;
 mod decide;
+mod error;
 pub(crate) mod flow;
 mod gemini;
 mod portal;
@@ -76,6 +77,7 @@ pub(crate) mod test_support;
 mod titan;
 
 use self::connection::accept;
+use self::error::Error;
 use self::titan::titan_accept;
 
 /// The only origin a submission may carry. The port-80 vhost redirects, so the
@@ -136,18 +138,25 @@ impl App {
     /// Read the configuration and the files it names. The question list is the
     /// crate's own, read at build time, so a wording change is a rebuild and the
     /// store holds no copy of it to drift from.
-    async fn load(cfg: config::Config) -> Result<App, String> {
-        let list = questions::shipped()?;
+    async fn load(cfg: config::Config) -> Result<App, Error> {
+        let list = questions::shipped().map_err(Error::Startup)?;
         if list.is_empty() {
-            return Err(format!("{} has no questions", questions::TRACKED));
+            return Err(Error::Startup(format!(
+                "{} has no questions",
+                questions::TRACKED
+            )));
         }
         // The catalogue is read the same way and refused the same way: a responder
         // that came up with no services would render an application page that
         // promises nothing, which is the failure the config path exists to
         // prevent.
-        let services = catalogue::parse(&Store::read_text(&cfg.catalogue).await?)?;
+        let services =
+            catalogue::parse(&Store::read_text(&cfg.catalogue).await?).map_err(Error::Startup)?;
         if services.is_empty() {
-            return Err(format!("{} has no services", catalogue::TRACKED));
+            return Err(Error::Startup(format!(
+                "{} has no services",
+                catalogue::TRACKED
+            )));
         }
         // The mirrored pages are read the same way and refused the same way: a
         // handler that came up without them would answer 51 for the pages the
@@ -158,7 +167,7 @@ impl App {
             let path = format!("{}/{}", cfg.pages.trim_end_matches('/'), file);
             let text = Store::read_text(&path).await?;
             if text.trim().is_empty() {
-                return Err(format!("{path} is empty"));
+                return Err(Error::Startup(format!("{path} is empty")));
             }
             pages.insert((*route).to_string(), text);
         }
@@ -234,7 +243,7 @@ struct Outcome {
 
 /// Run the responder on the three sockets the config names, until one of them
 /// stops accepting.
-pub async fn serve(cfg: config::Config) -> Result<(), String> {
+pub async fn serve(cfg: config::Config) -> Result<(), Error> {
     let app = Arc::new(App::load(cfg).await?);
     let httpd = bind(&app.cfg.httpd_socket)?;
     let gemini = bind(&app.cfg.gemini_socket)?;
@@ -279,7 +288,7 @@ enum Channel {
 /// `_gmid` for gmid's. A socket any local user could connect to would let that
 /// user forge the whole environment, `REMOTE_ADDR` included, which is the key the
 /// limits and the audit rest on.
-fn bind(path: &str) -> Result<UnixListener, String> {
+fn bind(path: &str) -> Result<UnixListener, Error> {
     let path = Path::new(path);
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.file_type().is_socket() {
@@ -313,7 +322,14 @@ mod tests {
         let Err(err) = App::load(handler_config(&dir)).await else {
             panic!("the handler started without a page");
         };
-        assert!(err.contains("aup.gmi"), "{err}");
+        assert!(
+            matches!(
+                &err,
+                Error::Store(kyriakon_onboard_core::store::Error::Io { path, .. })
+                    if path.ends_with("pages/aup.gmi")
+            ),
+            "{err}"
+        );
     }
 
     /// An empty staged file is the same failure as a missing one: the page exists
@@ -332,6 +348,9 @@ mod tests {
         let Err(err) = App::load(handler_config(&dir)).await else {
             panic!("the handler started on an empty page");
         };
-        assert!(err.contains("privacy.gmi"), "{err}");
+        assert!(
+            matches!(&err, Error::Startup(message) if message.contains("privacy.gmi")),
+            "{err}"
+        );
     }
 }

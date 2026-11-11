@@ -23,7 +23,7 @@ pub(super) const SLOW_STATUS: &str =
 
 /// One line from the portal, capped before the buffer grows. `None` is a
 /// connection that closed before the line was finished.
-pub(super) async fn portal_line<R>(reader: &mut R, limit: usize) -> Result<Option<String>, String>
+pub(super) async fn portal_line<R>(reader: &mut R, limit: usize) -> Result<Option<String>, Error>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
@@ -33,24 +33,33 @@ where
         match reader.read(&mut b).await {
             Ok(0) => return Ok(None),
             Ok(_) => bytes.push(b[0]),
-            Err(e) => return Err(format!("cannot read the portal request: {e}")),
+            Err(source) => {
+                return Err(Error::Io {
+                    what: "read the portal request",
+                    path: None,
+                    source,
+                })
+            }
         }
         if b[0] == b'\n' {
             break;
         }
         if bytes.len() > limit {
-            return Err(format!("the portal request is longer than {limit} bytes"));
+            return Err(Error::Line {
+                what: "the portal request",
+                limit,
+            });
         }
     }
     String::from_utf8(bytes)
         .map(Some)
-        .map_err(|e| format!("the portal request is not text: {e}"))
+        .map_err(|e| Error::Refused(format!("the portal request is not text: {e}")))
 }
 
 /// Answer one portal request: a status read is one line in, one line out, and a
 /// filed application adds one line of JSON. The portal is not a web front-end,
 /// and the one question it asks is answered in a line.
-pub(super) async fn portal_connection(stream: UnixStream, app: &App) -> Result<(), String> {
+pub(super) async fn portal_connection(stream: UnixStream, app: &App) -> Result<(), Error> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
     let Some(line) = portal_line(&mut reader, ipc::MAX_LINE).await? else {
@@ -60,11 +69,15 @@ pub(super) async fn portal_connection(stream: UnixStream, app: &App) -> Result<(
         let address = address.to_string();
         let body = match portal_line(&mut reader, ipc::MAX_BODY).await {
             Ok(Some(body)) => body,
-            Ok(None) => return Err("the portal closed before sending the application".to_string()),
+            Ok(None) => {
+                return Err(Error::Refused(
+                    "the portal closed before sending the application".to_string(),
+                ))
+            }
             // Answer rather than just closing: the portal can tell the reader
             // what happened at the end of a long session.
             Err(e) => {
-                let reply = ipc::file_answer(None, &e);
+                let reply = ipc::file_answer(None, &e.to_string());
                 return say(&mut writer, reply.as_bytes()).await;
             }
         };
@@ -77,7 +90,9 @@ pub(super) async fn portal_connection(stream: UnixStream, app: &App) -> Result<(
         return say(&mut writer, reply.as_bytes()).await;
     }
     let Some((address, token)) = ipc::parse_request(&line) else {
-        return Err("the portal sent no status request".to_string());
+        return Err(Error::Refused(
+            "the portal sent no status request".to_string(),
+        ));
     };
     let answer = portal_answer(app, address, token).await;
     // The route carries the token and the address, which is the log line every
@@ -112,7 +127,7 @@ pub(super) async fn portal_file(app: &App, address: &str, body: &str) -> String 
     let token = match store::status_token().await {
         Ok(token) => token,
         Err(e) => {
-            eprintln!("kyriakon-onboard: {e}");
+            e.report("the portal");
             return ipc::file_answer(None, "Temporary failure. Try again in a moment.");
         }
     };
@@ -120,12 +135,12 @@ pub(super) async fn portal_file(app: &App, address: &str, body: &str) -> String 
     let record = match build_record(app, &form, body_branch, &token, "tui") {
         Ok(record) => record,
         Err(e) => {
-            eprintln!("kyriakon-onboard: {e}");
+            e.report("the portal");
             return ipc::file_answer(None, "Temporary failure. Try again in a moment.");
         }
     };
     if let Err(e) = file_application(app, &record).await {
-        eprintln!("kyriakon-onboard: {e}");
+        e.report("the portal");
         return ipc::file_answer(None, "Temporary failure. Try again in a moment.");
     }
     ipc::file_answer(Some(&token), "")

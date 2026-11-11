@@ -24,13 +24,13 @@ use kyriakon_onboard_core::{flow::rate, mail::keycheck, store::draft};
 /// returning the error would cancel `try_join!` and take the web form and both
 /// unix front-ends down with it. The three unix listeners can share that shape
 /// safely because their sockets are 0660; a public TCP listener cannot.
-pub(super) async fn titan_accept(listener: TcpListener, app: Arc<App>) -> Result<(), String> {
+pub(super) async fn titan_accept(listener: TcpListener, app: Arc<App>) -> Result<(), Error> {
     let slots = Arc::new(tokio::sync::Semaphore::new(TITAN_CONNECTIONS));
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
-                eprintln!("kyriakon-onboard: cannot accept a titan connection: {e}");
+                Error::from(e).report("accepting a titan connection");
                 // A short pause keeps a hard failure from spinning the loop.
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
@@ -45,7 +45,7 @@ pub(super) async fn titan_accept(listener: TcpListener, app: Arc<App>) -> Result
                 return;
             };
             if let Err(e) = titan_connection(stream, &app, &peer.ip().to_string()).await {
-                eprintln!("kyriakon-onboard: {e}");
+                e.report("the titan request");
             }
         });
     }
@@ -63,7 +63,7 @@ pub(super) async fn titan_connection(
     stream: TcpStream,
     app: &App,
     peer: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let (mut reader, mut writer) = stream.into_split();
     let (reply, address) =
         match tokio::time::timeout(TITAN_TIMEOUT, titan_answer(&mut reader, app, Some(peer))).await
@@ -82,7 +82,7 @@ pub(super) async fn titan_connection(
     let write = say(&mut writer, &head);
     match tokio::time::timeout(TITAN_TIMEOUT, write).await {
         Ok(result) => result,
-        Err(_) => Err("the titan reply timed out".to_string()),
+        Err(_) => Err(Error::Failed("the titan reply timed out".to_string())),
     }
 }
 
@@ -95,7 +95,7 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     app: &App,
     peer: Option<&str>,
-) -> Result<(Reply, String), String> {
+) -> Result<(Reply, String), Error> {
     let first = match titan_line(reader, MAX_TITAN_LINE).await {
         Ok(Some(line)) => line,
         Ok(None) => {
@@ -106,7 +106,7 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
         }
         Err(why) => {
             return Ok((
-                Reply::gemini(59, &why, String::new()),
+                Reply::gemini(59, &why.to_string(), String::new()),
                 peer.unwrap_or("").to_string(),
             ))
         }
@@ -123,7 +123,7 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
             }
             Err(why) => {
                 return Ok((
-                    Reply::gemini(59, &why, String::new()),
+                    Reply::gemini(59, &why.to_string(), String::new()),
                     address.unwrap_or_default(),
                 ))
             }
@@ -163,7 +163,7 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
     let record = match draft::load(&app.store, token).await {
         Ok(record) => record,
         Err(e) => {
-            eprintln!("kyriakon-onboard: {e}");
+            e.report("the titan request");
             return Ok((Reply::gemini(40, TEMP_FAILURE, String::new()), address));
         }
     };
@@ -209,14 +209,14 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
     let _lock = match app.store.lock("drafts/.lock").await {
         Ok(lock) => lock,
         Err(e) => {
-            eprintln!("kyriakon-onboard: {e}");
+            e.report("the titan request");
             return Ok((Reply::gemini(40, TEMP_FAILURE, String::new()), address));
         }
     };
     let record = match draft::load(&app.store, token).await {
         Ok(record) => record,
         Err(e) => {
-            eprintln!("kyriakon-onboard: {e}");
+            e.report("the titan request");
             return Ok((Reply::gemini(40, TEMP_FAILURE, String::new()), address));
         }
     };
@@ -247,7 +247,7 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
         .mail_keys
         .push(keycheck::mail_key(mailbox.clone(), &blocks[0]));
     if let Err(e) = draft::save(&app.store, &mut record).await {
-        eprintln!("kyriakon-onboard: {e}");
+        e.report("the titan request");
         return Ok((Reply::gemini(40, TEMP_FAILURE, String::new()), address));
     }
     let link = format!("gemini://{HOST}/status/{token}");
@@ -280,23 +280,34 @@ pub(super) fn titan_mailbox(app: &App, record: &draft::Draft) -> Option<String> 
 pub(super) async fn titan_line<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     limit: usize,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, Error> {
     let mut bytes = Vec::new();
     loop {
         let mut b = [0u8; 1];
         match reader.read(&mut b).await {
             Ok(0) if bytes.is_empty() => return Ok(None),
-            Ok(0) => return Err("the titan request line was cut short".to_string()),
+            Ok(0) => {
+                return Err(Error::Refused(
+                    "the titan request line was cut short".to_string(),
+                ))
+            }
             Ok(_) => bytes.push(b[0]),
-            Err(e) => return Err(format!("cannot read the titan request: {e}")),
+            Err(source) => {
+                return Err(Error::Io {
+                    what: "read the titan request",
+                    path: None,
+                    source,
+                })
+            }
         }
         if b[0] == b'\n' {
             break;
         }
         if bytes.len() > limit {
-            return Err(format!(
-                "the titan request line is longer than {limit} bytes"
-            ));
+            return Err(Error::Line {
+                what: "the titan request line",
+                limit,
+            });
         }
     }
     if bytes.last() == Some(&b'\n') {
@@ -307,7 +318,7 @@ pub(super) async fn titan_line<R: tokio::io::AsyncRead + Unpin>(
     }
     String::from_utf8(bytes)
         .map(Some)
-        .map_err(|e| format!("the titan request line is not text: {e}"))
+        .map_err(|e| Error::Refused(format!("the titan request line is not text: {e}")))
 }
 
 /// The Titan request line's URL and its three parameters. `size` is mandatory;

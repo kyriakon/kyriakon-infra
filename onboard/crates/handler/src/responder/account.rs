@@ -4,7 +4,7 @@ use super::*;
 
 use super::connection::fields;
 use super::gemini::{account_notices, capsule_account};
-use super::reply::{notice, page_html, refused, server_error};
+use super::reply::{notice, page_html, refused, respond};
 use super::route::Call;
 use super::status::card_link;
 
@@ -51,12 +51,12 @@ pub(super) async fn account_web(app: &App, request: &Request) -> Reply {
     let account = match app.store.account(&member.username).await {
         Ok(Some(account)) => account,
         Ok(None) => return Reply::capability(200, page_html(&LoginPage { error: None })),
-        Err(e) => return server_error(&e.to_string()),
+        Err(e) => return respond(&Error::from(e), FrontEnd::Httpd),
     };
     let notices = account_notices(app, &account.username).await;
     let group = match group_state(app, account.group.as_deref()).await {
         Ok(group) => group,
-        Err(e) => return server_error(&e),
+        Err(e) => return respond(&e, FrontEnd::Httpd),
     };
     let dns = group_recipe(app, &account);
     let payment = account.payment_state().map(|block| {
@@ -108,7 +108,7 @@ pub(super) async fn login(app: &App, request: &Request) -> Reply {
         Ok(cookie) => Reply::Http(
             Http::redirect("/account").with_header("Set-Cookie", session::cookie(&cookie)),
         ),
-        Err(e) => server_error(&e),
+        Err(e) => respond(&Error::from(e), FrontEnd::Httpd),
     }
 }
 
@@ -127,7 +127,7 @@ pub(super) async fn logout(app: &App, request: &Request) -> Reply {
 pub(super) async fn session_account(
     app: &App,
     request: &Request,
-) -> Result<Option<(String, Account)>, String> {
+) -> Result<Option<(String, Account)>, Error> {
     let Some(cookie) = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE) else {
         return Ok(None);
     };
@@ -215,7 +215,7 @@ pub(super) async fn account_close(app: &App, request: &Request) -> Reply {
     let (cookie, account) = match session_account(app, request).await {
         Ok(Some(found)) => found,
         Ok(None) => return refused("Sign in to the account you want to close."),
-        Err(e) => return server_error(&e),
+        Err(e) => return respond(&e, FrontEnd::Httpd),
     };
     let form = fields(&String::from_utf8_lossy(&request.body));
     let password = form.get("password").map(String::as_str).unwrap_or("");
@@ -249,7 +249,10 @@ pub(super) async fn account_close(app: &App, request: &Request) -> Reply {
                 kyriakon_onboard_core::account::requests::erasure_answer(refund.as_deref());
             Reply::html(200, page_html(&notice("Closing your account", &message)))
         }
-        Err(e) => server_error(&format!("the closure could not be filed: {e}")),
+        Err(e) => respond(
+            &Error::from(format!("the closure could not be filed: {e}")),
+            FrontEnd::Httpd,
+        ),
     }
 }
 
@@ -263,7 +266,7 @@ pub(super) async fn account_password(app: &App, request: &Request) -> Reply {
     let (cookie, account) = match session_account(app, request).await {
         Ok(Some(found)) => found,
         Ok(None) => return refused("Sign in to the account whose password you want to change."),
-        Err(e) => return server_error(&e),
+        Err(e) => return respond(&e, FrontEnd::Httpd),
     };
     let Some(session_id) = session::id(&cookie) else {
         return refused("Sign in to the account whose password you want to change.");
@@ -317,7 +320,10 @@ pub(super) async fn account_password(app: &App, request: &Request) -> Reply {
             );
             Reply::html(200, page_html(&page))
         }
-        Err(e) => server_error(&format!("the password change could not be filed: {e}")),
+        Err(e) => respond(
+            &Error::from(format!("the password change could not be filed: {e}")),
+            FrontEnd::Httpd,
+        ),
     }
 }
 
@@ -328,7 +334,7 @@ pub(super) async fn account_upload_key(app: &App, request: &Request) -> Reply {
     let (cookie, account) = match session_account(app, request).await {
         Ok(Some(found)) => found,
         Ok(None) => return refused("Sign in to the account whose upload key you want to change."),
-        Err(e) => return server_error(&e),
+        Err(e) => return respond(&e, FrontEnd::Httpd),
     };
     let Some(session_id) = session::id(&cookie) else {
         return refused("Sign in to the account whose upload key you want to change.");
@@ -362,7 +368,10 @@ pub(super) async fn account_upload_key(app: &App, request: &Request) -> Reply {
                     );
                     Reply::html(200, page_html(&page))
                 }
-                Err(e) => server_error(&format!("the upload key could not be filed: {e}")),
+                Err(e) => respond(
+                    &Error::from(format!("the upload key could not be filed: {e}")),
+                    FrontEnd::Httpd,
+                ),
             }
         }
         Some("remove") => {
@@ -396,7 +405,10 @@ pub(super) async fn account_upload_key(app: &App, request: &Request) -> Reply {
                     );
                     Reply::html(200, page_html(&page))
                 }
-                Err(e) => server_error(&format!("the key removal could not be filed: {e}")),
+                Err(e) => respond(
+                    &Error::from(format!("the key removal could not be filed: {e}")),
+                    FrontEnd::Httpd,
+                ),
             }
         }
         _ => refused("That is not an upload-key action this page carries out."),
@@ -411,7 +423,7 @@ pub(super) async fn account_address(app: &App, request: &Request) -> Reply {
     let (cookie, account) = match session_account(app, request).await {
         Ok(Some(found)) => found,
         Ok(None) => return refused("Sign in to the account whose address you want to change."),
-        Err(e) => return server_error(&e),
+        Err(e) => return respond(&e, FrontEnd::Httpd),
     };
     let Some(session_id) = session::id(&cookie) else {
         return refused("Sign in to the account whose address you want to change.");
@@ -447,7 +459,10 @@ pub(super) async fn account_address(app: &App, request: &Request) -> Reply {
                 page_html(&notice("Your contact address is changing", message)),
             )
         }
-        Err(e) => server_error(&format!("the address change could not be filed: {e}")),
+        Err(e) => respond(
+            &Error::from(format!("the address change could not be filed: {e}")),
+            FrontEnd::Httpd,
+        ),
     }
 }
 
@@ -459,7 +474,7 @@ pub(super) async fn account_serving(app: &App, request: &Request) -> Reply {
     let (cookie, account) = match session_account(app, request).await {
         Ok(Some(found)) => found,
         Ok(None) => return refused("Sign in to the account whose serving you want to change."),
-        Err(e) => return server_error(&e),
+        Err(e) => return respond(&e, FrontEnd::Httpd),
     };
     let Some(session_id) = session::id(&cookie) else {
         return refused("Sign in to the account whose serving you want to change.");
@@ -486,7 +501,10 @@ pub(super) async fn account_serving(app: &App, request: &Request) -> Reply {
             );
             Reply::html(200, page_html(&page))
         }
-        Err(e) => server_error(&format!("the serving change could not be filed: {e}")),
+        Err(e) => respond(
+            &Error::from(format!("the serving change could not be filed: {e}")),
+            FrontEnd::Httpd,
+        ),
     }
 }
 
@@ -498,7 +516,7 @@ pub(super) async fn account_renewal(app: &App, request: &Request) -> Reply {
     let (cookie, account) = match session_account(app, request).await {
         Ok(Some(found)) => found,
         Ok(None) => return refused("Sign in to the account whose renewal you want to stop."),
-        Err(e) => return server_error(&e),
+        Err(e) => return respond(&e, FrontEnd::Httpd),
     };
     let Some(session_id) = session::id(&cookie) else {
         return refused("Sign in to the account whose renewal you want to stop.");
@@ -534,7 +552,10 @@ pub(super) async fn account_renewal(app: &App, request: &Request) -> Reply {
             );
             Reply::html(200, page_html(&page))
         }
-        Err(e) => server_error(&format!("the cancellation could not be filed: {e}")),
+        Err(e) => respond(
+            &Error::from(format!("the cancellation could not be filed: {e}")),
+            FrontEnd::Httpd,
+        ),
     }
 }
 
@@ -549,7 +570,7 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
     let (cookie, account) = match session_account(app, request).await {
         Ok(Some(found)) => found,
         Ok(None) => return refused("Sign in to the account whose mail key you want to replace."),
-        Err(e) => return server_error(&e),
+        Err(e) => return respond(&e, FrontEnd::Httpd),
     };
     let Some(session_id) = session::id(&cookie) else {
         return refused("Sign in to the account whose mail key you want to replace.");
@@ -599,7 +620,10 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
                         page_html(&notice("Your mail key is being replaced", message)),
                     )
                 }
-                Err(e) => server_error(&format!("the key replacement could not be filed: {e}")),
+                Err(e) => respond(
+                    &Error::from(format!("the key replacement could not be filed: {e}")),
+                    FrontEnd::Httpd,
+                ),
             }
         }
         Some("cancel") => {
@@ -623,7 +647,10 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
                     );
                     Reply::html(200, page_html(&page))
                 }
-                Err(e) => server_error(&format!("the cancellation could not be filed: {e}")),
+                Err(e) => respond(
+                    &Error::from(format!("the cancellation could not be filed: {e}")),
+                    FrontEnd::Httpd,
+                ),
             }
         }
         _ => refused("That is not a mail-key action this page carries out."),
@@ -633,10 +660,7 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
 /// The member a request's live session names, with the account it names. The
 /// page's actions use it: `REMOTE_USER` is not an identity here, because no
 /// HTTP authentication is configured for the host.
-pub(super) async fn session_member(
-    app: &App,
-    request: &Request,
-) -> Result<Option<Account>, String> {
+pub(super) async fn session_member(app: &App, request: &Request) -> Result<Option<Account>, Error> {
     let Some(cookie) = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE) else {
         return Ok(None);
     };
@@ -646,7 +670,7 @@ pub(super) async fn session_member(
     app.store
         .account(&member.username)
         .await
-        .map_err(String::from)
+        .map_err(Error::from)
 }
 
 /// "Take my data out": file the export intent for the account the session names.
@@ -661,7 +685,7 @@ pub(super) async fn account_export(app: &App, request: &Request) -> Reply {
     let account = match session_member(app, request).await {
         Ok(Some(account)) => account,
         Ok(None) => return refused("Sign in to the account you want to export."),
-        Err(e) => return server_error(&e),
+        Err(e) => return respond(&e, FrontEnd::Httpd),
     };
     let cookie = session::from_header(request.value("HTTP_COOKIE"), session::COOKIE);
     let Some(session_id) = cookie.as_deref().and_then(session::id) else {
@@ -685,7 +709,7 @@ pub(super) async fn account_export(app: &App, request: &Request) -> Reply {
             Reply::html(200, page_html(&page))
         }
         Err(e) => {
-            eprintln!("kyriakon-onboard: the export intent: {e}");
+            Error::from(e).report("the export intent");
             Reply::html(500, String::new())
         }
     }
@@ -698,14 +722,15 @@ pub(super) async fn account_export(app: &App, request: &Request) -> Reply {
 pub(super) async fn group_state(
     app: &App,
     domain: Option<&str>,
-) -> Result<Option<page::GroupView>, String> {
+) -> Result<Option<page::GroupView>, Error> {
     let Some(domain) = domain else {
         return Ok(None);
     };
     Ok(app
         .store
         .group(domain)
-        .await?
+        .await
+        .map_err(Error::Lookup)?
         .as_ref()
         .map(page::GroupView::from_record))
 }
@@ -722,7 +747,7 @@ pub(super) fn group_recipe(
     let domain = account.group.as_deref()?;
     let values = kyriakon_onboard_core::account::dns::Values::from(&app.cfg);
     if let Err(e) = values.check() {
-        eprintln!("kyriakon-onboard: {e}");
+        Error::from(e).report("the account page");
         return None;
     }
     Some(kyriakon_onboard_core::account::dns::recipe(domain, &values))
