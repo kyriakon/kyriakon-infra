@@ -507,7 +507,9 @@ pub async fn apply(
             Intent::RemoveGroup(intent) => {
                 transitions::groups::remove_group(cfg, store, journal, intent).await
             }
-            Intent::Close(intent) => transitions::lifecycle::close_account(store, intent).await,
+            Intent::Close(intent) => {
+                transitions::lifecycle::close_account(cfg, store, intent).await
+            }
             Intent::Resend(intent) => transitions::review::resend(cfg, store, intent).await,
             Intent::Credit(intent) => {
                 transitions::payments::credit(cfg, store, journal, intent).await

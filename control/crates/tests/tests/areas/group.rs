@@ -1479,6 +1479,73 @@ fn a_remove_group_intent_applied_twice_changes_nothing() {
     );
 }
 
+/// A card-paying group's removal stops the body's subscription before its token
+/// goes, once, and an already-canceled one calls no processor.
+#[test]
+fn a_group_removal_stops_the_bodys_subscription() {
+    let fix = Fix::new("group-remove-cancel");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    let path = fix.dir.join("store/groups/parish.example/group.json");
+    let mut group: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    group["payment"]["rail"] = json!("card");
+    group["payment"]["stripe"] = json!({
+        "subscription": SUBSCRIPTION,
+        "customer": "cus_example",
+        "status": "active"
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+
+    fix.file_remove_group("parish.example");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let log = fix.scripts_log();
+    assert_eq!(
+        log.matches("stripe-api.sh cancel sub_example").count(),
+        1,
+        "{log}"
+    );
+    assert!(
+        !fix.dir.join("store/groups/parish.example").exists(),
+        "the group record stayed"
+    );
+    assert!(!log.contains("failed"), "{log}");
+
+    // The subscription was already canceled, so the processor is not asked.
+    let stopped = Fix::new("group-remove-canceled");
+    stopped.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(stopped.drain().status.success());
+    let path = stopped.dir.join("store/groups/parish.example/group.json");
+    let mut group: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    group["payment"]["stripe"] = json!({
+        "subscription": SUBSCRIPTION,
+        "status": "canceled"
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+
+    stopped.file_remove_group("parish.example");
+    let out = stopped.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !stopped.scripts_log().contains("stripe-api.sh"),
+        "a canceled subscription called the processor: {}",
+        stopped.scripts_log()
+    );
+    assert!(!stopped.dir.join("store/groups/parish.example").exists());
+}
+
 /// A removal for a domain with no group record is refused and changes nothing:
 /// no table line, no script, no account and no group.
 #[test]

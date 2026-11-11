@@ -5,7 +5,9 @@
 //! A sweep reports one unreadable record and goes on to the next; an intent's
 //! body returns a [`Settlement`](super::Settlement) and the seam journals it.
 
-use super::boxrun::{outside_address, publish_mail_keys, run_script, write_public_key};
+use super::boxrun::{
+    cancel_stripe_if_active, outside_address, publish_mail_keys, run_script, write_public_key,
+};
 use super::groups::{
     account_on_box, application_token, close_group_tokens, group_record, hold_name,
     remove_group_record, take_group_down, write_account_record, write_group_record,
@@ -948,6 +950,14 @@ async fn delete_group(
         )
         .await?;
     }
+    // The body's subscription stops before the record that names it goes, so a
+    // lapsed group is not billed again. The flag is written back so the pass
+    // below does not send a second cancel.
+    let mut group = group.clone();
+    if cancel_stripe_if_active(cfg, &group.payment.stripe).await? {
+        group.payment.stripe.cancel_at_period_end = true;
+        write_group_record(store, &group).await?;
+    }
     take_group_down(cfg, store, &group.domain).await?;
     write_journal(
         store,
@@ -1286,6 +1296,13 @@ pub async fn delete_account(
         .await?;
     }
 
+    // A card subscription stops before the token and the record that name it
+    // go. A failure here fails the pass, so the intent stays for the backoff
+    // rather than the record going while Stripe keeps billing.
+    if let Some(payment) = account.payment_state() {
+        cancel_stripe_if_active(cfg, &payment.stripe).await?;
+    }
+
     // The full answer goes into the journal, which outlives the account. The
     // store directory, including its `notices.jsonl`, is deleted below, so a
     // notice recorded there is not the durable copy. The notice itself is sent
@@ -1381,7 +1398,11 @@ async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), E
 /// window. The deletion itself is the sweep's, so the account works normally
 /// until the window ends and a replayed intent changes nothing. The session that
 /// proves the request is `verify`'s.
-pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlement, Error> {
+pub async fn close_account(
+    cfg: &DrainConfig,
+    store: &Store,
+    intent: CloseIntent,
+) -> Result<Settlement, Error> {
     if intent.kind != "close" {
         return Err(Error::Failed(format!(
             "kind {:?} is not a close intent",
@@ -1421,6 +1442,16 @@ pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlem
             application,
             Some("the account was already closing".to_string()),
         ));
+    }
+    // A card subscription stops when the closure is filed, not when the sweep
+    // erases the record seven days later: the member asked for the closure, and
+    // a closing account under a live subscription is a card charged for a
+    // mailbox nobody uses. The flag is saved with the state, so a retry is
+    // refused by the record rather than sent to Stripe again.
+    if let Some(payment) = account.payment.as_mut() {
+        if cancel_stripe_if_active(cfg, &payment.stripe).await? {
+            payment.stripe.cancel_at_period_end = true;
+        }
     }
     account.state = "closing".to_string();
     account.closing_until = Some(util::date_after_days(7));
@@ -1692,23 +1723,46 @@ pub async fn cancel_renewal(
     let Some(mut account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
+    // A group's subscription is the body's, held on the group's record, so the
+    // site owner stops that one and the flag is written there. A mailbox in the
+    // group that is not the site owner has nothing to cancel.
+    if let Some(domain) = account.group.clone() {
+        let Some(mut group) = group_record(store, &domain).await? else {
+            return Ok(Settlement::refused(
+                "the account has no card subscription to cancel",
+            ));
+        };
+        if group.site_owner != account.username {
+            return Ok(Settlement::refused(
+                "only the group's site owner can stop its yearly renewal",
+            ));
+        }
+        if group.payment.stripe.subscription.is_none() {
+            return Ok(Settlement::refused(
+                "the account has no card subscription to cancel",
+            ));
+        }
+        if cancel_stripe_if_active(cfg, &group.payment.stripe).await? {
+            group.payment.stripe.cancel_at_period_end = true;
+            write_group_record(store, &group).await?;
+        }
+        return Ok(Settlement::line(
+            "applied",
+            ApplicationRef::group(group.site_owner.clone(), group.domain.clone()),
+            Some("the group's subscription stops renewing at the end of the period".to_string()),
+        ));
+    }
     let Some(payment) = account.payment.as_mut() else {
         return Ok(Settlement::refused(
             "the account has no card subscription to cancel",
         ));
     };
-    let Some(subscription) = payment.stripe.subscription.clone() else {
+    if payment.stripe.subscription.is_none() {
         return Ok(Settlement::refused(
             "the account has no card subscription to cancel",
         ));
-    };
-    if !payment.stripe.cancel_at_period_end {
-        run_script(
-            cfg,
-            "stripe-api.sh",
-            &["cancel", &subscription, &cfg.stripe_api_key],
-        )
-        .await?;
+    }
+    if cancel_stripe_if_active(cfg, &payment.stripe).await? {
         payment.stripe.cancel_at_period_end = true;
         save_account(store, &account).await?;
     }

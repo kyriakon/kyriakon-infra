@@ -161,6 +161,7 @@ impl Fix {
             "publish-mail-key.sh",
             "reload-smtpd.sh",
             "reload-spamd.sh",
+            "stripe-api.sh",
         ] {
             let log = fix.path("scripts.log");
             fix.script(s, &format!("#!/bin/sh\necho \"{s} $*\" >> '{log}'\n"));

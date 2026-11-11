@@ -66,7 +66,8 @@ pub struct AccountPage {
     pub mail_key: Option<String>,
     pub rotation: Option<RotationView>,
     /// Whether the card subscription is still set to renew: the page offers the
-    /// control only while there is something to stop.
+    /// control only while there is something to stop. A group's subscription is
+    /// the site owner's to stop, so only that mailbox sees it.
     pub renews: bool,
     pub renewal_stopped: bool,
     /// Every notice sent, newest last, each with the address it went to.
@@ -139,6 +140,13 @@ pub struct GroupView {
     /// per-account figures the page shows each mailbox.
     pub space_used: Option<String>,
     pub allowance: String,
+    /// The mailbox that owns the site, the only one the page offers the
+    /// renewal control to.
+    pub site_owner: String,
+    /// Whether the group's card subscription still renews, and whether its
+    /// owner has already stopped it. Both are false on a cash or free group.
+    pub renews: bool,
+    pub renewal_stopped: bool,
 }
 
 impl GroupView {
@@ -158,6 +166,8 @@ impl GroupView {
             "payment due"
         };
         let unpaid = !payment.no_charge && payment.paid_until.is_none();
+        let stripe = &payment.stripe;
+        let subscription = stripe.subscription.is_some();
         GroupView {
             domain: group.domain.clone(),
             name: group.name.clone(),
@@ -179,6 +189,12 @@ impl GroupView {
                 QUOTA_SOFT,
                 QUOTA_HARD
             ),
+            site_owner: group.site_owner.clone(),
+            renews: subscription
+                && !stripe.cancel_at_period_end
+                && stripe.status.as_deref() != Some("canceled"),
+            renewal_stopped: subscription
+                && (stripe.cancel_at_period_end || stripe.status.as_deref() == Some("canceled")),
         }
     }
 }
@@ -357,6 +373,27 @@ pub fn member_page(
 ) -> AccountPage {
     let has_hosting = !account.upload_keys.is_empty();
     let (site, capsule) = account.serving();
+    // The billing lives on the record that holds the subscription: a group's
+    // site owner sees the group's renewal, and a person sees their own. Another
+    // mailbox in the group is not offered a control over the body's card.
+    let owner_group = group
+        .as_ref()
+        .filter(|group| group.site_owner == account.username);
+    let account_stripe = account.payment.as_ref().map(|payment| &payment.stripe);
+    let renews = match owner_group {
+        Some(group) => group.renews,
+        None => account_stripe.is_some_and(|stripe| {
+            stripe.subscription.is_some()
+                && !stripe.cancel_at_period_end
+                && stripe.status.as_deref() != Some("canceled")
+        }),
+    };
+    let renewal_stopped = match owner_group {
+        Some(group) => group.renewal_stopped,
+        None => account_stripe.is_some_and(|stripe| {
+            stripe.cancel_at_period_end || stripe.status.as_deref() == Some("canceled")
+        }),
+    };
     AccountPage {
         services: services(list, Some(&account.username)),
         username: account.username.clone(),
@@ -384,23 +421,8 @@ pub fn member_page(
                 .unwrap_or(&rotation.applies_at)
                 .to_string(),
         }),
-        renews: account
-            .payment
-            .as_ref()
-            .map(|payment| {
-                payment.stripe.subscription.is_some()
-                    && !payment.stripe.cancel_at_period_end
-                    && payment.stripe.status.as_deref() != Some("canceled")
-            })
-            .unwrap_or(false),
-        renewal_stopped: account
-            .payment
-            .as_ref()
-            .map(|payment| {
-                payment.stripe.cancel_at_period_end
-                    || payment.stripe.status.as_deref() == Some("canceled")
-            })
-            .unwrap_or(false),
+        renews,
+        renewal_stopped,
         notices: notices
             .iter()
             .map(|notice| NoticeView {
