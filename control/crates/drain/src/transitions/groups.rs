@@ -364,8 +364,7 @@ pub async fn provision_group(
     // The mail tables before the accounts: provision-member.sh restarts smtpd
     // when it adds a new account's platform address, and that restart is what
     // makes these lines live.
-    ensure_table_line(&cfg.mail_domains, &intent.domain, None)?;
-    ensure_table_line(&cfg.dkim_domains, &intent.domain, None)?;
+    ensure_group_domain(cfg, &intent.domain)?;
     for address in &intent.addresses {
         ensure_table_line(
             &cfg.virtuals,
@@ -729,6 +728,17 @@ fn stale_table_lock(dir: &std::path::Path) -> Option<String> {
         }
     }
     None
+}
+
+/// The group's domain in the three tables that name it: smtpd's domain table,
+/// the DKIM filter's list and spamd's greylist pass-through list. The last is
+/// not a mail route: a destination domain absent from it is not greylisted, it
+/// is trapped and the sender blocklisted, so the domain goes in with the other
+/// two rather than waiting for an operator to notice.
+fn ensure_group_domain(cfg: &DrainConfig, domain: &str) -> Result<(), Error> {
+    ensure_table_line(&cfg.mail_domains, domain, None)?;
+    ensure_table_line(&cfg.dkim_domains, domain, None)?;
+    ensure_table_line(&cfg.spamd_alloweddomains, &format!("@{domain}"), None)
 }
 
 /// Ensure one line is in a virtual table: a bare value when `value` is `None`
@@ -1627,6 +1637,43 @@ mod tests {
             payment["stripe"] = stripe;
             assert_ne!(original, with_payment(payment), "payment.stripe.{label}");
         }
+    }
+
+    /// Provisioning writes the body's domain to every table that names it, and
+    /// the spamd line is at-prefixed: a destination absent from that file is
+    /// trapped rather than greylisted. The second pass is a retry, so it must
+    /// add no duplicate, and the header comment and the platform's own line
+    /// stay where they were.
+    #[test]
+    fn a_group_domain_lands_in_the_spamd_allow_list_once() {
+        let dir = std::env::temp_dir().join(format!("onboard-group-tables-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::transitions::test_support::quota_config(&dir);
+        std::fs::write(&cfg.mail_domains, "kyriakon.net\n").unwrap();
+        std::fs::write(&cfg.dkim_domains, "kyriakon.net\n").unwrap();
+        std::fs::write(
+            &cfg.spamd_alloweddomains,
+            "# greylist pass-through\n@kyriakon.net\n",
+        )
+        .unwrap();
+
+        ensure_group_domain(&cfg, "parish.example").unwrap();
+        ensure_group_domain(&cfg, "parish.example").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&cfg.mail_domains).unwrap(),
+            "kyriakon.net\nparish.example\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cfg.dkim_domains).unwrap(),
+            "kyriakon.net\nparish.example\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cfg.spamd_alloweddomains).unwrap(),
+            "# greylist pass-through\n@kyriakon.net\n@parish.example\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The lock the shell takes is `<table>.lock` with the owner's pid inside, so

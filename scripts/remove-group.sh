@@ -20,6 +20,9 @@
 #   /etc/mail/mail_domains       the domain's whole line
 #   /etc/mail/dkim_domains       the domain's whole line, so the filter stops
 #                                signing it
+#   /etc/mail/spamd.alloweddomains
+#                                the domain's `@<domain>` line, so spamd stops
+#                                treating mail to it as a spamtrap hit
 #   /etc/mail/virtuals           every <address>@<domain> entry, mailboxes and
 #                                aliases alike
 #   /etc/httpd.d/<domain>.conf   the generated vhosts
@@ -51,10 +54,10 @@
 # Not this script's job: the group record, the accounts, their keys and holds,
 # the token index and the journal. Those are the drain's, in the transition.
 #
-# Env: MAIL_DOMAINS, VIRTUALS, DKIM_DOMAINS, HTTPD_D, GMID_D, ACME_D, SSL_DIR,
-# SSL_PRIVATE and ACME_QUEUE_DIR rebind the paths, and SMTPD_CONF is passed
-# through to reload-smtpd.sh. The self-test uses the first set, so it needs no
-# root and touches nothing outside TMPDIR.
+# Env: MAIL_DOMAINS, VIRTUALS, DKIM_DOMAINS, SPAMD_ALLOWEDDOMAINS, HTTPD_D,
+# GMID_D, ACME_D, SSL_DIR, SSL_PRIVATE and ACME_QUEUE_DIR rebind the paths, and
+# SMTPD_CONF is passed through to reload-smtpd.sh. The self-test uses the first
+# set, so it needs no root and touches nothing outside TMPDIR.
 
 set -euo pipefail
 
@@ -75,6 +78,7 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 mail_domains=${MAIL_DOMAINS:-/etc/mail/mail_domains}
 virtuals=${VIRTUALS:-/etc/mail/virtuals}
 dkim_domains=${DKIM_DOMAINS:-/etc/mail/dkim_domains}
+spamd_alloweddomains=${SPAMD_ALLOWEDDOMAINS:-/etc/mail/spamd.alloweddomains}
 httpd_d=${HTTPD_D:-/etc/httpd.d}
 gmid_d=${GMID_D:-/etc/gmid.d}
 acme_d=${ACME_D:-/etc/acme-client.d}
@@ -142,12 +146,14 @@ remove_group() {
 
 	# 1. The mail tables. mail_domains and dkim_domains carry the domain as a
 	# whole line; virtuals carries one line per address on it, both mailboxes and
-	# aliases. Every match is literal, so a domain called parish-example.net is
-	# not the same line as parish.example.
+	# aliases. The allow list carries it at-prefixed. Every match is literal, so
+	# a domain called parish-example.net is not the same line as parish.example.
 	drop_table "$mail_domains" exact "$domain" \
 		"removed $domain from $mail_domains" || return 1
 	drop_table "$dkim_domains" exact "$domain" \
 		"removed $domain from $dkim_domains" || return 1
+	drop_table "$spamd_alloweddomains" exact "@$domain" \
+		"removed @$domain from $spamd_alloweddomains" || return 1
 	drop_table "$virtuals" suffix "@$domain" \
 		"removed the $domain entries from $virtuals" || return 1
 
@@ -189,6 +195,7 @@ self_test() {
 	mail_domains="$tree/etc/mail/mail_domains"
 	virtuals="$tree/etc/mail/virtuals"
 	dkim_domains="$tree/etc/mail/dkim_domains"
+	spamd_alloweddomains="$tree/etc/mail/spamd.alloweddomains"
 	httpd_d="$tree/etc/httpd.d"
 	gmid_d="$tree/etc/gmid.d"
 	acme_d="$tree/etc/acme-client.d"
@@ -214,6 +221,15 @@ self_test() {
 		printf '%s\n' "$lookalike"
 	} >"$mail_domains"
 	cp "$mail_domains" "$dkim_domains"
+	# What provisioning leaves in the greylist pass-through list: the body's
+	# at-prefixed line beside the platform's and the lookalike's, under the
+	# tracked header. The removal must take exactly one of them.
+	{
+		printf '# greylist pass-through\n'
+		printf '@kyriakon.net\n'
+		printf '@%s\n' "$domain"
+		printf '@%s\n' "$lookalike"
+	} >"$spamd_alloweddomains"
 	{
 		printf 'secretary@%s: parish-secretary\n' "$domain"
 		printf 'office@%s: parish-secretary\n' "$domain"
@@ -235,6 +251,8 @@ self_test() {
 	done
 
 	: >"$calls"
+	check "the allow list holds the line provisioning wrote" \
+		"$(grep -cxF "@$domain" "$spamd_alloweddomains")" 1
 	remove_group >"$tree/first.out" 2>"$tree/first.err"
 
 	check "the mail domain table lost the domain" \
@@ -247,6 +265,12 @@ self_test() {
 		"$(grep -cxF "$domain" "$dkim_domains" || true)" 0
 	check "and kept the other body" "$(grep -cxF "$other" "$dkim_domains")" 1
 	check "and the lookalike" "$(grep -cxF "$lookalike" "$dkim_domains")" 1
+	check "the allow list lost the at-prefixed line" \
+		"$(grep -cxF "@$domain" "$spamd_alloweddomains" || true)" 0
+	check "and kept the platform's line and the lookalike's" \
+		"$(grep -cxF -e '@kyriakon.net' -e "@$lookalike" "$spamd_alloweddomains")" 2
+	check "and the header that explains the file" \
+		"$(grep -cxF '# greylist pass-through' "$spamd_alloweddomains")" 1
 	check "the virtual table lost every address on the domain" \
 		"$(grep -cF "@$domain" "$virtuals" || true)" 0
 	check "and kept the platform's and the other body's" \
@@ -276,7 +300,7 @@ self_test() {
 		"$(find "$(dirname "$mail_domains")" -name 'mail_domains.*.bak' | wc -l | tr -d ' ')" 1
 	check "smtpd was restarted once" "$(grep -c '^reload-smtpd$' "$calls")" 1
 	check "and the first run said what it did" \
-		"$(grep -c '^removed ' "$tree/first.out")" 13
+		"$(grep -c '^removed ' "$tree/first.out")" 14
 
 	# A second run against the same tree must do nothing and say nothing.
 	: >"$calls"

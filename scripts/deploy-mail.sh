@@ -154,6 +154,26 @@ require_mail_domains() {
 	return 1
 }
 
+# merge_spamd_allowed <seed> <mail-domains> <destination>
+#
+# The greylist pass-through list, as the mail domain table names it. A box with
+# none is seeded from the tracked file, which carries the header and the
+# platform's own domain; every domain in the table that has no `@domain` line is
+# appended under the same table lock the drain takes, and a line already there is
+# not added twice. Installing the tracked file over the live one, which this
+# used to do, deleted each body's line on every deploy, and spamd(8) traps a
+# destination that has no line here rather than greylisting it.
+merge_spamd_allowed() {
+	typeset seed="$1" domains="$2" dst="$3" domain
+	[ -f "$dst" ] || install -m 0644 "$seed" "$dst"
+	while IFS= read -r domain; do
+		case "$domain" in
+		'' | '#'*) continue ;;
+		esac
+		table_set "$dst" "@$domain" "@$domain" || return 1
+	done <"$domains"
+}
+
 # mail_from_entries <passwd-file> <virtuals-file>: the mail-from table's lines,
 # of two kinds. Every account whose home is under /home gets its own identity,
 # <user>@<platform-domain>: <user>. Every full-address virtuals entry whose
@@ -347,6 +367,38 @@ self_test() {
 	code=0
 	( require_mail_domains "$tree/mail_domains" "$platform_domain" ) >/dev/null 2>&1 || code=$?
 	check "and accepts one that starts with it" "$code" 0
+
+	# --- the spamd greylist pass-through list ---
+	# A destination domain with no line here is not greylisted: spamd treats the
+	# sender as a spamtrap hit and blocklists it. So the file follows mail_domains
+	# rather than being installed from the tracked copy, which is what used to
+	# delete a body's line on every deploy.
+	printf 'kyriakon.net\nparish.example\nparish-example.net\n' > "$tree/mail_domains"
+	merge_spamd_allowed "$repo_dir/openbsd/etc/spamd.alloweddomains" \
+		"$tree/mail_domains" "$tree/spamd.alloweddomains"
+	check "the allow list is seeded from the tracked file" \
+		"$(grep -c '^#' "$tree/spamd.alloweddomains")" \
+		"$(grep -c '^#' "$repo_dir/openbsd/etc/spamd.alloweddomains")"
+	check "and every mail domain gets one at-prefixed line" \
+		"$(grep -cx -e '@kyriakon.net' -e '@parish.example' -e '@parish-example.net' \
+			"$tree/spamd.alloweddomains")" 3
+	check "a domain the seed already names is not added twice" \
+		"$(grep -cxF '@kyriakon.net' "$tree/spamd.alloweddomains")" 1
+	check "and the list is 0644" "$(stat -f %Lp "$tree/spamd.alloweddomains")" 644
+
+	# A deploy after a group was provisioned leaves the body's line where the
+	# drain put it, and a hand edit is not clobbered either.
+	cp "$tree/spamd.alloweddomains" "$tree/allowed.expected"
+	merge_spamd_allowed "$repo_dir/openbsd/etc/spamd.alloweddomains" \
+		"$tree/mail_domains" "$tree/spamd.alloweddomains"
+	check "a second merge leaves the list as it was" \
+		"$(cmp -s "$tree/spamd.alloweddomains" "$tree/allowed.expected" \
+			&& printf same || printf changed)" same
+	printf '# a hand edit\n@manual.example\n' >> "$tree/spamd.alloweddomains"
+	merge_spamd_allowed "$repo_dir/openbsd/etc/spamd.alloweddomains" \
+		"$tree/mail_domains" "$tree/spamd.alloweddomains"
+	check "a hand-written line and its comment survive a deploy" \
+		"$(grep -cx -e '# a hand edit' -e '@manual.example' "$tree/spamd.alloweddomains")" 2
 
 	# --- the mail-from table ---
 	# The submission rule is only as good as this table: it is a set of allowed
@@ -1155,8 +1207,14 @@ install -m 0644 "$repo_dir/openbsd/etc/spamd.conf" /etc/mail/spamd.conf
 # is not a spamd.conf(5) list: a greylisted host sending to a destination whose
 # domain matches none of these suffixes is blacklisted for 24 hours, so mail to a
 # kyriakon.net address must not be what teaches spamd that a new sender is a
-# spammer.
-install -m 0644 "$repo_dir/openbsd/etc/spamd.alloweddomains" /etc/mail/spamd.alloweddomains
+# spammer. It follows /etc/mail/mail_domains rather than the tracked copy: a
+# body's domain is appended by the drain when its group is provisioned, and
+# installing the tracked file over the live one would delete every one of those
+# lines on each deploy.
+merge_spamd_allowed "$repo_dir/openbsd/etc/spamd.alloweddomains" \
+	"$mail_domains_table" /etc/mail/spamd.alloweddomains
+printf 'spamd.alloweddomains: %s domains\n' \
+	"$(grep -c '^@' /etc/mail/spamd.alloweddomains || true)"
 
 # --- 4. DKIM -------------------------------------------------------------
 

@@ -292,6 +292,15 @@ fn a_group_intent_provisions_its_record_accounts_and_addresses() {
         1,
         "{domains}"
     );
+    // spamd greylists any destination whose domain has no line here and traps
+    // the rest, so the body's domain has to arrive with the mail route.
+    let allowed = fix.table("spamd.alloweddomains");
+    assert_eq!(
+        allowed.lines().filter(|l| *l == "@parish.example").count(),
+        1,
+        "{allowed}"
+    );
+    assert!(allowed.lines().any(|l| l == "@kyriakon.net"), "{allowed}");
     let virtuals = fix.table("virtuals");
     for address in ["secretary", "office"] {
         let key = format!("{address}@parish.example:");
@@ -397,6 +406,15 @@ fn a_group_intent_applied_twice_leaves_one_of_each() {
             .filter(|l| *l == "parish.example")
             .count(),
         1
+    );
+    assert_eq!(
+        fix.table("spamd.alloweddomains")
+            .lines()
+            .filter(|l| *l == "@parish.example")
+            .count(),
+        1,
+        "{}",
+        fix.table("spamd.alloweddomains")
     );
     assert_eq!(fix.names("accounts"), vec!["parish-secretary"]);
     // The key file holds one key, and the tree is the builder's to keep
@@ -1342,6 +1360,12 @@ fn a_group_removal_takes_the_domain_down_and_closes_its_accounts() {
     let dkim = fix.table("dkim_domains");
     assert!(!dkim.lines().any(|l| l == "parish.example"), "{dkim}");
     assert!(dkim.lines().any(|l| l == "kyriakon.net"), "{dkim}");
+    let allowed = fix.table("spamd.alloweddomains");
+    assert!(
+        !allowed.lines().any(|l| l == "@parish.example"),
+        "{allowed}"
+    );
+    assert!(allowed.lines().any(|l| l == "@kyriakon.net"), "{allowed}");
     let virtuals = fix.table("virtuals");
     assert!(!virtuals.contains("parish.example"), "{virtuals}");
     assert!(virtuals.contains("bob@kyriakon.net: bob"), "{virtuals}");
@@ -1467,6 +1491,7 @@ fn a_removal_for_a_domain_that_is_not_a_group_is_refused() {
     let tables = (
         fix.table("mail_domains"),
         fix.table("dkim_domains"),
+        fix.table("spamd.alloweddomains"),
         fix.table("virtuals"),
     );
     let accounts = fix.names("accounts");
@@ -1487,6 +1512,7 @@ fn a_removal_for_a_domain_that_is_not_a_group_is_refused() {
         (
             fix.table("mail_domains"),
             fix.table("dkim_domains"),
+            fix.table("spamd.alloweddomains"),
             fix.table("virtuals")
         ),
         tables,

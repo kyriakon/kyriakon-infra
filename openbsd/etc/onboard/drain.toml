@@ -61,6 +61,17 @@ virtuals = "/etc/mail/virtuals"
 # until it runs, the domain is listed and not yet signed.
 dkim_domains = "/etc/mail/dkim_domains"
 
+# spamd's greylist pass-through list, one `@domain` line per destination domain.
+# This is not a mail route: a greylisted host writing to a domain that has no
+# line here is treated as a spamtrap hit and its address is blocklisted for 24
+# hours, which is what happened to every external sender writing to a body's
+# domain while this file named only the platform's. The drain adds a body's
+# domain when its group is provisioned, scripts/remove-group.sh takes it out
+# again, and scripts/deploy-mail.sh merges /etc/mail/mail_domains into it on
+# every deploy rather than installing the tracked copy over the live one. A
+# value rather than a compiled-in path because a test points it at a fixture.
+spamd_alloweddomains = "/etc/mail/spamd.alloweddomains"
+
 # The root-only HMAC-SHA256 key the review email's three links and the one-time
 # password link are signed with. The drain signs and verifies with it; the
 # handler never reads it, because it only passes a click through as an intent.

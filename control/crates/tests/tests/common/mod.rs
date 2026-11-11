@@ -137,6 +137,13 @@ impl Fix {
         std::fs::write(fix.path("mail_domains"), "kyriakon.net\n").unwrap();
         std::fs::write(fix.path("virtuals"), "").unwrap();
         std::fs::write(fix.path("dkim_domains"), "kyriakon.net\n").unwrap();
+        // The greylist pass-through list, as deploy-mail.sh seeds it: the
+        // platform's own domain with a body's line added by a group provision.
+        std::fs::write(
+            fix.path("spamd.alloweddomains"),
+            "# greylist pass-through\n@kyriakon.net\n",
+        )
+        .unwrap();
         // The held-back names, copied from the tracked list so that a test can add
         // one to the fixture's without touching the repository's.
         let tracked =
@@ -176,6 +183,7 @@ impl Fix {
         let mail_domains = fix.path("mail_domains");
         let virtuals = fix.path("virtuals");
         let dkim_domains = fix.path("dkim_domains");
+        let spamd_allowed = fix.path("spamd.alloweddomains");
         let host = fix.dir.join("host").to_str().unwrap().to_string();
         fix.script(
             "remove-group.sh",
@@ -186,6 +194,7 @@ impl Fix {
                  for f in '{mail_domains}' '{dkim_domains}'; do\n\
                  \tawk -v d=\"$d\" '$0 != d' \"$f\" > \"$f.new\" && mv \"$f.new\" \"$f\"\n\
                  done\n\
+                 awk -v s=\"@$d\" '$0 != s' '{spamd_allowed}' > '{spamd_allowed}.new' && mv '{spamd_allowed}.new' '{spamd_allowed}'\n\
                  awk -v s=\"@$d\" -F: '{{ k = $1; gsub(/^[ \\t]+|[ \\t]+$/, \"\", k); if (length(k) >= length(s) && substr(k, length(k) - length(s) + 1) == s) next; print }}' '{virtuals}' > '{virtuals}.new' && mv '{virtuals}.new' '{virtuals}'\n\
                  rm -f '{host}/httpd.d/'\"$d\"'.conf' '{host}/gmid.d/'\"$d\"'.conf' '{host}/acme-client.d/'\"$d\"'.conf'\n\
                  rm -f '{host}/ssl/'\"$d\"'.fullchain.pem' '{host}/ssl/private/'\"$d\"'.key' '{host}/ssl/'\"$d\"'.crt'\n\
@@ -214,6 +223,7 @@ impl Fix {
              mail_domains = \"{}\"\n\
              virtuals = \"{}\"\n\
              dkim_domains = \"{}\"\n\
+             spamd_alloweddomains = \"{}\"\n\
              approval_key = \"{}\"\n\
              keyring_dir = \"{}\"\n\
              stripe_webhook_secret = \"{}/stripe\"\n\
@@ -251,6 +261,7 @@ impl Fix {
             fix.path("mail_domains"),
             fix.path("virtuals"),
             fix.path("dkim_domains"),
+            fix.path("spamd.alloweddomains"),
             fix.path("key"),
             fix.path("keyring"),
             fix.dir.display(),
