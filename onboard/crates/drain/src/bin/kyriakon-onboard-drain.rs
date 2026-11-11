@@ -31,15 +31,15 @@ async fn main() -> ExitCode {
             "--config" => match args.next() {
                 Some(p) => cfg_path = PathBuf::from(p),
                 None => {
-                    eprintln!("kyriakon-onboard-drain: --config needs a path");
+                    Error::Failed("--config needs a path".to_string()).report("the drain");
                     return ExitCode::FAILURE;
                 }
             },
             other => {
-                eprintln!(
-                    "kyriakon-onboard-drain: unknown argument {other:?}; \
-                     usage: kyriakon-onboard-drain [--config PATH]"
-                );
+                Error::Failed(format!(
+                    "unknown argument {other:?}; usage: kyriakon-onboard-drain [--config PATH]"
+                ))
+                .report("the drain");
                 return ExitCode::FAILURE;
             }
         }

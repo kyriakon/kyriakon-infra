@@ -111,7 +111,7 @@ async fn main() -> ExitCode {
             match args.next() {
                 Some(p) => cfg_path = PathBuf::from(p),
                 None => {
-                    eprintln!("kyriakon-onboardctl: --config needs a path");
+                    Error::Failed("--config needs a path".to_string()).report("the console");
                     return ExitCode::FAILURE;
                 }
             }
