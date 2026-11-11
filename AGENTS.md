@@ -24,22 +24,16 @@ written down. This repo has no decisions directory of its own.
 
 Pointers, so a search starts where the thing is.
 
-- `onboard/`: the Rust service. `src/frontend/responder/` serves the web form;
-  `responder/flow.rs` holds the shared applicant flow (`flow_path`, `flow_problem`,
-  `flow_answers`); `src/frontend/capsule.rs` renders the pages as gemtext;
-  `src/frontend/tui/mod.rs` is the terminal library (menu, sessions, the applicant
-  flow); `src/frontend/ipc.rs` is the terminal's one request to the handler;
-  `templates/*.html` are the web renderings; `src/drain/transitions.rs` holds the
-  drain's settlement seam (`Envelope`, `Settlement`, `settle`, `Disposition`), with the
-  verb bodies under `src/drain/transitions/` (`payments`, `groups`, `lifecycle`,
-  `review`, `stripe`, `boxrun`); `src/drain/mod.rs` holds the intent enum and its
-  payloads; `src/store/journal.rs` loads and indexes the journal once per pass;
-  `src/store/mod.rs` owns paths, locks and typed record reads; `src/payments/ledger.rs`
-  is the typed payment ledger; `src/bin/` holds the three binaries
-  (`kyriakon-onboard-drain`, `kyriakon-onboard-tui`, `kyriakon-onboardctl`);
-  `questions.toml` is the application's question list; `tests/drain.rs` is the drain's
-  acceptance suite, split by area under `tests/areas/`. Only `lib.rs`, `main.rs`,
-  `config.rs`, and `util.rs` sit at `src/` root; a new module goes in its section
+- `onboard/`: the Rust service, a Cargo workspace under `crates/`. `crates/core/`
+  holds the store, configuration, intent contract, IPC request and the shared
+  flow; `crates/handler/` serves the web form and renders the HTML and gemtext
+  pages; `crates/tui/` is the terminal library and binary; `crates/drain/` is the
+  root-side intent loop and transition verbs; `crates/ctl/` is the operator
+  console; `crates/tests/` is the acceptance suite. `templates/*.html` live under
+  `crates/handler/`. The four binaries keep their names (`kyriakon-onboard`,
+  `kyriakon-onboard-drain`, `kyriakon-onboard-tui`, `kyriakon-onboardctl`). A
+  package's `src/` root holds only its crate root, binary roots, and (in core)
+  `config.rs`, `util.rs` and `intent.rs`; a new module goes in its section
   directory, or a new directory with a `mod.rs` that names its job.
 - `kyriakon-encrypt/`: the CLI the save path runs to encrypt each message; `src/lib.rs`
   builds the PGP/MIME wrapper.
