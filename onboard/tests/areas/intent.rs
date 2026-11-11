@@ -9,7 +9,7 @@ use crate::common::*;
 
 use kyriakon_onboard::account::sign;
 use kyriakon_onboard::config::DrainConfig;
-use kyriakon_onboard::drain::{self, Intent};
+use kyriakon_onboard::intent::{self, Intent};
 use kyriakon_onboard::store::journal::Journal;
 use kyriakon_onboard::store::{self as st, Store};
 
@@ -41,7 +41,7 @@ fn a_variant_proves_itself_before_it_is_applied() {
 
     let id = runtime
         .block_on(
-            Intent::Close(drain::CloseIntent {
+            Intent::Close(intent::CloseIntent {
                 username: "secretary".to_string(),
                 session: session.to_string(),
                 ..Default::default()
@@ -60,14 +60,18 @@ fn a_variant_proves_itself_before_it_is_applied() {
     );
     assert!(
         runtime
-            .block_on(intent.verify(&cfg, &store, KEY, &file, &value))
+            .block_on(kyriakon_onboard::drain::verify(
+                &intent, &cfg, &store, KEY, &file, &value
+            ))
             .unwrap()
             .is_none(),
         "a live session proves the close"
     );
     assert_eq!(fix.account("secretary")["state"], "active");
     runtime
-        .block_on(intent.apply(&cfg, &store, &journal, KEY, &file, &value))
+        .block_on(kyriakon_onboard::drain::apply(
+            intent, &cfg, &store, &journal, KEY, &file, &value,
+        ))
         .unwrap();
 
     assert_eq!(fix.account("secretary")["state"], "closing");
@@ -88,7 +92,7 @@ fn a_variant_that_cannot_prove_itself_is_refused() {
     let (cfg, store, journal) = seam(&fix);
     let runtime = driver();
 
-    let intent = Intent::Resend(drain::ResendIntent {
+    let intent = Intent::Resend(intent::ResendIntent {
         username: "secretary".to_string(),
         token: "KYR-0123456789ABCD".to_string(),
         sig: String::new(),
@@ -96,7 +100,14 @@ fn a_variant_that_cannot_prove_itself_is_refused() {
     });
     let value = serde_json::to_value(&intent).unwrap();
     let refused = runtime
-        .block_on(intent.verify(&cfg, &store, KEY, "unsigned.json", &value))
+        .block_on(kyriakon_onboard::drain::verify(
+            &intent,
+            &cfg,
+            &store,
+            KEY,
+            "unsigned.json",
+            &value,
+        ))
         .unwrap_err();
     assert_eq!(
         refused, "the token resend's signature does not verify",
@@ -115,7 +126,14 @@ fn a_variant_that_cannot_prove_itself_is_refused() {
     assert!(matches!(unknown, Intent::Unknown { .. }));
     assert!(
         runtime
-            .block_on(unknown.verify(&cfg, &store, KEY, "unknown.json", &raw))
+            .block_on(kyriakon_onboard::drain::verify(
+                &unknown,
+                &cfg,
+                &store,
+                KEY,
+                "unknown.json",
+                &raw
+            ))
             .unwrap()
             .is_some(),
         "an unimplemented kind is settled, not applied"
@@ -123,7 +141,8 @@ fn a_variant_that_cannot_prove_itself_is_refused() {
     // The refusal is journalled by `settle`, which is the only writer: the
     // verify side hands it the settlement and does not write anything itself.
     runtime
-        .block_on(Intent::parse(&raw).unwrap().run(
+        .block_on(kyriakon_onboard::drain::run_intent(
+            Intent::parse(&raw).unwrap(),
             &cfg,
             &store,
             &journal,
@@ -155,7 +174,7 @@ fn the_one_writer_keeps_the_wire_the_drain_reads() {
     let runtime = driver();
     let id = runtime
         .block_on(
-            Intent::Credit(drain::CreditIntent {
+            Intent::Credit(intent::CreditIntent {
                 token: "KYR-0123456789ABCD".to_string(),
                 rail: "cash".to_string(),
                 amount_gbp: "20.00".to_string(),
@@ -193,28 +212,28 @@ fn every_variant() -> Vec<Intent> {
     let all = vec![
         Intent::Application(st::Intent::default()),
         // The three decisions share one variant and three kinds.
-        Intent::Decision(drain::DecisionIntent {
+        Intent::Decision(intent::DecisionIntent {
             kind: "approve".to_string(),
             ..Default::default()
         }),
-        Intent::Password(drain::PasswordIntent::default()),
+        Intent::Password(intent::PasswordIntent::default()),
         Intent::ProvisionGroup(Box::default()),
         Intent::GroupAddress(st::GroupAddressIntent::default()),
         Intent::RemoveGroup(st::GroupRemoveIntent::default()),
-        Intent::Close(drain::CloseIntent::default()),
-        Intent::Resend(drain::ResendIntent::default()),
-        Intent::Credit(drain::CreditIntent::default()),
-        Intent::WindowExtend(drain::WindowExtendIntent::default()),
-        Intent::ReconcileAttribute(drain::AttributeIntent::default()),
-        Intent::ReconcileReturn(drain::ReturnIntent::default()),
-        Intent::Refund(drain::RefundIntent::default()),
-        Intent::Export(drain::ExportIntent::default()),
-        Intent::ChangePassword(drain::ChangePasswordIntent::default()),
-        Intent::UploadKey(drain::UploadKeyIntent::default()),
-        Intent::OutsideAddress(drain::OutsideAddressIntent::default()),
-        Intent::Serving(drain::ServingIntent::default()),
-        Intent::CancelRenewal(drain::CancelRenewalIntent::default()),
-        Intent::MailKey(drain::MailKeyIntent::default()),
+        Intent::Close(intent::CloseIntent::default()),
+        Intent::Resend(intent::ResendIntent::default()),
+        Intent::Credit(intent::CreditIntent::default()),
+        Intent::WindowExtend(intent::WindowExtendIntent::default()),
+        Intent::ReconcileAttribute(intent::AttributeIntent::default()),
+        Intent::ReconcileReturn(intent::ReturnIntent::default()),
+        Intent::Refund(intent::RefundIntent::default()),
+        Intent::Export(intent::ExportIntent::default()),
+        Intent::ChangePassword(intent::ChangePasswordIntent::default()),
+        Intent::UploadKey(intent::UploadKeyIntent::default()),
+        Intent::OutsideAddress(intent::OutsideAddressIntent::default()),
+        Intent::Serving(intent::ServingIntent::default()),
+        Intent::CancelRenewal(intent::CancelRenewalIntent::default()),
+        Intent::MailKey(intent::MailKeyIntent::default()),
     ];
     for intent in &all {
         match intent {
@@ -299,7 +318,7 @@ fn a_settled_intent_is_not_applied_again() {
 
     let id = runtime
         .block_on(
-            Intent::Close(drain::CloseIntent {
+            Intent::Close(intent::CloseIntent {
                 username: "secretary".to_string(),
                 session: session.to_string(),
                 ..Default::default()
@@ -311,11 +330,15 @@ fn a_settled_intent_is_not_applied_again() {
     let value: Value = serde_json::from_str(&fix.read(&format!("intents/{id}.json"))).unwrap();
     let intent = Intent::parse(&value).unwrap();
     assert!(runtime
-        .block_on(intent.verify(&cfg, &store, KEY, &file, &value))
+        .block_on(kyriakon_onboard::drain::verify(
+            &intent, &cfg, &store, KEY, &file, &value
+        ))
         .unwrap()
         .is_none());
     runtime
-        .block_on(intent.apply(&cfg, &store, &journal, KEY, &file, &value))
+        .block_on(kyriakon_onboard::drain::apply(
+            intent, &cfg, &store, &journal, KEY, &file, &value,
+        ))
         .unwrap();
     let lines = fix
         .journal()
@@ -331,7 +354,9 @@ fn a_settled_intent_is_not_applied_again() {
     .unwrap();
     let intent = Intent::parse(&value).unwrap();
     runtime
-        .block_on(intent.apply(&cfg, &store, &journal, KEY, &file, &value))
+        .block_on(kyriakon_onboard::drain::apply(
+            intent, &cfg, &store, &journal, KEY, &file, &value,
+        ))
         .unwrap();
 
     assert!(

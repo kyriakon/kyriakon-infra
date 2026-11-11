@@ -12,17 +12,17 @@ use time::OffsetDateTime;
 
 use crate::frontend::fastcgi::Reply;
 use crate::frontend::page::{DecidePage, PasswordPage};
-use crate::{drain, store};
+use crate::{intent, store};
 
 /// The decision a link names, with the signature it carries. A link with no
 /// signature, or with one naming an action this build has no decision for, names
 /// no decision.
-pub(super) fn decision_from(f: &BTreeMap<String, String>) -> Option<&'static drain::Decision> {
+pub(super) fn decision_from(f: &BTreeMap<String, String>) -> Option<&'static intent::Decision> {
     let sig = f.get("sig").map(String::as_str).unwrap_or("");
     if sig.is_empty() {
         return None;
     }
-    drain::decision_for(f.get("action").map(String::as_str).unwrap_or(""))
+    intent::decision_for(f.get("action").map(String::as_str).unwrap_or(""))
 }
 
 /// Why a confirm page cannot name a decision, in the words the reader needs.
@@ -90,7 +90,7 @@ pub(super) async fn decide_file(app: &App, call: &Call<'_>) -> Reply {
         return refused("This link does not name a decision the platform knows.");
     };
     let sig = form.get("sig").cloned().unwrap_or_default();
-    match drain::Intent::Decision(drain::DecisionIntent {
+    match intent::Intent::Decision(intent::DecisionIntent {
         kind: decision.kind.to_string(),
         application: store::ApplicationRef::application(record.username.clone(), token.to_string()),
         action: decision.action.to_string(),
@@ -215,7 +215,7 @@ pub(super) async fn password_file(app: &App, call: &Call<'_>) -> Reply {
             error: Some(problem),
         });
     }
-    match drain::Intent::Password(drain::PasswordIntent {
+    match intent::Intent::Password(intent::PasswordIntent {
         application: store::ApplicationRef::application(record.username.clone(), token.to_string()),
         until: until.to_string(),
         sig: sig.clone(),

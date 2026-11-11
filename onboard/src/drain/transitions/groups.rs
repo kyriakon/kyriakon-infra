@@ -16,9 +16,9 @@ use super::boxrun::{
 };
 use super::{write_journal, Settlement};
 use crate::config::DrainConfig;
-use crate::drain::ADDRESS_ACTIONS;
 use crate::flow::questions;
 use crate::flow::validate;
+use crate::intent::ADDRESS_ACTIONS;
 use crate::payments::ledger::{Ledger, LedgerLine};
 use crate::store::journal::Journal;
 use crate::store::{

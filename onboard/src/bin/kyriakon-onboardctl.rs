@@ -62,11 +62,11 @@ use kyriakon_onboard::account::export;
 use kyriakon_onboard::account::requests;
 use kyriakon_onboard::account::sign;
 use kyriakon_onboard::config::DrainConfig;
-use kyriakon_onboard::drain;
 use kyriakon_onboard::drain::prepaid;
 use kyriakon_onboard::drain::transitions;
-use kyriakon_onboard::drain::Decision;
 use kyriakon_onboard::flow::validate;
+use kyriakon_onboard::intent;
+use kyriakon_onboard::intent::Decision;
 use kyriakon_onboard::mail::keycheck;
 use kyriakon_onboard::payments::ledger::{Ledger, LedgerLine};
 use kyriakon_onboard::store::journal::Journal;
@@ -139,7 +139,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), String> 
         // the drain knows.
         verb => {
             let username = one_username(rest)?;
-            let Some(decision) = drain::decision_for(verb) else {
+            let Some(decision) = intent::decision_for(verb) else {
                 return Err(usage());
             };
             let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
@@ -262,7 +262,7 @@ async fn token(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), 
         })?;
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::resend_payload(username, &token))?;
-    let id = drain::Intent::Resend(drain::ResendIntent {
+    let id = intent::Intent::Resend(intent::ResendIntent {
         username: username.to_string(),
         token: token.clone(),
         sig,
@@ -313,10 +313,10 @@ async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
         _ => payment_token(store, &flags).await?,
     };
     let rail = need(&flags, "rail")?;
-    if !drain::CREDIT_RAILS.contains(&rail) {
+    if !intent::CREDIT_RAILS.contains(&rail) {
         return Err(format!(
             "--rail {rail:?} is not one of {}",
-            drain::CREDIT_RAILS.join(", ")
+            intent::CREDIT_RAILS.join(", ")
         ));
     }
     // Cash in hand is the one rail keyed by a username: the operator was there
@@ -364,7 +364,7 @@ async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
             note,
         ),
     )?;
-    let id = drain::Intent::Credit(drain::CreditIntent {
+    let id = intent::Intent::Credit(intent::CreditIntent {
         token: token.clone(),
         rail: rail.to_string(),
         amount_gbp: amount.to_string(),
@@ -416,7 +416,7 @@ async fn window(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::window_extend_payload(token, days, reason))?;
-    let id = drain::Intent::WindowExtend(drain::WindowExtendIntent {
+    let id = intent::Intent::WindowExtend(intent::WindowExtendIntent {
         token: token.to_string(),
         days,
         reason: reason.to_string(),
@@ -543,7 +543,7 @@ async fn reconcile_attribute(
         &key,
         &sign::reconcile_attribute_payload(item, token, confirm_double, override_reason),
     )?;
-    let id = drain::Intent::ReconcileAttribute(drain::AttributeIntent {
+    let id = intent::Intent::ReconcileAttribute(intent::AttributeIntent {
         item: item.to_string(),
         token: token.to_string(),
         confirm_double,
@@ -576,7 +576,7 @@ async fn reconcile_return(cfg: &DrainConfig, store: &Store, args: &[String]) -> 
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::reconcile_return_payload(item, note))?;
-    let id = drain::Intent::ReconcileReturn(drain::ReturnIntent {
+    let id = intent::Intent::ReconcileReturn(intent::ReturnIntent {
         item: item.to_string(),
         note: note.to_string(),
         sig,
@@ -689,7 +689,7 @@ async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
             &key,
             &sign::refund_payload(&token, "", "", false, false, "", settled, ""),
         )?;
-        let id = drain::Intent::Refund(drain::RefundIntent {
+        let id = intent::Intent::Refund(intent::RefundIntent {
             token: token.clone(),
             settled_on: Some(settled.to_string()),
             sig,
@@ -702,10 +702,10 @@ async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
     }
 
     let rail = need(&flags, "rail")?;
-    if !drain::REFUND_RAILS.contains(&rail) {
+    if !intent::REFUND_RAILS.contains(&rail) {
         return Err(format!(
             "--rail {rail:?} is not one of {}",
-            drain::REFUND_RAILS.join(", ")
+            intent::REFUND_RAILS.join(", ")
         ));
     }
     let amount = need(&flags, "amount")?;
@@ -746,7 +746,7 @@ async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
             reason,
         ),
     )?;
-    let id = drain::Intent::Refund(drain::RefundIntent {
+    let id = intent::Intent::Refund(intent::RefundIntent {
         token: token.clone(),
         amount_gbp: Some(amount.to_string()),
         rail: Some(rail.to_string()),
@@ -998,10 +998,10 @@ async fn address(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<()
         return Err(format!("the domain {domain:?}: {why}"));
     }
     let action = need(&flags, "action")?;
-    if !drain::ADDRESS_ACTIONS.contains(&action) {
+    if !intent::ADDRESS_ACTIONS.contains(&action) {
         return Err(format!(
             "--action {action:?} is not one of {:?}\n{}",
-            drain::ADDRESS_ACTIONS,
+            intent::ADDRESS_ACTIONS,
             usage()
         ));
     }
@@ -1061,7 +1061,7 @@ async fn address(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<()
             mail_key.as_ref().map(|k| k.material.as_str()).unwrap_or(""),
         ),
     )?;
-    let id = drain::Intent::GroupAddress(store::GroupAddressIntent {
+    let id = intent::Intent::GroupAddress(store::GroupAddressIntent {
         domain: domain.to_string(),
         action: action.to_string(),
         address: address.to_string(),
@@ -1092,7 +1092,7 @@ async fn group(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), 
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::group_remove_payload(domain))?;
-    let id = drain::Intent::RemoveGroup(store::GroupRemoveIntent {
+    let id = intent::Intent::RemoveGroup(store::GroupRemoveIntent {
         domain: domain.to_string(),
         sig,
         ..Default::default()
@@ -1389,7 +1389,7 @@ async fn sign_and_file(
 ) -> Result<(), String> {
     let (token, _record) = find_application(store, username).await?;
     let sig = sign::sign(key, &sign::decide_payload(&token, decision.action))?;
-    let id = drain::Intent::Decision(drain::DecisionIntent {
+    let id = intent::Intent::Decision(intent::DecisionIntent {
         kind: decision.kind.to_string(),
         application: store::ApplicationRef::application(username.to_string(), token.clone()),
         action: decision.action.to_string(),
