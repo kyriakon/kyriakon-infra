@@ -987,8 +987,9 @@ fn a_monero_credit_recovers_with_its_quote_and_receipt_rate() {
     );
     // The receipt day is today, and the cache is fetched today, so the row can
     // record the receipt-date rate while the window quote stays at 300.00.
-    let received = kyriakon_control_core::util::filed_at()[..10].to_string();
-    fix.write_rate_cache("409.44", &kyriakon_control_core::util::filed_at());
+    let fetched = kyriakon_control_core::util::filed_at();
+    let received = fetched[..10].to_string();
+    fix.write_rate_cache("409.44", &fetched);
     let out = fix.ctl(&[
         "credit",
         "--token",
