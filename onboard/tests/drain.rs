@@ -12,6 +12,8 @@ mod common;
 mod account;
 #[path = "areas/card.rs"]
 mod card;
+#[path = "areas/catalogue.rs"]
+mod catalogue;
 #[path = "areas/erasure.rs"]
 mod erasure;
 #[path = "areas/export.rs"]
