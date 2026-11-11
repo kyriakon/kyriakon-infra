@@ -1546,6 +1546,47 @@ fn a_group_removal_stops_the_bodys_subscription() {
     assert!(!stopped.dir.join("store/groups/parish.example").exists());
 }
 
+/// A lapsed card group's grace ends through `delete_group`: the subscription is
+/// stopped there, and the flag that write saves keeps the same pass's
+/// `take_group_down` from sending a second cancel.
+#[test]
+fn a_lapsed_card_group_stops_its_subscription_once() {
+    let fix = Fix::new("group-lapse-cancel");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let path = fix.dir.join("store/groups/parish.example/group.json");
+    let mut group: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    group["payment"]["rail"] = json!("card");
+    group["payment"]["stripe"] = json!({
+        "subscription": SUBSCRIPTION,
+        "customer": "cus_example",
+        "status": "active"
+    });
+    group["payment"]["window"]["state"] = json!("closed");
+    group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let log = fix.scripts_log();
+    assert_eq!(
+        log.matches("stripe-api.sh cancel sub_example").count(),
+        1,
+        "{log}"
+    );
+    assert!(
+        !fix.dir.join("store/groups/parish.example").exists(),
+        "the lapsed group stayed: {}",
+        fix.journal()
+    );
+}
+
 /// A removal for a domain with no group record is refused and changes nothing:
 /// no table line, no script, no account and no group.
 #[test]

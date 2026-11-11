@@ -538,22 +538,29 @@ async fn settle_event(
 }
 
 /// One `charge.*` event: tell the operator and settle, because the charge is
-/// not ours to move money on or to refuse. The id is Stripe's charge, which the
-/// processed line records as the event's object.
+/// not ours to move money on or to refuse. The two objects differ. A dispute's
+/// object is the dispute, which names its charge; a refund's object is the
+/// charge, whose `amount` is the total and whose `amount_refunded` is the money
+/// that came back. The processed line records the object's own id either way.
 async fn charge_notice(
     cfg: &DrainConfig,
     kind: &str,
     object: &Value,
     todo: &str,
 ) -> Result<Settled, Error> {
-    let charge = object
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or("an unnamed charge");
-    let amount = object.get("amount").and_then(Value::as_i64);
-    let found = match amount {
-        Some(amount) => format!("{kind} for charge {charge}, {amount} minor units"),
-        None => format!("{kind} for charge {charge}"),
+    let text = |name: &str| object.get(name).and_then(Value::as_str);
+    let found = if kind == "charge.dispute.created" {
+        format!(
+            "{kind} for dispute {} on charge {}",
+            text("id").unwrap_or("an unnamed dispute"),
+            text("charge").unwrap_or("an unnamed charge")
+        )
+    } else {
+        let charge = text("id").unwrap_or("an unnamed charge");
+        match object.get("amount_refunded").and_then(Value::as_i64) {
+            Some(amount) => format!("{kind} for charge {charge}, {amount} minor units refunded"),
+            None => format!("{kind} for charge {charge}"),
+        }
     };
     notice::alert(cfg, "stripe", kind, &found, todo).await;
     Ok(Settled::Applied)

@@ -167,7 +167,6 @@ impl GroupView {
         };
         let unpaid = !payment.no_charge && payment.paid_until.is_none();
         let stripe = &payment.stripe;
-        let subscription = stripe.subscription.is_some();
         GroupView {
             domain: group.domain.clone(),
             name: group.name.clone(),
@@ -190,11 +189,8 @@ impl GroupView {
                 QUOTA_HARD
             ),
             site_owner: group.site_owner.clone(),
-            renews: subscription
-                && !stripe.cancel_at_period_end
-                && stripe.status.as_deref() != Some("canceled"),
-            renewal_stopped: subscription
-                && (stripe.cancel_at_period_end || stripe.status.as_deref() == Some("canceled")),
+            renews: stripe.renews(),
+            renewal_stopped: stripe.renewal_stopped(),
         }
     }
 }
@@ -382,17 +378,11 @@ pub fn member_page(
     let account_stripe = account.payment.as_ref().map(|payment| &payment.stripe);
     let renews = match owner_group {
         Some(group) => group.renews,
-        None => account_stripe.is_some_and(|stripe| {
-            stripe.subscription.is_some()
-                && !stripe.cancel_at_period_end
-                && stripe.status.as_deref() != Some("canceled")
-        }),
+        None => account_stripe.is_some_and(|stripe| stripe.renews()),
     };
     let renewal_stopped = match owner_group {
         Some(group) => group.renewal_stopped,
-        None => account_stripe.is_some_and(|stripe| {
-            stripe.cancel_at_period_end || stripe.status.as_deref() == Some("canceled")
-        }),
+        None => account_stripe.is_some_and(|stripe| stripe.renewal_stopped()),
     };
     AccountPage {
         services: services(list, Some(&account.username)),

@@ -1525,6 +1525,24 @@ pub struct StripeBilling {
     pub last_invoice: Option<String>,
 }
 
+impl StripeBilling {
+    /// Whether the subscription still renews, which is the one condition a
+    /// cancellation is sent for and the one the account page offers the control
+    /// under. A terminal status or a flag already set means nothing to do.
+    pub fn renews(&self) -> bool {
+        self.subscription.is_some()
+            && !self.cancel_at_period_end
+            && self.status.as_deref() != Some("canceled")
+    }
+
+    /// Whether there is a subscription that has stopped renewing, either
+    /// because the member asked or because Stripe reports it canceled.
+    pub fn renewal_stopped(&self) -> bool {
+        self.subscription.is_some()
+            && (self.cancel_at_period_end || self.status.as_deref() == Some("canceled"))
+    }
+}
+
 /// The account's payment state, from the nested block or, for a record written
 /// before that block existed, from the four flat fields the old shape carried.
 /// The flat fields are read-only: the next write puts the block in their place.
@@ -1758,6 +1776,47 @@ mod tests {
         // Crockford leaves out I, L, O and U, so no token can carry one.
         assert!(!t.contains(['i', 'l', 'o', 'u']));
         assert_ne!(t, status_token().await.unwrap());
+    }
+
+    /// The one "still renewing" rule: a subscription attached, not set to stop
+    /// at the period's end, and not canceled. The drain cancels under it and
+    /// the account page offers the control under it.
+    #[test]
+    fn a_subscription_renews_only_while_it_is_attached_and_unstopped() {
+        let cases = [
+            (StripeBilling::default(), false, false),
+            (
+                StripeBilling {
+                    subscription: Some("sub_example".to_string()),
+                    status: Some("active".to_string()),
+                    ..Default::default()
+                },
+                true,
+                false,
+            ),
+            (
+                StripeBilling {
+                    subscription: Some("sub_example".to_string()),
+                    cancel_at_period_end: true,
+                    ..Default::default()
+                },
+                false,
+                true,
+            ),
+            (
+                StripeBilling {
+                    subscription: Some("sub_example".to_string()),
+                    status: Some("canceled".to_string()),
+                    ..Default::default()
+                },
+                false,
+                true,
+            ),
+        ];
+        for (stripe, renews, stopped) in cases {
+            assert_eq!(stripe.renews(), renews, "{stripe:?}");
+            assert_eq!(stripe.renewal_stopped(), stopped, "{stripe:?}");
+        }
     }
 
     /// A subject writes only the fields it has, and an old line's plain string

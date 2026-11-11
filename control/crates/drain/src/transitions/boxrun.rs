@@ -125,7 +125,7 @@ pub(super) async fn cancel_stripe_if_active(
     let Some(subscription) = stripe.subscription.as_deref() else {
         return Ok(false);
     };
-    if stripe.cancel_at_period_end || stripe.status.as_deref() == Some("canceled") {
+    if !stripe.renews() {
         return Ok(false);
     }
     run_script(
