@@ -1,58 +1,30 @@
-[package]
-name = "kyriakon-onboard"
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/handler",
+    "crates/drain",
+    "crates/tui",
+    "crates/ctl",
+    "crates/tests",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Onboarding handler and root drain: the handler renders the applicant page and writes one JSON intent per submission; the drain applies them"
 publish = false
 
-[dependencies]
-# The pages the responder renders. The service itself is a FastCGI responder now
-# rather than an HTTP daemon, so there is no web framework here and no HTTP
-# parser: the front-ends on the box do that work and this reads the environment
-# they build.
+[workspace.dependencies]
 askama = "0.14"
-# sha2 and hmac are the one pair the drain adds. The review email's three links
-# and the one-time password link are HMAC-SHA256 over their payload, keyed from
-# the root-only approval key file: the same process signs and verifies, so a
-# signature would buy a keypair nothing here needs.
 hmac = "0.12"
 sha2 = "0.10"
-# The member's mail password: bcrypt, because the login is BSD auth against the
-# system account and that reads a $2b$ hash. The handler hashes and the drain
-# sets it, so no plaintext is written anywhere.
 bcrypt = "0.15"
-# sha1 is the handler's one hash of its own, and it is not a check: an OpenPGP
-# version 4 key's fingerprint is the SHA-1 of its framed public key packet, and
-# that is the number gpg prints and the reviewer compares with the key on the
-# box. The alternative was a fingerprint the client sends, which nothing on the
-# page could compute: the walkthrough is not built and the form carries no
-# script, so a submission carried a number that named material it was not
-# computed from (keycheck::pgp_fingerprint).
 sha1 = "0.10"
-# libc is for the two things std does not expose: geteuid, so the signing-key
-# check only demands a root-owned file when the drain is actually root, and
-# O_NOFOLLOW, so a temporary file the unprivileged half could plant a symlink at
-# is opened with the protections the store's mixed ownership needs.
 libc = "0.2"
-# serde deserializes the form and serializes the record.
 serde = { version = "1", features = ["derive"] }
-# The intent and the application record are JSON, the shape the drain reads.
 serde_json = "1"
-# filed_at, RFC 3339 in UTC, and reading back the decision time the drain
-# writes. One crate, so the formatting and parsing of a store timestamp move
-# together.
 time = { version = "0.3", features = ["std", "formatting", "parsing"] }
-# The drain runs the enqueuer and the provisioning scripts, which is what
-# "process" is for; the rest is the handler's own runtime.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "fs", "io-util", "process", "sync", "time"] }
-# The config is TOML, the format the spec names for the service's own file.
 toml = "0.9"
-# The intent id is a ULID, the format the drain parses. The status token is not a
-# ULID: it is 128 bits of Crockford encoded by hand in store.rs, because a ULID
-# spends 48 of its bits on a timestamp and a bearer capability must not.
 ulid = "1"
-# The key inspection is the crate the web page builds to WASM (#185), so the
-# terminal and the browser return the same verdict by construction rather than
-# from two copies of the rules. A path dependency because the crate is still
-# the prototype the release takes over.
 keygen-spike = { path = "../docs/planning/prototypes/keygen-spike", default-features = false }

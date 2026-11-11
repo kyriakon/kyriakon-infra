@@ -897,10 +897,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "kyriakon-onboard"
+name = "kyriakon-onboard-core"
 version = "0.1.0"
 dependencies = [
- "askama",
  "bcrypt",
  "hmac",
  "keygen-spike",
@@ -913,6 +912,69 @@ dependencies = [
  "tokio",
  "toml",
  "ulid",
+]
+
+[[package]]
+name = "kyriakon-onboard-drain"
+version = "0.1.0"
+dependencies = [
+ "hmac",
+ "kyriakon-onboard-core",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "time",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "kyriakon-onboard-handler"
+version = "0.1.0"
+dependencies = [
+ "askama",
+ "kyriakon-onboard-core",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
+name = "kyriakon-onboard-tests"
+version = "0.1.0"
+dependencies = [
+ "askama",
+ "kyriakon-onboard-core",
+ "kyriakon-onboard-drain",
+ "kyriakon-onboard-handler",
+ "kyriakon-onboard-tui",
+ "libc",
+ "serde_json",
+ "time",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
+name = "kyriakon-onboard-tui"
+version = "0.1.0"
+dependencies = [
+ "kyriakon-onboard-core",
+ "libc",
+]
+
+[[package]]
+name = "kyriakon-onboardctl"
+version = "0.1.0"
+dependencies = [
+ "kyriakon-onboard-core",
+ "kyriakon-onboard-drain",
+ "serde_json",
+ "time",
+ "tokio",
 ]
 
 [[package]]

@@ -39,13 +39,19 @@ jobs:
       # Hand formatted until now; this is what stops the next drift arriving as a
       # 700-line commit nobody can review.
       - name: fmt
-        run: cargo fmt --manifest-path onboard/Cargo.toml --check
+        run: cargo fmt --manifest-path onboard/Cargo.toml --all --check
       - name: test
         run: cargo test --manifest-path onboard/Cargo.toml
       # Warnings are errors: the crate is clean at this bar today, so a new one
       # fails the check rather than scrolling past.
       - name: clippy
         run: cargo clippy --manifest-path onboard/Cargo.toml --all-targets -- -D warnings
+      # The package cut is a rule, not a convention: the unprivileged handler
+      # must not link the root drain, and the terminal must not link the handler.
+      - name: package boundary
+        run: |
+          ! cargo tree --manifest-path onboard/Cargo.toml -p kyriakon-onboard-handler --edges normal | grep -q kyriakon-onboard-drain
+          ! cargo tree --manifest-path onboard/Cargo.toml -p kyriakon-onboard-tui --edges normal | grep -q kyriakon-onboard-handler
       # The handler links the prototype crate's check, so its fixtures, format
       # and lint run here; no other job in this file sees that crate.
       - name: key check fixtures

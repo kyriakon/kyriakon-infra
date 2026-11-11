@@ -344,7 +344,7 @@ dnsbl_verdict() {
 # subject says nothing is read last, if at all.
 #
 # The components, one word per thing the box runs, the same word in every mail
-# about it. onboard/src/mail/notice.rs builds the identical shape for the drain:
+# about it. onboard/crates/core/src/mail/notice.rs builds the identical shape for the drain:
 #
 #   onboard  the signup service: the handler, the drain and the store
 #   mail     smtpd, dovecot, and the accounts and allowances behind them
