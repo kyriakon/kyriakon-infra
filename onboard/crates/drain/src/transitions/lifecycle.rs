@@ -11,6 +11,7 @@ use super::groups::{
     take_group_down, write_account_record, write_group_record, write_group_state,
 };
 use super::payments::{resolve_payment, token_join, write_payment_copy};
+use super::Error;
 use super::{due, report_failure, write_journal, Settlement};
 use kyriakon_onboard_core::account::dns;
 use kyriakon_onboard_core::config::DrainConfig;
@@ -44,7 +45,7 @@ pub(super) fn group_recipient(
     record: &Record,
     site_owner: &str,
     domain: &str,
-) -> Result<String, String> {
+) -> Result<String, Error> {
     Ok(outside_address(record)?.unwrap_or_else(|| format!("{site_owner}@{domain}")))
 }
 
@@ -65,13 +66,13 @@ pub(super) async fn report_record(
     journal: &Journal,
     kind: &str,
     name: &str,
-    message: &str,
+    error: &Error,
 ) {
     let id = format!("{kind}:{name}");
     if !due(journal, &id, OffsetDateTime::now_utc()) {
         return;
     }
-    report_failure(cfg, store, journal, &id, "record", message).await;
+    report_failure(cfg, store, journal, &id, "record", error).await;
 }
 
 /// One account a sweep is about, or `None` when it is gone. A record that cannot
@@ -86,7 +87,7 @@ async fn sweep_account(
     match store.account(username).await {
         Ok(account) => account,
         Err(e) => {
-            report_record(cfg, store, journal, "account", username, &e.to_string()).await;
+            report_record(cfg, store, journal, "account", username, &Error::from(e)).await;
             None
         }
     }
@@ -119,7 +120,7 @@ async fn sweep_application(
     match store.application(token).await {
         Ok(record) => record,
         Err(e) => {
-            report_record(cfg, store, journal, "application", token, &e.to_string()).await;
+            report_record(cfg, store, journal, "application", token, &Error::from(e)).await;
             None
         }
     }
@@ -145,7 +146,7 @@ pub async fn set_password(
     intent: PasswordIntent,
     file: &str,
     value: &Value,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     let token = intent
         .application
         .status_token
@@ -183,8 +184,10 @@ pub async fn set_password(
     run_script(cfg, "set-mail-password.sh", &[username, &hash]).await?;
     // One use: the record keeps no link, so the page stops answering.
     record["password_link"] = Value::Null;
-    let bytes = serde_json::to_vec_pretty(&record)
-        .map_err(|e| format!("cannot encode the application record: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Error::Json {
+        context: "encode the application record",
+        source,
+    })?;
     // `applications/` belongs to the handler, which renders the status page as
     // _onboard: a root-owned record reads as missing to it.
     let owner = store.dir_owner("applications");
@@ -221,11 +224,7 @@ async fn password_refusal(
 /// a retry is the operator's decision, but the plaintext must not stay in
 /// `intents/` and every backup. The rewrite is the same atomic write, handed to
 /// the directory's owner so the unprivileged handler can still read it.
-pub(crate) async fn redact_password(
-    store: &Store,
-    file: &str,
-    value: &Value,
-) -> Result<(), String> {
+pub(crate) async fn redact_password(store: &Store, file: &str, value: &Value) -> Result<(), Error> {
     let mut redacted = value.clone();
     let Some(object) = redacted.as_object_mut() else {
         return Ok(());
@@ -233,22 +232,21 @@ pub(crate) async fn redact_password(
     if object.remove("password").is_none() {
         return Ok(());
     }
-    let bytes = serde_json::to_vec_pretty(&redacted)
-        .map_err(|e| format!("cannot encode the intent: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&redacted).map_err(|source| Error::Json {
+        context: "encode the intent",
+        source,
+    })?;
     let owner = store.dir_owner("intents");
     store
         .write_record_owned("intents", file, &bytes, owner)
         .await
-        .map_err(String::from)
+        .map_err(Error::from)
 }
 
 /// Give an open payment window its one extension, as `onboardctl window extend`
 /// asks. The new close is fourteen days past the old one, and the counter makes
 /// a second extension a refusal: the window is a courtesy, not a free tier.
-pub async fn window_extend(
-    store: &Store,
-    intent: WindowExtendIntent,
-) -> Result<Settlement, String> {
+pub async fn window_extend(store: &Store, intent: WindowExtendIntent) -> Result<Settlement, Error> {
     // A refusal is journaled once and the intent is left in place, as the credit
     // path does; a new intent is the way to change the answer.
     if !store::is_payment_token(&intent.token) {
@@ -291,16 +289,20 @@ pub async fn window_extend(
     // be read fails here, with the window still unchanged for the retry.
     let mut join = store.token(&intent.token).await?;
     account.payment = Some(payment.clone());
-    let bytes = serde_json::to_vec_pretty(&account)
-        .map_err(|e| format!("cannot encode the account: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+        context: "encode the account",
+        source,
+    })?;
     write_account_record(store, &username, &bytes).await?;
     write_payment_copy(store, &username, &payment).await?;
     // The token index carries the date the operator's list and any later lookup
     // sees, so keep it beside the account.
     if let Some(join) = join.as_mut() {
         join.window_closes_at = new_close.clone();
-        let bytes = serde_json::to_vec_pretty(&join)
-            .map_err(|e| format!("cannot encode the token record: {e}"))?;
+        let bytes = serde_json::to_vec_pretty(&join).map_err(|source| Error::Json {
+            context: "encode the token record",
+            source,
+        })?;
         store
             .write_record("tokens", &format!("{}.json", intent.token), &bytes)
             .await?;
@@ -332,7 +334,7 @@ async fn extend_group_window(
     store: &Store,
     intent: WindowExtendIntent,
     domain: &str,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     let Some(mut group) = group_record(store, domain).await? else {
         return Ok(Settlement::refused(
             "the token resolves to a group that is gone",
@@ -355,8 +357,10 @@ async fn extend_group_window(
     write_group_record(store, &group).await?;
     if let Some(join) = join.as_mut() {
         join.window_closes_at = new_close.clone();
-        let bytes = serde_json::to_vec_pretty(&join)
-            .map_err(|e| format!("cannot encode the token record: {e}"))?;
+        let bytes = serde_json::to_vec_pretty(&join).map_err(|source| Error::Json {
+            context: "encode the token record",
+            source,
+        })?;
         store
             .write_record("tokens", &format!("{}.json", intent.token), &bytes)
             .await?;
@@ -377,18 +381,22 @@ fn extend_open_window(
     paid_until: Option<&str>,
     window: &mut Window,
     days: i64,
-) -> Result<String, String> {
+) -> Result<String, Error> {
     if paid_until.is_some() || window.state != "open" {
-        return Err("the payment window is not open, so it has nothing to extend".to_string());
+        return Err(Error::from(
+            "the payment window is not open, so it has nothing to extend".to_string(),
+        ));
     }
     if window.extensions >= 1 {
-        return Err(
+        return Err(Error::from(
             "the payment window has already been extended once; a second extension is refused"
                 .to_string(),
-        );
+        ));
     }
     let Ok(closes) = OffsetDateTime::parse(&window.closes_at, &Rfc3339) else {
-        return Err("the window's close date cannot be read".to_string());
+        return Err(Error::from(
+            "the window's close date cannot be read".to_string(),
+        ));
     };
     let closes = closes + Duration::days(days);
     window.closes_at = closes
@@ -413,7 +421,7 @@ pub async fn window_sweep(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let now = OffsetDateTime::now_utc();
     for username in store.list("accounts").await? {
         let Some(mut account) = sweep_account(cfg, store, journal, &username).await else {
@@ -430,7 +438,7 @@ pub async fn window_sweep(
             // notice record, not the window, is what stops a duplicate.
             if account.state == "lapsed" {
                 if let Err(e) = lapse_notice(cfg, store, &username, &account, &payment).await {
-                    eprintln!("kyriakon-onboard: the lapse notice for {username}: {e}");
+                    e.report(&format!("the lapse notice for {username}"));
                 }
             }
             continue;
@@ -452,8 +460,10 @@ pub async fn window_sweep(
                 window.state = "paid".to_string();
             }
             account.payment = Some(payment.clone());
-            let bytes = serde_json::to_vec_pretty(&account)
-                .map_err(|e| format!("cannot encode the account: {e}"))?;
+            let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+                context: "encode the account",
+                source,
+            })?;
             write_account_record(store, &username, &bytes).await?;
             write_payment_copy(store, &username, &payment).await?;
             continue;
@@ -462,7 +472,7 @@ pub async fn window_sweep(
         // failure leaves the window open, so the next pass tries again rather
         // than the account reading lapsed while it still sends and pushes.
         if let Err(e) = run_script(cfg, "lapse-user.sh", &[username.as_str()]).await {
-            eprintln!("kyriakon-onboard: stopping access for {username}: {e}");
+            Error::from(e).report(&format!("stopping access for {username}"));
             continue;
         }
         let Some(window) = payment.window.as_mut() else {
@@ -472,12 +482,14 @@ pub async fn window_sweep(
         account.state = "lapsed".to_string();
         account.grace_until = Some(util::date_after_days(40));
         account.payment = Some(payment.clone());
-        let bytes = serde_json::to_vec_pretty(&account)
-            .map_err(|e| format!("cannot encode the account: {e}"))?;
+        let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+            context: "encode the account",
+            source,
+        })?;
         write_account_record(store, &username, &bytes).await?;
         write_payment_copy(store, &username, &payment).await?;
         if let Err(e) = lapse_notice(cfg, store, &username, &account, &payment).await {
-            eprintln!("kyriakon-onboard: the lapse notice for {username}: {e}");
+            e.report(&format!("the lapse notice for {username}"));
         }
     }
 
@@ -498,7 +510,7 @@ pub async fn window_sweep(
             // The group already lapsed; the notice is re-offered because the
             // notice record, not the window, is what stops a duplicate.
             if let Err(e) = group_lapse_notice(cfg, store, journal, &group, &window).await {
-                eprintln!("kyriakon-onboard: the lapse notice for {domain}: {e}");
+                e.report(&format!("the lapse notice for {domain}"));
             }
             continue;
         }
@@ -530,7 +542,7 @@ pub async fn window_sweep(
         let mut stopped = true;
         for mailbox in &group.accounts {
             if let Err(e) = run_script(cfg, "lapse-user.sh", &[mailbox.as_str()]).await {
-                eprintln!("kyriakon-onboard: stopping access for {mailbox} in {domain}: {e}");
+                Error::from(e).report(&format!("stopping access for {mailbox} in {domain}"));
                 stopped = false;
                 continue;
             }
@@ -538,7 +550,7 @@ pub async fn window_sweep(
                 Ok(Some(account)) => account,
                 Ok(None) => continue,
                 Err(e) => {
-                    report_record(cfg, store, journal, "account", mailbox, &e.to_string()).await;
+                    report_record(cfg, store, journal, "account", mailbox, &Error::from(e)).await;
                     stopped = false;
                     continue;
                 }
@@ -550,8 +562,10 @@ pub async fn window_sweep(
             }
             account.state = "lapsed".to_string();
             account.grace_until = Some(grace.clone());
-            let bytes = serde_json::to_vec_pretty(&account)
-                .map_err(|e| format!("cannot encode the account: {e}"))?;
+            let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+                context: "encode the account",
+                source,
+            })?;
             write_account_record(store, mailbox, &bytes).await?;
         }
         if !stopped {
@@ -563,7 +577,7 @@ pub async fn window_sweep(
         group.grace_until = Some(grace.clone());
         write_group_record(store, &group).await?;
         if let Err(e) = group_lapse_notice(cfg, store, journal, &group, &window).await {
-            eprintln!("kyriakon-onboard: the lapse notice for {domain}: {e}");
+            e.report(&format!("the lapse notice for {domain}"));
         }
     }
     Ok(())
@@ -578,7 +592,7 @@ async fn group_lapse_notice(
     journal: &Journal,
     group: &GroupRecord,
     window: &Window,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let Some(to) = group_notice_recipient(cfg, store, journal, group).await else {
         return Ok(());
     };
@@ -620,7 +634,7 @@ async fn group_grace_notice(
     journal: &Journal,
     group: &GroupRecord,
     grace: time::Date,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let Some(to) = group_notice_recipient(cfg, store, journal, group).await else {
         return Ok(());
     };
@@ -659,7 +673,7 @@ async fn group_final_notice(
     journal: &Journal,
     group: &GroupRecord,
     grace: time::Date,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let Some(to) = group_notice_recipient(cfg, store, journal, group).await else {
         return Ok(());
     };
@@ -696,11 +710,7 @@ async fn group_final_notice(
 /// deletion transition at `grace_until`. The notice is deduplicated by its
 /// `notices.jsonl` line, and the deletion is due-gated on the transition's own
 /// journal id so a failed erase backs off rather than being retried every minute.
-pub async fn grace_sweep(
-    cfg: &DrainConfig,
-    store: &Store,
-    journal: &Journal,
-) -> Result<(), String> {
+pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<(), Error> {
     let now = OffsetDateTime::now_utc();
     let today = now.date();
     for username in store.list("accounts").await? {
@@ -740,7 +750,7 @@ pub async fn grace_sweep(
             && today < grace - Duration::days(7)
         {
             if let Err(e) = grace_notice(cfg, store, &username, &account).await {
-                eprintln!("kyriakon-onboard: the grace notice for {username}: {e}");
+                e.report(&format!("the grace notice for {username}"));
             }
         }
         if today >= grace - Duration::days(7) {
@@ -750,7 +760,7 @@ pub async fn grace_sweep(
                 final_notice(cfg, store, &username, &account).await
             };
             if let Err(e) = sent {
-                eprintln!("kyriakon-onboard: the final notice for {username}: {e}");
+                e.report(&format!("the final notice for {username}"));
             }
         }
     }
@@ -763,7 +773,7 @@ pub async fn grace_sweep(
             Ok(Some(group)) => group,
             Ok(None) => continue,
             Err(e) => {
-                eprintln!("kyriakon-onboard: reading {domain}'s grace: {e}");
+                e.report(&format!("reading {domain}'s grace"));
                 continue;
             }
         };
@@ -799,12 +809,12 @@ pub async fn grace_sweep(
         }
         if today >= grace - Duration::days(30) && today < grace - Duration::days(7) {
             if let Err(e) = group_grace_notice(cfg, store, journal, &group, grace).await {
-                eprintln!("kyriakon-onboard: the grace notice for {domain}: {e}");
+                e.report(&format!("the grace notice for {domain}"));
             }
         }
         if today >= grace - Duration::days(7) {
             if let Err(e) = group_final_notice(cfg, store, journal, &group, grace).await {
-                eprintln!("kyriakon-onboard: the final notice for {domain}: {e}");
+                e.report(&format!("the final notice for {domain}"));
             }
         }
     }
@@ -832,7 +842,7 @@ fn notice_address(account: &Account) -> String {
 /// because provisioning writes a group mailbox's account without an outside
 /// address of its own. Both are read through the typed accessors of #554, and
 /// both are held to the same validation rule as a person's notice.
-async fn group_notice_address(store: &Store, group: &GroupRecord) -> Result<String, String> {
+async fn group_notice_address(store: &Store, group: &GroupRecord) -> Result<String, Error> {
     let path = format!("accounts/{}/account.json", group.site_owner);
     let account = store
         .account(&group.site_owner)
@@ -869,7 +879,10 @@ async fn group_notice_recipient(
                 journal,
                 "account",
                 &group.site_owner,
-                &format!("{e}, so {}'s group notice has no addressee", group.domain),
+                &Error::from(format!(
+                    "{e}, so {}'s group notice has no addressee",
+                    group.domain
+                )),
             )
             .await;
             None
@@ -886,7 +899,7 @@ async fn grace_notice(
     store: &Store,
     username: &str,
     account: &Account,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let grace = account.grace_until.as_deref().unwrap_or("");
     let token = account
         .payment_state()
@@ -917,7 +930,7 @@ async fn delete_group(
     journal: &Journal,
     group: &GroupRecord,
     id: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     if journal.has(id, "applied") {
         return remove_group_record(store, &group.domain).await;
     }
@@ -958,7 +971,7 @@ async fn final_notice(
     store: &Store,
     username: &str,
     account: &Account,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let grace = account.grace_until.as_deref().unwrap_or("");
     let token = account
         .payment_state()
@@ -988,7 +1001,7 @@ async fn suspension_final_notice(
     store: &Store,
     username: &str,
     account: &Account,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let grace = account.grace_until.as_deref().unwrap_or("");
     let reason = account.suspension_reason.as_deref().unwrap_or("");
     let to = notice_address(account);
@@ -1027,7 +1040,7 @@ async fn lapse_notice(
     username: &str,
     account: &Account,
     payment: &Payment,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let window = payment
         .window
         .as_ref()
@@ -1067,16 +1080,18 @@ pub async fn suspend(
     journal: &Journal,
     username: &str,
     reason: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     if let Some(why) = validate::username_shape(username) {
-        return Err(format!("the username {username:?}: {why}"));
+        return Err(Error::from(format!("the username {username:?}: {why}")));
     }
     let reason = reason.trim();
     if reason.is_empty() {
-        return Err("a suspension needs a reason, in the words the member will read".to_string());
+        return Err(Error::from(
+            "a suspension needs a reason, in the words the member will read".to_string(),
+        ));
     }
     let Some(mut account) = store.account(username).await? else {
-        return Err(format!("no account for {username}"));
+        return Err(Error::from(format!("no account for {username}")));
     };
     // The id is the account's own, so a retry after a crash finishes the same
     // suspension rather than starting a second one.
@@ -1103,8 +1118,10 @@ pub async fn suspend(
     if account.grace_until.is_none() {
         account.grace_until = Some(util::date_after_days(40));
     }
-    let bytes = serde_json::to_vec_pretty(&account)
-        .map_err(|e| format!("cannot encode the account: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+        context: "encode the account",
+        source,
+    })?;
     write_account_record(store, username, &bytes).await?;
     if !journal.has(&id, "applied") {
         write_journal(
@@ -1157,17 +1174,17 @@ pub async fn resume(
     store: &Store,
     journal: &Journal,
     username: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     if let Some(why) = validate::username_shape(username) {
-        return Err(format!("the username {username:?}: {why}"));
+        return Err(Error::from(format!("the username {username:?}: {why}")));
     }
     let Some(mut account) = store.account(username).await? else {
-        return Err(format!("no account for {username}"));
+        return Err(Error::from(format!("no account for {username}")));
     };
     if account.state != "suspended" {
-        return Err(format!(
+        return Err(Error::from(format!(
             "{username} is not suspended, so there is nothing to resume"
-        ));
+        )));
     }
     let id = format!("resume-{username}-{}", account.created_at);
     let application = ApplicationRef::account(username.to_string());
@@ -1186,8 +1203,10 @@ pub async fn resume(
     account.state = "active".to_string();
     account.suspension_reason = None;
     account.grace_until = None;
-    let bytes = serde_json::to_vec_pretty(&account)
-        .map_err(|e| format!("cannot encode the account: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+        context: "encode the account",
+        source,
+    })?;
     write_account_record(store, username, &bytes).await?;
     write_journal(
         store,
@@ -1226,9 +1245,9 @@ pub async fn delete_account(
     store: &Store,
     journal: &Journal,
     username: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     if let Some(why) = validate::username_shape(username) {
-        return Err(format!("the username {username}: {why}"));
+        return Err(Error::from(format!("the username {username}: {why}")));
     }
     // The account record is read before the journal line so the answer can name
     // a refund from the token's ledger lines. A record that has already gone is
@@ -1326,7 +1345,7 @@ pub async fn delete_account(
 /// nothing when the ledger has none. Read from the ledger rather than the
 /// account because the refund is a ledger line and the account record is about
 /// to go.
-async fn erasure_refund(store: &Store, account: &Account) -> Result<Option<String>, String> {
+async fn erasure_refund(store: &Store, account: &Account) -> Result<Option<String>, Error> {
     let Some(token) = account.payment_state().and_then(|p| p.token_ref) else {
         return Ok(None);
     };
@@ -1346,12 +1365,15 @@ async fn erasure_refund(store: &Store, account: &Account) -> Result<Option<Strin
 
 /// Drop one account's published key from the box keyring. A missing directory or
 /// file is already done, which is what makes a retry safe.
-async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), String> {
+async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
     let path = kyriakon_onboard_core::mail::keycheck::keyring_file(&cfg.keyring_dir, username);
     match tokio::fs::remove_file(&path).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("cannot remove {}: {e}", path.display())),
+        Err(e) => Err(Error::from(format!(
+            "cannot remove {}: {e}",
+            path.display()
+        ))),
     }
 }
 
@@ -1359,9 +1381,12 @@ async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), S
 /// window. The deletion itself is the sweep's, so the account works normally
 /// until the window ends and a replayed intent changes nothing. The session that
 /// proves the request is `verify`'s.
-pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlement, String> {
+pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlement, Error> {
     if intent.kind != "close" {
-        return Err(format!("kind {:?} is not a close intent", intent.kind));
+        return Err(Error::from(format!(
+            "kind {:?} is not a close intent",
+            intent.kind
+        )));
     }
     let application = ApplicationRef::account(intent.username.clone());
     let Some(mut account) = store.account(&intent.username).await? else {
@@ -1386,7 +1411,7 @@ pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlem
     };
     if let Err(e) = kyriakon_onboard_core::account::requests::record(store, request).await {
         if !e.contains("already recorded") {
-            return Err(e);
+            return Err(Error::from(e));
         }
     }
     if account.state == "closing" {
@@ -1398,8 +1423,10 @@ pub async fn close_account(store: &Store, intent: CloseIntent) -> Result<Settlem
     }
     account.state = "closing".to_string();
     account.closing_until = Some(util::date_after_days(7));
-    let bytes = serde_json::to_vec_pretty(&account)
-        .map_err(|e| format!("cannot encode the account: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+        context: "encode the account",
+        source,
+    })?;
     write_account_record(store, &intent.username, &bytes).await?;
     Ok(Settlement::line(
         "applied",
@@ -1419,9 +1446,11 @@ fn account_gone(username: &str) -> Settlement {
 
 /// Write an account record back, readable by the handler and owned the way the
 /// directory's other records are.
-async fn save_account(store: &Store, account: &Account) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(account)
-        .map_err(|e| format!("cannot encode the account: {e}"))?;
+async fn save_account(store: &Store, account: &Account) -> Result<(), Error> {
+    let bytes = serde_json::to_vec_pretty(account).map_err(|source| Error::Json {
+        context: "encode the account",
+        source,
+    })?;
     write_account_record(store, &account.username, &bytes).await
 }
 
@@ -1435,7 +1464,7 @@ pub async fn change_password(
     cfg: &DrainConfig,
     store: &Store,
     intent: ChangePasswordIntent,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     let Some(account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
@@ -1476,7 +1505,7 @@ pub async fn upload_key(
     cfg: &DrainConfig,
     store: &Store,
     intent: UploadKeyIntent,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     let Some(mut account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
@@ -1563,7 +1592,7 @@ pub async fn upload_key(
 pub async fn set_outside_address(
     store: &Store,
     intent: OutsideAddressIntent,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     let Some(mut account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
@@ -1599,7 +1628,7 @@ pub async fn set_serving(
     cfg: &DrainConfig,
     store: &Store,
     intent: ServingIntent,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     let Some(mut account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
@@ -1658,7 +1687,7 @@ pub async fn cancel_renewal(
     cfg: &DrainConfig,
     store: &Store,
     intent: CancelRenewalIntent,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     let Some(mut account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
@@ -1718,7 +1747,7 @@ async fn rotation_notices(
     request: &str,
     subject: &str,
     body: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     for (i, to) in account_addresses(account).iter().enumerate() {
         let kind = if i == 0 {
             format!("{notice_type}.{request}")
@@ -1740,7 +1769,7 @@ async fn signed_by_current_key(
     key_file: &std::path::Path,
     fingerprint: &str,
     signature: &str,
-) -> Result<bool, String> {
+) -> Result<bool, Error> {
     Ok(kyriakon_onboard_core::mail::keycheck::verify_signature(
         &cfg.gpg,
         key_file,
@@ -1762,13 +1791,13 @@ async fn apply_rotation(
     store: &Store,
     account: &mut Account,
     rotation: &store::Rotation,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let key = kyriakon_onboard_core::mail::keycheck::mail_key(String::new(), &rotation.material);
     if key.fingerprint != rotation.fingerprint {
-        return Err(format!(
+        return Err(Error::from(format!(
             "the pending key's fingerprint is {} and the key reads as {}",
             rotation.fingerprint, key.fingerprint
-        ));
+        )));
     }
     publish_mail_keys(cfg, &account.username, std::slice::from_ref(&key)).await?;
     account.mail_key = Some(rotation.fingerprint.clone());
@@ -1800,7 +1829,7 @@ pub async fn mail_key(
     cfg: &DrainConfig,
     store: &Store,
     intent: MailKeyIntent,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     let Some(mut account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
@@ -1931,7 +1960,7 @@ pub async fn mail_key_rotations(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     for username in store.list("accounts").await? {
         let Some(mut account) = sweep_account(cfg, store, journal, &username).await else {
             continue;
@@ -1993,12 +2022,12 @@ pub async fn check_group_dns(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let values = dns::Values::from(cfg);
     if let Err(e) = values.check() {
         // The approval already refuses a placeholder; a box that has one has no
         // published values to watch, and that is not a reason to hold the pass.
-        eprintln!("kyriakon-onboard: {e}");
+        Error::from(e).report("the DNS values");
         return Ok(());
     }
     let now = OffsetDateTime::now_utc();
@@ -2012,7 +2041,7 @@ pub async fn check_group_dns(
         // One group's bad record, failed write or refused notice is reported
         // and skipped: the other groups are still watched and the pass goes on.
         if let Err(e) = check_one_group(cfg, store, &values, &group, now).await {
-            eprintln!("kyriakon-onboard: watching {}: {e}", group.domain);
+            e.report(&format!("watching {}", group.domain));
         }
     }
     Ok(())
@@ -2025,7 +2054,7 @@ async fn check_one_group(
     values: &dns::Values,
     group: &GroupRecord,
     now: OffsetDateTime,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let state: Option<Value> = store
         .read_record(&format!("groups/{}", group.domain), "dns-check.json")
         .await
@@ -2109,7 +2138,7 @@ async fn write_dns_state(
     broken: bool,
     outage: Option<&str>,
     notified: bool,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let bytes = serde_json::to_vec_pretty(&json!({
         "version": 1,
         "checked_at": checked_at,
@@ -2117,11 +2146,14 @@ async fn write_dns_state(
         "outage": outage,
         "notified": notified,
     }))
-    .map_err(|e| format!("cannot encode the DNS check state: {e}"))?;
+    .map_err(|source| Error::Json {
+        context: "encode the DNS check state",
+        source,
+    })?;
     store
         .write_record(&format!("groups/{domain}"), "dns-check.json", &bytes)
         .await
-        .map_err(String::from)
+        .map_err(Error::from)
 }
 
 /// Whether any row the recipe names has stopped resolving, or a TXT answer no
@@ -2129,7 +2161,7 @@ async fn write_dns_state(
 /// The resolver is a configured command so the acceptance test never touches the
 /// network; it is read-only by construction and the body's zone is not a file
 /// this box can write.
-async fn dns_broken(cfg: &DrainConfig, values: &dns::Values, domain: &str) -> Result<bool, String> {
+async fn dns_broken(cfg: &DrainConfig, values: &dns::Values, domain: &str) -> Result<bool, Error> {
     // The checks come from the recipe itself, so a row added to it (or a
     // rotated selector) is watched without a second list to edit.
     let recipe = dns::recipe(domain, values);
@@ -2164,12 +2196,12 @@ async fn dns_broken(cfg: &DrainConfig, values: &dns::Values, domain: &str) -> Re
                 // non-zero when it could not reach a server, and a name that
                 // does not resolve answers successfully with nothing. Only the
                 // second is an outage, so this is the platform's own failure.
-                return Err(format!(
+                return Err(Error::from(format!(
                     "the resolver {} could not answer {name} {}: {}",
                     cfg.resolver,
                     row.record_type,
                     String::from_utf8_lossy(&out.stderr).trim()
-                ));
+                )));
             }
             let answer = String::from_utf8_lossy(&out.stdout);
             let answer = answer.trim();
@@ -2188,7 +2220,7 @@ async fn dns_broken(cfg: &DrainConfig, values: &dns::Values, domain: &str) -> Re
 /// in the mailbox's retained application copy, and the accountable address
 /// otherwise. The copy is inside the ninety-day purge, so an application already
 /// cleared falls back rather than failing the sweep.
-pub(super) async fn dns_contact(store: &Store, group: &GroupRecord) -> Result<String, String> {
+pub(super) async fn dns_contact(store: &Store, group: &GroupRecord) -> Result<String, Error> {
     let copy: Option<Value> = store
         .account_application_text(&group.site_owner)
         .await?
@@ -2238,7 +2270,7 @@ pub async fn refresh_space_used(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     // A pass with no accounts has nothing to record, so it writes neither the
     // report nor the state. That keeps a store that has never been provisioned
     // byte-identical across a pass, which the sweep tests rely on.
@@ -2270,19 +2302,15 @@ pub async fn refresh_space_used(
             // No repquota on this box, or no permission: the same no-op the
             // other sweeps take, and the state still moves so the error is not
             // printed every minute.
-            eprintln!(
-                "kyriakon-onboard: cannot read the quota with {}: {e}",
-                cfg.repquota
-            );
+            Error::Failed(format!("cannot read the quota with {}: {e}", cfg.repquota))
+                .report("the quota report");
             write_quota_state(store).await?;
             return Ok(());
         }
     };
     if !report.status.success() {
-        eprintln!(
-            "kyriakon-onboard: {} exited {}",
-            cfg.repquota, report.status
-        );
+        Error::Failed(format!("{} exited {}", cfg.repquota, report.status))
+            .report("the quota report");
         write_quota_state(store).await?;
         return Ok(());
     }
@@ -2301,13 +2329,15 @@ pub async fn refresh_space_used(
             continue;
         }
         account.space_used = Some(bytes);
-        let encoded = serde_json::to_vec_pretty(&account)
-            .map_err(|e| format!("cannot encode the account: {e}"))?;
+        let encoded = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+            context: "encode the account",
+            source,
+        })?;
         match write_account_record(store, username, &encoded).await {
             Ok(()) => {
                 recorded.insert(username.clone());
             }
-            Err(e) => eprintln!("kyriakon-onboard: recording {username}'s quota: {e}"),
+            Err(e) => e.report(&format!("recording {username}'s quota")),
         }
     }
 
@@ -2339,7 +2369,7 @@ pub async fn refresh_space_used(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    report_record(cfg, store, journal, "account", mailbox, &e.to_string()).await;
+                    report_record(cfg, store, journal, "account", mailbox, &Error::from(e)).await;
                     readable = false;
                     break;
                 }
@@ -2351,10 +2381,12 @@ pub async fn refresh_space_used(
             continue;
         }
         group.space_used = Some(total);
-        let encoded = serde_json::to_vec_pretty(&group)
-            .map_err(|e| format!("cannot encode the group record: {e}"))?;
+        let encoded = serde_json::to_vec_pretty(&group).map_err(|source| Error::Json {
+            context: "encode the group record",
+            source,
+        })?;
         if let Err(e) = write_group_state(store, &name, &encoded).await {
-            eprintln!("kyriakon-onboard: recording {name}'s quota: {e}");
+            e.report(&format!("recording {name}'s quota"));
         }
     }
     write_quota_state(store).await
@@ -2415,14 +2447,16 @@ fn over_limit_flags(field: &str) -> bool {
 
 /// The sweep's own due stamp, root-only at the store root. It carries the time
 /// alone: the figures are on the accounts, where the page reads them.
-async fn write_quota_state(store: &Store) -> Result<(), String> {
+async fn write_quota_state(store: &Store) -> Result<(), Error> {
     let state = json!({ "version": 1, "checked_at": util::filed_at() });
-    let bytes = serde_json::to_vec_pretty(&state)
-        .map_err(|e| format!("cannot encode the quota state: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&state).map_err(|source| Error::Json {
+        context: "encode the quota state",
+        source,
+    })?;
     store
         .write_record("", "quota-check.json", &bytes)
         .await
-        .map_err(String::from)
+        .map_err(Error::from)
 }
 
 /// The yearly note to an account approved without charge: nothing is due, and
@@ -2435,7 +2469,7 @@ pub async fn free_anniversaries(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let today = OffsetDateTime::now_utc().date();
     for username in store.list("accounts").await? {
         let Some(account) = sweep_account(cfg, store, journal, &username).await else {
@@ -2489,7 +2523,7 @@ pub async fn free_anniversaries(
         )
         .await
         {
-            eprintln!("kyriakon-onboard: the free anniversary note for {username}: {e}");
+            Error::from(e).report(&format!("the free anniversary note for {username}"));
         }
     }
     Ok(())
@@ -2504,7 +2538,7 @@ pub async fn prepaid_renewals(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let today = OffsetDateTime::now_utc().date();
     for username in store.list("accounts").await? {
         let Some(account) = sweep_account(cfg, store, journal, &username).await else {
@@ -2571,7 +2605,7 @@ pub async fn prepaid_renewals(
         )
         .await
         {
-            eprintln!("kyriakon-onboard: the renewal note for {username}: {e}");
+            Error::from(e).report(&format!("the renewal note for {username}"));
         }
     }
 
@@ -2582,7 +2616,7 @@ pub async fn prepaid_renewals(
             Ok(Some(group)) => group,
             Ok(None) => continue,
             Err(e) => {
-                eprintln!("kyriakon-onboard: reading {domain}'s renewal: {e}");
+                e.report(&format!("reading {domain}'s renewal"));
                 continue;
             }
         };
@@ -2613,7 +2647,7 @@ pub async fn prepaid_renewals(
         let to = match dns_contact(store, &group).await {
             Ok(to) => to,
             Err(e) => {
-                eprintln!("kyriakon-onboard: the renewal note for {domain}: {e}");
+                e.report(&format!("the renewal note for {domain}"));
                 continue;
             }
         };
@@ -2628,7 +2662,7 @@ pub async fn prepaid_renewals(
         )
         .await
         {
-            eprintln!("kyriakon-onboard: the renewal note for {domain}: {e}");
+            Error::from(e).report(&format!("the renewal note for {domain}"));
         }
     }
     Ok(())
@@ -2647,7 +2681,7 @@ pub async fn export_account(
     store: &Store,
     intent: ExportIntent,
     file: &str,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     let username = intent.username.as_str();
     let id = if intent.id.is_empty() {
         file.trim_end_matches(".json").to_string()
@@ -2712,7 +2746,7 @@ pub async fn purge_declined(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let now = OffsetDateTime::now_utc();
     for name in store.list("applications").await? {
         if !name.ends_with(".json") {
@@ -2738,9 +2772,10 @@ pub async fn purge_declined(
         // revalidated before it can reach a root script's argv; a record whose
         // name does not fit is skipped rather than erroring the whole pass.
         if validate::username_shape(&record.username).is_some() {
-            eprintln!(
-                "kyriakon-onboard-drain: declined record {name} has no usable username; skipped"
-            );
+            Error::Failed(format!(
+                "declined record {name} has no usable username; skipped"
+            ))
+            .report("the purge sweep");
             continue;
         }
         let app = ApplicationRef::application(record.username.clone(), record.status_token.clone());
@@ -2788,7 +2823,7 @@ pub async fn purge_declined(
                         journal,
                         "account",
                         &record.username,
-                        &e.to_string(),
+                        &Error::from(e),
                     )
                     .await;
                     continue;
@@ -2796,7 +2831,8 @@ pub async fn purge_declined(
             };
             if !taken {
                 if let Err(e) = run_script(cfg, "delete-user.sh", &[&record.username]).await {
-                    report_failure(cfg, store, journal, &purge_id, "decline", &e).await;
+                    report_failure(cfg, store, journal, &purge_id, "decline", &Error::from(e))
+                        .await;
                     continue;
                 }
             }
@@ -2830,7 +2866,7 @@ pub async fn purge_closing(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let today = util::date_after_days(0);
     for username in store.list("accounts").await? {
         if validate::username_shape(&username).is_some() {

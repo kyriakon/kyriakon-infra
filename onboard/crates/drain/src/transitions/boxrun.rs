@@ -8,9 +8,82 @@
 
 use kyriakon_onboard_core::config::DrainConfig;
 use kyriakon_onboard_core::flow::validate;
-use kyriakon_onboard_core::store::{KeyRecord, Record, Store};
+use kyriakon_onboard_core::store::{self, KeyRecord, Record, Store};
+use std::fmt;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use tokio::process::Command;
+
+/// A script, a key file, or an address the drain could not use.
+#[derive(Debug)]
+pub enum Error {
+    /// The configured script could not be started.
+    Spawn {
+        script: PathBuf,
+        source: std::io::Error,
+    },
+    /// The script ran and exited non-zero.
+    Exited {
+        script: PathBuf,
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
+    /// A value the drain refuses before it reaches the box.
+    Refused(String),
+    /// A key file could not be created, written or chmodded.
+    Io {
+        context: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// The store failed while writing a key.
+    Store(store::Error),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Spawn { script, source } => {
+                write!(f, "cannot run {}: {source}", script.display())
+            }
+            Error::Exited {
+                script,
+                status,
+                stderr,
+            } => write!(f, "{} exited {status}: {stderr}", script.display()),
+            Error::Refused(message) => f.write_str(message),
+            Error::Io {
+                context,
+                path,
+                source,
+            } => write!(f, "cannot {context} {}: {source}", path.display()),
+            Error::Store(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Spawn { source, .. } | Error::Io { source, .. } => Some(source),
+            Error::Store(error) => Some(error),
+            Error::Exited { .. } | Error::Refused(_) => None,
+        }
+    }
+}
+
+impl From<store::Error> for Error {
+    fn from(error: store::Error) -> Self {
+        Error::Store(error)
+    }
+}
+
+/// Bridge for callers not converted yet; step 5 removes it.
+impl From<Error> for String {
+    fn from(error: Error) -> String {
+        error.to_string()
+    }
+}
 
 /// Run one of the repository's privileged scripts by its configured path and
 /// hand back what it wrote. It is called with argv only: there is no shell
@@ -19,8 +92,8 @@ pub(super) async fn spawn_script(
     cfg: &DrainConfig,
     name: &str,
     args: &[&str],
-) -> Result<std::process::Output, String> {
-    let path = format!("{}/{}", cfg.scripts.trim_end_matches('/'), name);
+) -> Result<std::process::Output, Error> {
+    let path = PathBuf::from(format!("{}/{}", cfg.scripts.trim_end_matches('/'), name));
     // The drain runs from root cron, whose PATH is /usr/bin:/bin, and the scripts
     // it runs reach the packages in /usr/local: without this, a provision's
     // reload call cannot find gmid, refuses, and fails the whole approval.
@@ -32,11 +105,14 @@ pub(super) async fn spawn_script(
         )
         .output()
         .await
-        .map_err(|e| format!("cannot run {path}: {e}"))
+        .map_err(|source| Error::Spawn {
+            script: path,
+            source,
+        })
 }
 
 /// Run a script and refuse a non-zero exit, naming what it said.
-pub(super) async fn run_script(cfg: &DrainConfig, name: &str, args: &[&str]) -> Result<(), String> {
+pub(super) async fn run_script(cfg: &DrainConfig, name: &str, args: &[&str]) -> Result<(), Error> {
     let out = spawn_script(cfg, name, args).await?;
     if !out.status.success() {
         return Err(script_error(cfg, name, &out));
@@ -52,7 +128,7 @@ pub(super) async fn run_script_tolerating(
     name: &str,
     args: &[&str],
     tolerate: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let out = spawn_script(cfg, name, args).await?;
     if out.status.success() || String::from_utf8_lossy(&out.stderr).contains(tolerate) {
         return Ok(());
@@ -60,13 +136,13 @@ pub(super) async fn run_script_tolerating(
     Err(script_error(cfg, name, &out))
 }
 
-pub(super) fn script_error(cfg: &DrainConfig, name: &str, out: &std::process::Output) -> String {
-    let path = format!("{}/{}", cfg.scripts.trim_end_matches('/'), name);
-    format!(
-        "{path} exited {}: {}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr).trim()
-    )
+pub(super) fn script_error(cfg: &DrainConfig, name: &str, out: &std::process::Output) -> Error {
+    let script = PathBuf::from(format!("{}/{}", cfg.scripts.trim_end_matches('/'), name));
+    Error::Exited {
+        script,
+        status: out.status,
+        stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    }
 }
 
 /// Write the member's upload key where `provision-member.sh` reads it, in the
@@ -75,18 +151,20 @@ pub(super) async fn write_public_key(
     store: &Store,
     username: &str,
     material: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let body = material.trim();
     if body.is_empty() {
-        return Err("the upload key material is empty".to_string());
+        return Err(Error::Refused(
+            "the upload key material is empty".to_string(),
+        ));
     }
     store.ensure_dir("keys").await?;
     let mut bytes = body.as_bytes().to_vec();
     bytes.push(b'\n');
     store
         .write_record("keys", &format!("{username}.pub"), &bytes)
-        .await
-        .map_err(String::from)
+        .await?;
+    Ok(())
 }
 
 /// The localpart a mail key is published and served under: the mailbox when the
@@ -110,23 +188,31 @@ pub(super) async fn publish_mail_keys(
     cfg: &DrainConfig,
     username: &str,
     keys: &[KeyRecord],
-) -> Result<(), String> {
+) -> Result<(), Error> {
     if keys.is_empty() {
-        return Err(
+        return Err(Error::Refused(
             "the application carries no mail key, so the account could not receive mail"
                 .to_string(),
-        );
+        ));
     }
     let dir = std::path::Path::new(&cfg.keyring_dir);
-    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(dir).map_err(|source| Error::Io {
+        context: "create",
+        path: dir.to_path_buf(),
+        source,
+    })?;
     for key in keys {
         let localpart = mail_key_localpart(username, key);
         if let Some(why) = validate::username_shape(localpart) {
-            return Err(format!("the mail key's mailbox {localpart:?}: {why}"));
+            return Err(Error::Refused(format!(
+                "the mail key's mailbox {localpart:?}: {why}"
+            )));
         }
         let body = key.material.trim();
         if body.is_empty() {
-            return Err(format!("the mail key for {localpart} is empty"));
+            return Err(Error::Refused(format!(
+                "the mail key for {localpart} is empty"
+            )));
         }
         let path = kyriakon_onboard_core::mail::keycheck::keyring_file(&cfg.keyring_dir, localpart);
         let mut bytes = body.as_bytes().to_vec();
@@ -140,13 +226,21 @@ pub(super) async fn publish_mail_keys(
             .map(|have| have == bytes)
             .unwrap_or(false);
         if !same {
-            std::fs::write(&path, &bytes)
-                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            std::fs::write(&path, &bytes).map_err(|source| Error::Io {
+                context: "write",
+                path: path.clone(),
+                source,
+            })?;
         }
         // deploy-mail installs the tracked keys 0644, and the drift check and the
         // encrypting daemon both read them as they find them.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-            .map_err(|e| format!("cannot set the mode on {}: {e}", path.display()))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).map_err(
+            |source| Error::Io {
+                context: "set the mode on",
+                path: path.clone(),
+                source,
+            },
+        )?;
     }
     Ok(())
 }
@@ -165,7 +259,7 @@ pub(super) async fn publish_mail_keys_publicly(
     cfg: &DrainConfig,
     username: &str,
     keys: &[KeyRecord],
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let dir = cfg.keyring_dir.trim_end_matches('/');
     for key in keys {
         let localpart = mail_key_localpart(username, key);
@@ -185,11 +279,13 @@ pub(super) async fn publish_mail_keys_publicly(
 /// The address the applicant gave outside the platform, revalidated here because
 /// it was written by the unprivileged half and is about to become a mail header.
 /// `None` when none was given.
-pub(super) fn outside_address(record: &Record) -> Result<Option<String>, String> {
+pub(super) fn outside_address(record: &Record) -> Result<Option<String>, Error> {
     match record.outside_address.as_deref() {
         Some(addr) => {
             if let Some(why) = validate::address(addr) {
-                return Err(format!("the address outside the platform {addr:?}: {why}"));
+                return Err(Error::Refused(format!(
+                    "the address outside the platform {addr:?}: {why}"
+                )));
             }
             Ok(Some(addr.to_string()))
         }
@@ -199,6 +295,6 @@ pub(super) fn outside_address(record: &Record) -> Result<Option<String>, String>
 
 /// The address an approval notice goes to: the applicant's own outside address,
 /// or the mailbox the approval just created.
-pub(super) fn recipient(record: &Record, username: &str) -> Result<String, String> {
+pub(super) fn recipient(record: &Record, username: &str) -> Result<String, Error> {
     Ok(outside_address(record)?.unwrap_or_else(|| format!("{username}@kyriakon.net")))
 }

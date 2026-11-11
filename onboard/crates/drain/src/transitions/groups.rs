@@ -14,6 +14,7 @@ use super::boxrun::{
     publish_mail_keys, publish_mail_keys_publicly, run_script, run_script_tolerating,
     write_public_key,
 };
+use super::Error;
 use super::{write_journal, Settlement};
 use kyriakon_onboard_core::config::DrainConfig;
 use kyriakon_onboard_core::flow::questions;
@@ -38,14 +39,14 @@ use time::OffsetDateTime;
 /// names. An `own` line names a mailbox; an `alias` line points at one already
 /// named, and the address shares that mailbox. The name on an alias line is not
 /// used: the mailbox is the one its `own` target names.
-pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec<String>), String> {
+pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec<String>), Error> {
     let text = record
         .answers
         .get("body_addresses")
         .map(String::as_str)
         .unwrap_or("");
     if let Some(why) = validate::address_lines(text) {
-        return Err(format!("the address table: {why}"));
+        return Err(Error::from(format!("the address table: {why}")));
     }
     let lines: Vec<&str> = text
         .lines()
@@ -54,11 +55,11 @@ pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec
         .collect();
     let names = questions::account_names(&record.answers);
     if names.len() != lines.len() {
-        return Err(format!(
+        return Err(Error::from(format!(
             "{} addresses and {} account names; there is one name per address",
             lines.len(),
             names.len()
-        ));
+        )));
     }
 
     let mut own: BTreeMap<&str, &str> = BTreeMap::new();
@@ -70,13 +71,15 @@ pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec
         })?;
         let local = local.trim();
         if !seen.insert(local) {
-            return Err(format!("the address {local} is in the table twice"));
+            return Err(Error::from(format!(
+                "the address {local} is in the table twice"
+            )));
         }
         if rest.trim() == "own" {
             if mailboxes.iter().any(|m| m == name) {
-                return Err(format!(
+                return Err(Error::from(format!(
                     "the mailbox {name} is named by two mailboxes; an alias shares a mailbox instead"
-                ));
+                )));
             }
             own.insert(local, name);
             mailboxes.push(name.clone());
@@ -119,27 +122,27 @@ pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec
 /// shortcut: the community block has no site-owner question yet, so the site is
 /// the applicant's account when the table names it and the first mailbox
 /// otherwise; add the question and read it here.
-pub(super) fn site_owner(record: &Record, mailboxes: &[String]) -> Result<String, String> {
+pub(super) fn site_owner(record: &Record, mailboxes: &[String]) -> Result<String, Error> {
     if mailboxes.iter().any(|m| m == &record.username) {
         return Ok(record.username.clone());
     }
     mailboxes.first().cloned().ok_or_else(|| {
-        "the address table names no mailbox, so no account owns the site".to_string()
+        Error::from("the address table names no mailbox, so no account owns the site".to_string())
     })
 }
 
 /// The group record, when one is already there. A record that cannot be read or
 /// parsed is an error rather than "no group": treating it as absent would let an
 /// approval adopt accounts the record names.
-pub async fn group_record(store: &Store, domain: &str) -> Result<Option<GroupRecord>, String> {
+pub async fn group_record(store: &Store, domain: &str) -> Result<Option<GroupRecord>, Error> {
     let Some(record) = store.group(domain).await? else {
         return Ok(None);
     };
     if record.version != 1 {
-        return Err(format!(
+        return Err(Error::from(format!(
             "groups/{domain}/group.json has version {}, which this build does not read",
             record.version
-        ));
+        )));
     }
     Ok(Some(record))
 }
@@ -153,7 +156,7 @@ pub(super) async fn check_group_names(
     domain: &str,
     mailboxes: &[String],
     record: Option<&GroupRecord>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     for mailbox in mailboxes {
         name_allowed(cfg, mailbox).await?;
         let in_record = record
@@ -170,17 +173,19 @@ pub(super) async fn check_group_names(
         // A name a removed mailbox left is held for ninety days before the
         // group can reuse it. Both the approval and an add-mailbox pass here.
         if let Some(until) = name_held(store, mailbox).await? {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "the account name {mailbox} is held until {until}, so it cannot be reused yet"
-            ));
+            )));
         }
         if existing.is_some() {
-            return Err(format!("the account name {mailbox} is already taken"));
+            return Err(Error::from(format!(
+                "the account name {mailbox} is already taken"
+            )));
         }
         if account_on_box(cfg, mailbox)? {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "the account name {mailbox} is already in use on this box"
-            ));
+            )));
         }
     }
     Ok(())
@@ -194,46 +199,57 @@ pub async fn provision_group(
     store: &Store,
     journal: &Journal,
     intent: GroupIntent,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     if intent.kind != "provision-group" {
-        return Err(format!("kind {:?} is not a group intent", intent.kind));
+        return Err(Error::from(format!(
+            "kind {:?} is not a group intent",
+            intent.kind
+        )));
     }
     if let Some(why) = validate::domain(&intent.domain) {
-        return Err(format!("the domain {:?}: {why}", intent.domain));
+        return Err(Error::from(format!(
+            "the domain {:?}: {why}",
+            intent.domain
+        )));
     }
     if intent.mailboxes.is_empty() {
-        return Err("the intent names no mailbox, so there is nothing to provision".to_string());
+        return Err(Error::from(
+            "the intent names no mailbox, so there is nothing to provision".to_string(),
+        ));
     }
     if !intent.mailboxes.iter().any(|m| m == &intent.site_owner) {
-        return Err(format!(
+        return Err(Error::from(format!(
             "the site owner {} is not one of the mailboxes",
             intent.site_owner
-        ));
+        )));
     }
     let mut mailboxes = HashSet::new();
     for mailbox in &intent.mailboxes {
         if !mailboxes.insert(mailbox.as_str()) {
-            return Err(format!("the mailbox {mailbox} is named twice"));
+            return Err(Error::from(format!("the mailbox {mailbox} is named twice")));
         }
     }
     for address in &intent.addresses {
         if let Some(why) = validate::username_shape(&address.address) {
-            return Err(format!("the address {:?}: {why}", address.address));
+            return Err(Error::from(format!(
+                "the address {:?}: {why}",
+                address.address
+            )));
         }
         if !intent.mailboxes.iter().any(|m| m == &address.mailbox) {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "the address {}@{} points at {}, which is not a mailbox",
                 address.address, intent.domain, address.mailbox
-            ));
+            )));
         }
     }
     let mut seen = HashSet::new();
     for address in &intent.addresses {
         if !seen.insert(address.address.as_str()) {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "the address {} is in the table twice",
                 address.address
-            ));
+            )));
         }
     }
 
@@ -248,9 +264,9 @@ pub async fn provision_group(
             .cloned()
             .collect();
         if mine.is_empty() {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "the mailbox {mailbox} has no mail key, so its mail would bounce"
-            ));
+            )));
         }
         keys.insert(mailbox.clone(), mine);
     }
@@ -409,8 +425,10 @@ pub async fn provision_group(
             window_closes_at: window.closes_at.clone(),
             state: "issued".to_string(),
         };
-        let bytes = serde_json::to_vec_pretty(&join)
-            .map_err(|e| format!("cannot encode the token record: {e}"))?;
+        let bytes = serde_json::to_vec_pretty(&join).map_err(|source| Error::Json {
+            context: "encode the token record",
+            source,
+        })?;
         store.ensure_dir("tokens").await?;
         store
             .write_record("tokens", &format!("{token}.json"), &bytes)
@@ -464,15 +482,17 @@ pub async fn provision_group(
 /// The application's own copy, written into each mailbox's account so the block's
 /// answers sit inside the ninety-day purge with the rest of the application. The
 /// status link's end is stamped the way the person path's copy is.
-async fn application_copy(store: &Store, token: &str) -> Result<Option<String>, String> {
+async fn application_copy(store: &Store, token: &str) -> Result<Option<String>, Error> {
     let Some(text) = store.filed_application_text(token).await? else {
         return Ok(None);
     };
     let mut value: Value =
         serde_json::from_str(&text).map_err(|e| format!("the application record: {e}"))?;
     value["status_link_until"] = json!(util::after_days(7));
-    let bytes = serde_json::to_string_pretty(&value)
-        .map_err(|e| format!("cannot encode the application copy: {e}"))?;
+    let bytes = serde_json::to_string_pretty(&value).map_err(|source| Error::Json {
+        context: "encode the application copy",
+        source,
+    })?;
     Ok(Some(bytes))
 }
 
@@ -482,7 +502,7 @@ async fn write_group_application(
     store: &Store,
     mailbox: &str,
     copy: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let Some(copy) = copy else {
         return Ok(());
     };
@@ -494,7 +514,7 @@ async fn write_group_application(
             copy.as_bytes(),
         )
         .await
-        .map_err(String::from)
+        .map_err(Error::from)
 }
 
 /// The mailbox's account record: a reference to its group and no payment block
@@ -506,7 +526,7 @@ async fn write_group_account(
     domain: &str,
     payment: &GroupPayment,
     mail_key: Option<&KeyRecord>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let existing = store.account(mailbox).await?;
     let now = util::filed_at();
     let account = Account {
@@ -549,17 +569,21 @@ async fn write_group_account(
         closing_until: None,
         grace_until: None,
     };
-    let bytes = serde_json::to_vec_pretty(&account)
-        .map_err(|e| format!("cannot encode the account: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+        context: "encode the account",
+        source,
+    })?;
     store.ensure_dir(&format!("accounts/{mailbox}")).await?;
     write_account_record(store, mailbox, &bytes).await
 }
 
 /// Write one group's record. The caller owns the directory name, which is the
 /// validated domain, so a record can never land outside `groups/`.
-pub(super) async fn write_group_record(store: &Store, group: &GroupRecord) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(group)
-        .map_err(|e| format!("cannot encode the group record: {e}"))?;
+pub(super) async fn write_group_record(store: &Store, group: &GroupRecord) -> Result<(), Error> {
+    let bytes = serde_json::to_vec_pretty(group).map_err(|source| Error::Json {
+        context: "encode the group record",
+        source,
+    })?;
     store
         .ensure_dir(&format!("groups/{}", group.domain))
         .await?;
@@ -575,7 +599,7 @@ pub async fn write_account_record(
     store: &Store,
     username: &str,
     bytes: &[u8],
-) -> Result<(), String> {
+) -> Result<(), Error> {
     store
         .write_record_mode(
             &format!("accounts/{username}"),
@@ -585,7 +609,7 @@ pub async fn write_account_record(
             0o640,
         )
         .await
-        .map_err(String::from)
+        .map_err(Error::from)
 }
 
 /// The same for a group's record, for the same reason: the account page of any
@@ -595,7 +619,7 @@ pub(super) async fn write_group_state(
     store: &Store,
     domain: &str,
     bytes: &[u8],
-) -> Result<(), String> {
+) -> Result<(), Error> {
     store
         .write_record_mode(
             &format!("groups/{domain}"),
@@ -605,7 +629,7 @@ pub(super) async fn write_group_state(
             0o640,
         )
         .await
-        .map_err(String::from)
+        .map_err(Error::from)
 }
 
 /// The lock every writer of a mail table holds: a `<table>.lock` directory with
@@ -618,7 +642,7 @@ struct TableLock {
 }
 
 impl TableLock {
-    fn acquire(path: &str) -> Result<TableLock, String> {
+    fn acquire(path: &str) -> Result<TableLock, Error> {
         let dir = std::path::PathBuf::from(format!("{path}.lock"));
         let mut reaped = false;
         for attempt in 0..5 {
@@ -628,17 +652,18 @@ impl TableLock {
                         std::fs::write(dir.join("pid"), format!("{}\n", std::process::id()))
                     {
                         let _ = std::fs::remove_dir_all(&dir);
-                        return Err(format!(
+                        return Err(Error::from(format!(
                             "cannot write the owner pid into {}: {e}",
                             dir.display()
-                        ));
+                        )));
                     }
                     return Ok(TableLock { dir });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if !reaped {
                         if let Some(reason) = stale_table_lock(&dir) {
-                            eprintln!("reaping stale lock {}: {reason}", dir.display());
+                            Error::from(reason)
+                                .report(&format!("reaping stale lock {}", dir.display()));
                             let _ = std::fs::remove_dir_all(&dir);
                             reaped = true;
                             continue;
@@ -646,17 +671,17 @@ impl TableLock {
                     }
                 }
                 Err(e) => {
-                    return Err(format!("cannot lock {path}: {e}"));
+                    return Err(Error::from(format!("cannot lock {path}: {e}")));
                 }
             }
             if attempt < 4 {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
-        Err(format!(
+        Err(Error::from(format!(
             "could not lock {path}: {} exists and did not clear; remove it if no writer is running",
             dir.display()
-        ))
+        )))
     }
 }
 
@@ -706,7 +731,7 @@ fn stale_table_lock(dir: &std::path::Path) -> Option<String> {
 /// different value is a refusal, because overruling it would silently redirect
 /// somebody's mail. Written through a temporary in the same directory, so smtpd
 /// never reads half a table.
-fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), String> {
+fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), Error> {
     let _lock = TableLock::acquire(path)?;
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
@@ -724,10 +749,10 @@ fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), 
                     if have.trim() == want {
                         return Ok(());
                     }
-                    return Err(format!(
+                    return Err(Error::from(format!(
                         "{path} already maps {name} to {}, not {want}",
                         have.trim()
-                    ));
+                    )));
                 }
             }
         }
@@ -754,11 +779,11 @@ fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), 
     entry.push_str(&line);
     entry.push('\n');
     std::io::Write::write_all(&mut file, entry.as_bytes())
-        .map_err(|e| format!("cannot append to {path}: {e}"))
+        .map_err(|e| Error::from(format!("cannot append to {path}: {e}")))
 }
 
 /// The value a virtual table maps `name` to, or `None` when the key is absent.
-fn table_value(path: &str, name: &str) -> Result<Option<String>, String> {
+fn table_value(path: &str, name: &str) -> Result<Option<String>, Error> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
     for line in text.lines() {
@@ -773,7 +798,7 @@ fn table_value(path: &str, name: &str) -> Result<Option<String>, String> {
 
 /// How many addresses the body's domain has: every `<localpart>@<domain>` line,
 /// mailboxes and aliases alike, which is the ten-address cap's count.
-fn address_count(path: &str, domain: &str) -> Result<usize, String> {
+fn address_count(path: &str, domain: &str) -> Result<usize, Error> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
     let suffix = format!("@{domain}");
@@ -791,12 +816,13 @@ fn address_count(path: &str, domain: &str) -> Result<usize, String> {
 /// The `TableLock` argument is the proof that the caller holds the table's lock
 /// for the read that produced `text` as well as this write: an unlocked rewrite
 /// would drop a line another writer appended between the two.
-fn write_table(path: &str, text: &str, _lock: &TableLock) -> Result<(), String> {
+fn write_table(path: &str, text: &str, _lock: &TableLock) -> Result<(), Error> {
     let candidate = format!("{path}.onboard.{}", std::process::id());
     std::fs::write(&candidate, text).map_err(|e| format!("cannot write {candidate}: {e}"))?;
     std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o644))
         .map_err(|e| format!("cannot set the mode on {candidate}: {e}"))?;
-    std::fs::rename(&candidate, path).map_err(|e| format!("cannot replace {path}: {e}"))
+    std::fs::rename(&candidate, path)
+        .map_err(|e| Error::from(format!("cannot replace {path}: {e}")))
 }
 
 /// Repoint an existing virtual entry, keeping every other line. A value that is
@@ -804,7 +830,7 @@ fn write_table(path: &str, text: &str, _lock: &TableLock) -> Result<(), String> 
 /// nothing. `ensure_table_line` refuses a different value on purpose (it must
 /// not overrule a line somebody else made), so this is the explicit repoint.
 ///
-fn repoint_table_line(path: &str, name: &str, want: &str) -> Result<(), String> {
+fn repoint_table_line(path: &str, name: &str, want: &str) -> Result<(), Error> {
     let lock = TableLock::acquire(path)?;
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
@@ -833,7 +859,7 @@ fn repoint_table_line(path: &str, name: &str, want: &str) -> Result<(), String> 
 /// Drop every line for `domain` that points at `mailbox`. That is the mailbox's
 /// own address and any alias into it, so no entry is left delivering nowhere.
 /// Returns whether the table changed.
-fn remove_addresses(path: &str, domain: &str, mailbox: &str) -> Result<bool, String> {
+fn remove_addresses(path: &str, domain: &str, mailbox: &str) -> Result<bool, Error> {
     let lock = TableLock::acquire(path)?;
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {path}; run scripts/deploy-mail.sh first: {e}"))?;
@@ -862,7 +888,7 @@ fn remove_addresses(path: &str, domain: &str, mailbox: &str) -> Result<bool, Str
 /// a record that cannot be read is an error rather than no hold, because a
 /// broken hold file must not release a name the platform is still holding. A
 /// readable record with no usable date is no hold.
-pub(super) async fn name_held(store: &Store, username: &str) -> Result<Option<String>, String> {
+pub(super) async fn name_held(store: &Store, username: &str) -> Result<Option<String>, Error> {
     let Some(value) = store.hold(username).await? else {
         return Ok(None);
     };
@@ -878,7 +904,7 @@ pub(super) async fn name_held(store: &Store, username: &str) -> Result<Option<St
 /// Hold a closed account's name for ninety days. Written only when there is no
 /// live hold, so a retry keeps the date the removal first set rather than
 /// pushing the release out by another pass.
-pub(super) async fn hold_name(store: &Store, username: &str) -> Result<(), String> {
+pub(super) async fn hold_name(store: &Store, username: &str) -> Result<(), Error> {
     if name_held(store, username).await?.is_some() {
         return Ok(());
     }
@@ -886,12 +912,15 @@ pub(super) async fn hold_name(store: &Store, username: &str) -> Result<(), Strin
         "username": username,
         "until": util::after_days(90),
     }))
-    .map_err(|e| format!("cannot encode the hold: {e}"))?;
+    .map_err(|source| Error::Json {
+        context: "encode the hold",
+        source,
+    })?;
     store.ensure_dir("holds").await?;
     store
         .write_record("holds", &format!("{username}.json"), &bytes)
         .await
-        .map_err(String::from)
+        .map_err(Error::from)
 }
 
 /// The three steps that close one mailbox: its name held for ninety days, its
@@ -900,29 +929,34 @@ pub(super) async fn hold_name(store: &Store, username: &str) -> Result<(), Strin
 /// mailbox leaving a group and a whole group going, so the two cannot disagree
 /// about what a closed account is. The caller removes the virtual entry first,
 /// because it is the one that knows which table line belongs to the account.
-async fn close_mailbox(cfg: &DrainConfig, store: &Store, username: &str) -> Result<(), String> {
+async fn close_mailbox(cfg: &DrainConfig, store: &Store, username: &str) -> Result<(), Error> {
     hold_name(store, username).await?;
     store.remove("keys", &format!("{username}.pub")).await?;
-    run_script(cfg, "delete-user.sh", &[username]).await
+    run_script(cfg, "delete-user.sh", &[username])
+        .await
+        .map_err(Error::from)
 }
 
 /// The mail key a new mailbox carries, checked before anything is written: the
 /// material must be there and must be the mailbox's own key.
-fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, String> {
+fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, Error> {
     let Some(key) = intent.mail_key.as_ref() else {
-        return Err(format!(
+        return Err(Error::from(format!(
             "the mailbox {} has no mail key, so its mail would bounce",
             intent.mailbox
-        ));
+        )));
     };
     if !key.mailbox.is_empty() && key.mailbox != intent.mailbox {
-        return Err(format!(
+        return Err(Error::from(format!(
             "the mail key names {}, not {}",
             key.mailbox, intent.mailbox
-        ));
+        )));
     }
     if key.material.trim().is_empty() {
-        return Err(format!("the mail key for {} is empty", intent.mailbox));
+        return Err(Error::from(format!(
+            "the mail key for {} is empty",
+            intent.mailbox
+        )));
     }
     // The console carries whatever file the operator named. A private key, an
     // SSH key or a truncated block would reach the encryptor's keyring and
@@ -944,28 +978,43 @@ pub async fn group_address(
     store: &Store,
     journal: &Journal,
     intent: GroupAddressIntent,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     if intent.kind != "group-address" {
-        return Err(format!("kind {:?} is not an address intent", intent.kind));
+        return Err(Error::from(format!(
+            "kind {:?} is not an address intent",
+            intent.kind
+        )));
     }
     if !ADDRESS_ACTIONS.contains(&intent.action.as_str()) {
-        return Err(format!("{:?} is not an address change", intent.action));
+        return Err(Error::from(format!(
+            "{:?} is not an address change",
+            intent.action
+        )));
     }
     if let Some(why) = validate::domain(&intent.domain) {
-        return Err(format!("the domain {:?}: {why}", intent.domain));
+        return Err(Error::from(format!(
+            "the domain {:?}: {why}",
+            intent.domain
+        )));
     }
     let Some(mut group) = group_record(store, &intent.domain).await? else {
-        return Err(format!(
+        return Err(Error::from(format!(
             "there is no group for {}, so there is no address to change",
             intent.domain
-        ));
+        )));
     };
     if let Some(why) = validate::username_shape(&intent.mailbox) {
-        return Err(format!("the mailbox {:?}: {why}", intent.mailbox));
+        return Err(Error::from(format!(
+            "the mailbox {:?}: {why}",
+            intent.mailbox
+        )));
     }
     if intent.action != "remove" {
         if let Some(why) = validate::username_shape(&intent.address) {
-            return Err(format!("the address {:?}: {why}", intent.address));
+            return Err(Error::from(format!(
+                "the address {:?}: {why}",
+                intent.address
+            )));
         }
     }
 
@@ -979,24 +1028,24 @@ pub async fn group_address(
     match intent.action.as_str() {
         "add-alias" => {
             if !in_group(&intent.mailbox) {
-                return Err(format!(
+                return Err(Error::from(format!(
                     "the alias {}@{} points at {}, which is not a mailbox in the group",
                     intent.address, intent.domain, intent.mailbox
-                ));
+                )));
             }
             match &current {
                 Some(have) if have == &intent.mailbox => {}
                 Some(have) => {
-                    return Err(format!(
+                    return Err(Error::from(format!(
                         "{} already maps {entry} to {have}, not {}",
                         cfg.virtuals, intent.mailbox
-                    ))
+                    )))
                 }
                 None if address_count(&cfg.virtuals, &intent.domain)? >= 10 => {
-                    return Err(format!(
+                    return Err(Error::from(format!(
                         "{} already carries ten addresses, so {entry} cannot be added",
                         intent.domain
-                    ))
+                    )))
                 }
                 None => {}
             }
@@ -1005,10 +1054,10 @@ pub async fn group_address(
             address_key(&intent)?;
             if let Some(have) = &current {
                 if have != &intent.mailbox {
-                    return Err(format!(
+                    return Err(Error::from(format!(
                         "{} already maps {entry} to {have}, not {}",
                         cfg.virtuals, intent.mailbox
-                    ));
+                    )));
                 }
             }
             if !in_group(&intent.mailbox) {
@@ -1025,28 +1074,28 @@ pub async fn group_address(
             // already in the group: a second address into an existing mailbox
             // still costs one of the ten.
             if current.is_none() && address_count(&cfg.virtuals, &intent.domain)? >= 10 {
-                return Err(format!(
+                return Err(Error::from(format!(
                     "{} already carries ten addresses, so {} cannot be added",
                     intent.domain, entry
-                ));
+                )));
             }
         }
         "upgrade" => {
             address_key(&intent)?;
             match &current {
                 None => {
-                    return Err(format!(
+                    return Err(Error::from(format!(
                         "{} is not an address in {}, so there is no alias to upgrade",
                         entry, intent.domain
-                    ))
+                    )))
                 }
                 Some(have) if have == &intent.mailbox => {}
                 Some(have) => {
                     if !in_group(have) {
-                        return Err(format!(
+                        return Err(Error::from(format!(
                             "{} points at {have}, which is not a mailbox in the group",
                             entry
-                        ));
+                        )));
                     }
                 }
             }
@@ -1064,15 +1113,15 @@ pub async fn group_address(
         "remove" => {
             if group.site_owner == intent.mailbox {
                 let Some(replacement) = intent.site_owner.as_deref() else {
-                    return Err(format!(
+                    return Err(Error::from(format!(
                         "{} owns the site, so the intent must name the account that takes it",
                         intent.mailbox
-                    ));
+                    )));
                 };
                 if replacement == intent.mailbox || !in_group(replacement) {
-                    return Err(format!(
+                    return Err(Error::from(format!(
                         "the replacement site owner {replacement} is not another mailbox in the group"
-                    ));
+                    )));
                 }
             }
             let existing = store.account(&intent.mailbox).await?;
@@ -1081,10 +1130,10 @@ pub async fn group_address(
                 .map(|a| a.group.as_deref() == Some(intent.domain.as_str()))
                 .unwrap_or(false);
             if !in_group(&intent.mailbox) && !ours && account_on_box(cfg, &intent.mailbox)? {
-                return Err(format!(
+                return Err(Error::from(format!(
                     "the account {} is not a mailbox in {}",
                     intent.mailbox, intent.domain
-                ));
+                )));
             }
         }
         _ => unreachable!("the action was checked against ADDRESS_ACTIONS"),
@@ -1241,22 +1290,25 @@ pub async fn remove_group(
     store: &Store,
     journal: &Journal,
     intent: GroupRemoveIntent,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     if intent.kind != "remove-group" {
-        return Err(format!(
+        return Err(Error::from(format!(
             "kind {:?} is not a remove-group intent",
             intent.kind
-        ));
+        )));
     }
     if let Some(why) = validate::domain(&intent.domain) {
-        return Err(format!("the domain {:?}: {why}", intent.domain));
+        return Err(Error::from(format!(
+            "the domain {:?}: {why}",
+            intent.domain
+        )));
     }
 
     let Some(group) = group_record(store, &intent.domain).await? else {
-        return Err(format!(
+        return Err(Error::from(format!(
             "there is no group for {}, so there is no domain to remove",
             intent.domain
-        ));
+        )));
     };
     let application = ApplicationRef::group(group.site_owner.clone(), intent.domain.clone());
     if !journal.has(&intent.id, "applying") {
@@ -1292,7 +1344,7 @@ pub(super) async fn take_group_down(
     cfg: &DrainConfig,
     store: &Store,
     domain: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     run_script(cfg, "remove-group.sh", &[domain]).await?;
     run_script(cfg, "cron-apply.sh", &["--web"]).await?;
     let Some(group) = group_record(store, domain).await? else {
@@ -1313,12 +1365,12 @@ pub(super) async fn take_group_down(
 
 /// Remove the group's directory, record and all. A directory that is not there
 /// reads as done, the same rule `Store::remove` applies to a file.
-pub(super) async fn remove_group_record(store: &Store, domain: &str) -> Result<(), String> {
+pub(super) async fn remove_group_record(store: &Store, domain: &str) -> Result<(), Error> {
     let dir = store.path(&format!("groups/{domain}"));
     match tokio::fs::remove_dir_all(&dir).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("cannot remove {}: {e}", dir.display())),
+        Err(e) => Err(Error::from(format!("cannot remove {}: {e}", dir.display()))),
     }
 }
 
@@ -1327,7 +1379,7 @@ pub(super) async fn remove_group_record(store: &Store, domain: &str) -> Result<(
 /// is by `TokenRecord.username` rather than by the filename, because the
 /// directory also holds tokens that are not these accounts' and the record is
 /// what says whose one is.
-pub(super) async fn close_group_tokens(store: &Store, accounts: &[String]) -> Result<(), String> {
+pub(super) async fn close_group_tokens(store: &Store, accounts: &[String]) -> Result<(), Error> {
     for name in store.list("tokens").await? {
         if !name.ends_with(".json") {
             continue;
@@ -1354,7 +1406,7 @@ pub(super) async fn close_group_tokens(store: &Store, accounts: &[String]) -> Re
 /// has no `account.json`, and the drain must neither adopt it nor release its
 /// name. An unreadable file is an error rather than a "no", so the drain fails
 /// closed instead of acting on a box it cannot see.
-pub(super) fn account_on_box(cfg: &DrainConfig, username: &str) -> Result<bool, String> {
+pub(super) fn account_on_box(cfg: &DrainConfig, username: &str) -> Result<bool, Error> {
     let text = std::fs::read_to_string(&cfg.passwd)
         .map_err(|e| format!("cannot read {}: {e}", cfg.passwd))?;
     Ok(text
@@ -1367,7 +1419,7 @@ pub(super) fn account_on_box(cfg: &DrainConfig, username: &str) -> Result<bool, 
 /// Read where it is used rather than held for the pass: it is a short file, read
 /// at most twice a minute by a cron job, and a read that fails must refuse the
 /// work rather than let it through on an empty list.
-async fn reserved_names(cfg: &DrainConfig) -> Result<HashSet<String>, String> {
+async fn reserved_names(cfg: &DrainConfig) -> Result<HashSet<String>, Error> {
     Ok(validate::reserved(&Store::read_text(&cfg.reserved).await?))
 }
 
@@ -1377,11 +1429,11 @@ async fn reserved_names(cfg: &DrainConfig) -> Result<HashSet<String>, String> {
 /// The name is in the message because a failed pass is journalled against an
 /// empty application and mailed to the operator, so the message is the only
 /// place either of them can read which name was refused.
-pub(super) async fn name_allowed(cfg: &DrainConfig, username: &str) -> Result<(), String> {
+pub(super) async fn name_allowed(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
     let reserved = reserved_names(cfg).await?;
     match validate::username(username, &reserved) {
         None => Ok(()),
-        Some(why) => Err(format!("the username {username}: {why}")),
+        Some(why) => Err(Error::from(format!("the username {username}: {why}"))),
     }
 }
 
@@ -1395,7 +1447,7 @@ pub(super) async fn append_ledger(
     intent: &str,
     at: &str,
     amount_gbp: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let ledger = Ledger::open(store);
     if ledger.has_window_open(token).await? {
         return Ok(());

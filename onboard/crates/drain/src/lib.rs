@@ -16,6 +16,7 @@
 //! The wire payloads, [`DECISIONS`] and the rail constants live in
 //! [`kyriakon_onboard_core::intent`], beside [`Intent`]: the enum and the shape it deserialises
 //! are one contract.
+use crate::transitions::Error;
 
 pub mod mailbox;
 pub mod prepaid;
@@ -34,7 +35,7 @@ use kyriakon_onboard_core::store::Store;
 /// One pass: every intent, then the sweeps. The drain is a single short-lived
 /// process with no listener, so there is no loop inside it; cron runs it again
 /// a minute later.
-pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
+pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), Error> {
     // Read once for the whole pass: every dedup, backoff and recovery query
     // below asks this index rather than opening the file again, and an
     // unreadable journal is an error here rather than an empty one (#513).
@@ -45,7 +46,8 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), String> {
     let key = match sign::read_key(std::path::Path::new(&cfg.approval_key)) {
         Ok(k) => k,
         Err(e) => {
-            transitions::report_failure(cfg, store, &journal, "config", "config", &e).await;
+            transitions::report_failure(cfg, store, &journal, "config", "config", &Error::from(e))
+                .await;
             return Ok(());
         }
     };
@@ -121,7 +123,7 @@ async fn one(
     journal: &Journal,
     key: &[u8],
     file: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     // The listing is one snapshot, and a pass can delete a file another name in
     // that snapshot shares: an approval writes and applies its group intent in
     // the same pass, then removes it. A file that is gone reads as done, the
@@ -147,7 +149,7 @@ pub async fn run_intent(
     key: &[u8],
     file: &str,
     value: &Value,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     if let Some(settlement) = verify(&intent, cfg, store, key, file, value).await? {
         let envelope = transitions::Envelope::of(value, file, intent.kind());
         return transitions::settle(
@@ -183,7 +185,7 @@ pub async fn verify(
     key: &[u8],
     file: &str,
     value: &Value,
-) -> Result<Option<transitions::Settlement>, String> {
+) -> Result<Option<transitions::Settlement>, Error> {
     let proofs = std::path::Path::new(&cfg.proof_dir);
     match intent {
         // The handler files it and the drain only queues a review: nothing
@@ -197,28 +199,35 @@ pub async fn verify(
                 .as_deref()
                 .ok_or_else(|| "the status token is not 128 bits of Crockford".to_string())?;
             if !kyriakon_onboard_core::store::is_status_token(token) {
-                return Err("the status token is not 128 bits of Crockford".to_string());
+                return Err(Error::from(
+                    "the status token is not 128 bits of Crockford".to_string(),
+                ));
             }
             if let Some(why) =
                 kyriakon_onboard_core::flow::validate::username_shape(&intent.application.username)
             {
-                return Err(format!("the username: {why}"));
+                return Err(Error::from(format!("the username: {why}")));
             }
             let Some(decision) = decision_for_kind(&intent.kind) else {
-                return Err(format!("kind {:?} is not a decision", intent.kind));
+                return Err(Error::from(format!(
+                    "kind {:?} is not a decision",
+                    intent.kind
+                )));
             };
             if intent.action != decision.action {
-                return Err(format!(
+                return Err(Error::from(format!(
                     "the action {:?} does not match the kind {:?}",
                     intent.action, intent.kind
-                ));
+                )));
             }
             if !sign::verify(
                 key,
                 &sign::decide_payload(token, &intent.action),
                 &intent.sig,
             ) {
-                return Err("the decision intent's signature does not verify".to_string());
+                return Err(Error::from(
+                    "the decision intent's signature does not verify".to_string(),
+                ));
             }
             Ok(None)
         }
@@ -266,7 +275,9 @@ pub async fn verify(
             if sign::verify(key, &sign::group_provision_payload(intent), &intent.sig) {
                 Ok(None)
             } else {
-                Err("the group intent's signature does not verify".to_string())
+                Err(Error::from(
+                    "the group intent's signature does not verify".to_string(),
+                ))
             }
         }
         Intent::GroupAddress(intent) => {
@@ -285,7 +296,9 @@ pub async fn verify(
             if sign::verify(key, &payload, &intent.sig) {
                 Ok(None)
             } else {
-                Err("the address intent's signature does not verify".to_string())
+                Err(Error::from(
+                    "the address intent's signature does not verify".to_string(),
+                ))
             }
         }
         Intent::RemoveGroup(intent) => {
@@ -296,7 +309,9 @@ pub async fn verify(
             ) {
                 Ok(None)
             } else {
-                Err("the remove-group intent's signature does not verify".to_string())
+                Err(Error::from(
+                    "the remove-group intent's signature does not verify".to_string(),
+                ))
             }
         }
         Intent::Close(intent) => {
@@ -313,7 +328,9 @@ pub async fn verify(
             ) {
                 Ok(None)
             } else {
-                Err("the token resend's signature does not verify".to_string())
+                Err(Error::from(
+                    "the token resend's signature does not verify".to_string(),
+                ))
             }
         }
         Intent::Credit(intent) => {
@@ -455,7 +472,7 @@ pub async fn apply(
     key: &[u8],
     file: &str,
     value: &Value,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let kind = intent.kind().to_string();
     let envelope = transitions::Envelope::of(value, file, &kind);
     let disposition = disposition(&intent);
@@ -514,9 +531,9 @@ pub async fn apply(
             }
             Intent::MailKey(intent) => transitions::lifecycle::mail_key(cfg, store, intent).await,
             // `verify` refuses an unknown kind before this is reached.
-            Intent::Unknown { kind, .. } => {
-                Err(format!("this build does not implement the kind {kind:?}"))
-            }
+            Intent::Unknown { kind, .. } => Err(Error::from(format!(
+                "this build does not implement the kind {kind:?}"
+            ))),
         }
     })
     .await
@@ -588,9 +605,9 @@ fn disposition(intent: &Intent) -> transitions::Disposition {
 /// The one rule for a name the drain turns into a path: only an account name
 /// may be one, because an intent's username is a path component under the
 /// store. `Err` carries the reason, worded for the journal.
-fn account_name(username: &str) -> Result<(), String> {
+fn account_name(username: &str) -> Result<(), Error> {
     match kyriakon_onboard_core::flow::validate::username_shape(username) {
-        Some(why) => Err(format!("the username {username:?}: {why}")),
+        Some(why) => Err(Error::from(format!("the username {username:?}: {why}"))),
         None => Ok(()),
     }
 }
@@ -603,7 +620,7 @@ async fn session_proved(
     proofs: &std::path::Path,
     session: &str,
     username: &str,
-) -> Result<Option<transitions::Settlement>, String> {
+) -> Result<Option<transitions::Settlement>, Error> {
     match verify_session(store, proofs, session, username).await {
         Ok(()) => Ok(None),
         Err(reason) => Ok(Some(transitions::Settlement::refused(reason))),
@@ -617,7 +634,7 @@ async fn page_proved(
     proofs: &std::path::Path,
     session: &str,
     username: &str,
-) -> Result<Option<transitions::Settlement>, String> {
+) -> Result<Option<transitions::Settlement>, Error> {
     if let Err(why) = account_name(username) {
         return Ok(Some(transitions::Settlement::refused(why)));
     }
@@ -636,15 +653,19 @@ pub async fn verify_session(
     proof_dir: &std::path::Path,
     id: &str,
     username: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     if !kyriakon_onboard_core::store::is_status_token(id) {
-        return Err("the intent carries no usable session id".to_string());
+        return Err(Error::from(
+            "the intent carries no usable session id".to_string(),
+        ));
     }
     let Some(text) = store.read_record("sessions", &format!("{id}.json")).await else {
-        return Err("the session named by the intent has gone".to_string());
+        return Err(Error::from(
+            "the session named by the intent has gone".to_string(),
+        ));
     };
     let value: Value = serde_json::from_str(&text)
-        .map_err(|e| format!("the session record does not parse: {e}"))?;
+        .map_err(|e| Error::from(format!("the session record does not parse: {e}")))?;
     let proof = value.get("proof").and_then(Value::as_str).unwrap_or("");
     kyriakon_onboard_core::account::session::verify_proof(
         proof_dir,
@@ -653,6 +674,7 @@ pub async fn verify_session(
         OffsetDateTime::now_utc(),
     )
     .await
+    .map_err(Error::from)
 }
 
 #[cfg(test)]

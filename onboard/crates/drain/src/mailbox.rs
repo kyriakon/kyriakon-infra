@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 
 use time::OffsetDateTime;
 
+use crate::transitions::Error;
 use kyriakon_onboard_core::config::DrainConfig;
 use kyriakon_onboard_core::config::HOST;
 use kyriakon_onboard_core::mail::keycheck;
@@ -37,12 +38,12 @@ const REPLY_SUBJECT: &str = "Your Kyriakon application key";
 /// Read the spool and act on every message in it. A failure on one message is
 /// reported and the rest still run; the message that failed is left for the next
 /// pass, so a transient store error loses nothing.
-pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<(), String> {
+pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<(), Error> {
     let dir = std::path::Path::new(&cfg.mail_dir);
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(format!("cannot read {}: {e}", dir.display())),
+        Err(e) => return Err(Error::from(format!("cannot read {}: {e}", dir.display()))),
     };
     while let Some(entry) = entries
         .next_entry()
@@ -67,7 +68,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<
                     journal,
                     name.as_ref(),
                     "mail",
-                    &format!("cannot read {}: {e}", path.display()),
+                    &Error::from(format!("cannot read {}: {e}", path.display())),
                 )
                 .await;
                 continue;
@@ -85,7 +86,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<
                 journal,
                 name.as_ref(),
                 "mail",
-                &format!("cannot remove {}: {e}", path.display()),
+                &Error::from(format!("cannot remove {}: {e}", path.display())),
             )
             .await;
         }
@@ -98,7 +99,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<
 /// when From is empty, unless the draft recorded an address outside the
 /// platform: then the mail must come from that address, and a message with no
 /// usable From is refused with nothing to reply to.
-async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), String> {
+async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
     let message = Message::parse(raw);
     let blocks = labelled_blocks(&message.body);
     if blocks.is_empty() {
@@ -144,7 +145,7 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), String> 
     }
     let saved = draft::save(store, &mut draft).await;
     drop(lock);
-    saved.map_err(String::from)
+    saved.map_err(Error::from)
 }
 
 /// Answer the sender when there is one to answer. A message with no usable From
@@ -154,7 +155,7 @@ async fn reply_or_drop(
     store: &Store,
     message: &Message,
     body: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     match message.reply_address() {
         Some(from) => reply(cfg, store, &from, body).await,
         None => Ok(()),
@@ -349,7 +350,7 @@ fn name_in_label(label: &str, name: &str, domain: &str) -> bool {
 /// Send one reply unless this sender already had one today. The timestamp is
 /// written before the enqueuer runs, so a crash or a failed send cannot produce
 /// a second reply on the next pass.
-async fn reply(cfg: &DrainConfig, store: &Store, sender: &str, body: &str) -> Result<(), String> {
+async fn reply(cfg: &DrainConfig, store: &Store, sender: &str, body: &str) -> Result<(), Error> {
     let path = store.path("mail/replies.json");
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let mut sent: BTreeMap<String, i64> = store
@@ -362,14 +363,18 @@ async fn reply(cfg: &DrainConfig, store: &Store, sender: &str, body: &str) -> Re
         return Ok(());
     }
     sent.insert(sender.to_string(), now);
-    let bytes = serde_json::to_vec_pretty(&sent)
-        .map_err(|e| format!("cannot encode the reply log: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&sent).map_err(|source| Error::Json {
+        context: "encode the reply log",
+        source,
+    })?;
     let owner = store.dir_owner("mail");
     store
         .write_record_owned("mail", "replies.json", &bytes, owner)
         .await
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    notice::enqueue(cfg, sender, REPLY_SUBJECT, body).await
+        .map_err(|e| Error::from(format!("cannot write {}: {e}", path.display())))?;
+    notice::enqueue(cfg, sender, REPLY_SUBJECT, body)
+        .await
+        .map_err(Error::from)
 }
 
 fn restart_body() -> String {

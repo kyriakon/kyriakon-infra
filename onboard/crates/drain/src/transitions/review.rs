@@ -11,6 +11,7 @@ use super::groups::{
     name_held, site_owner, write_account_record,
 };
 use super::lifecycle::group_recipient;
+use super::Error;
 use super::{write_journal, Settlement};
 use kyriakon_onboard_core::account::dns;
 use kyriakon_onboard_core::account::sign;
@@ -51,7 +52,7 @@ async fn confirm(
     store: &Store,
     token: &str,
     record: &Record,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let Some(to) = outside_address(record)? else {
         return Ok(());
     };
@@ -74,21 +75,23 @@ async fn confirm(
         // than an approval that provisions with the letter lost.
         live.confirmation_at = None;
         save_application(store, token, &live).await?;
-        return Err(e);
+        return Err(Error::from(e));
     }
     Ok(())
 }
 
 /// Write the application record, handed to the handler's owner like every other
 /// record in `applications/`.
-async fn save_application(store: &Store, token: &str, record: &Record) -> Result<(), String> {
-    let bytes =
-        serde_json::to_vec_pretty(record).map_err(|e| format!("cannot encode the record: {e}"))?;
+async fn save_application(store: &Store, token: &str, record: &Record) -> Result<(), Error> {
+    let bytes = serde_json::to_vec_pretty(record).map_err(|source| Error::Json {
+        context: "encode the record",
+        source,
+    })?;
     let owner = store.dir_owner("applications");
     store
         .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
         .await
-        .map_err(String::from)
+        .map_err(Error::from)
 }
 
 /// A filed application: one review email to the reviewer, carrying every answer,
@@ -100,19 +103,29 @@ pub async fn filed_application(
     journal: &Journal,
     key: &[u8],
     intent: Intent,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     if intent.kind != "application" {
-        return Err(format!("kind {:?} is not an application", intent.kind));
+        return Err(Error::from(format!(
+            "kind {:?} is not an application",
+            intent.kind
+        )));
     }
     name_allowed(cfg, &intent.application.username).await?;
     let Some(token) = intent.application.status_token.as_deref() else {
-        return Err("the status token is not 128 bits of Crockford".to_string());
+        return Err(Error::from(
+            "the status token is not 128 bits of Crockford".to_string(),
+        ));
     };
     if !store::is_status_token(token) {
-        return Err("the status token is not 128 bits of Crockford".to_string());
+        return Err(Error::from(
+            "the status token is not 128 bits of Crockford".to_string(),
+        ));
     }
     if !RAILS.contains(&intent.rail.as_str()) {
-        return Err(format!("the rail {:?} is not one of the four", intent.rail));
+        return Err(Error::from(format!(
+            "the rail {:?} is not one of the four",
+            intent.rail
+        )));
     }
 
     // One review email per application, not per intent: the journal is the
@@ -155,7 +168,7 @@ pub async fn filed_application(
 
 /// The review email's body. Every field the ticket lists, and the three links
 /// beside their `kyriakon-onboardctl` equivalents.
-fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String, String> {
+fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String, Error> {
     let token = intent
         .application
         .status_token
@@ -254,14 +267,14 @@ pub async fn decision(
     journal: &Journal,
     key: &[u8],
     intent: DecisionIntent,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     match intent.kind.as_str() {
         "approve" => approve(cfg, store, journal, key, &intent, false).await,
         "provision" => approve(cfg, store, journal, key, &intent, true).await,
         "decline" => decline(cfg, store, journal, &intent).await,
         // Unreachable after the kind match the seam makes, kept so the dispatch
         // is total.
-        other => Err(format!("kind {other:?} is not a decision")),
+        other => Err(Error::from(format!("kind {other:?} is not a decision"))),
     }
 }
 
@@ -276,7 +289,7 @@ async fn approve(
     key: &[u8],
     intent: &DecisionIntent,
     no_charge: bool,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     let token = intent
         .application
         .status_token
@@ -285,7 +298,9 @@ async fn approve(
     let username = &intent.application.username;
     let record = application_record(store, token).await?;
     if record.username != *username {
-        return Err("the intent's username is not the application's".to_string());
+        return Err(Error::from(
+            "the intent's username is not the application's".to_string(),
+        ));
     }
     let no_charge = no_charge || record.no_charge;
     if record.decided_at.is_some() {
@@ -337,9 +352,9 @@ async fn approve(
         // this is the other gate that can create an account. Without it a person
         // could take a name a removal had just held.
         if let Some(until) = name_held(store, username).await? {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "the username {username} is held until {until}, so it cannot be reused yet"
-            ));
+            )));
         }
     }
 
@@ -352,9 +367,9 @@ async fn approve(
     if existing.is_none() {
         on_box = account_on_box(cfg, username)?;
         if on_box && !begun {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "the username {username} is already in use on this box and this application did not create it; the intent is left in place"
-            ));
+            )));
         }
     }
 
@@ -533,8 +548,10 @@ async fn approve(
         grace_until: None,
     };
     store.ensure_dir(&format!("accounts/{username}")).await?;
-    let account_bytes = serde_json::to_vec_pretty(&account)
-        .map_err(|e| format!("cannot encode the account: {e}"))?;
+    let account_bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+        context: "encode the account",
+        source,
+    })?;
     write_account_record(store, username, &account_bytes).await?;
 
     if let (Some(token), Some(window)) = (&token_ref, &window) {
@@ -546,8 +563,10 @@ async fn approve(
             window_closes_at: window.closes_at.clone(),
             state: "issued".to_string(),
         };
-        let bytes = serde_json::to_vec_pretty(&join)
-            .map_err(|e| format!("cannot encode the token record: {e}"))?;
+        let bytes = serde_json::to_vec_pretty(&join).map_err(|source| Error::Json {
+            context: "encode the token record",
+            source,
+        })?;
         store.ensure_dir("tokens").await?;
         store
             .write_record("tokens", &format!("{token}.json"), &bytes)
@@ -570,11 +589,15 @@ async fn approve(
     // back into the record it does read. A free approval carries none, which is
     // also why an undecided application never shows one.
     if let Some(block) = &account.payment {
-        app_copy["payment"] = serde_json::to_value(block)
-            .map_err(|e| format!("cannot encode the payment block: {e}"))?;
+        app_copy["payment"] = serde_json::to_value(block).map_err(|source| Error::Json {
+            context: "encode the payment block",
+            source,
+        })?;
     }
-    let copy_bytes = serde_json::to_vec_pretty(&app_copy)
-        .map_err(|e| format!("cannot encode the application copy: {e}"))?;
+    let copy_bytes = serde_json::to_vec_pretty(&app_copy).map_err(|source| Error::Json {
+        context: "encode the application copy",
+        source,
+    })?;
     store
         .write_record(
             &format!("accounts/{username}"),
@@ -649,13 +672,13 @@ async fn approve_group(
     intent: &DecisionIntent,
     record: &Record,
     no_charge: bool,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     let domain = record
         .domain
         .clone()
         .ok_or("the application names no domain")?;
     if let Some(why) = validate::domain(&domain) {
-        return Err(format!("the domain {domain:?}: {why}"));
+        return Err(Error::from(format!("the domain {domain:?}: {why}")));
     }
     // The recipe is part of this approval, so a config the deploy never
     // substituted refuses before the group check, the journal line or any
@@ -668,9 +691,9 @@ async fn approve_group(
     // path's does.
     let existing_group = group_record(store, &domain).await?;
     if existing_group.is_some() && !journal.approval_started(&record.status_token) {
-        return Err(format!(
+        return Err(Error::from(format!(
             "the domain {domain} already has a group that this application did not make"
-        ));
+        )));
     }
     let (addresses, mailboxes) = group_addresses(record)?;
     let site_owner = site_owner(record, &mailboxes)?;
@@ -679,9 +702,9 @@ async fn approve_group(
     // applicant has to change.
     for mailbox in &mailboxes {
         if !record.mail_keys.iter().any(|k| &k.mailbox == mailbox) {
-            return Err(format!(
+            return Err(Error::from(format!(
                 "the mailbox {mailbox} has no mail key, so its mail would bounce"
-            ));
+            )));
         }
     }
     // The recipient is read before the journal and the intent for the same
@@ -861,7 +884,7 @@ async fn decline(
     store: &Store,
     journal: &Journal,
     intent: &DecisionIntent,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     let token = intent
         .application
         .status_token
@@ -870,7 +893,9 @@ async fn decline(
     let username = &intent.application.username;
     let record = application_record(store, token).await?;
     if record.username != *username {
-        return Err("the intent's username is not the application's".to_string());
+        return Err(Error::from(
+            "the intent's username is not the application's".to_string(),
+        ));
     }
     if record.decided_at.is_some() {
         return Ok(Settlement::line(
@@ -888,7 +913,9 @@ async fn decline(
     let outside = match record.outside_address.as_deref() {
         Some(addr) => {
             if let Some(why) = validate::address(addr) {
-                return Err(format!("the address outside the platform {addr:?}: {why}"));
+                return Err(Error::from(format!(
+                    "the address outside the platform {addr:?}: {why}"
+                )));
             }
             Some(addr.to_string())
         }
@@ -931,11 +958,11 @@ async fn decline(
 /// The application record a decision acts on, or an error naming what is
 /// missing. A decision intent for an application that is not on disk is refused
 /// rather than creating anything.
-async fn application_record(store: &Store, token: &str) -> Result<Record, String> {
+async fn application_record(store: &Store, token: &str) -> Result<Record, Error> {
     store
         .application(token)
         .await?
-        .ok_or_else(|| "there is no application for this token".to_string())
+        .ok_or_else(|| Error::from("there is no application for this token".to_string()))
 }
 
 /// Write the decision onto the application record. `password_link` is written
@@ -946,7 +973,7 @@ async fn mark_decided(
     stage: &str,
     decided_at: &str,
     password_link: Option<String>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let mut record = store
         .application(token)
         .await?
@@ -954,8 +981,10 @@ async fn mark_decided(
     record.stage = stage.to_string();
     record.decided_at = Some(decided_at.to_string());
     record.password_link = password_link;
-    let bytes =
-        serde_json::to_vec_pretty(&record).map_err(|e| format!("cannot encode the record: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Error::Json {
+        context: "encode the record",
+        source,
+    })?;
     // `applications/` belongs to the handler, so the drain hands the rewritten
     // record back to that directory's owner. A root-owned 0600 file would read
     // as missing to the unprivileged process that renders the status page, and
@@ -964,7 +993,7 @@ async fn mark_decided(
     store
         .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
         .await
-        .map_err(String::from)
+        .map_err(Error::from)
 }
 
 fn decision_subject(what: &str, username: &str) -> String {
@@ -1014,7 +1043,7 @@ fn decision_body(
     token: Option<&str>,
     window: &Option<Window>,
     monero: Option<&Monero>,
-) -> Result<String, String> {
+) -> Result<String, Error> {
     if no_charge {
         return Ok(format!(
             "Your application for {username} has been approved, with no charge.\n\n\
@@ -1084,21 +1113,21 @@ pub async fn resend(
     cfg: &DrainConfig,
     store: &Store,
     intent: ResendIntent,
-) -> Result<Settlement, String> {
+) -> Result<Settlement, Error> {
     let username = intent.username.as_str();
     let account = store
         .account(username)
         .await?
         .ok_or_else(|| format!("no account for {username}"))?;
     let Some(payment) = account.payment_state() else {
-        return Err(format!(
+        return Err(Error::from(format!(
             "{username} was approved without charge, so there is no payment token to resend"
-        ));
+        )));
     };
     if payment.token_ref.as_deref() != Some(intent.token.as_str()) {
-        return Err(format!(
+        return Err(Error::from(format!(
             "the token the resend names is not the one {username}'s account holds"
-        ));
+        )));
     }
     let body = decision_body(
         cfg,

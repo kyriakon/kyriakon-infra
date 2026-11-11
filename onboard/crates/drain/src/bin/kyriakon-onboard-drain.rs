@@ -18,6 +18,7 @@ use std::process::ExitCode;
 
 use kyriakon_onboard_core::config::DrainConfig;
 use kyriakon_onboard_core::store::Store;
+use kyriakon_onboard_drain::transitions::Error;
 
 const DEFAULT_CONFIG: &str = "/etc/kyriakon/onboard/drain.toml";
 
@@ -52,7 +53,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cfg_path: &Path) -> Result<(), String> {
+async fn run(cfg_path: &Path) -> Result<(), Error> {
     let cfg = DrainConfig::load(cfg_path)?;
     let store = Store::new(&cfg.store_root);
     // One pass at a time. cron starts the drain every minute, and a pass that

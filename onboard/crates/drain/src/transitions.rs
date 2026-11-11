@@ -7,12 +7,13 @@
 //! after-line work and the file's disposition stay here. The retry schedule and
 //! the failure report are the other half of the same seam.
 
-use kyriakon_onboard_core::config::DrainConfig;
+use kyriakon_onboard_core::config::{self, DrainConfig};
 use kyriakon_onboard_core::mail::notice;
 use kyriakon_onboard_core::store::journal::Journal;
-use kyriakon_onboard_core::store::{ApplicationRef, JournalLine, Store};
+use kyriakon_onboard_core::store::{self, ApplicationRef, JournalLine, Store};
 use kyriakon_onboard_core::util;
 use serde_json::Value;
+use std::fmt;
 use std::future::Future;
 use time::Duration;
 use time::OffsetDateTime;
@@ -23,6 +24,104 @@ pub mod lifecycle;
 pub mod payments;
 pub mod review;
 pub mod stripe;
+
+/// A failed transition. The seam is one boundary, so the job modules share this
+/// type: a failure the operator reads, a store or script failure with its own
+/// source, and a parse or encode failure that kept its context.
+#[derive(Debug)]
+pub enum Error {
+    /// A transition failed for a reason that is not one of the typed sources.
+    Failed(String),
+    /// The store failed; its error keeps the path and source.
+    Store(store::Error),
+    /// The drain's configuration failed.
+    Config(config::Error),
+    /// A privileged script failed.
+    Script(boxrun::Error),
+    /// A JSON record did not encode or parse.
+    Json {
+        context: &'static str,
+        source: serde_json::Error,
+    },
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Failed(message) => f.write_str(message),
+            Error::Store(error) => error.fmt(f),
+            Error::Config(error) => error.fmt(f),
+            Error::Script(error) => error.fmt(f),
+            Error::Json { context, source } => write!(f, "cannot {context}: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Failed(_) => None,
+            Error::Store(error) => Some(error),
+            Error::Config(error) => Some(error),
+            Error::Script(error) => Some(error),
+            Error::Json { source, .. } => Some(source),
+        }
+    }
+}
+
+impl Error {
+    pub fn report(&self, context: &str) {
+        eprintln!("kyriakon-onboard: {context}: {self}");
+        let mut source = std::error::Error::source(self);
+        while let Some(cause) = source {
+            eprintln!("kyriakon-onboard:   caused by: {cause}");
+            source = cause.source();
+        }
+    }
+
+    /// Temporary while the transition tests still inspect prose; step 5
+    /// replaces those assertions with variants.
+    pub fn contains(&self, pattern: &str) -> bool {
+        self.to_string().contains(pattern)
+    }
+}
+
+impl From<store::Error> for Error {
+    fn from(error: store::Error) -> Self {
+        Error::Store(error)
+    }
+}
+
+impl From<config::Error> for Error {
+    fn from(error: config::Error) -> Self {
+        Error::Config(error)
+    }
+}
+
+impl From<boxrun::Error> for Error {
+    fn from(error: boxrun::Error) -> Self {
+        Error::Script(error)
+    }
+}
+
+impl From<String> for Error {
+    fn from(message: String) -> Self {
+        Error::Failed(message)
+    }
+}
+
+impl From<&str> for Error {
+    fn from(message: &str) -> Self {
+        Error::Failed(message.to_string())
+    }
+}
+
+/// Bridge for the binaries and callers not converted yet; step 5 removes it.
+impl From<Error> for String {
+    fn from(error: Error) -> String {
+        error.to_string()
+    }
+}
 
 /// Append one journal line. The caller writes this before the transition, which
 /// is the whole point of the journal, and again on completion so an approval that
@@ -38,7 +137,7 @@ async fn write_journal(
     application: &ApplicationRef,
     outcome: &str,
     note: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let line = JournalLine {
         version: 1,
         at: util::filed_at(),
@@ -50,7 +149,7 @@ async fn write_journal(
         note: note.map(str::to_string),
         credit: None,
     };
-    journal.append(store, &line).await.map_err(String::from)
+    journal.append(store, &line).await.map_err(Error::from)
 }
 
 /// The intent file's own words: the id and kind the journal line carries, and
@@ -112,7 +211,7 @@ pub enum Settlement {
     /// refusal is still recorded, and the pass reports it.
     Refused {
         reason: String,
-        failure: Option<String>,
+        failure: Option<Error>,
     },
 }
 
@@ -192,7 +291,7 @@ pub enum AfterLine {
     Print(String),
 }
 
-async fn finish(store: &Store, after: AfterLine) -> Result<(), String> {
+async fn finish(store: &Store, after: AfterLine) -> Result<(), Error> {
     match after {
         AfterLine::Nothing => Ok(()),
         AfterLine::RemoveGroupRecord(domain) => groups::remove_group_record(store, &domain).await,
@@ -247,20 +346,20 @@ pub async fn settle<F>(
     envelope: &Envelope,
     disposition: Disposition,
     body: F,
-) -> Result<(), String>
+) -> Result<(), Error>
 where
-    F: Future<Output = Result<Settlement, String>>,
+    F: Future<Output = Result<Settlement, Error>>,
 {
     if journal.has(&envelope.id, "applied") {
         finish(store, disposition.after).await?;
-        return store.remove("intents", file).await.map_err(String::from);
+        return store.remove("intents", file).await.map_err(Error::from);
     }
     if journal.has(&envelope.id, "refused") {
         // A refusal ran no after-line work when it was written, so a replay
         // runs none either. The file disposition still applies.
         return match disposition.refusal {
             RefusalFile::Keep => Ok(()),
-            RefusalFile::Remove => store.remove("intents", file).await.map_err(String::from),
+            RefusalFile::Remove => store.remove("intents", file).await.map_err(Error::from),
         };
     }
     match body.await? {
@@ -291,11 +390,11 @@ where
             if let Some(more) = more {
                 finish(store, more).await?;
             }
-            store.remove("intents", file).await.map_err(String::from)
+            store.remove("intents", file).await.map_err(Error::from)
         }
         Settlement::Nothing => {
             finish(store, disposition.after).await?;
-            store.remove("intents", file).await.map_err(String::from)
+            store.remove("intents", file).await.map_err(Error::from)
         }
         Settlement::Refused { reason, failure } => {
             // The prologue has already returned on a refused line, so this one
@@ -349,7 +448,7 @@ pub async fn note_failure(
     id: &str,
     kind: &str,
     message: &str,
-) -> Result<bool, String> {
+) -> Result<bool, Error> {
     let (_, _, previous) = journal.failures(id);
     write_journal(
         store,
@@ -378,9 +477,10 @@ pub async fn report_failure(
     journal: &Journal,
     id: &str,
     kind: &str,
-    message: &str,
+    error: &Error,
 ) {
-    let fresh = note_failure(store, journal, &cfg.release, id, kind, message)
+    let message = error.to_string();
+    let fresh = note_failure(store, journal, &cfg.release, id, kind, &message)
         .await
         .unwrap_or(true);
     if fresh {
@@ -530,7 +630,7 @@ mod tests {
                     AfterLine::RemoveGroupRecord("parish.example".to_string()),
                     RefusalFile::Keep,
                 ),
-                async { Err("the body ran on a settled intent".to_string()) },
+                async { Err(Error::from("the body ran on a settled intent".to_string())) },
             ))
             .unwrap();
 
@@ -589,7 +689,7 @@ mod tests {
                     &format!("{id}.json"),
                     &envelope,
                     Disposition::new(AfterLine::Nothing, refusal),
-                    async { Err("the body ran on a settled intent".to_string()) },
+                    async { Err(Error::from("the body ran on a settled intent".to_string())) },
                 ))
                 .unwrap();
             let left = dir.join(format!("store/intents/{id}.json"));
@@ -707,7 +807,7 @@ mod tests {
                     },
                     RefusalFile::Keep,
                 ),
-                async { Err("the body ran on a settled intent".to_string()) },
+                async { Err(Error::from("the body ran on a settled intent".to_string())) },
             ))
             .unwrap();
 
