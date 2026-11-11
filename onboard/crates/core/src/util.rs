@@ -26,6 +26,33 @@ pub fn stamp(at: OffsetDateTime) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
+/// The lines one failure prints: the error under the service prefix, then each
+/// source that says something the line already printed does not. A wrapper whose
+/// `Display` delegates to its source would otherwise print the same sentence
+/// twice, and cron mails the drain's stderr.
+pub fn report_lines(error: &(dyn std::error::Error + 'static), context: &str) -> Vec<String> {
+    let mut lines = vec![format!("kyriakon-onboard: {context}: {error}")];
+    let mut last = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if text != last {
+            lines.push(format!("kyriakon-onboard:   caused by: {text}"));
+            last = text;
+        }
+        source = cause.source();
+    }
+    lines
+}
+
+/// Print [`report_lines`]. The one reporting function: a journal note, an alert
+/// body and a binary's last line all go through here.
+pub fn report(error: &(dyn std::error::Error + 'static), context: &str) {
+    for line in report_lines(error, context) {
+        eprintln!("{line}");
+    }
+}
+
 /// A timestamp `days` from now, RFC 3339 UTC to the second. The window's close,
 /// the status link's end and the one-time password link's expiry all come from
 /// here, so there is one arithmetic and one format for the three.
@@ -161,8 +188,39 @@ pub fn gbp(pence: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
     use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
+
+    #[derive(Debug)]
+    struct Inner;
+    impl fmt::Display for Inner {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("same text")
+        }
+    }
+    impl std::error::Error for Inner {}
+
+    #[derive(Debug)]
+    struct Wrapper(Inner);
+    impl fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fmt(f)
+        }
+    }
+    impl std::error::Error for Wrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn a_wrapper_is_reported_once() {
+        assert_eq!(
+            super::report_lines(&Wrapper(Inner), "context"),
+            vec!["kyriakon-onboard: context: same text"]
+        );
+    }
 
     fn at(s: &str) -> OffsetDateTime {
         OffsetDateTime::parse(s, &Rfc3339).unwrap()

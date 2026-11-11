@@ -107,12 +107,7 @@ impl Error {
     /// reporting function: a journal note, an alert body and a binary's last
     /// line all go through here instead of formatting a sentence at the site.
     pub fn report(&self, context: &str) {
-        eprintln!("kyriakon-onboard: {context}: {self}");
-        let mut source = std::error::Error::source(self);
-        while let Some(cause) = source {
-            eprintln!("kyriakon-onboard:   caused by: {cause}");
-            source = cause.source();
-        }
+        crate::util::report(self, context);
     }
 }
 

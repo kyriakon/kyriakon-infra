@@ -8,7 +8,7 @@
 
 use time::OffsetDateTime;
 
-use kyriakon_onboard_core::store::Store;
+use kyriakon_onboard_core::store::{self, Store};
 use kyriakon_onboard_core::util;
 
 /// One open window, as the console prints it.
@@ -25,14 +25,17 @@ pub struct OpenWindow {
 /// by the date it closes and then by username, so two windows closing the same
 /// day read in a stable order. A window with no readable close date is left out:
 /// a fabricated countdown is worse than a missing row.
-pub async fn open_windows(store: &Store, now: OffsetDateTime) -> Result<Vec<OpenWindow>, String> {
+pub async fn open_windows(
+    store: &Store,
+    now: OffsetDateTime,
+) -> Result<Vec<OpenWindow>, store::Error> {
     let mut out = Vec::new();
     for username in store.list("accounts").await? {
         let account = match store.account(&username).await {
             Ok(Some(account)) => account,
             Ok(None) => continue,
             Err(e) => {
-                eprintln!("kyriakon-onboard: {e}, not listed");
+                e.report("an account could not be read, not listed");
                 continue;
             }
         };
@@ -68,9 +71,9 @@ pub async fn open_windows(store: &Store, now: OffsetDateTime) -> Result<Vec<Open
             Ok(Some(group)) => group,
             Ok(None) => continue,
             Err(e) => {
-                eprintln!(
-                    "kyriakon-onboard: groups/{domain}/group.json is unreadable, not listed: {e}"
-                );
+                e.report(&format!(
+                    "groups/{domain}/group.json is unreadable, not listed"
+                ));
                 continue;
             }
         };

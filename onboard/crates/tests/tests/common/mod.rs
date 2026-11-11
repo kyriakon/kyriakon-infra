@@ -1055,7 +1055,9 @@ impl Fix {
             .enable_all()
             .build()
             .map_err(|e| format!("cannot build the runtime: {e}"))?;
-        runtime.block_on(kyriakon_onboard_drain::run(&cfg, &store))
+        runtime
+            .block_on(kyriakon_onboard_drain::run(&cfg, &store))
+            .map_err(String::from)
     }
 
     pub fn ctl(&self, args: &[&str]) -> Output {

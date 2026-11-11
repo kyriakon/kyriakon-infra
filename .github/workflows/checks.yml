@@ -40,6 +40,10 @@ jobs:
       # 700-line commit nobody can review.
       - name: fmt
         run: cargo fmt --manifest-path onboard/Cargo.toml --all --check
+      # The acceptance suite runs the installed binaries by path. `cargo test`
+      # builds its own targets, not the plain binaries, so build them first.
+      - name: build binaries
+        run: cargo build --manifest-path onboard/Cargo.toml --workspace
       - name: test
         run: cargo test --manifest-path onboard/Cargo.toml
       # Warnings are errors: the crate is clean at this bar today, so a new one

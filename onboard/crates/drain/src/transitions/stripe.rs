@@ -8,6 +8,7 @@ use super::groups::{group_record, write_account_record, write_group_record};
 use super::lifecycle::{dns_contact, report_record};
 use super::payments::{restore_group_mailboxes, token_join, write_payment_copy};
 use super::report_failure;
+use super::Error;
 use kyriakon_onboard_core::account::sign;
 use kyriakon_onboard_core::config::DrainConfig;
 use kyriakon_onboard_core::flow::validate;
@@ -45,7 +46,7 @@ pub async fn stripe_webhooks(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     // A box whose card rail is not configured yet has no secret, and a pass
     // with nothing to verify must not fail every minute. The first delivery
     // makes the missing secret loud.
@@ -62,7 +63,15 @@ pub async fn stripe_webhooks(
     let secret = match sign::read_key(std::path::Path::new(&cfg.stripe_webhook_secret)) {
         Ok(secret) => secret,
         Err(e) => {
-            report_failure(cfg, store, journal, "stripe-secret", "config", &e).await;
+            report_failure(
+                cfg,
+                store,
+                journal,
+                "stripe-secret",
+                "config",
+                &Error::from(e),
+            )
+            .await;
             return Ok(());
         }
     };
@@ -82,7 +91,7 @@ pub async fn stripe_webhooks(
                 // A pair another iteration of this pass already settled.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    eprintln!("kyriakon-onboard: webhook {id} is unreadable: {e}");
+                    Error::Failed(format!("is unreadable: {e}")).report(&format!("webhook {id}"));
                     remove_webhook(store, id).await?;
                     continue;
                 }
@@ -97,14 +106,18 @@ pub async fn stripe_webhooks(
                 &body,
                 OffsetDateTime::now_utc().unix_timestamp(),
             ) {
-                eprintln!("kyriakon-onboard: webhook {id} refused: {why}");
+                why.report(&format!("webhook {id} refused"));
                 remove_webhook(store, id).await?;
                 continue;
             }
             let event: Value = match serde_json::from_slice(&body) {
                 Ok(event) => event,
                 Err(e) => {
-                    eprintln!("kyriakon-onboard: webhook {id} is not JSON: {e}");
+                    Error::Json {
+                        context: "parse the webhook",
+                        source: e,
+                    }
+                    .report(&format!("webhook {id}"));
                     remove_webhook(store, id).await?;
                     continue;
                 }
@@ -120,7 +133,8 @@ pub async fn stripe_webhooks(
                 continue;
             }
             if event_id.is_empty() || kind.is_empty() {
-                eprintln!("kyriakon-onboard: webhook {id} names no event id or type");
+                Error::Failed("names no event id or type".to_string())
+                    .report(&format!("webhook {id}"));
                 remove_webhook(store, id).await?;
                 continue;
             }
@@ -142,8 +156,10 @@ pub async fn stripe_webhooks(
                         "type": kind,
                         "object": object_id,
                     });
-                    let bytes = serde_json::to_vec(&line)
-                        .map_err(|e| format!("cannot encode the processed event: {e}"))?;
+                    let bytes = serde_json::to_vec(&line).map_err(|source| Error::Json {
+                        context: "encode the processed event",
+                        source,
+                    })?;
                     store.log("webhooks/processed.jsonl").append(&bytes).await?;
                     seen.insert(format!("event:{event_id}"));
                     if let Some(pair) = invoice_pair(kind, object_id) {
@@ -158,9 +174,7 @@ pub async fn stripe_webhooks(
                 // still in the directory, or one arriving later, will change.
                 Ok(Settled::Deferred) => {}
                 Err(e) => {
-                    eprintln!(
-                        "kyriakon-onboard: webhook {id} ({kind}) could not be settled yet: {e}"
-                    );
+                    e.report(&format!("webhook {id} ({kind}) could not be settled yet"));
                 }
             }
         }
@@ -172,7 +186,7 @@ pub async fn stripe_webhooks(
 /// is recent. Accepts only `v1`: `v0` is the test-only older scheme. The
 /// comparison is constant time through [`sign::verify_bytes`], and every `v1`
 /// value is tried so a secret mid-roll verifies either way.
-pub fn verify_webhook(secret: &[u8], header: &str, body: &[u8], now: i64) -> Result<(), String> {
+pub fn verify_webhook(secret: &[u8], header: &str, body: &[u8], now: i64) -> Result<(), Error> {
     let mut timestamp: Option<i64> = None;
     let mut signatures: Vec<&str> = Vec::new();
     for part in header.split(',') {
@@ -197,12 +211,14 @@ pub fn verify_webhook(secret: &[u8], header: &str, body: &[u8], now: i64) -> Res
     }
     let timestamp = timestamp.ok_or("the signature header carries no t=")?;
     if signatures.is_empty() {
-        return Err("the signature header carries no v1 signature".to_string());
+        return Err(Error::from(
+            "the signature header carries no v1 signature".to_string(),
+        ));
     }
     if (now - timestamp).abs() > WEBHOOK_TOLERANCE {
-        return Err(format!(
+        return Err(Error::from(format!(
             "the timestamp {timestamp} is more than five minutes from {now}"
-        ));
+        )));
     }
     let mut payload = timestamp.to_string().into_bytes();
     payload.push(b'.');
@@ -213,16 +229,16 @@ pub fn verify_webhook(secret: &[u8], header: &str, body: &[u8], now: i64) -> Res
     {
         Ok(())
     } else {
-        Err("no v1 signature matches the body".to_string())
+        Err(Error::from("no v1 signature matches the body".to_string()))
     }
 }
 
-async fn remove_webhook(store: &Store, id: &str) -> Result<(), String> {
+async fn remove_webhook(store: &Store, id: &str) -> Result<(), Error> {
     store.remove("webhooks", &format!("{id}.body")).await?;
     store
         .remove("webhooks", &format!("{id}.sig"))
         .await
-        .map_err(String::from)
+        .map_err(Error::from)
 }
 
 /// The one pair key the dedup uses: an invoice is one payment, so a second
@@ -235,7 +251,7 @@ fn invoice_pair(kind: &str, object: &str) -> Option<String> {
 
 /// The event ids and `(type, object)` pairs already settled. One append-only
 /// record, so a resend sees what an earlier pass did.
-async fn processed_events(store: &Store) -> Result<HashSet<String>, String> {
+async fn processed_events(store: &Store) -> Result<HashSet<String>, Error> {
     let mut seen = HashSet::new();
     for value in store
         .log("webhooks/processed.jsonl")
@@ -308,7 +324,7 @@ impl BillingTarget {
         cfg: &DrainConfig,
         store: &Store,
         date: String,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         match self {
             BillingTarget::Account(a) => {
                 let payment = a
@@ -331,11 +347,13 @@ impl BillingTarget {
         Ok(())
     }
 
-    async fn save(&self, store: &Store) -> Result<(), String> {
+    async fn save(&self, store: &Store) -> Result<(), Error> {
         match self {
             BillingTarget::Account(a) => {
-                let bytes = serde_json::to_vec_pretty(a)
-                    .map_err(|e| format!("cannot encode the account: {e}"))?;
+                let bytes = serde_json::to_vec_pretty(a).map_err(|source| Error::Json {
+                    context: "encode the account",
+                    source,
+                })?;
                 write_account_record(store, &a.username, &bytes).await
             }
             BillingTarget::Group(g) => write_group_record(store, g).await,
@@ -377,7 +395,7 @@ enum TargetRef {
     Group(String),
 }
 
-async fn load_target(store: &Store, target: &TargetRef) -> Result<Option<BillingTarget>, String> {
+async fn load_target(store: &Store, target: &TargetRef) -> Result<Option<BillingTarget>, Error> {
     match target {
         TargetRef::Account(username) => {
             let Some(account) = store.account(username).await? else {
@@ -409,7 +427,7 @@ async fn target_for_subscription(
     store: &Store,
     journal: &Journal,
     subscription: &str,
-) -> Result<Option<TargetRef>, String> {
+) -> Result<Option<TargetRef>, Error> {
     for username in store.list("accounts").await? {
         let account = match store.account(&username).await {
             Ok(account) => account,
@@ -417,8 +435,9 @@ async fn target_for_subscription(
                 // A corrupt account could own the subscription, so the scan
                 // cannot skip it. Report the record and fail this event; the
                 // delivery stays queued for the pass after the record is fixed.
-                report_record(cfg, store, journal, "account", &username, &e.to_string()).await;
-                return Err(e.to_string());
+                let error = Error::Store(e);
+                report_record(cfg, store, journal, "account", &username, &error).await;
+                return Err(error);
             }
         };
         let Some(account) = account else {
@@ -437,8 +456,9 @@ async fn target_for_subscription(
         let record = match group_record(store, &domain).await {
             Ok(record) => record,
             Err(e) => {
-                report_record(cfg, store, journal, "group", &domain, &e).await;
-                return Err(e);
+                let error = e;
+                report_record(cfg, store, journal, "group", &domain, &error).await;
+                return Err(error);
             }
         };
         let Some(record) = record else {
@@ -465,7 +485,7 @@ async fn settle_event(
     journal: &Journal,
     kind: &str,
     event: &Value,
-) -> Result<Settled, String> {
+) -> Result<Settled, Error> {
     let object = event
         .pointer("/data/object")
         .ok_or("the event carries no data.object")?;
@@ -502,7 +522,7 @@ async fn settle_event(
 async fn account_for_payment_reference(
     store: &Store,
     reference: &str,
-) -> Result<Option<Account>, String> {
+) -> Result<Option<Account>, Error> {
     if !store::is_payment_token(reference) {
         return Ok(None);
     }
@@ -537,7 +557,7 @@ async fn account_for_payment_reference(
 async fn target_for_payment_reference(
     store: &Store,
     reference: &str,
-) -> Result<Option<TargetRef>, String> {
+) -> Result<Option<TargetRef>, Error> {
     if let Some(account) = account_for_payment_reference(store, reference).await? {
         return Ok(Some(TargetRef::Account(account.username)));
     }
@@ -572,7 +592,7 @@ async fn attach_subscription(
     billing: &mut BillingTarget,
     subscription: &str,
     customer: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let stripe = billing.stripe_mut();
     stripe.subscription = Some(subscription.to_string());
     stripe.customer = customer.map(str::to_string);
@@ -583,7 +603,7 @@ async fn attach_subscription(
 /// the group's `KYR-` token, and the subscription and customer are attached to
 /// what it indexes. Nothing else happens: `invoice.paid` owns the date, so a
 /// first payment extends exactly one year and never two.
-async fn checkout_completed(store: &Store, object: &Value) -> Result<Settled, String> {
+async fn checkout_completed(store: &Store, object: &Value) -> Result<Settled, Error> {
     let Some(reference) = object
         .get("client_reference_id")
         .and_then(Value::as_str)
@@ -615,7 +635,7 @@ async fn invoice_paid(
     store: &Store,
     journal: &Journal,
     object: &Value,
-) -> Result<Settled, String> {
+) -> Result<Settled, Error> {
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
@@ -720,7 +740,7 @@ async fn invoice_paid(
 /// an event applied after the tax-year boundary would otherwise be recorded
 /// wrong. A missing amount or timestamp is an error, which leaves the event for
 /// the next pass rather than writing a guess.
-fn invoice_money(object: &Value) -> Result<(String, String), String> {
+fn invoice_money(object: &Value) -> Result<(String, String), Error> {
     let amount = object
         .get("amount_paid")
         .and_then(Value::as_i64)
@@ -749,7 +769,7 @@ async fn append_invoice_ledger(
     invoice: &str,
     amount_gbp: &str,
     received_on: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let Some(token) = token else {
         return Ok(());
     };
@@ -768,12 +788,14 @@ async fn append_invoice_ledger(
 
 /// The current subscription from the Stripe API, through the one script that
 /// holds the key. Read-only: the webhook path makes no Stripe writes.
-async fn retrieve_subscription(cfg: &DrainConfig, subscription: &str) -> Result<Value, String> {
+async fn retrieve_subscription(cfg: &DrainConfig, subscription: &str) -> Result<Value, Error> {
     if !subscription
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'_')
     {
-        return Err(format!("the subscription id {subscription:?} is not an id"));
+        return Err(Error::from(format!(
+            "the subscription id {subscription:?} is not an id"
+        )));
     }
     let out = spawn_script(
         cfg,
@@ -782,21 +804,26 @@ async fn retrieve_subscription(cfg: &DrainConfig, subscription: &str) -> Result<
     )
     .await?;
     if !out.status.success() {
-        return Err(script_error(cfg, "stripe-api.sh", &out));
+        return Err(Error::from(script_error(cfg, "stripe-api.sh", &out)));
     }
-    serde_json::from_slice(&out.stdout)
-        .map_err(|e| format!("stripe-api.sh did not answer with a subscription: {e}"))
+    serde_json::from_slice(&out.stdout).map_err(|e| {
+        Error::from(format!(
+            "stripe-api.sh did not answer with a subscription: {e}"
+        ))
+    })
 }
 
 /// The Checkout Session a subscription came from, read through the same script.
 /// The list is filtered by the subscription and bounded to one; an empty list or
 /// an unreachable API is an error, so the event stays for the next pass.
-async fn retrieve_session(cfg: &DrainConfig, subscription: &str) -> Result<Value, String> {
+async fn retrieve_session(cfg: &DrainConfig, subscription: &str) -> Result<Value, Error> {
     if !subscription
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'_')
     {
-        return Err(format!("the subscription id {subscription:?} is not an id"));
+        return Err(Error::from(format!(
+            "the subscription id {subscription:?} is not an id"
+        )));
     }
     let out = spawn_script(
         cfg,
@@ -805,10 +832,13 @@ async fn retrieve_session(cfg: &DrainConfig, subscription: &str) -> Result<Value
     )
     .await?;
     if !out.status.success() {
-        return Err(script_error(cfg, "stripe-api.sh", &out));
+        return Err(Error::from(script_error(cfg, "stripe-api.sh", &out)));
     }
-    serde_json::from_slice(&out.stdout)
-        .map_err(|e| format!("stripe-api.sh did not answer with a checkout session: {e}"))
+    serde_json::from_slice(&out.stdout).map_err(|e| {
+        Error::from(format!(
+            "stripe-api.sh did not answer with a checkout session: {e}"
+        ))
+    })
 }
 
 /// The account reference a repaired payment carries: the session's own
@@ -835,7 +865,7 @@ async fn invoice_payment_failed(
     store: &Store,
     journal: &Journal,
     object: &Value,
-) -> Result<Settled, String> {
+) -> Result<Settled, Error> {
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
@@ -867,7 +897,7 @@ async fn invoice_payment_action_required(
     store: &Store,
     journal: &Journal,
     object: &Value,
-) -> Result<Settled, String> {
+) -> Result<Settled, Error> {
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
@@ -932,7 +962,7 @@ async fn subscription_changed(
     journal: &Journal,
     object: &Value,
     deleted: bool,
-) -> Result<Settled, String> {
+) -> Result<Settled, Error> {
     let Some(subscription) = object.get("id").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
@@ -973,7 +1003,7 @@ async fn invoice_upcoming(
     store: &Store,
     journal: &Journal,
     object: &Value,
-) -> Result<Settled, String> {
+) -> Result<Settled, Error> {
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };

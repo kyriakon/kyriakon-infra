@@ -109,8 +109,12 @@ fn a_variant_that_cannot_prove_itself_is_refused() {
             &value,
         ))
         .unwrap_err();
-    assert_eq!(
-        refused, "the token resend's signature does not verify",
+    assert!(
+        matches!(
+            &refused,
+            kyriakon_onboard_drain::transitions::Error::Failed(message)
+                if message == "the token resend's signature does not verify"
+        ),
         "{refused}"
     );
     assert_eq!(
