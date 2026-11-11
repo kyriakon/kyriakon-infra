@@ -3,9 +3,9 @@
 use super::*;
 
 use super::connection::say;
-use super::flow::flow_path;
 use super::gemini::capsule_not_found;
 use super::reply::{too_many, Which};
+use crate::flow::applicant::flow_path;
 
 use std::sync::Arc;
 

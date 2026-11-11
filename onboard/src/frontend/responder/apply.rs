@@ -3,12 +3,11 @@
 use super::*;
 
 use super::connection::fields;
-use super::flow::{
-    application_problems, build_record, file_application, label, reading, render_applicant, Reading,
-};
+use super::flow::{application_problems, build_record, file_application, render_applicant};
 use super::gemini::capsule_new;
 use super::reply::{capability, page_html, refused, server_error, too_many, Which};
 use super::route::Call;
+use crate::flow::applicant::{label, reading, Reading};
 
 use crate::config::HOST;
 use crate::frontend::fastcgi::{Reply, Request};

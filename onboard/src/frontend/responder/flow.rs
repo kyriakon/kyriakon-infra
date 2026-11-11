@@ -6,122 +6,15 @@ use super::gemini::capsule_front;
 use super::reply::page_html;
 use super::route::Call;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
-use crate::flow::questions::{Branch, Kind, Question, Rule};
+use crate::flow::applicant::{body_cross_checks, mail_key_errors};
+use crate::flow::questions::{Branch, Rule};
 use crate::frontend::fastcgi::{Reply, Request};
 use crate::store::{Acceptance, Record};
 use crate::{
-    flow::questions, flow::validate, frontend::capsule, frontend::page, mail::keycheck,
-    store::draft, util,
+    flow::questions, flow::validate, frontend::capsule, frontend::page, mail::keycheck, util,
 };
-
-/// One page of the applicant's path. A mail key is one page per mailbox, with
-/// the mailbox in the prompt: a body's key page would otherwise ask for every
-/// key at once, and a status 10 answer cannot say which block is whose.
-pub(crate) struct Page<'a> {
-    pub(crate) q: &'a Question,
-    /// Set on a key page, which is generated per mailbox rather than read from
-    /// the question list.
-    pub(crate) mailbox: Option<Mailbox>,
-}
-
-pub(crate) struct Mailbox {
-    /// The account name the key is filed under, empty for a person.
-    pub(crate) name: String,
-    /// The address the page names.
-    pub(crate) address: String,
-}
-
-/// The pages this applicant's path will ask, in file order: the branch the
-/// `whose` answer selects, the blessing only once `orders` says monastic, and
-/// one mail-key page per mailbox. The capsule and the terminal both walk it, so
-/// the counter and the branches cannot disagree between the two.
-pub(crate) fn flow_path<'a>(
-    list: &'a [Question],
-    answers: &BTreeMap<String, String>,
-) -> Vec<Page<'a>> {
-    let body = answers.get("whose").map(String::as_str) == Some("body");
-    let monastic = questions::is_monastic(answers.get("orders").map(String::as_str));
-    let mut out = Vec::new();
-    for q in questions::shown(list, !body) {
-        if q.branch == Branch::Monastic && !monastic {
-            continue;
-        }
-        if q.id == "mail_key" && !body {
-            let name = answers.get("username").cloned().unwrap_or_default();
-            let address = if name.is_empty() {
-                "your address".to_string()
-            } else {
-                format!("{name}@kyriakon.net")
-            };
-            out.push(Page {
-                q,
-                mailbox: Some(Mailbox { name, address }),
-            });
-        } else if q.id == "body_mail_key" && body {
-            let domain = answers.get("body_domain").cloned().unwrap_or_default();
-            for name in questions::account_names(answers) {
-                let address = if domain.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{name}@{domain}")
-                };
-                out.push(Page {
-                    q,
-                    mailbox: Some(Mailbox { name, address }),
-                });
-            }
-        } else {
-            out.push(Page { q, mailbox: None });
-        }
-    }
-    out
-}
-
-/// Why one page's answer cannot advance the flow, or `None`. The shared rules are
-/// the web form's; the type's own shape is added where the shared rules are
-/// silent, because a yes/no page that accepted "maybe" would store a value the
-/// form never offers.
-pub(crate) fn flow_problem(
-    page: &Page,
-    value: &str,
-    reserved: &HashSet<String>,
-    required: bool,
-    answers: &BTreeMap<String, String>,
-) -> Option<String> {
-    let q = page.q;
-    if page.mailbox.is_some() {
-        if value.trim().is_empty() {
-            return Some("a public key is needed".to_string());
-        }
-        let blocks = keycheck::blocks(value);
-        if blocks.len() != 1 {
-            return Some("one key for one mailbox".to_string());
-        }
-        return keycheck::pgp_public_key(&blocks[0]).err();
-    }
-    if let Some(why) = validate::reason(q, value, reserved, required) {
-        return Some(why);
-    }
-    // The shared key check is the web form's, because `validate::reason` only
-    // proves the first block parses; it does not count blocks or compare them
-    // with the body's account names.
-    if q.rule == Rule::MailKey && !value.is_empty() {
-        if let Some(why) = mail_key_errors(q, value, answers).into_iter().next() {
-            return Some(why);
-        }
-    }
-    match q.kind {
-        Kind::YesNo => (!value.is_empty() && !matches!(value, "yes" | "no"))
-            .then(|| "answer yes or no".to_string()),
-        Kind::Acceptance => {
-            (!value.is_empty() && value != "yes").then(|| "this has to be accepted".to_string())
-        }
-        Kind::Addresses => validate::address_lines(value),
-        _ => None,
-    }
-}
 
 /// Draw the intent id and write the application then the intent. The application
 /// goes first, so the drain never sees an intent whose application is not on
@@ -155,33 +48,6 @@ pub(super) async fn file_application(app: &App, record: &Record) -> Result<(), S
     Ok(())
 }
 
-/// The draft's answers with the key answer rebuilt from the keys the draft
-/// holds, pasted and mailed alike. `build_record` pairs one block per mailbox in
-/// account order, so a key the mail route filed and one pasted on the next page
-/// cannot disagree about which mailbox they serve.
-pub(crate) fn flow_answers(record: &draft::Draft, body: bool) -> BTreeMap<String, String> {
-    let mut answers = record.answers.clone();
-    let (id, mailboxes) = if body {
-        ("body_mail_key", questions::account_names(&record.answers))
-    } else {
-        (
-            "mail_key",
-            vec![record.answers.get("username").cloned().unwrap_or_default()],
-        )
-    };
-    let mut materials = Vec::new();
-    for mailbox in &mailboxes {
-        match record.mail_keys.iter().find(|k| k.mailbox == *mailbox) {
-            Some(key) => materials.push(key.material.clone()),
-            None => return answers,
-        }
-    }
-    if !materials.is_empty() {
-        answers.insert(id.to_string(), materials.join("\n\n"));
-    }
-    answers
-}
-
 /// The applicant page, with the community block open for a body. `branch` is the
 /// branch the page was rendered for, which the GET carries so that a link to the
 /// body's page opens it.
@@ -211,35 +77,6 @@ pub(super) async fn root(app: &App, call: &Call<'_>) -> Reply {
     }
 }
 
-/// What a submission is read against.
-pub(super) struct Reading {
-    /// Whether it is read as a body's, which decides which questions exist.
-    pub(super) body: bool,
-    /// Whether the applicant has already been shown that branch's questions. False
-    /// when the answer names a branch the page did not carry, which is a question
-    /// the page had not opened and therefore answers it never showed.
-    pub(super) shown: bool,
-}
-
-/// The branch a submission is read against, and whether its own answers are the
-/// page it was shown. The branch question's answer settles this, from the same
-/// field whichever front-end filed the submission: the web form posts its select,
-/// and the terminal and the capsule post the same answer.
-pub(super) fn reading(form: &BTreeMap<String, String>) -> Reading {
-    let body = form.get("whose").map(String::as_str) == Some("body");
-    let shown = match form.get("branch") {
-        // The web form posts the branch its page was rendered for. An answer
-        // naming the other one means the applicant changed the select without
-        // opening the block it asks for, so the page they were shown is not the
-        // page their answer asks for.
-        Some(page) => (page == "body") == body,
-        // No page: a front-end that renders its own has already shown whatever its
-        // answer asks for, so its answer is the page.
-        None => true,
-    };
-    Reading { body, shown }
-}
-
 /// A submission's origin. `Origin` is sent on every browser POST; a value that is
 /// not this service's own is refused. When it is absent, `Sec-Fetch-Site` is the
 /// fallback, and a browser that sends neither is a client that is not a browser at
@@ -264,20 +101,6 @@ pub(super) fn own_origin(request: &Request) -> bool {
         // origin's: it is not a cross-site submission and does not need to be.
         Some(site) => site == "same-origin" || site == "same-site" || site == "none",
         None => true,
-    }
-}
-
-/// The front end that filed a submission: `web`, `tui` or `capsule`, and the web
-/// form when the field is not sent at all, since the browser form does not carry
-/// one. It is a label and nothing more, so nothing reads it but the reviewer and
-/// the intent: that is also why an unknown value is refused rather than recorded,
-/// because a value no reader recognises is a value that cannot be read at all.
-pub(super) fn label(form: &BTreeMap<String, String>) -> Result<&'static str, String> {
-    match form.get("front_end").map(String::as_str) {
-        None | Some("web") => Ok("web"),
-        Some("tui") => Ok("tui"),
-        Some("capsule") => Ok("capsule"),
-        Some(other) => Err(format!("unknown front_end {other:?}")),
     }
 }
 
@@ -310,23 +133,6 @@ pub(super) fn application_problems(app: &App, form: &BTreeMap<String, String>) -
         body_cross_checks(form, &mut errors);
     }
     errors
-}
-
-/// The body's addresses against its account names: the same number of lines, at
-/// most ten, and each address line `localpart: own` or `localpart: alias
-/// localpart`, which is the form the spec's community-block table gives.
-pub(crate) fn body_cross_checks(form: &BTreeMap<String, String>, errors: &mut Vec<String>) {
-    let addresses = form.get("body_addresses").map(String::as_str).unwrap_or("");
-    let a = addresses.lines().filter(|l| !l.trim().is_empty()).count();
-    let n = questions::account_names(form).len();
-    if a != n {
-        errors.push(format!(
-            "The addresses, one per line: {a} addresses and {n} account names; there is one account name per address"
-        ));
-    }
-    if let Some(why) = validate::address_lines(addresses) {
-        errors.push(format!("The addresses, one per line: {why}"));
-    }
 }
 
 pub(super) fn build_record(
@@ -418,39 +224,6 @@ pub(super) fn build_record(
         acceptances,
         question_list: app.cfg.release.clone(),
     })
-}
-
-/// The refusals for a mail-key answer. A person's key is one block; a body's is
-/// one block per mailbox, paired with the account names in the order given.
-pub(super) fn mail_key_errors(
-    q: &Question,
-    value: &str,
-    form: &BTreeMap<String, String>,
-) -> Vec<String> {
-    let blocks = keycheck::blocks(value);
-    if blocks.is_empty() {
-        return vec!["a public key is needed".to_string()];
-    }
-    if q.id == "body_mail_key" {
-        let mailboxes = questions::account_names(form).len();
-        if blocks.len() != mailboxes {
-            return vec![format!(
-                "one key per mailbox: {mailboxes} mailboxes and {} keys",
-                blocks.len()
-            )];
-        }
-        blocks
-            .iter()
-            .filter_map(|b| keycheck::pgp_public_key(b).err())
-            .collect()
-    } else if blocks.len() > 1 {
-        vec!["one key for one address".to_string()]
-    } else {
-        keycheck::pgp_public_key(&blocks[0])
-            .err()
-            .into_iter()
-            .collect()
-    }
 }
 
 pub(super) fn render_applicant(

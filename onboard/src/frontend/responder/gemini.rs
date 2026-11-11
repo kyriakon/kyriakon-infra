@@ -4,12 +4,11 @@ use super::*;
 
 use super::account::{group_recipe, group_state};
 use super::connection::decode;
-use super::flow::{
-    body_cross_checks, build_record, file_application, flow_answers, flow_path, flow_problem, Page,
-};
+use super::flow::{build_record, file_application};
 use super::reply::{too_many, Which};
 use super::route::Call;
 use super::status::card_link;
+use crate::flow::applicant::{body_cross_checks, flow_answers, flow_path, flow_problem, Page};
 
 use time::OffsetDateTime;
 

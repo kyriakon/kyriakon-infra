@@ -1,6 +1,7 @@
 //! Tests for the flow module.
 
-use super::{body_cross_checks, build_record, label};
+use super::build_record;
+use crate::flow::applicant::{body_cross_checks, label};
 use crate::flow::questions;
 use crate::frontend::fastcgi::fixture;
 use crate::frontend::responder::test_support::*;

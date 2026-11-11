@@ -39,10 +39,10 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::flow::applicant::{flow_answers, flow_path, flow_problem, Page};
 use crate::flow::catalogue::{self, Action, Protocol, Row, Service};
 use crate::flow::questions::{Kind, Question, Rule};
 use crate::frontend::ipc::Answer as StatusAnswer;
-use crate::frontend::responder::flow::{flow_answers, flow_path, flow_problem, Page};
 use crate::store;
 use crate::{mail::keycheck, store::draft};
 
@@ -728,10 +728,7 @@ fn application(
                     && draft.answers.contains_key("body_addresses")
                 {
                     let mut errors = Vec::new();
-                    crate::frontend::responder::flow::body_cross_checks(
-                        &draft.answers,
-                        &mut errors,
-                    );
+                    crate::flow::applicant::body_cross_checks(&draft.answers, &mut errors);
                     if !errors.is_empty() {
                         index -= 1;
                         put(
