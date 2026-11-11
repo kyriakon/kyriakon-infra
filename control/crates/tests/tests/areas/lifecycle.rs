@@ -987,6 +987,24 @@ fn a_groups_application_copy_in_every_mailbox_purges_once() {
     let mut record = fix.filed_body("warden");
     record["answers"]["body_addresses"] = json!("secretary: own\nrector: own");
     record["answers"]["body_account_names"] = json!("parish-secretary\nparish-office");
+    // Each mailbox needs its own key before an approval will start, and the
+    // record on disk is the one an approval reads: `filed_body` has already
+    // written it, so the mutation is written back too.
+    record["mail_keys"] = json!([
+        {
+            "mailbox": "parish-secretary",
+            "fingerprint": "1111 2222 3333 4444",
+            "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n-----END PGP PUBLIC KEY BLOCK-----",
+            "verdict": "works",
+        },
+        {
+            "mailbox": "parish-office",
+            "fingerprint": "5555 6666 7777 8888",
+            "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n-----END PGP PUBLIC KEY BLOCK-----",
+            "verdict": "works",
+        },
+    ]);
+    fix.rewrite_record(&record);
     fix.file_application(&record);
     assert!(fix.drain().status.success());
     fix.decide("approve", "warden");
