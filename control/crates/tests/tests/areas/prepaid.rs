@@ -979,11 +979,11 @@ fn a_credit_recovers_a_ledger_line_lost_after_the_account_write() {
 #[test]
 fn a_monero_credit_recovers_with_its_quote_and_receipt_rate() {
     let fix = Fix::new("credit-recovery-monero");
-    fix.rate_source(Some("300.00"));
+    fix.rate_source(Some("300.5"));
     let token = approved_paid(&fix, "secretary", "monero");
     assert_eq!(
         fix.account("secretary")["payment"]["monero"]["rate_gbp_per_xmr"],
-        json!("300.00")
+        json!("300.5")
     );
     // The receipt day is today, and the cache is fetched today, so the row can
     // record the receipt-date rate while the window quote stays at 300.00.
@@ -1029,7 +1029,7 @@ fn a_monero_credit_recovers_with_its_quote_and_receipt_rate() {
     let lines = payment_lines(&fix);
     assert_eq!(lines.len(), 1, "the line was not rebuilt: {lines:?}");
     assert_eq!(lines[0]["intent"], json!(id));
-    assert_eq!(lines[0]["rate_quoted"], json!("300.00"), "{lines:?}");
+    assert_eq!(lines[0]["rate_quoted"], json!("300.5"), "{lines:?}");
     assert_eq!(lines[0]["rate_source"], json!("coingecko"), "{lines:?}");
     assert!(lines[0]["rate_at"].as_str().is_some(), "{lines:?}");
     assert_eq!(lines[0]["rate_received"], json!("409.44"), "{lines:?}");
