@@ -945,15 +945,32 @@ pub(super) async fn name_held(store: &Store, username: &str) -> Result<Option<St
 /// Hold a closed account's name for ninety days. Written only when there is no
 /// live hold, so a retry keeps the date the removal first set rather than
 /// pushing the release out by another pass.
+///
+/// The hold also records the account's application status token where the
+/// account's copy still exists, which is what the journal prune uses to tell
+/// this account's lines from another applicant who asks for the same name.
 pub(super) async fn hold_name(store: &Store, username: &str) -> Result<(), Error> {
     if name_held(store, username).await?.is_some() {
         return Ok(());
     }
-    let bytes = serde_json::to_vec_pretty(&json!({
+    let token = store
+        .account_application_text(username)
+        .await?
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|copy| {
+            copy.get("status_token")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|token| !token.is_empty());
+    let mut hold = json!({
         "username": username,
         "until": util::after_days(90),
-    }))
-    .map_err(|source| Error::Json {
+    });
+    if let Some(token) = token {
+        hold["token"] = json!(token);
+    }
+    let bytes = serde_json::to_vec_pretty(&hold).map_err(|source| Error::Json {
         context: "encode the hold",
         source,
     })?;

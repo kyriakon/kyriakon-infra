@@ -329,28 +329,73 @@ fn the_console_refuses_a_name_with_no_account_and_no_deletion() {
 }
 
 /// Once the 90-day hold has run its course, the hold file and the journal lines
-/// that name the released account go, while a live hold and every other
-/// account's lines stay byte for byte.
+/// the deleted account owns go, while a live hold, another account's lines and
+/// another applicant's line for the same username stay byte for byte. A retried
+/// deletion's failure line is removed with the account's own lines.
 #[test]
 fn an_expired_hold_and_its_journal_lines_are_released() {
     let fix = Fix::new("erasure-hold-release");
     approved_paid(&fix, "secretary", "cash");
     approved_paid(&fix, "treasurer", "cash");
     fake_delete_user(&fix);
+    let application: Value =
+        serde_json::from_str(&fix.read("accounts/secretary/application.json")).unwrap();
+    let own_token = application["status_token"]
+        .as_str()
+        .expect("the approved account keeps its application token")
+        .to_string();
     assert!(fix.ctl(&["delete", "secretary"]).status.success());
     assert!(fix.ctl(&["delete", "treasurer"]).status.success());
-    assert!(fix.dir.join("store/holds/secretary.json").exists());
-    assert!(fix.dir.join("store/holds/treasurer.json").exists());
+    let hold: Value = serde_json::from_str(&fix.read("holds/secretary.json")).unwrap();
+    assert_eq!(hold["token"], own_token.as_str(), "{hold}");
 
-    // Ninety days pass for one name: its hold and the lines it bounds are dated
-    // in the past, while the other name's hold keeps today's date.
+    // Find the account's own deletion id, and the lines it names.
+    let journal = fix.journal();
+    let delete_id = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|entry| entry["kind"] == "delete" && entry["application"]["username"] == "secretary")
+        .and_then(|entry| entry["intent"].as_str().map(str::to_string))
+        .expect("the deletion journalled an intent id");
+
+    // A later applicant asks for the still-held name; their line carries another
+    // application token. The account's own delete failure carries no username,
+    // only the intent id, as the drain's failure lines do.
+    const FOREIGN: &str = "0123456789abcdefghjkmnpqrt";
+    let foreign = json!({
+        "version": 1,
+        "at": "2020-01-01T00:00:00Z",
+        "intent": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "kind": "approve",
+        "release": "test",
+        "application": {"username": "secretary", "status_token": FOREIGN},
+        "outcome": "applied",
+    });
+    let failed = json!({
+        "version": 1,
+        "at": "2020-01-01T00:00:00Z",
+        "intent": delete_id,
+        "kind": "delete",
+        "release": "test",
+        "application": {"username": ""},
+        "outcome": "failed",
+        "note": "delete-user.sh failed",
+    });
+
+    // Ninety days pass for one name: its own lines are dated in the past, while
+    // the other name's hold and lines keep today's date.
+    let aged_hold = json!({
+        "username": "secretary",
+        "until": "2020-06-01T00:00:00Z",
+        "token": own_token,
+    });
     std::fs::write(
         fix.dir.join("store/holds/secretary.json"),
-        br#"{"username":"secretary","until":"2020-06-01T00:00:00Z"}"#,
+        serde_json::to_vec(&aged_hold).unwrap(),
     )
     .unwrap();
     let mut aged = String::new();
-    for line in fix.journal().lines() {
+    for line in journal.lines() {
         let mut entry: Value = serde_json::from_str(line).unwrap();
         if entry["application"]["username"] == "secretary" {
             entry["at"] = json!("2020-01-01T00:00:00Z");
@@ -358,12 +403,18 @@ fn an_expired_hold_and_its_journal_lines_are_released() {
         aged.push_str(&serde_json::to_string(&entry).unwrap());
         aged.push('\n');
     }
+    aged.push_str(&serde_json::to_string(&foreign).unwrap());
+    aged.push('\n');
+    aged.push_str(&serde_json::to_string(&failed).unwrap());
+    aged.push('\n');
     std::fs::write(fix.dir.join("store/journal.jsonl"), &aged).unwrap();
+
     let kept: Vec<String> = aged
         .lines()
         .filter(|line| {
             let entry: Value = serde_json::from_str(line).unwrap();
-            entry["application"]["username"] != "secretary"
+            entry["application"]["username"] == "treasurer"
+                || entry["application"]["status_token"] == FOREIGN
         })
         .map(str::to_string)
         .collect();
@@ -381,6 +432,16 @@ fn an_expired_hold_and_its_journal_lines_are_released() {
     );
     let after: Vec<String> = fix.journal().lines().map(str::to_string).collect();
     assert_eq!(after, kept, "a journal line was not kept byte for byte");
+    assert!(
+        fix.journal().contains(FOREIGN),
+        "another applicant's line was removed: {}",
+        fix.journal()
+    );
+    assert!(
+        !fix.journal().contains("delete-user.sh failed"),
+        "the account's delete failure survived: {}",
+        fix.journal()
+    );
     assert!(
         fix.journal().ends_with('\n'),
         "the journal lost its newline"

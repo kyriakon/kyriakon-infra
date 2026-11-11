@@ -2642,3 +2642,42 @@ fn a_page_export_records_and_closes_its_request_line() {
     let out = fix.ctl(&["request", "list"]);
     assert!(body(&out).contains("no open requests"), "{}", body(&out));
 }
+
+/// A delivery that slips past the day the request was recorded closes on the
+/// day it was delivered, so a late answer does not read as on time.
+#[test]
+fn a_delayed_export_closes_on_the_day_it_delivers() {
+    let fix = Fix::new("data-export-delayed-close");
+    fix.member_tree("secretary");
+    approved_paid(&fix, "secretary", "cash");
+    let id = fix.file_page_action("export", "secretary", json!({}));
+    // The request was filed two days before this pass delivers it.
+    let out = fix.ctl(&[
+        "request",
+        "record",
+        "--username",
+        "secretary",
+        "--kind",
+        "access",
+        "--received",
+        "2020-01-01",
+        "--evidence",
+        "the account page's password check",
+        "--identity",
+        "password",
+        "--id",
+        &id,
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+
+    let record = fix.read("accounts/secretary/requests.jsonl");
+    let line: Value = serde_json::from_str(record.lines().next().unwrap()).unwrap();
+    assert_eq!(line["received"], "2020-01-01", "{line}");
+    assert_eq!(
+        line["done_at"],
+        kyriakon_control_core::util::date_after_days(0),
+        "{line}"
+    );
+    assert_ne!(line["done_at"], "2020-01-01", "{line}");
+}
