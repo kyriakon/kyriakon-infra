@@ -437,11 +437,12 @@ key_problems() {
 				printf 'its self-signature sets the AEAD feature bit (features: %s)\n' "$feat"
 			fi
 		done
-	# The primary and every subkey carry their own expiry in field 7. A primary
-	# that never expires with an encryption subkey that does stops delivery the
-	# same way, so both record types are read.
+	# The primary and every encryption-capable subkey carry the expiry that
+	# stops delivery. A signing subkey's expiry does not (the crate checks
+	# `encrypts` for the same reason), and reading it would refuse a key that
+	# approval's own check reports clean. Field 12 is the capabilities column.
 	gpg --batch --with-colons --show-keys "$key_file" 2>/dev/null |
-		awk -F: '($1 == "pub" || $1 == "sub") && $7 != "" { print $7 }' |
+		awk -F: '($1 == "pub" || ($1 == "sub" && $12 ~ /e/)) && $7 != "" { print $7 }' |
 		sort -un |
 		while read -r expires; do
 			printf 'it expires on %s, and delivery stops then without a word (a mail key must not expire)\n' \
