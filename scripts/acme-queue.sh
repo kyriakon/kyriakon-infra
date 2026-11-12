@@ -244,16 +244,33 @@ attempts_in_window() {
 	done < "$log"
 }
 
+# lane_log <name> : the log an attempt at <name> belongs in. Member names spend
+# kyriakon.net's budget and own-domain names their own, so the two lanes never
+# read or write each other's log.
+lane_log() {
+	case "$1" in
+	*.kyriakon.net) printf '%s' "$member_log" ;;
+	*) printf '%s' "$own_log" ;;
+	esac
+}
+
 # record_attempt <log> <now> : drop the lines that have aged out of the window and
 # append this attempt. A temporary file moved into place, so a killed pass leaves
-# the old log rather than half a line.
+# the old log rather than half a line. A failure is fatal and mailed: an attempt
+# the log does not carry lets the next pass retry at once, outside the window.
 record_attempt() {
 	typeset log="$1" now="$2"
-	{
+	if ! {
 		attempts_in_window "$log" "$now"
 		printf '%s\n' "$now"
-	} > "$log.tmp"
-	mv "$log.tmp" "$log"
+	} > "$log.tmp" 2>/dev/null; then
+		rm -f "$log.tmp"
+		die "could not write the attempt to $log, so the spacing is not recorded and the next pass could retry at once. Fix the store, then run --status"
+	fi
+	if ! mv "$log.tmp" "$log"; then
+		rm -f "$log.tmp"
+		die "could not move the attempt into $log, so the spacing is not recorded and the next pass could retry at once. Fix the store, then run --status"
+	fi
 }
 
 # minutes_until_member_slot <now> : 0 while fewer than BURST_LIMIT member attempts
@@ -403,10 +420,12 @@ attempt() {
 	cert="$ssl_dir/$name.fullchain.pem"
 	rc=0
 	log=$("$client" "$name" 2>&1) || rc=$?
-	case "$name" in
-	*.kyriakon.net) record_attempt "$member_log" "$(date +%s)" ;;
-	*) record_attempt "$own_log" "$(date +%s)" ;;
-	esac
+	# rc 2 means the certificate was already current, which is a renewal: it
+	# spends none of the registered domain's fifty and no authorization failure,
+	# so it is not an attempt the window should count.
+	if [ "$rc" -ne 2 ]; then
+		record_attempt "$(lane_log "$name")" "$(date +%s)"
+	fi
 	case "$rc" in
 	0 | 2)
 		# 0 issued or renewed; 2 still current. Either way the request is met.
@@ -724,6 +743,8 @@ STUB
 	# step from the hook fails here. The client and both drain scripts are stubs,
 	# and the certificate lands in a throwaway ssl directory.
 	ssl_dir="$work/ssl"
+	ACME_TEST_SSL="$ssl_dir"
+	export ACME_TEST_SSL
 	member_log="$work/attempts.kyriakon.net"
 	own_log="$work/attempts.own-domain"
 	: > "$member_log"
@@ -733,7 +754,7 @@ STUB
 	mkdir -p "$ssl_dir" "$pending_dir" "$drain_scripts"
 	cat > "$work/bin/acme-client" <<STUB
 #!/bin/sh
-: > "$ssl_dir/\$1.fullchain.pem"
+: > "\$ACME_TEST_SSL/\$1.fullchain.pem"
 STUB
 	cat > "$drain_scripts/provision-member-web.sh" <<STUB
 #!/bin/sh
@@ -777,6 +798,115 @@ apply --web"
 		"$(wc -l < "$own_log" | tr -d ' ')" "1"
 	check "and leaves the member log alone" \
 		"$(wc -l < "$member_log" | tr -d ' ')" "1"
+
+	# rc 2 is "already current": a renewal spends no refill slot and no
+	# authorization failure, so it closes the request without entering the log
+	# the burst count reads.
+	cat > "$work/bin/acme-current" <<STUB
+#!/bin/sh
+: > "\$ACME_TEST_SSL/\$1.fullchain.pem"
+exit 2
+STUB
+	chmod 0700 "$work/bin/acme-current"
+	client="$work/bin/acme-current"
+	member_before=$(wc -l < "$member_log" | tr -d ' ')
+	: > "$pending_dir/carol.kyriakon.net"
+	attempt carol.kyriakon.net > "$work/current.out" 2>&1
+	check "an already-current renewal closes its request" \
+		"$([ -e "$pending_dir/carol.kyriakon.net" ] && printf yes || printf no)" no
+	check "and is not counted as a member attempt" \
+		"$(wc -l < "$member_log" | tr -d ' ')" "$member_before"
+	client="$work/bin/acme-client"
+
+	# run() gates each lane on its own window. A full member count must not stop
+	# an own-domain order, and a recent own-domain attempt must not stop a member
+	# name. Both names are pending with the blocked lane's name older, so a gate
+	# that stopped the whole pass, or that ignored the lane when choosing, fails
+	# here. Each pass runs in a subshell so its lock trap and globals stay put.
+	now=$(date +%s)
+	run_queue="$work/run-member-closed"
+	queue_dir="$run_queue"
+	pending_dir="$run_queue/pending"
+	member_log="$run_queue/attempts.kyriakon.net"
+	own_log="$run_queue/attempts.own-domain"
+	ssl_dir="$work/ssl-run-member-closed"
+	ACME_TEST_SSL="$ssl_dir"
+	export ACME_TEST_SSL
+	mkdir -p "$pending_dir" "$ssl_dir"
+	i=0
+	while [ "$i" -lt 40 ]; do
+		printf '%s\n' "$now" >> "$member_log"
+		i=$(( i + 1 ))
+	done
+	: > "$own_log"
+	: > "$pending_dir/ok.kyriakon.net"
+	touch -t "$(date -r $(( now - 600 )) '+%Y%m%d%H%M.%S')" "$pending_dir/ok.kyriakon.net"
+	printf 'parish-secretary\n' > "$pending_dir/both.example"
+	touch -t "$(date -r $(( now - 300 )) '+%Y%m%d%H%M.%S')" "$pending_dir/both.example"
+	( run ) > "$work/run-member-closed.out" 2>&1
+	check "a full member window does not stop an own-domain order" \
+		"$([ -f "$ssl_dir/both.example.fullchain.pem" ] && printf yes || printf no)" yes
+	check "and the member name behind it is not attempted" \
+		"$([ -f "$ssl_dir/ok.kyriakon.net.fullchain.pem" ] && printf yes || printf no)" no
+	check "and the attempt is recorded in the own-domain log" \
+		"$(wc -l < "$own_log" | tr -d ' ')" "1"
+
+	run_queue="$work/run-own-closed"
+	queue_dir="$run_queue"
+	pending_dir="$run_queue/pending"
+	member_log="$run_queue/attempts.kyriakon.net"
+	own_log="$run_queue/attempts.own-domain"
+	ssl_dir="$work/ssl-run-own-closed"
+	ACME_TEST_SSL="$ssl_dir"
+	export ACME_TEST_SSL
+	mkdir -p "$pending_dir" "$ssl_dir"
+	: > "$member_log"
+	printf '%s\n' "$now" > "$own_log"
+	printf 'parish-secretary\n' > "$pending_dir/both.example"
+	touch -t "$(date -r $(( now - 600 )) '+%Y%m%d%H%M.%S')" "$pending_dir/both.example"
+	: > "$pending_dir/ok.kyriakon.net"
+	touch -t "$(date -r $(( now - 300 )) '+%Y%m%d%H%M.%S')" "$pending_dir/ok.kyriakon.net"
+	( run ) > "$work/run-own-closed.out" 2>&1
+	check "a recent own-domain attempt does not stop a member name" \
+		"$([ -f "$ssl_dir/ok.kyriakon.net.fullchain.pem" ] && printf yes || printf no)" yes
+	check "and the own-domain name behind it is not attempted" \
+		"$([ -f "$ssl_dir/both.example.fullchain.pem" ] && printf yes || printf no)" no
+	check "and the attempt is recorded in the member log" \
+		"$(wc -l < "$member_log" | tr -d ' ')" "1"
+
+	run_queue="$work/run-both-closed"
+	queue_dir="$run_queue"
+	pending_dir="$run_queue/pending"
+	member_log="$run_queue/attempts.kyriakon.net"
+	own_log="$run_queue/attempts.own-domain"
+	ssl_dir="$work/ssl-run-both-closed"
+	ACME_TEST_SSL="$ssl_dir"
+	export ACME_TEST_SSL
+	mkdir -p "$pending_dir" "$ssl_dir"
+	i=0
+	while [ "$i" -lt 40 ]; do
+		printf '%s\n' "$now" >> "$member_log"
+		i=$(( i + 1 ))
+	done
+	printf '%s\n' "$now" > "$own_log"
+	: > "$pending_dir/ok.kyriakon.net"
+	touch -t "$(date -r $(( now - 600 )) '+%Y%m%d%H%M.%S')" "$pending_dir/ok.kyriakon.net"
+	printf 'parish-secretary\n' > "$pending_dir/both.example"
+	touch -t "$(date -r $(( now - 300 )) '+%Y%m%d%H%M.%S')" "$pending_dir/both.example"
+	( run ) > "$work/run-both-closed.out" 2>&1
+	check "both windows closed attempts no member name" \
+		"$([ -f "$ssl_dir/ok.kyriakon.net.fullchain.pem" ] && printf yes || printf no)" no
+	check "and no own-domain name" \
+		"$([ -f "$ssl_dir/both.example.fullchain.pem" ] && printf yes || printf no)" no
+
+	# Back to the apply fixture's store for the remaining checks.
+	ssl_dir="$work/ssl"
+	ACME_TEST_SSL="$ssl_dir"
+	export ACME_TEST_SSL
+	member_log="$work/attempts.kyriakon.net"
+	own_log="$work/attempts.own-domain"
+	pending_dir="$work/apply-pending"
+	client="$work/bin/acme-client"
 
 	# An own-domain request with no owner cannot name a document root, so the hook
 	# refuses rather than writing a vhost it would have to guess.
