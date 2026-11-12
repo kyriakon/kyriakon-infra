@@ -27,6 +27,14 @@
 # repository are resolved and compared with their literal paths, so a symlink
 # planted in either place is refused rather than followed.
 #
+# Why the global config is nulled. `-c` outranks the repository config, but git
+# also reads ~/.gitconfig and $XDG_CONFIG_HOME/git/config first, and ~ is the
+# member's. A `uploadpack.packObjectsHook` there runs a command served by git
+# upload-pack, which a fetch reaches without any repository hook. The wrapper
+# therefore exports GIT_CONFIG_GLOBAL=/dev/null before the exec, which replaces
+# both files; the repository's own config still applies, under the two -c
+# settings above it.
+#
 # Usage (sshd does this; a human only runs --self-test):
 #   member-git-shell.sh -c "git-receive-pack '/home/<user>/repos/<name>.git'"
 #   member-git-shell.sh --self-test
@@ -140,6 +148,11 @@ run_command() {
 	# The repository's config is written by the member, so hooks and the monitor
 	# command are turned off on the command line: -c outranks the repository's
 	# own config. /dev/null is not a directory, so no hook is found there.
+	#
+	# GIT_CONFIG_GLOBAL replaces ~/.gitconfig and $XDG_CONFIG_HOME/git/config
+	# with an empty file. Without it a member's uploadpack.packObjectsHook runs
+	# a command on a fetch, which no -c setting in the repository covers.
+	export GIT_CONFIG_GLOBAL=/dev/null
 	exec "$git" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$verb" "$repo"
 }
 
@@ -151,23 +164,28 @@ self_test() {
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin
 	tree=$self_test_work
-	mkdir -p "$tree/home/alice/repos/pass.git/hooks" "$tree/bin"
+	mkdir -p "$tree/home/alice/repos/pass.git" "$tree/bin"
 	home=$(canonical "$tree/home/alice") || die "self-test: cannot resolve $tree/home/alice"
 
-	# The stub stands in for git: it records the argv it was handed. Nothing here
-	# opens a network connection.
+	# The global config a member can plant. Real git reads packObjectsHook from
+	# here on a fetch unless GIT_CONFIG_GLOBAL points elsewhere, and the stub
+	# below models that one setting, so the marker is a real assertion that the
+	# wrapper nulled the file rather than a check that always passes.
+	printf '[uploadpack]\n\tpackObjectsHook = touch %s\n' "$tree/global-hook-ran" \
+		>"$home/.gitconfig"
+
+	# The stub stands in for git: it records the argv and the global config path
+	# it was handed. Nothing here opens a network connection.
 	cat >"$tree/bin/git" <<EOF
 #!/bin/ksh
 printf '%s\n' "\$*" >>'$tree/git.argv'
+printf '%s\n' "\${GIT_CONFIG_GLOBAL:-unset}" >>'$tree/git.env'
+if [ "\${GIT_CONFIG_GLOBAL:-unset}" != /dev/null ] && grep -q packObjectsHook '$home/.gitconfig'; then
+	touch '$tree/global-hook-ran'
+fi
 EOF
 	chmod 0755 "$tree/bin/git"
 	git=$tree/bin/git
-
-	# A repository that would run a hook and a monitor command if git were
-	# allowed to read its config.
-	printf '#!/bin/ksh\ntouch %s\n' "$tree/hook-ran" >"$home/repos/pass.git/hooks/pre-receive"
-	chmod 0755 "$home/repos/pass.git/hooks/pre-receive"
-	printf '[core]\n\tfsmonitor = touch %s\n' "$tree/fsmonitor-ran" >"$home/repos/pass.git/config"
 
 	# A push or fetch naming anything but ~/repos/<name>.git is refused before
 	# git starts: the upload tree (outside this script's allowlist by design),
@@ -183,7 +201,7 @@ EOF
 		"sh -c id" \
 		"git-receive-pack"
 	do
-		rm -f "$tree/git.argv"
+		rm -f "$tree/git.argv" "$tree/git.env"
 		rc=0
 		( run_command "$command" ) >/dev/null 2>&1 || rc=$?
 		check "refused before git runs: $command" \
@@ -197,7 +215,7 @@ EOF
 	mkdir -p "$tree/home/carol/repos"
 	ln -s "$home/repos/pass.git" "$tree/home/carol/repos/pass.git"
 	saved_home=$home
-	rm -f "$tree/git.argv"
+	rm -f "$tree/git.argv" "$tree/git.env"
 	home=$tree/home/bob
 	rc=0
 	( run_command "git-receive-pack 'repos/pass.git'" ) >/dev/null 2>&1 || rc=$?
@@ -214,32 +232,33 @@ EOF
 	# the two -c settings that stop hooks and the monitor command from running.
 	# shellcheck disable=SC2088 # the forms a client sends, ~ literal on purpose
 	for arg in "repos/pass.git" "$home/repos/pass.git" "~/repos/pass.git"; do
-		rm -f "$tree/git.argv"
+		rm -f "$tree/git.argv" "$tree/git.env"
 		rc=0
 		( run_command "git-receive-pack '$arg'" ) >/dev/null 2>&1 || rc=$?
 		check "accepts $arg" "$rc" 0
 		check "and hands git the confined path for $arg" \
 			"$(cat "$tree/git.argv" 2>/dev/null)" \
 			"-c core.hooksPath=/dev/null -c core.fsmonitor=false receive-pack $home/repos/pass.git"
+		check "and replaces the member's global config for $arg" \
+			"$(cat "$tree/git.env" 2>/dev/null)" /dev/null
 	done
 	for arg in "repos/pass.git" "$home/repos/pass.git"; do
-		rm -f "$tree/git.argv"
+		rm -f "$tree/git.argv" "$tree/git.env"
 		rc=0
 		( run_command "git-upload-pack '$arg'" ) >/dev/null 2>&1 || rc=$?
 		check "accepts a fetch of $arg" "$rc" 0
 	done
-	rm -f "$tree/git.argv"
+	rm -f "$tree/git.argv" "$tree/git.env"
 	( run_command "git-upload-archive '$home/repos/pass.git'" ) >/dev/null 2>&1 || true
 	check "accepts an archive read" \
 		"$(cat "$tree/git.argv" 2>/dev/null)" \
 		"-c core.hooksPath=/dev/null -c core.fsmonitor=false upload-archive $home/repos/pass.git"
 
-	# The fixture's hook and monitor command were never reached. The stub does
-	# not run them either way; the argv above is what makes real git skip them.
-	check "the repository hook did not run" \
-		"$([ -e "$tree/hook-ran" ] && printf yes || printf no)" no
-	check "the fsmonitor command did not run" \
-		"$([ -e "$tree/fsmonitor-ran" ] && printf yes || printf no)" no
+	# The member's global config defines a hook git runs on a fetch. The stub
+	# runs it only when GIT_CONFIG_GLOBAL is not /dev/null, so a wrapper that
+	# stopped exporting the null file fails here.
+	check "the global config hook did not run" \
+		"$([ -e "$tree/global-hook-ran" ] && printf yes || printf no)" no
 
 	self_test_end
 }

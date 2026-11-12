@@ -64,11 +64,17 @@ on a provisioned member rewrites the same files and changes nothing else.
 ### The two sessions and the one key
 
 - One key serves both paths. The member's public key is written to
+  `/etc/ssh/authorized_keys/<name>`, owned by `root:wheel`, mode 0644, outside the
+  member's home. sshd is proposed to read it for the members group with
+  `AuthorizedKeysFile /etc/ssh/authorized_keys/%u`; that line is a hand step in the PR
+  and in the runbook because `sshd_config` is propose-only. Until the line is applied,
+  and as defence in depth after it, the key is also written to
   `/home/<name>/.ssh/authorized_keys`, owned by `root` and the member's group, mode 0640,
-  in a directory owned by `root` and that group, mode 0750. sshd reads a root-owned
-  `authorized_keys` under `StrictModes yes`, and a member who reaches code execution
-  cannot add a key to the account. No `authorized_keys` line is written for a comment-key
-  or a forced command: the port, not the key, decides which service the session reaches.
+  in a directory owned by `root` and that group, mode 0750. The home copy alone does not
+  stop the member, because `/home/<name>` stays member-owned and the member can rename
+  `.ssh` away; the managed copy is the one on a root-owned path. No `authorized_keys`
+  line is written for a comment-key or a forced command: the port, not the key, decides
+  which service the session reaches.
 - The session shell comes from the login class. `/etc/login.conf.d/member` carries
   `member:shell=/usr/local/libexec/member-git-shell.sh:tc=default:`, and `usermod -L
   member <name>` assigns it, so the confined shell runs on 2222 while `passwd` keeps

@@ -536,6 +536,24 @@ EOF
 	*) printf 'FAIL: a missing installed table is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
 	esac
 
+	# The member session shell is the one /usr/local/libexec row, and a stale
+	# copy there is a finding for the same reason /root/bin's is.
+	printf 'wrap.sh\t/usr/local/libexec\t-\n' >"$dir/libexec-table"
+	mkdir -p "$dir/libexec"
+	printf 'new\n' > "$dir/checkout/wrap.sh"
+	printf 'old\n' > "$dir/libexec/wrap.sh"
+	out=$(deployed_drift "$dir/checkout" "$dir/libexec-table" /usr/local/libexec "$dir/libexec")
+	case "$out" in
+	*wrap.sh*) ;;
+	*) printf 'FAIL: a stale libexec copy is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
+	printf 'new\n' > "$dir/libexec/wrap.sh"
+	out=$(deployed_drift "$dir/checkout" "$dir/libexec-table" /usr/local/libexec "$dir/libexec")
+	[ -z "$out" ] || {
+		printf 'FAIL: a matching libexec copy is not a finding; got [%s]\n' "$out" >&2
+		exit 1
+	}
+
 	printf 'mine\n' > "$dir/store/record.json"
 	[ -z "$(store_drift "$dir/store" "$(id -un)")" ] || {
 		printf 'FAIL: a record owned by the running user is not a finding\n' >&2
@@ -833,8 +851,9 @@ else
 fi
 
 # --- 9. the scripts the box runs are the scripts the checkout has ---------
-# The deploys install the rows of scripts/install-set.tsv into /root/bin and the
-# drain's directory, and nothing reads them again afterwards. A box running
+# The deploys install the rows of scripts/install-set.tsv into /root/bin, the
+# drain's directory, and /usr/local/libexec, and nothing reads them again
+# afterwards. A box running
 # copies older than its checkout gives no sign at all: operator mail went out
 # without the subject fix for months, and it surfaced because someone happened to
 # look at a subject line. A row with no installed file is the same finding from
@@ -859,11 +878,19 @@ if [ -d "$repo_dir/scripts" ]; then
 			|| drift_status=$?
 		drift_drain=$(deployed_drift "$repo_dir/scripts" "$install_set" drain "$drain_scripts_dir") \
 			|| drift_status=$?
+		drift_libexec=$(deployed_drift "$repo_dir/scripts" "$install_set" /usr/local/libexec /usr/local/libexec) \
+			|| drift_status=$?
 		if [ -z "$drift" ]; then
 			drift=$drift_drain
 		elif [ -n "$drift_drain" ]; then
 			drift="$drift
 $drift_drain"
+		fi
+		if [ -z "$drift" ]; then
+			drift=$drift_libexec
+		elif [ -n "$drift_libexec" ]; then
+			drift="$drift
+$drift_libexec"
 		fi
 		if [ "$drift_status" -ne 0 ]; then
 			printf 'installed scripts: %s could not be read, so the copies were not checked\n' \
@@ -872,7 +899,7 @@ $drift_drain"
 		elif [ -n "$drift" ]; then
 			printf 'installed scripts: these do not match the checkout at %s/scripts:\n' "$repo_dir"
 			printf '%s\n' "$drift" | sed -e 's/^/  /'
-			printf '  the fix is the deploy that installs them: deploy-mail.sh for /root/bin, deploy-control.sh for the drain\n'
+			printf '  the fix is the deploy that installs them: deploy-mail.sh for /root/bin and /usr/local/libexec, deploy-control.sh for the drain\n'
 			status=1
 		else
 			printf 'installed scripts: every copy matches the checkout\n'

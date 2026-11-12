@@ -57,7 +57,8 @@ BACKUP_PATHS='/home
 /etc/group
 /etc/httpd.d
 /etc/gmid.d
-/etc/acme-client.d'
+/etc/acme-client.d
+/etc/ssh/authorized_keys'
 export BACKUP_PATHS
 
 # Per-box values, so nothing has to be retyped or passed on a command line:

@@ -30,6 +30,7 @@
 #   /home/<username>/repos                      the member, 0700
 #   /home/<username>/.ssh                       root:<group>, 0750
 #   /home/<username>/.ssh/authorized_keys       root:<group>, 0640
+#   /etc/ssh/authorized_keys/<username>         root:wheel 0644
 #   /usr/local/libexec/member-git-shell.sh      root:wheel 0755
 #   /etc/login.conf.d/member                    root:wheel 0644
 #
@@ -52,12 +53,19 @@
 # outside that chroot, so the upload session never sees it and the repositories
 # are reached only through the confined git shell on 2222, which is not chrooted.
 #
-# .ssh is root-owned for the same reason the repositories are confined. sshd
-# accepts an authorized_keys file owned by root under StrictModes yes, and a
-# file the member cannot write is a file a process running as the member cannot
-# add a key to. The group is the member's own group, so sshd (running as root)
-# reads it and the member only ever reads it: 0750 on the directory, 0640 on the
-# file. The account still owns ~/repos and the Maildir.
+# The member's key is written twice. /etc/ssh/authorized_keys/<username> is the
+# one that matters: /etc and /etc/ssh are root-owned, so nothing the member can
+# write is on the path to it, which is what makes a root-authored key file
+# stick. sshd is proposed to read it for the members group
+# (AuthorizedKeysFile /etc/ssh/authorized_keys/%u); see the PR and the runbook
+# for the hand step, because openbsd/etc/sshd_config is propose-only.
+#
+# ~/.ssh/authorized_keys is the second copy, and it is defence in depth rather
+# than the fix: the home stays member-owned, so the member can rename ~/.ssh
+# away and put a directory of their own in its place. A user-owned file passes
+# StrictModes. The copy keeps the login working on a box whose sshd_config has
+# not been changed yet, and it is root:<group> 0750/0640 while it is used. The
+# account still owns ~/repos and the Maildir.
 #
 # Every path is checked after it is made, and a run that finds anything else
 # stops: a half-built tree that reports success is worse than a refusal.
@@ -117,6 +125,45 @@ assert_shape() {
 		printf 'refusing to report a tree that is not built\n' >&2
 		exit 1
 	fi
+}
+
+# ensure_dir <path> <mode> <owner> <group>: the directory, in that shape.
+# Returns 0 when it created or corrected it and 1 when it was already right, so
+# a run can report what it did rather than claiming work it did not do. install
+# -d on an existing directory sets the mode and owner, so a drifted permission
+# is corrected here rather than left for sshd to refuse at a session start.
+ensure_dir() {
+	typeset path mode want
+	path="$1"
+	mode="$2"
+	# The names, not the ids: every call site names an owner and a group, and
+	# %Su/%Sg are what print those. %u/%g would print 0:0 beside "root:wheel".
+	want="$3:$4 $(strip_mode "$2")"
+	if [ -d "$path" ] && [ "$(stat -f '%Su:%Sg %Lp' "$path")" = "$want" ]; then
+		return 1
+	fi
+	install -d -m "$mode" -o "$3" -g "$4" "$path"
+	return 0
+}
+
+# put_key <src> <dst> <owner> <group> <mode>: install one key file when its
+# bytes, owner or mode differ, so a second run leaves its inode and mtime alone.
+# Returns 0 when it wrote and 1 when the file was already right, the same
+# contract ensure_dir has. Both key copies go through this one body.
+put_key() {
+	typeset src dst owner group mode
+	src=$1
+	dst=$2
+	owner=$3
+	group=$4
+	mode=$5
+	if [ -f "$dst" ] &&
+		[ "$(stat -f '%Su:%Sg %Lp' "$dst")" = "$owner:$group $(strip_mode "$mode")" ] &&
+		cmp -s "$src" "$dst"; then
+		return 1
+	fi
+	install_staged "$src" "$dst" -m "$mode" -o "$owner" -g "$group"
+	return 0
 }
 
 # --- the member's own address -----------------------------------------------
@@ -234,6 +281,35 @@ self_test() {
 	check "strip_mode reads a stat mode the way a call site writes it" \
 		"$(strip_mode 0750)" 750
 	check "and the key file's mode, too" "$(strip_mode 0640)" 640
+
+	# The managed key file, through the same body the live run uses. The
+	# owner and group here are this run's, because the test has no root to
+	# chown to: the live call passes root and wheel.
+	printf 'ssh-ed25519 AAAAexample alice@example\n' >"$tree/key.pub"
+	mkdir -p "$tree/etc/ssh/authorized_keys"
+	key_fixture="$tree/etc/ssh/authorized_keys/alice"
+	rc=0
+	( put_key "$tree/key.pub" "$key_fixture" "$(id -un)" "$(id -gn)" 0644 ) >/dev/null 2>&1 || rc=$?
+	check "the managed key file is written" "$rc" 0
+	check "with the source bytes" \
+		"$(cmp -s "$tree/key.pub" "$key_fixture" && printf same || printf differs)" same
+	check "at the wanted mode" "$(stat -f '%Lp' "$key_fixture")" 644
+	rc=0
+	( put_key "$tree/key.pub" "$key_fixture" "$(id -un)" "$(id -gn)" 0644 ) >/dev/null 2>&1 || rc=$?
+	check "a second write finds it unchanged" "$rc" 1
+
+	# ensure_dir's contract, which the changed flag is read from: 1 when the
+	# directory is already right and 0 when it corrected it. The owner and group
+	# are this run's for the same reason put_key's are.
+	mkdir "$tree/dir"
+	chmod 0755 "$tree/dir"
+	rc=0
+	( ensure_dir "$tree/dir" 0755 "$(id -un)" "$(id -gn)" ) >/dev/null 2>&1 || rc=$?
+	check "an already-right directory reports no change" "$rc" 1
+	rc=0
+	( ensure_dir "$tree/dir" 0700 "$(id -un)" "$(id -gn)" ) >/dev/null 2>&1 || rc=$?
+	check "a drifted directory reports a change" "$rc" 0
+	check "and the mode is corrected" "$(stat -f '%Lp' "$tree/dir")" 700
 
 	self_test_end
 }
@@ -541,6 +617,8 @@ fi
 home="/home/$user"
 public="/home/www/$user.kyriakon.net"
 authorized_keys="$home/.ssh/authorized_keys"
+managed_keys_dir="/etc/ssh/authorized_keys"
+managed_key="$managed_keys_dir/$user"
 
 if [ ! -d "$home" ]; then
 	printf 'no home directory at %s, so the account is not one add-user.sh finished\n' "$home" >&2
@@ -548,54 +626,32 @@ if [ ! -d "$home" ]; then
 fi
 group=$(id -gn "$user")
 
-# ensure_dir <path> <mode> <owner> <group>: the directory, in that shape.
-# Returns 0 when it created or corrected it and 1 when it was already right, so
-# a run can report what it did rather than claiming work it did not do. install
-# -d on an existing directory sets the mode and owner, so a drifted permission
-# is corrected here rather than left for sshd to refuse at a session start.
-ensure_dir() {
-	typeset path mode want
-	path="$1"
-	mode="$2"
-	# The names, not the ids: every call site names an owner and a group, and
-	# %Su/%Sg are what print those. %u/%g would print 0:0 beside "root:wheel".
-	want="$3:$4 $(strip_mode "$2")"
-	if [ -d "$path" ] && [ "$(stat -f '%Su:%Sg %Lp' "$path")" = "$want" ]; then
-		return 1
-	fi
-	install -d -m "$mode" -o "$3" -g "$4" "$path"
-	return 0
-}
-
 # assert_shape <path> <owner:group> <mode>: fail loudly if the path is not what
 # was just built. This is the last line of defence for the whole script.
 # (Definition above the self-test, which drives it.)
 
 # The chroot root is root:wheel so sshd will chroot into it, and the two
 # directories that carry content belong to the member.
-ensure_dir "$public" 0755 root wheel || changed=yes
-ensure_dir "$public/www" 0755 "$user" members || changed=yes
-ensure_dir "$public/gemini" 0755 "$user" members || changed=yes
+if ensure_dir "$public" 0755 root wheel; then changed=yes; fi
+if ensure_dir "$public/www" 0755 "$user" members; then changed=yes; fi
+if ensure_dir "$public/gemini" 0755 "$user" members; then changed=yes; fi
 
-# Beside Maildir, which add-user.sh made, and outside the chroot above. .ssh is
-# root's: a process running as the member must not be able to add a key to the
-# account. sshd reads a root-owned authorized_keys under StrictModes yes, and
-# 0750/0640 leave it readable to the member's group and writable only by root.
-ensure_dir "$home/repos" 0700 "$user" "$group" || changed=yes
-ensure_dir "$home/.ssh" 0750 root "$group" || changed=yes
+# Beside Maildir, which add-user.sh made, and outside the chroot above. The
+# managed key under /etc is the one on a root-owned path. The .ssh copy below is
+# for a box that has not applied the sshd hand step, and after it is defence in
+# depth only: the home stays member-owned, so the member can replace the
+# directory, and sshd accepts a user-owned file under StrictModes.
+if ensure_dir "$home/repos" 0700 "$user" "$group"; then changed=yes; fi
+if ensure_dir "$home/.ssh" 0750 root "$group"; then changed=yes; fi
+if ensure_dir "$managed_keys_dir" 0755 root wheel; then changed=yes; fi
 
 # The key is installed whole rather than appended: the source file is the record
 # of which keys the account holds, one line each, so a line removed there is gone
-# from the account on the next run. Writing only when the bytes, the owner or the
-# mode differ is what lets a second run leave the file's mtime and inode alone.
-if [ -f "$authorized_keys" ] &&
-	[ "$(stat -f '%Su:%Sg %Lp' "$authorized_keys")" = "root:$group $(strip_mode 0640)" ] &&
-	cmp -s "$key_src" "$authorized_keys"; then
-	:
-else
-	install_staged "$key_src" "$authorized_keys" -m 0640 -o root -g "$group"
-	changed=yes
-fi
+# from the account on the next run. The managed copy under /etc is the one sshd
+# will read for members; the ~/.ssh copy keeps the session working until the
+# sshd_config hand step lands.
+if put_key "$key_src" "$authorized_keys" root "$group" 0640; then changed=yes; fi
+if put_key "$key_src" "$managed_key" root wheel 0644; then changed=yes; fi
 
 # --- the post-conditions ----------------------------------------------------
 
@@ -605,15 +661,19 @@ assert_shape "$public/gemini" "$user:members" 0755
 assert_shape "$home/repos" "$user:$group" 0700
 assert_shape "$home/.ssh" "root:$group" 0750
 assert_shape "$authorized_keys" "root:$group" 0640
+assert_shape "$managed_keys_dir" root:wheel 0755
+assert_shape "$managed_key" root:wheel 0644
 assert_shape "$shell_dst" root:wheel 0755
 
 # cmp, not a size: install could copy a truncated file and the mode would still
-# be right. The source is checked above, so this proves the copy is the file that
-# was checked.
-if ! cmp -s "$key_src" "$authorized_keys"; then
-	printf '%s and %s differ after the install\n' "$key_src" "$authorized_keys" >&2
-	exit 1
-fi
+# be right. The source is checked above, so this proves each copy is the file
+# that was checked.
+for key_copy in "$authorized_keys" "$managed_key"; do
+	if ! cmp -s "$key_src" "$key_copy"; then
+		printf '%s and %s differ after the install\n' "$key_src" "$key_copy" >&2
+		exit 1
+	fi
+done
 
 # The home belongs to the member, or the git session's ~ and everything the member
 # writes inside it land somewhere they cannot use.
@@ -678,6 +738,7 @@ printf 'provisioned %s\n' "$user"
 printf '  public:  %s (root:wheel 0755; www and gemini %s:members)\n' "$public" "$user"
 printf '  private: %s/repos 0700, %s/.ssh/authorized_keys root:%s 0640\n' "$home" "$home" "$group"
 printf '  session: sftp on 22 and confined git on 2222 from the member login class, one key\n'
+printf '  key:     %s (root:wheel 0644; sshd reads it for members once the hand step lands)\n' "$managed_key"
 printf '  files:   /etc/httpd.d/%s.kyriakon.net.conf, /etc/gmid.d/%s.kyriakon.net.conf\n' "$user" "$user"
 printf '           /etc/acme-client.d/%s.kyriakon.net.conf, request queued\n' "$user"
 printf '  key from: %s\n' "$key_src"

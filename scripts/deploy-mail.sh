@@ -1454,6 +1454,14 @@ for s in $libexec_scripts; do
 done
 printf 'member session shell installed into /usr/local/libexec\n'
 
+# The root-owned key directory the member sessions are proposed to read
+# (AuthorizedKeysFile /etc/ssh/authorized_keys/%u inside the members Match
+# block). It is on every run so the directory exists before a member is
+# provisioned, and it sits under /etc/ssh where nothing a member can write is on
+# the path. provision-member.sh writes one file per account.
+install -d -m 0755 -o root -g wheel /etc/ssh/authorized_keys
+printf 'member key directory installed at /etc/ssh/authorized_keys\n'
+
 # hcloud is installed at the top from openbsd/packages.tsv; restore-standup.sh
 # needs it to create the weekly test box.
 

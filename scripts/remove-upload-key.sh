@@ -8,11 +8,14 @@
 # Runs ON the box as root, from the drain, after the member removed their upload
 # key on the account page.
 #
-# One key serves both sessions: the chrooted sftp upload on port 22 and git-shell
-# on 2222, and sshd reads /home/<username>/.ssh/authorized_keys for each session
-# as it starts. So removing the file is the whole change. Nothing is restarted,
-# because there is nothing holding the old file open, and the next session is
-# refused rather than a running one being cut off.
+# One key serves both sessions: the chrooted sftp upload on port 22 and the
+# confined git shell on 2222, and sshd reads
+# /etc/ssh/authorized_keys/<username> for the members group once the hand
+# sshd_config step has landed. The older copy at
+# /home/<username>/.ssh/authorized_keys is still removed for a box that has not
+# applied that step, and for the transition. Removing both is the whole change.
+# Nothing is restarted, because there is nothing holding the old file open, and
+# the next session is refused rather than a running one being cut off.
 #
 # The tree, the published site, the repositories and the mail are left exactly
 # where they are. The account page's own words say the same: removing an upload
@@ -28,8 +31,9 @@
 # account must exist with a Maildir, so a name that is not a member never turns
 # into a path.
 #
-# Env: HOME_ROOT (default /home). It exists for the self-test's throwaway tree;
-# the drain sets nothing.
+# Env: HOME_ROOT (default /home) and AUTHORIZED_KEYS_DIR (default
+# /etc/ssh/authorized_keys). They exist for the self-test's throwaway tree; the
+# drain sets nothing.
 #
 # Exit: 0 the key is gone or was not there; 1 the file could not be removed;
 #       2 the arguments or the account are wrong.
@@ -41,6 +45,7 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 . "$script_dir/lib.sh"
 
 home_root=${HOME_ROOT:-/home}
+keys_root=${AUTHORIZED_KEYS_DIR:-/etc/ssh/authorized_keys}
 
 usage() {
 	printf 'usage: doas ksh %s <username>\n' "$0" >&2
@@ -63,7 +68,7 @@ is_root() { [ "$(id -u)" -eq 0 ]; }
 # remove <username>: the whole job, so the self-test drives the same body the
 # drain runs.
 remove() {
-	typeset user home key_file
+	typeset user home key_file removed=no
 	user=$1
 	valid_localpart "$user" ||
 		die "not a member name: $user (lowercase [a-z0-9-], starts and ends alphanumeric, at most 31 characters)"
@@ -73,12 +78,17 @@ remove() {
 	has_maildir "$home" ||
 		die "$user has no Maildir, so it is not a member account name; nothing was removed"
 
-	key_file="$home/.ssh/authorized_keys"
-	[ -f "$key_file" ] || return 0
-	rm -f "$key_file" || {
-		printf 'remove-upload-key: could not remove %s\n' "$key_file" >&2
-		exit 1
-	}
+	# Both copies, because a box that has not applied the sshd_config hand step
+	# reads the home one and a box that has reads the managed one.
+	for key_file in "$keys_root/$user" "$home/.ssh/authorized_keys"; do
+		[ -f "$key_file" ] || continue
+		rm -f "$key_file" || {
+			printf 'remove-upload-key: could not remove %s\n' "$key_file" >&2
+			exit 1
+		}
+		removed=yes
+	done
+	[ "$removed" = yes ] || return 0
 	printf 'removed the upload key for %s; sftp and git are refused from the next session\n' "$user"
 }
 
@@ -87,22 +97,26 @@ self_test() {
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work
 	home_root="$tree/home"
+	keys_root="$tree/etc/ssh/authorized_keys"
 
 	# The fixture is a member with one key, and the two predicates answer for it
 	# so no real account is touched.
 	account_exists() { [ "$1" = "alice" ]; }
 	has_maildir() { [ -d "$1/Maildir" ]; }
 	is_root() { return 0; }
-	mkdir -p "$home_root/alice/Maildir" "$home_root/alice/.ssh"
+	mkdir -p "$home_root/alice/Maildir" "$home_root/alice/.ssh" "$keys_root"
 	key_file="$home_root/alice/.ssh/authorized_keys"
+	managed_key="$keys_root/alice"
 	printf 'ssh-ed25519 AAAAexample alice@example\n' >"$key_file"
+	printf 'ssh-ed25519 AAAAexample alice@example\n' >"$managed_key"
 
 	set +e
 	( remove alice ) >"$tree/first.out" 2>&1
 	rc=$?
 	set -e
 	check "the key is removed" "$rc" 0
-	check "and the file is gone" "$([ -f "$key_file" ] && printf yes || printf no)" no
+	check "and the home copy is gone" "$([ -f "$key_file" ] && printf yes || printf no)" no
+	check "and the managed copy is gone" "$([ -f "$managed_key" ] && printf yes || printf no)" no
 	check "and the member's Maildir is untouched" \
 		"$([ -d "$home_root/alice/Maildir" ] && printf yes || printf no)" yes
 
