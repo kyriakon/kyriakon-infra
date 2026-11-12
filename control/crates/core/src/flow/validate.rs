@@ -43,7 +43,16 @@ pub fn reason(
         Rule::Usernames => usernames(v, reserved),
         Rule::Address => address(v),
         Rule::Domain => domain(v),
-        Rule::MailKey => keycheck::pgp_public_key(v).err().map(|e| e.to_string()),
+        // A key that cannot deliver is refused at the form, not carried to the
+        // review email: AEAD, an expiry, a revoked key or no encryption subkey
+        // all stop delivery, and the applicant is the one who can still change
+        // the key. The one advisory that proceeds is the parser-gap warning,
+        // where `inspected` is false and a person checks the key instead.
+        Rule::MailKey => match keycheck::pgp_public_key(v) {
+            Err(e) => Some(e.to_string()),
+            Ok(checked) if checked.inspected && checked.verdict != "works" => Some(checked.verdict),
+            Ok(_) => None,
+        },
         Rule::UploadKey => keycheck::openssh_public_key(v).err().map(|e| e.to_string()),
         Rule::Choice(opts) => choice(opts, v),
         Rule::MaxLen(n) => (v.chars().count() > *n).then(|| format!("at most {n} characters")),
@@ -228,6 +237,7 @@ fn choice(opts: &[questions::Choice], v: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::flow::questions::{Branch, Choice, Kind, Question, Rule};
+    use crate::mail::keycheck::fixtures::{AEAD, CLEAN, EXPIRED_SUBKEY, NO_ENCRYPTION};
 
     fn name() -> HashSet<String> {
         reserved("# comment\n\nmail\nwww\nsignup\n")
@@ -309,6 +319,24 @@ mod tests {
             rule: Rule::MailKey,
         };
         assert!(reason(&q, "", &name(), true).is_some());
+    }
+
+    #[test]
+    fn a_mail_key_that_cannot_deliver_is_refused_at_submission() {
+        let q = Question {
+            id: "mail_key".into(),
+            prompt: "Your public key".into(),
+            kind: Kind::Key,
+            branch: Branch::Person,
+            required: true,
+            rule: Rule::MailKey,
+        };
+        assert!(reason(&q, CLEAN, &name(), true).is_none());
+        assert!(reason(&q, AEAD, &name(), true).unwrap().contains("AEAD"));
+        assert!(reason(&q, EXPIRED_SUBKEY, &name(), true).is_some());
+        assert!(reason(&q, NO_ENCRYPTION, &name(), true)
+            .unwrap()
+            .contains("encryption-capable"));
     }
 
     #[test]

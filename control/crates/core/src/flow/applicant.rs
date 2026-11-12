@@ -92,9 +92,7 @@ pub fn flow_problem(
         if blocks.len() != 1 {
             return Some("one key for one mailbox".to_string());
         }
-        return keycheck::pgp_public_key(&blocks[0])
-            .err()
-            .map(|e| e.to_string());
+        return key_error(&blocks[0]);
     }
     if let Some(why) = validate::reason(q, value, reserved, required) {
         return Some(why);
@@ -220,17 +218,51 @@ pub fn mail_key_errors(q: &Question, value: &str, form: &BTreeMap<String, String
                 blocks.len()
             )];
         }
-        blocks
-            .iter()
-            .filter_map(|b| keycheck::pgp_public_key(b).err().map(|e| e.to_string()))
-            .collect()
+        blocks.iter().filter_map(|b| key_error(b)).collect()
     } else if blocks.len() > 1 {
         vec!["one key for one address".to_string()]
     } else {
-        keycheck::pgp_public_key(&blocks[0])
-            .err()
-            .map(|e| e.to_string())
-            .into_iter()
-            .collect()
+        key_error(&blocks[0]).into_iter().collect()
+    }
+}
+
+/// The refusal a submitted block has earned, or `None` when it can deliver.
+/// An inspected finding (AEAD, expiry, revocation, no encryption subkey) is a
+/// refusal at the form; the parser-gap advisory proceeds, because a key the
+/// platform cannot inspect is not a key it can prove bad.
+fn key_error(block: &str) -> Option<String> {
+    match keycheck::pgp_public_key(block) {
+        Err(e) => Some(e.to_string()),
+        Ok(checked) if checked.inspected && checked.verdict != "works" => Some(checked.verdict),
+        Ok(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flow::questions::{Branch, Kind, Question, Rule};
+    use crate::mail::keycheck::fixtures::{AEAD, CLEAN, EXPIRED_SUBKEY};
+
+    fn mail_key_question() -> Question {
+        Question {
+            id: "mail_key".into(),
+            prompt: "Your public key".into(),
+            kind: Kind::Key,
+            branch: Branch::Person,
+            required: true,
+            rule: Rule::MailKey,
+        }
+    }
+
+    #[test]
+    fn a_mail_key_that_cannot_deliver_is_refused() {
+        let q = mail_key_question();
+        let form = BTreeMap::new();
+        assert!(mail_key_errors(&q, CLEAN, &form).is_empty());
+        assert!(mail_key_errors(&q, AEAD, &form)
+            .iter()
+            .any(|why| why.contains("AEAD")));
+        assert!(!mail_key_errors(&q, EXPIRED_SUBKEY, &form).is_empty());
     }
 }
