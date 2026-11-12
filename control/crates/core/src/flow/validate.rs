@@ -50,8 +50,7 @@ pub fn reason(
         // where `inspected` is false and a person checks the key instead.
         Rule::MailKey => match keycheck::pgp_public_key(v) {
             Err(e) => Some(e.to_string()),
-            Ok(checked) if checked.inspected && checked.verdict != "works" => Some(checked.verdict),
-            Ok(_) => None,
+            Ok(checked) => checked.refusal().map(str::to_string),
         },
         Rule::UploadKey => keycheck::openssh_public_key(v).err().map(|e| e.to_string()),
         Rule::Choice(opts) => choice(opts, v),

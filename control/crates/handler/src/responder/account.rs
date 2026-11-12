@@ -599,8 +599,8 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
             // settles before any notice, so the page must say it here or the
             // member is never told. A block the parser could not inspect is an
             // advisory, not a finding: it files with the warning shown.
-            if checked.inspected && checked.verdict != "works" {
-                return refused(&checked.verdict);
+            if let Some(why) = checked.refusal() {
+                return refused(why);
             }
             let advisory = (!checked.inspected).then_some(checked.verdict.as_str());
             let Some(fingerprint) = keycheck::pgp_fingerprint(material) else {

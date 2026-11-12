@@ -1959,11 +1959,8 @@ pub async fn mail_key(
             // must not enter the keyring from `/account`. A block the parser
             // could not inspect carries an advisory, not a verdict, so it
             // proceeds like approval's.
-            if checked.inspected && checked.verdict != "works" {
-                return Ok(Settlement::refused(format!(
-                    "the mail key: {}",
-                    checked.verdict
-                )));
+            if let Some(why) = checked.refusal() {
+                return Ok(Settlement::refused(format!("the mail key: {why}")));
             }
             let Some(fingerprint) =
                 kyriakon_control_core::mail::keycheck::pgp_fingerprint(&intent.material)

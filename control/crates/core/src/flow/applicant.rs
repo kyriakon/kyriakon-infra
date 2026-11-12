@@ -233,8 +233,7 @@ pub fn mail_key_errors(q: &Question, value: &str, form: &BTreeMap<String, String
 pub fn key_error(block: &str) -> Option<String> {
     match keycheck::pgp_public_key(block) {
         Err(e) => Some(e.to_string()),
-        Ok(checked) if checked.inspected && checked.verdict != "works" => Some(checked.verdict),
-        Ok(_) => None,
+        Ok(checked) => checked.refusal().map(str::to_string),
     }
 }
 

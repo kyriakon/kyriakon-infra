@@ -52,6 +52,14 @@ pub struct Checked {
     pub inspected: bool,
 }
 
+impl Checked {
+    /// The findings that refuse a submission, or `None` when the block was not
+    /// inspected or the check found nothing. The parser-gap advisory proceeds.
+    pub fn refusal(&self) -> Option<&str> {
+        (self.inspected && self.verdict != "works").then_some(self.verdict.as_str())
+    }
+}
+
 struct Packet {
     tag: u8,
     body: Vec<u8>,
