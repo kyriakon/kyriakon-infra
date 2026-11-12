@@ -23,22 +23,37 @@
 # lives here.
 #
 # How it spaces. --run makes at most one attempt per pass and records the time of
-# every attempt in the store. A later pass will not attempt until 202 minutes have
-# passed since the last one, whatever the outcome, so two names can never be
-# attempted in the same pass and no two attempts are closer than one refill. The
-# attempt is recorded even when it fails: the point of the spacing is to protect
-# the CA's refill and the five-authorization-failures-per-identifier-per-hour
-# limit, and neither of those cares whether the last attempt succeeded. A failed
-# name is left pending, so its age keeps showing in --status.
+# every *.kyriakon.net attempt in a seven-day log in the store. Fifty certificates
+# per seven days is a burst allowance, not a wait after the first; so while fewer
+# than 40 attempts sit in that window the next pending name is attempted on the
+# next pass, and a signup day issues its certificates a quarter hour apart instead
+# of a refill apart. Forty is the reserve below the CA's fifty. At 40 or more the
+# bucket is treated as empty and a later pass will not attempt until 202 minutes
+# have passed since the newest one. Two names can still never be attempted in the
+# same pass.
+#
+# Attempts are counted, not issued certificates, and that is the conservative
+# reading: a failed attempt spends none of the fifty but does spend the
+# five-authorization-failures-per-identifier-per-hour budget, so counting it keeps
+# the failure lane inside the safe count too. A failed name is left pending, so
+# its age keeps showing in --status; while the burst window is open a retry comes
+# on the next pass, at most four times an hour, which is under that per-identifier
+# failure limit, and once the window fills the refill spacing is the retry.
 #
 # The budget, stated plainly because an own-domain body changes what a slot is
-# spent from. The queue has one global slot: at most one attempt every 202
-# minutes for the whole box, not one slot per name and not one per registered
-# domain. A member name spends one of kyriakon.net's fifty. A group's domain
-# order spends one of that domain's own fifty, because Let's Encrypt counts the
-# registered domain (the eTLD+1) and the body's domain is its own; the platform's
-# fifty is untouched. Either order occupies the queue's one slot for the pass
-# that makes it, so it waits behind earlier requests.
+# spent from. A member name spends one of kyriakon.net's fifty, so every
+# *.kyriakon.net attempt is written to the member log and gated by the burst and
+# refill above. A group's domain order spends one of that domain's own fifty,
+# because Let's Encrypt counts the registered domain (the eTLD+1) and the body's
+# domain is its own; the platform's fifty is untouched. Own-domain attempts are
+# therefore written to a log of their own and gated only by their own refill
+# spacing: neither lane's attempts close the other's window. One attempt per pass
+# holds across both, because --run works a single name.
+#
+# shortcut: the own-domain lane shares one log across domains rather than one per
+# domain. A second group's first certificate waits behind the first's refill, and
+# the CA's per-domain quota would allow it sooner; if own-domain volume ever makes
+# that wait real, key the log by the domain instead.
 #
 # Why a name that does not resolve is held, not attempted. An HTTP-01 attempt
 # against a name the world cannot resolve spends one of the five authorization
@@ -64,7 +79,10 @@
 #                                                    kyriakon-monitor under /var/db)
 #   request file   <store>/pending/<name>           one per name; the mtime is when
 #                                                    the request was filed and so its age
-#   last attempt   <store>/last-attempt             the epoch seconds of the last attempt
+#   member log     <store>/attempts.kyriakon.net    one epoch line per member attempt,
+#                                                    pruned to the last seven days
+#   own log        <store>/attempts.own-domain      the same for own-domain attempts
+#   burst limit    40 attempts per seven days       the reserve below the CA's fifty
 #   run lock       <store>/run.lock                 one pass at a time
 #   spacing        202 minutes                      the CA's published refill
 #   alert age      1440 minutes (24 hours)          read by scripts/abuse-monitor.sh
@@ -121,7 +139,11 @@ fi
 
 queue_dir="${ACME_QUEUE_DIR:-/var/db/kyriakon-acme-queue}"
 pending_dir="$queue_dir/pending"
-last_attempt_file="$queue_dir/last-attempt"
+# The attempt logs: one epoch line per attempt, pruned to the seven-day window
+# whenever an attempt is recorded. Member attempts and own-domain attempts are
+# kept apart so neither lane waits on the other's refill (see the header).
+member_log="$queue_dir/attempts.kyriakon.net"
+own_log="$queue_dir/attempts.own-domain"
 client="${ACME_CLIENT:-acme-client}"
 resolver="${ACME_RESOLVER:-host}"
 # Where the certificate lands. A variable so the self-test can point attempt() at
@@ -150,6 +172,12 @@ fi
 # one every 202 minutes. A constant rather than a tunable, because it is the CA's
 # number and not ours to set.
 REFILL_MINUTES=202
+
+# The burst allowance: while fewer than this many member attempts sit in the
+# seven-day window, the CA's bucket still has room and no spacing is applied. Ten
+# below the CA's fifty, so a day of signups cannot empty the bucket.
+BURST_LIMIT=40
+BURST_WINDOW_SECONDS=$(( 7 * 24 * 60 * 60 ))
 
 usage() {
 	printf 'usage: doas ksh %s --add <name> [<site-owner>] | --status | --run\n       ksh %s --self-test\n' \
@@ -190,7 +218,7 @@ name_ok() {
 # minutes still to wait. Rounded up, so the wait reported is never shorter than the
 # real one.
 minutes_until_slot() {
-	now="$1"; last="$2"
+	typeset now="$1" last="$2" left
 	if [ "$last" -le 0 ]; then
 		printf '0'
 		return 0
@@ -201,6 +229,72 @@ minutes_until_slot() {
 	else
 		printf '%s' "$(( (left + 59) / 60 ))"
 	fi
+}
+
+# attempts_in_window <log> <now> : the log's epoch lines less than seven days old,
+# oldest first, one per line; nothing when the log is absent. Read-only, because
+# --status calls it unprivileged; record_attempt prunes.
+attempts_in_window() {
+	typeset log="$1" now="$2" ts
+	[ -f "$log" ] || return 0
+	while read -r ts; do
+		case "$ts" in '' | *[!0-9]*) continue ;; esac
+		[ "$ts" -gt $(( now - BURST_WINDOW_SECONDS )) ] || continue
+		printf '%s\n' "$ts"
+	done < "$log"
+}
+
+# lane_log <name> : the log an attempt at <name> belongs in. Member names spend
+# kyriakon.net's budget and own-domain names their own, so the two lanes never
+# read or write each other's log.
+lane_log() {
+	case "$1" in
+	*.kyriakon.net) printf '%s' "$member_log" ;;
+	*) printf '%s' "$own_log" ;;
+	esac
+}
+
+# record_attempt <log> <now> : drop the lines that have aged out of the window and
+# append this attempt. A temporary file moved into place, so a killed pass leaves
+# the old log rather than half a line. A failure is fatal and mailed: an attempt
+# the log does not carry lets the next pass retry at once, outside the window.
+record_attempt() {
+	typeset log="$1" now="$2"
+	if ! {
+		attempts_in_window "$log" "$now"
+		printf '%s\n' "$now"
+	} > "$log.tmp" 2>/dev/null; then
+		rm -f "$log.tmp"
+		die "could not write the attempt to $log, so the spacing is not recorded and the next pass could retry at once. Fix the store, then run --status"
+	fi
+	if ! mv "$log.tmp" "$log"; then
+		rm -f "$log.tmp"
+		die "could not move the attempt into $log, so the spacing is not recorded and the next pass could retry at once. Fix the store, then run --status"
+	fi
+}
+
+# minutes_until_member_slot <now> : 0 while fewer than BURST_LIMIT member attempts
+# sit in the seven-day window, else the refill still owed since the newest one.
+# See the header for the bucket this mirrors.
+minutes_until_member_slot() {
+	typeset now="$1" lines count last
+	lines=$(attempts_in_window "$member_log" "$now")
+	count=$(printf '%s\n' "$lines" | awk 'NF { n++ } END { print n + 0 }')
+	if [ "$count" -lt "$BURST_LIMIT" ]; then
+		printf '0'
+		return 0
+	fi
+	last=$(printf '%s\n' "$lines" | awk 'NF { last = $1 } END { print last + 0 }')
+	minutes_until_slot "$now" "$last"
+}
+
+# minutes_until_own_slot <now> : the refill still owed since the newest own-domain
+# attempt in the window, or 0. This log never reads the member one: an own-domain
+# order spends its own registered domain's budget (see the header).
+minutes_until_own_slot() {
+	typeset now="$1" last
+	last=$(attempts_in_window "$own_log" "$now" | awk 'NF { last = $1 } END { print last + 0 }')
+	minutes_until_slot "$now" "$last"
 }
 
 # pending_oldest_first : the request files as "<mtime> <path>" lines, oldest first.
@@ -230,22 +324,32 @@ identifiers_resolve() {
 	resolve_ok "www.$1"
 }
 
-# next_attempt <list> : the oldest name in the "<mtime> <path>" list whose records
-# resolve, or nothing when none resolve. A name that does not resolve is skipped
-# and the queue moves past one member's missing record rather than stopping on it
-# (see the header). Skipped silently, not announced: a pass that attempts nothing
-# prints nothing, and a name that never resolves is reported by its age through
-# the monitor. Returns 0 either way; the caller reads the printed name.
+# next_attempt <list> [<member_wait> <own_wait>] : the oldest name in the
+# "<mtime> <path>" list whose lane is open and whose records resolve, or nothing
+# when none is. The waits default to 0, so a caller that does not gate gets the
+# oldest resolving name. A name whose lane is closed is skipped, so an own-domain
+# order inside its refill does not hold a member name that could be issued now,
+# and a member name at the burst limit does not hold an own-domain order. A name
+# that does not resolve is skipped too, and the queue moves past one member's
+# missing record rather than stopping on it (see the header). Skipped silently,
+# not announced: a pass that attempts nothing prints nothing, and a name that
+# never resolves is reported by its age through the monitor. Returns 0 either
+# way; the caller reads the printed name.
 next_attempt() {
+	typeset list="$1" member_wait="${2:-0}" own_wait="${3:-0}"
 	while read -r mtime path; do
 		[ -n "$path" ] || continue
 		name=${path##*/}
+		case "$name" in
+		*.kyriakon.net) [ "$member_wait" -eq 0 ] || continue ;;
+		*) [ "$own_wait" -eq 0 ] || continue ;;
+		esac
 		if identifiers_resolve "$name"; then
 			printf '%s' "$name"
 			return 0
 		fi
 	done <<EOF
-$1
+$list
 EOF
 	return 0
 }
@@ -316,7 +420,12 @@ attempt() {
 	cert="$ssl_dir/$name.fullchain.pem"
 	rc=0
 	log=$("$client" "$name" 2>&1) || rc=$?
-	printf '%s\n' "$(date +%s)" > "$last_attempt_file"
+	# rc 2 means the certificate was already current, which is a renewal: it
+	# spends none of the registered domain's fifty and no authorization failure,
+	# so it is not an attempt the window should count.
+	if [ "$rc" -ne 2 ]; then
+		record_attempt "$(lane_log "$name")" "$(date +%s)"
+	fi
 	case "$rc" in
 	0 | 2)
 		# 0 issued or renewed; 2 still current. Either way the request is met.
@@ -343,11 +452,27 @@ attempt() {
 		# one happened: a first issue spends one of the five per registered
 		# domain, and a renewal that was already current spends none.
 		if [ "$rc" -eq 0 ]; then
-			notify_operator acme issued "$(printf '%s: issued, and %s is in place, so the request is closed.\nThe vhost and keypair are applied. The next attempt can be %s minutes from now at the earliest, and this one spent a slot of the registered domain refill.' \
-				"$name" "$cert" "$REFILL_MINUTES")"
+			case "$name" in
+			*.kyriakon.net)
+				notify_operator acme issued "$(printf '%s: issued, and %s is in place, so the request is closed.\nThe vhost and keypair are applied. This one spent a slot of the registered domain refill: the next member name is attempted on the next pass while fewer than %s attempts sit in the last seven days, and %s minutes apart once the window fills.' \
+					"$name" "$cert" "$BURST_LIMIT" "$REFILL_MINUTES")"
+				;;
+			*)
+				notify_operator acme issued "$(printf '%s: issued, and %s is in place, so the request is closed.\nThe vhost and keypair are applied. Own-domain attempts keep a timer of their own, so the next own-domain attempt is %s minutes out at the earliest.' \
+					"$name" "$cert" "$REFILL_MINUTES")"
+				;;
+			esac
 		else
-			notify_operator acme current "$(printf '%s: already had a valid certificate, so the request is closed (%s).\nThe vhost and keypair are applied. The next attempt can be %s minutes from now at the earliest.' \
-				"$name" "$cert" "$REFILL_MINUTES")"
+			case "$name" in
+			*.kyriakon.net)
+				notify_operator acme current "$(printf '%s: already had a valid certificate, so the request is closed (%s).\nThe vhost and keypair are applied. A renewal that was already current spends no refill slot, so the next member name is attempted on the next pass while fewer than %s attempts sit in the last seven days, and %s minutes apart once the window fills.' \
+					"$name" "$cert" "$BURST_LIMIT" "$REFILL_MINUTES")"
+				;;
+			*)
+				notify_operator acme current "$(printf '%s: already had a valid certificate, so the request is closed (%s).\nThe vhost and keypair are applied. A renewal that was already current spends no refill slot, and own-domain attempts keep a timer of their own, so the next own-domain attempt is %s minutes out at the earliest.' \
+					"$name" "$cert" "$REFILL_MINUTES")"
+				;;
+			esac
 		fi
 		;;
 	*)
@@ -355,12 +480,12 @@ attempt() {
 		found=$(printf '%s: acme-client exited %s\n%s' "$name" "$rc" "$log")
 		case "$log" in
 		*"bad HTTP: 429"*)
-			found="$found$(printf '\n%s: the CA rate limited this order. A refusal spends no budget, but\n  acme-client 7.9 prints no Retry-After, so the %s-minute spacing stands as the retry.\n  Repeat occurrences: docs/planning/research/cert-issuance-ceiling.md' \
-				"$name" "$REFILL_MINUTES")"
+			found="$found$(printf '\n%s: the CA rate limited this order. A refusal spends no budget, but\n  acme-client 7.9 prints no Retry-After, so the queue spacing is the retry.\n  Repeat occurrences: docs/planning/research/cert-issuance-ceiling.md' \
+				"$name")"
 			;;
 		esac
 		notify_operator acme "attempt failed" "$found" \
-			"$name is left pending, so its age keeps saying how long the wait is, and the next pass tries it in $REFILL_MINUTES minutes at the earliest. --status reads the queue by hand."
+			"$name is left pending, so its age keeps saying how long the wait is. The next pass tries it again while the burst window is open, and $REFILL_MINUTES minutes after the newest attempt once $BURST_LIMIT attempts sit in the last seven days. --status reads the queue by hand."
 		exit 1
 		;;
 	esac
@@ -408,12 +533,19 @@ status() {
 	printf '%s\n' "$list" | while read -r mtime path; do
 		printf '%6s minutes  %s\n' "$(( (now - mtime) / 60 ))" "${path##*/}"
 	done
-	last=0
-	if [ -f "$last_attempt_file" ]; then
-		last=$(cat "$last_attempt_file")
+	member_lines=$(attempts_in_window "$member_log" "$now")
+	member_count=$(printf '%s\n' "$member_lines" | awk 'NF { n++ } END { print n + 0 }')
+	if [ "$member_count" -lt "$BURST_LIMIT" ]; then
+		printf 'member attempts in the last seven days: %s of %s (burst window open, so the next name is attempted on the next pass)\n' \
+			"$member_count" "$BURST_LIMIT"
+	else
+		printf 'member attempts in the last seven days: %s (at the %s limit)\n' \
+			"$member_count" "$BURST_LIMIT"
+		printf 'next member attempt in %s minutes (%s-minute refill)\n' \
+			"$(minutes_until_member_slot "$now")" "$REFILL_MINUTES"
 	fi
-	printf 'next attempt in %s minutes (%s-minute spacing)\n' \
-		"$(minutes_until_slot "$now" "$last")" "$REFILL_MINUTES"
+	printf 'next own-domain attempt in %s minutes (%s-minute refill, its own log)\n' \
+		"$(minutes_until_own_slot "$now")" "$REFILL_MINUTES"
 }
 
 run() {
@@ -442,18 +574,18 @@ run() {
 	trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true' EXIT
 
 	now=$(date +%s)
-	last=0
-	if [ -f "$last_attempt_file" ]; then
-		last=$(cat "$last_attempt_file")
-	fi
+	# Each lane has its own window, and only the lanes decide whether this pass has
+	# anything to do. Both closed is checked before the DNS lookups below, so a
+	# pass that cannot attempt anything costs no resolver traffic.
 	# A pass with nothing to do prints nothing. cron mails the output of a job, so
 	# a line here is a line in the operator's inbox every fifteen minutes: this
-	# queue is empty or inside its refill window for almost every pass it makes.
+	# queue is empty or inside a refill window for almost every pass it makes.
 	# --status is the reading for a human, and a request that has waited too long
 	# is reported by its age through the monitor, which is a signal rather than a
 	# running commentary.
-	wait=$(minutes_until_slot "$now" "$last")
-	if [ "$wait" -gt 0 ]; then
+	member_wait=$(minutes_until_member_slot "$now")
+	own_wait=$(minutes_until_own_slot "$now")
+	if [ "$member_wait" -gt 0 ] && [ "$own_wait" -gt 0 ]; then
 		return 0
 	fi
 
@@ -462,13 +594,14 @@ run() {
 		return 0
 	fi
 
-	# The one attempt this pass makes: the oldest pending name that resolves. Two
-	# attempts in a pass are impossible by construction, and attempt() records the
-	# time so the next pass cannot come back before the refill.
+	# The one attempt this pass makes: the oldest pending name whose lane is open
+	# and whose records resolve. Two attempts in a pass are impossible by
+	# construction, and attempt() records the attempt in its lane's log, so the
+	# next pass cannot come back before that lane's window allows it.
 	# Silent for the same reason: a name that does not resolve yet is held, and that
 	# is a normal state for a name whose records were asked for minutes ago. The age
 	# alert is what reports one that stays that way.
-	candidate=$(next_attempt "$list")
+	candidate=$(next_attempt "$list" "$member_wait" "$own_wait")
 	if [ -z "$candidate" ]; then
 		return 0
 	fi
@@ -521,6 +654,49 @@ self_test() {
 	check "a full refill past is open" "$(minutes_until_slot "$base" $(( base - 202 * 60 )))" "0"
 	check "a partly waited refill reports the remainder" "$(minutes_until_slot "$base" $(( base - 101 * 60 )))" "101"
 
+	# The burst window: fewer than BURST_LIMIT member attempts in seven days opens
+	# the lane, and the fortieth closes it to the refill. Synthetic timestamps
+	# against a fixed "now", so no clock, DNS or CA is involved.
+	member_log="$work/attempts.kyriakon.net"
+	own_log="$work/attempts.own-domain"
+	: > "$member_log"
+	check "an empty member log leaves the burst open" \
+		"$(minutes_until_member_slot "$base")" "0"
+	i=1
+	while [ "$i" -lt 40 ]; do
+		printf '%s\n' $(( base - 86400 + i )) >> "$member_log"
+		i=$(( i + 1 ))
+	done
+	check "39 attempts in seven days still leave the burst open" \
+		"$(minutes_until_member_slot "$base")" "0"
+	printf '%s\n' "$base" >> "$member_log"
+	check "the fortieth attempt closes the burst" \
+		"$(minutes_until_member_slot "$base")" "202"
+	check "and the refill counts from the newest attempt" \
+		"$(minutes_until_member_slot $(( base + 101 * 60 )))" "101"
+	check "an attempt older than seven days does not count" \
+		"$(attempts_in_window "$member_log" $(( base + 8 * 86400 )) | wc -l | tr -d ' ')" "0"
+
+	# Own-domain attempts are their own bucket: their log never closes the member
+	# window, and the member log never closes theirs.
+	: > "$own_log"
+	printf '%s\n' "$base" > "$own_log"
+	: > "$member_log"
+	check "a recent own-domain attempt does not close the member burst" \
+		"$(minutes_until_member_slot "$base")" "0"
+	printf '%s\n' "$base" >> "$member_log"
+	check "and a recent member attempt does not open the own-domain refill" \
+		"$(minutes_until_own_slot $(( base + 60 )))" "201"
+
+	# Recording an attempt prunes the lines that have aged out, so the log is the
+	# seven-day window rather than everything ever attempted.
+	: > "$own_log"
+	printf '%s\n' $(( base - 8 * 86400 )) > "$own_log"
+	record_attempt "$own_log" "$base"
+	check "recording an attempt drops the lines past the window" \
+		"$(wc -l < "$own_log" | tr -d ' ')" "1"
+	check "and keeps the new one" "$(cat "$own_log")" "$base"
+
 	# Three requests filed 30, 20 and 10 minutes ago must list oldest first, which
 	# is the order the queue works them in.
 	pending_dir="$work/pending"
@@ -565,6 +741,17 @@ STUB
 		"$(next_attempt "10 $pending_dir/parish.example" 2>/dev/null)" ""
 	check "one whose two identifiers both resolve is chosen" \
 		"$(next_attempt "10 $pending_dir/both.example" 2>/dev/null)" "both.example"
+	# A lane that is closed is skipped, not waited on: an own-domain order inside
+	# its refill does not hold a member name that could be issued now, and a member
+	# name at the burst limit does not hold an own-domain order.
+	check "a name whose lane is closed is skipped for the next lane" \
+		"$(next_attempt "10 $pending_dir/parish.example
+20 $pending_dir/ok.kyriakon.net" 0 120 2>/dev/null)" "ok.kyriakon.net"
+	check "and a closed member lane does not hold an own-domain order" \
+		"$(next_attempt "10 $pending_dir/ok.kyriakon.net
+20 $pending_dir/both.example" 120 0 2>/dev/null)" "both.example"
+	check "a name whose lane is closed is not attempted alone" \
+		"$(next_attempt "10 $pending_dir/parish.example" 0 120 2>/dev/null)" ""
 
 	# The apply hook, exercised through attempt() rather than through its own
 	# function: what has to hold is that a pass which issues a certificate runs the
@@ -572,13 +759,18 @@ STUB
 	# step from the hook fails here. The client and both drain scripts are stubs,
 	# and the certificate lands in a throwaway ssl directory.
 	ssl_dir="$work/ssl"
-	last_attempt_file="$work/last-attempt"
+	ACME_TEST_SSL="$ssl_dir"
+	export ACME_TEST_SSL
+	member_log="$work/attempts.kyriakon.net"
+	own_log="$work/attempts.own-domain"
+	: > "$member_log"
+	: > "$own_log"
 	pending_dir="$work/apply-pending"
 	drain_scripts="$work/drain"
 	mkdir -p "$ssl_dir" "$pending_dir" "$drain_scripts"
 	cat > "$work/bin/acme-client" <<STUB
 #!/bin/sh
-: > "$ssl_dir/\$1.fullchain.pem"
+: > "\$ACME_TEST_SSL/\$1.fullchain.pem"
 STUB
 	cat > "$drain_scripts/provision-member-web.sh" <<STUB
 #!/bin/sh
@@ -603,6 +795,10 @@ STUB
 	check "and runs the web lane then the web apply, in that order" \
 		"$(cat "$work/calls")" "web alice
 apply --web"
+	check "an issued member certificate records its attempt in the member log" \
+		"$(wc -l < "$member_log" | tr -d ' ')" "1"
+	check "and leaves the own-domain log alone" \
+		"$(wc -l < "$own_log" | tr -d ' ')" "0"
 
 	# An own-domain request carries its site owner, and the web lane is run with
 	# the domain and that account, because the 443 vhost roots the owner's tree.
@@ -614,6 +810,119 @@ apply --web"
 	check "and runs the domain's web lane with its owner, then the web apply" \
 		"$(cat "$work/calls")" "web parish.example parish-secretary
 apply --web"
+	check "an issued own-domain certificate records its attempt in the own-domain log" \
+		"$(wc -l < "$own_log" | tr -d ' ')" "1"
+	check "and leaves the member log alone" \
+		"$(wc -l < "$member_log" | tr -d ' ')" "1"
+
+	# rc 2 is "already current": a renewal spends no refill slot and no
+	# authorization failure, so it closes the request without entering the log
+	# the burst count reads.
+	cat > "$work/bin/acme-current" <<STUB
+#!/bin/sh
+: > "\$ACME_TEST_SSL/\$1.fullchain.pem"
+exit 2
+STUB
+	chmod 0700 "$work/bin/acme-current"
+	client="$work/bin/acme-current"
+	member_before=$(wc -l < "$member_log" | tr -d ' ')
+	: > "$pending_dir/carol.kyriakon.net"
+	attempt carol.kyriakon.net > "$work/current.out" 2>&1
+	check "an already-current renewal closes its request" \
+		"$([ -e "$pending_dir/carol.kyriakon.net" ] && printf yes || printf no)" no
+	check "and is not counted as a member attempt" \
+		"$(wc -l < "$member_log" | tr -d ' ')" "$member_before"
+	client="$work/bin/acme-client"
+
+	# run() gates each lane on its own window. A full member count must not stop
+	# an own-domain order, and a recent own-domain attempt must not stop a member
+	# name. Both names are pending with the blocked lane's name older, so a gate
+	# that stopped the whole pass, or that ignored the lane when choosing, fails
+	# here. Each pass runs in a subshell so its lock trap and globals stay put.
+	now=$(date +%s)
+	run_queue="$work/run-member-closed"
+	queue_dir="$run_queue"
+	pending_dir="$run_queue/pending"
+	member_log="$run_queue/attempts.kyriakon.net"
+	own_log="$run_queue/attempts.own-domain"
+	ssl_dir="$work/ssl-run-member-closed"
+	ACME_TEST_SSL="$ssl_dir"
+	export ACME_TEST_SSL
+	mkdir -p "$pending_dir" "$ssl_dir"
+	i=0
+	while [ "$i" -lt 40 ]; do
+		printf '%s\n' "$now" >> "$member_log"
+		i=$(( i + 1 ))
+	done
+	: > "$own_log"
+	: > "$pending_dir/ok.kyriakon.net"
+	touch -t "$(date -r $(( now - 600 )) '+%Y%m%d%H%M.%S')" "$pending_dir/ok.kyriakon.net"
+	printf 'parish-secretary\n' > "$pending_dir/both.example"
+	touch -t "$(date -r $(( now - 300 )) '+%Y%m%d%H%M.%S')" "$pending_dir/both.example"
+	( run ) > "$work/run-member-closed.out" 2>&1
+	check "a full member window does not stop an own-domain order" \
+		"$([ -f "$ssl_dir/both.example.fullchain.pem" ] && printf yes || printf no)" yes
+	check "and the member name behind it is not attempted" \
+		"$([ -f "$ssl_dir/ok.kyriakon.net.fullchain.pem" ] && printf yes || printf no)" no
+	check "and the attempt is recorded in the own-domain log" \
+		"$(wc -l < "$own_log" | tr -d ' ')" "1"
+
+	run_queue="$work/run-own-closed"
+	queue_dir="$run_queue"
+	pending_dir="$run_queue/pending"
+	member_log="$run_queue/attempts.kyriakon.net"
+	own_log="$run_queue/attempts.own-domain"
+	ssl_dir="$work/ssl-run-own-closed"
+	ACME_TEST_SSL="$ssl_dir"
+	export ACME_TEST_SSL
+	mkdir -p "$pending_dir" "$ssl_dir"
+	: > "$member_log"
+	printf '%s\n' "$now" > "$own_log"
+	printf 'parish-secretary\n' > "$pending_dir/both.example"
+	touch -t "$(date -r $(( now - 600 )) '+%Y%m%d%H%M.%S')" "$pending_dir/both.example"
+	: > "$pending_dir/ok.kyriakon.net"
+	touch -t "$(date -r $(( now - 300 )) '+%Y%m%d%H%M.%S')" "$pending_dir/ok.kyriakon.net"
+	( run ) > "$work/run-own-closed.out" 2>&1
+	check "a recent own-domain attempt does not stop a member name" \
+		"$([ -f "$ssl_dir/ok.kyriakon.net.fullchain.pem" ] && printf yes || printf no)" yes
+	check "and the own-domain name behind it is not attempted" \
+		"$([ -f "$ssl_dir/both.example.fullchain.pem" ] && printf yes || printf no)" no
+	check "and the attempt is recorded in the member log" \
+		"$(wc -l < "$member_log" | tr -d ' ')" "1"
+
+	run_queue="$work/run-both-closed"
+	queue_dir="$run_queue"
+	pending_dir="$run_queue/pending"
+	member_log="$run_queue/attempts.kyriakon.net"
+	own_log="$run_queue/attempts.own-domain"
+	ssl_dir="$work/ssl-run-both-closed"
+	ACME_TEST_SSL="$ssl_dir"
+	export ACME_TEST_SSL
+	mkdir -p "$pending_dir" "$ssl_dir"
+	i=0
+	while [ "$i" -lt 40 ]; do
+		printf '%s\n' "$now" >> "$member_log"
+		i=$(( i + 1 ))
+	done
+	printf '%s\n' "$now" > "$own_log"
+	: > "$pending_dir/ok.kyriakon.net"
+	touch -t "$(date -r $(( now - 600 )) '+%Y%m%d%H%M.%S')" "$pending_dir/ok.kyriakon.net"
+	printf 'parish-secretary\n' > "$pending_dir/both.example"
+	touch -t "$(date -r $(( now - 300 )) '+%Y%m%d%H%M.%S')" "$pending_dir/both.example"
+	( run ) > "$work/run-both-closed.out" 2>&1
+	check "both windows closed attempts no member name" \
+		"$([ -f "$ssl_dir/ok.kyriakon.net.fullchain.pem" ] && printf yes || printf no)" no
+	check "and no own-domain name" \
+		"$([ -f "$ssl_dir/both.example.fullchain.pem" ] && printf yes || printf no)" no
+
+	# Back to the apply fixture's store for the remaining checks.
+	ssl_dir="$work/ssl"
+	ACME_TEST_SSL="$ssl_dir"
+	export ACME_TEST_SSL
+	member_log="$work/attempts.kyriakon.net"
+	own_log="$work/attempts.own-domain"
+	pending_dir="$work/apply-pending"
+	client="$work/bin/acme-client"
 
 	# An own-domain request with no owner cannot name a document root, so the hook
 	# refuses rather than writing a vhost it would have to guess.

@@ -157,3 +157,36 @@ async fn the_card_pages_carry_the_keyed_payment_link() {
         "only the supported Payment Link parameters are used: {text}"
     );
 }
+
+/// A body's status page shows the group Payment Link, keyed to the group's
+/// token. A record with a `domain` is a body's application, and a body's year is
+/// its own price, so the account link would bill the wrong amount.
+#[tokio::test]
+async fn a_group_status_page_carries_the_group_payment_link() {
+    let (app, _dir) = handler("group-card-link").await;
+    let record: Record = serde_json::from_str(
+        r#"{"username":"warden","status_token":"abcdefghjkmnpqrstvwxyz0123",
+            "filed_at":"2026-10-01T09:00:00Z","front_end":"web","stage":"decided",
+            "domain":"parish.example",
+            "answers":{},"mail_keys":[],"rail":"card","no_charge":false,
+            "acceptances":[],"question_list":"2026-10-13 test",
+            "payment":{"token_ref":"KYR-AAAA-BBBB-CCCC",
+                       "token_issued_at":"2026-10-02T09:00:00Z","paid_until":null,
+                       "window":{"opened_at":"2099-10-02T09:00:00Z",
+                                 "closes_at":"2099-10-16T09:00:00Z",
+                                 "state":"open","extensions":0}}}"#,
+    )
+    .unwrap();
+    let view = payment_for(&app, Some(&record)).expect("a paid group approval has a block");
+    let text = view.instructions.join("\n");
+    assert!(
+        text.contains(
+            "https://buy.stripe.com/test_group_example?client_reference_id=KYR-AAAA-BBBB-CCCC"
+        ),
+        "the page carried the group link: {text}"
+    );
+    assert!(
+        !text.contains("https://buy.stripe.com/test_example?client_reference_id="),
+        "the page carried the account link: {text}"
+    );
+}

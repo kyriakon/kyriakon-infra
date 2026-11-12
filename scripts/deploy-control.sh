@@ -463,6 +463,18 @@ esac
 # trusted: a quote or a newline from a paste would break the config.
 printf '%s' "$STRIPE_PAYMENT_LINK" | grep -Eq '^https://[A-Za-z0-9._~:/?#@!$&*+,;=%-]+$' ||
 	die "STRIPE_PAYMENT_LINK in $env_file is not a plain https URL"
+# The group's own Payment Link, a separate Stripe object because a body's year
+# is its own price. Same rules as the person's link.
+case "${STRIPE_GROUP_PAYMENT_LINK:-}" in
+"")
+	die "STRIPE_GROUP_PAYMENT_LINK is not set in $env_file; add the group Payment Link's URL from the Stripe dashboard"
+	;;
+*REPLACE_ME*)
+	die "STRIPE_GROUP_PAYMENT_LINK in $env_file is still a placeholder; replace it with the group Payment Link's URL"
+	;;
+esac
+printf '%s' "$STRIPE_GROUP_PAYMENT_LINK" | grep -Eq '^https://[A-Za-z0-9._~:/?#@!$&*+,;=%-]+$' ||
+	die "STRIPE_GROUP_PAYMENT_LINK in $env_file is not a plain https URL"
 case "${KYRIAKON_IPV6:-}" in
 "" | *REPLACE_ME*)
 	die "KYRIAKON_IPV6 is not set in $env_file; set the box's IPv6 there"
@@ -522,12 +534,27 @@ case "$price_gbp" in
 	;;
 esac
 
+# The group price the handler's status page shows, from the same tracked file
+# the drain reads: two copies of the number can disagree as surely as a copy of
+# the person's price can.
+group_price_gbp=$(
+	awk -F'"' '/^group_price_gbp[[:space:]]*=/ { print $2; exit }' \
+		"$repo_dir/openbsd/etc/onboard/drain.toml"
+)
+case "$group_price_gbp" in
+"" | *REPLACE_ME*)
+	die "cannot read group_price_gbp from $repo_dir/openbsd/etc/onboard/drain.toml"
+	;;
+esac
+
 onboard_candidate=$(mktemp /etc/onboard/.onboard.toml.XXXXXX)
-RELEASE="$release" PRICE="$price_gbp" POSTAL="$POSTAL_ADDRESS" LINK="$STRIPE_PAYMENT_LINK" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
+RELEASE="$release" PRICE="$price_gbp" GROUP_PRICE="$group_price_gbp" POSTAL="$POSTAL_ADDRESS" LINK="$STRIPE_PAYMENT_LINK" GROUP_LINK="$STRIPE_GROUP_PAYMENT_LINK" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
 	/^release[[:space:]]*=/ { print "release = \"" ENVIRON["RELEASE"] "\""; next }
 	/^price_gbp[[:space:]]*=/ { print "price_gbp = \"" ENVIRON["PRICE"] "\""; next }
+	/^group_price_gbp[[:space:]]*=/ { print "group_price_gbp = \"" ENVIRON["GROUP_PRICE"] "\""; next }
 	/^postal_address[[:space:]]*=/ { print "postal_address = \"" ENVIRON["POSTAL"] "\""; next }
 	/^stripe_payment_link[[:space:]]*=/ { print "stripe_payment_link = \"" ENVIRON["LINK"] "\""; next }
+	/^stripe_group_payment_link[[:space:]]*=/ { print "stripe_group_payment_link = \"" ENVIRON["GROUP_LINK"] "\""; next }
 	/^ipv4[[:space:]]*=/ { print "ipv4 = \"" ENVIRON["IPV4"] "\""; next }
 	/^ipv6[[:space:]]*=/ { print "ipv6 = \"" ENVIRON["IPV6"] "\""; next }
 	/^dkim_selector[[:space:]]*=/ { print "dkim_selector = \"" ENVIRON["SELECTOR"] "\""; next }
@@ -552,10 +579,11 @@ mv "$onboard_candidate" /etc/onboard/onboard.toml
 # tracked template, substituted here; nothing is edited on the box.
 install -d -m 0700 -o root -g wheel /etc/kyriakon/onboard
 drain_candidate=$(mktemp /etc/kyriakon/onboard/.drain.toml.XXXXXX)
-RELEASE="$release" POSTAL="$POSTAL_ADDRESS" LINK="$STRIPE_PAYMENT_LINK" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
+RELEASE="$release" POSTAL="$POSTAL_ADDRESS" LINK="$STRIPE_PAYMENT_LINK" GROUP_LINK="$STRIPE_GROUP_PAYMENT_LINK" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
 	/^release[[:space:]]*=/ { print "release = \"" ENVIRON["RELEASE"] "\""; next }
 	/^postal_address[[:space:]]*=/ { print "postal_address = \"" ENVIRON["POSTAL"] "\""; next }
 	/^stripe_payment_link[[:space:]]*=/ { print "stripe_payment_link = \"" ENVIRON["LINK"] "\""; next }
+	/^stripe_group_payment_link[[:space:]]*=/ { print "stripe_group_payment_link = \"" ENVIRON["GROUP_LINK"] "\""; next }
 	/^ipv4[[:space:]]*=/ { print "ipv4 = \"" ENVIRON["IPV4"] "\""; next }
 	/^ipv6[[:space:]]*=/ { print "ipv6 = \"" ENVIRON["IPV6"] "\""; next }
 	/^dkim_selector[[:space:]]*=/ { print "dkim_selector = \"" ENVIRON["SELECTOR"] "\""; next }
@@ -572,6 +600,9 @@ awk -v want="postal_address = \"$POSTAL_ADDRESS\"" '$0 == want { found = 1 } END
 awk -v want="stripe_payment_link = \"$STRIPE_PAYMENT_LINK\"" '$0 == want { found = 1 } END { exit !found }' \
 	"$drain_candidate" \
 	|| die "/etc/kyriakon/onboard/drain.toml does not name the Payment Link; it should have been substituted, not left as a placeholder"
+awk -v want="stripe_group_payment_link = \"$STRIPE_GROUP_PAYMENT_LINK\"" '$0 == want { found = 1 } END { exit !found }' \
+	"$drain_candidate" \
+	|| die "/etc/kyriakon/onboard/drain.toml does not name the group Payment Link; it should have been substituted, not left as a placeholder"
 if grep -q 'REPLACE_ME' "$drain_candidate"; then
 	die "/etc/kyriakon/onboard/drain.toml still carries a REPLACE_ME placeholder"
 fi

@@ -109,6 +109,12 @@ keyring_publish_token = "/etc/kyriakon/onboard/keyring-publish-token"
 # sandbox link and a live link differ and neither belongs as a literal here.
 stripe_payment_link = "REPLACE_ME"
 
+# The Payment Link a group's card decision email carries. A group's year is its
+# own price, so its link is a separate Stripe object; the account link keyed to
+# a group's token would bill a person's price for a body. Substituted at deploy
+# from /root/.kyriakon-env.
+stripe_group_payment_link = "REPLACE_ME"
+
 # The one reviewer the whole application is mailed to. Every answer, the
 # mail-key result, whether an upload key was supplied, the rail, the no-charge
 # flag and the three signed links arrive in one message so the decision can be

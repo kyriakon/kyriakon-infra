@@ -127,11 +127,20 @@ pub struct Config {
     /// have to agree, the address because it is the operator's own and this
     /// repository is public.
     pub price_gbp: String,
+    /// The yearly price of an own-domain group, which the status page shows for
+    /// a body's token. Substituted at deploy from the drain's own config, so the
+    /// Stripe Price, the approval mail and the page cannot disagree.
+    pub group_price_gbp: String,
     pub postal_address: String,
     /// The card rail's Payment Link. It is public (a member is sent it), so the
     /// handler may hold it to render the same link the approval email carries.
     /// `REPLACE_ME` in the repository and substituted at deploy with the rest.
     pub stripe_payment_link: String,
+    /// The card rail's Payment Link for an own-domain group. It is a separate
+    /// Stripe object because a group's year is its own price, and a person's
+    /// link keyed to a group token would settle the wrong amount. Public in the
+    /// same way as `stripe_payment_link`, and substituted at deploy.
+    pub stripe_group_payment_link: String,
     /// Where the login check writes one proof per admitted login, and the drain
     /// reads it back. Root-owned 0700, created by `scripts/deploy-control.sh`;
     /// the handler may pass the path to the checker but cannot write there
@@ -241,6 +250,10 @@ pub struct DrainConfig {
     /// not a literal: the live link and a sandbox link differ, and the file is
     /// deployed from the box's own environment.
     pub stripe_payment_link: String,
+    /// The Payment Link a group's card decision email carries. A group's year is
+    /// its own price, so its link is a separate Stripe object; the account link
+    /// keyed to a group's token would bill a person's price for a body.
+    pub stripe_group_payment_link: String,
     pub keyring_publish_token: String,
     /// The one reviewer the whole application is mailed to.
     pub reviewer: String,
@@ -373,12 +386,15 @@ mod tests {
              dmarc_rua = \"mailto:dmarc@kyriakon.net\"\n\
              release = \"REPLACE_ME\"\n\
              price_gbp = \"20.00\"\n\
+             group_price_gbp = \"40.00\"\n\
              postal_address = \"REPLACE_ME\"\n\
-             stripe_payment_link = \"REPLACE_ME\"\n",
+             stripe_payment_link = \"REPLACE_ME\"\n\
+             stripe_group_payment_link = \"REPLACE_ME\"\n",
         )
         .unwrap();
         assert_eq!(c.pages, "/var/db/onboard/pages");
         assert_eq!(c.price_gbp, "20.00");
+        assert_eq!(c.group_price_gbp, "40.00");
         assert_eq!(c.postal_address, "REPLACE_ME");
         assert_eq!(c.httpd_socket, "/home/www/run/onboard-httpd/httpd.sock");
         assert_eq!(c.gemini_socket, "/home/www/run/onboard/onboard.sock");
@@ -457,6 +473,7 @@ mod tests {
              stripe_webhook_secret = \"/etc/kyriakon/onboard/stripe-webhook-secret\"\n\
              stripe_api_key = \"/etc/kyriakon/onboard/stripe-api-key\"\n\
              stripe_payment_link = \"REPLACE_ME\"\n\
+             stripe_group_payment_link = \"REPLACE_ME\"\n\
              keyring_publish_token = \"/etc/kyriakon/onboard/keyring-publish-token\"\n\
              reviewer = \"admin@kyriakon.net\"\n\
              from = \"kyriakon <hello@kyriakon.net>\"\n\
@@ -534,6 +551,8 @@ mod tests {
         assert_eq!(c.dkim_selector, "REPLACE_ME");
         assert_eq!(c.dkim_public_key, "REPLACE_ME");
         assert_eq!(c.stripe_payment_link, "REPLACE_ME");
+        assert_eq!(c.stripe_group_payment_link, "REPLACE_ME");
+        assert_eq!(c.group_price_gbp, "REPLACE_ME");
         assert!(crate::account::dns::Values::from(&c).check().is_err());
     }
 

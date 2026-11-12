@@ -23,6 +23,7 @@ pub(crate) fn quota_config(dir: &std::path::Path) -> DrainConfig {
         stripe_webhook_secret: String::new(),
         stripe_api_key: String::new(),
         stripe_payment_link: String::new(),
+        stripe_group_payment_link: String::new(),
         keyring_publish_token: String::new(),
         reviewer: "reviewer@example.invalid".to_string(),
         from: "kyriakon <hello@example.invalid>".to_string(),

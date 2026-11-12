@@ -3,7 +3,7 @@
 //! The card link and the payment instructions the account pages, the approval
 //! mail and the renewal note carry live in `payments::rails`.
 
-use super::boxrun::{script_error, spawn_script};
+use super::boxrun::{run_script, script_error, spawn_script};
 use super::groups::{group_record, write_account_record, write_group_record};
 use super::lifecycle::{dns_contact, report_record};
 use super::payments::{restore_group_mailboxes, token_join, write_payment_copy};
@@ -318,6 +318,24 @@ impl BillingTarget {
         }
     }
 
+    /// The name the operator alert uses for this target: the account's username
+    /// or the body's domain.
+    fn label(&self) -> &str {
+        match self {
+            BillingTarget::Account(a) => &a.username,
+            BillingTarget::Group(g) => &g.domain,
+        }
+    }
+
+    /// The field and value a year's price is read from. An account pays its own
+    /// price; a body's is the group price, not a person's price with a multiple.
+    fn price<'a>(&self, cfg: &'a DrainConfig) -> (&'static str, &'a String) {
+        match self {
+            BillingTarget::Account(_) => ("price_gbp", &cfg.price_gbp),
+            BillingTarget::Group(_) => ("group_price_gbp", &cfg.group_price_gbp),
+        }
+    }
+
     /// A payment extends the date and marks the window paid. A group's window
     /// closes the same way: one date, shared by every mailbox in it, and every
     /// mailbox a lapse had stopped comes back through the same restore loop a
@@ -330,6 +348,15 @@ impl BillingTarget {
     ) -> Result<(), Error> {
         match self {
             BillingTarget::Account(a) => {
+                // A payment after a lapse restores access from the day it is
+                // recorded. The restore runs before the record says active, as
+                // `apply_payment` does, so a failure leaves the account lapsed
+                // and the retry repeats an idempotent script.
+                if a.state == "lapsed" {
+                    run_script(cfg, "lapse-user.sh", &["--restore", &a.username]).await?;
+                    a.state = "active".to_string();
+                    a.grace_until = None;
+                }
                 let payment = a
                     .payment
                     .as_mut()
@@ -344,6 +371,7 @@ impl BillingTarget {
                 if let Some(window) = g.payment.window.as_mut() {
                     window.state = "paid".to_string();
                 }
+                g.grace_until = None;
                 restore_group_mailboxes(cfg, store, g).await?;
             }
         }
@@ -744,6 +772,35 @@ async fn invoice_paid(
     // The ledger line must carry what the invoice says was paid, on the day it
     // was paid, not the configured price on the day the drain happened to run.
     let (amount_gbp, received_on) = invoice_money(object)?;
+    if !invoice_covers(cfg, object, &billing)? {
+        // A zero-amount invoice, one in another currency, or one below the
+        // target's year is not a payment for this account or body. The member
+        // may still have been charged, so the operator is told before the event
+        // is settled: the date does not move, no ledger line opens, and the
+        // account stays where it was.
+        let currency = object
+            .get("currency")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        let paid = object
+            .get("amount_paid")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let (field, price) = billing.price(cfg);
+        notice::alert(
+            cfg,
+            "stripe",
+            "invoice.paid",
+            &format!(
+                "invoice {invoice} for {} paid {paid} minor units in {currency}; the configured {field} is {price}, so no year was added",
+                billing.label()
+            ),
+            "check the member's payment and access by hand; the invoice was settled and no date was extended",
+        )
+        .await;
+        billing.save(store).await?;
+        return Ok(Settled::Applied);
+    }
     if billing.stripe().last_invoice.as_deref() == Some(invoice) {
         // The date was saved on an earlier pass. The ledger line it opens may
         // still be missing if that pass died between the save and the append,
@@ -785,6 +842,33 @@ async fn invoice_paid(
     )
     .await?;
     Ok(Settled::Applied)
+}
+
+/// Whether a paid invoice is the target's year in pounds. The invoice's own
+/// currency and `amount_paid` decide: a Payment Link can be substituted with
+/// another target's token, and a zero-amount invoice is still an `invoice.paid`.
+/// Both sides are integer pence, so no float rounding decides a year's access.
+fn invoice_covers(
+    cfg: &DrainConfig,
+    object: &Value,
+    billing: &BillingTarget,
+) -> Result<bool, Error> {
+    if object.get("currency").and_then(Value::as_str) != Some("gbp") {
+        return Ok(false);
+    }
+    let (field, price) = billing.price(cfg);
+    let price = util::pence(price)
+        .map_err(|e| Error::context(format!("the drain's configured {field}"), e))?;
+    if price <= 0 {
+        return Err(Error::Failed(format!(
+            "the drain's configured {field} must be more than zero"
+        )));
+    }
+    let paid = object
+        .get("amount_paid")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    Ok(paid >= price)
 }
 
 /// What a paid invoice says it paid, in pounds, and the day it was paid. The
