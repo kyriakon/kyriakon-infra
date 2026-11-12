@@ -87,30 +87,32 @@ self_test() {
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	work=$self_test_work
 	check "a member shape passes" \
-		"$(valid_localpart 'theophilus.1' && printf yes || printf no)" yes
+		"$(valid_localpart 'theophilus-1' && printf yes || printf no)" yes
 	check "an uppercase letter is refused" \
 		"$(valid_localpart 'Theophilus' && printf yes || printf no)" no
 	check "a leading dot is refused" \
 		"$(valid_localpart '.theophilus' && printf yes || printf no)" no
 	check "a slash is refused" \
 		"$(valid_localpart 'theo/philus' && printf yes || printf no)" no
-	check "33 characters are refused" \
-		"$(valid_localpart 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' && printf yes || printf no)" no
+	check "31 characters are accepted" \
+		"$(valid_localpart 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' && printf yes || printf no)" yes
+	check "32 characters are refused" \
+		"$(valid_localpart 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' && printf yes || printf no)" no
 
-	token=$(mint_proof "$work" 'theophilus.1')
+	token=$(mint_proof "$work" 'theophilus-1')
 	check "a proof token is 64 lowercase hex characters" \
 		"$(printf '%s' "$token" | grep -cE '^[0-9a-f]{64}$')" "1"
 	check "the proof names the account" \
-		"$(grep -c '"username":"theophilus.1"' "$work/$token")" "1"
+		"$(grep -c '"username":"theophilus-1"' "$work/$token")" "1"
 	check "the proof carries an expiry" \
 		"$(grep -cE '"expires":[0-9]+' "$work/$token")" "1"
 	check "the proof is readable only by its owner" \
 		"$(stat -f '%Lp' "$work/$token" | sed 's/^0*//')" "600"
 	check "a second login mints a different token" \
-		"$([ "$(mint_proof "$work" 'theophilus.1')" = "$token" ] && printf same || printf different)" \
+		"$([ "$(mint_proof "$work" 'theophilus-1')" = "$token" ] && printf same || printf different)" \
 		different
 	check "a missing directory mints nothing" \
-		"$(mint_proof "$work/absent" theophilus.1 >/dev/null 2>&1 && printf yes || printf no)" no
+		"$(mint_proof "$work/absent" theophilus-1 >/dev/null 2>&1 && printf yes || printf no)" no
 	# The runner's own temp directory is 0700 and not root's, which is the
 	# misconfiguration this check exists to refuse on the box. A root run's mktemp
 	# is root's own, so make one owned by somebody else for that case; `nobody` is

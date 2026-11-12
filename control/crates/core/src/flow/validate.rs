@@ -50,8 +50,9 @@ pub fn reason(
     }
 }
 
-/// The username rule: the charset `scripts/add-user.sh` enforces, no longer than
-/// 32 characters, and not a reserved name. Never whether it exists.
+/// The username rule: the single DNS label `scripts/add-user.sh` enforces, 1-31
+/// characters of lowercase letters, digits and interior hyphens, and not a
+/// reserved name. Never whether it exists.
 pub fn username(value: &str, reserved: &HashSet<String>) -> Option<String> {
     if let Some(why) = username_shape(value) {
         return Some(why);
@@ -68,20 +69,19 @@ pub fn username_shape(value: &str) -> Option<String> {
     if value.is_empty() {
         return Some("a username is needed".to_string());
     }
-    if value.chars().count() > 32 {
-        return Some("a username is at most 32 characters".to_string());
+    if value.chars().count() > 31 {
+        return Some("a username is at most 31 characters".to_string());
     }
-    let first = value.as_bytes()[0];
-    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+    let bytes = value.as_bytes();
+    let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    if !alnum(bytes[0]) {
         return Some("a username starts with a lowercase letter or a digit".to_string());
     }
-    if !value
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
-    {
-        return Some(
-            "a username is lowercase letters, digits, dot, underscore and hyphen".to_string(),
-        );
+    if !bytes.iter().all(|&b| alnum(b) || b == b'-') {
+        return Some("a username is lowercase letters, digits and hyphen".to_string());
+    }
+    if !alnum(bytes[bytes.len() - 1]) {
+        return Some("a username ends with a lowercase letter or a digit".to_string());
     }
     None
 }
@@ -128,10 +128,35 @@ pub fn domain(value: &str) -> Option<String> {
         .then(|| "a domain has at least two labels, like theirparish.example".to_string())
 }
 
+/// The localpart of an own-domain address, the key written before `@` in the
+/// virtual table. It is not an account name, a keyring filename or a DNS label,
+/// so it keeps the wider address charset and the 32 character bound.
+pub fn address_localpart_shape(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return Some("an address localpart is needed".to_string());
+    }
+    if value.chars().count() > 32 {
+        return Some("an address localpart is at most 32 characters".to_string());
+    }
+    let first = value.as_bytes()[0];
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return Some("an address localpart starts with a lowercase letter or a digit".to_string());
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Some(
+            "an address localpart is lowercase letters, digits, dot, underscore and hyphen"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// The body's addresses, one per line, each `localpart: own` or
-/// `localpart: alias localpart`, at most ten. The localpart is the shape a
-/// username has, without the reserved set: it names an address on the body's own
-/// domain, not a name in the platform's namespace.
+/// `localpart: alias localpart`, at most ten. The localpart is an address on the
+/// body's own domain, not an account name, so dots and underscores stay legal.
 pub fn address_lines(value: &str) -> Option<String> {
     let lines: Vec<&str> = value
         .lines()
@@ -157,13 +182,13 @@ fn address_line(line: &str) -> Option<String> {
         None => return Some(malformed()),
     };
     let (local, rest) = (local.trim(), rest.trim());
-    if let Some(why) = username_shape(local) {
+    if let Some(why) = address_localpart_shape(local) {
         return Some(format!("the address line {line:?}: {why}"));
     }
     let mut words = rest.split_whitespace();
     match (words.next(), words.next(), words.next()) {
         (Some("own"), None, None) => None,
-        (Some("alias"), Some(target), None) => username_shape(target)
+        (Some("alias"), Some(target), None) => address_localpart_shape(target)
             .map(|why| format!("the address line {line:?}: the alias target {target:?} {why}")),
         _ => Some(malformed()),
     }
@@ -222,14 +247,29 @@ mod tests {
         assert!(username("Upper", &r).unwrap().contains("starts with"));
         assert!(username("bad_name!", &r)
             .unwrap()
-            .contains("dot, underscore and hyphen"));
+            .contains("digits and hyphen"));
+        assert!(username("bad.name", &r)
+            .unwrap()
+            .contains("digits and hyphen"));
+        assert!(username("bad-", &r).unwrap().contains("ends with"));
     }
 
     #[test]
-    fn a_username_past_32_characters_is_refused_with_its_reason() {
-        let long = "a".repeat(33);
-        assert!(username(&long, &name()).unwrap().contains("at most 32"));
-        assert!(username(&"a".repeat(32), &name()).is_none());
+    fn a_username_is_a_single_dns_label_of_at_most_31_characters() {
+        // Mirrors `scripts/lib.sh --self-test` and `scripts/acme-queue.sh
+        // --self-test`, which prove the same boundary names against
+        // `valid_localpart` and `name_ok` as `<username>.kyriakon.net`.
+        let r = name();
+        let thirty_one = "a".repeat(31);
+        let thirty_two = "a".repeat(32);
+        for value in ["a", "7", "a-b", "a1-2b", thirty_one.as_str()] {
+            assert!(username(value, &r).is_none(), "{value}");
+        }
+        for value in ["", "a.b", "a_b", "a-", "-a", thirty_two.as_str()] {
+            assert!(username(value, &r).is_some(), "{value}");
+        }
+        assert!(username(&thirty_two, &r).unwrap().contains("at most 31"));
+        assert!(username(&thirty_one, &r).is_none());
     }
 
     #[test]
@@ -332,6 +372,8 @@ mod tests {
     #[test]
     fn the_body_addresses_are_checked_line_by_line() {
         assert!(address_lines("secretary: own\nhall: alias secretary").is_none());
+        assert!(address_lines("first.last: own\nhall: alias first.last").is_none());
+        assert!(address_lines("first_last: own").is_none());
         assert!(address_lines("secretary: own").is_none());
         assert!(address_lines("secretary")
             .unwrap()

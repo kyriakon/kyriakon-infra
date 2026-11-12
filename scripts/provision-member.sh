@@ -214,7 +214,7 @@ changed=no
 # (<username>.kyriakon.net) and here also a chroot path component under
 # /home/www, so the shared charset rule is the guard.
 if ! valid_localpart "$user"; then
-	printf 'invalid username: %s (lowercase [a-z0-9._-], <=32 chars)\n' "$user" >&2
+	printf 'invalid username: %s (lowercase [a-z0-9-], starts and ends alphanumeric, 1-31 chars)\n' "$user" >&2
 	exit 1
 fi
 

@@ -66,7 +66,7 @@ remove() {
 	typeset user home key_file
 	user=$1
 	valid_localpart "$user" ||
-		die "not a member name: $user (lowercase [a-z0-9._-], first character alphanumeric, at most 32 characters)"
+		die "not a member name: $user (lowercase [a-z0-9-], starts and ends alphanumeric, at most 31 characters)"
 	is_root || die "run this with doas: the member's home is not yours to change"
 	account_exists "$user" || die "there is no account named $user"
 	home="$home_root/$user"

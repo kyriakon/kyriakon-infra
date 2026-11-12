@@ -317,9 +317,9 @@ remove_member() {
 
 # remove_own_addresses: drop this member's own lines from the virtual table.
 # Returns 0 when the file changed, 1 when it did not, and 2 when the write
-# failed; the caller must keep 2 apart from 1. The key is a literal prefix, so a
-# member named a.b does not take axb@ with them. lib.sh's table_drop keeps a copy
-# of the table it replaces, so a deletion can be undone.
+# failed; the caller must keep 2 apart from 1. The key is a literal prefix, so
+# only this member's own addresses go: the name cannot act as a pattern. lib.sh's
+# table_drop keeps a copy of the table it replaces, so a deletion can be undone.
 remove_own_addresses() {
 	table_drop "$virtuals" prefix "$user@"
 }
@@ -470,7 +470,7 @@ user="$1"
 # standing between this script and an rm -rf somewhere else, which is why the two
 # guards below repeat the work rather than trusting it.
 if ! valid_localpart "$user"; then
-	printf 'invalid username: %s (lowercase [a-z0-9._-], <=32 chars)\n' "$user" >&2
+	printf 'invalid username: %s (lowercase [a-z0-9-], starts and ends alphanumeric, 1-31 chars)\n' "$user" >&2
 	exit 1
 fi
 

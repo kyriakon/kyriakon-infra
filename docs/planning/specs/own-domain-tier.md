@@ -56,7 +56,7 @@ The ten addresses count mailboxes and aliases together. An office mailbox with f
 
 ### Account names
 
-The account name is the local part the platform knows a mailbox by, and the name of its key file, its home and its public tree. It must fit the charset `scripts/add-user.sh` enforces, lowercase letters, digits, dot, underscore and hyphen up to 32 characters, it must not be a reserved username, and it must not already exist. The applicant chooses one name per mailbox, because the address carries the domain and the account name does not, so two bodies may both have `secretary@` without collision. The front-ends offer no username oracle, so the form cannot say whether a name is free. The reviewer's view flags a reserved or taken name and approval waits until the applicant supplies another, and the drain refuses the intent if a collision reaches it anyway.
+The account name is the local part the platform knows a mailbox by, and the name of its key file, its home and its public tree. It must fit the charset `scripts/add-user.sh` enforces: a single DNS label of 1 to 31 lowercase letters, digits and interior hyphens, starting and ending alphanumeric. It must not be a reserved username, and it must not already exist. The applicant chooses one name per mailbox, because the address carries the domain and the account name does not, so two bodies may both have `secretary@` without collision. The front-ends offer no username oracle, so the form cannot say whether a name is free. The reviewer's view flags a reserved or taken name and approval waits until the applicant supplies another, and the drain refuses the intent if a collision reaches it anyway.
 
 ### One DKIM key for every domain the filter signs
 

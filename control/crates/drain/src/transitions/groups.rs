@@ -238,7 +238,7 @@ pub async fn provision_group(
         }
     }
     for address in &intent.addresses {
-        if let Some(why) = validate::username_shape(&address.address) {
+        if let Some(why) = validate::address_localpart_shape(&address.address) {
             return Err(Error::Failed(format!(
                 "the address {:?}: {why}",
                 address.address
@@ -1037,7 +1037,7 @@ pub async fn group_address(
         )));
     }
     if intent.action != "remove" {
-        if let Some(why) = validate::username_shape(&intent.address) {
+        if let Some(why) = validate::address_localpart_shape(&intent.address) {
             return Err(Error::Failed(format!(
                 "the address {:?}: {why}",
                 intent.address
