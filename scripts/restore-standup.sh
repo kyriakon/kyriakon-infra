@@ -48,10 +48,14 @@
 #
 # The cost of that is the throwaway's disk, which is plaintext for the minutes the run
 # takes and is not wiped when Hetzner frees it. The restored mail is PGP ciphertext and
-# the read-only key cannot write to the repository, so what a future holder of that disk
-# could read is the restored site and git content plus read access to the backups. An
-# encrypted scratch volume would remove that, and is a follow-up rather than part of this:
-# it needs a throwaway box to prove the unlock works on, and there is no spare box.
+# the read-only key cannot write to the repository, but the same restore carries the
+# control store (the payment ledger and every member's account record) and the drain's
+# secrets under /etc/kyriakon, so the restore target and the credentials are kept in the
+# memory filesystem described below rather than on that disk. What a future holder of the
+# disk could then read is the restored site and git content plus read access to the
+# backups. An encrypted scratch volume would remove that, and is a follow-up rather than
+# part of this: it needs a throwaway box to prove the unlock works on, and there is no
+# spare box.
 #
 # The read-only sub-account is the point rather than a detail: the test restores from the
 # repository and must not be able to write to it, so a fault on a throwaway box cannot
@@ -302,8 +306,10 @@ printf 'ssh answered after %ss\n' "$((attempt * 10))"
 
 # The scratch everything sensitive lands in is a memory filesystem. Hetzner frees a
 # deleted server's disk without wiping it, so anything written to that disk may be read by
-# whoever gets the physical device next, and what a run writes is the restored /etc/mail
-# with the DKIM keys in it and the backup repository's password. mount_mfs builds a file
+# whoever gets the physical device next, and what a run writes is the restored mail
+# with the DKIM keys in it, the control store with the payment ledger and every
+# member's account record, the drain's secrets and the box keyring under
+# /etc/kyriakon, and the backup repository's password. mount_mfs builds a file
 # system in virtual memory, backed by swap when memory runs low, and OpenBSD encrypts swap
 # with keys generated fresh at every boot and held only in memory, so its contents do not
 # outlive the box that held them. One mount is enough: the restore target lives inside it,

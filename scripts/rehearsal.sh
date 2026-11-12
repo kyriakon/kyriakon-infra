@@ -11,9 +11,11 @@
 #   RESTIC_PASSWORD_FILE       mode-0600 password file
 #   REHEARSAL_HEALTHCHECKS_URL Healthchecks ping URL for the ~90-day check (optional)
 #
-# The script restores /home into the box's live paths, then prints the manual
-# checklist. Daemon start-up and the round-trip check stay manual on purpose
-# (research §5): they need a real DNS/MX hand-off and a human watching.
+# The script restores the whole snapshot into the box's live paths, /home and the
+# state beside it (/etc/mail, /etc/kyriakon, the account database, the generated
+# daemon configs and the control store), then prints the manual checklist. Daemon
+# start-up and the round-trip check stay manual on purpose (research §5): they
+# need a real DNS/MX hand-off and a human watching.
 #
 # Reminder (the automation, since the run itself is manual): a Healthchecks check
 # with a ~90-day grace. This script pings /fail if the scripted restore fails;
@@ -47,6 +49,12 @@ trap 'hc_fail "${REHEARSAL_HEALTHCHECKS_URL:-}"' ERR
 
 # --target / puts /home/... back under the box's real /home paths.
 restic restore latest --target / --no-lock
+
+# libc reads /etc/pwd.db and /etc/spwd.db, not /etc/master.passwd, so the restored
+# account database is invisible to sshd, dovecot and smtpd until it is rebuilt.
+# -p writes the /etc/passwd that carries no password hashes.
+pwd_mkdb -p /etc/master.passwd
+printf 'password databases rebuilt from the restored /etc/master.passwd\n'
 
 printf '\nrestore complete — now the manual full-dress steps:\n'
 cat <<'EOF'

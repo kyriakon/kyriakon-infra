@@ -41,6 +41,25 @@ hc_fail() {
 export CANARY_PATH='/home/.kyriakon-backup-canary'
 export CANARY_TEXT='kyriakon backup canary v1'
 
+# Payload contract: the paths backup.sh hands restic, and the ones restore-test.sh
+# asserts came back. Single-sourced for the canary's reason: the two run on
+# different boxes and a list typed in both is how one side drifts. One path per
+# line. backup.sh skips a path this box has not created, since restic exits on a
+# missing one; restore-test.sh requires every path, because the snapshot it reads
+# is of the mail box, which has them all.
+BACKUP_PATHS='/home
+/etc/mail
+/var/db/onboard
+/var/db/kyriakon-acme-queue
+/etc/kyriakon
+/etc/master.passwd
+/etc/passwd
+/etc/group
+/etc/httpd.d
+/etc/gmid.d
+/etc/acme-client.d'
+export BACKUP_PATHS
+
 # Per-box values, so nothing has to be retyped or passed on a command line:
 # /root/.kyriakon-env, mode 0600, one 'export VAR=value' per line. The tracked
 # template is openbsd/etc/kyriakon.env in the repo, which deploy-mail.sh installs.

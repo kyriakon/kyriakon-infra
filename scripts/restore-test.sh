@@ -15,7 +15,8 @@
 #   RESTORE_TARGET_ROOT     scratch root (default /var/restore-test)
 #
 # Verification order (spec §26): snapshot-recency → check → full restore → canary
-# byte-identical + Maildir-is-PGP-ciphertext + git fsck + stats count → HC ping.
+# byte-identical + Maildir-is-PGP-ciphertext + git fsck + stats count + the
+# control store, account database and generated configs present → HC ping.
 
 set -euo pipefail
 
@@ -112,22 +113,38 @@ rm -f "$expected"
 # that only speaks when it fails gives the log nothing to point at.
 printf 'canary byte-identical at %s\n' "$CANARY_PATH"
 
-# --- 5. secrets and the capsule pair -----------------------------------
-# The backup takes /home, /etc/mail, and any capsule certificate pair, and
-# nothing else. /etc/mail carries the DKIM signing key and smtpd's queue key,
-# which exist nowhere else, so a rebuild without them comes back unable to sign
-# mail or read an existing queue. A capsule key is the only copy of its
+# --- 5. secrets, account database and control state ---------------------
+# The backup takes /home, /etc/mail, any capsule certificate pair, and the state
+# a rebuild cannot recreate: the control store, the box keyring and drain
+# secrets, the OS account database, the three generated daemon directories and
+# the certificate queue. /etc/mail carries the DKIM signing key and smtpd's queue
+# key, which exist nowhere else, so a rebuild without them comes back unable to
+# sign mail or read an existing queue. A capsule key is the only copy of its
 # long-lived certificate, so a pair that arrives without its key half is a
 # broken backup. /root carries the box's env file and the restic password; the
 # TSIG key in the former is DNS control for the domain, and the repository this
-# test reads with read-only credentials is no place for it. Asserting both
-# directions means an edit to the backup paths fails here, rather than quietly
-# dropping a key or shipping a secret to the storage box.
+# test reads with read-only credentials is no place for it. The presence checks
+# below and the absence of /root are both asserted. backup.sh and this test read
+# the same list from lib.sh, so the two cannot drift; what fails here is a
+# snapshot taken by an older list, or a secret that entered the set.
 for need in /etc/mail/dkim/private.rsa.key /etc/mail/smtpd.conf; do
 	if [ ! -e "$target$need" ]; then
 		die "missing from the snapshot: $need — the backup no longer covers /etc/mail"
 	fi
 done
+# The snapshot is of the mail box, which has carried the control plane and
+# per-member hosting since they landed, so every path in BACKUP_PATHS exists on
+# the box the backup runs on. A missing one in the restore is a payload that lost
+# state, not a box that never had any, and it is not allowed to pass vacuously. A
+# snapshot taken before these paths entered the payload fails this check until the
+# manual post-deploy backup run replaces it; that run is named in the deploy step.
+# The same here-doc shape as backup.sh, so the loop stays in this shell.
+while read -r need; do
+	[ -e "$target$need" ] \
+		|| die "missing from the snapshot: $need — the backup no longer covers it"
+done <<EOF
+$BACKUP_PATHS
+EOF
 for secret in /root/.kyriakon-env /root/.restic-pass; do
 	if [ -e "$target$secret" ]; then
 		die "present in the snapshot: $secret — the backup covers a path it should not"
@@ -148,7 +165,12 @@ for f in "$target"/etc/ssl/capsule-*.crt "$target"/etc/ssl/private/capsule-*.key
 	[ -f "$target$mate" ] \
 		|| die "capsule pair is split in the snapshot: ${f#"$target"} has no $mate"
 done
-printf 'verified /etc/mail secrets are in the snapshot and /root secrets are not\n'
+# The account database is asserted as files here, not as a working login: libc
+# reads the /etc/pwd.db and /etc/spwd.db that pwd_mkdb derives from
+# /etc/master.passwd, and this test starts no service. The recovery procedure
+# runs `pwd_mkdb -p /etc/master.passwd` before it starts anything, which is the
+# step that makes the restored files the database the daemons and sshd read.
+printf 'verified /etc/mail, control state and the account database are in the snapshot and /root secrets are not\n'
 
 # --- 6. Maildir-is-PGP-ciphertext --------------------------------------
 # Zero-access regression guard: every restored message must carry the ASCII-armor
