@@ -1,8 +1,9 @@
 use crate::common::*;
 
 /// A card ledger line carries what the invoice paid and when, not the
-/// configured price and the drain's clock: a discount on 10 September is a
-/// September line for GBP 15.00, even though the drain runs in October.
+/// configured price and the drain's clock: an invoice on 10 September is a
+/// September line for GBP 25.00, even though the drain runs in October and the
+/// year's price is GBP 20.00.
 #[test]
 fn a_card_ledger_line_uses_the_invoice_amount_and_paid_date() {
     let fix = Fix::new("card-ledger-invoice");
@@ -10,15 +11,15 @@ fn a_card_ledger_line_uses_the_invoice_amount_and_paid_date() {
     fix.webhook(
         "evt_card",
         "invoice.paid",
-        invoice_with("in_discount", 1_500, 1_789_000_000),
+        invoice_with("in_discount", 2_500, 1_789_000_000),
     );
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
 
     let payments = payment_lines(&fix);
     assert_eq!(payments.len(), 1, "{payments:?}");
-    assert_eq!(payments[0]["amount_gbp"], json!("15.00"), "{payments:?}");
-    assert_eq!(payments[0]["applied_gbp"], json!("15.00"), "{payments:?}");
+    assert_eq!(payments[0]["amount_gbp"], json!("25.00"), "{payments:?}");
+    assert_eq!(payments[0]["applied_gbp"], json!("25.00"), "{payments:?}");
     assert_eq!(
         payments[0]["received_on"],
         json!("2026-09-10"),
@@ -688,5 +689,82 @@ fn a_damaged_account_fails_an_invoice_visibly_and_keeps_it() {
     assert!(
         fix.read("webhooks/processed.jsonl").is_empty(),
         "the delivery was recorded as settled"
+    );
+}
+
+/// A card payment during the grace period brings a lapsed account back: the
+/// same restore a prepaid credit runs, the deletion date cleared, and the next
+/// grace sweep with nothing to delete.
+#[test]
+fn a_card_payment_restores_a_lapsed_account() {
+    let fix = Fix::new("card-lapsed-restore");
+    fix.card_account("secretary", None);
+    let mut account = fix.account("secretary");
+    account["state"] = json!("lapsed");
+    account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(40));
+    account["payment"]["window"]["state"] = json!("closed");
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+
+    fix.webhook("evt_paid", "invoice.paid", invoice("in_lapsed"));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("active"), "{account}");
+    assert!(account.get("grace_until").is_none(), "{account}");
+    assert!(account["payment"]["paid_until"].is_string(), "{account}");
+    assert!(
+        fix.scripts_log()
+            .contains("lapse-user.sh --restore secretary"),
+        "the lapsed account was not restored: {}",
+        fix.scripts_log()
+    );
+
+    // The next pass's grace sweep sees an active account: nothing is deleted or
+    // noticed.
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.account("secretary")["state"], json!("active"));
+    assert!(
+        fix.dir
+            .join("store/accounts/secretary/account.json")
+            .exists(),
+        "a paid account was deleted"
+    );
+}
+
+/// A zero-amount, foreign-currency or under-price invoice is not a year: the
+/// date stays where it was and no payment line opens.
+#[test]
+fn an_invoice_below_the_price_extends_nothing() {
+    let fix = Fix::new("card-underpaid");
+    fix.card_account("secretary", Some("2027-10-04T00:00:00Z"));
+    let paid = paid_until(&fix, "secretary");
+    let mut usd = invoice_with("in_usd", 2_000, 1_790_000_000);
+    usd["currency"] = json!("usd");
+
+    for (event, object) in [
+        ("evt_zero", invoice_with("in_zero", 0, 1_790_000_000)),
+        ("evt_under", invoice_with("in_under", 1_999, 1_790_000_000)),
+        ("evt_usd", usd),
+    ] {
+        fix.webhook(event, "invoice.paid", object);
+        let out = fix.drain();
+        assert!(out.status.success(), "{}", body(&out));
+        assert_eq!(
+            paid_until(&fix, "secretary"),
+            paid,
+            "{event} moved the paid-until date"
+        );
+    }
+    assert!(payment_lines(&fix).is_empty(), "{:?}", payment_lines(&fix));
+    assert!(
+        fix.webhooks().is_empty(),
+        "a refused invoice was left for a retry: {:?}",
+        fix.webhooks()
     );
 }

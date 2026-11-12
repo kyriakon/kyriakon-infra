@@ -34,13 +34,18 @@ pub(super) async fn status(app: &App, call: &Call<'_>) -> Reply {
 pub(super) fn payment_for(app: &App, record: Option<&Record>) -> Option<page::PaymentView> {
     let record = record?;
     let payment = record.payment.as_ref()?;
+    let link = if record.domain.is_some() {
+        group_card_link(app, payment.token_ref.as_deref())
+    } else {
+        card_link(app, payment.token_ref.as_deref())
+    };
     Some(page::payment(
         "active",
         &record.rail,
         payment,
         &app.cfg.price_gbp,
         &app.cfg.postal_address,
-        card_link(app, payment.token_ref.as_deref()).as_deref(),
+        link.as_deref(),
         OffsetDateTime::now_utc(),
     ))
 }
@@ -51,6 +56,14 @@ pub(super) fn payment_for(app: &App, record: Option<&Record>) -> Option<page::Pa
 /// does, and the page simply shows no link rather than a broken one.
 pub(super) fn card_link(app: &App, token: Option<&str>) -> Option<String> {
     rails::card_link(&app.cfg.stripe_payment_link, token?)
+        .ok()
+        .flatten()
+}
+
+/// The group's own Payment Link. A body's year is its own price, so the account
+/// link keyed to a group's token would bill the wrong amount.
+fn group_card_link(app: &App, token: Option<&str>) -> Option<String> {
+    rails::card_link(&app.cfg.stripe_group_payment_link, token?)
         .ok()
         .flatten()
 }

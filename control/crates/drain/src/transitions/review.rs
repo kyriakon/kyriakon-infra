@@ -815,7 +815,7 @@ async fn approve_group(
     // the approval of a body that never chose the card rail.
     let link = if written.payment.rail == "card" {
         card_link(
-            &cfg.stripe_payment_link,
+            &cfg.stripe_group_payment_link,
             written.payment.token_ref.as_deref().unwrap_or(""),
         )?
     } else {

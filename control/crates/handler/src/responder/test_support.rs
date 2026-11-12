@@ -76,6 +76,7 @@ pub(crate) fn handler_config(dir: &Path) -> config::Config {
         price_gbp: "20.00".to_string(),
         postal_address: "1 Example Street, Example".to_string(),
         stripe_payment_link: "https://buy.stripe.com/test_example".to_string(),
+        stripe_group_payment_link: "https://buy.stripe.com/test_group_example".to_string(),
         proof_dir: dir.join("proofs").to_str().unwrap().to_string(),
     }
 }

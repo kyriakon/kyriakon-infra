@@ -230,6 +230,7 @@ impl Fix {
              stripe_webhook_secret = \"{}/stripe\"\n\
              stripe_api_key = \"{}/stripe-key\"\n\
              stripe_payment_link = \"https://buy.stripe.com/test_example\"\n\
+             stripe_group_payment_link = \"https://buy.stripe.com/test_group_example\"\n\
              keyring_publish_token = \"{}/keyring-token\"\n\
              reviewer = \"reviewer@example.invalid\"\n\
              from = \"kyriakon <hello@example.invalid>\"\n\
@@ -1481,6 +1482,7 @@ pub fn invoice_with(id: &str, amount_paid: i64, paid_at: i64) -> Value {
         "customer": "cus_example",
         "attempt_count": 1,
         "amount_paid": amount_paid,
+        "currency": "gbp",
         "status_transitions": {"paid_at": paid_at},
         "created": paid_at,
     })

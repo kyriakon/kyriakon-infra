@@ -75,6 +75,12 @@ postal_address = "REPLACE_ME"
 # deploy from /root/.kyriakon-env.
 stripe_payment_link = "REPLACE_ME"
 
+# The card rail's Payment Link for an own-domain group. It is a separate Stripe
+# object because a group's year is its own price; the account link keyed to a
+# group's token would bill the wrong amount. Substituted at deploy from
+# /root/.kyriakon-env.
+stripe_group_payment_link = "REPLACE_ME"
+
 # Where the login check writes one proof per admitted login, and the drain reads
 # it back. It is root-owned 0700 and the deploy creates it, because the session
 # record lives in the handler's own store: the handler may hand this path to the
