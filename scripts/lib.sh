@@ -759,6 +759,15 @@ install_smtpd_conf() {
 	conf_key=$(cat "$conf_keyfile" 2>/dev/null) \
 		|| { printf 'could not read the queue key from %s\n' "$conf_keyfile" >&2; return 1; }
 	[ -n "$conf_key" ] || { printf '%s holds no queue key\n' "$conf_keyfile" >&2; return 1; }
+	# smtpd's crypto_setup() rejects anything but exactly 32 characters and
+	# exits, so a restored or hand-edited key of another length is a daemon that
+	# will not start. deploy-mail.sh regenerates one of the right length; this
+	# refuses to install a config that would take the running MTA down.
+	if [ "${#conf_key}" -ne 32 ]; then
+		printf '%s holds a %s-character queue key, not 32; run scripts/deploy-mail.sh to regenerate it\n' \
+			"$conf_keyfile" "${#conf_key}" >&2
+		return 1
+	fi
 	conf_candidate=$(mktemp "$conf_dst.XXXXXX") || {
 		printf 'could not create a candidate beside %s\n' "$conf_dst" >&2
 		return 1

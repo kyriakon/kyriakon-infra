@@ -173,25 +173,26 @@ ensure_mail_address() {
 		mail_changed=yes
 	fi
 	mail_from_ensure "$key" "$user"
-	# The filter's -d list is spliced into the configuration at deploy time, so a
-	# body's domain appended to the table is only signed after a re-render. This
-	# normally changes nothing on a member's path; it runs here because the
-	# restart below is the one place the configuration is read. A render that
-	# fails is a note, not a refusal: the member's address is on the platform's
-	# own domain, which the deployed list already carries.
-	if [ -f "$smtpd_template" ] && [ -f "$dkim_domains_table" ] && [ -f "$queue_key_file" ]; then
-		install_smtpd_conf "$smtpd_template" "$dkim_domains_table" \
-			"$queue_key_file" "$smtpd_conf" \
-			|| printf 'note: %s could not be re-expanded from %s; restart smtpd after fixing it\n' \
-				"$smtpd_conf" "$dkim_domains_table" >&2
-	fi
 	# smtpd reads the table when it starts, so a line is not live until it is
 	# restarted: /etc/rc.d/smtpd defines no reload verb, and delete-user.sh restarts
 	# it for the same reason. The configuration is checked first, so a table smtpd
 	# would refuse leaves the running daemon alone, and the restart happens only
 	# when a line was actually added, so a run that finds the line already present
 	# restarts nothing.
+	#
+	# The render runs only on the path that checks and restarts, so a config this
+	# script installs is always checked with smtpd -n. The filter's -d list is
+	# spliced at deploy time, so a body's domain appended to the table is only
+	# signed after a re-render. A render that fails is a note, not a refusal: the
+	# member's address is on the platform's own domain, which the deployed list
+	# already carries.
 	if [ "$mail_changed" = yes ]; then
+		if [ -f "$smtpd_template" ] && [ -f "$dkim_domains_table" ] && [ -f "$queue_key_file" ]; then
+			install_smtpd_conf "$smtpd_template" "$dkim_domains_table" \
+				"$queue_key_file" "$smtpd_conf" \
+				|| printf 'note: %s could not be re-expanded from %s; restart smtpd after fixing it\n' \
+					"$smtpd_conf" "$dkim_domains_table" >&2
+		fi
 		if [ -f "$smtpd_conf" ] && smtpd -n -f "$smtpd_conf"; then
 			rcctl restart smtpd >/dev/null
 			printf 'restarted smtpd, which reads the table at start\n'

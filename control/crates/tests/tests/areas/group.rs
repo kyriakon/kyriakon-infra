@@ -1280,6 +1280,18 @@ fn retrying_a_non_owner_removal_does_not_take_the_sites_key() {
     let after: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
     assert_eq!(after["site_owner"], "parish-secretary");
     assert_eq!(after["accounts"], json!(["parish-secretary"]));
+
+    // The departing address's sender identity goes with its route, and the
+    // mailbox that stays keeps its own.
+    let mail_from = fix.table("mail_from");
+    assert!(
+        !mail_from.contains("office@parish.example"),
+        "the removed address can still be submitted as: {mail_from}"
+    );
+    assert!(
+        mail_from.contains("secretary@parish.example: parish-secretary"),
+        "the remaining mailbox lost its sender identity: {mail_from}"
+    );
 }
 
 /// The same address intent handed to the drain again changes nothing: one

@@ -448,7 +448,7 @@ self_test() {
 	printf 'kyriakon.net\n' > "$tree/dkim_domains"
 	install_smtpd_conf "$template" "$tree/dkim_domains" "$tree/queue.key" "$tree/smtpd.conf"
 	check "and a domain dropped from the list leaves the filter" \
-		"$(grep -c '^-filter.*-d parish.example' "$tree/smtpd.conf")" 0
+		"$(grep -c '^filter.*-d parish.example' "$tree/smtpd.conf")" 0
 
 	# The two routing rules the mail cannot do without. The enqueuer's rule is
 	# what carries cron's own failure copy and every operator alert off the box:
@@ -494,15 +494,14 @@ self_test() {
 	check "an installed configuration is replaced, not rewritten" \
 		"$([ "$before" != "$after" ] && printf yes || printf no)" yes
 
-	# A substitution that cannot be read leaves the installed file as it was. This
-	# is the failure the redirect used to turn into an empty smtpd.conf, which is
-	# every mail path on the box, and the candidate it staged is gone rather than
-	# left readable beside the live file.
+	# A template that cannot be read fails after the candidate is staged, which is
+	# the failure the redirect used to turn into an empty smtpd.conf, every mail
+	# path on the box. The live file must be as it was and the staged candidate
+	# gone rather than left beside it.
 	cp "$tree/smtpd.conf" "$tree/expected"
-	printf 'kyriakon.net\nnot a domain\n' > "$tree/bad_dkim_domains"
 	set +e
-	( set -e; install_smtpd_conf "$template" "$tree/bad_dkim_domains" \
-		"$tree/queue.key" "$tree/smtpd.conf" ) >/dev/null 2>&1
+	( set -e; install_smtpd_conf "$tree/no-such-template" \
+		"$tree/dkim_domains" "$tree/queue.key" "$tree/smtpd.conf" ) >/dev/null 2>&1
 	code=$?
 	set -e
 	check "a substitution that fails leaves the configuration as it was" \

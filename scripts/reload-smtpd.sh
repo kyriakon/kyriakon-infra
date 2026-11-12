@@ -150,6 +150,22 @@ self_test() {
 		"$(grep -c 'could not be re-expanded' "$tree/badlist.out")" 1
 	printf 'kyriakon.net\n' > "$dkim_domains"
 
+	# The queue key is smtpd's crypto key and must be exactly 32 characters. A
+	# restored or hand-edited file of another length would stop the daemon, so the
+	# render refuses rather than installing a config built from it.
+	printf '0123456789abcdef\n' > "$queue_key_file"
+	if reload_smtpd >"$tree/badkey.out" 2>&1; then
+		code=0
+	else
+		code=$?
+	fi
+	check "a wrong-length queue key is refused" "$code" 1
+	check "and names the file and the deploy that regenerates it" \
+		"$(grep -c 'queue key, not 32; run scripts/deploy-mail.sh' "$tree/badkey.out")" 1
+	check "and a bad key restarts nothing" \
+		"$(wc -l <"$calls" | tr -d ' ')" 0
+	printf '0123456789abcdef0123456789abcdef\n' > "$queue_key_file"
+
 	smtpd_ok() { return 1; }
 	if reload_smtpd >"$tree/second.out" 2>&1; then
 		code=0
