@@ -944,20 +944,22 @@ fi
 # registered domain's budget of 50 new certificates per seven days, which refills
 # at one every 202 minutes (docs/planning/research/cert-issuance-ceiling.md,
 # section 2). scripts/acme-queue.sh holds one request per name, works them oldest
-# first, and attempts one every 202 minutes; this reads the age of the oldest
-# request straight from the queue's store, so the signal is real the day the first
-# request is filed.
+# first, and attempts a name on the next pass while fewer than 40 attempts sit in
+# the last seven days, then one every 202 minutes. This reads the age of the
+# oldest request straight from the queue's store, so the signal is real the day
+# the first request is filed.
 #
 # The alert carries the count and the age and never a name, so no member lands in
 # the check's event log, the same rule the drain signal above follows.
 #
 # Threshold 1440 minutes, a day, and it is the queue's own age rather than the
-# drain's 240: one name waits up to 202 minutes for its slot before anything is
-# wrong, so a value near the refill would alert on every second signup. A day is
-# where the queue is either not draining at all or deep enough that the oldest
-# member has waited a day; both are worth a person, and a backlog that shallow is
-# not. The value lives here as ACME_PENDING_MAX_MIN, and scripts/acme-queue.sh
-# states the same 1440 in its header as the age this watches.
+# drain's 240: a burst week issues a name on the next pass, and even inside the
+# refill the wait is hours, so a value near either would alert on every signup. A
+# day is where the queue is either not draining at all or deep enough that the
+# oldest member has waited a day; both are worth a person, and a backlog that
+# shallow is not. The value lives here as ACME_PENDING_MAX_MIN, and
+# scripts/acme-queue.sh states the same 1440 in its header as the age this
+# watches.
 acme_queue_pending="$acme_queue_dir/pending"
 if [ -d "$acme_queue_pending" ]; then
 	oldest=$(find "$acme_queue_pending" -type f -exec stat -f '%m' {} + 2>/dev/null \
@@ -966,7 +968,7 @@ if [ -d "$acme_queue_pending" ]; then
 		acme_pending=$(find "$acme_queue_pending" -type f 2>/dev/null | wc -l | tr -d ' ')
 		age_min=$(( ( $(date +%s) - oldest ) / 60 ))
 		if [ "$age_min" -gt "$acme_pending_max_min" ]; then
-			alert acme "certificate queue" "$acme_pending certificate request(s) pending, oldest $age_min minutes (max $acme_pending_max_min). The queue drains one name every 202 minutes against the registered domain refill, so an age past this means it is not draining or the backlog is this deep, and either way a member is waiting on a certificate the page says is coming"
+			alert acme "certificate queue" "$acme_pending certificate request(s) pending, oldest $age_min minutes (max $acme_pending_max_min). The queue attempts a name on the next pass while fewer than 40 have been attempted in the last seven days and one every 202 minutes after that, so an age past this means it is not draining or the backlog is this deep, and either way a member is waiting on a certificate the page says is coming"
 		fi
 	fi
 fi

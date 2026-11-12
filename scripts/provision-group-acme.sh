@@ -28,13 +28,14 @@
 # after approval.
 #
 # The order joins scripts/acme-queue.sh rather than issuing here. A new
-# certificate spends the registered domain's budget, one every 202 minutes, and
-# the queue works oldest first: one global attempt slot at a time. The body's
-# domain is its own registered domain, so this order spends one slot of the
-# body's fifty, not kyriakon.net's; the queue's global spacing still applies, so
-# it waits behind earlier requests in the same queue. The site owner's account is
-# recorded with the request because the queue needs it to write the 443 vhost when
-# the certificate lands.
+# certificate spends one of the registered domain's fifty per seven days, and the
+# queue works oldest first, one attempt per pass. The body's domain is its own
+# registered domain, so this order spends one slot of the body's fifty, not
+# kyriakon.net's; the queue keeps own-domain attempts on their own timer, apart
+# from kyriakon.net's burst window and refill, so this order neither waits on that
+# lane nor closes its window. The site owner's account is recorded with the
+# request because the queue needs it to write the 443 vhost when the certificate
+# lands.
 #
 # The request is filed on every run, not only when the file is new. acme-queue.sh
 # --add is idempotent and says "already queued" for a request that is already

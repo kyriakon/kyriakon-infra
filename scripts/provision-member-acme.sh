@@ -28,12 +28,13 @@
 # writer.
 #
 # Issuance is not immediate, and this lane does not issue anything. A new
-# certificate spends the registered domain's budget of one per 202 minutes, so
-# the request joins scripts/acme-queue.sh's queue and the worker spends a slot
-# when one opens. Until the certificate lands the member has mail, an upload path
-# and a capsule, and the httpd file has no block behind the relay; once it lands
-# the queue runs the web lane and scripts/cron-apply.sh --web, which is where the
-# loopback vhost, the relayd keypair and the reload come from.
+# certificate spends one of the registered domain's fifty per seven days, so the
+# request joins scripts/acme-queue.sh's queue and the worker attempts it once the
+# budget allows, which during a quiet week is the next fifteen-minute pass. Until
+# the certificate lands the member has mail, an upload path and a capsule, and the
+# httpd file has no block behind the relay; once it lands the queue runs the web
+# lane and scripts/cron-apply.sh --web, which is where the loopback vhost, the
+# relayd keypair and the reload come from.
 #
 # The request is filed on every run, not only when the file is new. acme-queue.sh
 # --add is idempotent and says "already queued" for a request that is already
