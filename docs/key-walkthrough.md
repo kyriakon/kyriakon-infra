@@ -8,13 +8,13 @@ The upload key is how you publish a website and use your git repositories. Both 
 
 Make both keys on your own machine. Make the mail key in Thunderbird's OpenPGP Key Manager on a desktop, or with gpg at a terminal. Make the upload key with `ssh-keygen -t ed25519` at a terminal. This site only ever receives the public half.
 
-## Keeping the private key safe
+## The recovery phrase
 
-There is no recovery phrase, and nothing on this site can unlock your key. The private half is the only thing that reads your mailbox.
+Your recovery phrase is a passphrase-protected offline copy of your mail private key. Make it as soon as the key exists. In Thunderbird you make it with the Key Manager's secret-key export; with gpg you make it with `gpg --armor --export-secret-keys`. Keep the file on a drive that stays away from the laptop, and keep the passphrase apart from it. The file and the passphrase together are the only way back into the mailbox on a new machine.
 
-Keep the private half on the machine that made it. Keep a backup somewhere else, on paper or on a drive that stays away from the laptop. Do not send the private half to yourself by email, and do not store it in a password manager that lives on the same machine as the key file.
+Do not send the recovery phrase to yourself by email, and do not store it in a password manager that lives on the same machine as the key file.
 
-The platform holds no key that opens your mailbox. Zero-access covers message content and not the addressing information mail needs to move: sender, recipient, timestamp and size appear in the server's logs and in the outer message wrapper, and the seven-day window bounds how long the raw record exists. If you lose the private key and your backup, the mail is gone permanently. We cannot restore it, because no key exists here to open it.
+The platform holds no key that opens your mailbox. Zero-access covers message content and not the addressing information mail needs to move: sender, recipient, timestamp and size appear in the server's logs and in the outer message wrapper, and the seven-day window bounds how long the raw record exists. If you lose the private key and the recovery phrase, the mail is gone permanently. We cannot restore it, because no key exists here to open it.
 
 ## Thunderbird on a desktop
 
@@ -25,7 +25,7 @@ Thunderbird on a desktop is the primary path. It has OpenPGP built in, so you do
 3. Choose a passphrase, and keep it somewhere safe, apart from the machine.
 4. Choose "Key does not expire". A mail key must not expire: delivery stops on its expiry date, without a word, so there is no date to renew.
 5. Export the public key to a file. This is the half you paste into the application.
-6. Back up the private key from the Key Manager's secret-key export, and keep that file offline.
+6. Export the secret key from the Key Manager. The passphrase-protected file it writes is your recovery phrase, so keep it apart from the machine.
 
 When the account is approved, the mail address starts accepting mail. Mail that arrives before your client is set up waits on the server, encrypted, and becomes readable once the key is in place.
 
@@ -35,11 +35,12 @@ Thunderbird for Android is not covered by this page. The prototype has not teste
 
 `gpg` at a terminal makes the same mail key, with no mail client installed.
 
-1. Run `gpg --full-generate-key`. Choose "RSA and RSA", 4096 bits, and an expiry of 0, which means the key never expires.
-2. When gpg asks for a name and an email address, put the address you applied for in both fields. gpg asks for a name, and any name you give it is published with the key, so the address is the only value that adds nothing.
-3. Choose a passphrase, and keep it somewhere safe, apart from the machine.
-4. Export the public key as text, replacing the address with the one you applied for: `gpg --armor --export you@kyriakon.net > mail-public.asc`. The file holds the block you paste into the application.
-5. Back up the private key, and keep the file offline: `gpg --armor --export-secret-keys you@kyriakon.net > mail-secret.asc`.
+1. Run `gpg --default-preference-list 'AES256 AES192 AES128 SHA512 SHA384 SHA256 ZLIB BZip2 ZIP Uncompressed' --full-generate-key`. The list leaves AEAD out: gpg 2.5 adds AEAD by default, and the application refuses a key that advertises it, because some mail clients cannot open AEAD mail.
+2. Choose "RSA and RSA" and 4096 bits. Choose an expiry of 0, which means the key never expires.
+3. Leave Real name and Comment empty, and put the address you applied for in Email address. gpg accepts an empty name, and a name or another address in the key is published with `keys/<username>.asc`.
+4. Choose a passphrase, and keep it somewhere safe, apart from the machine.
+5. Export the public key as text, replacing the address with the one you applied for: `gpg --armor --export you@kyriakon.net > mail-public.asc`. Paste that file into the application.
+6. Export the private key as your recovery phrase, and keep it apart from the machine: `gpg --armor --export-secret-keys you@kyriakon.net > mail-secret.asc`.
 
 ## The upload key
 

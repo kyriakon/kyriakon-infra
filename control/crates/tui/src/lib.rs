@@ -860,7 +860,7 @@ fn prompt(page: &Page, index: usize, total: usize) -> String {
         Kind::Key if page.mailbox.is_some() => {
             out.push_str(&key_walkthrough(
                 &[
-                    "Keeping the private key safe",
+                    "The recovery phrase",
                     "Thunderbird on a desktop",
                     "A key at a terminal",
                     "The upload key",
@@ -1515,9 +1515,10 @@ mod tests {
         for expected in [
             "MAKING A KEY",
             "a step for anyone who wants a website",
+            "THE RECOVERY PHRASE",
             "THUNDERBIRD ON A DESKTOP",
             "A KEY AT A TERMINAL",
-            "gpg --full-generate-key",
+            "gpg --default-preference-list",
             "sftp on port 22",
             "git on port 2222",
             "THE UPLOAD KEY",
