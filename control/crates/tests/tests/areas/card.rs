@@ -227,6 +227,72 @@ fn cancel_at_period_end_keeps_the_period_and_deletion_revokes_nothing() {
     );
 }
 
+/// A disputed charge and a refund are the operator's to answer: each one is
+/// settled rather than ignored, the alert names the charge, and the settled
+/// line keeps the object's own reference. Nothing about access moves either
+/// way.
+#[test]
+fn a_dispute_and_a_refund_alert_the_operator_instead_of_being_ignored() {
+    let fix = Fix::new("webhook-charge-operator");
+    fix.card_account("secretary", Some("2027-10-04T00:00:00Z"));
+    // Stripe's shapes: a dispute's object is the dispute, which names its
+    // charge; a refund's object is the charge, whose total is not the money
+    // that came back. The refund here is partial.
+    fix.webhook(
+        "evt_dispute",
+        "charge.dispute.created",
+        json!({"id": "dp_example", "charge": "ch_example", "amount": 2_000}),
+    );
+    fix.webhook(
+        "evt_refunded",
+        "charge.refunded",
+        json!({"id": "ch_example", "amount": 2_000, "amount_refunded": 500}),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let sent = fix.sent();
+    for kind in ["charge.dispute.created", "charge.refunded"] {
+        assert!(sent.contains(kind), "{kind} was not alerted: {sent}");
+    }
+    assert!(
+        sent.contains("dispute dp_example on charge ch_example"),
+        "the dispute alert names the dispute and its charge: {sent}"
+    );
+    assert!(
+        sent.contains("500 minor units refunded"),
+        "the refund alert names what came back, not the charge total: {sent}"
+    );
+    assert!(
+        !sent.contains("2000 minor units"),
+        "a partial refund was reported as the charge total: {sent}"
+    );
+    assert!(sent.contains("To: reviewer@example.invalid"), "{sent}");
+
+    let processed = fix.read("webhooks/processed.jsonl");
+    for line in [
+        "charge.dispute.created",
+        "charge.refunded",
+        "dp_example",
+        "ch_example",
+    ] {
+        assert!(
+            processed.contains(line),
+            "{line} is not journalled: {processed}"
+        );
+    }
+    assert!(
+        fix.webhooks().is_empty(),
+        "an alerted event was left for a retry: {:?}",
+        fix.webhooks()
+    );
+    assert_eq!(
+        fix.account("secretary")["payment"]["paid_until"],
+        "2027-10-04T00:00:00Z",
+        "a dispute or refund moved the date"
+    );
+}
+
 #[test]
 fn past_due_with_a_future_date_keeps_access() {
     let fix = Fix::new("webhook-past-due");

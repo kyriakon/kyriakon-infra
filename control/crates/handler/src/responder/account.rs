@@ -525,12 +525,24 @@ pub(super) async fn account_renewal(app: &App, request: &Request) -> Reply {
     if form.get("action").map(String::as_str) != Some("cancel") {
         return refused("That is not a renewal action this page carries out.");
     }
-    let card = account
+    let own_card = account
         .payment
         .as_ref()
-        .map(|payment| payment.stripe.subscription.is_some())
-        .unwrap_or(false);
-    if !card {
+        .is_some_and(|payment| payment.stripe.subscription.is_some());
+    // A group's subscription is the body's, so only its site owner may stop it:
+    // another mailbox reads the body's billing but is offered no control over
+    // its card.
+    let owns_group_card = match group_state(app, account.group.as_deref()).await {
+        Ok(Some(group)) => {
+            group.site_owner == account.username && (group.renews || group.renewal_stopped)
+        }
+        Ok(None) => false,
+        Err(e) => return respond(&e, FrontEnd::Httpd),
+    };
+    if account.group.is_some() && !owns_group_card {
+        return refused("Only the group's site owner can stop the body's yearly renewal.");
+    }
+    if !own_card && !owns_group_card {
         return refused(
             "This account has no card subscription to stop. A prepaid membership renews when you \
              pay again, and nothing is charged automatically.",

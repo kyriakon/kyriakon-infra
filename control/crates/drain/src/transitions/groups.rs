@@ -11,8 +11,8 @@
 //! `payments` for one line.
 
 use super::boxrun::{
-    publish_mail_keys, publish_mail_keys_publicly, run_script, run_script_tolerating,
-    write_public_key,
+    cancel_stripe_if_active, publish_mail_keys, publish_mail_keys_publicly, run_script,
+    run_script_tolerating, write_public_key,
 };
 use super::Error;
 use super::{write_journal, Settlement};
@@ -1414,6 +1414,9 @@ pub(super) async fn take_group_down(
     let Some(group) = group_record(store, domain).await? else {
         return Ok(());
     };
+    // The body's subscription stops before its token goes: the token is the
+    // record that names the card, and a removed body must not be billed again.
+    cancel_stripe_if_active(cfg, &group.payment.stripe).await?;
     for account in &group.accounts {
         close_mailbox(cfg, store, account).await?;
     }

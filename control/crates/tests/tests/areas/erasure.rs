@@ -260,6 +260,93 @@ fn the_page_close_and_the_console_delete_end_in_the_same_transition() {
     assert!(again.status.success(), "{}", body(&again));
 }
 
+/// Closing a card-paying account stops the subscription when the closure is
+/// filed, and the deletion that follows sends no second cancel.
+#[test]
+fn closing_a_card_account_stops_its_subscription_once() {
+    let fix = Fix::new("erasure-close-card");
+    fix.card_account("secretary", Some("2027-10-02"));
+    fix.file_close("secretary");
+    assert!(fix.drain().status.success());
+
+    let log = fix.scripts_log();
+    assert_eq!(
+        log.matches("stripe-api.sh cancel sub_example").count(),
+        1,
+        "{log}"
+    );
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["payment"]["stripe"]["cancel_at_period_end"],
+        json!(true),
+        "{account}"
+    );
+    assert_eq!(
+        account["payment"]["paid_until"], "2027-10-02",
+        "the paid period is not shortened: {account}"
+    );
+
+    // The seven days end: the deletion finds the flag and sends nothing.
+    let mut account = account;
+    account["closing_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+    assert!(
+        !fix.dir.join("store/accounts/secretary").exists(),
+        "the closing sweep left the account"
+    );
+    assert_eq!(
+        fix.scripts_log()
+            .matches("stripe-api.sh cancel sub_example")
+            .count(),
+        1,
+        "the deletion cancelled a subscription already stopped: {}",
+        fix.scripts_log()
+    );
+}
+
+/// The console's deletion of a card-paying account stops the subscription
+/// before the record goes, and an already-canceled one calls no processor.
+#[test]
+fn deleting_a_card_account_stops_its_subscription() {
+    let live = Fix::new("erasure-delete-card");
+    live.card_account("secretary", Some("2027-10-02"));
+    let out = live.ctl(&["delete", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let log = live.scripts_log();
+    assert_eq!(
+        log.matches("stripe-api.sh cancel sub_example").count(),
+        1,
+        "{log}"
+    );
+    assert!(!live.dir.join("store/accounts/secretary").exists());
+    assert!(
+        !live
+            .dir
+            .join("store/tokens/KYR-AAAA-BBBB-CCCC.json")
+            .exists(),
+        "the token index entry stayed"
+    );
+
+    let stopped = Fix::new("erasure-delete-card-canceled");
+    stopped.card_account("secretary", Some("2027-10-02"));
+    stopped.amend_account("secretary", |account| {
+        account["payment"]["stripe"]["status"] = json!("canceled");
+    });
+    let out = stopped.ctl(&["delete", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !stopped.scripts_log().contains("stripe-api.sh"),
+        "a canceled subscription called the processor: {}",
+        stopped.scripts_log()
+    );
+    assert!(!stopped.dir.join("store/accounts/secretary").exists());
+}
+
 /// A close intent whose session belongs to another account, or has expired, is
 /// refused and changes nothing.
 #[test]

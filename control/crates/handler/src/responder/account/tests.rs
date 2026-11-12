@@ -747,6 +747,53 @@ async fn the_renewal_control_needs_a_card_subscription() {
     assert_eq!(intent["kind"], "cancel-renewal");
 }
 
+/// A card-paying group's renewal control belongs to its site owner: that
+/// mailbox sees the control and files the cancel, and another mailbox in the
+/// body is offered nothing and refused.
+#[tokio::test]
+async fn a_group_site_owner_stops_the_groups_renewal_and_another_mailbox_cannot() {
+    let (app, dir) = handler("group-renewal").await;
+    file_group_account(&dir);
+    let path = dir.join("groups/parish.example/group.json");
+    let mut group: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    group["payment"]["rail"] = serde_json::json!("card");
+    group["payment"]["stripe"] = serde_json::json!({
+        "subscription": "sub_example",
+        "customer": "cus_example",
+        "status": "active"
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+    let cookie = signed_in(&app, "parish-secretary").await;
+
+    let (code, page) = ask(&app, &httpd_get_session("account", "", &cookie)).await;
+    assert_eq!(code, 200, "{page}");
+    assert!(page.contains("Stop the yearly renewal"), "{page}");
+    let (code, page) = ask(
+        &app,
+        &httpd_post_with("/account/renewal", "action=cancel", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    assert_eq!(filed_intent(&dir)["kind"], "cancel-renewal");
+
+    // The body names another site owner, so this mailbox is not the one that
+    // may stop its card.
+    std::fs::remove_dir_all(dir.join("intents")).unwrap();
+    std::fs::create_dir_all(dir.join("intents")).unwrap();
+    group["site_owner"] = serde_json::json!("parish-warden");
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+    let (_, page) = ask(&app, &httpd_get_session("account", "", &cookie)).await;
+    assert!(!page.contains("Stop the yearly renewal"), "{page}");
+    let (code, refused) = ask(
+        &app,
+        &httpd_post_with("/account/renewal", "action=cancel", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 403, "{refused}");
+    assert_eq!(filed(&dir), 0);
+}
+
 /// The mail key form rejects a block that is not a public key and the key
 /// already in use, and files both a replacement and a cancel.
 #[tokio::test]

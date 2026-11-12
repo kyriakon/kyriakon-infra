@@ -510,10 +510,60 @@ async fn settle_event(
             .await
         }
         "invoice.upcoming" => invoice_upcoming(cfg, store, journal, object).await,
+        // Money the platform did not choose, so the operator answers it by
+        // hand. The alert names the charge, and the settled line the caller
+        // writes carries the same reference as `object`.
+        "charge.dispute.created" => {
+            charge_notice(
+                cfg,
+                kind,
+                object,
+                "decide the member's access by hand; nothing was revoked or refunded here",
+            )
+            .await
+        }
+        "charge.refunded" => {
+            charge_notice(
+                cfg,
+                kind,
+                object,
+                "reconcile the paid-until date by hand if the refund was not one of ours",
+            )
+            .await
+        }
         // Everything else the endpoint is not subscribed to. A verified event of
         // an unknown type is not an error; it is simply not ours.
         _ => Ok(Settled::Ignored),
     }
+}
+
+/// One `charge.*` event: tell the operator and settle, because the charge is
+/// not ours to move money on or to refuse. The two objects differ. A dispute's
+/// object is the dispute, which names its charge; a refund's object is the
+/// charge, whose `amount` is the total and whose `amount_refunded` is the money
+/// that came back. The processed line records the object's own id either way.
+async fn charge_notice(
+    cfg: &DrainConfig,
+    kind: &str,
+    object: &Value,
+    todo: &str,
+) -> Result<Settled, Error> {
+    let text = |name: &str| object.get(name).and_then(Value::as_str);
+    let found = if kind == "charge.dispute.created" {
+        format!(
+            "{kind} for dispute {} on charge {}",
+            text("id").unwrap_or("an unnamed dispute"),
+            text("charge").unwrap_or("an unnamed charge")
+        )
+    } else {
+        let charge = text("id").unwrap_or("an unnamed charge");
+        match object.get("amount_refunded").and_then(Value::as_i64) {
+            Some(amount) => format!("{kind} for charge {charge}, {amount} minor units refunded"),
+            None => format!("{kind} for charge {charge}"),
+        }
+    };
+    notice::alert(cfg, "stripe", kind, &found, todo).await;
+    Ok(Settled::Applied)
 }
 
 /// The account a payment token names, through the index the credit path uses:

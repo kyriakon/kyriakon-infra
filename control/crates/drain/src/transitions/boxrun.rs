@@ -113,6 +113,30 @@ pub(super) async fn run_script(cfg: &DrainConfig, name: &str, args: &[&str]) -> 
     Ok(())
 }
 
+/// Stop a card subscription's renewal before the record that names it goes, so
+/// a closed or erased member is not charged on the next anniversary. `true`
+/// means the API was asked; a missing subscription, one already set to stop at
+/// the period's end, and a canceled one are all the state this wants, so they
+/// send nothing.
+pub(super) async fn cancel_stripe_if_active(
+    cfg: &DrainConfig,
+    stripe: &store::StripeBilling,
+) -> Result<bool, Error> {
+    let Some(subscription) = stripe.subscription.as_deref() else {
+        return Ok(false);
+    };
+    if !stripe.renews() {
+        return Ok(false);
+    }
+    run_script(
+        cfg,
+        "stripe-api.sh",
+        &["cancel", subscription, &cfg.stripe_api_key],
+    )
+    .await?;
+    Ok(true)
+}
+
 /// Run a script and tolerate one known refusal, named by the message it prints.
 /// `add-user.sh` exits non-zero when the account already exists, which is the
 /// state a run that died after it leaves and the state a retry has to get past.
@@ -290,4 +314,55 @@ pub(super) fn outside_address(record: &Record) -> Result<Option<String>, Error> 
 /// or the mailbox the approval just created.
 pub(super) fn recipient(record: &Record, username: &str) -> Result<String, Error> {
     Ok(outside_address(record)?.unwrap_or_else(|| format!("{username}@kyriakon.net")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transitions::test_support::quota_config;
+
+    /// The cancel is sent once for a subscription that still renews, and never
+    /// for the three states that are already the answer: no subscription, one
+    /// stopped at the period's end, and a canceled one.
+    #[tokio::test]
+    async fn a_cancel_is_sent_only_for_a_subscription_that_still_renews() {
+        let dir = std::env::temp_dir().join(format!("control-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let log = dir.join("sent");
+        let script = dir.join("bin/stripe-api.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = quota_config(&dir);
+
+        let live = store::StripeBilling {
+            subscription: Some("sub_example".to_string()),
+            status: Some("active".to_string()),
+            ..Default::default()
+        };
+        assert!(cancel_stripe_if_active(&cfg, &live).await.unwrap());
+        for stopped in [
+            store::StripeBilling::default(),
+            store::StripeBilling {
+                subscription: Some("sub_example".to_string()),
+                cancel_at_period_end: true,
+                ..Default::default()
+            },
+            store::StripeBilling {
+                subscription: Some("sub_example".to_string()),
+                status: Some("canceled".to_string()),
+                ..Default::default()
+            },
+        ] {
+            assert!(!cancel_stripe_if_active(&cfg, &stopped).await.unwrap());
+        }
+        let sent = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(sent.lines().count(), 1, "{sent}");
+        assert!(sent.starts_with("cancel sub_example"), "{sent}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

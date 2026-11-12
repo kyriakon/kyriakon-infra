@@ -5,7 +5,7 @@
 //! record's; every verb here returns a [`Settlement`](super::Settlement) and
 //! leaves the line, the after-line work and the remove to the seam.
 
-use super::boxrun::run_script;
+use super::boxrun::{cancel_stripe_if_active, run_script};
 use super::groups::{group_record, write_account_record, write_group_record};
 use super::lifecycle::dns_contact;
 use super::Error;
@@ -954,6 +954,12 @@ pub async fn refund(
     // recorded and the account still holding it, which no rerun could see.
     if intent.close || intent.excess {
         if intent.close {
+            // A cancellation refund closes the account, so the card stops
+            // before the record that names the subscription goes. A failure
+            // fails the pass and the intent stays for the backoff.
+            if cancel_stripe_if_active(cfg, &payment.stripe).await? {
+                payment.stripe.cancel_at_period_end = true;
+            }
             account.state = "closing".to_string();
             account.closing_until = Some(closing_until);
         }

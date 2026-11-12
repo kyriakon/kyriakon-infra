@@ -519,6 +519,71 @@ fn stopping_a_card_renewal_sets_the_flag_and_a_prepaid_account_is_refused() {
     assert!(fix.journal().contains("\"outcome\":\"refused\""));
 }
 
+/// A card-paying group's site owner stops the body's renewal from the account
+/// page: the flag is written on the group, not on the mailbox, and another
+/// mailbox in the body is refused.
+#[test]
+fn a_group_site_owner_stops_the_groups_renewal() {
+    let fix = Fix::new("account-group-renewal");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    let path = fix.dir.join("store/groups/parish.example/group.json");
+    let mut group: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    group["payment"]["rail"] = json!("card");
+    group["payment"]["stripe"] = json!({
+        "subscription": SUBSCRIPTION,
+        "customer": "cus_example",
+        "status": "active"
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+
+    fix.file_page_action("cancel-renewal", "parish-secretary", json!({}));
+    assert!(fix.drain().status.success());
+    let log = fix.scripts_log();
+    assert_eq!(
+        log.matches("stripe-api.sh cancel sub_example").count(),
+        1,
+        "{log}"
+    );
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(
+        group["payment"]["stripe"]["cancel_at_period_end"],
+        json!(true),
+        "{group}"
+    );
+    assert!(
+        fix.account("parish-secretary")["payment"].is_null(),
+        "the flag went on the mailbox"
+    );
+
+    // The body names another site owner: this mailbox may not stop its card.
+    let mut group = group;
+    group["site_owner"] = json!("parish-warden");
+    group["payment"]["stripe"]["cancel_at_period_end"] = json!(false);
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+    fix.file_page_action("cancel-renewal", "parish-secretary", json!({}));
+    assert!(fix.drain().status.success());
+    assert!(
+        fix.journal().contains("only the group's site owner"),
+        "{}",
+        fix.journal()
+    );
+    assert_eq!(
+        fix.scripts_log()
+            .matches("stripe-api.sh cancel sub_example")
+            .count(),
+        1,
+        "a non-owner cancelled the group: {}",
+        fix.scripts_log()
+    );
+}
+
 /// A replacement not signed by the current key waits, warns every address the
 /// account holds, can be cancelled, and applies when its window closes.
 #[test]

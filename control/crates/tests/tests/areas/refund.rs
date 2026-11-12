@@ -536,6 +536,18 @@ fn a_card_invoice_appends_a_line_and_a_card_refund_names_it() {
     assert_eq!(refunds[0]["rail"], json!("card"));
     assert_eq!(refunds[0]["refund_of"], json!(paid_seq));
     let refund_seq = refunds[0]["seq"].as_u64().unwrap();
+    // The cancellation refund closes the account, so the card stops once and
+    // the flag is saved with the closing state.
+    let log = fix.scripts_log();
+    assert_eq!(
+        log.matches("stripe-api.sh cancel sub_example").count(),
+        1,
+        "{log}"
+    );
+    assert_eq!(
+        fix.account("secretary")["payment"]["stripe"]["cancel_at_period_end"],
+        json!(true)
+    );
     assert!(
         fix.journal()
             .contains(&format!("Idempotency-Key refund-{refund_seq}")),
