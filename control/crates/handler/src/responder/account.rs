@@ -694,10 +694,10 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
 /// because only root's half can enqueue mail; the handler files the same
 /// session-proved intent every other `/account` form does.
 ///
-/// One a day: a test-mail intent for this account still in the queue already
-/// holds the slot, and once the drain has settled one today its notice line
-/// refuses a second. Either way a member who clicks again is told to look in the
-/// mailbox rather than filling the queue with messages the drain would drop.
+/// One a day: the drain records the message in the account's notice log before
+/// it enqueues it, so a day that already carries a test-mail notice is refused
+/// here rather than filed for a second send. The drain's own notice dedup is the
+/// backstop for an intent already queued.
 pub(super) async fn account_test_mail(app: &App, request: &Request) -> Reply {
     let (cookie, account) = match session_account(app, request).await {
         Ok(Some(found)) => found,
@@ -715,16 +715,6 @@ pub(super) async fn account_test_mail(app: &App, request: &Request) -> Reply {
     }
     let stamp = kyriakon_control_core::util::filed_at();
     let day = stamp.get(..10).unwrap_or(&stamp);
-    match test_mail_queued(app, &account.username, day).await {
-        Ok(true) => {
-            return refused(
-                "A test message is already on its way today. It arrives within a minute; check \
-                 the mailbox it was sent to before asking for another.",
-            )
-        }
-        Ok(false) => {}
-        Err(e) => return respond(&e, FrontEnd::Httpd),
-    }
     match notice::already_sent(
         &app.store,
         &account.username,
@@ -765,34 +755,6 @@ pub(super) async fn account_test_mail(app: &App, request: &Request) -> Reply {
             FrontEnd::Httpd,
         ),
     }
-}
-
-/// Whether this account already has a test-mail intent filed today waiting for
-/// the drain. `intents/` is the handler's own directory and the drain removes
-/// each file it settles, so this is the queue's record of what is still to do;
-/// the day check keeps an abandoned file from blocking the next day's test.
-async fn test_mail_queued(app: &App, username: &str, day: &str) -> Result<bool, Error> {
-    for name in app.store.list("intents").await.map_err(Error::from)? {
-        if !name.ends_with(".json") {
-            continue;
-        }
-        let Some(text) = app.store.read_record("intents", &name).await else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        if value.get("kind").and_then(|v| v.as_str()) != Some("test-mail")
-            || value.get("username").and_then(|v| v.as_str()) != Some(username)
-        {
-            continue;
-        }
-        let filed = value.get("filed_at").and_then(|v| v.as_str()).unwrap_or("");
-        if filed.get(..10) == Some(day) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// The member a request's live session names, with the account it names. The

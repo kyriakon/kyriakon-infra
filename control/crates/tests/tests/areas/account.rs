@@ -843,10 +843,14 @@ fn the_test_message_names_the_key_and_is_one_a_day() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     let sent = fix.sent();
-    assert!(sent.contains("To: alice@kyriakon.net"), "{sent}");
+    // The headers are the block before the first blank line. The body repeats
+    // the subject as an example, so checking the whole message would pass on a
+    // wrong outer header.
+    let head = sent.split("\n\n").next().unwrap_or("");
+    assert!(head.contains("To: alice@kyriakon.net"), "{sent}");
     assert!(
-        sent.contains("Subject: Your kyriakon.net test message ("),
-        "the message carries the test's own subject: {sent}"
+        head.contains("Subject: Your kyriakon.net test message ("),
+        "the message's own subject header: {sent}"
     );
     assert!(
         sent.contains("SHA256:not-a-real-key-fingerprint"),
