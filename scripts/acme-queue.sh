@@ -452,11 +452,27 @@ attempt() {
 		# one happened: a first issue spends one of the five per registered
 		# domain, and a renewal that was already current spends none.
 		if [ "$rc" -eq 0 ]; then
-			notify_operator acme issued "$(printf '%s: issued, and %s is in place, so the request is closed.\nThe vhost and keypair are applied. This one spent a slot of the registered domain refill: the next name is attempted on the next pass while fewer than %s attempts sit in the last seven days, and %s minutes apart after that.' \
-				"$name" "$cert" "$BURST_LIMIT" "$REFILL_MINUTES")"
+			case "$name" in
+			*.kyriakon.net)
+				notify_operator acme issued "$(printf '%s: issued, and %s is in place, so the request is closed.\nThe vhost and keypair are applied. This one spent a slot of the registered domain refill: the next member name is attempted on the next pass while fewer than %s attempts sit in the last seven days, and %s minutes apart once the window fills.' \
+					"$name" "$cert" "$BURST_LIMIT" "$REFILL_MINUTES")"
+				;;
+			*)
+				notify_operator acme issued "$(printf '%s: issued, and %s is in place, so the request is closed.\nThe vhost and keypair are applied. Own-domain attempts keep a timer of their own, so the next own-domain attempt is %s minutes out at the earliest.' \
+					"$name" "$cert" "$REFILL_MINUTES")"
+				;;
+			esac
 		else
-			notify_operator acme current "$(printf '%s: already had a valid certificate, so the request is closed (%s).\nThe vhost and keypair are applied. A renewal that was already current spends no refill slot, so the next name is attempted on the next pass.' \
-				"$name" "$cert")"
+			case "$name" in
+			*.kyriakon.net)
+				notify_operator acme current "$(printf '%s: already had a valid certificate, so the request is closed (%s).\nThe vhost and keypair are applied. A renewal that was already current spends no refill slot, so the next member name is attempted on the next pass while fewer than %s attempts sit in the last seven days, and %s minutes apart once the window fills.' \
+					"$name" "$cert" "$BURST_LIMIT" "$REFILL_MINUTES")"
+				;;
+			*)
+				notify_operator acme current "$(printf '%s: already had a valid certificate, so the request is closed (%s).\nThe vhost and keypair are applied. A renewal that was already current spends no refill slot, and own-domain attempts keep a timer of their own, so the next own-domain attempt is %s minutes out at the earliest.' \
+					"$name" "$cert" "$REFILL_MINUTES")"
+				;;
+			esac
 		fi
 		;;
 	*)
