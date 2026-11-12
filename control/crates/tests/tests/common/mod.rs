@@ -136,6 +136,7 @@ impl Fix {
         // address entries yet, so a group's lines are the drain's.
         std::fs::write(fix.path("mail_domains"), "kyriakon.net\n").unwrap();
         std::fs::write(fix.path("virtuals"), "").unwrap();
+        std::fs::write(fix.path("mail_from"), "").unwrap();
         std::fs::write(fix.path("dkim_domains"), "kyriakon.net\n").unwrap();
         // The greylist pass-through list, as deploy-mail.sh seeds it: the
         // platform's own domain with a body's line added by a group provision.
@@ -183,6 +184,7 @@ impl Fix {
         let log = fix.path("scripts.log");
         let mail_domains = fix.path("mail_domains");
         let virtuals = fix.path("virtuals");
+        let mail_from = fix.path("mail_from");
         let dkim_domains = fix.path("dkim_domains");
         let spamd_allowed = fix.path("spamd.alloweddomains");
         let host = fix.dir.join("host").to_str().unwrap().to_string();
@@ -197,6 +199,7 @@ impl Fix {
                  done\n\
                  awk -v s=\"@$d\" '$0 != s' '{spamd_allowed}' > '{spamd_allowed}.new' && mv '{spamd_allowed}.new' '{spamd_allowed}'\n\
                  awk -v s=\"@$d\" -F: '{{ k = $1; gsub(/^[ \\t]+|[ \\t]+$/, \"\", k); if (length(k) >= length(s) && substr(k, length(k) - length(s) + 1) == s) next; print }}' '{virtuals}' > '{virtuals}.new' && mv '{virtuals}.new' '{virtuals}'\n\
+                 awk -v s=\"@$d\" -F: '{{ k = $1; gsub(/^[ \\t]+|[ \\t]+$/, \"\", k); if (length(k) >= length(s) && substr(k, length(k) - length(s) + 1) == s) next; print }}' '{mail_from}' > '{mail_from}.new' && mv '{mail_from}.new' '{mail_from}'\n\
                  rm -f '{host}/httpd.d/'\"$d\"'.conf' '{host}/gmid.d/'\"$d\"'.conf' '{host}/acme-client.d/'\"$d\"'.conf'\n\
                  rm -f '{host}/ssl/'\"$d\"'.fullchain.pem' '{host}/ssl/private/'\"$d\"'.key' '{host}/ssl/'\"$d\"'.crt'\n\
                  rm -f '{host}/ssl/capsule-'\"$d\"'.cnf' '{host}/ssl/capsule-'\"$d\"'.crt' '{host}/ssl/private/capsule-'\"$d\"'.key'\n\
@@ -223,6 +226,7 @@ impl Fix {
              passwd = \"{}\"\n\
              mail_domains = \"{}\"\n\
              virtuals = \"{}\"\n\
+             mail_from = \"{}\"\n\
              dkim_domains = \"{}\"\n\
              spamd_alloweddomains = \"{}\"\n\
              approval_key = \"{}\"\n\
@@ -261,6 +265,7 @@ impl Fix {
             fix.path("passwd"),
             fix.path("mail_domains"),
             fix.path("virtuals"),
+            fix.path("mail_from"),
             fix.path("dkim_domains"),
             fix.path("spamd.alloweddomains"),
             fix.path("key"),

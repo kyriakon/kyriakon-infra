@@ -361,22 +361,6 @@ pub async fn provision_group(
     };
     write_group_record(store, &group).await?;
 
-    // The mail tables before the accounts: provision-member.sh restarts smtpd
-    // when it adds a new account's platform address, and that restart is what
-    // makes these lines live.
-    ensure_group_domain(cfg, &intent.domain)?;
-    // spamd reads the pass-through list at start and has no reload verb, so the
-    // body's line is not live until it restarts. Without this, mail to a group
-    // provisioned between deploys is still trapped and its senders blocklisted.
-    run_script(cfg, "reload-spamd.sh", &[]).await?;
-    for address in &intent.addresses {
-        ensure_table_line(
-            &cfg.virtuals,
-            &format!("{}@{}", address.address, intent.domain),
-            Some(&address.mailbox),
-        )?;
-    }
-
     let app_copy = application_copy(
         store,
         intent.application.status_token.as_deref().ok_or_else(|| {
@@ -387,8 +371,7 @@ pub async fn provision_group(
 
     // Every account and its keyring entry first. The public publish is a network
     // call to the forge, and it runs in a second loop so a forge outage cannot
-    // leave a later mailbox uncreated while its virtual entry already accepts
-    // mail.
+    // stand between a mailbox and the account that delivers to it.
     for mailbox in &intent.mailboxes {
         if let Some(mine) = keys.get(mailbox) {
             publish_mail_keys(cfg, mailbox, mine).await?;
@@ -413,6 +396,28 @@ pub async fn provision_group(
         .await?;
         write_group_application(store, mailbox, app_copy.as_deref()).await?;
     }
+    // The mail tables only after every account and keyring entry is in place.
+    // provision-member.sh restarts smtpd inside the loop above, so a virtuals
+    // line written first would make the rest of the group's addresses live while
+    // their accounts and keys do not exist yet: mail to them would be accepted
+    // and then bounce at LMTP. Written here, a partial failure exposes nothing,
+    // and the restart below is what makes them live.
+    ensure_group_domain(cfg, &intent.domain)?;
+    for address in &intent.addresses {
+        let entry = format!("{}@{}", address.address, intent.domain);
+        ensure_table_line(&cfg.virtuals, &entry, Some(&address.mailbox))?;
+        // The auth match's allowlist: the mailbox may submit as the address it
+        // publishes, which is the shape deploy-mail.sh generates.
+        ensure_table_line(&cfg.mail_from, &entry, Some(&address.mailbox))?;
+    }
+    // One restart for the new route and for the filter's -d list, which the
+    // script re-expands from dkim_domains before it checks the configuration.
+    run_script(cfg, "reload-smtpd.sh", &[]).await?;
+    // spamd reads the pass-through list at start and has no reload verb, so the
+    // body's line is not live until it restarts. Without this, mail to a group
+    // provisioned between deploys is still trapped and its senders blocklisted.
+    run_script(cfg, "reload-spamd.sh", &[]).await?;
+
     // The published set is what the drift check compares the keyring against.
     for mailbox in &intent.mailboxes {
         if let Some(mine) = keys.get(mailbox) {
@@ -738,7 +743,8 @@ fn stale_table_lock(dir: &std::path::Path) -> Option<String> {
 /// the DKIM filter's list and spamd's greylist pass-through list. The last is
 /// not a mail route: a destination domain absent from it is not greylisted, it
 /// is trapped and the sender blocklisted, so the domain goes in with the other
-/// two rather than waiting for an operator to notice.
+/// two rather than waiting for an operator to notice. smtpd's configuration is
+/// re-expanded from the DKIM list by the reload that follows.
 fn ensure_group_domain(cfg: &DrainConfig, domain: &str) -> Result<(), Error> {
     ensure_table_line(&cfg.mail_domains, domain, None)?;
     ensure_table_line(&cfg.dkim_domains, domain, None)?;
@@ -1220,8 +1226,10 @@ pub async fn group_address(
     match intent.action.as_str() {
         "add-alias" => {
             ensure_table_line(&cfg.virtuals, &entry, Some(&intent.mailbox))?;
-            // smtpd reads the table at start and has no reload verb, so the
-            // alias does not deliver until it restarts.
+            ensure_table_line(&cfg.mail_from, &entry, Some(&intent.mailbox))?;
+            // smtpd reads the tables at start and has no reload verb, so the
+            // alias neither delivers nor submits until it restarts. The script
+            // also re-expands the filter's -d list from dkim_domains.
             run_script(cfg, "reload-smtpd.sh", &[]).await?;
         }
         "add-mailbox" => {
@@ -1233,6 +1241,7 @@ pub async fn group_address(
             }
             let key = address_key(&intent)?;
             ensure_table_line(&cfg.virtuals, &entry, Some(&intent.mailbox))?;
+            ensure_table_line(&cfg.mail_from, &entry, Some(&intent.mailbox))?;
             publish_mail_keys(cfg, &intent.mailbox, std::slice::from_ref(&key)).await?;
             if !account_on_box(cfg, &intent.mailbox)? {
                 run_script_tolerating(cfg, "add-user.sh", &[&intent.mailbox], "already exists")
@@ -1270,6 +1279,7 @@ pub async fn group_address(
             )
             .await?;
             repoint_table_line(&cfg.virtuals, &entry, &intent.mailbox)?;
+            repoint_table_line(&cfg.mail_from, &entry, &intent.mailbox)?;
             // The repoint is a table rewrite after the builder's own restart,
             // and a retry that finds the account already made restarts nothing.
             // Without this the upgraded address keeps reaching the shared
@@ -1305,7 +1315,13 @@ pub async fn group_address(
             }
             group.accounts.retain(|a| a != &intent.mailbox);
             write_group_record(store, &group).await?;
-            if remove_addresses(&cfg.virtuals, &intent.domain, &intent.mailbox)? {
+            let routes_changed = remove_addresses(&cfg.virtuals, &intent.domain, &intent.mailbox)?;
+            // The sender identities go with the routes: an address left in the
+            // allowlist after its mailbox has gone still lets another account
+            // name it.
+            let senders_changed =
+                remove_addresses(&cfg.mail_from, &intent.domain, &intent.mailbox)?;
+            if routes_changed || senders_changed {
                 // delete-user.sh restarts smtpd only when it removed a line;
                 // the lines have gone here, so this pass makes them live.
                 run_script(cfg, "reload-smtpd.sh", &[]).await?;

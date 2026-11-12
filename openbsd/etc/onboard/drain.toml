@@ -54,11 +54,20 @@ passwd = "/etc/passwd"
 mail_domains = "/etc/mail/mail_domains"
 virtuals = "/etc/mail/virtuals"
 
+# The submitter allowlist the auth match reads: one `<address>: <account>` line
+# per envelope sender an authenticated account may name. deploy-mail.sh
+# generates it from the passwd file and the virtual table; the drain and
+# provision-member.sh append a body's addresses as they make them, so a mailbox
+# provisioned after the last deploy is not refused at MAIL FROM. A value rather
+# than a compiled-in path for the reason passwd is one.
+mail_from = "/etc/mail/mail_from"
+
 # The DKIM filter's domain list. A body's domain is appended when its group is
 # provisioned, so the platform's one key signs the body's mail at the selector
 # the body publishes. The filter's `-d` list is spliced into smtpd.conf from
-# this file by scripts/deploy-mail.sh, which is the batched configuration pass;
-# until it runs, the domain is listed and not yet signed.
+# this file, and scripts/reload-smtpd.sh re-expands it before every restart, so
+# the domain is signed on the pass that provisioned it; scripts/deploy-mail.sh
+# does the same splice from the tracked template when it installs the file.
 dkim_domains = "/etc/mail/dkim_domains"
 
 # spamd's greylist pass-through list, one `@domain` line per destination domain.

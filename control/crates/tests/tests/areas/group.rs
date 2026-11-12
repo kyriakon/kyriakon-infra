@@ -314,6 +314,20 @@ fn a_group_intent_provisions_its_record_accounts_and_addresses() {
             "{virtuals}"
         );
     }
+    // Each address is also a sender the auth match allows, the shape
+    // deploy-mail.sh generates: without it the mailbox is refused at MAIL FROM
+    // until the next deploy.
+    let mail_from = fix.table("mail_from");
+    for address in ["secretary", "office"] {
+        assert_eq!(
+            mail_from
+                .lines()
+                .filter(|l| *l == format!("{address}@parish.example: parish-secretary"))
+                .count(),
+            1,
+            "{mail_from}"
+        );
+    }
 
     // The block's upload key is where provision-member.sh reads it.
     let key = fix.read("keys/parish-secretary.pub");
@@ -435,6 +449,89 @@ fn a_group_intent_applied_twice_leaves_one_of_each() {
             .count(),
         1,
         "the intent is settled, so the second pass does no work: {}",
+        fix.scripts_log()
+    );
+}
+
+/// A group whose second mailbox cannot be made exposes no mail route for either
+/// mailbox. The tables are written only after every account and keyring entry is
+/// in place, so a partial failure leaves nothing smtpd will accept and then
+/// bounce at LMTP, and a retry starts from accounts it can find.
+#[test]
+fn a_group_whose_second_mailbox_fails_exposes_no_mail_route() {
+    let fix = Fix::new("group-partial");
+    // The builder works for the first mailbox and refuses the second, the shape
+    // a missing keyring entry or a failed add-user.sh leaves behind.
+    let log = fix.path("scripts.log");
+    fix.script(
+        "provision-member.sh",
+        &format!(
+            "#!/bin/sh\necho \"provision-member.sh $*\" >> '{log}'\n\
+             [ \"$1\" = parish-secretary ] || {{ echo 'builder refused' >&2; exit 1; }}\n"
+        ),
+    );
+    let id = fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    // The intent is not settled: it stays for the retry, with the failure.
+    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
+    assert!(
+        fix.failed_note().contains("builder refused"),
+        "{}",
+        fix.failed_note()
+    );
+
+    // No route is live, and nothing names the body's domain yet.
+    assert!(
+        fix.table("virtuals").is_empty(),
+        "a mailbox was exposed before it existed: {}",
+        fix.table("virtuals")
+    );
+    assert!(
+        fix.table("mail_from").is_empty(),
+        "an address was sendable before its mailbox existed: {}",
+        fix.table("mail_from")
+    );
+    assert!(
+        !fix.table("mail_domains").contains("parish.example"),
+        "{}",
+        fix.table("mail_domains")
+    );
+    assert!(
+        !fix.table("dkim_domains").contains("parish.example"),
+        "{}",
+        fix.table("dkim_domains")
+    );
+    assert!(
+        !fix.table("spamd.alloweddomains")
+            .contains("@parish.example"),
+        "{}",
+        fix.table("spamd.alloweddomains")
+    );
+
+    // What the pass did make is where a retry looks for it: the accounts and
+    // the keyring entries, which a second pass finds rather than makes again.
+    assert!(
+        fix.passwd_file().contains("parish-secretary:"),
+        "{}",
+        fix.passwd_file()
+    );
+    assert!(fix.dir.join("keyring/parish-secretary.asc").exists());
+    assert!(fix.dir.join("keyring/parish-office.asc").exists());
+    assert!(
+        fix.scripts_log()
+            .contains("provision-member.sh parish-office"),
+        "the second mailbox was not attempted: {}",
         fix.scripts_log()
     );
 }
@@ -946,6 +1043,12 @@ fn an_alias_added_to_a_group_writes_one_entry_and_no_account() {
         virtuals.contains("office@parish.example: parish-secretary"),
         "{virtuals}"
     );
+    assert!(
+        fix.table("mail_from")
+            .contains("office@parish.example: parish-secretary"),
+        "the alias cannot be submitted as: {}",
+        fix.table("mail_from")
+    );
     assert_eq!(fix.passwd_file(), passwd, "an alias made an account");
     assert_eq!(fix.names("accounts"), accounts);
     assert!(
@@ -960,7 +1063,7 @@ fn an_alias_added_to_a_group_writes_one_entry_and_no_account() {
     let log = fix.scripts_log();
     assert_eq!(
         log.matches("reload-smtpd.sh").count(),
-        1,
+        scripts.matches("reload-smtpd.sh").count() + 1,
         "the alias was not made live: {log}"
     );
     assert_eq!(
@@ -1016,6 +1119,12 @@ fn a_mailbox_added_to_a_group_gets_an_account_key_and_entry() {
     assert!(
         virtuals.contains("office@parish.example: parish-office"),
         "{virtuals}"
+    );
+    assert!(
+        fix.table("mail_from")
+            .contains("office@parish.example: parish-office"),
+        "the new mailbox cannot be submitted as: {}",
+        fix.table("mail_from")
     );
     let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
     assert_eq!(
@@ -1085,6 +1194,17 @@ fn upgrading_an_alias_repoints_it_without_changing_the_count() {
     );
     assert!(fix.passwd_file().contains("parish-office:"));
     assert!(fix.dir.join("keyring/parish-office.asc").exists());
+    // The sender identity follows the route: the upgraded address submits as
+    // its new mailbox, not the shared one.
+    let mail_from = fix.table("mail_from");
+    assert!(
+        mail_from.contains("office@parish.example: parish-office"),
+        "{mail_from}"
+    );
+    assert!(
+        !mail_from.contains("office@parish.example: parish-secretary"),
+        "{mail_from}"
+    );
     let log = fix.scripts_log();
     let built = log
         .rfind("provision-member.sh parish-office")
@@ -1373,6 +1493,11 @@ fn a_group_removal_takes_the_domain_down_and_closes_its_accounts() {
     let virtuals = fix.table("virtuals");
     assert!(!virtuals.contains("parish.example"), "{virtuals}");
     assert!(virtuals.contains("bob@kyriakon.net: bob"), "{virtuals}");
+    let mail_from = fix.table("mail_from");
+    assert!(
+        !mail_from.contains("parish.example"),
+        "a removed body's addresses can still be submitted as: {mail_from}"
+    );
 
     // The generated blocks and certificate material went, and the other body's
     // stayed.

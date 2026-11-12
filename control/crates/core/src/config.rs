@@ -200,10 +200,18 @@ pub struct DrainConfig {
     /// `passwd` is one.
     pub mail_domains: String,
     pub virtuals: String,
+    /// The submitter allowlist the auth match reads, `/etc/mail/mail_from`: the
+    /// envelope senders an authenticated account may name. deploy-mail.sh
+    /// generates one line per account and per full-address virtuals entry, and
+    /// a group's transition appends its addresses as it provisions them, so a
+    /// mailbox provisioned after the last deploy is not refused at MAIL FROM. A
+    /// configuration value for the reason `passwd` is one.
+    pub mail_from: String,
     /// The DKIM filter's domain list, one domain per line. A body's domain is
-    /// appended here when its group is provisioned, so the next deploy's splice
-    /// of the filter's `-d` arguments signs it; the splice itself is the batched
-    /// configuration pass, not this write.
+    /// appended here when its group is provisioned, and reload-smtpd.sh
+    /// re-expands the filter's `-d` arguments from this file before it restarts
+    /// smtpd, so the body's mail is signed on the pass that made the domain live
+    /// rather than at the next deploy.
     pub dkim_domains: String,
     /// spamd's greylist pass-through list, `/etc/mail/spamd.alloweddomains`: one
     /// `@domain` line per destination domain spamd must not trap. A destination
@@ -441,6 +449,7 @@ mod tests {
              passwd = \"/etc/passwd\"\n\
              mail_domains = \"/etc/mail/mail_domains\"\n\
              virtuals = \"/etc/mail/virtuals\"\n\
+             mail_from = \"/etc/mail/mail_from\"\n\
              dkim_domains = \"/etc/mail/dkim_domains\"\n\
              spamd_alloweddomains = \"/etc/mail/spamd.alloweddomains\"\n\
              approval_key = \"/etc/kyriakon/onboard/approval-signing-key\"\n\
@@ -492,6 +501,7 @@ mod tests {
         assert_eq!(c.passwd, "/etc/passwd");
         assert_eq!(c.mail_domains, "/etc/mail/mail_domains");
         assert_eq!(c.virtuals, "/etc/mail/virtuals");
+        assert_eq!(c.mail_from, "/etc/mail/mail_from");
         assert_eq!(c.dkim_domains, "/etc/mail/dkim_domains");
         assert_eq!(c.approval_key, "/etc/kyriakon/onboard/approval-signing-key");
         assert_eq!(c.keyring_dir, "/etc/kyriakon/keys");
