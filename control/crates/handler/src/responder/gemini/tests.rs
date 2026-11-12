@@ -574,6 +574,7 @@ async fn a_mailed_key_answers_the_capsule_key_page() {
         .mail_keys
         .push(kyriakon_control_core::mail::keycheck::mail_key(
             "secretary".to_string(),
+            "secretary@parish.example",
             GOOD_KEY,
         ));
     let path = flow_path(&app.questions, &record.answers);
@@ -624,12 +625,14 @@ async fn a_mailed_key_is_in_the_filed_application_in_mailbox_order() {
         .mail_keys
         .push(kyriakon_control_core::mail::keycheck::mail_key(
             "secretary".into(),
+            "secretary@parish.example",
             GOOD_KEY,
         ));
     record
         .mail_keys
         .push(kyriakon_control_core::mail::keycheck::mail_key(
             "hall".into(),
+            "hall@parish.example",
             GOOD_KEY,
         ));
     record.cursor = flow_path(&app.questions, &record.answers).len();

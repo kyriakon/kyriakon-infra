@@ -893,10 +893,15 @@ fn prompt(page: &Page, index: usize, total: usize) -> String {
 fn store_answer(page: &Page, draft: &mut draft::Draft, value: String) {
     match &page.mailbox {
         Some(mailbox) => {
+            let address = if mailbox.address.is_empty() {
+                mailbox.name.clone()
+            } else {
+                mailbox.address.clone()
+            };
             draft.mail_keys.retain(|k| k.mailbox != mailbox.name);
             draft
                 .mail_keys
-                .push(keycheck::mail_key(mailbox.name.clone(), &value));
+                .push(keycheck::mail_key(mailbox.name.clone(), &address, &value));
         }
         None => {
             draft.answers.insert(page.q.id.clone(), value);

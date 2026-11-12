@@ -233,10 +233,15 @@ pub(super) async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) ->
     }
     match &page.mailbox {
         Some(mailbox) => {
+            let address = if mailbox.address.is_empty() {
+                mailbox.name.clone()
+            } else {
+                mailbox.address.clone()
+            };
             record.mail_keys.retain(|k| k.mailbox != mailbox.name);
             record
                 .mail_keys
-                .push(keycheck::mail_key(mailbox.name.clone(), &value));
+                .push(keycheck::mail_key(mailbox.name.clone(), &address, &value));
         }
         None => {
             record.answers.insert(q.id.clone(), value);

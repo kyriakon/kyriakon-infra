@@ -156,10 +156,25 @@ pub(super) fn build_record(
     };
     let mut mail_keys = Vec::new();
     for (i, block) in blocks.iter().enumerate() {
-        mail_keys.push(keycheck::mail_key(
-            mailboxes.get(i).cloned().unwrap_or_default(),
-            block,
-        ));
+        let mailbox = mailboxes.get(i).cloned().unwrap_or_default();
+        // A person's key is filed under no mailbox, but its identity is the
+        // username answer; a body mailbox's identity is its own address.
+        let address = if body {
+            let domain = form.get("body_domain").cloned().unwrap_or_default();
+            if domain.is_empty() {
+                mailbox.clone()
+            } else {
+                format!("{mailbox}@{domain}")
+            }
+        } else {
+            let name = answers.get("username").cloned().unwrap_or_default();
+            if name.is_empty() {
+                String::new()
+            } else {
+                format!("{name}@kyriakon.net")
+            }
+        };
+        mail_keys.push(keycheck::mail_key(mailbox, &address, block));
     }
 
     let upload_key_id = if body {

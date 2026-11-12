@@ -92,8 +92,11 @@ async fn a_titan_upload_files_the_key_and_the_mail_verdict() {
     let draft = read_draft(&dir, TOKEN);
     assert_eq!(draft.mail_keys.len(), 1);
     let filed = &draft.mail_keys[0];
-    let expected =
-        kyriakon_control_core::mail::keycheck::mail_key("secretary".to_string(), GOOD_KEY);
+    let expected = kyriakon_control_core::mail::keycheck::mail_key(
+        "secretary".to_string(),
+        "secretary@kyriakon.net",
+        GOOD_KEY,
+    );
     assert_eq!(filed.mailbox, "secretary");
     assert_eq!(filed.material, expected.material);
     assert_eq!(filed.fingerprint, expected.fingerprint);
