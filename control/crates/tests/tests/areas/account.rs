@@ -828,6 +828,65 @@ fn a_mail_key_replacement_refuses_an_expiring_or_aead_key() {
     );
 }
 
+/// The page's test message goes to the account's own address, names the key
+/// delivery uses, and is one a day: a second intent settled the same day sends
+/// nothing, and an account with no recorded key has nothing to encrypt to.
+#[test]
+fn the_test_message_names_the_key_and_is_one_a_day() {
+    let fix = Fix::new("account-test-mail");
+    fix.page_account(
+        "alice",
+        json!({"mail_key": "SHA256:not-a-real-key-fingerprint"}),
+    );
+
+    fix.file_page_action("test-mail", "alice", json!({}));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let sent = fix.sent();
+    assert!(sent.contains("To: alice@kyriakon.net"), "{sent}");
+    assert!(
+        sent.contains("Subject: Your kyriakon.net test message ("),
+        "the message carries the test's own subject: {sent}"
+    );
+    assert!(
+        sent.contains("SHA256:not-a-real-key-fingerprint"),
+        "the body names the key delivery used: {sent}"
+    );
+    assert!(
+        sent.contains("Subject: ..."),
+        "the body says what a client that drops the protected header shows: {sent}"
+    );
+    assert!(
+        fix.read("accounts/alice/notices.jsonl")
+            .contains("\"type\":\"test-mail\""),
+        "the message is a notice like every other: {}",
+        fix.read("accounts/alice/notices.jsonl")
+    );
+    assert!(fix.intents().is_empty(), "the applied intent is removed");
+
+    // A second request the same day: the notice record refuses the message.
+    fix.file_page_action("test-mail", "alice", json!({}));
+    assert!(fix.drain().status.success());
+    assert_eq!(fix.sent(), sent, "one message a day");
+    assert!(
+        fix.journal()
+            .contains("a test message had already gone today"),
+        "{}",
+        fix.journal()
+    );
+
+    // An account with no recorded key has nothing to encrypt to.
+    fix.amend_account("alice", |account| account["mail_key"] = Value::Null);
+    fix.file_page_action("test-mail", "alice", json!({}));
+    assert!(fix.drain().status.success());
+    assert!(
+        fix.journal().contains("no mail key recorded"),
+        "{}",
+        fix.journal()
+    );
+    assert_eq!(fix.sent(), sent, "nothing was sent");
+}
+
 /// The mail-key route: a detached signature or a clearsigned message over the
 /// account's own platform address verifies against the keyring entry, prints the
 /// signing key's fingerprint, and writes no request line.

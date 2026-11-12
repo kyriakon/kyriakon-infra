@@ -21,7 +21,8 @@ use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::validate;
 use kyriakon_control_core::intent::{
     CancelRenewalIntent, ChangePasswordIntent, CloseIntent, ExportIntent, MailKeyIntent,
-    OutsideAddressIntent, PasswordIntent, ServingIntent, UploadKeyIntent, WindowExtendIntent,
+    OutsideAddressIntent, PasswordIntent, ServingIntent, TestMailIntent, UploadKeyIntent,
+    WindowExtendIntent,
 };
 use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::payments::ledger::Ledger;
@@ -1770,6 +1771,65 @@ pub async fn cancel_renewal(
         "applied",
         ApplicationRef::account(account.username.clone()),
         Some("the subscription stops renewing at the end of the period".to_string()),
+    ))
+}
+
+/// Send the account page's one diagnostic message. It goes to the member's own
+/// platform address, so delivery encrypts it to the same key as everything else
+/// the platform sends them, with the same protected headers. The body names the
+/// fingerprint that key was, so a member who can read the message has proved
+/// both their client's decryption and its handling of the protected `Subject:`.
+pub async fn test_mail(
+    cfg: &DrainConfig,
+    store: &Store,
+    intent: TestMailIntent,
+) -> Result<Settlement, Error> {
+    let Some(account) = store.account(&intent.username).await? else {
+        return Ok(account_gone(&intent.username));
+    };
+    // Delivery encrypts to the fingerprint the record holds; a record without
+    // one has nothing to encrypt to, and the handler refuses the same request
+    // before it files so the member is told on the page.
+    let Some(fingerprint) = account.mail_key.clone() else {
+        return Ok(Settlement::refused(
+            "the account has no mail key recorded, so delivery has nothing to encrypt to",
+        ));
+    };
+    // The notice record's dedup is type and subject, so the day in the subject
+    // is what makes tomorrow's test a new message rather than a suppressed
+    // retry of today's.
+    let stamp = util::filed_at();
+    let subject = notice::test_mail_subject(stamp.get(..10).unwrap_or(&stamp));
+    let to = account.platform_address();
+    let body = format!(
+        "This is the test message you asked for from your account page. If you can read it, \
+         your mail client holds the private key for the mail key delivery uses now:\n\n\
+         {fingerprint}\n\n\
+         The platform keeps no copy of that private key and cannot read this message itself.\n\n\
+         Your client should show the Subject: header as it was written:\n\n\
+         Subject: {subject}\n\n\
+         If it shows `Subject: ...` instead, the body decrypted but the protected header was \
+         not restored: look for a PGP/MIME or protected-headers setting in the client. \
+         Nothing about the account changes either way; this message is the whole test.\n"
+    );
+    let sent = notice::send_account_notice(
+        cfg,
+        store,
+        &intent.username,
+        notice::TEST_MAIL_NOTICE,
+        &subject,
+        &to,
+        &body,
+    )
+    .await?;
+    Ok(Settlement::line(
+        "applied",
+        ApplicationRef::account(intent.username.clone()),
+        Some(if sent {
+            "the test message was sent".to_string()
+        } else {
+            "a test message had already gone today".to_string()
+        }),
     ))
 }
 

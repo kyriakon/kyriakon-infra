@@ -14,7 +14,12 @@ use crate::fastcgi::{Http, Reply, Request};
 use crate::page;
 use crate::page::LoginPage;
 use kyriakon_control_core::store::Account;
-use kyriakon_control_core::{account::session, flow::validate, intent, mail::keycheck};
+use kyriakon_control_core::{
+    account::session,
+    flow::validate,
+    intent,
+    mail::{keycheck, notice},
+};
 
 /// The account page, which each front end renders for the identity it has: the
 /// web's session cookie and the capsule's certificate.
@@ -202,6 +207,7 @@ pub(super) async fn account_action(app: &App, call: &Call<'_>) -> Reply {
         "serving" => account_serving(app, call.request).await,
         "renewal" => account_renewal(app, call.request).await,
         "mail-key" => account_mail_key(app, call.request).await,
+        "test-mail" => account_test_mail(app, call.request).await,
         _ => Reply::html(404, String::new()),
     }
 }
@@ -682,6 +688,111 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
         }
         _ => refused("That is not a mail-key action this page carries out."),
     }
+}
+
+/// The page's "send a test encrypted email". The message itself is the drain's,
+/// because only root's half can enqueue mail; the handler files the same
+/// session-proved intent every other `/account` form does.
+///
+/// One a day: a test-mail intent for this account still in the queue already
+/// holds the slot, and once the drain has settled one today its notice line
+/// refuses a second. Either way a member who clicks again is told to look in the
+/// mailbox rather than filling the queue with messages the drain would drop.
+pub(super) async fn account_test_mail(app: &App, request: &Request) -> Reply {
+    let (cookie, account) = match session_account(app, request).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return refused("Sign in to the account you want the test message sent to."),
+        Err(e) => return respond(&e, FrontEnd::Httpd),
+    };
+    let Some(session_id) = session::id(&cookie) else {
+        return refused("Sign in to the account you want the test message sent to.");
+    };
+    if account.mail_key.is_none() {
+        return refused(
+            "The platform has not recorded a mail key for this account yet, so there is nothing \
+             to encrypt a test message to.",
+        );
+    }
+    let stamp = kyriakon_control_core::util::filed_at();
+    let day = stamp.get(..10).unwrap_or(&stamp);
+    match test_mail_queued(app, &account.username, day).await {
+        Ok(true) => {
+            return refused(
+                "A test message is already on its way today. It arrives within a minute; check \
+                 the mailbox it was sent to before asking for another.",
+            )
+        }
+        Ok(false) => {}
+        Err(e) => return respond(&e, FrontEnd::Httpd),
+    }
+    match notice::already_sent(
+        &app.store,
+        &account.username,
+        notice::TEST_MAIL_NOTICE,
+        &notice::test_mail_subject(day),
+    )
+    .await
+    {
+        Ok(true) => {
+            return refused(
+                "A test message has already gone out today. Check the mailbox it was sent to \
+                 before asking for another.",
+            )
+        }
+        Ok(false) => {}
+        Err(e) => return respond(&Error::from(e), FrontEnd::Httpd),
+    }
+    match intent::Intent::TestMail(intent::TestMailIntent {
+        username: account.username.clone(),
+        session: session_id.to_string(),
+        ..Default::default()
+    })
+    .file(&app.store)
+    .await
+    {
+        Ok(_) => {
+            let page = notice(
+                "Your test message is on its way",
+                "The platform is sending one message to your address on this platform now. It is \
+                 encrypted to the mail key above, with its Subject: protected, so opening it and \
+                 seeing the real subject is the proof your client is set up. It arrives within a \
+                 minute.",
+            );
+            Reply::html(200, page_html(&page))
+        }
+        Err(e) => respond(
+            &Error::Failed(format!("the test message could not be filed: {e}")),
+            FrontEnd::Httpd,
+        ),
+    }
+}
+
+/// Whether this account already has a test-mail intent filed today waiting for
+/// the drain. `intents/` is the handler's own directory and the drain removes
+/// each file it settles, so this is the queue's record of what is still to do;
+/// the day check keeps an abandoned file from blocking the next day's test.
+async fn test_mail_queued(app: &App, username: &str, day: &str) -> Result<bool, Error> {
+    for name in app.store.list("intents").await.map_err(Error::from)? {
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let Some(text) = app.store.read_record("intents", &name).await else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if value.get("kind").and_then(|v| v.as_str()) != Some("test-mail")
+            || value.get("username").and_then(|v| v.as_str()) != Some(username)
+        {
+            continue;
+        }
+        let filed = value.get("filed_at").and_then(|v| v.as_str()).unwrap_or("");
+        if filed.get(..10) == Some(day) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The member a request's live session names, with the account it names. The

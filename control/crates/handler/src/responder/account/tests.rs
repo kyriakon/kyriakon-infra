@@ -505,6 +505,49 @@ async fn the_account_pages_export_action_files_an_intent_for_the_session_account
     );
 }
 
+/// The test-mail button files one session-proved intent for the account the
+/// session names, and a second click before the drain takes the first refuses
+/// rather than queueing another. A request with no session files nothing.
+#[tokio::test]
+async fn the_test_mail_button_files_one_intent_and_refuses_a_duplicate() {
+    let (app, dir) = handler("account-test-mail").await;
+    file_account(&dir);
+    amend_account(&dir, "alice", |value| {
+        value["mail_key"] = serde_json::json!("AAAA");
+    });
+    let cookie = signed_in(&app, "alice").await;
+
+    let (code, page) = ask(
+        &app,
+        &httpd_post_with("/account/test-mail", "", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    assert!(page.contains("Your test message is on its way"), "{page}");
+    let intent = filed_intent(&dir);
+    assert_eq!(intent["kind"], "test-mail");
+    assert_eq!(intent["username"], "alice");
+    assert_eq!(
+        intent["session"],
+        cookie.split('.').next().unwrap(),
+        "the session the drain will verify"
+    );
+
+    // The first intent is still queued, so the same click again files nothing.
+    let (code, refused) = ask(
+        &app,
+        &httpd_post_with("/account/test-mail", "", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 403, "{refused}");
+    assert_eq!(filed(&dir), 1, "a second intent was filed");
+
+    // No session, no account to send to.
+    let (code, _) = ask(&app, &httpd_post("/account/test-mail", "")).await;
+    assert_eq!(code, 403);
+    assert_eq!(filed(&dir), 1, "an intent was filed without a session");
+}
+
 /// The password form re-enters the current password whatever the session's age,
 /// and files one intent carrying the new hash and nothing else. A wrong current
 /// password, a short new one and a mismatched pair all file nothing.
@@ -992,6 +1035,7 @@ async fn the_account_page_offers_every_action() {
         "/account/address",
         "/account/serving",
         "/account/mail-key",
+        "/account/test-mail",
     ] {
         assert!(body.contains(action), "{action} is missing: {body}");
     }
