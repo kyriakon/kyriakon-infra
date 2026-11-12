@@ -254,7 +254,7 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
     // The same retain-then-push the capsule's key page uses, so a retry for one
     // mailbox replaces its key rather than adding a second.
     record.mail_keys.retain(|k| k.mailbox != mailbox);
-    let address = if record.answers.get("whose").map(String::as_str) == Some("body") {
+    let identity = if record.answers.get("whose").map(String::as_str) == Some("body") {
         let domain = record
             .answers
             .get("body_domain")
@@ -270,7 +270,7 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
     };
     record
         .mail_keys
-        .push(keycheck::mail_key(mailbox.clone(), &address, &blocks[0]));
+        .push(keycheck::mail_key(mailbox.clone(), &identity, &blocks[0]));
     if let Err(e) = draft::save(&app.store, &mut record).await {
         e.report("the titan request");
         return Ok((Reply::gemini(40, TEMP_FAILURE, String::new()), address));
