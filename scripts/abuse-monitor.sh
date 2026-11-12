@@ -304,7 +304,7 @@ enforce_sender_cap() {
 		if [ "$lapse_rc" -eq 0 ]; then
 			alert mail "sender cap $user" "$user submitted $count outbound recipients since last run (max $sender_max), so its submission was lapsed with scripts/lapse-user.sh. Mail still arrives and the site stays up; change the password, then run scripts/lapse-user.sh --restore $user"
 		else
-			alert mail "sender cap $user" "$user submitted $count outbound recipients since last run (max $sender_max) and the lapse FAILED: $lapse_out. Outbound submission is still open; run scripts/lapse-user.sh $user by hand"
+			alert mail "sender cap $user" "$user submitted $count outbound recipients since last run (max $sender_max) and the lapse FAILED: $lapse_out. Outbound submission is still open; run scripts/lapse-user.sh $user by hand" "" fail
 			printf 'abuse-monitor: could not lapse %s after %s recipients: %s\n' "$user" "$count" "$lapse_out" >&2
 			exit 1
 		fi
@@ -390,10 +390,12 @@ newest_snapshot_epoch() {
 # repeat it. And the check is what survives this box being the broken thing: mail
 # cannot report a broken mail path, and the check's silence covers that case.
 #
-# alert <component> <event> <body> [<what to do>]: the component and the event are
-# the two words the subject carries, from the vocabulary notify_operator in lib.sh
-# lists, so a list of subjects says what happened without any of them being
-# opened.
+# alert <component> <event> <body> [<what to do>] [<check: ok|fail>]: the
+# component and the event are the two words the subject carries, from the
+# vocabulary notify_operator in lib.sh lists, so a list of subjects says what
+# happened without any of them being opened. The check argument is the state to
+# leave the external check in, ok by default; fail is for a run that could not do
+# its job, which today is the circuit breaker's own lapse failing.
 #
 # Nothing is printed for an alert. The mail is the report, and cron mails what a
 # job prints, so a print would be the same finding a second time under a subject
@@ -427,18 +429,19 @@ alert() {
 	# The body lands in the check's event log, which is what makes an alert
 	# raised while mail is broken still readable somewhere.
 	#
-	# Pinned to the success URL rather than /fail on purpose. A finding is not an
-	# outage: pinging /fail marked the dead-man's switch down and the ping at the
-	# end of the same run brought it straight back up, so Healthchecks mailed
-	# "is UP, the downtime lasted 0 seconds" every time the monitor had something
-	# to say, which is noise that trains you to ignore the one channel that
-	# survives this box going away. The check's state now means "the monitor is
-	# running". /fail belongs to a run that could not do its job, and under set -e
-	# such a run dies before reaching any ping, leaving Healthchecks to alert on
-	# silence, which is what the switch is for.
+	# A finding is not an outage, so the default is the success URL: pinging /fail
+	# marked the dead-man's switch down and the ping at the end of the same run
+	# brought it straight back up, which mailed "is UP, the downtime lasted 0
+	# seconds" every time the monitor had something to say. The check means "the
+	# monitor is running". A run that cannot do its job passes fail and exits
+	# nonzero; the alert pings /fail itself because it runs before that exit, and
+	# a success ping here would mark the check up on the one run that must not
+	# look clean.
 	if [ -n "${HEALTHCHECKS_URL:-}" ]; then
+		check_url="$HEALTHCHECKS_URL"
+		[ "${5:-ok}" = "fail" ] && check_url="$HEALTHCHECKS_URL/fail"
 		curl -fsS -m 10 --retry 3 --data "$when $component $event: $body" \
-			"$HEALTHCHECKS_URL" >/dev/null 2>&1 || true
+			"$check_url" >/dev/null 2>&1 || true
 	fi
 }
 
@@ -596,6 +599,21 @@ STUB
 	check "an account under the cap is not lapsed" "$(cat "$work/lapsed")" "alice"
 	enforce_sender_cap 50 "" >"$work/cap.out" 2>&1
 	check "a run with no attributable recipient does not alert" "$(cat "$work/cap.out")" ""
+	# The external check must not be marked up by the alert on a failed lapse.
+	# curl is stubbed, and the last argument is the URL it was asked to ping.
+	mkdir -p "$work/bin"
+	cat > "$work/bin/curl" <<'STUB'
+#!/bin/sh
+last=""
+for arg in "$@"; do last=$arg; done
+printf '%s\n' "$last" >>"$CURL_LOG"
+STUB
+	chmod 0700 "$work/bin/curl"
+	export CURL_LOG="$work/curl.log"
+	export PATH="$work/bin:$PATH"
+	health_url="https://check.example.invalid/token"
+	export HEALTHCHECKS_URL="$health_url"
+	rm -f "$CURL_LOG"
 	export LAPSE_USER_SH="$work/lapse-fail"
 	if ( enforce_sender_cap 50 "carol 51" ) >"$work/cap.out" 2>&1; then cap_rc=0; else cap_rc=$?; fi
 	check "a failed lapse exits nonzero" "$cap_rc" "1"
@@ -603,7 +621,13 @@ STUB
 		"$(grep -c 'kyriakon: mail: sender cap carol' "$work/cap.out")" "1"
 	check "a failed lapse reports why" \
 		"$(grep -c 'lapse FAILED: usermod: permission denied' "$work/cap.out")" "1"
+	check "a failed lapse leaves the external check failed" \
+		"$(cat "$CURL_LOG")" "$health_url/fail"
+	rm -f "$CURL_LOG"
 	export LAPSE_USER_SH="$work/lapse-ok"
+	enforce_sender_cap 50 "dave 51" >"$work/cap.out" 2>&1
+	check "a successful lapse leaves the external check up" "$(cat "$CURL_LOG")" "$health_url"
+	unset HEALTHCHECKS_URL
 
 	# A cold resolver must be retried rather than skipped past, which is the
 	# 2026-10-05 alert: the box had just rebooted, the probe gave up, the query fell
@@ -746,6 +770,14 @@ new_authlog=$(new_lines "$authlog" "$state/authlog.pos")
 # busiest interval seen. One unverified input, recorded in the note: whether a
 # send to sixty recipients counts as one relay or sixty. That observation is
 # what would move this value.
+#
+# This count is box-wide and takes no origin, so a local enqueue counts too and a
+# mailing list fanning out through the socket can still trip it. The "mta
+# disconnected" line carries only messages=N. Attributing a relay to the enqueue
+# behind it means joining "mta delivery evpid" to "smtp message msgid" (the evpid
+# starts with the message id), which has not been verified on this box and is not
+# needed until the _mlmmj lane exists. That split is deferred to the lane; the
+# per-account cap below is the member-facing exclusion.
 outbound=$(printf '%s\n' "$new_maillog" \
 	| awk '/mta disconnected reason=quit/ { split($0, a, "messages="); s += a[2]+0 } END { print s+0 }')
 if [ "$outbound" -gt "$mail_spike_max" ]; then
