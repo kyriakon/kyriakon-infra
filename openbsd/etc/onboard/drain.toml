@@ -54,12 +54,13 @@ passwd = "/etc/passwd"
 mail_domains = "/etc/mail/mail_domains"
 virtuals = "/etc/mail/virtuals"
 
-# The submitter allowlist the auth match reads: one `<address>: <account>` line
-# per envelope sender an authenticated account may name. deploy-mail.sh
-# generates it from the passwd file and the virtual table; the drain and
-# provision-member.sh append a body's addresses as they make them, so a mailbox
-# provisioned after the last deploy is not refused at MAIL FROM. A value rather
-# than a compiled-in path for the reason passwd is one.
+# The senders mapping the submission listeners read: one line per account,
+# `<account>: <address>,<address>`, naming the envelope senders that account may
+# submit as. deploy-mail.sh generates it from the passwd file and the virtual
+# table; the drain and provision-member.sh add a body's addresses to the owning
+# account's line as they make them, so a mailbox provisioned after the last
+# deploy is not refused at MAIL FROM. A value rather than a compiled-in path for
+# the reason passwd is one.
 mail_from = "/etc/mail/mail_from"
 
 # The DKIM filter's domain list. A body's domain is appended when its group is

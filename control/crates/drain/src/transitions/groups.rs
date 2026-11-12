@@ -406,9 +406,10 @@ pub async fn provision_group(
     for address in &intent.addresses {
         let entry = format!("{}@{}", address.address, intent.domain);
         ensure_table_line(&cfg.virtuals, &entry, Some(&address.mailbox))?;
-        // The auth match's allowlist: the mailbox may submit as the address it
-        // publishes, which is the shape deploy-mail.sh generates.
-        ensure_table_line(&cfg.mail_from, &entry, Some(&address.mailbox))?;
+        // The sender mapping: the mailbox may submit as the address it publishes,
+        // and only as an address on its own line. deploy-mail.sh generates the
+        // same shape for an address a virtuals entry delivers into.
+        ensure_sender(&cfg.mail_from, &address.mailbox, &entry)?;
     }
     // One restart for the new route and for the filter's -d list, which the
     // script re-expands from dkim_domains before it checks the configuration.
@@ -931,6 +932,152 @@ fn remove_addresses(path: &str, domain: &str, mailbox: &str) -> Result<bool, Err
     Ok(changed)
 }
 
+/// The addresses in a sender mapping line's value: comma-separated, trimmed,
+/// with empty entries dropped.
+fn sender_values(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// One sender mapping line in the shape deploy-mail.sh writes.
+fn sender_line(account: &str, values: &[String]) -> String {
+    format!("{account}: {}\n", values.join(","))
+}
+
+/// Add `address` to `account`'s list in the sender mapping, creating the line
+/// when the account has none. A list that already names it is left alone, so a
+/// retry changes nothing. The mapping is what the listeners' `senders` option
+/// checks, so an address here is one this account may submit as.
+fn ensure_sender(path: &str, account: &str, address: &str) -> Result<(), Error> {
+    let lock = TableLock::acquire(path)?;
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        Error::context(
+            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
+            e,
+        )
+    })?;
+    let mut out = String::new();
+    let mut found = false;
+    for line in text.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            if key.trim() == account {
+                found = true;
+                let mut values = sender_values(value);
+                if !values.iter().any(|v| v == address) {
+                    values.push(address.to_string());
+                }
+                out.push_str(&sender_line(account, &values));
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !found {
+        out.push_str(&sender_line(account, &[address.to_string()]));
+    }
+    if out != text {
+        write_table(path, &out, &lock)?;
+    }
+    Ok(())
+}
+
+/// Give `address` to `keep`'s line in the sender mapping and take it off every
+/// other account's, which is what an upgraded address needs: the shared mailbox
+/// it came from must stop submitting as it, and the new mailbox must start.
+/// `keep` has no line yet on a first upgrade, so one is appended. Returns
+/// whether the table changed.
+fn repoint_sender(path: &str, address: &str, keep: &str) -> Result<bool, Error> {
+    let lock = TableLock::acquire(path)?;
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        Error::context(
+            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
+            e,
+        )
+    })?;
+    let mut out = String::new();
+    let mut changed = false;
+    let mut found = false;
+    for line in text.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            let key = key.trim();
+            let mut values = sender_values(value);
+            if key == keep {
+                found = true;
+                if !values.iter().any(|v| v == address) {
+                    values.push(address.to_string());
+                    changed = true;
+                    out.push_str(&sender_line(key, &values));
+                    continue;
+                }
+            } else if values.iter().any(|v| v == address) {
+                values.retain(|v| v != address);
+                changed = true;
+                if values.is_empty() {
+                    continue;
+                }
+                out.push_str(&sender_line(key, &values));
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !found {
+        out.push_str(&sender_line(keep, &[address.to_string()]));
+        changed = true;
+    }
+    if changed {
+        write_table(path, &out, &lock)?;
+    }
+    Ok(changed)
+}
+
+/// Drop every address on `domain` from `mailbox`'s sender line, dropping the
+/// line when no address is left. Other accounts' lines and the mailbox's own
+/// platform identity are untouched. Returns whether the table changed.
+fn remove_senders_for_domain(path: &str, domain: &str, mailbox: &str) -> Result<bool, Error> {
+    let lock = TableLock::acquire(path)?;
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        Error::context(
+            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
+            e,
+        )
+    })?;
+    let suffix = format!("@{domain}");
+    let mut out = String::new();
+    let mut changed = false;
+    for line in text.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            if key.trim() == mailbox {
+                let values = sender_values(value);
+                let kept: Vec<String> = values
+                    .iter()
+                    .filter(|v| !v.ends_with(&suffix))
+                    .cloned()
+                    .collect();
+                if kept.len() != values.len() {
+                    changed = true;
+                }
+                if !kept.is_empty() {
+                    out.push_str(&sender_line(mailbox, &kept));
+                }
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if changed {
+        write_table(path, &out, &lock)?;
+    }
+    Ok(changed)
+}
+
 /// A username's hold, while it still has time to run. The date is the record's;
 /// a record that cannot be read is an error rather than no hold, because a
 /// broken hold file must not release a name the platform is still holding. A
@@ -1226,7 +1373,7 @@ pub async fn group_address(
     match intent.action.as_str() {
         "add-alias" => {
             ensure_table_line(&cfg.virtuals, &entry, Some(&intent.mailbox))?;
-            ensure_table_line(&cfg.mail_from, &entry, Some(&intent.mailbox))?;
+            ensure_sender(&cfg.mail_from, &intent.mailbox, &entry)?;
             // smtpd reads the tables at start and has no reload verb, so the
             // alias neither delivers nor submits until it restarts. The script
             // also re-expands the filter's -d list from dkim_domains.
@@ -1241,7 +1388,7 @@ pub async fn group_address(
             }
             let key = address_key(&intent)?;
             ensure_table_line(&cfg.virtuals, &entry, Some(&intent.mailbox))?;
-            ensure_table_line(&cfg.mail_from, &entry, Some(&intent.mailbox))?;
+            ensure_sender(&cfg.mail_from, &intent.mailbox, &entry)?;
             publish_mail_keys(cfg, &intent.mailbox, std::slice::from_ref(&key)).await?;
             if !account_on_box(cfg, &intent.mailbox)? {
                 run_script_tolerating(cfg, "add-user.sh", &[&intent.mailbox], "already exists")
@@ -1279,7 +1426,10 @@ pub async fn group_address(
             )
             .await?;
             repoint_table_line(&cfg.virtuals, &entry, &intent.mailbox)?;
-            repoint_table_line(&cfg.mail_from, &entry, &intent.mailbox)?;
+            // The sender identity moves with the route: off the shared
+            // mailbox's line and onto the new mailbox's, which may have no line
+            // yet on a first upgrade.
+            repoint_sender(&cfg.mail_from, &entry, &intent.mailbox)?;
             // The repoint is a table rewrite after the builder's own restart,
             // and a retry that finds the account already made restarts nothing.
             // Without this the upgraded address keeps reaching the shared
@@ -1316,11 +1466,10 @@ pub async fn group_address(
             group.accounts.retain(|a| a != &intent.mailbox);
             write_group_record(store, &group).await?;
             let routes_changed = remove_addresses(&cfg.virtuals, &intent.domain, &intent.mailbox)?;
-            // The sender identities go with the routes: an address left in the
-            // allowlist after its mailbox has gone still lets another account
-            // name it.
+            // The sender identities go with the routes: an address left on the
+            // mailbox's line after it has gone still lets it submit.
             let senders_changed =
-                remove_addresses(&cfg.mail_from, &intent.domain, &intent.mailbox)?;
+                remove_senders_for_domain(&cfg.mail_from, &intent.domain, &intent.mailbox)?;
             if routes_changed || senders_changed {
                 // delete-user.sh restarts smtpd only when it removed a line;
                 // the lines have gone here, so this pass makes them live.
@@ -1720,6 +1869,56 @@ mod tests {
             std::fs::read_to_string(&cfg.spamd_alloweddomains).unwrap(),
             "# greylist pass-through\n@kyriakon.net\n@parish.example\n"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The sender mapping is per account, which is what closes the spoofing gap:
+    /// an address added for one account never appears on another's line, an
+    /// upgrade takes it off the old line rather than leaving two claims, and a
+    /// body leaving empties or drops the line that held its addresses.
+    #[test]
+    fn the_sender_mapping_keeps_each_account_to_its_own_addresses() {
+        let dir = std::env::temp_dir().join(format!("onboard-senders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let table = dir.join("mail_from");
+        std::fs::write(
+            &table,
+            "alice: alice@kyriakon.net\nbob: bob@kyriakon.net\ncarol: office@parish.example\n",
+        )
+        .unwrap();
+        let path = table.to_str().unwrap();
+        let read = || std::fs::read_to_string(&table).unwrap();
+
+        ensure_sender(path, "alice", "secretary@parish.example").unwrap();
+        ensure_sender(path, "alice", "secretary@parish.example").unwrap();
+        assert_eq!(
+            read(),
+            "alice: alice@kyriakon.net,secretary@parish.example\nbob: bob@kyriakon.net\ncarol: office@parish.example\n"
+        );
+        assert!(
+            !read().contains("bob: bob@kyriakon.net,secretary@"),
+            "one account's address landed on another's line: {}",
+            read()
+        );
+
+        // An upgrade moves the address to a mailbox that has no line yet; the
+        // old line must not keep a claim.
+        assert!(repoint_sender(path, "secretary@parish.example", "dave").unwrap());
+        assert_eq!(
+            read(),
+            "alice: alice@kyriakon.net\nbob: bob@kyriakon.net\ncarol: office@parish.example\ndave: secretary@parish.example\n"
+        );
+
+        // A body leaving takes its addresses out, dropping a line left empty.
+        assert!(remove_senders_for_domain(path, "parish.example", "dave").unwrap());
+        assert!(!remove_senders_for_domain(path, "parish.example", "dave").unwrap());
+        assert_eq!(
+            read(),
+            "alice: alice@kyriakon.net\nbob: bob@kyriakon.net\ncarol: office@parish.example\n"
+        );
+        assert!(remove_senders_for_domain(path, "parish.example", "carol").unwrap());
+        assert_eq!(read(), "alice: alice@kyriakon.net\nbob: bob@kyriakon.net\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -25,8 +25,9 @@
 #                                treating mail to it as a spamtrap hit
 #   /etc/mail/virtuals           every <address>@<domain> entry, mailboxes and
 #                                aliases alike
-#   /etc/mail/mail_from          every sender identity on the domain, so a
-#                                mailbox that has left cannot submit as one
+#   /etc/mail/mail_from          every address on the domain from every
+#                                account's sender list, so a mailbox that has
+#                                left cannot submit as one
 #   /etc/httpd.d/<domain>.conf   the generated vhosts
 #   /etc/gmid.d/<domain>.conf    the generated capsule block
 #   /etc/acme-client.d/<domain>.conf
@@ -171,10 +172,11 @@ remove_group() {
 		"removed @$domain from $spamd_alloweddomains" || return 1
 	drop_table "$virtuals" suffix "@$domain" \
 		"removed the $domain entries from $virtuals" || return 1
-	# The auth match's allowlist carries the same addresses as sender identities,
-	# so a mailbox that has left the domain cannot name one as its envelope
-	# sender. mail_from lives beside virtuals and is dropped the same literal way.
-	drop_table "$mail_from" suffix "@$domain" \
+	# The sender mapping carries the same addresses as values, keyed by the
+	# account that may submit as them, so the domain is removed from every
+	# account's list and a line left with no address goes. mail_from lives beside
+	# virtuals and every match is literal.
+	drop_table "$mail_from" value-suffix "@$domain" \
 		"removed the $domain senders from $mail_from" || return 1
 
 	# 2. The generated daemon blocks and the certificate material. The order
@@ -263,14 +265,15 @@ self_test() {
 		printf 'secretary@%s: somebody\n' "$other"
 		printf 'secretary@%s: somebody\n' "$lookalike"
 	} >"$virtuals"
-	# The sender identities the auth match reads. Provisioning appends a line per
-	# address, so the removal has to take the body's and keep the platform's.
+	# The sender mapping the listeners read. Provisioning adds each address to
+	# the owning account's list, so the removal has to take the body's addresses
+	# out of every list and keep the platform's, the other body's, the
+	# lookalike's, and a line that had another address as well.
 	{
-		printf 'secretary@%s: parish-secretary\n' "$domain"
-		printf 'office@%s: parish-secretary\n' "$domain"
-		printf 'alice@kyriakon.net: alice\n'
-		printf 'secretary@%s: somebody\n' "$other"
-		printf 'secretary@%s: somebody\n' "$lookalike"
+		printf 'parish-secretary: secretary@%s,office@%s\n' "$domain" "$domain"
+		printf 'alice: alice@kyriakon.net,secretary@%s\n' "$domain"
+		printf 'somebody: secretary@%s\n' "$other"
+		printf 'lookalike: secretary@%s\n' "$lookalike"
 	} >"$mail_from"
 	for d in "$domain" "$other"; do
 		: >"$httpd_d/$d.conf"
@@ -312,10 +315,14 @@ self_test() {
 		"$(grep -cE '^(alice@kyriakon\.net|secretary@other\.example)' "$virtuals")" 2
 	check "and the lookalike's address" \
 		"$(grep -c "^secretary@$lookalike:" "$virtuals")" 1
-	check "the sender list lost every address on the domain" \
+	check "the sender mapping lost every address on the domain" \
 		"$(grep -cF "@$domain" "$mail_from" || true)" 0
+	check "and the list that also held another address kept it" \
+		"$(grep -cxF 'alice: alice@kyriakon.net' "$mail_from")" 1
+	check "and a line left with no address went" \
+		"$(grep -c '^parish-secretary:' "$mail_from" || true)" 0
 	check "and kept the platform's, the other body's and the lookalike's" \
-		"$(grep -cE '^(alice@kyriakon\.net|secretary@other\.example|secretary@parish-example\.net)' "$mail_from")" 3
+		"$(grep -cE '^(alice: alice@kyriakon\.net|somebody: secretary@other\.example|lookalike: secretary@parish-example\.net)' "$mail_from")" 3
 	check "the vhost went" "$([ -e "$httpd_d/$domain.conf" ] && echo present || echo gone)" gone
 	check "the capsule block went" "$([ -e "$gmid_d/$domain.conf" ] && echo present || echo gone)" gone
 	check "the ACME block went" "$([ -e "$acme_d/$domain.conf" ] && echo present || echo gone)" gone

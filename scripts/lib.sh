@@ -639,13 +639,19 @@ table_set() {
 	return 0
 }
 
-# table_drop <table> <exact|prefix|suffix> <text>
+# table_drop <table> <exact|prefix|suffix|value-suffix> <text>
 #
 # Drop every line whose key matches <text> literally: equal to it, starting with
 # it, or ending with it. Literal on purpose: the caller's value is an address
 # or a domain and contains a dot, and an ERE would let a.b drop axb and let
 # parish-example match parish.example. A table of bare domains, such as
 # mail_domains, has the whole line as its key.
+#
+# value-suffix is for a mapping whose value is a comma-separated address list,
+# such as mail_from: it removes every address ending with <text> from every
+# line's list, keeps the rest of that line, and drops a line left with no
+# address. A line whose key matches is never dropped whole, because the account
+# still has its other addresses.
 #
 # Returns 0 when the table changed, 1 when it did not, and 2 on failure after
 # naming it on stderr. Callers must not read 2 as "nothing to do". A changed
@@ -667,6 +673,22 @@ table_drop() {
 	if ! awk -F: -v how="$how" -v text="$text" '{
 		key = $1
 		gsub(/^[ \t]+|[ \t]+$/, "", key)
+		if (how == "value-suffix") {
+			value = substr($0, index($0, ":") + 1)
+			n = split(value, part, ",")
+			out = ""
+			for (i = 1; i <= n; i++) {
+				addr = part[i]
+				gsub(/^[ \t]+|[ \t]+$/, "", addr)
+				if (addr == "") continue
+				if (length(addr) >= length(text) &&
+				    substr(addr, length(addr) - length(text) + 1) == text)
+					continue
+				out = (out == "") ? addr : out "," addr
+			}
+			if (out != "") print key ": " out
+			next
+		}
 		drop = 0
 		if (how == "exact") {
 			drop = (key == text)
@@ -712,6 +734,71 @@ table_drop() {
 		return 2
 	fi
 	printf 'kept %s\n' "$backup" >&2
+	table_unlock "$table"
+	return 0
+}
+
+# table_map_add <table> <key> <value>
+#
+# Add <value> to the comma-separated value list of the mapping line whose key is
+# <key> literally, creating the line when the key is absent. The order in the
+# list is the order addresses were added, which is why a deploy that regenerates
+# the whole table and an append by provisioning produce the same line. A value
+# already in the list changes nothing.
+#
+# Returns 0 when the table changed, 1 when it did not, and 2 on failure after
+# naming it on stderr. The read-modify-replace runs under the table lock and
+# through a candidate beside the table, so a reader never sees half a line and a
+# concurrent writer cannot lose the other's append.
+table_map_add() {
+	typeset table="$1" key="$2" value="$3" candidate
+	if [ ! -f "$table" ]; then
+		printf 'no table at %s\n' "$table" >&2
+		return 2
+	fi
+	table_lock "$table" || return 2
+	candidate=$(mktemp "$table.XXXXXX") || {
+		printf 'could not create a candidate beside %s\n' "$table" >&2
+		table_unlock "$table"
+		return 2
+	}
+	if ! awk -F: -v k="$key" -v v="$value" '
+		$1 == k {
+			found = 1
+			value = substr($0, index($0, ":") + 1)
+			n = split(value, part, ",")
+			out = ""
+			have = 0
+			for (i = 1; i <= n; i++) {
+				addr = part[i]
+				gsub(/^[ \t]+|[ \t]+$/, "", addr)
+				if (addr == "") continue
+				if (addr == v) have = 1
+				out = (out == "") ? addr : out "," addr
+			}
+			if (!have) out = (out == "") ? v : out "," v
+			print k ": " out
+			next
+		}
+		{ print }
+		END { if (!found) print k ": " v }
+	' "$table" > "$candidate"; then
+		printf 'could not rewrite %s\n' "$table" >&2
+		rm -f "$candidate"
+		table_unlock "$table"
+		return 2
+	fi
+	if cmp -s "$table" "$candidate"; then
+		rm -f "$candidate"
+		table_unlock "$table"
+		return 1
+	fi
+	if ! chmod 0644 "$candidate" || ! mv "$candidate" "$table"; then
+		printf 'could not replace %s\n' "$table" >&2
+		rm -f "$candidate"
+		table_unlock "$table"
+		return 2
+	fi
 	table_unlock "$table"
 	return 0
 }
