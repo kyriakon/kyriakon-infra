@@ -621,6 +621,45 @@ SETPREF
 	assert_has 'the refusal says when it expires' 'expires on' "$out"
 	assert_no_log 'nothing was opened for an expiring key' 'PUT'
 
+	printf '%s\n' '--- a key whose encryption subkey expires is refused'
+	subexp_key="$fix/subexp.asc"
+	gpg --batch --pinentry-mode loopback --passphrase '' \
+		--quick-generate-key 'Sub Exp <subexp@example.invalid>' ed25519 cert never >/dev/null 2>&1
+	subexp=$(gpg --batch --with-colons --list-keys 'subexp@example.invalid' 2>/dev/null |
+		awk -F: '/^fpr:/ { print $10; exit }')
+	gpg --batch --pinentry-mode loopback --passphrase '' \
+		--quick-add-key "$subexp" cv25519 encr 20y >/dev/null 2>&1
+	gpg --batch --armor --export 'subexp@example.invalid' >"$subexp_key" 2>/dev/null
+	run subexp "$subexp_key" "$fix/token"
+	assert_eq 'subkey expiry exit' 1 "$rc"
+	assert_has 'the refusal names the subkey expiry' 'expires on' "$out"
+	assert_no_log 'nothing was opened for a subkey-expiring key' 'PUT'
+
+	printf '%s\n' '--- a signing subkey that expires does not stop a publish'
+	signsub_key="$fix/signsub.asc"
+	gpg --batch --pinentry-mode loopback --passphrase '' \
+		--quick-generate-key 'Sign Sub <signsub@example.invalid>' ed25519 cert never >/dev/null 2>&1
+	signsub=$(gpg --batch --with-colons --list-keys 'signsub@example.invalid' 2>/dev/null |
+		awk -F: '/^fpr:/ { print $10; exit }')
+	gpg --batch --pinentry-mode loopback --passphrase '' \
+		--quick-add-key "$signsub" ed25519 sign 20y >/dev/null 2>&1
+	gpg --batch --pinentry-mode loopback --passphrase '' \
+		--quick-add-key "$signsub" cv25519 encr never >/dev/null 2>&1
+	# Only the primary's preferences matter to the AEAD gate, so the fixture is
+	# made publishable the same way make_key does.
+	gpg --batch --yes --pinentry-mode loopback --passphrase '' --command-fd 0 \
+		--edit-key 'signsub@example.invalid' >/dev/null 2>&1 <<'SETPREF'
+setpref AES256 AES192 AES SHA512 SHA384 SHA256 ZLIB BZIP2 ZIP Uncompressed
+y
+save
+SETPREF
+	gpg --batch --armor --export 'signsub@example.invalid' >"$signsub_key" 2>/dev/null
+	rm -f "$fix/state/main" "$fix/state/branch"
+	run signsub "$signsub_key" "$fix/token"
+	assert_eq 'signing-subkey expiry exit' 0 "$rc"
+	assert_has 'the change names the member' 'opened publish-key/signsub' "$out"
+	assert_log 'the key with an expiring signing subkey was published' '/pulls'
+
 	printf '%s\n' '--- a different key on the branch is refused'
 	rm -f "$fix/state/main"
 	cp "$fix/bob.asc" "$fix/state/branch"

@@ -104,6 +104,43 @@ async fn a_titan_upload_files_the_key_and_the_mail_verdict() {
 }
 
 #[tokio::test]
+async fn a_titan_upload_of_an_undeliverable_key_is_refused() {
+    let (app, dir) = handler("titan-refuses").await;
+    let mut record = kyriakon_control_core::store::draft::Draft::new(TOKEN.to_string());
+    record
+        .answers
+        .insert("whose".to_string(), "person".to_string());
+    record
+        .answers
+        .insert("username".to_string(), "secretary".to_string());
+    kyriakon_control_core::store::draft::save(&app.store, &mut record)
+        .await
+        .unwrap();
+
+    let body = std::fs::read_to_string(format!(
+        "{}/../../../docs/planning/prototypes/keygen-spike/fixtures/gpg-aead.asc",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let head = format!(
+        "titan://signup.kyriakon.net:1966/key;size={};mime=application/pgp-keys;token={TOKEN}\r\n",
+        body.len()
+    );
+    let (code, reply, leftover) = titan_exchange(&app, &head, body.as_bytes()).await;
+    assert_eq!(code, 59, "{reply}");
+    assert_eq!(leftover, 0, "the whole body is read: {reply}");
+    assert!(
+        reply.contains("AEAD"),
+        "the refusal names the fault: {reply}"
+    );
+    let draft = read_draft(&dir, TOKEN);
+    assert!(
+        draft.mail_keys.is_empty(),
+        "an undeliverable key is not filed"
+    );
+}
+
+#[tokio::test]
 async fn a_second_titan_upload_is_refused_and_the_first_key_stays() {
     let (app, dir) = handler("titan-second").await;
     let mut record = kyriakon_control_core::store::draft::Draft::new(TOKEN.to_string());

@@ -9,9 +9,9 @@
 //! return the same verdict from one implementation rather than from two copies
 //! of the rules. The verdict recorded is the crate's, not a value the client
 //! sends. This module refuses only something that is not a public key block at
-//! all, and never a key merely because the crate would warn about it: the spec
-//! warns and proceeds, because a heuristic refusal turns a guarantee into a
-//! support queue.
+//! all; the form refuses an inspected key whose verdict is not "works", because
+//! AEAD, an expiry, a revoked key or no encryption subkey all stop delivery and
+//! the applicant can still change the key. The parser-gap advisory proceeds.
 //!
 //! The fingerprints are the exception to that division of labour, and they are
 //! hashes rather than checks: a number that names material it was not computed
@@ -45,6 +45,19 @@ pub struct Checked {
     /// "works" when the shared check finds nothing, or its findings joined with
     /// "; " when one or more trips.
     pub verdict: String,
+    /// False when the block is well framed but the crate could not read it. The
+    /// verdict is then the advisory that a person will check the key, the one
+    /// advisory that proceeds; a key is refused only when `inspected` and the
+    /// verdict is not "works".
+    pub inspected: bool,
+}
+
+impl Checked {
+    /// The findings that refuse a submission, or `None` when the block was not
+    /// inspected or the check found nothing. The parser-gap advisory proceeds.
+    pub fn refusal(&self) -> Option<&str> {
+        (self.inspected && self.verdict != "works").then_some(self.verdict.as_str())
+    }
 }
 
 struct Packet {
@@ -54,15 +67,17 @@ struct Packet {
 
 /// Inspect an armoured PGP public key block. `Err` is the refusal reason; the
 /// verdict is the shared crate's reading of the three conditions, joined when
-/// more than one trips.
+/// more than one trips. `inspected` separates a finding from the advisory that
+/// the parser could not read the block.
 pub fn pgp_public_key(value: &str) -> Result<Checked, Error> {
-    let findings = pgp_findings(value)?;
+    let (findings, inspected) = inspect(value)?;
     Ok(Checked {
         verdict: if findings.is_empty() {
             "works".to_string()
         } else {
             findings.join("; ")
         },
+        inspected,
     })
 }
 
@@ -70,6 +85,18 @@ pub fn pgp_public_key(value: &str) -> Result<Checked, Error> {
 /// the framing check that decides whether the material is a public key block at
 /// all. The conditions themselves are not repeated here.
 pub fn pgp_findings(value: &str) -> Result<Vec<String>, Error> {
+    inspect(value).map(|(findings, _)| findings)
+}
+
+/// The advisory a well-framed block gets when the crate cannot parse it. It is
+/// not a verdict on the key, and a caller that refuses findings must not refuse
+/// this one.
+const UNINSPECTED: &str = "The key could not be inspected automatically, so a person will \
+     check it against the key on the box. The application can still be filed.";
+
+/// The framing checks and the crate's findings, with whether the crate read the
+/// block at all.
+fn inspect(value: &str) -> Result<(Vec<String>, bool), Error> {
     let value = value.trim();
     if value.is_empty() {
         return Err(Error::Failed("a public key is needed".to_string()));
@@ -95,12 +122,8 @@ pub fn pgp_findings(value: &str) -> Result<Vec<String>, Error> {
     // proceeds, because a refusal would turn a support question into a lost
     // application. The warning says what happened so the reviewer reads it.
     match keygen_spike::check_public_key(value, now_secs()) {
-        Ok(findings) => Ok(findings),
-        Err(_) => Ok(vec![
-            "The key could not be inspected automatically, so a person will check it \
-             against the key on the box. The application can still be filed."
-                .to_string(),
-        ]),
+        Ok(findings) => Ok((findings, true)),
+        Err(_) => Ok((vec![UNINSPECTED.to_string()], false)),
     }
 }
 
@@ -296,8 +319,8 @@ pub fn blocks(value: &str) -> Vec<String> {
 
 /// The record for one mail key, with the fingerprint and the verdict computed
 /// over the material rather than taken from the client. A block that does not
-/// parse is still recorded: the spec warns and proceeds, and the verdict says
-/// what the check found.
+/// parse is still recorded: the form refuses an inspected finding, and the
+/// parser-gap advisory proceeds with the verdict saying what the check found.
 pub fn mail_key(mailbox: String, material: &str) -> KeyRecord {
     record(mailbox, material, Kind::Mail)
 }
@@ -504,8 +527,32 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The prototype's four key fixtures, shared by every test that needs a key of
+/// a known shape: the keycheck tests below and the form-validation tests in
+/// `flow`. The expired-subkey fixture is made by gpg 2.5.24 with a faked 2020
+/// clock and a one-day subkey; gpg's export includes it.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    // The core crate's manifest is `control/crates/core`, so three levels up
+    // is the repository root. Naming it from there keeps the path readable and
+    // independent of where this file sits.
+    macro_rules! fixture {
+        ($name:literal) => {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../docs/planning/prototypes/keygen-spike/fixtures/",
+                $name
+            ))
+        };
+    }
+    pub(crate) const CLEAN: &str = fixture!("generated-clean.asc");
+    pub(crate) const AEAD: &str = fixture!("gpg-aead.asc");
+    pub(crate) const NO_ENCRYPTION: &str = fixture!("gpg-no-encryption-subkey.asc");
+    pub(crate) const EXPIRED_SUBKEY: &str = fixture!("gpg-expired-subkey.asc");
+}
 #[cfg(test)]
 mod tests {
+    use super::fixtures::{AEAD, CLEAN, EXPIRED_SUBKEY, NO_ENCRYPTION};
     use super::*;
 
     // A public key packet (tag 6, algo 18 ECDH) and a public subkey packet
@@ -515,21 +562,6 @@ mod tests {
     const GOOD: &str = "mAYEAAAAABK4BgQAAAAAEg==";
     // One signature packet (tag 2, algo 18), no key packet at all.
     const NO_KEY: &str = "iAYEAAAAABI=";
-
-    // The prototype's four fixtures, which its CLI and the page's WASM build both
-    // check. The expired-subkey fixture is made by gpg 2.5.24 with a faked 2020
-    // clock and a one-day subkey; gpg's export includes it.
-    const CLEAN: &str = include_str!(
-        "../../../../../docs/planning/prototypes/keygen-spike/fixtures/generated-clean.asc"
-    );
-    const AEAD: &str =
-        include_str!("../../../../../docs/planning/prototypes/keygen-spike/fixtures/gpg-aead.asc");
-    const NO_ENCRYPTION: &str = include_str!(
-        "../../../../../docs/planning/prototypes/keygen-spike/fixtures/gpg-no-encryption-subkey.asc"
-    );
-    const EXPIRED_SUBKEY: &str = include_str!(
-        "../../../../../docs/planning/prototypes/keygen-spike/fixtures/gpg-expired-subkey.asc"
-    );
 
     fn armoured(b64: &str) -> String {
         format!("{BEGIN}\n\n{b64}\n={END}\n")
@@ -590,13 +622,18 @@ mod tests {
     fn a_framed_block_the_parser_cannot_read_warns_and_proceeds() {
         // `GOOD` has the framing and a public key packet, and nothing the
         // parser can understand. A refusal here would lose an application over
-        // a gap in the check, so it is a warning with a reader named.
+        // a gap in the check, so it is a warning with a reader named, and it is
+        // marked uninspected so a caller that refuses findings lets it through.
         let c = pgp_public_key(&armoured(GOOD)).expect("a warning is not a refusal");
         assert!(
             c.verdict.contains("could not be inspected"),
             "{}",
             c.verdict
         );
+        assert!(!c.inspected, "{}", c.verdict);
+
+        let clean = pgp_public_key(CLEAN).unwrap();
+        assert!(clean.inspected);
     }
 
     #[test]

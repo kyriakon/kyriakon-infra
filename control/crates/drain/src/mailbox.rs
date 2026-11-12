@@ -139,6 +139,16 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
             return reply_or_drop(cfg, store, &message, &missing_body(&missing.0)).await;
         }
     };
+    // A mailed key takes the same refusal as the typed form: approval would
+    // otherwise write the keyring and provision the account before the publish
+    // gate refused, leaving the member half-created.
+    for (mailbox, material) in &keys {
+        if let Some(why) = kyriakon_control_core::flow::applicant::key_error(material) {
+            drop(lock);
+            let body = format!("The key for {mailbox} cannot be used:\n{why}\n");
+            return reply_or_drop(cfg, store, &message, &body).await;
+        }
+    }
     for (mailbox, material) in keys {
         draft.mail_keys.retain(|k| k.mailbox != mailbox);
         draft.mail_keys.push(keycheck::mail_key(mailbox, &material));

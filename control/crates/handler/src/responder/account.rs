@@ -591,9 +591,18 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
     match form.get("action").map(String::as_str) {
         Some("replace") => {
             let material = form.get("key").map(String::as_str).unwrap_or("").trim();
-            if let Err(why) = keycheck::pgp_public_key(material) {
-                return refused(&why.to_string());
+            let checked = match keycheck::pgp_public_key(material) {
+                Ok(checked) => checked,
+                Err(why) => return refused(&why.to_string()),
+            };
+            // The drain refuses a key that cannot serve mail, and a refusal
+            // settles before any notice, so the page must say it here or the
+            // member is never told. A block the parser could not inspect is an
+            // advisory, not a finding: it files with the warning shown.
+            if let Some(why) = checked.refusal() {
+                return refused(why);
             }
+            let advisory = (!checked.inspected).then_some(checked.verdict.as_str());
             let Some(fingerprint) = keycheck::pgp_fingerprint(material) else {
                 return refused("That block carries no public key packet.");
             };
@@ -618,18 +627,24 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
             .await
             {
                 Ok(_) => {
-                    let message = if signed {
+                    let mut message = if signed {
                         "The platform is checking the signature against the key you use now. If it \
                          verifies, the new key is in use within a minute; if it does not, nothing \
                          changes and no replacement starts."
+                            .to_string()
                     } else {
                         "The replacement waits 72 hours. A warning goes to every address on the \
                          account, and until the new key applies you can cancel it on this page. \
                          If you did not ask for this, cancel it now."
+                            .to_string()
                     };
+                    if let Some(advisory) = advisory {
+                        message.push(' ');
+                        message.push_str(advisory);
+                    }
                     Reply::html(
                         200,
-                        page_html(&notice("Your mail key is being replaced", message)),
+                        page_html(&notice("Your mail key is being replaced", &message)),
                     )
                 }
                 Err(e) => respond(

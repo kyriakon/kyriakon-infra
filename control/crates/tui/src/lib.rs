@@ -704,9 +704,11 @@ fn application(
                     input.word()?;
                     continue;
                 }
-                // A mail key that trips one of the three conditions is a warning
-                // at its own page and the flow carries on; a refusal here would
-                // turn a heuristic into a support queue.
+                // The only mail-key finding that reaches this screen is the
+                // parser-gap advisory: an inspected AEAD/expiry/revocation/no-
+                // subkey finding is refused by flow_problem above. The advisory
+                // is a warning and the flow carries on, because the platform has
+                // no way to prove that key bad.
                 let warnings = if page.mailbox.is_some() {
                     keycheck::pgp_findings(&value).unwrap_or_default()
                 } else {
@@ -1551,71 +1553,22 @@ mod tests {
         );
     }
 
-    /// A key that advertises AEAD is a warning screen and then the flow carries
-    /// on, files the key and asks the next question.
+    /// A key that advertises AEAD is refused at its page; the form is not
+    /// filed until a key that can deliver is pasted.
     #[test]
-    fn a_key_warning_is_shown_and_the_session_proceeds() {
+    fn a_key_that_cannot_deliver_is_refused() {
         let rows = rows(None);
         let at = apply_row();
         let aead =
             include_str!("../../../../docs/planning/prototypes/keygen-spike/fixtures/gpg-aead.asc");
-        // The warning screen asks for Enter before the next question.
         let mut script = scripts(&person_lines_with(at, aead, &[""]));
         let mut files = Files::default();
-        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
-        assert_eq!(left, Departure::Quit);
-        assert!(seen.contains("Warning: The key asks for AEAD"), "{seen}");
-        assert!(seen.contains("Press Enter to continue"), "{seen}");
-        assert_eq!(files.forms.len(), 1, "the warning refused the key");
-        assert!(script.spent(), "the session stopped at the warning");
-    }
-
-    /// The warning screen's `back` returns to the key page, and the key that is
-    /// filed is the one answered after the warning rather than the one it named.
-    #[test]
-    fn a_key_warning_can_be_answered_again() {
-        let rows = rows(None);
-        let at = apply_row();
-        let aead =
-            include_str!("../../../../docs/planning/prototypes/keygen-spike/fixtures/gpg-aead.asc");
-        let mut lines: Vec<String> = ["", &(at + 1).to_string(), "theophilus", "person", "", ""]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        lines.extend(aead.lines().map(str::to_string));
-        lines.push("back".to_string());
-        lines.extend(KEY_BLOCK.lines().map(str::to_string));
-        lines.extend(
-            [
-                "",
-                "no_charge",
-                "",
-                "layman",
-                "",
-                "",
-                "",
-                "yes",
-                "yes",
-                "yes",
-            ]
-            .into_iter()
-            .map(str::to_string),
-        );
-        let mut script = scripts(&lines);
-        let mut files = Files::default();
-        let (left, seen) = session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
-        assert_eq!(left, Departure::Quit);
-        assert!(seen.contains("Warning: The key asks for AEAD"), "{seen}");
-        assert_eq!(
-            files.forms.len(),
-            1,
-            "the corrected key was not filed: {seen}"
-        );
-        assert_eq!(
-            files.forms[0].get("mail_key").unwrap().trim_end(),
-            KEY_BLOCK.trim_end(),
-            "the warned key stayed on the form"
-        );
+        let (_left, seen) =
+            session_with(&rows, Mode::Plain, &mut script, &mut NoStatus, &mut files);
+        assert!(seen.contains("The key asks for AEAD"), "{seen}");
+        assert!(seen.contains("Press Enter to try again"), "{seen}");
+        assert!(!seen.contains("Warning:"), "{seen}");
+        assert!(files.forms.is_empty(), "the refused key was filed: {seen}");
     }
 
     /// A paste longer than the capsule's 1024-byte prompt limit is read and

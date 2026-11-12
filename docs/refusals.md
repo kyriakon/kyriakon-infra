@@ -32,10 +32,10 @@ Retention of message or application text past the 90-day window. Check: the wind
 An interactive shell for a standard-tier user. Check: `scripts/add-user.sh` creates the account with
 `-s /sbin/nologin`.
 
-A signup refused on the shape of a key. Signup warns about weak keys, and the minimum is recorded in
-the acceptable use policy §4. Check: the signup path warns and proceeds, because the platform cannot
-verify what a client generated and a heuristic rejection would turn a guarantee into a support
-ticket.
+A signup refused for a key it cannot inspect. The form refuses an inspected key that advertises
+AEAD, expires, is revoked, or has no encryption-capable subkey, because delivery would fail after
+provisioning; a well-framed block the parser cannot inspect proceeds with its warning, because a
+parser gap is not proof the key is bad. Check: `flow::validate` and `flow::applicant::key_error`.
 
 A warrant canary. It can be coerced into silence and it needs standing signing infrastructure, where
 a static statement of capability in `transparency.md` is checkable against configuration. Check:

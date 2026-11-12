@@ -1840,7 +1840,8 @@ async fn signed_by_current_key(
 /// address. The published set is not touched here: scripts/publish-mail-key.sh
 /// refuses to replace a key already on the default branch, because that is this
 /// rotation, so the operator publishes it (the runbook's "Replace a member's
-/// key"). scripts/deploy-mail.sh keeps the rotated keyring file until they do.
+/// key") and is alerted here to do so. scripts/deploy-mail.sh keeps the rotated
+/// keyring file until they do.
 async fn apply_rotation(
     cfg: &DrainConfig,
     store: &Store,
@@ -1858,6 +1859,31 @@ async fn apply_rotation(
     account.mail_key = Some(rotation.fingerprint.clone());
     account.rotation = None;
     save_account(store, account).await?;
+    // The published set is the operator's step, and the box keyring and the
+    // repository now disagree until they take it. The drift check waits seven
+    // days, so say so now rather than make the operator find out then.
+    let keyring =
+        kyriakon_control_core::mail::keycheck::keyring_file(&cfg.keyring_dir, &account.username);
+    notice::alert(
+        cfg,
+        "keyring",
+        "mail key rotated",
+        &format!(
+            "{} replaced the mail key the box delivers with. The new fingerprint is {} and \
+             the keyring file is {}.",
+            account.username,
+            rotation.fingerprint,
+            keyring.display()
+        ),
+        &format!(
+            "put the new key in keys/{}.asc on main and deploy, as docs/runbook.md \"Replace \
+             a member's key\" describes, before scripts/check-keyring-drift.sh's seven-day \
+             window ends. scripts/publish-mail-key.sh refuses to replace a key already \
+             published, which is this rotation.",
+            account.username
+        ),
+    )
+    .await;
     let body = format!(
         "The new mail key for {} is in use. Mail arriving from now is encrypted to it, \
          and mail delivered before it arrived stays readable with the key you held then. \
@@ -1920,9 +1946,20 @@ pub async fn mail_key(
             ))
         }
         "replace" => {
-            if let Err(why) =
-                kyriakon_control_core::mail::keycheck::pgp_public_key(&intent.material)
-            {
+            let checked =
+                match kyriakon_control_core::mail::keycheck::pgp_public_key(&intent.material) {
+                    Ok(checked) => checked,
+                    Err(why) => {
+                        return Ok(Settlement::refused(format!("the mail key: {why}")));
+                    }
+                };
+            // Signup warns and proceeds because a heuristic refusal turns a
+            // guarantee into a support queue. A replacement refuses, because
+            // the account already receives mail and a key that stops delivery
+            // must not enter the keyring from `/account`. A block the parser
+            // could not inspect carries an advisory, not a verdict, so it
+            // proceeds like approval's.
+            if let Some(why) = checked.refusal() {
                 return Ok(Settlement::refused(format!("the mail key: {why}")));
             }
             let Some(fingerprint) =

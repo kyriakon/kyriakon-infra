@@ -12,10 +12,23 @@ fn logging_script(fix: &Fix, name: &str) -> String {
     log
 }
 
-/// A real PGP public key block from the key-check fixtures, for a replacement.
+/// A real PGP public key block from the key-check fixtures, for a replacement:
+/// the generator's own clean key, since a replacement must pass the same check
+/// approval does.
 fn replacement_key() -> String {
-    let path = repo_root().join("docs/planning/prototypes/keygen-spike/fixtures/gpg-aead.asc");
+    let path =
+        repo_root().join("docs/planning/prototypes/keygen-spike/fixtures/generated-clean.asc");
     std::fs::read_to_string(path).unwrap()
+}
+
+/// A fixture by file name, for a key whose verdict is the point of the test.
+fn fixture(name: &str) -> String {
+    std::fs::read_to_string(
+        repo_root()
+            .join("docs/planning/prototypes/keygen-spike/fixtures")
+            .join(name),
+    )
+    .unwrap()
 }
 
 /// A throwaway signing keypair in a temporary GNUPGHOME, with its public key, a
@@ -705,6 +718,18 @@ fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
             .trim(),
         key.trim()
     );
+    // The operator hears about the rotation when it applies, so they publish
+    // keys/<username>.asc before check-keyring-drift.sh's seven-day window ends.
+    let sent = fix.sent();
+    assert!(
+        sent.contains("kyriakon: keyring: mail key rotated"),
+        "{sent}"
+    );
+    assert!(
+        sent.contains("alice") && sent.contains(&fingerprint),
+        "the alert names the username and fingerprint: {sent}"
+    );
+    assert!(sent.contains("keys/alice.asc"), "{sent}");
 
     // A signature made with a different key is not the current key's, so
     // nothing changes.
@@ -727,6 +752,80 @@ fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
         "a signature that does not verify starts no window: {account}"
     );
     assert!(fix.journal().contains("\"outcome\":\"refused\""));
+}
+
+/// A replacement carrying a verdict other than "works" is refused, so a key
+/// that would stop delivery cannot enter the keyring from `/account`. The key
+/// in use and the keyring file stay as they were. A block the parser could not
+/// inspect carries an advisory, so it still starts a window.
+#[test]
+fn a_mail_key_replacement_refuses_an_expiring_or_aead_key() {
+    let fix = Fix::new("account-rotation-refused");
+    let clean = replacement_key();
+    let current = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&clean).unwrap();
+    fix.page_account("alice", json!({"mail_key": current}));
+    fix.mail_key("alice", &clean);
+    let before = std::fs::read_to_string(fix.dir.join("keyring/alice.asc")).unwrap();
+
+    for (name, key, why) in [
+        (
+            "expiring",
+            fixture("gpg-future-expiry.asc"),
+            "The key expires",
+        ),
+        (
+            "subkey expiring",
+            fixture("gpg-future-expiry-subkey.asc"),
+            "encryption subkey expires",
+        ),
+        ("AEAD", fixture("gpg-aead.asc"), "AEAD"),
+    ] {
+        fix.file_page_action(
+            "mail-key",
+            "alice",
+            json!({"action": "replace", "material": key, "signature": "AAAA"}),
+        );
+        assert!(fix.drain().status.success());
+        let account = fix.account("alice");
+        assert_eq!(account["mail_key"], json!(current), "{name}: {account}");
+        assert!(
+            account.get("rotation").is_none_or(Value::is_null),
+            "{name}: a refused key starts no window: {account}"
+        );
+        assert!(
+            fix.journal().contains("\"outcome\":\"refused\"") && fix.journal().contains(why),
+            "{name}: {}",
+            fix.journal()
+        );
+        assert!(
+            !fix.journal().contains("the signature does not verify"),
+            "{name}: the verdict is checked before the signature: {}",
+            fix.journal()
+        );
+    }
+
+    // The parser cannot read this block, so the check is advisory and the
+    // replacement proceeds rather than becoming impossible to start.
+    let uninspected = GOOD_KEY;
+    let fingerprint = kyriakon_control_core::mail::keycheck::pgp_fingerprint(uninspected).unwrap();
+    fix.file_page_action(
+        "mail-key",
+        "alice",
+        json!({"action": "replace", "material": uninspected, "signature": ""}),
+    );
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.account("alice")["rotation"]["fingerprint"],
+        json!(fingerprint),
+        "{}",
+        fix.journal()
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(fix.dir.join("keyring/alice.asc")).unwrap(),
+        before,
+        "the keyring file is unchanged"
+    );
 }
 
 /// The mail-key route: a detached signature or a clearsigned message over the

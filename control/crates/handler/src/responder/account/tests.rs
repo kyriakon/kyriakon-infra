@@ -794,14 +794,15 @@ async fn a_group_site_owner_stops_the_groups_renewal_and_another_mailbox_cannot(
     assert_eq!(filed(&dir), 0);
 }
 
-/// The mail key form rejects a block that is not a public key and the key
-/// already in use, and files both a replacement and a cancel.
+/// The mail key form rejects a block that is not a public key, a key approval
+/// would refuse, and the key already in use, and files both a replacement and a
+/// cancel.
 #[tokio::test]
 async fn the_mail_key_form_starts_and_cancels_a_replacement() {
     let (app, dir) = handler("account-mail-key").await;
     file_account(&dir);
     let key = std::fs::read_to_string(format!(
-        "{}/../../../docs/planning/prototypes/keygen-spike/fixtures/gpg-aead.asc",
+        "{}/../../../docs/planning/prototypes/keygen-spike/fixtures/generated-clean.asc",
         env!("CARGO_MANIFEST_DIR")
     ))
     .unwrap();
@@ -844,12 +845,7 @@ async fn the_mail_key_form_starts_and_cancels_a_replacement() {
     amend_account(&dir, "alice", |value| {
         value["mail_key"] = serde_json::json!("AAAA");
     });
-    let other = std::fs::read_to_string(format!(
-        "{}/../../../docs/planning/prototypes/keygen-spike/fixtures/gpg-no-encryption-subkey.asc",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap();
-    let body = format!("action=replace&key={}", url_encode(&other));
+    let body = format!("action=replace&key={}", url_encode(&key));
     let (code, page) = ask(
         &app,
         &httpd_post_with("/account/mail-key", &body, Some(&cookie)),
@@ -860,7 +856,7 @@ async fn the_mail_key_form_starts_and_cancels_a_replacement() {
     assert_eq!(intent["kind"], "mail-key");
     assert_eq!(intent["action"], "replace");
     assert_eq!(intent["signature"], "");
-    assert_eq!(intent["material"], other.trim());
+    assert_eq!(intent["material"], key.trim());
 
     // With a replacement waiting, the cancel files.
     std::fs::remove_dir_all(dir.join("intents")).unwrap();
@@ -882,6 +878,75 @@ async fn the_mail_key_form_starts_and_cancels_a_replacement() {
     let intent = filed_intent(&dir);
     assert_eq!(intent["kind"], "mail-key");
     assert_eq!(intent["action"], "cancel");
+}
+
+/// A key the drain would refuse is refused at the page, with the reason, and
+/// no intent is filed: a settlement refusal runs no after-line work, so the
+/// member would otherwise never be told.
+#[tokio::test]
+async fn the_mail_key_form_refuses_a_key_delivery_cannot_use() {
+    let (app, dir) = handler("account-mail-key-refused").await;
+    file_account(&dir);
+    amend_account(&dir, "alice", |value| {
+        value["mail_key"] = serde_json::json!("AAAA");
+    });
+    let cookie = signed_in(&app, "alice").await;
+
+    for (fixture, why) in [
+        ("gpg-future-expiry.asc", "expires at"),
+        (
+            "gpg-future-expiry-subkey.asc",
+            "encryption subkey expires at",
+        ),
+        ("gpg-aead.asc", "AEAD"),
+        (
+            "gpg-no-encryption-subkey.asc",
+            "no encryption-capable subkey",
+        ),
+    ] {
+        let key = std::fs::read_to_string(format!(
+            "{}/../../../docs/planning/prototypes/keygen-spike/fixtures/{fixture}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let body = format!("action=replace&key={}", url_encode(&key));
+        let (code, page) = ask(
+            &app,
+            &httpd_post_with("/account/mail-key", &body, Some(&cookie)),
+        )
+        .await;
+        assert_eq!(code, 403, "{fixture}: {page}");
+        assert!(page.contains(why), "{fixture}: {page}");
+        assert_eq!(filed(&dir), 0, "{fixture}: an intent was filed");
+    }
+}
+
+/// A block the key crate cannot parse is an advisory, not a finding: the page
+/// shows the warning and files the intent, because approval warns and proceeds
+/// and a parser gap must not stop a rotation.
+#[tokio::test]
+async fn the_mail_key_form_warns_but_files_an_uninspected_key() {
+    let (app, dir) = handler("account-mail-key-uninspected").await;
+    file_account(&dir);
+    amend_account(&dir, "alice", |value| {
+        value["mail_key"] = serde_json::json!("AAAA");
+    });
+    let cookie = signed_in(&app, "alice").await;
+    // Framing and a public key packet, and nothing the parser can read, which
+    // is `GOOD_KEY` in the acceptance suite's fixtures.
+    let key = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
+               mAYEAAAAABK4BgQAAAAAEg==\n-----END PGP PUBLIC KEY BLOCK-----\n";
+    let body = format!("action=replace&key={}", url_encode(key));
+    let (code, page) = ask(
+        &app,
+        &httpd_post_with("/account/mail-key", &body, Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    assert!(page.contains("could not be inspected"), "{page}");
+    let intent = filed_intent(&dir);
+    assert_eq!(intent["kind"], "mail-key");
+    assert_eq!(intent["material"], key.trim());
 }
 
 /// A value for an `application/x-www-form-urlencoded` body, so a pasted key
