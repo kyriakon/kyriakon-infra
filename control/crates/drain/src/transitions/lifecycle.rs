@@ -7,8 +7,9 @@
 
 use super::boxrun::{outside_address, publish_mail_keys, run_script, write_public_key};
 use super::groups::{
-    account_on_box, close_group_tokens, group_record, hold_name, remove_group_record,
-    take_group_down, write_account_record, write_group_record, write_group_state,
+    account_on_box, application_token, close_group_tokens, group_record, hold_name,
+    remove_group_record, take_group_down, write_account_record, write_group_record,
+    write_group_state,
 };
 use super::payments::{resolve_payment, token_join, write_payment_copy};
 use super::Error;
@@ -2674,14 +2675,145 @@ pub async fn prepaid_renewals(
     Ok(())
 }
 
+/// One released username: the end of its hold and, where the hold recorded it,
+/// the deleted account's application status token.
+struct Released {
+    username: String,
+    until: OffsetDateTime,
+    token: Option<String>,
+}
+
+impl Released {
+    /// Whether a journal line belongs to this released account.
+    ///
+    /// The account's own lines carry its application token, or no token where
+    /// the transition is account-scoped. A line naming the same username with
+    /// another applicant's token is that applicant's record and is kept. A hold
+    /// written before the token was recorded is completed from the account's
+    /// application copy where it survives, and where it does not every
+    /// token-bearing line is kept rather than guessed at.
+    fn owns(&self, entry: &store::JournalLine) -> bool {
+        let own_id = entry.intent == format!("account:{}", self.username)
+            || entry
+                .intent
+                .strip_prefix(&format!("delete-{}-", self.username))
+                .is_some_and(|created| OffsetDateTime::parse(created, &Rfc3339).is_ok())
+            || self.token.as_ref().is_some_and(|token| {
+                entry.intent == format!("purge-{token}")
+                    || entry.intent == format!("application:{token}")
+            });
+        let own_line = entry.application.username == self.username
+            && match (
+                entry.application.status_token.as_deref(),
+                self.token.as_deref(),
+            ) {
+                (None, _) => true,
+                (Some(token), Some(hold)) => token == hold,
+                (Some(_), None) => false,
+            };
+        // A line written after the hold ended belongs to a later account that
+        // reused the released name, or to a delayed retry this prune leaves for
+        // a later pass rather than risk another account's record.
+        let inside = OffsetDateTime::parse(&entry.at, &Rfc3339).is_ok_and(|at| at < self.until);
+        inside && (own_id || own_line)
+    }
+}
+
+/// Release every username hold whose ninety days have run, and the journal
+/// lines that account owns with it. Run once per drain pass, last, so no append
+/// after the rewrite reads the loaded index's stale line positions.
+///
+/// The hold records the account's application token at deletion, so an
+/// applicant who asks for the still-held name keeps their own lines even though
+/// the username matches. A hold that cannot be read is left alone: releasing a
+/// name the platform cannot see the end of is worse than keeping it.
+pub async fn holds_sweep(store: &Store) -> Result<(), Error> {
+    let now = OffsetDateTime::now_utc();
+    let mut expired: Vec<Released> = Vec::new();
+    for name in store.list("holds").await? {
+        let Some(username) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let value = match store.hold(username).await {
+            Ok(Some(value)) => value,
+            Ok(None) => continue,
+            Err(e) => {
+                e.report(&format!("reading {username}'s hold"));
+                continue;
+            }
+        };
+        let Some(until) = value.get("until").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(at) = OffsetDateTime::parse(until, &Rfc3339) else {
+            continue;
+        };
+        if at > now {
+            continue;
+        }
+        let token = match value
+            .get("token")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+        {
+            Some(token) => Some(token.to_string()),
+            // A hold written before the token was recorded is completed from
+            // the account's application copy where it still exists. Where that
+            // copy is gone, its token-bearing lines are kept rather than
+            // guessed at, which is the exception the notice names.
+            None => application_token(store, username).await,
+        };
+        expired.push(Released {
+            username: username.to_string(),
+            until: at,
+            token,
+        });
+    }
+    if expired.is_empty() {
+        return Ok(());
+    }
+
+    // The lines go before the hold files: a crash between the two then leaves a
+    // hold the next pass retries, never journal lines with no hold left to
+    // release them.
+    {
+        let log = store.log("journal.jsonl");
+        let _guard = log.lock().await?;
+        let mut kept = String::new();
+        let mut dropped = false;
+        for line in log.raw_lines().await? {
+            let named = serde_json::from_str::<store::JournalLine>(&line)
+                .ok()
+                .is_some_and(|entry| expired.iter().any(|hold| hold.owns(&entry)));
+            if named {
+                dropped = true;
+                continue;
+            }
+            kept.push_str(&line);
+            kept.push('\n');
+        }
+        if dropped {
+            store.rewrite_log("journal.jsonl", kept.as_bytes()).await?;
+        }
+    }
+    for hold in &expired {
+        store
+            .remove("holds", &format!("{}.json", hold.username))
+            .await?;
+    }
+    Ok(())
+}
+
 /// Carry out one export intent: the page's "Take my data out", filed by the
 /// handler with the account the session belongs to and nothing else. The session
 /// that proves it is `verify`'s.
 ///
 /// The bundle is written into the member's own chroot and the ready notice is
-/// appended in the same pass. The journal line names the application the account
-/// was approved from when the copy is still inside ADR 0005's purge; an export
-/// after the purge has no status token left to name and journals none.
+/// appended in the same pass, and the request's line is closed with the bundle's
+/// path so the page's own ask does not stay open. The journal line names the
+/// application the account was approved from when the copy is still inside ADR
+/// 0005's purge; an export after the purge has no status token left to name and
+/// journals none.
 pub async fn export_account(
     cfg: &DrainConfig,
     store: &Store,
@@ -2698,16 +2830,24 @@ pub async fn export_account(
     // a page-filed export is one. It is written before the answer, keyed by the
     // intent's own id so a retry after a failed pass does not append a second
     // request for the same ask.
-    let recorded = store
+    let existing = store
         .log(&format!("accounts/{username}/requests.jsonl"))
         .jsonl::<kyriakon_control_core::account::requests::RequestLine>()
         .await?
-        .iter()
-        .any(|line| line.id == id);
-    if !recorded {
-        let received = kyriakon_control_core::util::date_string(
-            kyriakon_control_core::account::requests::today(),
-        );
+        .into_iter()
+        .find(|line| line.id == id);
+    // The day the request is answered. A retry reads the recorded line's own
+    // receipt date, so the same pass that finishes the export closes the same
+    // line on the same day rather than moving the date the answer carries.
+    let received = existing
+        .as_ref()
+        .map(|line| line.received.clone())
+        .unwrap_or_else(|| {
+            kyriakon_control_core::util::date_string(
+                kyriakon_control_core::account::requests::today(),
+            )
+        });
+    if existing.is_none() {
         kyriakon_control_core::account::requests::record(
             store,
             kyriakon_control_core::account::requests::NewRequest {
@@ -2737,6 +2877,27 @@ pub async fn export_account(
         })
         .unwrap_or_default();
     let bundle = kyriakon_control_core::account::export::deliver(cfg, store, username).await?;
+    // Record the delivery and close the line it answers, so the page's own
+    // export is not left open in the operator's docket. A pass that delivered
+    // and closed but crashed before its journal line is replayed by the next
+    // pass: the line is already closed, which is the same fact rather than a
+    // second request.
+    kyriakon_control_core::account::requests::set_bundle(store, &id, username, &bundle).await?;
+    if existing.as_ref().is_none_or(|line| line.done.is_none()) {
+        // The answer date is the day the bundle was delivered, not the day it
+        // was asked for: a delivery that slipped past the filing day must not
+        // read as on time.
+        let delivered_on = kyriakon_control_core::util::date_string(
+            kyriakon_control_core::account::requests::today(),
+        );
+        kyriakon_control_core::account::requests::close(
+            store,
+            &id,
+            &delivered_on,
+            "delivered to the member's export directory",
+        )
+        .await?;
+    }
     let application = ApplicationRef::application(username.to_string(), status_token);
     Ok(Settlement::line(
         "applied",

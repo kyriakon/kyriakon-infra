@@ -113,7 +113,13 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), Error> {
     // The card rail's arriving events are settled after everything else: a
     // misconfigured signing secret must not hold up an approval, and an event
     // that cannot be applied yet is left for the next pass.
-    transitions::stripe::stripe_webhooks(cfg, store, &journal).await
+    let stripe = transitions::stripe::stripe_webhooks(cfg, store, &journal).await;
+    // Released holds go last, so the prune's rewrite of `journal.jsonl` is not
+    // followed by an append that would use the loaded index's stale positions.
+    // The sweep runs even when the card pass failed.
+    let sweep = transitions::lifecycle::holds_sweep(store).await;
+    stripe?;
+    sweep
 }
 
 /// One intent file, deserialised once into its variant, proved, then applied.

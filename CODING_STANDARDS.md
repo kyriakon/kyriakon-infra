@@ -28,10 +28,12 @@ A store file ending `.jsonl` is a record and stays append-only. It is reached
 through `Store::log`, which has no write, and `Store::write_record` refuses the
 name. Three writes complete a line that has to be completed later rather than
 appended again: a refund's settlement, a held payment's attribution and a
-request's close. Each takes `Store::log(...).lock()` across its read and its
-write and calls the one named API, `Store::rewrite_log`. Appends take the same
-lock, and the code says why: a rewrite without it can drop a line another
-process appended between the read and the rename.
+request's close. A retention prune removes whole lines once their window has
+run, as `lifecycle::holds_sweep` does for a released username. Each takes
+`Store::log(...).lock()` across its read and its write and calls the one named
+API, `Store::rewrite_log`. Appends take the same lock, and the code says why: a
+rewrite without it can drop a line another process appended between the read
+and the rename.
 
 ## Docs
 

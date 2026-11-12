@@ -942,18 +942,42 @@ pub(super) async fn name_held(store: &Store, username: &str) -> Result<Option<St
     }
 }
 
+/// The account's application status token from its retained application copy,
+/// where the copy is still there and readable. `None` leaves the journal prune
+/// keeping token-bearing lines rather than guessing whose they are.
+pub(super) async fn application_token(store: &Store, username: &str) -> Option<String> {
+    let text = store
+        .account_application_text(username)
+        .await
+        .ok()
+        .flatten()?;
+    let copy: Value = serde_json::from_str(&text).ok()?;
+    copy.get("status_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
 /// Hold a closed account's name for ninety days. Written only when there is no
 /// live hold, so a retry keeps the date the removal first set rather than
 /// pushing the release out by another pass.
+///
+/// The hold also records the account's application status token where the
+/// account's copy still exists, which is what the journal prune uses to tell
+/// this account's lines from another applicant who asks for the same name.
 pub(super) async fn hold_name(store: &Store, username: &str) -> Result<(), Error> {
     if name_held(store, username).await?.is_some() {
         return Ok(());
     }
-    let bytes = serde_json::to_vec_pretty(&json!({
+    let token = application_token(store, username).await;
+    let mut hold = json!({
         "username": username,
         "until": util::after_days(90),
-    }))
-    .map_err(|source| Error::Json {
+    });
+    if let Some(token) = token {
+        hold["token"] = json!(token);
+    }
+    let bytes = serde_json::to_vec_pretty(&hold).map_err(|source| Error::Json {
         context: "encode the hold",
         source,
     })?;

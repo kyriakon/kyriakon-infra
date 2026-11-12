@@ -679,9 +679,10 @@ impl Store {
     /// Rewrite an append-only record whole, under a lock the caller holds.
     ///
     /// This is the one exception `CODING_STANDARDS.md` names: a recorded line
-    /// that has to be completed later rather than appended again. The three
+    /// that has to be completed later rather than appended again. The four
     /// callers (`ledger::Ledger::settle_refund`, `rewrite_unattributed`,
-    /// `requests::rewrite`) each hold [`Log::lock`] across the read and this
+    /// `requests::rewrite` and the drain's `holds_sweep`, which drops the lines
+    /// of a released username) each hold [`Log::lock`] across the read and this
     /// write, and appends take the same lock, so a line another process appends
     /// in between is either seen by the read or lands after the rewrite.
     /// Nothing else may call this, and the name is the warning.

@@ -2571,3 +2571,113 @@ fn a_damaged_declinee_does_not_stop_a_healthy_closing_deletion() {
         fix.journal()
     );
 }
+
+/// A self-service export from the account page closes its own request line: the
+/// bundle's path, the day it was delivered and what was done are on the same
+/// line, and the operator's docket does not list the member's own ask as open or
+/// overdue. A retry after a crash before the journal line finishes the same
+/// line rather than appending a second request.
+#[test]
+fn a_page_export_records_and_closes_its_request_line() {
+    let fix = Fix::new("data-export-request-closed");
+    fix.member_tree("secretary");
+    approved_paid(&fix, "secretary", "cash");
+    let id = fix.file_page_action("export", "secretary", json!({}));
+    let filed = fix.read(&format!("intents/{id}.json"));
+    assert!(fix.drain().status.success());
+
+    let record = fix.read("accounts/secretary/requests.jsonl");
+    let lines: Vec<Value> = record
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1, "{record}");
+    let line = &lines[0];
+    assert_eq!(line["id"], id.as_str());
+    assert_eq!(line["kind"], "access");
+    assert_eq!(line["done_at"], line["received"], "{line}");
+    assert_eq!(
+        line["done"], "delivered to the member's export directory",
+        "{line}"
+    );
+    assert!(
+        line["bundle"].as_str().unwrap().contains("export/"),
+        "{line}"
+    );
+    let out = fix.ctl(&["request", "list"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("no open requests"), "{}", body(&out));
+
+    // A pass that delivered and closed but crashed before its journal line:
+    // the intent and its request line are already there, so the retry delivers
+    // again and leaves the close alone.
+    let journal = fix.journal();
+    let kept: String = journal
+        .lines()
+        .filter(|line| !line.contains(&format!("\"intent\":\"{id}\"")))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    std::fs::write(fix.dir.join("store/journal.jsonl"), kept).unwrap();
+    std::fs::write(
+        fix.dir.join("store/intents").join(format!("{id}.json")),
+        filed,
+    )
+    .unwrap();
+    // One export per second names one directory.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.journal().contains("\"outcome\":\"failed\""),
+        "{}",
+        fix.journal()
+    );
+    let record = fix.read("accounts/secretary/requests.jsonl");
+    let again: Vec<Value> = record
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(again.len(), 1, "the retry appended a request: {record}");
+    assert_eq!(again[0]["done_at"], line["done_at"], "{record}");
+    let out = fix.ctl(&["request", "list"]);
+    assert!(body(&out).contains("no open requests"), "{}", body(&out));
+}
+
+/// A delivery that slips past the day the request was recorded closes on the
+/// day it was delivered, so a late answer does not read as on time.
+#[test]
+fn a_delayed_export_closes_on_the_day_it_delivers() {
+    let fix = Fix::new("data-export-delayed-close");
+    fix.member_tree("secretary");
+    approved_paid(&fix, "secretary", "cash");
+    let id = fix.file_page_action("export", "secretary", json!({}));
+    // The request was filed two days before this pass delivers it.
+    let out = fix.ctl(&[
+        "request",
+        "record",
+        "--username",
+        "secretary",
+        "--kind",
+        "access",
+        "--received",
+        "2020-01-01",
+        "--evidence",
+        "the account page's password check",
+        "--identity",
+        "password",
+        "--id",
+        &id,
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+
+    let record = fix.read("accounts/secretary/requests.jsonl");
+    let line: Value = serde_json::from_str(record.lines().next().unwrap()).unwrap();
+    assert_eq!(line["received"], "2020-01-01", "{line}");
+    assert_eq!(
+        line["done_at"],
+        kyriakon_control_core::util::date_after_days(0),
+        "{line}"
+    );
+    assert_ne!(line["done_at"], "2020-01-01", "{line}");
+}
