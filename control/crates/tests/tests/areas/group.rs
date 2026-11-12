@@ -2500,7 +2500,11 @@ fn a_card_renewal_writes_one_date_on_the_group() {
             "customer": "cus_example",
         }),
     );
-    fix.webhook("02-invoice", "invoice.paid", invoice("in_group_first"));
+    fix.webhook(
+        "02-invoice",
+        "invoice.paid",
+        invoice_with("in_group_first", 4_000, 1_790_000_000),
+    );
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
 
@@ -3110,7 +3114,12 @@ fn a_card_renewal_restores_a_lapsed_groups_mailboxes() {
         serde_json::to_vec_pretty(&account).unwrap(),
     )
     .unwrap();
-    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let path = fix.dir.join("store/groups/parish.example/group.json");
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(10));
+    group["payment"]["window"]["state"] = json!("closed");
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
     let token = group["payment"]["token_ref"].as_str().unwrap().to_string();
     fix.webhook(
         "01-checkout",
@@ -3122,13 +3131,22 @@ fn a_card_renewal_restores_a_lapsed_groups_mailboxes() {
             "customer": "cus_example",
         }),
     );
-    fix.webhook("02-invoice", "invoice.paid", invoice("in_group_restore"));
+    fix.webhook(
+        "02-invoice",
+        "invoice.paid",
+        invoice_with("in_group_restore", 4_000, 1_790_000_000),
+    );
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
 
     let account = fix.account(mailbox);
     assert_eq!(account["state"], json!("active"), "{mailbox}: {account}");
     assert!(account.get("grace_until").is_none(), "{mailbox}: {account}");
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert!(
+        group.get("grace_until").is_none(),
+        "the group kept its deletion date: {group}"
+    );
     assert!(
         fix.scripts_log()
             .contains(&format!("lapse-user.sh --restore {mailbox}")),
@@ -3290,4 +3308,88 @@ fn closing_a_site_owner_leaves_the_groups_token_alone() {
         fix.dir.join("store/groups/parish.example").exists(),
         "the group went with one of its mailboxes"
     );
+}
+
+/// A group's card decision email carries the group's own Payment Link, keyed to
+/// the group's token: a body's year is its own price.
+#[test]
+fn a_group_on_the_card_rail_receives_the_group_payment_link() {
+    let fix = Fix::new("group-card-link");
+    let mut record = fix.filed_body("warden");
+    record["rail"] = json!("card");
+    record["answers"]["rail"] = json!("card");
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let token = group["payment"]["token_ref"].as_str().unwrap();
+    let sent = fix.sent();
+    assert!(
+        sent.contains(&format!(
+            "https://buy.stripe.com/test_group_example?client_reference_id={token}"
+        )),
+        "the group's approval did not carry the group link: {sent}"
+    );
+    assert!(
+        !sent.contains(&format!(
+            "https://buy.stripe.com/test_example?client_reference_id={token}"
+        )),
+        "the group's approval carried the account link: {sent}"
+    );
+
+    // The status page reads the application record, so the body's block has to
+    // be there and not only on the root-owned group record.
+    let app: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    assert_eq!(app["payment"]["token_ref"], json!(token), "{app}");
+}
+
+/// A group invoice below the group's year, in another currency, or for nothing
+/// does not extend the group's date, even with the group's token on it.
+#[test]
+fn a_group_invoice_below_the_price_extends_nothing() {
+    let fix = Fix::new("group-underpaid");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let path = fix.dir.join("store/groups/parish.example/group.json");
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["payment"]["rail"] = json!("card");
+    group["payment"]["stripe"]["subscription"] = json!(SUBSCRIPTION);
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+    let mut usd = invoice_with("in_group_usd", 4_000, 1_790_000_000);
+    usd["currency"] = json!("usd");
+
+    for (event, object) in [
+        (
+            "evt_group_zero",
+            invoice_with("in_group_zero", 0, 1_790_000_000),
+        ),
+        (
+            "evt_group_under",
+            invoice_with("in_group_under", 3_999, 1_790_000_000),
+        ),
+        ("evt_group_usd", usd),
+    ] {
+        fix.webhook(event, "invoice.paid", object);
+        let out = fix.drain();
+        assert!(out.status.success(), "{}", body(&out));
+        let group: Value =
+            serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+        assert!(
+            group["payment"]["paid_until"].is_null(),
+            "{event} moved the group's date: {group}"
+        );
+    }
+    assert!(payment_lines(&fix).is_empty(), "{:?}", payment_lines(&fix));
 }
