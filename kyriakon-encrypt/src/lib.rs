@@ -149,7 +149,8 @@ fn armored_ciphertext(key: &Path, gpg_home: &Path, input: &[u8]) -> Result<Vec<u
 }
 
 /// The first line of every envelope this crate produces: the one definition,
-/// written by `rfc3156_envelope` and required by the envelope gate.
+/// written by `rfc3156_envelope`. The gate finds the Content-Type by name
+/// instead, because inbound mail carries transport headers before it.
 const ENVELOPE_MARKER: &str =
     "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";";
 
@@ -436,10 +437,13 @@ fn long_key_id(id: &str) -> Option<String> {
 }
 
 /// Whether a `gpg --list-packets` dump is ciphertext: it carries an encrypted
-/// data or session-key packet and no top-level literal data packet. A stream
+/// data or session-key packet and no literal data packet anywhere. A stream
 /// that pairs a session-key packet with a literal packet is a message dressed
-/// as ciphertext, and storing it in the clear would leak it. Nested packets are
-/// indented, so a line starting at column zero is a top-level one.
+/// as ciphertext, and storing it in the clear would leak it. The save path
+/// asks gpg in a secretless homedir, so gpg cannot descend into encrypted data
+/// and a legitimate envelope shows no literal packet. Reject on any literal
+/// line rather than trusting indentation, which gpg does not keep consistent
+/// once it can decrypt.
 fn is_ciphertext_packets(packets: &[u8]) -> bool {
     let mut encrypted = false;
     for line in String::from_utf8_lossy(packets).lines() {
@@ -1009,10 +1013,14 @@ mod tests {
 
     #[test]
     fn a_session_key_packet_with_a_literal_packet_is_not_ciphertext() {
-        // A packet stream that names the recipient's key but then carries a
-        // literal (unencrypted) message is a message dressed as ciphertext.
+        // A packet stream that names the recipient's key and carries real
+        // encrypted data, then appends a literal (unencrypted) message. The
+        // literal packet is the only thing that rejects it.
         let dressed = b":pubkey enc packet: version 3, algo 1, keyid DC81B0FDFE212297\n\
             \tdata: [3070 bits]\n\
+            :encrypted data packet:\n\
+            \tlength: unknown\n\
+            \tmdc_method: 2\n\
             :literal data packet:\n\
             \tmode b (62), created 0, name=\"\", raw data: 5 bytes\n";
         assert!(!is_ciphertext_packets(dressed));
@@ -1026,6 +1034,18 @@ mod tests {
         assert!(is_ciphertext_packets(
             b":symkey enc packet: version 4, cipher 9, aead 1, symkey algo 9\n\
               :encrypted data packet:\n"
+        ));
+        // gpg 2.4 lists AEAD-encrypted data as `:ocb encrypted packet:`.
+        assert!(is_ciphertext_packets(
+            b":pubkey enc packet: version 3, algo 1, keyid DC81B0FDFE212297\n\
+              :ocb encrypted packet: cipher=9 aead=2 cb=16\n\
+              \tlength: 241\n"
+        ));
+        // Whatever else the dump holds, a literal packet makes it a message.
+        assert!(!is_ciphertext_packets(
+            b":pubkey enc packet: version 3, algo 1, keyid DC81B0FDFE212297\n\
+              :ocb encrypted packet: cipher=9 aead=2 cb=16\n\
+              :literal data packet:\n"
         ));
         assert!(!is_ciphertext_packets(b":literal data packet:\n"));
         assert!(!is_ciphertext_packets(b""));
