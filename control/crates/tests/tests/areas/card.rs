@@ -767,4 +767,13 @@ fn an_invoice_below_the_price_extends_nothing() {
         "a refused invoice was left for a retry: {:?}",
         fix.webhooks()
     );
+    let sent = fix.sent();
+    assert!(
+        sent.contains("invoice in_zero") && sent.contains("the configured price_gbp is 20.00"),
+        "the operator was not told about the refused invoice: {sent}"
+    );
+    assert!(
+        sent.contains("no year was added"),
+        "the alert does not say nothing was extended: {sent}"
+    );
 }

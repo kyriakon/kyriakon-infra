@@ -810,6 +810,12 @@ async fn approve_group(
     let written = group_record(store, &domain)
         .await?
         .ok_or_else(|| Error::Failed("the group record vanished mid-approval".to_string()))?;
+    // The handler renders the status page as `_onboard` and cannot read the
+    // root-owned group record, so the block it shows is this copy in the
+    // application record, as the person path writes the account's.
+    if !written.payment.no_charge {
+        stamp_group_payment(store, &record.status_token, &written).await?;
+    }
     let price = cfg.group_price_gbp.as_str();
     // A group on a cash rail has no Stripe link, and asking for one would fail
     // the approval of a body that never chose the card rail.
@@ -817,7 +823,14 @@ async fn approve_group(
         card_link(
             &cfg.stripe_group_payment_link,
             written.payment.token_ref.as_deref().unwrap_or(""),
-        )?
+        )
+        .map_err(|_| {
+            Error::Failed(
+                "stripe_group_payment_link is not configured, so a group card approval has no \
+                 link to send"
+                    .to_string(),
+            )
+        })?
     } else {
         None
     };
@@ -874,6 +887,48 @@ async fn approve_group(
         intent.application.clone(),
         None,
     ))
+}
+
+/// Put the body's payment block on the application record the status page
+/// reads. The handler cannot read the root-owned group record, so the page
+/// shows this copy, as `approve` copies the account's block. A free group has
+/// no block anywhere, and its application record stays without one.
+async fn stamp_group_payment(
+    store: &Store,
+    token: &str,
+    group: &kyriakon_control_core::store::GroupRecord,
+) -> Result<(), Error> {
+    let text = store
+        .filed_application_text(token)
+        .await?
+        .ok_or_else(|| Error::Failed("the application record is gone".to_string()))?;
+    let mut record: Value =
+        serde_json::from_str(&text).map_err(|e| Error::context("the application record", e))?;
+    let block = Payment {
+        token_ref: group.payment.token_ref.clone(),
+        token_issued_at: Some(group.created_at.clone()),
+        paid_until: group.payment.paid_until.clone(),
+        window: group.payment.window.clone(),
+        rail: Some(group.payment.rail.clone()),
+        stripe: group.payment.stripe.clone(),
+        ..Default::default()
+    };
+    record["payment"] = serde_json::to_value(block).map_err(|source| Error::Json {
+        context: "encode the group payment block",
+        source,
+    })?;
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Error::Json {
+        context: "encode the application record",
+        source,
+    })?;
+    // `applications/` belongs to the handler, so the drain hands the rewritten
+    // record back to that directory's owner. A root-owned file would read as
+    // missing to the process that renders the page.
+    let owner = store.dir_owner("applications");
+    store
+        .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
+        .await
+        .map_err(Error::from)
 }
 
 /// The decline: no reason, a message that offers the way back, the application

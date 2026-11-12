@@ -2977,7 +2977,12 @@ fn a_card_renewal_restores_a_lapsed_groups_mailboxes() {
         serde_json::to_vec_pretty(&account).unwrap(),
     )
     .unwrap();
-    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let path = fix.dir.join("store/groups/parish.example/group.json");
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(10));
+    group["payment"]["window"]["state"] = json!("closed");
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
     let token = group["payment"]["token_ref"].as_str().unwrap().to_string();
     fix.webhook(
         "01-checkout",
@@ -3000,6 +3005,11 @@ fn a_card_renewal_restores_a_lapsed_groups_mailboxes() {
     let account = fix.account(mailbox);
     assert_eq!(account["state"], json!("active"), "{mailbox}: {account}");
     assert!(account.get("grace_until").is_none(), "{mailbox}: {account}");
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert!(
+        group.get("grace_until").is_none(),
+        "the group kept its deletion date: {group}"
+    );
     assert!(
         fix.scripts_log()
             .contains(&format!("lapse-user.sh --restore {mailbox}")),
@@ -3193,6 +3203,12 @@ fn a_group_on_the_card_rail_receives_the_group_payment_link() {
         )),
         "the group's approval carried the account link: {sent}"
     );
+
+    // The status page reads the application record, so the body's block has to
+    // be there and not only on the root-owned group record.
+    let app: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    assert_eq!(app["payment"]["token_ref"], json!(token), "{app}");
 }
 
 /// A group invoice below the group's year, in another currency, or for nothing

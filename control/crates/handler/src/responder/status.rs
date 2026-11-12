@@ -34,38 +34,37 @@ pub(super) async fn status(app: &App, call: &Call<'_>) -> Reply {
 pub(super) fn payment_for(app: &App, record: Option<&Record>) -> Option<page::PaymentView> {
     let record = record?;
     let payment = record.payment.as_ref()?;
-    let link = if record.domain.is_some() {
-        group_card_link(app, payment.token_ref.as_deref())
+    // A record with a domain is a body's application. A body's year is its own
+    // price and its own Payment Link, so both come from the group values.
+    let group = record.domain.is_some();
+    let price = if group {
+        &app.cfg.group_price_gbp
     } else {
-        card_link(app, payment.token_ref.as_deref())
+        &app.cfg.price_gbp
     };
     Some(page::payment(
         "active",
         &record.rail,
         payment,
-        &app.cfg.price_gbp,
+        price,
         &app.cfg.postal_address,
-        link.as_deref(),
+        card_link(app, payment.token_ref.as_deref(), group).as_deref(),
         OffsetDateTime::now_utc(),
     ))
 }
 
 /// The card rail's Payment Link for a page, or `None` when the rail is not card,
-/// there is no token yet, or the box's link is unconfigured. A page is not the
-/// place to refuse an approval for a placeholder: the approval email already
-/// does, and the page simply shows no link rather than a broken one.
-pub(super) fn card_link(app: &App, token: Option<&str>) -> Option<String> {
-    rails::card_link(&app.cfg.stripe_payment_link, token?)
-        .ok()
-        .flatten()
-}
-
-/// The group's own Payment Link. A body's year is its own price, so the account
-/// link keyed to a group's token would bill the wrong amount.
-fn group_card_link(app: &App, token: Option<&str>) -> Option<String> {
-    rails::card_link(&app.cfg.stripe_group_payment_link, token?)
-        .ok()
-        .flatten()
+/// there is no token yet, or the box's link is unconfigured. `group` picks the
+/// body's own link, because its year is the group price. A page is not the place
+/// to refuse an approval for a placeholder: the approval email already does, and
+/// the page simply shows no link rather than a broken one.
+pub(super) fn card_link(app: &App, token: Option<&str>, group: bool) -> Option<String> {
+    let link = if group {
+        &app.cfg.stripe_group_payment_link
+    } else {
+        &app.cfg.stripe_payment_link
+    };
+    rails::card_link(link, token?).ok().flatten()
 }
 
 /// The page one token's record renders, or the one notice that covers a token

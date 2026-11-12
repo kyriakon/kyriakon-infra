@@ -127,6 +127,10 @@ pub struct Config {
     /// have to agree, the address because it is the operator's own and this
     /// repository is public.
     pub price_gbp: String,
+    /// The yearly price of an own-domain group, which the status page shows for
+    /// a body's token. Substituted at deploy from the drain's own config, so the
+    /// Stripe Price, the approval mail and the page cannot disagree.
+    pub group_price_gbp: String,
     pub postal_address: String,
     /// The card rail's Payment Link. It is public (a member is sent it), so the
     /// handler may hold it to render the same link the approval email carries.
@@ -374,6 +378,7 @@ mod tests {
              dmarc_rua = \"mailto:dmarc@kyriakon.net\"\n\
              release = \"REPLACE_ME\"\n\
              price_gbp = \"20.00\"\n\
+             group_price_gbp = \"40.00\"\n\
              postal_address = \"REPLACE_ME\"\n\
              stripe_payment_link = \"REPLACE_ME\"\n\
              stripe_group_payment_link = \"REPLACE_ME\"\n",
@@ -381,6 +386,7 @@ mod tests {
         .unwrap();
         assert_eq!(c.pages, "/var/db/onboard/pages");
         assert_eq!(c.price_gbp, "20.00");
+        assert_eq!(c.group_price_gbp, "40.00");
         assert_eq!(c.postal_address, "REPLACE_ME");
         assert_eq!(c.httpd_socket, "/home/www/run/onboard-httpd/httpd.sock");
         assert_eq!(c.gemini_socket, "/home/www/run/onboard/onboard.sock");
@@ -536,6 +542,7 @@ mod tests {
         assert_eq!(c.dkim_public_key, "REPLACE_ME");
         assert_eq!(c.stripe_payment_link, "REPLACE_ME");
         assert_eq!(c.stripe_group_payment_link, "REPLACE_ME");
+        assert_eq!(c.group_price_gbp, "REPLACE_ME");
         assert!(crate::account::dns::Values::from(&c).check().is_err());
     }
 

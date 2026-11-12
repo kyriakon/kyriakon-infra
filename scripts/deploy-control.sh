@@ -532,10 +532,24 @@ case "$price_gbp" in
 	;;
 esac
 
+# The group price the handler's status page shows, from the same tracked file
+# the drain reads: two copies of the number can disagree as surely as a copy of
+# the person's price can.
+group_price_gbp=$(
+	awk -F'"' '/^group_price_gbp[[:space:]]*=/ { print $2; exit }' \
+		"$repo_dir/openbsd/etc/onboard/drain.toml"
+)
+case "$group_price_gbp" in
+"" | *REPLACE_ME*)
+	die "cannot read group_price_gbp from $repo_dir/openbsd/etc/onboard/drain.toml"
+	;;
+esac
+
 onboard_candidate=$(mktemp /etc/onboard/.onboard.toml.XXXXXX)
-RELEASE="$release" PRICE="$price_gbp" POSTAL="$POSTAL_ADDRESS" LINK="$STRIPE_PAYMENT_LINK" GROUP_LINK="$STRIPE_GROUP_PAYMENT_LINK" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
+RELEASE="$release" PRICE="$price_gbp" GROUP_PRICE="$group_price_gbp" POSTAL="$POSTAL_ADDRESS" LINK="$STRIPE_PAYMENT_LINK" GROUP_LINK="$STRIPE_GROUP_PAYMENT_LINK" IPV4="$KYRIAKON_IPV4" IPV6="$KYRIAKON_IPV6" SELECTOR="$dkim_selector" DKIM="$dkim_public_key" awk '
 	/^release[[:space:]]*=/ { print "release = \"" ENVIRON["RELEASE"] "\""; next }
 	/^price_gbp[[:space:]]*=/ { print "price_gbp = \"" ENVIRON["PRICE"] "\""; next }
+	/^group_price_gbp[[:space:]]*=/ { print "group_price_gbp = \"" ENVIRON["GROUP_PRICE"] "\""; next }
 	/^postal_address[[:space:]]*=/ { print "postal_address = \"" ENVIRON["POSTAL"] "\""; next }
 	/^stripe_payment_link[[:space:]]*=/ { print "stripe_payment_link = \"" ENVIRON["LINK"] "\""; next }
 	/^stripe_group_payment_link[[:space:]]*=/ { print "stripe_group_payment_link = \"" ENVIRON["GROUP_LINK"] "\""; next }

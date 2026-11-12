@@ -318,6 +318,24 @@ impl BillingTarget {
         }
     }
 
+    /// The name the operator alert uses for this target: the account's username
+    /// or the body's domain.
+    fn label(&self) -> &str {
+        match self {
+            BillingTarget::Account(a) => &a.username,
+            BillingTarget::Group(g) => &g.domain,
+        }
+    }
+
+    /// The field and value a year's price is read from. An account pays its own
+    /// price; a body's is the group price, not a person's price with a multiple.
+    fn price<'a>(&self, cfg: &'a DrainConfig) -> (&'static str, &'a String) {
+        match self {
+            BillingTarget::Account(_) => ("price_gbp", &cfg.price_gbp),
+            BillingTarget::Group(_) => ("group_price_gbp", &cfg.group_price_gbp),
+        }
+    }
+
     /// A payment extends the date and marks the window paid. A group's window
     /// closes the same way: one date, shared by every mailbox in it, and every
     /// mailbox a lapse had stopped comes back through the same restore loop a
@@ -756,9 +774,30 @@ async fn invoice_paid(
     let (amount_gbp, received_on) = invoice_money(object)?;
     if !invoice_covers(cfg, object, &billing)? {
         // A zero-amount invoice, one in another currency, or one below the
-        // target's year is not a payment for this account or body. The
-        // subscription's state is recorded above, but the date does not move and
-        // no ledger line opens.
+        // target's year is not a payment for this account or body. The member
+        // may still have been charged, so the operator is told before the event
+        // is settled: the date does not move, no ledger line opens, and the
+        // account stays where it was.
+        let currency = object
+            .get("currency")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        let paid = object
+            .get("amount_paid")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let (field, price) = billing.price(cfg);
+        notice::alert(
+            cfg,
+            "stripe",
+            "invoice.paid",
+            &format!(
+                "invoice {invoice} for {} paid {paid} minor units in {currency}; the configured {field} is {price}, so no year was added",
+                billing.label()
+            ),
+            "check the member's payment and access by hand; the invoice was settled and no date was extended",
+        )
+        .await;
         billing.save(store).await?;
         return Ok(Settled::Applied);
     }
@@ -817,10 +856,7 @@ fn invoice_covers(
     if object.get("currency").and_then(Value::as_str) != Some("gbp") {
         return Ok(false);
     }
-    let (field, price) = match billing {
-        BillingTarget::Account(_) => ("price_gbp", &cfg.price_gbp),
-        BillingTarget::Group(_) => ("group_price_gbp", &cfg.group_price_gbp),
-    };
+    let (field, price) = billing.price(cfg);
     let price = util::pence(price)
         .map_err(|e| Error::context(format!("the drain's configured {field}"), e))?;
     if price <= 0 {

@@ -67,6 +67,10 @@ dmarc_rua = "mailto:dmarc@kyriakon.net"
 # the Stripe Price and the prepaid price cannot disagree. The deploy refuses a
 # file that still carries a placeholder.
 price_gbp = "REPLACE_ME"
+# The yearly price of an own-domain group, copied from the drain's config at
+# deploy for the same reason: the status page, the approval mail and the Stripe
+# Price must agree.
+group_price_gbp = "REPLACE_ME"
 postal_address = "REPLACE_ME"
 
 # The card rail's Payment Link, the same one the drain appends each account's
