@@ -11,6 +11,7 @@ pub(crate) fn quota_config(dir: &std::path::Path) -> DrainConfig {
         passwd: dir.join("passwd").to_str().unwrap().to_string(),
         mail_domains: dir.join("mail_domains").to_str().unwrap().to_string(),
         virtuals: dir.join("virtuals").to_str().unwrap().to_string(),
+        mail_from: dir.join("mail_from").to_str().unwrap().to_string(),
         dkim_domains: dir.join("dkim_domains").to_str().unwrap().to_string(),
         spamd_alloweddomains: dir
             .join("spamd.alloweddomains")

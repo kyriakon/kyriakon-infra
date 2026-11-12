@@ -3,7 +3,7 @@
 use crate::responder::test_support::*;
 use crate::responder::*;
 use kyriakon_control_core::{account::session, mail::keycheck};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
 /// A mailbox account's `group` resolves to the group record, and the recipe it
@@ -505,6 +505,127 @@ async fn the_account_pages_export_action_files_an_intent_for_the_session_account
     );
 }
 
+/// The test-mail button files one session-proved intent for the account the
+/// session names. A request with no session files nothing.
+#[tokio::test]
+async fn the_test_mail_button_files_an_intent_for_the_session_account() {
+    let (app, dir) = handler("account-test-mail").await;
+    file_account(&dir);
+    amend_account(&dir, "alice", |value| {
+        value["mail_key"] = serde_json::json!("AAAA");
+    });
+    let cookie = signed_in(&app, "alice").await;
+
+    let (code, page) = ask(
+        &app,
+        &httpd_post_with("/account/test-mail", "", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    assert!(page.contains("Your test message is on its way"), "{page}");
+    let intent = filed_intent(&dir);
+    assert_eq!(intent["kind"], "test-mail");
+    assert_eq!(intent["username"], "alice");
+    assert_eq!(
+        intent["session"],
+        cookie.split('.').next().unwrap(),
+        "the session the drain will verify"
+    );
+
+    // No session, no account to send to.
+    let (code, _) = ask(&app, &httpd_post("/account/test-mail", "")).await;
+    assert_eq!(code, 403);
+    assert_eq!(filed(&dir), 1, "an intent was filed without a session");
+}
+
+/// Without a recorded mail key there is nothing to encrypt to, so the route
+/// refuses rather than filing a message delivery could not address.
+#[tokio::test]
+async fn the_test_mail_button_needs_a_recorded_mail_key() {
+    let (app, dir) = handler("account-test-mail-no-key").await;
+    file_account(&dir);
+    let cookie = signed_in(&app, "alice").await;
+
+    let (code, page) = ask(
+        &app,
+        &httpd_post_with("/account/test-mail", "", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 403, "{page}");
+    assert!(page.contains("has not recorded a mail key"), "{page}");
+    assert_eq!(filed(&dir), 0, "an intent was filed without a key");
+}
+
+/// The notice record is the day's dedup. Another day's notice, and today's date
+/// under another subject, both leave the route free; today's own notice refuses
+/// it rather than filing a second send.
+#[tokio::test]
+async fn the_test_mail_button_reads_the_day_from_the_notice_record() {
+    let (app, dir) = handler("account-test-mail-day").await;
+    file_account(&dir);
+    amend_account(&dir, "alice", |value| {
+        value["mail_key"] = serde_json::json!("AAAA");
+    });
+    let cookie = signed_in(&app, "alice").await;
+    let today = kyriakon_control_core::util::filed_at();
+
+    // Yesterday's notice, with yesterday's subject, does not count.
+    add_test_mail_notice(&dir, "2026-01-01T09:00:00Z", None);
+    let (code, page) = ask(
+        &app,
+        &httpd_post_with("/account/test-mail", "", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    assert_eq!(filed(&dir), 1, "an earlier day blocked today's test");
+
+    // Today's date under another subject is not this test's notice either.
+    add_test_mail_notice(&dir, &today, Some("Another subject entirely"));
+    let (code, page) = ask(
+        &app,
+        &httpd_post_with("/account/test-mail", "", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    assert_eq!(
+        filed(&dir),
+        2,
+        "a notice for another subject blocked the test"
+    );
+
+    // Today's own notice is the one message the day gets.
+    add_test_mail_notice(&dir, &today, None);
+    let (code, page) = ask(
+        &app,
+        &httpd_post_with("/account/test-mail", "", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 403, "{page}");
+    assert!(page.contains("already gone out today"), "{page}");
+    assert_eq!(filed(&dir), 2, "a second intent was filed for the day");
+}
+
+/// Append one notice line, as the drain records it before it enqueues a
+/// message. The subject defaults to the day's own test subject so a caller can
+/// make it differ.
+fn add_test_mail_notice(dir: &Path, at: &str, subject: Option<&str>) {
+    let day = at.get(..10).unwrap_or(at);
+    let subject = subject
+        .map(str::to_string)
+        .unwrap_or_else(|| kyriakon_control_core::mail::notice::test_mail_subject(day));
+    let line = serde_json::json!({
+        "version": 1,
+        "at": at,
+        "type": "test-mail",
+        "subject": subject,
+        "to": "alice@kyriakon.net",
+    });
+    let path = dir.join("accounts/alice/notices.jsonl");
+    let mut notices = std::fs::read_to_string(&path).unwrap();
+    notices.push_str(&format!("{line}\n"));
+    std::fs::write(&path, notices).unwrap();
+}
+
 /// The password form re-enters the current password whatever the session's age,
 /// and files one intent carrying the new hash and nothing else. A wrong current
 /// password, a short new one and a mismatched pair all file nothing.
@@ -992,6 +1113,7 @@ async fn the_account_page_offers_every_action() {
         "/account/address",
         "/account/serving",
         "/account/mail-key",
+        "/account/test-mail",
     ] {
         assert!(body.contains(action), "{action} is missing: {body}");
     }
@@ -1001,4 +1123,12 @@ async fn the_account_page_offers_every_action() {
         body.contains(r#"name="gemini"#) && !body.contains(r#"name="gemini" checked"#),
         "the two checkboxes carry their own state: {body}"
     );
+
+    // Without a recorded key there is nothing to encrypt a test message to, so
+    // the control is absent rather than a button that always refuses.
+    amend_account(&dir, "alice", |value| {
+        value["mail_key"] = serde_json::Value::Null;
+    });
+    let (_, body) = ask(&app, &httpd_get_session("account", "", &cookie)).await;
+    assert!(!body.contains("/account/test-mail"), "{body}");
 }

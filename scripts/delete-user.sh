@@ -82,6 +82,7 @@ authorized_keys_dir=${AUTHORIZED_KEYS_DIR:-/etc/ssh/authorized_keys}
 ssl_dir=${SSL_DIR:-/etc/ssl}
 ssl_private=${SSL_PRIVATE:-/etc/ssl/private}
 virtuals=${VIRTUALS:-/etc/mail/virtuals}
+mail_from=${MAIL_FROM:-/etc/mail/mail_from}
 onboard_store=${ONBOARD_STORE:-/var/db/onboard}
 finger_page=${FINGER_PAGE:-/etc/kyriakon/finger.txt}
 
@@ -263,6 +264,12 @@ remove_member() {
 	# wrote and nothing else removes. A lookup that finds nothing there has
 	# nothing to expand to, so the address starts bouncing at RCPT time, which is
 	# the point: a deleted member is not a catch-all.
+	#
+	# The submitter allowlist beside it holds the same identity, and is the set
+	# the auth match reads: a line left there still lets some other account name
+	# this deleted address as its envelope sender. Both tables go under one
+	# restart, because smtpd reads either at start.
+	mail_changed=no
 	if [ -f "$virtuals" ]; then
 		if [ "$show" = yes ]; then
 			if awk -v u="$user" -F: '$1 ~ ("^" u "@")' "$virtuals" | grep -q .; then
@@ -278,8 +285,7 @@ remove_member() {
 			fi
 			if [ "$drop_rc" -eq 0 ]; then
 				printf 'removed the address lines for %s@ from %s\n' "$user" "$virtuals"
-				restart_smtpd
-				printf 'restarted smtpd, which reads the table at start\n'
+				mail_changed=yes
 			fi
 		fi
 		# An address that points at this member without being theirs is a body's
@@ -291,6 +297,29 @@ remove_member() {
 			printf 'note: %s point at %s and were left alone; they now deliver nowhere\n' "$aliases" "$user" >&2
 			printf '  Re-point or remove them in %s and restart smtpd.\n' "$virtuals" >&2
 		fi
+	fi
+	if [ -f "$mail_from" ]; then
+		if [ "$show" = yes ]; then
+			if awk -v u="$user" -F: '$1 ~ ("^" u "@")' "$mail_from" | grep -q .; then
+				printf 'would remove the sender lines for %s@\n' "$user"
+			fi
+		else
+			drop_rc=0
+			remove_own_senders || drop_rc=$?
+			if [ "$drop_rc" -gt 1 ]; then
+				printf 'the sender lines for %s@ were not removed from %s; fix the table, then rerun\n' \
+					"$user" "$mail_from" >&2
+				return 1
+			fi
+			if [ "$drop_rc" -eq 0 ]; then
+				printf 'removed the sender lines for %s@ from %s\n' "$user" "$mail_from"
+				mail_changed=yes
+			fi
+		fi
+	fi
+	if [ "$mail_changed" = yes ]; then
+		restart_smtpd
+		printf 'restarted smtpd, which reads the tables at start\n'
 	fi
 
 	# The control plane's record of the account, last. The note below says the
@@ -336,6 +365,14 @@ remove_own_addresses() {
 	table_drop "$virtuals" prefix "$user@"
 }
 
+# remove_own_senders: drop the same identities from the submitter allowlist. The
+# prefix is literal, so only this member's own addresses go; a body's alias that
+# happens to name them stays, as its virtuals line does, and is the note above.
+# Returns 0 when the file changed, 1 when it did not, and 2 when the write failed.
+remove_own_senders() {
+	table_drop "$mail_from" prefix "$user@"
+}
+
 # --- the self-test ----------------------------------------------------------
 #
 # Rebind the paths to a throwaway tree and replace the four steps that need root,
@@ -352,11 +389,13 @@ self_test() {
 	HTTPD_D="$tree/etc/httpd.d"; GMID_D="$tree/etc/gmid.d"; ACME_D="$tree/etc/acme-client.d"
 	SSL_DIR="$tree/etc/ssl"; SSL_PRIVATE="$tree/etc/ssl/private"
 	VIRTUALS="$tree/etc/mail/virtuals"
+	MAIL_FROM="$tree/etc/mail/mail_from"
 	ONBOARD_STORE="$tree/store"
 	AUTHORIZED_KEYS_DIR="$tree/etc/ssh/authorized_keys"
 	www_root="$WWW_ROOT"; httpd_d="$HTTPD_D"
 	gmid_d="$GMID_D"; acme_d="$ACME_D"; ssl_dir="$SSL_DIR"
 	ssl_private="$SSL_PRIVATE"; virtuals="$VIRTUALS"
+	mail_from="$MAIL_FROM"
 	onboard_store="$ONBOARD_STORE"
 	authorized_keys_dir="$AUTHORIZED_KEYS_DIR"
 
@@ -393,6 +432,15 @@ self_test() {
 		printf 'secretary@parish.example: alice\n'
 		printf 'oliver@kyriakon.net: oliver\n'
 	} >"$virtuals"
+	# The submitter allowlist as deploy-mail.sh and provisioning leave it: the
+	# member's own identity, an address that delivers into them, and another
+	# account's. The alias stays, as its virtuals line does, because it names a
+	# body's address rather than the member's own.
+	{
+		printf 'alice@kyriakon.net: alice\n'
+		printf 'secretary@parish.example: alice\n'
+		printf 'oliver@kyriakon.net: oliver\n'
+	} >"$mail_from"
 
 	remove_member >"$tree/first.out" 2>"$tree/first.err"
 	check "the vhost went" "$([ -e "$httpd_d/$user.kyriakon.net.conf" ] && echo present || echo gone)" gone
@@ -409,9 +457,15 @@ self_test() {
 	check "someone else's address stayed" "$(awk '/^oliver@/' "$virtuals" | wc -l | tr -d ' ')" 1
 	check "the alias into them stayed" "$(awk '/^secretary@/' "$virtuals" | wc -l | tr -d ' ')" 1
 	check "and the note names it" "$(grep -c 'secretary@parish.example' "$tree/first.err")" 1
+	check "the member's own sender line went" \
+		"$(awk '/^alice@/' "$mail_from" | wc -l | tr -d ' ')" 0
+	check "and another account's stayed" "$(awk '/^oliver@/' "$mail_from" | wc -l | tr -d ' ')" 1
+	check "and the address that delivers into them stayed" \
+		"$(awk '/^secretary@/' "$mail_from" | wc -l | tr -d ' ')" 1
 	check "the order starts with the indexes" "$(awk 'NR == 1' "$case_dir/calls")" 'cron-apply --web'
 	check "and the account goes last of the tools" "$(awk 'NR == 3' "$case_dir/calls")" 'userdel -r alice'
-	check "smtpd restarted once" "$(grep -c 'rcctl restart smtpd' "$case_dir/calls")" 1
+	check "smtpd restarted once, after both mail tables" \
+		"$(grep -c 'rcctl restart smtpd' "$case_dir/calls")" 1
 	check "the member's group goes after the account" "$(awk 'NR == 4' "$case_dir/calls")" 'groupdel alice'
 	check "the finger page is regenerated last" \
 		"$(tail -1 "$case_dir/calls")" 'gen-finger-page'
