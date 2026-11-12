@@ -248,6 +248,9 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
             address,
         ));
     }
+    if let Some(why) = kyriakon_control_core::flow::applicant::key_error(&blocks[0]) {
+        return Ok((Reply::gemini(59, &why, String::new()), address));
+    }
     // The same retain-then-push the capsule's key page uses, so a retry for one
     // mailbox replaces its key rather than adding a second.
     record.mail_keys.retain(|k| k.mailbox != mailbox);

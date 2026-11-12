@@ -230,7 +230,7 @@ pub fn mail_key_errors(q: &Question, value: &str, form: &BTreeMap<String, String
 /// An inspected finding (AEAD, expiry, revocation, no encryption subkey) is a
 /// refusal at the form; the parser-gap advisory proceeds, because a key the
 /// platform cannot inspect is not a key it can prove bad.
-fn key_error(block: &str) -> Option<String> {
+pub fn key_error(block: &str) -> Option<String> {
     match keycheck::pgp_public_key(block) {
         Err(e) => Some(e.to_string()),
         Ok(checked) if checked.inspected && checked.verdict != "works" => Some(checked.verdict),
