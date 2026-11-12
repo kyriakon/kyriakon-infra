@@ -281,11 +281,22 @@ fn resaving_our_own_envelope_does_not_encrypt_it_again() {
     // secret key, which is what gpg sees in production.
     let (ok, again) = encrypt_seam_input(env, "alice", &envelope, &scratch_gpg_home(env));
     assert!(ok, "re-saving our own ciphertext must succeed");
-    assert_eq!(again, envelope, "the envelope must come back byte for byte");
+    assert_valid_envelope(&again);
+    assert_eq!(
+        octet_stream(&again),
+        octet_stream(&envelope),
+        "the ciphertext must come back untouched"
+    );
     assert_eq!(
         env.decrypt(&octet_stream(&again)),
         expected_payload().as_bytes(),
         "one decrypt must yield the message, not another envelope"
+    );
+    let text = String::from_utf8_lossy(&again);
+    assert_eq!(
+        text.matches("Content-Type: multipart/encrypted;").count(),
+        1,
+        "a single layer:\n{text}"
     );
 }
 
@@ -396,13 +407,14 @@ fn a_message_with_plaintext_in_its_version_part_is_encrypted() {
 }
 
 #[test]
-fn a_message_with_a_foreign_preamble_is_encrypted() {
+fn a_message_with_a_foreign_preamble_is_resaved_without_it() {
     let env = TestEnv::get();
     let (ok, real) = encrypt_seam(env, "alice");
     assert!(ok, "encrypt failed for alice");
 
-    // The preamble is stored in the clear too, so replacing the fixed notice
-    // makes this a message to encrypt even though the rest is a real envelope.
+    // An external client's own preamble is normal inbound PGP/MIME. The rebuild
+    // replaces it, so whatever it held is not stored in the clear and the
+    // ciphertext keeps its one layer.
     let text = String::from_utf8(real).expect("envelope is ASCII");
     let foreign = text.replacen(
         "This is an OpenPGP/MIME encrypted message (RFC 4880 and 3156).",
@@ -413,15 +425,74 @@ fn a_message_with_a_foreign_preamble_is_encrypted() {
     let foreign = foreign.into_bytes();
 
     let (ok, out) = encrypt_seam_input(env, "alice", &foreign, &scratch_gpg_home(env));
-    assert!(ok, "the message must be encrypted");
-    assert_ne!(out, foreign, "a foreign preamble is not an envelope");
+    assert!(ok, "the message must be saved");
     assert_valid_envelope(&out);
-    let payload = env.decrypt(&octet_stream(&out));
     assert!(
-        payload
-            .windows(b"hidden plaintext in the preamble".len())
-            .any(|w| w == b"hidden plaintext in the preamble"),
-        "the preamble must be inside the ciphertext"
+        !String::from_utf8_lossy(&out).contains("hidden plaintext in the preamble"),
+        "the preamble must not stay in the clear"
+    );
+    assert_eq!(
+        env.decrypt(&octet_stream(&out)),
+        expected_payload().as_bytes(),
+        "the ciphertext is untouched"
+    );
+}
+
+#[test]
+fn an_inbound_pgp_mime_message_is_not_encrypted_again() {
+    let env = TestEnv::get();
+    let (ok, real) = encrypt_seam(env, "alice");
+    assert!(ok, "encrypt failed for alice");
+    let armor = octet_stream(&real);
+
+    // What arrives from smtpd for external PGP/MIME: transport headers and a
+    // plaintext Subject before Content-Type, and the sender's own preamble.
+    let boundary = "kt592-inbound";
+    let mut inbound = format!(
+        "Return-Path: <sender@example.invalid>\n\
+         Received: from mx.example.invalid by kyriakon.net\n\
+         Subject: inbound plaintext subject\n\
+         Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";\n\
+         \tboundary=\"{boundary}\"\n\
+         MIME-Version: 1.0\n\
+         \n\
+         Sender's own preamble.\n\
+         \n\
+         --{boundary}\n\
+         Content-Type: application/pgp-encrypted\n\
+         \n\
+         Version: 1\n\
+         \n\
+         --{boundary}\n\
+         Content-Type: application/octet-stream\n\
+         \n"
+    )
+    .into_bytes();
+    inbound.extend_from_slice(&armor);
+    inbound.extend_from_slice(format!("\n--{boundary}--\n").as_bytes());
+
+    let (ok, out) = encrypt_seam_input(env, "alice", &inbound, &scratch_gpg_home(env));
+    assert!(ok, "the inbound message must be saved");
+    assert_valid_envelope(&out);
+
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("Subject: ...\n"), "{text}");
+    for leaked in [
+        "inbound plaintext subject",
+        "Return-Path",
+        "Sender's own preamble",
+    ] {
+        assert!(!text.contains(leaked), "{leaked} leaked:\n{text}");
+    }
+    assert_eq!(
+        octet_stream(&out),
+        armor,
+        "the inbound ciphertext keeps its single layer"
+    );
+    assert_eq!(
+        env.decrypt(&octet_stream(&out)),
+        expected_payload().as_bytes(),
+        "one decrypt yields the message"
     );
 }
 

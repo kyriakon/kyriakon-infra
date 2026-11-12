@@ -12,8 +12,10 @@
 //! Fail-closed: no key file for the recipient => error, and the caller never
 //! sees plaintext.
 //!
-//! Input that is already an envelope of ours for that recipient is returned
-//! unchanged, so a client re-uploading a message cannot have it encrypted twice.
+//! Input that is already an RFC 3156 envelope to that recipient is rebuilt
+//! from its verified ciphertext rather than encrypted again, so a client
+//! re-uploading a message cannot have it encrypted twice and inbound PGP/MIME
+//! mail keeps its single layer.
 //!
 //! The Dovecot shim runs `kyriakon-encrypt encrypt` and reads the ciphertext
 //! from its stdout: exit status carries failure, so a gpg error or a write cut
@@ -96,8 +98,8 @@ pub fn encrypt(
     if !key.is_file() {
         return Err(Error::MissingKey(base.to_string()));
     }
-    if already_encrypted(input, &key, gpg_home) {
-        return Ok(input.to_vec());
+    if let Some(armor) = already_encrypted(input, &key, gpg_home) {
+        return Ok(rfc3156_envelope(&make_boundary(), armor, input));
     }
     let payload = protected_payload(input);
     let armor = armored_ciphertext(&key, gpg_home, &payload)?;
@@ -151,80 +153,74 @@ fn armored_ciphertext(key: &Path, gpg_home: &Path, input: &[u8]) -> Result<Vec<u
 const ENVELOPE_MARKER: &str =
     "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";";
 
-/// The RFC 3156 preamble the builder writes before the first boundary. The
-/// envelope gate accepts only this text, because everything before the first
-/// part is stored in the clear: a sender that puts anything else there has
-/// written a message to encrypt, not ciphertext to keep.
+/// The RFC 3156 preamble the builder writes before the first boundary. It is
+/// a human-readable notice, not content: the envelope gate accepts whatever a
+/// sender's client put there and the rebuild replaces it.
 const ENVELOPE_PREAMBLE: &str = "This is an OpenPGP/MIME encrypted message (RFC 4880 and 3156).";
 
-/// Whether `input` is already an envelope this crate built for the recipient of
-/// `cert`, in which case it is saved as it stands rather than encrypted again.
+/// The verified armoured ciphertext of `input` when it is already an RFC 3156
+/// envelope to the recipient of `cert`, in which case the caller rebuilds the
+/// outer message around it instead of encrypting again.
 ///
 /// A second encryption does not lose the message, but it breaks it: the store
 /// holds a ciphertext whose payload is another envelope, so a client decrypts
 /// once and shows an encrypted blob where the mail should be. A client that
 /// files a message by re-uploading it on the save path did that on the live box.
+/// Inbound PGP/MIME from an external sender arrives the same way, behind
+/// `Return-Path` and `Received` headers and under its own preamble, and must
+/// keep its single layer too.
 ///
 /// The marker alone cannot be trusted to mean ciphertext, since a sender could
 /// mail a message that begins with it - a forwarded mail, say, whose attachment
 /// is ciphertext for this recipient - and have the plaintext written to the
 /// store as though it were encrypted. So the outer MIME has to be the RFC 3156
-/// shape this crate builds (`envelope_ciphertext`), and the key id is read from
-/// that envelope's ciphertext part alone. Ciphertext addressed to another key,
-/// a copy of the cert carried inline, a stream gpg cannot parse, and anything
-/// whose parts do not match all fall through to normal encryption.
-fn already_encrypted(input: &[u8], cert: &Path, gpg_home: &Path) -> bool {
-    let Some(ciphertext) = envelope_ciphertext(input) else {
-        return false;
-    };
-    let Ok(cert_packets) = std::fs::read(cert) else {
-        return false;
-    };
-    let ours = cert_key_ids(&list_packets(&cert_packets, gpg_home));
-    if ours.is_empty() {
-        return false;
-    }
-    message_key_ids(&list_packets(ciphertext, gpg_home))
-        .iter()
-        .any(|id| ours.contains(id))
-}
-
-/// The armoured ciphertext body of `input` when it is the envelope this crate
-/// builds: the marker Content-Type first, the builder's preamble, exactly two
-/// parts, the first `application/pgp-encrypted` with `Version: 1`, the second
-/// `application/octet-stream`, and the message ending at the closing boundary.
-/// Anything else is not our envelope: a message that merely begins with the
-/// marker is a message to encrypt, not ciphertext to keep.
-fn envelope_ciphertext(input: &[u8]) -> Option<&[u8]> {
-    if !input.starts_with(ENVELOPE_MARKER.as_bytes()) {
+/// shape (`envelope_ciphertext`), the ciphertext part has to be an armoured PGP
+/// message and its packets have to be encrypted, and the key id is read from
+/// those packets alone. Ciphertext addressed to another key, a copy of the cert
+/// carried inline, a stream gpg cannot parse, and anything whose parts do not
+/// match all fall through to normal encryption.
+fn already_encrypted<'a>(input: &'a [u8], cert: &Path, gpg_home: &Path) -> Option<&'a [u8]> {
+    let ciphertext = envelope_ciphertext(input)?;
+    let packets = list_packets(ciphertext, gpg_home);
+    if !is_ciphertext_packets(&packets) {
         return None;
     }
+    let cert_packets = std::fs::read(cert).ok()?;
+    let ours = cert_key_ids(&list_packets(&cert_packets, gpg_home));
+    if ours.is_empty() {
+        return None;
+    }
+    message_key_ids(&packets)
+        .iter()
+        .any(|id| ours.contains(id))
+        .then_some(ciphertext)
+}
+
+/// The armoured ciphertext of `input` when it is an RFC 3156 envelope: a
+/// `multipart/encrypted` Content-Type anywhere in the outer header block
+/// (inbound mail arrives behind `Return-Path` and `Received`), any preamble,
+/// exactly two parts, the first `application/pgp-encrypted` with `Version: 1`,
+/// the second `application/octet-stream` whose body is nothing but a bare
+/// ASCII-armoured PGP message. Anything else is not ciphertext to keep: a
+/// message that merely mentions the wrapper is a message to encrypt.
+fn envelope_ciphertext(input: &[u8]) -> Option<&[u8]> {
     let (block, sep, body) = split_message(input);
     if sep.is_empty() {
         return None;
     }
-    let (name, start, end) = header_spans(block).into_iter().next()?;
-    if name != "content-type" {
+    let (_, start, end) = header_spans(block)
+        .into_iter()
+        .find(|(name, _, _)| name == "content-type")?;
+    let header = &block[start..end];
+    if media_type(header)? != "multipart/encrypted" {
         return None;
     }
-    let boundary = boundary_param(&block[start..end])?;
-    let (version, ciphertext) = two_parts(strip_preamble(body)?, &boundary)?;
+    let boundary = boundary_param(header)?;
+    let (version, ciphertext) = two_parts(body, &boundary)?;
     if !is_version_part(version) {
         return None;
     }
-    part_body(ciphertext)
-}
-
-/// Strip the builder's preamble and the blank line after it. A client that
-/// re-uploads a stored message may send CRLF, so either ending is accepted;
-/// the line itself has to match.
-fn strip_preamble(body: &[u8]) -> Option<&[u8]> {
-    let rest = body.strip_prefix(ENVELOPE_PREAMBLE.as_bytes())?;
-    let rest = rest
-        .strip_prefix(b"\r\n")
-        .or_else(|| rest.strip_prefix(b"\n"))?;
-    rest.strip_prefix(b"\r\n")
-        .or_else(|| rest.strip_prefix(b"\n"))
+    armored_message(part_body(ciphertext)?)
 }
 
 /// The `boundary` parameter of a Content-Type header, unquoted.
@@ -261,15 +257,25 @@ fn media_type(header: &[u8]) -> Option<String> {
 }
 
 /// The two parts of a multipart body that starts at the opening delimiter and
-/// ends at the closing one, with nothing after it.
+/// ends at the closing one, with nothing after it. Anything before the opening
+/// delimiter is the RFC 3156 preamble, which is a readable notice rather than
+/// message content and is discarded by the rebuild.
 fn two_parts<'a>(body: &'a [u8], boundary: &str) -> Option<(&'a [u8], &'a [u8])> {
     let delim = format!("--{boundary}");
     let close = format!("--{boundary}--");
     let (delim, close) = (delim.as_bytes(), close.as_bytes());
 
-    let (line, mut pos) = next_line(body, 0)?;
-    if line != delim {
-        return None;
+    let mut pos = 0;
+    loop {
+        let (line, next) = next_line(body, pos)?;
+        if line == close {
+            return None;
+        }
+        if line == delim {
+            pos = next;
+            break;
+        }
+        pos = next;
     }
     let first_start = pos;
     let mut first_end = None;
@@ -329,6 +335,54 @@ fn part_body(part: &[u8]) -> Option<&[u8]> {
     (media_type(&block[start..end])?.as_str() == "application/octet-stream").then_some(body)
 }
 
+/// The bare ASCII-armoured PGP message in a MIME part body, when the body is
+/// nothing else. Leading blank lines are tolerated; armor header comments are
+/// not, because the rebuild writes none and accepting them would drop bytes a
+/// sender put there. The returned slice runs from the BEGIN line through the
+/// END line's line ending, ready to be wrapped again; gpg will not parse an
+/// armour that does not end in a newline.
+fn armored_message(body: &[u8]) -> Option<&[u8]> {
+    const BEGIN: &str = "-----BEGIN PGP MESSAGE-----";
+    const END: &str = "-----END PGP MESSAGE-----";
+
+    let mut pos = 0;
+    let (begin, after_begin) = loop {
+        let (line, next) = next_line(body, pos)?;
+        if line.is_empty() {
+            pos = next;
+        } else if line == BEGIN.as_bytes() {
+            break (pos, next);
+        } else {
+            return None;
+        }
+    };
+    // The line after BEGIN must be blank: a header comment belongs to the
+    // clear text the store must not keep.
+    let (line, next) = next_line(body, after_begin)?;
+    if !line.is_empty() {
+        return None;
+    }
+    pos = next;
+    let mut data = false;
+    loop {
+        let (line, next) = next_line(body, pos)?;
+        if line == END.as_bytes() {
+            if !data || body[next..].iter().any(|b| !b.is_ascii_whitespace()) {
+                return None;
+            }
+            return Some(&body[begin..next]);
+        }
+        let base64 = line
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='));
+        if line.is_empty() || !base64 {
+            return None;
+        }
+        data = true;
+        pos = next;
+    }
+}
+
 /// One line of `block` from `pos`, without its line ending, and the offset of
 /// the line after it. `None` past the end.
 fn next_line(block: &[u8], pos: usize) -> Option<(&[u8], usize)> {
@@ -379,6 +433,30 @@ fn message_key_ids(packets: &[u8]) -> Vec<String> {
 
 fn long_key_id(id: &str) -> Option<String> {
     (id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_string())
+}
+
+/// Whether a `gpg --list-packets` dump is ciphertext: it carries an encrypted
+/// data or session-key packet and no top-level literal data packet. A stream
+/// that pairs a session-key packet with a literal packet is a message dressed
+/// as ciphertext, and storing it in the clear would leak it. Nested packets are
+/// indented, so a line starting at column zero is a top-level one.
+fn is_ciphertext_packets(packets: &[u8]) -> bool {
+    let mut encrypted = false;
+    for line in String::from_utf8_lossy(packets).lines() {
+        if line.starts_with(":literal data packet:") {
+            return false;
+        }
+        if line.starts_with(":encrypted data packet:")
+            || line.starts_with(":symkey enc packet:")
+            // AEAD-encrypted data is a distinct packet tag, listed as `:ocb
+            // encrypted packet:`; a key that advertises AEAD still receives
+            // ciphertext this crate must not encrypt again.
+            || line.starts_with(":ocb encrypted packet:")
+        {
+            encrypted = true;
+        }
+    }
+    encrypted
 }
 
 /// `gpg --list-packets` over `input`. Inspection only, and best effort: a
@@ -625,6 +703,14 @@ mod tests {
         \n\
         body line\n";
 
+    /// A bare armoured message: no armor header comment, a base64 body and a
+    /// checksum line, as gpg emits it.
+    const ARMOR: &[u8] = b"-----BEGIN PGP MESSAGE-----\n\
+        \n\
+        YWJjZA==\n\
+        =abcd\n\
+        -----END PGP MESSAGE-----\n";
+
     fn payload(msg: &[u8]) -> String {
         String::from_utf8_lossy(&protected_payload(msg)).into_owned()
     }
@@ -728,7 +814,7 @@ mod tests {
 
     #[test]
     fn envelope_exposes_transport_metadata_only() {
-        let env = String::from_utf8_lossy(&rfc3156_envelope("b", b"ARMOR", MESSAGE)).into_owned();
+        let env = String::from_utf8_lossy(&rfc3156_envelope("b", ARMOR, MESSAGE)).into_owned();
         assert!(
             env.starts_with("Content-Type: multipart/encrypted;"),
             "{env}"
@@ -774,14 +860,14 @@ mod tests {
     }
 
     fn envelope() -> Vec<u8> {
-        rfc3156_envelope("b", b"ARMOR", MESSAGE)
+        rfc3156_envelope("b", ARMOR, MESSAGE)
     }
 
     #[test]
     fn an_envelope_yields_its_ciphertext_part() {
         // The envelope's own ciphertext part comes back as the armour alone, so
         // the key-id scan sees ciphertext and nothing else.
-        assert_eq!(envelope_ciphertext(&envelope()), Some(&b"ARMOR\n"[..]));
+        assert_eq!(envelope_ciphertext(&envelope()), Some(ARMOR));
     }
 
     #[test]
@@ -823,5 +909,144 @@ mod tests {
         let mut junk = whole.clone();
         junk.extend_from_slice(b"epilogue\n");
         assert_eq!(envelope_ciphertext(&junk), None);
+    }
+
+    #[test]
+    fn an_inbound_envelope_is_recognised_through_transport_headers_and_preamble() {
+        // smtpd puts Return-Path and Received before Content-Type, the client
+        // puts a plaintext Subject among them, and it writes its own preamble.
+        // All of it is ordinary inbound PGP/MIME and must keep one layer.
+        let msg = format!(
+            "Return-Path: <sender@example.invalid>\n\
+             Received: from mx.example.invalid by kyriakon.net\n\
+             Subject: plaintext subject\n\
+             Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";\n\
+             \tboundary=\"in\"\n\
+             MIME-Version: 1.0\n\
+             \n\
+             A sender's own notice.\n\
+             \n\
+             --in\n\
+             Content-Type: application/pgp-encrypted\n\
+             \n\
+             Version: 1\n\
+             \n\
+             --in\n\
+             Content-Type: application/octet-stream\n\
+             \n\
+             {}\n\
+             --in--\n",
+            String::from_utf8_lossy(ARMOR)
+        );
+        assert_eq!(envelope_ciphertext(msg.as_bytes()), Some(ARMOR));
+
+        // Saving it rebuilds the outer message around that ciphertext, so the
+        // transport headers, the sender's subject and its preamble are gone and
+        // the ciphertext is untouched.
+        let saved = rfc3156_envelope("n", ARMOR, msg.as_bytes());
+        let text = String::from_utf8_lossy(&saved);
+        assert!(text.starts_with(ENVELOPE_MARKER), "{text}");
+        assert!(text.contains("Subject: ...\n"), "{text}");
+        for leaked in [
+            "plaintext subject",
+            "Return-Path",
+            "Received:",
+            "sender's own notice",
+        ] {
+            assert!(!text.contains(leaked), "{leaked} leaked:\n{text}");
+        }
+        assert!(
+            text.contains(String::from_utf8_lossy(ARMOR).as_ref()),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn resaving_strips_plaintext_headers_around_the_ciphertext() {
+        // A message of the builder's own shape carrying a plaintext Subject and
+        // custom headers in the outer block and inside both parts. Everything
+        // outside the ciphertext part is stored in the clear, so only the
+        // rebuilt wrapper may survive.
+        let msg = format!(
+            "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";\n\
+             \tboundary=\"b\"\n\
+             Subject: plaintext subject\n\
+             X-Custom: plaintext outer header\n\
+             MIME-Version: 1.0\n\
+             \n\
+             {}\n\
+             \n\
+             --b\n\
+             Content-Type: application/pgp-encrypted\n\
+             X-Version: plaintext version header\n\
+             \n\
+             Version: 1\n\
+             \n\
+             --b\n\
+             Content-Type: application/octet-stream\n\
+             Subject: plaintext part header\n\
+             \n\
+             {}\n\
+             --b--\n",
+            ENVELOPE_PREAMBLE,
+            String::from_utf8_lossy(ARMOR)
+        );
+        let ciphertext = envelope_ciphertext(msg.as_bytes()).expect("recognised");
+        assert_eq!(ciphertext, ARMOR);
+
+        let saved = rfc3156_envelope("n", ciphertext, msg.as_bytes());
+        let text = String::from_utf8_lossy(&saved);
+        assert!(text.contains("Subject: ...\n"), "{text}");
+        for leaked in [
+            "plaintext subject",
+            "X-Custom",
+            "X-Version",
+            "plaintext part header",
+        ] {
+            assert!(!text.contains(leaked), "{leaked} leaked:\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_session_key_packet_with_a_literal_packet_is_not_ciphertext() {
+        // A packet stream that names the recipient's key but then carries a
+        // literal (unencrypted) message is a message dressed as ciphertext.
+        let dressed = b":pubkey enc packet: version 3, algo 1, keyid DC81B0FDFE212297\n\
+            \tdata: [3070 bits]\n\
+            :literal data packet:\n\
+            \tmode b (62), created 0, name=\"\", raw data: 5 bytes\n";
+        assert!(!is_ciphertext_packets(dressed));
+
+        let encrypted = b":pubkey enc packet: version 3, algo 1, keyid DC81B0FDFE212297\n\
+            \tdata: [3070 bits]\n\
+            :encrypted data packet:\n\
+            \tlength: unknown\n\
+            \tmdc_method: 2\n";
+        assert!(is_ciphertext_packets(encrypted));
+        assert!(is_ciphertext_packets(
+            b":symkey enc packet: version 4, cipher 9, aead 1, symkey algo 9\n\
+              :encrypted data packet:\n"
+        ));
+        assert!(!is_ciphertext_packets(b":literal data packet:\n"));
+        assert!(!is_ciphertext_packets(b""));
+    }
+
+    #[test]
+    fn an_armour_with_header_comments_or_trailing_text_is_not_ciphertext_to_keep() {
+        // Armor header comments would be dropped by the rebuild, so they are
+        // not accepted as ciphertext: the message is encrypted instead.
+        let commented = b"-----BEGIN PGP MESSAGE-----\n\
+            Version: test\n\
+            \n\
+            YWJjZA==\n\
+            -----END PGP MESSAGE-----\n";
+        assert_eq!(armored_message(commented), None);
+
+        let trailing = b"-----BEGIN PGP MESSAGE-----\n\
+            \n\
+            YWJjZA==\n\
+            -----END PGP MESSAGE-----\n\
+            not part of the armour\n";
+        assert_eq!(armored_message(trailing), None);
     }
 }
