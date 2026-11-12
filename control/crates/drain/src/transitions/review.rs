@@ -867,10 +867,13 @@ async fn approve_group(
     };
     let recipe = dns::recipe(&domain, &values);
     let subject = decision_subject("approved", &domain);
-    let body = format!(
-        "Your application for {domain} has been approved. The mailboxes in the group are \
-         ready to receive mail as soon as the records below are live.{payment_note}\n{}",
-        recipe.text()
+    let body = group_approval_body(
+        cfg,
+        record,
+        written.payment.no_charge,
+        &domain,
+        &payment_note,
+        &recipe.text(),
     );
     notice::send_account_notice(
         cfg,
@@ -1159,6 +1162,29 @@ fn approval_body(
     out
 }
 
+/// The body's approval mail: the payment note and the DNS recipe, plus the
+/// durable-medium confirmation when no address outside the platform was given.
+/// `group_recipient` falls back to the site owner's mailbox on the body's own
+/// domain, so that mailbox is where the confirmation has to reach.
+fn group_approval_body(
+    cfg: &DrainConfig,
+    record: &Record,
+    no_charge: bool,
+    domain: &str,
+    payment_note: &str,
+    recipe: &str,
+) -> String {
+    let mut out = format!(
+        "Your application for {domain} has been approved. The mailboxes in the group are \
+         ready to receive mail as soon as the records below are live.{payment_note}\n{recipe}"
+    );
+    if record.outside_address.is_none() {
+        out.push('\n');
+        out.push_str(&confirmation_body(cfg, record, no_charge));
+    }
+    out
+}
+
 /// The decision email for an approval. The words are short because #333 owns
 /// the notice copy; what matters here is that the token and the rail's own
 /// instructions are on it, and that the free path says neither.
@@ -1401,5 +1427,30 @@ mod tests {
         let body = confirmation_body(&cfg, &record, false);
         assert!(body.contains("GBP 40.00"), "{body}");
         assert!(body.contains("the whole group"), "{body}");
+    }
+
+    /// `group_recipient` falls back to the site owner's mailbox on the body's
+    /// domain, so a body with no outside address gets the same confirmation
+    /// there, in its approval mail.
+    #[test]
+    fn a_group_approval_mail_carries_the_confirmation_when_there_is_no_outside_address() {
+        let cfg = test_config();
+        let mut record = record(&[]);
+        record.domain = Some("body.example".to_string());
+        let body = group_approval_body(
+            &cfg,
+            &record,
+            false,
+            "body.example",
+            "\n\nThe amount is GBP 40.00 for the year, for the whole group.\n",
+            "recipe text",
+        );
+        assert!(body.contains("fourteen days to cancel"), "{body}");
+        assert!(body.contains(&cfg.postal_address), "{body}");
+        assert!(body.contains("GBP 40.00"), "{body}");
+        assert!(
+            body.contains("I give notice that I cancel my contract"),
+            "{body}"
+        );
     }
 }

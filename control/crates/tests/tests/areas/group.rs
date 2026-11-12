@@ -75,11 +75,11 @@ fn an_approval_sends_the_confirmation_to_the_outside_address() {
     assert!(app["confirmation_at"].is_string(), "{app}");
 }
 
-/// An approval with no address outside the platform sends no confirmation and
-/// still provisions: before the account exists there is no mailbox to reach, so
-/// the status page is the applicant's record instead.
+/// An approval with no address outside the platform sends no separate
+/// confirmation before the account exists, and the approval mail to the new
+/// mailbox carries the durable-medium confirmation instead.
 #[test]
-fn an_approval_without_an_outside_address_sends_no_confirmation() {
+fn an_approval_without_an_outside_address_carries_the_confirmation() {
     let fix = Fix::new("confirmation-none");
     add_user_asks_whether_the_confirmation_left(&fix);
     let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
@@ -96,13 +96,19 @@ fn an_approval_without_an_outside_address_sends_no_confirmation() {
     let log = fix.scripts_log();
     assert!(
         log.contains("confirmation-missing"),
-        "a confirmation left before provisioning: {log}"
+        "no confirmation left before provisioning: {log}"
     );
-    assert!(!fix.sent().contains("digital content"), "{}", fix.sent());
+    let sent = fix.sent();
+    assert!(sent.contains("secretary@kyriakon.net"), "{sent}");
+    assert!(sent.contains("digital content"), "{sent}");
+    assert!(sent.contains("fourteen days"), "{sent}");
     assert!(
-        !fix.sent().contains("was confirmed"),
-        "no confirmation was sent: {}",
-        fix.sent()
+        sent.contains("I give notice that I cancel my contract"),
+        "{sent}"
+    );
+    assert!(
+        !sent.contains("was confirmed"),
+        "the confirmation travels in the approval mail, not a second one: {sent}"
     );
 }
 
