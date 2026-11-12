@@ -205,6 +205,12 @@ pub struct DrainConfig {
     /// of the filter's `-d` arguments signs it; the splice itself is the batched
     /// configuration pass, not this write.
     pub dkim_domains: String,
+    /// spamd's greylist pass-through list, `/etc/mail/spamd.alloweddomains`: one
+    /// `@domain` line per destination domain spamd must not trap. A destination
+    /// missing from it is not delayed, it is treated as a spamtrap hit and the
+    /// sending host is blocklisted, so a body's domain is added when its group
+    /// is provisioned. A configuration value for the reason `passwd` is one.
+    pub spamd_alloweddomains: String,
     /// The root-only HMAC key the review and password links are signed with.
     pub approval_key: String,
     /// The box keyring the encrypting LMTP reads: one `<localpart>.asc` per
@@ -436,6 +442,7 @@ mod tests {
              mail_domains = \"/etc/mail/mail_domains\"\n\
              virtuals = \"/etc/mail/virtuals\"\n\
              dkim_domains = \"/etc/mail/dkim_domains\"\n\
+             spamd_alloweddomains = \"/etc/mail/spamd.alloweddomains\"\n\
              approval_key = \"/etc/kyriakon/onboard/approval-signing-key\"\n\
              keyring_dir = \"/etc/kyriakon/keys\"\n\
              stripe_webhook_secret = \"/etc/kyriakon/onboard/stripe-webhook-secret\"\n\
@@ -467,6 +474,7 @@ mod tests {
         assert_eq!(c.price_gbp, "20.00");
         assert_eq!(c.group_price_gbp, "40.00");
         assert_eq!(c.scripts, "/root/bin");
+        assert_eq!(c.spamd_alloweddomains, "/etc/mail/spamd.alloweddomains");
         let bad: Result<DrainConfig, _> = toml::from_str(&text.replace("sendmail", "sendmaill"));
         assert!(bad.is_err());
     }

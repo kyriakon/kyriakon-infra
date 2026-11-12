@@ -751,15 +751,15 @@ fi
 # --- 7. the two files that name the mail domains --------------------------
 # smtpd accepts mail for every domain in mail_domains, and spamd's greylist
 # pass-through list is what decides which destinations it lets through. The two
-# are written by different steps and only the first is generated: deploy-mail.sh
-# seeds the platform's own domain into it, and the drain appends a body's domain
-# as it provisions one, while spamd.alloweddomains is installed once from the
-# tracked file and nothing rewrites it. A domain in the first and not the second
-# is not mail that is delayed: spamd(8) traps it and puts the sending host on the
-# blocklist, wherever the greylist diverts are in place, so the failure is seen
-# by whoever writes to that parish and not by anything here. The allow list's own
-# header says the same, which is what made the pair worth checking rather than
-# trusting.
+# are written by different steps: deploy-mail.sh seeds the allow list from the
+# tracked file and merges this table into it, the drain appends a body's domain
+# as it provisions one, and remove-group.sh takes the line out again. A restore
+# of one file without the other, or a hand edit, is how they still go out of
+# step. A domain in the first and not the second is not mail that is delayed:
+# spamd(8) traps it and puts the sending host on the blocklist, wherever the
+# greylist diverts are in place, so the failure is seen by whoever writes to that
+# parish and not by anything here. The allow list's own header says the same,
+# which is what made the pair worth checking rather than trusting.
 mail_domains_table=/etc/mail/mail_domains
 platform_domain=kyriakon.net
 spamd_allowed=/etc/mail/spamd.alloweddomains
@@ -779,7 +779,7 @@ else
 		mail_domains_ok=no
 	fi
 	if [ ! -f "$spamd_allowed" ]; then
-		printf 'mail domains: %s is missing; it is installed from openbsd/etc/spamd.alloweddomains\n' \
+		printf 'mail domains: %s is missing; scripts/deploy-mail.sh seeds it from openbsd/etc/spamd.alloweddomains\n' \
 			"$spamd_allowed"
 		status=1
 		mail_domains_ok=no
@@ -789,7 +789,7 @@ else
 			printf 'mail domains: %s names these and %s has no line for them, so spamd traps them and blocklists the sender:\n' \
 				"$mail_domains_table" "$spamd_allowed"
 			printf '%s\n' "$unwelcome" | sed -e 's/^/  /'
-			printf '  the line it wants is @<domain>; add it and reload spamd\n'
+			printf '  the line it wants is @<domain>; add it and restart spamd\n'
 			status=1
 			mail_domains_ok=no
 		fi

@@ -172,7 +172,7 @@ Paths are relative to the service's store root ([#156](https://github.com/kyriak
 | `intents/<id>.json` | modified | a `provision-group` intent carrying the domain, the addresses, the mailboxes and the site owner |
 | `journal.jsonl` | modified | one line per group transition |
 
-Outside the store, the drain writes `/etc/mail/mail_domains`, `/etc/mail/virtuals`, the DKIM filter's domain list, the generated index entries, the certificate config and its `include`, the mailboxes' login class, and each account's `authorized_keys`.
+Outside the store, the drain writes `/etc/mail/mail_domains`, `/etc/mail/virtuals`, the DKIM filter's domain list, the `@<domain>` line in `/etc/mail/spamd.alloweddomains` and restarts spamd for it, the generated index entries, the certificate config and its `include`, the mailboxes' login class, and each account's `authorized_keys`.
 
 ## Testing decisions
 

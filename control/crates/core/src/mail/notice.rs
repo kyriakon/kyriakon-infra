@@ -269,6 +269,11 @@ mod tests {
             mail_domains: dir.join("mail_domains").to_str().unwrap().to_string(),
             virtuals: dir.join("virtuals").to_str().unwrap().to_string(),
             dkim_domains: dir.join("dkim_domains").to_str().unwrap().to_string(),
+            spamd_alloweddomains: dir
+                .join("spamd.alloweddomains")
+                .to_str()
+                .unwrap()
+                .to_string(),
             approval_key: dir.join("key").to_str().unwrap().to_string(),
             keyring_dir: dir.join("keyring").to_str().unwrap().to_string(),
             stripe_webhook_secret: String::new(),

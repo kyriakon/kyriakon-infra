@@ -63,3 +63,4 @@ publish-mail-key.sh	drain	-
 set-mail-password.sh	drain	-
 stripe-api.sh	drain	-
 reload-smtpd.sh	drain	-
+reload-spamd.sh	drain	-

@@ -7,6 +7,13 @@
 # accept mail for, otherwise legitimate mail to kyriakon.net users would be
 # trapped and the sender blacklisted.
 #
+# This tracked copy is the seed for a box that has none; it is not the whole
+# list on a running box. scripts/deploy-mail.sh merges /etc/mail/mail_domains
+# into the installed copy on every deploy, and the drain appends `@<domain>`
+# when it provisions a body's group and restarts spamd, so a body's domain
+# lives only in the installed file. Do not install this file over the live one:
+# that deletes the body's line and makes spamd trap its mail.
+#
 # NOTE: greylisting itself is switched on at the pf layer (divert-to), which is a
 # propose-only change; the fragment, its rationale and the checks are in
 # docs/planning/research/spamd-greylisting.md. This file is the data half, and it
