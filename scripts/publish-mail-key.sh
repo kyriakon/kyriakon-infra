@@ -276,6 +276,13 @@ publish() {
 		refuse "$localpart" "$want" "the key cannot serve this platform's mail:
 $problems"
 
+	# A name or outside address in the User ID is allowed, but the published set
+	# is public forever. Say what it would carry; do not refuse it.
+	uids=$(uid_warnings "$key_file" "$localpart")
+	[ -z "$uids" ] ||
+		printf 'warning: keys/%s.asc will publish these User IDs beyond %s@kyriakon.net:\n%s\n' \
+			"$localpart" "$localpart" "$uids" >&2
+
 	path="$key_dir/$localpart.asc"
 	branch="publish-key/$localpart"
 
@@ -475,8 +482,10 @@ save
 SETPREF
 		gpg --batch --armor --export "$1" >"$2" 2>/dev/null
 	}
-	make_key 'Alice Publish <alice@example.invalid>' "$fix/alice.asc"
-	make_key 'Bob Publish <bob@example.invalid>' "$fix/bob.asc"
+	make_key 'alice@kyriakon.net' "$fix/alice.asc"
+	make_key 'bob@kyriakon.net' "$fix/bob.asc"
+	# A key with a display name and an outside address, for the UID warning.
+	make_key 'Alice Publish <alice@example.invalid>' "$fix/nonplatform.asc"
 	alice=$(fpr_of "$fix/alice.asc")
 	bob=$(fpr_of "$fix/bob.asc")
 	if [ -z "$alice" ] || [ -z "$bob" ] || [ "$alice" = "$bob" ]; then
@@ -506,6 +515,13 @@ SETPREF
 			;;
 		esac
 	}
+
+	# The UID warning: a display name or outside address is listed, the platform
+	# identity alone is silent.
+	assert_eq "a non-platform User ID is warned about" \
+		"$(uid_warnings "$fix/nonplatform.asc" alice)" 'Alice Publish <alice@example.invalid>'
+	assert_eq "a platform User ID needs no warning" \
+		"$(uid_warnings "$fix/alice.asc" alice)" ''
 	assert_log() {
 		case "$(cat "$fix/stub.log")" in
 		*"$2"*)

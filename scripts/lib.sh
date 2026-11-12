@@ -450,6 +450,17 @@ key_problems() {
 		done
 }
 
+# uid_warnings <key-file> <localpart> — the User IDs the published
+# keys/<localpart>.asc would carry beyond <localpart>@kyriakon.net, one line
+# each, and nothing when the key is the platform identity alone. A display name
+# or another address is allowed, because a member may want it, but the published
+# set is public forever, so it is a warning rather than a refusal.
+uid_warnings() {
+	gpg --batch --with-colons --show-keys "$1" 2>/dev/null |
+		awk -F: -v want="$2@kyriakon.net" \
+			'$1 == "uid" && tolower($10) != want { print $10 }'
+}
+
 # --- tables ----------------------------------------------------------------
 #
 # The mail scripts' tables (/etc/mail/virtuals, mail_domains, mail_from,

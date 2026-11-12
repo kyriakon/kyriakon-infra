@@ -127,6 +127,59 @@ fn inspect(value: &str) -> Result<(Vec<String>, bool), Error> {
     }
 }
 
+/// The User ID and user-attribute packets a key would publish, as warnings
+/// rather than refusals. The default identity is `<localpart>@kyriakon.net`
+/// alone; a display name, another address or a photo is allowed, because a
+/// member may want it, but `keys/<localpart>.asc` is public forever and the
+/// reviewer must see what it would carry. `None` when the armour does not parse
+/// (the framing check already speaks for that case).
+pub fn uid_warnings(value: &str, localpart: &str) -> Vec<String> {
+    let Some(packets) = raw_packets(value) else {
+        return Vec::new();
+    };
+    let expected = format!("{}@kyriakon.net", localpart.to_ascii_lowercase());
+    let mut warnings = Vec::new();
+    let mut uids = 0usize;
+    for packet in &packets {
+        match packet.tag {
+            13 => {
+                uids += 1;
+                let uid = String::from_utf8_lossy(&packet.body).trim().to_string();
+                if uid.to_ascii_lowercase() != expected {
+                    warnings.push(format!(
+                        "the key's User ID is {uid:?}, which will be published with \
+                         keys/{localpart}.asc. The default is {expected} alone; a name or \
+                         another address is allowed, but it is public forever"
+                    ));
+                }
+            }
+            17 => {
+                uids += 1;
+                warnings.push(format!(
+                    "the key carries a user-attribute packet (such as a photo), which will \
+                     be published with keys/{localpart}.asc"
+                ));
+            }
+            _ => {}
+        }
+    }
+    if uids == 0 {
+        warnings.push(format!(
+            "the key carries no User ID; keys/{localpart}.asc will publish it without \
+             one, and the default is {expected}"
+        ));
+    }
+    warnings
+}
+
+/// The decoded packets of an armoured block, for the warnings above. `None` on
+/// framing this parser cannot read, which the key check already reports.
+fn raw_packets(value: &str) -> Option<Vec<Packet>> {
+    let body = armour_body(value).ok()?;
+    let raw = base64_decode(&body)?;
+    packets(&raw)
+}
+
 /// The clock the crate asks its caller for, because `SystemTime::now()` panics
 /// on wasm32 and the browser supplies its own.
 fn now_secs() -> u64 {
@@ -336,9 +389,19 @@ enum Kind {
 }
 
 fn record(mailbox: String, material: &str, kind: Kind) -> KeyRecord {
-    let verdict = pgp_public_key(material)
+    let mut verdict = pgp_public_key(material)
         .map(|c| c.verdict)
         .unwrap_or_else(|_| "unchecked".to_string());
+    if matches!(kind, Kind::Mail) && !mailbox.is_empty() {
+        for warning in uid_warnings(material, &mailbox) {
+            if verdict == "works" {
+                verdict = warning;
+            } else {
+                verdict.push_str("; ");
+                verdict.push_str(&warning);
+            }
+        }
+    }
     let fingerprint = match kind {
         Kind::Mail => pgp_fingerprint(material),
         Kind::Upload => openssh_fingerprint(material),
@@ -549,10 +612,11 @@ pub(crate) mod fixtures {
     pub(crate) const AEAD: &str = fixture!("gpg-aead.asc");
     pub(crate) const NO_ENCRYPTION: &str = fixture!("gpg-no-encryption-subkey.asc");
     pub(crate) const EXPIRED_SUBKEY: &str = fixture!("gpg-expired-subkey.asc");
+    pub(crate) const PLATFORM_UID: &str = fixture!("platform-uid.asc");
 }
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{AEAD, CLEAN, EXPIRED_SUBKEY, NO_ENCRYPTION};
+    use super::fixtures::{AEAD, CLEAN, EXPIRED_SUBKEY, NO_ENCRYPTION, PLATFORM_UID};
     use super::*;
 
     // A public key packet (tag 6, algo 18 ECDH) and a public subkey packet
@@ -571,6 +635,21 @@ mod tests {
     fn the_generators_own_key_checks_clean() {
         let c = pgp_public_key(CLEAN).unwrap();
         assert_eq!(c.verdict, "works");
+    }
+
+    #[test]
+    fn a_uid_that_is_not_the_platform_address_is_a_warning_not_a_refusal() {
+        assert!(uid_warnings(PLATFORM_UID, "alice").is_empty());
+        let warnings = uid_warnings(CLEAN, "spike");
+        assert!(
+            warnings.iter().any(|w| w.contains("User ID")),
+            "{warnings:?}"
+        );
+        let recorded = mail_key("spike".into(), CLEAN);
+        assert!(recorded.verdict.contains("User ID"), "{}", recorded.verdict);
+        // The rotation path passes no mailbox and must not append a UID
+        // warning to the verdict the rotation check reads.
+        assert_eq!(mail_key(String::new(), CLEAN).verdict, "works");
     }
 
     #[test]
