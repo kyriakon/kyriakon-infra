@@ -21,11 +21,12 @@
 #   9. root filesystem: / filling, and any filesystem with none left
 #  10. certificate queue: the age of the oldest pending certificate request
 #
-# The per-account cap counts authenticated smtps sessions only. A local enqueue
-# logs "smtp connected address=local" and never authenticates, so cron,
-# sendmail(1) and the future _mlmmj mailing-list lane, which enqueues on
-# /var/run/smtpd.sock, cannot trip a member cap: a parish announcement list
-# fans out on its own lane and is not one member's submission.
+# The per-account cap counts sessions that authenticated on an egress listener,
+# smtps or the auth-optional STARTTLS one. A local enqueue logs "smtp connected
+# address=local" and never authenticates, so cron, sendmail(1) and the future
+# _mlmmj mailing-list lane, which enqueues on /var/run/smtpd.sock, cannot trip a
+# member cap: a parish announcement list fans out on its own lane and is not one
+# member's submission.
 #
 # The numbers all come from the dogfood logs, baselined in
 # docs/planning/research/alert-thresholds.md (PR #179, read 2026-10-01). Each
@@ -239,8 +240,8 @@ mail_auth_events() {
 # A message whose session never authenticated is not counted. That is every
 # local enqueue: the socket and lo0 listeners log "smtp connected address=local"
 # and have no authentication, so cron, sendmail(1) and the future _mlmmj list
-# lane on /var/run/smtpd.sock cannot trip a member cap. Inbound mail on the
-# public listener is unauthenticated for the same reason.
+# lane on /var/run/smtpd.sock cannot trip a member cap. Inbound mail from other
+# MTAs is unauthenticated for the same reason.
 sender_recipients() {
 	awk -v maillog_path="$1" '
 		BEGIN {
@@ -304,7 +305,9 @@ enforce_sender_cap() {
 		if [ "$lapse_rc" -eq 0 ]; then
 			alert mail "sender cap $user" "$user submitted $count outbound recipients since last run (max $sender_max), so its submission was lapsed with scripts/lapse-user.sh. Mail still arrives and the site stays up; change the password, then run scripts/lapse-user.sh --restore $user"
 		else
-			alert mail "sender cap $user" "$user submitted $count outbound recipients since last run (max $sender_max) and the lapse FAILED: $lapse_out. Outbound submission is still open; run scripts/lapse-user.sh $user by hand" "" fail
+			# A distinct event key, so this alert cannot sit inside the successful
+			# lapse's cooldown and leave "still open" as the last mail.
+			alert mail "sender cap fail $user" "$user submitted $count outbound recipients since last run (max $sender_max) and the lapse FAILED: $lapse_out. Outbound submission is still open; run scripts/lapse-user.sh $user by hand" "" fail
 			printf 'abuse-monitor: could not lapse %s after %s recipients: %s\n' "$user" "$count" "$lapse_out" >&2
 			exit 1
 		fi
@@ -617,15 +620,17 @@ STUB
 	export LAPSE_USER_SH="$work/lapse-fail"
 	if ( enforce_sender_cap 50 "carol 51" ) >"$work/cap.out" 2>&1; then cap_rc=0; else cap_rc=$?; fi
 	check "a failed lapse exits nonzero" "$cap_rc" "1"
-	check "a failed lapse still alerts" \
-		"$(grep -c 'kyriakon: mail: sender cap carol' "$work/cap.out")" "1"
+	check "a failed lapse still alerts under its own key" \
+		"$(grep -c 'kyriakon: mail: sender cap fail carol' "$work/cap.out")" "1"
 	check "a failed lapse reports why" \
 		"$(grep -c 'lapse FAILED: usermod: permission denied' "$work/cap.out")" "1"
 	check "a failed lapse leaves the external check failed" \
 		"$(cat "$CURL_LOG")" "$health_url/fail"
 	rm -f "$CURL_LOG"
 	export LAPSE_USER_SH="$work/lapse-ok"
-	enforce_sender_cap 50 "dave 51" >"$work/cap.out" 2>&1
+	enforce_sender_cap 50 "carol 51" >"$work/cap.out" 2>&1
+	check "a successful lapse after a failed one is not in its cooldown" \
+		"$(grep -c 'kyriakon: mail: sender cap carol' "$work/cap.out")" "1"
 	check "a successful lapse leaves the external check up" "$(cat "$CURL_LOG")" "$health_url"
 	unset HEALTHCHECKS_URL
 
