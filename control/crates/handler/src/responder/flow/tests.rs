@@ -230,6 +230,30 @@ async fn the_second_checkbox_is_recorded_beside_the_documents() {
     );
 }
 
+/// A person's key record has no mailbox, so the expected identity comes from
+/// the username answer. Without that, a display name or outside address was
+/// filed with verdict "works" and the review email never showed it.
+#[tokio::test]
+async fn a_persons_key_is_checked_against_the_username() {
+    let (app, _dir) = handler("person-uid").await;
+    let key = std::fs::read_to_string(format!(
+        "{}/../../../docs/planning/prototypes/keygen-spike/fixtures/generated-clean.asc",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let mut form = BTreeMap::new();
+    form.insert("username".to_string(), "alice".to_string());
+    form.insert("whose".to_string(), "person".to_string());
+    form.insert("mail_key".to_string(), key);
+    let record = build_record(&app, &form, false, TOKEN, "web").unwrap();
+    assert_eq!(record.mail_keys.len(), 1);
+    assert!(
+        record.mail_keys[0].verdict.contains("User ID"),
+        "{}",
+        record.mail_keys[0].verdict
+    );
+}
+
 #[test]
 fn a_front_end_is_web_tui_or_capsule_and_nothing_else() {
     let mut form = BTreeMap::new();

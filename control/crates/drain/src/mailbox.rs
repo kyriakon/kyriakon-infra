@@ -149,9 +149,26 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
             return reply_or_drop(cfg, store, &message, &body).await;
         }
     }
+    let body = draft.answers.get("whose").map(String::as_str) == Some("body");
+    let domain = draft
+        .answers
+        .get("body_domain")
+        .cloned()
+        .unwrap_or_default();
     for (mailbox, material) in keys {
+        let address = if body {
+            if domain.is_empty() {
+                mailbox.clone()
+            } else {
+                format!("{mailbox}@{domain}")
+            }
+        } else {
+            format!("{mailbox}@kyriakon.net")
+        };
         draft.mail_keys.retain(|k| k.mailbox != mailbox);
-        draft.mail_keys.push(keycheck::mail_key(mailbox, &material));
+        draft
+            .mail_keys
+            .push(keycheck::mail_key(mailbox.clone(), &address, &material));
     }
     let saved = draft::save(store, &mut draft).await;
     drop(lock);

@@ -1848,7 +1848,8 @@ async fn apply_rotation(
     account: &mut Account,
     rotation: &store::Rotation,
 ) -> Result<(), Error> {
-    let key = kyriakon_control_core::mail::keycheck::mail_key(String::new(), &rotation.material);
+    let key =
+        kyriakon_control_core::mail::keycheck::mail_key(String::new(), "", &rotation.material);
     if key.fingerprint != rotation.fingerprint {
         return Err(Error::Failed(format!(
             "the pending key's fingerprint is {} and the key reads as {}",

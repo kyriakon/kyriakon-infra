@@ -21,7 +21,7 @@ The platform holds no key that opens your mailbox. Zero-access covers message co
 Thunderbird on a desktop is the primary path. It has OpenPGP built in, so you do not need a separate program.
 
 1. Install Thunderbird and open the OpenPGP Key Manager, under Tools.
-2. Choose to generate a new key pair, with the address you applied for as its identity.
+2. Choose to generate a new key pair, with the address you applied for as its identity, and no name. A name or another address in the key is published with `keys/<username>.asc`, so leave the identity as the address alone; if you do add one, the reviewer sees it in the review email before approval.
 3. Choose a passphrase, and write it down with the recovery phrase.
 4. Choose "Key does not expire". A mail key must not expire: delivery stops on its expiry date, without a word, so there is no date to renew.
 5. Export the public key to a file. This is the half you paste into the application.
@@ -35,7 +35,7 @@ Thunderbird for Android is not covered by this page. The prototype has not teste
 
 The generator is at https://signup.kyriakon.net/ and runs in your browser. The page's own code makes the key on your machine, and the private key file is written by the page for you to keep.
 
-It makes the mail key and the upload key together, and it shows the recovery phrase once. Write the phrase down before you close the tab.
+It makes the mail key and the upload key together, and it shows the recovery phrase once. Write the phrase down before you close the tab. The mail key's identity is your kyriakon.net address and nothing else; the generator does not add a name.
 
 Use it if you would rather not install a mail client first, or if the machine you are applying from has no terminal. It is also the path for the upload key, since making an ssh key without a terminal is otherwise awkward.
 

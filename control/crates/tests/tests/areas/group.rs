@@ -1861,8 +1861,11 @@ fn the_console_files_a_validated_mail_key() {
     let intents = fix.intents();
     assert_eq!(intents.len(), 1, "{intents:?}");
     let filed: Value = serde_json::from_str(&fix.read(&format!("intents/{}", intents[0]))).unwrap();
-    let expected =
-        kyriakon_control_core::mail::keycheck::mail_key("parish-office".to_string(), GOOD_KEY);
+    let expected = kyriakon_control_core::mail::keycheck::mail_key(
+        "parish-office".to_string(),
+        "parish-office@kyriakon.net",
+        GOOD_KEY,
+    );
     assert!(!expected.fingerprint.is_empty());
     assert_eq!(
         filed["mail_key"]["fingerprint"],

@@ -69,7 +69,8 @@ pub(crate) async fn address(
             // submission cannot file a mailbox the pages would have refused:
             // the fingerprint and verdict are computed from the material, never
             // left blank or "unchecked" for something that is not a key.
-            let record = keycheck::mail_key(mailbox.to_string(), &material);
+            let address = format!("{mailbox}@kyriakon.net");
+            let record = keycheck::mail_key(mailbox.to_string(), &address, &material);
             if record.fingerprint.is_empty() {
                 let why = keycheck::pgp_public_key(&material)
                     .err()
