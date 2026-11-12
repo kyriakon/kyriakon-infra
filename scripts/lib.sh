@@ -715,6 +715,78 @@ table_drop() {
 	return 0
 }
 
+# --- the MTA configuration -------------------------------------------------
+#
+# smtpd.conf carries two placeholders that deploy-mail.sh fills in from the box's
+# own state: the queue key and the DKIM filter's -d list. The list is a table the
+# drain appends to when a body joins or leaves, so the substitution has to be
+# repeatable outside a deploy, or the filter keeps signing a body's mail with the
+# fallback domain. The template deploy-mail.sh installs beside the live file is
+# what these two read, and every caller that restarts smtpd goes through them.
+
+# dkim_domains_args <file>: print the "-d <domain>" arguments for the filter's
+# proc-exec line, in file order, because the filter signs with the domain that
+# matches the message's From header and falls back to the first one given. Each
+# line is validated here rather than left to smtpd: the list is spliced into a
+# command string, so a stray line would reach the configuration as part of that
+# string, and smtpd's complaint would name the config file rather than the list.
+dkim_domains_args() {
+	dk_args=
+	while IFS= read -r dk_domain; do
+		[ -n "$dk_domain" ] || continue
+		printf '%s\n' "$dk_domain" \
+			| grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$' \
+			|| { printf '%s holds a line that is not a domain: %s\n' "$1" "$dk_domain" >&2; return 1; }
+		dk_args="$dk_args -d $dk_domain"
+	done < "$1"
+	[ -n "$dk_args" ] || { printf '%s holds no domains\n' "$1" >&2; return 1; }
+	printf '%s\n' "${dk_args# }"
+}
+
+# install_smtpd_conf <template> <dkim-domains> <queue-key-file> <destination>
+#
+# The shipped config with the queue key and the filter's domain list substituted,
+# staged beside <destination> and renamed onto it, 0600 because it carries the
+# key. Both placeholders are substituted in the one pass, so the file is never
+# left with the key and not the list, or the reverse. The redirect used to go
+# straight onto the live file, which empties the MTA's only configuration before
+# filling it, and the chmod landed two lines later: for that window the file
+# carrying the substituted queue key existed under the caller's umask.
+install_smtpd_conf() {
+	typeset conf_template="$1" conf_domains="$2" conf_keyfile="$3" conf_dst="$4" \
+		conf_key conf_args conf_candidate
+	conf_args=$(dkim_domains_args "$conf_domains") || return 1
+	conf_key=$(cat "$conf_keyfile" 2>/dev/null) \
+		|| { printf 'could not read the queue key from %s\n' "$conf_keyfile" >&2; return 1; }
+	[ -n "$conf_key" ] || { printf '%s holds no queue key\n' "$conf_keyfile" >&2; return 1; }
+	# smtpd's crypto_setup() rejects anything but exactly 32 characters and
+	# exits, so a restored or hand-edited key of another length is a daemon that
+	# will not start. deploy-mail.sh regenerates one of the right length; this
+	# refuses to install a config that would take the running MTA down.
+	if [ "${#conf_key}" -ne 32 ]; then
+		printf '%s holds a %s-character queue key, not 32; run scripts/deploy-mail.sh to regenerate it\n' \
+			"$conf_keyfile" "${#conf_key}" >&2
+		return 1
+	fi
+	conf_candidate=$(mktemp "$conf_dst.XXXXXX") || {
+		printf 'could not create a candidate beside %s\n' "$conf_dst" >&2
+		return 1
+	}
+	if ! sed -e "s|REPLACE_ME_QUEUE_KEY|$conf_key|" \
+		-e "s|REPLACE_ME_DKIM_DOMAINS|$conf_args|" \
+		"$conf_template" > "$conf_candidate"; then
+		printf 'could not render %s from %s\n' "$conf_dst" "$conf_template" >&2
+		rm -f "$conf_candidate"
+		return 1
+	fi
+	if ! chmod 0600 "$conf_candidate" || ! mv "$conf_candidate" "$conf_dst"; then
+		printf 'could not replace %s\n' "$conf_dst" >&2
+		rm -f "$conf_candidate"
+		return 1
+	fi
+	return 0
+}
+
 # --- self-tests ------------------------------------------------------------
 #
 # A --self-test is the one check a script can run without the box's own state, so

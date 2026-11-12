@@ -110,24 +110,9 @@ dkim_domains_add() {
 	printf 'dkim domain %s added\n' "$2"
 }
 
-# dkim_domains_args <file>: print the "-d <domain>" arguments for the filter's
-# proc-exec line, in file order, because the filter signs with the domain that
-# matches the message's From header and falls back to the first one given. Each
-# line is validated here rather than left to smtpd: the list is spliced into a
-# command string, so a stray line would reach the configuration as part of that
-# string, and smtpd's complaint would name the config file rather than the list.
-dkim_domains_args() {
-	dk_args=
-	while IFS= read -r dk_domain; do
-		[ -n "$dk_domain" ] || continue
-		printf '%s\n' "$dk_domain" \
-			| grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$' \
-			|| { printf '%s holds a line that is not a domain: %s\n' "$1" "$dk_domain" >&2; return 1; }
-		dk_args="$dk_args -d $dk_domain"
-	done < "$1"
-	[ -n "$dk_args" ] || { printf '%s holds no domains\n' "$1" >&2; return 1; }
-	printf '%s\n' "${dk_args# }"
-}
+# dkim_domains_args lives in lib.sh: the deploy is no longer the only caller, so
+# reload-smtpd.sh and provision-member.sh re-expand the filter's -d list from the
+# same table after a body joins or leaves.
 
 # set_virtual <table> <name> <entry>
 #
@@ -211,23 +196,9 @@ mail_from_entries() {
 	' "$1" "$2"
 }
 
-# install_smtpd_conf <destination> <candidate>
-#
-# The shipped config with the queue key and the filter's domain list substituted,
-# written through <candidate> and moved onto <destination>. Both placeholders are
-# substituted in the one pass, so the file is never left with the key and not the
-# list, or the reverse. The redirect used to go straight onto the live file,
-# which empties the MTA's only configuration before filling it, and the chmod
-# landed two lines later: for that window the file carrying the substituted queue
-# key existed under this script's umask.
-install_smtpd_conf() {
-	typeset dst="$1" candidate="$2"
-	sed -e "s|REPLACE_ME_QUEUE_KEY|$queue_key|" \
-		-e "s|REPLACE_ME_DKIM_DOMAINS|$dkim_d_args|" \
-		"$repo_dir/openbsd/etc/smtpd.conf" > "$candidate"
-	chmod 0600 "$candidate"
-	mv "$candidate" "$dst"
-}
+# install_smtpd_conf lives in lib.sh: reload-smtpd.sh and provision-member.sh
+# re-render the same template from the same two box files whenever they restart
+# smtpd, so a body's domain is signed without waiting for the next deploy.
 
 # install_indexes <root> — create the three generated index files and leave them
 # 0644. `root` is /etc on the box and a fixture in the self-test, which is what
@@ -299,7 +270,7 @@ warn_aead() {
 # had, never with half of a new one. The routing rules the installed config must
 # carry are checked here too, because smtpd -n cannot be run off an OpenBSD box.
 self_test() {
-	typeset tree code before after candidate i got
+	typeset tree code before after i got
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work
@@ -442,27 +413,42 @@ self_test() {
 
 	# --- the MTA configuration ---
 	# Against the file that gets installed rather than a fixture: the substitution
-	# below is what puts the queue key and the filter's domain list in place.
+	# below is what puts the queue key and the filter's domain list in place, and
+	# reload-smtpd.sh runs the same function after a body joins or leaves.
 	if [ ! -r "$repo_dir/openbsd/etc/smtpd.conf" ]; then
 		printf 'self-test: no %s/openbsd/etc/smtpd.conf to read: run this from the checkout, or pass its root as the second argument\n' \
 			"$repo_dir" >&2
 		exit 1
 	fi
+	template="$repo_dir/openbsd/etc/smtpd.conf"
 	queue_key=0123456789abcdef0123456789abcdef
-	dkim_d_args="-d kyriakon.net"
+	printf '%s\n' "$queue_key" > "$tree/queue.key"
+	printf 'kyriakon.net\n' > "$tree/dkim_domains"
 	# The umask an operator's shell is likely to have. The file holds the queue
 	# key, so the mode it lands with must not depend on this.
 	umask 022
-	install_smtpd_conf "$tree/smtpd.conf" "$(mktemp "$tree/smtpd.conf.XXXXXX")"
+	install_smtpd_conf "$template" "$tree/dkim_domains" "$tree/queue.key" "$tree/smtpd.conf"
 	check "no placeholder is left in the installed configuration" \
 		"$(grep -c REPLACE_ME "$tree/smtpd.conf")" 0
 	# One substituted line for each placeholder in the shipped file, whatever shape
 	# that file's filter declaration has. The key is checked by the line above.
 	check "every placeholder line is given the domain list" \
 		"$(grep -c -- '-d kyriakon.net' "$tree/smtpd.conf")" \
-		"$(grep -c REPLACE_ME_DKIM_DOMAINS "$repo_dir/openbsd/etc/smtpd.conf")"
+		"$(grep -c REPLACE_ME_DKIM_DOMAINS "$template")"
 	check "the installed configuration is 0600 under a 022 umask" \
 		"$(stat -f %Lp "$tree/smtpd.conf")" 600
+
+	# A body's domain appended to the list is in the next render, in file order
+	# behind the platform's: the filter falls back to the first -d, so the order
+	# is the property, not decoration.
+	printf 'kyriakon.net\nparish.example\n' > "$tree/dkim_domains"
+	install_smtpd_conf "$template" "$tree/dkim_domains" "$tree/queue.key" "$tree/smtpd.conf"
+	check "a body's domain reaches the filter's -d list on a re-render" \
+		"$(grep -c '^filter \"dkimsign\" proc-exec \"filter-dkimsign -d kyriakon.net -d parish.example' "$tree/smtpd.conf")" 1
+	printf 'kyriakon.net\n' > "$tree/dkim_domains"
+	install_smtpd_conf "$template" "$tree/dkim_domains" "$tree/queue.key" "$tree/smtpd.conf"
+	check "and a domain dropped from the list leaves the filter" \
+		"$(grep -c '^filter.*-d parish.example' "$tree/smtpd.conf")" 0
 
 	# The two routing rules the mail cannot do without. The enqueuer's rule is
 	# what carries cron's own failure copy and every operator alert off the box:
@@ -503,25 +489,26 @@ self_test() {
 		"$([ -n "$apply_match" ] && [ -n "$local_match" ] && [ "$apply_match" -lt "$local_match" ] && printf yes || printf no)" yes
 
 	before=$(stat -f %i "$tree/smtpd.conf")
-	install_smtpd_conf "$tree/smtpd.conf" "$(mktemp "$tree/smtpd.conf.XXXXXX")"
+	install_smtpd_conf "$template" "$tree/dkim_domains" "$tree/queue.key" "$tree/smtpd.conf"
 	after=$(stat -f %i "$tree/smtpd.conf")
 	check "an installed configuration is replaced, not rewritten" \
 		"$([ "$before" != "$after" ] && printf yes || printf no)" yes
 
-	# A substitution that cannot be read leaves the installed file as it was. This
-	# is the failure the redirect used to turn into an empty smtpd.conf, which is
-	# every mail path on the box, and the candidate it leaves is not readable.
+	# A template that cannot be read fails after the candidate is staged, which is
+	# the failure the redirect used to turn into an empty smtpd.conf, every mail
+	# path on the box. The live file must be as it was and the staged candidate
+	# gone rather than left beside it.
 	cp "$tree/smtpd.conf" "$tree/expected"
-	candidate=$(mktemp "$tree/smtpd.conf.XXXXXX")
-	repo_dir="$tree/no-such-checkout"
 	set +e
-	( set -e; install_smtpd_conf "$tree/smtpd.conf" "$candidate" ) >/dev/null 2>&1
+	( set -e; install_smtpd_conf "$tree/no-such-template" \
+		"$tree/dkim_domains" "$tree/queue.key" "$tree/smtpd.conf" ) >/dev/null 2>&1
 	code=$?
 	set -e
 	check "a substitution that fails leaves the configuration as it was" \
 		"$(cmp -s "$tree/smtpd.conf" "$tree/expected" && printf same || printf changed)" same
 	check "and says that it failed" "$([ "$code" -ne 0 ] && printf yes || printf no)" yes
-	check "and what it left behind is not readable" "$(stat -f %Lp "$candidate")" 600
+	check "and leaves no candidate beside it" \
+		"$(find "$tree" -maxdepth 1 -name 'smtpd.conf.*' | wc -l | tr -d ' ')" 0
 
 	# --- the generated indexes ---
 	# The three include targets are created here, not by the config they are
@@ -1023,11 +1010,12 @@ fi
 # on a config naming a table the box does not have and it is the running daemon
 # that fails.
 #
-# The drain hooks in here. Its group-provision step (#156, the onboarding
-# service's root cron) appends one line to /etc/mail/mail_domains per body
-# domain and a "full-address account" line to /etc/mail/virtuals per body
-# address, then reloads smtpd. That drain is a later ticket and is not built
-# here.
+# The drain hooks in here. Its group-provision step appends one line to
+# /etc/mail/mail_domains per body domain, a "full-address account" line to
+# /etc/mail/virtuals per body address, and the same address to
+# /etc/mail/mail_from, then runs reload-smtpd.sh, which re-expands the filter's
+# -d list and restarts smtpd. The mail_from generation below is the same table's
+# other writer, under the same lock.
 # The platform's own domain. Every account under /home answers for it, and it is
 # the one line this deploy owns in mail_domains.
 platform_domain=kyriakon.net
@@ -1058,10 +1046,10 @@ chmod 0644 "$virtuals_table"
 # this deploy shares with the drain is how the fallback would move by accident.
 # The list is not a secret, only the domains the box sends as.
 #
-# The drain writes the file too, but a line here is not enough on its own: the -d
-# list is spliced into /etc/mail/smtpd.conf below, so whoever appends a domain
-# re-runs that splice and reloads smtpd, exactly as this deploy does. That drain
-# is a later ticket and is not built here.
+# The drain writes the file too, and a line here is not enough on its own: the -d
+# list is spliced into /etc/mail/smtpd.conf. Whoever appends a domain re-runs
+# that splice, which is why this deploy installs the template beside the live
+# file and scripts/reload-smtpd.sh renders it on every restart.
 dkim_domains_table=/etc/mail/dkim_domains
 if [ -s "$dkim_domains_table" ]; then
 	dkim_first=$(awk 'NF { print; exit }' "$dkim_domains_table")
@@ -1123,12 +1111,11 @@ hello: oliver"
 # to that address.
 # One trap for every candidate in this section: a second `trap ... EXIT` would
 # replace this one rather than add to it, and the earlier writes' candidates
-# would be left behind. smtpd_tmp and mail_from_tmp are set below; `:-` covers
-# this trap running first. The virtual writes create their own candidate inside
-# table_set, under the lock.
-smtpd_tmp=''
+# would be left behind. mail_from_tmp is set below; `:-` covers this trap running
+# first. The virtual writes create their own candidate inside table_set, under
+# the lock.
 mail_from_tmp=''
-trap 'rm -f "${smtpd_tmp:-}" "${mail_from_tmp:-}"' EXIT
+trap 'rm -f "${mail_from_tmp:-}"' EXIT
 while IFS= read -r entry; do
 	set_virtual "$virtuals_table" "${entry%%:*}" "$entry"
 done <<EOF
@@ -1179,27 +1166,32 @@ EOF
 # It holds an address when an account owns it: the account's login identity, and
 # every full-address virtuals line that delivers into an account with a home
 # under /home. A bare alias and an address aimed at a service account are not
-# account identities and stay out. This deploy is the one step that owns the
-# table: a member provisioned after it submits once the next deploy has run, and
-# no script writes a line here by hand, because a rewritten table would drop it
-# again.
+# account identities and stay out. The generation covers everything the box holds
+# at that moment; provision-member.sh and the drain's group transition append a
+# new line as they make it, so a member provisioned after this deploy submits
+# without waiting for the next one. The read-modify-replace runs under the same
+# table lock those writers take: an append landing between the virtuals read and
+# the rename would otherwise be dropped.
 mail_from_table=/etc/mail/mail_from
 mail_from_tmp=$(mktemp "$mail_from_table.XXXXXX")
+table_lock "$mail_from_table" || exit 1
 mail_from_entries /etc/passwd "$virtuals_table" > "$mail_from_tmp"
 chmod 0644 "$mail_from_tmp"
 mv "$mail_from_tmp" "$mail_from_table"
+table_unlock "$mail_from_table"
 printf 'mail_from: %s entries\n' "$(grep -c . "$mail_from_table" || true)"
 
-# The filter's -d list, expanded from the domain list in file order. The first
-# domain is the one the filter falls back to, so the order is not cosmetic.
-# dkim_domains_args fails rather than printing a partial list, and the assignment
-# stops the deploy when it does.
-dkim_d_args=$(dkim_domains_args "$dkim_domains_table")
+# The shipped template with both placeholders still in it, installed beside the
+# live file. reload-smtpd.sh and provision-member.sh re-render from it whenever a
+# body joins or leaves, so the filter's -d list follows /etc/mail/dkim_domains
+# without waiting for a deploy.
+install -m 0644 "$repo_dir/openbsd/etc/smtpd.conf" /etc/mail/smtpd.conf.template
 
 # '|' delimits the s/// because base64 keys contain '/'. The deployed file holds
-# the key, hence 0600.
-smtpd_tmp=$(mktemp /etc/mail/smtpd.conf.XXXXXX)
-install_smtpd_conf /etc/mail/smtpd.conf "$smtpd_tmp"
+# the key, hence 0600. install_smtpd_conf stages beside the live file, so a
+# failure leaves the running configuration whole.
+install_smtpd_conf /etc/mail/smtpd.conf.template "$dkim_domains_table" \
+	"$queue_key_file" /etc/mail/smtpd.conf
 for placeholder in REPLACE_ME_QUEUE_KEY REPLACE_ME_DKIM_DOMAINS; do
 	grep -q "$placeholder" /etc/mail/smtpd.conf \
 		&& { printf '%s was not substituted in /etc/mail/smtpd.conf\n' "$placeholder" >&2; exit 1; }

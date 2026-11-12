@@ -25,6 +25,8 @@
 #                                treating mail to it as a spamtrap hit
 #   /etc/mail/virtuals           every <address>@<domain> entry, mailboxes and
 #                                aliases alike
+#   /etc/mail/mail_from          every sender identity on the domain, so a
+#                                mailbox that has left cannot submit as one
 #   /etc/httpd.d/<domain>.conf   the generated vhosts
 #   /etc/gmid.d/<domain>.conf    the generated capsule block
 #   /etc/acme-client.d/<domain>.conf
@@ -58,7 +60,7 @@
 # Not this script's job: the group record, the accounts, their keys and holds,
 # the token index and the journal. Those are the drain's, in the transition.
 #
-# Env: MAIL_DOMAINS, VIRTUALS, DKIM_DOMAINS, SPAMD_ALLOWEDDOMAINS, HTTPD_D,
+# Env: MAIL_DOMAINS, VIRTUALS, MAIL_FROM, DKIM_DOMAINS, SPAMD_ALLOWEDDOMAINS, HTTPD_D,
 # GMID_D, ACME_D, SSL_DIR, SSL_PRIVATE and ACME_QUEUE_DIR rebind the paths, and
 # SMTPD_CONF is passed through to reload-smtpd.sh. The self-test uses the first
 # set, so it needs no root and touches nothing outside TMPDIR.
@@ -81,6 +83,7 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 
 mail_domains=${MAIL_DOMAINS:-/etc/mail/mail_domains}
 virtuals=${VIRTUALS:-/etc/mail/virtuals}
+mail_from=${MAIL_FROM:-/etc/mail/mail_from}
 dkim_domains=${DKIM_DOMAINS:-/etc/mail/dkim_domains}
 spamd_alloweddomains=${SPAMD_ALLOWEDDOMAINS:-/etc/mail/spamd.alloweddomains}
 httpd_d=${HTTPD_D:-/etc/httpd.d}
@@ -168,6 +171,11 @@ remove_group() {
 		"removed @$domain from $spamd_alloweddomains" || return 1
 	drop_table "$virtuals" suffix "@$domain" \
 		"removed the $domain entries from $virtuals" || return 1
+	# The auth match's allowlist carries the same addresses as sender identities,
+	# so a mailbox that has left the domain cannot name one as its envelope
+	# sender. mail_from lives beside virtuals and is dropped the same literal way.
+	drop_table "$mail_from" suffix "@$domain" \
+		"removed the $domain senders from $mail_from" || return 1
 
 	# 2. The generated daemon blocks and the certificate material. The order
 	# inside this step does not matter: cron-apply.sh --web runs after this
@@ -210,6 +218,7 @@ self_test() {
 
 	mail_domains="$tree/etc/mail/mail_domains"
 	virtuals="$tree/etc/mail/virtuals"
+	mail_from="$tree/etc/mail/mail_from"
 	dkim_domains="$tree/etc/mail/dkim_domains"
 	spamd_alloweddomains="$tree/etc/mail/spamd.alloweddomains"
 	httpd_d="$tree/etc/httpd.d"
@@ -254,6 +263,15 @@ self_test() {
 		printf 'secretary@%s: somebody\n' "$other"
 		printf 'secretary@%s: somebody\n' "$lookalike"
 	} >"$virtuals"
+	# The sender identities the auth match reads. Provisioning appends a line per
+	# address, so the removal has to take the body's and keep the platform's.
+	{
+		printf 'secretary@%s: parish-secretary\n' "$domain"
+		printf 'office@%s: parish-secretary\n' "$domain"
+		printf 'alice@kyriakon.net: alice\n'
+		printf 'secretary@%s: somebody\n' "$other"
+		printf 'secretary@%s: somebody\n' "$lookalike"
+	} >"$mail_from"
 	for d in "$domain" "$other"; do
 		: >"$httpd_d/$d.conf"
 		: >"$gmid_d/$d.conf"
@@ -294,6 +312,10 @@ self_test() {
 		"$(grep -cE '^(alice@kyriakon\.net|secretary@other\.example)' "$virtuals")" 2
 	check "and the lookalike's address" \
 		"$(grep -c "^secretary@$lookalike:" "$virtuals")" 1
+	check "the sender list lost every address on the domain" \
+		"$(grep -cF "@$domain" "$mail_from" || true)" 0
+	check "and kept the platform's, the other body's and the lookalike's" \
+		"$(grep -cE '^(alice@kyriakon\.net|secretary@other\.example|secretary@parish-example\.net)' "$mail_from")" 3
 	check "the vhost went" "$([ -e "$httpd_d/$domain.conf" ] && echo present || echo gone)" gone
 	check "the capsule block went" "$([ -e "$gmid_d/$domain.conf" ] && echo present || echo gone)" gone
 	check "the ACME block went" "$([ -e "$acme_d/$domain.conf" ] && echo present || echo gone)" gone
@@ -319,7 +341,7 @@ self_test() {
 	check "and spamd, whose allow list lost the line" \
 		"$(grep -c '^reload-spamd$' "$calls")" 1
 	check "and the first run said what it did" \
-		"$(grep -c '^removed ' "$tree/first.out")" 14
+		"$(grep -c '^removed ' "$tree/first.out")" 15
 
 	# A second run against the same tree must do nothing and say nothing.
 	: >"$calls"

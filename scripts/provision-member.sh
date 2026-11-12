@@ -105,12 +105,41 @@ usage() {
 # a note rather than a failure: the account is usable for everything but mail
 # until then.
 #
-# mail_from is deliberately not written here. deploy-mail.sh derives it from
-# passwd and this table, so a hand line is regenerated at the next deploy; the
-# deploy is the step that owns it.
+# mail_from is the submitter allowlist the auth match reads: an authenticated
+# account may only name an envelope sender that some account owns. The deploy
+# generates it from /etc/passwd and this table, and it is written here too,
+# because the member is made after the last deploy and is refused at MAIL FROM
+# until the next one. The same table lock the table helpers take keeps a deploy's
+# regeneration and this append from losing each other's lines.
 virtuals=${VIRTUALS:-/etc/mail/virtuals}
 mail_domains_table=${MAIL_DOMAINS:-/etc/mail/mail_domains}
+mail_from_table=${MAIL_FROM:-/etc/mail/mail_from}
 smtpd_conf=${SMTPD_CONF:-/etc/mail/smtpd.conf}
+smtpd_template=${SMTPD_TEMPLATE:-/etc/mail/smtpd.conf.template}
+dkim_domains_table=${DKIM_DOMAINS:-/etc/mail/dkim_domains}
+queue_key_file=${QUEUE_KEY:-/etc/mail/queue.key}
+
+# mail_from_ensure <address> <account>: add the sender identity, saying so when
+# it was not there. A box that has not run the mail deploy has no table yet,
+# which is the same note the virtual table gives rather than a failure.
+mail_from_ensure() {
+	typeset address="$1" account="$2"
+	if [ ! -f "$mail_from_table" ]; then
+		printf 'note: no %s yet, so %s cannot submit until the mail deploy runs\n' \
+			"$mail_from_table" "$address" >&2
+		return 0
+	fi
+	if awk -F: -v k="$address" '$1 == k { found = 1 } END { exit !found }' "$mail_from_table"; then
+		return 0
+	fi
+	table_set "$mail_from_table" "$address" "$address: $account" \
+		|| { printf 'could not add %s to %s\n' "$address" "$mail_from_table" >&2; exit 1; }
+	awk -F: -v k="$address" '$1 == k { found = 1 } END { exit !found }' "$mail_from_table" \
+		|| { printf 'could not add %s to %s\n' "$address" "$mail_from_table" >&2; exit 1; }
+	printf 'mail-from %s added\n' "$address"
+	changed=yes
+	mail_changed=yes
+}
 
 # ensure_mail_address: the address line, and the smtpd restart that makes it
 # live. A function so the self-test drives the same body against a fixture tree.
@@ -143,13 +172,27 @@ ensure_mail_address() {
 		changed=yes
 		mail_changed=yes
 	fi
+	mail_from_ensure "$key" "$user"
 	# smtpd reads the table when it starts, so a line is not live until it is
 	# restarted: /etc/rc.d/smtpd defines no reload verb, and delete-user.sh restarts
 	# it for the same reason. The configuration is checked first, so a table smtpd
 	# would refuse leaves the running daemon alone, and the restart happens only
 	# when a line was actually added, so a run that finds the line already present
 	# restarts nothing.
+	#
+	# The render runs only on the path that checks and restarts, so a config this
+	# script installs is always checked with smtpd -n. The filter's -d list is
+	# spliced at deploy time, so a body's domain appended to the table is only
+	# signed after a re-render. A render that fails is a note, not a refusal: the
+	# member's address is on the platform's own domain, which the deployed list
+	# already carries.
 	if [ "$mail_changed" = yes ]; then
+		if [ -f "$smtpd_template" ] && [ -f "$dkim_domains_table" ] && [ -f "$queue_key_file" ]; then
+			install_smtpd_conf "$smtpd_template" "$dkim_domains_table" \
+				"$queue_key_file" "$smtpd_conf" \
+				|| printf 'note: %s could not be re-expanded from %s; restart smtpd after fixing it\n' \
+					"$smtpd_conf" "$dkim_domains_table" >&2
+		fi
 		if [ -f "$smtpd_conf" ] && smtpd -n -f "$smtpd_conf"; then
 			rcctl restart smtpd >/dev/null
 			printf 'restarted smtpd, which reads the table at start\n'
@@ -160,9 +203,10 @@ ensure_mail_address() {
 	fi
 }
 
-# The mail write against a fixture tree, on a table whose last line has no
+# The mail writes against a fixture tree, on a table whose last line has no
 # newline: that is the state an interrupted append leaves behind and the one the
-# helper has to survive.
+# helper has to survive. The render runs against the tracked template, so the
+# self-test proves the -d list follows the table.
 self_test() {
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin
@@ -171,9 +215,19 @@ self_test() {
 	changed=no
 	virtuals="$tree/virtuals"
 	mail_domains_table="$tree/mail_domains"
+	mail_from_table="$tree/mail_from"
 	smtpd_conf="$tree/smtpd.conf"
-	printf 'kyriakon.net\n' > "$mail_domains_table"
+	smtpd_template="$tree/smtpd.conf.template"
+	dkim_domains_table="$tree/dkim_domains"
+	queue_key_file="$tree/queue.key"
+	printf 'kyriakon.net\nparish.example\n' > "$mail_domains_table"
 	printf 'hello: oliver' > "$virtuals"
+	printf 'oliver@kyriakon.net: oliver' > "$mail_from_table"
+	printf 'kyriakon.net\nparish.example\n' > "$dkim_domains_table"
+	printf '0123456789abcdef0123456789abcdef\n' > "$queue_key_file"
+	# The tracked template, placeholders and all, as deploy-mail.sh installs it.
+	repo_dir=$(cd "$script_dir/.." && pwd)
+	cp "$repo_dir/openbsd/etc/smtpd.conf" "$smtpd_template"
 
 	ensure_mail_address > "$tree/first.out" 2>&1
 	check "the member's address is added" \
@@ -184,6 +238,13 @@ self_test() {
 	check "the table is left 0644" "$(stat -f '%Lp' "$virtuals")" 644
 	check "and the run says what it added" \
 		"$(grep -c '^virtual alice@kyriakon.net added$' "$tree/first.out")" 1
+	check "the address is also a sender the auth match allows" \
+		"$(grep -c '^alice@kyriakon.net: alice$' "$mail_from_table")" 1
+	check "and the earlier sender line survives" \
+		"$(grep -c '^oliver@kyriakon.net: oliver$' "$mail_from_table")" 1
+	check "the body's domain is in the filter's -d list" \
+		"$(grep -c '^filter \"dkimsign\" proc-exec \"filter-dkimsign -d kyriakon.net -d parish.example' "$smtpd_conf")" 1
+	check "with no placeholder left" "$(grep -c REPLACE_ME "$smtpd_conf")" 0
 
 	changed=no
 	ensure_mail_address > "$tree/second.out" 2>&1
