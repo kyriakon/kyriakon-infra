@@ -28,8 +28,9 @@
 #   /home/www/<username>.kyriakon.net/www       <username>:members 0755
 #   /home/www/<username>.kyriakon.net/gemini    <username>:members 0755
 #   /home/<username>/repos                      the member, 0700
-#   /home/<username>/.ssh                       the member, 0700
-#   /home/<username>/.ssh/authorized_keys       the member, 0600
+#   /home/<username>/.ssh                       root:<group>, 0750
+#   /home/<username>/.ssh/authorized_keys       root:<group>, 0640
+#   /usr/local/libexec/member-git-shell.sh      root:wheel 0755
 #   /etc/login.conf.d/member                    root:wheel 0644
 #
 # and then hands the last three lanes to scripts of their own, so that one command
@@ -49,7 +50,14 @@
 # two content directories are the member's; a component the member could write
 # would let them replace the root of their own jail. repos is beside Maildir,
 # outside that chroot, so the upload session never sees it and the repositories
-# are reached only through git-shell on 2222, which is not chrooted.
+# are reached only through the confined git shell on 2222, which is not chrooted.
+#
+# .ssh is root-owned for the same reason the repositories are confined. sshd
+# accepts an authorized_keys file owned by root under StrictModes yes, and a
+# file the member cannot write is a file a process running as the member cannot
+# add a key to. The group is the member's own group, so sshd (running as root)
+# reads it and the member only ever reads it: 0750 on the directory, 0640 on the
+# file. The account still owns ~/repos and the Maildir.
 #
 # Every path is checked after it is made, and a run that finds anything else
 # stops: a half-built tree that reports success is worse than a refusal.
@@ -88,6 +96,27 @@ usage() {
 	printf 'usage: %s <username> [public-key-file]\n' "$0" >&2
 	printf '       ksh %s --self-test\n' "$0" >&2
 	exit 2
+}
+
+# stat's %Lp prints a mode in octal with no leading zero, so a call site reads
+# 0755 while the comparison is against 755. Strip the zero the same way in the
+# checks and the assertions, or every comparison would report a change.
+strip_mode() {
+	printf '%s\n' "${1#0}"
+}
+
+# assert_shape <path> <owner:group> <mode>: fail loudly if the path is not what
+# was just built. This is the last line of defence for the whole script, and it
+# sits above the self-test so the test drives this body rather than a copy.
+assert_shape() {
+	typeset got want
+	got=$(stat -f '%Su:%Sg %Lp' "$1" 2>/dev/null) || got=missing
+	want="$2 $(strip_mode "$3")"
+	if [ "$got" != "$want" ]; then
+		printf '%s is %s, wanted %s\n' "$1" "$got" "$want" >&2
+		printf 'refusing to report a tree that is not built\n' >&2
+		exit 1
+	fi
 }
 
 # --- the member's own address -----------------------------------------------
@@ -188,6 +217,23 @@ self_test() {
 	changed=no
 	ensure_mail_address > "$tree/second.out" 2>&1
 	check "a second run writes nothing" "$(wc -c < "$tree/second.out" | tr -d ' ')" 0
+
+	# The post-condition the run ends with: a path in the shape it wants passes,
+	# and one whose mode has drifted fails. Both run in a subshell because
+	# assert_shape exits on a mismatch rather than returning.
+	mkdir -p "$tree/shape"
+	chmod 0750 "$tree/shape"
+	shape_owner=$(stat -f '%Su:%Sg' "$tree/shape")
+	rc=0
+	( assert_shape "$tree/shape" "$shape_owner" 0750 ) >/dev/null 2>&1 || rc=$?
+	check "a path in the wanted shape passes the post-condition" "$rc" 0
+	chmod 0700 "$tree/shape"
+	rc=0
+	( assert_shape "$tree/shape" "$shape_owner" 0750 ) >/dev/null 2>&1 || rc=$?
+	check "a drifted mode fails the post-condition" "$rc" 1
+	check "strip_mode reads a stat mode the way a call site writes it" \
+		"$(strip_mode 0750)" 750
+	check "and the key file's mode, too" "$(strip_mode 0640)" 640
 
 	self_test_end
 }
@@ -292,12 +338,23 @@ ensure_mail_address
 # One account carries both sessions and the port decides which. Port 22's block
 # forces internal-sftp, which sshd runs in process before it reads any shell, and
 # 2222 has no forced command, so a push arrives there as
-# `git-shell -c '<client command>'`. That shell comes from the account's login
-# class rather than from the password entry: auth.c sets
+# `member-git-shell.sh -c '<client command>'`. That shell comes from the account's
+# login class rather than from the password entry: auth.c sets
 # lc = login_getclass(pw->pw_class), and session.c's do_child() takes
 # login_getcapstr(lc, "shell", pw_shell, pw_shell) before it execs anything. So
 # the entry keeps /sbin/nologin, which is the platform's core safety property,
-# and 2222 runs git-shell all the same.
+# and 2222 runs the confined shell all the same.
+#
+# Why not git-shell(1): git-shell re-execs git-receive-pack or git-upload-pack
+# with whatever path the client sent. Port 2222 is not chrooted, and the upload
+# tree the chrooted sftp session on 22 reaches is the same directory the member
+# owns outside it, so a repository uploaded there with an executable
+# hooks/pre-receive (or a config naming core.fsmonitor) would run as the member
+# on a push. git-shell also runs executables from ~/git-shell-commands. The
+# wrapper in scripts/member-git-shell.sh accepts only the three git commands,
+# only /home/<user>/repos/<name>.git, and passes core.hooksPath=/dev/null and
+# core.fsmonitor=false to git. login.conf.d/member names it, and it is installed
+# here beside the class so a class that names a missing file cannot land.
 #
 # The class is the drop-in at /etc/login.conf.d/member, the directory this box
 # already runs its dovecot and rspamd classes from, and a class there takes
@@ -315,12 +372,33 @@ ensure_mail_address
 # was added, so this runs cap_mkdb whenever the database is the older of the two
 # files and says which of the two states it found rather than assuming either.
 class_src="$script_dir/../openbsd/etc/login.conf.d/member"
+shell_src="$script_dir/member-git-shell.sh"
+shell_dst=/usr/local/libexec/member-git-shell.sh
 login_conf_d=/etc/login.conf.d
 if [ ! -f "$class_src" ]; then
 	printf 'no %s, which is the member class this script installs\n' "$class_src" >&2
 	printf 'this script is run from the repository checkout:\n' >&2
 	printf '  doas ksh scripts/provision-member.sh %s\n' "$user" >&2
 	exit 1
+fi
+if [ ! -f "$shell_src" ]; then
+	printf 'no %s, which is the session shell the member class names\n' "$shell_src" >&2
+	printf 'this script is run from the repository checkout:\n' >&2
+	printf '  doas ksh scripts/provision-member.sh %s\n' "$user" >&2
+	exit 1
+fi
+
+# The session shell before the class that names it. root:wheel 0755, in a
+# directory the member can read and execute and cannot write, and which the
+# member's PATH does not include.
+install -d -m 0755 /usr/local/libexec
+if [ -f "$shell_dst" ] && cmp -s "$shell_src" "$shell_dst" &&
+	[ "$(stat -f '%Su:%Sg %Lp' "$shell_dst")" = "root:wheel $(strip_mode 0755)" ]; then
+	:
+else
+	install_staged "$shell_src" "$shell_dst" -m 0755 -o root -g wheel
+	printf 'session shell installed: %s\n' "$shell_dst"
+	changed=yes
 fi
 install -d -m 0755 "$login_conf_d"
 if [ -f "$login_conf_d/member" ] && cmp -s "$class_src" "$login_conf_d/member"; then
@@ -366,7 +444,7 @@ fi
 
 class_now=$(awk -F: -v u="$user" '$1 == u { print $5 }' /etc/master.passwd)
 if [ "$class_now" != member ]; then
-	printf '%s is in the %s login class, not member, so 2222 would run a shell that is not git-shell\n' \
+	printf '%s is in the %s login class, not member, so 2222 would run a shell that is not the confined git shell\n' \
 		"$user" "${class_now:-default}" >&2
 	exit 1
 fi
@@ -379,11 +457,11 @@ if [ "$shell_now" != /sbin/nologin ]; then
 fi
 
 # The members group is what sshd's Match blocks key on, and both the sftp upload
-# on 22 and git-shell on 2222 sit behind it. An account outside the group has
+# on 22 and the confined git shell on 2222 sit behind it. An account outside the group has
 # neither, so the tree built below would be unreachable, and that is a refusal
 # rather than a note. deploy-mail.sh creates the group, so a box that has not run
 # it has none. The check runs for a mail-only account too: the own-domain tier
-# gives every mailbox the class whose shell is git-shell, and the group is what
+# gives every mailbox the class whose shell is confined git, and the group is what
 # the member sessions match.
 if ! getent group members >/dev/null 2>&1; then
 	printf 'no members group, which is what sshd matches for the member sessions\n' >&2
@@ -403,7 +481,7 @@ fi
 # tree, the upload session and the daemon lanes are not built because there is
 # no key to reach them with. The class is set for a mail-only account too, the
 # same as for one with a key: an own-domain mailbox carries no key of its own,
-# and the spec gives every mailbox the class whose shell is git-shell. An
+# and the spec gives every mailbox the class whose shell is confined git. An
 # account with no `authorized_keys` cannot use that session either way.
 if [ "$have_key" = no ]; then
 	printf 'provisioned %s: mail only, no upload key\n' "$user"
@@ -449,7 +527,7 @@ fi
 
 # Only bare key lines, checked before anything is built. An authorized_keys line
 # may carry options before its key type, and the spec writes none of them: the
-# port decides whether a session is the sftp upload or git-shell, not a forced
+# port decides whether a session is the sftp upload or the git session, not a forced
 # command, so a line that begins with anything but a key type is refused here
 # rather than installed into an account root later authenticates against.
 if ! awk 'NF && $1 !~ /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9-]+@openssh\.com)$/ { exit 1 }' "$key_src"; then
@@ -470,13 +548,6 @@ if [ ! -d "$home" ]; then
 fi
 group=$(id -gn "$user")
 
-# stat's %Lp prints a mode in octal with no leading zero, so a call site reads
-# 0755 while the comparison is against 755. Strip the zero the same way in the
-# check and in the assertion below, or every comparison would report a change.
-strip_mode() {
-	printf '%s\n' "${1#0}"
-}
-
 # ensure_dir <path> <mode> <owner> <group>: the directory, in that shape.
 # Returns 0 when it created or corrected it and 1 when it was already right, so
 # a run can report what it did rather than claiming work it did not do. install
@@ -486,8 +557,10 @@ ensure_dir() {
 	typeset path mode want
 	path="$1"
 	mode="$2"
-	want="$(id -u "$3"):$4 $(strip_mode "$2")"
-	if [ -d "$path" ] && [ "$(stat -f '%u:%g %Lp' "$path")" = "$want" ]; then
+	# The names, not the ids: every call site names an owner and a group, and
+	# %Su/%Sg are what print those. %u/%g would print 0:0 beside "root:wheel".
+	want="$3:$4 $(strip_mode "$2")"
+	if [ -d "$path" ] && [ "$(stat -f '%Su:%Sg %Lp' "$path")" = "$want" ]; then
 		return 1
 	fi
 	install -d -m "$mode" -o "$3" -g "$4" "$path"
@@ -496,16 +569,7 @@ ensure_dir() {
 
 # assert_shape <path> <owner:group> <mode>: fail loudly if the path is not what
 # was just built. This is the last line of defence for the whole script.
-assert_shape() {
-	typeset got want
-	got=$(stat -f '%u:%g %Lp' "$1" 2>/dev/null) || got=missing
-	want="$2 $(strip_mode "$3")"
-	if [ "$got" != "$want" ]; then
-		printf '%s is %s, wanted %s\n' "$1" "$got" "$want" >&2
-		printf 'refusing to report a tree that is not built\n' >&2
-		exit 1
-	fi
-}
+# (Definition above the self-test, which drives it.)
 
 # The chroot root is root:wheel so sshd will chroot into it, and the two
 # directories that carry content belong to the member.
@@ -513,20 +577,23 @@ ensure_dir "$public" 0755 root wheel || changed=yes
 ensure_dir "$public/www" 0755 "$user" members || changed=yes
 ensure_dir "$public/gemini" 0755 "$user" members || changed=yes
 
-# Beside Maildir, which add-user.sh made, and outside the chroot above.
+# Beside Maildir, which add-user.sh made, and outside the chroot above. .ssh is
+# root's: a process running as the member must not be able to add a key to the
+# account. sshd reads a root-owned authorized_keys under StrictModes yes, and
+# 0750/0640 leave it readable to the member's group and writable only by root.
 ensure_dir "$home/repos" 0700 "$user" "$group" || changed=yes
-ensure_dir "$home/.ssh" 0700 "$user" "$group" || changed=yes
+ensure_dir "$home/.ssh" 0750 root "$group" || changed=yes
 
 # The key is installed whole rather than appended: the source file is the record
 # of which keys the account holds, one line each, so a line removed there is gone
 # from the account on the next run. Writing only when the bytes, the owner or the
 # mode differ is what lets a second run leave the file's mtime and inode alone.
 if [ -f "$authorized_keys" ] &&
-	[ "$(stat -f '%u:%g %Lp' "$authorized_keys")" = "$(id -u "$user"):$group $(strip_mode 0600)" ] &&
+	[ "$(stat -f '%Su:%Sg %Lp' "$authorized_keys")" = "root:$group $(strip_mode 0640)" ] &&
 	cmp -s "$key_src" "$authorized_keys"; then
 	:
 else
-	install_staged "$key_src" "$authorized_keys" -m 0600 -o "$user" -g "$group"
+	install_staged "$key_src" "$authorized_keys" -m 0640 -o root -g "$group"
 	changed=yes
 fi
 
@@ -536,8 +603,9 @@ assert_shape "$public" root:wheel 0755
 assert_shape "$public/www" "$user:members" 0755
 assert_shape "$public/gemini" "$user:members" 0755
 assert_shape "$home/repos" "$user:$group" 0700
-assert_shape "$home/.ssh" "$user:$group" 0700
-assert_shape "$authorized_keys" "$user:$group" 0600
+assert_shape "$home/.ssh" "root:$group" 0750
+assert_shape "$authorized_keys" "root:$group" 0640
+assert_shape "$shell_dst" root:wheel 0755
 
 # cmp, not a size: install could copy a truncated file and the mode would still
 # be right. The source is checked above, so this proves the copy is the file that
@@ -547,7 +615,7 @@ if ! cmp -s "$key_src" "$authorized_keys"; then
 	exit 1
 fi
 
-# The home belongs to the member, or git-shell's ~ and everything the member
+# The home belongs to the member, or the git session's ~ and everything the member
 # writes inside it land somewhere they cannot use.
 home_owner=$(stat -f '%Su' "$home")
 if [ "$home_owner" != "$user" ]; then
@@ -608,8 +676,8 @@ fi
 
 printf 'provisioned %s\n' "$user"
 printf '  public:  %s (root:wheel 0755; www and gemini %s:members)\n' "$public" "$user"
-printf '  private: %s/repos 0700, %s/.ssh/authorized_keys 0600\n' "$home" "$home"
-printf '  session: sftp on 22 and git-shell on 2222 from the member login class, one key\n'
+printf '  private: %s/repos 0700, %s/.ssh/authorized_keys root:%s 0640\n' "$home" "$home" "$group"
+printf '  session: sftp on 22 and confined git on 2222 from the member login class, one key\n'
 printf '  files:   /etc/httpd.d/%s.kyriakon.net.conf, /etc/gmid.d/%s.kyriakon.net.conf\n' "$user" "$user"
 printf '           /etc/acme-client.d/%s.kyriakon.net.conf, request queued\n' "$user"
 printf '  key from: %s\n' "$key_src"

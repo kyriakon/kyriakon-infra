@@ -64,12 +64,20 @@ on a provisioned member rewrites the same files and changes nothing else.
 ### The two sessions and the one key
 
 - One key serves both paths. The member's public key is written to
-  `/home/<name>/.ssh/authorized_keys`, owned by the member, mode 0600, directory 0700. No
-  `authorized_keys` line is written for a comment-key or a forced command: the port, not
-  the key, decides which service the session reaches.
+  `/home/<name>/.ssh/authorized_keys`, owned by `root` and the member's group, mode 0640,
+  in a directory owned by `root` and that group, mode 0750. sshd reads a root-owned
+  `authorized_keys` under `StrictModes yes`, and a member who reaches code execution
+  cannot add a key to the account. No `authorized_keys` line is written for a comment-key
+  or a forced command: the port, not the key, decides which service the session reaches.
 - The session shell comes from the login class. `/etc/login.conf.d/member` carries
-  `member:shell=/usr/local/bin/git-shell:tc=default:`, and `usermod -L member <name>`
-  assigns it, so `git-shell` runs on 2222 while `passwd` keeps `/sbin/nologin`. The
+  `member:shell=/usr/local/libexec/member-git-shell.sh:tc=default:`, and `usermod -L
+  member <name>` assigns it, so the confined shell runs on 2222 while `passwd` keeps
+  `/sbin/nologin`. The wrapper accepts only `git-receive-pack`, `git-upload-pack` and
+  `git-upload-archive`, only a repository at `/home/<name>/repos/<repo>.git`, and passes
+  `core.hooksPath=/dev/null` and `core.fsmonitor=false` to git, so an uploaded repository
+  cannot run a hook on a push. `git-shell` itself is not named: it would accept any path
+  outside the port-22 chroot and its `~/git-shell-commands` feature would run executables
+  the member wrote. The
   drop-in directory is the convention already in use on the box (`dovecot`, `rspamd`), and
   `cap_mkdb /etc/login.conf` is required after an edit to either file while
   `/etc/login.conf.db` exists, which it does on this box since the onboard

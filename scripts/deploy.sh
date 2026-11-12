@@ -73,6 +73,9 @@ install_dests() {
 	for dest in $dests; do
 		case "$dest" in
 		/root/bin) needs_mail=yes ;;
+		# The member session shell: deploy-mail.sh installs it, the class that
+		# names it is a manual step printed with the plan.
+		/usr/local/libexec) needs_mail=yes ;;
 		drain) needs_control=yes ;;
 		# Run from the checkout, so a change to it is installed by nothing: the
 		# pull that changes it is the whole deploy.
@@ -585,16 +588,24 @@ self_test() {
 	# name its row could not carry.
 	drain_rows=$(awk -F'\t' '!/^#/ && $2 == "drain" { print $1 }' "$install_set")
 	root_bin_rows=$(awk -F'\t' '!/^#/ && $2 == "/root/bin" { print $1 }' "$install_set")
+	libexec_rows=$(awk -F'\t' '!/^#/ && $2 == "/usr/local/libexec" { print $1 }' "$install_set")
 	check 'the table names drain scripts' \
 		"$([ -n "$drain_rows" ] && printf yes || printf no)" yes
 	check 'the table names /root/bin scripts' \
 		"$([ -n "$root_bin_rows" ] && printf yes || printf no)" yes
+	check 'the table names /usr/local/libexec scripts' \
+		"$([ -n "$libexec_rows" ] && printf yes || printf no)" yes
 	for installed in $drain_rows; do
 		reset_plan
 		classify "scripts/$installed"
 		check "scripts/$installed plans deploy-control" "$needs_control" yes
 	done
 	for installed in $root_bin_rows; do
+		reset_plan
+		classify "scripts/$installed"
+		check "scripts/$installed plans deploy-mail" "$needs_mail" yes
+	done
+	for installed in $libexec_rows; do
 		reset_plan
 		classify "scripts/$installed"
 		check "scripts/$installed plans deploy-mail" "$needs_mail" yes

@@ -276,9 +276,11 @@ die() { printf '%s: %s\n' "$0" "$*" >&2; exit 1; }
 # it to rewrite /etc/relayd.conf's member keypair region, from the directory
 # cron-apply.sh sits in, and lib.sh because every one of them sources it.
 # provision-member.sh and lapse-user.sh also read the tracked login classes next
-# to themselves (their own ../openbsd/etc/login.conf.d/member and lapsed), so this
-# deploy installs both files into the layout the relative read resolves to rather
-# than copying the scripts somewhere the read would leave behind.
+# to themselves (their own ../openbsd/etc/login.conf.d/member and lapsed), and
+# provision-member.sh reads member-git-shell.sh beside itself, so this deploy
+# installs all three files into the layout the relative reads resolve to rather
+# than copying the scripts somewhere the reads would leave behind. The login
+# class's own copy of the shell at /usr/local/libexec is deploy-mail.sh's.
 drain_scripts=$(install_rows "$install_set" drain) \
 	|| die "cannot read $install_set"
 [ -n "$drain_scripts" ] || die "$install_set names no drain scripts"
