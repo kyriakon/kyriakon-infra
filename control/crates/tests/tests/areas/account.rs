@@ -853,6 +853,10 @@ fn the_test_message_names_the_key_and_is_one_a_day() {
         "the message's own subject header: {sent}"
     );
     assert!(
+        head.contains("(2026-10-02)"),
+        "the subject's day is the intent's filing day, not this pass's clock: {sent}"
+    );
+    assert!(
         sent.contains("SHA256:not-a-real-key-fingerprint"),
         "the body names the key delivery used: {sent}"
     );

@@ -694,10 +694,13 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
 /// because only root's half can enqueue mail; the handler files the same
 /// session-proved intent every other `/account` form does.
 ///
-/// One a day: the drain records the message in the account's notice log before
-/// it enqueues it, so a day that already carries a test-mail notice is refused
-/// here rather than filed for a second send. The drain's own notice dedup is the
-/// backstop for an intent already queued.
+/// One a day, as far as the handler can see: `notice::already_sent` reads the
+/// account's own notice log, which the drain writes before it enqueues. Two
+/// requests that race the check can both file an intent, and the per-address
+/// counter is what bounds them; the drain dedups on the same type and subject,
+/// so the member still receives one message for the day. A lock that made the
+/// check and the file one step would have to live in `accounts/<username>/`,
+/// which belongs to root and the handler cannot write.
 pub(super) async fn account_test_mail(app: &App, request: &Request) -> Reply {
     let (cookie, account) = match session_account(app, request).await {
         Ok(Some(found)) => found,

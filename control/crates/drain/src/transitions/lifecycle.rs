@@ -1795,10 +1795,15 @@ pub async fn test_mail(
             "the account has no mail key recorded, so delivery has nothing to encrypt to",
         ));
     };
-    // The notice record's dedup is type and subject, so the day in the subject
-    // is what makes tomorrow's test a new message rather than a suppressed
-    // retry of today's.
-    let stamp = util::filed_at();
+    // The day is the one the handler checked when it filed: the intent's own
+    // `filed_at`, not this pass's clock, so a click just before midnight and a
+    // drain pass just after it agree on which day's message this is. A file
+    // without a stamp falls back to now.
+    let stamp = if intent.filed_at.is_empty() {
+        util::filed_at()
+    } else {
+        intent.filed_at.clone()
+    };
     let subject = notice::test_mail_subject(stamp.get(..10).unwrap_or(&stamp));
     let to = account.platform_address();
     let body = format!(

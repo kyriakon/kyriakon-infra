@@ -538,6 +538,24 @@ async fn the_test_mail_button_files_an_intent_for_the_session_account() {
     assert_eq!(filed(&dir), 1, "an intent was filed without a session");
 }
 
+/// Without a recorded mail key there is nothing to encrypt to, so the route
+/// refuses rather than filing a message delivery could not address.
+#[tokio::test]
+async fn the_test_mail_button_needs_a_recorded_mail_key() {
+    let (app, dir) = handler("account-test-mail-no-key").await;
+    file_account(&dir);
+    let cookie = signed_in(&app, "alice").await;
+
+    let (code, page) = ask(
+        &app,
+        &httpd_post_with("/account/test-mail", "", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 403, "{page}");
+    assert!(page.contains("has not recorded a mail key"), "{page}");
+    assert_eq!(filed(&dir), 0, "an intent was filed without a key");
+}
+
 /// The notice record is the day's dedup. Another day's notice, and today's date
 /// under another subject, both leave the route free; today's own notice refuses
 /// it rather than filing a second send.
