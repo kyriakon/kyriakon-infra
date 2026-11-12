@@ -351,6 +351,7 @@ pub async fn verify(
                 &intent.received,
                 intent.txid.as_deref(),
                 intent.amount_xmr.as_deref(),
+                intent.rate.as_deref(),
                 intent.confirm_double,
                 intent.override_reason.as_deref(),
                 intent.note.as_deref(),

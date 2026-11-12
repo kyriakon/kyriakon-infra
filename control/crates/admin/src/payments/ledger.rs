@@ -5,10 +5,13 @@ use crate::*;
 
 /// `ledger export --tax-year <year> --format csv`: the year's lines for the
 /// accountant. It reads `ledger/payments.jsonl` in place and prints; nothing is
-/// written, because the ledger is the record and the file is never purged. The
-/// held money in `ledger/unattributed.jsonl` is not income until it is
-/// attributed, so it follows the keyed rows in a section of its own rather than
-/// as a row without a token.
+/// written, because the ledger is the record and the file is never purged.
+///
+/// A refund is a deduction on a cash basis, so its `settled_on` decides the
+/// year it lands in, not the day the refund was filed. A refund that has not
+/// been paid out has no such date and is listed after the keyed rows, like the
+/// held money in `ledger/unattributed.jsonl`, rather than mixed into the year's
+/// takings as a negative row.
 pub(crate) async fn ledger(store: &Store, args: &[String]) -> Result<(), Error> {
     let rest = match args {
         [verb, rest @ ..] if verb == "export" => rest,
@@ -31,18 +34,44 @@ pub(crate) async fn ledger(store: &Store, args: &[String]) -> Result<(), Error> 
     );
 
     let mut rows = Vec::new();
+    let mut unsettled = Vec::new();
     for line in Ledger::open(store).lines().await? {
-        if in_tax_year(line.received_on.as_deref(), start, end) {
-            rows.push(line);
+        match export_section(&line, start, end) {
+            Section::Takings => rows.push(line),
+            Section::UnsettledRefund => unsettled.push(line),
+            Section::Elsewhere => {}
         }
     }
     rows.sort_by_key(|line| line.seq);
+    unsettled.sort_by_key(|line| line.seq);
     for line in rows {
         let cells: Vec<String> = columns
             .iter()
             .map(|(_, value)| csv_cell(&value(&line)))
             .collect();
         println!("{}", cells.join(","));
+    }
+
+    println!();
+    println!("# unsettled refunds");
+    println!("seq,token,rail,received_on,amount_gbp,refund_of");
+    for line in unsettled {
+        let cells = [
+            line.seq.to_string(),
+            line.token.clone(),
+            line.rail.clone(),
+            line.received_on.clone().unwrap_or_default(),
+            line.amount_gbp.clone().unwrap_or_default(),
+            line.refund_of().map(|n| n.to_string()).unwrap_or_default(),
+        ];
+        println!(
+            "{}",
+            cells
+                .iter()
+                .map(|cell| csv_cell(cell))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
     }
 
     println!();
@@ -65,6 +94,40 @@ pub(crate) async fn ledger(store: &Store, args: &[String]) -> Result<(), Error> 
         println!("{}", cells.join(","));
     }
     Ok(())
+}
+
+/// Which part of the export a ledger line belongs in: the year's takings and
+/// settled refunds, the unsettled refunds listed apart, or neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Section {
+    Takings,
+    UnsettledRefund,
+    Elsewhere,
+}
+
+/// The section a line belongs in for this tax year. A refund is filtered by the
+/// day it was paid out; an unsettled one is listed apart by the year it was
+/// filed in, so it is visible without being taken as negative revenue.
+pub(crate) fn export_section(line: &LedgerLine, start: time::Date, end: time::Date) -> Section {
+    if line.kind == "refund" {
+        match line.settled_on() {
+            Some(settled_on) => {
+                if in_tax_year(Some(settled_on), start, end) {
+                    Section::Takings
+                } else {
+                    Section::Elsewhere
+                }
+            }
+            None if in_tax_year(line.received_on.as_deref(), start, end) => {
+                Section::UnsettledRefund
+            }
+            None => Section::Elsewhere,
+        }
+    } else if in_tax_year(line.received_on.as_deref(), start, end) {
+        Section::Takings
+    } else {
+        Section::Elsewhere
+    }
 }
 
 /// Whether a ledger row's `received_on` falls in the half-open-by-year tax
@@ -123,7 +186,7 @@ pub(crate) fn cell(value: &Value) -> String {
 
 /// The payments section's columns, in the order the accountant's sheet takes.
 /// The header and the cells both come from this list, so they cannot drift.
-pub(crate) fn payment_columns() -> [PaymentColumn; 15] {
+pub(crate) fn payment_columns() -> [PaymentColumn; 20] {
     [
         ("seq", |line| line.seq.to_string()),
         ("token", |line| line.token.clone()),
@@ -151,6 +214,12 @@ pub(crate) fn payment_columns() -> [PaymentColumn; 15] {
         ("settled_on", |line| {
             line.settled_on().unwrap_or_default().to_string()
         }),
+        ("refund_basis", |line| {
+            line.refund_basis().unwrap_or_default().to_string()
+        }),
+        ("rate_refund", |line| {
+            line.rate_refund().unwrap_or_default().to_string()
+        }),
         ("rate_quoted", |line| {
             line.rate_quoted.clone().unwrap_or_default()
         }),
@@ -158,6 +227,15 @@ pub(crate) fn payment_columns() -> [PaymentColumn; 15] {
             line.rate_source.clone().unwrap_or_default()
         }),
         ("rate_at", |line| line.rate_at.clone().unwrap_or_default()),
+        ("rate_received", |line| {
+            line.rate_received.clone().unwrap_or_default()
+        }),
+        ("rate_received_source", |line| {
+            line.rate_received_source.clone().unwrap_or_default()
+        }),
+        ("rate_received_at", |line| {
+            line.rate_received_at.clone().unwrap_or_default()
+        }),
     ]
 }
 

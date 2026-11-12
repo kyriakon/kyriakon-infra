@@ -116,7 +116,7 @@ The ledger line is append-only and looks like this:
 
 Two payments sharing a token, where the first is already credited, are treated as a renewal. The second credit needs `--confirm-double`, because for cash the second envelope may be a stranger's with a copied token, and because the same member paying twice by accident is the likelier case only if they say so. If the second credit is applied it extends the date and lands under the 24-month ceiling; if the operator cannot tell whose money it is, it goes to the unattributed queue and the account keeps the first credit.
 
-A payment that carries no token, or a Monero payment to the wallet's main address rather than a member's subaddress, cannot be joined to anything. It goes to `ledger/unattributed.jsonl` and is held: recorded with the rail, the amount, the date and a free-text note, and marked `held`. A payment to a deleted member's subaddress is held in the unattributed queue like any other and refunded in XMR to an address they give. It is not income until it is attributed or the tax year ends, and it is never silently absorbed into a member's credit. The operator tries the postmark, the date, the amount and any note, and either attributes it with `kyriakon-admin reconcile attribute` or returns it with `kyriakon-admin reconcile return`, which records the postal evidence and nothing about the person. Anything still held at the end of the tax year is recorded in the main ledger as a payment with no token, which is the one line in that file without a token and the only one without an invoice behind it.
+A payment that carries no token, or a Monero payment to the wallet's main address rather than a member's subaddress, cannot be joined to anything. It goes to `ledger/unattributed.jsonl` and is held: recorded with the rail, the amount, the date and a free-text note, and marked `held`. A payment to a deleted member's subaddress is held in the unattributed queue like any other and refunded in XMR to an address they give. It is not income until it is attributed or the tax year ends, and it is never silently absorbed into a member's credit. The operator tries the postmark, the date, the amount and any note, and either attributes it with `kyriakon-admin reconcile attribute` or returns it with `kyriakon-admin reconcile return`, which records the postal evidence and nothing about the person. Anything still held at the end of the tax year is closed as income with `kyriakon-admin reconcile return <UN-id> --note "taken as income at the end of <YYYY-YY>"`. The item leaves the held queue and the export's `# unattributed` table, and the note records the year it was recognised in. It is not added to `ledger/payments.jsonl`, which stays a record of money joined to a token.
 
 ## Refunds
 
@@ -148,7 +148,7 @@ This is the pass's first command. It lists every open window with the token, the
 kyriakon-admin credit --token KYR-4F2M-9QH7-XT3B --rail cash --amount 20.00 --received 2026-10-04
 kyriakon-admin credit --username frseraphim --rail cash-hand --amount 20.00 --received 2026-10-04
 kyriakon-admin credit --token KYR-4F2M-9QH7-XT3B --rail monero --amount 20.00 --received 2026-10-04 \
-  --txid <64 hex> --xmr 0.048847
+  --txid <64 hex> --xmr 0.048847 --rate 409.44
 ```
 
 The credit is the one action per payment. It writes an intent, and the drain applies it on its next run, so the operator can record four envelopes in a row without waiting for each one.
@@ -169,7 +169,7 @@ kyriakon-admin payment show --username frseraphim
 kyriakon-admin ledger export --tax-year 2026-27 --format csv
 ```
 
-The window extension is the one case the operator answers on the member's word. The refund is the command; posting the money, or issuing the Stripe refund, or sending the Monero, is the human step that follows it, and the operator records the settlement with `kyriakon-admin refund --settled <date>` on the same line. `token resend` repeats the payment instructions without issuing anything new. The ledger export is the year's file for the accountant, and it contains tokens, amounts and dates, and no usernames.
+The window extension is the one case the operator answers on the member's word. The refund is the command; posting the money, or issuing the Stripe refund, or sending the Monero, is the human step that follows it, and the operator records the settlement with `kyriakon-admin refund --settled <date>` on the same line. `token resend` repeats the payment instructions without issuing anything new. The ledger export is the year's file for the accountant, and it contains tokens, amounts, dates, rates and refund bases, and no usernames. A refund is filtered by `settled_on`, the cash-basis payout date, not by the day the refund was filed; a refund with no settlement date is listed apart rather than counted as negative revenue.
 
 The commands that already exist for the lifecycle are unchanged: `kyriakon-admin approve`, `kyriakon-admin decline`, `kyriakon-admin suspend`, `kyriakon-admin delete`. `delete` is the one that matters here, because removing the account's token index entry is what makes the ledger unlinkable, and it happens in the same transition that removes the mailbox.
 
@@ -231,7 +231,7 @@ Notices are recorded before they are enqueued, and a crash between the record an
 | Open the post | operator | no command; the date the envelope was opened is the credit's `--received` |
 | Record a posted cash payment | operator | `kyriakon-admin credit --token <t> --rail cash --amount <gbp> --received <date>` |
 | Record cash handed over | operator | `kyriakon-admin credit --username <u> --rail cash-hand --amount <gbp> --received <date>` |
-| Check the wallet and record Monero | operator | `kyriakon-admin credit --token <t> --rail monero --amount <gbp> --received <date> --txid <id> --xmr <amount>` |
+| Check the wallet and record Monero | operator | `kyriakon-admin credit --token <t> --rail monero --amount <gbp> --received <date> --txid <id> --xmr <amount> [--rate <gbp-per-xmr>]` |
 | Deal with money that arrived with no token | operator | `kyriakon-admin reconcile list`, then `kyriakon-admin reconcile attribute` or `kyriakon-admin reconcile return` |
 | Give a member one more fortnight | operator | `kyriakon-admin window extend --token <t> --days 14 --reason <text>` |
 | Refund | operator | `kyriakon-admin refund ...`, then the Stripe refund, the Monero send, or the postal step, then `--settled <date>`; a posted-cash refund keeps the posting receipt |

@@ -1660,6 +1660,11 @@ pub struct CreditProgress {
     pub paid_until_after: Option<String>,
     pub applied_gbp: String,
     pub balance_gbp: Option<String>,
+    /// Whether this credit carried the window's quote. Read back by the recovery
+    /// pass after the account write has set `paid_until`, when the payment
+    /// block can no longer tell a first credit from a renewal.
+    #[serde(default)]
+    pub quoted: bool,
 }
 
 /// One line of `journal.jsonl`. Appended before a transition is carried out, so

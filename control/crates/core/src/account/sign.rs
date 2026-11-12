@@ -243,12 +243,16 @@ pub fn credit_payload(
     received: &str,
     txid: Option<&str>,
     amount_xmr: Option<&str>,
+    rate: Option<&str>,
     confirm_double: bool,
     override_reason: Option<&str>,
     note: Option<&str>,
 ) -> String {
+    // The rate segment is omitted when absent, so an intent filed before the
+    // receipt-date rate existed still verifies with the payload it signed.
+    let rate = rate.map(|rate| format!(":{rate}")).unwrap_or_default();
     format!(
-        "credit:{token}:{rail}:{amount_gbp}:{received}:{}:{}:{confirm_double}:{}:{}",
+        "credit:{token}:{rail}:{amount_gbp}:{received}:{}:{}{rate}:{confirm_double}:{}:{}",
         txid.unwrap_or(""),
         amount_xmr.unwrap_or(""),
         free_text(override_reason.unwrap_or("")),
@@ -409,6 +413,7 @@ mod tests {
             "2026-10-04",
             None,
             None,
+            None,
             false,
             Some("a:b"),
             Some("c"),
@@ -420,11 +425,35 @@ mod tests {
             "2026-10-04",
             None,
             None,
+            None,
             false,
             Some("a"),
             Some("b:c"),
         );
         assert_ne!(a, b, "two field splits signed the same payload");
+    }
+
+    /// The receipt-date rate is one of the fields the credit signs, so editing
+    /// it in `intents/` invalidates the signature.
+    #[test]
+    fn a_credit_rate_is_part_of_the_signed_payload() {
+        let payload = |rate: Option<&str>| {
+            credit_payload(
+                "KYR-4F2M-9QH7-XT3B",
+                "monero",
+                "20.00",
+                "2026-10-04",
+                None,
+                Some("0.048848"),
+                rate,
+                false,
+                None,
+                None,
+            )
+        };
+        assert_ne!(payload(Some("409.44")), payload(Some("410.00")));
+        assert!(payload(Some("409.44")).contains(":409.44:"));
+        assert!(!payload(None).contains("409.44"));
     }
 
     #[test]

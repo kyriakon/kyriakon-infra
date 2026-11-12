@@ -179,7 +179,8 @@ fn usage() -> String {
        kyriakon-admin token resend <username>
        kyriakon-admin credit (--token <t> | --username <u> | --note <text>) \
      --rail <cash|cash-hand|monero> --amount <gbp> --received <YYYY-MM-DD> \
-     [--txid <id>] [--xmr <amount>] [--override <reason>] [--confirm-double]
+     [--txid <id>] [--xmr <amount>] [--rate <gbp-per-xmr>] \
+     [--override <reason>] [--confirm-double]
        kyriakon-admin prepaid list --window open [--expiring <days>]
        kyriakon-admin window extend --token <t> --days 14 --reason <text>
        kyriakon-admin reconcile list

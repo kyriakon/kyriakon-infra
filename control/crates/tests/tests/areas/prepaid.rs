@@ -972,6 +972,69 @@ fn a_credit_recovers_a_ledger_line_lost_after_the_account_write() {
     );
 }
 
+/// The same crash on a first Monero credit keeps both rates: the window quote
+/// the member was shown and the receipt-date rate. Recovery reads whether the
+/// quote existed from the journal, because the written account's paid-until
+/// date can no longer tell a first credit from a renewal.
+#[test]
+fn a_monero_credit_recovers_with_its_quote_and_receipt_rate() {
+    let fix = Fix::new("credit-recovery-monero");
+    fix.rate_source(Some("300.5"));
+    let token = approved_paid(&fix, "secretary", "monero");
+    assert_eq!(
+        fix.account("secretary")["payment"]["monero"]["rate_gbp_per_xmr"],
+        json!("300.5")
+    );
+    // The receipt day is today, and the cache is fetched today, so the row can
+    // record the receipt-date rate while the window quote stays at 300.00.
+    let fetched = kyriakon_control_core::util::filed_at();
+    let received = fetched[..10].to_string();
+    fix.write_rate_cache("409.44", &fetched);
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "monero",
+        "--amount",
+        "20.00",
+        "--received",
+        &received,
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let names = fix.intents();
+    assert_eq!(names.len(), 1, "{names:?}");
+    let replay = std::fs::read_to_string(fix.dir.join("store/intents").join(&names[0])).unwrap();
+    assert!(fix.drain().status.success());
+    let id = names[0].trim_end_matches(".json").to_string();
+
+    let ledger = fix.read("ledger/payments.jsonl");
+    let kept: String = ledger
+        .lines()
+        .filter(|line| !line.contains("\"kind\":\"payment\""))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    std::fs::write(fix.dir.join("store/ledger/payments.jsonl"), kept).unwrap();
+    let journal: String = fix
+        .journal()
+        .lines()
+        .filter(|line| !(line.contains(&id) && line.contains("\"outcome\":\"applied\"")))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    std::fs::write(fix.dir.join("store/journal.jsonl"), journal).unwrap();
+    std::fs::write(fix.dir.join("store/intents").join(&names[0]), &replay).unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let lines = payment_lines(&fix);
+    assert_eq!(lines.len(), 1, "the line was not rebuilt: {lines:?}");
+    assert_eq!(lines[0]["intent"], json!(id));
+    assert_eq!(lines[0]["rate_quoted"], json!("300.5"), "{lines:?}");
+    assert_eq!(lines[0]["rate_source"], json!("coingecko"), "{lines:?}");
+    assert!(lines[0]["rate_at"].as_str().is_some(), "{lines:?}");
+    assert_eq!(lines[0]["rate_received"], json!("409.44"), "{lines:?}");
+}
+
 /// A credit past the 24-month ceiling is refused and journals why; a reason
 /// given with `--override` lets it through and lands on the journal line.
 #[test]
@@ -1083,7 +1146,7 @@ fn a_credit_dated_past_the_calendar_is_refused_and_starves_nothing() {
         let sig = sign::sign(
             &key,
             &sign::credit_payload(
-                &token, "cash", "20.00", received, None, None, false, None, None,
+                &token, "cash", "20.00", received, None, None, None, false, None, None,
             ),
         )
         .unwrap();
