@@ -14,7 +14,7 @@ use super::groups::{
 use super::payments::{resolve_payment, token_join, write_payment_copy};
 use super::Error;
 use super::{due, report_failure, write_journal, Settlement};
-use kyriakon_control_core::account::dns;
+use kyriakon_control_core::account::{dns, export};
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::validate;
 use kyriakon_control_core::intent::{
@@ -2906,6 +2906,46 @@ pub async fn export_account(
     ))
 }
 
+/// Release `username` when nothing holds it, for a purge whose application is
+/// going. `true` means the caller may finish; `false` means the box could not be
+/// asked or the script failed, and the caller leaves its record for the next
+/// pass.
+///
+/// The box is the oracle and the record only a fast path: an account made by the
+/// operator or by a script run by hand has no record, and the front end never
+/// checks whether a name is taken, so either form means the name is in use and
+/// the purge must not delete what holds it. A failed script leaves the record
+/// for the next pass rather than losing the release, and its error is reported
+/// once rather than every minute.
+async fn release_username(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    purge_id: &str,
+    kind: &str,
+    username: &str,
+) -> Result<bool, Error> {
+    let taken = match store.account(username).await {
+        Ok(Some(_)) => true,
+        Ok(None) => account_on_box(cfg, username)?,
+        Err(e) => {
+            // The account holding the name cannot be read, so the purge cannot
+            // tell whether releasing the name would take an account with it.
+            // Report and leave the application for the next pass rather than
+            // release on a guess.
+            report_record(cfg, store, journal, "account", username, &Error::from(e)).await;
+            return Ok(false);
+        }
+    };
+    if !taken {
+        if let Err(e) = run_script(cfg, "delete-user.sh", &[username]).await {
+            report_failure(cfg, store, journal, purge_id, kind, &Error::from(e)).await;
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Clear away every declined application whose week is up, and release the
 /// username. Run once per drain pass, after the intents: this is what carries
 /// the decline's week out without the application being touched again.
@@ -2969,39 +3009,11 @@ pub async fn purge_declined(
                 )
                 .await?;
             }
-            // Release the name only when nothing holds it. The box is the oracle
-            // and the record only a fast path: an account made by the operator
-            // or by a script run by hand has no record, and the front end never
-            // checks whether a name is taken, so either form means the name is
-            // in use and the purge must not delete what holds it. A failed
-            // script leaves the record for the next pass rather than losing the
-            // release, and its error is reported once rather than every minute.
-            let taken = match store.account(&record.username).await {
-                Ok(Some(_)) => true,
-                Ok(None) => account_on_box(cfg, &record.username)?,
-                Err(e) => {
-                    // The account holding the name cannot be read, so the purge
-                    // cannot tell whether releasing the name would take an
-                    // account with it. Report and leave the application for the
-                    // next pass rather than release on a guess.
-                    report_record(
-                        cfg,
-                        store,
-                        journal,
-                        "account",
-                        &record.username,
-                        &Error::from(e),
-                    )
-                    .await;
-                    continue;
-                }
-            };
-            if !taken {
-                if let Err(e) = run_script(cfg, "delete-user.sh", &[&record.username]).await {
-                    report_failure(cfg, store, journal, &purge_id, "decline", &Error::from(e))
-                        .await;
-                    continue;
-                }
+            // Release the name only when nothing holds it.
+            if !release_username(cfg, store, journal, &purge_id, "decline", &record.username)
+                .await?
+            {
+                continue;
             }
             write_journal(
                 store,
@@ -3012,6 +3024,222 @@ pub async fn purge_declined(
                 &app,
                 "purged",
                 Some("the application was cleared away"),
+            )
+            .await?;
+        }
+        store.remove("applications", &name).await?;
+    }
+    Ok(())
+}
+
+/// Whether ADR 0005's window has ended for a record filed at `filed_at`. A stamp
+/// that cannot be read is `false`, so the purge fails closed: without a date the
+/// boundary cannot be proved, which is the export's rule too.
+fn purge_due(filed_at: &str, today: time::Date) -> bool {
+    OffsetDateTime::parse(filed_at, &Rfc3339)
+        .ok()
+        .is_some_and(|filed| !export::within_purge(filed.date(), today))
+}
+
+/// The status tokens queued intents name. An approval writes `mark_decided`
+/// last, so a failure or a backoff leaves the record at `received` with its
+/// intent still in `intents/`; the purge must not take the record out from under
+/// that retry.
+async fn queued_tokens(store: &Store) -> Result<HashSet<String>, Error> {
+    let mut queued = HashSet::new();
+    for name in store.list("intents").await? {
+        let Some(text) = store.read_record("intents", &name).await else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if let Some(token) = value
+            .get("application")
+            .and_then(|application| application.get("status_token"))
+            .and_then(Value::as_str)
+        {
+            queued.insert(token.to_string());
+        }
+    }
+    Ok(queued)
+}
+
+/// Clear away the application answers ADR 0005 gives ninety days. Run once per
+/// drain pass, beside [`purge_declined`].
+///
+/// Three shapes outlive their decision: the copy in each mailbox's
+/// `accounts/<username>/application.json`, which an approval and a group's
+/// provisioning write (a group's copy is in every mailbox); an abandoned
+/// `applications/<token>.json` still in `received`; and a decided record whose
+/// mailbox copies are already gone, which no account reaches. The journal line
+/// is the token's own, `purge-<token>`, so a retry that has already cleared one
+/// copy does not journal a second line. `account.json` is untouched: the payment
+/// and the outside address stay with the account, and only an abandoned name is
+/// released. A declined record belongs to [`purge_declined`].
+pub async fn purge_applications(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+) -> Result<(), Error> {
+    let now = OffsetDateTime::now_utc();
+    let today = now.date();
+
+    for mailbox in store.list("accounts").await? {
+        let text = match store.account_application_text(&mailbox).await {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err(e) => {
+                report_record(
+                    cfg,
+                    store,
+                    journal,
+                    "application",
+                    &mailbox,
+                    &Error::from(e),
+                )
+                .await;
+                continue;
+            }
+        };
+        let (Some(token), Some(filed)) = (
+            serde_json::from_str::<Value>(&text).ok().and_then(|copy| {
+                copy.get("status_token")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }),
+            export::filed_day(&text),
+        ) else {
+            continue;
+        };
+        if export::within_purge(filed, today) {
+            continue;
+        }
+        let purge_id = format!("purge-{token}");
+        let app = ApplicationRef::application(mailbox.clone(), token.clone());
+        if !journal.has(&purge_id, "purged") && !journal.has(&purge_id, "applying") {
+            write_journal(
+                store,
+                journal,
+                &cfg.release,
+                &purge_id,
+                "purge",
+                &app,
+                "applying",
+                Some("ADR 0005's ninety days are up; the answers are being cleared away"),
+            )
+            .await?;
+        }
+        // The token record goes first: a crash after it leaves the account copy
+        // for the next pass, where the other order would leave the token record
+        // with no copy left to reach it. A file already gone reads as done, and
+        // the removal is not guarded by the journal, so a group's other copies
+        // are cleared on the pass that has already journalled this token.
+        store
+            .remove("applications", &format!("{token}.json"))
+            .await?;
+        store
+            .remove(&format!("accounts/{mailbox}"), "application.json")
+            .await?;
+        if !journal.has(&purge_id, "purged") {
+            write_journal(
+                store,
+                journal,
+                &cfg.release,
+                &purge_id,
+                "purge",
+                &app,
+                "purged",
+                Some("the application answers were cleared away"),
+            )
+            .await?;
+        }
+    }
+
+    let queued = queued_tokens(store).await?;
+    for name in store.list("applications").await? {
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let Some(record) =
+            sweep_application(cfg, store, journal, name.trim_end_matches(".json")).await
+        else {
+            continue;
+        };
+        if !purge_due(&record.filed_at, today) {
+            continue;
+        }
+        // A received record with its decision still queued is mid-approval, not
+        // abandoned: skipping the purge lets the retry finish rather than
+        // stranding an intent whose record has gone.
+        if record.stage == "received" && queued.contains(&record.status_token) {
+            continue;
+        }
+        // A declined record belongs to [`purge_declined`], which owns its
+        // seven-day window and its release; one still here after ninety days is
+        // a release that keeps failing, and clearing it here would lose the
+        // release rather than complete it.
+        if record.stage.starts_with("declined") {
+            continue;
+        }
+        // `received` is the abandoned shape, whose name is released. Anything
+        // else is decided: its mailbox copies would normally have carried it
+        // out through the loop above, so a record still here has none left (an
+        // account deleted before the window, or a group's mailboxes removed).
+        // Its name belongs to an account or to a hold, and is not released.
+        let abandoned = record.stage == "received";
+        // The record was written by the unprivileged half, so the username is
+        // revalidated before it can reach a root script's argv.
+        if abandoned && validate::username_shape(&record.username).is_some() {
+            Error::Failed(format!(
+                "application {name} has no usable username; skipped"
+            ))
+            .report("the purge sweep");
+            continue;
+        }
+        let purge_id = format!("purge-{}", record.status_token);
+        if !due(journal, &purge_id, now) {
+            continue;
+        }
+        if !journal.has(&purge_id, "purged") {
+            let app =
+                ApplicationRef::application(record.username.clone(), record.status_token.clone());
+            let what = if abandoned {
+                "abandoned application"
+            } else {
+                "application record"
+            };
+            if !journal.has(&purge_id, "applying") {
+                let note =
+                    format!("ADR 0005's ninety days are up; the {what} is being cleared away");
+                write_journal(
+                    store,
+                    journal,
+                    &cfg.release,
+                    &purge_id,
+                    "purge",
+                    &app,
+                    "applying",
+                    Some(&note),
+                )
+                .await?;
+            }
+            if abandoned
+                && !release_username(cfg, store, journal, &purge_id, "purge", &record.username)
+                    .await?
+            {
+                continue;
+            }
+            let note = format!("the {what} was cleared away");
+            write_journal(
+                store,
+                journal,
+                &cfg.release,
+                &purge_id,
+                "purge",
+                &app,
+                "purged",
+                Some(&note),
             )
             .await?;
         }
