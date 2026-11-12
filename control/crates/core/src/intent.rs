@@ -251,6 +251,20 @@ pub struct MailKeyIntent {
     pub signature: String,
 }
 
+/// A `test-mail` intent: the page's "Send a test encrypted email", filed by the
+/// handler with the account and the session that asked for it. The drain sends
+/// one diagnostic message to the account's platform address, which is the only
+/// way the member can prove their client decrypts what delivery sends.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct TestMailIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub username: String,
+    pub session: String,
+}
+
 /// A manual credit: one payment recorded against the token its account holds.
 /// The console resolves a `--username` to that token before filing, and this
 /// carries the token, the rail, the money, the day the money arrived and the
@@ -408,6 +422,7 @@ pub enum Intent {
     Serving(ServingIntent),
     CancelRenewal(CancelRenewalIntent),
     MailKey(MailKeyIntent),
+    TestMail(TestMailIntent),
     /// A kind this build does not implement, carried as it was read: `verify`
     /// refuses it by name and leaves the file where a later ticket finds it.
     Unknown {
@@ -454,6 +469,7 @@ impl Intent {
             "serving" => Intent::Serving(parsed(value, "the serving intent")?),
             "cancel-renewal" => Intent::CancelRenewal(parsed(value, "the renewal intent")?),
             "mail-key" => Intent::MailKey(parsed(value, "the mail key intent")?),
+            "test-mail" => Intent::TestMail(parsed(value, "the test message intent")?),
             other => Intent::Unknown {
                 kind: other.to_string(),
                 value: value.clone(),
@@ -489,6 +505,7 @@ impl Intent {
             Intent::Serving(_) => "serving",
             Intent::CancelRenewal(_) => "cancel-renewal",
             Intent::MailKey(_) => "mail-key",
+            Intent::TestMail(_) => "test-mail",
             Intent::Unknown { kind, .. } => kind,
         }
     }

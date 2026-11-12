@@ -463,6 +463,9 @@ pub async fn verify(
         Intent::MailKey(intent) => {
             page_proved(store, proofs, &intent.session, &intent.username).await
         }
+        Intent::TestMail(intent) => {
+            page_proved(store, proofs, &intent.session, &intent.username).await
+        }
         Intent::Unknown { .. } => Ok(Some(transitions::Settlement::refused(
             "this build does not implement this kind; the intent is left in place",
         ))),
@@ -543,6 +546,7 @@ pub async fn apply(
                 transitions::lifecycle::cancel_renewal(cfg, store, intent).await
             }
             Intent::MailKey(intent) => transitions::lifecycle::mail_key(cfg, store, intent).await,
+            Intent::TestMail(intent) => transitions::lifecycle::test_mail(cfg, store, intent).await,
             // `verify` refuses an unknown kind before this is reached.
             Intent::Unknown { kind, .. } => Err(Error::Failed(format!(
                 "this build does not implement the kind {kind:?}"
@@ -584,6 +588,7 @@ fn disposition(intent: &Intent) -> transitions::Disposition {
         | Intent::Serving(_)
         | Intent::CancelRenewal(_)
         | Intent::MailKey(_)
+        | Intent::TestMail(_)
         | Intent::Unknown { .. } => transitions::AfterLine::Nothing,
     };
     // A page action's refusal is the handler's own input, so its file goes;
@@ -597,7 +602,8 @@ fn disposition(intent: &Intent) -> transitions::Disposition {
         | Intent::CancelRenewal(_)
         | Intent::MailKey(_)
         | Intent::Close(_)
-        | Intent::Export(_) => transitions::RefusalFile::Remove,
+        | Intent::Export(_)
+        | Intent::TestMail(_) => transitions::RefusalFile::Remove,
         Intent::Application(_)
         | Intent::Decision(_)
         | Intent::Password(_)

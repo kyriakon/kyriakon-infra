@@ -231,6 +231,19 @@
   <p class="hint">A replacement takes effect after 72 hours, which is the window in which you can cancel it, and a warning goes to every address the account holds. A request signed with your current private key over the new key's fingerprint applies at once: <code>printf '%s' 'FINGERPRINT' | gpg --detach-sign --armor</code>. Mail delivered before the new key applies stays readable with the old private key; the platform cannot recover either.</p>
 </form>
 
+{#
+  The diagnostic. A POST because it enqueues a message, and separate from the
+  replacement form because it changes nothing on the account: it proves the
+  client decrypts what delivery sends, protected subject included. It is absent
+  without a recorded key, because there is nothing to encrypt to.
+#}
+{% if mail_key.is_some() %}
+<form method="post" action="/account/test-mail">
+  <button class="btn" type="submit">Send a test encrypted email</button>
+  <p class="hint">One test message a day, to your address on this platform. It is encrypted to the key above and its <code>Subject:</code> is protected, so if the message opens and the real subject is there rather than <code>...</code>, your client is set up. The body names the fingerprint the message was encrypted to.</p>
+</form>
+{% endif %}
+
 {% if can_close %}
 {#
   The mail password. The current one is re-entered however fresh the session is,

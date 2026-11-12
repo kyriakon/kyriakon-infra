@@ -82,6 +82,16 @@ pub fn operator_subject(component: &str, event: &str) -> String {
     format!("kyriakon: {component}: {event}")
 }
 
+/// The notice type the account page's test message is recorded under, and the
+/// subject the day's one carries. The date in the subject makes each day's test
+/// a new notice rather than a suppressed retry, and the handler reads the same
+/// pair from the account's record to refuse a second request the same day.
+pub const TEST_MAIL_NOTICE: &str = "test-mail";
+
+pub fn test_mail_subject(day: &str) -> String {
+    format!("Your kyriakon.net test message ({day})")
+}
+
 /// One operator alert, the only way this half sends one, so the shape cannot
 /// drift per call site: the subject names the component and the event, and the
 /// body says what ran, when, what it found and what to do about it. It goes to

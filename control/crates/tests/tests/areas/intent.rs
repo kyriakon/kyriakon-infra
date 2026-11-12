@@ -238,6 +238,7 @@ fn every_variant() -> Vec<Intent> {
         Intent::Serving(intent::ServingIntent::default()),
         Intent::CancelRenewal(intent::CancelRenewalIntent::default()),
         Intent::MailKey(intent::MailKeyIntent::default()),
+        Intent::TestMail(intent::TestMailIntent::default()),
     ];
     for intent in &all {
         match intent {
@@ -260,7 +261,8 @@ fn every_variant() -> Vec<Intent> {
             | Intent::OutsideAddress(_)
             | Intent::Serving(_)
             | Intent::CancelRenewal(_)
-            | Intent::MailKey(_) => {}
+            | Intent::MailKey(_)
+            | Intent::TestMail(_) => {}
             Intent::Unknown { .. } => panic!("the round trip covers implemented kinds only"),
         }
     }

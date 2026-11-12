@@ -14,7 +14,12 @@ use crate::fastcgi::{Http, Reply, Request};
 use crate::page;
 use crate::page::LoginPage;
 use kyriakon_control_core::store::Account;
-use kyriakon_control_core::{account::session, flow::validate, intent, mail::keycheck};
+use kyriakon_control_core::{
+    account::session,
+    flow::validate,
+    intent,
+    mail::{keycheck, notice},
+};
 
 /// The account page, which each front end renders for the identity it has: the
 /// web's session cookie and the capsule's certificate.
@@ -202,6 +207,7 @@ pub(super) async fn account_action(app: &App, call: &Call<'_>) -> Reply {
         "serving" => account_serving(app, call.request).await,
         "renewal" => account_renewal(app, call.request).await,
         "mail-key" => account_mail_key(app, call.request).await,
+        "test-mail" => account_test_mail(app, call.request).await,
         _ => Reply::html(404, String::new()),
     }
 }
@@ -681,6 +687,76 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
             }
         }
         _ => refused("That is not a mail-key action this page carries out."),
+    }
+}
+
+/// The page's "send a test encrypted email". The message itself is the drain's,
+/// because only root's half can enqueue mail; the handler files the same
+/// session-proved intent every other `/account` form does.
+///
+/// One a day, as far as the handler can see: `notice::already_sent` reads the
+/// account's own notice log, which the drain writes before it enqueues. Two
+/// requests that race the check can both file an intent, and the per-address
+/// counter is what bounds them; the drain dedups on the same type and subject,
+/// so the member still receives one message for the day. A lock that made the
+/// check and the file one step would have to live in `accounts/<username>/`,
+/// which belongs to root and the handler cannot write.
+pub(super) async fn account_test_mail(app: &App, request: &Request) -> Reply {
+    let (cookie, account) = match session_account(app, request).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return refused("Sign in to the account you want the test message sent to."),
+        Err(e) => return respond(&e, FrontEnd::Httpd),
+    };
+    let Some(session_id) = session::id(&cookie) else {
+        return refused("Sign in to the account you want the test message sent to.");
+    };
+    if account.mail_key.is_none() {
+        return refused(
+            "The platform has not recorded a mail key for this account yet, so there is nothing \
+             to encrypt a test message to.",
+        );
+    }
+    let stamp = kyriakon_control_core::util::filed_at();
+    let day = stamp.get(..10).unwrap_or(&stamp);
+    match notice::already_sent(
+        &app.store,
+        &account.username,
+        notice::TEST_MAIL_NOTICE,
+        &notice::test_mail_subject(day),
+    )
+    .await
+    {
+        Ok(true) => {
+            return refused(
+                "A test message has already gone out today. Check the mailbox it was sent to \
+                 before asking for another.",
+            )
+        }
+        Ok(false) => {}
+        Err(e) => return respond(&Error::from(e), FrontEnd::Httpd),
+    }
+    match intent::Intent::TestMail(intent::TestMailIntent {
+        username: account.username.clone(),
+        session: session_id.to_string(),
+        ..Default::default()
+    })
+    .file(&app.store)
+    .await
+    {
+        Ok(_) => {
+            let page = notice(
+                "Your test message is on its way",
+                "The platform is sending one message to your address on this platform now. It is \
+                 encrypted to the mail key above, with its Subject: protected, so opening it and \
+                 seeing the real subject is the proof your client is set up. It arrives within a \
+                 minute.",
+            );
+            Reply::html(200, page_html(&page))
+        }
+        Err(e) => respond(
+            &Error::Failed(format!("the test message could not be filed: {e}")),
+            FrontEnd::Httpd,
+        ),
     }
 }
 
