@@ -78,6 +78,7 @@ www_root=${WWW_ROOT:-/home/www}
 httpd_d=${HTTPD_D:-/etc/httpd.d}
 gmid_d=${GMID_D:-/etc/gmid.d}
 acme_d=${ACME_D:-/etc/acme-client.d}
+authorized_keys_dir=${AUTHORIZED_KEYS_DIR:-/etc/ssh/authorized_keys}
 ssl_dir=${SSL_DIR:-/etc/ssl}
 ssl_private=${SSL_PRIVATE:-/etc/ssl/private}
 virtuals=${VIRTUALS:-/etc/mail/virtuals}
@@ -217,6 +218,17 @@ remove_member() {
 	# unavailable for other updates: nothing after this step touches either.
 	if account_exists; then
 		did=yes
+		# The managed key is outside the home, so userdel -r does not take it.
+		# Left behind, the next account with this name would inherit the key.
+		managed_key="$authorized_keys_dir/$user"
+		if [ -e "$managed_key" ]; then
+			if [ "$show" = yes ]; then
+				printf 'would remove %s\n' "$managed_key"
+			else
+				rm -f "$managed_key"
+				printf 'removed %s\n' "$managed_key"
+			fi
+		fi
 		if [ "$show" = yes ]; then
 			printf 'would clear the quota record\n'
 		else
@@ -379,13 +391,16 @@ self_test() {
 	VIRTUALS="$tree/etc/mail/virtuals"
 	MAIL_FROM="$tree/etc/mail/mail_from"
 	ONBOARD_STORE="$tree/store"
+	AUTHORIZED_KEYS_DIR="$tree/etc/ssh/authorized_keys"
 	www_root="$WWW_ROOT"; httpd_d="$HTTPD_D"
 	gmid_d="$GMID_D"; acme_d="$ACME_D"; ssl_dir="$SSL_DIR"
 	ssl_private="$SSL_PRIVATE"; virtuals="$VIRTUALS"
 	mail_from="$MAIL_FROM"
 	onboard_store="$ONBOARD_STORE"
+	authorized_keys_dir="$AUTHORIZED_KEYS_DIR"
 
-	mkdir -p "$httpd_d" "$gmid_d" "$acme_d" "$ssl_private" "$www_root" "$(dirname "$virtuals")"
+	mkdir -p "$httpd_d" "$gmid_d" "$acme_d" "$ssl_private" "$www_root" \
+		"$(dirname "$virtuals")" "$authorized_keys_dir"
 
 	# The predicate and the steps, recorded rather than run.
 	account_exists() { return 0; }
@@ -411,6 +426,7 @@ self_test() {
 	: >"$ssl_dir/$user.kyriakon.net.fullchain.pem"
 	: >"$ssl_private/$user.kyriakon.net.key"
 	ln -s "$user.kyriakon.net.fullchain.pem" "$ssl_dir/$user.kyriakon.net.crt"
+	printf 'ssh-ed25519 AAAAexample alice@example\n' >"$authorized_keys_dir/$user"
 	{
 		printf 'alice@kyriakon.net: alice\n'
 		printf 'secretary@parish.example: alice\n'
@@ -435,6 +451,8 @@ self_test() {
 	check "the member's key went" "$([ -e "$ssl_private/$user.kyriakon.net.key" ] && echo present || echo gone)" gone
 	check "the relayd link went with them" \
 		"$([ -L "$ssl_dir/$user.kyriakon.net.crt" ] && echo present || echo gone)" gone
+	check "the managed key went with them" \
+		"$([ -e "$authorized_keys_dir/$user" ] && echo present || echo gone)" gone
 	check "the member's own address went" "$(awk '/^alice@/' "$virtuals" | wc -l | tr -d ' ')" 0
 	check "someone else's address stayed" "$(awk '/^oliver@/' "$virtuals" | wc -l | tr -d ' ')" 1
 	check "the alias into them stayed" "$(awk '/^secretary@/' "$virtuals" | wc -l | tr -d ' ')" 1

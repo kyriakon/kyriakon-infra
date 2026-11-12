@@ -9,7 +9,8 @@
 # Columns, tab-separated:
 #
 #   script       the file in scripts/, by name
-#   destination  /root/bin, drain for the directory the drain's own config names
+#   destination  /root/bin, /usr/local/libexec for the member session shell,
+#                drain for the directory the drain's own config names
 #                at run time (installed into by scripts/deploy-control.sh), or
 #                checkout for a script cron runs from the checkout itself, which
 #                nothing installs
@@ -27,6 +28,11 @@
 #   - kyriakon-authcheck.sh, which deploy-control.sh installs as
 #     /usr/local/libexec/kyriakon-authcheck, with lib.sh beside it;
 #   - render-docs.sh, which deploy-control.sh runs from the checkout.
+#
+# member-git-shell.sh has two rows: the /usr/local/libexec one the login class
+# names, and a drain row that puts the source beside provision-member.sh, which
+# installs it again when it runs. deploy-mail.sh installs it directly; the drain
+# copy is the source the per-member run reads, the way the login class below is.
 lib.sh	/root/bin	-
 abuse-monitor.sh	/root/bin	*/15 * * * *
 check-keyring-drift.sh	/root/bin	0 4 * * *	--box
@@ -64,3 +70,5 @@ set-mail-password.sh	drain	-
 stripe-api.sh	drain	-
 reload-smtpd.sh	drain	-
 reload-spamd.sh	drain	-
+member-git-shell.sh	drain	-
+member-git-shell.sh	/usr/local/libexec	-

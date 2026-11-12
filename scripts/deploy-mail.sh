@@ -62,9 +62,9 @@ say() { printf '== %s\n' "$*"; }
 
 # The one list of which scripts the box runs, and where. scripts/install-set.tsv
 # is its own explanation, and lib.sh's install_rows is how this reads it. This
-# deploy installs the /root/bin rows, cron-apply.sh schedules them,
-# check-hygiene.sh checks the copies, and deploy.sh routes a changed script by
-# its row.
+# deploy installs the /root/bin rows and the one /usr/local/libexec row (the
+# member session shell), cron-apply.sh schedules the former, check-hygiene.sh
+# checks the copies, and deploy.sh routes a changed script by its row.
 install_set="$script_dir/install-set.tsv"
 
 # stale_copies <installed names>: the pre-split copies in /root/bin that this
@@ -1429,6 +1429,30 @@ for s in $(stale_copies "$root_bin"); do
 	printf 'removed the stale copy /root/bin/%s\n' "$s"
 done
 printf 'cron scripts installed into /root/bin\n'
+
+# The member session shell on 2222, from the table's /usr/local/libexec row. The
+# member login class names this path, so the file is installed here even though
+# the class itself is a hand step scripts/deploy.sh prints: applying the class
+# before the file is there would refuse every member's push. root:wheel 0755 in
+# /usr/local/libexec, which a member can read and execute and cannot write, and
+# which is not in the PATH a member session is handed.
+libexec_scripts=$(install_rows "$install_set" /usr/local/libexec) \
+	|| { printf 'cannot read %s\n' "$install_set" >&2; exit 1; }
+[ -n "$libexec_scripts" ] \
+	|| { printf '%s names no /usr/local/libexec script\n' "$install_set" >&2; exit 1; }
+install -d -m 0755 /usr/local/libexec
+for s in $libexec_scripts; do
+	install_staged "$repo_dir/scripts/$s" "/usr/local/libexec/$s" -m 0755 -o root -g wheel
+done
+printf 'member session shell installed into /usr/local/libexec\n'
+
+# The root-owned key directory the member sessions are proposed to read
+# (AuthorizedKeysFile /etc/ssh/authorized_keys/%u inside the members Match
+# block). It is on every run so the directory exists before a member is
+# provisioned, and it sits under /etc/ssh where nothing a member can write is on
+# the path. provision-member.sh writes one file per account.
+install -d -m 0755 -o root -g wheel /etc/ssh/authorized_keys
+printf 'member key directory installed at /etc/ssh/authorized_keys\n'
 
 # hcloud is installed at the top from openbsd/packages.tsv; restore-standup.sh
 # needs it to create the weekly test box.
