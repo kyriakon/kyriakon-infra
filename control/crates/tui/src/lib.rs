@@ -608,11 +608,6 @@ fn key_walkthrough(sections: &[&str], preamble: bool) -> String {
                 out.push('\n');
                 out.push_str(&title.trim().to_uppercase());
                 out.push('\n');
-            } else if line.starts_with("You can make both in a browser") {
-                // Its next sentence points at the recovery phrase section, which
-                // this cut does not carry; the generator section gives the
-                // instruction that matters here.
-                continue;
             } else {
                 out.push_str(&line.replace("**", "").replace('`', ""));
                 out.push('\n');
@@ -865,9 +860,9 @@ fn prompt(page: &Page, index: usize, total: usize) -> String {
         Kind::Key if page.mailbox.is_some() => {
             out.push_str(&key_walkthrough(
                 &[
-                    "The recovery phrase",
+                    "Keeping the private key safe",
                     "Thunderbird on a desktop",
-                    "The browser generator",
+                    "A key at a terminal",
                     "The upload key",
                 ],
                 true,
@@ -1521,7 +1516,8 @@ mod tests {
             "MAKING A KEY",
             "a step for anyone who wants a website",
             "THUNDERBIRD ON A DESKTOP",
-            "https://signup.kyriakon.net/",
+            "A KEY AT A TERMINAL",
+            "gpg --full-generate-key",
             "sftp on port 22",
             "git on port 2222",
             "THE UPLOAD KEY",

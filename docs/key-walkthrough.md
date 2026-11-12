@@ -6,15 +6,15 @@ The mail key is how you read your mail. Your messages are PGP ciphertext on our 
 
 The upload key is how you publish a website and use your git repositories. Both are reached by ssh with a key, and neither accepts a password. This key is a step for anyone who wants a website, not an extra: a member who skips it gets mail and nothing else.
 
-You can make both in a browser at the generator, or make the mail key in Thunderbird on a desktop. The recovery phrase is the part that matters most, so read that section before you start.
+Make both keys on your own machine. Make the mail key in Thunderbird's OpenPGP Key Manager on a desktop, or with gpg at a terminal. Make the upload key with `ssh-keygen -t ed25519` at a terminal. This site only ever receives the public half.
 
-## The recovery phrase
+## Keeping the private key safe
 
-When a key is made, a recovery phrase is shown. It is the only way to unlock the private key on a new machine if the key file is lost, and it is the password you will be asked for when your mail client first uses the key.
+There is no recovery phrase, and nothing on this site can unlock your key. The private half is the only thing that reads your mailbox.
 
-Write it down on paper. Write it down again and keep the two copies in separate places, because one copy in the same bag as the laptop is one copy. Do not keep it in a password manager that lives on the same machine as the key file, and do not send it to yourself by email.
+Keep the private half on the machine that made it. Keep a backup somewhere else, on paper or on a drive that stays away from the laptop. Do not send the private half to yourself by email, and do not store it in a password manager that lives on the same machine as the key file.
 
-The platform holds no key that opens your mailbox. Zero-access covers message content and not the addressing information mail needs to move: sender, recipient, timestamp and size appear in the server's logs and in the outer message wrapper, and the seven-day window bounds how long the raw record exists. If you lose the device and the recovery phrase, the mail is gone permanently. We cannot restore it, because no key exists here to open it.
+The platform holds no key that opens your mailbox. Zero-access covers message content and not the addressing information mail needs to move: sender, recipient, timestamp and size appear in the server's logs and in the outer message wrapper, and the seven-day window bounds how long the raw record exists. If you lose the private key and your backup, the mail is gone permanently. We cannot restore it, because no key exists here to open it.
 
 ## Thunderbird on a desktop
 
@@ -22,30 +22,32 @@ Thunderbird on a desktop is the primary path. It has OpenPGP built in, so you do
 
 1. Install Thunderbird and open the OpenPGP Key Manager, under Tools.
 2. Choose to generate a new key pair, with the address you applied for as its identity, and no name. A name or another address in the key is published with `keys/<username>.asc`, so leave the identity as the address alone; if you do add one, the reviewer sees it in the review email before approval.
-3. Choose a passphrase, and write it down with the recovery phrase.
+3. Choose a passphrase, and keep it somewhere safe, apart from the machine.
 4. Choose "Key does not expire". A mail key must not expire: delivery stops on its expiry date, without a word, so there is no date to renew.
 5. Export the public key to a file. This is the half you paste into the application.
-6. Keep the private key in Thunderbird's own key store, and keep the recovery phrase somewhere else.
+6. Back up the private key from the Key Manager's secret-key export, and keep that file offline.
 
 When the account is approved, the mail address starts accepting mail. Mail that arrives before your client is set up waits on the server, encrypted, and becomes readable once the key is in place.
 
-Thunderbird for Android is not covered by this page. The prototype has not tested it end to end, so describing it here would be a claim we cannot stand behind. Use the desktop path, or the browser generator on a desktop, until that changes.
+Thunderbird for Android is not covered by this page. The prototype has not tested it end to end, so describing it here would be a claim we cannot stand behind. Use the desktop path until that changes.
 
-## The browser generator
+## A key at a terminal
 
-The generator is at https://signup.kyriakon.net/ and runs in your browser. The page's own code makes the key on your machine, and the private key file is written by the page for you to keep.
+`gpg` at a terminal makes the same mail key, with no mail client installed.
 
-It makes the mail key and the upload key together, and it shows the recovery phrase once. Write the phrase down before you close the tab. The mail key's identity is your kyriakon.net address and nothing else; the generator does not add a name.
-
-Use it if you would rather not install a mail client first, or if the machine you are applying from has no terminal. It is also the path for the upload key, since making an ssh key without a terminal is otherwise awkward.
+1. Run `gpg --full-generate-key`. Choose "RSA and RSA", 4096 bits, and an expiry of 0, which means the key never expires.
+2. When gpg asks for a name and an email address, put the address you applied for in both fields. gpg asks for a name, and any name you give it is published with the key, so the address is the only value that adds nothing.
+3. Choose a passphrase, and keep it somewhere safe, apart from the machine.
+4. Export the public key as text, replacing the address with the one you applied for: `gpg --armor --export you@kyriakon.net > mail-public.asc`. The file holds the block you paste into the application.
+5. Back up the private key, and keep the file offline: `gpg --armor --export-secret-keys you@kyriakon.net > mail-secret.asc`.
 
 ## The upload key
 
 An upload key is an Ed25519 key pair. It is separate from the mail key, and its private file is the only copy.
 
-1. Make the key in the browser generator, or with `ssh-keygen -t ed25519` if you have a terminal.
+1. Run `ssh-keygen -t ed25519`. It asks where to save the key, and it offers a passphrase. A passphrase is optional; without one, any file copied to the machine can use the key.
 2. Keep the private file on the machine you will upload from.
-3. Give the public half, which starts `ssh-ed25519`, to the application.
+3. Print the public half, which starts `ssh-ed25519`, with `cat ~/.ssh/id_ed25519.pub`, and give it to the application.
 
 The two ports are these, and they are the only two you need:
 
