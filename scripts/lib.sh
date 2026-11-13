@@ -831,7 +831,7 @@ dkim_domains_args() {
 	printf '%s\n' "${dk_args# }"
 }
 
-# install_smtpd_conf <template> <dkim-domains> <queue-key-file> <destination>
+# install_smtpd_conf <template> <dkim-domains> <queue-key-file> <destination> [<parser>]
 #
 # The shipped config with the queue key and the filter's domain list substituted,
 # staged beside <destination> and renamed onto it, 0600 because it carries the
@@ -840,6 +840,12 @@ dkim_domains_args() {
 # straight onto the live file, which empties the MTA's only configuration before
 # filling it, and the chmod landed two lines later: for that window the file
 # carrying the substituted queue key existed under the caller's umask.
+#
+# With a fifth argument the candidate is parsed before the rename, as
+# `"$parser" -n -f <candidate>`; the live callers pass `smtpd`. A self-test sets
+# SMTPD_CONF_CHECK=no: `smtpd -n` validates the live tree, maildir and filter,
+# which a fixture tree does not have, and the deploy self-test proves the check
+# with a stub parser instead.
 install_smtpd_conf() {
 	typeset conf_template="$1" conf_domains="$2" conf_keyfile="$3" conf_dst="$4" \
 		conf_key conf_args conf_candidate
@@ -867,9 +873,58 @@ install_smtpd_conf() {
 		rm -f "$conf_candidate"
 		return 1
 	fi
-	if ! chmod 0600 "$conf_candidate" || ! mv "$conf_candidate" "$conf_dst"; then
+	if ! chmod 0600 "$conf_candidate"; then
+		printf 'could not set the mode of %s\n' "$conf_candidate" >&2
+		rm -f "$conf_candidate"
+		return 1
+	fi
+	# The candidate is parsed before it becomes the live file when the caller
+	# names the parser. The live callers pass `smtpd`. A checkout without it (the
+	# deploy self-test, a laptop) skips the parse: the box has smtpd in base, so
+	# the check is never skipped where it matters.
+	if [ -n "${5:-}" ] && [ "${SMTPD_CONF_CHECK:-yes}" = yes ] \
+		&& command -v "$5" >/dev/null 2>&1; then
+		if ! "$5" -n -f "$conf_candidate"; then
+			printf '%s fails its own syntax check; %s is unchanged\n' \
+				"$conf_candidate" "$conf_dst" >&2
+			rm -f "$conf_candidate"
+			return 1
+		fi
+	fi
+	if ! mv "$conf_candidate" "$conf_dst"; then
 		printf 'could not replace %s\n' "$conf_dst" >&2
 		rm -f "$conf_candidate"
+		return 1
+	fi
+	return 0
+}
+
+# install_validated <source> <destination> <checker> [<args>...]: install a
+# config to <destination>.new, run the daemon's own parser over the candidate,
+# then rename it onto the live path. A parser that refuses leaves the live file
+# exactly as it was and removes the candidate.
+#
+# The other order — install, then check — leaves a file that cannot start at the
+# live path, and the next restart or reboot takes the service down with nothing
+# to roll back to. relayd.conf was fixed this way first; this is the shared body.
+install_validated() {
+	typeset src="$1" dst="$2"
+	shift 2
+	install -m 0644 "$src" "$dst.new" || {
+		printf 'could not stage %s.new; %s is unchanged\n' "$dst" "$dst" >&2
+		rm -f "$dst.new"
+		return 1
+	}
+	# The parsers print the normalised config on success; only a refusal is
+	# worth the deploy log's space.
+	if ! "$@" "$dst.new" >/dev/null; then
+		printf '%s fails its own syntax check; %s is unchanged\n' "$dst.new" "$dst" >&2
+		rm -f "$dst.new"
+		return 1
+	fi
+	if ! mv "$dst.new" "$dst"; then
+		printf 'could not replace %s\n' "$dst" >&2
+		rm -f "$dst.new"
 		return 1
 	fi
 	return 0

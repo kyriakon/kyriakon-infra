@@ -269,7 +269,7 @@ ensure_mail_address() {
 	if [ "$mail_changed" = yes ]; then
 		if [ -f "$smtpd_template" ] && [ -f "$dkim_domains_table" ] && [ -f "$queue_key_file" ]; then
 			install_smtpd_conf "$smtpd_template" "$dkim_domains_table" \
-				"$queue_key_file" "$smtpd_conf" \
+				"$queue_key_file" "$smtpd_conf" smtpd \
 				|| printf 'note: %s could not be re-expanded from %s; restart smtpd after fixing it\n' \
 					"$smtpd_conf" "$dkim_domains_table" >&2
 		fi
@@ -291,6 +291,9 @@ self_test() {
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin
 	tree=$self_test_work
+	# smtpd -n validates the live tree, maildir and filter, which this fixture
+	# does not have. The deploy self-test proves the parser check with a stub.
+	export SMTPD_CONF_CHECK=no
 	user=alice
 	changed=no
 	virtuals="$tree/virtuals"
