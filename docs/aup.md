@@ -37,7 +37,7 @@ These content rules govern what you publish. Your private mail is PGP ciphertext
 
 ## 4. Account security
 
-- Keep your private keys and your recovery phrase safe. Because the platform holds neither, losing both your mail private key and your recovery phrase means permanent mail loss.
+- Keep your private keys and your recovery phrase safe. Your recovery phrase is a passphrase-protected offline export of your mail private key. Because the platform holds neither the private key nor the export, losing both your mail private key and your recovery phrase means permanent mail loss.
 - Do not share your mail password or raw private keys with another person. Where a group shares access, share credentials through an encrypted `pass` repository.
 - Use a PGP-capable mail client; there is no webmail.
 - Your account has no interactive shell. Access is confined to IMAP and SMTP for mail, SFTP for web and Gemini uploads, and `git-shell` for your repositories.

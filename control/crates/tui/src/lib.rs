@@ -581,9 +581,10 @@ const KEY_WALKTHROUGH: &str = include_str!("../../../../docs/key-walkthrough.md"
 /// The walkthrough cut to the sections a key page needs, stripped to plain
 /// terminal text. This is not a Markdown renderer: the selected prose carries no
 /// links, and the only markup it uses is the heading, emphasis and code ticks
-/// removed below. The mail-key page wants the two ways to make a key and the
-/// upload-key paragraph; the upload-key page wants only its own section, so the
-/// step reads as a step rather than as a page of unrelated advice.
+/// removed below. The mail-key page wants the recovery phrase, the two ways to
+/// make a key and the upload-key paragraph; the upload-key page wants only its
+/// own section, so the step reads as a step rather than as a page of unrelated
+/// advice.
 fn key_walkthrough(sections: &[&str], preamble: bool) -> String {
     let mut out = String::new();
     let mut in_preamble = true;

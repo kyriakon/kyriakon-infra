@@ -10,9 +10,9 @@ Make both keys on your own machine. Make the mail key in Thunderbird's OpenPGP K
 
 ## The recovery phrase
 
-Your recovery phrase is a passphrase-protected offline copy of your mail private key. Make it as soon as the key exists. In Thunderbird you make it with the Key Manager's secret-key export; with gpg you make it with `gpg --armor --export-secret-keys`. Keep the file on a drive that stays away from the laptop, and keep the passphrase apart from it. The file and the passphrase together are the only way back into the mailbox on a new machine.
+Your recovery phrase is a passphrase-protected offline export of your mail private key. Make it as soon as the key exists. In Thunderbird you make it with the Key Manager's secret-key export; with gpg you make it with `gpg --armor --export-secret-keys`. Keep the export on a drive that stays away from the laptop, and keep the passphrase apart from it. The export and the passphrase together are the only way back into the mailbox on a new machine.
 
-Do not send the recovery phrase to yourself by email, and do not store it in a password manager that lives on the same machine as the key file.
+Do not send the recovery phrase to yourself by email, and do not store it in a password manager that lives on the same machine as the private key.
 
 The platform holds no key that opens your mailbox. Zero-access covers message content and not the addressing information mail needs to move: sender, recipient, timestamp and size appear in the server's logs and in the outer message wrapper, and the seven-day window bounds how long the raw record exists. If you lose the private key and the recovery phrase, the mail is gone permanently. We cannot restore it, because no key exists here to open it.
 
@@ -25,7 +25,7 @@ Thunderbird on a desktop is the primary path. It has OpenPGP built in, so you do
 3. Choose a passphrase, and keep it somewhere safe, apart from the machine.
 4. Choose "Key does not expire". A mail key must not expire: delivery stops on its expiry date, without a word, so there is no date to renew.
 5. Export the public key to a file. This is the half you paste into the application.
-6. Export the secret key from the Key Manager. The passphrase-protected file it writes is your recovery phrase, so keep it apart from the machine.
+6. Export the secret key from the Key Manager. The passphrase-protected export it writes is your recovery phrase, so keep it apart from the machine.
 
 When the account is approved, the mail address starts accepting mail. Mail that arrives before your client is set up waits on the server, encrypted, and becomes readable once the key is in place.
 

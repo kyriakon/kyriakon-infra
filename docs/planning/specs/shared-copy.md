@@ -132,7 +132,7 @@ action = "read"
 [[service]]
 id = "key"
 name = "Keys"
-summary = "making a mail key and an upload key, and the browser generator"
+summary = "making a mail key and an upload key on your own machine"
 state = "live"
 host = "signup.kyriakon.net"
 action = "read"
