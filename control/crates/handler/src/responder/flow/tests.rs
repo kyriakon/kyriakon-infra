@@ -230,6 +230,66 @@ async fn the_second_checkbox_is_recorded_beside_the_documents() {
     );
 }
 
+/// A value the page never offers is refused, not filed. The acceptance boxes
+/// carry `yes` and nothing else, and the record quotes every acceptance as
+/// given, so a hand-crafted `no` would file a refusal as consent; the records
+/// question offers yes or no, so a `maybe` is refused too. The answer the page
+/// does carry is still filed.
+#[tokio::test]
+async fn an_answer_the_page_does_not_offer_is_refused_rather_than_filed() {
+    let (app, dir) = handler("answer-shape").await;
+    let filed = || std::fs::read_dir(dir.join("applications")).unwrap().count();
+
+    for (id, value, why) in [
+        ("accept_terms", "no", "this has to be accepted"),
+        ("accept_supply", "no", "this has to be accepted"),
+        ("body_records", "maybe", "answer yes or no"),
+    ] {
+        let answers: Vec<(&str, &str)> = body_answers()
+            .into_iter()
+            .map(|(k, v)| if k == id { (k, value) } else { (k, v) })
+            .collect();
+        let (code, page) = ask(&app, &httpd_post("/apply", &encoded(&answers))).await;
+        assert_eq!(code, 422, "{id}={value} is refused: {page}");
+        assert!(page.contains(why), "{id}={value}: {page}");
+        assert_eq!(filed(), 0, "{id}={value} files nothing");
+    }
+
+    let (code, _) = ask(&app, &httpd_post("/apply", &encoded(&body_answers()))).await;
+    assert_eq!(code, 200, "yes is the answer the page offers");
+    assert_eq!(filed(), 1);
+}
+
+/// A padded `yes` is the answer the page offers: the check trims it, and the
+/// record must read it the same way, or the acknowledgement the applicant gave
+/// is silently dropped from the trail.
+#[tokio::test]
+async fn a_padded_yes_records_the_acceptance_it_names() {
+    let (app, dir) = handler("answer-padded").await;
+    let answers: Vec<(&str, &str)> = body_answers()
+        .into_iter()
+        .map(|(k, v)| {
+            if k == "accept_supply" {
+                (k, " yes")
+            } else {
+                (k, v)
+            }
+        })
+        .collect();
+    let (code, page) = ask(&app, &httpd_post("/apply", &encoded(&answers))).await;
+    assert_eq!(code, 200, "{page}");
+    let entry = std::fs::read_dir(dir.join("applications"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let record = std::fs::read_to_string(entry.path()).unwrap();
+    assert!(
+        record.contains("immediate supply"),
+        "the trimmed acceptance is recorded: {record}"
+    );
+}
+
 /// A person's key record has no mailbox, so the expected identity comes from
 /// the username answer. Without that, a display name or outside address was
 /// filed with verdict "works" and the review email never showed it.

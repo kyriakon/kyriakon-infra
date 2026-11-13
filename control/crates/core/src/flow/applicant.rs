@@ -72,10 +72,10 @@ pub fn flow_path<'a>(list: &'a [Question], answers: &BTreeMap<String, String>) -
     out
 }
 
-/// Why one page's answer cannot advance the flow, or `None`. The shared rules are
-/// the web form's; the type's own shape is added where the shared rules are
-/// silent, because a yes/no page that accepted "maybe" would store a value the
-/// form never offers.
+/// Why one page's answer cannot advance the flow, or `None`. The rules are the
+/// web form's, `validate::reason` included, so the capsule refuses what the form
+/// refuses; a key's per-mailbox checks and an address list's shape are added
+/// here because `reason` proves one block and no list.
 pub fn flow_problem(
     page: &Page,
     value: &str,
@@ -105,15 +105,10 @@ pub fn flow_problem(
             return Some(why);
         }
     }
-    match q.kind {
-        Kind::YesNo => (!value.is_empty() && !matches!(value, "yes" | "no"))
-            .then(|| "answer yes or no".to_string()),
-        Kind::Acceptance => {
-            (!value.is_empty() && value != "yes").then(|| "this has to be accepted".to_string())
-        }
-        Kind::Addresses => validate::address_lines(value),
-        _ => None,
+    if q.kind == Kind::Addresses {
+        return validate::address_lines(value);
     }
+    None
 }
 
 /// The draft's answers with the key answer rebuilt from the keys the draft

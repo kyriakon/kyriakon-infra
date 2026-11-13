@@ -200,7 +200,7 @@ pub(super) fn build_record(
             version: app.cfg.release.clone(),
         })
         .collect();
-    if form.get("accept_supply").map(String::as_str) == Some("yes") {
+    if form.get("accept_supply").map(|v| v.trim()) == Some("yes") {
         acceptances.push(Acceptance {
             document: "immediate supply and the digital-content acknowledgement".to_string(),
             version: app.cfg.release.clone(),
