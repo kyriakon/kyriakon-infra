@@ -503,18 +503,6 @@ fn write_tree(
     Ok(stamp)
 }
 
-/// The address the ready notice goes to: the contact the member gave, when it
-/// validates as a mail header, and the mailbox on the platform otherwise. A
-/// group mailbox's platform address is its mailbox on the group's own domain.
-fn member_address(account: &Account) -> String {
-    account
-        .outside_address
-        .as_deref()
-        .filter(|addr| crate::flow::validate::address(addr).is_none())
-        .map(str::to_string)
-        .unwrap_or_else(|| account.platform_address())
-}
-
 /// Write the written part into the member's sftp chroot and append the ready
 /// notice. Returns the bundle's path relative to the chroot, which is the shape
 /// the request record's `bundle` field carries.
@@ -544,7 +532,7 @@ pub async fn deliver(cfg: &DrainConfig, store: &Store, username: &str) -> Result
     let name = stamp(now);
     let export = export_dir(&chroot)?;
     write_tree(&export, &name, &docs, owner)?;
-    let to = member_address(&account);
+    let to = account.notice_address();
     notice::send_again(
         cfg,
         store,
@@ -572,13 +560,22 @@ fn bundle_text(docs: &[(String, Vec<u8>)]) -> String {
 }
 
 /// The one explanation a member with neither the key nor the password is owed.
-fn reachable() -> String {
+/// The drain closes a page export with this text when the member has no key, so
+/// the docket says the same thing the mailed path's error does.
+pub fn reachable() -> String {
     "What is still reachable is the written part of the export and the login: the\n\
      login through the password path in the runbook, and the written part by post or\n\
      in person from the operator. The mail is ciphertext to a key the platform does\n\
      not hold, and with no private key it is unreadable to the member too; the answer\n\
      says which parts are reachable rather than promising the whole."
         .to_string()
+}
+
+/// Whether the member holds a published mail key. A page export for a member
+/// without one cannot be mailed, so the drain settles it with [`reachable`]
+/// instead of failing a pass the backoff would retry forever.
+pub fn has_mail_key(cfg: &DrainConfig, username: &str) -> bool {
+    keycheck::keyring_file(&cfg.keyring_dir, username).is_file()
 }
 
 /// Encrypt the written part to the member's public key with the same gpg
@@ -665,7 +662,7 @@ pub async fn deliver_by_mail(
     let (account, answer, docs) = written(cfg, store, username, now, true).await?;
     let armored = encrypt(&cfg.gpg, &key, bundle_text(&docs).as_bytes()).await?;
     let filename = format!("export-{}.txt.asc", stamp(now));
-    let to = member_address(&account);
+    let to = account.notice_address();
     notice::send_account_notice_attachment(
         cfg,
         store,

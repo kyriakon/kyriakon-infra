@@ -833,17 +833,10 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
 /// The contact address the member gave, when it validates as a mail header. It
 /// is validated again because it becomes a mail header, and a record that
 /// reached it from outside the drain is not trusted.
-pub(super) fn valid_contact(address: Option<&str>) -> Option<String> {
+fn valid_contact(address: Option<&str>) -> Option<String> {
     address
         .filter(|addr| validate::address(addr).is_none())
         .map(str::to_string)
-}
-
-/// The address a lifecycle notice goes to: the contact the member gave, or the
-/// mailbox that reaches them on the platform. A group mailbox's platform
-/// address is its mailbox on the group's own domain.
-fn notice_address(account: &Account) -> String {
-    valid_contact(account.outside_address.as_deref()).unwrap_or_else(|| account.platform_address())
 }
 
 /// The address a group's lifecycle notice goes to: the site owner's account
@@ -914,7 +907,7 @@ async fn grace_notice(
         .payment_state()
         .and_then(|payment| payment.token_ref)
         .unwrap_or_default();
-    let to = notice_address(account);
+    let to = account.notice_address();
     let subject = format!("Your kyriakon.net account's grace ends on {grace} ({username})");
     let body = format!(
         "The payment window for {username} closed and no payment has been recorded.\n\n\
@@ -994,7 +987,7 @@ async fn final_notice(
         .payment_state()
         .and_then(|payment| payment.token_ref)
         .unwrap_or_default();
-    let to = notice_address(account);
+    let to = account.notice_address();
     let subject = "Your kyriakon.net account will be deleted in seven days".to_string();
     let body = format!(
         "The payment window for {username} closed and no payment was recorded.\n\n\
@@ -1021,7 +1014,7 @@ async fn suspension_final_notice(
 ) -> Result<(), Error> {
     let grace = account.grace_until.as_deref().unwrap_or("");
     let reason = account.suspension_reason.as_deref().unwrap_or("");
-    let to = notice_address(account);
+    let to = account.notice_address();
     let subject = format!(
         "Your suspended kyriakon.net account is deleted in seven days: {reason} ({username})"
     );
@@ -1065,7 +1058,7 @@ async fn lapse_notice(
     let closes_on = &window.closes_at[..10.min(window.closes_at.len())];
     let token = payment.token_ref.as_deref().unwrap_or("");
     let grace = account.grace_until.as_deref().unwrap_or("");
-    let to = notice_address(account);
+    let to = account.notice_address();
     let subject = "Your kyriakon.net payment window has closed".to_string();
     let body = format!(
         "The payment window for {username} closed on {closes_on} and no payment was recorded.\n\n\
@@ -1156,7 +1149,7 @@ pub async fn suspend(
         )
         .await?;
     }
-    let to = notice_address(&account);
+    let to = account.notice_address();
     // The reason is in the subject, so a corrected reason is a new notice and a
     // rerun of the same one stays deduplicated.
     let subject = format!("Your kyriakon.net account is suspended: {reason} ({username})");
@@ -2716,7 +2709,7 @@ pub async fn free_anniversaries(
         // The address the approval used: the one outside the platform, or the
         // member's mailbox. It was validated before it was written, and is
         // validated again here because it is about to become a mail header.
-        let to = notice_address(&account);
+        let to = account.notice_address();
         let subject = format!(
             "Your kyriakon.net account is free for another year ({})",
             due.year()
@@ -2805,7 +2798,7 @@ pub async fn prepaid_renewals(
         )
         .join("\n");
         let token = payment.token_ref.as_deref().unwrap_or("");
-        let to = notice_address(&account);
+        let to = account.notice_address();
         let subject = format!("Your kyriakon.net membership runs out on {paid_until} ({username})");
         let body = format!(
             "The membership for {username} is paid until {paid_until}.\n\n\
@@ -3023,11 +3016,14 @@ pub async fn holds_sweep(store: &Store) -> Result<(), Error> {
 /// that proves it is `verify`'s.
 ///
 /// The bundle is written into the member's own chroot and the ready notice is
-/// appended in the same pass, and the request's line is closed with the bundle's
-/// path so the page's own ask does not stay open. The journal line names the
-/// application the account was approved from when the copy is still inside ADR
-/// 0005's purge; an export after the purge has no status token left to name and
-/// journals none.
+/// appended in the same pass; a member with no site or upload key has the same
+/// written part mailed encrypted instead, and one with no published key at all
+/// settles with the text that says what is still reachable and sends nothing.
+/// The request's line is closed with what was done so the page's own ask does
+/// not stay open. A replayed pass settles from that line rather than delivering
+/// again. The journal line names the application the account was approved from
+/// when the copy is still inside ADR 0005's purge; an export after the purge has
+/// no status token left to name and journals none.
 pub async fn export_account(
     cfg: &DrainConfig,
     store: &Store,
@@ -3094,6 +3090,23 @@ pub async fn export_account(
         .account(username)
         .await?
         .ok_or_else(|| Error::Failed(format!("accounts/{username}/account.json is missing")))?;
+    let application = ApplicationRef::application(username.to_string(), status_token);
+    // A pass that delivered and closed but crashed before its journal line is
+    // replayed by the next pass. The delivered bundle is already on the line,
+    // so the replay settles from it: only the close was guarded before, and the
+    // mailed path sent the member a second encrypted copy.
+    if let Some(line) = existing.as_ref().filter(|line| line.done.is_some()) {
+        let delivered = line
+            .bundle
+            .clone()
+            .or_else(|| line.done.clone())
+            .unwrap_or_default();
+        return Ok(Settlement::line(
+            "applied",
+            application,
+            Some(format!("already settled: {delivered}")),
+        ));
+    }
     // A member with no site or no upload key cannot reach a bundle written into
     // the chroot, so the same written part goes by mail instead. An existing
     // path that cannot be read is left to `deliver` to report rather than
@@ -3102,6 +3115,17 @@ pub async fn export_account(
     let absent =
         std::fs::symlink_metadata(&chroot).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
     let mailed = absent || account.upload_keys.is_empty();
+    if mailed && !export::has_mail_key(cfg, username) {
+        // No published key cannot be fixed by retrying: close the request with
+        // what is still reachable, so the docket settles and the operator is
+        // told once rather than every pass.
+        let done = export::reachable();
+        let delivered_on = kyriakon_control_core::util::date_string(
+            kyriakon_control_core::account::requests::today(),
+        );
+        kyriakon_control_core::account::requests::close(store, &id, &delivered_on, &done).await?;
+        return Ok(Settlement::line("applied", application, Some(done)));
+    }
     let (bundle, done) = if mailed {
         (
             export::deliver_by_mail(cfg, store, username).await?,
@@ -3114,21 +3138,14 @@ pub async fn export_account(
         )
     };
     // Record the delivery and close the line it answers, so the page's own
-    // export is not left open in the operator's docket. A pass that delivered
-    // and closed but crashed before its journal line is replayed by the next
-    // pass: the line is already closed, which is the same fact rather than a
-    // second request.
+    // export is not left open in the operator's docket.
     kyriakon_control_core::account::requests::set_bundle(store, &id, username, &bundle).await?;
-    if existing.as_ref().is_none_or(|line| line.done.is_none()) {
-        // The answer date is the day the bundle was delivered, not the day it
-        // was asked for: a delivery that slipped past the filing day must not
-        // read as on time.
-        let delivered_on = kyriakon_control_core::util::date_string(
-            kyriakon_control_core::account::requests::today(),
-        );
-        kyriakon_control_core::account::requests::close(store, &id, &delivered_on, done).await?;
-    }
-    let application = ApplicationRef::application(username.to_string(), status_token);
+    // The answer date is the day the bundle was delivered, not the day it was
+    // asked for: a delivery that slipped past the filing day must not read as
+    // on time.
+    let delivered_on =
+        kyriakon_control_core::util::date_string(kyriakon_control_core::account::requests::today());
+    kyriakon_control_core::account::requests::close(store, &id, &delivered_on, done).await?;
     Ok(Settlement::line(
         "applied",
         application.clone(),

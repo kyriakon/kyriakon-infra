@@ -366,7 +366,7 @@ fn the_export_refuses_a_bad_year_and_a_format_that_is_not_csv() {
 /// A throwaway public key, generated for this suite and holding no private half
 /// anywhere: the mailed path only needs something gpg will encrypt to. It is
 /// public key material, not a secret.
-const EXPORT_TEST_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
+pub(crate) const EXPORT_TEST_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
 mDMEauZdXxYJKwYBBAHaRw8BAQdAUI2d9ahgJ7dCRCpMCpZuXkyAO3ODPjDTuo70\n\
 294GsJW0Mkt5cmlha29uIEV4cG9ydCBUZXN0IDxleHBvcnQtdGVzdEBleGFtcGxl\n\
 LmludmFsaWQ+iK8EExYKAFcWIQRH5ksicdvER5HUFAZXZl05+hflaQUCauZdXxsU\n\
@@ -969,12 +969,57 @@ fn both_export_paths_address_a_group_mailbox_on_its_domain() {
         .unwrap();
 
     let sent = fix.sent();
+    // The first notice already addressed the group domain, so assert on the
+    // mailed bundle's own message rather than the concatenated file.
+    let mailed = sent
+        .split("From: ")
+        .find(|message| message.contains("Content-Disposition: attachment"))
+        .unwrap_or_else(|| panic!("the mailed path sent no attachment: {sent}"));
     assert!(
-        sent.contains("To: parish-secretary@parish.example"),
-        "{sent}"
+        mailed.contains("To: parish-secretary@parish.example"),
+        "{mailed}"
+    );
+    assert!(!sent.contains("parish-secretary@kyriakon.net"), "{sent}");
+}
+
+/// A page export for a member with no published mail key cannot be written to a
+/// tree or mailed, and no retry can publish a key: the pass closes the request
+/// with the text that says what is still reachable, so the docket settles
+/// instead of retrying forever.
+#[test]
+fn a_page_export_with_no_mail_key_closes_with_what_is_reachable() {
+    let fix = Fix::new("data-export-nokey-page");
+    let record = fix.filed_with("secretary", "cash", &[("rail", "cash")], None, None);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    assert!(fix.drain().status.success());
+    std::fs::remove_file(fix.dir.join("keyring/secretary.asc")).unwrap();
+
+    fix.file_page_action("export", "secretary", json!({}));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert!(
+        !fix.journal().contains("\"failed\""),
+        "the pass backed off: {}",
+        fix.journal()
     );
     assert!(
-        !sent.contains("To: parish-secretary@kyriakon.net"),
-        "{sent}"
+        !fix.sent().contains("Content-Disposition: attachment"),
+        "nothing can be encrypted without a key: {}",
+        fix.sent()
     );
+
+    let requests = fix.read("accounts/secretary/requests.jsonl");
+    let line: Value = serde_json::from_str(requests.lines().next().unwrap()).unwrap();
+    assert!(
+        line["done"]
+            .as_str()
+            .is_some_and(|done| done.contains("still reachable")),
+        "{line}"
+    );
+    let out = fix.ctl(&["request", "list"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("no open requests"), "{}", body(&out));
 }

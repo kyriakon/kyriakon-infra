@@ -809,7 +809,8 @@ pub(super) async fn account_export(app: &App, request: &Request) -> Reply {
                  appear in your sftp space as export/<timestamp>/ beside www/ and \
                  gemini/, and a notice will say when it is ready. An account with no \
                  site or upload key gets the same record mailed encrypted to its mail \
-                 key instead.",
+                 key instead; with no mail key either, the answer says what is still \
+                 reachable and nothing is sent.",
             );
             Reply::html(200, page_html(&page))
         }

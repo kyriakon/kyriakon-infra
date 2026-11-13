@@ -3323,8 +3323,8 @@ fn a_page_export_records_and_closes_its_request_line() {
     assert!(body(&out).contains("no open requests"), "{}", body(&out));
 
     // A pass that delivered and closed but crashed before its journal line:
-    // the intent and its request line are already there, so the retry delivers
-    // again and leaves the close alone.
+    // the intent and its request line are already there, so the retry settles
+    // from the line's recorded bundle and delivers nothing again.
     let journal = fix.journal();
     let kept: String = journal
         .lines()
@@ -3337,8 +3337,6 @@ fn a_page_export_records_and_closes_its_request_line() {
         filed,
     )
     .unwrap();
-    // One export per second names one directory.
-    std::thread::sleep(std::time::Duration::from_secs(1));
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     assert!(
@@ -3355,6 +3353,48 @@ fn a_page_export_records_and_closes_its_request_line() {
     assert_eq!(again[0]["done_at"], line["done_at"], "{record}");
     let out = fix.ctl(&["request", "list"]);
     assert!(body(&out).contains("no open requests"), "{}", body(&out));
+}
+
+/// A replayed pass over a mailed export settles from the closed request line and
+/// mails nothing again: when only the close was guarded, the retry sent the
+/// member a second encrypted copy.
+#[test]
+fn two_runs_over_one_export_intent_mail_nothing_twice() {
+    let fix = Fix::new("data-export-twice-mail");
+    let record = fix.filed_with("secretary", "cash", &[("rail", "cash")], None, None);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    assert!(fix.drain().status.success());
+    fix.mail_key("secretary", crate::export::EXPORT_TEST_KEY);
+
+    let id = fix.file_page_action("export", "secretary", json!({}));
+    let filed = fix.read(&format!("intents/{id}.json"));
+    assert!(fix.drain().status.success());
+    let after_first = fix.snapshot();
+    let subject = "Subject: Your kyriakon.net data export is ready";
+    assert_eq!(fix.sent().matches(subject).count(), 1, "{}", fix.sent());
+
+    // The same intent again, as a crash before the delete leaves it: the pass
+    // re-reads it and must settle from the line rather than mailing again.
+    std::fs::write(
+        fix.dir.join("store/intents").join(format!("{id}.json")),
+        &filed,
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.sent().matches(subject).count(),
+        1,
+        "a replayed pass mailed a second copy: {}",
+        fix.sent()
+    );
+    assert_eq!(
+        after_first,
+        fix.snapshot(),
+        "the second run changed the store"
+    );
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
 }
 
 /// A delivery that slips past the day the request was recorded closes on the
