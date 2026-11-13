@@ -1220,9 +1220,27 @@ fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, Error> {
     // fail closed, so the shared check refuses it before the journal line.
     let checked = kyriakon_control_core::mail::keycheck::pgp_public_key(&key.material)
         .map_err(|e| Error::context(format!("the mail key for {}", intent.mailbox), e))?;
+    // The form and the rotation path refuse a key whose verdict is not "works";
+    // the console is the same boundary, so an AEAD advert or an expiring subkey
+    // cannot reach the keyring by this route.
+    if let Some(why) = checked.refusal() {
+        return Err(Error::Failed(format!(
+            "the mail key for {} cannot be used: {why}",
+            intent.mailbox
+        )));
+    }
     let mut key = key.clone();
     key.mailbox = intent.mailbox.clone();
     key.verdict = checked.verdict;
+    // The signature covers the material, not the fingerprint beside it, so the
+    // fingerprint is computed from the parsed key rather than trusted.
+    key.fingerprint = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&key.material)
+        .ok_or_else(|| {
+            Error::Failed(format!(
+                "the mail key for {} has no fingerprint this build can derive",
+                intent.mailbox
+            ))
+        })?;
     Ok(key)
 }
 

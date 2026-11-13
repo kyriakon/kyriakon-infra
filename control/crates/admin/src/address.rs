@@ -67,17 +67,21 @@ pub(crate) async fn address(
             }
             // The same check the responder and the portal run, so a console
             // submission cannot file a mailbox the pages would have refused:
-            // the fingerprint and verdict are computed from the material, never
-            // left blank or "unchecked" for something that is not a key.
+            // the refusal and the verdict are the check's, never "unchecked"
+            // for something that is not a key.
+            let checked = keycheck::pgp_public_key(&material)
+                .map_err(|why| Error::Failed(format!("the mail key {path}: {why}")))?;
+            if let Some(why) = checked.refusal() {
+                return Err(Error::Failed(format!(
+                    "the mail key for {mailbox} cannot be used: {why}"
+                )));
+            }
             let address = format!("{mailbox}@kyriakon.net");
             let record = keycheck::mail_key(mailbox.to_string(), &address, &material);
             if record.fingerprint.is_empty() {
-                let why = keycheck::pgp_public_key(&material)
-                    .err()
-                    .unwrap_or_else(|| {
-                        kyriakon_control_core::Error::Failed("it carries no key packet".to_string())
-                    });
-                return Err(Error::Failed(format!("the mail key {path}: {why}")));
+                return Err(Error::Failed(format!(
+                    "the mail key {path}: it carries no key packet"
+                )));
             }
             Some(record)
         }
