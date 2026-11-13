@@ -13,14 +13,22 @@ resource "hcloud_server" "mail" {
   location    = var.location
   image       = data.hcloud_image.openbsd.id
 
-  # The live box must never be rebuilt from whatever the selector currently
-  # resolves to. `image` is ForceNew in the provider, so a change to the data
-  # source is not an in-place update: it is destroy and recreate, and the server
-  # it would destroy is the only copy of the mail. The selector moves on its own
-  # as snapshots are taken and relabelled, and the existing server's image is a
-  # historical fact about when it was built, not a setting to keep in sync.
   lifecycle {
-    ignore_changes = [image]
+    # `image` is ForceNew in the provider, so a change to the data source is not
+    # an in-place update: it is destroy and recreate, and the server it would
+    # destroy is the only copy of the mail. The live box must never be rebuilt
+    # from whatever the selector currently resolves to. The selector moves on
+    # its own as snapshots are taken and relabelled, and the existing server's
+    # image is a historical fact about when it was built, not a setting to keep
+    # in sync.
+    #
+    # `server_type` is ignored for the same console reason as `public_net`
+    # below: the provider's update path for a type change powers the server
+    # off, changes the type, and does not power it back on, so an apply leaves
+    # the box off at the softraid passphrase prompt. A resize is a hand step in
+    # the Hetzner console (docs/runbook.md, "How much the box carries"), and
+    # `terraform plan` should show no diff after one.
+    ignore_changes = [image, server_type]
 
     # Terraform is refused the chance to plan this server's removal at all, replacement
     # included, since any ForceNew change plans as a destroy. delete_protection below is
@@ -37,6 +45,13 @@ resource "hcloud_server" "mail" {
   # same reason as delete: a rebuild replaces the root disk with an image.
   delete_protection  = true
   rebuild_protection = true
+
+  # Off, and declared so on purpose: restic on the storage box is the copy
+  # (scripts/backup.sh, proven by the weekly restore test), not Hetzner's own
+  # backups. Leaving this undeclared means a console enable is planned back off
+  # without a line in this file to explain it; declared, the correction is still
+  # applied, but the intent is visible to a reviewer.
+  backups = false
 
   # public_net is deliberately not declared. The provider's update path for it
   # powers the server off, does its work, and powers it back on, and this box
