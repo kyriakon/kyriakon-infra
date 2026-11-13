@@ -30,8 +30,8 @@ fi
 # shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
 . "$script_dir/lib.sh"
 
-: "${RESTIC_REPOSITORY:?RESTIC_REPOSITORY is required}"
-: "${RESTIC_PASSWORD_FILE:?RESTIC_PASSWORD_FILE is required}"
+# The live pass's required environment is checked after the --self-test
+# dispatch below: the guard's fixtures need no repository and no key file.
 
 # restic caches repository metadata under $HOME, and cron hands these scripts
 # HOME=/var/log, so the cache would sit in the log directory instead. All three
@@ -59,6 +59,102 @@ die() {
 	printf '%s\n' "$1" >&2
 	hc_fail "${HEALTHCHECKS_URL:-}"
 }
+
+# maildir_ciphertext_ok <file>: a restored message is the RFC 3156 envelope this
+# platform writes — the multipart/encrypted Content-Type on its first line — with
+# the PGP armor inside it. A plaintext message that merely quotes the armor line
+# fails the first test, and one with no armor fails the second.
+maildir_ciphertext_ok() {
+	head -n 1 "$1" | grep -q '^Content-Type: multipart/encrypted;' || return 1
+	LC_ALL=C tr -d '\r' < "$1" | grep -qx -- '-----BEGIN PGP MESSAGE-----' || return 1
+	return 0
+}
+
+# check_maildir_ciphertext <target-root>: every message in every mailbox, the
+# hidden folders included (admin@ delivers to Maildir/.Admin), must be the
+# envelope. Passes vacuously when there is no mail yet. A subfolder was the hole
+# in the old glob: it scanned cur/ and new/ under each Maildir but nothing under
+# Maildir/.*.
+check_maildir_ciphertext() {
+	typeset target="$1" msg msg_count=0
+	for msg in "$target"/home/*/Maildir/cur/* \
+		"$target"/home/*/Maildir/new/* \
+		"$target"/home/*/Maildir/.[!.]*/cur/* \
+		"$target"/home/*/Maildir/.[!.]*/new/*; do
+		[ -f "$msg" ] || continue
+		msg_count=$(( msg_count + 1 ))
+		maildir_ciphertext_ok "$msg" ||
+			die "restored Maildir message is not an RFC 3156 envelope with PGP armor: $msg"
+	done
+	printf 'verified %s restored Maildir messages are PGP ciphertext\n' "$msg_count"
+}
+
+# The guard's own fixtures, no box needed: a real envelope passes, a plaintext
+# message quoting the armor line fails, and a plaintext message in a hidden
+# folder is not invisible.
+self_test() {
+	self_test_begin
+	# The fixtures exercise the failure paths on purpose; a real dead-man's
+	# switch must not be told the box is down by its own test.
+	unset HEALTHCHECKS_URL
+	# shellcheck disable=SC2154 # set by self_test_begin
+	tree=$self_test_work
+	mkdir -p "$tree/home/alice/Maildir/cur" "$tree/home/alice/Maildir/.Admin/cur"
+	{
+		printf 'Content-Type: multipart/encrypted; protocol="application/pgp-encrypted";\n'
+		printf '\tboundary="kyriakon-self-test"\n\n'
+		printf -- '-----BEGIN PGP MESSAGE-----\n\nciphertext\n'
+	} > "$tree/home/alice/Maildir/cur/envelope"
+	code=0
+	( check_maildir_ciphertext "$tree" ) >/dev/null 2>&1 || code=$?
+	check "a real envelope passes" "$code" 0
+	printf 'From: sender@example.invalid\nSubject: hi\n\nquoted:\n-----BEGIN PGP MESSAGE-----\n' \
+		> "$tree/home/alice/Maildir/cur/plain"
+	code=0
+	( check_maildir_ciphertext "$tree" ) >/dev/null 2>&1 || code=$?
+	check "a plaintext quote of the armor line fails" "$code" 1
+	rm "$tree/home/alice/Maildir/cur/plain"
+	# An envelope line with no armor is a truncated restore: the armor half of
+	# the guard must fail it on its own.
+	printf 'Content-Type: multipart/encrypted; protocol="application/pgp-encrypted";\n\nbody\n' \
+		> "$tree/home/alice/Maildir/cur/no-armor"
+	code=0
+	( check_maildir_ciphertext "$tree" ) >/dev/null 2>&1 || code=$?
+	check "an envelope with no armor fails" "$code" 1
+	rm "$tree/home/alice/Maildir/cur/no-armor"
+	# A quote of the armor line under a real envelope header is not the armor.
+	printf 'Content-Type: multipart/encrypted; protocol="application/pgp-encrypted";\n\n> -----BEGIN PGP MESSAGE-----\n' \
+		> "$tree/home/alice/Maildir/cur/quoted-armor"
+	code=0
+	( check_maildir_ciphertext "$tree" ) >/dev/null 2>&1 || code=$?
+	check "a quoted armor line under an envelope fails" "$code" 1
+	rm "$tree/home/alice/Maildir/cur/quoted-armor"
+	# A client re-upload can leave CRLF armor; it is still the real armor.
+	printf 'Content-Type: multipart/encrypted; protocol="application/pgp-encrypted";\r\n\r\n-----BEGIN PGP MESSAGE-----\r\n\r\nciphertext\r\n' \
+		> "$tree/home/alice/Maildir/cur/crlf"
+	code=0
+	( check_maildir_ciphertext "$tree" ) >/dev/null 2>&1 || code=$?
+	check "CRLF armor passes" "$code" 0
+	rm "$tree/home/alice/Maildir/cur/crlf"
+	printf 'From: sender@example.invalid\nSubject: hi\n\nplain body\n' \
+		> "$tree/home/alice/Maildir/.Admin/cur/plain"
+	code=0
+	( check_maildir_ciphertext "$tree" ) >/dev/null 2>&1 || code=$?
+	check "a plaintext message in a hidden folder fails" "$code" 1
+	self_test_end
+}
+
+case "${1:-}" in
+--self-test) self_test ;;
+'') ;;
+*)
+	printf 'usage: doas ksh %s\n' "$0" >&2
+	exit 2
+	;;
+esac
+
+: "${RESTIC_REPOSITORY:?RESTIC_REPOSITORY is required}"
+: "${RESTIC_PASSWORD_FILE:?RESTIC_PASSWORD_FILE is required}"
 
 # Before anything is restored or removed. `${target_root:?}` refuses unset and
 # empty, not `/`, so the root is refused here by name. The removal below is
@@ -173,17 +269,12 @@ done
 printf 'verified /etc/mail, control state and the account database are in the snapshot and /root secrets are not\n'
 
 # --- 6. Maildir-is-PGP-ciphertext --------------------------------------
-# Zero-access regression guard: every restored message must carry the ASCII-armor
-# header. A plaintext message (or a quote of "BEGIN PGP MESSAGE") must not pass.
-# cur/ and new/ contain only messages (Dovecot indexes live in the Maildir root),
-# so nothing else to skip. Passes vacuously if there are no messages yet.
-msg_count=0
-for msg in "$target"/home/*/Maildir/cur/* "$target"/home/*/Maildir/new/*; do
-	[ -f "$msg" ] || continue
-	msg_count=$(( msg_count + 1 ))
-	grep -q -e '-----BEGIN PGP MESSAGE-----' "$msg" || die "restored Maildir message is not PGP ciphertext: $msg"
-done
-printf 'verified %s restored Maildir messages are PGP ciphertext\n' "$msg_count"
+# Zero-access regression guard: every restored message must be the envelope this
+# platform writes, with the armor inside it. A plaintext message, and a message
+# that merely quotes "BEGIN PGP MESSAGE", must not pass. Every mailbox is
+# scanned, hidden folders included: admin@ is delivered to alice+Admin, so that
+# mail lives in Maildir/.Admin. Passes vacuously if there are no messages yet.
+check_maildir_ciphertext "$target"
 
 # --- 7. git fsck on restored bare repos ---------------------------------
 repo_count=0
