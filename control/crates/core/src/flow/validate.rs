@@ -17,6 +17,10 @@ pub fn reserved(text: &str) -> HashSet<String> {
         .collect()
 }
 
+/// The longest a single-line answer may be. A body's name is a name, not a
+/// paragraph, and without a bound a megabyte answer is stored and printed.
+const SINGLE_LINE_MAX: usize = 200;
+
 /// The refusal for one answer, or `None` when it is acceptable. `required` is
 /// passed in rather than read from the question, because the monastic blessing
 /// is required only on the monastic path.
@@ -69,11 +73,17 @@ pub fn reason(
         Rule::MaxLen(n) => (v.chars().count() > *n).then(|| format!("at most {n} characters")),
         // The raw value, not the trimmed one: a trailing newline would be cut
         // by `trim` and land on the record anyway. The capsule prints this
-        // answer as gemtext, where a line break starts a line of its own.
-        Rule::SingleLine => value
-            .chars()
-            .any(char::is_control)
-            .then(|| format!("{} is one line, without control characters", q.prompt)),
+        // answer as gemtext, where a line break starts a line of its own. The
+        // caller prefixes the question's own prompt, so this fragment does not
+        // repeat it.
+        Rule::SingleLine => {
+            if value.chars().any(char::is_control) {
+                Some("one line, without control characters".to_string())
+            } else {
+                (value.chars().count() > SINGLE_LINE_MAX)
+                    .then(|| format!("at most {SINGLE_LINE_MAX} characters"))
+            }
+        }
     }
 }
 
@@ -343,9 +353,10 @@ mod tests {
     }
 
     /// A one-line answer cannot carry a line break or an escape sequence onto
-    /// the record, because the capsule prints it into gemtext unchanged.
+    /// the record, because the capsule prints it into gemtext unchanged, and
+    /// it is a name rather than a paragraph, so it has a bound.
     #[test]
-    fn a_single_line_answer_refuses_control_characters() {
+    fn a_single_line_answer_refuses_a_control_character_or_an_over_long_value() {
         let q = Question {
             id: "body_name".into(),
             prompt: "The body's name".into(),
@@ -357,14 +368,20 @@ mod tests {
         assert!(reason(&q, "Parish of Example", &name(), true).is_none());
         let why = reason(&q, "Parish\n=> https://evil.example/", &name(), true)
             .expect("a newline is refused");
-        assert!(
-            why.contains("one line, without control characters"),
-            "{why}"
-        );
-        assert!(why.contains("The body's name"), "{why}");
+        assert_eq!(why, "one line, without control characters");
         for hostile in ["Parish\rX", "Parish\u{1b}X", "Parish\tX", "Parish\u{7}X"] {
             assert!(reason(&q, hostile, &name(), true).is_some(), "{hostile:?}");
         }
+
+        // The bound is the last character accepted and one more refused.
+        let at_bound = "a".repeat(SINGLE_LINE_MAX);
+        assert!(reason(&q, &at_bound, &name(), true).is_none());
+        let over = "a".repeat(SINGLE_LINE_MAX + 1);
+        let why = reason(&q, &over, &name(), true).expect("one over the bound is refused");
+        assert!(
+            why.contains(&format!("at most {SINGLE_LINE_MAX} characters")),
+            "{why}"
+        );
     }
 
     #[test]
