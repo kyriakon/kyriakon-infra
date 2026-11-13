@@ -347,7 +347,7 @@ attention, not the member's mailbox.
 **Command.**
 
 	spamdb | awk -F'|' '{c[$1]++} END {for (k in c) printf "%s %d\n", k, c[k]}'
-	for f in /var/log/daemon.[0-4].gz; do gzip -dc "$f"; done | cat - /var/log/daemon |
+	for f in /var/log/daemon.[0-6].gz; do gzip -dc "$f"; done | cat - /var/log/daemon |
 	grep -c '(GREY)'
 
 **Observed.** The live count on 2026-09-30 is 3 GREY, 5 WHITE and 2 TRAPPED. The log records new

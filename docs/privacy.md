@@ -45,7 +45,7 @@ That covers stored content, not the addressing information mail needs to move. S
 
 | What | How long |
 | --- | --- |
-| Log records that identify you: smtpd envelope, Dovecot authentication, sshd, dns | 7 days |
+| Log records that identify you: smtpd envelope, Dovecot authentication, sshd, dns, the onboarding handler and httpd access logs | 7 days |
 | Spam greylist and whitelist entries | about 36 days on the whitelist |
 | Application data for an application that is rejected or abandoned, and the text the triage model saw | 90 days |
 | Your account, mailbox, website, gemini capsule and git repositories | while the account exists, then deleted |

@@ -91,10 +91,11 @@ It is named so that its absence is a decision rather than an oversight.
 
 Logs carrying user-identifiable data are bounded rather than eliminated. `openbsd/etc/newsyslog.conf`
 enforces a seven-day retention window on `maillog` (smtpd envelopes and Dovecot authentication),
-`authlog` (sshd) and `nsd.log`, so the raw per-user record, meaning source address, timestamps and
-message size, expires about a week after it is written. Seven days is the shortest window that still
-lets abuse monitoring catch a slow-burn compromise such as a low-and-slow relay or a
-credential-stuffing ramp, without keeping a permanent per-user log.
+`authlog` (sshd), `nsd.log`, `/var/log/daemon` (the onboarding handler's route, token and client
+address) and httpd's access log (client addresses and capability URLs), so the raw per-user record,
+meaning source address, timestamps and message size, expires about a week after it is written. Seven
+days is the shortest window that still lets abuse monitoring catch a slow-burn compromise such as a
+low-and-slow relay or a credential-stuffing ramp, without keeping a permanent per-user log.
 
 Abuse monitoring (`scripts/abuse-monitor.sh`) reads aggregate counts: relay volume,
 authentication failures, greylist churn, plus a per-account outbound recipient count for the
