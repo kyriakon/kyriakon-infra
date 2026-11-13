@@ -36,7 +36,7 @@ pub use error::Error;
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -89,6 +89,21 @@ https://signup.kyriakon.net works the same way and has no session limit.
 pub const SESSION_DIR: &str = "/var/db/kyriakon-onboard-tui";
 pub const SESSIONS_PER_ADDRESS: usize = 2;
 pub const SESSIONS_TOTAL: usize = 16;
+
+/// The longest line this program reads, in bytes. A real armoured key line is 64
+/// characters of base64, so this is a hundredfold margin. It is a bound rather
+/// than a buffer size: `Reader` streams a longer line through a fixed buffer
+/// and keeps none of it, so one paste cannot grow the process to the login
+/// class's memory ceiling. [#753]
+///
+/// [#753]: https://github.com/kyriakon/kyriakon-infra/issues/753
+pub const LINE_CAP: usize = 8 * 1024;
+
+/// The most one answer may keep, in characters: every line of a multi-line
+/// answer and every line of a pasted key block counts against it, and an answer
+/// past it is refused rather than truncated. A key block is a few kilobytes, so
+/// this is a margin of ten or more over a real one.
+pub const ANSWER_CAP: usize = 64 * 1024;
 
 /// The directory-wide count lock. Unlike the session files it is permanent, so a
 /// test holding the section has the same name to open.
@@ -320,13 +335,126 @@ pub enum Departure {
 /// which leaves the session rather than being an error: an sshd session whose
 /// client went away is ordinary.
 pub trait Input {
-    /// A word the reader typed and ended with Enter. The terminal is in its
-    /// ordinary state for this, so the reader sees what they type and backspace
-    /// works.
-    fn word(&mut self) -> Result<Option<String>, Error>;
+    /// A word the reader typed and ended with Enter, or the fact that the line
+    /// was longer than `LINE_CAP`. The terminal is in its ordinary state for
+    /// this, so the reader sees what they type and backspace works.
+    fn word(&mut self) -> Result<Option<Word>, Error>;
 
     /// One key, with a screen being drawn.
     fn key(&mut self) -> Result<Option<Key>, Error>;
+}
+
+/// What the reader's line turned out to be.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Word {
+    /// The line, without its ending.
+    Line(String),
+    /// Longer than `LINE_CAP`. The rest of the line was read and dropped, so the
+    /// session is left on a line boundary and can ask again rather than carry
+    /// the bytes.
+    TooLong,
+}
+
+/// One session's input, read a line at a time through a fixed buffer.
+///
+/// This is where the portal's memory bound is: a reader can send a line of any
+/// length to a port that needs no authentication, so the line is streamed rather
+/// than collected, and the bytes past `LINE_CAP` are dropped a buffer at a time
+/// until the line ends. Nothing here allocates in proportion to what arrives: the
+/// line kept is at most the cap, and the bytes a read brought past its ending
+/// wait in one more buffer, because a paste arrives several lines to a read.
+pub struct Reader<R: Read> {
+    inner: R,
+    /// What the last read brought past the line it ended, waiting for the next
+    /// call. One buffer, for the same reason the read asks for one.
+    held: [u8; 4096],
+    held_at: usize,
+    held_len: usize,
+}
+
+impl<R: Read> Reader<R> {
+    pub fn new(inner: R) -> Reader<R> {
+        Reader {
+            inner,
+            held: [0u8; 4096],
+            held_at: 0,
+            held_len: 0,
+        }
+    }
+
+    /// Wait for at least one byte, and say whether there is one. `false` is a
+    /// connection that closed.
+    fn hold(&mut self) -> Result<bool, Error> {
+        while self.held_at == self.held_len {
+            let n = match self.inner.read(&mut self.held) {
+                Ok(0) => return Ok(false),
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(Error::Failed(format!(
+                        "cannot read the session's input: {e}"
+                    )))
+                }
+            };
+            self.held_at = 0;
+            self.held_len = n;
+        }
+        Ok(true)
+    }
+
+    /// One byte, or `None` when the connection closed. A key comes through here
+    /// rather than from the terminal directly, so a byte a paste left behind is
+    /// still read in the order it arrived.
+    pub fn byte(&mut self) -> Result<Option<u8>, Error> {
+        if !self.hold()? {
+            return Ok(None);
+        }
+        let byte = self.held[self.held_at];
+        self.held_at += 1;
+        Ok(Some(byte))
+    }
+
+    /// One line, or `None` when the connection closed.
+    pub fn word(&mut self) -> Result<Option<Word>, Error> {
+        let mut line: Vec<u8> = Vec::new();
+        let mut over = false;
+        let mut read_any = false;
+        loop {
+            if !self.hold()? {
+                break;
+            }
+            read_any = true;
+            let (end, ended) = {
+                let rest = &self.held[self.held_at..self.held_len];
+                let end = rest.iter().position(|b| *b == b'\n').unwrap_or(rest.len());
+                if !over {
+                    if line.len() + end > LINE_CAP {
+                        // The line is past the cap: what was kept is worth
+                        // nothing, and the rest of it is still read so the next
+                        // prompt starts where this line ended.
+                        over = true;
+                        line = Vec::new();
+                    } else {
+                        line.extend_from_slice(&rest[..end]);
+                    }
+                }
+                (end, rest.get(end) == Some(&b'\n'))
+            };
+            self.held_at += end + usize::from(ended);
+            if ended {
+                break;
+            }
+        }
+        if !read_any {
+            return Ok(None);
+        }
+        if over {
+            return Ok(Some(Word::TooLong));
+        }
+        String::from_utf8(line)
+            .map(|line| Some(Word::Line(line)))
+            .map_err(|_| Error::Failed("the session's input is not text".to_string()))
+    }
 }
 
 /// The menu's rows: the catalogue as this front-end shows it, one per entry, in
@@ -367,6 +495,11 @@ pub fn run(
     loop {
         let Some(word) = input.word()? else {
             return Ok(Departure::Gone);
+        };
+        let Word::Line(word) = word else {
+            // A line past the cap names nothing here; the screen asks again.
+            put(out, "\nPress Enter to start, or type quit to leave.\n")?;
+            continue;
         };
         match word.trim() {
             "" => break,
@@ -461,7 +594,10 @@ fn answer(
         }),
         Mode::Plain => Ok(match input.word()? {
             None => None,
-            Some(line) => match line.trim() {
+            // A line past the cap names no row, which is answered the same way
+            // as a number that names none.
+            Some(Word::TooLong) => Some(Answer::Again),
+            Some(Word::Line(line)) => match line.trim() {
                 "quit" | "q" => Some(Answer::Quit),
                 "" => Some(Answer::Again),
                 // A number that names no row is answered by painting the rows
@@ -661,8 +797,12 @@ fn application(
         let path = flow_path(flow.questions, &draft.answers);
         if index >= path.len() {
             paint(mode, out, &confirmation(flow.questions, &draft))?;
-            let Some(word) = input.word()? else {
-                return Ok(Departure::Gone);
+            let word = match input.word()? {
+                None => return Ok(Departure::Gone),
+                // A line past the cap is no word this screen knows; the confirm
+                // stays up and asks again.
+                Some(Word::TooLong) => continue,
+                Some(Word::Line(word)) => word,
             };
             match word.trim().to_ascii_lowercase().as_str() {
                 "yes" | "y" => {
@@ -702,6 +842,20 @@ fn application(
                 index = index.saturating_sub(1);
                 continue;
             }
+            Entered::TooLong => {
+                // The answer was dropped as it arrived, so the page is still the
+                // page: say so and ask it again rather than keep a prefix.
+                put(
+                    out,
+                    &format!(
+                        "\nThat answer is longer than this form accepts ({} characters at most).\n\
+                         Nothing was kept. Press Enter to try again.\n",
+                        answer_limit(page)
+                    ),
+                )?;
+                input.word()?;
+                continue;
+            }
             Entered::Value(value) => {
                 if let Some(why) =
                     flow_problem(page, &value, flow.reserved, required, &draft.answers)
@@ -731,14 +885,19 @@ fn application(
                         put(out, &format!("\nWarning: {warning}\n"))?;
                     }
                     put(out, "\nPress Enter to continue, or back to answer again.\n")?;
-                    match input.word()?.as_deref() {
+                    let answer = match input.word()? {
                         None => return Ok(Departure::Gone),
-                        Some("back") => {
+                        Some(Word::Line(line)) => line,
+                        // A line past the cap is no word this screen asks for.
+                        Some(Word::TooLong) => String::new(),
+                    };
+                    match answer.as_str() {
+                        "back" => {
                             index = index.saturating_sub(1);
                             continue;
                         }
-                        Some("quit") | Some("q") => return Ok(Departure::Quit),
-                        Some(_) => {}
+                        "quit" | "q" => return Ok(Departure::Quit),
+                        _ => {}
                     }
                 }
                 // The body's two line lists are checked together, because the
@@ -773,6 +932,20 @@ enum Entered {
     Back,
     Quit,
     Gone,
+    /// An answer past the cap `answer_limit` gives this page. The reader's input
+    /// was read and dropped, not kept, so the page can ask again.
+    TooLong,
+}
+
+/// The most characters one answer on this page may keep, its lines and their
+/// newlines together: the question's own `maxlen` where it names one, so a
+/// bounded question is bounded at the reader as well as at the validator, and
+/// `ANSWER_CAP` otherwise.
+fn answer_limit(page: &Page) -> usize {
+    match page.q.rule {
+        Rule::MaxLen(n) => n,
+        _ => ANSWER_CAP,
+    }
 }
 
 /// Read one answer. A multi-line answer, and an address list, end with a full
@@ -781,13 +954,21 @@ enum Entered {
 /// are read before a free-text answer starts, and on any line of a key, because
 /// neither word can appear in an armoured block and a mistaken paste otherwise
 /// has no way out.
+///
+/// The answer is bounded by `answer_limit`: a paste past it is refused before it
+/// is kept, because an answer a validator will refuse is not worth carrying.
 fn read_answer(page: &Page, input: &mut dyn Input) -> Result<Entered, Error> {
     let key = page.q.kind == Kind::Key;
     let multiline = matches!(page.q.kind, Kind::Multiline | Kind::Addresses);
-    let mut lines = Vec::new();
+    let limit = answer_limit(page);
+    let mut lines: Vec<String> = Vec::new();
+    let mut kept = 0;
     loop {
         let Some(word) = input.word()? else {
             return Ok(Entered::Gone);
+        };
+        let Word::Line(word) = word else {
+            return Ok(Entered::TooLong);
         };
         let line = word.trim_end_matches(['\r', '\n']);
         if lines.is_empty() && matches!(line, "\x1b[D" | "\x1bOD") {
@@ -805,12 +986,16 @@ fn read_answer(page: &Page, input: &mut dyn Input) -> Result<Entered, Error> {
         if line.trim().is_empty() && lines.is_empty() {
             break;
         }
+        // The terminator is the page's shape rather than part of its answer.
+        if multiline && line.trim() == "." {
+            break;
+        }
+        kept += line.chars().count() + usize::from(!lines.is_empty());
+        if kept > limit {
+            return Ok(Entered::TooLong);
+        }
         lines.push(line.to_string());
         if multiline {
-            if line.trim() == "." {
-                lines.pop();
-                break;
-            }
             continue;
         }
         if key {
@@ -981,7 +1166,7 @@ fn token_word(input: &mut dyn Input, out: &mut dyn Write) -> Result<Option<Strin
         out,
         "\nPaste the token from your status link, or press Enter to go back.\n",
     )?;
-    let Some(word) = input.word()? else {
+    let Some(Word::Line(word)) = input.word()? else {
         return Ok(None);
     };
     let token = word.trim();
@@ -1044,7 +1229,7 @@ mod tests {
     /// ends the session rather than passing.
     #[derive(Default)]
     struct Script {
-        words: VecDeque<Option<String>>,
+        words: VecDeque<Option<Word>>,
         keys: VecDeque<Option<Key>>,
     }
 
@@ -1053,7 +1238,7 @@ mod tests {
         /// both modes, and then these keys at the menu.
         fn full(keys: &[Key]) -> Script {
             Script {
-                words: [Some(String::new())].into(),
+                words: [Some(Word::Line(String::new()))].into(),
                 keys: keys.iter().copied().map(Some).collect(),
             }
         }
@@ -1062,7 +1247,30 @@ mod tests {
         /// answer the menu.
         fn lines(lines: &[&str]) -> Script {
             Script {
-                words: lines.iter().map(|l| Some((*l).to_string())).collect(),
+                words: lines
+                    .iter()
+                    .map(|l| Some(Word::Line((*l).to_string())))
+                    .collect(),
+                keys: VecDeque::new(),
+            }
+        }
+
+        /// A session whose first answer is a line past the cap, then these lines:
+        /// what an oversized paste at "Press Enter to start" looks like.
+        fn oversized(lines: &[&str]) -> Script {
+            Script {
+                words: std::iter::once(Some(Word::TooLong))
+                    .chain(lines.iter().map(|l| Some(Word::Line((*l).to_string()))))
+                    .collect(),
+                keys: VecDeque::new(),
+            }
+        }
+
+        /// A line session from owned lines, for answers that carry a cap's worth
+        /// of text.
+        fn owned(lines: Vec<String>) -> Script {
+            Script {
+                words: lines.into_iter().map(|l| Some(Word::Line(l))).collect(),
                 keys: VecDeque::new(),
             }
         }
@@ -1075,7 +1283,7 @@ mod tests {
     }
 
     impl Input for Script {
-        fn word(&mut self) -> Result<Option<String>, Error> {
+        fn word(&mut self) -> Result<Option<Word>, Error> {
             Ok(self.words.pop_front().unwrap_or(None))
         }
 
@@ -1469,7 +1677,7 @@ mod tests {
     /// One completed application in the line mode.
     fn scripts(lines: &[String]) -> Script {
         Script {
-            words: lines.iter().map(|l| Some(l.clone())).collect(),
+            words: lines.iter().map(|l| Some(Word::Line(l.clone()))).collect(),
             keys: VecDeque::new(),
         }
     }
@@ -1864,7 +2072,7 @@ mod tests {
 
         for (id, page, lines, expected) in cases {
             let mut script = Script {
-                words: lines.into_iter().map(Some).collect(),
+                words: lines.into_iter().map(|l| Some(Word::Line(l))).collect(),
                 keys: VecDeque::new(),
             };
             match read_answer(&page, &mut script).unwrap() {
@@ -1884,6 +2092,213 @@ mod tests {
                 "{id} was read but refused"
             );
         }
+    }
+
+    /// A reader that generates its bytes instead of holding them, and that
+    /// refuses a buffer larger than a fixed one: a read that collected the line
+    /// would ask for a growing vector's worth and fail here.
+    struct Flood {
+        left: usize,
+        seen: usize,
+    }
+
+    impl std::io::Read for Flood {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            assert!(
+                buf.len() <= 64 * 1024,
+                "the read loop asked for a {}-byte buffer",
+                buf.len()
+            );
+            let n = buf.len().min(self.left);
+            buf[..n].fill(b'A');
+            self.left -= n;
+            self.seen += n;
+            Ok(n)
+        }
+    }
+
+    /// A line past the cap is streamed through a fixed buffer rather than
+    /// collected: 64 MiB arrives, the portal keeps none of it, and the refusal is
+    /// the whole of what it reports. The line after an over-long one is still the
+    /// line after it, because the rest of the paste is read and dropped.
+    #[test]
+    fn a_hostile_line_is_streamed_rather_than_collected() {
+        let mut reader = Reader::new(Flood {
+            left: 64 * 1024 * 1024,
+            seen: 0,
+        });
+        assert_eq!(reader.word().unwrap(), Some(Word::TooLong));
+        assert_eq!(
+            reader.inner.seen,
+            64 * 1024 * 1024,
+            "the reader stopped mid-line"
+        );
+        assert_eq!(reader.word().unwrap(), None);
+    }
+
+    /// The line cap is exact: a line of `LINE_CAP` bytes is a line, one byte more
+    /// is refused, and either way the reader is left on the next line's first
+    /// byte, even when both lines arrived in one read.
+    #[test]
+    fn a_line_at_the_cap_is_read_and_one_byte_over_is_refused() {
+        let at_cap = format!("{}\nnext\n", "a".repeat(LINE_CAP));
+        let mut reader = Reader::new(std::io::Cursor::new(at_cap.into_bytes()));
+        assert_eq!(
+            reader.word().unwrap(),
+            Some(Word::Line("a".repeat(LINE_CAP)))
+        );
+        assert_eq!(
+            reader.word().unwrap(),
+            Some(Word::Line("next".to_string())),
+            "the line after an accepted one was lost"
+        );
+
+        let over = format!("{}\nnext\n", "a".repeat(LINE_CAP + 1));
+        let mut reader = Reader::new(std::io::Cursor::new(over.into_bytes()));
+        assert_eq!(reader.word().unwrap(), Some(Word::TooLong));
+        assert_eq!(
+            reader.word().unwrap(),
+            Some(Word::Line("next".to_string())),
+            "the reader was left mid-line after an over-long one"
+        );
+        assert_eq!(reader.word().unwrap(), None);
+    }
+
+    /// A free-text question with no limit of its own: the shape a hostile answer
+    /// arrives at.
+    fn note_question() -> Question {
+        Question {
+            id: "note".to_string(),
+            prompt: "Note".to_string(),
+            kind: Kind::Multiline,
+            branch: kyriakon_control_core::flow::questions::Branch::All,
+            required: true,
+            rule: Rule::None,
+        }
+    }
+
+    /// An answer is bounded at `ANSWER_CAP` characters of value, the newlines
+    /// between its lines included: exactly the cap is read, one character past it
+    /// is refused and none of it is kept.
+    #[test]
+    fn an_answer_at_the_cap_is_kept_and_one_past_it_is_refused() {
+        let question = Question {
+            kind: Kind::Text,
+            ..note_question()
+        };
+        let page = Page {
+            q: &question,
+            mailbox: None,
+        };
+        let mut script = Script::owned(vec!["a".repeat(ANSWER_CAP)]);
+        match read_answer(&page, &mut script).unwrap() {
+            Entered::Value(value) => assert_eq!(value.chars().count(), ANSWER_CAP),
+            _ => panic!("an answer at the cap was not read"),
+        }
+        assert!(script.spent());
+
+        let mut script = Script::owned(vec!["a".repeat(ANSWER_CAP + 1)]);
+        assert!(matches!(
+            read_answer(&page, &mut script).unwrap(),
+            Entered::TooLong
+        ));
+
+        // A multi-line answer counts its lines together: eight lines of 8192
+        // characters and the seven newlines between them are past the cap.
+        let multiline = note_question();
+        let page = Page {
+            q: &multiline,
+            mailbox: None,
+        };
+        let mut lines: Vec<String> = vec!["a".repeat(8192); 8];
+        lines.push(".".to_string());
+        let mut script = Script::owned(lines);
+        assert!(matches!(
+            read_answer(&page, &mut script).unwrap(),
+            Entered::TooLong
+        ));
+    }
+
+    /// A question whose own rule names a limit is bounded at that limit at the
+    /// reader as well: the answer is refused before it is kept, not after the
+    /// validator reads it.
+    #[test]
+    fn a_questions_own_limit_bounds_what_is_read() {
+        let question = Question {
+            kind: Kind::Text,
+            rule: Rule::MaxLen(5),
+            ..note_question()
+        };
+        let page = Page {
+            q: &question,
+            mailbox: None,
+        };
+        let mut script = Script::lines(&["abcde"]);
+        match read_answer(&page, &mut script).unwrap() {
+            Entered::Value(value) => assert_eq!(value, "abcde"),
+            _ => panic!("an answer at the question's limit was not read"),
+        }
+
+        let mut script = Script::lines(&["abcdef"]);
+        assert!(matches!(
+            read_answer(&page, &mut script).unwrap(),
+            Entered::TooLong
+        ));
+    }
+
+    /// An answer past the cap is refused with a message and the same question is
+    /// asked again; the answer after it is the one kept, and none of the refused
+    /// paste reaches the confirm screen.
+    #[test]
+    fn an_answer_past_the_cap_is_refused_and_the_page_asks_again() {
+        let questions = [note_question()];
+        let reserved = reserved_names();
+        let flow = Flow {
+            questions: &questions,
+            reserved: &reserved,
+        };
+        let mut script = Script {
+            words: [
+                Some(Word::TooLong),
+                // The reader's Enter at the refusal screen.
+                Some(Word::Line(String::new())),
+                Some(Word::Line("small note".to_string())),
+                Some(Word::Line(".".to_string())),
+                Some(Word::Line("yes".to_string())),
+            ]
+            .into(),
+            keys: VecDeque::new(),
+        };
+        let mut files = Files::default();
+        let mut out = Vec::new();
+        let left = application(&flow, Mode::Plain, &mut script, &mut files, &mut out).unwrap();
+        let seen = String::from_utf8(out).unwrap();
+
+        assert_eq!(left, Departure::Quit);
+        assert!(
+            seen.contains("longer than this form accepts"),
+            "the oversized answer was not refused: {seen}"
+        );
+        assert!(seen.contains("Note: small note"), "{seen}");
+        assert!(!seen.contains("aaaa"), "a refused paste was kept");
+        assert_eq!(files.forms.len(), 1);
+        assert!(script.spent(), "the session stopped at the refusal");
+    }
+
+    /// The first screen is bounded too: an oversized line there is refused and the
+    /// screen is asked again rather than the session ending.
+    #[test]
+    fn an_oversized_line_at_the_first_screen_is_refused_and_asked_again() {
+        let rows = rows(None);
+        let mut script = Script::oversized(&["", "quit"]);
+        let (left, seen) = session(&rows, Mode::Plain, &mut script);
+        assert_eq!(left, Departure::Quit);
+        assert_eq!(
+            seen.matches("Press Enter to start").count(),
+            2,
+            "the first screen was not asked again: {seen}"
+        );
+        assert!(script.spent());
     }
 
     /// The full mode's left arrow returns to the previous question as the spec
@@ -2019,8 +2434,8 @@ mod tests {
         // The same answers without the opening line and the menu's row number,
         // and with the arrows that reach the same row.
         let answers = &person_lines(at)[2..];
-        let mut words: VecDeque<Option<String>> = VecDeque::from([Some(String::new())]);
-        words.extend(answers.iter().cloned().map(Some));
+        let mut words: VecDeque<Option<Word>> = VecDeque::from([Some(Word::Line(String::new()))]);
+        words.extend(answers.iter().cloned().map(|l| Some(Word::Line(l))));
         let mut keys: VecDeque<Option<Key>> = vec![Some(Key::Down); at].into();
         keys.push_back(Some(Key::Enter));
         let mut full = Script { words, keys };

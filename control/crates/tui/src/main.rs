@@ -37,7 +37,6 @@
 //! handler, which validates it again and is the only writer of the intent.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Read};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -45,7 +44,7 @@ use std::process::ExitCode;
 use kyriakon_control_core::{config, flow::catalogue, flow::questions, flow::validate, ipc};
 use kyriakon_control_tui as tui;
 use kyriakon_control_tui::Error;
-use kyriakon_control_tui::{Departure, Filing, Input, Key, Mode};
+use kyriakon_control_tui::{Departure, Filing, Input, Key, Mode, Word};
 
 /// The handler's own configuration, read for the one value the portal needs from
 /// it: the path the catalogue is installed at. Named here rather than derived, the
@@ -264,6 +263,8 @@ fn chosen() -> Mode {
 /// reader cannot see what they typed at is not a prompt.
 struct Term {
     mode: Mode,
+    /// The session's input, bounded a line at a time.
+    input: tui::Reader<std::io::Stdin>,
     /// The terminal's own settings, kept from the first time the screen was
     /// drawn and put back by `cooked` and by `Drop`.
     saved: Option<libc::termios>,
@@ -271,7 +272,11 @@ struct Term {
 
 impl Term {
     fn new(mode: Mode) -> Term {
-        Term { mode, saved: None }
+        Term {
+            mode,
+            input: tui::Reader::new(std::io::stdin()),
+            saved: None,
+        }
     }
 
     /// Take the terminal's own settings, before anything is changed.
@@ -323,14 +328,7 @@ impl Term {
 
     /// One byte, or `None` when the connection closed.
     fn byte(&mut self) -> Result<Option<u8>, Error> {
-        let mut b = [0u8; 1];
-        match std::io::stdin().lock().read(&mut b) {
-            Ok(0) => Ok(None),
-            Ok(_) => Ok(Some(b[0])),
-            Err(e) => Err(Error::Failed(format!(
-                "cannot read the session's input: {e}"
-            ))),
-        }
+        self.input.byte()
     }
 
     /// One key. The arrows arrive as `ESC [ A` and `ESC [ B`, or with `O` in
@@ -363,26 +361,23 @@ impl Term {
 }
 
 impl Input for Term {
-    fn word(&mut self) -> Result<Option<String>, Error> {
+    fn word(&mut self) -> Result<Option<Word>, Error> {
         self.cooked();
-        let mut line = String::new();
-        match std::io::stdin().lock().read_line(&mut line) {
-            Ok(0) => Ok(None),
-            Ok(_) => Ok(Some(line)),
-            Err(e) => Err(Error::Failed(format!(
-                "cannot read the session's input: {e}"
-            ))),
-        }
+        self.input.word()
     }
 
     fn key(&mut self) -> Result<Option<Key>, Error> {
         if self.mode == Mode::Plain {
             // A line terminal's one key is the line's own meaning, which is what
             // the plain session asks for at the one screen that waits for Enter.
-            return Ok(self.word()?.map(|line| match line.trim() {
-                "" => Key::Enter,
-                "q" | "quit" => Key::Quit,
-                _ => Key::Other,
+            return Ok(self.word()?.map(|word| match word {
+                Word::Line(line) => match line.trim() {
+                    "" => Key::Enter,
+                    "q" | "quit" => Key::Quit,
+                    _ => Key::Other,
+                },
+                // A line past the cap is no key any screen waits for.
+                Word::TooLong => Key::Other,
             }));
         }
         self.drawing()?;
