@@ -90,6 +90,10 @@ pub const SESSION_DIR: &str = "/var/db/kyriakon-onboard-tui";
 pub const SESSIONS_PER_ADDRESS: usize = 2;
 pub const SESSIONS_TOTAL: usize = 16;
 
+/// The directory-wide count lock. Unlike the session files it is permanent, so a
+/// test holding the section has the same name to open.
+const COUNT_LOCK: &str = "sessions.lock";
+
 /// One session's lock file, held open for the session's life. The kernel releases
 /// the lock when the process ends, so a file left behind by a crash can be told
 /// from a live one without trusting a pid. The path is removed on a clean exit;
@@ -118,18 +122,16 @@ impl Sessions {
                 e,
             )
         })?;
-        prune(dir)?;
-        let Some(address) = address else {
-            return Ok(Admission::Open(Sessions {
-                path: None,
-                _lock: None,
-            }));
-        };
-
-        // One directory-wide lock, so the counts and the create are one critical
-        // section across every address. It is the only permanent file here; the
-        // session files are removed on exit or pruned.
-        let count_path = dir.join("sessions.lock");
+        // One directory-wide lock, so the prune, the counts and the create are one
+        // critical section across every address. It is the only permanent file
+        // here; the session files are removed on exit or pruned.
+        //
+        // The prune is inside it because a session file is created and flocked
+        // here: a prune that ran outside the section could lock and unlink a file
+        // between another opener's create and its flock, and that session would
+        // run on without being counted. A session with no address is a manual run
+        // and prunes under the same lock rather than racing the ones that count.
+        let count_path = dir.join(COUNT_LOCK);
         let count_lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -137,6 +139,14 @@ impl Sessions {
             .open(&count_path)
             .map_err(|e| Error::context(format!("cannot open {}", count_path.display()), e))?;
         lock_exclusive(count_lock.as_raw_fd(), &count_path)?;
+        prune(dir)?;
+
+        let Some(address) = address else {
+            return Ok(Admission::Open(Sessions {
+                path: None,
+                _lock: None,
+            }));
+        };
 
         let prefix = format!("{address}@");
         let mut held = 0;
@@ -2065,6 +2075,47 @@ mod tests {
             "{why}"
         );
         assert!(out.is_empty(), "the refusal drew a screen");
+    }
+
+    /// The prune runs inside the count lock, because the session file is created
+    /// and flocked inside it. A prune that ran before taking the lock could land
+    /// in another opener's create-to-flock window, lock and unlink a file whose
+    /// session is still running, and that session would then run uncounted.
+    ///
+    /// [#701]: https://github.com/kyriakon/kyriakon-infra/issues/701
+    #[test]
+    fn a_prune_waits_for_the_count_lock() {
+        let dir = std::env::temp_dir().join(format!("onboard-portal-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // What a killed session leaves: a file no process holds.
+        let stale = dir.join("203.0.113.9@999999-0");
+        std::fs::write(&stale, "").unwrap();
+
+        // Another opener inside the section: the prune must wait for it.
+        let count_path = dir.join(COUNT_LOCK);
+        let held = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&count_path)
+            .unwrap();
+        lock_exclusive(held.as_raw_fd(), &count_path).unwrap();
+        let opener = {
+            let dir = dir.clone();
+            std::thread::spawn(move || Sessions::open(&dir, Some("203.0.113.9".parse().unwrap())))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(stale.exists(), "the prune ran outside the count lock");
+
+        // The lock goes, and the same call prunes the file it could not reach.
+        drop(held);
+        let session = opener.join().unwrap().unwrap();
+        assert!(
+            matches!(session, Admission::Open(_)),
+            "the opener was refused its own slot"
+        );
+        assert!(!stale.exists(), "the prune did not run at all");
     }
 
     /// Two concurrent sessions per address, a third refused in the screen the
