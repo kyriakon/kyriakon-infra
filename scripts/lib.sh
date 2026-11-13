@@ -834,6 +834,11 @@ table_map_add() {
 # line is validated here rather than left to smtpd: the list is spliced into a
 # command string, so a stray line would reach the configuration as part of that
 # string, and smtpd's complaint would name the config file rather than the list.
+#
+# The regex is the intake rule: control/crates/core/src/flow/validate.rs's
+# domain() accepts exactly the names this matches, because the drain writes its
+# answers into the table read here. Changing one without the other wedges every
+# reload with a name the form let through, or refuses one it promised.
 dkim_domains_args() {
 	dk_args=
 	while IFS= read -r dk_domain; do

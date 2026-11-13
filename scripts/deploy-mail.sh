@@ -466,6 +466,23 @@ self_test() {
 	check "and a domain dropped from the list leaves the filter" \
 		"$(grep -c '^filter.*-d parish.example' "$tree/smtpd.conf")" 0
 
+	# The renderer's rule is the intake's: control/crates/core/src/flow/validate.rs's
+	# domain() accepts these, and the same corpus is in its own test. A numeric
+	# top-level label is a name intake must refuse, because a line here fails the
+	# render and every later transition that reloads smtpd with it.
+	printf 'kyriakon.net\nsub.parish.example\nparish-12.example\na.bb\n' > "$tree/dkim_domains"
+	check "every domain the intake accepts renders" \
+		"$(dkim_domains_args "$tree/dkim_domains")" \
+		"-d kyriakon.net -d sub.parish.example -d parish-12.example -d a.bb"
+	printf 'kyriakon.net\nparish.12\n' > "$tree/dkim_domains"
+	if dkim_domains_args "$tree/dkim_domains" >/dev/null 2>&1; then
+		code=0
+	else
+		code=$?
+	fi
+	check "a numeric top-level label is refused by the renderer" "$code" 1
+	printf 'kyriakon.net\n' > "$tree/dkim_domains"
+
 	# The routing rules the mail cannot do without. The enqueuer's rule is what
 	# carries cron's own failure copy and every operator alert off the box: with
 	# it gone they are refused at RCPT and the alert path disappears silently.
