@@ -22,23 +22,25 @@
 # connection nobody is on the other end of does not sit open. A client that is
 # still there answers the probes, so long-running commands are unaffected.
 #
-# The member fragment adds port 2222 and the two Match blocks at the end of the
+# The member fragment adds port 2222 and the three Match blocks at the end of the
 # file. A member uploads with sftp and pushes to pass repositories with git-shell
 # from one account and one key, and ChrootDirectory applies to every session of a
-# user, so the two cannot share a chroot: a chrooted session has no
-# /usr/local/bin/git-shell inside it, and OpenBSD has no nullfs to lend it one.
-# sshd separates them by port instead. sftp keeps the default port 22, where
+# user, so the two cannot share a chroot: a chrooted session has no git, nor the
+# wrapper in /usr/local/libexec, inside it, and OpenBSD has no nullfs to lend it
+# one. sshd separates them by port instead. sftp keeps the default port 22, where
 # ForceCommand internal-sftp is handled inside sshd before the login shell is
-# exec'd; git-shell stays on 2222, unchrooted.
+# exec'd; 2222 is unchrooted and carries a ForceCommand of the wrapper, so an sftp
+# request there is refused rather than served outside the chroot.
 #
-# Both blocks were checked against the live binary on 2026-10-01, with a
-# throwaway host key under /tmp and no change to the box: `sshd -T -f <fragment>
-# -h <throwaway key> -C user=oliver,lport=22` reports chrootdirectory
-# /home/www/%u.kyriakon.net and forcecommand "internal-sftp -u 0022", the same
-# check with lport=2222 reports chrootdirectory none and forcecommand none, and a
-# port matching neither block (lport=23) also reports none. The %u token is left
-# unexpanded by -T; sshd expands it when the session starts. The test account was
-# in wheel rather than members, because no members group exists yet.
+# The 22 block was checked against the live binary on 2026-10-01, with a throwaway
+# host key under /tmp and no change to the box: `sshd -T -f <fragment> -h
+# <throwaway key> -C user=oliver,lport=22` reports chrootdirectory
+# /home/www/%u.kyriakon.net and forcecommand "internal-sftp -u 0022", and a port
+# matching no block (lport=23) reports none. The %u token is left unexpanded by
+# -T; sshd expands it when the session starts. The test account was in wheel
+# rather than members, because no members group exists yet. The 2222 block came
+# after that check: the runbook's `sshd -T ... lport=2222` step confirms it on the
+# box, reporting forcecommand /usr/local/libexec/member-git-shell.sh --force.
 #
 # Applied by hand, never by a deploy: this file is reviewed line by line.
 #
@@ -164,15 +166,27 @@ Subsystem	sftp	/usr/libexec/sftp-server
 # (safely_chroot in session.c), so the signup path leaves that directory
 # root:wheel 0755 and gives the two subdirectories to the member.
 #
-# There is deliberately no LocalPort 2222 block. 2222 is where the member's
-# session shell runs, and that shell is /usr/local/bin/git-shell, so a push
-# arrives as `git-shell -c '<client command>'`. A ForceCommand there would
-# replace the client's command and break the push, and a ChrootDirectory would
-# put git-shell outside the filesystem.
+# The third block is the port 2222 session, and it carries a ForceCommand of its
+# own. Without one, an sftp subsystem request on 2222 runs /usr/libexec/sftp-server
+# straight from the global Subsystem line, with the member's uid and no chroot:
+# the login shell is only consulted for a shell command, and a subsystem is not
+# one. That session could read every world-readable file on the box and write
+# anywhere the account can write, which is not the confinement the port split
+# promises. ForceCommand applies to shell, command and subsystem execution, so the
+# sftp request now reaches the wrapper, which refuses it as a non-git command.
+#
+# The wrapper is what makes the ForceCommand safe for the push. sshd runs a forced
+# command through the login shell with -c (session.c, do_child()), and that shell
+# is the wrapper, so it receives its own name with --force as the -c argument and
+# takes the client's command from SSH_ORIGINAL_COMMAND. An sftp subsystem request
+# puts /usr/libexec/sftp-server there, and the wrapper refuses that as a non-git
+# command. The allowlist and path checks run as before. A ChrootDirectory stays
+# out of this block: the wrapper is outside the chroot and runs git from
+# /usr/local/bin.
 #
 # That shell is not in the password entry, which goes on carrying /sbin/nologin.
 # It comes from the member login class: /etc/login.conf.d/member carries
-# `shell=/usr/local/bin/git-shell`, and provisioning assigns it with
+# `shell=/usr/local/libexec/member-git-shell.sh`, and provisioning assigns it with
 # `usermod -L member <name>`. sshd takes the session shell from there, since
 # auth.c sets lc = login_getclass(pw->pw_class) and session.c's do_child() takes
 # shell = login_getcapstr(lc, "shell", pw_shell, pw_shell) before it execs
@@ -188,3 +202,6 @@ Match Group members
 Match Group members LocalPort 22
 	ChrootDirectory /home/www/%u.kyriakon.net
 	ForceCommand internal-sftp -u 0022
+
+Match Group members LocalPort 2222
+	ForceCommand /usr/local/libexec/member-git-shell.sh --force

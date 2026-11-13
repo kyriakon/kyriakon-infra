@@ -504,8 +504,9 @@ ensure_mail_address
 #
 # One account carries both sessions and the port decides which. Port 22's block
 # forces internal-sftp, which sshd runs in process before it reads any shell, and
-# 2222 has no forced command, so a push arrives there as
-# `member-git-shell.sh -c '<client command>'`. That shell comes from the account's
+# 2222 forces the wrapper, which sshd runs through the same login shell with -c,
+# so a push arrives there as `member-git-shell.sh -c '<wrapper> --force'` with
+# the client's command in SSH_ORIGINAL_COMMAND. That shell comes from the account's
 # login class rather than from the password entry: auth.c sets
 # lc = login_getclass(pw->pw_class), and session.c's do_child() takes
 # login_getcapstr(lc, "shell", pw_shell, pw_shell) before it execs anything. So

@@ -53,9 +53,20 @@
 # channel for an account with no shell, so dropping upload-archive from the
 # allowlist is what closes it. It stays because the per-member hosting spec
 # names the verb, and changing the allowlist is a spec change, not a fix here.
+# Why the ForceCommand mode. sshd's port 2222 block names this wrapper as its
+# ForceCommand. sshd runs an external subsystem request through the login shell
+# too (session_subsystem_req -> do_exec -> do_child), so the login-class wrapper
+# already refused an sftp request on 2222; the ForceCommand states the boundary
+# at the port as well, and holds if the login class ever names another shell.
+# sshd runs a forced command through that shell with `-c`, so the argument it
+# receives is this script's own name followed by `--force`, and the client's
+# command is in SSH_ORIGINAL_COMMAND. For an sftp subsystem request that value is
+# /usr/libexec/sftp-server, which the allowlist below refuses. A git push arrives
+# with its own command in SSH_ORIGINAL_COMMAND and passes the same checks.
 #
 # Usage (sshd does this; a human only runs --self-test):
 #   member-git-shell.sh -c "git-receive-pack '/home/<user>/repos/<name>.git'"
+#   member-git-shell.sh -c "/usr/local/libexec/member-git-shell.sh --force"
 #   member-git-shell.sh --self-test
 
 set -euo pipefail
@@ -69,6 +80,9 @@ git=/usr/local/bin/git
 home=''
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
+# The path sshd's ForceCommand string names, used to recognise a forced session:
+# sshd runs the forced command through the login shell, which is this script.
+self="$script_dir/${0##*/}"
 
 usage() {
 	printf 'usage: %s -c "<git-receive-pack|git-upload-pack|git-upload-archive> <path>"\n' "$0" >&2
@@ -79,6 +93,28 @@ usage() {
 die() {
 	printf 'kyriakon git shell: %s\n' "$*" >&2
 	exit 1
+}
+
+# client_command <argv>: print the command the session asked to run. sshd runs
+# this script two ways. As the login shell it is `-c <command>`. As the port 2222
+# ForceCommand it is still `-c`, with the forced string as the argument, because
+# sshd runs a forced command through the login shell (session.c do_child()); the
+# argument then reads `<path>/member-git-shell.sh --force` and the client's own
+# command is in SSH_ORIGINAL_COMMAND. Both forms end at run_command below, so an
+# sftp subsystem request, whose SSH_ORIGINAL_COMMAND is the sftp-server command,
+# is refused there like any other non-git command.
+client_command() {
+	case "${1:-}" in
+	-c)
+		[ "$#" -eq 2 ] || usage
+		if [ "$2" = "$self --force" ]; then
+			printf '%s\n' "${SSH_ORIGINAL_COMMAND:-}"
+		else
+			printf '%s\n' "$2"
+		fi
+		;;
+	*) usage ;;
+	esac
 }
 
 # canonical <path>: the path with every symlink resolved, printing it. `pwd -P`
@@ -279,6 +315,29 @@ EOF
 	check "the global config hook did not run" \
 		"$([ -e "$tree/global-hook-ran" ] && printf yes || printf no)" no
 
+	# sshd's port 2222 ForceCommand runs the login shell, which is this script,
+	# with `-c` and the forced string as the argument, and leaves the client's
+	# command in SSH_ORIGINAL_COMMAND. An sftp subsystem request puts
+	# /usr/libexec/sftp-server in that variable, and the allowlist must refuse it
+	# rather than let a server start; a git request must pass the same gate the
+	# login shell does.
+	forced="$self --force"
+	SSH_ORIGINAL_COMMAND=/usr/libexec/sftp-server
+	rc=0
+	out=$( (run_command "$(client_command -c "$forced")") 2>&1) || rc=$?
+	check "a forced sftp subsystem request is refused as a non-git command" \
+		"$rc/$out" \
+		'1/kyriakon git shell: refusing a command that is not git-receive-pack, git-upload-pack or git-upload-archive'
+	SSH_ORIGINAL_COMMAND="git-upload-pack '$home/repos/pass.git'"
+	rm -f "$tree/git.argv" "$tree/git.env"
+	rc=0
+	(run_command "$(client_command -c "$forced")") >/dev/null 2>&1 || rc=$?
+	check "a forced upload-pack reaches the allowlist" "$rc" 0
+	check "and hands git the confined path" \
+		"$(cat "$tree/git.argv" 2>/dev/null)" \
+		"-c core.hooksPath=/dev/null -c core.fsmonitor=false upload-pack $home/repos/pass.git"
+	unset SSH_ORIGINAL_COMMAND
+
 	self_test_end
 }
 
@@ -289,7 +348,7 @@ case "${1:-}" in
 	;;
 esac
 
-[ "$#" -eq 2 ] && [ "$1" = -c ] || usage
+cmd=$(client_command "$@")
 
 user=$(id -un) || die "cannot find the account name"
 home=$(getent passwd "$user" 2>/dev/null | awk -F: 'NR == 1 { print $6 }')
@@ -298,4 +357,4 @@ home=$(getent passwd "$user" 2>/dev/null | awk -F: 'NR == 1 { print $6 }')
 home=$(canonical "$home") || die "refusing: $home is not a directory"
 
 [ -x "$git" ] || die "no git at $git"
-run_command "$2"
+run_command "$cmd"
