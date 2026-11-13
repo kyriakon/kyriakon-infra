@@ -183,8 +183,8 @@ fn a_client_that_withholds_its_origin_reaches_no_session() {
             false,
         ),
         (
-            // WebKit 26 attached the cookie and sent no Sec-Fetch-Site; Chromium
-            // sent none either and withheld the cookie.
+            // WebKit 27.2 attached the cookie and sent no Sec-Fetch-Site;
+            // Chromium sent none either and withheld the cookie.
             "sandboxed allow-forms frame, no Sec-Fetch-Site, cookie attached",
             Some("null"),
             None,
