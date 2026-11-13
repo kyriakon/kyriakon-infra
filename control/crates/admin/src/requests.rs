@@ -122,7 +122,7 @@ pub(crate) async fn request_verify(
                     "the signature does not verify against {username}'s keyring entry"
                 ))
             })?;
-    println!("verified {fingerprint}; From: {own}");
+    println!("verified {fingerprint}; From: {}", util::clean(&own));
     Ok(())
 }
 

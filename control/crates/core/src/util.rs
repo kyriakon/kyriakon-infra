@@ -27,10 +27,24 @@ pub fn stamp(at: OffsetDateTime) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
+/// Text safe to write to a terminal: every control character becomes `?`.
+///
+/// A message header reaches an operator's screen through [`report`] or [`log`],
+/// and the header is a member's to write: an escape would let it clear the
+/// screen, retitle the window or fill the clipboard over OSC 52. Replacing the
+/// character rather than deleting it keeps the rest of the line where the reader
+/// expects it, and one character for one character keeps a line's width.
+pub fn clean(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 /// The lines one failure prints: the error under the service prefix, then each
 /// source that says something the line already printed does not. A wrapper whose
 /// `Display` delegates to its source would otherwise print the same sentence
-/// twice, and cron mails the drain's stderr.
+/// twice, and cron mails the drain's stderr. Cleaned, since an error message can
+/// quote what a member sent.
 pub fn report_lines(error: &(dyn std::error::Error + 'static), context: &str) -> Vec<String> {
     let mut lines = vec![format!("kyriakon-control: {context}: {error}")];
     let mut last = error.to_string();
@@ -43,7 +57,7 @@ pub fn report_lines(error: &(dyn std::error::Error + 'static), context: &str) ->
         }
         source = cause.source();
     }
-    lines
+    lines.iter().map(|line| clean(line)).collect()
 }
 
 /// Print [`report_lines`]. The one reporting function: a journal note, an alert
@@ -58,7 +72,7 @@ pub fn report(error: &(dyn std::error::Error + 'static), context: &str) {
 /// stderr, so a log line and a failure report cannot drift onto different
 /// streams.
 pub fn log(line: &str) {
-    eprintln!("{line}");
+    eprintln!("{}", clean(line));
 }
 
 /// A timestamp `days` from now, RFC 3339 UTC to the second. The window's close,
@@ -227,6 +241,32 @@ mod tests {
         assert_eq!(
             super::report_lines(&Wrapper(Inner), "context"),
             vec!["kyriakon-control: context: same text"]
+        );
+    }
+
+    #[derive(Debug)]
+    struct Hostile;
+    impl fmt::Display for Hostile {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("the message is from \x1b]52;c;cG93bmVk\x07a\r\n@evil.example")
+        }
+    }
+    impl std::error::Error for Hostile {}
+
+    #[test]
+    fn a_terminal_line_loses_its_control_characters() {
+        // A plain value keeps its width and its text.
+        assert_eq!(super::clean("Re: my data"), "Re: my data");
+        // ESC, BEL, CR, LF, a C1 control and DEL each become one `?`.
+        assert_eq!(
+            super::clean("a\x1b]52;c;cG93bmVk\x07b\rc\nd\u{9b}e\u{7f}f"),
+            "a?]52;c;cG93bmVk?b?c?d?e?f"
+        );
+        assert_eq!(
+            super::report_lines(&Hostile, "verifying a request"),
+            vec![
+                "kyriakon-control: verifying a request: the message is from ?]52;c;cG93bmVk?a??@evil.example"
+            ]
         );
     }
 
