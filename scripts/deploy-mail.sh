@@ -271,6 +271,43 @@ warn_aead() {
 	fi
 }
 
+# dkim_selector <smtpd.conf>: the selector the dkimsign filter signs under, read
+# from the filter's own -s argument. The zone check and the repair record follow
+# it, so a rotation that changes -s does not leave the comparison on the record
+# the old selector published.
+dkim_selector() {
+	awk '/filter "dkimsign"/ { for (i = 1; i < NF; i++) if ($i == "-s") { print $(i + 1); exit } }' "$1"
+}
+
+# dkim_zone_check <smtpd.conf>: compare the on-box public key ($dkim_pub) with
+# the TXT record the filter's selector names. A value over 255 bytes is served
+# as adjacent character-strings, and dig prints one space between them once the
+# quoting is stripped, while the base64 from openssl contains no spaces. Drop
+# the whitespace before comparing, or a correct record reads as a mismatch on
+# every run, which is exactly what happened the first time this record was
+# published.
+dkim_zone_check() {
+	typeset selector published
+	selector=$(dkim_selector "$1")
+	if [ -z "$selector" ]; then
+		printf 'no DKIM selector in %s: the signing filter has no -s argument\n' "$1" >&2
+		return 1
+	fi
+	published=$(dig +short @ns1.he.net "$selector._domainkey.kyriakon.net" TXT | tr -d '"' | tr -d '[:space:]')
+	case "$published" in
+	*"$dkim_pub"*) printf 'zone record matches the on-box key\n' ;;
+	*) printf 'zone record does NOT match. Publish this in\n'
+	   printf 'openbsd/etc/nsd/kyriakon.net.zone (bump the SOA serial), then redeploy nsd:\n\n'
+	   # split at 255 bytes including the "v=DKIM1; k=rsa; p=" prefix, because
+	   # nsd rejects a single longer character-string and stops serving the
+	   # zone entirely rather than complaining
+	   printf '\t%s._domainkey\tIN\tTXT\t( "v=DKIM1; k=rsa; p=%s"\n' \
+		   "$selector" "$(printf '%s' "$dkim_pub" | cut -c1-$((255 - 18)))"
+	   printf '\t\t\t\t"%s" )\n\n' "$(printf '%s' "$dkim_pub" | cut -c$((255 - 18 + 1))-)"
+	   ;;
+	esac
+}
+
 # self_test — the writes this deploy makes into files the box reads, against
 # fixtures and the shipped smtpd.conf, and not the box. Each install moves a
 # candidate onto the live file, and that is what the checks are about: a write
@@ -564,6 +601,27 @@ self_test() {
 	check "and leaves the live file alone" "$(cat "$tree/staged.live")" old
 	check "and leaves no candidate behind it" \
 		"$([ -e "$tree/staged.live.new" ] && printf present || printf gone)" gone
+
+	# --- the DKIM selector and the zone check ---
+	# The zone check follows the filter's -s argument. A rotation changes that
+	# argument, and a comparison hardcoded to "mail" would then report the new
+	# record as missing on every deploy.
+	check "the DKIM selector is read from the filter line" \
+		"$(dkim_selector "$tree/smtpd.conf")" mail
+	sed 's/-s mail/-s parish/' "$tree/smtpd.conf" > "$tree/rotated.conf"
+	check "and a rotated selector is followed" \
+		"$(dkim_selector "$tree/rotated.conf")" parish
+	dkim_pub=AAAA
+	dig() { printf '%s\n' "$*" > "$tree/dig.args"; printf '"AAAA"\n'; }
+	dkim_zone_check "$tree/rotated.conf" > "$tree/zone.out"
+	check "the zone check queries the selector the filter names" \
+		"$(grep -c 'parish\._domainkey\.kyriakon\.net' "$tree/dig.args")" 1
+	check "and reports the match" \
+		"$(grep -c 'zone record matches the on-box key' "$tree/zone.out")" 1
+	dig() { printf '"BBBB"\n'; }
+	dkim_zone_check "$tree/rotated.conf" > "$tree/zone-miss.out"
+	check "and the repair record names the same selector" \
+		"$(grep -c 'parish\._domainkey' "$tree/zone-miss.out")" 1
 
 	# --- the log retention config ---
 	# docs/privacy.md promises a seven-day window on the logs that hold a member's
@@ -1315,24 +1373,11 @@ if [ ! -s "$dkim_key" ]; then
 	printf 'generated %s\n' "$dkim_key"
 fi
 dkim_pub=$(openssl rsa -in "$dkim_key" -pubout -outform DER | openssl base64 -A)
-# A TXT value over 255 bytes is served as adjacent character-strings, and dig
-# prints one space between them once the quoting is stripped, while the base64
-# from openssl contains no spaces. Drop the whitespace before comparing, or a
-# correct record reads as a mismatch on every run, which is exactly what
-# happened the first time this record was published.
-published=$(dig +short @ns1.he.net mail._domainkey.kyriakon.net TXT | tr -d '"' | tr -d '[:space:]')
-case "$published" in
-	*"$dkim_pub"*) printf 'zone record matches the on-box key\n' ;;
-	*) printf 'zone record does NOT match. Publish this in\n'
-	   printf 'openbsd/etc/nsd/kyriakon.net.zone (bump the SOA serial), then redeploy nsd:\n\n'
-	   # split at 255 bytes including the "v=DKIM1; k=rsa; p=" prefix, because
-	   # nsd rejects a single longer character-string and stops serving the
-	   # zone entirely rather than complaining
-	   printf '\tmail._domainkey\tIN\tTXT\t( "v=DKIM1; k=rsa; p=%s"\n' \
-		   "$(printf '%s' "$dkim_pub" | cut -c1-$((255 - 18)))"
-	   printf '\t\t\t\t"%s" )\n\n' "$(printf '%s' "$dkim_pub" | cut -c$((255 - 18 + 1))-)"
-	   ;;
-esac
+# The selector comes from the filter line, not a literal: after a rotation -s
+# names the new selector and the old one is published only until its messages
+# age out, so a fixed "mail" here would report a correct rotation as a mismatch
+# and tell the operator to retire the old selector early.
+dkim_zone_check /etc/mail/smtpd.conf || exit 1
 
 say "SPF"
 # The mail host is a sending identity of its own. Cron output, the daily

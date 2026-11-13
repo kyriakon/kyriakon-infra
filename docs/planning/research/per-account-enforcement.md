@@ -689,9 +689,10 @@ Deletion is a sequence, and the order avoids writing into a tree that is being r
    that per-user subdomains resolve without a DNS write per signup".
 9. Regenerate the finger page, which is derived from the httpd and gmid configs. The candidate is a
    `mktemp` file under the root-owned `/etc/kyriakon`, the way `scripts/delete-user.sh` does it, so a
-   local user cannot plant a symlink where root writes:
+   local user cannot plant a symlink where root writes. It is renamed over the live page only after the
+   generator succeeds, and the temp is removed on failure:
    ```
-   doas ksh -c 'f=$(mktemp /etc/kyriakon/finger.XXXXXX) && ksh scripts/gen-finger-page.sh > "$f" && install -m 0644 "$f" /etc/kyriakon/finger.txt && rm -f "$f"'
+   doas ksh -c 'f=$(mktemp /etc/kyriakon/finger.XXXXXX) || exit 1; ksh scripts/gen-finger-page.sh > "$f" || { rm -f "$f"; exit 1; }; chmod 0644 "$f" && mv "$f" /etc/kyriakon/finger.txt || rm -f "$f"'
    ```
 10. Remove any cron entry and alias entry if one was ever created. Standard accounts have no
     crontab, and `/etc/mail/aliases` today points only at `oliver`, so both are guards rather
