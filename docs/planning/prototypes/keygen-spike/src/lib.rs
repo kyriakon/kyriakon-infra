@@ -186,7 +186,7 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
 
     if !key.details.revocation_signatures.is_empty() {
         findings.push(
-            "The key has been revoked. Make a new key with the generator; a revoked key \
+            "The key has been revoked. Make a new key in Thunderbird or with gpg; a revoked key \
              cannot receive mail."
                 .into(),
         );
@@ -196,7 +196,7 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
         findings.push(format!(
             "The key asks for AEAD ciphers ({}), so mail encrypted to it may not open in \
              the member's mail program. Remove AEAD from the key's preferences, or make a \
-             new key with the generator.",
+             new key in Thunderbird or with gpg.",
             aead.join(", ")
         ));
     }
@@ -212,7 +212,7 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
         findings.push(if u64::from(expires_at) <= now_secs {
             format!(
                 "The key expired at {expires_at} seconds since the epoch and cannot be \
-                 used. Make a new key with the generator, or extend the expiry in your \
+                 used. Make a new key in Thunderbird or with gpg, or extend the expiry in your \
                  mail client before it lapses."
             )
         } else {
@@ -248,7 +248,7 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
         if sub_revoked && encrypts {
             findings.push(format!(
                 "The encryption subkey {:?} has been revoked, so mail cannot be encrypted to \
-                 it. Make a new key with the generator; a revoked subkey cannot receive mail.",
+                 it. Make a new key in Thunderbird or with gpg; a revoked subkey cannot receive mail.",
                 sub.key.fingerprint()
             ));
         }
@@ -260,7 +260,7 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
                 format!(
                     "The encryption subkey expired at {expires_at} seconds since the epoch, \
                      so mail encrypted to this key may not open. Extend the subkey's expiry \
-                     in your mail client, or make a new key with the generator."
+                     in your mail client, or make a new key in Thunderbird or with gpg."
                 )
             } else {
                 format!(
@@ -282,7 +282,7 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
     if encrypting.is_empty() {
         findings.push(
             "There is no encryption-capable subkey, so mail to this member would be \
-             refused rather than delivered. Make a new key with the generator, which makes \
+             refused rather than delivered. Make a new key in Thunderbird or with gpg, which makes \
              an encryption subkey beside the signing one."
                 .into(),
         );

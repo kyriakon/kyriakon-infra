@@ -104,7 +104,7 @@ There is one restriction on who may apply. Applications from residents of countr
 
 ## Keys and your account
 
-The platform holds no key that opens your mail. Your mail key is made on your own machine, and the private half never reaches us. The recovery phrase you write down, together with the key file, is the only way back into the mailbox. If you lose your device and the recovery phrase, the mail is gone permanently: we cannot restore it, because no key exists here to open it. Keep the file and the phrase in separate places.
+The platform holds no key that opens your mail. Your mail key is made on your own machine, and the private half never reaches us. Your recovery phrase is a passphrase-protected offline export of your private key, and that export together with its passphrase is the only way back into the mailbox. If you lose the private key and the recovery phrase, the mail is gone permanently: we cannot restore it, because no key exists here to open it. Keep the export and the passphrase in separate places.
 
 You submit your mail public key and, if you want a website, an SSH key for uploads. The private keys and the recovery phrase stay with you. Zero-access covers message content and not the addressing information mail needs to move, and the hosting page states that limit wherever the property is claimed.
 
