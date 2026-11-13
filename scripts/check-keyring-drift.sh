@@ -327,6 +327,12 @@ self_test() {
 	make_key() {
 		gpg --batch --pinentry-mode loopback --passphrase '' \
 			--quick-generate-key "$1" ed25519 sign 0 >/dev/null 2>&1
+		# The usability check refuses a key with no encryption-capable key, so
+		# a fixture has to carry one, as a delivrable key does.
+		fpr=$(gpg --batch --with-colons --list-keys "$1" 2>/dev/null |
+			awk -F: '$1 == "fpr" { print $10; exit }')
+		gpg --batch --pinentry-mode loopback --passphrase '' \
+			--quick-add-key "$fpr" cv25519 encr 0 >/dev/null 2>&1
 		# gpg 2.4+ writes the AEAD preference into every self-signature, and the
 		# file is otherwise reported by the usability check below; a fixture has
 		# to look like a key the publish path would have accepted.
