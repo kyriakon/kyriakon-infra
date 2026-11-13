@@ -238,9 +238,11 @@ pub async fn set_password(
     // A link's single use is recorded in `spent/`, root's own directory, because
     // the application record is the handler's to rewrite. Checked before the
     // record's own field, so a handler that restores `password_link` cannot
-    // revive a link that has already installed a password.
+    // revive a link that has already installed a password. A marker that cannot
+    // be read fails the pass instead of reading as unspent: the retry is safe
+    // and a replay would not be.
     let spent = format!("{token}.json");
-    if store.read_record("spent", &spent).await.is_some() {
+    if store.spent_link(token).await?.is_some() {
         return Ok(password_refusal(store, file, value, "the link has already been used").await);
     }
     let mut plain = intent.password;
