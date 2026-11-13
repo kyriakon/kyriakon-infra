@@ -212,3 +212,21 @@ fn a_quoted_signed_request_under_another_from_is_refused() {
         "{err}"
     );
 }
+/// `delete` accepts a journal line only when the id is `delete-<name>-` plus an
+/// RFC 3339 time, the shape the transition writes. A hyphenated account's line
+/// (`delete-bo-x-…`) must not make `delete bo` claim an erasure that never ran.
+#[test]
+fn a_deletion_line_owns_only_its_own_account() {
+    assert!(account::owns_delete("delete-bo-2024-01-01T00:00:00Z", "bo"));
+    assert!(!account::owns_delete(
+        "delete-bo-x-2024-01-01T00:00:00Z",
+        "bo"
+    ));
+    assert!(account::owns_delete(
+        "delete-bo-x-2024-01-01T00:00:00Z",
+        "bo-x"
+    ));
+    assert!(!account::owns_delete("delete-bo-", "bo"));
+    assert!(!account::owns_delete("delete-bo-not-a-time", "bo"));
+    assert!(!account::owns_delete("account:bo", "bo"));
+}

@@ -415,6 +415,25 @@ fn the_console_refuses_a_name_with_no_account_and_no_deletion() {
     assert!(!fix.dir.join("store/holds/nobody.json").exists());
 }
 
+/// A deletion line for a hyphenated account does not authorise deleting its
+/// prefix: `delete-bo-x-<time>` is bo-x's erasure, so `delete bo` must refuse
+/// rather than rerun an erasure that never happened.
+#[test]
+fn a_hyphenated_deletion_line_does_not_authorise_deleting_its_prefix() {
+    let fix = Fix::new("erasure-prefix");
+    approved_paid(&fix, "bo-x", "cash");
+    fake_delete_user(&fix);
+    assert!(fix.ctl(&["delete", "bo-x"]).status.success());
+    assert!(
+        fix.journal().contains("delete-bo-x-"),
+        "the account's own line is written: {}",
+        fix.journal()
+    );
+    let out = fix.ctl(&["delete", "bo"]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("no account for bo"), "{}", body(&out));
+}
+
 /// Once the 90-day hold has run its course, the hold file and the journal lines
 /// the deleted account owns go, while a live hold, another account's lines and
 /// another applicant's line for the same username stay byte for byte. A retried
