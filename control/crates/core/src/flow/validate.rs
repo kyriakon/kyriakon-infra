@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 
-use crate::flow::questions::{self, Question, Rule};
+use crate::flow::questions::{self, Kind, Question, Rule};
 use crate::mail::keycheck;
 
 /// The reserved set, one name per line, `#` comments and blank lines skipped so
@@ -36,6 +36,18 @@ pub fn reason(
         } else {
             "this is needed".to_string()
         });
+    }
+    // The answer's type is a rule of its own, and the one the form offers: a
+    // yes/no page offers two answers, and an acceptance tick offers one. An
+    // empty answer is settled above, so only a non-empty one is shape-checked
+    // here; the web form and the capsule both read this, so neither can file a
+    // value the other refuses.
+    if let Some(why) = match q.kind {
+        Kind::YesNo => (!matches!(v, "yes" | "no")).then(|| "answer yes or no".to_string()),
+        Kind::Acceptance => (v != "yes").then(|| "this has to be accepted".to_string()),
+        _ => None,
+    } {
+        return Some(why);
     }
     match &q.rule {
         Rule::None => None,
@@ -353,6 +365,38 @@ mod tests {
         };
         assert!(reason(&q, "card", &name(), true).is_none());
         assert!(reason(&q, "bitcoin", &name(), true).is_some());
+    }
+
+    #[test]
+    fn an_answer_the_question_type_does_not_offer_is_refused() {
+        let yesno = Question {
+            id: "body_records".into(),
+            prompt: "The records".into(),
+            kind: Kind::YesNo,
+            branch: Branch::Body,
+            required: true,
+            rule: Rule::None,
+        };
+        assert!(reason(&yesno, "yes", &name(), true).is_none());
+        assert!(reason(&yesno, "no", &name(), true).is_none());
+        assert!(reason(&yesno, "maybe", &name(), true)
+            .unwrap()
+            .contains("answer yes or no"));
+        // An empty value is the `required` question's, not the type's.
+        assert!(reason(&yesno, "", &name(), false).is_none());
+
+        let acceptance = Question {
+            id: "accept_terms".into(),
+            prompt: "I accept".into(),
+            kind: Kind::Acceptance,
+            branch: Branch::All,
+            required: true,
+            rule: Rule::None,
+        };
+        assert!(reason(&acceptance, "yes", &name(), true).is_none());
+        assert!(reason(&acceptance, "no", &name(), true)
+            .unwrap()
+            .contains("this has to be accepted"));
     }
 
     #[test]
