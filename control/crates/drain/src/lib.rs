@@ -605,13 +605,13 @@ fn disposition(intent: &Intent) -> transitions::Disposition {
         | Intent::MailKey(_)
         | Intent::Close(_)
         | Intent::Export(_)
-        | Intent::TestMail(_) => transitions::RefusalFile::Remove,
+        | Intent::TestMail(_)
+        | Intent::RemoveGroup(_)
+        | Intent::GroupAddress(_) => transitions::RefusalFile::Remove,
         Intent::Application(_)
         | Intent::Decision(_)
         | Intent::Password(_)
         | Intent::ProvisionGroup(_)
-        | Intent::GroupAddress(_)
-        | Intent::RemoveGroup(_)
         | Intent::Resend(_)
         | Intent::Credit(_)
         | Intent::WindowExtend(_)
