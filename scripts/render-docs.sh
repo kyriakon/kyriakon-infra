@@ -157,6 +157,9 @@ render_all() {
 
 	# Stage every page before installing any of them: a page that fails its
 	# placeholder check must not replace the good copy already in --out. The
+	# install is a second loop so a failure part-way leaves the previous release
+	# whole: a mixed set of new and old pages still carries one release stamp in
+	# onboard.toml, and the handler cannot tell it from a complete one. The
 	# subshell owns the stage's EXIT trap, so it does not replace the self-test's
 	# own trap. mv is atomic within the directory, which is why the stage sits
 	# inside --out.
@@ -166,6 +169,8 @@ render_all() {
 		for name in "$@"; do
 			render_one "$docs/$name.md" "$stage/$name.md" || exit 1
 			chmod 0644 "$stage/$name.md" || exit 1
+		done
+		for name in "$@"; do
 			mv "$stage/$name.md" "$out/$name.md" || exit 1
 		done
 	) || exit 1
@@ -285,6 +290,9 @@ gemini_all() {
 	[ "$out_abs" != "$docs_abs" ] \
 		|| die "refusing to write into the tracked source directory $docs; name the capsule's page directory"
 
+	# Convert every page into the stage before installing any of them, for the same
+	# reason as the web mode: a page the converter refuses must leave the previous
+	# release whole, not a mixed set under one release stamp.
 	(
 		stage=$(mktemp -d "$out/.render.XXXXXX") || exit 1
 		trap 'rm -rf "$stage"' EXIT
@@ -292,6 +300,8 @@ gemini_all() {
 			render_one "$docs/$name.md" "$stage/$name.md" || exit 1
 			gemini_one "$stage/$name.md" "$stage/$name.gmi" || exit 1
 			chmod 0644 "$stage/$name.gmi" || exit 1
+		done
+		for name in "$@"; do
 			mv "$stage/$name.gmi" "$out/$name.gmi" || exit 1
 		done
 	) || exit 1
@@ -407,19 +417,27 @@ MD
 		"$(grep -q -F 'addressing information' "$work/gemini/aup.gmi" && printf yes)" yes
 
 	# A construct the converter does not handle stops the render rather than
-	# reaching a reader as literal markdown.
-	mkdir -p "$work/bad-docs"
+	# reaching a reader as literal markdown. The bad construct is on the last page,
+	# so a per-page install would already have published the three before it.
+	mkdir -p "$work/bad-docs" "$work/bad-out"
 	cp "$repo_dir/docs/terms.md" "$repo_dir/docs/privacy.md" "$repo_dir/docs/aup.md" \
 		"$repo_dir/docs/key-walkthrough.md" "$work/bad-docs/"
-	printf '\n![a diagram](https://example.invalid/diagram.png)\n' >>"$work/bad-docs/terms.md"
+	printf '\n![a diagram](https://example.invalid/diagram.png)\n' >>"$work/bad-docs/key-walkthrough.md"
+	for name in terms privacy aup key-walkthrough; do
+		printf 'previous %s.gmi\n' "$name" > "$work/bad-out/$name.gmi"
+	done
 	if ( gemini_all "$work/bad-docs" "$work/bad-out" ) >/dev/null 2>&1; then
 		got=yes
 	else
 		got=no
 	fi
 	check 'an unsupported markdown construct is refused' "$got" no
-	check 'a refused conversion writes no page' \
-		"$(find "$work/bad-out" -type f 2>/dev/null | wc -l | tr -d ' ')" 0
+	for name in terms privacy aup key-walkthrough; do
+		check "a refused conversion leaves the previous $name.gmi" \
+			"$(cat "$work/bad-out/$name.gmi")" "previous $name.gmi"
+	done
+	check 'a refused conversion leaves no staging directory' \
+		"$(find "$work/bad-out" -maxdepth 1 -name '.render.*' | wc -l | tr -d ' ')" 0
 
 	# No address: fail, and do not leave a partial output directory behind.
 	if ( POSTAL_ADDRESS=; render_all "$repo_dir/docs" "$work/no-address" ) >/dev/null 2>&1; then
@@ -452,7 +470,8 @@ MD
 	# A mistaken --out at the source would put the address into the tracked files.
 	# The test uses a copy, so a broken refusal cannot rewrite the repository.
 	mkdir -p "$work/source"
-	cp "$repo_dir/docs/terms.md" "$repo_dir/docs/privacy.md" "$repo_dir/docs/aup.md" "$work/source/"
+	cp "$repo_dir/docs/terms.md" "$repo_dir/docs/privacy.md" "$repo_dir/docs/aup.md" \
+		"$repo_dir/docs/key-walkthrough.md" "$work/source/"
 	if ( render_all "$work/source" "$work/source" ) >/dev/null 2>&1; then
 		got=yes
 	else
@@ -487,27 +506,34 @@ MD
 	fi
 	check 'writing gemtext into the source directory is refused' "$got" no
 
-	# A page that fails its placeholder check must not replace the good page
-	# already in --out.
+	# A page that fails its placeholder check must not replace the good pages
+	# already in --out. The failure is on the last page and the fixture carries
+	# every source, so the render reaches the install loop; a per-page install
+	# would have published the three pages before it.
 	mkdir -p "$work/fail-source" "$work/fail-out"
-	cp "$repo_dir/docs/terms.md" "$repo_dir/docs/privacy.md" "$repo_dir/docs/aup.md" "$work/fail-source/"
-	printf '\nREPLACE_ME_VAT_NUMBER\n' >> "$work/fail-source/privacy.md"
-	printf 'previous page\n' > "$work/fail-out/terms.md"
+	cp "$repo_dir/docs/terms.md" "$repo_dir/docs/privacy.md" "$repo_dir/docs/aup.md" \
+		"$repo_dir/docs/key-walkthrough.md" "$work/fail-source/"
+	printf '\nREPLACE_ME_VAT_NUMBER\n' >> "$work/fail-source/key-walkthrough.md"
+	for name in terms privacy aup key-walkthrough; do
+		printf 'previous %s\n' "$name" > "$work/fail-out/$name.md"
+	done
 	if ( render_all "$work/fail-source" "$work/fail-out" ) >/dev/null 2>&1; then
 		got=yes
 	else
 		got=no
 	fi
 	check 'a failed render is refused' "$got" no
-	check 'a failed render leaves the previous page' "$(cat "$work/fail-out/terms.md")" 'previous page'
-	check 'a failed render leaves no privacy page' \
-		"$(test -e "$work/fail-out/privacy.md" && printf yes || printf no)" no
+	for name in terms privacy aup key-walkthrough; do
+		check "a failed render leaves the previous $name.md" \
+			"$(cat "$work/fail-out/$name.md")" "previous $name"
+	done
 	check 'a failed render leaves no staging directory' \
 		"$(find "$work/fail-out" -maxdepth 1 -name '.render.*' | wc -l | tr -d ' ')" 0
 
 	# The bare form is a placeholder too, not only the suffixed one.
 	mkdir -p "$work/bare-source" "$work/bare-out"
-	cp "$repo_dir/docs/terms.md" "$repo_dir/docs/privacy.md" "$repo_dir/docs/aup.md" "$work/bare-source/"
+	cp "$repo_dir/docs/terms.md" "$repo_dir/docs/privacy.md" "$repo_dir/docs/aup.md" \
+		"$repo_dir/docs/key-walkthrough.md" "$work/bare-source/"
 	printf '\nsee REPLACE_ME.\n' >> "$work/bare-source/privacy.md"
 	if ( render_all "$work/bare-source" "$work/bare-out" ) >/dev/null 2>&1; then
 		got=yes
