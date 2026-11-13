@@ -237,6 +237,35 @@ fn an_upload_key_is_added_and_removed_for_both_sessions() {
     );
 }
 
+/// A lapsed or suspended account is not sending, so its upload session is not
+/// rebuilt. Re-provisioning assigned the member class before the provisioner
+/// saw the group the lapse emptied, which undid the lapse while the record
+/// still said lapsed.
+#[test]
+fn an_upload_key_on_a_lapsed_account_is_refused() {
+    let fix = Fix::new("account-upload-key-lapsed");
+    fix.page_account("alice", json!({"state": "lapsed"}));
+    logging_script(&fix, "provision-member.sh");
+
+    fix.file_page_action(
+        "upload-key",
+        "alice",
+        json!({"action": "add", "material": UPLOAD_KEY}),
+    );
+    assert!(fix.drain().status.success());
+    assert!(fix.journal().contains("not sending"), "{}", fix.journal());
+    assert!(
+        !std::path::Path::new(&fix.path("keys/alice.pub")).exists(),
+        "the key the builder reads was not written"
+    );
+    assert!(
+        !fix.scripts_log().contains("provision-member.sh"),
+        "the account's class was not rebuilt: {}",
+        fix.scripts_log()
+    );
+    assert_eq!(fix.account("alice")["state"], json!("lapsed"));
+}
+
 /// The page session is a file the handler writes, so it cannot prove a name
 /// outside the charset. Without the drain's own shape check, a forged session
 /// naming `alice/../bob` reaches bob's record through the store's path join.

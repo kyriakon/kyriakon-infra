@@ -1593,6 +1593,15 @@ pub async fn upload_key(
     let now = util::filed_at();
     match intent.action.as_str() {
         "add" => {
+            // A lapsed or suspended account is not sending, and rebuilding its
+            // upload session would assign the member class before the
+            // provisioner sees the group the lapse emptied: the lapse would be
+            // undone while the record still says lapsed. Nothing to rebuild.
+            if !matches!(account.state.as_str(), "active" | "closing") {
+                return Ok(Settlement::refused(
+                    "the account is not sending, so its upload session is not rebuilt",
+                ));
+            }
             if let Err(why) =
                 kyriakon_control_core::mail::keycheck::openssh_public_key(&intent.material)
             {

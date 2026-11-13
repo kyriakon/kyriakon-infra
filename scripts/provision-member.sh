@@ -599,8 +599,13 @@ fi
 # there; nothing else in that file is looked at. usermod -L is the only step that
 # puts an account in a class, so an account left in the default class is one whose
 # 2222 session is /sbin/nologin, which ignores -c and exits.
+#
+# A lapsed account keeps its class. Assigning member here would undo the lapse
+# before the group check below notices: submission would work again while the
+# store and the page still said lapsed. The check that follows refuses either
+# way; the difference is whether the refusal leaves the account as it was.
 class_now=$(awk -F: -v u="$user" '$1 == u { print $5 }' /etc/master.passwd)
-if [ "$class_now" != member ]; then
+if [ "$class_now" != member ] && [ "$class_now" != lapsed ]; then
 	usermod -L member "$user" || {
 		printf 'usermod -L member %s failed\n' "$user" >&2
 		exit 1
