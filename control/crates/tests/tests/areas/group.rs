@@ -1,5 +1,16 @@
 use crate::common::*;
 
+/// One of the key-check fixtures, by file name, for a key whose verdict is the
+/// point of the test.
+fn fixture(name: &str) -> String {
+    std::fs::read_to_string(
+        repo_root()
+            .join("docs/planning/prototypes/keygen-spike/fixtures")
+            .join(name),
+    )
+    .unwrap()
+}
+
 /// A free account that gave an address outside the platform has its yearly note
 /// sent there, not to the mailbox it may no longer read.
 #[test]
@@ -1142,6 +1153,15 @@ fn a_mailbox_added_to_a_group_gets_an_account_key_and_entry() {
         .expect("the mailbox's key is on the box");
     assert!(key.contains("BEGIN PGP PUBLIC KEY BLOCK"), "{key}");
     assert_eq!(fix.account("parish-office")["group"], "parish.example");
+    // The intent carried a fingerprint the signature does not cover, so the
+    // record must show the one computed from the material.
+    let computed = kyriakon_control_core::mail::keycheck::pgp_fingerprint(GOOD_KEY).unwrap();
+    assert_eq!(
+        fix.account("parish-office")["mail_key"],
+        json!(computed),
+        "{}",
+        fix.journal()
+    );
 
     let virtuals = fix.table("virtuals");
     assert!(
@@ -1164,6 +1184,51 @@ fn a_mailbox_added_to_a_group_gets_an_account_key_and_entry() {
     assert!(log.contains("add-user.sh parish-office"), "{log}");
     assert!(log.contains("provision-member.sh parish-office"), "{log}");
     assert!(log.contains("publish-mail-key.sh parish-office"), "{log}");
+}
+
+/// A key the shared check refuses (here an AEAD advert) never reaches the
+/// keyring or the account record, exactly as the web form and the rotation
+/// path refuse it. The intent stays for the backoff and nothing is written.
+#[test]
+fn a_group_address_key_the_check_refuses_is_not_installed() {
+    let fix = Fix::new("group-address-aead");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+
+    let aead = fixture("gpg-aead.asc");
+    let id = fix.file_address(
+        "parish.example",
+        "add-mailbox",
+        "office",
+        "parish-office",
+        Some(&aead),
+        None,
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
+    let failed = fix.failed_note();
+    assert!(failed.contains("cannot be used"), "{failed}");
+    assert!(failed.contains("AEAD"), "{failed}");
+
+    assert!(
+        !fix.dir.join("keyring/parish-office.asc").exists(),
+        "a refused key reached the keyring"
+    );
+    assert!(
+        !fix.dir
+            .join("store/accounts/parish-office/account.json")
+            .exists(),
+        "a refused key reached an account record"
+    );
+    assert!(!fix.passwd_file().contains("parish-office:"));
+    assert!(!fix.table("virtuals").contains("office@parish.example"));
 }
 
 /// Upgrading an alias makes the account and key and repoints the entry. The
@@ -2203,6 +2268,41 @@ fn the_console_refuses_a_mail_key_that_is_not_a_public_key() {
     assert!(body(&out).contains("public key block"), "{}", body(&out));
     assert!(fix.intents().is_empty(), "{:?}", fix.intents());
     assert!(!fix.passwd_file().contains("parish-office:"));
+}
+
+/// A `--key-file` the shared check refuses is refused at the console too, so
+/// the console cannot file a mailbox the pages would have refused.
+#[test]
+fn the_console_refuses_a_mail_key_the_check_refuses() {
+    let fix = Fix::new("group-ctl-key-aead");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+
+    let path = fix.path("mail.asc");
+    std::fs::write(&path, fixture("gpg-aead.asc")).unwrap();
+    let out = fix.ctl(&[
+        "address",
+        "--domain",
+        "parish.example",
+        "--action",
+        "add-mailbox",
+        "--address",
+        "office",
+        "--mailbox",
+        "parish-office",
+        "--key-file",
+        &path,
+    ]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("cannot be used"), "{}", body(&out));
+    assert!(body(&out).contains("AEAD"), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
 }
 
 /// The same console path with a real public key computes the fingerprint and
