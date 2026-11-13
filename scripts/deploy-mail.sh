@@ -533,6 +533,38 @@ self_test() {
 	check "and leaves no candidate beside it" \
 		"$(find "$tree" -maxdepth 1 -name 'smtpd.conf.*' | wc -l | tr -d ' ')" 0
 
+	# The live callers name the parser, so a candidate smtpd refuses never lands.
+	printf '#!/bin/sh\nexit 1\n' > "$tree/smtpd-refuses"
+	chmod 0755 "$tree/smtpd-refuses"
+	cp "$tree/smtpd.conf" "$tree/expected-smtpd"
+	code=0
+	( install_smtpd_conf "$template" "$tree/dkim_domains" "$tree/queue.key" \
+		"$tree/smtpd.conf" "$tree/smtpd-refuses" ) >/dev/null 2>&1 || code=$?
+	check "a parser that refuses fails the smtpd render" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and leaves the live file alone" \
+		"$(cmp -s "$tree/smtpd.conf" "$tree/expected-smtpd" && printf same || printf changed)" same
+	check "and leaves no candidate behind it" \
+		"$(find "$tree" -maxdepth 1 -name 'smtpd.conf.*' | wc -l | tr -d ' ')" 0
+
+	# The shared staged install, which the other three configs use.
+	printf 'new\n' > "$tree/staged.src"
+	printf 'old\n' > "$tree/staged.live"
+	printf '#!/bin/sh\nexit 0\n' > "$tree/check-ok"
+	printf '#!/bin/sh\nexit 1\n' > "$tree/check-bad"
+	chmod 0755 "$tree/check-ok" "$tree/check-bad"
+	install_validated "$tree/staged.src" "$tree/staged.live" "$tree/check-ok"
+	check "a validated config replaces the live file" "$(cat "$tree/staged.live")" new
+	printf 'old\n' > "$tree/staged.live"
+	code=0
+	( install_validated "$tree/staged.src" "$tree/staged.live" "$tree/check-bad" ) \
+		>/dev/null 2>&1 || code=$?
+	check "a parser that refuses fails the install" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and leaves the live file alone" "$(cat "$tree/staged.live")" old
+	check "and leaves no candidate behind it" \
+		"$([ -e "$tree/staged.live.new" ] && printf present || printf gone)" gone
+
 	# --- the generated indexes ---
 	# The three include targets are created here, not by the config they are
 	# included from. Dropping one again is what #339 did, and the deployed
@@ -664,14 +696,13 @@ need_packages "$repo_dir/openbsd/packages.tsv" deploy-mail.sh
 
 # The resolver config is tracked for one setting in it: without
 # `qname-minimisation: no` Spamhaus gives no verdict for a clean address, so the
-# blocklist check reports coverage it does not have. Installed and then validated
-# before the service is signalled, which is the order the nsd deploy uses and for
-# the same reason: a bad file on disk with the resolver still running its old
-# config is recoverable, and the reverse is not, because this resolver is DNS for
-# everything else on the box. The service's own rc_pre repeats the check, so a
-# file that slips past here fails loudly at the restart instead of half-starting.
-install -m 0644 "$repo_dir/openbsd/etc/unbound.conf" /var/unbound/etc/unbound.conf
-unbound-checkconf /var/unbound/etc/unbound.conf
+# blocklist check reports coverage it does not have. The candidate is parsed
+# before it is renamed onto the live path: a typo left there would take the
+# next restart down, and this resolver is DNS for everything else on the box.
+# The service's own rc_pre repeats the check, so a file that slips past here
+# fails loudly at the restart instead of half-starting.
+install_validated "$repo_dir/openbsd/etc/unbound.conf" \
+	/var/unbound/etc/unbound.conf unbound-checkconf
 start_service unbound
 
 command -v cargo >/dev/null || { printf 'cargo missing after pkg_add rust\n' >&2; exit 1; }
@@ -767,7 +798,7 @@ if [ -d /var/www/logs ]; then
 	printf '      The live logs are /home/www/logs. Delete the stale tree when convenient:\n' >&2
 	printf '      doas rm -rf /var/www/logs\n' >&2
 fi
-install -m 0644 "$repo_dir/openbsd/etc/httpd.conf" /etc/httpd.conf
+install_validated "$repo_dir/openbsd/etc/httpd.conf" /etc/httpd.conf httpd -n -f
 install -m 0644 "$repo_dir/openbsd/etc/acme-client.conf" /etc/acme-client.conf
 
 # The log-rotation and retention bound. Installed whole rather than merged: it
@@ -775,7 +806,6 @@ install -m 0644 "$repo_dir/openbsd/etc/acme-client.conf" /etc/acme-client.conf
 # include, so a file holding only our own lines would stop rotating every log
 # that is not ours. See the file's header.
 install -m 0644 "$repo_dir/openbsd/etc/newsyslog.conf" /etc/newsyslog.conf
-httpd -n -f /etc/httpd.conf
 start_service httpd
 
 # acme-client exits 0 on change, 2 when the certificate is already current.
@@ -855,8 +885,7 @@ if ! ksh "$repo_dir/scripts/provision-member-capsule.sh" --pair; then
 	exit 1
 fi
 
-install -m 0644 "$repo_dir/openbsd/etc/gmid.conf" /etc/gmid.conf
-gmid -n -c /etc/gmid.conf
+install_validated "$repo_dir/openbsd/etc/gmid.conf" /etc/gmid.conf gmid -n -c
 start_service gmid
 
 # The capsule block needs one live request, because gmid accepts a mistyped
@@ -1224,18 +1253,21 @@ printf 'mail_from: %s entries\n' "$(grep -c . "$mail_from_table" || true)"
 install -m 0644 "$repo_dir/openbsd/etc/smtpd.conf" /etc/mail/smtpd.conf.template
 
 # '|' delimits the s/// because base64 keys contain '/'. The deployed file holds
-# the key, hence 0600. install_smtpd_conf stages beside the live file, so a
-# failure leaves the running configuration whole.
+# the key, hence 0600. install_smtpd_conf stages beside the live file and parses
+# the candidate with `smtpd -n -f` before the rename, so a failure leaves the
+# running configuration whole and the live file untouched.
 install_smtpd_conf /etc/mail/smtpd.conf.template "$dkim_domains_table" \
-	"$queue_key_file" /etc/mail/smtpd.conf
+	"$queue_key_file" /etc/mail/smtpd.conf smtpd
 for placeholder in REPLACE_ME_QUEUE_KEY REPLACE_ME_DKIM_DOMAINS; do
 	grep -q "$placeholder" /etc/mail/smtpd.conf \
 		&& { printf '%s was not substituted in /etc/mail/smtpd.conf\n' "$placeholder" >&2; exit 1; }
 done
-smtpd -n -f /etc/mail/smtpd.conf
 
-install -m 0644 "$repo_dir/openbsd/dovecot/dovecot.conf" /etc/dovecot/dovecot.conf
-doveconf -n >/dev/null
+# The same order for Dovecot: the candidate is parsed before it takes the live
+# path, so a typo costs a refused deploy rather than every IMAP session after
+# the next restart.
+install_validated "$repo_dir/openbsd/dovecot/dovecot.conf" \
+	/etc/dovecot/dovecot.conf doveconf -n -c
 
 # spamd.conf holds no blacklists, and greylisting needs no list to run: it is
 # spamd's default mode, and <spamd-white> is maintained by spamd itself from

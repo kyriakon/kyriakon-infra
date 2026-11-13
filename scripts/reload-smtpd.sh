@@ -74,7 +74,7 @@ reload_smtpd() {
 	# the next deploy installs the template.
 	if [ -f "$smtpd_template" ]; then
 		if ! install_smtpd_conf "$smtpd_template" "$dkim_domains" \
-			"$queue_key_file" "$smtpd_conf"; then
+			"$queue_key_file" "$smtpd_conf" smtpd; then
 			printf 'refusing: %s could not be re-expanded from %s, so the running daemon is left alone\n' \
 				"$smtpd_conf" "$dkim_domains" >&2
 			return 1
@@ -99,6 +99,9 @@ self_test() {
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work
+	# smtpd -n validates the live tree, which this fixture does not have; the
+	# deploy self-test proves the parser check itself.
+	export SMTPD_CONF_CHECK=no
 
 	calls="$tree/calls"
 	: >"$calls"
