@@ -1313,6 +1313,26 @@ fn an_approval_provisions_with_add_user_first() {
         .dir
         .join("store/accounts/secretary/application.json")
         .exists());
+    // The directory is readable by the handler: 0750 with the parent's group,
+    // not the 0700 a plain ensure_dir leaves, because the page runs as another
+    // account and a directory it cannot enter reads as a missing record.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(fix.dir.join("store/accounts/secretary"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o750, "the account directory is group-readable");
+        // The chown branch only runs as root; where it ran, the handler's group
+        // is the parent's, which is what makes 0750 readable to it.
+        if unsafe { libc::geteuid() } == 0 {
+            use std::os::unix::fs::MetadataExt;
+            let dir = std::fs::metadata(fix.dir.join("store/accounts/secretary")).unwrap();
+            let parent = std::fs::metadata(fix.dir.join("store/accounts")).unwrap();
+            assert_eq!(dir.gid(), parent.gid(), "the parent's group owns it");
+        }
+    }
     assert!(!fix.read("accounts/secretary/notices.jsonl").is_empty());
     // The completion line is written, so a finished approval does not read like
     // one that died midway.

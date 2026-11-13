@@ -23,7 +23,7 @@ pub mod journal;
 pub use error::{Action, Error};
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::fchown;
+use std::os::unix::fs::{fchown, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
@@ -508,6 +508,62 @@ impl Store {
             path: d,
             source,
         })
+    }
+
+    /// Create a directory under the root at `mode`, handed to `owner` when
+    /// running as root, and correct an existing one whose mode has drifted.
+    ///
+    /// `ensure_dir`'s 0700 is right for the handler's own working directories
+    /// and for lock files, but an account or group record's directory is read
+    /// by `_onboard`: a root-owned 0700 directory makes
+    /// `accounts/<user>/account.json` unreadable however the file itself is
+    /// written, and the page then behaves as though the record were missing.
+    /// 0750 with the parent's group is what `control-store.sh` gives `accounts/`
+    /// and `groups/`.
+    pub async fn ensure_dir_owned(
+        &self,
+        dir: &str,
+        mode: u32,
+        owner: Option<(u32, u32)>,
+    ) -> Result<(), Error> {
+        let d = self.root.join(dir);
+        let mut builder = tokio::fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.mode(mode);
+        builder.create(&d).await.map_err(|source| Error::Io {
+            action: Action::Create,
+            path: d.clone(),
+            source,
+        })?;
+        // The descriptor, not the path: this is root handing a directory to
+        // another account, and a name in the tree can be replaced. `accounts/`
+        // and `groups/` are root-owned with no group write, so the handler
+        // cannot plant one here, but the descriptor keeps the rule local.
+        let f = tokio::fs::File::open(&d)
+            .await
+            .map_err(|source| Error::Io {
+                action: Action::Open,
+                path: d.clone(),
+                source,
+            })?;
+        if unsafe { libc::geteuid() } == 0 {
+            if let Some((uid, gid)) = owner {
+                fchown(&f, Some(uid), Some(gid)).map_err(|source| Error::Io {
+                    action: Action::Chown,
+                    path: d.clone(),
+                    source,
+                })?;
+            }
+        }
+        // A directory made by an earlier release is repaired rather than left
+        // at the mode that hid it.
+        f.set_permissions(std::fs::Permissions::from_mode(mode))
+            .await
+            .map_err(|source| Error::Io {
+                action: Action::Chmod,
+                path: d,
+                source,
+            })
     }
 
     /// The owner of a directory under the store. The drain uses this to write
@@ -1825,6 +1881,43 @@ pub struct Notice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An account or group record's directory is 0750, not the 0700 the plain
+    /// `ensure_dir` makes: the handler reads the record as another account, and
+    /// a directory it cannot enter reads as a record that is not there. A
+    /// directory an earlier release left at 0700 is repaired by the next write.
+    #[tokio::test]
+    async fn an_owned_directory_is_group_readable_and_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("onboard-dirmode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("accounts")).unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        store
+            .ensure_dir_owned("accounts/alice", 0o750, None)
+            .await
+            .unwrap();
+        assert_eq!(mode(&dir.join("accounts/alice")), 0o750);
+
+        std::fs::set_permissions(
+            dir.join("accounts/alice"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        store
+            .ensure_dir_owned("accounts/alice", 0o750, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            mode(&dir.join("accounts/alice")),
+            0o750,
+            "an existing 0700 directory is repaired"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[tokio::test]
     async fn a_128_bit_token_is_26_crockford_characters() {

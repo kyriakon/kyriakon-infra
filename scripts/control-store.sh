@@ -206,13 +206,25 @@ share_record() {
 		chmod 0640 "$1"
 	fi
 }
+# The directory is the handler's way in: a 0700 root directory hides even a
+# 0640 record from it, so the deploy repairs the mode with the records.
+repair_record_dir() {
+	[ -d "$1" ] || return 0
+	if [ "$(stat -f '%Su %Sg %Lp' "$1")" != "root $onboard_user 750" ]; then
+		changed=1
+		chown root:"$onboard_user" "$1"
+		chmod 0750 "$1"
+	fi
+}
 for account in "$store"/accounts/*; do
 	[ -d "$account" ] || continue
+	repair_record_dir "$account"
 	share_record "$account/account.json"
 	share_record "$account/notices.jsonl"
 done
 for group in "$store"/groups/*; do
 	[ -d "$group" ] || continue
+	repair_record_dir "$group"
 	share_record "$group/group.json"
 done
 
