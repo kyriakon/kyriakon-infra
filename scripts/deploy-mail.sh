@@ -467,20 +467,27 @@ self_test() {
 		"$(grep -c '^filter.*-d parish.example' "$tree/smtpd.conf")" 0
 
 	# The renderer's rule is the intake's: control/crates/core/src/flow/validate.rs's
-	# domain() accepts these, and the same corpus is in its own test. A numeric
-	# top-level label is a name intake must refuse, because a line here fails the
-	# render and every later transition that reloads smtpd with it.
+	# domain() accepts these, and the same corpus is in its own test. A line the
+	# rule refuses can still be in the table from before the rule, so it is
+	# skipped with a warning rather than failing the render: one bad line must
+	# not stop every body's mail being signed.
 	printf 'kyriakon.net\nsub.parish.example\nparish-12.example\na.bb\n' > "$tree/dkim_domains"
 	check "every domain the intake accepts renders" \
 		"$(dkim_domains_args "$tree/dkim_domains")" \
 		"-d kyriakon.net -d sub.parish.example -d parish-12.example -d a.bb"
 	printf 'kyriakon.net\nparish.12\n' > "$tree/dkim_domains"
-	if dkim_domains_args "$tree/dkim_domains" >/dev/null 2>&1; then
+	if dkim_domains_args "$tree/dkim_domains" >"$tree/skipped.out" 2>&1; then
 		code=0
 	else
 		code=$?
 	fi
-	check "a numeric top-level label is refused by the renderer" "$code" 1
+	check "a line the renderer refuses does not fail the render" "$code" 0
+	check "and the good domain still renders" \
+		"$(grep -cx -- '-d kyriakon.net' "$tree/skipped.out" || true)" 1
+	check "and the refused line is named in the warning" \
+		"$(grep -c 'not a domain, so it is not signed: parish.12' "$tree/skipped.out")" 1
+	check "and it is not in the filter arguments" \
+		"$(grep -c -- '-d parish.12' "$tree/skipped.out" || true)" 0
 	printf 'kyriakon.net\n' > "$tree/dkim_domains"
 
 	# The routing rules the mail cannot do without. The enqueuer's rule is what
