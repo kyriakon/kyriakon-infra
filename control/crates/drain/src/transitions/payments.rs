@@ -1686,6 +1686,12 @@ pub async fn write_payment_copy(
         .write_record(&format!("accounts/{username}"), "application.json", &bytes)
         .await?;
     if let Some(token) = copy.get("status_token").and_then(Value::as_str) {
+        // `status_token` comes from a copy the unprivileged handler owns. A
+        // planted value must never become a path under `applications/`, so a
+        // token that is not the generated shape leaves nothing to rewrite.
+        if !store::is_status_token(token) {
+            return Ok(());
+        }
         if store.filed_application_text(token).await?.is_some() {
             let owner = store.dir_owner("applications");
             store
@@ -2076,8 +2082,6 @@ mod tests {
     /// on a pipe nobody reads yet, which holds the settlement exactly there.
     #[test]
     fn a_settlement_journals_with_the_ledger_lock_released() {
-        use std::ffi::CString;
-        use std::io::Read;
         use std::time::{Duration, Instant};
 
         let dir = std::env::temp_dir().join(format!("onboard-settle-lock-{}", std::process::id()));
@@ -2106,10 +2110,10 @@ mod tests {
             ),
         )
         .unwrap();
-        // The journal is a pipe, so its append waits for a reader: the state of
-        // the lock is observable at that point rather than a race. The index is
-        // loaded first, while the file is still missing (an empty journal), so
-        // the settlement's append is what blocks on the pipe.
+        // The journal lock is held here, so the settlement's append waits on it:
+        // the state of the ledger lock is observable at that point rather than a
+        // race. The index is loaded first, while the file is missing (an empty
+        // journal), so the append is what waits.
         let journal = {
             let store = Store::new_for_test(&root_text);
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2119,8 +2123,14 @@ mod tests {
             runtime.block_on(Journal::load(&store)).unwrap()
         };
         let journal_path = root.join("journal.jsonl");
-        let c_path = CString::new(journal_path.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let held = {
+            let store = Store::new_for_test(&root_text);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(store.log("journal.jsonl").lock()).unwrap()
+        };
 
         let value = json!({
             "id": "01HZZZZZZZZZZZZZZZZZZZZZZZ",
@@ -2176,23 +2186,20 @@ mod tests {
 
         // Unblock the append and let the settlement finish either way, so a
         // failure reads as an assertion rather than a hang.
-        let read_journal = {
-            let journal = journal_path.clone();
-            std::thread::spawn(move || {
-                let mut text = String::new();
-                std::fs::File::open(&journal)
-                    .and_then(|mut f| f.read_to_string(&mut text))
-                    .map(|_| text)
-            })
-        };
+        drop(held);
         let settled = settle.join().unwrap();
-        read_journal.join().unwrap().unwrap();
 
         assert!(
             free,
             "the ledger lock is still held while the settlement journals"
         );
         assert!(settled.is_ok(), "{settled:?}");
+        assert!(
+            std::fs::read_to_string(&journal_path)
+                .unwrap()
+                .contains("\"kind\":\"refund\""),
+            "the settlement journalled"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
