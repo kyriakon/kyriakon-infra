@@ -3347,6 +3347,50 @@ pub async fn export_account(
     ))
 }
 
+/// Erase what an approval that began left on the box, for a decline over a
+/// failed approval. The approval journals "applying" before it provisions and
+/// writes `accounts/<user>/account.json` last, so a failure in between leaves a
+/// live OS account, its Maildir, the keyring file, the published key and the
+/// virtuals line with no record any sweep starts from; a decline accepted over
+/// that would leave an account nobody owns and a name held by it. `true` means
+/// something was erased.
+///
+/// A record means the account was made, so the delete transition's own path
+/// applies, with the published key's removal ahead of it. Without one the box is
+/// cleared the way a closed account is: the name held for ninety days, the
+/// stored key dropped, `delete-user.sh`, the published key and the keyring
+/// entry. Nothing is held when the box never held the name: the approval stopped
+/// before `add-user.sh`, so no address could have received mail for it. The
+/// published key is removed either way, because the approval publishes it before
+/// the record is written and a name reused after the hold would otherwise meet a
+/// publish that refuses to replace it. A failed script fails the decline,
+/// leaving its intent for the next pass.
+pub(super) async fn erase_half_made(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    username: &str,
+) -> Result<bool, Error> {
+    if store.account(username).await?.is_some() {
+        // Before the deletion, so the drift check never sees a key that is
+        // published and no longer served.
+        remove_published_key(cfg, username).await?;
+        delete_account(cfg, store, journal, username).await?;
+        return Ok(true);
+    }
+    let on_box = account_on_box(cfg, username)?;
+    if on_box {
+        hold_name(store, username).await?;
+    }
+    store.remove("keys", &format!("{username}.pub")).await?;
+    if on_box {
+        run_script(cfg, "delete-user.sh", &[username]).await?;
+    }
+    remove_published_key(cfg, username).await?;
+    remove_keyring_entry(cfg, username).await?;
+    Ok(on_box)
+}
+
 /// Release `username` when nothing holds it, for a purge whose application is
 /// going. `true` means the caller may finish; `false` means the box could not be
 /// asked or the script failed, and the caller leaves its record for the next
@@ -3355,9 +3399,12 @@ pub async fn export_account(
 /// The box is the oracle and the record only a fast path: an account made by the
 /// operator or by a script run by hand has no record, and the front end never
 /// checks whether a name is taken, so either form means the name is in use and
-/// the purge must not delete what holds it. A failed script leaves the record
-/// for the next pass rather than losing the release, and its error is reported
-/// once rather than every minute.
+/// the purge must not delete what holds it. The one exception is `half_made`: a
+/// box account with no record whose declined application's own approval began is
+/// the account that approval never finished making, and the purge erases it
+/// rather than leave it unowned. A failed script leaves the record for the next
+/// pass rather than losing the release, and its error is reported once rather
+/// than every minute.
 async fn release_username(
     cfg: &DrainConfig,
     store: &Store,
@@ -3365,10 +3412,10 @@ async fn release_username(
     purge_id: &str,
     kind: &str,
     username: &str,
+    half_made: bool,
 ) -> Result<bool, Error> {
-    let taken = match store.account(username).await {
-        Ok(Some(_)) => true,
-        Ok(None) => account_on_box(cfg, username)?,
+    let recorded = match store.account(username).await {
+        Ok(record) => record.is_some(),
         Err(e) => {
             // The account holding the name cannot be read, so the purge cannot
             // tell whether releasing the name would take an account with it.
@@ -3378,7 +3425,30 @@ async fn release_username(
             return Ok(false);
         }
     };
-    if !taken {
+    // Only a name with nothing over it is asked of the box, and only the
+    // half-made case is read as the decline's own.
+    let on_box = !recorded && account_on_box(cfg, username)?;
+    let half_made = half_made && on_box;
+    if half_made {
+        // The account held an address long enough to receive mail, so the name
+        // is held for ninety days as a closed account's is.
+        if let Err(e) = hold_name(store, username).await {
+            report_failure(cfg, store, journal, purge_id, kind, &e).await;
+            return Ok(false);
+        }
+        // The approval published the key before it wrote the record, so the
+        // half-made account's own publications go with it: the repository's
+        // key first, then the box keyring entry, then the account itself.
+        if let Err(e) = remove_published_key(cfg, username).await {
+            report_failure(cfg, store, journal, purge_id, kind, &e).await;
+            return Ok(false);
+        }
+        if let Err(e) = remove_keyring_entry(cfg, username).await {
+            report_failure(cfg, store, journal, purge_id, kind, &e).await;
+            return Ok(false);
+        }
+    }
+    if !recorded && (!on_box || half_made) {
         if let Err(e) = run_script(cfg, "delete-user.sh", &[username]).await {
             report_failure(cfg, store, journal, purge_id, kind, &Error::from(e)).await;
             return Ok(false);
@@ -3450,9 +3520,21 @@ pub async fn purge_declined(
                 )
                 .await?;
             }
-            // Release the name only when nothing holds it.
-            if !release_username(cfg, store, journal, &purge_id, "decline", &record.username)
-                .await?
+            // Release the name only when nothing holds it. A body's approval
+            // makes the group's mailboxes, not an account of the site owner's,
+            // so only a person application can hold a half-made account here.
+            let half_made =
+                record.domain.is_none() && journal.approval_started(&record.status_token);
+            if !release_username(
+                cfg,
+                store,
+                journal,
+                &purge_id,
+                "decline",
+                &record.username,
+                half_made,
+            )
+            .await?
             {
                 continue;
             }
@@ -3675,11 +3757,22 @@ pub async fn purge_applications(
                 )
                 .await?;
             }
-            if abandoned
-                && !release_username(cfg, store, journal, &purge_id, "purge", &record.username)
-                    .await?
-            {
-                continue;
+            if abandoned {
+                let half_made =
+                    record.domain.is_none() && journal.approval_started(&record.status_token);
+                if !release_username(
+                    cfg,
+                    store,
+                    journal,
+                    &purge_id,
+                    "purge",
+                    &record.username,
+                    half_made,
+                )
+                .await?
+                {
+                    continue;
+                }
             }
             let note = format!("the {what} was cleared away");
             write_journal(
