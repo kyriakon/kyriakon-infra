@@ -1687,6 +1687,18 @@ impl Account {
         }
     }
 
+    /// Where a notice goes: the contact the member gave, when it validates as a
+    /// mail header, and their platform mailbox otherwise. The contact is
+    /// validated again because it becomes a mail header, and a record that
+    /// reached it from outside the drain is not trusted.
+    pub fn notice_address(&self) -> String {
+        self.outside_address
+            .as_deref()
+            .filter(|addr| crate::flow::validate::address(addr).is_none())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.platform_address())
+    }
+
     /// Whether the site and the capsule are served. An unrecorded lane on a
     /// member with an upload key is on, because provision-member.sh wrote it;
     /// a member with no upload key has no lane at all, so neither is served.
@@ -2437,6 +2449,35 @@ mod tests {
         assert!(is_status_token("0123456789abcdefghjkmnpqrs"));
         assert!(!is_status_token("0123456789abcdefghjkmnpqrst"));
         assert!(!is_status_token("0123456789abcdefghjkmnpqrsT"));
+    }
+
+    /// A notice goes to the validated contact and otherwise to the member's own
+    /// platform mailbox: a group mailbox's is its mailbox on the group's domain,
+    /// and an outside address that is not a mail header is not used.
+    #[test]
+    fn a_notice_address_is_the_validated_contact_or_the_platform_mailbox() {
+        let parse = |extra: &str| -> Account {
+            serde_json::from_str(&format!(
+                r#"{{"version": 1, "username": "secretary", "state": "active",
+                    "decision": "approve", "decided_at": "2026-10-01T09:00:00Z",
+                    "rail": "no_charge", "no_charge": true,
+                    "created_at": "2026-10-01T09:00:00Z"{extra}}}"#
+            ))
+            .unwrap()
+        };
+        assert_eq!(parse("").notice_address(), "secretary@kyriakon.net");
+        assert_eq!(
+            parse(r#", "outside_address": "secretary@example.invalid""#).notice_address(),
+            "secretary@example.invalid"
+        );
+        assert_eq!(
+            parse(r#", "outside_address": "warden at example.invalid""#).notice_address(),
+            "secretary@kyriakon.net"
+        );
+        assert_eq!(
+            parse(r#", "group": "parish.example""#).notice_address(),
+            "secretary@parish.example"
+        );
     }
 
     #[tokio::test]

@@ -274,9 +274,11 @@
 </form>
 <p>The platform gathers its written record of your account into your sftp space,
 as <code>export/&lt;timestamp&gt;/</code> beside <code>www/</code> and
-<code>gemini/</code>, and sends a notice when it is ready. Your mail, your
-repositories and your sites stay where they are; the manifest names each path
-and copies none of them.</p>
+<code>gemini/</code>, and sends a notice when it is ready. An account with no
+site or upload key gets the same record mailed encrypted to its mail key
+instead; with no mail key either, the answer says what is still reachable and
+nothing is sent. Your mail, your repositories and your sites stay where they
+are; the manifest names each path and copies none of them.</p>
 {% endif %}
 
 <h3>What the platform offers</h3>

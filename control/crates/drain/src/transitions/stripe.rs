@@ -519,10 +519,7 @@ impl BillingTarget {
     /// domain rather than the platform's.
     async fn recipient(&self, store: &Store) -> String {
         match self {
-            BillingTarget::Account(a) => a
-                .outside_address
-                .clone()
-                .unwrap_or_else(|| format!("{}@kyriakon.net", a.username)),
+            BillingTarget::Account(a) => a.notice_address(),
             BillingTarget::Group(g) => dns_contact(store, g)
                 .await
                 .unwrap_or_else(|_| format!("{}@{}", g.site_owner, g.domain)),
