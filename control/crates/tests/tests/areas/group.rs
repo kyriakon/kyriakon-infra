@@ -1749,8 +1749,9 @@ fn a_lapsed_card_group_stops_its_subscription_once() {
     );
 }
 
-/// A removal for a domain with no group record is refused and changes nothing:
-/// no table line, no script, no account and no group.
+/// A removal for a domain with no group record is settled as refused, not a
+/// failure that retries: no intent is left behind, and nothing changes -- no
+/// table line, no script, no account and no group.
 #[test]
 fn a_removal_for_a_domain_that_is_not_a_group_is_refused() {
     let fix = Fix::new("group-remove-missing");
@@ -1775,12 +1776,23 @@ fn a_removal_for_a_domain_that_is_not_a_group_is_refused() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
 
-    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
     assert!(
-        fix.failed_note()
-            .contains("there is no group for other.example"),
-        "{}",
-        fix.failed_note()
+        fix.intents().is_empty(),
+        "a refused removal left its intent armed: {:?}",
+        fix.intents()
+    );
+    let journal = fix.journal();
+    assert!(
+        journal.contains(&format!("\"intent\":\"{id}\",\"kind\":\"remove-group\"")),
+        "{journal}"
+    );
+    assert!(
+        journal.contains("there is no group for other.example"),
+        "{journal}"
+    );
+    assert!(
+        !journal.contains("\"outcome\":\"failed\""),
+        "a missing group failed the pass: {journal}"
     );
     assert_eq!(
         (
@@ -1795,6 +1807,199 @@ fn a_removal_for_a_domain_that_is_not_a_group_is_refused() {
     assert_eq!(fix.names("accounts"), accounts);
     assert_eq!(fix.scripts_log(), log, "a refused removal ran a script");
     assert!(fix.dir.join("store/groups/parish.example").exists());
+}
+
+/// A body cannot claim the platform's own domain, or a name under it: the
+/// approval settles as refused before the journal's applying line, no script
+/// runs and no virtual entry is made.
+#[test]
+fn a_body_that_claims_the_platforms_own_domain_is_refused() {
+    for (case, domain) in [
+        ("group-platform-domain", "kyriakon.net"),
+        ("group-platform-subdomain", "mail.kyriakon.net"),
+    ] {
+        let fix = Fix::new(case);
+        let mut record = fix.filed_body("warden");
+        record["domain"] = json!(domain);
+        record["answers"]["body_domain"] = json!(domain);
+        fix.rewrite_record(&record);
+        fix.file_application(&record);
+        assert!(fix.drain().status.success());
+        fix.decide("approve", "warden");
+        let out = fix.drain();
+        assert!(out.status.success(), "{domain}: {}", body(&out));
+
+        let journal = fix.journal();
+        assert!(
+            journal.contains(&format!("{domain} is the platform's own domain")),
+            "{domain} was not refused in the journal: {journal}"
+        );
+        assert!(
+            !journal.contains("\"outcome\":\"applying\""),
+            "{domain}: a refused approval began: {journal}"
+        );
+        assert!(
+            !fix.scripts_log().contains("provision"),
+            "{domain}: a refused approval ran a script: {}",
+            fix.scripts_log()
+        );
+        assert_eq!(
+            fix.table("virtuals"),
+            "",
+            "{domain}: a refused approval made a virtual entry"
+        );
+        assert_eq!(
+            fix.table("mail_domains"),
+            "kyriakon.net\n",
+            "{domain}: a refused approval changed the platform's domain table"
+        );
+        assert!(!fix.dir.join("store/groups").join(domain).exists());
+    }
+}
+
+/// `group remove` for the platform's own domain, or a name under it, settles as
+/// refused and leaves the platform's mail tables and certificate material
+/// alone: the removal would otherwise delete every `*@kyriakon.net` entry and
+/// the platform's own certificate.
+#[test]
+fn a_removal_of_the_platforms_own_domain_is_refused() {
+    let fix = Fix::new("group-platform-remove");
+    std::fs::write(
+        fix.path("virtuals"),
+        "abuse@kyriakon.net: warden\nadmin@kyriakon.net: warden\nbob@parish.example: bob\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fix.path("mail_from"),
+        "warden: abuse@kyriakon.net,admin@kyriakon.net\n",
+    )
+    .unwrap();
+    let platform_files = [
+        "httpd.d/kyriakon.net.conf",
+        "gmid.d/kyriakon.net.conf",
+        "acme-client.d/kyriakon.net.conf",
+        "ssl/kyriakon.net.fullchain.pem",
+        "ssl/private/kyriakon.net.key",
+        "httpd.d/mail.kyriakon.net.conf",
+        "ssl/mail.kyriakon.net.fullchain.pem",
+    ];
+    for path in platform_files {
+        std::fs::write(fix.host(path), b"generated\n").unwrap();
+    }
+    let tables = (
+        fix.table("mail_domains"),
+        fix.table("dkim_domains"),
+        fix.table("virtuals"),
+        fix.table("mail_from"),
+    );
+
+    for domain in ["kyriakon.net", "mail.kyriakon.net"] {
+        fix.file_remove_group(domain);
+    }
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let journal = fix.journal();
+    for domain in ["kyriakon.net", "mail.kyriakon.net"] {
+        assert!(
+            journal.contains(&format!("{domain} is the platform's own domain")),
+            "{domain} was not refused: {journal}"
+        );
+    }
+    assert!(
+        !journal.contains("\"outcome\":\"failed\""),
+        "a platform removal failed the pass: {journal}"
+    );
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert_eq!(
+        (
+            fix.table("mail_domains"),
+            fix.table("dkim_domains"),
+            fix.table("virtuals"),
+            fix.table("mail_from")
+        ),
+        tables,
+        "a refused platform removal changed a table"
+    );
+    for path in platform_files {
+        assert!(fix.host(path).exists(), "{path} was removed");
+    }
+    assert!(
+        !fix.scripts_log().contains("remove-group.sh"),
+        "a refused platform removal ran the removal script: {}",
+        fix.scripts_log()
+    );
+}
+
+/// A second removal filed after the first took the group down settles as
+/// refused, leaves no intent behind and does not retry, so a group made on that
+/// domain later is not taken down by the stale signed removal.
+#[test]
+fn a_stale_removal_settles_refused_and_spares_a_later_group() {
+    let fix = Fix::new("group-remove-stale");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+
+    // The first removal takes the group down; the second, filed in the state a
+    // second `group remove` leaves behind, finds no record.
+    fix.file_remove_group("parish.example");
+    assert!(fix.drain().status.success());
+    assert!(
+        !fix.dir.join("store/groups/parish.example").exists(),
+        "the first removal did not take the group down"
+    );
+    let stale = fix.file_remove_group("parish.example");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let journal = fix.journal();
+    assert!(
+        journal.contains(&format!("\"intent\":\"{stale}\",\"kind\":\"remove-group\""))
+            && journal.contains("there is no group for parish.example"),
+        "the stale removal did not settle refused: {journal}"
+    );
+    assert!(
+        !journal.contains("\"outcome\":\"failed\""),
+        "the stale removal keeps retrying: {journal}"
+    );
+    assert!(
+        fix.intents().is_empty(),
+        "the stale removal was left armed: {:?}",
+        fix.intents()
+    );
+
+    // A later pass has nothing to do, and would have retried a failure.
+    let lines = journal.lines().count();
+    let log = fix.scripts_log();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.journal().lines().count(), lines, "the seam retried");
+    assert_eq!(fix.scripts_log(), log, "a later pass ran a script");
+
+    // A new body on the same domain is not the stale removal's to delete.
+    fix.file_group(
+        "parish.example",
+        "parish-office",
+        &[("office", "parish-office")],
+        &["parish-office"],
+        None,
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.dir
+            .join("store/groups/parish.example/group.json")
+            .exists(),
+        "the stale removal deleted a later group: {}",
+        fix.journal()
+    );
+    assert!(fix.table("mail_domains").contains("parish.example"));
 }
 
 /// The console takes `group remove`, signs the domain, and refuses a name that
@@ -3417,4 +3622,27 @@ fn a_group_invoice_below_the_price_extends_nothing() {
         );
     }
     assert!(payment_lines(&fix).is_empty(), "{:?}", payment_lines(&fix));
+}
+
+/// An address change for a domain with no group record settles as refused
+/// rather than failing: a signed intent left armed would land on a later group
+/// with the same domain, and a failure line keeps retrying it every pass.
+#[test]
+fn an_address_change_for_a_missing_group_settles_as_refused() {
+    let fix = Fix::new("address-no-group");
+    fix.file_address(
+        "parish.example",
+        "remove",
+        "",
+        "parish-secretary",
+        None,
+        None,
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let journal = fix.journal();
+    assert!(journal.contains("\"outcome\":\"refused\""), "{journal}");
+    assert!(journal.contains("no group for parish.example"), "{journal}");
+    assert!(!journal.contains("\"outcome\":\"failed\""), "{journal}");
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
 }
