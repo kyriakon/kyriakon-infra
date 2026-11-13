@@ -65,8 +65,9 @@ pub async fn credit(
             Some("replayed: the ledger already holds this credit".to_string()),
         ));
     }
-    // A refusal is recorded once; the intent is left in place, as every other
-    // refused intent is, and a new intent is the way to change it.
+    // A refusal is recorded once and its intent removed by the seam: a new
+    // intent is the way to change it, and a kept file would sit in the
+    // unapplied backlog for good.
     let amount = match credit_fields(&intent) {
         Ok(amount) => amount,
         Err(problem) => return Ok(Settlement::refused(&problem)),
@@ -135,12 +136,12 @@ fn credit_fields(intent: &CreditIntent) -> Result<i64, Error> {
             intent.received
         )));
     }
-    if !valid_txid(intent.txid.as_deref()) {
+    if !xmr::valid_txid(intent.txid.as_deref()) {
         return Err(Error::Failed(
             "the credit's transaction id is not 64 hexadecimal characters".to_string(),
         ));
     }
-    if !valid_xmr(intent.amount_xmr.as_deref()) {
+    if !xmr::valid_xmr(intent.amount_xmr.as_deref()) {
         return Err(Error::Failed(
             "the credit's XMR amount is not a decimal amount".to_string(),
         ));
@@ -1564,26 +1565,6 @@ async fn held_txid(store: &Store, txid: &str) -> Result<Option<(String, String)>
         .into_iter()
         .find(|line| line.txid.as_deref() == Some(txid))
         .map(|line| (line.id, line.received_on)))
-}
-
-fn valid_txid(txid: Option<&str>) -> bool {
-    match txid {
-        None => true,
-        Some(t) => t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()),
-    }
-}
-
-/// An XMR amount is written as a decimal, never a float, with at most the
-/// twelve decimal places the coin's atomic unit carries.
-fn valid_xmr(amount: Option<&str>) -> bool {
-    let Some(amount) = amount else {
-        return true;
-    };
-    let (whole, fraction) = amount.split_once('.').unwrap_or((amount, ""));
-    !whole.is_empty()
-        && whole.bytes().all(|b| b.is_ascii_digit())
-        && fraction.len() <= 12
-        && fraction.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// What a credit's money does, in pence. Any amount at or above the price is

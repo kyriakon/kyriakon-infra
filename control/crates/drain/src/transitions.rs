@@ -304,10 +304,11 @@ async fn finish(store: &Store, after: AfterLine) -> Result<(), Error> {
     }
 }
 
-/// What a refusal leaves of the intent file. A page action's refusal is the
-/// handler's own input refused in the drain, so its file goes; every other
-/// refusal is kept for the operator to read, as `refuse` leaves an unknown
-/// kind.
+/// What a refusal leaves of the intent file. A refusal no retry can change — a
+/// page action's own input, a removal with nothing to remove — takes the file
+/// with it; every other refusal is kept for the operator to read, as `refuse`
+/// leaves an unknown kind. A refused credit is kept: its file is the only
+/// record of the payment the console accepted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RefusalFile {
     Keep,
@@ -334,8 +335,8 @@ impl Disposition {
 /// file survived the crash between the two is finished here by removing the
 /// file; any other outcome line the journal already carries is not appended
 /// again, and the file is finished the same way. A `refused` line leaves the
-/// file for the operator, except for a page action, whose refusal is the
-/// handler's own input. The body does the work, writes the `applying` line
+/// file for the operator, except where its disposition is `RefusalFile::Remove`:
+/// a page action's input, a credit that does not verify, a stale removal. The body does the work, writes the `applying` line
 /// where the verb has one, and returns what the intent settled as.
 pub async fn settle<F>(
     cfg: &DrainConfig,

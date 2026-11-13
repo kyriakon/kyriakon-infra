@@ -593,10 +593,9 @@ fn disposition(intent: &Intent) -> transitions::Disposition {
     };
     // A page action's refusal is the handler's own input, so its file goes;
     // every other verb keeps a refusal for the operator. A close is a page
-    // action too, though its only refusal is the session proof's. A refused
-    // group removal goes as well: it is the console's own domain refused, and a
-    // signed removal left on disk is a removal that could land on a group made
-    // on that domain later.
+    // action too, though its only refusal is the session proof's. A credit's
+    // refusal is final too: a new intent is the way to change it, and keeping
+    // the file would leave it in the unapplied backlog for good.
     let refusal = match intent {
         Intent::ChangePassword(_)
         | Intent::UploadKey(_)
@@ -606,13 +605,13 @@ fn disposition(intent: &Intent) -> transitions::Disposition {
         | Intent::MailKey(_)
         | Intent::Close(_)
         | Intent::Export(_)
-        | Intent::TestMail(_)
-        | Intent::RemoveGroup(_)
-        | Intent::GroupAddress(_) => transitions::RefusalFile::Remove,
+        | Intent::TestMail(_) => transitions::RefusalFile::Remove,
         Intent::Application(_)
         | Intent::Decision(_)
         | Intent::Password(_)
         | Intent::ProvisionGroup(_)
+        | Intent::GroupAddress(_)
+        | Intent::RemoveGroup(_)
         | Intent::Resend(_)
         | Intent::Credit(_)
         | Intent::WindowExtend(_)
