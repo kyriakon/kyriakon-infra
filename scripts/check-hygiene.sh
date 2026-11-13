@@ -248,6 +248,28 @@ permission_drift() {
 	return 0
 }
 
+# log_file_problems <logdir> [<owner:group>]: one line per access log under the
+# directory whose owner or mode is not root:wheel 600. The owner argument exists
+# for the self-test, which cannot create a root-owned fixture; the live call
+# takes the default.
+log_file_problems() {
+	typeset dir="$1" want="${2:-root:wheel}" log got mode
+	# A deleted log is not a healthy one: httpd recreates it 0644, so its
+	# absence is the finding rather than a pass.
+	if [ ! -f "$dir/access.log" ]; then
+		printf '%s: missing\n' "$dir/access.log"
+		return 0
+	fi
+	for log in "$dir"/access.log "$dir"/access.log.*; do
+		[ -f "$log" ] || continue
+		got=$(stat -f '%Su:%Sg %Lp' "$log")
+		mode=${got##* }
+		# 0400 is as private as 0600; only group or other access is a finding.
+		[ "${got% *}" = "$want" ] && [ "${mode#?}" = "00" ] && continue
+		printf '%s: %s\n' "$log" "$got"
+	done
+}
+
 # The comparison above, the remedy lines and the address check below, against
 # fixtures, so a change to any of them is not a claim. Each drives a function
 # and not the box, which is why this can run anywhere.
@@ -567,6 +589,46 @@ EOF
 	*) printf 'FAIL: a record the owner cannot be is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
 	esac
 
+	# The access log names capability URLs, so a widened mode is a finding and
+	# the rotated copies are covered by the same glob.
+	mkdir "$dir/logs"
+	printf 'x\n' > "$dir/logs/access.log"
+	printf 'x\n' > "$dir/logs/access.log.0.gz"
+	chmod 600 "$dir/logs/access.log" "$dir/logs/access.log.0.gz"
+	pair=$(stat -f '%Su:%Sg' "$dir/logs/access.log")
+	out=$(log_file_problems "$dir/logs" "$pair")
+	[ -z "$out" ] || {
+		printf 'FAIL: a 600 access log is not a finding; got [%s]\n' "$out" >&2
+		exit 1
+	}
+	chmod 400 "$dir/logs/access.log"
+	out=$(log_file_problems "$dir/logs" "$pair")
+	[ -z "$out" ] || {
+		printf 'FAIL: a 400 access log is not a finding; got [%s]\n' "$out" >&2
+		exit 1
+	}
+	chmod 600 "$dir/logs/access.log"
+	chmod 644 "$dir/logs/access.log.0.gz"
+	out=$(log_file_problems "$dir/logs" "$pair" | grep -c 'access.log.0.gz')
+	[ "$out" = 1 ] || {
+		printf 'FAIL: a world-readable rotated log is a finding; got [%s]\n' "$out" >&2
+		exit 1
+	}
+	# The live call passes no owner, so the default is what must be compared.
+	# The CI VM runs as root:wheel, where the fixture cannot differ from the
+	# default; the mode arm still runs there.
+	chmod 600 "$dir/logs/access.log.0.gz"
+	if [ "$(stat -f '%Su:%Sg' "$dir/logs/access.log")" != root:wheel ]; then
+		out=$(log_file_problems "$dir/logs")
+		case "$out" in
+		*access.log:*) ;;
+		*)
+			printf 'FAIL: a log not owned by root:wheel is a finding; got [%s]\n' "$out" >&2
+			exit 1
+			;;
+		esac
+	fi
+
 	printf 'check-hygiene: self-test passed\n'
 }
 
@@ -604,6 +666,27 @@ if [ "$(id -u)" -eq 0 ]; then
 	fi
 else
 	printf 'permissions: skipped, needs root to read /etc/mtree/special\n'
+fi
+
+# --- 1b. the access log's mode -------------------------------------------
+# The signup access log carries capability URLs: /status/<token> renders the
+# password link, and /password/…?sig= and /decide/…?sig= are capabilities in the
+# request line. A 644 file is readable by every local account, the unprivileged
+# handler included, so a restored or hand-edited log is a live takeover path.
+# deploy-mail.sh repairs the mode and newsyslog.conf keeps each rotation at 600;
+# this is the assertion that neither has been undone.
+if [ "$(id -u)" -eq 0 ] && [ -d /home/www/logs ]; then
+	if bad=$(log_file_problems /home/www/logs) && [ -z "$bad" ]; then
+		printf 'logs: the access log is root:wheel 600\n'
+	else
+		printf 'logs: the access log names capability URLs and is readable beyond root\n'
+		printf '%s\n' "$bad" | sed 's/^/  /'
+		printf '  doas chmod 600 /home/www/logs/access.log*\n'
+		printf '  doas chown root:wheel /home/www/logs/access.log*\n'
+		status=1
+	fi
+else
+	printf 'logs: skipped, needs root and /home/www/logs\n'
 fi
 
 # --- 2. blocklist --------------------------------------------------------
