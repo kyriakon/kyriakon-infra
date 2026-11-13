@@ -202,7 +202,7 @@ Provisioning is manual today. The service that will take it over is covered in t
 
 		sftp -P 2222 <username>@mail.kyriakon.net
 
-   It fails with `subsystem request failed`, prints the wrapper's `refusing a command that is not git-receive-pack, git-upload-pack or git-upload-archive` line, and exits non-zero. A prompt or a directory listing means the ForceCommand is not deployed. `httpd -n -f /etc/httpd.conf`, `gmid -n -c /etc/gmid.conf` and `relayd -n -f /etc/relayd.conf` are silent. An sftp session as the member on 22 puts a file into `www/`.
+   It prints the wrapper's `kyriakon git shell: refusing a command that is not git-receive-pack, git-upload-pack or git-upload-archive` line and `Connection closed`, then exits non-zero. A prompt or a directory listing means the session is not going through the wrapper. The attempt cannot by itself show whether the ForceCommand landed, because sshd runs an external subsystem request through the login shell either way; the `sshd -T ... lport=2222` output above is what reports it. `httpd -n -f /etc/httpd.conf`, `gmid -n -c /etc/gmid.conf` and `relayd -n -f /etc/relayd.conf` are silent. An sftp session as the member on 22 puts a file into `www/`.
 
 Do not give the account a shell. `chsh -s /bin/ksh <username>` undoes the platform's central safety property. The operator account is the one exception, and `deploy-mail.sh` flips it back to `/bin/ksh` on every run.
 

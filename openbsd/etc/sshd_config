@@ -30,7 +30,9 @@
 # one. sshd separates them by port instead. sftp keeps the default port 22, where
 # ForceCommand internal-sftp is handled inside sshd before the login shell is
 # exec'd; 2222 is unchrooted and carries a ForceCommand of the wrapper, so an sftp
-# request there is refused rather than served outside the chroot.
+# request there is refused rather than served outside the chroot. The login class
+# alone would refuse it too, because sshd runs an external subsystem request
+# through the login shell; the ForceCommand keeps that true if the class changes.
 #
 # The 22 block was checked against the live binary on 2026-10-01, with a throwaway
 # host key under /tmp and no change to the box: `sshd -T -f <fragment> -h
@@ -39,8 +41,9 @@
 # matching no block (lport=23) reports none. The %u token is left unexpanded by
 # -T; sshd expands it when the session starts. The test account was in wheel
 # rather than members, because no members group exists yet. The 2222 block came
-# after that check: the runbook's `sshd -T ... lport=2222` step confirms it on the
-# box, reporting forcecommand /usr/local/libexec/member-git-shell.sh --force.
+# after that check and is not deployed yet: it is a pending hand step, and the
+# runbook's `sshd -T ... lport=2222` check is what will confirm it on the box,
+# reporting forcecommand /usr/local/libexec/member-git-shell.sh --force.
 #
 # Applied by hand, never by a deploy: this file is reviewed line by line.
 #
@@ -167,22 +170,23 @@ Subsystem	sftp	/usr/libexec/sftp-server
 # root:wheel 0755 and gives the two subdirectories to the member.
 #
 # The third block is the port 2222 session, and it carries a ForceCommand of its
-# own. Without one, an sftp subsystem request on 2222 runs /usr/libexec/sftp-server
-# straight from the global Subsystem line, with the member's uid and no chroot:
-# the login shell is only consulted for a shell command, and a subsystem is not
-# one. That session could read every world-readable file on the box and write
-# anywhere the account can write, which is not the confinement the port split
-# promises. ForceCommand applies to shell, command and subsystem execution, so the
-# sftp request now reaches the wrapper, which refuses it as a non-git command.
+# own. sshd already runs an external subsystem request through the login shell:
+# session_subsystem_req() hands the global Subsystem command,
+# /usr/libexec/sftp-server, to do_exec(), and do_child() execs the shell with -c
+# and that command. The login class names the wrapper as the member's shell, so an
+# sftp request on 2222 was refused on that path before this block existed. The
+# ForceCommand states the boundary in this file as well, so it holds if the class
+# ever names another shell, and it applies to shell, command and subsystem
+# execution alike.
 #
 # The wrapper is what makes the ForceCommand safe for the push. sshd runs a forced
-# command through the login shell with -c (session.c, do_child()), and that shell
-# is the wrapper, so it receives its own name with --force as the -c argument and
-# takes the client's command from SSH_ORIGINAL_COMMAND. An sftp subsystem request
-# puts /usr/libexec/sftp-server there, and the wrapper refuses that as a non-git
-# command. The allowlist and path checks run as before. A ChrootDirectory stays
-# out of this block: the wrapper is outside the chroot and runs git from
-# /usr/local/bin.
+# command through the login shell with -c (do_exec() and do_child()), and that
+# shell is the wrapper, so it receives the forced string with --force as the -c
+# argument and takes the client's command from SSH_ORIGINAL_COMMAND. An sftp
+# subsystem request puts /usr/libexec/sftp-server there, and the wrapper refuses
+# that as a non-git command. The allowlist and path checks run as before. A
+# ChrootDirectory stays out of this block: the wrapper is outside the chroot and
+# runs git from /usr/local/bin.
 #
 # That shell is not in the password entry, which goes on carrying /sbin/nologin.
 # It comes from the member login class: /etc/login.conf.d/member carries
