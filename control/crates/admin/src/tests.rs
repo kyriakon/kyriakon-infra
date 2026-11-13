@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::payments::ledger::{csv_cell, export_section, payment_columns, tax_year, Section};
-use crate::requests::message_from;
+use crate::requests::{header_from, message_from};
 use kyriakon_control_core::payments::ledger::RefundTail;
 
 fn args(items: &[&str]) -> Vec<String> {
@@ -229,6 +229,24 @@ fn a_quoted_signed_request_under_another_from_is_refused() {
         "{err}"
     );
 }
+
+/// The `From:` of a delivered message is its sender's to write. It is kept as
+/// sent, so the comparison with the account's address reads the real value, and
+/// the escape is dropped when the refusal is printed.
+#[test]
+fn an_escape_in_a_from_header_never_reaches_the_terminal() {
+    let hostile = "\x1b[2J\x1b]0;pwned\x07 attacker@evil.example";
+    assert!(header_from("From: \x1b[2Jattacker@evil.example\n\n")
+        .unwrap()
+        .unwrap()
+        .contains('\x1b'));
+    let message = format!("From: {hostile}\r\nSubject: hi\r\n\r\n{SIGNED}");
+    let err = message_from(&message).unwrap_err();
+    let printed = util::report_lines(&err, "verifying a request").join("\n");
+    assert!(!printed.chars().any(char::is_control), "{printed:?}");
+    assert!(printed.contains("attacker@evil.example"), "{printed:?}");
+}
+
 /// `delete` accepts a journal line only when the id is `delete-<name>-` plus an
 /// RFC 3339 time, the shape the transition writes. A hyphenated account's line
 /// (`delete-bo-x-…`) must not make `delete bo` claim an erasure that never ran.
