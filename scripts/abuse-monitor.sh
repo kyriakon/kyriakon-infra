@@ -193,7 +193,13 @@ source_tally() {
 # result=permfail|tempfail" and no source address. Dovecot writes "(auth failed,
 # N attempts in M secs)" with user=<X> and rip=<address>.
 mail_auth_events() {
-	awk -v members=" $1 " '
+	awk -v members="$1" '
+		BEGIN {
+			# Exact equality, not a substring of the joined list: with members
+			# "alice bob carol", the substring test called "alice bob" real.
+			n = split(members, m, /[[:space:]]+/)
+			for (i = 1; i <= n; i++) if (m[i] != "") member[m[i]] = 1
+		}
 		function user_of(line,   s) {
 			if (match(line, /user=<[^>]*>/)) {
 				s = substr(line, RSTART + 6, RLENGTH - 7)
@@ -220,8 +226,10 @@ mail_auth_events() {
 			} else {
 				next
 			}
+			# A localpart cannot contain a space, so a name that parses with one
+			# is never a member, whatever a substring of the list would say.
 			kind = "unknown"
-			if (user != "" && index(members, " " user " ") > 0)
+			if (user != "" && user !~ /[[:space:]]/ && (user in member))
 				kind = "real"
 			printf "%s\t%s\t%s\n", kind, user, source
 		}'
@@ -416,6 +424,32 @@ newest_snapshot_epoch() {
 	return 0
 }
 
+# --- new_lines: emit log lines appended since last run -------------------
+# Line-offset delta is rotation-safe and needs no date parsing: cron interval
+# IS the detection window. First run only baselines (no historical replay).
+#
+# An absent or unreadable log returns 1, which the caller reads as a failed
+# check: the outbound, sender-cap and mail-auth alerts read the maillog, and treating a lost one as an
+# empty one let the run ping Healthy with all six blind. Defined above the
+# self-test dispatch so --self-test drives the real function.
+new_lines() {
+	log="$1"; posfile="$2"
+	[ -f "$log" ] && [ -r "$log" ] || return 1
+	cur=$(wc -l < "$log" | tr -d ' ')
+	[ "$cur" -gt 0 ] || return 0
+	if [ ! -f "$posfile" ]; then
+		printf '%s\n' "$cur" > "$posfile"
+		return 0
+	fi
+	prev=$(cat "$posfile")
+	if [ "$cur" -lt "$prev" ]; then
+		tail -n +1 "$log"        # newsyslog rotated/truncated: rescan the new file
+	elif [ "$cur" -gt "$prev" ]; then
+		tail -n +"$(( prev + 1 ))" "$log"
+	fi
+	printf '%s\n' "$cur" > "$posfile"
+}
+
 # --- alert: content-rich mail, plus the external check --------------------
 # Alerts go out as mail to ALERT_EMAIL, an address off this box, and the same
 # event marks the Healthchecks check down so the external channel carries it too.
@@ -478,6 +512,17 @@ alert() {
 		curl -fsS -m 10 --retry 3 --data "$when $component $event: $body" \
 			"$check_url" >/dev/null 2>&1 || true
 	fi
+}
+
+# log_failure <paths>: the report for a run whose log it could not read. The
+# caller exits non-zero after this, which skips the dead-man's-switch ping, and
+# the alert marks the check down itself: a run that cannot see what it is
+# checking is a finding, the shape check-keyring-drift.sh uses for a missing
+# keyring.
+log_failure() {
+	alert mail "log unreadable" \
+		"cannot read $1, so the signals that read it did not run and this run is not a clean one" \
+		"restore it, or point MAILLOG/AUTHLOG at the file the service writes, and check the rotation that removed it" fail
 }
 
 self_test() {
@@ -571,6 +616,19 @@ MAILLOG
 		"$(mail_auth_events alice < "$work/maillog" | awk -F'\t' '{ printf "%s:%s:%s ", $1, $2, $3 }')" \
 		"unknown:admin: real:alice: real:alice:192.0.2.5 unknown:nobody:198.51.100.7 "
 
+	# A username that is a run of adjacent member names is not a member. The test
+	# against the space-joined list was a substring match, so with members
+	# "alice bob carol" it called "alice bob" real and the alert named an account
+	# string that is not an account.
+	spaced='Nov  7 11:00:04 mail dovecot: imap-login: Info: Disconnection (auth failed, 1 attempts in 0 secs): user=<alice bob>, method=PLAIN, rip=203.0.113.9, lip=203.0.113.1'
+	check "a space-joined run of member names is unknown" \
+		"$(printf '%s\n' "$spaced" | mail_auth_events "alice bob carol" | awk -F'\t' '{ print $1 }')" \
+		"unknown"
+	member_line='Nov  7 11:00:05 mail dovecot: imap-login: Info: Disconnection (auth failed, 1 attempts in 0 secs): user=<bob>, method=PLAIN, rip=203.0.113.9, lip=203.0.113.1'
+	check "and an exact member name in the same list is still real" \
+		"$(printf '%s\n' "$member_line" | mail_auth_events "alice bob carol" | awk -F'\t' '{ print $1 }')" \
+		"real"
+
 	# The per-account recipient cap. The account comes from the session's
 	# successful authentication and the volume from nrcpt on the same session id.
 	# The window fixture deliberately carries no authentication line: the map is
@@ -630,6 +688,22 @@ STUB
 	cap_members="alice bob carol wheelie"
 	export LAPSE_LOG="$work/lapsed"
 	export LAPSE_USER_SH="$work/lapse-ok"
+
+	# A missing log is a failed check, not a clean run. new_lines used to return 0
+	# with no lines, so a lost or rotated-away maillog silenced six of the ten
+	# signals and the run still pinged Healthy. The path is named and the check is
+	# marked down, which is what check-keyring-drift.sh does for a missing keyring.
+	unset HEALTHCHECKS_URL
+	if new_lines "$work/absent-maillog" "$work/absent.pos" >/dev/null 2>&1; then missing_rc=0; else missing_rc=$?; fi
+	check "a missing log is not an empty one" "$missing_rc" "1"
+	check "and no offset is written for it" \
+		"$([ -e "$work/absent.pos" ] && printf yes || printf no)" "no"
+	log_failure "$work/absent-maillog" >"$work/logfail.out" 2>&1
+	check "the failed check names the log it could not read" \
+		"$(grep -c "cannot read $work/absent-maillog" "$work/logfail.out")" "1"
+	check "and says the run is not a clean one" \
+		"$(grep -c 'this run is not a clean one' "$work/logfail.out")" "1"
+
 	# The alert's stderr goes through a file: ksh93 leaves a `$(... 2>&1)` around
 	# a function call redirecting the shell's stderr afterwards, and notify_operator
 	# is the thing being tested here.
@@ -798,29 +872,24 @@ acme_pending_max_min="${ACME_PENDING_MAX_MIN:-1440}"
 snapshot_max_age_hours="${SNAPSHOT_MAX_AGE_HOURS:-26}"
 root_fs_warn_pct="${ROOT_FS_WARN_PCT:-80}"
 
-# --- new_lines: emit log lines appended since last run -------------------
-# Line-offset delta is rotation-safe and needs no date parsing: cron interval
-# IS the detection window. First run only baselines (no historical replay).
-new_lines() {
-	log="$1"; posfile="$2"
-	[ -f "$log" ] || return 0
-	cur=$(wc -l < "$log" | tr -d ' ')
-	[ "$cur" -gt 0 ] || return 0
-	if [ ! -f "$posfile" ]; then
-		printf '%s\n' "$cur" > "$posfile"
-		return 0
-	fi
-	prev=$(cat "$posfile")
-	if [ "$cur" -lt "$prev" ]; then
-		tail -n +1 "$log"        # newsyslog rotated/truncated: rescan the new file
-	elif [ "$cur" -gt "$prev" ]; then
-		tail -n +"$(( prev + 1 ))" "$log"
-	fi
-	printf '%s\n' "$cur" > "$posfile"
-}
-
-new_maillog=$(new_lines "$maillog" "$state/maillog.pos")
-new_authlog=$(new_lines "$authlog" "$state/authlog.pos")
+# Both logs are checked before either offset moves: a run that consumed the
+# maillog window and then failed on the authlog would drop those lines for good,
+# because nothing replays a consumed offset.
+unreadable_logs=""
+[ -f "$maillog" ] && [ -r "$maillog" ] || unreadable_logs="$maillog"
+[ -f "$authlog" ] && [ -r "$authlog" ] || \
+	unreadable_logs="${unreadable_logs:+$unreadable_logs, }$authlog"
+if [ -n "$unreadable_logs" ]; then
+	log_failure "$unreadable_logs"
+	exit 1
+fi
+new_maillog=$(new_lines "$maillog" "$state/maillog.pos") || unreadable_logs="$maillog"
+new_authlog=$(new_lines "$authlog" "$state/authlog.pos") || \
+	unreadable_logs="${unreadable_logs:+$unreadable_logs, }$authlog"
+if [ -n "$unreadable_logs" ]; then
+	log_failure "$unreadable_logs"
+	exit 1
+fi
 
 # The members group add-user.sh puts every member in. The breaker uses it to
 # decide who may be lapsed, and the auth split below to tell a member's stale

@@ -302,8 +302,14 @@ minutes_until_own_slot() {
 # waited. stat -f '%m %N' prints the mtime and the path; a validated name holds no
 # space, so the caller can split the two on the last field.
 pending_oldest_first() {
-	[ -d "$pending_dir" ] || return 0
-	find "$pending_dir" -type f -exec stat -f '%m %N' {} + 2>/dev/null | sort -n
+	typeset listing
+	# A find that fails is a queue that cannot be seen, not an empty one: the
+	# silent status it used to leave read as "nothing pending".
+	if ! listing=$(find "$pending_dir" -type f -exec stat -f '%m %N' {} + 2>/dev/null); then
+		die "could not read the pending requests in $pending_dir"
+	fi
+	[ -n "$listing" ] || return 0
+	printf '%s\n' "$listing" | sort -n
 }
 
 # resolve_ok <name> : true when the name has an A record. See the header for why a
@@ -522,7 +528,13 @@ add_request() {
 }
 
 status() {
-	[ -d "$pending_dir" ] || { printf 'no pending certificate requests\n'; return 0; }
+	# An absent or unreadable store is not an empty queue. The store is 0700 root,
+	# so an unprivileged --status sees exactly this while requests are waiting, and
+	# "no pending certificate requests" is the one answer it must not give.
+	if [ ! -d "$pending_dir" ] || [ ! -r "$pending_dir" ] || [ ! -x "$pending_dir" ]; then
+		printf 'cannot read the queue store at %s\n' "$pending_dir" >&2
+		return 2
+	fi
 	list=$(pending_oldest_first)
 	if [ -z "$list" ]; then
 		printf 'no pending certificate requests\n'
@@ -711,6 +723,49 @@ self_test() {
 	check "requests list oldest first" \
 		"$(pending_oldest_first | awk '{ n = $2; sub(".*/", "", n); print n }' | tr '\n' ' ')" \
 		"c.kyriakon.net b.kyriakon.net a.kyriakon.net "
+
+	# A store it cannot read is a finding, not an empty queue, and --status is by
+	# hand so the message on stderr is the report.
+	pending_dir="$work/no-store/pending"
+	if ( status ) >"$work/status.out" 2>"$work/status.err"; then absent_rc=0; else absent_rc=$?; fi
+	check "an absent store is not an empty queue" "$absent_rc" "2"
+	check "and the diagnostic names the path" \
+		"$(grep -c "cannot read the queue store at $pending_dir" "$work/status.err")" "1"
+
+	# The same store present but mode 000: stat-able, so it exists, and not
+	# listable, so the queue cannot be seen. Root reads a 000 directory anyway, so
+	# this half proves nothing there and says so rather than passing silently.
+	pending_dir="$work/locked/pending"
+	mkdir -p "$pending_dir"
+	chmod 000 "$pending_dir"
+	if [ "$(id -u)" -eq 0 ]; then
+		printf 'ok: an unreadable store is a finding (not exercised: root reads mode 000)\n'
+	else
+		if ( status ) >"$work/status.out" 2>"$work/status.err"; then locked_rc=0; else locked_rc=$?; fi
+		check "an unreadable store is not an empty queue" "$locked_rc" "2"
+		check "and names the store it could not read" \
+			"$(grep -c "cannot read the queue store at $pending_dir" "$work/status.err")" "1"
+	fi
+	chmod 0700 "$pending_dir"
+
+	# Under that gate, a find that fails is still fatal and named rather than an
+	# empty list: the silent abort was the other half of the same bug.
+	mkdir -p "$work/bin"
+	cat > "$work/bin/find" <<'STUB'
+#!/bin/sh
+printf 'find: %s: Permission denied\n' "$2" >&2
+exit 1
+STUB
+	chmod 0700 "$work/bin/find"
+	saved_path=$PATH
+	PATH="$work/bin:$PATH"
+	pending_dir="$work/locked/pending"
+	if ( pending_oldest_first ) >/dev/null 2>"$work/find.err"; then find_rc=0; else find_rc=$?; fi
+	PATH=$saved_path
+	pending_dir="$work/pending"
+	check "a find failure is fatal" "$find_rc" "1"
+	check "and names the directory it could not read" \
+		"$(grep -c "could not read the pending requests in $work/locked/pending" "$work/find.err")" "1"
 
 	# The resolver is stubbed so the selection rule is checkable without DNS: a
 	# name without an A record is held and the next oldest name that resolves is
