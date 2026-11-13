@@ -11,11 +11,15 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "encrypt-run.h"
+#include "encrypt-save.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int failures;
 
@@ -35,6 +39,210 @@ mode(const char *name)
 		unsetenv("KYRIAKON_FAKE_MODE");
 	else
 		setenv("KYRIAKON_FAKE_MODE", name, 1);
+}
+
+/* One save driven through encrypt-save.h: a non-blocking pipe stands in for
+ * the IMAP client socket (or the LMTP temp file, once its write end closes),
+ * and the backend's save methods just record what they were handed. */
+struct save_fixture {
+	struct kyriakon_save_ops ops;
+	int begin_calls, continue_calls, finish_calls, cancel_calls;
+	unsigned char cipher[4096];
+	size_t cipher_len;
+
+	int fd;
+	unsigned char read_buffer[4096];
+	unsigned int pull_calls;
+
+	const char *fake;
+	unsigned int encrypt_calls;
+	unsigned char plain[4096];
+	size_t plain_len;
+};
+
+static int
+fixture_save_begin(void *context, const unsigned char *cipher, size_t size)
+{
+	struct save_fixture *f = context;
+
+	f->begin_calls++;
+	if (size <= sizeof(f->cipher)) {
+		memcpy(f->cipher, cipher, size);
+		f->cipher_len = size;
+	}
+	return 0;
+}
+
+static int
+fixture_save_continue(void *context)
+{
+	struct save_fixture *f = context;
+
+	f->continue_calls++;
+	return 0;
+}
+
+static int
+fixture_save_finish(void *context)
+{
+	struct save_fixture *f = context;
+
+	f->finish_calls++;
+	return 0;
+}
+
+static void
+fixture_save_cancel(void *context)
+{
+	struct save_fixture *f = context;
+
+	f->cancel_calls++;
+}
+
+static int
+fixture_pull(void *context, const unsigned char **data_r, size_t *size_r,
+	     char *error, size_t error_size)
+{
+	struct save_fixture *f = context;
+	ssize_t ret;
+
+	f->pull_calls++;
+	ret = read(f->fd, f->read_buffer, sizeof(f->read_buffer));
+	if (ret > 0) {
+		*data_r = f->read_buffer;
+		*size_r = (size_t)ret;
+		return KYRIAKON_SAVE_PULL_DATA;
+	}
+	if (ret == 0)
+		return KYRIAKON_SAVE_PULL_EOF;
+	if (errno == EAGAIN || errno == EWOULDBLOCK)
+		return KYRIAKON_SAVE_PULL_WAIT;
+	snprintf(error, error_size, "%s", strerror(errno));
+	return KYRIAKON_SAVE_PULL_ERROR;
+}
+
+static bool
+fixture_encrypt(void *context, const unsigned char *plain, size_t plain_len,
+		struct kyriakon_encrypt_result *result)
+{
+	struct save_fixture *f = context;
+
+	f->encrypt_calls++;
+	if (plain_len <= sizeof(f->plain)) {
+		memcpy(f->plain, plain, plain_len);
+		f->plain_len = plain_len;
+	}
+	return kyriakon_encrypt_message(f->fake, "alice", "/keyring", "/gpg",
+					plain, plain_len, result);
+}
+
+static void
+save_arm(struct kyriakon_save *save, struct save_fixture *f, int fd,
+	 const char *fake)
+{
+	memset(f, 0, sizeof(*f));
+	f->fd = fd;
+	f->fake = fake;
+	f->ops.save_begin = fixture_save_begin;
+	f->ops.save_continue = fixture_save_continue;
+	f->ops.save_finish = fixture_save_finish;
+	f->ops.save_cancel = fixture_save_cancel;
+	kyriakon_save_begin(save, &f->ops, f, fixture_pull, fixture_encrypt, f);
+}
+
+/* The ordering that makes a synchronizing IMAP APPEND work: save_begin reads
+ * nothing, a save with no literal available returns to the ioloop instead of
+ * spinning, and the ciphertext appears only once the input reaches EOF. */
+static void
+test_save_ordering(const char *fake)
+{
+	struct kyriakon_save save;
+	struct save_fixture f;
+	int fds[2];
+
+	/* (a) Arming the save must not touch the input, the encryptor, or the
+	 * backend: Dovecot answers `+ OK` only after save_begin returns. */
+	pipe(fds);
+	fcntl(fds[0], F_SETFL, O_NONBLOCK);
+	memset(&save, 0, sizeof(save));
+	save_arm(&save, &f, fds[0], fake);
+	expect(f.pull_calls == 0, "save_begin does not read the input");
+	expect(f.encrypt_calls == 0, "save_begin does not run the encryptor");
+	expect(f.begin_calls == 0, "save_begin does not start the backend");
+
+	/* The client is still waiting for `+ OK`: one non-blocking read, then
+	 * back to the ioloop. The old drain loop spun here. */
+	expect(kyriakon_save_continue(&save) == 0, "an empty input waits");
+	expect(f.pull_calls == 1, "an empty input is read once, not spun on");
+	expect(f.encrypt_calls == 0, "nothing is encrypted before EOF");
+	expect(f.begin_calls == 0, "the backend is not started before EOF");
+
+	/* Half the literal has arrived: still nothing to encrypt. */
+	expect(write(fds[1], "hello ", 6) == 6, "write the first half");
+	expect(kyriakon_save_continue(&save) == 0, "a partial literal waits");
+	expect(f.encrypt_calls == 0, "a partial literal is not encrypted");
+	expect(f.begin_calls == 0, "the backend waits for the whole literal");
+
+	/* (b) The literal completes: encrypt once, then start the backend on the
+	 * ciphertext and continue it. */
+	expect(write(fds[1], "world", 5) == 5, "write the second half");
+	close(fds[1]);
+	expect(kyriakon_save_continue(&save) == 0, "EOF starts the save");
+	expect(save.begun, "the save is begun at EOF");
+	expect(f.encrypt_calls == 1, "the message is encrypted exactly once");
+	expect(f.plain_len == 11 && memcmp(f.plain, "hello world", 11) == 0,
+	       "the encryptor gets the whole message");
+	expect(f.begin_calls == 1, "the backend starts at EOF");
+	expect(f.cipher_len == 14 &&
+		       memcmp(f.cipher, "CT:hello world", 14) == 0,
+	       "the backend is handed the ciphertext");
+	expect(f.continue_calls == 1, "the backend is continued once");
+
+	expect(kyriakon_save_continue(&save) == 0, "later continues forward");
+	expect(f.continue_calls == 2, "later continues reach the backend");
+	expect(kyriakon_save_finish(&save) == 0, "finish forwards");
+	expect(f.finish_calls == 1, "the backend finishes");
+	kyriakon_save_deinit(&save);
+	close(fds[0]);
+
+	/* A failed encryptor refuses the save before anything reaches the
+	 * backend, exactly as the exit status decides today. */
+	pipe(fds);
+	fcntl(fds[0], F_SETFL, O_NONBLOCK);
+	memset(&save, 0, sizeof(save));
+	mode("fail");
+	save_arm(&save, &f, fds[0], fake);
+	expect(write(fds[1], "x", 1) == 1, "write a message that will fail");
+	close(fds[1]);
+	expect(kyriakon_save_continue(&save) == -1,
+	       "a failed encryption is refused");
+	expect(f.encrypt_calls == 1, "the encryptor ran once");
+	expect(f.begin_calls == 0, "a refused save never starts the backend");
+	expect(save.error[0] != '\0', "a refusal says why");
+	kyriakon_save_cancel(&save);
+	expect(f.cancel_calls == 0,
+	       "cancelling before the backend starts touches nothing");
+	kyriakon_save_deinit(&save);
+	close(fds[0]);
+
+	/* Finishing before the input reaches EOF refuses rather than starting a
+	 * backend that has no ciphertext. */
+	pipe(fds);
+	fcntl(fds[0], F_SETFL, O_NONBLOCK);
+	memset(&save, 0, sizeof(save));
+	mode(NULL);
+	save_arm(&save, &f, fds[0], fake);
+	expect(write(fds[1], "x", 1) == 1, "write a partial message");
+	expect(kyriakon_save_continue(&save) == 0, "the partial message waits");
+	expect(kyriakon_save_finish(&save) == -1, "finish before EOF is refused");
+	expect(f.finish_calls == 0, "the backend is not finished");
+	expect(f.cancel_calls == 1, "the backend's context is cancelled");
+	expect(save.error[0] != '\0', "the refusal says why");
+	kyriakon_save_cancel(&save);
+	expect(f.cancel_calls == 1, "cancelling after the refusal is local");
+	kyriakon_save_deinit(&save);
+	close(fds[1]);
+	close(fds[0]);
 }
 
 int
@@ -135,6 +343,8 @@ main(int argc, char **argv)
 	expect(!ok, "a missing encryptor is rejected");
 	expect(strstr(result.error, "cannot run") != NULL,
 	       "a missing encryptor says which one");
+
+	test_save_ordering(fake);
 
 	free(input);
 	if (failures != 0)
