@@ -493,8 +493,11 @@ fn a_page_refusal_removes_its_file_and_an_operator_refusal_keeps_it() {
         journal.contains(&format!("\"intent\":\"{page}\"")) && journal.contains("\"refused\""),
         "{journal}"
     );
+    // The operator's intent is journalled under the id its signature names,
+    // which is not the file name the console chose.
+    let filed = kyriakon_control_core::intent::id_for(&sig);
     assert!(
-        journal.contains(&format!("\"intent\":\"{operator}\"")),
+        journal.contains(&format!("\"intent\":\"{filed}\"")),
         "{journal}"
     );
     // Both proofs passed and both bodies refused: the page verb's session was

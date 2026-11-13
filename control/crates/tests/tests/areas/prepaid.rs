@@ -909,7 +909,12 @@ fn a_credit_recovers_a_ledger_line_lost_after_the_account_write() {
     let replay = std::fs::read_to_string(fix.dir.join("store/intents").join(&names[0])).unwrap();
     assert!(fix.drain().status.success());
     assert_eq!(payment_lines(&fix).len(), 1);
-    let id = names[0].trim_end_matches(".json").to_string();
+    // The journal and the ledger key on the id the signature names, which is
+    // the intent's identity whichever file it is read from.
+    let replay_value: Value = serde_json::from_str(&replay).unwrap();
+    let id = kyriakon_control_core::intent::id_for(
+        replay_value["sig"].as_str().expect("a signed credit"),
+    );
 
     // A crash after the account write and before the append leaves the line
     // missing and the applied line unwritten, while the account carries the
@@ -1006,7 +1011,10 @@ fn a_monero_credit_recovers_with_its_quote_and_receipt_rate() {
     assert_eq!(names.len(), 1, "{names:?}");
     let replay = std::fs::read_to_string(fix.dir.join("store/intents").join(&names[0])).unwrap();
     assert!(fix.drain().status.success());
-    let id = names[0].trim_end_matches(".json").to_string();
+    let replay_value: Value = serde_json::from_str(&replay).unwrap();
+    let id = kyriakon_control_core::intent::id_for(
+        replay_value["sig"].as_str().expect("a signed credit"),
+    );
 
     let ledger = fix.read("ledger/payments.jsonl");
     let kept: String = ledger
@@ -1103,6 +1111,62 @@ fn a_credit_past_the_ceiling_is_refused_until_an_override_names_a_reason() {
         fix.journal().contains("member prepaid two years"),
         "the override reason is not in the journal: {}",
         fix.journal()
+    );
+}
+
+/// A signed credit used to be replayable under a rewritten id: the id is not in
+/// the signed payload, the journal and the ledger dedup on the id, and the new
+/// one had no line. It is now derived from the signature, so every copy of one
+/// filing is the same intent and the applied line stops a second year.
+#[test]
+fn a_signed_credit_replayed_under_a_new_id_buys_no_second_year() {
+    let fix = Fix::new("credit-replay-id");
+    let token = approved_paid(&fix, "secretary", "cash");
+    set_paid_until(&fix, "secretary", "2026-10-04");
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+        "--confirm-double",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let filed = fix.intents();
+    assert_eq!(filed.len(), 1, "{filed:?}");
+    let text = fix.read(&format!("intents/{}", filed[0]));
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let date = fix.account("secretary")["payment"]["paid_until"].clone();
+    assert_eq!(payment_lines(&fix).len(), 1);
+
+    // The same bytes with only the id rewritten, under a new file name.
+    let mut replay: Value = serde_json::from_str(&text).unwrap();
+    replay["id"] = json!("01J00000000000000000REPLAYID");
+    fix.write_intent("01J00000000000000000REPLAYID", &replay);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert_eq!(
+        fix.account("secretary")["payment"]["paid_until"],
+        date,
+        "a replay under a new id bought a second year"
+    );
+    assert_eq!(
+        payment_lines(&fix).len(),
+        1,
+        "a replay wrote a second ledger line: {}",
+        fix.read("ledger/payments.jsonl")
+    );
+    assert!(
+        fix.intents().is_empty(),
+        "the replay was not cleared: {:?}",
+        fix.intents()
     );
 }
 
@@ -1440,7 +1504,11 @@ fn a_tokenless_credit_is_held_and_reconcile_attribute_credits_it_once() {
     assert!(out.status.success(), "{}", body(&out));
     let names = fix.intents();
     assert_eq!(names.len(), 1, "{names:?}");
-    let attribute_id = names[0].trim_end_matches(".json").to_string();
+    let attribute_id = {
+        let text = std::fs::read_to_string(fix.dir.join("store/intents").join(&names[0])).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        kyriakon_control_core::intent::id_for(value["sig"].as_str().expect("a signed attribute"))
+    };
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     assert_eq!(
@@ -1469,8 +1537,11 @@ fn a_tokenless_credit_is_held_and_reconcile_attribute_credits_it_once() {
         "attributing sent no receipt, or sent two"
     );
 
-    // A second attribute of the same item is refused: it is no longer held, and
-    // no second year is added.
+    // A second attribute of the same item is the same signed request, so it
+    // shares the first one's identity: the journal's applied line stops it
+    // before the body can refuse it as no longer held, and no second year is
+    // added.
+    let journal_before = fix.journal().lines().count();
     let out = fix.ctl(&["reconcile", "attribute", &id, "--token", &token]);
     assert!(out.status.success(), "{}", body(&out));
     let out = fix.drain();
@@ -1483,11 +1554,12 @@ fn a_tokenless_credit_is_held_and_reconcile_attribute_credits_it_once() {
     assert_eq!(
         fix.account("secretary")["payment"]["paid_until"],
         json!("2027-10-04"),
-        "a refused attribute moved the date"
+        "a replay moved the date"
     );
-    assert!(
-        fix.journal().contains("not held"),
-        "the refusal does not say the item is not held: {}",
+    assert_eq!(
+        fix.journal().lines().count(),
+        journal_before,
+        "a replay appended a line: {}",
         fix.journal()
     );
 }

@@ -153,12 +153,24 @@ impl Envelope {
     /// application is still journalled under what it does say, exactly as the
     /// refusal path has always read it.
     pub fn of(value: &Value, file: &str, kind: &str) -> Self {
+        // A signed intent's id is derived from its signature, exactly as
+        // `Intent::parse` derives it. The journal and the ledger dedup on this
+        // id, so a rewritten `id` in the file must not give one signed intent a
+        // second identity: that is how a captured renewal bought a second year.
+        let id = value
+            .get("sig")
+            .and_then(Value::as_str)
+            .filter(|sig| !sig.is_empty() && kyriakon_control_core::intent::id_is_signed(kind))
+            .map(kyriakon_control_core::intent::id_for)
+            .unwrap_or_else(|| {
+                value
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| file.trim_end_matches(".json").to_string())
+            });
         Envelope {
-            id: value
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| file.trim_end_matches(".json").to_string()),
+            id,
             kind: kind.to_string(),
             // A page action names its account at the top level rather than in an
             // `application` block, and its refusal is journalled under it: the
@@ -337,11 +349,35 @@ pub async fn settle<F>(
 where
     F: Future<Output = Result<Settlement, Error>>,
 {
+    // The file's own id is the key a line written before the identity became
+    // the signature carries, and it is also what tells a second filing of the
+    // same command from a replay of the first.
+    let filed = file.trim_end_matches(".json");
     if journal.has(&envelope.id, "applied") {
         finish(store, disposition.after).await?;
         return store.remove("intents", file).await.map_err(Error::from);
     }
-    if journal.has(&envelope.id, "refused") {
+    if filed != envelope.id && journal.has(filed, "applied") {
+        // Either this intent applied under its file's id before the identity
+        // moved, or it is a second identical filing and shares the first's
+        // signature. Neither applies again; a refusal line and the kept file
+        // make the duplicate visible instead of dropping it.
+        write_journal(
+            store,
+            journal,
+            &cfg.release,
+            filed,
+            &envelope.kind,
+            &envelope.application,
+            "refused",
+            Some("an identical signed request already applied; this filing was not applied again"),
+        )
+        .await?;
+        return Ok(());
+    }
+    if journal.has(&envelope.id, "refused")
+        || (filed != envelope.id && journal.has(filed, "refused"))
+    {
         // A refusal ran no after-line work when it was written, so a replay
         // runs none either. The file disposition still applies.
         return match disposition.refusal {
