@@ -58,8 +58,8 @@
 # the daily mail already covers the permissions half.
 #
 #   ksh scripts/check-hygiene.sh --self-test   the checks that run on fixtures:
-#                                              sections 1, 7, 8, 9 and 10, and
-#                                              section 3's remedy lines
+#                                              sections 1, 4, 6, 7, 8, 9 and 10,
+#                                              and section 3's remedy lines
 
 set -euo pipefail
 
@@ -268,6 +268,27 @@ log_file_problems() {
 		[ "${got% *}" = "$want" ] && [ "${mode#?}" = "00" ] && continue
 		printf '%s: %s\n' "$log" "$got"
 	done
+}
+
+# prevent_destroy_present <terraform-dir>
+#
+# True when the live root's main.tf still refuses to remove its server. Anchored
+# to a non-comment line, because a commented-out guard is not the guard: terraform
+# ignores it, and the setting this exists to catch losing is exactly the one whose
+# loss is a `#` away. An unanchored match reported that as present.
+prevent_destroy_present() {
+	grep -qE '^[[:space:]]*prevent_destroy[[:space:]]*=[[:space:]]*true' "$1/main.tf" 2>/dev/null
+}
+
+# finger_endpoints <page>
+#
+# The generated endpoint lines in the finger page. gen-finger-page.sh indents each
+# one by exactly two spaces, and the prose above them is indented too (ASCII art
+# by one to seven spaces, plus two prose URLs at four), so counting every indented
+# line counted 18 on a page carrying no endpoints at all and made the empty-page
+# branch unreachable.
+finger_endpoints() {
+	grep -cE '^  (https|gemini)://' "$1" || true
 }
 
 # The comparison above, the remedy lines and the address check below, against
@@ -629,6 +650,37 @@ EOF
 		esac
 	fi
 
+	# Section 6: a commented-out guard is not the guard. Terraform ignores it, so
+	# matching it reported the live root protected with nothing in front of a bad
+	# plan.
+	mkdir -p "$dir/tf"
+	printf 'resource "hcloud_server" "mail" {\n  # prevent_destroy = true\n  name = "mail"\n}\n' > "$dir/tf/main.tf"
+	if prevent_destroy_present "$dir/tf"; then
+		printf 'FAIL: a commented-out prevent_destroy is not the setting\n' >&2
+		exit 1
+	fi
+	printf 'resource "hcloud_server" "mail" {\n  prevent_destroy = true\n  name = "mail"\n}\n' > "$dir/tf/main.tf"
+	prevent_destroy_present "$dir/tf" || {
+		printf 'FAIL: an uncommented prevent_destroy must pass\n' >&2
+		exit 1
+	}
+
+	# Section 4: the shipped prose is indented, and none of it is a generated
+	# endpoint. Counting every indented line is what made the no-endpoints branch
+	# unreachable, so the fixture is the page itself.
+	out=$(finger_endpoints "$script_dir/../openbsd/etc/finger.txt")
+	[ "$out" -eq 0 ] || {
+		printf 'FAIL: the prose page carries no endpoints; got [%s]\n' "$out" >&2
+		exit 1
+	}
+	cat "$script_dir/../openbsd/etc/finger.txt" > "$dir/finger.txt"
+	printf '\n  https://kyriakon.net\n  gemini://kyriakon.net\n' >> "$dir/finger.txt"
+	out=$(finger_endpoints "$dir/finger.txt")
+	[ "$out" -eq 2 ] || {
+		printf 'FAIL: a generated endpoint block is counted; got [%s]\n' "$out" >&2
+		exit 1
+	}
+
 	printf 'check-hygiene: self-test passed\n'
 }
 
@@ -756,10 +808,11 @@ fi
 finger_page=/etc/kyriakon/finger.txt
 finger_provider=/usr/local/libexec/kyriakon-finger
 if [ -f "$finger_page" ] && [ -s "$finger_page" ]; then
-	# The endpoint lines are the indented ones, so this is the count that matters
-	# rather than the line count. grep -c returns non-zero at zero matches, which
-	# under set -e would end the script before it could report the problem.
-	endpoints=$(grep -c '^  ' "$finger_page" || true)
+	# The generated endpoint lines are what this counts, rather than the line
+	# count: the prose above them is indented too. grep -c returns non-zero at
+	# zero matches, which under set -e would end the script before it could
+	# report the problem.
+	endpoints=$(finger_endpoints "$finger_page")
 	printf 'finger: page present, %s endpoint lines\n' "$endpoints"
 	if [ "$endpoints" -eq 0 ]; then
 		printf 'finger: the page carries no endpoints; httpd.conf and gmid.conf are the source\n'
@@ -823,7 +876,7 @@ fi
 # the repo's own instructions assume and a wrong path reads exactly like a missing guard.
 # It is set once at the top of this script, where the catalogue's comparison reads it too.
 tf_dir="$repo_root/terraform"
-if grep -q 'prevent_destroy[[:space:]]*=[[:space:]]*true' "$tf_dir/main.tf" 2>/dev/null; then
+if prevent_destroy_present "$tf_dir"; then
 	printf 'terraform: the live root refuses to plan the removal of its server\n'
 else
 	printf 'terraform: no prevent_destroy in %s/main.tf; only delete_protection would stand between a bad plan and the mail box\n' "$tf_dir"
