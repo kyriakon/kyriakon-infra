@@ -100,7 +100,13 @@ credential() {
 		die "$key_file is not owned by root"
 	fi
 	key=$(cat "$key_file") || die "cannot read $key_file"
-	printf '%s' "$key" | grep -Eq '^[A-Za-z0-9_-]{20,255}$' ||
+	# A byte outside the class is the failure this check exists for: the value
+	# goes into a curl config, where a second line is a directive.
+	case "$key" in
+	'' | *[!A-Za-z0-9_-]*) bad=yes ;;
+	*) [ "${#key}" -ge 20 ] && [ "${#key}" -le 255 ] || bad=yes ;;
+	esac
+	[ -z "${bad:-}" ] ||
 		die "$key_file does not hold one API key; a pasted newline, a trailing comment or a Bearer prefix would all go into the request"
 
 	{
@@ -323,6 +329,15 @@ EOF
 		fi
 		out=$(cat "$fix/out")
 	}
+
+	printf '%s\n' '--- a two-line key file is refused before any call'
+	: >"$SELFTEST_LOG"
+	printf 'sk_test_aaaaaaaaaaaaaaaaaaaa\nurl = https://example.invalid/\n' >"$fix/key-multiline"
+	chmod 600 "$fix/key-multiline"
+	run subscription sub_123 "$fix/key-multiline"
+	assert_eq 'multi-line key exit' 2 "$rc"
+	assert_has 'the refusal says it is not one API key' 'does not hold one API key' "$out"
+	assert_eq 'no call was made with a multi-line key' '' "$(cat "$SELFTEST_LOG")"
 
 	printf '%s\n' '--- an active subscription is printed'
 	SELFTEST_MODE=active

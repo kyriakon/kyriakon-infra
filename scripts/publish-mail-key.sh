@@ -250,7 +250,13 @@ publish() {
 		die "$token_file is not owned by root"
 	fi
 	token=$(cat "$token_file") || die "cannot read $token_file"
-	printf '%s' "$token" | grep -Eq '^[A-Za-z0-9_.-]{20,255}$' ||
+	# A byte outside the class is the one failure this check exists for: the
+	# value is written into a curl config, where a second line is a directive.
+	case "$token" in
+	'' | *[!A-Za-z0-9_.-]*) bad=yes ;;
+	*) [ "${#token}" -ge 20 ] && [ "${#token}" -le 255 ] || bad=yes ;;
+	esac
+	[ -z "${bad:-}" ] ||
 		die "$token_file does not hold one token; a pasted newline, a trailing comment or a Bearer prefix would all go into the request"
 
 	# The token goes into a curl config file rather than onto a command line: an
@@ -702,6 +708,24 @@ SETPREF
 	else
 		printf 'ok: the token is not in any argument\n'
 	fi
+
+	printf '%s\n' '--- a token shorter than the API allows is refused'
+	rm -f "$fix/state/main" "$fix/state/branch"
+	printf '%s\n' 'aaaaaaaaaaaaaaaaaaa' >"$fix/token-short"
+	chmod 600 "$fix/token-short"
+	run alice "$fix/alice.asc" "$fix/token-short"
+	assert_eq 'short token exit' 2 "$rc"
+	assert_has 'the refusal says it is not one token' 'does not hold one token' "$out"
+	assert_eq 'nothing was sent for a short token' '' "$(cat "$fix/stub.log")"
+
+	printf '%s\n' '--- a two-line token file is refused before anything is sent'
+	rm -f "$fix/state/main" "$fix/state/branch"
+	printf 'aaaaaaaaaaaaaaaaaaaaaaaa\noutput = /tmp/injected\n' >"$fix/token-multiline"
+	chmod 600 "$fix/token-multiline"
+	run alice "$fix/alice.asc" "$fix/token-multiline"
+	assert_eq 'multi-line token exit' 2 "$rc"
+	assert_has 'the refusal says it is not one token' 'does not hold one token' "$out"
+	assert_eq 'nothing was sent' '' "$(cat "$fix/stub.log")"
 
 	printf '%s\n' '--- a token another user can read is refused'
 	chmod 644 "$fix/token"
