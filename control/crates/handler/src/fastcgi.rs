@@ -368,15 +368,31 @@ impl Http {
     }
 }
 
+/// Every HTML reply's policy. The pages carry one inline stylesheet and no
+/// script, so the inline style allowance is the whole of what they need; the
+/// frame refusal is what stops a hostile page overlaying a one-click control on
+/// one of them, and the handler is the only place it can be added because
+/// OpenBSD's httpd has no header-rewrite directive.
+const CONTENT_SECURITY_POLICY: &str = concat!(
+    "default-src 'none'; style-src 'unsafe-inline'; ",
+    "form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+);
+
 impl Reply {
     /// An HTML page, which is every page the web form renders.
     pub fn html(status: u16, body: String) -> Reply {
         Reply::Http(Http {
             status,
-            headers: vec![(
-                "Content-Type".to_string(),
-                "text/html; charset=utf-8".to_string(),
-            )],
+            headers: vec![
+                (
+                    "Content-Type".to_string(),
+                    "text/html; charset=utf-8".to_string(),
+                ),
+                (
+                    "Content-Security-Policy".to_string(),
+                    CONTENT_SECURITY_POLICY.to_string(),
+                ),
+            ],
             body,
         })
     }
@@ -393,6 +409,10 @@ impl Reply {
                 ),
                 ("Cache-Control".to_string(), "no-store".to_string()),
                 ("Referrer-Policy".to_string(), "no-referrer".to_string()),
+                (
+                    "Content-Security-Policy".to_string(),
+                    CONTENT_SECURITY_POLICY.to_string(),
+                ),
             ],
             body,
         })
@@ -709,6 +729,27 @@ mod tests {
         );
         assert!(text.contains("Cache-Control: no-store\r\n"), "{text}");
         assert!(text.ends_with("\r\n\r\n<p>no</p>"), "{text}");
+    }
+
+    /// Every HTML reply carries the policy, including the bare error and refusal
+    /// pages a caller answers with no body.
+    #[test]
+    fn every_html_reply_carries_the_content_security_policy() {
+        for reply in [
+            Reply::html(200, "<p>page</p>".into()),
+            Reply::html(404, String::new()),
+            Reply::capability(200, "<p>page</p>".into()),
+        ] {
+            let bytes = reply_bytes(&reply, 1);
+            let (body, _) = fixture::reply(&bytes);
+            let text = String::from_utf8(body).unwrap();
+            assert!(
+                text.contains(
+                    "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'\r\n"
+                ),
+                "{text}"
+            );
+        }
     }
 
     #[test]
