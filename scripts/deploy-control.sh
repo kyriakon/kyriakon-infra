@@ -898,16 +898,19 @@ titan_listener=$(config_value titan_listener)
 # is what decides which daemon may connect and a directory's set-group-id bit can
 # carry one group. Without the bit the socket would take _onboard's own group and
 # neither www nor _gmid could reach it. Nothing else may connect: a local user who
-# could would forge the request environment, REMOTE_ADDR among it.
+# could would forge the request environment, REMOTE_ADDR among it. The group gets
+# search on the directory and nothing else: write would let a process running as
+# that group unlink the live socket and plant a file at its path, and the handler
+# then refuses to bind it. Only _onboard, the owner, creates anything here.
 say "sockets"
 for pair in "www:$httpd_socket_path" "_gmid:$gemini_socket_path" "$portal_group:$portal_socket_path"; do
 	group=${pair%%:*}
 	dir=$(dirname "${pair#*:}")
-	install -d -o "$onboard_user" -g "$group" -m 2770 "$dir"
+	install -d -o "$onboard_user" -g "$group" -m 2750 "$dir"
 	[ -g "$dir" ] || die "$dir is not set-group-id, so the socket in it would not carry $group"
-	[ "$(stat -f '%Su %Sg' "$dir")" = "$onboard_user $group" ] \
-		|| die "$dir is not $onboard_user:$group"
-	printf '%s (%s, 2770)
+	[ "$(stat -f '%Su %Sg %Lp' "$dir")" = "$onboard_user $group 2750" ] \
+		|| die "$dir is not $onboard_user:$group mode 2750"
+	printf '%s (%s, 2750)
 ' "$dir" "$group"
 done
 

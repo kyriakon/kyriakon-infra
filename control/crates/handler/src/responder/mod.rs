@@ -46,7 +46,7 @@
 //!   subject and any issuer.
 
 use std::collections::{BTreeMap, HashSet};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -280,11 +280,14 @@ enum Channel {
     Portal,
 }
 
-/// Bind one socket, replacing the file a previous run left behind. A socket file
-/// outlives the process that made it, so a restart after a crash would otherwise
-/// fail to bind until somebody removed it by hand. Only a socket is removed: a
-/// path that is something else is a mistake in the config and is left to the
-/// error, which names the path.
+/// Bind one socket, replacing whatever a previous run left at the path. A socket
+/// file outlives the process that made it, so a restart after a crash would
+/// otherwise fail to bind until somebody removed it by hand; a plain file or a
+/// dangling symlink at the path does the same, and the socket directory is no
+/// longer a place a local process can put one. `symlink_metadata` is what makes a
+/// dangling symlink a file to remove rather than the `ENOENT` a following
+/// `metadata` would report, and `remove_file` unlinks the symlink itself, never
+/// its target, so the removal reaches nothing the config did not name.
 ///
 /// The file is mode 0660, and the group it carries comes from the set-group-id
 /// directory the front-ends' deploy creates it in: `www` for httpd's socket and
@@ -293,13 +296,19 @@ enum Channel {
 /// limits and the audit rest on.
 fn bind(path: &str) -> Result<UnixListener, Error> {
     let path = Path::new(path);
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.file_type().is_socket() {
-            std::fs::remove_file(path).map_err(|source| Error::Io {
-                what: "remove the socket",
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => std::fs::remove_file(path).map_err(|source| Error::Io {
+            what: "clear the path for",
+            path: Some(path.into()),
+            source,
+        })?,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(Error::Io {
+                what: "check",
                 path: Some(path.into()),
                 source,
-            })?;
+            })
         }
     }
     let listener = UnixListener::bind(path).map_err(|source| Error::Io {
@@ -366,5 +375,37 @@ mod tests {
             matches!(&err, Error::Startup(message) if message.contains("privacy.gmi")),
             "{err}"
         );
+    }
+
+    /// A file left at a socket's path does not stop the handler: bind clears the
+    /// path and listens. The dangling symlink is the case a following `metadata`
+    /// reports as absent, so it is the one the removal has to carry.
+    #[tokio::test]
+    async fn the_handler_binds_over_a_file_left_at_the_socket_path() {
+        use std::os::unix::fs::{symlink, FileTypeExt};
+
+        let dir = fixture_dir("bind-over-file");
+        let path = dir.join("portal.sock");
+        std::fs::write(&path, b"planted").unwrap();
+        let listener = bind(path.to_str().unwrap()).expect("bind over a planted file");
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_socket());
+        drop(listener);
+
+        let target = dir.join("gone");
+        std::fs::remove_file(&path).unwrap();
+        symlink(&target, &path).unwrap();
+        let listener = bind(path.to_str().unwrap()).expect("bind over a dangling symlink");
+        assert!(
+            target.symlink_metadata().is_err(),
+            "the link's target is untouched"
+        );
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_socket());
+        drop(listener);
     }
 }
