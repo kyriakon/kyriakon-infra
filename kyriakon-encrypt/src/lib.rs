@@ -131,20 +131,28 @@ fn armored_ciphertext(key: &Path, gpg_home: &Path, input: &[u8]) -> Result<Vec<u
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| Error::Gpg(format!("cannot spawn gpg: {e}")))?;
-    child
-        .stdin
-        .take()
-        .expect("stdin piped")
-        .write_all(input)
-        .map_err(|e| Error::Gpg(format!("cannot write to gpg: {e}")))?;
-    let out = child
-        .wait_with_output()
-        .map_err(|e| Error::Gpg(format!("cannot wait for gpg: {e}")))?;
+    let stdin = child.stdin.take().expect("stdin piped");
+    // gpg writes as it reads, and its armour outgrows the ~64 KiB pipe on any
+    // message past ~200 KiB: writing all of stdin here before draining stdout
+    // deadlocks the two. The write owns its own thread; this one drains.
+    let (out, written) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            let mut stdin = stdin;
+            stdin.write_all(input)
+        });
+        let out = child.wait_with_output();
+        (out, writer.join())
+    });
+    let out = out.map_err(|e| Error::Gpg(format!("cannot wait for gpg: {e}")))?;
     if !out.status.success() {
+        // gpg's own complaint, not the EPIPE its early exit gives the writer.
         return Err(Error::Gpg(
             String::from_utf8_lossy(&out.stderr).trim().to_string(),
         ));
     }
+    written
+        .map_err(|_| Error::Gpg("gpg stdin writer panicked".to_string()))?
+        .map_err(|e| Error::Gpg(format!("cannot write to gpg: {e}")))?;
     Ok(out.stdout)
 }
 
@@ -492,15 +500,25 @@ fn list_packets(input: &[u8], gpg_home: &Path) -> Vec<u8> {
     let Ok(mut child) = spawned else {
         return Vec::new();
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(input).is_err() {
-            return Vec::new();
+    let stdin = child.stdin.take();
+    // Same pipe-buffer hazard as `armored_ciphertext`: gpg lists packets while
+    // it reads, so the write must not block this thread's drain. Best effort
+    // throughout, so both failures stay silent.
+    std::thread::scope(|scope| {
+        let writer = stdin.map(|mut stdin| {
+            scope.spawn(move || {
+                let _ = stdin.write_all(input);
+            })
+        });
+        let out = child.wait_with_output();
+        if let Some(writer) = writer {
+            let _ = writer.join();
         }
-    }
-    match child.wait_with_output() {
-        Ok(out) => out.stdout,
-        Err(_) => Vec::new(),
-    }
+        match out {
+            Ok(out) => out.stdout,
+            Err(_) => Vec::new(),
+        }
+    })
 }
 
 /// Create the gpg scratch dir (0700). Idempotent; run per message because the
@@ -537,41 +555,54 @@ fn split_message(msg: &[u8]) -> (&[u8], &[u8], &[u8]) {
 }
 
 /// The span of every header in a block: its lowercase name, and the byte range
-/// covering it plus any folded continuation lines, excluding the final line
-/// ending. A line that is neither a header nor a continuation is folded into
-/// the preceding header, so a message that is only being rewritten never loses
-/// bytes.
+/// covering it plus its folded continuation lines, excluding the final line
+/// ending.
+///
+/// Only a line beginning with a space or tab continues the header above it. A
+/// line that is neither a header nor a continuation belongs to no span:
+/// `rfc3156_envelope` copies exposed spans into the unencrypted wrapper, so
+/// folding arbitrary text in would put it outside the ciphertext. The payload
+/// copies the whole block regardless, so no bytes are lost.
 fn header_spans(block: &[u8]) -> Vec<(String, usize, usize)> {
     let mut spans: Vec<(String, usize, usize)> = Vec::new();
+    // The previous line was a header or one of its continuations.
+    let mut open = false;
     let mut pos = 0;
     while pos < block.len() {
-        let (line_end, next) = match block[pos..].iter().position(|&b| b == b'\n') {
+        // A bare CR ends a line too: a message that never reached LF
+        // normalisation must not be read as one enormous header.
+        let (line_end, next) = match block[pos..].iter().position(|&b| b == b'\n' || b == b'\r') {
             Some(off) => {
-                let nl = pos + off;
-                let line_end = if nl > pos && block[nl - 1] == b'\r' {
-                    nl - 1
+                let end = pos + off;
+                let next = if block[end] == b'\r' && block.get(end + 1) == Some(&b'\n') {
+                    end + 2
                 } else {
-                    nl
+                    end + 1
                 };
-                (line_end, nl + 1)
+                (end, next)
             }
             None => (block.len(), block.len()),
         };
         let line = &block[pos..line_end];
-        let name = match line.first() {
-            Some(b' ') | Some(b'\t') => None,
-            _ => line
-                .iter()
+        let continuation = matches!(line.first(), Some(b' ' | b'\t'));
+        let name = if continuation {
+            None
+        } else {
+            line.iter()
                 .position(|&b| b == b':')
-                .map(|c| String::from_utf8_lossy(&line[..c]).to_ascii_lowercase()),
+                .map(|c| String::from_utf8_lossy(&line[..c]).to_ascii_lowercase())
         };
         match name {
-            Some(name) => spans.push((name, pos, line_end)),
-            None => {
+            Some(name) => {
+                spans.push((name, pos, line_end));
+                open = true;
+            }
+            None if continuation && open => {
                 if let Some(last) = spans.last_mut() {
                     last.2 = line_end;
                 }
             }
+            None => open = false,
         }
         pos = next;
     }
@@ -838,6 +869,32 @@ mod tests {
             !env.contains("Content-Type: text/plain"),
             "the payload's Content-Type leaked:\n{env}"
         );
+    }
+
+    #[test]
+    fn a_colonless_line_is_not_folded_into_the_header_above_it() {
+        // Anything an exposed span covers is copied into the unencrypted
+        // wrapper. A line with no colon is not a header, so it belongs to no
+        // span, while a real continuation still travels with its header.
+        let msg = b"To: bob@example.invalid,\n\
+            \tcarol@example.invalid\n\
+            smuggled plaintext\n\
+            Date: Mon, 1 Jan 2024 00:00:00 +0000\n\
+            \n\
+            body\n";
+        let env = String::from_utf8_lossy(&rfc3156_envelope("b", ARMOR, msg)).into_owned();
+        assert!(!env.contains("smuggled plaintext"), "{env}");
+        assert!(
+            env.contains("To: bob@example.invalid,\n\tcarol@example.invalid\n"),
+            "{env}"
+        );
+        assert!(
+            env.contains("Date: Mon, 1 Jan 2024 00:00:00 +0000\n"),
+            "{env}"
+        );
+        // Nothing is lost: the payload still carries the whole block.
+        let p = payload(msg);
+        assert!(p.contains("smuggled plaintext\n"), "{p}");
     }
 
     #[test]
