@@ -1047,6 +1047,19 @@ async fn decline(
         }
         None => None,
     };
+    // An approval journals "applying" before it provisions and writes the
+    // account record last, so a failure in between leaves a live OS account, its
+    // Maildir, the keyring file and the virtuals line with no record. Every
+    // sweep starts from `accounts/`, so a decline accepted over that would leave
+    // an account nobody owns and a name no purge can release. Erase what the
+    // approval made before the decision is recorded; a failure here fails the
+    // decline and leaves its intent for the next pass rather than a decision
+    // over a live account. A body's approval makes the group's mailboxes, not an
+    // account of the site owner's, so that path is left to its own transition.
+    let mut erased = false;
+    if record.domain.is_none() && journal.approval_started(token) {
+        erased = super::lifecycle::erase_half_made(cfg, store, journal, username).await?;
+    }
     write_journal(
         store,
         journal,
@@ -1055,7 +1068,7 @@ async fn decline(
         &intent.kind,
         &intent.application,
         "applying",
-        None,
+        erased.then_some("the failed approval's half-made account was erased first"),
     )
     .await?;
 

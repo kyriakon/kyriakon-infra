@@ -1163,6 +1163,10 @@ fn a_decline_purges_after_its_week_and_releases_the_username() {
         "nothing is released before the week: {}",
         fix.scripts_log()
     );
+    assert!(
+        !fix.dir.join("store/holds/secretary.json").exists(),
+        "a decline over no approval holds no name"
+    );
 
     // Move the decision a week back, as a week of cron would, and run again.
     let mut app: Value =
@@ -1186,6 +1190,222 @@ fn a_decline_purges_after_its_week_and_releases_the_username() {
         fix.scripts_log().contains("delete-user.sh secretary"),
         "the username is released: {}",
         fix.scripts_log()
+    );
+    let _ = record;
+}
+
+/// An approval that fails after `add-user.sh` leaves a live OS account, its
+/// Maildir, the keyring file and the virtuals line with no `account.json`: the
+/// record is written last. A decline must erase what the approval made rather
+/// than mark the application declined over an account no sweep starts from, and
+/// hold the name for ninety days because the address existed long enough to
+/// receive mail.
+#[test]
+fn a_decline_after_a_failed_approval_erases_the_half_made_account() {
+    let fix = Fix::new("decline-half-made");
+    // The builder refuses, so the approval stops after add-user.sh and before
+    // the account record.
+    fix.provision_fails();
+    let record = fix.filed_with(
+        "secretary",
+        "cash",
+        &[("rail", "cash")],
+        Some("applicant@example.invalid"),
+        Some((UPLOAD_KEY, "works")),
+    );
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    // The half-made account: on the box, with a keyring entry and a stored key,
+    // and no record.
+    assert!(
+        fix.passwd_file().contains("secretary:"),
+        "{}",
+        fix.passwd_file()
+    );
+    assert!(fix.dir.join("keyring/secretary.asc").exists());
+    assert!(fix.dir.join("store/keys/secretary.pub").exists());
+    assert!(!fix
+        .dir
+        .join("store/accounts/secretary/account.json")
+        .exists());
+
+    // The decline erases it instead of deciding over it.
+    fix.decide("decline", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.passwd_file().contains("secretary:"),
+        "the half-made account stayed: {}",
+        fix.passwd_file()
+    );
+    assert!(
+        fix.scripts_log().contains("delete-user.sh secretary"),
+        "the account was never erased: {}",
+        fix.scripts_log()
+    );
+    assert!(
+        !fix.dir.join("keyring/secretary.asc").exists(),
+        "the keyring entry stayed"
+    );
+    assert!(
+        fix.scripts_log()
+            .contains("publish-mail-key.sh --remove secretary"),
+        "the published key stayed: {}",
+        fix.scripts_log()
+    );
+    assert!(
+        !fix.dir.join("store/keys/secretary.pub").exists(),
+        "the stored key stayed"
+    );
+    assert!(!fix
+        .dir
+        .join("store/accounts/secretary/account.json")
+        .exists());
+    // The name is held, with the date a later approval refuses on.
+    let hold: Value = serde_json::from_str(&fix.read("holds/secretary.json")).unwrap();
+    let until = OffsetDateTime::parse(
+        hold["until"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    assert!(until > OffsetDateTime::now_utc(), "{hold}");
+    // The application is still held for its week, decided.
+    let app: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    assert!(
+        app["stage"].as_str().unwrap().starts_with("declined"),
+        "{app}"
+    );
+
+    // A week later the purge clears the application and leaves the name held and
+    // the box empty.
+    let mut app: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    app["decided_at"] = json!("2026-09-01T00:00:00Z");
+    std::fs::write(
+        fix.dir.join(format!("store/applications/{TOKEN}.json")),
+        serde_json::to_vec_pretty(&app).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir
+            .join(format!("store/applications/{TOKEN}.json"))
+            .exists(),
+        "the week past, the application is cleared away"
+    );
+    assert!(
+        !fix.passwd_file().contains("secretary:"),
+        "{}",
+        fix.passwd_file()
+    );
+    assert!(
+        fix.dir.join("store/holds/secretary.json").exists(),
+        "the name's hold was lost"
+    );
+    assert!(
+        fix.journal().contains("half-made account was erased first"),
+        "the journal does not say why the name is held: {}",
+        fix.journal()
+    );
+    assert!(fix.journal().contains("purged"), "{}", fix.journal());
+    let _ = record;
+}
+
+/// The approval publishes no key when it stops at the keyring write, so the
+/// decline's erase asks the keys repository for a removal that is already done
+/// and does not fail, deletes no account and holds no name: nothing reached the
+/// box.
+#[test]
+fn a_decline_after_an_approval_that_made_nothing_removes_no_key_and_holds_nothing() {
+    let fix = Fix::new("decline-half-made-absent");
+    let mut record = fix.filed_with(
+        "secretary",
+        "cash",
+        &[("rail", "cash")],
+        Some("applicant@example.invalid"),
+        Some((UPLOAD_KEY, "works")),
+    );
+    // No mail key, so the approval is refused at the keyring write: after its
+    // "applying" line and before add-user.sh.
+    record["mail_keys"] = json!([]);
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    assert!(fix.drain().status.success());
+    assert!(!fix.dir.join("keyring/secretary.asc").exists());
+    assert!(!fix.dir.join("store/keys/secretary.pub").exists());
+
+    fix.decide("decline", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let app: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    assert!(
+        app["stage"].as_str().unwrap().starts_with("declined"),
+        "{app}"
+    );
+    assert!(
+        fix.scripts_log()
+            .contains("publish-mail-key.sh --remove secretary"),
+        "the unused name was never offered a removal: {}",
+        fix.scripts_log()
+    );
+    assert!(
+        !fix.scripts_log().contains("delete-user.sh"),
+        "{}",
+        fix.scripts_log()
+    );
+    assert!(
+        !fix.dir.join("store/holds/secretary.json").exists(),
+        "a name the box never held was held for ninety days"
+    );
+}
+
+/// A decline over a box account the application's approval never began is still
+/// refused: the name is in use by somebody else, and a purge must not delete
+/// what holds it. The half-made case needs the journal's `applying` line.
+#[test]
+fn a_decline_of_a_name_the_approval_never_began_keeps_the_box_account() {
+    let fix = Fix::new("decline-adopted-box");
+    let record = fix.filed_with(
+        "secretary",
+        "cash",
+        &[("rail", "cash")],
+        Some("applicant@example.invalid"),
+        Some((UPLOAD_KEY, "works")),
+    );
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    // The operator made this one by hand; no approval of this application ran.
+    std::fs::write(
+        fix.path("passwd"),
+        "secretary:x:1000:1000::/home/secretary:/sbin/nologin\n",
+    )
+    .unwrap();
+    fix.decide("decline", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert!(
+        fix.passwd_file().contains("secretary:"),
+        "a decline deleted an account it did not make: {}",
+        fix.passwd_file()
+    );
+    assert!(
+        !fix.scripts_log().contains("delete-user.sh"),
+        "{}",
+        fix.scripts_log()
+    );
+    assert!(
+        !fix.dir.join("store/holds/secretary.json").exists(),
+        "a name nothing proved was held for ninety days"
     );
     let _ = record;
 }
