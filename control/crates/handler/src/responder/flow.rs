@@ -77,22 +77,34 @@ pub(super) async fn root(app: &App, call: &Call<'_>) -> Reply {
 }
 
 /// A submission's origin. `Origin` is sent on every browser POST; a value that is
-/// not this service's own is refused. When it is absent, `Sec-Fetch-Site` is the
-/// fallback, and a browser that sends neither is a client that is not a browser at
-/// all, which is not a cross-site request.
-pub(super) fn own_origin(request: &Request) -> bool {
+/// not this service's own is refused. When it is absent — or literally `null`,
+/// which is what a document with no origin sends — `Sec-Fetch-Site` is the
+/// fallback, but only on a route that a cookie cannot reach: a session-bearing
+/// route requires this site's own `Origin`, because the cookie is the identity
+/// such a request acts on.
+pub(super) fn own_origin(request: &Request, session: bool) -> bool {
     // A browser that posts a form sends Origin, and an ordinary tab sends this
-    // site as it. An in-app browser, which is what a link tapped in a mail or
-    // chat client opens, sends `Origin: null` instead, and `Sec-Fetch-Site:
-    // same-origin` beside it. The null origin used to refuse that submission
-    // without ever reading the header that would have answered the question, so
-    // null falls through to Sec-Fetch-Site now, as an absent Origin already did.
+    // site as it. What sends `null` instead is a document with no origin: a
+    // sandboxed frame, a `data:` document, an in-app browser's synthetic page.
+    // The null origin used to refuse those submissions without ever reading the
+    // header that would have answered the question, so null falls through to
+    // Sec-Fetch-Site now, as an absent Origin already did.
     let origin = request.get("HTTP_ORIGIN");
     let site = request.get("HTTP_SEC_FETCH_SITE");
     if let Some(origin) = origin {
         if origin != "null" {
             return origin == OWN_ORIGIN;
         }
+    }
+    // A null or absent Origin is a client with no origin to name: a sandboxed
+    // frame, a `data:` document, an in-app browser's synthetic page, or a client
+    // that is not a browser at all. None of them is this page, and the fallback
+    // cannot tell them apart, so a session route, whose identity arrives as the
+    // cookie the browser attaches by itself, may not take any of them. Safari
+    // sends no `Sec-Fetch-Site` and does attach the same-site `Lax` cookie to a
+    // sandboxed frame's form post, so this is the branch the whole check turns on.
+    if session {
+        return false;
     }
     match site {
         // same-site is the same registrable site as this page, which is what a

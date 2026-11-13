@@ -127,22 +127,149 @@ fn a_submission_must_come_from_this_form() {
             })
     };
     assert!(
-        own_origin(&request(&[("REQUEST_METHOD", "POST")])),
-        "a client that is not a browser is allowed"
+        own_origin(&request(&[("REQUEST_METHOD", "POST")]), false),
+        "a client that is not a browser is allowed on the application route"
     );
-    assert!(own_origin(&request(&[("HTTP_ORIGIN", OWN_ORIGIN)])));
-    assert!(!own_origin(&request(&[(
-        "HTTP_ORIGIN",
-        "https://elsewhere.example"
-    )])));
-    assert!(!own_origin(&request(&[(
-        "HTTP_SEC_FETCH_SITE",
-        "cross-site"
-    )])));
-    assert!(own_origin(&request(&[(
-        "HTTP_SEC_FETCH_SITE",
-        "same-origin"
-    )])));
+    assert!(own_origin(&request(&[("HTTP_ORIGIN", OWN_ORIGIN)]), true));
+    assert!(!own_origin(
+        &request(&[("HTTP_ORIGIN", "https://elsewhere.example")]),
+        true
+    ));
+    assert!(!own_origin(
+        &request(&[("HTTP_SEC_FETCH_SITE", "cross-site")]),
+        false
+    ));
+    assert!(own_origin(
+        &request(&[("HTTP_SEC_FETCH_SITE", "same-origin")]),
+        false
+    ));
+}
+
+/// The browser matrix #704 was opened with, replayed through the guard. Each row
+/// is what a real client sent for a form POST from a page on a sibling subdomain,
+/// and whether that client also attached the host-only `SameSite=Lax` session
+/// cookie: Chromium 150 and 156 and WebKit as installed on this workstation, plus
+/// `curl`. The rows that carry the cookie are the attack; a session route must
+/// refuse every one of them.
+#[test]
+fn a_client_that_withholds_its_origin_reaches_no_session() {
+    let request = |env: &[(&str, &str)]| {
+        let bytes = fixture::httpd(env, b"");
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                fastcgi::read_request(&mut &bytes[..], MAX_BODY)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            })
+    };
+    // (what sent it, Origin, Sec-Fetch-Site, application route, session route)
+    type Row<'a> = (&'a str, Option<&'a str>, Option<&'a str>, bool, bool);
+    let rows: &[Row<'_>] = &[
+        (
+            "this page's own form, cookie attached",
+            Some(OWN_ORIGIN),
+            Some("same-origin"),
+            true,
+            true,
+        ),
+        (
+            "sibling subdomain, top-level form, cookie attached",
+            Some("https://alice.kyriakon.net"),
+            Some("same-site"),
+            false,
+            false,
+        ),
+        (
+            // WebKit 26 attached the cookie and sent no Sec-Fetch-Site; Chromium
+            // sent none either and withheld the cookie.
+            "sandboxed allow-forms frame, no Sec-Fetch-Site, cookie attached",
+            Some("null"),
+            None,
+            true,
+            false,
+        ),
+        (
+            "sandboxed allow-forms frame, same-site, cookie attached",
+            Some("null"),
+            Some("same-site"),
+            true,
+            false,
+        ),
+        (
+            "sandboxed allow-forms frame, cross-site",
+            Some("null"),
+            Some("cross-site"),
+            false,
+            false,
+        ),
+        ("data: document", Some("null"), None, true, false),
+        (
+            "in-app browser, as the old comment described it",
+            Some("null"),
+            Some("same-origin"),
+            true,
+            false,
+        ),
+        ("curl, no browser headers at all", None, None, true, false),
+    ];
+    for (what, origin, site, application, session) in rows {
+        let mut env = vec![("REQUEST_METHOD", "POST")];
+        if let Some(origin) = origin {
+            env.push(("HTTP_ORIGIN", *origin));
+        }
+        if let Some(site) = site {
+            env.push(("HTTP_SEC_FETCH_SITE", *site));
+        }
+        let request = request(&env);
+        assert_eq!(
+            own_origin(&request, false),
+            *application,
+            "{what}: the application route"
+        );
+        assert_eq!(
+            own_origin(&request, true),
+            *session,
+            "{what}: a session route"
+        );
+    }
+}
+
+/// The matrix's WebKit row, end to end: the front end refuses a `null` Origin on
+/// every route that acts on the session, before the handler reads the cookie the
+/// browser attached, and still answers the applicant form from a client that has
+/// no origin to name.
+#[tokio::test]
+async fn a_null_origin_reaches_no_session_route_but_still_reaches_the_form() {
+    let (app, _dir) = handler("null-origin").await;
+    let cookie = signed_in(&app, "alice").await;
+
+    for path in ["account/upload-key", "account/close", "account", "logout"] {
+        let (code, page) = ask(
+            &app,
+            &httpd_post_from(path, "", Some("null"), None, Some(&cookie)),
+        )
+        .await;
+        assert_eq!(code, 403, "{path}: {page}");
+        assert!(page.contains("own page"), "{path}: {page}");
+    }
+    // A client that sends no Origin at all is refused on a session route too: the
+    // cookie is the identity, and only this page's own origin may carry it.
+    let (code, page) = ask(
+        &app,
+        &httpd_post_from("account/upload-key", "", None, None, Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 403, "{page}");
+    assert!(page.contains("own page"), "{page}");
+
+    // The application route keeps the client the fallback was written for.
+    for (path, body) in [("apply", "username=theophilus"), ("", "whose=body")] {
+        let (code, page) = ask(&app, &httpd_post_from(path, body, Some("null"), None, None)).await;
+        assert_ne!(code, 403, "{path}: {page}");
+    }
 }
 
 /// The path is decoded before it reaches the log, so a client can put a newline
