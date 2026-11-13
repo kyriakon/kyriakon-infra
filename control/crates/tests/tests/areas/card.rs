@@ -78,6 +78,106 @@ fn a_webhook_that_does_not_verify_leaves_the_store_untouched() {
 }
 
 #[test]
+fn a_delivery_received_inside_the_window_survives_a_late_pass() {
+    let fix = Fix::new("webhook-late-pass");
+    fix.card_account("secretary", None);
+    // The handler took this ten minutes ago; the pass reaches it only now. The
+    // recency guard is measured from the arrival, so a delayed pass settles it
+    // instead of deleting a genuine payment.
+    let received = OffsetDateTime::now_utc().unix_timestamp() - 600;
+    fix.webhook_at(
+        "evt_late_pass",
+        "invoice.paid",
+        invoice("in_late_pass"),
+        received,
+    );
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert!(
+        paid_until(&fix, "secretary").is_some(),
+        "the late pass deleted a delivery that arrived in time"
+    );
+    assert!(fix.webhooks().is_empty(), "{:?}", fix.webhooks());
+    assert!(
+        fix.read("webhooks/processed.jsonl")
+            .contains("evt_late_pass"),
+        "the settled payment was not journalled"
+    );
+}
+
+#[test]
+fn a_delivery_with_no_arrival_stamp_uses_when_it_was_stored() {
+    let fix = Fix::new("webhook-old-queue");
+    fix.card_account("secretary", None);
+    // A pair queued by a handler that predates the arrival stamp: its body's
+    // mtime is the only record of when it arrived, and a later pass must use
+    // it rather than treat the delivery as late.
+    let received = OffsetDateTime::now_utc().unix_timestamp() - 600;
+    fix.webhook_at(
+        "evt_old_queue",
+        "invoice.paid",
+        invoice("in_old_queue"),
+        received,
+    );
+    let dir = fix.dir.join("store/webhooks");
+    std::fs::remove_file(dir.join("evt_old_queue.at")).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(dir.join("evt_old_queue.body"))
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(received as u64))
+        .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert!(
+        paid_until(&fix, "secretary").is_some(),
+        "an old queue entry was deleted for being late"
+    );
+    assert!(fix.webhooks().is_empty(), "{:?}", fix.webhooks());
+}
+
+#[test]
+fn a_delivery_stale_against_its_arrival_is_still_refused() {
+    let fix = Fix::new("webhook-stale-arrival");
+    fix.card_account("secretary", None);
+    let event = json!({
+        "id": "evt_stale_arrival",
+        "type": "invoice.paid",
+        "data": {"object": invoice("in_stale_arrival")},
+    });
+    let bytes = serde_json::to_vec(&event).unwrap();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    // Received an hour ago carrying a timestamp two hours old: the header is
+    // stale against its own arrival, so this is a replay and not a delivery.
+    let received = now - 3600;
+    let stale = now - 7200;
+    let mut payload = stale.to_string().into_bytes();
+    payload.push(b'.');
+    payload.extend_from_slice(&bytes);
+    let sig = sign::sign_bytes(WEBHOOK_SECRET, &payload).unwrap();
+    fix.webhook_raw("evt_stale_arrival", &bytes, &format!("t={stale},v1={sig}"));
+    std::fs::write(
+        fix.dir.join("store/webhooks/evt_stale_arrival.at"),
+        received.to_string(),
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert_eq!(paid_until(&fix, "secretary"), None);
+    assert!(fix.webhooks().is_empty(), "{:?}", fix.webhooks());
+    assert!(
+        fix.read("webhooks/processed.jsonl").is_empty(),
+        "a replayed event was recorded as settled"
+    );
+}
+
+#[test]
 fn a_replayed_event_id_or_invoice_extends_nothing() {
     let fix = Fix::new("webhook-replay");
     fix.card_account("secretary", None);
@@ -677,12 +777,20 @@ fn payment_action_required_records_the_attempt_and_asks_once() {
 
 /// A missing webhook secret is a misconfigured box, not a failed pass: the
 /// delivery stays for the pass that can verify it, the pass exits 0, and the
-/// mail is sent once rather than every minute.
+/// mail is sent once rather than every minute. The delivery is already old by
+/// the time the secret arrives, and the first pass with a secret still settles
+/// it: recency is measured from the arrival, not from that pass's clock.
 #[test]
 fn a_missing_webhook_secret_is_mailed_once_and_keeps_the_delivery() {
     let fix = Fix::new("webhook-no-secret");
     fix.card_account("secretary", None);
-    fix.webhook("evt_no_secret", "invoice.paid", invoice("in_no_secret"));
+    let received = OffsetDateTime::now_utc().unix_timestamp() - 3600;
+    fix.webhook_at(
+        "evt_no_secret",
+        "invoice.paid",
+        invoice("in_no_secret"),
+        received,
+    );
     std::fs::remove_file(fix.path("stripe")).unwrap();
 
     for _ in 0..2 {
@@ -708,6 +816,18 @@ fn a_missing_webhook_secret_is_mailed_once_and_keeps_the_delivery() {
         "the delivery was dropped: {:?}",
         fix.webhooks()
     );
+
+    // The box is configured, and the first pass that can verify the hour-old
+    // delivery settles it rather than deleting it for being late.
+    std::fs::write(fix.path("stripe"), [WEBHOOK_SECRET, b"\n"].concat()).unwrap();
+    std::fs::set_permissions(fix.path("stripe"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        paid_until(&fix, "secretary").is_some(),
+        "the queued delivery was deleted once a secret could verify it"
+    );
+    assert!(fix.webhooks().is_empty(), "{:?}", fix.webhooks());
 }
 
 /// An account record that is there and does not parse is drift, not an account

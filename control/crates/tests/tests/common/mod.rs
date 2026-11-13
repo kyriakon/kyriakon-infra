@@ -505,37 +505,51 @@ impl Fix {
     /// filename is the event id, which is what the handler writes, so the pair
     /// and the record under `verified/` share one name.
     pub fn webhook(&self, id: &str, kind: &str, object: Value) {
+        self.webhook_at(id, kind, object, OffsetDateTime::now_utc().unix_timestamp());
+    }
+
+    /// Deliver one event received at `received`: the header timestamp and the
+    /// arrival stamp the handler writes both name that instant, so a pass that
+    /// reaches it later is still allowed to settle it.
+    pub fn webhook_at(&self, id: &str, kind: &str, object: Value, received: i64) {
         let event_id = id.to_string();
         let event = json!({
             "id": event_id,
             "type": kind,
-            "created": OffsetDateTime::now_utc().unix_timestamp(),
+            "created": received,
             "data": {"object": object},
         });
         let body = serde_json::to_vec(&event).unwrap();
-        let timestamp = OffsetDateTime::now_utc().unix_timestamp();
+        let timestamp = received;
         let mut payload = timestamp.to_string().into_bytes();
         payload.push(b'.');
         payload.extend_from_slice(&body);
         let sig = sign::sign_bytes(WEBHOOK_SECRET, &payload).unwrap();
-        self.webhook_raw(id, &body, &format!("t={timestamp},v1={sig}"));
+        self.webhook_raw_at(id, &body, &format!("t={timestamp},v1={sig}"), received);
     }
 
     /// Deliver bytes and a signature header verbatim, for the refusals a valid
-    /// delivery cannot produce.
+    /// delivery cannot produce. The arrival is now, as the handler records it.
     pub fn webhook_raw(&self, id: &str, body: &[u8], header: &str) {
+        self.webhook_raw_at(id, body, header, OffsetDateTime::now_utc().unix_timestamp());
+    }
+
+    /// The same, with the arrival stamp the handler wrote beside the pair.
+    fn webhook_raw_at(&self, id: &str, body: &[u8], header: &str, received: i64) {
         let dir = self.dir.join("store/webhooks");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(format!("{id}.body")), body).unwrap();
         std::fs::write(dir.join(format!("{id}.sig")), header).unwrap();
+        std::fs::write(dir.join(format!("{id}.at")), received.to_string()).unwrap();
     }
 
-    /// The undecided deliveries left in `webhooks/`, which is the body and
-    /// signature pairs rather than the append-only processed record.
+    /// The undecided deliveries left in `webhooks/`, which is the body,
+    /// signature and arrival files rather than the append-only processed
+    /// record.
     pub fn webhooks(&self) -> Vec<String> {
         self.names("webhooks")
             .into_iter()
-            .filter(|n| n.ends_with(".body") || n.ends_with(".sig"))
+            .filter(|n| n.ends_with(".body") || n.ends_with(".sig") || n.ends_with(".at"))
             .collect()
     }
 

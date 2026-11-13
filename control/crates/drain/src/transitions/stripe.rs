@@ -23,9 +23,10 @@ use std::collections::HashSet;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-/// How far a webhook's timestamp may be from this box's clock. Stripe's own
-/// libraries default to five minutes, and the box runs NTP so the window means
-/// something. A body older than this is a replay, not a delivery.
+/// How far a webhook's timestamp may be from this box's clock at the moment
+/// the handler accepted the delivery. Stripe's own libraries default to five
+/// minutes, and the box runs NTP so the window means something. A timestamp
+/// more than this from the delivery's arrival is a replay, not a delivery.
 const WEBHOOK_TOLERANCE: i64 = 300;
 
 /// Settle the Stripe events the handler wrote under `webhooks/`.
@@ -33,8 +34,9 @@ const WEBHOOK_TOLERANCE: i64 = 300;
 /// The handler holds no secret and verifies nothing: it stores the raw body and
 /// the `Stripe-Signature` header and answers 2xx. This pass is the half with the
 /// secret, so it is the half that decides. The first sight of an event is
-/// verified over the exact bytes received, inside five minutes of now, and
-/// against every `v1` value the header carries (a rolled secret signs with two);
+/// verified over the exact bytes received, inside five minutes of the arrival
+/// the handler stamped beside it, and against every `v1` value the header
+/// carries (a rolled secret signs with two);
 /// its id is then recorded in root-only `verified/`. A later pass trusts that
 /// record and checks only the HMAC: a deferred event is waiting for the event it
 /// follows, not late, so the clock no longer deletes it. The record goes when
@@ -148,12 +150,18 @@ pub async fn stripe_webhooks(
             };
             let verified = match record {
                 Some(_) => verify_signature(&secret, &sig, &body),
-                None => verify_webhook(
-                    &secret,
-                    &sig,
-                    &body,
-                    OffsetDateTime::now_utc().unix_timestamp(),
-                ),
+                None => {
+                    // Recency is measured against the moment the handler took
+                    // the delivery, not this pass's clock: a pass delayed by a
+                    // restart or a slow step must not turn a genuine delivery
+                    // into a replay. A pair queued before the handler wrote the
+                    // stamp falls back to its body's mtime, which is when it was
+                    // stored.
+                    let arrived = webhook_received(store, id)
+                        .await
+                        .unwrap_or_else(|| OffsetDateTime::now_utc().unix_timestamp());
+                    verify_webhook(&secret, &sig, &body, arrived)
+                }
             };
             if let Err(why) = verified {
                 why.report(&format!("webhook {id} refused"));
@@ -263,14 +271,14 @@ pub async fn stripe_webhooks(
 /// comparison is constant time through [`sign::verify_bytes`], and every `v1`
 /// value is tried so a secret mid-roll verifies either way.
 ///
-/// The recency check is a replay guard, so it is first-sight only. A delivery
-/// whose id `verified/` already records was proven once; the clock is not
-/// applied to it again.
-pub fn verify_webhook(secret: &[u8], header: &str, body: &[u8], now: i64) -> Result<(), Error> {
+/// The recency check is a replay guard, so it is first-sight only and `now` is
+/// the delivery's arrival, not the pass's clock. A delivery whose id `verified/`
+/// already records was proven once; the clock is not applied to it again.
+pub fn verify_webhook(secret: &[u8], header: &str, body: &[u8], arrived: i64) -> Result<(), Error> {
     let (timestamp, payload, signatures) = signature_parts(header, body)?;
-    if (now - timestamp).abs() > WEBHOOK_TOLERANCE {
+    if (arrived - timestamp).abs() > WEBHOOK_TOLERANCE {
         return Err(Error::Failed(format!(
-            "the timestamp {timestamp} is more than five minutes from {now}"
+            "the timestamp {timestamp} is more than five minutes from its arrival {arrived}"
         )));
     }
     check_signatures(secret, &payload, &signatures)
@@ -351,10 +359,30 @@ pub fn event_id_shape(id: &str) -> bool {
 
 async fn remove_webhook(store: &Store, id: &str) -> Result<(), Error> {
     store.remove("webhooks", &format!("{id}.body")).await?;
+    store.remove("webhooks", &format!("{id}.sig")).await?;
     store
-        .remove("webhooks", &format!("{id}.sig"))
+        .remove("webhooks", &format!("{id}.at"))
         .await
         .map_err(Error::from)
+}
+
+/// When the handler accepted this delivery, as a unix timestamp. It writes
+/// `webhooks/<id>.at` before the body, so a body's presence means the stamp is
+/// there. A pair queued by an older handler has no stamp, so the body's mtime —
+/// the instant it was written — stands in for it; `None` only when neither can
+/// be read, and the caller keeps its old comparison against now.
+async fn webhook_received(store: &Store, id: &str) -> Option<i64> {
+    if let Some(stamp) = store.read_record("webhooks", &format!("{id}.at")).await {
+        if let Ok(at) = stamp.trim().parse::<i64>() {
+            return Some(at);
+        }
+    }
+    let modified = tokio::fs::metadata(store.path(&format!("webhooks/{id}.body")))
+        .await
+        .ok()?
+        .modified()
+        .ok()?;
+    Some(OffsetDateTime::from(modified).unix_timestamp())
 }
 
 /// Drop the first-sight record once the event has settled, so `verified/` does
