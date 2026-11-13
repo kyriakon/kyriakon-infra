@@ -7,22 +7,50 @@
 #include <stdlib.h>
 #include <string.h>
 
+int
+kyriakon_save_pull(int ret, const char *read_error,
+		   char *error, size_t error_size)
+{
+	if (ret > 0)
+		return KYRIAKON_SAVE_PULL_DATA;
+	if (ret == 0)
+		return KYRIAKON_SAVE_PULL_WAIT;
+	if (ret == -1)
+		return KYRIAKON_SAVE_PULL_EOF;
+	snprintf(error, error_size, "read input: %s",
+		 read_error != NULL && read_error[0] != '\0' ?
+		 read_error : "failed");
+	return KYRIAKON_SAVE_PULL_ERROR;
+}
+
 static bool
 plain_append(struct kyriakon_save *save, const unsigned char *data, size_t size)
 {
-	size_t needed = save->plain_len + size, capacity;
+	size_t needed, capacity;
 	unsigned char *grown;
 
 	if (size == 0)
 		return true;
+	if (size > KYRIAKON_SAVE_PLAIN_MAX - save->plain_len) {
+		snprintf(save->error, sizeof(save->error),
+			 "message exceeds the %u MiB plaintext limit",
+			 (unsigned int)(KYRIAKON_SAVE_PLAIN_MAX / (1024 * 1024)));
+		return false;
+	}
+	needed = save->plain_len + size;
 	if (needed > save->plain_capacity) {
 		capacity = save->plain_capacity == 0 ? 8192 :
 			save->plain_capacity;
 		while (capacity < needed)
 			capacity *= 2;
+		if (capacity > KYRIAKON_SAVE_PLAIN_MAX)
+			capacity = KYRIAKON_SAVE_PLAIN_MAX;
 		grown = realloc(save->plain, capacity);
-		if (grown == NULL)
+		if (grown == NULL) {
+			snprintf(save->error, sizeof(save->error),
+				 "out of memory");
 			return false;
+		}
 		save->plain = grown;
 		save->plain_capacity = capacity;
 	}
@@ -35,14 +63,13 @@ void
 kyriakon_save_begin(struct kyriakon_save *save,
 		    const struct kyriakon_save_ops *ops, void *ops_context,
 		    kyriakon_save_pull_fn pull,
-		    kyriakon_save_encrypt_fn encrypt, void *io_context)
+		    kyriakon_save_encrypt_fn encrypt)
 {
 	kyriakon_save_deinit(save);
 	save->ops = ops;
 	save->ops_context = ops_context;
 	save->pull = pull;
 	save->encrypt = encrypt;
-	save->io_context = io_context;
 }
 
 int
@@ -52,20 +79,20 @@ kyriakon_save_continue(struct kyriakon_save *save)
 	size_t size;
 	int ret;
 
-	if (save->begun)
-		return save->ops->save_continue(save->ops_context);
+	/* Failed is checked first and stays set: a backend save_begin that
+	   half-started must not have its save_continue called on it. */
 	if (save->failed)
 		return -1;
+	if (save->begun)
+		return save->ops->save_continue(save->ops_context);
 
 	if (!save->encrypted) {
 		for (;;) {
-			ret = save->pull(save->io_context, &data, &size,
+			ret = save->pull(save->ops_context, &data, &size,
 					 save->error, sizeof(save->error));
 			if (ret != KYRIAKON_SAVE_PULL_DATA)
 				break;
 			if (!plain_append(save, data, size)) {
-				snprintf(save->error, sizeof(save->error),
-					 "out of memory");
 				save->failed = true;
 				return -1;
 			}
@@ -80,7 +107,7 @@ kyriakon_save_continue(struct kyriakon_save *save)
 			return -1;
 		}
 		/* EOF: the whole message is buffered now. */
-		if (!save->encrypt(save->io_context, save->plain, save->plain_len,
+		if (!save->encrypt(save->ops_context, save->plain, save->plain_len,
 				   &save->result)) {
 			snprintf(save->error, sizeof(save->error), "%s",
 				 save->result.error[0] != '\0' ?
@@ -129,7 +156,16 @@ kyriakon_save_cancel(struct kyriakon_save *save)
 void
 kyriakon_save_deinit(struct kyriakon_save *save)
 {
-	free(save->plain);
+	if (save->plain != NULL) {
+		volatile unsigned char *p = save->plain;
+		size_t i;
+
+		/* Mail plaintext: a memset the optimiser may drop is not a
+		   wipe, so write through a volatile pointer. */
+		for (i = 0; i < save->plain_len; i++)
+			p[i] = 0;
+		free(save->plain);
+	}
 	free(save->result.ciphertext);
 	memset(save, 0, sizeof(*save));
 }

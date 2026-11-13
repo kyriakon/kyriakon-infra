@@ -12,8 +12,10 @@
  * literal, so save_begin only arms the save and never reads the input. The
  * caller drives the literal through save_continue; the input is pulled there
  * without blocking, and at EOF the message is encrypted and the wrapped
- * save_begin starts on the ciphertext (encrypt-save.h). LMTP's DATA is a temp
- * file, so its first save_continue still encrypts before anything is written.
+ * save_begin starts on the ciphertext (encrypt-save.h). LMTP is the same path
+ * with nothing to wait for: its DATA arrives as a blocking temp file whose
+ * reads never return 0, so the first save_continue drains it to EOF and
+ * encrypts inside that call.
  *
  * Fail-closed: a non-zero exit status (missing key, gpg error, the process
  * killed mid-write) aborts the save before the wrapped save_begin runs, so
@@ -67,27 +69,24 @@ static MODULE_CONTEXT_DEFINE_INIT(kyriakon_mailbox_module,
 				  &mail_storage_module_register);
 
 /* The input can be a non-blocking client socket (IMAP APPEND): a 0 read means
- * "nothing yet", and the ioloop has to run before there can be more. */
+ * "nothing yet", and the ioloop has to run before there can be more. The
+ * status mapping itself lives in encrypt-save.c, where the test drives it. */
 static int
 kyriakon_pull_input(void *context, const unsigned char **data_r, size_t *size_r,
 		    char *error, size_t error_size)
 {
 	struct kyriakon_save_ctx *sctx = context;
+	const char *read_error = NULL;
 	int ret;
 
 	ret = i_stream_read(sctx->input);
 	if (ret > 0) {
 		*data_r = i_stream_get_data(sctx->input, size_r);
 		i_stream_skip(sctx->input, *size_r);
-		return KYRIAKON_SAVE_PULL_DATA;
+	} else if (ret < -1) {
+		read_error = i_stream_get_error(sctx->input);
 	}
-	if (ret == 0)
-		return KYRIAKON_SAVE_PULL_WAIT;
-	if (ret == -1)
-		return KYRIAKON_SAVE_PULL_EOF;
-	snprintf(error, error_size, "read input: %s",
-		 i_stream_get_error(sctx->input));
-	return KYRIAKON_SAVE_PULL_ERROR;
+	return kyriakon_save_pull(ret, read_error, error, error_size);
 }
 
 static bool
@@ -255,7 +254,7 @@ kyriakon_mail_save_begin(struct mail_save_context *ctx, struct istream *input)
 	sctx->input = input;
 	i_stream_ref(input);
 	kyriakon_save_begin(&sctx->save, &kyriakon_save_ops, sctx,
-			    kyriakon_pull_input, kyriakon_encrypt_input, sctx);
+			    kyriakon_pull_input, kyriakon_encrypt_input);
 	return 0;
 }
 

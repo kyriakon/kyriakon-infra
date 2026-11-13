@@ -66,8 +66,9 @@ test: test-encrypt-run test-fake-encryptor
 
 test-encrypt-run: test-encrypt-run.c encrypt-run.c encrypt-run.h \
 		encrypt-save.c encrypt-save.h
-	${CC} -std=c99 -Wall -Wextra -Werror -o test-encrypt-run \
-		test-encrypt-run.c encrypt-run.c encrypt-save.c
+	${CC} -std=c99 -Wall -Wextra -Werror \
+		-DKYRIAKON_SAVE_PLAIN_MAX=4096 \
+		-o test-encrypt-run test-encrypt-run.c encrypt-run.c encrypt-save.c
 
 test-fake-encryptor: test-fake-encryptor.c
 	${CC} -std=c99 -Wall -Wextra -Werror -o test-fake-encryptor \
