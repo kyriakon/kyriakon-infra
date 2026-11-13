@@ -72,3 +72,4 @@ reload-smtpd.sh	drain	-
 reload-spamd.sh	drain	-
 member-git-shell.sh	drain	-
 member-git-shell.sh	/usr/local/libexec	-
+filter-fromcheck.sh	/usr/local/libexec	-
