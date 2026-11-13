@@ -154,9 +154,9 @@ pub async fn filed_application(
     .await?;
 
     // The same subject shape as every other operator mail: the component, then
-    // the event, with the application named in it. The token stays because it is
-    // the one thing in this mail that is not written out anywhere in the body,
-    // and two applications from one username differ only by it.
+    // the event, with the application named in it. The token stays because two
+    // applications from one username differ only by it, so the mailbox list is
+    // where the operator can tell them apart before opening either.
     let subject = notice::operator_subject(
         "control",
         &format!(
@@ -244,9 +244,14 @@ fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String,
     // look like the reliable one.
     let username = &intent.application.username;
     out.push_str("\nFrom a terminal\n");
-    out.push_str(&format!("  kyriakon-admin approve {username}\n"));
-    out.push_str(&format!("  kyriakon-admin approve-free {username}\n"));
-    out.push_str(&format!("  kyriakon-admin decline {username}\n"));
+    // The token is part of the command, not decoration: the console signs for
+    // the application this token names, so a second application filed under the
+    // same username cannot be what the terminal decision signs.
+    out.push_str(&format!("  kyriakon-admin approve {username} {token}\n"));
+    out.push_str(&format!(
+        "  kyriakon-admin approve-free {username} {token}\n"
+    ));
+    out.push_str(&format!("  kyriakon-admin decline {username} {token}\n"));
     out.push_str(
         "\nOr by link, which works once. Each is 140 characters and the signature\n\
          is at the end, so a mail client that wraps a long line cuts it at the\n\

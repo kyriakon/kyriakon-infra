@@ -171,7 +171,7 @@ kyriakon-admin ledger export --tax-year 2026-27 --format csv
 
 The window extension is the one case the operator answers on the member's word. The refund is the command; posting the money, or issuing the Stripe refund, or sending the Monero, is the human step that follows it, and the operator records the settlement with `kyriakon-admin refund --settled <date>` on the same line. `token resend` repeats the payment instructions without issuing anything new. The ledger export is the year's file for the accountant, and it contains tokens, amounts, dates, rates and refund bases, and no usernames. A refund is filtered by `settled_on`, the cash-basis payout date, not by the day the refund was filed; a refund with no settlement date is listed apart rather than counted as negative revenue.
 
-The commands that already exist for the lifecycle are unchanged: `kyriakon-admin approve`, `kyriakon-admin decline`, `kyriakon-admin suspend`, `kyriakon-admin delete`. `delete` is the one that matters here, because removing the account's token index entry is what makes the ledger unlinkable, and it happens in the same transition that removes the mailbox.
+The lifecycle commands are the ones that already exist, with a decision naming the application: `kyriakon-admin approve <username> <token>`, `kyriakon-admin decline <username> <token>`, `kyriakon-admin suspend <username>`, `kyriakon-admin delete <username>`. `delete` is the one that matters here, because removing the account's token index entry is what makes the ledger unlinkable, and it happens in the same transition that removes the mailbox.
 
 Two human steps have no command. Opening the post and banking the cash is one, and holding the Monero is the other: the platform receives XMR and does not convert it, so the operator decides when, and whether, to sell. HMRC treats business income paid in cryptoassets as trading income and taxes what the holder does with it, so the ledger's record of the receipt rate is what the eventual disposal is measured against (CRYPTO40350 and CRYPTO40100, read on 2026-10-01). Whether a disposal is taxed as trading or as a capital gain is the accountant's question, and it is out of scope here.
 
@@ -227,7 +227,7 @@ Notices are recorded before they are enqueued, and a crash between the record an
 
 | Step | Who | What they run |
 |---|---|---|
-| Approve, approve without charge, or decline | operator | the signed link in the email, or `kyriakon-admin approve <username>`, `kyriakon-admin decline <username>` |
+| Approve, approve without charge, or decline | operator | the signed link in the email, or `kyriakon-admin approve <username> <token>`, `kyriakon-admin decline <username> <token>` |
 | Open the post | operator | no command; the date the envelope was opened is the credit's `--received` |
 | Record a posted cash payment | operator | `kyriakon-admin credit --token <t> --rail cash --amount <gbp> --received <date>` |
 | Record cash handed over | operator | `kyriakon-admin credit --username <u> --rail cash-hand --amount <gbp> --received <date>` |

@@ -293,6 +293,14 @@ the store, not that mailbox. The drain purges `accounts/<username>/application.j
 and `applications/<token>.json` when the window ends, and it cannot reach a message
 already delivered as ordinary mail.
 
+The terminal form the mail prints names the application by its token:
+`kyriakon-admin approve <username> <token>`, and the same for `approve-free` and
+`decline`. The console signs the application that token names and refuses the
+command when the record's username differs, so a second application filed for the
+same name between the mail and the terminal is never what gets signed. Take the
+token from the review mail. `kyriakon-admin show <username>` prints only the newest
+application, so it cannot say which one the operator is deciding.
+
 Prune the review mail by hand. Delete each `Subject: kyriakon: control: application
 filed (...)` message from `admin@kyriakon.net` once the decision is made, and no
 later than the 90th day after the application was filed. The first exclusion in

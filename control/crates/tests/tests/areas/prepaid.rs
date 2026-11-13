@@ -2211,9 +2211,9 @@ fn a_second_application_does_not_reuse_the_first_approvals_payment() {
         "the first approval opened a window: {ledger}"
     );
 
-    // The same person applies again, later, and that application is approved.
-    // One day later than the fixture's first application, so the console's
-    // newest-wins lookup reaches this one, and still inside the purge window.
+    // The same person applies again, later, and that application is the one the
+    // operator names. One day later than the fixture's first application, so a
+    // newest-wins lookup would reach this one, and still inside the purge window.
     let second = json!({
         "username": "secretary",
         "status_token": OTHER_TOKEN,
@@ -2242,9 +2242,9 @@ fn a_second_application_does_not_reuse_the_first_approvals_payment() {
     .unwrap();
     fix.file_application(&second);
     fix.drain();
-    // The console looks the application up by username and takes the newest, which
-    // is how the operator reaches a second application for one person.
-    let out = fix.ctl(&["approve", "secretary"]);
+    // The console signs the application the command names by token, which here
+    // is the second application for one person.
+    let out = fix.ctl(&["approve", "secretary", OTHER_TOKEN]);
     assert!(out.status.success(), "{}", body(&out));
     assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
     let out = fix.drain();

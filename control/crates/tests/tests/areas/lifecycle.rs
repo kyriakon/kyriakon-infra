@@ -47,15 +47,17 @@ fn a_filed_application_produces_one_review_email() {
     assert!(sent.contains("action=approve-free&"), "{sent}");
     assert!(sent.contains("action=decline&"), "{sent}");
     assert!(
-        sent.contains("\n  kyriakon-admin approve secretary\n"),
+        sent.contains(&format!("\n  kyriakon-admin approve secretary {TOKEN}\n")),
         "{sent}"
     );
     assert!(
-        sent.contains("\n  kyriakon-admin approve-free secretary\n"),
+        sent.contains(&format!(
+            "\n  kyriakon-admin approve-free secretary {TOKEN}\n"
+        )),
         "{sent}"
     );
     assert!(
-        sent.contains("\n  kyriakon-admin decline secretary\n"),
+        sent.contains(&format!("\n  kyriakon-admin decline secretary {TOKEN}\n")),
         "{sent}"
     );
     // Each decision link is on a line of its own, so a client that wraps at a
@@ -667,7 +669,7 @@ fn admin_files_a_decision_and_shows_the_application() {
     let fix = Fix::new("ctl");
     let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
 
-    let out = fix.ctl(&["approve", "secretary"]);
+    let out = fix.ctl(&["approve", "secretary", TOKEN]);
     assert!(out.status.success(), "{}", body(&out));
     assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
     let intent: Value =
@@ -692,7 +694,7 @@ fn admin_files_a_decision_and_shows_the_application() {
         for name in fix.intents() {
             std::fs::remove_file(fix.dir.join("store/intents").join(name)).unwrap();
         }
-        let out = fix.ctl(&[verb, "secretary"]);
+        let out = fix.ctl(&[verb, "secretary", TOKEN]);
         assert!(out.status.success(), "{}", body(&out));
         let names = fix.intents();
         assert_eq!(names.len(), 1, "{}", body(&out));
@@ -706,11 +708,86 @@ fn admin_files_a_decision_and_shows_the_application() {
     assert!(text.contains("application secretary"), "{text}");
     assert!(text.contains("cash"), "{text}");
 
-    // A verb the console does not know is refused, and an unknown username
-    // names nothing.
+    // A verb the console does not know is refused, and a username the token
+    // does not name is refused.
     assert!(!fix.ctl(&["purge", "secretary"]).status.success());
-    assert!(!fix.ctl(&["approve", "nobody"]).status.success());
+    assert!(!fix.ctl(&["approve", "nobody", TOKEN]).status.success());
+    // A decision without a token is refused: the console will not guess which
+    // application the operator read.
+    assert!(!fix.ctl(&["approve", "secretary"]).status.success());
+    // A malformed token is refused, and so is a well-formed one naming no
+    // record: neither signs an application, and neither files an intent.
+    let out = fix.ctl(&["approve", "secretary", "not-a-token"]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("not a status token"), "{}", body(&out));
+    let absent = "zzzzzzzzzzzzzzzzzzzzzzzzzz";
+    let out = fix.ctl(&["approve", "secretary", absent]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(
+        body(&out).contains(&format!("no application at token {absent}")),
+        "{}",
+        body(&out)
+    );
+    assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
     let _ = record;
+}
+
+/// A decision signs the application its token names, not whichever application
+/// was filed last for the username. Anyone can file a second application between
+/// the review mail and the terminal, and signing that one would approve facts
+/// nobody reviewed: its no-charge answer, its domain and its mail keys.
+#[test]
+fn a_decision_signs_the_application_its_token_names() {
+    let fix = Fix::new("ctl-token");
+    let first = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    // A second application for the same name, filed later, asking for no charge
+    // and naming an own domain: approving it would be a free account on the
+    // attacker's keys.
+    let mut second = first.clone();
+    second["status_token"] = json!(OTHER_TOKEN);
+    second["filed_at"] = json!(kyriakon_control_core::util::filed_at());
+    second["rail"] = json!("no_charge");
+    second["no_charge"] = json!(true);
+    second["domain"] = json!("attacker.example");
+    std::fs::write(
+        fix.dir
+            .join(format!("store/applications/{OTHER_TOKEN}.json")),
+        serde_json::to_vec_pretty(&second).unwrap(),
+    )
+    .unwrap();
+
+    // The command names the first application, and the intent carries its token
+    // even though the second is newer.
+    let out = fix.ctl(&["approve", "secretary", TOKEN]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
+    let intent: Value =
+        serde_json::from_str(&fix.read(&format!("intents/{}", fix.intents()[0]))).unwrap();
+    assert_eq!(intent["application"]["status_token"], json!(TOKEN));
+    assert_eq!(intent["action"], json!("approve"));
+    let sig = intent["sig"].as_str().unwrap();
+    assert!(
+        sign::verify(
+            b"the approval key",
+            &sign::decide_payload(TOKEN, "approve"),
+            sig
+        ),
+        "{intent}"
+    );
+    // The second application is untouched: no decision was recorded on it.
+    let untouched: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{OTHER_TOKEN}.json"))).unwrap();
+    assert!(untouched.get("decided_at").is_none(), "{untouched}");
+
+    // A token that names a different username is refused, and files nothing.
+    let out = fix.ctl(&["approve", "alice", OTHER_TOKEN]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(
+        body(&out).contains("is for secretary, not alice"),
+        "{}",
+        body(&out)
+    );
+    assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
 }
 
 /// A decline purges nothing on the first run; the run after its week clears the
@@ -3135,7 +3212,7 @@ fn a_corrupt_application_record_is_named_by_show_and_approve() {
     )
     .unwrap();
 
-    for args in [["show", "alice"], ["approve", "alice"]] {
+    for args in [vec!["show", "alice"], vec!["approve", "alice", TOKEN]] {
         let out = fix.ctl(&args);
         let text = body(&out);
         assert!(!out.status.success(), "{}: {text}", args.join(" "));
