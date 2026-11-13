@@ -119,6 +119,9 @@ pub enum Rule {
     UploadKey,
     Choice(Vec<Choice>),
     MaxLen(usize),
+    /// One line of text, with no control character in it: a value the capsule
+    /// prints into gemtext cannot carry a line break of its own.
+    SingleLine,
 }
 
 impl Rule {
@@ -131,6 +134,7 @@ impl Rule {
             "domain" => Rule::Domain,
             "mail-key" => Rule::MailKey,
             "upload-key" => Rule::UploadKey,
+            "single-line" => Rule::SingleLine,
             other => match other.strip_prefix("maxlen:") {
                 Some(n) => Rule::MaxLen(
                     n.parse()
@@ -471,6 +475,12 @@ choices = [
     fn maxlen_carries_its_number() {
         let t = SAMPLE.replace("validation = \"username\"", "validation = \"maxlen:12\"");
         assert_eq!(parse(&t).unwrap()[0].rule, Rule::MaxLen(12));
+    }
+
+    #[test]
+    fn single_line_is_a_named_rule() {
+        let t = SAMPLE.replace("validation = \"username\"", "validation = \"single-line\"");
+        assert_eq!(parse(&t).unwrap()[0].rule, Rule::SingleLine);
     }
 
     /// The tracked file, read at compile time, so a malformed commit of the data

@@ -67,6 +67,13 @@ pub fn reason(
         Rule::UploadKey => keycheck::openssh_public_key(v).err().map(|e| e.to_string()),
         Rule::Choice(opts) => choice(opts, v),
         Rule::MaxLen(n) => (v.chars().count() > *n).then(|| format!("at most {n} characters")),
+        // The raw value, not the trimmed one: a trailing newline would be cut
+        // by `trim` and land on the record anyway. The capsule prints this
+        // answer as gemtext, where a line break starts a line of its own.
+        Rule::SingleLine => value
+            .chars()
+            .any(char::is_control)
+            .then(|| format!("{} is one line, without control characters", q.prompt)),
     }
 }
 
@@ -333,6 +340,31 @@ mod tests {
             rule: Rule::MailKey,
         };
         assert!(reason(&q, "", &name(), true).is_some());
+    }
+
+    /// A one-line answer cannot carry a line break or an escape sequence onto
+    /// the record, because the capsule prints it into gemtext unchanged.
+    #[test]
+    fn a_single_line_answer_refuses_control_characters() {
+        let q = Question {
+            id: "body_name".into(),
+            prompt: "The body's name".into(),
+            kind: Kind::Text,
+            branch: Branch::Body,
+            required: true,
+            rule: Rule::SingleLine,
+        };
+        assert!(reason(&q, "Parish of Example", &name(), true).is_none());
+        let why = reason(&q, "Parish\n=> https://evil.example/", &name(), true)
+            .expect("a newline is refused");
+        assert!(
+            why.contains("one line, without control characters"),
+            "{why}"
+        );
+        assert!(why.contains("The body's name"), "{why}");
+        for hostile in ["Parish\rX", "Parish\u{1b}X", "Parish\tX", "Parish\u{7}X"] {
+            assert!(reason(&q, hostile, &name(), true).is_some(), "{hostile:?}");
+        }
     }
 
     #[test]

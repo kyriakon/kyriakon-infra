@@ -49,6 +49,7 @@ prompt = "The body's name"
 type = "text"
 branch = "body"
 required = true
+validation = "single-line"
 
 [[question]]
 id = "body_kind"
