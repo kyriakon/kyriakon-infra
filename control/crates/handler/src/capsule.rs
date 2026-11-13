@@ -284,7 +284,11 @@ pub fn account(
     if let Some(g) = group {
         out.push_str(&format!(
             "## Your body\n\n{} ({}) on {}.\nState: {}. Rail: {}.\n",
-            g.name, g.kind, g.domain, g.state, g.rail
+            one_line(&g.name),
+            g.kind,
+            g.domain,
+            g.state,
+            g.rail
         ));
         if let Some(until) = &g.paid_until {
             out.push_str(&format!("Paid until {until}.\n"));
@@ -432,10 +436,27 @@ fn date(at: &str) -> &str {
     at.get(..10).unwrap_or(at)
 }
 
+/// Free text as one gemtext line. The web page escapes a value through askama;
+/// the capsule has no such layer, so a newline in a name would start a line of
+/// its own, where `=>` is a link and `#` a heading in the platform's voice. A
+/// control character becomes a space, and a value that would open with a
+/// gemtext construct is indented out of the first column.
+fn one_line(text: &str) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if flat.starts_with("=>") || matches!(flat.chars().next(), Some('#' | '*' | '>' | '`')) {
+        format!(" {flat}")
+    } else {
+        flat
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::page::StatusPage;
+    use crate::page::{GroupView, StatusPage};
 
     #[test]
     fn the_front_page_names_the_web_form_and_the_pages_that_stay_https() {
@@ -665,6 +686,48 @@ mod tests {
         record.space_used = None;
         let text = account(&record, &[], None, None, None);
         assert!(text.contains("Space used: not recorded yet"), "{text}");
+    }
+
+    /// A body's name is applicant free text and the capsule has no escaping
+    /// layer under it, so a newline must not become a line of the platform's
+    /// own: `=>` there is a link and `##` a heading.
+    #[test]
+    fn a_group_name_starts_no_gemtext_line() {
+        let group: kyriakon_control_core::store::GroupRecord = serde_json::from_value(
+            serde_json::json!({
+                "version": 1,
+                "domain": "parish.example",
+                "name": "Parish of X\n=> https://evil.example/renew Renew now\n## This account is suspended",
+                "kind": "parish",
+                "payment": {
+                    "rail": "cash",
+                    "no_charge": true,
+                    "token_ref": null,
+                    "window": null,
+                    "paid_until": null
+                },
+                "accounts": ["parish-secretary"],
+                "site_owner": "parish-secretary"
+            }),
+        )
+        .expect("a group record the store could hold");
+        let view = GroupView::from_record(&group);
+        let text = account(&member(), &[], None, None, Some(&view));
+        assert!(
+            !text.lines().any(|line| line.starts_with("=>")),
+            "the name starts no link line: {text}"
+        );
+        assert!(
+            !text.lines().any(|line| line.starts_with("## This")),
+            "the name starts no heading: {text}"
+        );
+        assert!(
+            text.contains(
+                "Parish of X => https://evil.example/renew Renew now ## This account is suspended \
+                 (parish) on parish.example."
+            ),
+            "the name is still visible as one line: {text}"
+        );
     }
 
     #[test]
