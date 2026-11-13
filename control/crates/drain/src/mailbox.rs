@@ -5,9 +5,11 @@
 //! path, because the drain has to read the key to file it and zero-access mail
 //! is exactly what it cannot read. Each pass reads `mail/new`, files whatever
 //! key the message carries against the draft named in its subject, and deletes
-//! the message. A message that carries no key block is not answered; one whose
-//! token no longer resolves gets one reply with a fresh link, rate-limited per
-//! sender so the address cannot become a backscatter source.
+//! the message. A message that carries no key block, no token, or a token that
+//! names no live draft is dropped unanswered. A live draft is the only thing
+//! that names an address to reply to: smtpd authenticates neither the envelope
+//! sender nor the From header, so a stranger's From is never a reply target and
+//! the address cannot become a backscatter source.
 //!
 //! The parser is deliberately small: headers, multipart, and the two transfer
 //! encodings a mail client uses for an armoured block. Anything it cannot read
@@ -28,10 +30,10 @@ use kyriakon_control_core::store::Store;
 
 const BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
 const END: &str = "-----END PGP PUBLIC KEY BLOCK-----";
-/// One reply per sender per day. The spec's requirement is that the address is
-/// not a backscatter source; a day is long enough that a second mail from the
-/// same applicant is not answered twice and short enough that a genuine retry
-/// the next day is.
+/// One reply per address per day. Only a live draft's recorded address is ever
+/// answered, and a day is long enough that a second mail from the same
+/// applicant is not answered twice and short enough that a genuine retry the
+/// next day is.
 const REPLY_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 const REPLY_SUBJECT: &str = "Your Kyriakon application key";
 
@@ -98,7 +100,8 @@ pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<
 /// whether that was files, refuse or ignore. A live token files the key even
 /// when From is empty, unless the draft recorded an address outside the
 /// platform: then the mail must come from that address, and a message with no
-/// usable From is refused with nothing to reply to.
+/// usable From is refused with nothing to reply to. A message with no token, or
+/// one whose token names no live draft, has no address to answer: it is dropped.
 async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
     let message = Message::parse(raw);
     let blocks = labelled_blocks(&message.body);
@@ -106,37 +109,42 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
         return Ok(());
     }
     let Some(token) = token_in_subject(&message.subject) else {
-        return reply_or_drop(cfg, store, &message, &restart_body()).await;
+        return Ok(());
     };
     let lock = store.lock("drafts/.lock").await?;
     let Some(mut draft) = draft::load(store, &token).await? else {
         drop(lock);
-        return reply_or_drop(cfg, store, &message, &restart_body()).await;
+        return Ok(());
     };
+    // The only address a reply may go to: the one this live draft recorded.
+    // smtpd authenticates neither an inbound envelope sender nor the From
+    // header, so a stranger can write any address there and a reply to it would
+    // make the address a backscatter source. A draft that recorded none gets no
+    // reply; the status page carries the outcome.
+    let recorded = draft
+        .answers
+        .get("address_outside")
+        .filter(|address| !address.is_empty())
+        .cloned();
     // A draft that recorded an address outside the platform takes a mailed key
     // only from that address. Anyone who learns the token could otherwise
     // replace the key, and the approval would encrypt the account's future mail
     // to the attacker. A draft with no such address keeps the old rule: the
     // portal's applicant has no address to compare against.
-    if let Some(outside) = draft
-        .answers
-        .get("address_outside")
-        .map(String::as_str)
-        .filter(|address| !address.is_empty())
-    {
+    if let Some(outside) = recorded.as_deref() {
         let same = message
             .reply_address()
             .is_some_and(|from| from.eq_ignore_ascii_case(outside));
         if !same {
             drop(lock);
-            return reply_or_drop(cfg, store, &message, &sender_mismatch_body()).await;
+            return reply_or_drop(cfg, store, recorded.as_deref(), &sender_mismatch_body()).await;
         }
     }
     let keys = match assign(&blocks, &draft) {
         Ok(keys) => keys,
         Err(missing) => {
             drop(lock);
-            return reply_or_drop(cfg, store, &message, &missing_body(&missing.0)).await;
+            return reply_or_drop(cfg, store, recorded.as_deref(), &missing_body(&missing.0)).await;
         }
     };
     // A mailed key takes the same refusal as the typed form: approval would
@@ -146,7 +154,7 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
         if let Some(why) = kyriakon_control_core::flow::applicant::key_error(material) {
             drop(lock);
             let body = format!("The key for {mailbox} cannot be used:\n{why}\n");
-            return reply_or_drop(cfg, store, &message, &body).await;
+            return reply_or_drop(cfg, store, recorded.as_deref(), &body).await;
         }
     }
     // A draft holds one key per mailbox, and a person's key is filed under no
@@ -207,21 +215,22 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
              The approval mail names who to contact if it is wrong.\n",
             names.join(", ")
         );
-        return reply_or_drop(cfg, store, &message, &body).await;
+        return reply_or_drop(cfg, store, recorded.as_deref(), &body).await;
     }
     Ok(())
 }
 
-/// Answer the sender when there is one to answer. A message with no usable From
-/// still gets its key filed, but there is nowhere to send a refusal.
+/// Send a reply only to the address the live draft recorded. There is nothing
+/// else to answer: smtpd authenticates neither an inbound envelope sender nor
+/// the From header, so a stranger's From is never a reply target.
 async fn reply_or_drop(
     cfg: &DrainConfig,
     store: &Store,
-    message: &Message,
+    to: Option<&str>,
     body: &str,
 ) -> Result<(), Error> {
-    match message.reply_address() {
-        Some(from) => reply(cfg, store, &from, body).await,
+    match to {
+        Some(to) => reply(cfg, store, to, body).await,
         None => Ok(()),
     }
 }
@@ -454,18 +463,9 @@ async fn reply(cfg: &DrainConfig, store: &Store, sender: &str, body: &str) -> Re
         .map_err(Error::from)
 }
 
-fn restart_body() -> String {
-    format!(
-        "The application this key belongs to has closed, or the subject carried no \
-         application token, so the key was not filed.\n\n\
-         Start again here, and keep the new link:\n\n\
-         gemini://{HOST}/apply\n"
-    )
-}
-
-/// The refusal for a key mailed from another address. It never names the
-/// recorded address: the sender is whoever holds the token, not necessarily the
-/// applicant.
+/// The refusal for a key mailed from another address, sent to the address the
+/// draft recorded. It never names the sender: the sender is whoever holds the
+/// token, not necessarily the applicant.
 fn sender_mismatch_body() -> String {
     format!(
         "The key was not filed: the message did not come from the address this \
