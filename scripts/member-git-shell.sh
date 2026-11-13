@@ -5,7 +5,9 @@
 # /usr/local/libexec/member-git-shell.sh, and named as the shell capability of
 # the member login class in openbsd/etc/login.conf.d/member. sshd runs a
 # session's login shell as `shell -c '<client command>'` (session.c do_child()),
-# so this program receives exactly what a `git push` or `git fetch` sends.
+# so this program receives exactly what a `git push` or `git fetch` sends. An
+# external subsystem request arrives the same way: session_subsystem_req() passes
+# the Subsystem command to do_exec(), and do_child() execs the shell with it.
 #
 # Why not git-shell(1) itself. git-shell parses `-c` and re-execs
 # git-receive-pack or git-upload-pack with the client's path verbatim, so a
@@ -53,9 +55,20 @@
 # channel for an account with no shell, so dropping upload-archive from the
 # allowlist is what closes it. It stays because the per-member hosting spec
 # names the verb, and changing the allowlist is a spec change, not a fix here.
+# Why the ForceCommand mode. Port 2222's block carries a ForceCommand of this
+# wrapper, which states the port's boundary in sshd_config rather than leaving it
+# to the login class. sshd runs the forced command through the login shell with
+# `-c '<forced string>'` (do_exec() and do_child()), and this script is that shell,
+# so the argument is the literal string sshd_config names,
+# `/usr/local/libexec/member-git-shell.sh --force`. The client's own command,
+# including a subsystem's command line, is in SSH_ORIGINAL_COMMAND. An sftp
+# session on 2222 is refused as a non-git command whether its request was replaced
+# by the ForceCommand or handed to the login shell directly, and a git push
+# reaches the allowlist, path and git-config checks below unchanged.
 #
 # Usage (sshd does this; a human only runs --self-test):
 #   member-git-shell.sh -c "git-receive-pack '/home/<user>/repos/<name>.git'"
+#   member-git-shell.sh -c "/usr/local/libexec/member-git-shell.sh --force"
 #   member-git-shell.sh --self-test
 
 set -euo pipefail
@@ -79,6 +92,23 @@ usage() {
 die() {
 	printf 'kyriakon git shell: %s\n' "$*" >&2
 	exit 1
+}
+
+# client_command <argv>: print the command the session asked to run. sshd runs
+# this script as the login shell with `-c <command>`. When a forced command is in
+# effect, do_exec() replaces that command with the forced string and records the
+# client's own command in SSH_ORIGINAL_COMMAND, so the variable wins when it is
+# set. Without one it is unset, and the -c argument is the client's command. Every
+# form ends at run_command below, so an sftp subsystem request, whose command is
+# /usr/libexec/sftp-server, is refused there like any other non-git command.
+client_command() {
+	case "${1:-}" in
+	-c)
+		[ "$#" -eq 2 ] || usage
+		printf '%s\n' "${SSH_ORIGINAL_COMMAND:-$2}"
+		;;
+	*) usage ;;
+	esac
 }
 
 # canonical <path>: the path with every symlink resolved, printing it. `pwd -P`
@@ -279,6 +309,41 @@ EOF
 	check "the global config hook did not run" \
 		"$([ -e "$tree/global-hook-ran" ] && printf yes || printf no)" no
 
+	# sshd runs a session through the login shell with `-c <command>`. A forced
+	# command puts the literal from sshd_config in that argument and the client's
+	# own command in SSH_ORIGINAL_COMMAND; without one, the -c argument is the
+	# client's command. The literal is the one sshd_config carries, not a path made
+	# from this checkout's $0, and the forced calls run from the member's home the
+	# way sshd does after do_child() chdirs there. An sftp subsystem request puts
+	# /usr/libexec/sftp-server in that variable, and the allowlist must refuse it
+	# rather than let a server start; a git request must pass the same gate the
+	# login shell does.
+	forced='/usr/local/libexec/member-git-shell.sh --force'
+	SSH_ORIGINAL_COMMAND=/usr/libexec/sftp-server
+	rc=0
+	out=$( (cd "$home" && run_command "$(client_command -c "$forced")") 2>&1) || rc=$?
+	check "a forced sftp subsystem request is refused as a non-git command" \
+		"$rc/$out" \
+		'1/kyriakon git shell: refusing a command that is not git-receive-pack, git-upload-pack or git-upload-archive'
+	SSH_ORIGINAL_COMMAND="git-upload-pack '$home/repos/pass.git'"
+	rm -f "$tree/git.argv" "$tree/git.env"
+	rc=0
+	(cd "$home" && run_command "$(client_command -c "$forced")") >/dev/null 2>&1 || rc=$?
+	check "a forced upload-pack reaches the allowlist" "$rc" 0
+	check "and hands git the confined path for the forced upload-pack" \
+		"$(cat "$tree/git.argv" 2>/dev/null)" \
+		"-c core.hooksPath=/dev/null -c core.fsmonitor=false upload-pack $home/repos/pass.git"
+	# No forced command: sshd sets no SSH_ORIGINAL_COMMAND, so the -c argument is
+	# the one that runs.
+	unset SSH_ORIGINAL_COMMAND
+	rm -f "$tree/git.argv" "$tree/git.env"
+	rc=0
+	(run_command "$(client_command -c "git-receive-pack '$home/repos/pass.git'")") >/dev/null 2>&1 || rc=$?
+	check "an unforced push reaches the allowlist" "$rc" 0
+	check "and hands git the confined path for the unforced push" \
+		"$(cat "$tree/git.argv" 2>/dev/null)" \
+		"-c core.hooksPath=/dev/null -c core.fsmonitor=false receive-pack $home/repos/pass.git"
+
 	self_test_end
 }
 
@@ -289,7 +354,7 @@ case "${1:-}" in
 	;;
 esac
 
-[ "$#" -eq 2 ] && [ "$1" = -c ] || usage
+cmd=$(client_command "$@")
 
 user=$(id -un) || die "cannot find the account name"
 home=$(getent passwd "$user" 2>/dev/null | awk -F: 'NR == 1 { print $6 }')
@@ -298,4 +363,4 @@ home=$(getent passwd "$user" 2>/dev/null | awk -F: 'NR == 1 { print $6 }')
 home=$(canonical "$home") || die "refusing: $home is not a directory"
 
 [ -x "$git" ] || die "no git at $git"
-run_command "$2"
+run_command "$cmd"

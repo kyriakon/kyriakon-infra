@@ -503,11 +503,15 @@ ensure_mail_address
 # --- the session shell, from the login class --------------------------------
 #
 # One account carries both sessions and the port decides which. Port 22's block
-# forces internal-sftp, which sshd runs in process before it reads any shell, and
-# 2222 has no forced command, so a push arrives there as
-# `member-git-shell.sh -c '<client command>'`. That shell comes from the account's
-# login class rather than from the password entry: auth.c sets
-# lc = login_getclass(pw->pw_class), and session.c's do_child() takes
+# forces internal-sftp, which sshd runs in process before it reads any shell.
+# Every other session runs through the login shell with -c, an external subsystem
+# request included: session_subsystem_req() hands the Subsystem command to
+# do_exec(), and do_child() execs the shell with it. Port 2222 also carries a
+# ForceCommand of the wrapper, so a push arrives there as
+# `member-git-shell.sh -c '<wrapper> --force'` with the client's command in
+# SSH_ORIGINAL_COMMAND, and an sftp request is refused either way. That shell
+# comes from the account's login class rather than from the password entry: auth.c
+# sets lc = login_getclass(pw->pw_class), and session.c's do_child() takes
 # login_getcapstr(lc, "shell", pw_shell, pw_shell) before it execs anything. So
 # the entry keeps /sbin/nologin, which is the platform's core safety property,
 # and 2222 runs the confined shell all the same.

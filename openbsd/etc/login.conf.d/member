@@ -10,9 +10,11 @@
 # The account's password entry keeps /sbin/nologin. sshd takes the session shell
 # from the class instead: auth.c sets lc = login_getclass(pw->pw_class), and
 # session.c's do_child() takes shell = login_getcapstr(lc, "shell", pw_shell,
-# pw_shell) and execs the session's command through it. So a push over port 2222
-# arrives as `member-git-shell.sh -c '<client command>'` while the account has no
-# shell of its own in /etc/master.passwd.
+# pw_shell) and execs the session's command through it. Port 2222 also carries
+# ForceCommand, so a push arrives as
+# `member-git-shell.sh -c '/usr/local/libexec/member-git-shell.sh --force'` with
+# the client's command in SSH_ORIGINAL_COMMAND, while the account has no shell of
+# its own in /etc/master.passwd.
 #
 # The port 22 upload session is unaffected by this class. Its block carries
 # ForceCommand internal-sftp, and do_exec() sets is_subsystem =
