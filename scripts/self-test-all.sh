@@ -32,11 +32,9 @@ unset ALERT_EMAIL
 # deliberate edit. lib.sh and provision-member.sh are absent because their
 # table-writing helpers have tests of their own.
 self_test_optional="
-add-user.sh
 backup.sh
 deploy-nsd.sh
 gen-finger-page.sh
-control-store.sh
 rehearsal.sh
 rekey-mail-key.sh
 renew-acme.sh

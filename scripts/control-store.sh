@@ -50,10 +50,8 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "$0")" && pwd)
 repo_dir=$(cd "$script_dir/.." && pwd)
 
-if [ "$#" -ne 0 ]; then
-	printf 'usage: doas ksh %s\n' "$0" >&2
-	exit 2
-fi
+# The arguments are checked below, after the functions: --self-test has to
+# reach self_test(), and the live run takes none.
 
 store='/var/db/onboard'
 drain_conf='/etc/kyriakon/onboard'
@@ -91,6 +89,11 @@ assert_mode() {
 # store_dir <name> <owner> <group> <mode>: create one directory under the store
 # and assert it at once, so the assertion cannot be forgotten for a later entry.
 store_dir() {
+	# install -d follows a final symlink, and the parent of some of these
+	# entries is owned by `_onboard`: a link planted there makes root chown
+	# and chmod the target (/etc/mail, /etc/ssl/private, the ledger) before
+	# the assertion below notices. Refuse it first, and never touch it.
+	[ -L "$store/$1" ] && fail "$store/$1 is a symlink; refusing to install through it"
 	# A missing directory, or one with the wrong owner, group or mode, is what
 	# this run is for; one already right changes nothing.
 	[ "$(stat -f '%Su %Sg %Lp' "$store/$1" 2>/dev/null)" = "$2 $3 $4" ] || changed=1
@@ -119,6 +122,38 @@ remove_legacy() {
 	rm -f "$1"
 	changed=1
 }
+
+# The guard's own check: a symlink planted at a store entry is refused, and the
+# target it points at keeps its mode. Runs as the invoking user in a scratch
+# store, so it needs no root and no box; the live call sites pass `_onboard` and
+# root, which a self-test cannot.
+self_test() {
+	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+	. "$script_dir/lib.sh"
+	self_test_begin
+	# shellcheck disable=SC2154 # set by self_test_begin
+	tree=$self_test_work
+	mkdir -p "$tree/target" "$tree/store"
+	chmod 0755 "$tree/target"
+	ln -s "$tree/target" "$tree/store/mail"
+	store=$tree/store
+	code=0
+	( store_dir mail "$(id -un)" "$(id -gn)" 0700 ) >/dev/null 2>"$tree/err" || code=$?
+	check "a symlinked store entry is refused" "$code" 1
+	check "and the target keeps its mode" "$(stat -f '%Lp' "$tree/target")" 755
+	check "the refusal names the link" \
+		"$(grep -c 'is a symlink' "$tree/err")" 1
+	self_test_end
+}
+
+case "${1:-}" in
+--self-test) self_test ;;
+'') ;;
+*)
+	printf 'usage: doas ksh %s\n' "$0" >&2
+	exit 2
+	;;
+esac
 
 # The account is the one thing here this script will not create. Print the line
 # rather than a description of it: the account is a reserved-uid one in the same

@@ -135,6 +135,13 @@ assert_shape() {
 ensure_dir() {
 	typeset path mode want
 	path="$1"
+	# install -d follows a final symlink, and the tree it descends is the
+	# member's own: a planted link would make root chown and chmod the target
+	# before the shape check below ran. Refuse it first, and never touch it.
+	[ -L "$path" ] && {
+		printf '%s is a symlink; refusing to install through it\n' "$path" >&2
+		exit 1
+	}
 	mode="$2"
 	# The names, not the ids: every call site names an owner and a group, and
 	# %Su/%Sg are what print those. %u/%g would print 0:0 beside "root:wheel".
@@ -378,6 +385,19 @@ self_test() {
 	( ensure_dir "$tree/dir" 0700 "$(id -un)" "$(id -gn)" ) >/dev/null 2>&1 || rc=$?
 	check "a drifted directory reports a change" "$rc" 0
 	check "and the mode is corrected" "$(stat -f '%Lp' "$tree/dir")" 700
+
+	# A planted symlink is refused before install runs. The rc alone cannot
+	# tell a refusal from "already right", so the message is what is asserted,
+	# beside the target's untouched mode.
+	mkdir "$tree/planted-target"
+	chmod 0755 "$tree/planted-target"
+	ln -s "$tree/planted-target" "$tree/planted"
+	rc=0
+	( ensure_dir "$tree/planted" 0700 "$(id -un)" "$(id -gn)" ) >/dev/null 2>"$tree/planted.err" || rc=$?
+	check "a symlinked directory is refused" "$rc" 1
+	check "and its target keeps its mode" "$(stat -f '%Lp' "$tree/planted-target")" 755
+	check "the refusal names the link" \
+		"$(grep -c 'is a symlink' "$tree/planted.err")" 1
 
 	self_test_end
 }

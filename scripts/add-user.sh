@@ -22,6 +22,46 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 # shellcheck disable=SC1091 # resolves at runtime from this script's directory
 . "$script_dir/lib.sh"
 
+# ensure_maildir_dir <path> <owner> <group>: one Maildir directory in the
+# account's shape. install -d follows a final symlink, and the home it descends
+# is the account's own: a link planted there would make root chown and chmod the
+# target, so refuse one before the install runs.
+ensure_maildir_dir() {
+	[ -L "$1" ] && {
+		printf '%s is a symlink; refusing to install through it\n' "$1" >&2
+		exit 1
+	}
+	install -d -m 0700 -o "$2" -g "$3" "$1"
+	chown "$2:$3" "$1"
+}
+
+# The guard's own check: a symlink planted at a Maildir entry is refused and its
+# target keeps its mode; a plain path is created 0700. Runs as the invoking
+# user, so it needs no root.
+self_test() {
+	self_test_begin
+	# shellcheck disable=SC2154 # set by self_test_begin
+	tree=$self_test_work
+	mkdir -p "$tree/target" "$tree/Maildir"
+	chmod 0755 "$tree/target"
+	ln -s "$tree/target" "$tree/Maildir/cur"
+	code=0
+	( ensure_maildir_dir "$tree/Maildir/cur" "$(id -un)" "$(id -gn)" ) >/dev/null 2>"$tree/err" || code=$?
+	check "a symlinked Maildir entry is refused" "$code" 1
+	check "and the target keeps its mode" "$(stat -f '%Lp' "$tree/target")" 755
+	check "the refusal names the link" \
+		"$(grep -c 'is a symlink' "$tree/err")" 1
+	code=0
+	( ensure_maildir_dir "$tree/Maildir/new" "$(id -un)" "$(id -gn)" ) >/dev/null 2>&1 || code=$?
+	check "a plain Maildir entry is created" "$code" 0
+	check "at 0700" "$(stat -f '%Lp' "$tree/Maildir/new")" 700
+	self_test_end
+}
+
+case "${1:-}" in
+--self-test) self_test ;;
+esac
+
 if [ "$#" -ne 1 ]; then
 	printf 'usage: %s <username>\n' "$0" >&2
 	exit 2
@@ -67,8 +107,7 @@ fi
 # account then authenticates, every service reports healthy, and each IMAP
 # session fails with "file_dotlock_create ... Permission denied".
 for d in "$home/Maildir" "$home/Maildir/cur" "$home/Maildir/new" "$home/Maildir/tmp"; do
-	install -d -m 0700 -o "$user" -g "$user" "$d"
-	chown "$user:$user" "$d"
+	ensure_maildir_dir "$d" "$user" "$user"
 done
 
 owner=$(stat -f '%Su' "$home/Maildir")
