@@ -168,6 +168,14 @@ from_problem() {
 				problem("5.7.1 the message has no From header")
 			exit
 		}
+		# An RFC 5322 comment may itself contain an address, so comments are
+		# removed before anything is read out of the header: otherwise the
+		# address in "hello@kyriakon.net (x <alice@kyriakon.net>)" would be the
+		# one in the comment, and the header own address never checked. To a
+		# fixpoint, innermost first, because comments nest.
+		while (match(value, /\([^()]*\)/)) {
+			value = substr(value, 1, RSTART - 1) " " substr(value, RSTART + RLENGTH)
+		}
 		if (match(value, /<[^>]*>/)) {
 			# Every angle-bracketed address, which also keeps a display name
 			# containing a comma from being split as two addresses.
@@ -177,8 +185,7 @@ from_problem() {
 			}
 			exit
 		}
-		# No brackets: drop a trailing comment, then split on commas.
-		gsub(/\([^)]*\)/, " ", value)
+		# No brackets: split on commas.
 		n = split(value, part, ",")
 		for (i = 1; i <= n; i++)
 			add(part[i])
@@ -472,6 +479,18 @@ $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: Alice" \
 	"filter|0.7|2.0b|smtp-in|data-line|$session|t8| <alice@kyriakon.net>")"
 	check "a folded From header is unfolded" "$(decision)" proceed
 
+	# A comment can carry an address-looking string. The header's real address
+	# is the one outside it, so the comment is dropped before the check.
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: hello@kyriakon.net (x <alice@kyriakon.net>)")"
+	check_reject "an address hidden in a comment is not the header's address" \
+		"550 5.7.1 hello@kyriakon.net"
+
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: \"Alice\" (the platform) <alice@kyriakon.net>")"
+	check "a comment beside a display name does not change the address" \
+		"$(decision)" proceed
+
 	# A message with no From at all has no address to check, and dkimsign has
 	# nothing to sign either: refused rather than let through unsigned.
 	run_case "$(connect_remote)
@@ -496,6 +515,11 @@ $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: root@mail.kyriakon
 $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: secretary@parish.example")"
 	check_reject "the enqueuer cannot write a body domain" \
 		"550 5.7.1 secretary@parish.example"
+
+	run_case "$(connect_local)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: x@evil.example (x <hello@kyriakon.net>)")"
+	check_reject "the enqueuer cannot hide a foreign domain in a comment" \
+		"550 5.7.1 x@evil.example"
 
 	# A From: line in the body is body text, not a header: the header block
 	# ended at the blank line.
