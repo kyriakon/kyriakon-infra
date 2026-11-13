@@ -417,3 +417,26 @@ fn a_control_character_in_the_path_never_forges_a_log_line() {
         "/status/x?kyriakon-control: httpd /status/forged 200 198.51.100.7"
     );
 }
+
+/// An accept error is the connection's failure, not the listener's: the loop
+/// never returns, because a return cancels `try_join!` and takes the web form
+/// and the capsule down with the socket that failed.
+#[test]
+fn an_accept_error_is_waited_out_rather_than_stopping_the_listener() {
+    // A connection that aborted in the queue has already left it, and a signal
+    // interrupts the call and changes nothing, so the next accept runs at once.
+    assert_eq!(
+        super::backoff(&std::io::Error::from(std::io::ErrorKind::ConnectionAborted)),
+        std::time::Duration::ZERO
+    );
+    assert_eq!(
+        super::backoff(&std::io::Error::from(std::io::ErrorKind::Interrupted)),
+        std::time::Duration::ZERO
+    );
+    // A descriptor limit arrives with the backlog as ready as it was, so the
+    // loop has to wait: an immediate retry would spin until a connection closed.
+    assert_eq!(
+        super::backoff(&std::io::Error::from(std::io::ErrorKind::Other)),
+        super::ACCEPT_BACKOFF
+    );
+}

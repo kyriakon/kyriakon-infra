@@ -16,24 +16,87 @@ use crate::fastcgi::{self, Reply, Request};
 use kyriakon_control_core::flow::rate;
 use kyriakon_control_core::store::Certificate;
 
-/// Accept connections for as long as the listener holds, which is until it fails:
-/// a socket that has stopped accepting is not something this process can repair,
-/// and rc.d's own check is where a human reads that the daemon is gone.
+/// How long the loop waits after an accept error it cannot attribute to a dead
+/// connection. A full descriptor table (`EMFILE`, `ENFILE`) leaves the backlog
+/// as ready as it was, so an unpaused retry would spin; a connection closing
+/// ends the wait sooner than any other repair could.
+const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The wait before the next accept. `accept(2)`'s errors are the connection's,
+/// not the listener's: a connection that died in the queue (`ECONNABORTED`) or
+/// a signal (`EINTR`) has already left the backlog, so the next call runs at
+/// once, and everything else is treated as the descriptor limit above.
+fn backoff(error: &std::io::Error) -> std::time::Duration {
+    match error.kind() {
+        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted => {
+            std::time::Duration::ZERO
+        }
+        _ => ACCEPT_BACKOFF,
+    }
+}
+
+/// How long one portal connection may take, from the first byte to the reply.
+/// The protocol is one line in and one line out, so a client that connects and
+/// sends nothing is gone by this deadline instead of holding a descriptor for
+/// the life of the process.
+const PORTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Portal connections served at once. The rest wait for a permit before the
+/// socket is accepted, so a flood costs the listening backlog rather than a
+/// descriptor each. The web form and the capsule have no ceiling of this kind
+/// and do not share this one.
+const PORTAL_CONNECTIONS: usize = 64;
+
+/// Accept connections for as long as the process lives. An accept error is a
+/// connection a flood provoked, not the listener: returning it would cancel the
+/// other three listeners in `try_join!` and take every front-end down with it,
+/// so the loop logs, waits and continues.
 pub(super) async fn accept(
     listener: UnixListener,
     app: Arc<App>,
     channel: Channel,
 ) -> Result<(), Error> {
+    let slots = matches!(channel, Channel::Portal)
+        .then(|| Arc::new(tokio::sync::Semaphore::new(PORTAL_CONNECTIONS)));
     loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .map_err(|e| Error::context("cannot accept", e))?;
+        let (stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                let wait = backoff(&e);
+                Error::context("cannot accept", e).report("accepting a connection");
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+        };
+        // A permit is waited for here rather than in the spawned task, so a flood
+        // costs the listening backlog and one accepted socket, not a descriptor
+        // per waiting connection. It is released when the task that holds the
+        // connection ends.
+        let permit = match &slots {
+            Some(slots) => match slots.clone().acquire_owned().await {
+                Ok(permit) => Some(permit),
+                Err(_) => return Ok(()),
+            },
+            None => None,
+        };
         let app = app.clone();
         tokio::spawn(async move {
+            // Held for as long as this connection is served.
+            let _permit = permit;
             let outcome = match channel {
                 Channel::FrontEnd => connection(stream, &app).await,
-                Channel::Portal => portal_connection(stream, &app).await,
+                Channel::Portal => {
+                    match tokio::time::timeout(PORTAL_TIMEOUT, portal_connection(stream, &app))
+                        .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(_) => {
+                            kyriakon_control_core::util::log(
+                                "kyriakon-control: the portal connection timed out",
+                            );
+                            return;
+                        }
+                    }
+                }
             };
             if let Err(e) = outcome {
                 e.report("serving a connection");
