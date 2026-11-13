@@ -31,10 +31,11 @@
 # verification at the end is then the sockets existing with the modes that keep
 # every other local user out.
 #
-# It generates the approval key when it is absent, and never rotates one that is
-# already there, so a first deploy signs and a later one leaves the links it
-# signed alone. Stripe's webhook secret is the one that stays a paste by hand,
-# because a real secret cannot live in this repository at all.
+# It generates the approval key when there is no usable one — absent, or left
+# empty or short by an interrupted write — and never rotates one that works, so a
+# first deploy signs and a later one leaves the links it signed alone. Stripe's
+# webhook secret is the one that stays a paste by hand, because a real secret
+# cannot live in this repository at all.
 
 set -euo pipefail
 
@@ -102,6 +103,42 @@ settle_old_names() { # <dir> <yes|no>
 			printf '%s\n' "$old"
 		fi
 	done
+}
+
+# approval_key_ok <path>: the file holds the key `openssl rand -base64 32`
+# makes, which is one line of 44 base64 characters and what sign::read_key
+# strips back to 32 bytes. Anything else — the empty file a killed write left,
+# a line cut short — is not a key, and `-e` alone reported it as kept forever
+# while every drain pass stopped on it.
+approval_key_ok() { # <path>
+	LC_ALL=C tr -d '[:space:]' <"$1" 2>/dev/null | grep -qxE '[A-Za-z0-9+/]{43}='
+}
+
+# write_approval_key <dest> <generator...>: generate the key into a sibling temp
+# in <dest>'s own directory, give it its final mode and owner there, and rename
+# it into place. A generator that fails, a short write, or a deploy killed in
+# the window leaves <dest> as it was rather than empty, and the temp is removed.
+write_approval_key() {
+	typeset key_dest="$1" key_tmp
+	shift
+	key_tmp=$(mktemp "$key_dest.XXXXXX") || return 1
+	if ! ( umask 077; "$@" >"$key_tmp" ) || ! approval_key_ok "$key_tmp"; then
+		rm -f "$key_tmp"
+		printf 'could not generate %s; nothing was written\n' "$key_dest" >&2
+		return 1
+	fi
+	chmod 0600 "$key_tmp" || { rm -f "$key_tmp"; return 1; }
+	# The box's deploy runs as root, where the key has to be root's; the
+	# self-test that drives a failing generator does not, and cannot chown.
+	if [ "$(id -u)" -eq 0 ]; then
+		chown root:wheel "$key_tmp" || { rm -f "$key_tmp"; return 1; }
+	fi
+	if ! mv "$key_tmp" "$key_dest"; then
+		rm -f "$key_tmp"
+		printf 'could not rename %s into place; %s left as it was\n' \
+			"$key_tmp" "$key_dest" >&2
+		return 1
+	fi
 }
 
 self_test() {
@@ -236,6 +273,92 @@ STUB
 			exit 1
 		}
 	done
+
+	# The approval key's write. A generator that fails, or one that writes a
+	# short line and claims success, must leave nothing at the destination and no
+	# temp beside it; a failed run over a key already there must leave it exactly
+	# as it was. And a zero-byte file is not a key: the check that decides
+	# whether to keep one has to reject it, or the file a killed write left is
+	# reported as kept on every later deploy while every drain pass stops on it.
+	cat >"$work/bin/keygen-fail" <<'STUB'
+#!/bin/sh
+exit 1
+STUB
+	cat >"$work/bin/keygen-short" <<'STUB'
+#!/bin/sh
+printf 'AAAAAAAAAA\n'
+STUB
+	cat >"$work/bin/keygen" <<'STUB'
+#!/bin/sh
+printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n'
+STUB
+	chmod +x "$work/bin/keygen-fail" "$work/bin/keygen-short" "$work/bin/keygen"
+	mkdir "$work/key"
+	"$work/bin/keygen" >"$work/key/real"
+	good_key=$(cat "$work/key/real")
+	: >"$work/key/empty"
+	printf '%s\n' "${good_key%?}" >"$work/key/short"
+	approval_key_ok "$work/key/real" || {
+		printf 'self-test: a generated key did not read as a key\n' >&2
+		exit 1
+	}
+	for bad in "$work/key/empty" "$work/key/short"; do
+		if approval_key_ok "$bad"; then
+			printf 'self-test: %s was accepted as a key\n' "$bad" >&2
+			exit 1
+		fi
+	done
+
+	mkdir "$work/key-fail"
+	if write_approval_key "$work/key-fail/fresh" "$work/bin/keygen-fail" 2>/dev/null; then
+		printf 'self-test: a failing key generator reported success\n' >&2
+		exit 1
+	fi
+	[ -z "$(ls -A "$work/key-fail")" ] || {
+		printf 'self-test: a failed key generation left %s behind\n' \
+			"$(ls -A "$work/key-fail")" >&2
+		exit 1
+	}
+
+	if write_approval_key "$work/key/real" "$work/bin/keygen-fail" 2>/dev/null; then
+		printf 'self-test: a failing key generator reported success over a key\n' >&2
+		exit 1
+	fi
+	[ "$(cat "$work/key/real")" = "$good_key" ] || {
+		printf 'self-test: a failed key generation damaged the existing key\n' >&2
+		exit 1
+	}
+
+	mkdir "$work/key-short"
+	if write_approval_key "$work/key-short/fresh" "$work/bin/keygen-short" 2>/dev/null; then
+		printf 'self-test: a truncated key was put in place\n' >&2
+		exit 1
+	fi
+	[ -z "$(ls -A "$work/key-short")" ] || {
+		printf 'self-test: a truncated key generation left %s behind\n' \
+			"$(ls -A "$work/key-short")" >&2
+		exit 1
+	}
+
+	mkdir "$work/key-good"
+	if ! write_approval_key "$work/key-good/fresh" "$work/bin/keygen"; then
+		printf 'self-test: a good key generator failed\n' >&2
+		exit 1
+	fi
+	approval_key_ok "$work/key-good/fresh" || {
+		printf 'self-test: the key write put a file that is not a key in place\n' >&2
+		exit 1
+	}
+	[ "$(ls -A "$work/key-good")" = fresh ] || {
+		printf 'self-test: the key write left %s behind\n' \
+			"$(ls -A "$work/key-good")" >&2
+		exit 1
+	}
+	# shellcheck disable=SC2012 # a mode string, not a name the shell must split
+	[ "$(ls -l "$work/key-good/fresh" | cut -c1-10)" = '-rw-------' ] || {
+		printf 'self-test: the key is not mode 0600\n' >&2
+		exit 1
+	}
 
 	printf 'self-test: ok\n'
 }
@@ -626,16 +749,22 @@ for page in terms.gmi aup.gmi privacy.gmi key-walkthrough.gmi; do
 done
 
 # The approval key, generated once and never by a later deploy: a second run must
-# not invalidate links a previous run has already signed. Replacing it is the
-# operator's own act, by hand, and the only rotation there is.
+# not invalidate links a previous run has already signed. Replacing a working key
+# is the operator's own act, by hand, and the only rotation there is. A file here
+# that is not a key at all is the other case, and it is not a rotation: nothing
+# can sign with it, so it is replaced.
 approval_key=/etc/kyriakon/onboard/approval-signing-key
-if [ ! -e "$approval_key" ]; then
-	[ -x /usr/bin/openssl ] || die "no /usr/bin/openssl, which generates the approval key"
-	(umask 077 && /usr/bin/openssl rand -base64 32 > "$approval_key")
-	chown root:wheel "$approval_key"
-	printf 'generated %s\n' "$approval_key"
-else
+if approval_key_ok "$approval_key"; then
 	printf 'kept the existing %s\n' "$approval_key"
+else
+	# A file there that is not a key is the empty one an interrupted write used
+	# to leave: nothing can sign with it, so it is replaced rather than kept.
+	[ ! -e "$approval_key" ] \
+		|| printf 'the %s is empty or truncated; generating a new one\n' "$approval_key" >&2
+	[ -x /usr/bin/openssl ] || die "no /usr/bin/openssl, which generates the approval key"
+	write_approval_key "$approval_key" /usr/bin/openssl rand -base64 32 \
+		|| die "could not generate $approval_key"
+	printf 'generated %s\n' "$approval_key"
 fi
 # Stripe's webhook secret is the exception: a real secret cannot live in this
 # repository, so the card rail's ticket leaves that file as a paste by hand.
