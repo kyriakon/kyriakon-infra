@@ -490,11 +490,24 @@ self_test() {
 	check "authenticated submission is held to the sender mapping" \
 		"$(grep -c '^match auth from any for any action "relay"$' "$tree/smtpd.conf")" 1
 	check "and the submission listener reads it" \
-		"$(grep -c '^listen on egress smtps pki mail.kyriakon.net auth filter "dkimsign" senders <mail_from>$' "$tree/smtpd.conf")" 1
+		"$(grep -c '^listen on egress smtps pki mail.kyriakon.net auth filter "sign" senders <mail_from>$' "$tree/smtpd.conf")" 1
 	check "and so does the auth-optional port, so it is not a way around it" \
-		"$(grep -c '^listen on egress tls pki mail.kyriakon.net auth-optional senders <mail_from>$' "$tree/smtpd.conf")" 1
+		"$(grep -c '^listen on egress tls pki mail.kyriakon.net auth-optional filter "fromcheck" senders <mail_from>$' "$tree/smtpd.conf")" 1
 	check "and the table the listeners name is installed" \
 		"$(grep -c '^table mail_from file:/etc/mail/mail_from$' "$tree/smtpd.conf")" 1
+	# The From header is the other half: `senders` binds the envelope and the
+	# signer signs whatever From says, so the chain has to put the From check
+	# first. An exact line, like the rule checks above, because the order is the
+	# property: reversed, the message is signed and then refused, and a reversed
+	# chain that still passed `smtpd -n` is what this has to catch.
+	check "the From filter runs ahead of the signer" \
+		"$(grep -c '^filter "sign" chain { "fromcheck", "dkimsign" }$' "$tree/smtpd.conf")" 1
+	check "and the signed local enqueue uses that chain" \
+		"$(grep -c '^listen on socket filter "sign"$' "$tree/smtpd.conf")" 1
+	check "and the From filter reads the mapping the listeners bind" \
+		"$(grep -c '^filter "fromcheck" proc-exec "/usr/local/libexec/filter-fromcheck.sh' "$tree/smtpd.conf")" 1
+	check "and it is a command this deploy installs" \
+		"$(grep -cx 'filter-fromcheck.sh	/usr/local/libexec	-' "$install_set")" 1
 	check "no unauthenticated TCP loopback listener is left" \
 		"$(grep -c '^listen on lo0' "$tree/smtpd.conf" || true)" 0
 
@@ -1246,6 +1259,23 @@ mv "$mail_from_tmp" "$mail_from_table"
 table_unlock "$mail_from_table"
 printf 'mail_from: %s entries\n' "$(grep -c . "$mail_from_table" || true)"
 
+# The table's /usr/local/libexec rows, installed before the configuration that
+# names them: the member session shell on 2222 (the member login class names that
+# path, and applying the class before the file is there would refuse every
+# member's push) and the From-header filter smtpd starts below (proc-exec resolves
+# the command when the filter starts, so a missing one is a filter that never
+# registers). root:wheel 0755, which a member can read and execute and cannot
+# write, and which is not in the PATH a member session is handed.
+libexec_scripts=$(install_rows "$install_set" /usr/local/libexec) \
+	|| { printf 'cannot read %s\n' "$install_set" >&2; exit 1; }
+[ -n "$libexec_scripts" ] \
+	|| { printf '%s names no /usr/local/libexec script\n' "$install_set" >&2; exit 1; }
+install -d -m 0755 /usr/local/libexec
+for s in $libexec_scripts; do
+	install_staged "$repo_dir/scripts/$s" "/usr/local/libexec/$s" -m 0755 -o root -g wheel
+done
+printf 'member session shell and the From-header filter installed into /usr/local/libexec\n'
+
 # The shipped template with both placeholders still in it, installed beside the
 # live file. reload-smtpd.sh and provision-member.sh re-render from it whenever a
 # body joins or leaves, so the filter's -d list follows /etc/mail/dkim_domains
@@ -1497,22 +1527,6 @@ for s in $(stale_copies "$root_bin"); do
 	printf 'removed the stale copy /root/bin/%s\n' "$s"
 done
 printf 'cron scripts installed into /root/bin\n'
-
-# The member session shell on 2222, from the table's /usr/local/libexec row. The
-# member login class names this path, so the file is installed here even though
-# the class itself is a hand step scripts/deploy.sh prints: applying the class
-# before the file is there would refuse every member's push. root:wheel 0755 in
-# /usr/local/libexec, which a member can read and execute and cannot write, and
-# which is not in the PATH a member session is handed.
-libexec_scripts=$(install_rows "$install_set" /usr/local/libexec) \
-	|| { printf 'cannot read %s\n' "$install_set" >&2; exit 1; }
-[ -n "$libexec_scripts" ] \
-	|| { printf '%s names no /usr/local/libexec script\n' "$install_set" >&2; exit 1; }
-install -d -m 0755 /usr/local/libexec
-for s in $libexec_scripts; do
-	install_staged "$repo_dir/scripts/$s" "/usr/local/libexec/$s" -m 0755 -o root -g wheel
-done
-printf 'member session shell installed into /usr/local/libexec\n'
 
 # The root-owned key directory the member sessions are proposed to read
 # (AuthorizedKeysFile /etc/ssh/authorized_keys/%u inside the members Match
