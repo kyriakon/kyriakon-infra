@@ -1502,6 +1502,22 @@ pub async fn group_address(
                     write_public_key(store, replacement, material).await?;
                 }
                 run_script(cfg, "provision-member.sh", &[replacement]).await?;
+                // The vhosts root at the site owner's tree, and
+                // `cron-apply.sh --web` rewrites only the indexes: without the
+                // lanes the new root is never written and the old one is
+                // deleted with the departing account. They run before the
+                // record is written, so a retry after a lane refusal repeats
+                // them; a group with no upload key has no tree and the lanes
+                // would refuse.
+                if old_key.is_some() {
+                    for lane in [
+                        "provision-group-web.sh",
+                        "provision-group-capsule.sh",
+                        "provision-group-acme.sh",
+                    ] {
+                        run_script(cfg, lane, &[&intent.domain, replacement]).await?;
+                    }
+                }
                 group.site_owner = replacement.to_string();
             }
             group.accounts.retain(|a| a != &intent.mailbox);

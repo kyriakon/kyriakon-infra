@@ -2114,6 +2114,16 @@ fn a_departing_site_owner_must_name_a_replacement() {
         .expect("the old owner was deleted");
     assert!(builder < delete, "the replacement was built first: {log}");
     assert!(log.contains("cron-apply.sh --web"), "{log}");
+    for lane in [
+        "provision-group-web.sh",
+        "provision-group-capsule.sh",
+        "provision-group-acme.sh",
+    ] {
+        assert!(
+            log.contains(&format!("{lane} parish.example parish-office")),
+            "{lane} did not re-root the site at the replacement: {log}"
+        );
+    }
 }
 
 /// The console files a signed address intent the drain then applies, which is
