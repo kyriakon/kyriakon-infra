@@ -96,11 +96,13 @@ message size, expires about a week after it is written. Seven days is the shorte
 lets abuse monitoring catch a slow-burn compromise such as a low-and-slow relay or a
 credential-stuffing ramp, without keeping a permanent per-user log.
 
-Abuse monitoring (`scripts/abuse-monitor.sh`) reads aggregate counts only: relay volume,
-authentication failures, greylist churn. Never a per-address identifier. Raw addresses are discarded
-at rotation. Hashing addresses to keep a longer-lived collision signal was considered and rejected,
-because a retained hash is a pseudonymous identifier rather than data minimization, and every signal
-it would serve is already a count the monitor keeps without the raw address.
+Abuse monitoring (`scripts/abuse-monitor.sh`) reads aggregate counts: relay volume,
+authentication failures, greylist churn, plus a per-account outbound recipient count for the
+current fifteen-minute run. The count is not written to a state file. Never a per-address
+identifier. Raw addresses are discarded at rotation.
+Hashing addresses to keep a longer-lived collision signal was considered and rejected, because a
+retained hash is a pseudonymous identifier rather than data minimization, and every signal it would
+serve is already a count the monitor keeps without the raw address.
 
 Greylisting (`spamd`) is the one store that holds a literal source address, and it is not a user log.
 Greylist tuples are dropped after four hours if the sending host never retries, and a host that does

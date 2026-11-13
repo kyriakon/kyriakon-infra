@@ -3,7 +3,9 @@
 #
 # Watches ten signals (spec §30-33, plus the release additions in issue #173 and
 # the certificate queue in issue #288), each tripping a content-rich alert:
-#   1. outbound mail-volume spike: relayed message count (MTA sessions)
+#   1. outbound mail volume: relayed message count (MTA sessions), and the
+#      per-account submission cap, which lapses an account above 50 recipients
+#      in a run and alerts
 #   2. auth failures: smtpd + dovecot (maillog), sshd (authlog), and the
 #      applicant sshd's admissions per source, which are what the second
 #      public listener adds to authlog
@@ -18,6 +20,15 @@
 #   8. backup recency: a restic snapshot inside the last 26 hours
 #   9. root filesystem: / filling, and any filesystem with none left
 #  10. certificate queue: the age of the oldest pending certificate request
+#
+# The per-account cap counts sessions that authenticated on an egress listener,
+# smtps or the auth-optional STARTTLS one. A local enqueue logs "smtp connected
+# address=local" and never authenticates, so cron, sendmail(1) and the future
+# _mlmmj mailing-list lane, which enqueues on /var/run/smtpd.sock, cannot trip a
+# member cap: a parish announcement list fans out on its own lane and is not one
+# member's submission. An account outside the members group, or a member account
+# in wheel, is alerted but never lapsed: lapse-user.sh empties every secondary
+# group, which would take doas from the operator.
 #
 # The numbers all come from the dogfood logs, baselined in
 # docs/planning/research/alert-thresholds.md (PR #179, read 2026-10-01). Each
@@ -50,6 +61,8 @@
 #   DNSBL_ZONES            blocklists to query, strongest first (default in lib.sh:
 #                          zen.spamhaus.org bl.spamcop.net all.s5h.net dnsbl.dronebl.org)
 #   MAIL_SPIKE_MAX         outbound msgs per run that counts as a spike (default 50)
+#   MAIL_SENDER_RCPT_MAX   outbound recipients one authenticated account may
+#                          submit per run before the account is lapsed (default 50)
 #   AUTH_FAIL_MAX          failed ssh logins, or applicant admissions, from one
 #                          address before alert (default 300)
 #   QUOTA_WARN_PCT         quota usage % of soft limit that trips the alert (default 80)
@@ -86,6 +99,23 @@ fi
 
 # shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
 . "$script_dir/lib.sh"
+
+# Where lapse-user.sh lives. It is a drain script, not a /root/bin one: the
+# monitor runs from /root/bin and the circuit breaker calls the copy the drain
+# installs, the same one its non-payment sweep runs. The directory comes from the
+# drain's config the way acme-queue.sh reads it, with the compiled-in default for
+# a box whose config cannot be read. DRAIN_SCRIPTS points it at a copy;
+# LAPSE_USER_SH names the script itself, which is what --self-test uses.
+drain_toml="${DRAIN_TOML:-/etc/kyriakon/onboard/drain.toml}"
+drain_scripts="${DRAIN_SCRIPTS:-/usr/local/libexec/kyriakon/scripts}"
+if [ -z "${DRAIN_SCRIPTS:-}" ] && [ -r "$drain_toml" ]; then
+	configured_scripts=$(awk -F'"' '/^scripts[[:space:]]*=/ { print $2; exit }' "$drain_toml")
+	[ -z "$configured_scripts" ] || drain_scripts=$configured_scripts
+fi
+
+# The group lookup the breaker's safety check uses. ID_CMD points it at a stub in
+# --self-test, the way LAPSE_USER_SH points the lapse at one.
+id_cmd=${ID_CMD:-id}
 
 # A storm keeps a signal true for hours, and telling the operator the same thing
 # every hour is how an alert channel stops being read. These are the ones a
@@ -197,6 +227,127 @@ mail_auth_events() {
 		}'
 }
 
+# sender_recipients <maillog> — read this run's maillog lines on stdin and print
+# "<user> <recipients>", one line per account, for messages accepted on a
+# session that authenticated as that account.
+#
+# The join key is the session id OpenSMTPD prefixes to every line of a session.
+# The account comes from "smtp authentication user=X result=ok" and the volume
+# from "smtp message ... nrcpt=N" on the same id. The whole current maillog is
+# read for the authentication half, because a session can authenticate in one
+# run and send in the next; only the lines on stdin are counted, so the tally is
+# still this run's window. The one session this misses is one that authenticates
+# before the daily rotation and sends after it, a window of minutes at most.
+#
+# nrcpt is the recipient count the server accepted for the message, and it is
+# one line per message. The "smtp envelope ... to=<...>" lines carry the same
+# recipients one per line, so counting both would double the tally.
+#
+# A message whose session never authenticated is not counted. That is every
+# local enqueue: the socket and lo0 listeners log "smtp connected address=local"
+# and have no authentication, so cron, sendmail(1) and the future _mlmmj list
+# lane on /var/run/smtpd.sock cannot trip a member cap. Inbound mail from other
+# MTAs is unauthenticated for the same reason.
+sender_recipients() {
+	awk -v maillog_path="$1" '
+		BEGIN {
+			while ((getline line < maillog_path) > 0) {
+				if (line !~ /smtp authentication user=/) continue
+				id = ""; user = ""; ok = 0
+				n = split(line, f, " ")
+				for (i = 1; i <= n; i++) {
+					if (f[i] == "smtp") id = f[i - 1]
+					else if (f[i] ~ /^user=/) user = substr(f[i], 6)
+					else if (f[i] == "result=ok") ok = 1
+				}
+				if (ok && id != "" && user != "") user_of[id] = user
+			}
+			close(maillog_path)
+		}
+		/smtp message / && / nrcpt=/ {
+			id = ""; nrcpt = 0
+			n = split($0, f, " ")
+			for (i = 1; i <= n; i++) {
+				if (f[i] == "smtp") id = f[i - 1]
+				else if (f[i] ~ /^nrcpt=/) nrcpt = substr(f[i], 7) + 0
+			}
+			if (id != "" && (id in user_of) && nrcpt > 0)
+				count[user_of[id]] += nrcpt
+		}
+		END { for (u in count) printf "%s %d\n", u, count[u] }
+	'
+}
+
+# lapse_refusal <user> <members> — print why the account must not be lapsed, or
+# nothing when it may be.
+#
+# The breaker must never take doas from the operator. lapse-user.sh runs
+# `usermod -S ''`, which empties every secondary group, so a wheel account loses
+# wheel, and on a box with PermitRootLogin no the alert's own recovery command
+# can no longer be run. An account outside the members group is refused for the
+# same class of reason: it is not a member mailbox, and emptying its groups would
+# break whatever it is for. Both are alerted without being lapsed.
+lapse_refusal() {
+	case " ${2:-} " in
+	*" $1 "*) ;;
+	*) printf 'is not in the members group'; return 0 ;;
+	esac
+	user_groups=$("${ID_CMD:-$id_cmd}" -Gn "$1" 2>/dev/null || true)
+	case " $user_groups " in
+	*" wheel "*) printf 'is privileged (wheel)' ;;
+	esac
+	return 0
+}
+
+# enforce_sender_cap <max> <tally> <members> — for each "<user> <recipients>"
+# line over max, lapse that account and alert, unless lapse_refusal refuses it.
+#
+# The window is the cron interval: the tally is what the account submitted since
+# the last run, and the next run starts it again. The action is
+# scripts/lapse-user.sh, the primitive the drain's non-payment sweep already
+# uses: auth-smtp=reject stops submission while IMAP and the site keep working.
+# It leaves the account record alone, so `lapse-user.sh --restore <username>`
+# hands it back after the password is changed.
+#
+# A failed lapse stops the run and still alerts. The account is still sending,
+# and carrying on would report the next one while this one relays; the nonzero
+# exit is what leaves the dead-man's switch to alert on silence.
+enforce_sender_cap() {
+	sender_max="$1"; tally="${2:-}"; member_list="${3:-}"
+	[ -n "$tally" ] || return 0
+	while read -r user count; do
+		[ -n "$user" ] || continue
+		[ "${count:-0}" -gt "$sender_max" ] || continue
+		refusal=$(lapse_refusal "$user" "$member_list")
+		if [ -n "$refusal" ]; then
+			alert mail "sender cap held $user" "$user is over the cap at $count outbound recipients since last run (max $sender_max) but $refusal; not lapsed. Outbound submission is still open; inspect the account and stop it by hand if it is compromised"
+			continue
+		fi
+		# The lapse's output goes through a file rather than `$(... 2>&1)`:
+		# ksh93 leaves the substitution's stderr redirection in place afterwards,
+		# so the alert raised next would have its own stderr swallowed.
+		lapse_out_file="$state/lapse.out"
+		if ksh "${LAPSE_USER_SH:-$drain_scripts/lapse-user.sh}" "$user" >"$lapse_out_file" 2>&1; then
+			lapse_rc=0
+		else
+			lapse_rc=$?
+		fi
+		lapse_out=$(cat "$lapse_out_file")
+		rm -f "$lapse_out_file"
+		if [ "$lapse_rc" -eq 0 ]; then
+			alert mail "sender cap $user" "$user submitted $count outbound recipients since last run (max $sender_max), so its submission was lapsed with scripts/lapse-user.sh. Mail still arrives and the site stays up; change the password, then run scripts/lapse-user.sh --restore $user"
+		else
+			# A distinct event key, so this alert cannot sit inside the successful
+			# lapse's cooldown and leave "still open" as the last mail.
+			alert mail "sender cap fail $user" "$user submitted $count outbound recipients since last run (max $sender_max) and the lapse FAILED: $lapse_out. Outbound submission is still open; run scripts/lapse-user.sh $user by hand" "" fail
+			printf 'abuse-monitor: could not lapse %s after %s recipients: %s\n' "$user" "$count" "$lapse_out" >&2
+			exit 1
+		fi
+	done <<EOF
+$tally
+EOF
+}
+
 # Entries in the first list that are not in the second. Files rather than strings,
 # so a caller can hand it a state file and a fresh dump.
 new_entries() {
@@ -263,6 +414,70 @@ newest_snapshot_epoch() {
 	done
 	[ -n "$newest" ] && printf '%s' "$newest"
 	return 0
+}
+
+# --- alert: content-rich mail, plus the external check --------------------
+# Alerts go out as mail to ALERT_EMAIL, an address off this box, and the same
+# event marks the Healthchecks check down so the external channel carries it too.
+#
+# Two channels because they fail differently. Mail is what can describe a finding:
+# the check's dashboard shows a stored body but the notification itself does not
+# repeat it. And the check is what survives this box being the broken thing: mail
+# cannot report a broken mail path, and the check's silence covers that case.
+#
+# alert <component> <event> <body> [<what to do>] [<check: ok|fail>]: the
+# component and the event are the two words the subject carries, from the
+# vocabulary notify_operator in lib.sh lists, so a list of subjects says what
+# happened without any of them being opened. The check argument is the state to
+# leave the external check in, ok by default; fail is for a run that could not do
+# its job, which today is the circuit breaker's own lapse failing.
+#
+# Nothing is printed for an alert. The mail is the report, and cron mails what a
+# job prints, so a print would be the same finding a second time under a subject
+# of cron's own. The line that used to be printed here was that second copy;
+# notify_operator prints instead when it could not mail, so an alert raised while
+# the mail path is broken still reaches the operator, ugly and once.
+#
+# The cooldown is per signal, one file named from the component and the event. It
+# used to be one file for all six checks, so the first to fire silenced the rest
+# for the hour, and the baseline note found that in the state directory: an
+# address making hundreds of ssh guesses trips every quarter hour, which held the
+# channel shut and is why the ssh threshold could not be lowered. The single file
+# the old code wrote, $state/alert.last, is left where it is and no longer read,
+# and the file names changed when the subject did, so the first run after this
+# deploys may fire once on a signal that was inside its cooldown.
+#
+# It is defined above the self-test dispatch so a --self-test exercises the real
+# cooldown and notification path rather than a stand-in.
+alert() {
+	component="$1"; event="$2"; body="$3"; to_do="${4:-}"
+	now=$(date +%s)
+	last_file="$state/alert.last.$(printf '%s-%s' "$component" "$event" | tr 'A-Z ' 'a-z-' | tr -cd 'a-z0-9-')"
+	last=0
+	[ -f "$last_file" ] && last=$(cat "$last_file")
+	if [ "$(( now - last ))" -lt "$(( $(cooldown_for "$component $event") * 60 ))" ]; then
+		return 0
+	fi
+	printf '%s\n' "$now" > "$last_file"
+	when=$(date '+%F %T')
+	notify_operator "$component" "$event" "$body" "$to_do"
+	# The body lands in the check's event log, which is what makes an alert
+	# raised while mail is broken still readable somewhere.
+	#
+	# A finding is not an outage, so the default is the success URL: pinging /fail
+	# marked the dead-man's switch down and the ping at the end of the same run
+	# brought it straight back up, which mailed "is UP, the downtime lasted 0
+	# seconds" every time the monitor had something to say. The check means "the
+	# monitor is running". A run that cannot do its job passes fail and exits
+	# nonzero; the alert pings /fail itself because it runs before that exit, and
+	# a success ping here would mark the check up on the one run that must not
+	# look clean.
+	if [ -n "${HEALTHCHECKS_URL:-}" ]; then
+		check_url="$HEALTHCHECKS_URL"
+		[ "${5:-ok}" = "fail" ] && check_url="$HEALTHCHECKS_URL/fail"
+		curl -fsS -m 10 --retry 3 --data "$when $component $event: $body" \
+			"$check_url" >/dev/null 2>&1 || true
+	fi
 }
 
 self_test() {
@@ -355,6 +570,128 @@ MAILLOG
 	check "a member's failures are told apart from scanner usernames" \
 		"$(mail_auth_events alice < "$work/maillog" | awk -F'\t' '{ printf "%s:%s:%s ", $1, $2, $3 }')" \
 		"unknown:admin: real:alice: real:alice:192.0.2.5 unknown:nobody:198.51.100.7 "
+
+	# The per-account recipient cap. The account comes from the session's
+	# successful authentication and the volume from nrcpt on the same session id.
+	# The window fixture deliberately carries no authentication line: the map is
+	# built from the whole maillog, because a session can authenticate in one run
+	# and send in the next.
+	cat > "$work/cap-maillog" <<'CAPLOG'
+Nov  7 11:00:01 mail smtpd[1]: 00000000000000a1 smtp connected address=203.0.113.9 host=client
+Nov  7 11:00:02 mail smtpd[1]: 00000000000000a1 smtp authentication user=alice result=ok
+Nov  7 11:00:03 mail smtpd[1]: 00000000000000a2 smtp connected address=198.51.100.7 host=phone
+Nov  7 11:00:04 mail smtpd[1]: 00000000000000a2 smtp authentication user=bob result=ok
+Nov  7 11:00:05 mail smtpd[1]: 00000000000000a3 smtp connected address=local host=mail
+Nov  7 11:00:06 mail smtpd[1]: 00000000000000a4 smtp connected address=203.0.113.44 host=scan
+Nov  7 11:00:07 mail smtpd[1]: 00000000000000a4 smtp authentication user=alice result=permfail
+CAPLOG
+	cat > "$work/cap-window" <<'CAPWINDOW'
+Nov  7 11:01:01 mail smtpd[1]: 00000000000000a1 smtp message msgid=00000001 size=100 nrcpt=30 proto=ESMTP
+Nov  7 11:01:02 mail smtpd[1]: 00000000000000a2 smtp message msgid=00000002 size=100 nrcpt=20 proto=ESMTP
+Nov  7 11:01:03 mail smtpd[1]: 00000000000000a3 smtp message msgid=00000003 size=100 nrcpt=100 proto=ESMTP
+Nov  7 11:01:04 mail smtpd[1]: 00000000000000a4 smtp message msgid=00000004 size=100 nrcpt=40 proto=ESMTP
+Nov  7 11:01:05 mail smtpd[1]: 00000000000000a1 smtp message msgid=00000005 size=100 nrcpt=25 proto=ESMTP
+Nov  7 11:01:06 mail smtpd[1]: 00000000000000a1 smtp envelope evpid=0000000500000001 from=<alice@kyriakon.net> to=<one@example.org>
+CAPWINDOW
+	check "recipients are joined to the account that authenticated the session" \
+		"$(sender_recipients "$work/cap-maillog" < "$work/cap-window" | sort | tr '\n' ' ')" \
+		"alice 55 bob 20 "
+	check "a local socket burst is not a member submission" \
+		"$(printf '%s\n' 'Nov  7 11:01:03 mail smtpd[1]: 00000000000000a3 smtp message msgid=00000003 size=100 nrcpt=100 proto=ESMTP' \
+			| sender_recipients "$work/cap-maillog")" ""
+
+	# The breaker. Over the cap lapses and alerts; under it, or with no
+	# attributable message, does nothing; a failed lapse alerts and exits nonzero
+	# so the run is not a clean ping.
+	state="$work/state"
+	mkdir -p "$state"
+	unset HEALTHCHECKS_URL
+	cat > "$work/lapse-ok" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$1" >>"$LAPSE_LOG"
+STUB
+	cat > "$work/lapse-fail" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$1" >>"$LAPSE_LOG"
+printf 'usermod: permission denied\n' >&2
+exit 1
+STUB
+	chmod 0700 "$work/lapse-ok" "$work/lapse-fail"
+	# The group lookup: wheelie is a member and also in wheel, stranger is neither.
+	cat > "$work/groups" <<'STUB'
+#!/bin/sh
+case "$2" in
+wheelie) printf '%s\n' "wheelie wheel members" ;;
+*) printf '%s\n' "$2 members" ;;
+esac
+STUB
+	chmod 0700 "$work/groups"
+	export ID_CMD="$work/groups"
+	cap_members="alice bob carol wheelie"
+	export LAPSE_LOG="$work/lapsed"
+	export LAPSE_USER_SH="$work/lapse-ok"
+	# The alert's stderr goes through a file: ksh93 leaves a `$(... 2>&1)` around
+	# a function call redirecting the shell's stderr afterwards, and notify_operator
+	# is the thing being tested here.
+	enforce_sender_cap 50 "$(sender_recipients "$work/cap-maillog" < "$work/cap-window")" "$cap_members" >"$work/cap.out" 2>&1
+	check "the account over the cap is lapsed" "$(cat "$work/lapsed")" "alice"
+	check "the account under the cap is left alone" "$(grep -c '^bob$' "$work/lapsed")" "0"
+	check "the cap alert names the account" \
+		"$(grep -c 'kyriakon: mail: sender cap alice' "$work/cap.out")" "1"
+	check "the cap alert carries the count and the threshold" \
+		"$(grep -c '55 outbound recipients since last run (max 50)' "$work/cap.out")" "1"
+	enforce_sender_cap 50 "bob 20" "$cap_members" >"$work/cap.out" 2>&1
+	check "an account under the cap does not alert" "$(cat "$work/cap.out")" ""
+	check "an account under the cap is not lapsed" "$(cat "$work/lapsed")" "alice"
+	enforce_sender_cap 50 "" "$cap_members" >"$work/cap.out" 2>&1
+	check "a run with no attributable recipient does not alert" "$(cat "$work/cap.out")" ""
+	# The external check must not be marked up by the alert on a failed lapse.
+	# curl is stubbed, and the last argument is the URL it was asked to ping.
+	mkdir -p "$work/bin"
+	cat > "$work/bin/curl" <<'STUB'
+#!/bin/sh
+last=""
+for arg in "$@"; do last=$arg; done
+printf '%s\n' "$last" >>"$CURL_LOG"
+STUB
+	chmod 0700 "$work/bin/curl"
+	export CURL_LOG="$work/curl.log"
+	export PATH="$work/bin:$PATH"
+	health_url="https://check.example.invalid/token"
+	export HEALTHCHECKS_URL="$health_url"
+	rm -f "$CURL_LOG"
+	export LAPSE_USER_SH="$work/lapse-fail"
+	if ( enforce_sender_cap 50 "carol 51" "$cap_members" ) >"$work/cap.out" 2>&1; then cap_rc=0; else cap_rc=$?; fi
+	check "a failed lapse exits nonzero" "$cap_rc" "1"
+	check "a failed lapse still alerts under its own key" \
+		"$(grep -c 'kyriakon: mail: sender cap fail carol' "$work/cap.out")" "1"
+	check "a failed lapse reports why" \
+		"$(grep -c 'lapse FAILED: usermod: permission denied' "$work/cap.out")" "1"
+	check "a failed lapse leaves the external check failed" \
+		"$(cat "$CURL_LOG")" "$health_url/fail"
+	rm -f "$CURL_LOG"
+	export LAPSE_USER_SH="$work/lapse-ok"
+	enforce_sender_cap 50 "carol 51" "$cap_members" >"$work/cap.out" 2>&1
+	check "a successful lapse after a failed one is not in its cooldown" \
+		"$(grep -c 'kyriakon: mail: sender cap carol' "$work/cap.out")" "1"
+	check "a successful lapse leaves the external check up" "$(cat "$CURL_LOG")" "$health_url"
+	unset HEALTHCHECKS_URL
+
+	# The safety filter: an account the breaker must not touch is alerted, not
+	# lapsed. A member in wheel keeps doas, and an account outside members is not
+	# a member mailbox at all, operator included.
+	enforce_sender_cap 50 "wheelie 51" "$cap_members" >"$work/cap.out" 2>&1
+	check "a wheel account is not lapsed" "$(grep -c '^wheelie$' "$work/lapsed")" "0"
+	check "a wheel account still alerts" \
+		"$(grep -c 'kyriakon: mail: sender cap held wheelie' "$work/cap.out")" "1"
+	check "the wheel alert says what stopped the lapse" \
+		"$(grep -c 'is privileged (wheel); not lapsed' "$work/cap.out")" "1"
+	enforce_sender_cap 50 "stranger 51" "$cap_members" >"$work/cap.out" 2>&1
+	check "an account outside members is not lapsed" "$(grep -c '^stranger$' "$work/lapsed")" "0"
+	check "an account outside members still alerts" \
+		"$(grep -c 'kyriakon: mail: sender cap held stranger' "$work/cap.out")" "1"
+	check "the non-member alert says what stopped the lapse" \
+		"$(grep -c 'is not in the members group; not lapsed' "$work/cap.out")" "1"
 
 	# A cold resolver must be retried rather than skipped past, which is the
 	# 2026-10-05 alert: the box had just rebooted, the probe gave up, the query fell
@@ -461,64 +798,6 @@ acme_pending_max_min="${ACME_PENDING_MAX_MIN:-1440}"
 snapshot_max_age_hours="${SNAPSHOT_MAX_AGE_HOURS:-26}"
 root_fs_warn_pct="${ROOT_FS_WARN_PCT:-80}"
 
-# --- alert: content-rich mail, plus the external check --------------------
-# Alerts go out as mail to ALERT_EMAIL, an address off this box, and the same
-# event marks the Healthchecks check down so the external channel carries it too.
-#
-# Two channels because they fail differently. Mail is what can describe a finding:
-# the check's dashboard shows a stored body but the notification itself does not
-# repeat it. And the check is what survives this box being the broken thing: mail
-# cannot report a broken mail path, and the check's silence covers that case.
-#
-# alert <component> <event> <body> [<what to do>]: the component and the event are
-# the two words the subject carries, from the vocabulary notify_operator in lib.sh
-# lists, so a list of subjects says what happened without any of them being
-# opened.
-#
-# Nothing is printed for an alert. The mail is the report, and cron mails what a
-# job prints, so a print would be the same finding a second time under a subject
-# of cron's own. The line that used to be printed here was that second copy;
-# notify_operator prints instead when it could not mail, so an alert raised while
-# the mail path is broken still reaches the operator, ugly and once.
-#
-# The cooldown is per signal, one file named from the component and the event. It
-# used to be one file for all six checks, so the first to fire silenced the rest
-# for the hour, and the baseline note found that in the state directory: an
-# address making hundreds of ssh guesses trips every quarter hour, which held the
-# channel shut and is why the ssh threshold could not be lowered. The single file
-# the old code wrote, $state/alert.last, is left where it is and no longer read,
-# and the file names changed when the subject did, so the first run after this
-# deploys may fire once on a signal that was inside its cooldown.
-alert() {
-	component="$1"; event="$2"; body="$3"; to_do="${4:-}"
-	now=$(date +%s)
-	last_file="$state/alert.last.$(printf '%s-%s' "$component" "$event" | tr 'A-Z ' 'a-z-' | tr -cd 'a-z0-9-')"
-	last=0
-	[ -f "$last_file" ] && last=$(cat "$last_file")
-	if [ "$(( now - last ))" -lt "$(( $(cooldown_for "$component $event") * 60 ))" ]; then
-		return 0
-	fi
-	printf '%s\n' "$now" > "$last_file"
-	when=$(date '+%F %T')
-	notify_operator "$component" "$event" "$body" "$to_do"
-	# The body lands in the check's event log, which is what makes an alert
-	# raised while mail is broken still readable somewhere.
-	#
-	# Pinned to the success URL rather than /fail on purpose. A finding is not an
-	# outage: pinging /fail marked the dead-man's switch down and the ping at the
-	# end of the same run brought it straight back up, so Healthchecks mailed
-	# "is UP, the downtime lasted 0 seconds" every time the monitor had something
-	# to say, which is noise that trains you to ignore the one channel that
-	# survives this box going away. The check's state now means "the monitor is
-	# running". /fail belongs to a run that could not do its job, and under set -e
-	# such a run dies before reaching any ping, leaving Healthchecks to alert on
-	# silence, which is what the switch is for.
-	if [ -n "${HEALTHCHECKS_URL:-}" ]; then
-		curl -fsS -m 10 --retry 3 --data "$when $component $event: $body" \
-			"$HEALTHCHECKS_URL" >/dev/null 2>&1 || true
-	fi
-}
-
 # --- new_lines: emit log lines appended since last run -------------------
 # Line-offset delta is rotation-safe and needs no date parsing: cron interval
 # IS the detection window. First run only baselines (no historical replay).
@@ -543,6 +822,12 @@ new_lines() {
 new_maillog=$(new_lines "$maillog" "$state/maillog.pos")
 new_authlog=$(new_lines "$authlog" "$state/authlog.pos")
 
+# The members group add-user.sh puts every member in. The breaker uses it to
+# decide who may be lapsed, and the auth split below to tell a member's stale
+# client from a scanner. An account outside it, the operator mailbox included,
+# is never lapsed by the breaker.
+members=$(getent group members 2>/dev/null | cut -d: -f4 | tr ',' ' ' || true)
+
 # --- 1. outbound mail-volume spike ---------------------------------------
 # Outbound relay completions only (mta = relay; inbound is smtp to LMTP, not mta).
 # Log line (mta_session.c): "<id> mta disconnected reason=quit messages=N".
@@ -555,11 +840,38 @@ new_authlog=$(new_lines "$authlog" "$state/authlog.pos")
 # busiest interval seen. One unverified input, recorded in the note: whether a
 # send to sixty recipients counts as one relay or sixty. That observation is
 # what would move this value.
+#
+# This count is box-wide and takes no origin, so a local enqueue counts too and a
+# mailing list fanning out through the socket can still trip it. The "mta
+# disconnected" line carries only messages=N. Attributing a relay to the enqueue
+# behind it means joining "mta delivery evpid" to "smtp message msgid" (the evpid
+# starts with the message id), which has not been verified on this box and is not
+# needed until the _mlmmj lane exists. That split is deferred to the lane; the
+# per-account cap below is the member-facing exclusion.
 outbound=$(printf '%s\n' "$new_maillog" \
 	| awk '/mta disconnected reason=quit/ { split($0, a, "messages="); s += a[2]+0 } END { print s+0 }')
 if [ "$outbound" -gt "$mail_spike_max" ]; then
 	alert mail "outbound spike" "outbound: $outbound messages relayed since last run (max $mail_spike_max)"
 fi
+
+# Per-account submission cap, the signal that can act by itself. The box-wide
+# count above says a spam run is happening; this says whose account it is, and
+# stops it at the authenticated session before the run that would get the box
+# listed. One account's password is the thing a phish takes, so the tally is by
+# the authenticated `user=`, not by the envelope sender: /etc/mail/mail_from is a
+# shared set of addresses, and a compromised account can submit as any of them.
+#
+# Threshold 50 recipients per run per account, the same number as the box-wide
+# spike and for the same reason: nothing in the eight-day window goes near it,
+# while a spam run clears it in one interval. It counts recipients rather than
+# messages, so one send to sixty counts sixty; the note's open question about
+# whether the MTA records that as one relay or sixty does not apply to `nrcpt`,
+# which is the recipient count the server accepted for the message. A member
+# mailing a parish from their own account trips it, which is the intended cost:
+# the account is lapsed read-only, not suspended, and `--restore` puts it back.
+sender_rcpt_max="${MAIL_SENDER_RCPT_MAX:-50}"
+per_user=$(printf '%s\n' "$new_maillog" | sender_recipients "$maillog")
+enforce_sender_cap "$sender_rcpt_max" "$per_user" "$members"
 
 # --- 2. auth failures ----------------------------------------------------
 # Split by kind, because the two mean opposite things. A mail-side failure that
@@ -570,9 +882,8 @@ fi
 # the member case alerts at one and the scanner case only above MAIL_PROBE_MAX.
 #
 # The log forms and the fields they carry are in mail_auth_events above. The
-# member list is the group add-user.sh puts every member in, so an attempt on a
-# system account is a guess like any other and not a stale client.
-members=$(getent group members 2>/dev/null | cut -d: -f4 | tr ',' ' ' || true)
+# member list computed above is the group add-user.sh puts every member in, so an
+# attempt on a system account is a guess like any other and not a stale client.
 mail_events=$(printf '%s\n' "$new_maillog" | mail_auth_events "$members")
 real_auth=$(printf '%s\n' "$mail_events" | awk -F'\t' '$1 == "real" { c++ } END { print c + 0 }')
 unknown_auth=$(printf '%s\n' "$mail_events" | awk -F'\t' '$1 == "unknown" { c++ } END { print c + 0 }')
