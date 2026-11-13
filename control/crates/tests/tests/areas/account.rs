@@ -168,6 +168,41 @@ fn a_password_change_hashes_the_plaintext_and_refuses_a_hash() {
     assert!(fix.intents().is_empty(), "the refused intent is settled");
 }
 
+/// A password change from the page ends every session that was live before it:
+/// the old cookie's record is what `lookup` reads, so deleting the record is
+/// what stops a copied cookie opening the account. A login after the change is
+/// a new record and works.
+#[test]
+fn a_password_change_revokes_the_live_page_session() {
+    let fix = Fix::new("account-password-sessions");
+    fix.page_account("alice", json!({}));
+    logging_script(&fix, "set-mail-password.sh");
+    let old = fix.open_session("alice");
+    assert!(fix.session_is_live(&old));
+    fix.file_page_action(
+        "change-password",
+        "alice",
+        json!({"password": "a long new password"}),
+    );
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.session_is_live(&old),
+        "the cookie from before the change still opens the account"
+    );
+    assert!(
+        fix.names("sessions").is_empty(),
+        "a session survived the change: {:?}",
+        fix.names("sessions")
+    );
+    let fresh = fix.open_session("alice");
+    assert!(
+        fix.session_is_live(&fresh),
+        "a login after the change was refused"
+    );
+}
+
 /// One upload key serves sftp and git. Adding it writes the key the builder
 /// reads and rebuilds the member; removing it takes both the store's copy and
 /// the authorized_keys line away, and a key the account does not carry is

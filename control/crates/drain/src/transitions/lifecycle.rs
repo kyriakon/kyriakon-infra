@@ -16,7 +16,7 @@ use super::groups::{
 use super::payments::{resolve_payment, token_join, write_payment_copy};
 use super::Error;
 use super::{due, report_failure, write_journal, Settlement};
-use kyriakon_control_core::account::{dns, export};
+use kyriakon_control_core::account::{dns, export, session};
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::validate;
 use kyriakon_control_core::intent::{
@@ -215,8 +215,9 @@ async fn clear_status_link(store: &Store, username: &str) -> Result<(), Error> {
 /// cannot prove itself before this runs. What is left is the half the handler
 /// cannot do at all: the plaintext is hashed here and nowhere else, the hash is
 /// checked to be one this build made, and the mailbox's own record must still
-/// hold the token. Applying it clears the link, so a replay finds nothing to
-/// apply and is refused like any other spent link.
+/// hold the token. Applying it spends the link in `spent/`, root's own
+/// directory, so a replay is refused even if the handler restores the record's
+/// field, and it closes the account's page sessions as a password change does.
 ///
 /// The remaining limit: a compromised handler chooses the plaintext it submits,
 /// so it can still set a password it knows. It can no longer install a chosen
@@ -234,6 +235,14 @@ pub async fn set_password(
             Error::Failed("the password intent names no status token".to_string())
         })?;
     let username = intent.application.username.as_str();
+    // A link's single use is recorded in `spent/`, root's own directory, because
+    // the application record is the handler's to rewrite. Checked before the
+    // record's own field, so a handler that restores `password_link` cannot
+    // revive a link that has already installed a password.
+    let spent = format!("{token}.json");
+    if store.read_record("spent", &spent).await.is_some() {
+        return Ok(password_refusal(store, file, value, "the link has already been used").await);
+    }
     let mut plain = intent.password;
     let hash = match kyriakon_control_core::account::password::make(&plain) {
         Ok(hash) if kyriakon_control_core::account::password::is_hash(&hash) => hash,
@@ -288,32 +297,59 @@ pub async fn set_password(
         return Ok(password_refusal(store, file, value, "the link has already been used").await);
     }
 
-    run_script(cfg, "set-mail-password.sh", &[username, &hash]).await?;
-
-    // One use: the mailbox keeps no link, so the page stops answering.
-    account.password_link = None;
-    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-        context: "encode the account",
+    // Spend the link before the password is installed: a crash between the two
+    // must not leave a link that can install a second time, and this marker is
+    // what the replay check above reads. It carries no secret, only the account
+    // and the moment, because the password was hashed above.
+    let marker = json!({"username": username, "spent_at": util::filed_at()});
+    let marker = serde_json::to_vec_pretty(&marker).map_err(|source| Error::Json {
+        context: "encode the spent link",
         source,
     })?;
-    write_account_record(store, username, &bytes).await?;
+    store.ensure_dir("spent").await?;
+    store.write_record("spent", &spent, &marker).await?;
 
-    // Clear the status page's copy too, when this token is the link that page
-    // carries. A reset's token has no application record, so it is left alone.
-    if let Some(record) = app_record.as_mut() {
-        if record.get("password_link").is_some_and(|v| !v.is_null()) {
-            record["password_link"] = Value::Null;
-            let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Error::Json {
-                context: "encode the application record",
-                source,
-            })?;
-            // `applications/` belongs to the handler, which renders the status
-            // page as _onboard: a root-owned record reads as missing to it.
-            let owner = store.dir_owner("applications");
-            store
-                .write_record_owned("applications", &name, &bytes, owner)
-                .await?;
+    let finished = async {
+        run_script(cfg, "set-mail-password.sh", &[username, &hash]).await?;
+
+        // One use: the mailbox keeps no link, so the page stops answering.
+        account.password_link = None;
+        let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+            context: "encode the account",
+            source,
+        })?;
+        write_account_record(store, username, &bytes).await?;
+
+        // Clear the status page's copy too, when this token is the link that page
+        // carries. A reset's token has no application record, so it is left alone.
+        if let Some(record) = app_record.as_mut() {
+            if record.get("password_link").is_some_and(|v| !v.is_null()) {
+                record["password_link"] = Value::Null;
+                let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Error::Json {
+                    context: "encode the application record",
+                    source,
+                })?;
+                // `applications/` belongs to the handler, which renders the status
+                // page as _onboard: a root-owned record reads as missing to it.
+                let owner = store.dir_owner("applications");
+                store
+                    .write_record_owned("applications", &name, &bytes, owner)
+                    .await?;
+            }
         }
+
+        // A password set through a link ends every page session the account
+        // holds, as a change from the page does.
+        session::close_all(store, username).await?;
+        Ok::<(), Error>(())
+    }
+    .await;
+    if let Err(e) = finished {
+        // The password may be installed but the record was not finished, so the
+        // link must stay retryable: it is settled spent only when the whole job
+        // is, and a retry rewrites the same hash.
+        let _ = store.remove("spent", &spent).await;
+        return Err(e);
     }
     // The settlement, with the link cleared: `settle` appends it and removes
     // the file, which is why the remove is still the pass's last act.
@@ -1385,7 +1421,10 @@ pub async fn resume(
 /// and their indexes first, reloads the daemons, then the published tree, the
 /// member's certificate, the OS account and home (Maildir and repositories),
 /// the quota record and the store directory, and regenerates the finger page.
-/// The keyring entry and the token index entry are the drain's and go after it:
+/// The published mail key goes next, through scripts/publish-mail-key.sh
+/// --remove, so a name reused after the hold cannot meet a publish that refuses
+/// to replace a key the deleted member left behind; the keyring entry and the
+/// token index entry are the drain's and go after it:
 /// the account record is what names the token, so removing the record first is
 /// what makes the surviving ledger line unlinkable. The ledger line itself is
 /// never touched.
@@ -1418,6 +1457,7 @@ pub async fn delete_account(
         // not here. Only the publication cleanup can be left, and every step is
         // safe over an already-absent path.
         store.remove("keys", &format!("{username}.pub")).await?;
+        remove_published_key(cfg, username).await?;
         remove_keyring_entry(cfg, username).await?;
         close_group_tokens(store, &[username.to_string()]).await?;
         return Ok(());
@@ -1485,6 +1525,11 @@ pub async fn delete_account(
     hold_name(store, username).await?;
     store.remove("keys", &format!("{username}.pub")).await?;
     run_script(cfg, "delete-user.sh", &[username]).await?;
+    // The published set holds the key forever otherwise, and a name reused after
+    // the hold would meet a publish that refuses to replace it. The removal
+    // change goes first so the drift check never sees a key that is published
+    // and no longer served.
+    remove_published_key(cfg, username).await?;
     // The box keyring entry goes now, not before the account: the encryptor
     // failing closed for a mailbox that still exists would bounce its mail.
     remove_keyring_entry(cfg, username).await?;
@@ -1523,6 +1568,26 @@ async fn erasure_refund(store: &Store, account: &Account) -> Result<Option<Strin
     Ok(Some(format!(
         "A refund of GBP {amount} was recorded on {on}; it is settled separately and is not affected by this closure."
     )))
+}
+
+/// Unpublish the account's mail key, `keys/<localpart>.asc` in the repository.
+/// `scripts/publish-mail-key.sh --remove` opens the deletion through the same
+/// token the approval published the key with, and a non-zero exit fails the
+/// transition so the intent is retried. A key that was never published is
+/// already done, which is what makes a retry safe.
+///
+/// This runs before the box keyring entry goes, because
+/// `scripts/check-keyring-drift.sh` alerts on a published key the box no longer
+/// serves: publishing the removal first keeps that signal to the window the
+/// change takes to merge.
+async fn remove_published_key(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
+    run_script(
+        cfg,
+        "publish-mail-key.sh",
+        &["--remove", username, cfg.keyring_publish_token.as_str()],
+    )
+    .await
+    .map_err(Error::from)
 }
 
 /// Drop one account's published key from the box keyring. A missing directory or
@@ -1651,7 +1716,8 @@ async fn save_account(store: &Store, account: &Account) -> Result<(), Error> {
 /// new one as plaintext, and the drain hashes it here. An intent carrying a
 /// `hash` is the old shape and is refused. `set-mail-password.sh` writes the
 /// hash as root, which replaces the old hash and makes the old password stop
-/// working.
+/// working. Every page session the account holds is deleted in the same
+/// transition, so a cookie copied before the change stops opening the account.
 pub async fn change_password(
     cfg: &DrainConfig,
     store: &Store,
@@ -1680,6 +1746,10 @@ pub async fn change_password(
         }
     };
     run_script(cfg, "set-mail-password.sh", &[&account.username, &hash]).await?;
+    // A password change is also the end of every page session: the record is
+    // the whole of what a cookie proves, so a cookie copied before the change
+    // must not keep the account page open. A new login makes a new record.
+    session::close_all(store, &account.username).await?;
     Ok(Settlement::line(
         "applied",
         ApplicationRef::account(account.username.clone()),

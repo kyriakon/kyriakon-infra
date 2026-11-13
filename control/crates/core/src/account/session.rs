@@ -297,6 +297,29 @@ pub async fn lookup(store: &Store, cookie: &str, now: OffsetDateTime) -> Option<
     })
 }
 
+/// Remove every session that belongs to `username`. A password change runs
+/// this: the record is the whole of what a cookie proves, so deleting it is what
+/// ends the authority a copied cookie still names. A session for another
+/// account, and a record that does not parse, are left to `prune`; a store that
+/// cannot be listed is an error rather than a silent pass, because a password
+/// that changed with a live session left behind is the bug this prevents.
+pub async fn close_all(store: &Store, username: &str) -> Result<(), Error> {
+    for name in store.list("sessions").await? {
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let Some(text) = store.read_record("sessions", &name).await else {
+            continue;
+        };
+        let belongs =
+            serde_json::from_str::<Record>(&text).is_ok_and(|record| record.username == username);
+        if belongs {
+            store.remove("sessions", &name).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Remove the session records whose expiry has passed. One unreadable file is
 /// skipped rather than failing every login: the directory holds only what this
 /// module wrote, and a partial record is not a session either.
@@ -529,6 +552,32 @@ mod tests {
         // Closing removes the record, so the cookie answers nothing afterwards.
         close(&store, &cookie).await;
         assert!(lookup(&store, &cookie, now()).await.is_none());
+    }
+
+    /// A password change closes every session the account holds and leaves
+    /// another account's alone. A login after the change is a fresh record, so
+    /// the new cookie is what the member uses, not the one that was revoked.
+    #[tokio::test]
+    async fn closing_an_accounts_sessions_leaves_anothers_and_a_new_login() {
+        let store = store("close-all");
+        let alice_proof = mint(&store, "alice", now().unix_timestamp() + 3600);
+        let first = open(&store, "alice", &alice_proof, now()).await.unwrap();
+        let second = open(&store, "alice", &alice_proof, now()).await.unwrap();
+        let bob_proof = mint(&store, "bob", now().unix_timestamp() + 3600);
+        let bob = open(&store, "bob", &bob_proof, now()).await.unwrap();
+
+        close_all(&store, "alice").await.unwrap();
+        assert!(lookup(&store, &first, now()).await.is_none());
+        assert!(lookup(&store, &second, now()).await.is_none());
+        assert!(
+            lookup(&store, &bob, now()).await.is_some(),
+            "another account's session was closed"
+        );
+        let fresh = open(&store, "alice", &alice_proof, now()).await.unwrap();
+        assert!(
+            lookup(&store, &fresh, now()).await.is_some(),
+            "a login after the change still works"
+        );
     }
 
     #[test]

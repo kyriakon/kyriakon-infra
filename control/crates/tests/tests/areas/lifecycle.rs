@@ -114,6 +114,7 @@ fn a_password_link_applies_once_and_only_when_signed() {
         "password": "correct horse battery",
     });
     fix.write_intent("01J00000000000000000PASSWORD", &intent);
+    let before = fix.open_session("secretary");
     let out = fix.drain();
     assert!(
         out.status.success(),
@@ -157,10 +158,36 @@ fn a_password_link_applies_once_and_only_when_signed() {
             .contains("\"outcome\":\"applied\""),
         "the journal should record the apply"
     );
+    // The link's single use is recorded where the handler cannot rewrite it, and
+    // the sessions that were live before the password changed are gone.
+    assert_eq!(
+        fix.names("spent"),
+        vec![format!("{TOKEN}.json")],
+        "the spent link left no root record"
+    );
+    assert!(
+        !fix.session_is_live(&before),
+        "a session from before the password set survived it"
+    );
+    let later = fix.open_session("secretary");
+    assert!(
+        fix.session_is_live(&later),
+        "a login after the link was used was refused"
+    );
+
+    // A handler that puts the link back on the application record cannot revive
+    // it: the spent marker is checked before the record's field.
+    let mut restored = after.clone();
+    restored["password_link"] = record["password_link"].clone();
+    std::fs::write(
+        fix.path(&format!("store/applications/{TOKEN}.json")),
+        serde_json::to_vec_pretty(&restored).unwrap(),
+    )
+    .unwrap();
 
     // A replay of the same intent is caught by the journal's own dedup, a fresh
-    // click on a spent link by the record, and a forged signature by the key.
-    // None of the three runs the script again.
+    // click on a spent link by the spent marker (its record restored), and a
+    // forged signature by the key. None of the three runs the script again.
     fix.write_intent("01J00000000000000000PASSWORD", &intent);
     let mut fresh = intent.clone();
     fresh["id"] = json!("01J00000000000000000SPENT");

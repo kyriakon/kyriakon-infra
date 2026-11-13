@@ -618,9 +618,11 @@ A card payer's subscription is stopped first, before the token and the record th
 4. Remove the keyring entry on the box and in the repository.
 
 		doas rm /etc/kyriakon/keys/<localpart>.asc
-		git rm keys/<localpart>.asc
+		git -C /usr/local/src/kyriakon-infra rm keys/<localpart>.asc
 
-   Both steps are needed. `deploy-mail.sh` installs each key it finds and never removes one that has left the set, so deleting the repository file alone leaves the on-box entry in place and delivery keeps working for a key that is supposed to be gone.
+   Both steps are needed. `deploy-mail.sh` installs each key it finds and never removes one that has left the set, so deleting the repository file alone leaves the on-box entry in place and delivery keeps working for a key that is supposed to be gone. The automated path runs the repository half itself through `scripts/publish-mail-key.sh --remove` before it removes the box entry, so these two commands are for the fallback when the service is not running.
+
+   The off-box run of `scripts/check-keyring-drift.sh` compares the published set against a recorded copy it cannot write, so refresh that copy with `scripts/check-keyring-drift.sh --fingerprints` where it lives once the removal has merged. A member leaving is one of the reviewed changes that script's header names as a reason to refresh it.
 
 5. Remove the per-member vhost files and their include lines, then reload.
 
