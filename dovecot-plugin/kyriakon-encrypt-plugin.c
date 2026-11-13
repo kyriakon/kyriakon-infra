@@ -69,8 +69,11 @@ static MODULE_CONTEXT_DEFINE_INIT(kyriakon_mailbox_module,
 				  &mail_storage_module_register);
 
 /* The input can be a non-blocking client socket (IMAP APPEND): a 0 read means
- * "nothing yet", and the ioloop has to run before there can be more. The
- * status mapping itself lives in encrypt-save.c, where the test drives it. */
+ * "nothing yet", and the ioloop has to run before there can be more. -1 is
+ * both EOF and a stream error; only stream_errno says which, and an error
+ * must fail the save rather than complete it on a short body. -2 is "buffer
+ * full": its bytes are already there to hand out. The status mapping itself
+ * lives in encrypt-save.c, where the test drives it. */
 static int
 kyriakon_pull_input(void *context, const unsigned char **data_r, size_t *size_r,
 		    char *error, size_t error_size)
@@ -80,10 +83,12 @@ kyriakon_pull_input(void *context, const unsigned char **data_r, size_t *size_r,
 	int ret;
 
 	ret = i_stream_read(sctx->input);
-	if (ret > 0) {
+	if (ret > 0 || ret == -2) {
 		*data_r = i_stream_get_data(sctx->input, size_r);
 		i_stream_skip(sctx->input, *size_r);
-	} else if (ret < -1) {
+		/* -2 only happens with data buffered, so report it as data. */
+		ret = *size_r > 0 ? 1 : 0;
+	} else if (ret < 0 && sctx->input->stream_errno != 0) {
 		read_error = i_stream_get_error(sctx->input);
 	}
 	return kyriakon_save_pull(ret, read_error, error, error_size);

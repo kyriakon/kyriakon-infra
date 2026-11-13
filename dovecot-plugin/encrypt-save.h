@@ -44,8 +44,11 @@ enum kyriakon_save_pull {
 #endif
 
 /* Map one i_stream_read() result onto a pull status: > 0 data, 0 nothing yet,
- * -1 EOF, anything lower a stream error named by read_error. Lives here, not
- * in the plugin, so the status mapping is the one the test exercises. */
+ * -1 EOF (only when read_error is empty), -2 "buffer full" and so a retry,
+ * and a non-empty read_error an error whatever the result. -1 carrying an
+ * error is not EOF: the plaintext is only a prefix, and the save must fail.
+ * Lives here, not in the plugin, so the status mapping is the one the test
+ * exercises. */
 int kyriakon_save_pull(int ret, const char *read_error,
 		       char *error, size_t error_size);
 
