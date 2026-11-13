@@ -631,6 +631,19 @@ per week, refilling one per 202 minutes, is a rate the platform has to live insi
 only published escape from it, for a single registered domain at this volume, is an override whose
 application form begins above the platform's ceiling.
 
+### Parked: the wildcard, 2026-11-13
+
+#605 asked whether to adopt one `*.kyriakon.net` certificate. The decision is to park it and keep
+the per-member HTTP-01 path. `acme-client` on OpenBSD 7.9 is HTTP-01 only, so a wildcard needs a
+second client plus a script that writes `_acme-challenge.kyriakon.net` into the hidden primary's
+zone and reloads nsd. That adds a new executable, a new ACME account and a DNS mutation path to the
+mail and hosting box, and it concentrates every member name under one key and one account.
+
+#648 now gives the HTTP-01 queue its initial burst and separates the own-domain spacing, so the
+queue no longer makes a signup wait a week behind the 50-certificate window. The wildcard is a
+larger change than the remaining problem justifies. Revisit if a maintained DNS-01 client lands in
+base or ports, or if signup volume again spends the window after the burst.
+
 ## 7. Not verified, and unreachable
 
 The following could not be checked and are not claimed.
