@@ -102,8 +102,15 @@ impl TestEnv {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(armor).unwrap();
-        let out = child.wait_with_output().unwrap();
+        // A megabyte of plaintext fills the stdout pipe before the write ends,
+        // so the write runs on its own thread while this one drains.
+        let mut stdin = child.stdin.take().unwrap();
+        let out = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || stdin.write_all(armor).unwrap());
+            let out = child.wait_with_output().unwrap();
+            writer.join().unwrap();
+            out
+        });
         assert!(
             out.status.success(),
             "decrypt failed: {}",
@@ -591,6 +598,144 @@ fn a_session_key_packet_with_a_literal_packet_is_encrypted_normally() {
         env.decrypt(&octet_stream(&out)),
         expected.as_bytes(),
         "the message must be the payload, not kept in the clear"
+    );
+}
+
+#[test]
+fn a_bare_cr_message_keeps_its_body_out_of_the_clear_wrapper() {
+    let env = TestEnv::get();
+
+    // The envelope splitter must treat a bare CR as a line ending: otherwise a
+    // message with no LF at all is one line, and the first colon names the whole
+    // body a header, which `rfc3156_envelope` then copies outside the armour.
+    let msg = b"From: alice@example.invalid\rSubject: x\r\rENTIRE-SECRET-BODY-TEXT\r";
+    let (ok, out) = encrypt_seam_input(env, "alice", msg, &scratch_gpg_home(env));
+    assert!(ok, "encrypt failed");
+    assert_valid_envelope(&out);
+    let wrapper = String::from_utf8_lossy(&out);
+    assert!(
+        !wrapper.contains("ENTIRE-SECRET-BODY-TEXT"),
+        "the body leaked into the clear wrapper:\n{wrapper}"
+    );
+    assert!(
+        wrapper.contains("From: alice@example.invalid\n"),
+        "the header is still exposed:\n{wrapper}"
+    );
+    assert!(
+        String::from_utf8_lossy(&env.decrypt(&octet_stream(&out)))
+            .contains("ENTIRE-SECRET-BODY-TEXT"),
+        "the body is still inside the ciphertext"
+    );
+}
+
+#[test]
+fn a_message_larger_than_the_pipe_buffer_encrypts() {
+    let env = TestEnv::get();
+
+    // gpg writes ciphertext as it reads, so a save path that writes all of
+    // stdin before draining stdout deadlocks as soon as the armour outgrows the
+    // ~64 KiB pipe: 256 KiB hung where 160 KiB did not. The body is
+    // incompressible because gpg deflates by default, and a megabyte of one
+    // byte would arrive as a few hundred bytes of armour.
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let body: Vec<u8> = (0..1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    let mut msg = b"From: alice@example.invalid\n\
+        To: bob@example.invalid\n\
+        Subject: big\n\
+        Content-Type: text/plain; charset=utf-8\n\
+        \n"
+    .to_vec();
+    msg.extend_from_slice(&body);
+    msg.push(b'\n');
+
+    // Bound the run: a reintroduced deadlock must fail the test, not hang CI.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(encrypt_seam_input(env, "alice", &msg, &env.gpg_home));
+    });
+    let (ok, out) = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("encrypting 1 MiB did not finish within 120s");
+    assert!(ok, "a megabyte must encrypt");
+    assert_valid_envelope(&out);
+    let armor = octet_stream(&out);
+    assert!(
+        armor.len() > body.len(),
+        "the armour carries the whole body: {} bytes",
+        armor.len()
+    );
+
+    // Re-saving our own envelope runs the packet listing over the same armour,
+    // which shared the write-before-drain hazard.
+    let (ok, again) = encrypt_seam_input(env, "alice", &out, &scratch_gpg_home(env));
+    assert!(ok, "re-saving the large envelope must succeed");
+    assert_eq!(
+        octet_stream(&again),
+        armor,
+        "the large ciphertext comes back untouched"
+    );
+
+    let mut expected = b"From: alice@example.invalid\n\
+        To: bob@example.invalid\n\
+        Subject: big\n\
+        Content-Type: text/plain; charset=utf-8; protected-headers=\"v1\"\n\
+        \n"
+    .to_vec();
+    expected.extend_from_slice(&body);
+    expected.push(b'\n');
+    assert_eq!(
+        env.decrypt(&armor),
+        expected,
+        "the whole message is the payload"
+    );
+}
+
+#[test]
+fn a_colonless_line_is_not_carried_in_the_clear_wrapper() {
+    let env = TestEnv::get();
+
+    // Only a continuation line folds into the header above it. Anything else is
+    // not a header, so copying exposed spans into the unencrypted wrapper must
+    // not pick it up: this text would sit outside the ciphertext.
+    let msg = b"From: alice@example.invalid\n\
+        To: bob@example.invalid,\n\
+        \tcarol@example.invalid\n\
+        smuggled plaintext\n\
+        Date: Mon, 1 Jan 2024 00:00:00 +0000\n\
+        \n\
+        body\n";
+
+    let (ok, out) = encrypt_seam_input(env, "alice", msg, &scratch_gpg_home(env));
+    assert!(ok, "encrypt failed for alice");
+    assert_valid_envelope(&out);
+    let wrapper = String::from_utf8_lossy(&out);
+    assert!(
+        !wrapper.contains("smuggled plaintext"),
+        "a non-header line leaked into the clear wrapper:\n{wrapper}"
+    );
+    assert!(
+        wrapper.contains("To: bob@example.invalid,\n\tcarol@example.invalid\n"),
+        "the folded continuation travels with its header:\n{wrapper}"
+    );
+    assert!(
+        wrapper.contains("Date: Mon, 1 Jan 2024 00:00:00 +0000\n"),
+        "the header after it is still exposed:\n{wrapper}"
+    );
+
+    // Nothing is lost: the line is part of the payload, inside the ciphertext.
+    let payload = env.decrypt(&octet_stream(&out));
+    assert!(
+        payload
+            .windows(b"smuggled plaintext".len())
+            .any(|w| w == b"smuggled plaintext"),
+        "the message must survive inside the ciphertext"
     );
 }
 
