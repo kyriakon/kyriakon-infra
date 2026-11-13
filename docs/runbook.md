@@ -84,6 +84,14 @@ The marker is `/var/db/kyriakon/deployed`, one line holding the commit and the
 UTC time it was recorded. It is written by `--record`, or by a run whose range
 had no manual step.
 
+## The network edge
+
+There is no provider-level firewall. Reachability is decided by which daemon binds where, over the stock `block return all` / `pass all` `pf.conf` that `scripts/pf-apply.sh` appends its pass rules to. That is the intended posture, decided in #703: the public mail and web surface is the product, and there is no stable operator source address to restrict 22 and 2222 to.
+
+Open to the world by design: 22, 25, 53, 80, 443, 465, 587, 993, 995, 1965, 4190, and 1966 when the Titan upload is enabled, plus 2222 for the member git-shell. Ports 22 and 2222 are reachable from anywhere as well; their bound is key authentication and, on 2222, the confinement in `scripts/member-git-shell.sh`, not a source address.
+
+`pf.conf` and `sshd_config` stay propose-only: `scripts/deploy.sh` prints the commands and never applies them, and a host rule change is made by hand after review. A provider firewall was considered and declined; the second-host and second-jurisdiction trigger in ADR 0007 is the point to revisit the layering, so it is not decided twice.
+
 ## Publish the governance documents
 
 The terms, the acceptable use policy and the privacy notice are `docs/terms.md`,
@@ -625,6 +633,8 @@ Do not delete an account before its window ends, and do not delete by hand anyth
 
 `scripts/backup.sh` writes an encrypted restic snapshot to the storage box every night, with retention of 30 daily, 8 weekly and 6 monthly snapshots. `scripts/cron-apply.sh` installs its cron line.
 
+Hetzner's own server backups are declared off in `terraform/main.tf` (`backups = false`). The restic repository is the copy, and the weekly restore test is the proof it exists. Enabling backups in the console is corrected by the next apply on purpose: change the declaration instead of the console if that is ever wanted.
+
 The snapshot holds the paths `BACKUP_PATHS` in `scripts/lib.sh` lists, plus the capsule certificate pairs. That is the user data under `/home`, the mail secrets, and the state a rebuild cannot recreate: the control store, the box keyring and drain secrets, the account database, the generated daemon directories and the certificate queue. `scripts/restore-test.sh` reads the same list, so the payload and its assertion cannot drift. A path that does not exist on the box is skipped rather than failing the run, because restic exits on a missing path. Hand-written config stays out: it is the git-tracked repository.
 
 The weekly test runs on a box that exists for the length of the run. From the mail box:
@@ -757,6 +767,8 @@ Do not delete files under `/home` to free space. The account lifecycle is the pa
 The box is a Hetzner `cx23` in `hel1`: 2 vCPU, 3.9 GiB of memory, and one 40 GB disk divided into partitions, of which `/home` is 8.2 GB. Every member is promised 5 GB, which is proposal 6.5 and is enforced: `/home` is mounted with quotas, `/home/quota.user` holds the records, and `scripts/quota-apply.sh` writes each account a soft 5 GB and a hard 5.5 GB limit. At that promise the partition carries one member and two would overrun it, and at the 1.9 MB of mail the account on it now uses, it would carry thousands.
 
 The promise is the one that is sold, so the box's resource is grown when it becomes the wall rather than a member count being fixed in advance, and the choice between the two ways of growing it is made at the time: attaching a volume, or moving to a larger server type.
+
+A move to a larger server type is made by hand in the Hetzner console, not by `terraform apply`: the provider's update path for a type change powers the box off and back on, and it stops at the softraid passphrase prompt, so `server_type` sits in the resource's `ignore_changes`. After a console resize, `terraform plan` should show no `server_type` diff; a diff there means the declaration changed, not the box.
 
 The trigger is the `/home` partition, looked at in the quarterly pass in `## Run the quarterly indirect-tax check`:
 

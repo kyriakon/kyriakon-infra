@@ -94,7 +94,7 @@ boots vulnerable rspamd (section 6.10).
 | Variable            | Default        | Notes |
 | ------------------- | -------------- | ----- |
 | `server_name`       | -              | host-identifying; set in `terraform.tfvars` |
-| `server_type`       | `cx23`         | disk >= snapshot's source disk |
+| `server_type`       | `cx23`         | disk >= snapshot's source disk; create-time only, later resizes are a hand step in the Hetzner console (runbook) |
 | `location`          | `hel1`         | region the storage box is NOT in |
 | `snapshot_selector` | `kind=gold`   | set at `create-image` time |
 
