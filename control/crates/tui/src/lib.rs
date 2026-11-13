@@ -948,6 +948,48 @@ fn answer_limit(page: &Page) -> usize {
     }
 }
 
+/// Read and drop the rest of an answer whose cap tripped, up to the page's own
+/// terminator, so the refusal screen's Enter is followed by a fresh answer rather
+/// than by the middle of the paste that was refused.
+///
+/// A one-line answer has nothing left to drop: `Reader` read that line to its
+/// end before refusing it. A paste that names no terminator is read to the end of
+/// the connection, which is what the page would have done without the cap; the
+/// bytes are dropped as they arrive, so the process stays at its bound.
+fn drain_answer(page: &Page, input: &mut dyn Input) {
+    let multiline = matches!(page.q.kind, Kind::Multiline | Kind::Addresses);
+    let key = page.q.kind == Kind::Key && page.q.rule != Rule::UploadKey;
+    if !multiline && !key {
+        return;
+    }
+    // The same bound the key read uses, so a block that never ends is dropped
+    // rather than read forever.
+    let mut dropped = 0;
+    loop {
+        match input.word() {
+            Ok(Some(Word::Line(word))) => {
+                let line = word.trim_end_matches(['\r', '\n']);
+                if multiline && line.trim() == "." {
+                    return;
+                }
+                if key {
+                    if line.starts_with("-----END PGP PUBLIC KEY BLOCK-----") {
+                        return;
+                    }
+                    dropped += 1;
+                    if dropped > 200 {
+                        return;
+                    }
+                }
+            }
+            // An over-long line was read to its end as well, so carry on.
+            Ok(Some(Word::TooLong)) => {}
+            // A closed connection or a failed read is the next read's to report.
+            Ok(None) | Err(_) => return,
+        }
+    }
+}
+
 /// Read one answer. A multi-line answer, and an address list, end with a full
 /// stop on its own line; a mail key ends at the armour's own end line; the upload
 /// key is one line, because that is the shape OpenSSH writes. `back` and `quit`
@@ -956,7 +998,8 @@ fn answer_limit(page: &Page) -> usize {
 /// has no way out.
 ///
 /// The answer is bounded by `answer_limit`: a paste past it is refused before it
-/// is kept, because an answer a validator will refuse is not worth carrying.
+/// is kept, because an answer a validator will refuse is not worth carrying. The
+/// rest of that paste is dropped before this returns, so the retry starts clean.
 fn read_answer(page: &Page, input: &mut dyn Input) -> Result<Entered, Error> {
     let key = page.q.kind == Kind::Key;
     let multiline = matches!(page.q.kind, Kind::Multiline | Kind::Addresses);
@@ -968,6 +1011,7 @@ fn read_answer(page: &Page, input: &mut dyn Input) -> Result<Entered, Error> {
             return Ok(Entered::Gone);
         };
         let Word::Line(word) = word else {
+            drain_answer(page, input);
             return Ok(Entered::TooLong);
         };
         let line = word.trim_end_matches(['\r', '\n']);
@@ -992,6 +1036,7 @@ fn read_answer(page: &Page, input: &mut dyn Input) -> Result<Entered, Error> {
         }
         kept += line.chars().count() + usize::from(!lines.is_empty());
         if kept > limit {
+            drain_answer(page, input);
             return Ok(Entered::TooLong);
         }
         lines.push(line.to_string());
@@ -1166,8 +1211,22 @@ fn token_word(input: &mut dyn Input, out: &mut dyn Write) -> Result<Option<Strin
         out,
         "\nPaste the token from your status link, or press Enter to go back.\n",
     )?;
-    let Some(Word::Line(word)) = input.word()? else {
-        return Ok(None);
+    let word = match input.word()? {
+        None => return Ok(None),
+        Some(Word::Line(word)) => word,
+        // A token past the cap is refused in the words the answers use, and the
+        // first screen comes back rather than the reader being dropped.
+        Some(Word::TooLong) => {
+            put(
+                out,
+                &format!(
+                    "\nThat token is longer than this form accepts ({} characters at most).\n\
+                     Nothing was kept. Press Enter to start.\n",
+                    ANSWER_CAP
+                ),
+            )?;
+            return Ok(None);
+        }
     };
     let token = word.trim();
     Ok((!token.is_empty()).then(|| token.to_string()))
@@ -2247,8 +2306,9 @@ mod tests {
     }
 
     /// An answer past the cap is refused with a message and the same question is
-    /// asked again; the answer after it is the one kept, and none of the refused
-    /// paste reaches the confirm screen.
+    /// asked again; the rest of the refused paste is dropped first, so the retry
+    /// reads the reader's next fresh line rather than a fragment of the paste, and
+    /// none of it reaches the confirm screen.
     #[test]
     fn an_answer_past_the_cap_is_refused_and_the_page_asks_again() {
         let questions = [note_question()];
@@ -2257,16 +2317,30 @@ mod tests {
             questions: &questions,
             reserved: &reserved,
         };
-        let mut script = Script {
-            words: [
-                Some(Word::TooLong),
+        // Eight 8 KiB lines trip the cap inside a paste that carries on for two
+        // more lines and its own full stop.
+        let mut words: Vec<Option<Word>> = vec!["a".repeat(8192); 8]
+            .into_iter()
+            .map(|line| Some(Word::Line(line)))
+            .collect();
+        words.extend(
+            [
+                // The rest of the abandoned paste, and its terminator.
+                "paste fragment".to_string(),
+                "another fragment".to_string(),
+                ".".to_string(),
                 // The reader's Enter at the refusal screen.
-                Some(Word::Line(String::new())),
-                Some(Word::Line("small note".to_string())),
-                Some(Word::Line(".".to_string())),
-                Some(Word::Line("yes".to_string())),
+                String::new(),
+                // The fresh answer.
+                "small note".to_string(),
+                ".".to_string(),
+                "yes".to_string(),
             ]
-            .into(),
+            .into_iter()
+            .map(|line| Some(Word::Line(line))),
+        );
+        let mut script = Script {
+            words: words.into(),
             keys: VecDeque::new(),
         };
         let mut files = Files::default();
@@ -2279,10 +2353,102 @@ mod tests {
             seen.contains("longer than this form accepts"),
             "the oversized answer was not refused: {seen}"
         );
-        assert!(seen.contains("Note: small note"), "{seen}");
+        assert!(
+            seen.contains("Note: small note"),
+            "the retry did not read the reader's fresh line: {seen}"
+        );
+        assert!(
+            !seen.contains("fragment"),
+            "a refused paste was kept: {seen}"
+        );
         assert!(!seen.contains("aaaa"), "a refused paste was kept");
         assert_eq!(files.forms.len(), 1);
         assert!(script.spent(), "the session stopped at the refusal");
+    }
+
+    /// A refusal drops the rest of the answer up to the page's own terminator, and
+    /// no further: a multi-line answer ends at its full stop and a pasted block at
+    /// its armour line, so the line after each is the reader's next answer.
+    #[test]
+    fn a_refused_answer_is_drained_to_its_own_terminator() {
+        let multi = note_question();
+        let page = Page {
+            q: &multi,
+            mailbox: None,
+        };
+        let mut words: Vec<String> = vec!["a".repeat(8192); 8];
+        words.extend([
+            "fragment".to_string(),
+            // The refused answer's own full stop: the drain stops here.
+            ".".to_string(),
+            // The fresh answer the reader types next, with its own full stop.
+            "fresh line".to_string(),
+            ".".to_string(),
+        ]);
+        let mut script = Script::owned(words);
+        assert!(matches!(
+            read_answer(&page, &mut script).unwrap(),
+            Entered::TooLong
+        ));
+        match read_answer(&page, &mut script).unwrap() {
+            Entered::Value(value) => assert_eq!(value, "fresh line"),
+            _ => panic!("the retry read a fragment of the refused paste"),
+        }
+
+        let key = Question {
+            kind: Kind::Key,
+            rule: Rule::MailKey,
+            ..note_question()
+        };
+        let page = Page {
+            q: &key,
+            mailbox: None,
+        };
+        let mut words: Vec<String> = vec!["a".repeat(8192); 8];
+        words.extend([
+            "fragment".to_string(),
+            // The refused block's own armour end: the drain stops here.
+            "-----END PGP PUBLIC KEY BLOCK-----".to_string(),
+            // The fresh block the reader pastes next.
+            "fresh line".to_string(),
+            "-----END PGP PUBLIC KEY BLOCK-----".to_string(),
+        ]);
+        let mut script = Script::owned(words);
+        assert!(matches!(
+            read_answer(&page, &mut script).unwrap(),
+            Entered::TooLong
+        ));
+        match read_answer(&page, &mut script).unwrap() {
+            Entered::Value(value) => {
+                assert!(value.starts_with("fresh line"), "{value}");
+                assert!(!value.contains("fragment"), "{value}");
+            }
+            _ => panic!("the retry read a fragment of the refused paste"),
+        }
+    }
+
+    /// The status token prompt refuses an over-long paste in the words the answers
+    /// use and puts the first screen back, rather than going quiet.
+    #[test]
+    fn an_oversized_token_is_refused_with_a_message() {
+        let rows = rows(None);
+        let mut script = Script {
+            words: [
+                Some(Word::Line("status".to_string())),
+                Some(Word::TooLong),
+                Some(Word::Line(String::new())),
+                Some(Word::Line("quit".to_string())),
+            ]
+            .into(),
+            keys: VecDeque::new(),
+        };
+        let (left, seen) = session(&rows, Mode::Plain, &mut script);
+        assert_eq!(left, Departure::Quit);
+        assert!(
+            seen.contains("That token is longer than this form accepts"),
+            "{seen}"
+        );
+        assert!(script.spent(), "the token refusal swallowed the next line");
     }
 
     /// The first screen is bounded too: an oversized line there is refused and the
