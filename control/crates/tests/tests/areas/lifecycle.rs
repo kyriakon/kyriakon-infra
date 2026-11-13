@@ -76,7 +76,7 @@ fn a_filed_application_produces_one_review_email() {
 }
 
 /// A password set through the one-time link is applied once, and only with a
-/// signature over the link's own token and date. The drain hashes the plaintext
+/// signature over the link's own token, account and date. The drain hashes the plaintext
 /// it is given, the record stops holding the link, and a replay or a forged
 /// signature is refused without the script being run.
 #[test]
@@ -100,7 +100,7 @@ fn a_password_link_applies_once_and_only_when_signed() {
     )
     .unwrap();
 
-    let sig = sign::sign(&key, &sign::password_payload(TOKEN, &until)).unwrap();
+    let sig = sign::sign(&key, &sign::password_payload(TOKEN, "secretary", &until)).unwrap();
     let intent = json!({
         "id": "01J00000000000000000PASSWORD",
         "kind": "set-password",
@@ -181,6 +181,98 @@ fn a_password_link_applies_once_and_only_when_signed() {
     );
 }
 
+/// A signature the drain issued for one account does not set another's
+/// password. The handler can rewrite the application copy and file the intent
+/// under any name, so the account the signature covers is the intent's own:
+/// an intent that names another account fails verification, and one whose
+/// record was rewritten is refused by the record check. Neither runs
+/// `set-mail-password.sh`.
+#[test]
+fn a_password_link_cannot_be_pointed_at_another_account() {
+    let fix = Fix::new("password-repointed");
+    let log = fix.path("password.log");
+    fix.script(
+        "set-mail-password.sh",
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n"),
+    );
+    let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
+    let until = kyriakon_control_core::util::date_after_days(7);
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    // The link and signature the drain issued for the filed account.
+    let username = record["username"].as_str().unwrap();
+    let link = sign::password_link(
+        "https://signup.example.invalid",
+        &key,
+        TOKEN,
+        username,
+        &until,
+    )
+    .unwrap();
+    // Take the signature from the link the production code issued, so the
+    // link's own payload is what the drain verifies.
+    let sig = link
+        .split("sig=")
+        .nth(1)
+        .expect("the issued link carries its signature")
+        .to_string();
+    let rewrite_record = |username: &str| {
+        let mut copy = record.clone();
+        copy["username"] = json!(username);
+        copy["password_link"] = json!(link);
+        std::fs::write(
+            fix.path(&format!("store/applications/{TOKEN}.json")),
+            serde_json::to_vec_pretty(&copy).unwrap(),
+        )
+        .unwrap();
+    };
+    let file_intent = |id: &str, username: &str| {
+        fix.write_intent(
+            id,
+            &json!({
+                "id": id,
+                "kind": "set-password",
+                "filed_at": "2026-10-21T09:00:00Z",
+                "application": { "username": username, "status_token": TOKEN },
+                "until": until,
+                "sig": sig,
+                "password": "correct horse battery",
+            }),
+        );
+    };
+
+    // The handler points the captured signature at a victim by naming the
+    // victim in the intent and rewriting the record to match.
+    rewrite_record("victim");
+    file_intent("01J00000000000000000TAKEOVER", "victim");
+    // And the other half: the intent keeps the signed name and the record was
+    // rewritten, so the drain's record check is what refuses.
+    file_intent("01J00000000000000000RELABEL", username);
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !std::path::Path::new(&log).exists(),
+        "the script ran for another account: {}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert_eq!(fix.intents().len(), 2, "a refusal is not a settlement");
+    let journal = fix.journal();
+    assert!(
+        journal.contains("the link's signature does not verify"),
+        "{journal}"
+    );
+    assert!(
+        journal.contains("the intent names another account"),
+        "{journal}"
+    );
+    // Nothing was applied, so the link is still live on the record.
+    let after: Value = serde_json::from_str(
+        &std::fs::read_to_string(fix.path(&format!("store/applications/{TOKEN}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert!(!after["password_link"].is_null(), "{after}");
+}
+
 /// A `set-password` intent that carries a hash is refused even under a valid
 /// link signature: the drain hashes the plaintext, so a handler that holds a
 /// valid link cannot install a hash of its own choosing.
@@ -204,7 +296,7 @@ fn a_password_intent_carrying_a_hash_is_refused() {
     )
     .unwrap();
 
-    let sig = sign::sign(&key, &sign::password_payload(TOKEN, &until)).unwrap();
+    let sig = sign::sign(&key, &sign::password_payload(TOKEN, "secretary", &until)).unwrap();
     let chosen =
         kyriakon_control_core::account::password::make("a password the member never typed")
             .unwrap();
@@ -260,7 +352,7 @@ fn a_refused_password_intent_keeps_no_plaintext() {
         serde_json::to_vec_pretty(&record).unwrap(),
     )
     .unwrap();
-    let sig = sign::sign(&key, &sign::password_payload(TOKEN, until)).unwrap();
+    let sig = sign::sign(&key, &sign::password_payload(TOKEN, "secretary", until)).unwrap();
     fix.write_intent(
         "01J00000000000000000EXPIRED",
         &json!({
@@ -371,7 +463,7 @@ fn a_failed_password_pass_is_retried_after_the_backoff() {
         serde_json::to_vec_pretty(&record).unwrap(),
     )
     .unwrap();
-    let sig = sign::sign(&key, &sign::password_payload(TOKEN, &until)).unwrap();
+    let sig = sign::sign(&key, &sign::password_payload(TOKEN, "secretary", &until)).unwrap();
     fix.write_intent(
         "01J00000000000000000RETRY",
         &json!({

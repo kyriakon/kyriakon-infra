@@ -621,7 +621,8 @@ async fn approve(
     // how to set the password. The spec asks for the link in the email and on
     // the status page both.
     let password_until = util::date_after_days(7);
-    let password_link = sign::password_link(&cfg.base_url, key, token, &password_until)?;
+    let password_link =
+        sign::password_link(&cfg.base_url, key, token, &record.username, &password_until)?;
     let body = approval_body(
         cfg,
         &record,
