@@ -1463,6 +1463,43 @@ fn a_confirmation_that_cannot_be_sent_is_not_recorded_as_sent() {
         .exists());
 }
 
+/// With no outside address the approval mail to the new mailbox is the durable
+/// medium, so it has to carry the Schedule 2 particulars in `docs/terms.md`: the
+/// trader and the geographic address, the price and period, and the cancellation
+/// form.
+#[test]
+fn a_no_address_approval_carries_the_confirmation_particulars() {
+    let fix = Fix::new("confirmation-particulars");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let sent = fix.sent();
+    assert!(sent.contains("was approved"), "{sent}");
+    assert!(sent.contains("1 Example Street, Example"), "{sent}");
+    assert!(sent.contains("GBP 20.00 for one year"), "{sent}");
+    assert!(
+        sent.contains("I give notice that I cancel my contract"),
+        "{sent}"
+    );
+    assert!(
+        sent.contains("digital content is supplied immediately"),
+        "{sent}"
+    );
+    assert_eq!(
+        sent.matches("was confirmed").count(),
+        0,
+        "the confirmation travels in the approval mail: {sent}"
+    );
+    assert!(fix
+        .dir
+        .join("store/accounts/secretary/account.json")
+        .exists());
+}
+
 /// With no outside address the confirmation travels inside the approval mail,
 /// so a failed approval enqueue must not leave that notice recorded as sent: the
 /// retry would read it as delivered and the confirmation would be lost. The

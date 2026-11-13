@@ -46,7 +46,7 @@ Provisioning does not take the right away, and we refund in full if you cancel i
 - your express request that we start now, before the cancellation period ends;
 - your acknowledgement, for digital content, that supply begins immediately and the right to cancel can be lost once it does.
 
-Those are the two checkboxes that appear before payment. We record both, and the confirmation email we send before we provision the account repeats them in writing. If you tick neither, we hold the account until the fourteen days have passed.
+Those are the two checkboxes that appear before payment. We record both, and the confirmation we send repeats them in writing: as its own email before we provision the account when you gave an address outside this platform, or in the approval mail to your new mailbox when you did not. If you tick neither, we hold the account until the fourteen days have passed.
 
 Cancelling inside the window costs you nothing. We refund what you paid in full, within fourteen days, in the rail you paid with, or as a credit against the next year if you would rather. Even though the law allows us to charge for the part of the year already supplied, we do not: if you cancel on day three you get the whole amount back and we deduct nothing.
 
@@ -100,7 +100,7 @@ Because nothing was paid, the liability cap below is nil for a free account, and
 
 ## Who may apply
 
-There is one restriction on who may apply. Applications from residents of countries under UK sanctions are declined. The reviewer checks the consolidated list at approval. That is the only limit: no other country, and no other ground, is a reason to refuse an application.
+There is one restriction on who may apply. By applying you confirm that you are not a person designated under UK sanctions, and that your residence does not make this contract one that UK sanctions prohibit. We hold no legal name, postal address or country for an applicant, so we do not check the consolidated list at approval, and the restriction rests on that confirmation. If we learn it was untrue we may refuse or close the account. That is the only limit: no other country, and no other ground, is a reason to refuse an application.
 
 ## Keys and your account
 
@@ -115,6 +115,8 @@ There is no webmail. You need a PGP-capable mail client, and the walkthrough sho
 Nothing in these terms excludes our liability for death or personal injury caused by our negligence, for fraud, or for anything else the law does not let us exclude. Your statutory rights as a consumer are not affected, and the Consumer Rights Act 2015 requires us to perform the service with reasonable care and skill.
 
 Except for those, our liability for any claim is capped at the fees you paid us in the twelve months before the claim. For a free account that is nothing, which is the honest figure rather than a rebate. We are not liable for indirect or consequential loss.
+
+Where the account is held in the course of a business, we are not liable for loss of profit, loss of revenue, loss of business, loss of goodwill, or loss of anticipated savings, whether direct or indirect. We are not liable for the loss of mail, other data, keys or the account itself where the cause is that you lost a private key or the recovery phrase described under Keys and your account. No copy of the private key exists here, so nothing we hold can open the mailbox or restore the mail.
 
 We do not promise any particular uptime and we do not promise a response time. One operator runs one server. If it fails, we tell you by mail from a different machine, because if the box is down your mailbox is one of the things that is down. We do not promise that a message will be delivered, that a certificate will be issued on a particular day, or that ciphertext archived today stays unreadable. The hosting page and the refusal list state those limits beside the claims they qualify.
 
