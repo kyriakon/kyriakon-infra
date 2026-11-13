@@ -230,6 +230,7 @@ impl Store {
         owner: Option<(u32, u32)>,
         mode: u32,
     ) -> Result<(), Error> {
+        check_name(name)?;
         // The handler renders account and group records and runs as `_onboard`,
         // so a root-only mode here is a page that reads as missing. Refuse it
         // rather than letting three call sites rediscover the rule.
@@ -419,13 +420,33 @@ impl Store {
             line.push(b'\n');
         }
         let sync = self.sync;
+        // A symlink or a FIFO planted at the record's name is refused before
+        // open: O_NOFOLLOW stops the link, and O_NONBLOCK stops a readerless
+        // FIFO from hanging the pass while it holds the lock.
+        if let Ok(meta) = tokio::fs::symlink_metadata(&p).await {
+            if !meta.file_type().is_file() {
+                return Err(Error::Refused(format!(
+                    "a symlink is planted at {}; an append is not written through it",
+                    p.display()
+                )));
+            }
+        }
         let placed = async {
             let mut f = tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .mode(mode)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(&p)
                 .await?;
+            // The path could change between the check and the open; the
+            // descriptor is what is appended to.
+            if !f.metadata().await?.is_file() {
+                return Err(std::io::Error::other(format!(
+                    "{} is not a regular file; it is not appended to",
+                    p.display()
+                )));
+            }
             // The mode argument above applies only at creation, and an upgrade
             // finds the file already 0600; both are corrected here.
             f.set_permissions(std::fs::Permissions::from_mode(mode))
@@ -456,10 +477,20 @@ impl Store {
             }
         }
         .await;
-        placed.map_err(|source| Error::Io {
-            action: Action::Append,
-            path: p,
-            source,
+        placed.map_err(|source| {
+            // O_NOFOLLOW answers ELOOP for a planted symlink; say which record
+            // and why rather than reporting an append that failed for no reason.
+            if source.raw_os_error() == Some(libc::ELOOP) {
+                return Error::Refused(format!(
+                    "a symlink is planted at {}; an append is not written through it",
+                    p.display()
+                ));
+            }
+            Error::Io {
+                action: Action::Append,
+                path: p,
+                source,
+            }
         })
     }
 
@@ -491,6 +522,7 @@ impl Store {
     /// that is interrupted and rerun completes rather than failing on the files
     /// it already cleared.
     pub async fn remove(&self, dir: &str, name: &str) -> Result<(), Error> {
+        check_name(name)?;
         let p = self.root.join(dir).join(name);
         match tokio::fs::remove_file(&p).await {
             Ok(()) => Ok(()),
@@ -1044,6 +1076,19 @@ fn crockford128(bytes: [u8; 16]) -> String {
         out.push(A[((v >> (5 * i)) & 31) as usize] as char);
     }
     out
+}
+
+/// A record name is one component inside its directory. A name carrying a
+/// separator or a NUL, or one that names the directory itself, is refused
+/// rather than joined: the drain turns fields from records the unprivileged
+/// handler owns into names, and `../../x` would leave the store.
+fn check_name(name: &str) -> Result<(), Error> {
+    if name.contains(['/', '\0']) || name.starts_with('.') {
+        return Err(Error::Refused(format!(
+            "{name:?} is not a record name; it must be one component inside its directory"
+        )));
+    }
+    Ok(())
 }
 
 /// The status token's shape, checked before a token is used as a path or looked
@@ -2295,7 +2340,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_store_file_appends_and_reads_back_line_by_line() {
-        let dir = std::env::temp_dir().join(format!("onboard-append-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("onboard-append-lines-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::new(dir.to_str().unwrap());
         let log = store.log("journal.jsonl");
@@ -2431,6 +2476,65 @@ mod tests {
             (lock.uid(), lock.gid(), lock.mode() & 0o777),
             (apps.uid(), apps.gid(), 0o600)
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An append opens the record without following a symlink: a `.jsonl` name
+    /// the unprivileged handler plants as a link to a file outside the store is
+    /// refused, and neither the target's bytes nor its mode move.
+    #[tokio::test]
+    async fn an_append_refuses_a_planted_symlink_and_leaves_its_target_alone() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let dir =
+            std::env::temp_dir().join(format!("onboard-append-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ledger")).unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+        let target = dir.join("shadow");
+        let body = b"root:*:0:0::0:0:Charlie Root:/root:/bin/ksh\n";
+        std::fs::write(&target, body).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = std::fs::metadata(&target).unwrap();
+        symlink(&target, dir.join("ledger/payments.jsonl")).unwrap();
+
+        let err = store
+            .log("ledger/payments.jsonl")
+            .append(b"{\"amount_gbp\":\"20.00\"}\n")
+            .await
+            .expect_err("a planted symlink must be refused");
+        assert!(
+            matches!(&err, Error::Refused(message) if message.contains("ledger/payments.jsonl")),
+            "{err}"
+        );
+        let after = std::fs::metadata(&target).unwrap();
+        assert_eq!(
+            (after.uid(), after.gid(), after.mode() & 0o777),
+            (before.uid(), before.gid(), 0o600)
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A record name is one component inside its directory: a name that walks
+    /// out of it is refused by both the writer and the removal.
+    #[tokio::test]
+    async fn a_record_name_that_leaves_its_directory_is_refused() {
+        let dir = std::env::temp_dir().join(format!("onboard-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("accounts")).unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+
+        let err = store
+            .write_record("accounts", "../x.json", b"{}")
+            .await
+            .expect_err("a name that leaves its directory must be refused");
+        assert!(matches!(&err, Error::Refused(_)), "{err}");
+        let err = store
+            .remove("accounts", "../x.json")
+            .await
+            .expect_err("a removal that leaves its directory must be refused");
+        assert!(matches!(&err, Error::Refused(_)), "{err}");
+        assert!(!dir.join("x.json").exists(), "the escape wrote a file");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -3023,3 +3023,56 @@ fn a_refused_attribute_leaves_the_held_line_held() {
         fix.journal()
     );
 }
+
+/// The application copy belongs to the handler, so its `status_token` is a
+/// field it can plant. A credit rewrites the copy and, when the token names
+/// one, the token record: a planted value must name nothing outside `store/`.
+/// The same pass runs the ninety-day purge, which would remove the file that
+/// path reaches, so both the rewrite and the delete are covered here.
+#[test]
+fn a_planted_status_token_never_reaches_a_file_outside_the_store() {
+    let fix = Fix::new("planted-status-token");
+    let token = approved_paid(&fix, "secretary", "cash");
+    // Two parents up from `store/applications/` is the fixture's own directory,
+    // so this name reaches a file the store does not own.
+    let victim = fix.dir.join("victim.json");
+    let planted = b"not the application".to_vec();
+    std::fs::write(&victim, &planted).unwrap();
+    let copy = fix.dir.join("store/accounts/secretary/application.json");
+    let mut app: Value = serde_json::from_str(&std::fs::read_to_string(&copy).unwrap()).unwrap();
+    app["status_token"] = json!("../../victim");
+    // Aged past ADR 0005's window, so the purge reads the same copy this pass.
+    app["filed_at"] = json!((OffsetDateTime::now_utc() - time::Duration::days(100))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap());
+    std::fs::write(&copy, serde_json::to_vec_pretty(&app).unwrap()).unwrap();
+
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        planted,
+        "a planted status token rewrote a file outside the store"
+    );
+    assert!(
+        !fix.read("ledger/payments.jsonl").is_empty(),
+        "the credit did not land"
+    );
+    assert!(
+        !copy.exists(),
+        "the aged account copy is purged even when its token names no file"
+    );
+}

@@ -160,7 +160,15 @@ pub async fn stripe_webhooks(
                         context: "encode the processed event",
                         source,
                     })?;
-                    store.log("webhooks/processed.jsonl").append(&bytes).await?;
+                    // A pair whose record cannot be written is left in place:
+                    // the event is settled and must be retried, and dropping
+                    // the webhook here would apply it twice.
+                    if let Err(e) = store.log("webhooks/processed.jsonl").append(&bytes).await {
+                        e.report(&format!(
+                            "webhook {id} ({kind}) could not be recorded as processed; it will be retried"
+                        ));
+                        continue;
+                    }
                     seen.insert(format!("event:{event_id}"));
                     if let Some(pair) = invoice_pair(kind, object_id) {
                         seen.insert(pair);

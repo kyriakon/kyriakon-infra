@@ -3329,6 +3329,16 @@ pub async fn purge_applications(
         if export::within_purge(filed, today) {
             continue;
         }
+        // The copy is the handler's, and the token becomes a name under
+        // `applications/`: a planted value that is not the generated shape names
+        // nothing under that directory. The account copy is not named by the
+        // token, so it still goes.
+        if !store::is_status_token(&token) {
+            store
+                .remove(&format!("accounts/{mailbox}"), "application.json")
+                .await?;
+            continue;
+        }
         let purge_id = format!("purge-{token}");
         let app = ApplicationRef::application(mailbox.clone(), token.clone());
         if !journal.has(&purge_id, "purged") && !journal.has(&purge_id, "applying") {
