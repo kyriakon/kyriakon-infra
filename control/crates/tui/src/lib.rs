@@ -2077,6 +2077,15 @@ mod tests {
         assert!(out.is_empty(), "the refusal drew a screen");
     }
 
+    /// A scratch directory the session tests own, holding nothing.
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("onboard-portal-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     /// The prune runs inside the count lock, because the session file is created
     /// and flocked inside it. A prune that ran before taking the lock could land
     /// in another opener's create-to-flock window, lock and unlink a file whose
@@ -2085,9 +2094,7 @@ mod tests {
     /// [#701]: https://github.com/kyriakon/kyriakon-infra/issues/701
     #[test]
     fn a_prune_waits_for_the_count_lock() {
-        let dir = std::env::temp_dir().join(format!("onboard-portal-prune-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("prune");
         // What a killed session leaves: a file no process holds.
         let stale = dir.join("203.0.113.9@999999-0");
         std::fs::write(&stale, "").unwrap();
@@ -2101,12 +2108,25 @@ mod tests {
             .open(&count_path)
             .unwrap();
         lock_exclusive(held.as_raw_fd(), &count_path).unwrap();
+        // The opener cannot get past the lock the test holds, so this only says
+        // the thread is scheduled: a bug that prunes before the lock has landed
+        // by the time it reports in.
+        let (started, running) = std::sync::mpsc::channel();
         let opener = {
             let dir = dir.clone();
-            std::thread::spawn(move || Sessions::open(&dir, Some("203.0.113.9".parse().unwrap())))
+            std::thread::spawn(move || {
+                started.send(()).unwrap();
+                Sessions::open(&dir, Some("203.0.113.9".parse().unwrap()))
+            })
         };
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(stale.exists(), "the prune ran outside the count lock");
+        running.recv().unwrap();
+        // Sample across half a second rather than once: the opener runs whenever
+        // the scheduler gives it the core, and one sample can miss a prune that
+        // happened before the assertion was reached.
+        for _ in 0..50 {
+            assert!(stale.exists(), "the prune ran outside the count lock");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         // The lock goes, and the same call prunes the file it could not reach.
         drop(held);
@@ -2122,10 +2142,7 @@ mod tests {
     /// spec words, and a session file no process holds pruned by the next start.
     #[test]
     fn a_third_session_from_one_address_is_refused() {
-        let dir =
-            std::env::temp_dir().join(format!("onboard-portal-sessions-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("sessions");
         let address: IpAddr = "203.0.113.9".parse().unwrap();
         // A file with no lock held is what a killed session leaves behind.
         let stale = dir.join("203.0.113.9@999999-0");
@@ -2168,8 +2185,7 @@ mod tests {
     /// it: the last slot is refused to a new address.
     #[test]
     fn the_box_wide_total_is_enforced() {
-        let dir = std::env::temp_dir().join(format!("onboard-portal-total-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("total");
         let mut open = Vec::new();
         for i in 0..SESSIONS_TOTAL {
             let address: IpAddr = format!("198.51.100.{}", i + 1).parse().unwrap();

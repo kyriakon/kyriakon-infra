@@ -94,6 +94,12 @@ fn concurrent_opens_do_not_lose_a_live_session() {
         second_lost.load(Ordering::Relaxed),
         over_cap.load(Ordering::Relaxed)
     );
+    // A refused or failed open is skipped above, so counters of zero mean
+    // nothing happened unless at least one round ran.
+    assert!(
+        rounds.load(Ordering::Relaxed) > 0,
+        "no round ran, so the counters prove nothing"
+    );
     assert_eq!(
         first_lost.load(Ordering::Relaxed)
             + second_lost.load(Ordering::Relaxed)
