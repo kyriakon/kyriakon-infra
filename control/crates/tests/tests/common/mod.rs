@@ -501,10 +501,13 @@ impl Fix {
     }
 
     /// Deliver one event the way the handler stored it: the raw body and a
-    /// `Stripe-Signature` header over `t.` and that body, dated now.
+    /// `Stripe-Signature` header over `t.` and that body, dated now. The
+    /// filename is the event id, which is what the handler writes, so the pair
+    /// and the record under `verified/` share one name.
     pub fn webhook(&self, id: &str, kind: &str, object: Value) {
+        let event_id = id.to_string();
         let event = json!({
-            "id": id,
+            "id": event_id,
             "type": kind,
             "created": OffsetDateTime::now_utc().unix_timestamp(),
             "data": {"object": object},

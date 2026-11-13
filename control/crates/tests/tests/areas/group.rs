@@ -2831,7 +2831,7 @@ fn a_card_renewal_writes_one_date_on_the_group() {
     );
 
     fix.webhook(
-        "01-checkout",
+        "evt_01_checkout",
         "checkout.session.completed",
         json!({
             "id": "cs_example",
@@ -2841,7 +2841,7 @@ fn a_card_renewal_writes_one_date_on_the_group() {
         }),
     );
     fix.webhook(
-        "02-invoice",
+        "evt_02_invoice",
         "invoice.paid",
         invoice_with("in_group_first", 4_000, 1_790_000_000),
     );
@@ -3557,7 +3557,7 @@ fn a_card_renewal_restores_a_lapsed_groups_mailboxes() {
     std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
     let token = group["payment"]["token_ref"].as_str().unwrap().to_string();
     fix.webhook(
-        "01-checkout",
+        "evt_01_checkout",
         "checkout.session.completed",
         json!({
             "id": "cs_example",
@@ -3567,7 +3567,7 @@ fn a_card_renewal_restores_a_lapsed_groups_mailboxes() {
         }),
     );
     fix.webhook(
-        "02-invoice",
+        "evt_02_invoice",
         "invoice.paid",
         invoice_with("in_group_restore", 4_000, 1_790_000_000),
     );

@@ -187,6 +187,14 @@ impl Store {
         self.typed_record(&format!("holds/{username}.json")).await
     }
 
+    /// One webhook event id the drain proved on first sight,
+    /// `verified/<event_id>.json`. The directory is root-owned, so the handler
+    /// cannot plant or rewrite a record. A damaged file is an error: treating
+    /// it as no record would re-judge a proven event against this pass's clock.
+    pub async fn verified_webhook(&self, id: &str) -> Result<Option<serde_json::Value>, Error> {
+        self.typed_record(&format!("verified/{id}.json")).await
+    }
+
     /// Write one record by rename: a temporary file in the same directory, then
     /// the rename, so a reader never sees half of one and a crash leaves the
     /// temporary file rather than a truncated record. The file is created 0600,
