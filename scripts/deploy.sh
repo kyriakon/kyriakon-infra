@@ -56,6 +56,7 @@ reset_plan() {
 	manual_sshd=no
 	manual_sshd_onboard=no
 	manual_member_class=no
+	manual_lapsed_class=no
 	manual_cron=no
 	manual_env=no
 	manual_terraform=no
@@ -64,12 +65,14 @@ reset_plan() {
 # install_dests <script name> <table> — set the deploy flags for one script's
 # install-set rows. A table this cannot read, or a destination no deploy
 # installs, is an error rather than a silent skip: the alternative is a script
-# that never reaches the box.
+# that never reaches the box. Returns 1 when the table has no row for the
+# script, so its caller can refuse a change nothing would install.
 install_dests() {
 	typeset name="$1" table="$2" dest dests
 	[ -f "$table" ] || die "no install-set table at $table"
 	dests=$(awk -F'\t' -v n="$name" '!/^#/ && $1 == n { print $2 }' "$table") ||
 		die "cannot read $table"
+	[ -n "$dests" ] || return 1
 	for dest in $dests; do
 		case "$dest" in
 		/root/bin) needs_mail=yes ;;
@@ -88,7 +91,9 @@ install_dests() {
 # classify_script <path> — the scripts/ arms. Most scripts are routed by their
 # install-set row, through install_dests at the end. The arms above it are the
 # ones whose deploy is not their install: the scripts nothing installs, and the
-# deploy scripts themselves, which plan the deploy they are.
+# deploy scripts themselves, which plan the deploy they are. A script with
+# neither an arm nor a row returns 1, so the plan fails on it rather than
+# skipping a change nothing on the box would pick up.
 classify_script() {
 	case "$1" in
 	# A helper of both the relay deploy and the drain's web pass, so a change to
@@ -118,8 +123,26 @@ classify_script() {
 		needs_control=yes
 		return 0
 		;;
-	# A deploy script's own code changed, so run it. `deploy.sh` itself is the
-	# dispatcher and deliberately plans nothing.
+	# deploy-mail.sh runs it from the checkout to write /etc/kyriakon/finger.txt,
+	# so no row installs it and a change here is that deploy.
+	scripts/gen-finger-page.sh)
+		needs_mail=yes
+		return 0
+		;;
+	# Operator-run: the plan prints the run as the env step, whether the reason is
+	# the script or the values file it writes.
+	scripts/setup-env.sh)
+		manual_env=yes
+		return 0
+		;;
+	# Nothing installs these and no deploy runs them: the dispatcher itself, an
+	# operator script read from the checkout, and the workstation/throwaway-box
+	# scripts. A change reaches the next run through the pull.
+	scripts/deploy.sh | scripts/install-packages.sh | scripts/merge-pr.sh | \
+		scripts/rehearsal.sh | scripts/rekey-mail-key.sh | scripts/restore-test.sh)
+		return 0
+		;;
+	# A deploy script's own code changed, so run it.
 	scripts/deploy-mail.sh)
 		needs_mail=yes
 		return 0
@@ -175,13 +198,23 @@ classify() {
 		needs_control=yes
 		manual_member_class=yes
 		;;
+	# deploy-control.sh installs the drain's copy, and lapse-user.sh installs
+	# /etc/login.conf.d/lapsed when it next runs, so that copy is by hand.
+	openbsd/etc/login.conf.d/lapsed)
+		needs_control=yes
+		manual_lapsed_class=yes
+		;;
 	reserved-usernames.txt | scripts/control-store.sh) needs_control=yes ;;
 	# The installed set is the table's: a script's row names the deploy that
 	# installs it, so adding one is a row there and not an arm here.
-	scripts/*) classify_script "$1" ;;
+	scripts/*) classify_script "$1" || return 1 ;;
 	keys/*) needs_mail=yes ;;
 	terraform/*) manual_terraform=yes ;;
-	docs/* | .github/* | .githooks/* | .omp/* | openbsd/restore-template/*) : ;;
+	# deploy-control.sh renders terms.md, privacy.md, aup.md and
+	# key-walkthrough.md into the capsule and stamps the release, so a docs change
+	# is that deploy; `*.md` below is the rest of the tree's markdown.
+	docs/*) needs_control=yes ;;
+	.github/* | .githooks/* | .omp/* | openbsd/restore-template/*) : ;;
 	*.md) : ;;
 	*) return 1 ;;
 	esac
@@ -211,6 +244,11 @@ plan() {
 	unknown=''
 	while IFS= read -r path; do
 		[ -n "$path" ] || continue
+		# A deleted script has no worktree file to classify, and nothing for a
+		# deploy to install; retiring one must not block the rest of the range.
+		case "$path" in
+		scripts/*) [ -e "$plan_repo/$path" ] || continue ;;
+		esac
 		if ! classify "$path"; then
 			unknown="$unknown $path"
 		fi
@@ -267,7 +305,8 @@ render_onboard_sshd() {
 
 manual_any() {
 	[ "$manual_pf" = yes ] || [ "$manual_sshd" = yes ] || [ "$manual_sshd_onboard" = yes ] ||
-		[ "$manual_member_class" = yes ] || [ "$manual_cron" = yes ] ||
+		[ "$manual_member_class" = yes ] || [ "$manual_lapsed_class" = yes ] ||
+		[ "$manual_cron" = yes ] ||
 		[ "$manual_env" = yes ] || [ "$manual_terraform" = yes ]
 }
 
@@ -317,6 +356,11 @@ print_manual() {
 		printf '  doas install -m 0644 %s/openbsd/etc/login.conf.d/member /etc/login.conf.d/member\n' "$repo_dir"
 		printf '  doas cap_mkdb /etc/login.conf   # only when /etc/login.conf.db exists\n'
 		printf '  doas usermod -L member <username>\n'
+	fi
+	if [ "$manual_lapsed_class" = yes ]; then
+		printf 'the lapsed login class changed; an already-lapsed account keeps the old one until:\n'
+		printf '  doas install -m 0644 %s/openbsd/etc/login.conf.d/lapsed /etc/login.conf.d/lapsed\n' "$repo_dir"
+		printf '  doas cap_mkdb /etc/login.conf   # only when /etc/login.conf.db exists\n'
 	fi
 	if [ "$manual_cron" = yes ]; then
 		printf 'the crontab or its scripts changed:\n  doas ksh scripts/cron-apply.sh\n'
@@ -503,17 +547,52 @@ self_test() {
 	check 'a manual step gates the marker' \
 		"$(if manual_any; then printf yes; else printf no; fi)" yes
 
+	# docs/ is rendered into the capsule by the control deploy, so a docs change
+	# is that deploy; markdown elsewhere in the tree is not.
 	printf 'more\n' >>"$repo/docs/readme.md"
 	git -C "$repo" commit -qam three
+	third=$(git -C "$repo" rev-parse HEAD)
 	plan "$repo" "$second"
-	check 'a docs-only range plans nothing' "$(plan_order)" ''
-	check 'a docs-only range has no manual step' \
+	check 'a docs range plans the control deploy' "$(plan_order)" 'deploy-control.sh'
+	check 'a docs range has no manual step' \
 		"$(if manual_any; then printf yes; else printf no; fi)" no
+
+	printf 'more\n' >"$repo/NOTES.md"
+	git -C "$repo" add -A
+	git -C "$repo" commit -qm four
+	plan "$repo" "$third"
+	check 'markdown outside docs/ plans nothing' "$(plan_order)" ''
+
+	reset_plan
+	classify 'docs/terms.md'
+	check 'the terms page plans the control deploy' "$needs_control" yes
 
 	reset_plan
 	got=0
 	( classify 'mystery/file' ) || got=$?
 	check 'an unrecognised path is refused' "$got" 1
+
+	reset_plan
+	got=0
+	( classify 'scripts/no-such-helper.sh' ) || got=$?
+	check 'an uninstalled script with no rule is refused' "$got" 1
+
+	# Retiring an installed script deletes the script and its row in one commit.
+	# The dead path must not refuse the whole range.
+	printf 'gone.sh\t/usr/local/bin\tdeploy-mail.sh\n' > "$self_test_work/table.tsv"
+	install_set="$self_test_work/table.tsv"
+	printf 'x\n' > "$repo/scripts/gone.sh"
+	git -C "$repo" add -A
+	git -C "$repo" commit -qm five
+	fifth=$(git -C "$repo" rev-parse HEAD)
+	rm "$repo/scripts/gone.sh"
+	: > "$self_test_work/table.tsv"
+	git -C "$repo" add -A
+	git -C "$repo" commit -qm six
+	got=0
+	plan "$repo" "$fifth" || got=$?
+	install_set="$script_dir/install-set.tsv"
+	check 'a deleted script does not block the plan' "$got" 0
 
 	reset_plan
 	classify 'scripts/backup.sh'
@@ -559,8 +638,17 @@ self_test() {
 	classify 'openbsd/etc/login.conf.d/hello'
 	check 'the portal login class is a manual step' "$manual_sshd_onboard" yes
 	reset_plan
+	classify 'openbsd/etc/login.conf.d/lapsed'
+	check 'the lapsed login class plans deploy-control' "$needs_control" yes
+	check 'the lapsed login class is a manual step' "$manual_lapsed_class" yes
+	reset_plan
 	classify 'scripts/deploy.sh'
 	check 'the deploy script plans nothing' "$(plan_order)" ''
+	for s in install-packages merge-pr rehearsal rekey-mail-key restore-test; do
+		reset_plan
+		classify "scripts/$s.sh"
+		check "scripts/$s.sh plans nothing" "$(plan_order)" ''
+	done
 	reset_plan
 	classify 'scripts/deploy-mail.sh'
 	check 'the mail deploy plans itself' "$needs_mail" yes
@@ -579,6 +667,13 @@ self_test() {
 	reset_plan
 	classify 'scripts/reload-smtpd.sh'
 	check 'the smtpd reload script plans deploy-control' "$needs_control" yes
+	reset_plan
+	classify 'scripts/gen-finger-page.sh'
+	check 'the finger page renderer plans deploy-mail' "$needs_mail" yes
+	reset_plan
+	classify 'scripts/setup-env.sh'
+	check 'the setup script plans no deploy' "$(plan_order)" ''
+	check 'the setup script is the manual env step' "$manual_env" yes
 
 	# Every row of the install-set table has to plan the deploy that installs it,
 	# or a fix to that script lands in the checkout and never reaches the box. The
@@ -705,6 +800,16 @@ self_test() {
 	head=$(git -C "$repo" rev-parse HEAD)
 	record_now "$repo" "$self_test_work/recorded"
 	check 'record_now writes HEAD' "$(marker_base "$self_test_work/recorded")" "$head"
+
+	# A scripts/ path with no arm and no install row now fails the plan instead of
+	# planning nothing, which is how a change to a script nothing installs was
+	# skipped.
+	printf 'x\n' >"$repo/scripts/unknown-helper.sh"
+	git -C "$repo" add -A
+	git -C "$repo" commit -qm five
+	got=0
+	( plan "$repo" "$head" ) >/dev/null 2>&1 || got=$?
+	check 'an uninstalled script fails the plan' "$got" 1
 
 	self_test_end
 }
