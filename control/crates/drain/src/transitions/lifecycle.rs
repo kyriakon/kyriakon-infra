@@ -150,16 +150,15 @@ pub async fn issue_password_link(
         .account(username)
         .await?
         .ok_or_else(|| Error::Failed(format!("no account for {username}")))?;
-    let token = store::status_token().await?;
-    let until = util::date_after_days(7);
-    let link = kyriakon_control_core::account::sign::password_link(
+    let link = PasswordLink::fresh().await?;
+    let url = kyriakon_control_core::account::sign::password_link(
         &cfg.base_url,
         key,
-        &token,
+        &link.token,
         username,
-        &until,
+        &link.until,
     )?;
-    account.password_link = Some(PasswordLink { token, until });
+    account.password_link = Some(link);
     // The status page renders the application copy, not the account. A reset
     // replaces the link, so clear the page's copy before the account changes: a
     // failure here leaves the old link live and the retry safe, where the reverse
@@ -170,7 +169,7 @@ pub async fn issue_password_link(
         source,
     })?;
     write_account_record(store, username, &bytes).await?;
-    Ok(link)
+    Ok(url)
 }
 
 /// Clear the status page's copy of an application's password link, when the copy

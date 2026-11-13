@@ -357,23 +357,20 @@ impl Store {
     /// when no account does. A link's token is a path component the handler
     /// reads, and the account record is the one place the link's state lives, so
     /// this is the handler's lookup for a link a group approval or a reset
-    /// issued. A damaged record is skipped for the same reason the certificate
-    /// walk skips it: the page answers as an unknown token rather than as an
-    /// error a probe can read.
+    /// issued. A damaged record is skipped, so one unreadable account cannot
+    /// take every other mailbox's page down with it: the page answers as an
+    /// unknown token rather than as an error a probe can read.
     pub async fn account_for_password_token(&self, token: &str) -> Result<Option<Account>, Error> {
         // The link's token is 26 lowercase Crockford characters, the same shape
         // as a status token. A probe of another shape is refused before any
         // record is read.
-        let well_formed = token.len() == 26
-            && token
-                .bytes()
-                .all(|b| b"0123456789abcdefghjkmnpqrstvwxyz".contains(&b));
-        if !well_formed {
+        if !is_status_token(token) {
             return Ok(None);
         }
         for username in self.list("accounts").await? {
-            let Some(account) = self.account(&username).await? else {
-                continue;
+            let account = match self.account(&username).await {
+                Ok(Some(account)) => account,
+                Ok(None) | Err(_) => continue,
             };
             if account
                 .password_link
@@ -1420,6 +1417,18 @@ pub struct PasswordLink {
     pub until: String,
 }
 
+impl PasswordLink {
+    /// A new link: a fresh token and the seven-day window a mailed link needs to
+    /// reach a member and be used. Nothing else mints one, so the window is
+    /// written in one place.
+    pub async fn fresh() -> Result<Self, Error> {
+        Ok(Self {
+            token: status_token().await?,
+            until: crate::util::date_after_days(7),
+        })
+    }
+}
+
 /// A mail-key replacement waiting out its window. The material is a public key
 /// and the intent that filed it carried the same bytes, so nothing here is a
 /// secret; it is kept in the record because the intent file is deleted once the
@@ -2145,6 +2154,54 @@ mod tests {
         assert!(
             matches!(&err, Error::Parse { path, .. } if path.ends_with("accounts/broken/account.json")),
             "{err}"
+        );
+    }
+
+    /// The password-link lookup answers for the mailbox holding that token even
+    /// when a damaged record sorts ahead of it in the walk: one unreadable
+    /// account must not make every link's page answer as an error.
+    #[tokio::test]
+    async fn a_password_link_is_found_past_a_damaged_record() {
+        let dir = std::env::temp_dir().join(format!("control-store-pwlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let token = "0123456789abcdefghjkmnpqrs";
+        std::fs::create_dir_all(dir.join("accounts/live")).unwrap();
+        let account = serde_json::json!({
+            "version": 1,
+            "username": "live",
+            "state": "active",
+            "decision": "approve",
+            "decided_at": "2026-10-01T09:00:00Z",
+            "rail": "no_charge",
+            "no_charge": true,
+            "created_at": "2026-10-01T09:00:00Z",
+            "password_link": { "token": token, "until": "2026-11-20" },
+        });
+        std::fs::write(
+            dir.join("accounts/live/account.json"),
+            serde_json::to_vec(&account).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("accounts/broken")).unwrap();
+        std::fs::write(dir.join("accounts/broken/account.json"), "not json").unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+
+        assert_eq!(
+            store
+                .account_for_password_token(token)
+                .await
+                .unwrap()
+                .expect("the mailbox whose link this is")
+                .username,
+            "live"
+        );
+        assert!(
+            store
+                .account_for_password_token("0123456789abcdefghjkmnpqrt")
+                .await
+                .unwrap()
+                .is_none(),
+            "a well-formed token no account holds names nobody"
         );
     }
 

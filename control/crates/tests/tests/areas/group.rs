@@ -1158,14 +1158,15 @@ fn a_mailbox_added_to_a_group_gets_an_account_key_and_entry() {
         .expect("the mailbox's key is on the box");
     assert!(key.contains("BEGIN PGP PUBLIC KEY BLOCK"), "{key}");
     assert_eq!(fix.account("parish-office")["group"], "parish.example");
-    // The new mailbox carries a one-time password link of its own, delivered
-    // with `kyriakon-admin password reset` if this address intent did not carry
-    // it to the member.
-    assert!(
-        fix.account("parish-office")["password_link"]["token"].is_string(),
-        "{}",
-        fix.account("parish-office")
-    );
+    // The new mailbox carries a one-time password link of its own, and the mail
+    // this pass sends is what delivers it: a token left only in the record is a
+    // password the member cannot set.
+    let link = fix.account("parish-office")["password_link"]["token"]
+        .as_str()
+        .expect("the new mailbox carries a link")
+        .to_string();
+    let sent = fix.sent();
+    assert!(sent.contains(&format!("/password/{link}?")), "{sent}");
     // The intent carried a fingerprint the signature does not cover, so the
     // record must show the one computed from the material.
     let computed = kyriakon_control_core::mail::keycheck::pgp_fingerprint(GOOD_KEY).unwrap();

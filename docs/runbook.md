@@ -395,7 +395,7 @@ Decide how the member proves the account is theirs before you set that password,
 
 ## A member who has forgotten their mail password
 
-Every mailbox gets a one-time link in the approval mail that made it, and the link lasts seven days. Once it has been used, has expired, or was never received, issue a fresh one from the console. A member who still knows the password changes it on the account page; the console is the path when they do not.
+Every mailbox gets a one-time link in the approval mail that made it, and the link lasts seven days. A mailbox an `add-mailbox` or `upgrade` intent makes gets its link in a mail of its own to the group's contact, sent when the intent applies. A group approved before this release has no link on its mailboxes, so issue one reset per mailbox. Once a link has been used, has expired, or was never received, issue a fresh one from the console. A member who still knows the password changes it on the account page; the console is the path when they do not.
 
 1. Confirm the member is asking, and record how they did, the same way a data request is recorded. The link is a credential for the mailbox, so do not issue one on an unverified request.
 

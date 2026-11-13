@@ -533,7 +533,11 @@ async fn approve(
             token: record.status_token.clone(),
             until: util::date_after_days(7),
         });
+    // Signed and recorded with the account's own token, never the status token:
+    // a reset between the first pass and a retry replaces the account's link, so
+    // a link built from the status token would be one the drain refuses.
     let password_until = account_password_link.until.clone();
+    let password_token = account_password_link.token.clone();
 
     let account = Account {
         version: 1,
@@ -644,8 +648,13 @@ async fn approve(
     // Built before the body, so the mail that says the account exists also says
     // how to set the password. The spec asks for the link in the email and on
     // the status page both.
-    let password_link =
-        sign::password_link(&cfg.base_url, key, token, &record.username, &password_until)?;
+    let password_link = sign::password_link(
+        &cfg.base_url,
+        key,
+        &password_token,
+        &record.username,
+        &password_until,
+    )?;
     let body = approval_body(
         cfg,
         &record,

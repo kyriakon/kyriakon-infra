@@ -505,7 +505,7 @@ pub async fn apply(
                 transitions::groups::provision_group(cfg, store, journal, *intent).await
             }
             Intent::GroupAddress(intent) => {
-                transitions::groups::group_address(cfg, store, journal, intent).await
+                transitions::groups::group_address(cfg, store, journal, key, intent).await
             }
             Intent::RemoveGroup(intent) => {
                 transitions::groups::remove_group(cfg, store, journal, intent).await
