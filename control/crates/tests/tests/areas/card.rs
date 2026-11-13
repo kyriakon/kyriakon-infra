@@ -71,6 +71,10 @@ fn a_webhook_that_does_not_verify_leaves_the_store_untouched() {
         fix.read("webhooks/processed.jsonl").is_empty(),
         "a refused event is not recorded as settled"
     );
+    assert!(
+        fix.read("verified/evt_refused.json").is_empty(),
+        "a refused first sight was recorded as verified"
+    );
 }
 
 #[test]
@@ -137,9 +141,13 @@ fn a_first_payment_with_a_checkout_and_an_invoice_extends_one_year() {
     // Both events of a first payment, the invoice filed first to prove the pass
     // settles the checkout before it. The reference is the account's `KYR-`
     // token, which is what the approval email carried.
-    fix.webhook("00-invoice", "invoice.paid", invoice("in_first_payment"));
     fix.webhook(
-        "01-checkout",
+        "evt_00_invoice",
+        "invoice.paid",
+        invoice("in_first_payment"),
+    );
+    fix.webhook(
+        "evt_01_checkout",
         "checkout.session.completed",
         json!({
             "id": "cs_example",
@@ -350,6 +358,109 @@ fn an_invoice_waits_for_an_unreachable_api_and_extends_on_the_next_pass() {
         "the retry settles the payment"
     );
     assert!(fix.webhooks().is_empty(), "{:?}", fix.webhooks());
+}
+
+#[test]
+fn a_deferred_event_survives_past_the_timestamp_window() {
+    let fix = Fix::new("webhook-deferred-verified");
+    fix.card_account("secretary", None);
+    fix.stripe_unreachable();
+
+    fix.webhook("evt_deferred", "invoice.paid", invoice("in_deferred"));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.webhooks()
+            .iter()
+            .any(|n| n.starts_with("evt_deferred.body")),
+        "the deferred pair was not kept: {:?}",
+        fix.webhooks()
+    );
+    assert!(
+        !fix.read("verified/evt_deferred.json").is_empty(),
+        "the first sight was not recorded"
+    );
+
+    // The same delivery, now carrying a timestamp an hour old: this pass's
+    // clock is well past the five-minute tolerance, as the pass after a failed
+    // settlement is. The recorded id is the proof, so the pair is not late.
+    let bytes = std::fs::read(fix.dir.join("store/webhooks/evt_deferred.body")).unwrap();
+    let stale = OffsetDateTime::now_utc().unix_timestamp() - 3600;
+    let mut payload = stale.to_string().into_bytes();
+    payload.push(b'.');
+    payload.extend_from_slice(&bytes);
+    let sig = sign::sign_bytes(WEBHOOK_SECRET, &payload).unwrap();
+    std::fs::write(
+        fix.dir.join("store/webhooks/evt_deferred.sig"),
+        format!("t={stale},v1={sig}"),
+    )
+    .unwrap();
+
+    fix.stripe_subscription("active", 1_790_000_000);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        paid_until(&fix, "secretary").is_some(),
+        "the deferred payment was lost to the clock"
+    );
+    assert!(fix.webhooks().is_empty(), "{:?}", fix.webhooks());
+    assert!(
+        fix.read("verified/evt_deferred.json").is_empty(),
+        "the record outlived the event it proved"
+    );
+    assert!(
+        fix.read("webhooks/processed.jsonl")
+            .contains("evt_deferred"),
+        "the settled payment was not journalled"
+    );
+}
+
+/// A check that fails after the delivery was proven once leaves the pair for
+/// the retry rather than deleting a money-bearing event.
+#[test]
+fn a_verification_error_does_not_drop_a_proven_pair() {
+    let fix = Fix::new("webhook-verify-retry");
+    fix.card_account("secretary", None);
+    fix.stripe_unreachable();
+
+    fix.webhook(
+        "evt_verify_retry",
+        "invoice.paid",
+        invoice("in_verify_retry"),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.read("verified/evt_verify_retry.json").is_empty(),
+        "the first sight was not recorded"
+    );
+
+    // The signature on disk no longer matches what it signed: a secret mid-roll
+    // or a damaged header. The event was proven once, so the pair stays.
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    std::fs::write(
+        fix.dir.join("store/webhooks/evt_verify_retry.sig"),
+        format!("t={now},v1=0000"),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.webhooks()
+            .iter()
+            .any(|n| n.starts_with("evt_verify_retry.body")),
+        "the proven pair was deleted: {:?}",
+        fix.webhooks()
+    );
+    assert!(
+        !fix.read("verified/evt_verify_retry.json").is_empty(),
+        "the proof was deleted with the failed check"
+    );
+    assert_eq!(
+        paid_until(&fix, "secretary"),
+        None,
+        "an unverified event extended the date"
+    );
 }
 
 #[test]

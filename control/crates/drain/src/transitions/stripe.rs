@@ -32,12 +32,20 @@ const WEBHOOK_TOLERANCE: i64 = 300;
 ///
 /// The handler holds no secret and verifies nothing: it stores the raw body and
 /// the `Stripe-Signature` header and answers 2xx. This pass is the half with the
-/// secret, so it is the half that decides. Each pair is verified over the exact
-/// bytes received, inside five minutes of now, and against every `v1` value the
-/// header carries (a rolled secret signs with two). A refusal is logged with the
-/// file it names and both files are deleted; nothing else is written. A verified
-/// event is deduplicated on its id and on `(type, object.id)`, applied, recorded
-/// in `webhooks/processed.jsonl`, and only then removed.
+/// secret, so it is the half that decides. The first sight of an event is
+/// verified over the exact bytes received, inside five minutes of now, and
+/// against every `v1` value the header carries (a rolled secret signs with two);
+/// its id is then recorded in root-only `verified/`. A later pass trusts that
+/// record and checks only the HMAC: a deferred event is waiting for the event it
+/// follows, not late, so the clock no longer deletes it. The record goes when
+/// the event is applied or settles.
+///
+/// A pair never proven is refused and both files are deleted, which is what a
+/// forged or replayed delivery is. A pair proven before keeps its queue entry if
+/// a later check fails: the bytes or the secret changed, and a money-bearing
+/// event is not root's to drop. A verified event is deduplicated on its id and
+/// on `(type, object.id)`, applied, recorded in `webhooks/processed.jsonl`, and
+/// only then removed.
 ///
 /// An event that cannot be applied yet — the Stripe API unreachable for an
 /// invoice's subscription — is left in place so the next pass tries again. The
@@ -100,16 +108,9 @@ pub async fn stripe_webhooks(
                 .read_record("webhooks", &format!("{id}.sig"))
                 .await
                 .unwrap_or_default();
-            if let Err(why) = verify_webhook(
-                &secret,
-                &sig,
-                &body,
-                OffsetDateTime::now_utc().unix_timestamp(),
-            ) {
-                why.report(&format!("webhook {id} refused"));
-                remove_webhook(store, id).await?;
-                continue;
-            }
+            // The body is parsed first, because the event id in it decides
+            // whether this is the first sight of the delivery. A body that is
+            // not JSON is refused whatever the id would have said.
             let event: Value = match serde_json::from_slice(&body) {
                 Ok(event) => event,
                 Err(e) => {
@@ -124,27 +125,89 @@ pub async fn stripe_webhooks(
             };
             let event_id = event.get("id").and_then(Value::as_str).unwrap_or("");
             let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
-            let object_id = event
-                .pointer("/data/object/id")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let is_checkout = kind == "checkout.session.completed";
-            if is_checkout != checkout_first {
-                continue;
-            }
-            if event_id.is_empty() || kind.is_empty() {
+            // The id names a file under `verified/`, so its shape is checked
+            // before it is joined into one. Stripe's ids are `evt_` and
+            // alphanumerics; anything else is not an event this rail settles.
+            if !event_id_shape(event_id) || kind.is_empty() {
                 Error::Failed("names no event id or type".to_string())
                     .report(&format!("webhook {id}"));
                 remove_webhook(store, id).await?;
                 continue;
             }
+            // A delivery proven on an earlier pass is not judged against this
+            // pass's clock: it is waiting for the event it follows, not late.
+            // Only the HMAC is checked again.
+            let record = match store.verified_webhook(event_id).await {
+                Ok(record) => record,
+                Err(e) => {
+                    // A record that cannot be read is not proof, and dropping
+                    // the pair could lose the payment it carries.
+                    Error::from(e).report(&format!("webhook {id}"));
+                    continue;
+                }
+            };
+            let verified = match record {
+                Some(_) => verify_signature(&secret, &sig, &body),
+                None => verify_webhook(
+                    &secret,
+                    &sig,
+                    &body,
+                    OffsetDateTime::now_utc().unix_timestamp(),
+                ),
+            };
+            if let Err(why) = verified {
+                why.report(&format!("webhook {id} refused"));
+                // A pair never proven is forged, replayed or unreadable, and
+                // stays the refusal it always was. One proven before keeps its
+                // queue entry: the signatures or the secret changed since, and
+                // the event is not ours to delete. The proof names the queue
+                // entry it was taken from, so a forged pair carrying a proven
+                // event id does not inherit the trust.
+                let proven_pair = record
+                    .as_ref()
+                    .and_then(|value| value.get("pair").and_then(Value::as_str))
+                    .is_some_and(|pair| pair == id);
+                if !proven_pair {
+                    remove_webhook(store, id).await?;
+                }
+                continue;
+            }
+            let object_id = event
+                .pointer("/data/object/id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let is_checkout = kind == "checkout.session.completed";
+            // The first sight is recorded before anything can defer it, so a
+            // later pass has the proof rather than a stale timestamp.
+            if record.is_none() {
+                let line = serde_json::json!({
+                    "at": util::filed_at(),
+                    "pair": id,
+                    "event": event_id,
+                    "type": kind,
+                    "object": object_id,
+                });
+                let bytes = serde_json::to_vec(&line).map_err(|source| Error::Json {
+                    context: "encode the verified event",
+                    source,
+                })?;
+                store.ensure_dir("verified").await?;
+                store
+                    .write_record("verified", &format!("{event_id}.json"), &bytes)
+                    .await?;
+            }
+            if is_checkout != checkout_first {
+                continue;
+            }
             if seen.contains(&format!("event:{event_id}")) {
                 remove_webhook(store, id).await?;
+                forget_verified(store, event_id).await?;
                 continue;
             }
             if let Some(pair) = invoice_pair(kind, object_id) {
                 if seen.contains(&pair) {
                     remove_webhook(store, id).await?;
+                    forget_verified(store, event_id).await?;
                     continue;
                 }
             }
@@ -174,12 +237,17 @@ pub async fn stripe_webhooks(
                         seen.insert(pair);
                     }
                     remove_webhook(store, id).await?;
+                    forget_verified(store, event_id).await?;
                 }
                 // A valid event with nothing of ours in it settles nothing and
                 // writes nothing; the pair is still removed so it is not retried.
-                Ok(Settled::Ignored) => remove_webhook(store, id).await?,
+                Ok(Settled::Ignored) => {
+                    remove_webhook(store, id).await?;
+                    forget_verified(store, event_id).await?;
+                }
                 // The account this names is not known yet, which a checkout
                 // still in the directory, or one arriving later, will change.
+                // The pair and its record stay for the pass that can settle it.
                 Ok(Settled::Deferred) => {}
                 Err(e) => {
                     e.report(&format!("webhook {id} ({kind}) could not be settled yet"));
@@ -190,11 +258,37 @@ pub async fn stripe_webhooks(
     Ok(())
 }
 
-/// Whether a `Stripe-Signature` header proves this body, and that the delivery
-/// is recent. Accepts only `v1`: `v0` is the test-only older scheme. The
+/// Whether the signature header proves this body, and that the delivery is
+/// recent. Accepts only `v1`: `v0` is the test-only older scheme. The
 /// comparison is constant time through [`sign::verify_bytes`], and every `v1`
 /// value is tried so a secret mid-roll verifies either way.
+///
+/// The recency check is a replay guard, so it is first-sight only. A delivery
+/// whose id `verified/` already records was proven once; the clock is not
+/// applied to it again.
 pub fn verify_webhook(secret: &[u8], header: &str, body: &[u8], now: i64) -> Result<(), Error> {
+    let (timestamp, payload, signatures) = signature_parts(header, body)?;
+    if (now - timestamp).abs() > WEBHOOK_TOLERANCE {
+        return Err(Error::Failed(format!(
+            "the timestamp {timestamp} is more than five minutes from {now}"
+        )));
+    }
+    check_signatures(secret, &payload, &signatures)
+}
+
+/// The HMAC alone, with no clock: a delivery already recorded under `verified/`
+/// is verified against the secret again but not judged for recency, because a
+/// deferred event is not late.
+pub fn verify_signature(secret: &[u8], header: &str, body: &[u8]) -> Result<(), Error> {
+    let (_, payload, signatures) = signature_parts(header, body)?;
+    check_signatures(secret, &payload, &signatures)
+}
+
+/// The header split into its timestamp, the signed payload and its `v1` values.
+fn signature_parts<'a>(
+    header: &'a str,
+    body: &[u8],
+) -> Result<(i64, Vec<u8>, Vec<&'a str>), Error> {
     let mut timestamp: Option<i64> = None;
     let mut signatures: Vec<&str> = Vec::new();
     for part in header.split(',') {
@@ -224,17 +318,16 @@ pub fn verify_webhook(secret: &[u8], header: &str, body: &[u8], now: i64) -> Res
             "the signature header carries no v1 signature".to_string(),
         ));
     }
-    if (now - timestamp).abs() > WEBHOOK_TOLERANCE {
-        return Err(Error::Failed(format!(
-            "the timestamp {timestamp} is more than five minutes from {now}"
-        )));
-    }
     let mut payload = timestamp.to_string().into_bytes();
     payload.push(b'.');
     payload.extend_from_slice(body);
+    Ok((timestamp, payload, signatures))
+}
+
+fn check_signatures(secret: &[u8], payload: &[u8], signatures: &[&str]) -> Result<(), Error> {
     if signatures
         .iter()
-        .any(|sig| sign::verify_bytes(secret, &payload, sig))
+        .any(|sig| sign::verify_bytes(secret, payload, sig))
     {
         Ok(())
     } else {
@@ -244,10 +337,31 @@ pub fn verify_webhook(secret: &[u8], header: &str, body: &[u8], now: i64) -> Res
     }
 }
 
+/// Whether `id` has the shape Stripe gives an event and is safe as a filename
+/// under `verified/`: `evt_`, then letters, digits and `_`. The id comes from
+/// the body, so it is a shape check before it is a path; a longer bound keeps a
+/// name the filesystem would refuse out of the record write.
+pub fn event_id_shape(id: &str) -> bool {
+    id.strip_prefix("evt_").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest.len() <= 200
+            && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    })
+}
+
 async fn remove_webhook(store: &Store, id: &str) -> Result<(), Error> {
     store.remove("webhooks", &format!("{id}.body")).await?;
     store
         .remove("webhooks", &format!("{id}.sig"))
+        .await
+        .map_err(Error::from)
+}
+
+/// Drop the first-sight record once the event has settled, so `verified/` does
+/// not grow with every payment. A deferred event keeps it for the retry.
+async fn forget_verified(store: &Store, event_id: &str) -> Result<(), Error> {
+    store
+        .remove("verified", &format!("{event_id}.json"))
         .await
         .map_err(Error::from)
 }
@@ -1185,4 +1299,30 @@ fn period_end(value: &Value) -> Option<String> {
                 .pointer("/items/data/0/current_period_end")
                 .and_then(stamp)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The event id becomes a filename under `verified/`, so a body that names
+    /// a path is refused before the join. Stripe's ids are `evt_` and
+    /// alphanumerics.
+    #[test]
+    fn an_event_id_is_a_name_not_a_path() {
+        assert!(event_id_shape("evt_1Nqk9abcdef_XYZ"));
+        for id in [
+            "",
+            "evt_",
+            "evt_a/b",
+            "evt_..",
+            "../evt_a",
+            "cs_example",
+            "evt_a.b",
+            "evt_a b",
+            "evt_\u{00e9}",
+        ] {
+            assert!(!event_id_shape(id), "{id:?} was accepted as an event id");
+        }
+    }
 }
