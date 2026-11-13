@@ -123,20 +123,35 @@ async fn a_correct_mail_password_opens_a_session_and_a_wrong_one_does_not() {
     )
     .await;
     assert_eq!(code, 303, "{body}");
+    let set_cookie = body
+        .split("Set-Cookie: ")
+        .nth(1)
+        .and_then(|rest| rest.split(['\r', '\n']).next())
+        .expect("a session cookie is set");
+    for flag in [
+        "__Host-kyriakon_session=",
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Lax",
+        "Max-Age=43200",
+        "Secure",
+    ] {
+        assert!(
+            set_cookie.contains(flag),
+            "the cookie misses {flag}: {set_cookie}"
+        );
+    }
     assert!(
-        body.contains("Set-Cookie: kyriakon_session="),
-        "a session cookie is set: {body}"
+        !set_cookie.contains("Domain"),
+        "the cookie is host-only: {set_cookie}"
     );
     assert!(body.contains("Cache-Control: no-store"), "{body}");
     assert!(body.contains("Referrer-Policy: no-referrer"), "{body}");
-    for flag in ["HttpOnly", "SameSite=Lax", "Max-Age=43200", "Secure"] {
-        assert!(body.contains(flag), "the cookie misses {flag}: {body}");
-    }
 
     // The cookie it set opens the account page, and a wrong password sets
     // nothing and comes back as the login page.
     let cookie = body
-        .split("Set-Cookie: kyriakon_session=")
+        .split("Set-Cookie: __Host-kyriakon_session=")
         .nth(1)
         .and_then(|rest| rest.split(';').next())
         .expect("the cookie value");

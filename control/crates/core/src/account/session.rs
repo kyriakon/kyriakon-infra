@@ -26,8 +26,11 @@ use crate::account::sign;
 use crate::store::Store;
 use crate::Error;
 
-/// The cookie's name.
-pub const COOKIE: &str = "kyriakon_session";
+/// The cookie's name. The `__Host-` prefix is enforced by the browser: only a
+/// host-only cookie with `Secure` and `Path=/` and no `Domain` may carry it, so
+/// a member's `*.kyriakon.net` page cannot set a domain-wide cookie that the
+/// handler would read ahead of its own.
+pub const COOKIE: &str = "__Host-kyriakon_session";
 
 /// How long a session lasts, server-side and in the cookie. The login check's
 /// proof lives for the same span, so a session cannot outlive the login that
@@ -532,6 +535,7 @@ mod tests {
     fn the_cookie_is_http_only_same_site_and_expires_with_the_session() {
         let cookie = cookie("abc.def");
         for flag in [
+            "__Host-kyriakon_session=abc.def;",
             "HttpOnly",
             "Secure",
             "SameSite=Lax",
@@ -540,14 +544,32 @@ mod tests {
         ] {
             assert!(cookie.contains(flag), "{cookie} misses {flag}");
         }
+        // `__Host-` is only valid host-only, so the cookie must carry no Domain.
+        assert!(!cookie.contains("Domain"), "{cookie}");
         assert!(clear_cookie().contains("Max-Age=0"));
+        assert!(!clear_cookie().contains("Domain"), "{}", clear_cookie());
     }
 
     #[test]
     fn one_named_cookie_is_read_from_a_header_with_others() {
-        let header = "other=1; kyriakon_session=abc.def; trailing=2";
+        let header = "other=1; __Host-kyriakon_session=abc.def; trailing=2";
         assert_eq!(from_header(header, COOKIE).as_deref(), Some("abc.def"));
         assert_eq!(from_header("other=1", COOKIE), None);
+    }
+
+    #[test]
+    fn the_unprefixed_cookie_a_subdomain_can_set_is_ignored() {
+        // A member's page can set `kyriakon_session` with `Domain=kyriakon.net`;
+        // the handler reads only the host-only, browser-guarded name.
+        assert_eq!(from_header("kyriakon_session=forged", COOKIE), None);
+        assert_eq!(
+            from_header(
+                "kyriakon_session=forged; __Host-kyriakon_session=abc.def",
+                COOKIE
+            )
+            .as_deref(),
+            Some("abc.def")
+        );
     }
 
     #[tokio::test]
