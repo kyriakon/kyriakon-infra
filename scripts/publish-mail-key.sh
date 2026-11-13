@@ -477,6 +477,12 @@ EOF
 	make_key() {
 		gpg --batch --pinentry-mode loopback --passphrase '' \
 			--quick-generate-key "$1" ed25519 sign 0 >/dev/null 2>&1
+		# The publish gate refuses a key with no encryption-capable key, so a
+		# fixture has to carry one, as a key the platform would deliver to does.
+		fpr=$(gpg --batch --with-colons --list-keys "$1" 2>/dev/null |
+			awk -F: '$1 == "fpr" { print $10; exit }')
+		gpg --batch --pinentry-mode loopback --passphrase '' \
+			--quick-add-key "$fpr" cv25519 encr 0 >/dev/null 2>&1
 		# gpg 2.4+ writes the AEAD preference into every self-signature, and the
 		# publish gate refuses that: a fixture has to look like a key the platform
 		# would publish, or every case below would test the refusal instead.
@@ -492,6 +498,11 @@ SETPREF
 	make_key 'bob@kyriakon.net' "$fix/bob.asc"
 	# A key with a display name and an outside address, for the UID warning.
 	make_key 'Alice Publish <alice@example.invalid>' "$fix/nonplatform.asc"
+	# A cert-only key: the publish gate must refuse it, because no message to it
+	# could be encrypted.
+	gpg --batch --pinentry-mode loopback --passphrase '' \
+		--quick-generate-key 'certonly@example.invalid' ed25519 cert 0 >/dev/null 2>&1
+	gpg --batch --armor --export 'certonly@example.invalid' >"$fix/certonly.asc" 2>/dev/null
 	alice=$(fpr_of "$fix/alice.asc")
 	bob=$(fpr_of "$fix/bob.asc")
 	if [ -z "$alice" ] || [ -z "$bob" ] || [ "$alice" = "$bob" ]; then
@@ -615,6 +626,12 @@ SETPREF
 	assert_has 'the refusal names the published key' "$bob" "$out"
 	assert_has 'the refusal names the key on the box' "$alice" "$out"
 	assert_no_log 'the published file was not written' 'PUT'
+
+	printf '%s\n' '--- a cert-only key is refused before anything is opened'
+	run certonly "$fix/certonly.asc" "$fix/token"
+	assert_eq 'cert-only exit' 1 "$rc"
+	assert_has 'the refusal says no key is encryption-capable' 'encryption-capable' "$out"
+	assert_no_log 'nothing was opened for a cert-only key' 'PUT'
 
 	printf '%s\n' '--- a key that advertises AEAD is refused before anything is opened'
 	aead_key="$fix/carol.asc"

@@ -81,11 +81,13 @@ slightly behind (proposal section 6.10). Then re-snapshot (section 3).
 
 ## 3. Re-snapshot after every patch cycle
 
-A snapshot freezes base + packages. After each `syspatch`/`pkg_add -u` cycle on
-the live box, shut down cleanly and re-snapshot with the same `kind=gold`
-label. `most_recent` makes Terraform pick up the newest matching snapshot
-automatically - never reprovision from a stale one, or a rebuilt box boots
-vulnerable rspamd (section 6.10).
+A snapshot freezes base + packages. After each `syspatch`/`pkg_add -u` cycle,
+build the new `kind=gold` image on a throwaway box, as the runbook's "Rebuild
+the gold image" procedure does - never snapshot the live mail box: its root
+disk holds member mail and the DKIM key, and a `kind=gold` image is the source
+of every future box. `most_recent` makes Terraform pick up the newest matching
+snapshot automatically - never reprovision from a stale one, or a rebuilt box
+boots vulnerable rspamd (section 6.10).
 
 ## Variables
 

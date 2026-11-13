@@ -108,7 +108,18 @@ pub(super) async fn respond(app: &App, request: &Request) -> Outcome {
 pub(super) fn outcome(incoming: Incoming, reply: Reply) -> Outcome {
     Outcome {
         reply,
-        route: format!("/{}", incoming.path),
+        // The path is percent-decoded, so `%0A` and `%1B` arrive here as a
+        // newline and an escape. The log line is the audit trail: one request
+        // must be one line, and a control character would let an unauthenticated
+        // client forge a second one.
+        route: format!(
+            "/{}",
+            incoming
+                .path
+                .chars()
+                .map(|c| if c.is_control() { '?' } else { c })
+                .collect::<String>()
+        ),
         addr: incoming.addr,
     }
 }

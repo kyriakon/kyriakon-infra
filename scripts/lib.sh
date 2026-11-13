@@ -438,6 +438,19 @@ key_problems() {
 				printf 'its self-signature sets the AEAD feature bit (features: %s)\n' "$feat"
 			fi
 		done
+	# A revoked or cert-only key is accepted by the checks above and then
+	# refused by kyriakon-encrypt at delivery time, so the publish gate reads
+	# capability and validity too: `pub`/`sub` field 12 is the capability
+	# column, field 2 the validity.
+	gpg --batch --with-colons --show-keys "$key_file" 2>/dev/null |
+		awk -F: '
+			$1 == "pub" && ($2 == "r" || $2 == "e" || $2 == "i" || $2 == "d") {
+				printf "the key is %s, and delivery refuses it\n", \
+					($2 == "r" ? "revoked" : $2 == "e" ? "expired" : $2 == "i" ? "invalid" : "disabled")
+			}
+			($1 == "pub" || $1 == "sub") && $12 ~ /e/ && $2 !~ /^[reid]$/ { enc = 1 }
+			END { if (!enc) print "no key in it is encryption-capable, so every message to it would fail" }
+		'
 	# The primary and every encryption-capable subkey carry the expiry that
 	# stops delivery. A signing subkey's expiry does not (the crate checks
 	# `encrypts` for the same reason), and reading it would refuse a key that
