@@ -223,14 +223,10 @@ fn usage() -> String {
 /// required: the token is which application the review mail named, and the
 /// username is only the label the operator reads, checked against the record.
 fn application_args(rest: &[String]) -> Result<(&str, &str), Error> {
-    let (username, token) = match rest {
-        [_, username, token] => (username.as_str(), token.as_str()),
-        _ => return Err(Error::Failed(usage())),
+    let [_, _, token] = rest else {
+        return Err(Error::Failed(usage()));
     };
-    if let Some(why) = validate::username_shape(username) {
-        return Err(Error::Failed(format!("the username {username:?}: {why}")));
-    }
-    Ok((username, token))
+    Ok((one_username(&rest[..2])?, token.as_str()))
 }
 
 /// The one username a verb that takes one reads. `request` and `free` take none.

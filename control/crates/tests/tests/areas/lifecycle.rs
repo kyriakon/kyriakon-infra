@@ -715,6 +715,20 @@ fn admin_files_a_decision_and_shows_the_application() {
     // A decision without a token is refused: the console will not guess which
     // application the operator read.
     assert!(!fix.ctl(&["approve", "secretary"]).status.success());
+    // A malformed token is refused, and so is a well-formed one naming no
+    // record: neither signs an application, and neither files an intent.
+    let out = fix.ctl(&["approve", "secretary", "not-a-token"]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("not a status token"), "{}", body(&out));
+    let absent = "zzzzzzzzzzzzzzzzzzzzzzzzzz";
+    let out = fix.ctl(&["approve", "secretary", absent]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(
+        body(&out).contains(&format!("no application at token {absent}")),
+        "{}",
+        body(&out)
+    );
+    assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
     let _ = record;
 }
 

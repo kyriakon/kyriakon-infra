@@ -290,8 +290,8 @@ The terminal form the mail prints names the application by its token:
 `decline`. The console signs the application that token names and refuses the
 command when the record's username differs, so a second application filed for the
 same name between the mail and the terminal is never what gets signed. Take the
-token from the review mail, or read it from `kyriakon-admin show <username>`, which
-prints the newest application's token and its filed date.
+token from the review mail. `kyriakon-admin show <username>` prints only the newest
+application, so it cannot say which one the operator is deciding.
 
 Prune the review mail by hand. Delete each `Subject: kyriakon: control: application
 filed (...)` message from `admin@kyriakon.net` once the decision is made, and no
