@@ -35,15 +35,24 @@
 # both files; the repository's own config still applies, under the two -c
 # settings above it.
 #
-# Why packObjectsHook needs no -c of its own. Since the setting landed, in git
-# 2.10, upload-pack has ignored it outside protected configuration (the system,
-# global and command scopes), so a repository-local value never runs; nulling
-# the global file closes the only scope the member can write. An empty override
-# is not the answer: `-c uploadpack.packObjectsHook=` is an empty command, and
-# every fetch then dies in "cannot run :". The repository-local commands git
-# does run, tar.<format>.command through upload-archive and
-# core.alternateRefsCommand, are accepted: they run as the member in the
-# member's own repository, which is where the session already is.
+# Why packObjectsHook needs no -c of its own. The setting landed in git 2.10,
+# but upload-pack has read it only from protected configuration (the system,
+# global and command scopes) since 2.38, so a repository-local value never
+# runs; nulling the global file closes the only scope the member can write.
+# The box's `git --version` must therefore be 2.38 or later, and
+# packages.tsv installs git unversioned. An empty override is not the answer:
+# `-c uploadpack.packObjectsHook=` is an empty command, and every fetch then
+# dies in "cannot run :".
+# shortcut: nothing enforces that version floor; add the check when
+# install-packages.sh is next changed.
+#
+# The known exec channel the allowlist leaves open. A format defined by
+# tar.<format>.command runs through git-upload-archive, one of the three
+# allowlisted verbs, when the repository also sets tar.<format>.remote=true;
+# user-defined formats are not remote-enabled without it. That is an exec
+# channel for an account with no shell, so dropping upload-archive from the
+# allowlist is what closes it. It stays because the per-member hosting spec
+# names the verb, and changing the allowlist is a spec change, not a fix here.
 #
 # Usage (sshd does this; a human only runs --self-test):
 #   member-git-shell.sh -c "git-receive-pack '/home/<user>/repos/<name>.git'"
