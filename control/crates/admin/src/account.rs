@@ -3,6 +3,7 @@
 use crate::payments::{group_payment, print_payment};
 use crate::Error;
 use crate::*;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 /// Print what the store holds for a username: the application, while it is
 /// inside ADR 0005's window, and the account once an approval has made one. The
@@ -105,7 +106,6 @@ pub(crate) async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) ->
     // touching a keyring or token entry. A deletion that stopped partway is
     // still accepted: the account record has gone but its journal line has not.
     let recorded = store.account(username).await?.is_some();
-    let prefix = format!("delete-{username}-");
     let interrupted = store
         .log("journal.jsonl")
         .jsonl::<Value>()
@@ -115,7 +115,7 @@ pub(crate) async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) ->
             value
                 .get("intent")
                 .and_then(Value::as_str)
-                .is_some_and(|id| id.starts_with(&prefix))
+                .is_some_and(|id| owns_delete(id, username))
         });
     if !recorded && !interrupted {
         return Err(Error::Failed(format!("no account for {username}")));
@@ -124,6 +124,17 @@ pub(crate) async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) ->
     transitions::lifecycle::delete_account(cfg, store, &journal, username).await?;
     println!("deleted {username}");
     Ok(())
+}
+
+/// Whether a journal line's id names this account's deletion: `delete-<name>-`
+/// followed by an RFC 3339 timestamp, the id shape `delete_account` writes.
+///
+/// A hyphenated account writes `delete-bo-x-<time>`, and a bare prefix match
+/// makes `delete bo` claim it: the console would print "deleted bo" for an
+/// erasure that never ran. The drain's `Released::owns` has the same rule.
+pub(crate) fn owns_delete(id: &str, username: &str) -> bool {
+    id.strip_prefix(&format!("delete-{username}-"))
+        .is_some_and(|created| OffsetDateTime::parse(created, &Rfc3339).is_ok())
 }
 
 /// `free`: how many accounts were approved without charge. The count is read
