@@ -31,11 +31,18 @@
 #                  being compromised, since the box holds a merge credential for
 #                  the repository that the first rule reads.
 #
-#   --fingerprints print the published set in the recorded copy's format. This is
-#                  how that copy is refreshed after a reviewed and expected change
-#                  (a rotation, a member leaving). Additions are deliberately
-#                  silent under --publication: a new key is a signup, and the box
-#                  rule is what watches whether it ever reaches the published set.
+#   --fingerprints [path]
+#                  print the published set in the recorded copy's format, or write
+#                  it to path. This is how that copy is refreshed after a reviewed
+#                  and expected change (a rotation, a member leaving). The path
+#                  form writes a sibling file and renames it over the destination,
+#                  because `> "$KEYRING_STORE"` truncates the record before this
+#                  script starts, and a run that then failed would leave the
+#                  recorded copy empty. An empty recorded copy is refused by
+#                  --publication rather than read as agreement. Additions are
+#                  deliberately silent under --publication: a new key is a signup,
+#                  and the box rule is what watches whether it ever reaches the
+#                  published set.
 #
 #   --self-test    build throwaway keyrings under TMPDIR and check both rules
 #                  against a known answer. Needs gpg and nothing else.
@@ -89,11 +96,11 @@ fi
 
 usage() {
 	cat <<'EOF'
-usage: check-keyring-drift.sh [--box | --publication | --fingerprints | --self-test]
+usage: check-keyring-drift.sh [--box | --publication | --fingerprints [path] | --self-test]
 
   --box           (default) the box keyring against the merged published set
   --publication   the merged published set against the recorded copy in the second repository
-  --fingerprints  print the published set in the recorded copy's format
+  --fingerprints  print the published set in the recorded copy's format, or write it to path
   --self-test     run the local fixtures (needs gpg, writes only under TMPDIR)
 
 The header of this script documents the environment it reads, the exit codes and
@@ -102,11 +109,21 @@ EOF
 }
 
 mode=box
+fingerprints_out=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--box) mode=box ;;
 		--publication) mode=publication ;;
-		--fingerprints) mode=fingerprints ;;
+		--fingerprints)
+			mode=fingerprints
+			case "${2:-}" in
+				'' | -*) ;;
+				*)
+					fingerprints_out=$2
+					shift
+					;;
+			esac
+			;;
 		--self-test) mode=self_test ;;
 		-h | --help)
 			usage
@@ -251,6 +268,15 @@ check_publication() {
 	[ -n "${KEYRING_STORE:-}" ] ||
 		die "--publication needs KEYRING_STORE, the recorded copy in the second repository"
 	[ -r "$KEYRING_STORE" ] || die "cannot read the recorded copy at $KEYRING_STORE"
+	# An empty record compares clean against anything, which is the one answer a
+	# drift check must never give: a failed refresh leaves it empty. Say what is
+	# missing instead of reporting agreement.
+	[ -s "$KEYRING_STORE" ] ||
+		die "the recorded copy at $KEYRING_STORE is empty; refresh it with --fingerprints $KEYRING_STORE"
+	# The same two fields the comparison below reads, so a file holding only
+	# comments or blanks is refused rather than counted as a record.
+	awk 'NF >= 2 && $1 !~ /^#/ { found = 1; exit } END { exit !found }' "$KEYRING_STORE" ||
+		die "the recorded copy at $KEYRING_STORE holds no key lines"
 	build_pub_map
 
 	# The recorded copy, against the published set. Additions are not reported
@@ -270,7 +296,18 @@ check_publication() {
 
 print_fingerprints() {
 	build_pub_map
-	cat "$pub_map"
+	if [ -z "$fingerprints_out" ]; then
+		cat "$pub_map"
+		return
+	fi
+	# Written beside the destination and renamed over it, so a refresh that fails
+	# leaves the recorded copy as it was. A `> "$KEYRING_STORE"` redirect would
+	# truncate it before this script even starts.
+	new="$fingerprints_out.tmp.$$"
+	if ! cp "$pub_map" "$new" || ! mv "$new" "$fingerprints_out"; then
+		rm -f "$new"
+		die "cannot write the recorded copy at $fingerprints_out"
+	fi
 }
 
 # --- self-test: both rules against a known answer ------------------------------
@@ -420,6 +457,19 @@ SETPREF
 	assert_has 'the finding names the localpart' 'aead:' "$out"
 	assert_has 'and says the key cannot deliver' 'cannot deliver to it' "$out"
 
+	printf '%s\n' '--- an empty recorded copy is a failure to run, not a clean check'
+	: >"$store"
+	KEYRING_STORE="$store"
+	run --publication
+	assert_eq 'empty recorded copy exit' 2 "$rc"
+	assert_has 'and names what is missing' "the recorded copy at $store is empty" "$out"
+
+	printf '%s\n' '--- a recorded copy with no key lines is a failure to run too'
+	printf '%s\n' '# refreshed, but nothing was written' >"$store"
+	run --publication
+	assert_eq 'no key lines exit' 2 "$rc"
+	assert_has 'and says it holds no key lines' 'holds no key lines' "$out"
+
 	printf '%s\n' '--- a recorded copy that matches is silent, additions included'
 	printf '%s %s\n%s %s\n' alice "$alice" bob "$bob" >"$store"
 	KEYRING_STORE="$store"
@@ -443,6 +493,14 @@ SETPREF
 	run --fingerprints
 	assert_eq 'fingerprints exit' 0 "$rc"
 	assert_has 'bob: the published fingerprint' "bob $carol" "$out"
+
+	printf '%s\n' '--- --fingerprints writes the recorded copy to a path'
+	run --fingerprints "$fixture/store-out"
+	assert_eq 'write exit' 0 "$rc"
+	assert_eq 'the written file names bob at his published fingerprint' \
+		"bob $carol" "$(awk '$1 == "bob" { print $1, $2 }' "$fixture/store-out")"
+	assert_eq 'and it leaves no temporary file behind' '' \
+		"$(find "$fixture" -name 'store-out.tmp.*' -print)"
 
 	if [ "$fail" -ne 0 ]; then
 		printf '\nself-test: FAILED\n' >&2

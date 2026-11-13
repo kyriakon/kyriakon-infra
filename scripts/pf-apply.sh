@@ -18,7 +18,8 @@
 #     present, so it is safe to run repeatedly. It rewrites nothing outside its
 #     own marker pairs, with two exceptions it makes on purpose: it drops a
 #     byte-identical second copy of one of its own blocks, and it drops the
-#     greylisting block when the file already diverts SMTP to spamd without it;
+#     greylisting block when a live rule outside it already diverts SMTP to
+#     spamd; a commented-out copy of that rule does not count;
 #   - the candidate is built in a temp file and checked with pfctl -n before
 #     anything live is touched, and the installed file is checked again;
 #   - the file it replaces is kept beside the original, timestamped;
@@ -98,6 +99,72 @@ pass in log on egress proto tcp to any port $2
 EOF
 }
 
+# A divert is live only when a rule line carries it. A commented-out stock or
+# revert copy in the file is not a rule, and counting one is what let this script
+# drop the live greylisting block while reporting it "already in" the file (#692).
+live_divert_in() {
+	awk '!/^[[:space:]]*#/ && /divert-to 127\.0\.0\.1 port spamd/ { found = 1 } END { exit !found }' "$1"
+}
+
+# A live divert outside our own marker pairs: a stock pf.conf carries the same
+# rules in its own words, and only those make our greylisting block redundant.
+# Our block's own divert line must not count, or a box whose only divert is our
+# block would look like a box that does not need it.
+external_divert_in() {
+	awk '
+	/^# --- kyriakon: / { inblk = 1; next }
+	inblk && /^# --- end kyriakon: / { inblk = 0; next }
+	inblk { next }
+	/^[[:space:]]*#/ { next }
+	/divert-to 127\.0\.0\.1 port spamd/ { found = 1 }
+	END { exit !found }
+	' "$1"
+}
+
+# Whether the greylisting fragment is already carried: by its own marker, or by a
+# live divert to spamd outside a comment.
+grey_in() { has_block_in "$1" greylisting || live_divert_in "$1"; }
+
+# build_candidate <src> <dst>: copy src to dst with the copies of our own blocks
+# that are no longer needed removed, and set $external to whether an outside live
+# divert makes the greylisting block redundant.
+#
+# Two things make a block redundant. One is a byte-identical repeat: a check that
+# keyed on a rule's text appended finger twice, and only this script can repair a
+# root-only file the operator will not hand-edit. The other is our greylisting
+# block when the file already diverts SMTP to spamd outside it, because a stock
+# pf.conf carries those same rules in its own words and our copy is then dead
+# weight. A block is its two marker lines and everything between them; a line
+# outside them is copied through untouched, and two copies that differ (a block
+# appended twice around a changed value) are both kept and left to the diff,
+# because guessing which is wanted is not this script's call.
+build_candidate() {
+	if external_divert_in "$1"; then
+		external=1
+	else
+		external=0
+	fi
+	awk -v dropped="$dropped" -v dropgrey="$external" '
+/^# --- kyriakon: / { inblk = 1; buf = $0 ORS; open = $0; next }
+inblk && /^# --- end kyriakon: / {
+	buf = buf $0 ORS
+	if (dropgrey == 1 && open ~ /^# --- kyriakon: greylisting /) {
+		print "greylisting, superseded by the divert rules already in the file: " open >> dropped
+	} else if (buf in seen) {
+		print "byte-identical duplicate: " open >> dropped
+	} else {
+		seen[buf] = 1
+		printf "%s", buf
+	}
+	inblk = 0
+	next
+}
+inblk { buf = buf $0 ORS; next }
+{ print }
+END { if (inblk) printf "%s", buf }
+' "$1" > "$2"
+}
+
 self_test() {
 	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
 	. "$(dirname "$0")/lib.sh"
@@ -132,6 +199,70 @@ self_test() {
 	check "and the file is byte-identical" "$(cksum "$first")" "$before"
 	check "the block's port is readable" "$(block_port "$first" 'titan upload')" "1966"
 
+	# The greylisting scans once matched a commented-out stock rule and dropped
+	# the live block, leaving SMTP on smtpd while the output said it was already
+	# there (#692). A file carrying both a commented stock copy and our live block
+	# must keep the block.
+	dropped="$tree/dropped"
+	: > "$dropped"
+	both="$tree/grey-both.conf"
+	cat > "$both" <<'EOF'
+set skip on lo
+block return
+pass
+#pass in on egress proto tcp to any port smtp divert-to 127.0.0.1 port spamd
+# --- kyriakon: greylisting (docs/planning/research/spamd-greylisting.md) ---
+table <spamd-white> persist
+pass in on egress proto tcp to any port smtp divert-to 127.0.0.1 port spamd
+pass in log on egress proto tcp from <spamd-white> to any port smtp
+# --- end kyriakon: greylisting ---
+EOF
+	check "a commented stock divert is not external" \
+		"$(external_divert_in "$both" && printf yes || printf no)" no
+	cand="$tree/grey-both.out"
+	build_candidate "$both" "$cand"
+	check "the live greylisting block survives a commented copy" \
+		"$(has_block_in "$cand" greylisting && printf yes || printf no)" yes
+	check "and nothing was dropped" "$(awk 'END { print NR + 0 }' "$dropped")" 0
+
+	# A commented divert alone is not live, so the block is planned rather than
+	# skipped.
+	commented="$tree/grey-commented.conf"
+	printf '%s\n' \
+		'set skip on lo' \
+		'pass' \
+		'#pass in on egress proto tcp to any port smtp divert-to 127.0.0.1 port spamd' > "$commented"
+	check "a commented-only divert is not live" \
+		"$(live_divert_in "$commented" && printf yes || printf no)" no
+	check "so the greylisting block is planned" \
+		"$(grey_in "$commented" && printf present || printf absent)" absent
+
+	# With no divert at all the block is planned too.
+	plain="$tree/grey-absent.conf"
+	printf '%s\n' 'set skip on lo' 'pass' > "$plain"
+	check "an absent divert plans the greylisting block" \
+		"$(grey_in "$plain" && printf present || printf absent)" absent
+
+	# A live stock divert outside our block still makes our copy redundant, and
+	# the candidate keeps that live rule.
+	stock="$tree/grey-stock.conf"
+	cat > "$stock" <<'EOF'
+set skip on lo
+pass in on egress proto tcp to any port smtp divert-to 127.0.0.1 port spamd
+# --- kyriakon: greylisting (docs/planning/research/spamd-greylisting.md) ---
+table <spamd-white> persist
+pass in on egress proto tcp to any port smtp divert-to 127.0.0.1 port spamd
+pass in log on egress proto tcp from <spamd-white> to any port smtp
+# --- end kyriakon: greylisting ---
+EOF
+	cand="$tree/grey-stock.out"
+	build_candidate "$stock" "$cand"
+	check "a live stock divert is external" "$external" 1
+	check "and our redundant block is dropped" \
+		"$(has_block_in "$cand" greylisting && printf yes || printf no)" no
+	check "and the live divert is what remains" \
+		"$(live_divert_in "$cand" && printf yes || printf no)" yes
+
 	self_test_end
 }
 
@@ -154,49 +285,12 @@ work=$(mktemp)
 bak=${pf_conf}.bak.$(date +%Y%m%d%H%M%S)
 
 # The candidate starts as the live file with the copies of our own blocks that are
-# no longer needed removed. Two things make a block redundant. One is a
-# byte-identical repeat: a check that keyed on a rule's text appended finger twice,
-# and only this script can repair a root-only file the operator will not hand-edit.
-# The other is our greylisting block when the file already diverts SMTP to spamd
-# outside it, because a stock pf.conf carries those same rules in its own words and
-# our copy is then dead weight. A block is its two marker lines and everything
-# between them; a line outside them is copied through untouched, and two copies
-# that differ (a block appended twice around a changed value) are both kept and
-# left to the diff, because guessing which is wanted is not this script's call.
+# no longer needed removed; build_candidate documents which two make a block
+# redundant. Whether the diverts are already there is decided with our own marker
+# pairs stripped out first, and with comments ignored.
 dropped=$(mktemp)
 collapsed=0
-# Whether the diverts are already there is decided with our own marker pairs
-# stripped out first. A scan that saw our block's own divert line would call a box
-# whose only divert is our block a box that does not need it, and drop it, sending
-# SMTP to smtpd instead of spamd: a mail change made by a firewall script for no
-# reason. So a box with the stock rules drops our block, and a box whose only
-# divert is our block keeps it.
-outdivert=$(awk '
-/^# --- kyriakon: / { inblk = 1; next }
-inblk && /^# --- end kyriakon: / { inblk = 0; next }
-inblk { next }
-/divert-to 127\.0\.0\.1 port spamd/ { found = 1 }
-END { print found + 0 }
-' "$pf_conf")
-awk -v dropped="$dropped" -v dropgrey="$outdivert" '
-/^# --- kyriakon: / { inblk = 1; buf = $0 ORS; open = $0; next }
-inblk && /^# --- end kyriakon: / {
-	buf = buf $0 ORS
-	if (dropgrey == 1 && open ~ /^# --- kyriakon: greylisting /) {
-		print "greylisting, superseded by the divert rules already in the file: " open >> dropped
-	} else if (buf in seen) {
-		print "byte-identical duplicate: " open >> dropped
-	} else {
-		seen[buf] = 1
-		printf "%s", buf
-	}
-	inblk = 0
-	next
-}
-inblk { buf = buf $0 ORS; next }
-{ print }
-END { if (inblk) printf "%s", buf }
-' "$pf_conf" > "$work"
+build_candidate "$pf_conf" "$work"
 if [ -s "$dropped" ]; then
 	collapsed=$(awk 'END { print NR + 0 }' "$dropped")
 	printf 'removing %s kyriakon block(s):\n' "$collapsed"
@@ -218,7 +312,7 @@ added=0
 # marker. The other five open services a stock file has nothing for, so there their
 # marker is the whole story. Removing our block once the stock rules are doing the
 # work is the candidate builder's job below, not this test's.
-if has_block greylisting || grep -q 'divert-to 127.0.0.1 port spamd' "$pf_conf"; then
+if grey_in "$pf_conf"; then
 	printf 'greylisting:  already in %s\n' "$pf_conf"
 else
 	cat >>"$work" <<'EOF'
