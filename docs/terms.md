@@ -72,11 +72,11 @@ Write to us, or send this form. You do not have to use it, and any clear stateme
 
 ## Renewal and lapse
 
-Your year runs from the day we record your payment. We email a reminder before it ends. If the year ends with nothing paid, the account lapses.
+A paid year runs from the day we record your payment. We email a reminder thirty days before the date it ends, except on the card rail, where Stripe sends its own note before the next invoice.
 
-A lapsed account still receives mail and you can still read it, and everything you published stays up. What stops is sending from your address, uploading to your site, and pushing to your git repositories. Nothing you already have is withheld over a missed payment; the pressure to pay is the notices, not the holding of your correspondence.
+When that annual date passes without a renewal, nothing about your account changes by itself. The operator follows up. Write to admin@kyriakon.net to arrange the renewal, or to say you have already sent the money. If the renewal stays unpaid, the operator may close the account, telling every address it holds first. No automatic lapse, grace period or deletion runs from an annual expiry. The pressure to pay is the notices, not the holding of your correspondence.
 
-Lapsing starts a grace period of forty days. We send a final notice before the end of it, and if nothing changes the account is deleted automatically on the last day. Deletion removes the account and the live data. Copies remain in our encrypted backups for up to about seven months and then expire, which the privacy notice states in full.
+A new approval has a fourteen-day payment window, and that is the automatic case. If it closes with no payment recorded, the account lapses. Sending from your address, uploading to your site and pushing to your git repositories stop, while mail keeps arriving and you can still read it, and everything you published stays up. Lapsing starts a grace period of forty days. We send a final notice before the end of it, and if nothing changes the account is deleted on the last day. Deletion removes the account and the live data. Copies remain in our encrypted backups for up to about seven months and then expire, which the privacy notice states in full.
 
 ## Suspension, closing and deletion
 

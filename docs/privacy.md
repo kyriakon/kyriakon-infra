@@ -51,7 +51,8 @@ That covers stored content, not the addressing information mail needs to move. S
 | Your account, mailbox, website, gemini capsule and git repositories | while the account exists, then deleted |
 | The hold on your username, and the transition journal lines for your account | 90 days after deletion. A journal line written before the hold recorded the application token may remain |
 | A suspended account | a 40-day grace, then deletion |
-| An account after a failed renewal | a 40-day grace, then deletion |
+| An annual renewal that is not paid | no automatic lapse, grace or deletion. The operator follows up while the account remains |
+| An account that lapses for non-payment | a 40-day grace, then deletion |
 | Copies of deleted data in the encrypted backup repository | up to about 7 months after the data leaves the live tree |
 | Billing and accounting records | 5 years after the 31 January filing deadline for the tax year, and 6 years once we are registered for VAT |
 | Card data | never held by us; held by Stripe |
