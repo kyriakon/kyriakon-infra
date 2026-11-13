@@ -104,14 +104,31 @@ usage() {
 # of them, and no label starting or ending with a hyphen. It is the stem of every
 # generated file name and a path component under /etc/ssl, so a name outside this
 # set could not be a body's domain.
+#
+# The platform's own domain and everything under it are refused here too. It is
+# the last line of defence: the drain refuses such a removal before this script
+# runs, but a hand-run `remove-group.sh kyriakon.net` would delete the platform's
+# mail table lines, vhosts and certificate. The platform's name is the first line
+# of mail_domains, read the way provision-member.sh reads it.
 domain_ok() {
-	typeset name="$1"
+	typeset name="$1" platform
 	[ "${#name}" -le 253 ] || return 1
 	case "$name" in
 	*.*) ;;
 	*) return 1 ;;
 	esac
-	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$' || return 1
+	# A table that is missing or empty refuses every name rather than guessing:
+	# without its first line there is no way to tell the operator's domain from a
+	# body's.
+	platform=$(mail_domains_first "$mail_domains") || return 1
+	[ -n "$platform" ] || return 1
+	# kyriakon.com is the platform's defensive registration: the box serves it
+	# with its own certificate and relayd keypair, which a removal would delete.
+	case "$name" in
+	"$platform" | *."$platform" | kyriakon.com | *.kyriakon.com) return 1 ;;
+	esac
+	return 0
 }
 
 # The restarts, as functions so the self-test can record them instead of running
@@ -372,6 +389,16 @@ self_test() {
 	check "a path is refused" "$(domain_ok ../parish.example && printf yes || printf no)" no
 	check "a leading hyphen is refused" "$(domain_ok -parish.example && printf yes || printf no)" no
 	check "an uppercase label is refused" "$(domain_ok Parish.example && printf yes || printf no)" no
+	# The platform's own domain is the first line of the table, and it and
+	# everything under it belong to the operator: a removal would take the
+	# platform's mail lines, vhosts and certificate with it.
+	platform=$(mail_domains_first "$mail_domains")
+	check "the platform's own domain is refused" \
+		"$(domain_ok "$platform" && printf yes || printf no)" no
+	check "and a name under it" \
+		"$(domain_ok "mail.$platform" && printf yes || printf no)" no
+	check "but a name that merely contains the same letters is accepted" \
+		"$(domain_ok "not$platform" && printf yes || printf no)" yes
 
 	self_test_end
 }
@@ -393,7 +420,7 @@ case "${1:-}" in
 	[ "$#" -eq 1 ] || usage
 	domain="$1"
 	domain_ok "$domain" || {
-		printf 'invalid domain: %s (lowercase FQDN, at least two labels)\n' "$domain" >&2
+		printf 'invalid domain: %s (a lowercase FQDN of at least two labels, and not the platform'\''s own domain or a name under it)\n' "$domain" >&2
 		exit 1
 	}
 	[ "$(id -u)" -eq 0 ] || {

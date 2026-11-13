@@ -7,8 +7,8 @@ use super::boxrun::{
     run_script_tolerating, write_public_key,
 };
 use super::groups::{
-    account_on_box, append_ledger, check_group_names, group_addresses, group_record, name_allowed,
-    name_held, site_owner, write_account_record,
+    account_on_box, append_ledger, body_domain_refusal, check_group_names, group_addresses,
+    group_record, name_allowed, name_held, site_owner, write_account_record,
 };
 use super::lifecycle::group_recipient;
 use super::Error;
@@ -688,6 +688,13 @@ async fn approve_group(
         .ok_or_else(|| Error::Failed("the application names no domain".to_string()))?;
     if let Some(why) = validate::domain(&domain) {
         return Err(Error::Failed(format!("the domain {domain:?}: {why}")));
+    }
+    // The platform's own domain is not a body's to claim: its approval would
+    // shadow the operator's addresses and its later removal would take the
+    // platform's tables, vhosts and certificate. A refusal, so the decision
+    // settles rather than retrying forever.
+    if let Some(reason) = body_domain_refusal(cfg, &domain).await? {
+        return Ok(Settlement::refused(reason));
     }
     // The recipe is part of this approval, so a config the deploy never
     // substituted refuses before the group check, the journal line or any

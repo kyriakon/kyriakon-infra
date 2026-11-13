@@ -197,6 +197,42 @@ pub(super) async fn check_group_names(
     Ok(())
 }
 
+/// The platform's own domain: the first line of `mail_domains`, the line
+/// `scripts/lib.sh`'s `mail_domains_first` reads and `provision-member.sh`
+/// addresses a new member on. Read rather than configured, so the drain and the
+/// scripts can never disagree about which name belongs to the operator.
+async fn platform_domain(cfg: &DrainConfig) -> Result<String, Error> {
+    let text = Store::read_text(&cfg.mail_domains).await?;
+    match text.lines().next().map(str::trim) {
+        Some(first) if !first.is_empty() => Ok(first.to_string()),
+        _ => Err(Error::Failed(format!(
+            "{} has no first line, so the platform's own domain is unknown",
+            cfg.mail_domains
+        ))),
+    }
+}
+
+/// Why a body may not have `domain`, or `None` when it may. The platform's own
+/// domain and anything under it are the operator's: a body there would shadow
+/// the platform's own addresses in `virtuals`, and removing it would take the
+/// platform's mail table lines, vhosts and certificate with it. The comparison
+/// is by label boundary, so a name that merely ends in the same letters is a
+/// different domain.
+pub(super) async fn body_domain_refusal(
+    cfg: &DrainConfig,
+    domain: &str,
+) -> Result<Option<String>, Error> {
+    let platform = platform_domain(cfg).await?;
+    // The defensive registrations are the platform's too: `kyriakon.com` is
+    // served with the platform's own certificate and relayd keypair, so a body
+    // there would shadow them and its removal would take them with it.
+    const PLATFORM_DOMAINS: [&str; 1] = ["kyriakon.com"];
+    let owned = std::iter::once(platform.as_str())
+        .chain(PLATFORM_DOMAINS)
+        .any(|name| domain == name || domain.ends_with(&format!(".{name}")));
+    Ok(owned.then(|| format!("{domain} is the platform's own domain")))
+}
+
 /// Apply one `provision-group` intent: the record, the accounts, the mail table
 /// entries and the site owner's key. Everything is idempotent, so a retry after
 /// a crash makes nothing twice.
@@ -217,6 +253,9 @@ pub async fn provision_group(
             "the domain {:?}: {why}",
             intent.domain
         )));
+    }
+    if let Some(reason) = body_domain_refusal(cfg, &intent.domain).await? {
+        return Ok(Settlement::refused(reason));
     }
     if intent.mailboxes.is_empty() {
         return Err(Error::Failed(
@@ -1216,7 +1255,9 @@ pub async fn group_address(
         )));
     }
     let Some(mut group) = group_record(store, &intent.domain).await? else {
-        return Err(Error::Failed(format!(
+        // Settled, not failed: a signed address change left armed would land
+        // on a later group on the same domain.
+        return Ok(Settlement::refused(format!(
             "there is no group for {}, so there is no address to change",
             intent.domain
         )));
@@ -1532,10 +1573,15 @@ pub async fn remove_group(
             intent.domain
         )));
     }
+    if let Some(reason) = body_domain_refusal(cfg, &intent.domain).await? {
+        return Ok(Settlement::refused(reason));
+    }
 
     let Some(group) = group_record(store, &intent.domain).await? else {
-        return Err(Error::Failed(format!(
-            "there is no group for {}, so there is no domain to remove",
+        // A refusal, not a failure: there is nothing to retry, and a signed
+        // removal left armed would take a new group on this domain down later.
+        return Ok(Settlement::refused(format!(
+            "there is no group for {}",
             intent.domain
         )));
     };
