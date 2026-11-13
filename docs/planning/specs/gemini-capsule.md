@@ -190,7 +190,7 @@ This is a stated exception, not a hole: the address exists to carry an applicati
 
 The drain reads the Maildir on each run. It matches the draft's token in the subject, case-insensitively, and takes the first PGP public key block from the message body. For a body with more than one mailbox it takes each block labelled with the mailbox above it and refuses an unlabelled block when there is more than one, replying to name what is missing. It runs the same three-condition check, records the verdict, and files the key against the draft. The message is deleted once it has been acted on, so the plaintext spool stays empty between runs.
 
-A key whose subject carries a token that no longer resolves has arrived after the draft expired. The drain replies to the sender with one message carrying a fresh draft link, rather than leaving the applicant without an answer; it creates no draft from the mail alone, so the applicant starts again from the link. The reply is sent only when the message actually carries a public key block, and is rate-limited per sender, so ordinary mail to the address is not answered and the address is not a backscatter source.
+A key whose subject carries a token that names no live draft is dropped without a reply. smtpd authenticates neither the envelope sender nor the From header, so the only address the drain may answer is the one the live draft recorded. A stranger's From is never a reply target, which is what keeps the address from being a backscatter source, and a message with no token is dropped the same way. The status page carries the outcome for an applicant whose mail went unanswered. A refusal reply to the recorded address is rate-limited per address.
 
 ## A member over gemini
 
@@ -253,7 +253,7 @@ The counters are process state and are not on disk.
 
 The seam is the redirect chain, because a defect there files a wrong application. Answering a page advances the cursor exactly once, and re-requesting the same page with the same answer (a client retry, or a reload) does it once and not twice. A token that has been purged leaves no answers behind. Two different tokens never write to each other's draft.
 
-The key mail is the other seam. A token in the subject files the block against the right draft and the right mailbox; an unknown token replies with a fresh link and creates no draft; a message with no key block is not answered.
+The key mail is the other seam. A token in the subject files the block against the right draft and the right mailbox; an unknown token is dropped and creates no draft; a message with no key block is not answered.
 
 The limits and the counter are worth one case each. Exceeding either counter answers 44, and one shared address can still make the single draft a six-mailbox body needs. The counter's total matches the pages the path will actually ask, including after a branch answer. Multi-line normalisation is one table: `%0A`, `%0D%0A`, a literal newline and a bare CR, each landing as LF or as an ordinary character as the specification requires, with `+` staying a plus.
 

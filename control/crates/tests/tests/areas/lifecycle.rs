@@ -2724,12 +2724,17 @@ fn a_mailed_key_from_another_address_does_not_replace_the_drafts_key() {
         "{}",
         fix.sent()
     );
+    assert!(
+        fix.sent().contains("To: applicant@example.invalid"),
+        "the refusal goes to the recorded address, not the sender: {}",
+        fix.sent()
+    );
 }
 
 /// A draft holds one key per mailbox: a second mailed key is refused rather than
-/// replacing the first, even when the draft recorded no outside address to
-/// compare the sender against. Nothing in smtpd.conf authenticates the sender,
-/// so the refusal is the control.
+/// replacing the first. smtpd authenticates neither the From header nor an
+/// inbound envelope sender, and the draft recorded no address to answer, so the
+/// refusal is the control and the forged sender gets no mail back.
 #[test]
 fn a_second_mailed_key_does_not_replace_the_first() {
     let fix = Fix::new("mail-key-second");
@@ -2750,8 +2755,8 @@ fn a_second_mailed_key_does_not_replace_the_first() {
     let after: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
     assert_eq!(after["mail_keys"], json!([key]), "the key was replaced");
     assert!(
-        fix.sent().contains("already filed"),
-        "the second sender is told why it was refused: {}",
+        fix.sent().is_empty(),
+        "a forged From is not answered: {}",
         fix.sent()
     );
 }
@@ -2788,8 +2793,8 @@ fn a_mailed_key_does_not_replace_a_key_the_form_filed() {
         "the form's key was replaced"
     );
     assert!(
-        fix.sent().contains("already filed"),
-        "the sender is told why it was refused: {}",
+        fix.sent().is_empty(),
+        "a draft with no recorded address answers no-one: {}",
         fix.sent()
     );
 }
@@ -2805,6 +2810,7 @@ fn a_colliding_block_does_not_discard_the_others() {
             ("whose", "body"),
             ("body_domain", "parish.example"),
             ("body_account_names", "secretary\nhall"),
+            ("address_outside", "applicant@example.invalid"),
         ],
     );
     fix.mail(
@@ -2888,6 +2894,7 @@ fn an_unlabelled_key_for_two_mailboxes_is_refused_by_name() {
             ("whose", "body"),
             ("body_domain", "parish.example"),
             ("body_account_names", "secretary\nhall"),
+            ("address_outside", "applicant@example.invalid"),
         ],
     );
     fix.mail("one", "applicant@example.invalid", TOKEN, GOOD_KEY);
@@ -2904,13 +2911,14 @@ fn an_unlabelled_key_for_two_mailboxes_is_refused_by_name() {
     );
 }
 
-/// A token that no longer resolves gets one reply with a fresh link and creates
-/// no draft. The second message from the same sender is not answered again.
+/// A token that no longer resolves is dropped: it names no live draft, so there
+/// is no address the platform can answer, and a forged From must not turn the
+/// address into a backscatter source. No draft is created.
 #[test]
-fn a_key_for_a_dead_token_gets_one_reply_and_files_no_draft() {
+fn a_key_for_a_dead_token_is_dropped_without_a_reply() {
     let fix = Fix::new("mail-dead-token");
     fix.mail("one", "applicant@example.invalid", OTHER_TOKEN, GOOD_KEY);
-    fix.mail("two", "applicant@example.invalid", OTHER_TOKEN, GOOD_KEY);
+    fix.mail("two", "victim@example.org", OTHER_TOKEN, GOOD_KEY);
 
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
@@ -2920,15 +2928,47 @@ fn a_key_for_a_dead_token_gets_one_reply_and_files_no_draft() {
         .filter(|n| n.ends_with(".json"))
         .collect();
     assert!(drafts.is_empty(), "a mail creates no draft: {drafts:?}");
-    assert_eq!(
-        fix.sent()
-            .matches("Subject: Your Kyriakon application key")
-            .count(),
-        1,
-        "one reply per sender:\n{}",
+    assert!(fix.sent().is_empty(), "nothing to answer:\n{}", fix.sent());
+    assert!(fix.names("mail/new").is_empty());
+}
+
+/// A message that carries a key block but no token is dropped unanswered: the
+/// reply address is whatever its sender wrote, so answering it is backscatter.
+#[test]
+fn a_key_block_with_no_token_is_not_answered() {
+    let fix = Fix::new("mail-no-token");
+    fix.mail("one", "victim@example.org", "no token here", GOOD_KEY);
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.sent().is_empty(), "{}", fix.sent());
+    assert!(
+        fix.names("mail/new").is_empty(),
+        "the message is still drained"
+    );
+}
+
+/// Distinct forged From values are the exploit's lever. With no token in the
+/// message there is no draft behind it, so none of them produces mail.
+#[test]
+fn forged_from_values_produce_no_mail() {
+    let fix = Fix::new("mail-forged-from");
+    for n in 0..3 {
+        fix.mail(
+            &format!("m{n}"),
+            &format!("victim-{n}@example.org"),
+            "hello",
+            GOOD_KEY,
+        );
+    }
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.sent().is_empty(),
+        "a forged From was answered: {}",
         fix.sent()
     );
-    assert!(fix.sent().contains("gemini://signup.kyriakon.net/apply"));
     assert!(fix.names("mail/new").is_empty());
 }
 
