@@ -144,3 +144,35 @@ fn a_submission_must_come_from_this_form() {
         "same-origin"
     )])));
 }
+
+/// The path is decoded before it reaches the log, so a client can put a newline
+/// in it. The audit line is one request per line: a control character is
+/// replaced, and the forged line never reaches stderr.
+#[test]
+fn a_control_character_in_the_path_never_forges_a_log_line() {
+    let incoming = crate::responder::Incoming {
+        path: "status/x\nkyriakon-control: httpd /status/forged 200 198.51.100.7".to_string(),
+        query: String::new(),
+        key: Key::V4(Ipv4Addr::new(203, 0, 113, 10)),
+        addr: "203.0.113.10".to_string(),
+        certificate: None,
+    };
+    let outcome = super::outcome(
+        incoming,
+        crate::fastcgi::Reply::Gemini {
+            status: 20,
+            meta: "text/gemini".to_string(),
+            body: String::new(),
+        },
+    );
+    assert!(!outcome.route.contains('\n'), "{}", outcome.route);
+    assert!(
+        !outcome.route.chars().any(char::is_control),
+        "{}",
+        outcome.route
+    );
+    assert_eq!(
+        outcome.route,
+        "/status/x?kyriakon-control: httpd /status/forged 200 198.51.100.7"
+    );
+}
