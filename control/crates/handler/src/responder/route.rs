@@ -6,7 +6,7 @@ use super::account::{account, account_action, account_close, account_export, log
 use super::apply::{apply, webhook};
 use super::connection::{fields, form_post};
 use super::decide::{decide_confirm, decide_file, password_file, password_page};
-use super::flow::{branch_step, own_origin, root};
+use super::flow::{branch_step, own_origin, root, Reaches};
 use super::gemini::{acceptances, capsule_apply, mirrored};
 use super::reply::{page_html, refused};
 use super::status::status;
@@ -98,14 +98,32 @@ impl Handler {
     /// request whose `Origin` it withholds (Safari does, from a sandboxed frame on
     /// a sibling subdomain). Logging in is not one of them: it opens the session
     /// the request did not have.
-    fn takes_session(self) -> bool {
-        matches!(
-            self,
+    ///
+    /// Every variant is named, with no wildcard: a handler added later has to say
+    /// which side it is on rather than defaulting to "not a session route", which
+    /// would widen what the fallback covers without anyone deciding to.
+    pub(super) fn takes_session(self) -> bool {
+        match self {
             Handler::Logout
-                | Handler::AccountClose
-                | Handler::AccountAction
-                | Handler::AccountExport
-        )
+            | Handler::AccountClose
+            | Handler::AccountAction
+            | Handler::AccountExport => true,
+            Handler::Webhook
+            | Handler::Status
+            | Handler::DecideConfirm
+            | Handler::DecideFile
+            | Handler::PasswordPage
+            | Handler::PasswordFile
+            | Handler::Apply
+            | Handler::LoginPage
+            | Handler::LoginSubmit
+            | Handler::Account
+            | Handler::Root
+            | Handler::BranchStep
+            | Handler::CapsuleApply
+            | Handler::Mirrored
+            | Handler::Acceptances => false,
+        }
     }
 }
 
@@ -438,11 +456,15 @@ pub(super) async fn http(app: &App, request: &Request, incoming: &Incoming) -> R
     let preflight = takes_form(&incoming.path);
     // A session route is answered out of the cookie, so it requires this site's
     // own Origin rather than the Sec-Fetch-Site fallback: see `own_origin`.
-    let session = takes_session(&incoming.path);
+    let reaches = if takes_session(&incoming.path) {
+        Reaches::Session
+    } else {
+        Reaches::Form
+    };
     // A POST from somewhere that is not this form is refused for being that,
     // whatever path it names, as the middleware in front of the old HTTP daemon's
     // router did: the check runs before a route is chosen.
-    if preflight && method == "POST" && !own_origin(request, session) {
+    if preflight && method == "POST" && !own_origin(request, reaches) {
         // The two values, in the refusal: neither is a secret and the pair is
         // the only way to tell which kind of client was refused.
         return refused(&format!(

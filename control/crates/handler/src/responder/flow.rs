@@ -76,13 +76,27 @@ pub(super) async fn root(app: &App, call: &Call<'_>) -> Reply {
     }
 }
 
+/// Which of the two kinds of route a submission is for, as the guard reads it:
+/// the route table settles this before a header is looked at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Reaches {
+    /// A route answered out of the session cookie. The cookie is the identity,
+    /// so this site's exact `Origin` is required and nothing else will do.
+    /// Logging in is not one of these: it opens the session the request did not
+    /// have.
+    Session,
+    /// A route whose identity is not the cookie, so the `Sec-Fetch-Site`
+    /// fallback may answer when `Origin` cannot name this site.
+    Form,
+}
+
 /// A submission's origin. `Origin` is sent on every browser POST; a value that is
 /// not this service's own is refused. When it is absent — or literally `null`,
 /// which is what a document with no origin sends — `Sec-Fetch-Site` is the
 /// fallback, but only on a route that a cookie cannot reach: a session-bearing
 /// route requires this site's own `Origin`, because the cookie is the identity
 /// such a request acts on.
-pub(super) fn own_origin(request: &Request, session: bool) -> bool {
+pub(super) fn own_origin(request: &Request, reaches: Reaches) -> bool {
     // A browser that posts a form sends Origin, and an ordinary tab sends this
     // site as it. What sends `null` instead is a document with no origin: a
     // sandboxed frame, a `data:` document, an in-app browser's synthetic page.
@@ -103,7 +117,7 @@ pub(super) fn own_origin(request: &Request, session: bool) -> bool {
     // cookie the browser attaches by itself, may not take any of them. Safari
     // sends no `Sec-Fetch-Site` and does attach the same-site `Lax` cookie to a
     // sandboxed frame's form post, so this is the branch the whole check turns on.
-    if session {
+    if reaches == Reaches::Session {
         return false;
     }
     match site {
