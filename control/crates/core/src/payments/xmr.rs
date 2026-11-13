@@ -1,4 +1,5 @@
-//! The XMR/GBP rate the Monero rail quotes from.
+//! The XMR/GBP rate the Monero rail quotes from, and the shape a Monero
+//! credit's transaction id and amount must have.
 //!
 //! One named source, cached in `rates/xmr-gbp.json` for twenty-four hours. The
 //! drain is the only writer and the only caller: a quote is computed when a
@@ -151,6 +152,28 @@ pub fn quote_xmr(price_pence: i64, rate: &str) -> Result<String, Error> {
 /// either is used.
 pub fn valid_rate(rate: &str) -> bool {
     parse_rate(rate).is_some()
+}
+
+/// A Monero transaction id is a 32-byte hash written as 64 hexadecimal
+/// characters. Absent is valid: only a Monero credit carries one.
+pub fn valid_txid(txid: Option<&str>) -> bool {
+    match txid {
+        None => true,
+        Some(t) => t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()),
+    }
+}
+
+/// An XMR amount is written as a decimal, never a float, with at most the
+/// twelve decimal places the coin's atomic unit carries. Absent is valid.
+pub fn valid_xmr(amount: Option<&str>) -> bool {
+    let Some(amount) = amount else {
+        return true;
+    };
+    let (whole, fraction) = amount.split_once('.').unwrap_or((amount, ""));
+    !whole.is_empty()
+        && whole.bytes().all(|b| b.is_ascii_digit())
+        && fraction.len() <= 12
+        && fraction.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `(R, d)` for a decimal `R / 10^d` with `R > 0`.
@@ -313,6 +336,25 @@ mod tests {
             !valid_rate("0.0000000000001"),
             "thirteen places is not a rate"
         );
+    }
+
+    #[test]
+    fn a_credit_fields_validator_accepts_only_the_coin_shape() {
+        let txid = "a".repeat(64);
+        let short = "a".repeat(63);
+        let non_hex = format!("{}g", "a".repeat(63));
+        assert!(valid_txid(None));
+        assert!(valid_txid(Some(txid.as_str())));
+        assert!(!valid_txid(Some("not-a-txid")));
+        assert!(!valid_txid(Some(short.as_str())), "short");
+        assert!(!valid_txid(Some(non_hex.as_str())), "non-hex");
+        assert!(valid_xmr(None));
+        assert!(valid_xmr(Some("0.048847")));
+        assert!(valid_xmr(Some("20")));
+        assert!(!valid_xmr(Some("0.1.2")));
+        assert!(!valid_xmr(Some("")));
+        assert!(!valid_xmr(Some(".5")));
+        assert!(!valid_xmr(Some("0.0000000000001")), "thirteen places");
     }
 
     #[test]

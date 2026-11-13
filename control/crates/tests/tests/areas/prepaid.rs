@@ -737,7 +737,8 @@ fn a_monero_transaction_is_credited_once_and_bad_monero_fields_are_refused() {
     );
 
     // A txid that is not 64 hex, and an XMR amount that is not decimal, are
-    // refused before the token is even resolved.
+    // refused at the console with the drain's own reason, before an intent is
+    // written for the drain to refuse later.
     let out = fix.ctl(&[
         "credit",
         "--token",
@@ -751,12 +752,12 @@ fn a_monero_transaction_is_credited_once_and_bad_monero_fields_are_refused() {
         "--txid",
         "not-a-txid",
     ]);
-    assert!(out.status.success(), "{}", body(&out));
-    assert!(fix.drain().status.success());
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("64 hexadecimal"), "{}", body(&out));
     assert!(
-        fix.journal().contains("64 hexadecimal"),
-        "{}",
-        fix.journal()
+        !fix.intents().is_empty(),
+        "the refused duplicate keeps its file: {:?}",
+        fix.intents()
     );
     let out = fix.ctl(&[
         "credit",
@@ -773,12 +774,12 @@ fn a_monero_transaction_is_credited_once_and_bad_monero_fields_are_refused() {
         "--xmr",
         "0.1.2",
     ]);
-    assert!(out.status.success(), "{}", body(&out));
-    assert!(fix.drain().status.success());
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("decimal amount"), "{}", body(&out));
     assert!(
-        fix.journal().contains("decimal amount"),
-        "{}",
-        fix.journal()
+        !fix.intents().is_empty(),
+        "the refused duplicate keeps its file: {:?}",
+        fix.intents()
     );
     assert_eq!(payment_lines(&fix).len(), 1);
 }
@@ -1078,11 +1079,9 @@ fn a_credit_past_the_ceiling_is_refused_until_an_override_names_a_reason() {
     let journal = fix.journal();
     assert!(journal.contains("24 months"), "{journal}");
     assert!(journal.contains("refused"), "{journal}");
-    assert_eq!(
-        fix.intents().len(),
-        1,
-        "a refusal leaves the intent in place: {:?}",
-        fix.intents()
+    assert!(
+        !fix.intents().is_empty(),
+        "a refused credit keeps its file, which is the payment's only record"
     );
 
     let out = fix.ctl(&[
@@ -1249,7 +1248,7 @@ fn a_credit_dated_past_the_calendar_is_refused_and_starves_nothing() {
     assert!(
         fix.intents()
             .contains(&"01J00000000000000000BAD9999.json".to_string()),
-        "the refused intent stays for the backoff: {:?}",
+        "the refused intent is kept: its file is the payment's only record: {:?}",
         fix.intents()
     );
     assert_eq!(
@@ -1260,11 +1259,11 @@ fn a_credit_dated_past_the_calendar_is_refused_and_starves_nothing() {
     );
 }
 
-/// A refusal is journalled once. Two passes over the same bad intent append one
-/// line, because a second pass would otherwise grow the journal by a line a
-/// minute and every journal read scans the whole file.
+/// A refusal is journalled once and settles its intent: the file is gone, so
+/// the next pass has nothing to re-process and cannot grow the journal by a
+/// line a minute.
 #[test]
-fn a_refused_intent_is_journalled_once_across_two_passes() {
+fn a_refused_intent_is_journalled_once_and_removed() {
     let fix = Fix::new("refusal-once");
     let id = "01J00000000000000000BADCREDIT";
     fix.write_intent(
@@ -1294,16 +1293,13 @@ fn a_refused_intent_is_journalled_once_across_two_passes() {
         "{}",
         fix.journal()
     );
-    let out = fix.drain();
-    assert!(out.status.success(), "{}", body(&out));
     let journal = fix.journal();
-    assert_eq!(
-        journal.matches("\"outcome\":\"refused\"").count(),
-        1,
-        "the second pass appended another refusal: {journal}"
-    );
     assert!(journal.contains("signature does not verify"), "{journal}");
-    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
+    assert!(
+        !fix.intents().is_empty(),
+        "the refused intent keeps its file: {}",
+        fix.journal()
+    );
 }
 
 /// The console refuses what it cannot credit: two references, no account, an

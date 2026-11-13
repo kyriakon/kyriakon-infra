@@ -132,6 +132,16 @@ pub(crate) async fn credit(cfg: &DrainConfig, store: &Store, args: &[String]) ->
     }
     let txid = flags.get("txid").map(String::as_str);
     let xmr = flags.get("xmr").map(String::as_str);
+    // The drain's own checks, so a field it would refuse is refused here
+    // before an intent is filed and left unapplied.
+    if !xmr::valid_txid(txid) {
+        return Err(Error::Failed(
+            "--txid is not 64 hexadecimal characters".to_string(),
+        ));
+    }
+    if !xmr::valid_xmr(xmr) {
+        return Err(Error::Failed("--xmr is not a decimal amount".to_string()));
+    }
     let rate = flags.get("rate").map(String::as_str);
     if let Some(rate) = rate {
         if rail != "monero" {
