@@ -565,6 +565,20 @@ self_test() {
 	check "and leaves no candidate behind it" \
 		"$([ -e "$tree/staged.live.new" ] && printf present || printf gone)" gone
 
+	# --- the log retention config ---
+	# docs/privacy.md promises a seven-day window on the logs that hold a member's
+	# address or timestamp. That promise is only a property of the config while
+	# these two lines say seven daily generations, so the shipped file is checked
+	# here rather than left to a reader to notice.
+	# shellcheck disable=SC2016 # $D0 is the literal newsyslog token
+	check "the daemon log keeps seven daily generations" \
+		"$(grep -E -c '^/var/log/daemon[[:space:]]+640[[:space:]]+7[[:space:]]+\*[[:space:]]+\$D0' \
+			"$repo_dir/openbsd/etc/newsyslog.conf" || true)" 1
+	# shellcheck disable=SC2016 # as above
+	check "the access log keeps seven daily generations at root:wheel 600" \
+		"$(grep -E -c '^/home/www/logs/access\.log[[:space:]]+root:wheel[[:space:]]+600[[:space:]]+7[[:space:]]+\*[[:space:]]+\$D0' \
+			"$repo_dir/openbsd/etc/newsyslog.conf" || true)" 1
+
 	# --- the generated indexes ---
 	# The three include targets are created here, not by the config they are
 	# included from. Dropping one again is what #339 did, and the deployed
