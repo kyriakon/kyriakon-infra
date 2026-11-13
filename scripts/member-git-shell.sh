@@ -35,6 +35,16 @@
 # both files; the repository's own config still applies, under the two -c
 # settings above it.
 #
+# Why packObjectsHook needs no -c of its own. Since the setting landed, in git
+# 2.10, upload-pack has ignored it outside protected configuration (the system,
+# global and command scopes), so a repository-local value never runs; nulling
+# the global file closes the only scope the member can write. An empty override
+# is not the answer: `-c uploadpack.packObjectsHook=` is an empty command, and
+# every fetch then dies in "cannot run :". The repository-local commands git
+# does run, tar.<format>.command through upload-archive and
+# core.alternateRefsCommand, are accepted: they run as the member in the
+# member's own repository, which is where the session already is.
+#
 # Usage (sshd does this; a human only runs --self-test):
 #   member-git-shell.sh -c "git-receive-pack '/home/<user>/repos/<name>.git'"
 #   member-git-shell.sh --self-test
@@ -150,8 +160,8 @@ run_command() {
 	# own config. /dev/null is not a directory, so no hook is found there.
 	#
 	# GIT_CONFIG_GLOBAL replaces ~/.gitconfig and $XDG_CONFIG_HOME/git/config
-	# with an empty file. Without it a member's uploadpack.packObjectsHook runs
-	# a command on a fetch, which no -c setting in the repository covers.
+	# with an empty file. Without it a packObjectsHook in the member's global
+	# config runs a command on a fetch, which the repository cannot turn off.
 	export GIT_CONFIG_GLOBAL=/dev/null
 	exec "$git" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$verb" "$repo"
 }
