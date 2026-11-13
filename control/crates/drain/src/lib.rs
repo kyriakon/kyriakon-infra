@@ -249,7 +249,7 @@ pub async fn verify(
                 Some("the intent carries a hash rather than a plaintext".to_string())
             } else if !sign::verify(
                 key,
-                &sign::password_payload(token, &intent.until),
+                &sign::password_payload(token, &intent.application.username, &intent.until),
                 &intent.sig,
             ) {
                 Some("the link's signature does not verify".to_string())

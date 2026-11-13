@@ -102,14 +102,16 @@ pub fn decide_payload(token: &str, action: &str) -> String {
 }
 
 /// The payload the one-time password link signs. The date is in the payload so
-/// the expiry is covered by the signature and not merely beside it. The password
-/// is not, and cannot usefully be: the drain hashes the plaintext the handler
-/// files, so the signature proves the link and not the password. A compromised
-/// handler can therefore still choose the plaintext it submits, and so set a
-/// password it knows; it cannot install a chosen hash without a plaintext that
-/// produces it.
-pub fn password_payload(token: &str, until: &str) -> String {
-    format!("password:{token}:{until}")
+/// the expiry is covered by the signature and not merely beside it, and the
+/// account is in it because the drain derives the account from a record the
+/// unprivileged handler can rewrite: without the name in the payload a signature
+/// for one link could be pointed at another account. The password is not, and
+/// cannot usefully be: the drain hashes the plaintext the handler files, so the
+/// signature proves the link and not the password. A compromised handler can
+/// therefore still choose the plaintext it submits, and so set a password it
+/// knows; it cannot install a chosen hash without a plaintext that produces it.
+pub fn password_payload(token: &str, username: &str, until: &str) -> String {
+    format!("password:{token}:{username}:{until}")
 }
 
 /// The payload a group-address intent signs: every field the drain acts on, so
@@ -318,8 +320,14 @@ pub fn decide_link(base: &str, key: &[u8], token: &str, action: &str) -> Result<
 }
 
 /// The one-time password link, the same mechanism as the review links.
-pub fn password_link(base: &str, key: &[u8], token: &str, until: &str) -> Result<String, Error> {
-    let sig = sign(key, &password_payload(token, until))?;
+pub fn password_link(
+    base: &str,
+    key: &[u8],
+    token: &str,
+    username: &str,
+    until: &str,
+) -> Result<String, Error> {
+    let sig = sign(key, &password_payload(token, username, until))?;
     Ok(format!("{base}/password/{token}?until={until}&sig={sig}"))
 }
 
@@ -467,7 +475,38 @@ mod tests {
                 sign(key, "decide:tok:approve-free").unwrap()
             )
         );
-        let pw = password_link("https://signup.kyriakon.net", key, "tok", "2026-10-20").unwrap();
-        assert!(pw.contains("/password/tok?until=2026-10-20&sig="), "{pw}");
+        let pw = password_link(
+            "https://signup.kyriakon.net",
+            key,
+            "tok",
+            "secretary",
+            "2026-10-20",
+        )
+        .unwrap();
+        assert_eq!(
+            pw,
+            format!(
+                "https://signup.kyriakon.net/password/tok?until=2026-10-20&sig={}",
+                sign(key, "password:tok:secretary:2026-10-20").unwrap()
+            )
+        );
+    }
+
+    /// The account is signed into the password link, so a signature the drain
+    /// issued for one account does not verify when pointed at another.
+    #[test]
+    fn a_password_link_is_bound_to_the_account_it_sets() {
+        let key = b"k";
+        let sig = sign(key, &password_payload("tok", "secretary", "2026-10-20")).unwrap();
+        assert!(verify(
+            key,
+            &password_payload("tok", "secretary", "2026-10-20"),
+            &sig
+        ));
+        assert!(!verify(
+            key,
+            &password_payload("tok", "victim", "2026-10-20"),
+            &sig
+        ));
     }
 }
