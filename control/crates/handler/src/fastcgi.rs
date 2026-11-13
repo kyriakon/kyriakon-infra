@@ -354,6 +354,10 @@ impl Http {
                 ),
                 ("Cache-Control".to_string(), "no-store".to_string()),
                 ("Referrer-Policy".to_string(), "no-referrer".to_string()),
+                (
+                    "Content-Security-Policy".to_string(),
+                    CONTENT_SECURITY_POLICY.to_string(),
+                ),
                 ("Location".to_string(), location.to_string()),
             ],
             body: String::new(),
@@ -739,6 +743,7 @@ mod tests {
             Reply::html(200, "<p>page</p>".into()),
             Reply::html(404, String::new()),
             Reply::capability(200, "<p>page</p>".into()),
+            Reply::Http(Http::redirect("/account")),
         ] {
             let bytes = reply_bytes(&reply, 1);
             let (body, _) = fixture::reply(&bytes);
