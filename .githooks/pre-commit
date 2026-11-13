@@ -13,15 +13,29 @@ if [ -n "$binaries" ]; then
 	printf 'pre-commit: refusing binary file(s):\n%s\n' "$binaries" >&2
 	exit 1
 fi
-scripts=$(printf '%s\n' "$staged" | grep '\.sh$' || true)
+# A shell script is a staged *.sh or a staged file whose first line is a shell
+# shebang: the ksh programs under openbsd/etc carry no suffix. Paths are read one
+# per line and passed quoted, never word-split, so a path with a space in it is
+# still one argument.
+is_script() {
+	case "$1" in
+	*.sh) return 0 ;;
+	esac
+	case "$(head -n 1 -- "$1" 2>/dev/null)" in
+	'#!'*sh | '#!'*sh\ *) return 0 ;;
+	esac
+	return 1
+}
+scripts=$(printf '%s\n' "$staged" | while IFS= read -r f; do
+	if [ -f "$f" ] && is_script "$f"; then printf '%s\n' "$f"; fi
+done)
 if [ -n "$scripts" ]; then
 	if ! command -v shellcheck >/dev/null 2>&1; then
 		printf 'pre-commit: shellcheck is not on PATH; install it, or commit with --no-verify\n' >&2
 		exit 1
 	fi
-	# shellcheck disable=SC2086 # a list of paths, by construction
-	shellcheck $scripts
-	for s in $scripts; do
+	printf '%s\n' "$scripts" | while IFS= read -r s; do
+		shellcheck "$s"
 		if command -v ksh >/dev/null 2>&1; then
 			ksh -n "$s"
 		fi
