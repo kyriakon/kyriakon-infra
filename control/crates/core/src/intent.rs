@@ -62,6 +62,35 @@ pub fn decision_for_kind(kind: &str) -> Option<&'static Decision> {
     DECISIONS.iter().find(|d| d.kind == kind)
 }
 
+/// The id a signed intent is known by: the first 26 characters of its
+/// signature, which are 104 bits of an HMAC under the root-only key.
+///
+/// The id is what the journal, the ledger and the held queue dedup on, and it is
+/// not inside the signed payload. Without deriving it from the signature, a
+/// captured intent can be replayed under a rewritten id and applied again: a
+/// renewal bought a second year. Deriving it gives every copy of one signed
+/// intent the same identity whatever file it sits in, so the dedup it was
+/// written for holds. Filing and dispatch both call this, so the two cannot
+/// disagree.
+pub fn id_for(sig: &str) -> String {
+    sig.chars().take(26).collect()
+}
+
+/// Whether an intent's identity is its signature. Only the verbs whose body
+/// cannot tell two copies apart are here: a credit, a window extension and the
+/// two reconcile moves all apply money or time from values the payload already
+/// carries, so a copy under a new id is not distinguishable and used to be
+/// applied again. The other signed verbs refuse a repeat in the body (a spent
+/// link, a decided application, an identical refund at the same seq), so
+/// binding their id would only merge filings that are genuinely distinct (two
+/// same-amount refunds are two refunds).
+pub fn id_is_signed(kind: &str) -> bool {
+    matches!(
+        kind,
+        "credit" | "window-extend" | "reconcile-attribute" | "reconcile-return"
+    )
+}
+
 /// A reviewer's decision intent, from `kyriakon-admin` or a signed link.
 /// Every
 /// decision intent carries the action it performs and the signature over it: the
@@ -440,7 +469,7 @@ impl Intent {
     /// malformed intent is reported with the same words it always was.
     pub fn parse(value: &Value) -> Result<Intent, Error> {
         let kind = value.get("kind").and_then(Value::as_str).unwrap_or("");
-        let intent = match kind {
+        let mut intent = match kind {
             "application" => Intent::Application(parsed(value, "the intent")?),
             "approve" | "provision" | "decline" => {
                 Intent::Decision(parsed(value, "the decision intent")?)
@@ -475,7 +504,50 @@ impl Intent {
                 value: value.clone(),
             },
         };
+        // The id the dedup reads is the signature's, not the file's: a signed
+        // intent's identity cannot be rewritten, whichever name it is read
+        // under. `Envelope::of` derives the same value for the journal line.
+        if id_is_signed(kind) {
+            if let Some(sig) = value
+                .get("sig")
+                .and_then(Value::as_str)
+                .filter(|sig| !sig.is_empty())
+            {
+                if let Some(id) = intent.id_mut() {
+                    *id = id_for(sig);
+                }
+            }
+        }
         Ok(intent)
+    }
+
+    /// Every variant's id, for the one normalisation `parse` does. `Unknown`
+    /// carries none, because it is not a verb this build files.
+    fn id_mut(&mut self) -> Option<&mut String> {
+        Some(match self {
+            Intent::Application(intent) => &mut intent.id,
+            Intent::Decision(intent) => &mut intent.id,
+            Intent::Password(intent) => &mut intent.id,
+            Intent::ProvisionGroup(intent) => &mut intent.id,
+            Intent::GroupAddress(intent) => &mut intent.id,
+            Intent::RemoveGroup(intent) => &mut intent.id,
+            Intent::Close(intent) => &mut intent.id,
+            Intent::Resend(intent) => &mut intent.id,
+            Intent::Credit(intent) => &mut intent.id,
+            Intent::WindowExtend(intent) => &mut intent.id,
+            Intent::ReconcileAttribute(intent) => &mut intent.id,
+            Intent::ReconcileReturn(intent) => &mut intent.id,
+            Intent::Refund(intent) => &mut intent.id,
+            Intent::Export(intent) => &mut intent.id,
+            Intent::ChangePassword(intent) => &mut intent.id,
+            Intent::UploadKey(intent) => &mut intent.id,
+            Intent::OutsideAddress(intent) => &mut intent.id,
+            Intent::Serving(intent) => &mut intent.id,
+            Intent::CancelRenewal(intent) => &mut intent.id,
+            Intent::MailKey(intent) => &mut intent.id,
+            Intent::TestMail(intent) => &mut intent.id,
+            Intent::Unknown { .. } => return None,
+        })
     }
 
     /// The `kind` this variant is filed under and parsed from. The writer stamps
