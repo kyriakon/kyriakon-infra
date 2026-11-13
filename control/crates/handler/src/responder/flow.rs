@@ -76,8 +76,8 @@ pub(super) async fn root(app: &App, call: &Call<'_>) -> Reply {
     }
 }
 
-/// Which of the two kinds of route a submission is for, as the guard reads it:
-/// the route table settles this before a header is looked at.
+/// Which kind of route a submission is for, as the guard reads it: the route
+/// table settles this before a header is looked at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Reaches {
     /// A route answered out of the session cookie. The cookie is the identity,
@@ -85,6 +85,11 @@ pub(super) enum Reaches {
     /// Logging in is not one of these: it opens the session the request did not
     /// have.
     Session,
+    /// The login. It opens no session the request already had, so a same-site
+    /// sibling is not acting on an identity; but a cross-site login is a login
+    /// CSRF, which opens the attacker's session in the victim's browser, so it
+    /// still has to name itself as this page and a missing signal is refused.
+    Login,
     /// A route whose identity is not the cookie, so the `Sec-Fetch-Site`
     /// fallback may answer when `Origin` cannot name this site.
     Form,
@@ -95,7 +100,10 @@ pub(super) enum Reaches {
 /// which is what a document with no origin sends — `Sec-Fetch-Site` is the
 /// fallback, but only on a route that a cookie cannot reach: a session-bearing
 /// route requires this site's own `Origin`, because the cookie is the identity
-/// such a request acts on.
+/// such a request acts on. The login is between the two: it opens a session
+/// rather than acting on one, so it takes `Sec-Fetch-Site`, but only the values
+/// that say this page, because a cross-site login hands the victim the
+/// attacker's session.
 pub(super) fn own_origin(request: &Request, reaches: Reaches) -> bool {
     // A browser that posts a form sends Origin, and an ordinary tab sends this
     // site as it. What sends `null` instead is a document with no origin: a
@@ -117,15 +125,24 @@ pub(super) fn own_origin(request: &Request, reaches: Reaches) -> bool {
     // cookie the browser attaches by itself, may not take any of them. Safari
     // sends no `Sec-Fetch-Site` and does attach the same-site `Lax` cookie to a
     // sandboxed frame's form post, so this is the branch the whole check turns on.
-    if reaches == Reaches::Session {
-        return false;
-    }
     match site {
+        // `same-origin` is this page and `none` is the user typing the address
+        // or following a link: both are the login's own page for the login's
+        // purposes. A session route still takes neither, because the cookie it
+        // acts on arrived without the request naming itself.
+        Some("same-origin") | Some("none") => reaches != Reaches::Session,
         // same-site is the same registrable site as this page, which is what a
         // browser reports when it reads the post as this site's but not this
-        // origin's: it is not a cross-site submission and does not need to be.
-        Some(site) => site == "same-origin" || site == "same-site" || site == "none",
-        None => true,
+        // origin's: it is not a cross-site submission and the application form
+        // does not need it to be. The login is the one route where it is the
+        // attack: a sibling subdomain is not this page's form.
+        Some("same-site") => reaches == Reaches::Form,
+        Some(_) => false,
+        // A browser that sends neither header cannot say it is this page. The
+        // application form has always answered a client with no origin to name
+        // (the terminal, a script), and the login has not: a POST that opens a
+        // session has to name one signal or the other.
+        None => reaches == Reaches::Form,
     }
 }
 

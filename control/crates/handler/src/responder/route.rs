@@ -327,6 +327,15 @@ pub(super) fn takes_session(path: &str) -> bool {
         .any(|row| row.handler.takes_session() && row.matches(path).is_some())
 }
 
+/// Whether this path logs in. It acts on no cookie, but it opens a session, and
+/// a cross-site login opens the attacker's session in the victim's browser, so
+/// the guard requires it to name itself as this page: see `own_origin`.
+pub(super) fn takes_login(path: &str) -> bool {
+    ROUTES
+        .iter()
+        .any(|row| row.handler == Handler::LoginSubmit && row.matches(path).is_some())
+}
+
 /// What one path resolves to.
 #[derive(Debug)]
 pub(super) enum Resolution<'a> {
@@ -455,9 +464,13 @@ pub(super) async fn http(app: &App, request: &Request, incoming: &Incoming) -> R
     // webhook's body is not the form's: see `takes_form`.
     let preflight = takes_form(&incoming.path);
     // A session route is answered out of the cookie, so it requires this site's
-    // own Origin rather than the Sec-Fetch-Site fallback: see `own_origin`.
+    // own Origin rather than the Sec-Fetch-Site fallback. The login is not a
+    // session route, but a cross-site one is a login CSRF, so it requires a
+    // same-origin signal rather than any browser-shaped request: see `own_origin`.
     let reaches = if takes_session(&incoming.path) {
         Reaches::Session
+    } else if takes_login(&incoming.path) {
+        Reaches::Login
     } else {
         Reaches::Form
     };
