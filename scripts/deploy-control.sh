@@ -402,6 +402,36 @@ STUB
 		exit 1
 	}
 
+	# The socket directory's mode is what stops the connecting group unlinking
+	# the socket. It is asserted from the deploy line first, the way the drain
+	# scan above reads the source rather than a second list, because the driven
+	# check below cannot run everywhere: stat(1) without -f cannot report a
+	# mode, and a platform that will not keep the set-group-id bit for an
+	# unprivileged process (macOS in /tmp does not) cannot show one either.
+	# The only block in this self-test that uses `check`; the rest exit on
+	# their own. The counter starts here so the gate at the end reports it.
+	self_test_fails=0
+	lines=$(grep -cE '^[[:space:]]*install -d -o .*-g .*-m 2750 "' \
+		"$script_dir/deploy-control.sh" || true)
+	check "the socket directories are created mode 2750" "$lines" 1
+	if stat -f '%Lp' "$work" >/dev/null 2>&1; then
+		sockdir=$work/onboard-portal
+		install -d -m 2770 "$sockdir"
+		if [ "$(stat -f '%Lp' "$sockdir")" = 2770 ]; then
+			# The part the line above cannot show: a re-deploy over a directory
+			# an older run left 2770 has to end 2750.
+			install -d -m 2750 "$sockdir"
+			check "install -d re-modes an existing socket directory to 2750" \
+				"$(stat -f '%Lp' "$sockdir")" 2750
+		else
+			printf 'self-test: this platform does not keep the set-group-id bit, so the install -d re-mode check is skipped\n'
+		fi
+	else
+		printf 'self-test: stat -f is absent, so the install -d re-mode check is skipped\n'
+	fi
+	# shellcheck disable=SC2154 # self_test_begin in lib.sh owns the counter
+	[ "$self_test_fails" -eq 0 ] || exit 1
+
 	printf 'self-test: ok\n'
 }
 
