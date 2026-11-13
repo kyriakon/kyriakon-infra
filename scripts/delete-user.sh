@@ -272,7 +272,7 @@ remove_member() {
 	mail_changed=no
 	if [ -f "$virtuals" ]; then
 		if [ "$show" = yes ]; then
-			if awk -v u="$user" -F: '$1 ~ ("^" u "@")' "$virtuals" | grep -q .; then
+			if [ -n "$(own_virtual_keys)" ]; then
 				printf 'would remove the address lines for %s@\n' "$user"
 			fi
 		else
@@ -296,6 +296,28 @@ remove_member() {
 		if [ -n "$aliases" ]; then
 			printf 'note: %s point at %s and were left alone; they now deliver nowhere\n' "$aliases" "$user" >&2
 			printf '  Re-point or remove them in %s and restart smtpd.\n' "$virtuals" >&2
+		fi
+		# A line on another domain that carries the member's localpart but
+		# delivers elsewhere is someone else's address; it was kept, and the
+		# operator should see why the name survives.
+		shared=$(awk -v u="$user" -F: '
+			{ t = $2; gsub(/^[ \t]+|[ \t]+$/, "", t) }
+			substr($1, 1, length(u) + 1) == u "@" && t != u { print $1 }
+		' "$virtuals" | tr '\n' ' ')
+		if [ -n "$shared" ]; then
+			printf 'note: %s carry %s@ but deliver elsewhere and were left alone\n' "$shared" "$user" >&2
+		fi
+		# shortcut: only `key: value` lines are matched, which is what every
+		# writer emits; a hand-edited table can use the space form table(5)
+		# allows, and that line would still deliver into the deleted account.
+		# A restore or hand edit that brings one back must be checked by hand.
+		unparsed=$(awk -v u="$user" '
+			{ line = $0; sub(/^[ \t]+/, "", line)
+			  if (line ~ ("^" u "@[^:]+[ \t]+" u "$")) print line }
+		' "$virtuals" | tr '\n' ' ')
+		if [ -n "$unparsed" ]; then
+			printf 'note: these deliver to %s but are not in key: value form, so they were not removed:\n  %s\n' \
+				"$user" "$unparsed" >&2
 		fi
 	fi
 	if [ -f "$mail_from" ]; then
@@ -356,13 +378,38 @@ remove_member() {
 	return 0
 }
 
+# own_virtual_keys: the virtual-table keys this member owns, one per line: the
+# key starts with the member's localpart and delivers to the member.
+own_virtual_keys() {
+	awk -v u="$user" -F: '
+		{ t = $2; gsub(/^[ \t]+|[ \t]+$/, "", t) }
+		substr($1, 1, length(u) + 1) == u "@" && t == u { print $1 }
+	' "$virtuals"
+}
+
 # remove_own_addresses: drop this member's own lines from the virtual table.
 # Returns 0 when the file changed, 1 when it did not, and 2 when the write
-# failed; the caller must keep 2 apart from 1. The key is a literal prefix, so
-# only this member's own addresses go: the name cannot act as a pattern. lib.sh's
-# table_drop keeps a copy of the table it replaces, so a deletion can be undone.
+# failed; the caller must keep 2 apart from 1.
+#
+# A body's own-domain address can share the member's localpart: deleting
+# `alice` must not drop `alice@parish.example: parish-secretary`, which is a
+# group mailbox on the body's domain. A line goes only when it names this member
+# on both sides, the same rule the caller's alias note applies in reverse.
 remove_own_addresses() {
-	table_drop "$virtuals" prefix "$user@"
+	typeset key status=1 rc
+	keys=$(own_virtual_keys) || return 2
+	# Each table_drop keeps the table it replaced; with more than one key only
+	# the last copy survives, so this is not a one-step undo.
+	# shellcheck disable=SC2086 # one address per word; an address carries no whitespace
+	for key in $keys; do
+		rc=0
+		table_drop "$virtuals" exact "$key" >/dev/null || rc=$?
+		case $rc in
+		2) return 2 ;;
+		0) status=0 ;;
+		esac
+	done
+	return "$status"
 }
 
 # remove_own_senders: drop this account's line from the sender mapping. The key
@@ -431,6 +478,8 @@ self_test() {
 	{
 		printf 'alice@kyriakon.net: alice\n'
 		printf 'secretary@parish.example: alice\n'
+		printf 'alice@parish.example: parish-secretary\n'
+		printf 'alice@other.example: alice\n'
 		printf 'oliver@kyriakon.net: oliver\n'
 	} >"$virtuals"
 	# The sender mapping as deploy-mail.sh and provisioning leave it: the
@@ -452,7 +501,12 @@ self_test() {
 		"$([ -L "$ssl_dir/$user.kyriakon.net.crt" ] && echo present || echo gone)" gone
 	check "the managed key went with them" \
 		"$([ -e "$authorized_keys_dir/$user" ] && echo present || echo gone)" gone
-	check "the member's own address went" "$(awk '/^alice@/' "$virtuals" | wc -l | tr -d ' ')" 0
+	check "the member's own address went" "$(awk '/^alice@kyriakon.net/' "$virtuals" | wc -l | tr -d ' ')" 0
+	check "and a second own line went with it" \
+		"$(awk '/^alice@other.example/' "$virtuals" | wc -l | tr -d ' ')" 0
+	check "a body's same-localpart address stayed" \
+		"$(awk '/^alice@parish.example: parish-secretary$/' "$virtuals" | wc -l | tr -d ' ')" 1
+	check "and the note names the kept body address" "$(grep -c 'alice@parish.example' "$tree/first.err")" 1
 	check "someone else's address stayed" "$(awk '/^oliver@/' "$virtuals" | wc -l | tr -d ' ')" 1
 	check "the alias into them stayed" "$(awk '/^secretary@/' "$virtuals" | wc -l | tr -d ' ')" 1
 	check "and the note names it" "$(grep -c 'secretary@parish.example' "$tree/first.err")" 1
