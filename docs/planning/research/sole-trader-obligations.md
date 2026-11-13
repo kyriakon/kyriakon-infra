@@ -549,7 +549,7 @@ docs repository `../kyriakon/docs/decisions/`.
 
 | Data | How long | Where the number comes from |
 |---|---|---|
-| Per-user log records: smtpd envelope, Dovecot authentication, sshd, nsd | 7 days | [newsyslog.conf](../../../openbsd/etc/newsyslog.conf) rotates `maillog`, `authlog` and `nsd.log` weekly with 7 generations; `docs/threat-model.md` calls this "the single place that enforces the retention window the threat model claims" |
+| Per-user log records: smtpd envelope, Dovecot authentication, sshd, nsd, the handler's daemon log, httpd's access log | 7 days | [newsyslog.conf](../../../openbsd/etc/newsyslog.conf) rotates each of them daily with 7 generations; `docs/threat-model.md` calls this "the single place that enforces the retention window the threat model claims" |
 | spamd greylist and whitelist entries | about 36 days on the whitelist | `docs/planning/research/spamd-greylisting.md`; `whiteexp` "defaults to ... 864 (hours, approximately 36 days)" ([spamd(8)](https://man.openbsd.org/spamd.8)). An anti-spam lifetime rather than a retention policy, as `docs/threat-model.md` says |
 | Application data, rejected or abandoned | 90 days | proposal §5.9.1, "Rejected/abandoned application data is purged after 90 days"; ADR 0005 |
 | Message text and application text seen by the triage classifier | 90 days | ADR 0005. Decisions, scores and outcome labels are kept, and fitted calibration scalars persist beyond the window |

@@ -30,7 +30,7 @@ Three things are not in the bundle, and the written answer says so rather than l
 
 The operator's own mailbox holds the member's application email, and with it the member's own words. It is not part of the export. It is the operator's correspondence, encrypted to the operator's key, and the application purge in ADR 0005 is what bounds the text in it. A member who wants their own words back is told where they are, and is not given a second copy of them in the bundle.
 
-The per-user log records, the smtpd envelope line, the Dovecot authentication line, sshd and nsd, live seven days and are gone after that. `openbsd/etc/newsyslog.conf` rotates `maillog`, `authlog` and `nsd.log` weekly with seven generations and nothing keeps the raw per-user record beyond it, so the export does not reconstruct the logs and a request that arrives inside the seven days does not turn a log into a records store.
+The per-user log records, the smtpd envelope line, the Dovecot authentication line, sshd, nsd, the handler's daemon log and httpd's access log, live seven days and are gone after that. `openbsd/etc/newsyslog.conf` rotates each of them daily with seven generations and nothing keeps the raw per-user record beyond it, so the export does not reconstruct the logs and a request that arrives inside the seven days does not turn a log into a records store.
 
 Nothing about another member can be in the bundle, because nothing is selected that is not reached from this account's directory or from this account's token. One Maildir, one set of repositories and one pair of site roots belong to one account, and the boundary is the account.
 

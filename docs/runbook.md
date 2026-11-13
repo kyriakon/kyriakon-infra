@@ -644,10 +644,9 @@ A card payer's subscription is stopped first, before the token and the record th
 
    The allowance is read back before the command reports success, so a clear that did not take says so rather than passing quietly. Nothing about the account's files changes here: this removes the limit, and the deletion that follows removes the data.
 
-8. Regenerate the finger page, which is derived from the httpd and gmid configuration.
+8. Regenerate the finger page, which is derived from the httpd and gmid configuration. The page is generated into a `mktemp` file under `/etc/kyriakon`, which is root-owned and not writable by anyone else, so no local user can plant a symlink where root writes. `scripts/delete-user.sh` regenerates the page the same way.
 
-		doas ksh scripts/gen-finger-page.sh > /tmp/finger.txt
-		doas install -m 0644 /tmp/finger.txt /etc/kyriakon/finger.txt
+		doas ksh -c 'f=$(mktemp /etc/kyriakon/finger.XXXXXX) && ksh scripts/gen-finger-page.sh > "$f" && install -m 0644 "$f" /etc/kyriakon/finger.txt && rm -f "$f"'
 
 DNS needs nothing. The zone answers every member subdomain from a wildcard, so there is no per-member record to remove.
 
@@ -918,7 +917,12 @@ A rotation that keeps sending unbroken needs a second selector, because a messag
 
 2. Publish that value at a new selector in `openbsd/etc/nsd/kyriakon.net.zone`, splitting it into two quoted strings at 255 bytes the way the existing record does, and bump the SOA serial. `nsd` rejects a single longer character string and then serves nothing for the zone.
 
-3. Point the signing filter at the new selector in `openbsd/etc/smtpd.conf`, deploy both files, and wait for the new record to be served. The zone's default TTL is 3600 seconds.
+3. Install the new key where the filter reads it, with the ownership and mode `filter-dkimsign` needs, then point the filter at the new selector. `openbsd/etc/smtpd.conf` names `-k /etc/mail/dkim/private.rsa.key`, and `scripts/deploy-mail.sh` compares that same path with the published record, so the new key takes that name rather than a new one. `install` sets the owner, group and mode in the same operation as the copy. Remove the staging copy once it is installed.
+
+		doas install -o _dkimsign -g _dkimsign -m 0600 /etc/mail/dkim/private.rsa.next /etc/mail/dkim/private.rsa.key
+		doas rm /etc/mail/dkim/private.rsa.next
+
+   Change `-s mail` in the filter line to the new selector, commit and push, then deploy both files and wait for the new record to be served. The zone's default TTL is 3600 seconds.
 
 		doas git -C /usr/local/src/kyriakon-infra pull --ff-only
 		doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-nsd.sh
@@ -931,7 +935,7 @@ A rotation that keeps sending unbroken needs a second selector, because a messag
 
 		<oldselector>._domainkey	IN	TXT	"v=DKIM1; k=rsa; p="
 
-   RFC 6376 section 3.6.1 says an empty `p=` means the key is revoked, and section 6.1.2 tells a verifier to treat a signature under it as a failed check and return `PERMFAIL (key revoked)`. The same standard records that there is no defined difference between a revoked key and a removed record, so leaving the record in place with an empty `p=` is the form that says the key is known and retired. The change takes effect when resolvers stop serving the old record, so it is bounded by the TTL and by any cache in the path, which is why step 4 waits before this one.
+   RFC 6376 section 3.6.1 says an empty `p=` means the key is revoked, and section 6.1.2 tells a verifier to treat a signature under it as a failed check and return `PERMFAIL (key revoked)`. The same standard records that there is no defined difference between a revoked key and a removed record, so leaving the record in place with an empty `p=` is the form that says the key is known and retired. The change takes effect when resolvers stop serving the old record, so it is bounded by the TTL and by any cache in the path, which is why step 5 waits before this one.
 
 The `t=s` flag that the proposal names as the published revocation path is a flag on the same key record. RFC 6376 section 3.6.1 defines it: a signature whose `i=` domain does not match its `d=` domain exactly, with no subdomain, fails. The same section says to use the flag unless subdomain signing is needed, and this platform signs one domain.
 
