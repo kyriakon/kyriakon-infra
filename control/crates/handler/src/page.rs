@@ -805,7 +805,13 @@ mod tests {
                 choices(&[("person", "Just me"), ("body", "A body")]),
             ),
             q("vat", Branch::Body, Kind::Text, false, Rule::None),
-            q("body_name", Branch::Body, Kind::Text, true, Rule::None),
+            q(
+                "body_name",
+                Branch::Body,
+                Kind::Text,
+                true,
+                Rule::SingleLine,
+            ),
             q(
                 "address_outside",
                 Branch::All,
