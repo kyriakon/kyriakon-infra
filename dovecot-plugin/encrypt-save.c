@@ -15,12 +15,16 @@ kyriakon_save_pull(int ret, const char *read_error,
 		return KYRIAKON_SAVE_PULL_DATA;
 	if (ret == 0)
 		return KYRIAKON_SAVE_PULL_WAIT;
-	if (ret == -1)
-		return KYRIAKON_SAVE_PULL_EOF;
-	snprintf(error, error_size, "read input: %s",
-		 read_error != NULL && read_error[0] != '\0' ?
-		 read_error : "failed");
-	return KYRIAKON_SAVE_PULL_ERROR;
+	/* i_stream_read() returns -1 for both EOF and a stream error: only the
+	   error text says which. A prefix followed by an error must fail the
+	   save, never be encrypted as a complete message. */
+	if (read_error != NULL && read_error[0] != '\0') {
+		snprintf(error, error_size, "read input: %s", read_error);
+		return KYRIAKON_SAVE_PULL_ERROR;
+	}
+	/* -2 is "buffer full", not a failure: data is buffered and the caller
+	   consumes it before reading again. */
+	return ret == -1 ? KYRIAKON_SAVE_PULL_EOF : KYRIAKON_SAVE_PULL_WAIT;
 }
 
 static bool

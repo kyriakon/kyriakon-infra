@@ -153,6 +153,24 @@ bulk_pull(void *context, const unsigned char **data_r, size_t *size_r,
 	return KYRIAKON_SAVE_PULL_DATA;
 }
 
+/* One prefix chunk and then a stream error, as i_stream_read() reports it:
+ * -1 with stream_errno set, not EOF. */
+static int
+error_after_data_pull(void *context, const unsigned char **data_r,
+		      size_t *size_r, char *error, size_t error_size)
+{
+	struct save_fixture *f = context;
+
+	f->pull_calls++;
+	if (f->bulk_remaining > 0) {
+		*data_r = f->read_buffer;
+		*size_r = f->bulk_remaining;
+		f->bulk_remaining = 0;
+		return KYRIAKON_SAVE_PULL_DATA;
+	}
+	return kyriakon_save_pull(-1, "connection reset", error, error_size);
+}
+
 static bool
 fixture_encrypt(void *context, const unsigned char *plain, size_t plain_len,
 		struct kyriakon_encrypt_result *result)
@@ -290,13 +308,48 @@ test_pull_status(void)
 	expect(kyriakon_save_pull(0, NULL, error, sizeof(error)) ==
 	       KYRIAKON_SAVE_PULL_WAIT, "a zero read waits");
 	expect(kyriakon_save_pull(-1, NULL, error, sizeof(error)) ==
-	       KYRIAKON_SAVE_PULL_EOF, "a -1 read is EOF");
+	       KYRIAKON_SAVE_PULL_EOF, "a -1 read with no error is EOF");
 	error[0] = '\0';
-	expect(kyriakon_save_pull(-2, "connection reset", error,
+	expect(kyriakon_save_pull(-1, "connection reset", error,
 				  sizeof(error)) == KYRIAKON_SAVE_PULL_ERROR,
-	       "a stream error is an error");
+	       "a -1 read naming a stream error is not EOF");
 	expect(strstr(error, "connection reset") != NULL,
 	       "a stream error names the cause");
+	expect(kyriakon_save_pull(-2, NULL, error, sizeof(error)) ==
+	       KYRIAKON_SAVE_PULL_WAIT, "a -2 read is buffer full, not an error");
+}
+
+/* A stream that hands out a prefix and then fails: the truncated plaintext
+ * must never be encrypted. i_stream_read() reports both EOF and a failure as
+ * -1, so the pull carries the stream's message with it. */
+static void
+test_pull_error_after_data(const char *fake)
+{
+	struct kyriakon_save save;
+	struct save_fixture f;
+
+	memset(&save, 0, sizeof(save));
+	memset(&f, 0, sizeof(f));
+	f.fake = fake;
+	f.bulk_remaining = 16;
+	f.ops.save_begin = fixture_save_begin;
+	f.ops.save_continue = fixture_save_continue;
+	f.ops.save_finish = fixture_save_finish;
+	f.ops.save_cancel = fixture_save_cancel;
+	kyriakon_save_begin(&save, &f.ops, &f, error_after_data_pull,
+			    fixture_encrypt);
+	expect(kyriakon_save_continue(&save) == -1,
+	       "a stream error after data fails the save");
+	expect(f.encrypt_calls == 0,
+	       "the truncated plaintext is never encrypted");
+	expect(f.begin_calls == 0, "the truncated message never reaches the backend");
+	expect(strstr(save.error, "connection reset") != NULL,
+	       "the failure names the stream's error");
+	expect(kyriakon_save_continue(&save) == -1, "the failure is sticky");
+	kyriakon_save_cancel(&save);
+	expect(f.cancel_calls == 0,
+	       "cancelling before the backend starts touches nothing");
+	kyriakon_save_deinit(&save);
 }
 
 /* A backend save_begin that fails leaves the save failed even though the
@@ -467,6 +520,7 @@ main(int argc, char **argv)
 	       "a missing encryptor says which one");
 
 	test_pull_status();
+	test_pull_error_after_data(fake);
 	test_save_ordering(fake);
 	test_backend_begin_failure(fake);
 	test_plaintext_cap(fake);
