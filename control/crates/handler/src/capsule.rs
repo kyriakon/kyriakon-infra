@@ -234,8 +234,9 @@ pub fn account(
         .filter(|_| account.state == "suspended")
     {
         out.push_str(&format!(
-            "## This account is suspended\n\n{reason}\n\n\
-             Inbound mail keeps arriving. Write to admin@kyriakon.net to answer it.\n\n"
+            "## This account is suspended\n\n{}\n\n\
+             Inbound mail keeps arriving. Write to admin@kyriakon.net to answer it.\n\n",
+            one_line(reason)
         ));
     }
     if let Some(date) = &account.closing_until {
@@ -727,6 +728,25 @@ mod tests {
                  (parish) on parish.example."
             ),
             "the name is still visible as one line: {text}"
+        );
+    }
+
+    /// The suspension reason is free text an operator writes, and the page
+    /// prints it into gemtext, so a newline in it must not start a link line
+    /// beside the platform's own words.
+    #[test]
+    fn a_suspension_reason_starts_no_gemtext_line() {
+        let mut record = member();
+        record.state = "suspended".into();
+        record.suspension_reason = Some("x\n=> https://evil.example/".into());
+        let text = account(&record, &[], None, None, None);
+        assert!(
+            !text.lines().any(|line| line.starts_with("=>")),
+            "the reason starts no link line: {text}"
+        );
+        assert!(
+            text.contains("This account is suspended\n\nx => https://evil.example/\n"),
+            "the reason is still readable on one line: {text}"
         );
     }
 
