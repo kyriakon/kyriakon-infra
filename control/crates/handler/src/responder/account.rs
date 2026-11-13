@@ -90,8 +90,10 @@ pub(super) async fn login(app: &App, request: &Request) -> Reply {
     let password = form.get("password").map(String::as_str).unwrap_or("");
     // The shape is checked before the check runs: a name the platform could not
     // have made is not passed to `doveadm`, and the answer is the same one a
-    // wrong password gets. The checker mints the proof in the root-owned
-    // directory and prints its token; the handler stores it and cannot make one.
+    // wrong password gets. The checker then refuses a name with no member
+    // account record in the control store, so a system account never reaches
+    // `bsdauth`. It mints the proof in the root-owned directory and prints its
+    // token; the handler stores it and cannot make one.
     let proof_dir = std::path::Path::new(&app.cfg.proof_dir);
     let proof = if username.is_empty()
         || password.is_empty()
