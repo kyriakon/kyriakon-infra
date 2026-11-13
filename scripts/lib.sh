@@ -552,6 +552,9 @@ table_unlock() {
 # single DNS label. It is a filesystem path component, a subdomain label and a
 # keyring filename, so every script that takes a member name checks it here.
 valid_localpart() {
+	# Before the pattern check: grep matches any line of its input, so a newline
+	# would let a valid first line carry an arbitrary second one through.
+	case "$1" in *[!a-z0-9-]*) return 1 ;; esac
 	printf '%s' "$1" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,29}[a-z0-9])?$'
 }
 
@@ -949,6 +952,10 @@ self_test() {
 		"$(valid_localpart aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa && printf yes || printf no)" yes
 	check "a name of 32 characters is refused" \
 		"$(valid_localpart aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa && printf yes || printf no)" no
+	check "a valid first line does not carry a path" \
+		"$(valid_localpart "$(printf 'alice\n../../etc')" && printf yes || printf no)" no
+	check "a valid first line does not carry an option" \
+		"$(valid_localpart "$(printf 'alice\n-rf')" && printf yes || printf no)" no
 
 	# The fixture that motivated the helper: the last line has no newline, so a
 	# plain append joins the new entry to it and both keys stop matching.

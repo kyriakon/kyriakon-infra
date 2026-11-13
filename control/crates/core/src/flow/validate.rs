@@ -111,6 +111,9 @@ pub fn usernames(value: &str, reserved: &HashSet<String>) -> Option<String> {
 /// This value is the group key the drain writes under and the DNS and
 /// certificate material, so a traversal or a space must not reach it.
 pub fn domain(value: &str) -> Option<String> {
+    if value.len() > 253 {
+        return Some("a domain is at most 253 characters".to_string());
+    }
     for label in value.split('.') {
         if label.is_empty() {
             return Some("a domain has no empty labels".to_string());
@@ -383,6 +386,40 @@ mod tests {
         assert!(domain(&long).unwrap().contains("at most 63"));
         // The traversal a group key must never take.
         assert!(domain("../../../etc/cron.d/evil").is_some());
+    }
+
+    #[test]
+    fn a_domain_is_at_most_253_characters() {
+        // Four valid labels and three dots: exactly DNS's limit, still accepted.
+        let longest = [
+            "a".repeat(63),
+            "a".repeat(63),
+            "a".repeat(63),
+            "a".repeat(61),
+        ]
+        .join(".");
+        assert_eq!(longest.len(), 253);
+        assert!(domain(&longest).is_none());
+        // One over the limit: 254 bytes. The cap is exact, not "long".
+        let too_long = [
+            "a".repeat(63),
+            "a".repeat(63),
+            "a".repeat(63),
+            "a".repeat(63),
+            "a".repeat(3),
+        ]
+        .join(".");
+        assert_eq!(too_long.len(), 259);
+        assert!(domain(&too_long).unwrap().contains("at most 253"));
+        let one_over = [
+            "a".repeat(63),
+            "a".repeat(63),
+            "a".repeat(63),
+            "a".repeat(62),
+        ]
+        .join(".");
+        assert_eq!(one_over.len(), 254);
+        assert!(domain(&one_over).unwrap().contains("at most 253"));
     }
 
     #[test]
