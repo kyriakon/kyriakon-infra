@@ -33,7 +33,7 @@ Two other things are worth saying plainly. If you ask not to be charged, we hold
 
 ## What we do not hold
 
-We collect no legal name and no postal address, at signup or at approval. We hold no card details: card payment happens on Stripe's site and the card data never reaches us. We hold no country on your account. For a card payment the billing country in Stripe's record is the evidence we use where VAT or India's OIDAR rules need to know where a consumer is. Cash by post, cash in hand and Monero carry no country, so for a prepaid payment the only country evidence is the member's own declaration, given when a tax position turns on it; the signup form asks for none. We serve no third-party scripts, fonts or beacons on the pages we publish, and we use no analytics.
+We collect no legal name and no postal address, at signup or at approval. We hold no card details: card payment happens on Stripe's site and the card data never reaches us. We hold no country on your account. For a card payment the billing country in Stripe's record is the evidence we use where VAT or India's OIDAR rules need to know where a consumer is. Cash by post, cash in hand and Monero carry no country, so a prepaid payment supplies no country evidence; the signup form asks for none. We serve no third-party scripts, fonts or beacons on the pages we publish, and we use no analytics.
 
 ## Zero-access mail, and its limit
 

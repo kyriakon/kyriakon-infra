@@ -85,6 +85,6 @@ provider and the devices at either end, is outside this statement.
 ## Status
 
 The mail stack, the backup and restore path, the control plane that holds payment state, and the
-published-configuration claims in these documents are built and installed by the scripts in
-`scripts/`. This statement describes what that system holds, not whether applications are open.
+published configuration behind the claims in these documents is built and installed by the scripts
+in `scripts/`. This statement describes what that system holds, not whether applications are open.
 When a capability changes, this statement and `aup.md` are updated with it rather than before it.

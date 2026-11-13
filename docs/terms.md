@@ -23,7 +23,7 @@ The 5 GB is shared across mail, web and git. Every account needs an SSH key for 
 
 ## Price and payment
 
-The price is stated in pounds, and the number on this page is the number you pay. If you are a consumer in the European Union, the rate of VAT that applies where you live is accounted for out of the price rather than added to it, so we do not add a surcharge at checkout and no page needs an asterisk.
+The price is stated in pounds, and the number on this page is the number you pay. If you are a consumer in the European Union, the rate of VAT that applies where you are billed is accounted for out of the price rather than added to it, so we do not add a surcharge at checkout and no page needs an asterisk. The card rail's billing country is the country we hold; a prepaid payment carries none, so no Union rate is attributed to it.
 
 You pay by card through Stripe, by cash by post, by cash in hand, or in Monero. Card payment happens on Stripe's own site and your card details never reach us. For the other rails we give you a payment token, and a postal address or a Monero subaddress. The amount owed is in pounds even when it is quoted in Monero.
 
@@ -100,7 +100,7 @@ Because nothing was paid, the liability cap below is nil for a free account, and
 
 ## Who may apply
 
-There is one restriction on who may apply. By applying you confirm that you are not a person designated under UK sanctions, and that your residence does not make this contract one that UK sanctions prohibit. We hold no legal name, postal address or country for an applicant, so we do not check the consolidated list at approval, and the restriction rests on that confirmation. If we learn it was untrue we may refuse or close the account. That is the only limit: no other country, and no other ground, is a reason to refuse an application.
+There is one restriction on who may apply. By applying you confirm that you are not a person designated under UK sanctions, and that your residence does not make this contract one that UK sanctions prohibit. We hold no legal name, postal address or country for an individual applicant, so we do not check the consolidated list at approval, and the restriction rests on that confirmation. If we learn it was untrue we may refuse or close the account. That is the only limit: no other country, and no other ground, is a reason to refuse an application.
 
 ## Keys and your account
 
@@ -116,7 +116,9 @@ Nothing in these terms excludes our liability for death or personal injury cause
 
 Except for those, our liability for any claim is capped at the fees you paid us in the twelve months before the claim. For a free account that is nothing, which is the honest figure rather than a rebate. We are not liable for indirect or consequential loss.
 
-Where the account is held in the course of a business, we are not liable for loss of profit, loss of revenue, loss of business, loss of goodwill, or loss of anticipated savings, whether direct or indirect. We are not liable for the loss of mail, other data, keys or the account itself where the cause is that you lost a private key or the recovery phrase described under Keys and your account. No copy of the private key exists here, so nothing we hold can open the mailbox or restore the mail.
+Where the account is held in the course of a business, we are not liable for loss of profit, loss of revenue, loss of business, loss of goodwill, or loss of anticipated savings, whether direct or indirect.
+
+In every case, we are not liable for the loss of mail, other data, keys or the account itself where the cause is that you lost a private key or the recovery phrase described under Keys and your account. No copy of the private key exists here, so nothing we hold can open the mailbox or restore the mail.
 
 We do not promise any particular uptime and we do not promise a response time. One operator runs one server. If it fails, we tell you by mail from a different machine, because if the box is down your mailbox is one of the things that is down. We do not promise that a message will be delivered, that a certificate will be issued on a particular day, or that ciphertext archived today stays unreadable. The hosting page and the refusal list state those limits beside the claims they qualify.
 
