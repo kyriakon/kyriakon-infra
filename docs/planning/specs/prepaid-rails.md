@@ -227,7 +227,7 @@ Notices are recorded before they are enqueued, and a crash between the record an
 
 | Step | Who | What they run |
 |---|---|---|
-| Approve, approve without charge, or decline | operator | the signed link in the email, or `kyriakon-admin approve <username>`, `kyriakon-admin decline <username>` |
+| Approve, approve without charge, or decline | operator | the signed link in the email, or `kyriakon-admin approve <username> <token>`, `kyriakon-admin decline <username> <token>` |
 | Open the post | operator | no command; the date the envelope was opened is the credit's `--received` |
 | Record a posted cash payment | operator | `kyriakon-admin credit --token <t> --rail cash --amount <gbp> --received <date>` |
 | Record cash handed over | operator | `kyriakon-admin credit --username <u> --rail cash-hand --amount <gbp> --received <date>` |

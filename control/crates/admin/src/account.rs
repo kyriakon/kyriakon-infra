@@ -153,9 +153,10 @@ pub(crate) async fn free(store: &Store, rest: &[String]) -> Result<(), Error> {
 
 /// The newest application filed for a username, or `None` when the store holds
 /// none. The front-end never checks whether a name exists, so more than one can
-/// be on disk; the one the reviewer means is the one filed last. A record that
-/// cannot be read is an error, not an absence: the purge leaves no file, and
-/// damage is a different thing.
+/// be on disk, and this is only `show`'s summary of the newest; a decision names
+/// its application by token rather than starting here. A record that cannot be
+/// read is an error, not an absence: the purge leaves no file, and damage is a
+/// different thing.
 pub(crate) async fn find_application(
     store: &Store,
     username: &str,

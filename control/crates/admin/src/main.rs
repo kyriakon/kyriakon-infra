@@ -13,9 +13,9 @@
 //!
 //! Usage:
 //!
-//!   kyriakon-admin [--config PATH] approve <username>
-//!   kyriakon-admin [--config PATH] approve-free <username>
-//!   kyriakon-admin [--config PATH] decline <username>
+//!   kyriakon-admin [--config PATH] approve <username> <token>
+//!   kyriakon-admin [--config PATH] approve-free <username> <token>
+//!   kyriakon-admin [--config PATH] decline <username> <token>
 //!   kyriakon-admin [--config PATH] delete <username>
 //!   kyriakon-admin [--config PATH] address --domain <domain> --action <change> \
 //!       --mailbox <account> [--address <localpart>] [--key-file <path>] \
@@ -160,19 +160,25 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), Error> {
         // crate's one decision list, so a verb this console takes is a decision
         // the drain knows.
         verb => {
-            let username = one_username(rest)?;
+            // The application is the one the review mail names by its token, not
+            // whichever application holds the username now: the front end never
+            // checks whether a name exists, so a second application can be filed
+            // between the mail and this command, and signing that one would sign
+            // for an application nobody reviewed.
+            let (username, token) = application_args(rest)?;
             let Some(decision) = intent::decision_for(verb) else {
                 return Err(Error::Failed(usage()));
             };
             let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
-            sign_and_file(&store, &key, decision, username).await
+            sign_and_file(&store, &key, decision, username, token).await
         }
     }
 }
 
 fn usage() -> String {
     "usage: kyriakon-admin [--config PATH] \
-     approve|approve-free|decline|delete|show <username>
+     approve|approve-free|decline <username> <token>
+       kyriakon-admin delete|show <username>
        kyriakon-admin suspend <username> --reason <text>
        kyriakon-admin resume <username>
        kyriakon-admin free
@@ -211,6 +217,20 @@ fn usage() -> String {
      [--extended-on <YYYY-MM-DD>] \
        kyriakon-admin request close <id> --done <YYYY-MM-DD> --note <text>"
         .to_string()
+}
+
+/// The username and the application token a decision verb takes. Both are
+/// required: the token is which application the review mail named, and the
+/// username is only the label the operator reads, checked against the record.
+fn application_args(rest: &[String]) -> Result<(&str, &str), Error> {
+    let (username, token) = match rest {
+        [_, username, token] => (username.as_str(), token.as_str()),
+        _ => return Err(Error::Failed(usage())),
+    };
+    if let Some(why) = validate::username_shape(username) {
+        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+    }
+    Ok((username, token))
 }
 
 /// The one username a verb that takes one reads. `request` and `free` take none.

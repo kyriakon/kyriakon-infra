@@ -54,6 +54,23 @@ fn one_username_takes_exactly_one_valid_name() {
 }
 
 #[test]
+fn a_decision_takes_a_username_and_a_token() {
+    let token = "0123456789abcdefghjkmnpqrs";
+    let argv = args(&["approve", "alice", token]);
+    let (username, parsed) = application_args(&argv).unwrap();
+    assert_eq!((username, parsed), ("alice", token));
+    // The token is not optional: the console will not guess which application
+    // the operator read.
+    assert!(application_args(&args(&["approve", "alice"])).is_err());
+    assert!(application_args(&args(&["approve"])).is_err());
+    assert!(application_args(&args(&["approve", "alice", token, "extra"])).is_err());
+    assert!(matches!(
+        application_args(&args(&["approve", "Alice", token])).unwrap_err(),
+        Error::Failed(message) if message.contains("starts with")
+    ));
+}
+
+#[test]
 fn a_tax_year_is_six_april_to_five_april_in_either_spelling() {
     let (start, end) = tax_year("2026-27").unwrap();
     assert_eq!(start.to_string(), "2026-04-06");
