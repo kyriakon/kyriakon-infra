@@ -195,6 +195,14 @@ impl Store {
         self.typed_record(&format!("verified/{id}.json")).await
     }
 
+    /// One spent one-time password link, `spent/<token>.json`. The directory is
+    /// root-owned, so the handler cannot plant or rewrite a marker. A damaged
+    /// file is an error rather than no record: reading it as unspent would let a
+    /// captured link be replayed, which is the fact the marker exists to keep.
+    pub async fn spent_link(&self, token: &str) -> Result<Option<serde_json::Value>, Error> {
+        self.typed_record(&format!("spent/{token}.json")).await
+    }
+
     /// Write one record by rename: a temporary file in the same directory, then
     /// the rename, so a reader never sees half of one and a crash leaves the
     /// temporary file rather than a truncated record. The file is created 0600,

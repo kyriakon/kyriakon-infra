@@ -25,8 +25,8 @@
 # the smtpd action for apply@ delivers into as that user. The rest belongs to the
 # root drain: accounts, groups, tokens, keys (the members' public upload keys,
 # which the builder reads), holds (a closed member's name, kept ninety days),
-# ledger, rates, verified (the webhook ids the drain proved at first sight) and
-# journal.jsonl.
+# ledger, rates, verified (the webhook ids the drain proved at first sight),
+# spent (the one-time password links that have been used) and journal.jsonl.
 #
 # accounts/ and groups/ are root:_onboard 0750, and the records the drain writes
 # in them are 0640. The handler renders the account page from those records and
@@ -193,6 +193,7 @@ store_dir keys         root wheel 750
 store_dir holds        root wheel 750
 store_dir ledger       root wheel 750
 store_dir verified     root wheel 750
+store_dir spent        root wheel 750
 store_dir rates        root wheel 750
 
 # The records the handler renders are readable by its group, and an upgrade

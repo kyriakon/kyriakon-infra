@@ -114,6 +114,7 @@ fn a_password_link_applies_once_and_only_when_signed() {
         "password": "correct horse battery",
     });
     fix.write_intent("01J00000000000000000PASSWORD", &intent);
+    let before = fix.open_session("secretary");
     let out = fix.drain();
     assert!(
         out.status.success(),
@@ -157,10 +158,36 @@ fn a_password_link_applies_once_and_only_when_signed() {
             .contains("\"outcome\":\"applied\""),
         "the journal should record the apply"
     );
+    // The link's single use is recorded where the handler cannot rewrite it, and
+    // the sessions that were live before the password changed are gone.
+    assert_eq!(
+        fix.names("spent"),
+        vec![format!("{TOKEN}.json")],
+        "the spent link left no root record"
+    );
+    assert!(
+        !fix.session_is_live(&before),
+        "a session from before the password set survived it"
+    );
+    let later = fix.open_session("secretary");
+    assert!(
+        fix.session_is_live(&later),
+        "a login after the link was used was refused"
+    );
+
+    // A handler that puts the link back on the application record cannot revive
+    // it: the spent marker is checked before the record's field.
+    let mut restored = after.clone();
+    restored["password_link"] = record["password_link"].clone();
+    std::fs::write(
+        fix.path(&format!("store/applications/{TOKEN}.json")),
+        serde_json::to_vec_pretty(&restored).unwrap(),
+    )
+    .unwrap();
 
     // A replay of the same intent is caught by the journal's own dedup, a fresh
-    // click on a spent link by the record, and a forged signature by the key.
-    // None of the three runs the script again.
+    // click on a spent link by the spent marker (its record restored), and a
+    // forged signature by the key. None of the three runs the script again.
     fix.write_intent("01J00000000000000000PASSWORD", &intent);
     let mut fresh = intent.clone();
     fresh["id"] = json!("01J00000000000000000SPENT");
@@ -181,6 +208,69 @@ fn a_password_link_applies_once_and_only_when_signed() {
     assert!(
         journal.contains("the link's signature does not verify"),
         "{journal}"
+    );
+}
+
+/// A spent marker that cannot be read is not read as "not spent". The pass fails
+/// and leaves the intent for a retry, so a damaged root record cannot let a
+/// captured link install a password a second time.
+#[test]
+fn a_damaged_spent_marker_refuses_the_pass_rather_than_replaying_the_link() {
+    let fix = Fix::new("password-damaged-marker");
+    let log = fix.path("password.log");
+    fix.script(
+        "set-mail-password.sh",
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n"),
+    );
+    let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
+    let until = kyriakon_control_core::util::date_after_days(7);
+    let mut record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.page_account("secretary", json!({}));
+    record["password_link"] = json!(format!(
+        "https://signup.example.invalid/password/{TOKEN}?until={until}&sig=x"
+    ));
+    std::fs::write(
+        fix.path(&format!("store/applications/{TOKEN}.json")),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    let sig = sign::sign(&key, &sign::password_payload(TOKEN, "secretary", &until)).unwrap();
+    fix.write_intent(
+        "01J00000000000000000DAMAGED",
+        &json!({
+            "id": "01J00000000000000000DAMAGED",
+            "kind": "set-password",
+            "filed_at": "2026-10-21T09:00:00Z",
+            "application": { "username": "secretary", "status_token": TOKEN },
+            "until": until,
+            "sig": sig,
+            "password": "correct horse battery",
+        }),
+    );
+    std::fs::create_dir_all(fix.path("store/spent")).unwrap();
+    std::fs::write(
+        fix.path(&format!("store/spent/{TOKEN}.json")),
+        "not a marker",
+    )
+    .unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !std::path::Path::new(&log).exists(),
+        "the script ran over a damaged marker: {}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert_eq!(
+        fix.intents(),
+        vec!["01J00000000000000000DAMAGED.json"],
+        "a failed pass is not a settlement"
+    );
+    assert!(
+        fix.journal().contains("does not parse")
+            && fix.journal().contains(&format!("spent/{TOKEN}.json")),
+        "the failure does not name the damaged marker: {}",
+        fix.journal()
     );
 }
 

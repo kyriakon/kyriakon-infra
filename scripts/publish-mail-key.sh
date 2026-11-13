@@ -8,6 +8,7 @@
 #
 # Usage:
 #   doas ksh scripts/publish-mail-key.sh <localpart> <key-file> <token-file>
+#   doas ksh scripts/publish-mail-key.sh --remove <localpart> <token-file>
 #   ksh scripts/publish-mail-key.sh --self-test
 #
 # The drain runs the first form, as root, once per mail key, after the key is in
@@ -15,6 +16,12 @@
 # notice. This is the other half of scripts/check-keyring-drift.sh: that check's
 # box rule alerts when a key is on the box and not in the merged published set,
 # which is the right signal and, without this, a permanent one.
+#
+# --remove is the deletion transition's: it opens the removal of
+# keys/<localpart>.asc on its own branch so the published set cannot keep naming
+# a deleted member's key, which a name reused after the ninety-day hold would
+# otherwise meet as a publish that refuses to replace it. A key not on the
+# default branch is already gone and exits 0, which is what makes a retry safe.
 #
 #   <localpart>   the member's account name, or the mailbox the key is for
 #   <key-file>    the armored public key, the file the drain just wrote into the
@@ -111,6 +118,7 @@ accept_json='application/vnd.github+json'
 usage() {
 	cat <<'EOF'
 usage: publish-mail-key.sh <localpart> <key-file> <token-file>
+       publish-mail-key.sh --remove <localpart> <token-file>
        publish-mail-key.sh --self-test
 
   <localpart>   the member's account name, or the mailbox the key is for
@@ -191,10 +199,31 @@ api() {
 	fi
 }
 
-# ensure_change <branch> <localpart> <fingerprint>: the change itself, opened
-# once. GitHub answers 422 for a pull request that already exists for that head
-# branch, which is what a second run of this finds and what "does not open a
-# second change" means; anything else is a failure.
+# open_change <branch> <localpart> <detail> <title> <body>: one pull request,
+# opened once. GitHub answers 422 for a change that already exists for that head
+# branch, which is a retry's own work and not a failure; anything else is a
+# failed publish and is loud and named. `detail` is the fingerprint or, for a
+# removal, the word that stands where one would be.
+open_change() {
+	branch=$1
+	localpart=$2
+	detail=$3
+	title=$4
+	body=$5
+	jq -n --arg title "$title" --arg head "$branch" --arg base "$base_branch" --arg body "$body" \
+		'{title:$title, head:$head, base:$base, body:$body}' >"$tmp/change.json"
+	api POST "$accept_json" "$api_base/repos/$repo/pulls" "$tmp/change.json"
+	case "$code" in
+	201) ;;
+	422)
+		already_there ||
+			refuse "$localpart" "$detail" "$repo refused the change for $branch (HTTP 422): $(cat "$resp")"
+		;;
+	*) refuse "$localpart" "$detail" "$repo would not open the change for $branch (HTTP $code): $(cat "$resp")" ;;
+	esac
+}
+
+# ensure_change <branch> <localpart> <fingerprint>: the publication's change.
 ensure_change() {
 	branch=$1
 	localpart=$2
@@ -209,17 +238,42 @@ ensure_change() {
 			"" \
 			"Fingerprint: $fingerprint"
 	)
-	jq -n --arg title "$title" --arg head "$branch" --arg base "$base_branch" --arg body "$body" \
-		'{title:$title, head:$head, base:$base, body:$body}' >"$tmp/change.json"
-	api POST "$accept_json" "$api_base/repos/$repo/pulls" "$tmp/change.json"
-	case "$code" in
-	201) ;;
-	422)
-		already_there ||
-			refuse "$localpart" "$fingerprint" "$repo refused the change for $branch (HTTP 422): $(cat "$resp")"
-		;;
-	*) refuse "$localpart" "$fingerprint" "$repo would not open the change for $branch (HTTP $code): $(cat "$resp")" ;;
+	open_change "$branch" "$localpart" "$fingerprint" "$title" "$body"
+}
+
+# credential <token-file>: read the forge token into the curl config and refuse
+# a file that is not one token only root can read. The token reaches no argument
+# and no output.
+credential() {
+	token_file=$1
+	[ -f "$token_file" ] ||
+		die "no token file at $token_file; scripts/deploy-control.sh prints the line that installs one"
+	if [ "$(stat -f '%Lp' "$token_file")" != 600 ]; then
+		die "$token_file is not mode 600, and a token another user can read is a token that can write the published set"
+	fi
+	if [ "$(id -u)" -eq 0 ] && [ "$(stat -f '%Su' "$token_file")" != root ]; then
+		die "$token_file is not owned by root"
+	fi
+	token=$(cat "$token_file") || die "cannot read $token_file"
+	# A byte outside the class is the one failure this check exists for: the
+	# value is written into a curl config, where a second line is a directive.
+	case "$token" in
+	'' | *[!A-Za-z0-9_.-]*) bad=yes ;;
+	*) [ "${#token}" -ge 20 ] && [ "${#token}" -le 255 ] || bad=yes ;;
 	esac
+	[ -z "${bad:-}" ] ||
+		die "$token_file does not hold one token; a pasted newline, a trailing comment or a Bearer prefix would all go into the request"
+
+	# The token goes into a curl config file rather than onto a command line: an
+	# argument is readable in the process table for the life of the call, and this
+	# box has several accounts. Nothing here prints it either.
+	{
+		printf 'header = "Authorization: Bearer %s"\n' "$token"
+		printf 'header = "X-GitHub-Api-Version: %s"\n' "$api_version"
+		printf 'header = "User-Agent: kyriakon-publish-mail-key"\n'
+		printf 'silent\nshow-error\nmax-time = 30\nretry = 3\n'
+	} >"$curlrc"
+	unset token
 }
 
 # publish <localpart> <key-file> <token-file>: the whole job.
@@ -241,34 +295,7 @@ publish() {
 		die "the key file $key_file holds a private key, and only the public half is published"
 	fi
 
-	[ -f "$token_file" ] ||
-		die "no token file at $token_file; scripts/deploy-control.sh prints the line that installs one"
-	if [ "$(stat -f '%Lp' "$token_file")" != 600 ]; then
-		die "$token_file is not mode 600, and a token another user can read is a token that can write the published set"
-	fi
-	if [ "$(id -u)" -eq 0 ] && [ "$(stat -f '%Su' "$token_file")" != root ]; then
-		die "$token_file is not owned by root"
-	fi
-	token=$(cat "$token_file") || die "cannot read $token_file"
-	# A byte outside the class is the one failure this check exists for: the
-	# value is written into a curl config, where a second line is a directive.
-	case "$token" in
-	'' | *[!A-Za-z0-9_.-]*) bad=yes ;;
-	*) [ "${#token}" -ge 20 ] && [ "${#token}" -le 255 ] || bad=yes ;;
-	esac
-	[ -z "${bad:-}" ] ||
-		die "$token_file does not hold one token; a pasted newline, a trailing comment or a Bearer prefix would all go into the request"
-
-	# The token goes into a curl config file rather than onto a command line: an
-	# argument is readable in the process table for the life of the call, and this
-	# box has several accounts. Nothing below prints it either.
-	{
-		printf 'header = "Authorization: Bearer %s"\n' "$token"
-		printf 'header = "X-GitHub-Api-Version: %s"\n' "$api_version"
-		printf 'header = "User-Agent: kyriakon-publish-mail-key"\n'
-		printf 'silent\nshow-error\nmax-time = 30\nretry = 3\n'
-	} >"$curlrc"
-	unset token
+	credential "$token_file"
 
 	want=$(fpr_of "$key_file")
 	[ -n "$want" ] ||
@@ -365,15 +392,94 @@ $problems"
 	printf 'opened %s: %s\n' "$branch" "$want"
 }
 
+# remove <localpart> <token-file>: open the deletion of keys/<localpart>.asc.
+#
+# The file is read as JSON because the Contents API's delete wants the blob's
+# sha, and its absence is the job already done: a key that never reached the
+# published set, or one whose removal has merged, is not an error. The branch is
+# remove-key/<localpart>, distinct from a publication's, so whichever of the two
+# ran first is not mistaken for the other on a retry.
+remove() {
+	localpart=$1
+	token_file=$2
+	valid_localpart "$localpart" ||
+		die "the localpart $localpart is not a name this platform uses"
+	credential "$token_file"
+
+	path="$key_dir/$localpart.asc"
+	branch="remove-key/$localpart"
+
+	api GET "$accept_json" "$api_base/repos/$repo/contents/$path?ref=$base_branch"
+	case "$code" in
+	404) return 0 ;;
+	200) ;;
+	*) unexpected "$path" ;;
+	esac
+
+	# The default branch's commit, which the removal branch starts from. A branch
+	# already there is a previous run's and is used as it is.
+	api GET "$accept_json" "$api_base/repos/$repo/git/ref/heads/$base_branch"
+	[ "$code" = 200 ] || unexpected "refs/heads/$base_branch"
+	head=$(jq -r '.object.sha // empty' "$resp" 2>/dev/null) || head=""
+	[ -n "$head" ] ||
+		refuse "$localpart" "removal" "$repo answered $base_branch with no commit; nothing was removed"
+
+	jq -n --arg ref "refs/heads/$branch" --arg sha "$head" \
+		'{ref:$ref, sha:$sha}' >"$tmp/branch.json"
+	api POST "$accept_json" "$api_base/repos/$repo/git/refs" "$tmp/branch.json"
+	case "$code" in
+	201) ;;
+	422)
+		already_there ||
+			refuse "$localpart" "removal" "$repo refused the branch $branch (HTTP 422): $(cat "$resp")"
+		;;
+	*) refuse "$localpart" "removal" "$repo would not create $branch (HTTP $code): $(cat "$resp")" ;;
+	esac
+
+	# The file's sha on the branch, which is what the delete names. Absent there
+	# is a retry whose delete already landed, so only the change is left.
+	api GET "$accept_json" "$api_base/repos/$repo/contents/$path?ref=$branch"
+	case "$code" in
+	200)
+		sha=$(jq -r '.sha // empty' "$resp" 2>/dev/null) || sha=""
+		[ -n "$sha" ] ||
+			refuse "$localpart" "removal" "$branch holds $path but names no blob to delete"
+		jq -n --arg message "chore(keys): remove $localpart's mail key" \
+			--arg sha "$sha" --arg branch "$branch" \
+			'{message:$message, sha:$sha, branch:$branch}' >"$tmp/file.json"
+		api DELETE "$accept_json" "$api_base/repos/$repo/contents/$path" "$tmp/file.json"
+		case "$code" in
+		200 | 201) ;;
+		*) refuse "$localpart" "removal" "$repo would not delete $path on $branch (HTTP $code): $(cat "$resp")" ;;
+		esac
+		;;
+	404) ;;
+	*) unexpected "$path on $branch" ;;
+	esac
+
+	title="chore(keys): remove $localpart's mail key"
+	body=$(
+		printf '%s\n' \
+			"Removes keys/$localpart.asc, the mail key the box no longer serves because" \
+			"the account was deleted. Opened by scripts/publish-mail-key.sh --remove from" \
+			"the deletion transition: a key left in the published set would make a later" \
+			"applicant for the same name meet a publish that refuses to replace it." \
+			"" \
+			"Deletion, not substitution: this removes one published key and adds none."
+	)
+	open_change "$branch" "$localpart" "removal" "$title" "$body"
+	printf 'opened %s: removed %s\n' "$branch" "$path"
+}
+
 # --- self-test: the decisions, against a stub forge ----------------------------
 #
 # curl is replaced on PATH by a stub that answers the calls this script makes
 # from fixture files, so what is exercised is this script's own decisions:
-# already published, on the branch, a different key either side, and a credential
-# it must refuse. Every case also reads the stub's log, because "a second publish
-# opens no second change" and "the token is never an argument" are claims about
-# what did not happen. gpg and jq are real; the keys are throwaway ones under
-# TMPDIR.
+# already published, on the branch, a different key either side, a removal that
+# already landed, and a credential it must refuse. Every case also reads the
+# stub's log, because "a second publish opens no second change" and "the token is
+# never an argument" are claims about what did not happen. gpg and jq are real;
+# the keys are throwaway ones under TMPDIR.
 self_test() {
 	fix="$tmp/self"
 	mkdir -p "$fix/bin" "$fix/state"
@@ -400,7 +506,7 @@ while [ "$#" -gt 0 ]; do
 		shift
 		;;
 	-H)
-		accept=$2
+		accept=${2#Accept: }
 		shift
 		;;
 	--data-binary)
@@ -419,21 +525,29 @@ done
 printf '%s\n' "$method $url [$argv]" >>"$SELFTEST_LOG"
 case "$url" in
 *"/contents/"*"?ref=main")
-	if [ -f "$SELFTEST_STATE/main" ]; then
+	if [ ! -f "$SELFTEST_STATE/main" ]; then
+		code=404
+		: >"$out"
+	elif [ "$accept" = "application/vnd.github+json" ]; then
+		# The removal reads the metadata for the blob sha; the publish reads
+		# the key file itself.
+		code=200
+		printf '{"sha":"0000000000000000000000000000000000000000"}\n' >"$out"
+	else
 		code=200
 		cp "$SELFTEST_STATE/main" "$out"
-	else
-		code=404
-		: >"$out"
 	fi
 	;;
-*"/contents/"*"?ref=publish-key/"*)
-	if [ -f "$SELFTEST_STATE/branch" ]; then
-		code=200
-		cp "$SELFTEST_STATE/branch" "$out"
-	else
+*"/contents/"*"?ref=publish-key/"* | *"/contents/"*"?ref=remove-key/"*)
+	if [ ! -f "$SELFTEST_STATE/branch" ]; then
 		code=404
 		: >"$out"
+	elif [ "$accept" = "application/vnd.github+json" ]; then
+		code=200
+		printf '{"sha":"0000000000000000000000000000000000000000"}\n' >"$out"
+	else
+		code=200
+		cp "$SELFTEST_STATE/branch" "$out"
 	fi
 	;;
 *"/git/ref/heads/"*)
@@ -441,12 +555,28 @@ case "$url" in
 	printf '{"object":{"sha":"0000000000000000000000000000000000000000"}}\n' >"$out"
 	;;
 *"/git/refs")
-	code=201
-	: >"$out"
+	if [ -n "${SELFTEST_BRANCH_EXISTS:-}" ]; then
+		# A retry whose branch is already there: the forge refuses the create,
+		# which the script reads as its own previous work.
+		code=422
+		printf '{"message":"Reference already exists"}\n' >"$out"
+	else
+		code=201
+		# A branch starts from the default branch's commit, so it holds the same
+		# key until the caller writes or deletes it.
+		if [ -f "$SELFTEST_STATE/main" ]; then
+			cp "$SELFTEST_STATE/main" "$SELFTEST_STATE/branch"
+		fi
+		: >"$out"
+	fi
 	;;
 *"/contents/"*)
 	code=201
-	if [ -f "$body" ]; then
+	if [ "$method" = DELETE ]; then
+		# The removal branch loses the file; the default branch's fixture stays,
+		# so a second removal is the retry case.
+		rm -f "$SELFTEST_STATE/branch"
+	elif [ -f "$body" ]; then
 		jq -j '.content|@base64d' "$body" >"$SELFTEST_STATE/branch"
 	fi
 	: >"$out"
@@ -571,6 +701,18 @@ SETPREF
 		: >"$fix/stub.log"
 		: >"$fix/out"
 		if (PATH="$fix/bin:$PATH" publish "$@" >"$fix/out" 2>&1); then
+			rc=0
+		else
+			rc=$?
+		fi
+		out=$(cat "$fix/out")
+	}
+
+	# run_remove <args...> is the same for the removal, whose function is its own.
+	run_remove() {
+		: >"$fix/stub.log"
+		: >"$fix/out"
+		if (PATH="$fix/bin:$PATH" remove "$@" >"$fix/out" 2>&1); then
 			rc=0
 		else
 			rc=$?
@@ -759,6 +901,70 @@ SETPREF
 	assert_has 'the refusal says why' 'private key' "$out"
 	assert_eq 'nothing was sent' '' "$(cat "$fix/stub.log")"
 
+	printf '%s\n' '--- a key never published needs no removal and says nothing'
+	rm -f "$fix/state/main" "$fix/state/branch"
+	run_remove alice "$fix/token"
+	assert_eq 'unpublished removal exit' 0 "$rc"
+	assert_eq 'unpublished removal output' '' "$out"
+	assert_no_log 'nothing was deleted' 'DELETE'
+	assert_no_log 'no change was opened' '/pulls'
+
+	printf '%s\n' '--- a published key is removed through its own branch'
+	cp "$fix/alice.asc" "$fix/state/main"
+	run_remove alice "$fix/token"
+	assert_eq 'removal exit' 0 "$rc"
+	assert_log 'the delete was sent' 'DELETE'
+	assert_log 'the change was opened' '/pulls'
+	assert_has 'the output names the branch' 'opened remove-key/alice' "$out"
+	assert_has 'the output names the published file' 'keys/alice.asc' "$out"
+	if [ -f "$fix/state/branch" ]; then
+		printf 'FAIL: the removal branch still holds the key\n'
+		fail=1
+	else
+		printf 'ok: the removal branch holds no key\n'
+	fi
+
+	printf '%s\n' '--- a retry after the delete landed opens no second delete'
+	# The default branch still shows the key because the change has not merged;
+	# the branch exists but already lost the file, which is what a retry finds.
+	export SELFTEST_BRANCH_EXISTS=1
+	run_remove alice "$fix/token"
+	unset SELFTEST_BRANCH_EXISTS
+	assert_eq 'removal retry exit' 0 "$rc"
+	assert_log 'the change was ensured' '/pulls'
+	assert_no_log 'the file was not deleted twice' 'DELETE'
+
+	printf '%s\n' '--- a name whose old key left the published set accepts a new one'
+	# The change merged: the default branch no longer carries the removed key, so
+	# a reused name publishes without meeting the substitution refusal.
+	rm -f "$fix/state/main" "$fix/state/branch"
+	run alice "$fix/nonplatform.asc" "$fix/token"
+	assert_eq 'republish exit' 0 "$rc"
+	assert_log 'the new key was written' 'PUT'
+	assert_has 'the change is a publication' 'opened publish-key/alice' "$out"
+
+	printf '%s\n' '--- a 422 that is not an existing change is a failed removal'
+	cp "$fix/alice.asc" "$fix/state/main"
+	export SELFTEST_PULL_CODE=422
+	export SELFTEST_PULL_MESSAGE='Validation Failed'
+	run_remove alice "$fix/token"
+	unset SELFTEST_PULL_CODE SELFTEST_PULL_MESSAGE
+	assert_eq 'refused removal exit' 1 "$rc"
+	assert_has 'the refusal names the member' 'alice' "$out"
+	assert_has 'the refusal carries what the forge said' 'Validation Failed' "$out"
+
+	printf '%s\n' '--- a name that is not a localpart is refused before anything is sent'
+	run_remove 'not/a/name' "$fix/token"
+	assert_eq 'invalid name exit' 2 "$rc"
+	assert_eq 'nothing was sent for an invalid name' '' "$(cat "$fix/stub.log")"
+
+	printf '%s\n' '--- a removal refuses a token another user can read'
+	chmod 644 "$fix/token"
+	run_remove alice "$fix/token"
+	assert_eq 'removal token exit' 2 "$rc"
+	assert_eq 'nothing was sent for a readable token' '' "$(cat "$fix/stub.log")"
+	chmod 600 "$fix/token"
+
 	if [ "$fail" -ne 0 ]; then
 		printf '\nself-test: FAILED\n' >&2
 		return 1
@@ -786,6 +992,16 @@ case "${1:-}" in
 	;;
 -h | --help)
 	usage
+	exit 0
+	;;
+--remove)
+	[ "$#" -eq 3 ] || {
+		usage >&2
+		exit 2
+	}
+	command -v curl >/dev/null || die "curl is not on PATH (pkg_add curl)"
+	command -v jq >/dev/null || die "jq is not on PATH (pkg_add jq)"
+	remove "$2" "$3"
 	exit 0
 	;;
 esac

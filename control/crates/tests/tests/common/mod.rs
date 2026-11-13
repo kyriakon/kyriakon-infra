@@ -1143,6 +1143,23 @@ impl Fix {
             .unwrap()
     }
 
+    /// Whether a cookie names a live session, read the way the account route
+    /// reads it: the record's own secret and expiry, checked in-process.
+    pub fn session_is_live(&self, cookie: &str) -> bool {
+        let cfg = DrainConfig::load(Path::new(&self.config())).unwrap();
+        let store = Store::new_for_test(&cfg.store_root);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(kyriakon_control_core::account::session::lookup(
+                &store,
+                cookie,
+                OffsetDateTime::now_utc(),
+            ))
+            .is_some()
+    }
+
     /// The session id inside a cookie value, which is what a close intent carries.
     pub fn session_id(cookie: &str) -> &str {
         cookie.split_once('.').map(|(id, _)| id).unwrap_or("")

@@ -127,6 +127,12 @@ fn the_console_delete_removes_the_account_and_leaves_the_ledger_unlinkable() {
     assert!(log.contains("delete-user.sh secretary"), "{log}");
     assert!(log.contains("quota-apply --clear secretary"), "{log}");
     assert!(log.contains("gen-finger-page"), "{log}");
+    // The published set loses the key through the same token the approval
+    // published it with, so a name reused after the hold can publish again.
+    assert!(
+        log.contains("publish-mail-key.sh --remove secretary"),
+        "the published key was not removed: {log}"
+    );
 
     // The ledger is unchanged and still resolves to the token alone.
     assert_eq!(fix.read("ledger/payments.jsonl"), ledger_before);
@@ -255,9 +261,19 @@ fn the_page_close_and_the_console_delete_end_in_the_same_transition() {
     );
     assert!(console.scripts_log().contains("delete-user.sh secretary"));
     // The record has gone but the journal line remains, so a retry is accepted
-    // rather than refused as an unknown name.
+    // rather than refused as an unknown name, and the retry repeats the
+    // publication cleanup because the first pass may have died before it.
     let again = console.ctl(&["delete", "secretary"]);
     assert!(again.status.success(), "{}", body(&again));
+    assert_eq!(
+        console
+            .scripts_log()
+            .matches("publish-mail-key.sh --remove secretary")
+            .count(),
+        2,
+        "the retry did not remove the published key: {}",
+        console.scripts_log()
+    );
 }
 
 /// Closing a card-paying account stops the subscription when the closure is
