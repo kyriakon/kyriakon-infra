@@ -679,16 +679,31 @@ impl Store {
     /// Rewrite an append-only record whole, under a lock the caller holds.
     ///
     /// This is the one exception `CODING_STANDARDS.md` names: a recorded line
-    /// that has to be completed later rather than appended again. The four
-    /// callers (`ledger::Ledger::settle_refund`, `rewrite_unattributed`,
-    /// `requests::rewrite` and the drain's `holds_sweep`, which drops the lines
-    /// of a released username) each hold [`Log::lock`] across the read and this
-    /// write, and appends take the same lock, so a line another process appends
-    /// in between is either seen by the read or lands after the rewrite.
-    /// Nothing else may call this, and the name is the warning.
+    /// that has to be completed later rather than appended again. The callers
+    /// (`ledger::Ledger::settle_refund`, `rewrite_unattributed`,
+    /// `requests::rewrite`, the drain's `holds_sweep`, which drops the lines of
+    /// a released username, and the notice rollback that takes back a line whose
+    /// enqueue failed) each hold [`Log::lock`] across the read and this write,
+    /// and appends take the same lock, so a line another process appends in
+    /// between is either seen by the read or lands after the rewrite. Nothing
+    /// else may call this, and the name is the warning.
     pub async fn rewrite_log(&self, path: &str, bytes: &[u8]) -> Result<(), Error> {
+        self.rewrite_log_mode(path, bytes, None, 0o600).await
+    }
+
+    /// [`Store::rewrite_log`] for a record the unprivileged handler reads:
+    /// `notices.jsonl` is 0640 and handed to the accounts directory's group, as
+    /// its appends are. The rollback of a notice whose enqueue failed needs the
+    /// same mode, or the account page loses the notices it still lists.
+    pub(crate) async fn rewrite_log_mode(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        owner: Option<(u32, u32)>,
+        mode: u32,
+    ) -> Result<(), Error> {
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
-        self.place_record(dir, name, bytes, None, 0o600).await
+        self.place_record(dir, name, bytes, owner, mode).await
     }
 }
 

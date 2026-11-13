@@ -224,7 +224,7 @@ async fn record(
     notice_type: &str,
     subject: &str,
     to: &str,
-) -> Result<(), Error> {
+) -> Result<String, Error> {
     let line = Notice {
         version: 1,
         at: crate::util::filed_at(),
@@ -238,7 +238,8 @@ async fn record(
         .log(&format!("accounts/{username}/notices.jsonl"))
         .append_mode(encoded.as_bytes(), store.dir_owner("accounts"), 0o640)
         .await
-        .map_err(Error::from)
+        .map_err(Error::from)?;
+    Ok(encoded)
 }
 
 async fn record_and_enqueue(
@@ -250,8 +251,38 @@ async fn record_and_enqueue(
     to: &str,
     body: &str,
 ) -> Result<(), Error> {
-    record(store, username, notice_type, subject, to).await?;
-    enqueue(cfg, to, subject, body).await
+    let line = record(store, username, notice_type, subject, to).await?;
+    if let Err(e) = enqueue(cfg, to, subject, body).await {
+        // A line saying the notice was sent, left behind by an enqueue that
+        // returned an error, makes the retry's `already_sent` match and the
+        // mail is never sent. Take the line back before the error leaves, as
+        // the application's confirmation stamp is cleared.
+        unrecord(store, username, &line).await?;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Take back the notice line a failed enqueue left recorded. The record's own
+/// lock is held across the read and the rewrite, so an append that lands
+/// meanwhile is either seen or follows the rewrite rather than being dropped.
+async fn unrecord(store: &Store, username: &str, line: &str) -> Result<(), Error> {
+    let path = format!("accounts/{username}/notices.jsonl");
+    let log = store.log(&path);
+    let _lock = log.lock().await?;
+    let mut lines = log.raw_lines().await?;
+    let Some(index) = lines.iter().rposition(|written| written == line) else {
+        return Ok(());
+    };
+    lines.remove(index);
+    let mut bytes = lines.join("\n");
+    if !bytes.is_empty() {
+        bytes.push('\n');
+    }
+    store
+        .rewrite_log_mode(&path, bytes.as_bytes(), store.dir_owner("accounts"), 0o640)
+        .await
+        .map_err(Error::from)
 }
 
 #[cfg(test)]

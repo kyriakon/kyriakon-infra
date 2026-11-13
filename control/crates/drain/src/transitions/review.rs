@@ -1100,7 +1100,14 @@ fn confirmation_body(cfg: &DrainConfig, record: &Record, no_charge: bool) -> Str
         cfg.postal_address
     ));
     if no_charge {
-        out.push_str("There is no charge for this account and no billing period.\n");
+        let what = if record.domain.is_some() {
+            "the whole group"
+        } else {
+            "this account"
+        };
+        out.push_str(&format!(
+            "There is no charge for {what} and no billing period.\n"
+        ));
     } else {
         let price = if record.domain.is_some() {
             &cfg.group_price_gbp
@@ -1424,7 +1431,12 @@ mod tests {
         let cfg = test_config();
         let body = confirmation_body(&cfg, &record(&[]), true);
         assert!(body.contains("no charge"), "{body}");
+        assert!(body.contains("this account"), "{body}");
         assert!(!body.contains("GBP"), "{body}");
+        let mut group = record(&[]);
+        group.domain = Some("body.example".to_string());
+        let body = confirmation_body(&cfg, &group, true);
+        assert!(body.contains("no charge for the whole group"), "{body}");
     }
 
     #[test]
