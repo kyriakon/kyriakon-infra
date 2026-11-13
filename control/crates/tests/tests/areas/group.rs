@@ -88,7 +88,10 @@ fn an_approval_sends_the_confirmation_to_the_outside_address() {
 
 /// An approval with no address outside the platform sends no separate
 /// confirmation before the account exists, and the approval mail to the new
-/// mailbox carries the durable-medium confirmation instead.
+/// mailbox carries the durable-medium confirmation instead. That mail is the
+/// durable medium, so it has to carry the Schedule 2 particulars in
+/// `docs/terms.md`: the trader and the geographic address, the price and
+/// period, and the cancellation form.
 #[test]
 fn an_approval_without_an_outside_address_carries_the_confirmation() {
     let fix = Fix::new("confirmation-none");
@@ -110,7 +113,9 @@ fn an_approval_without_an_outside_address_carries_the_confirmation() {
         "no confirmation left before provisioning: {log}"
     );
     let sent = fix.sent();
-    assert!(sent.contains("secretary@kyriakon.net"), "{sent}");
+    assert!(sent.contains("To: secretary@kyriakon.net"), "{sent}");
+    assert!(sent.contains("1 Example Street, Example"), "{sent}");
+    assert!(sent.contains("GBP 20.00 for one year"), "{sent}");
     assert!(sent.contains("digital content"), "{sent}");
     assert!(sent.contains("fourteen days"), "{sent}");
     assert!(

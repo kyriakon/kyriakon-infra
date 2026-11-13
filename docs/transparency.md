@@ -84,7 +84,7 @@ provider and the devices at either end, is outside this statement.
 
 ## Status
 
-The mail stack, the backup and restore path, and the published-configuration claims in these
-documents are built and checkable now. The paid tier and the control plane that holds payment
-state are specified and not yet live; when they land, this statement and `aup.md` are updated with
-them rather than before them.
+The mail stack, the backup and restore path, the control plane that holds payment state, and the
+published configuration behind the claims in these documents is built and installed by the scripts
+in `scripts/`. This statement describes what that system holds, not whether applications are open.
+When a capability changes, this statement and `aup.md` are updated with it rather than before it.
