@@ -98,7 +98,13 @@ jobs:
           # it changes and whatever sits past the cap is never inspected. The
           # pull request's own count is the only way to tell a complete list from
           # a truncated one; a mismatch blocks the merge.
-          changed=$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json changed_files --jq .changed_files)
+          changed=$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json changedFiles --jq .changedFiles)
+          case "$changed" in
+          '' | *[!0-9]*)
+            printf 'leaving #%s alone: its changed file count is unreadable (%s)\n' "$pr" "$changed"
+            exit 0
+            ;;
+          esac
           listed=$(printf '%s\n' "$files" | grep -c . || true)
           if [ "$changed" -ne "$listed" ]; then
             printf 'leaving #%s alone: %s files changed, only %s listed\n' "$pr" "$changed" "$listed"

@@ -139,6 +139,27 @@ jobs:
             openbsd/etc/rc.d/kyriakon_control \
             openbsd/etc/rc.d/kyriakon_onboard_sshd |
             xargs -0 shellcheck
+      # A path with a space has to reach shellcheck as one argument. A
+      # word-split list lints two names that do not exist and never reads this
+      # file, which is what #746 was.
+      - name: shellcheck a spaced path
+        run: |
+          set -eu
+          dir=$(mktemp -d)
+          git -C "$dir" init -q
+          printf '#!/bin/sh\necho $1\n' > "$dir/a b.sh"
+          git -C "$dir" add -A
+          if out=$(cd "$dir" && git ls-files -z '*.sh' | xargs -0 shellcheck 2>&1); then
+            printf 'a broken script was not linted at all:\n%s\n' "$out" >&2
+            exit 1
+          fi
+          case "$out" in
+          *"a b.sh"*) ;;
+          *)
+            printf 'shellcheck did not see the spaced path:\n%s\n' "$out" >&2
+            exit 1
+            ;;
+          esac
       # A tracked binary is a build artifact, not source: it is unreviewable and
       # platform-specific. The pre-commit hook refuses a new one; this catches a
       # commit made with --no-verify.

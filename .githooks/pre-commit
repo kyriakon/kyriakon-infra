@@ -1,10 +1,13 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Fast checks on what is being committed: shellcheck and ksh -n on the staged
 # scripts, rustfmt --check on the crates when Rust is staged. CI runs the full
 # set; this catches the failures that used to reach it and be found there.
+#
+# bash, not sh, for `read -d`: the staged names arrive NUL-separated, so a path
+# holding a space, quote or backslash is one name. On the newline-separated list
+# git C-quotes such a path, and a quoted name is not a path: the check skipped it.
 set -e
 cd "$(git rev-parse --show-toplevel)"
-staged=$(git diff --cached --name-only --diff-filter=ACM)
 # A build artifact is never source. Rejecting every added binary keeps a compiled
 # test helper out of the public tree; `.gitignore` also names the ones this repo
 # builds, so this only fires on a path nobody expected to be binary.
@@ -14,9 +17,8 @@ if [ -n "$binaries" ]; then
 	exit 1
 fi
 # A shell script is a staged *.sh or a staged file whose first line is a shell
-# shebang: the ksh programs under openbsd/etc carry no suffix. Paths are read one
-# per line and passed quoted, never word-split, so a path with a space in it is
-# still one argument.
+# shebang: the ksh programs under openbsd/etc carry no suffix. Each path is
+# passed quoted, so it is one argument whatever characters it holds.
 is_script() {
 	case "$1" in
 	*.sh) return 0 ;;
@@ -26,22 +28,25 @@ is_script() {
 	esac
 	return 1
 }
-scripts=$(printf '%s\n' "$staged" | while IFS= read -r f; do
-	if [ -f "$f" ] && is_script "$f"; then printf '%s\n' "$f"; fi
-done)
-if [ -n "$scripts" ]; then
+scripts=()
+rust=0
+while IFS= read -r -d '' f; do
+	case "$f" in *.rs) rust=1 ;; esac
+	if [ -f "$f" ] && is_script "$f"; then scripts+=("$f"); fi
+done < <(git diff --cached --name-only -z --diff-filter=ACM)
+if [ ${#scripts[@]} -gt 0 ]; then
 	if ! command -v shellcheck >/dev/null 2>&1; then
 		printf 'pre-commit: shellcheck is not on PATH; install it, or commit with --no-verify\n' >&2
 		exit 1
 	fi
-	printf '%s\n' "$scripts" | while IFS= read -r s; do
+	for s in "${scripts[@]}"; do
 		shellcheck "$s"
 		if command -v ksh >/dev/null 2>&1; then
 			ksh -n "$s"
 		fi
 	done
 fi
-if printf '%s\n' "$staged" | grep -q '\.rs$'; then
+if [ "$rust" = 1 ]; then
 	for crate in control kyriakon-encrypt; do
 		[ -f "$crate/Cargo.toml" ] || continue
 		cargo fmt --manifest-path "$crate/Cargo.toml" --all --check
