@@ -353,6 +353,36 @@ impl Store {
         Ok(None)
     }
 
+    /// The account whose one-time password link carries this token, or `None`
+    /// when no account does. A link's token is a path component the handler
+    /// reads, and the account record is the one place the link's state lives, so
+    /// this is the handler's lookup for a link a group approval or a reset
+    /// issued. A damaged record is skipped, so one unreadable account cannot
+    /// take every other mailbox's page down with it: the page answers as an
+    /// unknown token rather than as an error a probe can read.
+    pub async fn account_for_password_token(&self, token: &str) -> Result<Option<Account>, Error> {
+        // The link's token is 26 lowercase Crockford characters, the same shape
+        // as a status token. A probe of another shape is refused before any
+        // record is read.
+        if !is_status_token(token) {
+            return Ok(None);
+        }
+        for username in self.list("accounts").await? {
+            let account = match self.account(&username).await {
+                Ok(Some(account)) => account,
+                Ok(None) | Err(_) => continue,
+            };
+            if account
+                .password_link
+                .as_ref()
+                .is_some_and(|link| link.token == token)
+            {
+                return Ok(Some(account));
+            }
+        }
+        Ok(None)
+    }
+
     /// The names in one directory, sorted. A missing directory reads as empty,
     /// which is what a first run against a fresh store is: no intents, no
     /// journal, no notices, and none of those is an error to a reader.
@@ -1341,6 +1371,14 @@ pub struct Account {
     /// member can read it and answer it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suspension_reason: Option<String>,
+    /// The one-time link that sets this mailbox's mail password, and the day it
+    /// stops working. Written for every mailbox an approval or an address change
+    /// makes, and again by an operator reset; cleared when the link is used, so
+    /// the state is the link's own and not the application's. The record is the
+    /// authority even when the application record still carries the link for the
+    /// status page to render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_link: Option<PasswordLink>,
     /// The domain of the group this account belongs to, for a mailbox the
     /// own-domain tier made. The group holds the payment state, so an account
     /// with this set carries no payment block of its own. `None` for a person's
@@ -1367,6 +1405,28 @@ pub struct Account {
 pub struct UploadKey {
     pub fingerprint: String,
     pub added_at: String,
+}
+
+/// A one-time password link's state: the token in the URL and the last day the
+/// signature is accepted. No signature is stored, because the link is rebuilt
+/// from these two fields and the key when it is mailed, and the drain verifies
+/// the submitted signature against them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PasswordLink {
+    pub token: String,
+    pub until: String,
+}
+
+impl PasswordLink {
+    /// A new link: a fresh token and the seven-day window a mailed link needs to
+    /// reach a member and be used. Nothing else mints one, so the window is
+    /// written in one place.
+    pub async fn fresh() -> Result<Self, Error> {
+        Ok(Self {
+            token: status_token().await?,
+            until: crate::util::date_after_days(7),
+        })
+    }
 }
 
 /// A mail-key replacement waiting out its window. The material is a public key
@@ -2094,6 +2154,54 @@ mod tests {
         assert!(
             matches!(&err, Error::Parse { path, .. } if path.ends_with("accounts/broken/account.json")),
             "{err}"
+        );
+    }
+
+    /// The password-link lookup answers for the mailbox holding that token even
+    /// when a damaged record sorts ahead of it in the walk: one unreadable
+    /// account must not make every link's page answer as an error.
+    #[tokio::test]
+    async fn a_password_link_is_found_past_a_damaged_record() {
+        let dir = std::env::temp_dir().join(format!("control-store-pwlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let token = "0123456789abcdefghjkmnpqrs";
+        std::fs::create_dir_all(dir.join("accounts/live")).unwrap();
+        let account = serde_json::json!({
+            "version": 1,
+            "username": "live",
+            "state": "active",
+            "decision": "approve",
+            "decided_at": "2026-10-01T09:00:00Z",
+            "rail": "no_charge",
+            "no_charge": true,
+            "created_at": "2026-10-01T09:00:00Z",
+            "password_link": { "token": token, "until": "2026-11-20" },
+        });
+        std::fs::write(
+            dir.join("accounts/live/account.json"),
+            serde_json::to_vec(&account).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("accounts/broken")).unwrap();
+        std::fs::write(dir.join("accounts/broken/account.json"), "not json").unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+
+        assert_eq!(
+            store
+                .account_for_password_token(token)
+                .await
+                .unwrap()
+                .expect("the mailbox whose link this is")
+                .username,
+            "live"
+        );
+        assert!(
+            store
+                .account_for_password_token("0123456789abcdefghjkmnpqrt")
+                .await
+                .unwrap()
+                .is_none(),
+            "a well-formed token no account holds names nobody"
         );
     }
 

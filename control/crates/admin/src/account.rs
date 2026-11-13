@@ -5,6 +5,74 @@ use crate::Error;
 use crate::*;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+/// `password reset`: issue a fresh one-time link for an existing mailbox and
+/// deliver it. With an address outside the platform that passes the same check
+/// the page uses, the link is mailed there and recorded in the account's
+/// notices; otherwise it is printed for the operator to pass on over whatever
+/// channel reaches the member. The command refuses a name with no account, and
+/// the new token replaces any link already on the account, so the one in an
+/// earlier mail stops working.
+pub(crate) async fn password(
+    cfg: &DrainConfig,
+    store: &Store,
+    args: &[String],
+) -> Result<(), Error> {
+    let (username, action) = match args {
+        [action, username] => (username.as_str(), action.as_str()),
+        _ => return Err(Error::Failed(usage())),
+    };
+    if action != "reset" {
+        return Err(Error::Failed(usage()));
+    }
+    if let Some(why) = validate::username_shape(username) {
+        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+    }
+    let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
+    let link = transitions::lifecycle::issue_password_link(cfg, store, username, &key).await?;
+    // Read back what the issue wrote, so the message names the same date the
+    // signature covers rather than a clock this function kept of its own.
+    let account = store
+        .account(username)
+        .await?
+        .ok_or_else(|| Error::Failed(format!("no account for {username}")))?;
+    let until = account
+        .password_link
+        .as_ref()
+        .map(|link| link.until.clone())
+        .unwrap_or_default();
+    let outside = account
+        .outside_address
+        .as_deref()
+        .filter(|address| validate::address(address).is_none());
+    match outside {
+        Some(to) => {
+            let subject = format!("Your kyriakon.net password link ({username})");
+            let body = format!(
+                "A one-time link was issued to set the mail password for {username}. It works \
+                 once, until {until}:\n\n{link}\n\nIf you did not ask for this, write to \
+                 admin@kyriakon.net and do not use the link.\n"
+            );
+            kyriakon_control_core::mail::notice::send_again(
+                cfg,
+                store,
+                username,
+                "password.reset",
+                &subject,
+                to,
+                &body,
+            )
+            .await?;
+            println!("mailed a password link for {username} to {to}");
+        }
+        None => println!(
+            "no valid address outside the platform is on {username}; give this one-time link \
+             to the member over a channel that reaches them. It works once, until {until}:\n\n\
+             {link}"
+        ),
+    }
+    Ok(())
+}
+
 /// Print what the store holds for a username: the application, while it is
 /// inside ADR 0005's window, and the account once an approval has made one. The
 /// purge deletes the application after ninety days, so it is optional here and

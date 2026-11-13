@@ -117,5 +117,11 @@ pub(crate) async fn address(
     .file(store)
     .await?;
     println!("filed {action} for {domain} as intent {id}");
+    if matches!(action, "add-mailbox" | "upgrade") {
+        println!(
+            "the drain writes a one-time password link onto {mailbox} when the intent applies \
+             and mails it to the group's contact"
+        );
+    }
     Ok(())
 }

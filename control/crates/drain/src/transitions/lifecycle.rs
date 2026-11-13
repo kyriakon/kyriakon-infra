@@ -29,8 +29,8 @@ use kyriakon_control_core::payments::ledger::Ledger;
 use kyriakon_control_core::payments::rails::rail_instructions;
 use kyriakon_control_core::store::journal::Journal;
 use kyriakon_control_core::store::{
-    self, Account, ApplicationRef, GroupPayment, GroupRecord, Payment, Record, Store, UploadKey,
-    Window,
+    self, Account, ApplicationRef, GroupPayment, GroupRecord, PasswordLink, Payment, Record, Store,
+    UploadKey, Window,
 };
 use kyriakon_control_core::util;
 use serde_json::json;
@@ -130,15 +130,93 @@ async fn sweep_application(
     }
 }
 
+/// Issue a fresh one-time password link for `username`: a new token, the
+/// seven-day window, and the state written onto the mailbox's own record. A new
+/// mailbox gets its first link where its account is written; this is the reissue
+/// path, so a mailbox has one live link at a time and issuing another replaces
+/// the one before it. The account record is the authority for the link; the
+/// application copy an individual approval also writes is only what the status
+/// page renders.
+///
+/// An unknown account is refused: a typo in the console must not mint a link for
+/// a name the platform never made.
+pub async fn issue_password_link(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+    key: &[u8],
+) -> Result<String, Error> {
+    let mut account = store
+        .account(username)
+        .await?
+        .ok_or_else(|| Error::Failed(format!("no account for {username}")))?;
+    let link = PasswordLink::fresh().await?;
+    let url = kyriakon_control_core::account::sign::password_link(
+        &cfg.base_url,
+        key,
+        &link.token,
+        username,
+        &link.until,
+    )?;
+    account.password_link = Some(link);
+    // The status page renders the application copy, not the account. A reset
+    // replaces the link, so clear the page's copy before the account changes: a
+    // failure here leaves the old link live and the retry safe, where the reverse
+    // order could consume the old link without delivering the new one.
+    clear_status_link(store, username).await?;
+    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+        context: "encode the account",
+        source,
+    })?;
+    write_account_record(store, username, &bytes).await?;
+    Ok(url)
+}
+
+/// Clear the status page's copy of an application's password link, when the copy
+/// belongs to this account. A group mailbox stores the body's application copy,
+/// whose username is the applicant and not the mailbox, so it is left alone.
+async fn clear_status_link(store: &Store, username: &str) -> Result<(), Error> {
+    let Some(copy) = store.account_application_text(username).await? else {
+        return Ok(());
+    };
+    let Ok(copy) = serde_json::from_str::<Value>(&copy) else {
+        return Ok(());
+    };
+    let Some(token) = copy.get("status_token").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(text) = store.filed_application_text(token).await? else {
+        return Ok(());
+    };
+    let mut record: Value = serde_json::from_str(&text)
+        .map_err(|e| Error::context("the application record does not parse", e))?;
+    if record.get("username").and_then(Value::as_str) != Some(username) {
+        return Ok(());
+    }
+    if record.get("password_link").is_none_or(Value::is_null) {
+        return Ok(());
+    }
+    record["password_link"] = Value::Null;
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Error::Json {
+        context: "encode the application record",
+        source,
+    })?;
+    let owner = store.dir_owner("applications");
+    store
+        .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
+        .await
+        .map_err(Error::from)
+}
+
 /// Apply a password set through a one-time link.
 ///
 /// The link's signature, its date, the plaintext's validation and the one-use
 /// replay checks are the seam's: `verify` refuses a submission that
 /// cannot prove itself before this runs. What is left is the half the handler
 /// cannot do at all: the plaintext is hashed here and nowhere else, the hash is
-/// checked to be one this build made, and the record must still hold the link.
-/// Applying it clears the link, so a replay finds nothing to apply and is
-/// refused like any other spent link.
+/// checked to be one this build made, and the mailbox's own record must still
+/// hold the token. Applying it clears the link, so a replay finds nothing to
+/// apply and is refused like any other spent link.
 ///
 /// The remaining limit: a compromised handler chooses the plaintext it submits,
 /// so it can still set a password it knows. It can no longer install a chosen
@@ -169,34 +247,74 @@ pub async fn set_password(
     // still holds a copy until the remove below, which is why that remove is the
     // pass's last act and runs on the success path only.
     unsafe { plain.as_mut_vec().fill(0) };
+
+    // The application copy is read only for the binding this link has always
+    // had: a link issued for one account cannot be relabelled onto another by a
+    // handler that rewrites the record. A group mailbox's link has no
+    // application record at all, and the account is what authorizes it.
     let name = format!("{token}.json");
-    let Some(text) = store.filed_application_text(token).await? else {
-        return Ok(password_refusal(store, file, value, "the application record is gone").await);
+    let mut app_record: Option<Value> = match store.filed_application_text(token).await? {
+        Some(text) => Some(
+            serde_json::from_str(&text)
+                .map_err(|e| Error::context("the application record does not parse", e))?,
+        ),
+        None => None,
     };
-    // Read as a Value and edit one key: the record carries fields this build
-    // does not model, and writing it back through the typed struct would drop
-    // them.
-    let mut record: Value = serde_json::from_str(&text)
-        .map_err(|e| Error::context("the application record does not parse", e))?;
-    if record.get("username").and_then(Value::as_str) != Some(username) {
-        return Ok(password_refusal(store, file, value, "the intent names another account").await);
+    if let Some(record) = &app_record {
+        if record.get("username").and_then(Value::as_str) != Some(username) {
+            return Ok(
+                password_refusal(store, file, value, "the intent names another account").await,
+            );
+        }
     }
-    if record.get("password_link").is_none_or(Value::is_null) {
+
+    let Some(mut account) = store.account(username).await? else {
+        return Ok(
+            password_refusal(store, file, value, format!("no account for {username}")).await,
+        );
+    };
+    // The mailbox's own record holds one live link. A record written by the
+    // release before this field existed has none on the account and the link
+    // only in the application copy, so that link answers for its own name; an
+    // account that carries a link refuses every other token, which is what makes
+    // a reset replace the link it supersedes.
+    let authorized = match &account.password_link {
+        Some(link) => link.token == token,
+        None => app_record
+            .as_ref()
+            .is_some_and(|record| record.get("password_link").is_some_and(|v| !v.is_null())),
+    };
+    if !authorized {
         return Ok(password_refusal(store, file, value, "the link has already been used").await);
     }
+
     run_script(cfg, "set-mail-password.sh", &[username, &hash]).await?;
-    // One use: the record keeps no link, so the page stops answering.
-    record["password_link"] = Value::Null;
-    let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Error::Json {
-        context: "encode the application record",
+
+    // One use: the mailbox keeps no link, so the page stops answering.
+    account.password_link = None;
+    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+        context: "encode the account",
         source,
     })?;
-    // `applications/` belongs to the handler, which renders the status page as
-    // _onboard: a root-owned record reads as missing to it.
-    let owner = store.dir_owner("applications");
-    store
-        .write_record_owned("applications", &name, &bytes, owner)
-        .await?;
+    write_account_record(store, username, &bytes).await?;
+
+    // Clear the status page's copy too, when this token is the link that page
+    // carries. A reset's token has no application record, so it is left alone.
+    if let Some(record) = app_record.as_mut() {
+        if record.get("password_link").is_some_and(|v| !v.is_null()) {
+            record["password_link"] = Value::Null;
+            let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Error::Json {
+                context: "encode the application record",
+                source,
+            })?;
+            // `applications/` belongs to the handler, which renders the status
+            // page as _onboard: a root-owned record reads as missing to it.
+            let owner = store.dir_owner("applications");
+            store
+                .write_record_owned("applications", &name, &bytes, owner)
+                .await?;
+        }
+    }
     // The settlement, with the link cleared: `settle` appends it and removes
     // the file, which is why the remove is still the pass's last act.
     Ok(Settlement::applied(intent.application, None))

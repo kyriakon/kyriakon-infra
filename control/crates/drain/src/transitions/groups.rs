@@ -14,17 +14,20 @@ use super::boxrun::{
     cancel_stripe_if_active, publish_mail_keys, publish_mail_keys_publicly, run_script,
     run_script_tolerating, write_public_key,
 };
+use super::lifecycle::dns_contact;
 use super::Error;
 use super::{write_journal, Settlement};
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::questions;
 use kyriakon_control_core::flow::validate;
 use kyriakon_control_core::intent::ADDRESS_ACTIONS;
+use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::payments::ledger::{Ledger, LedgerLine};
 use kyriakon_control_core::store::journal::Journal;
 use kyriakon_control_core::store::{
     self, Account, ApplicationRef, FlatPayment, GroupAddress, GroupAddressIntent, GroupIntent,
-    GroupPayment, GroupRecord, GroupRemoveIntent, KeyRecord, Record, Store, TokenRecord, Window,
+    GroupPayment, GroupRecord, GroupRemoveIntent, KeyRecord, PasswordLink, Record, Store,
+    TokenRecord, Window,
 };
 use kyriakon_control_core::util;
 use serde_json::json;
@@ -589,6 +592,12 @@ async fn write_group_account(
 ) -> Result<(), Error> {
     let existing = store.account(mailbox).await?;
     let now = util::filed_at();
+    // A new mailbox gets its own one-time link; a retry keeps the token the
+    // first pass wrote, because the mail that carries it may already have left.
+    let password_link = match existing.as_ref().and_then(|a| a.password_link.clone()) {
+        Some(link) => link,
+        None => PasswordLink::fresh().await?,
+    };
     let account = Account {
         version: 1,
         username: mailbox.to_string(),
@@ -625,6 +634,7 @@ async fn write_group_account(
             .or_else(|| existing.as_ref().and_then(|a| a.mail_key.clone())),
         rotation: existing.as_ref().and_then(|a| a.rotation.clone()),
         suspension_reason: None,
+        password_link: Some(password_link),
         group: Some(domain.to_string()),
         closing_until: None,
         grace_until: None,
@@ -1284,6 +1294,7 @@ pub async fn group_address(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
+    key: &[u8],
     intent: GroupAddressIntent,
 ) -> Result<Settlement, Error> {
     if intent.kind != "group-address" {
@@ -1604,7 +1615,62 @@ pub async fn group_address(
         _ => unreachable!("the action was checked against ADDRESS_ACTIONS"),
     }
 
+    // A mailbox an address change makes has no approval mail to carry its link,
+    // and no status page of its own to render one, so the mail is the whole
+    // delivery: without it the token sits in the account unread and the member
+    // cannot set a password. After the arm, so every step that can fail has.
+    if matches!(intent.action.as_str(), "add-mailbox" | "upgrade") {
+        mail_password_link(cfg, store, key, &group, &intent.mailbox).await?;
+    }
+
     Ok(Settlement::line("applied", application, None))
+}
+
+/// Mail one mailbox's one-time password link to the group's contact, the same
+/// recipient and account-copy lookup every other group notice uses. A retry
+/// mails nothing: the subject is fixed by the mailbox, and the account keeps the
+/// token the first pass wrote.
+async fn mail_password_link(
+    cfg: &DrainConfig,
+    store: &Store,
+    key: &[u8],
+    group: &GroupRecord,
+    mailbox: &str,
+) -> Result<(), Error> {
+    let account = store
+        .account(mailbox)
+        .await?
+        .ok_or_else(|| Error::Failed(format!("the mailbox {mailbox} has no account record")))?;
+    let Some(link) = account.password_link else {
+        return Ok(());
+    };
+    let url = kyriakon_control_core::account::sign::password_link(
+        &cfg.base_url,
+        key,
+        &link.token,
+        mailbox,
+        &link.until,
+    )?;
+    let to = dns_contact(store, group).await?;
+    let subject = format!("Set the mail password for {mailbox}@{}", group.domain);
+    let body = format!(
+        "{mailbox}@{domain} is ready to receive mail. Set its mail password from this \
+         one-time link. It works once, until {until}:\n\n{url}\n\nIf you did not ask for \
+         this, write to admin@kyriakon.net and do not use the link.\n",
+        domain = group.domain,
+        until = link.until
+    );
+    notice::send_account_notice_retryable(
+        cfg,
+        store,
+        mailbox,
+        "password.link",
+        &subject,
+        &to,
+        &body,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Apply one `remove-group` intent: take a body's domain off the box whole.

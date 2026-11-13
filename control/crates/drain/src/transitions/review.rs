@@ -23,8 +23,8 @@ use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::payments::rails::{card_link, rail_instructions};
 use kyriakon_control_core::store::journal::Journal;
 use kyriakon_control_core::store::{
-    self, Account, ApplicationRef, FlatPayment, GroupIntent, GroupPayment, Intent, Monero, Payment,
-    Record, Store, TokenRecord, UploadKey, Window,
+    self, Account, ApplicationRef, FlatPayment, GroupIntent, GroupPayment, Intent, Monero,
+    PasswordLink, Payment, Record, Store, TokenRecord, UploadKey, Window,
 };
 use kyriakon_control_core::util;
 use serde_json::json;
@@ -523,6 +523,22 @@ async fn approve(
     // to read a lane nobody has turned off as off.
     let hosted = record.upload_key.is_some().then_some(true);
 
+    // The link this approval mails and stores on the status page. The mailbox's
+    // own record carries the same token, so `set_password` authorizes from the
+    // account and a retry keeps the token and date the first pass put in the mail.
+    let account_password_link = existing
+        .as_ref()
+        .and_then(|a| a.password_link.clone())
+        .unwrap_or_else(|| PasswordLink {
+            token: record.status_token.clone(),
+            until: util::date_after_days(7),
+        });
+    // Signed and recorded with the account's own token, never the status token:
+    // a reset between the first pass and a retry replaces the account's link, so
+    // a link built from the status token would be one the drain refuses.
+    let password_until = account_password_link.until.clone();
+    let password_token = account_password_link.token.clone();
+
     let account = Account {
         version: 1,
         username: username.clone(),
@@ -553,6 +569,7 @@ async fn approve(
         // the first pass; the window outlives the intent either way.
         rotation: existing.as_ref().and_then(|a| a.rotation.clone()),
         suspension_reason: None,
+        password_link: Some(account_password_link),
         group: None,
         closing_until: None,
         grace_until: None,
@@ -631,9 +648,13 @@ async fn approve(
     // Built before the body, so the mail that says the account exists also says
     // how to set the password. The spec asks for the link in the email and on
     // the status page both.
-    let password_until = util::date_after_days(7);
-    let password_link =
-        sign::password_link(&cfg.base_url, key, token, &record.username, &password_until)?;
+    let password_link = sign::password_link(
+        &cfg.base_url,
+        key,
+        &password_token,
+        &record.username,
+        &password_until,
+    )?;
     let body = approval_body(
         cfg,
         &record,
@@ -790,7 +811,7 @@ async fn approve_group(
             stripe: Default::default(),
         },
         addresses,
-        mailboxes,
+        mailboxes: mailboxes.clone(),
         site_owner: site_owner.clone(),
         upload_key: record
             .upload_key
@@ -886,6 +907,23 @@ async fn approve_group(
             .to_string(),
     };
     let recipe = dns::recipe(&domain, &values);
+    // One link per mailbox the approval just made. The tokens were written onto
+    // each account by the provision pass, so a retry of this approval mails the
+    // same links rather than invalidating the ones already sent.
+    let mut password_links: Vec<(String, String)> = Vec::new();
+    for mailbox in &mailboxes {
+        let account = store
+            .account(mailbox)
+            .await?
+            .ok_or_else(|| Error::Failed(format!("the mailbox {mailbox} has no account record")))?;
+        let link = account
+            .password_link
+            .ok_or_else(|| Error::Failed(format!("the mailbox {mailbox} has no password link")))?;
+        password_links.push((
+            mailbox.clone(),
+            sign::password_link(&cfg.base_url, key, &link.token, mailbox, &link.until)?,
+        ));
+    }
     let subject = decision_subject("approved", &domain);
     let body = group_approval_body(
         cfg,
@@ -894,6 +932,7 @@ async fn approve_group(
         &domain,
         &payment_note,
         &recipe.text(),
+        &password_links,
     );
     notice::send_account_notice_retryable(
         cfg,
@@ -1212,11 +1251,21 @@ fn group_approval_body(
     domain: &str,
     payment_note: &str,
     recipe: &str,
+    password_links: &[(String, String)],
 ) -> String {
-    let out = format!(
+    let mut out = format!(
         "Your application for {domain} has been approved. The mailboxes in the group are \
          ready to receive mail as soon as the records below are live.{payment_note}\n{recipe}"
     );
+    if !password_links.is_empty() {
+        out.push_str(
+            "\nSet each mailbox's mail password from its own one-time link. Each link works \
+             until its date, and once:\n\n",
+        );
+        for (mailbox, link) in password_links {
+            out.push_str(&format!("{mailbox}: {link}\n"));
+        }
+    }
     with_confirmation(cfg, record, no_charge, out)
 }
 
@@ -1484,6 +1533,7 @@ mod tests {
             "body.example",
             "\n\nThe amount is GBP 40.00 for the year, for the whole group.\n",
             "recipe text",
+            &[],
         );
         assert!(body.contains("fourteen days to cancel"), "{body}");
         assert!(body.contains(&cfg.postal_address), "{body}");

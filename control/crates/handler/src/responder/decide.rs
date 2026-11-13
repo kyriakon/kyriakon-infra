@@ -164,6 +164,36 @@ mod password_window_tests {
     }
 }
 
+/// The mailbox a password token names, or `None` when no live link carries it.
+///
+/// The account record is the authority: a group approval and an operator reset
+/// write a token there, and the account's token is the one the drain accepts.
+/// A link the previous release wrote only onto the application record still
+/// answers for its own name, so an approval inside its seven-day window keeps
+/// working across the upgrade.
+async fn password_subject(app: &App, token: &str) -> Option<String> {
+    match app.store.account_for_password_token(token).await {
+        Ok(Some(account)) => return Some(account.username),
+        Ok(None) => {}
+        Err(e) => {
+            e.report("the password link");
+            return None;
+        }
+    }
+    let record = record_for(app, token).await?;
+    record.password_link.as_ref()?;
+    // An account that carries a live link has replaced this one, so the older
+    // application copy must not open a page whose submission the drain refuses.
+    match app.store.account(&record.username).await {
+        Ok(Some(account)) if account.password_link.is_some() => None,
+        Ok(_) => Some(record.username),
+        Err(e) => {
+            e.report("the password link");
+            None
+        }
+    }
+}
+
 /// The form behind a one-time password link.
 ///
 /// Past its window, or once the record no longer holds a link, this is the
@@ -172,17 +202,17 @@ mod password_window_tests {
 pub(super) async fn password_page(app: &App, call: &Call<'_>) -> Reply {
     let token = call.rest;
     let query = call.query();
-    let Some(record) = record_for(app, token).await else {
+    let Some(username) = password_subject(app, token).await else {
         return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     };
     let (Some(until), Some(sig)) = (query.get("until"), query.get("sig")) else {
         return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     };
-    if record.password_link.is_none() || !password_window_open(until) {
+    if !password_window_open(until) {
         return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     }
     capability(&PasswordPage {
-        username: record.username,
+        username,
         token: token.to_string(),
         until: until.to_string(),
         sig: sig.clone(),
@@ -197,13 +227,13 @@ pub(super) async fn password_page(app: &App, call: &Call<'_>) -> Reply {
 pub(super) async fn password_file(app: &App, call: &Call<'_>) -> Reply {
     let token = call.rest;
     let form = call.form();
-    let Some(record) = record_for(app, token).await else {
+    let Some(username) = password_subject(app, token).await else {
         return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     };
     let (Some(until), Some(sig)) = (form.get("until"), form.get("sig")) else {
         return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     };
-    if record.password_link.is_none() || !password_window_open(until) {
+    if !password_window_open(until) {
         return capability(&status_page(None, None, OffsetDateTime::now_utc()));
     }
     let password = form.get("password").map(String::as_str).unwrap_or("");
@@ -217,7 +247,7 @@ pub(super) async fn password_file(app: &App, call: &Call<'_>) -> Reply {
     };
     if let Some(problem) = problem {
         return capability(&PasswordPage {
-            username: record.username,
+            username,
             token: token.to_string(),
             until: until.to_string(),
             sig: sig.clone(),
@@ -225,7 +255,7 @@ pub(super) async fn password_file(app: &App, call: &Call<'_>) -> Reply {
         });
     }
     match intent::Intent::Password(intent::PasswordIntent {
-        application: store::ApplicationRef::application(record.username.clone(), token.to_string()),
+        application: store::ApplicationRef::application(username, token.to_string()),
         until: until.to_string(),
         sig: sig.clone(),
         password: password.to_string(),
