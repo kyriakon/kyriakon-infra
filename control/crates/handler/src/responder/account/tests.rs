@@ -162,6 +162,41 @@ async fn a_correct_mail_password_opens_a_session_and_a_wrong_one_does_not() {
     assert!(page.contains("Referrer-Policy: no-referrer"), "{page}");
 }
 
+/// #761: a login that cannot name itself as this page is refused before the
+/// password is read, so the reply carries no session cookie. These are the rows
+/// an attacker can drive; the same-origin submit above is the ordinary path.
+#[tokio::test]
+async fn a_login_from_another_origin_opens_no_session() {
+    let (mut app, _dir) = handler("login-origin").await;
+    app.auth = session::Authenticator {
+        program: checker("login-origin", "right horse battery"),
+        args: Vec::new(),
+    };
+    for (origin, site, what) in [
+        (
+            Some("null"),
+            None,
+            "a sandboxed frame with no Fetch Metadata",
+        ),
+        (None, Some("cross-site"), "a page on another site"),
+        (None, None, "a client with no browser headers"),
+    ] {
+        let (code, body) = ask(
+            &app,
+            &httpd_post_from(
+                "/login",
+                "username=alice&password=right+horse+battery",
+                origin,
+                site,
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(code, 403, "{what}: {body}");
+        assert!(!body.contains("Set-Cookie"), "{what}: {body}");
+    }
+}
+
 /// A checker the closure tests run directly. It lives here rather than in a
 /// shared helper because the closure tests are the only ones this branch adds,
 /// and the account-page branch owns the login fixture.

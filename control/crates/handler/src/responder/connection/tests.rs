@@ -151,6 +151,42 @@ fn a_submission_must_come_from_this_form() {
     ));
 }
 
+/// #761: a cross-site login is a login CSRF, which leaves the victim signed in to
+/// the attacker's account. The login takes no cookie, so it keeps the
+/// `Sec-Fetch-Site` fallback, but only a signal that says this page: a client
+/// that sends neither header cannot be told apart from the sandboxed frame.
+#[test]
+fn a_login_must_name_itself_as_this_page() {
+    // The refusal #761 is about: a sandboxed frame's `null` and no Fetch
+    // Metadata, and a client that sends no browser headers at all.
+    for env in [
+        vec![("HTTP_ORIGIN", "null")],
+        vec![
+            ("HTTP_ORIGIN", "null"),
+            ("HTTP_SEC_FETCH_SITE", "same-site"),
+        ],
+        vec![("HTTP_SEC_FETCH_SITE", "cross-site")],
+        vec![],
+    ] {
+        assert!(
+            !own_origin(&httpd_request(&env), Reaches::Login),
+            "a login from {env:?} is not this page's"
+        );
+    }
+    // The ordinary submit: this site's own Origin, the page's own Fetch
+    // Metadata, or the user following a link to the form.
+    for env in [
+        vec![("HTTP_ORIGIN", OWN_ORIGIN)],
+        vec![("HTTP_SEC_FETCH_SITE", "same-origin")],
+        vec![("HTTP_SEC_FETCH_SITE", "none")],
+    ] {
+        assert!(
+            own_origin(&httpd_request(&env), Reaches::Login),
+            "a login from {env:?} is this page's"
+        );
+    }
+}
+
 /// The browser matrix #704 was opened with, replayed through the guard.
 ///
 /// *Observed* rows are what a recording endpoint logged for a form POST from a
