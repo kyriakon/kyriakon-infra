@@ -35,6 +35,25 @@
 # both files; the repository's own config still applies, under the two -c
 # settings above it.
 #
+# Why packObjectsHook needs no -c of its own. The setting landed in git 2.10,
+# but upload-pack has read it only from protected configuration (the system,
+# global and command scopes) since 2.38, so a repository-local value never
+# runs; nulling the global file closes the only scope the member can write.
+# The box's `git --version` must therefore be 2.38 or later, and
+# packages.tsv installs git unversioned. An empty override is not the answer:
+# `-c uploadpack.packObjectsHook=` is an empty command, and every fetch then
+# dies in "cannot run :".
+# shortcut: nothing enforces that version floor; add the check when
+# install-packages.sh is next changed.
+#
+# The known exec channel the allowlist leaves open. A format defined by
+# tar.<format>.command runs through git-upload-archive, one of the three
+# allowlisted verbs, when the repository also sets tar.<format>.remote=true;
+# user-defined formats are not remote-enabled without it. That is an exec
+# channel for an account with no shell, so dropping upload-archive from the
+# allowlist is what closes it. It stays because the per-member hosting spec
+# names the verb, and changing the allowlist is a spec change, not a fix here.
+#
 # Usage (sshd does this; a human only runs --self-test):
 #   member-git-shell.sh -c "git-receive-pack '/home/<user>/repos/<name>.git'"
 #   member-git-shell.sh --self-test
@@ -150,8 +169,8 @@ run_command() {
 	# own config. /dev/null is not a directory, so no hook is found there.
 	#
 	# GIT_CONFIG_GLOBAL replaces ~/.gitconfig and $XDG_CONFIG_HOME/git/config
-	# with an empty file. Without it a member's uploadpack.packObjectsHook runs
-	# a command on a fetch, which no -c setting in the repository covers.
+	# with an empty file. Without it a packObjectsHook in the member's global
+	# config runs a command on a fetch, which the repository cannot turn off.
 	export GIT_CONFIG_GLOBAL=/dev/null
 	exec "$git" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$verb" "$repo"
 }
