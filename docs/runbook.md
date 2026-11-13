@@ -416,7 +416,7 @@ One case is automatic. `scripts/abuse-monitor.sh` counts the outbound recipients
 
    The command moves the account into the login class that rejects submission through `scripts/lapse-user.sh`, so IMAP keeps working, and it stops the sftp upload and the git push with the same script. It sets the state to suspended, writes the reason where the account page reads it, and sends the suspension notice with the reason and the way to answer it. A second run with the same reason sends no second notice.
 
-   The suspension starts the same forty-day grace as a lapse: the drain sends a final notice seven days before the deletion, naming the reason again, and an unanswered suspension runs the ordinary deletion transition. To lift one, run `doas kyriakon-admin resume <username>`: it restores the three access paths, sets the account active again, and clears the reason and the grace, so the deletion clock stops.
+   The suspension starts the same forty-day grace as a lapse: the drain sends a final notice seven days before the deletion, naming the reason again, and an unanswered suspension runs the ordinary deletion transition. To lift one, run `doas kyriakon-admin resume <username>`: it restores the three access paths, clears the reason and the grace, and sets the account active again. If the payment window has already closed — or the mailbox's group has lapsed, since a group mailbox takes the group's window — it stays lapsed instead and the deletion clock keeps running; record the payment or restore the group first.
 
 3. Check afterwards that submission fails for the account, that IMAP still works, and that the site is down while the certificate is still valid.
 

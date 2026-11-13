@@ -2782,6 +2782,53 @@ fn a_suspension_starts_the_grace_and_resume_clears_it() {
     );
 }
 
+/// Resuming a lapsed account does not hand back full access while its payment
+/// window is still closed: it stays lapsed, no restore runs, and the next pass
+/// leaves it lapsed rather than finding nothing left to do.
+#[test]
+fn resuming_a_lapsed_account_keeps_it_lapsed() {
+    let fix = Fix::new("resume-lapsed");
+    approved_paid(&fix, "secretary", "cash");
+    let mut account = fix.account("secretary");
+    account["payment"]["window"]["closes_at"] = json!("2020-01-01T00:00:00Z");
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+    assert_eq!(fix.account("secretary")["state"], json!("lapsed"));
+
+    let reason = "Published material is outside the acceptable use policy.";
+    let out = fix.ctl(&["suspend", "secretary", "--reason", reason]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.ctl(&["resume", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["state"],
+        json!("lapsed"),
+        "an unpaid account was resumed to active with its window closed: {account}"
+    );
+    assert!(account.get("suspension_reason").is_none(), "{account}");
+    assert!(
+        !fix.scripts_log()
+            .contains("lapse-user.sh --restore secretary"),
+        "access was restored to an account that has not paid: {}",
+        fix.scripts_log()
+    );
+
+    // Neither sweep touches an active account with a closed window, which is
+    // why the resume itself has to keep it lapsed; a pass keeps it there.
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.account("secretary")["state"],
+        json!("lapsed"),
+        "a later pass left the account active with its window closed"
+    );
+}
+
 /// A corrupt account record is reported and skipped, not read as an account
 /// that has gone: the healthy account beside it still lapses on time, and the
 /// failure is mailed once rather than every minute.

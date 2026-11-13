@@ -544,6 +544,12 @@ pub async fn window_sweep(
         let grace = util::date_after_days(40);
         let mut stopped = true;
         for mailbox in &group.accounts {
+            // The account was deleted without pruning the group's list, so the
+            // box has no mailbox to stop. Running the script would fail and
+            // leave the window open forever; skip it and lapse the rest.
+            if !account_on_box(cfg, mailbox)? {
+                continue;
+            }
             if let Err(e) = run_script(cfg, "lapse-user.sh", &[mailbox.as_str()]).await {
                 Error::from(e).report(&format!("stopping access for {mailbox} in {domain}"));
                 stopped = false;
@@ -1176,10 +1182,12 @@ pub async fn suspend(
     Ok(())
 }
 
-/// `kyriakon-admin resume`: the inverse of a suspension. The three access paths come
-/// back through the shared lapse script, the state returns to active, and the
-/// reason and the grace it started are cleared, so a member who answered the
-/// suspension is not deleted on a clock that no longer applies.
+/// `kyriakon-admin resume`: the inverse of a suspension. A member whose payment
+/// is still in order returns to active: the three access paths come back
+/// through the shared lapse script, and the reason and the grace the suspension
+/// started are cleared. A lapsed account stays lapsed rather than regaining
+/// access with its window still closed, so resolving a suspension does not
+/// silently undo the payment lapse.
 pub async fn resume(
     cfg: &DrainConfig,
     store: &Store,
@@ -1210,10 +1218,35 @@ pub async fn resume(
         account.suspension_reason.as_deref(),
     )
     .await?;
-    run_script(cfg, "lapse-user.sh", &["--restore", username]).await?;
-    account.state = "active".to_string();
+    // A group mailbox carries no payment of its own: the group holds it, so a
+    // resume inside a lapsed body restores the mailbox into a window that is
+    // still closed.
+    let lapsed = if let Some(domain) = account.group.as_deref() {
+        group_record(store, domain).await?.is_some_and(|group| {
+            group.payment.paid_until.is_none()
+                && group
+                    .payment
+                    .window
+                    .as_ref()
+                    .is_some_and(|window| window.state == "closed")
+        })
+    } else {
+        account.payment_state().is_some_and(|payment| {
+            payment.paid_until.is_none()
+                && payment
+                    .window
+                    .as_ref()
+                    .is_some_and(|window| window.state == "closed")
+        })
+    };
+    if !lapsed {
+        run_script(cfg, "lapse-user.sh", &["--restore", username]).await?;
+    }
+    account.state = if lapsed { "lapsed" } else { "active" }.to_string();
     account.suspension_reason = None;
-    account.grace_until = None;
+    if !lapsed {
+        account.grace_until = None;
+    }
     let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
         context: "encode the account",
         source,
@@ -1227,7 +1260,7 @@ pub async fn resume(
         "resume",
         &application,
         "applied",
-        None,
+        lapsed.then_some("left lapsed: the payment window is closed"),
     )
     .await?;
     Ok(())
@@ -1456,6 +1489,21 @@ pub async fn close_account(
     }
     account.state = "closing".to_string();
     account.closing_until = Some(util::date_after_days(7));
+    // A closing mailbox leaves its group's list with its closure, so the record
+    // does not keep naming a mailbox the seven-day purge will delete. The lapse
+    // sweep skips a name the box no longer has, but the two records agree here.
+    if let Some(domain) = account.group.clone() {
+        if let Some(mut group) = group_record(store, &domain).await? {
+            if group
+                .accounts
+                .iter()
+                .any(|mailbox| mailbox == &intent.username)
+            {
+                group.accounts.retain(|mailbox| mailbox != &intent.username);
+                write_group_record(store, &group).await?;
+            }
+        }
+    }
     let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
         context: "encode the account",
         source,

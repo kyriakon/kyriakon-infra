@@ -2638,6 +2638,101 @@ fn a_group_lapse_takes_every_mailbox_and_one_conversation_of_notices() {
     assert_eq!(notices.matches("group.lapsed").count(), 1, "{notices}");
 }
 
+/// A group lapse settles even when its account list names a mailbox the box no
+/// longer has: the deleted name is skipped instead of failing the script, and
+/// the remaining mailboxes lapse and the window closes.
+#[test]
+fn a_group_lapse_skips_a_mailbox_the_box_no_longer_has() {
+    let fix = Fix::new("group-lapse-missing-mailbox");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+
+    // The console's delete removes the box account and the store record, but
+    // not the group's list: the sweep has to survive a record that still names
+    // the deleted mailbox.
+    let out = fix.ctl(&["delete", "parish-office"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(!fix.passwd_file().contains("parish-office:"));
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert!(
+        group["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|mailbox| mailbox == "parish-office"),
+        "the fixture has to leave the stale name for the sweep: {group}"
+    );
+
+    let mut group = group;
+    group["payment"]["window"]["closes_at"] = json!(kyriakon_control_core::util::after_days(-10));
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(
+        group["payment"]["window"]["state"],
+        json!("closed"),
+        "the group's window never closed: {group}"
+    );
+    assert_eq!(
+        fix.account("parish-secretary")["state"],
+        json!("lapsed"),
+        "the remaining mailbox still sends"
+    );
+    assert!(
+        !fix.scripts_log().contains("lapse-user.sh parish-office"),
+        "the deleted mailbox was handed to the script: {}",
+        fix.scripts_log()
+    );
+}
+
+/// Closing one mailbox of a group drops its name from the group record, so the
+/// record and the box agree once the seven-day window ends.
+#[test]
+fn closing_a_group_mailbox_drops_it_from_the_group_record() {
+    let fix = Fix::new("group-close-prune");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+
+    fix.file_close("parish-office");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.account("parish-office")["state"], json!("closing"));
+    assert!(
+        fix.passwd_file().contains("parish-office:"),
+        "the box account stays for the seven-day window"
+    );
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(
+        group["accounts"],
+        json!(["parish-secretary"]),
+        "the closing name was left in the group: {group}"
+    );
+}
+
 /// Every group lifecycle notice follows the address the site owner gave outside
 /// the platform, read from the durable account record the ninety-day purge of
 /// the application copy does not touch.
