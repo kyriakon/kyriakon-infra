@@ -183,6 +183,20 @@ pub(crate) fn httpd_post(path: &str, body: &str) -> Vec<u8> {
 /// A form post has no other identity: `REMOTE_USER` is not authenticated on
 /// this hostname, so the helper offers no way to claim one.
 pub(crate) fn httpd_post_with(path: &str, body: &str, cookie: Option<&str>) -> Vec<u8> {
+    httpd_post_from(path, body, Some(OWN_ORIGIN), Some("same-origin"), cookie)
+}
+
+/// The same post from whatever the client states its origin to be. `Some("null")`
+/// is a document with no origin, which is what a sandboxed frame, a `data:`
+/// document and an in-app browser send; `None` is a client that sends no `Origin`
+/// header at all, which is what `curl` does.
+pub(crate) fn httpd_post_from(
+    path: &str,
+    body: &str,
+    origin: Option<&str>,
+    site: Option<&str>,
+    cookie: Option<&str>,
+) -> Vec<u8> {
     let length = body.len().to_string();
     let cookie_header;
     let mut env = vec![
@@ -192,11 +206,15 @@ pub(crate) fn httpd_post_with(path: &str, body: &str, cookie: Option<&str>) -> V
         ("CONTENT_TYPE", "application/x-www-form-urlencoded"),
         ("CONTENT_LENGTH", &length),
         ("HTTP_HOST", "signup.kyriakon.net"),
-        ("HTTP_ORIGIN", OWN_ORIGIN),
-        ("HTTP_SEC_FETCH_SITE", "same-origin"),
         ("REMOTE_ADDR", "127.0.0.1"),
         ("HTTP_X_FORWARDED_FOR", "203.0.113.10"),
     ];
+    if let Some(origin) = origin {
+        env.push(("HTTP_ORIGIN", origin));
+    }
+    if let Some(site) = site {
+        env.push(("HTTP_SEC_FETCH_SITE", site));
+    }
     if let Some(cookie) = cookie {
         cookie_header = format!("{}={cookie}", session::COOKIE);
         env.push(("HTTP_COOKIE", &cookie_header));
