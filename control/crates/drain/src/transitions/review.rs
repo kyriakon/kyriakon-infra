@@ -134,6 +134,13 @@ pub async fn filed_application(
         )));
     }
 
+    // The links are signed from the record the approval will read, and the mail
+    // shows those same values, so a rewrite between the mail and the click no
+    // longer verifies. A record that is not there cannot be reviewed or
+    // approved; failing here leaves the intent and the record for the next pass
+    // rather than sending links that could never be carried out.
+    let record = application_record(store, token).await?;
+
     // One review email per application, not per intent: the journal is the
     // record and it is written before the send, so a crash loses an email
     // rather than sending two.
@@ -165,7 +172,7 @@ pub async fn filed_application(
             intent.application.status_token.as_deref().unwrap_or("")
         ),
     );
-    let body = review_body(cfg, key, &intent)?;
+    let body = review_body(cfg, key, &record)?;
     notice::enqueue(cfg, &cfg.reviewer, &subject, &body).await?;
     // The `review-sent` line was written before the send, which is what keeps a
     // crash from sending twice; only the file is left to settle.
@@ -174,45 +181,46 @@ pub async fn filed_application(
 
 /// The review email's body. Every field the ticket lists, and the three links
 /// beside their `kyriakon-admin` equivalents.
-fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String, Error> {
-    let token =
-        intent.application.status_token.as_deref().ok_or_else(|| {
-            Error::Failed("the application intent names no status token".to_string())
-        })?;
+///
+/// Everything here comes from the record, not the intent, because the links are
+/// signed over the record: the reviewer must see exactly the field values the
+/// signature covers.
+fn review_body(cfg: &DrainConfig, key: &[u8], record: &Record) -> Result<String, Error> {
+    let token = record.status_token.as_str();
     let mut out = String::new();
-    out.push_str(&format!("Application {}\n", intent.application.username));
+    out.push_str(&format!("Application {}\n", record.username));
     out.push_str(&format!(
         "Filed {} by the {} front end\n",
-        intent.filed_at, intent.front_end
+        record.filed_at, record.front_end
     ));
-    out.push_str(&format!("Question list {}\n", intent.question_list));
-    out.push_str(&format!("Rail: {}\n", intent.rail));
+    out.push_str(&format!("Question list {}\n", record.question_list));
+    out.push_str(&format!("Rail: {}\n", record.rail));
     out.push_str(&format!(
         "No charge asked for: {}\n",
-        if intent.no_charge { "yes" } else { "no" }
+        if record.no_charge { "yes" } else { "no" }
     ));
     out.push_str(&format!(
         "Domain: {}\n",
-        intent.domain.as_deref().unwrap_or("none")
+        record.domain.as_deref().unwrap_or("none")
     ));
     out.push_str(&format!(
         "Address outside the platform: {}\n",
-        intent.outside_address.as_deref().unwrap_or("none")
+        record.outside_address.as_deref().unwrap_or("none")
     ));
     out.push_str(&format!(
         "Upload key: {}\n",
-        if intent.upload_key.is_some() {
+        if record.upload_key.is_some() {
             "supplied"
         } else {
             "not supplied"
         }
     ));
 
-    if intent.mail_keys.is_empty() {
+    if record.mail_keys.is_empty() {
         out.push_str("Mail key: none submitted\n");
     } else {
         out.push_str("Mail keys:\n");
-        for k in &intent.mail_keys {
+        for k in &record.mail_keys {
             let mailbox = if k.mailbox.is_empty() {
                 "address"
             } else {
@@ -226,7 +234,7 @@ fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String,
     }
 
     out.push_str("\nAnswers\n");
-    for (id, answer) in &intent.answers {
+    for (id, answer) in &record.answers {
         // A multiline answer keeps its own lines, indented under its id, so a
         // free-text answer reads as the applicant wrote it.
         let mut lines = answer.lines();
@@ -242,7 +250,7 @@ fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String,
     // cuts it before the signature whatever the label does: the fix is to lead
     // with the form that cannot be wrapped, and say so rather than let the link
     // look like the reliable one.
-    let username = &intent.application.username;
+    let username = &record.username;
     out.push_str("\nFrom a terminal\n");
     // The token is part of the command, not decoration: the console signs for
     // the application this token names, so a second application filed under the
@@ -261,7 +269,7 @@ fn review_body(cfg: &DrainConfig, key: &[u8], intent: &Intent) -> Result<String,
         out.push_str(&format!(
             "\n  {}\n  {}\n",
             d.label,
-            sign::decide_link(&cfg.base_url, key, token, d.action)?
+            sign::decide_link(&cfg.base_url, key, record, d.action)?
         ));
     }
     Ok(out)
@@ -321,6 +329,20 @@ async fn approve(
         ));
     }
 
+    // The signature is checked again against the record this approval will act
+    // on, not only against the one `verify` read a moment before. Both halves of
+    // the drain's read are handler-rewritable and the record can change between
+    // them; this is the read whose name and keys are installed.
+    if !sign::verify(
+        key,
+        &sign::decide_payload(&record, &intent.action),
+        &intent.sig,
+    ) {
+        return Err(Error::Failed(
+            "the decision intent's signature does not verify against this record".to_string(),
+        ));
+    }
+
     // A body's accounts are the address table's, not the applicant's: the person
     // path below would make one account for the accountable person and none of
     // the mailboxes. The whole application is one group intent instead.
@@ -333,10 +355,23 @@ async fn approve(
     // half-applied.
     let to = recipient(&record, username)?;
 
-    // Whether this application's own approval already began. A genuine retry has
-    // its own "applying" line; anything else holding this name is not this
-    // application's.
+    // Whether this application's own approval already began, and under which
+    // name. A genuine retry has its own "applying" line; anything else holding
+    // this name is not this application's. The line is root-written from the
+    // signed decision, so the name it carries is the one the account was made
+    // under, and a record rewritten to another name after the review mail cannot
+    // adopt it. The check runs before any gate, so the rewrite cannot reach a
+    // gate the first approval's line would excuse.
     let begun = journal.approval_started(token);
+    if let Some(started) = begun.as_deref() {
+        if started != record.username {
+            return Err(Error::Failed(format!(
+                "this application's approval began for {started}, not {}; the intent is left in place",
+                record.username
+            )));
+        }
+    }
+    let retry = begun.is_some();
     let existing = store.account(username).await?;
 
     // An account record that this application never began is a second
@@ -346,26 +381,24 @@ async fn approve(
     // application's payment state, leaving the account and the ledger
     // disagreeing about what is owed. This is the replay rule for a different
     // reason: the click is recorded and the intent is dropped.
-    if existing.is_some() && !begun {
+    if existing.is_some() && !retry {
         return Ok(Settlement::line("already-member", intent.application.clone(), Some("this username already has an account that this application did not make; nothing was carried out".to_string())));
     }
 
     // The held-back names are checked here, where the account would be made,
     // rather than where the intent is read: only an approval creates an account,
-    // and a decline of a held-back name must still be carried out. Only when the
-    // approval is starting, so a name added to the list after an approval began
-    // does not turn the retry of a half-made account into an intent that can
-    // never finish.
-    if !begun {
-        name_allowed(cfg, username).await?;
-        // A group mailbox that closed leaves the name held for ninety days, and
-        // this is the other gate that can create an account. Without it a person
-        // could take a name a removal had just held.
-        if let Some(until) = name_held(store, username).await? {
-            return Err(Error::Failed(format!(
-                "the username {username} is held until {until}, so it cannot be reused yet"
-            )));
-        }
+    // and a decline of a held-back name must still be carried out. They run on a
+    // retry too: the retry is bound to the journal's name, and a name that
+    // became reserved or held since that line was written is no longer one this
+    // approval may install.
+    name_allowed(cfg, username).await?;
+    // A group mailbox that closed leaves the name held for ninety days, and
+    // this is the other gate that can create an account. Without it a person
+    // could take a name a removal had just held.
+    if let Some(until) = name_held(store, username).await? {
+        return Err(Error::Failed(format!(
+            "the username {username} is held until {until}, so it cannot be reused yet"
+        )));
     }
 
     // The box is the oracle and the record only a fast path. A name already on
@@ -376,11 +409,33 @@ async fn approve(
     let mut on_box = false;
     if existing.is_none() {
         on_box = account_on_box(cfg, username)?;
-        if on_box && !begun {
+        if on_box && !retry {
             return Err(Error::Failed(format!(
                 "the username {username} is already in use on this box and this application did not create it; the intent is left in place"
             )));
         }
+    }
+
+    // The key material is checked again here, before the journal line, because a
+    // signature over whatever the handler wrote still installs a key that is not
+    // a key: a private block, an SSH key or a truncated one would reach the
+    // encryptor's keyring or the member's `authorized_keys`. The form and the
+    // rotation path refuse the same shapes; this is the last path that can
+    // create a mailbox, so it runs the same check rather than trusting the
+    // record's own verdict field. It runs only when something would be
+    // installed: the already-member and name refusals above make no account.
+    for key in &record.mail_keys {
+        let checked = kyriakon_control_core::mail::keycheck::pgp_public_key(&key.material)
+            .map_err(|e| Error::context("the application's mail key", e))?;
+        if let Some(why) = checked.refusal() {
+            return Err(Error::Failed(format!(
+                "the application's mail key cannot be used: {why}"
+            )));
+        }
+    }
+    if let Some(key) = record.upload_key.as_ref() {
+        kyriakon_control_core::mail::keycheck::openssh_public_key(&key.material)
+            .map_err(|e| Error::context("the application's upload key", e))?;
     }
 
     // The confirmation the spec promises goes out before the journal's
@@ -738,7 +793,7 @@ async fn approve_group(
     // application's own approval has its "applying" line, the way the person
     // path's does.
     let existing_group = group_record(store, &domain).await?;
-    if existing_group.is_some() && !journal.approval_started(&record.status_token) {
+    if existing_group.is_some() && journal.approval_started(&record.status_token).is_none() {
         return Err(Error::Failed(format!(
             "the domain {domain} already has a group that this application did not make"
         )));

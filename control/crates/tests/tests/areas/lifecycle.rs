@@ -529,8 +529,7 @@ fn an_approval_email_carries_the_password_link() {
     let fix = Fix::new("password-in-mail");
     let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
     fix.file_application(&record);
-    let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
-    let sig = sign::sign(&key, &sign::decide_payload(TOKEN, "approve-free")).unwrap();
+    let sig = fix.sign_action("approve-free");
     fix.write_decision("provision", "approve-free", &sig, "secretary");
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
@@ -863,10 +862,18 @@ fn a_replayed_approval_changes_nothing() {
     assert!(touching.is_empty(), "changed: {touching:?}");
     // No second decision email.
     assert_eq!(fix.sent().matches("Subject:").count(), sent_after_first);
-    // The journal records that the replay was seen.
-    assert!(
-        fix.journal().contains("already-decided"),
+    // The replay carries the same signature as the first click, so its id is
+    // that signature's and `settle` removes the duplicate without a second
+    // line: one decision, applied once.
+    assert_eq!(
+        fix.journal().matches("\"outcome\":\"applied\"").count(),
+        1,
         "{}",
+        fix.journal()
+    );
+    assert!(
+        !fix.journal().contains("already-decided"),
+        "a duplicate signature was treated as a fresh decision: {}",
         fix.journal()
     );
     assert!(fix.intents().is_empty(), "{:?}", fix.intents());
@@ -1021,11 +1028,7 @@ fn admin_files_a_decision_and_shows_the_application() {
     assert_eq!(intent["action"], json!("approve"));
     let sig = intent["sig"].as_str().unwrap();
     assert!(
-        sign::verify(
-            b"the approval key",
-            &sign::decide_payload(TOKEN, "approve"),
-            sig
-        ),
+        sign::verify(b"the approval key", &fix.decision_payload("approve"), sig),
         "{intent}"
     );
 
@@ -1107,11 +1110,7 @@ fn a_decision_signs_the_application_its_token_names() {
     assert_eq!(intent["action"], json!("approve"));
     let sig = intent["sig"].as_str().unwrap();
     assert!(
-        sign::verify(
-            b"the approval key",
-            &sign::decide_payload(TOKEN, "approve"),
-            sig
-        ),
+        sign::verify(b"the approval key", &fix.decision_payload("approve"), sig),
         "{intent}"
     );
     // The second application is untouched: no decision was recorded on it.
@@ -2775,6 +2774,296 @@ fn a_decision_without_a_good_signature_is_refused() {
     );
     // Both are left in place, not silently dropped.
     assert_eq!(fix.intents().len(), 2, "{:?}", fix.intents());
+}
+
+/// A decision whose intent names an account the signed record does not is
+/// refused: the signature covers the record's name, and the approval installs
+/// only the account the record names.
+#[test]
+fn a_decision_naming_another_account_than_the_record_is_refused() {
+    let fix = Fix::new("decision-other-name");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    let sig = fix.sign_action("approve");
+    fix.write_decision("approve", "approve", &sig, "www");
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/www").exists(),
+        "an intent naming another account provisioned it"
+    );
+    assert!(
+        fix.failed_note()
+            .contains("the intent's username is not the application's"),
+        "{}",
+        fix.failed_note()
+    );
+    assert_eq!(fix.intents().len(), 1, "the decision was dropped, not left");
+}
+
+/// The record's username is in the signed payload, so rewriting it after the
+/// review mail cannot point a signature at another account.
+#[test]
+fn a_record_rewritten_to_another_account_after_signing_is_refused() {
+    let fix = Fix::new("decision-record-name");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    let sig = fix.sign_action("approve");
+    fix.amend_application(TOKEN, |record| {
+        record["username"] = json!("www");
+    });
+    fix.write_decision("approve", "approve", &sig, "www");
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/www").exists(),
+        "a rewritten record installed another account"
+    );
+    assert!(
+        fix.failed_note().contains("signature does not verify"),
+        "{}",
+        fix.failed_note()
+    );
+}
+
+/// The key material is hashed into the signed payload, so a mail or upload key
+/// swapped after the review mail is refused rather than installed.
+#[test]
+fn a_key_swapped_after_signing_is_refused() {
+    let fix = Fix::new("decision-key-swap");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    let sig = fix.sign_action("approve");
+    fix.amend_application(TOKEN, |record| {
+        record["mail_keys"][0]["material"] = json!(
+            "-----BEGIN PGP PUBLIC KEY BLOCK-----\nattacker\n-----END PGP PUBLIC KEY BLOCK-----"
+        );
+    });
+    fix.write_decision("approve", "approve", &sig, "secretary");
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/secretary").exists(),
+        "a swapped key approval made the account"
+    );
+    assert!(
+        !fix.dir.join("keyring/secretary.asc").exists(),
+        "a swapped key reached the keyring"
+    );
+    assert!(
+        fix.failed_note().contains("signature does not verify"),
+        "{}",
+        fix.failed_note()
+    );
+}
+
+/// A mail key the shared check cannot frame is refused at approval rather than
+/// handed to the encryptor, even though the signature covers the material.
+#[test]
+fn an_unframeable_mail_key_is_refused_at_approval() {
+    let fix = Fix::new("decision-bad-key");
+    let mut record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    record["mail_keys"][0]["material"] = json!("not a key");
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    let sig = fix.sign_action("approve");
+    fix.write_decision("approve", "approve", &sig, "secretary");
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/secretary").exists(),
+        "an unframeable key approval made the account"
+    );
+    assert!(
+        !fix.dir.join("keyring/secretary.asc").exists(),
+        "an unframeable key reached the keyring"
+    );
+    assert!(
+        fix.failed_note()
+            .contains("not an armoured PGP public key block"),
+        "{}",
+        fix.failed_note()
+    );
+}
+
+/// A retry is bound to the name the journal's `applying` line recorded. A
+/// record rewritten to another account after an approval began is refused
+/// before any gate the first line would excuse.
+#[test]
+fn a_retry_naming_another_account_than_the_journal_is_refused() {
+    let fix = Fix::new("decision-retry-name");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    // The earlier pass journalled that this application's approval began under
+    // `secretary`, before it could finish.
+    std::fs::write(
+        fix.path("store/journal.jsonl"),
+        format!(
+            "{{\"version\":1,\"at\":\"2026-10-02T09:00:00Z\",\"intent\":\"01H\",\"kind\":\"approve\",\"release\":\"test\",\"application\":{{\"username\":\"secretary\",\"status_token\":\"{TOKEN}\"}},\"outcome\":\"applying\"}}\n"
+        ),
+    )
+    .unwrap();
+    fix.amend_application(TOKEN, |record| {
+        record["username"] = json!("www");
+    });
+    // Signed over the rewritten record, so the signature itself verifies: the
+    // refusal must be the journal's name, not the payload.
+    let sig = fix.sign_action("approve");
+    fix.write_decision("approve", "approve", &sig, "www");
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/www").exists(),
+        "a retry under a rewritten name provisioned that account"
+    );
+    assert!(
+        fix.failed_note()
+            .contains("approval began for secretary, not www"),
+        "{}",
+        fix.failed_note()
+    );
+}
+
+/// Every field the approval acts on is in the signed payload, so rewriting one
+/// after the review mail is refused: a no-charge flip, a rail change, an own
+/// domain, an outside address or an answer.
+#[test]
+fn a_decision_is_refused_when_an_acted_on_field_changes_after_signing() {
+    let cases: &[(&str, fn(&mut Value))] = &[
+        ("no-charge", |record| record["no_charge"] = json!(true)),
+        ("rail", |record| record["rail"] = json!("monero")),
+        ("domain", |record| {
+            record["domain"] = json!("attacker.example")
+        }),
+        ("outside-address", |record| {
+            record["outside_address"] = json!("attacker@example.invalid")
+        }),
+        ("answer", |record| {
+            record["answers"]["intended_use"] = json!("changed")
+        }),
+    ];
+    for (name, amend) in cases {
+        let fix = Fix::new(&format!("decision-field-{name}"));
+        let record = fix.filed(
+            "secretary",
+            "cash",
+            &[("rail", "cash"), ("intended_use", "parish mail")],
+        );
+        fix.file_application(&record);
+        let sig = fix.sign_action("approve");
+        fix.amend_application(TOKEN, |record| amend(record));
+        fix.write_decision("approve", "approve", &sig, "secretary");
+
+        let out = fix.drain();
+        assert!(out.status.success(), "{name}: {}", body(&out));
+        assert!(
+            !fix.dir.join("store/accounts/secretary").exists(),
+            "{name} installed an account"
+        );
+        assert!(
+            fix.failed_note().contains("signature does not verify"),
+            "{name}: {}",
+            fix.failed_note()
+        );
+    }
+}
+
+/// A body's name and mailboxes are answers, so rewriting one after the review
+/// mail is refused like any other answer.
+#[test]
+fn a_group_name_rewritten_after_signing_is_refused() {
+    let fix = Fix::new("decision-group-name");
+    let record = fix.filed_body("warden");
+    fix.file_application(&record);
+    let sig = fix.sign_action("approve");
+    fix.amend_application(TOKEN, |record| {
+        record["answers"]["body_name"] = json!("Another Body");
+    });
+    fix.write_decision("approve", "approve", &sig, "warden");
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/parish-secretary").exists(),
+        "a rewritten body name provisioned its mailboxes"
+    );
+    assert!(
+        fix.failed_note().contains("signature does not verify"),
+        "{}",
+        fix.failed_note()
+    );
+}
+
+/// An upload key swapped after the review mail is refused too: the second
+/// half of acceptance bullet 3, beside the mail-key case.
+#[test]
+fn an_upload_key_swapped_after_signing_is_refused() {
+    let fix = Fix::new("decision-upload-swap");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    let sig = fix.sign_action("approve");
+    fix.amend_application(TOKEN, |record| {
+        record["upload_key"]["material"] =
+            json!("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIattacker attacker@example");
+    });
+    fix.write_decision("approve", "approve", &sig, "secretary");
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/secretary").exists(),
+        "a swapped upload key approval made the account"
+    );
+    assert!(
+        !fix.dir.join("store/keys/secretary.pub").exists(),
+        "a swapped upload key was written"
+    );
+    assert!(
+        fix.failed_note().contains("signature does not verify"),
+        "{}",
+        fix.failed_note()
+    );
+}
+
+/// The reserved-name gate is armed on a retry: a name reserved after the
+/// approval's `applying` line was written is refused rather than skipped.
+#[test]
+fn a_retry_for_a_name_reserved_since_the_line_was_written_is_refused() {
+    let fix = Fix::new("decision-retry-gate");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    std::fs::write(
+        fix.path("store/journal.jsonl"),
+        format!(
+            "{{\"version\":1,\"at\":\"2026-10-02T09:00:00Z\",\"intent\":\"01H\",\"kind\":\"approve\",\"release\":\"test\",\"application\":{{\"username\":\"secretary\",\"status_token\":\"{TOKEN}\"}},\"outcome\":\"applying\"}}\n"
+        ),
+    )
+    .unwrap();
+    fix.reserve("secretary");
+    let sig = fix.sign_action("approve");
+    fix.write_decision("approve", "approve", &sig, "secretary");
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/secretary").exists(),
+        "a retry skipped the reserved-name gate"
+    );
+    assert!(
+        !fix.passwd_file().contains("secretary:"),
+        "a retry skipped the reserved-name gate and made the account: {}",
+        fix.passwd_file()
+    );
+    assert!(
+        fix.failed_note().contains("held back"),
+        "{}",
+        fix.failed_note()
+    );
 }
 
 /// The record the drain rewrites stays readable by the handler: it keeps the

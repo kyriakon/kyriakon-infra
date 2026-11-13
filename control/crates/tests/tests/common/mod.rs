@@ -643,7 +643,9 @@ impl Fix {
             "mail_keys": [{
                 "mailbox": "",
                 "fingerprint": "1111 2222 3333 4444",
-                "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n-----END PGP PUBLIC KEY BLOCK-----",
+                // The approval re-runs the key check before it installs, so the
+                // fixture carries a block the check can frame.
+                "material": GOOD_KEY,
                 "verdict": "works",
             }],
             "upload_key": upload_key,
@@ -717,6 +719,19 @@ impl Fix {
         let mut account = self.account(username);
         amend(&mut account);
         self.write_account(username, &account);
+    }
+
+    /// Change a filed application record in place, as the unprivileged handler
+    /// that owns `applications/` can.
+    pub fn amend_application(&self, token: &str, amend: impl FnOnce(&mut Value)) {
+        let path = self
+            .dir
+            .join("store/applications")
+            .join(format!("{token}.json"));
+        let mut record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        amend(&mut record);
+        std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
     }
 
     /// Write one `provision-group` intent under `id`, as an approval files it.
@@ -1001,10 +1016,26 @@ impl Fix {
         id
     }
 
+    /// The payload a decision signs for this fixture's record, built exactly as
+    /// the console builds it: every field the approval acts on.
+    pub fn decision_payload(&self, action: &str) -> String {
+        let record: Record =
+            serde_json::from_str(&self.read(&format!("applications/{TOKEN}.json"))).unwrap();
+        sign::decide_payload(&record, action)
+    }
+
     /// The signature the drain will accept for an action, from the same key the
-    /// fixture's kyriakon-admin reads.
+    /// fixture's kyriakon-admin reads. An application that was never filed still
+    /// gets a signed intent: the drain refuses it for the missing record before
+    /// it reads the signature, which is what a test of that failure needs.
     pub fn sign_action(&self, action: &str) -> String {
-        sign::sign(b"the approval key", &sign::decide_payload(TOKEN, action)).unwrap()
+        let payload =
+            match serde_json::from_str::<Record>(&self.read(&format!("applications/{TOKEN}.json")))
+            {
+                Ok(record) => sign::decide_payload(&record, action),
+                Err(_) => format!("decide:{TOKEN}:{action}"),
+            };
+        sign::sign(b"the approval key", &payload).unwrap()
     }
 
     /// A provision-member.sh that refuses when the upload key file is not there,

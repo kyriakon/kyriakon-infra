@@ -30,7 +30,7 @@ pub(crate) async fn sign_and_file(
             record.username
         )));
     }
-    let sig = sign::sign(key, &sign::decide_payload(token, decision.action))?;
+    let sig = sign::sign(key, &sign::decide_payload(&record, decision.action))?;
     let id = intent::Intent::Decision(intent::DecisionIntent {
         kind: decision.kind.to_string(),
         application: store::ApplicationRef::application(username.to_string(), token.to_string()),

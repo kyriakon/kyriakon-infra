@@ -84,10 +84,20 @@ pub fn id_for(sig: &str) -> String {
 /// link, a decided application, an identical refund at the same seq), so
 /// binding their id would only merge filings that are genuinely distinct (two
 /// same-amount refunds are two refunds).
+///
+/// The decisions are here because their signature is what binds the account and
+/// the keys they install: two files carrying one signature are one decision,
+/// and a copy under a rewritten id must not be a second attempt at the record.
 pub fn id_is_signed(kind: &str) -> bool {
     matches!(
         kind,
-        "credit" | "window-extend" | "reconcile-attribute" | "reconcile-return"
+        "credit"
+            | "window-extend"
+            | "reconcile-attribute"
+            | "reconcile-return"
+            | "approve"
+            | "provision"
+            | "decline"
     )
 }
 
@@ -106,8 +116,10 @@ pub struct DecisionIntent {
     pub application: ApplicationRef,
     /// `approve`, `approve-free` or `decline`, and it must match the kind.
     pub action: String,
-    /// The HMAC-SHA256 of `decide:<status_token>:<action>` under the approval
-    /// key.
+    /// The HMAC-SHA256 of `sign::decide_payload` under the approval key: the
+    /// token, the action, the account the record names and a digest of the key
+    /// material the approval installs. The record is handler-owned, so the
+    /// signature covers what it would install and not merely the token.
     pub sig: String,
 }
 

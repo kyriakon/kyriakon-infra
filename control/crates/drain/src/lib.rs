@@ -228,9 +228,20 @@ pub async fn verify(
                     intent.action, intent.kind
                 )));
             }
+            // The signature covers the record the approval installs, not only
+            // the token: `applications/<token>.json` belongs to the handler, so
+            // a link over the token alone could be replayed against a rewritten
+            // name or key set. The record is read here and again by the
+            // approval that installs it, which re-checks the signature against
+            // that second read.
+            let Some(record) = store.application(token).await? else {
+                return Err(Error::Failed(
+                    "there is no application for this token".to_string(),
+                ));
+            };
             if !sign::verify(
                 key,
-                &sign::decide_payload(token, &intent.action),
+                &sign::decide_payload(&record, &intent.action),
                 &intent.sig,
             ) {
                 return Err(Error::Failed(

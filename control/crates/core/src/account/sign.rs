@@ -15,6 +15,7 @@
 //! fabricated without the key and that a signature from one application cannot
 //! be replayed against another.
 
+use crate::store::{KeyRecord, Record};
 use crate::Error;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -94,11 +95,73 @@ pub fn verify_bytes(key: &[u8], payload: &[u8], sig: &str) -> bool {
     }
 }
 
-/// The payload a review link signs: the application it decides and the decision
-/// it carries. Both halves are in it, so a link for one application cannot be
-/// replayed against another even if a token were reused.
-pub fn decide_payload(token: &str, action: &str) -> String {
-    format!("decide:{token}:{action}")
+/// The payload a review link signs: every field of the application record the
+/// decision acts on, plus a digest of the key material the approval installs.
+///
+/// The token and the action alone were not enough. The record in
+/// `applications/<token>.json` belongs to the unprivileged handler, and the
+/// approval derives everything it installs from that record at click time. A
+/// signature over the token alone would let a rewrite install an account name,
+/// keys, a free outcome, an own domain or an outside address the reviewer saw
+/// none of: `no_charge` makes a paid application permanently free, `domain`
+/// provisions a body under an unreviewed domain, `outside_address` redirects
+/// the approval mail that carries the signed one-time password link, and
+/// `answers` carries the body's name and its mailboxes. Each is length-
+/// prefixed, and the two large fields — the answers and the key material — are
+/// covered by a digest so the link stays a link.
+pub fn decide_payload(record: &Record, action: &str) -> String {
+    format!(
+        "decide:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        free_text(&record.status_token),
+        free_text(action),
+        free_text(&record.username),
+        record.no_charge,
+        free_text(&record.rail),
+        free_text(record.domain.as_deref().unwrap_or("")),
+        free_text(record.outside_address.as_deref().unwrap_or("")),
+        answers_digest(&record.answers),
+        key_digest(&record.mail_keys, record.upload_key.as_ref()),
+    )
+}
+
+/// A digest of the application's answers. `answers` is a `BTreeMap`, so the
+/// keys are already sorted and two equal maps encode identically; each key and
+/// value is length-prefixed, so an answer that contains a colon or a boundary
+/// marker cannot be read as the start of the next one. A rewritten answer —
+/// including a body's `body_name` — changes the payload.
+fn answers_digest(answers: &std::collections::BTreeMap<String, String>) -> String {
+    let mut canonical = String::new();
+    for (key, value) in answers {
+        canonical.push_str(&free_text(key));
+        canonical.push_str(&free_text(value));
+    }
+    hex(Sha256::digest(canonical.as_bytes()).as_slice())
+}
+
+/// The digest of the key material an approval installs, so one signature covers
+/// the keys as well as the account. Every field is length-prefixed before it is
+/// joined, so no separator inside a mailbox, a fingerprint, a key's material or
+/// its verdict can be read as the boundary before the next field. The signing
+/// and verifying halves both build this from the record, so a key swapped after
+/// the review mail no longer verifies.
+fn key_digest(mail_keys: &[KeyRecord], upload_key: Option<&KeyRecord>) -> String {
+    let field = |key: &KeyRecord| {
+        format!(
+            "{}{}{}{}",
+            free_text(&key.mailbox),
+            free_text(&key.fingerprint),
+            free_text(&key.material),
+            free_text(&key.verdict)
+        )
+    };
+    let mut canonical = String::new();
+    for key in mail_keys {
+        canonical.push_str(&format!("m:{};", field(key)));
+    }
+    if let Some(key) = upload_key {
+        canonical.push_str(&format!("u:{};", field(key)));
+    }
+    hex(Sha256::digest(canonical.as_bytes()).as_slice())
 }
 
 /// The payload the one-time password link signs. The date is in the payload so
@@ -314,9 +377,12 @@ pub fn refund_payload(
 }
 
 /// One decision link, pointing at the handler's click-through path.
-pub fn decide_link(base: &str, key: &[u8], token: &str, action: &str) -> Result<String, Error> {
-    let sig = sign(key, &decide_payload(token, action))?;
-    Ok(format!("{base}/decide/{token}?action={action}&sig={sig}"))
+pub fn decide_link(base: &str, key: &[u8], record: &Record, action: &str) -> Result<String, Error> {
+    let sig = sign(key, &decide_payload(record, action))?;
+    Ok(format!(
+        "{base}/decide/{}?action={action}&sig={sig}",
+        record.status_token
+    ))
 }
 
 /// The one-time password link, the same mechanism as the review links.
@@ -370,20 +436,97 @@ mod tests {
         assert_ne!(a, sign(b"k", "decide:tok:decline").unwrap());
     }
 
+    fn key_record(mailbox: &str, fingerprint: &str, material: &str) -> KeyRecord {
+        KeyRecord {
+            mailbox: mailbox.to_string(),
+            fingerprint: fingerprint.to_string(),
+            material: material.to_string(),
+            verdict: "works".to_string(),
+        }
+    }
+
+    fn record(mail: Vec<KeyRecord>, upload: Option<KeyRecord>) -> Record {
+        serde_json::from_value(serde_json::json!({
+            "username": "secretary",
+            "status_token": "0123456789abcdefghjkmnpqrs",
+            "filed_at": "2026-10-01T09:00:00Z",
+            "front_end": "web",
+            "stage": "received",
+            "domain": null,
+            "outside_address": null,
+            "answers": {"intended_use": "parish mail"},
+            "mail_keys": mail,
+            "upload_key": upload,
+            "rail": "cash",
+            "no_charge": false,
+            "acceptances": [],
+            "question_list": "2026-10-01 abc1234"
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn a_signature_verifies_only_for_its_own_payload() {
         let key = b"the approval key";
-        let payload = decide_payload("tok", "approve");
+        let filed = record(vec![key_record("", "1111", "mail material")], None);
+        let payload = decide_payload(&filed, "approve");
         let sig = sign(key, &payload).unwrap();
         assert!(verify(key, &payload, &sig));
         // A signature for one application does not verify against another, so a
         // link cannot be replayed across applications.
-        assert!(!verify(key, &decide_payload("tok2", "approve"), &sig));
-        assert!(!verify(key, &decide_payload("tok", "decline"), &sig));
+        let mut other = filed.clone();
+        other.status_token = "fedcba98765432100123456789".to_string();
+        assert!(!verify(key, &decide_payload(&other, "approve"), &sig));
+        assert!(!verify(key, &decide_payload(&filed, "decline"), &sig));
         assert!(!verify(b"other key", &payload, &sig));
         // A truncated or padded signature is refused rather than panicking.
         assert!(!verify(key, &payload, ""));
         assert!(!verify(key, &payload, &format!("{sig}0")));
+    }
+
+    /// Every field the approval acts on is signed, so a record rewritten after
+    /// the review mail installs none of a different account, outcome, rail,
+    /// domain, outside address, answer or key.
+    #[test]
+    fn a_decision_link_is_bound_to_every_field_it_installs() {
+        let key = b"k";
+        let filed = record(vec![key_record("", "1111", "mail material")], None);
+        let sig = sign(key, &decide_payload(&filed, "approve")).unwrap();
+        let refused = |changed: &Record| {
+            assert!(
+                !verify(key, &decide_payload(changed, "approve"), &sig),
+                "a rewritten record verified"
+            );
+        };
+        let mut changed = filed.clone();
+        changed.username = "victim".to_string();
+        refused(&changed);
+        let mut changed = filed.clone();
+        changed.no_charge = true;
+        refused(&changed);
+        let mut changed = filed.clone();
+        changed.rail = "monero".to_string();
+        refused(&changed);
+        let mut changed = filed.clone();
+        changed.domain = Some("attacker.example".to_string());
+        refused(&changed);
+        let mut changed = filed.clone();
+        changed.outside_address = Some("attacker@example.invalid".to_string());
+        refused(&changed);
+        let mut changed = filed.clone();
+        changed
+            .answers
+            .insert("intended_use".to_string(), "changed".to_string());
+        refused(&changed);
+        let mut changed = filed.clone();
+        changed.mail_keys[0].material = "attacker material".to_string();
+        refused(&changed);
+        let mut changed = filed.clone();
+        changed.mail_keys.clear();
+        refused(&changed);
+        let mut changed = filed.clone();
+        changed.upload_key = Some(key_record("", "2222", "ssh-ed25519 AAAA"));
+        refused(&changed);
     }
 
     #[test]
@@ -467,12 +610,14 @@ mod tests {
     #[test]
     fn the_links_put_the_token_in_the_path_and_the_signature_in_the_query() {
         let key = b"k";
-        let link = decide_link("https://signup.kyriakon.net", key, "tok", "approve-free").unwrap();
+        let filed = record(vec![key_record("", "1111", "mail material")], None);
+        let link = decide_link("https://signup.kyriakon.net", key, &filed, "approve-free").unwrap();
         assert_eq!(
             link,
             format!(
-                "https://signup.kyriakon.net/decide/tok?action=approve-free&sig={}",
-                sign(key, "decide:tok:approve-free").unwrap()
+                "https://signup.kyriakon.net/decide/{}?action=approve-free&sig={}",
+                filed.status_token,
+                sign(key, &decide_payload(&filed, "approve-free")).unwrap()
             )
         );
         let pw = password_link(
