@@ -393,6 +393,22 @@ A member who has lost the private key and the phrase cannot read what is stored 
 
 Decide how the member proves the account is theirs before you set that password, and record the decision on the account. Where the member gave no address outside the platform, the notice that a new key is in place can only reach them in the mailbox the new key opens, so tell them by whatever channel they used to ask.
 
+## A member who has forgotten their mail password
+
+Every mailbox gets a one-time link in the approval mail that made it, and the link lasts seven days. Once it has been used, has expired, or was never received, issue a fresh one from the console. A member who still knows the password changes it on the account page; the console is the path when they do not.
+
+1. Confirm the member is asking, and record how they did, the same way a data request is recorded. The link is a credential for the mailbox, so do not issue one on an unverified request.
+
+2. Issue the link.
+
+		doas kyriakon-admin password reset <username>
+
+   The command refuses a name with no account, so a typo mints nothing. When the account carries a valid address outside the platform, the link is mailed there and the send is written to the account's `notices.jsonl`. Otherwise the command prints the link for you to pass on over a channel that reaches the member. Either way the new link replaces any link already on the account, so an earlier one stops working as soon as this runs.
+
+3. The member opens the link on `/password/...` and sets the password. The drain hashes it and applies it within a minute, and the link stops working when it does. If the member cannot use the link, run the command again for a fresh one; there is no other expiry to wait out.
+
+The link is signed for one mailbox and one purpose, so a link for one address cannot set another's password. The account record at `accounts/<username>/account.json` holds the token and its last day under `password_link`; it is cleared when the link is used.
+
 ## A lifecycle notice that bounces
 
 The lifecycle notices go to the member's platform address and to every other address on the account. The drain records each send. A hard bounce at the platform address means the mailbox cannot receive, which is one of the things a notice may be about. A hard bounce at the only address we hold means no channel reached the member, and the grace clock stops until a channel works. Decided in #153.

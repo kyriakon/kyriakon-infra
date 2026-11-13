@@ -1158,6 +1158,14 @@ fn a_mailbox_added_to_a_group_gets_an_account_key_and_entry() {
         .expect("the mailbox's key is on the box");
     assert!(key.contains("BEGIN PGP PUBLIC KEY BLOCK"), "{key}");
     assert_eq!(fix.account("parish-office")["group"], "parish.example");
+    // The new mailbox carries a one-time password link of its own, delivered
+    // with `kyriakon-admin password reset` if this address intent did not carry
+    // it to the member.
+    assert!(
+        fix.account("parish-office")["password_link"]["token"].is_string(),
+        "{}",
+        fix.account("parish-office")
+    );
     // The intent carried a fingerprint the signature does not cover, so the
     // record must show the one computed from the material.
     let computed = kyriakon_control_core::mail::keycheck::pgp_fingerprint(GOOD_KEY).unwrap();
@@ -1292,6 +1300,11 @@ fn upgrading_an_alias_repoints_it_without_changing_the_count() {
     );
     assert!(fix.passwd_file().contains("parish-office:"));
     assert!(fix.dir.join("keyring/parish-office.asc").exists());
+    assert!(
+        fix.account("parish-office")["password_link"]["token"].is_string(),
+        "{}",
+        fix.account("parish-office")
+    );
     // The sender identity follows the route: the upgraded address submits as
     // its new mailbox, not the shared one, and the new mailbox had no line
     // before this pass.

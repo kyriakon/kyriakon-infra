@@ -353,6 +353,39 @@ impl Store {
         Ok(None)
     }
 
+    /// The account whose one-time password link carries this token, or `None`
+    /// when no account does. A link's token is a path component the handler
+    /// reads, and the account record is the one place the link's state lives, so
+    /// this is the handler's lookup for a link a group approval or a reset
+    /// issued. A damaged record is skipped for the same reason the certificate
+    /// walk skips it: the page answers as an unknown token rather than as an
+    /// error a probe can read.
+    pub async fn account_for_password_token(&self, token: &str) -> Result<Option<Account>, Error> {
+        // The link's token is 26 lowercase Crockford characters, the same shape
+        // as a status token. A probe of another shape is refused before any
+        // record is read.
+        let well_formed = token.len() == 26
+            && token
+                .bytes()
+                .all(|b| b"0123456789abcdefghjkmnpqrstvwxyz".contains(&b));
+        if !well_formed {
+            return Ok(None);
+        }
+        for username in self.list("accounts").await? {
+            let Some(account) = self.account(&username).await? else {
+                continue;
+            };
+            if account
+                .password_link
+                .as_ref()
+                .is_some_and(|link| link.token == token)
+            {
+                return Ok(Some(account));
+            }
+        }
+        Ok(None)
+    }
+
     /// The names in one directory, sorted. A missing directory reads as empty,
     /// which is what a first run against a fresh store is: no intents, no
     /// journal, no notices, and none of those is an error to a reader.
@@ -1341,6 +1374,14 @@ pub struct Account {
     /// member can read it and answer it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suspension_reason: Option<String>,
+    /// The one-time link that sets this mailbox's mail password, and the day it
+    /// stops working. Written for every mailbox an approval or an address change
+    /// makes, and again by an operator reset; cleared when the link is used, so
+    /// the state is the link's own and not the application's. The record is the
+    /// authority even when the application record still carries the link for the
+    /// status page to render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_link: Option<PasswordLink>,
     /// The domain of the group this account belongs to, for a mailbox the
     /// own-domain tier made. The group holds the payment state, so an account
     /// with this set carries no payment block of its own. `None` for a person's
@@ -1367,6 +1408,16 @@ pub struct Account {
 pub struct UploadKey {
     pub fingerprint: String,
     pub added_at: String,
+}
+
+/// A one-time password link's state: the token in the URL and the last day the
+/// signature is accepted. No signature is stored, because the link is rebuilt
+/// from these two fields and the key when it is mailed, and the drain verifies
+/// the submitted signature against them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PasswordLink {
+    pub token: String,
+    pub until: String,
 }
 
 /// A mail-key replacement waiting out its window. The material is a public key

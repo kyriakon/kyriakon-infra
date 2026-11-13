@@ -24,7 +24,8 @@ use kyriakon_control_core::payments::ledger::{Ledger, LedgerLine};
 use kyriakon_control_core::store::journal::Journal;
 use kyriakon_control_core::store::{
     self, Account, ApplicationRef, FlatPayment, GroupAddress, GroupAddressIntent, GroupIntent,
-    GroupPayment, GroupRecord, GroupRemoveIntent, KeyRecord, Record, Store, TokenRecord, Window,
+    GroupPayment, GroupRecord, GroupRemoveIntent, KeyRecord, PasswordLink, Record, Store,
+    TokenRecord, Window,
 };
 use kyriakon_control_core::util;
 use serde_json::json;
@@ -589,6 +590,15 @@ async fn write_group_account(
 ) -> Result<(), Error> {
     let existing = store.account(mailbox).await?;
     let now = util::filed_at();
+    // A new mailbox gets its own one-time link; a retry keeps the token the
+    // first pass wrote, because the mail that carries it may already have left.
+    let password_link = match existing.as_ref().and_then(|a| a.password_link.clone()) {
+        Some(link) => link,
+        None => PasswordLink {
+            token: store::status_token().await?,
+            until: util::date_after_days(7),
+        },
+    };
     let account = Account {
         version: 1,
         username: mailbox.to_string(),
@@ -625,6 +635,7 @@ async fn write_group_account(
             .or_else(|| existing.as_ref().and_then(|a| a.mail_key.clone())),
         rotation: existing.as_ref().and_then(|a| a.rotation.clone()),
         suspension_reason: None,
+        password_link: Some(password_link),
         group: Some(domain.to_string()),
         closing_until: None,
         grace_until: None,

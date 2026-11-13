@@ -93,6 +93,7 @@ fn a_password_link_applies_once_and_only_when_signed() {
     let until = kyriakon_control_core::util::date_after_days(7);
 
     let mut record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.page_account("secretary", json!({}));
     record["password_link"] = json!(format!(
         "https://signup.example.invalid/password/{TOKEN}?until={until}&sig=x"
     ));
@@ -200,6 +201,7 @@ fn a_password_link_cannot_be_pointed_at_another_account() {
     let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
     let until = kyriakon_control_core::util::date_after_days(7);
     let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.page_account("secretary", json!({}));
     // The link and signature the drain issued for the filed account.
     let username = record["username"].as_str().unwrap();
     let link = sign::password_link(
@@ -289,6 +291,7 @@ fn a_password_intent_carrying_a_hash_is_refused() {
     let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
     let until = kyriakon_control_core::util::date_after_days(7);
     let mut record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.page_account("secretary", json!({}));
     record["password_link"] = json!(format!(
         "https://signup.example.invalid/password/{TOKEN}?until={until}&sig=x"
     ));
@@ -446,6 +449,252 @@ fn an_approval_email_carries_the_password_link() {
     assert!(sent.contains("works once"), "{sent}");
 }
 
+/// The token, date and signature a `/password/...` link carries, in the shape
+/// the drain verifies when the page files it.
+fn password_link_parts(link: &str) -> (String, String, String) {
+    let token = link
+        .split("/password/")
+        .nth(1)
+        .expect("a password link")
+        .split('?')
+        .next()
+        .expect("a token")
+        .to_string();
+    let query = link.split_once('?').expect("the link's query").1;
+    let field = |name: &str| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(name))
+            .expect("the link's field")
+            .to_string()
+    };
+    (token, field("until="), field("sig="))
+}
+
+/// The `set-password` intent the password page files for one link.
+fn file_password_link(fix: &Fix, id: &str, mailbox: &str, link: &str, password: &str) {
+    let (token, until, sig) = password_link_parts(link);
+    fix.write_intent(
+        id,
+        &json!({
+            "id": id,
+            "kind": "set-password",
+            "filed_at": "2026-10-21T09:00:00Z",
+            "application": {"username": mailbox, "status_token": token},
+            "until": until,
+            "sig": sig,
+            "password": password,
+        }),
+    );
+}
+
+/// A body's approval writes a one-time link onto every mailbox it makes and
+/// mails one link per mailbox. Each link sets its own mailbox's password and
+/// then stops working.
+#[test]
+fn a_group_approval_issues_a_working_password_link_for_every_mailbox() {
+    let fix = Fix::new("group-password-links");
+    let log = fix.path("password.log");
+    fix.script(
+        "set-mail-password.sh",
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n"),
+    );
+
+    let mut record = fix.filed_body("warden");
+    record["outside_address"] = json!("warden@example.invalid");
+    record["answers"]["body_addresses"] = json!("secretary: own\noffice: own");
+    record["answers"]["body_account_names"] = json!("parish-secretary\nparish-office");
+    record["mail_keys"] = json!([
+        {
+            "mailbox": "parish-secretary",
+            "fingerprint": "1111 2222 3333 4444",
+            "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n-----END PGP PUBLIC KEY BLOCK-----",
+            "verdict": "works",
+        },
+        {
+            "mailbox": "parish-office",
+            "fingerprint": "5555 6666 7777 8888",
+            "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nyy\n-----END PGP PUBLIC KEY BLOCK-----",
+            "verdict": "works",
+        },
+    ]);
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    for mailbox in ["parish-secretary", "parish-office"] {
+        let account = stored_account(&fix, mailbox);
+        assert!(
+            account.password_link.is_some(),
+            "{mailbox} has no password link: {account:?}"
+        );
+    }
+
+    let sent = fix.sent();
+    let links: Vec<(String, String)> = sent
+        .lines()
+        .filter_map(|line| {
+            let (mailbox, rest) = line.split_once(": https://")?;
+            let link = format!("https://{rest}");
+            link.contains("/password/")
+                .then(|| (mailbox.to_string(), link))
+        })
+        .collect();
+    assert_eq!(links.len(), 2, "{sent}");
+    assert!(
+        links
+            .iter()
+            .any(|(mailbox, _)| mailbox == "parish-secretary"),
+        "{sent}"
+    );
+    assert!(
+        links.iter().any(|(mailbox, _)| mailbox == "parish-office"),
+        "{sent}"
+    );
+
+    for (i, (mailbox, link)) in links.iter().enumerate() {
+        file_password_link(
+            &fix,
+            &format!("mail-password-{i}"),
+            mailbox,
+            link,
+            "correct horse battery",
+        );
+    }
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let written = std::fs::read_to_string(&log).unwrap_or_default();
+    for mailbox in ["parish-secretary", "parish-office"] {
+        assert!(
+            written
+                .lines()
+                .any(|line| line.starts_with(&format!("{mailbox} "))),
+            "{mailbox}'s link did not set its password: {written}"
+        );
+        assert!(
+            stored_account(&fix, mailbox).password_link.is_none(),
+            "{mailbox}'s link was not spent"
+        );
+    }
+}
+
+/// `kyriakon-admin password reset` mails a fresh link to a valid address
+/// outside the platform, replaces the link it supersedes, and refuses a name
+/// with no account. The old link is refused, the new one applies once, and a
+/// replay is refused.
+#[test]
+fn the_console_issues_a_fresh_password_link_and_refuses_an_unknown_name() {
+    let fix = Fix::new("password-reset");
+    let log = fix.path("password.log");
+    fix.script(
+        "set-mail-password.sh",
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n"),
+    );
+
+    let record = fix.filed_with(
+        "secretary",
+        "cash",
+        &[("rail", "cash")],
+        Some("secretary@example.invalid"),
+        Some((UPLOAD_KEY, "works")),
+    );
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let initial = fix
+        .sent()
+        .lines()
+        .find(|line| line.contains("/password/"))
+        .expect("the approval mail carries its link")
+        .to_string();
+    let first = stored_account(&fix, "secretary")
+        .password_link
+        .expect("the approval wrote a link")
+        .token;
+
+    let out = fix.ctl(&["password", "reset", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        body(&out).contains("mailed a password link for secretary"),
+        "{}",
+        body(&out)
+    );
+    let sent = fix.sent();
+    let reset = sent
+        .lines()
+        .rev()
+        .find(|line| line.contains("/password/"))
+        .expect("the reset mail carries its link")
+        .to_string();
+    let second = stored_account(&fix, "secretary")
+        .password_link
+        .expect("the reset wrote a link")
+        .token;
+    assert_ne!(first, second, "the reset reused the old token");
+    assert!(reset.contains(&second), "{reset}");
+
+    // The link the approval mailed is refused once a reset replaced it.
+    file_password_link(
+        &fix,
+        "old-password-link",
+        "secretary",
+        &initial,
+        "correct horse battery",
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.journal().contains("the link has already been used"),
+        "{}",
+        fix.journal()
+    );
+    assert!(
+        !std::path::Path::new(&log).exists(),
+        "the replaced link ran the script"
+    );
+
+    // The reset link sets the password, and a replay of it is refused.
+    file_password_link(
+        &fix,
+        "reset-password-link",
+        "secretary",
+        &reset,
+        "correct horse battery",
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let written = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(written.starts_with("secretary "), "{written}");
+    assert!(stored_account(&fix, "secretary").password_link.is_none());
+
+    file_password_link(
+        &fix,
+        "reset-password-replay",
+        "secretary",
+        &reset,
+        "correct horse battery",
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let written = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(written.lines().count(), 1, "{written}");
+
+    // A name with no account mints nothing.
+    let out = fix.ctl(&["password", "reset", "nobody"]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(
+        body(&out).contains("no account for nobody"),
+        "{}",
+        body(&out)
+    );
+}
+
 /// After a failed pass and its backoff, the next pass applies the intent: a
 /// failed journal line is the reason to retry, not a settlement.
 #[test]
@@ -459,6 +708,7 @@ fn a_failed_password_pass_is_retried_after_the_backoff() {
     let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
     let until = kyriakon_control_core::util::date_after_days(7);
     let mut record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.page_account("secretary", json!({}));
     record["password_link"] = json!("https://signup.example.invalid/password/x");
     std::fs::write(
         fix.path(&format!("store/applications/{TOKEN}.json")),

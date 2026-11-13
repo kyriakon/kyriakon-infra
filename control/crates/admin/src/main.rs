@@ -17,6 +17,7 @@
 //!   kyriakon-admin [--config PATH] approve-free <username> <token>
 //!   kyriakon-admin [--config PATH] decline <username> <token>
 //!   kyriakon-admin [--config PATH] delete <username>
+//!   kyriakon-admin [--config PATH] password reset <username>
 //!   kyriakon-admin [--config PATH] address --domain <domain> --action <change> \
 //!       --mailbox <account> [--address <localpart>] [--key-file <path>] \
 //!       [--site-owner <account>]
@@ -87,7 +88,7 @@ mod group;
 mod payments;
 mod requests;
 
-use account::{delete, free, resume, show, suspend};
+use account::{delete, free, password, resume, show, suspend};
 use address::address;
 use decisions::sign_and_file;
 use group::group;
@@ -149,6 +150,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), Error> {
         "ledger" => ledger(&store, &rest[1..]).await,
         "export" => export(&cfg, &store, &rest[1..]).await,
         "show" => show(&store, one_username(rest)?).await,
+        "password" => password(&cfg, &store, &rest[1..]).await,
         "suspend" => suspend(&cfg, &store, &rest[1..]).await,
         "resume" => resume(&cfg, &store, rest).await,
         "delete" => delete(&cfg, &store, rest).await,
@@ -179,6 +181,7 @@ fn usage() -> String {
     "usage: kyriakon-admin [--config PATH] \
      approve|approve-free|decline <username> <token>
        kyriakon-admin delete|show <username>
+       kyriakon-admin password reset <username>
        kyriakon-admin suspend <username> --reason <text>
        kyriakon-admin resume <username>
        kyriakon-admin free
