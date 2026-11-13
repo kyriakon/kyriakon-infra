@@ -136,9 +136,16 @@ pub fn usernames(value: &str, reserved: &HashSet<String>) -> Option<String> {
 }
 
 /// A dotted hostname: lowercase letters, digits and hyphens, each label at most
-/// 63 characters and not beginning or ending with a hyphen, at least two labels.
-/// This value is the group key the drain writes under and the DNS and
-/// certificate material, so a traversal or a space must not reach it.
+/// 63 characters and not beginning or ending with a hyphen, at least two labels,
+/// and a last label that is two or more letters. This value is the group key the
+/// drain writes under and the DNS and certificate material, so a traversal or a
+/// space must not reach it.
+///
+/// The last-label rule is `scripts/lib.sh`'s `dkim_domains_args`, which renders
+/// every line of `/etc/mail/dkim_domains` into smtpd's filter arguments. The
+/// drain writes this rule's answers into that table, so the two must accept the
+/// same names: a name accepted here and refused there fails the render and every
+/// later transition that reloads smtpd.
 pub fn domain(value: &str) -> Option<String> {
     if value.len() > 253 {
         return Some("a domain is at most 253 characters".to_string());
@@ -164,8 +171,18 @@ pub fn domain(value: &str) -> Option<String> {
             ));
         }
     }
-    (value.split('.').count() < 2)
-        .then(|| "a domain has at least two labels, like theirparish.example".to_string())
+    if value.split('.').count() < 2 {
+        return Some("a domain has at least two labels, like theirparish.example".to_string());
+    }
+    // A numeric or hyphenated top-level label is a real DNS name but not a
+    // registrable domain, and the DKIM list will not take it.
+    let tld = value.rsplit('.').next().unwrap_or_default();
+    if tld.len() < 2 || !tld.bytes().all(|b| b.is_ascii_lowercase()) {
+        return Some(format!(
+            "the domain's last label {tld:?} must be two or more letters, like theirparish.example"
+        ));
+    }
+    None
 }
 
 /// The localpart of an own-domain address, the key written before `@` in the
@@ -479,6 +496,27 @@ mod tests {
         assert!(domain(&long).unwrap().contains("at most 63"));
         // The traversal a group key must never take.
         assert!(domain("../../../etc/cron.d/evil").is_some());
+    }
+
+    #[test]
+    fn the_last_label_is_the_tld_the_smtpd_render_accepts() {
+        // scripts/lib.sh's dkim_domains_args takes `(label.)+[A-Za-z]{2,}` and
+        // is what renders /etc/mail/dkim_domains into smtpd's filter arguments.
+        // scripts/deploy-mail.sh --self-test feeds this same list to it; a name
+        // accepted here and refused there wedges every later smtpd reload.
+        for good in [
+            "theirparish.example",
+            "sub.parish.example",
+            "parish-12.example",
+            "a.bb",
+            "parish.example",
+        ] {
+            assert!(domain(good).is_none(), "{good}: {:?}", domain(good));
+        }
+        for bad in ["parish.12", "parish.ab-c", "parish.ex4mple", "parish.x"] {
+            let why = domain(bad).unwrap_or_default();
+            assert!(why.contains("last label"), "{bad}: {why}");
+        }
     }
 
     #[test]

@@ -136,17 +136,32 @@ self_test() {
 	check "and the reload still restarts once" \
 		"$(wc -l <"$calls" | tr -d ' ')" 2
 
-	# A list that cannot be expanded is refused before the daemon is touched: a
-	# restart here would leave the body's domain unsigned while reporting a
-	# reload.
+	# A line the renderer refuses can be in the table from before the intake was
+	# tightened. It is skipped with a warning naming it, so the rest of the table
+	# still renders and the daemon still restarts: one old record must not stop
+	# every body's mail being signed after the fix.
 	: >"$calls"
-	printf 'kyriakon.net\nnot a domain\n' > "$dkim_domains"
+	printf 'kyriakon.net\nparish.12\n' > "$dkim_domains"
+	reload_smtpd >"$tree/badline.out" 2>&1
+	check "a line the renderer refuses does not block the reload" \
+		"$(wc -l <"$calls" | tr -d ' ')" 1
+	check "and the good domain is in the rendered filter" \
+		"$(grep -c -- '-d kyriakon.net' "$smtpd_conf")" 1
+	check "and the refused domain is not" \
+		"$(grep -c 'parish.12' "$smtpd_conf" || true)" 0
+	check "and the warning names it" \
+		"$(grep -c 'not signed: parish.12' "$tree/badline.out")" 1
+
+	# A list with nothing acceptable is still refused before the daemon is
+	# touched: there is no filter to render.
+	: >"$calls"
+	printf 'not a domain\n' > "$dkim_domains"
 	if reload_smtpd >"$tree/badlist.out" 2>&1; then
 		code=0
 	else
 		code=$?
 	fi
-	check "a bad domain list is refused" "$code" 1
+	check "a list with no acceptable domain is refused" "$code" 1
 	check "and the daemon is not restarted" \
 		"$(wc -l <"$calls" | tr -d ' ')" 0
 	check "and the refusal says what could not be expanded" \

@@ -834,13 +834,26 @@ table_map_add() {
 # line is validated here rather than left to smtpd: the list is spliced into a
 # command string, so a stray line would reach the configuration as part of that
 # string, and smtpd's complaint would name the config file rather than the list.
+#
+# A line outside the shape is skipped with a warning naming it, not refused: the
+# table outlives the rule that filled it, so a body approved before the intake
+# was tightened, or a hand edit, must not stop every body's mail being signed.
+# The skipped domain is absent from the filter, which the warning says.
+#
+# The shape is the intake rule: control/crates/core/src/flow/validate.rs's
+# domain() is stricter, and everything it accepts this regex accepts. The
+# guarantee runs that way only: this accepts uppercase and unbounded labels,
+# which the form never produces.
 dkim_domains_args() {
-	dk_args=
+	typeset dk_args='' dk_domain
 	while IFS= read -r dk_domain; do
 		[ -n "$dk_domain" ] || continue
-		printf '%s\n' "$dk_domain" \
-			| grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$' \
-			|| { printf '%s holds a line that is not a domain: %s\n' "$1" "$dk_domain" >&2; return 1; }
+		if ! printf '%s\n' "$dk_domain" \
+			| grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$'; then
+			printf 'warning: %s holds a line that is not a domain, so it is not signed: %s\n' \
+				"$1" "$dk_domain" >&2
+			continue
+		fi
 		dk_args="$dk_args -d $dk_domain"
 	done < "$1"
 	[ -n "$dk_args" ] || { printf '%s holds no domains\n' "$1" >&2; return 1; }
