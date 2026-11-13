@@ -44,16 +44,22 @@ use time::OffsetDateTime;
 /// it was sent.
 ///
 /// With no outside address there is no mailbox that can receive one before the
-/// account exists. The acceptances stay on the application record, which is what
-/// the confirmation quotes; the status page carries the decision and the
-/// password link, not this letter.
+/// account exists, so this function returns without sending. The approval mail
+/// to the mailbox the approval creates carries the same [`confirmation_body`],
+/// which is how the durable-medium confirmation reaches an applicant who gave
+/// no other address. The acceptances stay on the application record either way,
+/// and the status page carries the decision and the password link, not this
+/// letter.
 async fn confirm(
     cfg: &DrainConfig,
     store: &Store,
     token: &str,
     record: &Record,
+    no_charge: bool,
 ) -> Result<(), Error> {
     let Some(to) = outside_address(record)? else {
+        // Nothing to send yet: the mailbox does not exist. `approval_body` puts
+        // this letter on the approval mail that reaches the new mailbox.
         return Ok(());
     };
     // The stamp is a read-check-write of a record replaced by rename, so the
@@ -67,7 +73,7 @@ async fn confirm(
         return Ok(());
     }
     let subject = confirmation_subject(&live.username);
-    let body = confirmation_body(&live);
+    let body = confirmation_body(cfg, &live, no_charge);
     live.confirmation_at = Some(util::filed_at());
     save_application(store, token, &live).await?;
     if let Err(e) = notice::enqueue(cfg, &to, &subject, &body).await {
@@ -375,7 +381,7 @@ async fn approve(
     // The confirmation the spec promises goes out before the journal's
     // "applying" line and before any provisioning, so the record of what was
     // agreed exists before the service begins.
-    confirm(cfg, store, token, &record).await?;
+    confirm(cfg, store, token, &record, no_charge).await?;
 
     write_journal(
         store,
@@ -616,8 +622,10 @@ async fn approve(
     // the status page both.
     let password_until = util::date_after_days(7);
     let password_link = sign::password_link(&cfg.base_url, key, token, &password_until)?;
-    let body = format!(
-        "{}\n\nSet your mail password from this one-time link, which works until {password_until}:\n\n{password_link}\n\nIt works once. The same link is on your status page.\n",
+    let body = approval_body(
+        cfg,
+        &record,
+        no_charge,
         decision_body(
             cfg,
             &record.username,
@@ -626,14 +634,17 @@ async fn approve(
             token_ref.as_deref(),
             &window,
             account.payment.as_ref().and_then(|p| p.monero.as_ref()),
-        )?
+        )?,
+        &password_until,
+        &password_link,
     );
     let notice_type = if no_charge {
         "approval.free"
     } else {
         "approval.paid"
     };
-    notice::send_account_notice(cfg, store, username, notice_type, &subject, &to, &body).await?;
+    notice::send_account_notice_retryable(cfg, store, username, notice_type, &subject, &to, &body)
+        .await?;
 
     // The decision is recorded last, so a crash anywhere above leaves the
     // application undecided and rerunnable.
@@ -718,7 +729,7 @@ async fn approve_group(
     // The confirmation is the applicant's and goes before the body's accounts
     // exist, as it does on the person path. Every refusal above has already run,
     // so a refused application still sends nothing.
-    confirm(cfg, store, &record.status_token, record).await?;
+    confirm(cfg, store, &record.status_token, record, no_charge).await?;
 
     write_journal(
         store,
@@ -857,12 +868,15 @@ async fn approve_group(
     };
     let recipe = dns::recipe(&domain, &values);
     let subject = decision_subject("approved", &domain);
-    let body = format!(
-        "Your application for {domain} has been approved. The mailboxes in the group are \
-         ready to receive mail as soon as the records below are live.{payment_note}\n{}",
-        recipe.text()
+    let body = group_approval_body(
+        cfg,
+        record,
+        written.payment.no_charge,
+        &domain,
+        &payment_note,
+        &recipe.text(),
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         &site_owner,
@@ -1060,9 +1074,15 @@ fn confirmation_subject(username: &str) -> String {
 }
 
 /// The confirmation email. It repeats the two things the second checkbox
-/// recorded, the version of every document accepted, and the 14-day right with
-/// how to use it, in the words `docs/terms.md` uses.
-fn confirmation_body(record: &Record) -> String {
+/// recorded, the version of every document accepted, the trader's identity and
+/// address, the price and period, and the 14-day right with the model
+/// cancellation form, in the words `docs/terms.md` uses.
+///
+/// Reg 16(2) and Schedule 2 want the identity and geographic address of the
+/// trader, the price and how it is billed, and the cancellation right with the
+/// Schedule 3 Part B form. The text here is the durable-medium copy of the
+/// contract summary, so it is complete without the applicant opening the site.
+fn confirmation_body(cfg: &DrainConfig, record: &Record, no_charge: bool) -> String {
     let mut out = String::from(
         "We are starting your account now, before the cancellation period ends:\n\
          digital content is supplied immediately, and this does not take your right\n\
@@ -1075,6 +1095,36 @@ fn confirmation_body(record: &Record) -> String {
             acceptance.document, acceptance.version
         ));
     }
+    out.push_str(&format!(
+        "\nThe contract is with kyriakon.net, run by Oliver Brotchie, a sole trader in\n\
+         the United Kingdom, at {}. Contact: admin@kyriakon.net.\n\n",
+        cfg.postal_address
+    ));
+    if no_charge {
+        let what = if record.domain.is_some() {
+            "the whole group"
+        } else {
+            "this account"
+        };
+        out.push_str(&format!(
+            "There is no charge for {what} and no billing period.\n"
+        ));
+    } else {
+        let price = if record.domain.is_some() {
+            &cfg.group_price_gbp
+        } else {
+            &cfg.price_gbp
+        };
+        let what = if record.domain.is_some() {
+            "the whole group"
+        } else {
+            "the account"
+        };
+        out.push_str(&format!(
+            "The price is GBP {price} for one year, for {what}. The year starts on the day\n\
+             we record your payment.\n"
+        ));
+    }
     out.push_str(
         "\nYou have fourteen days to cancel, starting the day the contract is made. The\n\
          right is unconditional: you can cancel for any reason, or none. An email to\n\
@@ -1082,7 +1132,73 @@ fn confirmation_body(record: &Record) -> String {
          you paid in full, within fourteen days, in the rail you paid with, or as a\n\
          credit against the next year if you would rather.\n",
     );
+    out.push_str(&format!(
+        "\nYou can cancel by writing, or with this form:\n\n\
+         To Oliver Brotchie, {}, admin@kyriakon.net:\n\n\
+         I give notice that I cancel my contract for the supply of a kyriakon.net account.\n\n\
+         Ordered on: [date]\n\n\
+         Name:\n\n\
+         Address:\n\n\
+         Signature (only if you send this on paper):\n\n\
+         Date:\n",
+        cfg.postal_address
+    ));
     out
+}
+
+/// The approval mail's body: the decision and the password link, and — when the
+/// applicant gave no address outside the platform — the durable-medium
+/// confirmation, because [`confirm`] sends nothing to that applicant and this
+/// mail is the first thing the new mailbox receives. With an outside address the
+/// confirmation already left as its own earlier email, so appending it here
+/// would deliver it twice.
+fn approval_body(
+    cfg: &DrainConfig,
+    record: &Record,
+    no_charge: bool,
+    decision: String,
+    password_until: &str,
+    password_link: &str,
+) -> String {
+    let out = format!(
+        "{decision}\n\nSet your mail password from this one-time link, which works until {password_until}:\n\n{password_link}\n\nIt works once. The same link is on your status page.\n"
+    );
+    with_confirmation(cfg, record, no_charge, out)
+}
+
+/// Appends the durable-medium confirmation when the applicant gave no address
+/// outside the platform. Both approval mails call this, so the rule for when the
+/// confirmation travels with an approval mail lives in one place.
+fn with_confirmation(
+    cfg: &DrainConfig,
+    record: &Record,
+    no_charge: bool,
+    mut out: String,
+) -> String {
+    if record.outside_address.is_none() {
+        out.push('\n');
+        out.push_str(&confirmation_body(cfg, record, no_charge));
+    }
+    out
+}
+
+/// The body's approval mail: the payment note and the DNS recipe, plus the
+/// durable-medium confirmation when no address outside the platform was given.
+/// `group_recipient` falls back to the site owner's mailbox on the body's own
+/// domain, so that mailbox is where the confirmation has to reach.
+fn group_approval_body(
+    cfg: &DrainConfig,
+    record: &Record,
+    no_charge: bool,
+    domain: &str,
+    payment_note: &str,
+    recipe: &str,
+) -> String {
+    let out = format!(
+        "Your application for {domain} has been approved. The mailboxes in the group are \
+         ready to receive mail as soon as the records below are live.{payment_note}\n{recipe}"
+    );
+    with_confirmation(cfg, record, no_charge, out)
 }
 
 /// The decision email for an approval. The words are short because #333 owns
@@ -1263,6 +1379,99 @@ mod tests {
         assert_eq!(
             decision_subject("approved", "secretary"),
             "Your application to kyriakon.net was approved (secretary)"
+        );
+    }
+
+    fn test_config() -> DrainConfig {
+        let dir = std::env::temp_dir().join(format!("control-review-{}", std::process::id()));
+        crate::transitions::test_support::quota_config(&dir)
+    }
+
+    fn approval_mail(cfg: &DrainConfig, record: &Record, no_charge: bool) -> String {
+        approval_body(
+            cfg,
+            record,
+            no_charge,
+            "Your application for secretary has been approved.".to_string(),
+            "2026-10-08",
+            "https://signup.kyriakon.net/password/token",
+        )
+    }
+
+    /// No outside address means `confirm` sent nothing, so the approval mail to
+    /// the new mailbox has to carry the full durable-medium confirmation.
+    #[test]
+    fn a_no_address_approval_mail_carries_the_durable_confirmation() {
+        let cfg = test_config();
+        let body = approval_mail(&cfg, &record(&[]), false);
+        assert!(body.contains("Set your mail password"), "{body}");
+        assert!(body.contains("fourteen days to cancel"), "{body}");
+        assert!(body.contains(&cfg.postal_address), "{body}");
+        assert!(body.contains("GBP 20.00"), "{body}");
+        assert!(
+            body.contains("I give notice that I cancel my contract"),
+            "{body}"
+        );
+    }
+
+    /// With an outside address the confirmation left as its own earlier email;
+    /// the approval mail must not deliver it a second time.
+    #[test]
+    fn an_outside_address_approval_mail_omits_the_confirmation() {
+        let cfg = test_config();
+        let mut record = record(&[]);
+        record.outside_address = Some("member@example.invalid".to_string());
+        let body = approval_mail(&cfg, &record, false);
+        assert!(body.contains("Set your mail password"), "{body}");
+        assert!(!body.contains("fourteen days to cancel"), "{body}");
+        assert!(!body.contains("I give notice that I cancel"), "{body}");
+    }
+
+    #[test]
+    fn a_no_charge_confirmation_says_there_is_no_charge() {
+        let cfg = test_config();
+        let body = confirmation_body(&cfg, &record(&[]), true);
+        assert!(body.contains("no charge"), "{body}");
+        assert!(body.contains("this account"), "{body}");
+        assert!(!body.contains("GBP"), "{body}");
+        let mut group = record(&[]);
+        group.domain = Some("body.example".to_string());
+        let body = confirmation_body(&cfg, &group, true);
+        assert!(body.contains("no charge for the whole group"), "{body}");
+    }
+
+    #[test]
+    fn a_group_confirmation_quotes_the_group_price() {
+        let cfg = test_config();
+        let mut record = record(&[]);
+        record.domain = Some("body.example".to_string());
+        let body = confirmation_body(&cfg, &record, false);
+        assert!(body.contains("GBP 40.00"), "{body}");
+        assert!(body.contains("the whole group"), "{body}");
+    }
+
+    /// `group_recipient` falls back to the site owner's mailbox on the body's
+    /// domain, so a body with no outside address gets the same confirmation
+    /// there, in its approval mail.
+    #[test]
+    fn a_group_approval_mail_carries_the_confirmation_when_there_is_no_outside_address() {
+        let cfg = test_config();
+        let mut record = record(&[]);
+        record.domain = Some("body.example".to_string());
+        let body = group_approval_body(
+            &cfg,
+            &record,
+            false,
+            "body.example",
+            "\n\nThe amount is GBP 40.00 for the year, for the whole group.\n",
+            "recipe text",
+        );
+        assert!(body.contains("fourteen days to cancel"), "{body}");
+        assert!(body.contains(&cfg.postal_address), "{body}");
+        assert!(body.contains("GBP 40.00"), "{body}");
+        assert!(
+            body.contains("I give notice that I cancel my contract"),
+            "{body}"
         );
     }
 }

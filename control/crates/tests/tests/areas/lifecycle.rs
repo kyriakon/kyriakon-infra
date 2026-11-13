@@ -1351,6 +1351,70 @@ fn a_confirmation_that_cannot_be_sent_is_not_recorded_as_sent() {
         .exists());
 }
 
+/// With no outside address the confirmation travels inside the approval mail,
+/// so a failed approval enqueue must not leave that notice recorded as sent: the
+/// retry would read it as delivered and the confirmation would be lost. The
+/// failed line comes back, and the retry sends the approval once with the
+/// confirmation in it.
+#[test]
+fn a_no_address_confirmation_that_cannot_be_sent_is_resent_on_the_retry() {
+    let fix = Fix::new("confirmation-none-send-fails");
+    let sent = fix.path("sent");
+    fix.script(
+        "enqueuer.sh",
+        &format!(
+            "#!/bin/sh\nmsg=$(cat)\ncase \"$msg\" in\n*'has been approved'*) echo 'the mail path is broken' >&2; exit 1;;\nesac\nprintf '%s' \"$msg\" >> '{sent}'\n"
+        ),
+    );
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    assert!(fix.drain().status.success());
+
+    // Provisioning happened, but no notice claims the approval mail left.
+    assert!(fix
+        .dir
+        .join("store/accounts/secretary/account.json")
+        .exists());
+    assert!(
+        !fix.read("accounts/secretary/notices.jsonl")
+            .contains("approval.paid"),
+        "{}",
+        fix.read("accounts/secretary/notices.jsonl")
+    );
+    assert!(!fix.sent().contains("was approved"), "{}", fix.sent());
+
+    // With the mail path back, the retry sends the approval once, and the
+    // confirmation is in it.
+    fix.enqueuer_works();
+    fix.age_failures();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let sent = fix.sent();
+    assert_eq!(sent.matches("was approved").count(), 1, "{sent}");
+    assert!(sent.contains("digital content"), "{sent}");
+    assert!(sent.contains("fourteen days"), "{sent}");
+    assert!(
+        sent.contains("I give notice that I cancel my contract"),
+        "{sent}"
+    );
+    assert_eq!(
+        fix.sent().matches("was confirmed").count(),
+        0,
+        "the confirmation travels in the approval mail: {sent}"
+    );
+    assert!(
+        fix.read("accounts/secretary/notices.jsonl")
+            .contains("approval.paid"),
+        "{}",
+        fix.read("accounts/secretary/notices.jsonl")
+    );
+    assert!(fix
+        .read(&format!("applications/{TOKEN}.json"))
+        .contains("approved: an account was made"));
+}
+
 /// The upload key the application carried is written where `provision-member.sh`
 /// reads it before that script runs, so an approval completes against the real
 /// script's contract rather than only against a stub that ignores the key.

@@ -152,6 +152,25 @@ pub async fn send_account_notice(
     Ok(true)
 }
 
+/// The approval mail's send. A failed enqueue takes its notice line back, so
+/// the retry after provisioning sends the approval and the durable-medium
+/// confirmation it carries instead of treating it as already sent.
+pub async fn send_account_notice_retryable(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+    notice_type: &str,
+    subject: &str,
+    to: &str,
+    body: &str,
+) -> Result<bool, Error> {
+    if already_sent(store, username, notice_type, subject).await? {
+        return Ok(false);
+    }
+    record_and_enqueue_retryable(cfg, store, username, notice_type, subject, to, body).await?;
+    Ok(true)
+}
+
 /// Record a notice and enqueue it whether or not the account already records
 /// one. The resend of a member's payment instructions is the case: they asked
 /// for the same message again, so the second copy is the point, and the line in
@@ -224,7 +243,7 @@ async fn record(
     notice_type: &str,
     subject: &str,
     to: &str,
-) -> Result<(), Error> {
+) -> Result<String, Error> {
     let line = Notice {
         version: 1,
         at: crate::util::filed_at(),
@@ -238,7 +257,8 @@ async fn record(
         .log(&format!("accounts/{username}/notices.jsonl"))
         .append_mode(encoded.as_bytes(), store.dir_owner("accounts"), 0o640)
         .await
-        .map_err(Error::from)
+        .map_err(Error::from)?;
+    Ok(encoded)
 }
 
 async fn record_and_enqueue(
@@ -252,6 +272,49 @@ async fn record_and_enqueue(
 ) -> Result<(), Error> {
     record(store, username, notice_type, subject, to).await?;
     enqueue(cfg, to, subject, body).await
+}
+
+/// The approval's send: unlike the other notices, a failed enqueue must not
+/// leave the line recorded, because the approval is retried after provisioning
+/// and `already_sent` would then skip the mail forever. The line is taken back
+/// before the error leaves, as the application's confirmation stamp is cleared.
+async fn record_and_enqueue_retryable(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+    notice_type: &str,
+    subject: &str,
+    to: &str,
+    body: &str,
+) -> Result<(), Error> {
+    let line = record(store, username, notice_type, subject, to).await?;
+    if let Err(e) = enqueue(cfg, to, subject, body).await {
+        unrecord(store, username, &line).await?;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Take back the notice line a failed enqueue left recorded. The record's own
+/// lock is held across the read and the rewrite, so an append that lands
+/// meanwhile is either seen or follows the rewrite rather than being dropped.
+async fn unrecord(store: &Store, username: &str, line: &str) -> Result<(), Error> {
+    let path = format!("accounts/{username}/notices.jsonl");
+    let log = store.log(&path);
+    let _lock = log.lock().await?;
+    let mut lines = log.raw_lines().await?;
+    let Some(index) = lines.iter().rposition(|written| written == line) else {
+        return Ok(());
+    };
+    lines.remove(index);
+    let mut bytes = lines.join("\n");
+    if !bytes.is_empty() {
+        bytes.push('\n');
+    }
+    store
+        .rewrite_log_mode(&path, bytes.as_bytes(), store.dir_owner("accounts"), 0o640)
+        .await
+        .map_err(Error::from)
 }
 
 #[cfg(test)]
