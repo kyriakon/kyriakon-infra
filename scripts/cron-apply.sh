@@ -85,6 +85,11 @@ while [ "$#" -gt 0 ]; do
 done
 
 env_file="${KYRIAKON_ENV:-/root/.kyriakon-env}"
+# Root's tab on disk. crontab(1) reads and writes it, and a read that fails
+# while this file holds lines is the case to refuse rather than replace.
+tab_path=/var/cron/tabs/root
+# Where the tab it replaces is kept, timestamped per run.
+bak_dir=/root
 # The one list of which scripts the box runs, and where. This script schedules
 # its /root/bin rows; deploy-mail.sh installs them, deploy-control.sh installs
 # the drain's, and deploy.sh routes a changed script by its row.
@@ -510,6 +515,20 @@ yes) exit 1 ;;
 esac
 STUB
 	chmod 0755 "$stub/httpd" "$stub/gmid" "$stub/relayd" "$stub/rcctl"
+	# crontab(1), reduced to the two calls apply_crontab makes: read the tab, and
+	# replace it. STUB_CRONTAB_FAIL makes the read fail the way an unreadable or
+	# corrupt tab does, which OpenBSD's also does when root simply has none.
+	cat > "$stub/crontab" <<'STUB'
+#!/bin/sh
+if [ "$1" = "-l" ]; then
+	[ "${STUB_CRONTAB_FAIL:-no}" = no ] || exit 1
+	[ -f "$STUB_CRONTAB_TAB" ] || exit 1
+	cat "$STUB_CRONTAB_TAB"
+	exit 0
+fi
+cp "$1" "$STUB_CRONTAB_TAB"
+STUB
+	chmod 0755 "$stub/crontab"
 	PATH="$stub:$PATH"
 	export PATH
 
@@ -815,7 +834,199 @@ EOF
 		"$(printf '%s\n' "$got" | grep -c 'kyriakon-onboard-drain')" 0
 	check "and every other line is kept" "$(printf '%s\n' "$got" | grep -c .)" 2
 
+	# The crontab read. `crontab -l` failing is the first run only when root has
+	# no tab on disk: with a tab that holds lines, the new tab would be built from
+	# the block alone and every entry this script did not write would be gone.
+	cron_tree="$tree/cron"
+	mkdir -p "$cron_tree/scripts" "$cron_tree/bak"
+	printf 'probe.sh\tcheckout\t0 5 * * 1\t--box\n' > "$cron_tree/install-set.tsv"
+	: > "$cron_tree/scripts/probe.sh"
+	printf '#!/bin/sh\nexit 0\n' > "$cron_tree/drain"
+	chmod 0755 "$cron_tree/drain"
+	for v in $needed_vars; do
+		printf "export %s='value'\n" "$v"
+	done > "$cron_tree/env"
+	install_set="$cron_tree/install-set.tsv"
+	repo_dir="$cron_tree"
+	drain_bin="$cron_tree/drain"
+	env_file="$cron_tree/env"
+	tab_path="$cron_tree/tab"
+	bak_dir="$cron_tree/bak"
+
+	printf '@reboot /root/bin/setup.sh\n' > "$tab_path"
+	STUB_CRONTAB_FAIL=yes
+	STUB_CRONTAB_TAB="$tab_path"
+	export STUB_CRONTAB_FAIL STUB_CRONTAB_TAB
+	code=0
+	( apply_crontab ) > "$tree/read-failed.out" 2>&1 || code=$?
+	check "a failed crontab read with a tab on disk is refused" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and names what was not written" \
+		"$(grep -c 'cannot read root.s crontab; nothing was written' "$tree/read-failed.out")" 1
+	check "and leaves the tab alone" \
+		"$(cat "$tab_path")" '@reboot /root/bin/setup.sh'
+	set -- "$cron_tree/bak"/*
+	check "and takes no backup" "$([ -e "$1" ] && printf yes || printf no)" no
+
+	rm -f "$tab_path"
+	code=0
+	( apply_crontab ) > "$tree/first-run.out" 2>&1 || code=$?
+	check "the same failure with no tab on disk is the first run" "$code" 0
+	check "and the block is installed" \
+		"$(grep -c '# --- kyriakon: scheduled by scripts/cron-apply.sh ---' "$tab_path")" 1
+
+	# A read that works must still keep what is already scheduled, which is what
+	# the refusal above protects.
+	printf '@reboot /root/bin/setup.sh\n' > "$tab_path"
+	STUB_CRONTAB_FAIL=no
+	code=0
+	( apply_crontab ) > "$tree/keep.out" 2>&1 || code=$?
+	check "a working read installs the block" "$code" 0
+	check "an entry this script did not write survives" \
+		"$(grep -c '@reboot /root/bin/setup.sh' "$tab_path")" 1
+	check "beside the block it added" \
+		"$(grep -c '# --- kyriakon: scheduled by scripts/cron-apply.sh ---' "$tab_path")" 1
+
 	self_test_end
+}
+
+# apply_crontab — the default mode: add the lines this box is missing to root's
+# tab and leave every entry already there in place.
+apply_crontab() {
+	read_scheduled_scripts
+	# A failed read is not an empty tab. OpenBSD's crontab(1) exits non-zero
+	# when root has no tab yet, which is the intended first run; a tab that is on
+	# disk and holds lines cannot be read, and treating it as empty would build
+	# the new tab from the block alone and drop every entry it did not write.
+	if ! current=$(crontab -l 2>/dev/null); then
+		if [ -s "$tab_path" ]; then
+			die "cannot read root's crontab; nothing was written"
+		fi
+		current=''
+	fi
+
+	missing_scripts=""
+	to_add=""
+	pending=$(mktemp)
+	: >"$pending"
+	for s in $needed_scripts; do
+		path=$(script_path "$s") || die "$install_set names $s for no destination this schedules"
+		[ -f "$path" ] || missing_scripts="$missing_scripts $s"
+		if ! printf '%s\n' "$current" | grep -qF "$path"; then
+			to_add="$to_add $s"
+			line_for "$s" >>"$pending"
+		fi
+	done
+
+	# The drain, checked at its own installed path. A line whose binary the deploy
+	# never installed is caught here rather than added for cron to fail on in
+	# silence.
+	if [ ! -x "$drain_bin" ]; then
+		missing_scripts="$missing_scripts kyriakon-control-drain"
+	fi
+	if ! printf '%s\n' "$current" | grep -qF "$drain_bin"; then
+		to_add="$to_add kyriakon-control-drain"
+		line_for kyriakon-control-drain >>"$pending"
+	fi
+
+	if [ -n "$missing_scripts" ]; then
+		printf 'not installed:%s\n' "$missing_scripts"
+	fi
+	if [ -z "$to_add" ]; then
+		rm -f "$pending"
+		printf 'nothing to do: every script this schedules is already in the crontab\n\n'
+		printf 'Compare what is there against the lines this would have added:\n\n'
+		for s in $needed_scripts; do
+			line_for "$s"
+		done
+		line_for kyriakon-control-drain
+		exit 0
+	fi
+	printf 'to be added:%s\n' "$to_add"
+
+	# The block is assembled in a file, not a variable: command substitution
+	# strips the trailing newline, which puts the closing marker on the last cron
+	# line and leaves that job running a command with a comment glued to the end
+	# of it.
+	block=$(mktemp)
+	{
+		printf '\n# --- kyriakon: scheduled by scripts/cron-apply.sh ---\n'
+		cat "$pending"
+		printf '# --- end kyriakon ---\n'
+	} >"$block"
+	rm -f "$pending"
+
+	if [ -n "$missing_scripts" ]; then
+		die "install the missing scripts first: scripts/deploy-control.sh installs the drain and the mail deploy the rest"
+	fi
+	# A missing or half-filled env is the likely first run, so report which
+	# variables are at fault and point at the one script that owns the file.
+	missing_vars=""
+	placeholder_vars=""
+	for v in $needed_vars; do
+		if ! grep -q "^export $v=" "$env_file" 2>/dev/null; then
+			missing_vars="$missing_vars $v"
+		elif grep -q "^export $v='.*REPLACE_ME" "$env_file"; then
+			placeholder_vars="$placeholder_vars $v"
+		fi
+	done
+	if [ -n "$missing_vars" ] || [ -n "$placeholder_vars" ]; then
+		printf 'cron-apply: %s is not usable\n' "$env_file" >&2
+		if [ -n "$missing_vars" ]; then
+			printf '  not set:%s\n' "$missing_vars" >&2
+		fi
+		if [ -n "$placeholder_vars" ]; then
+			printf '  still a placeholder:%s\n' "$placeholder_vars" >&2
+		fi
+		printf 'Run: doas ksh %s/setup-env.sh\n' "$(dirname "$0")" >&2
+		printf 'Nothing was written.\n' >&2
+		exit 1
+	fi
+
+	work=$(mktemp)
+	before=$(mktemp)
+	bak=$bak_dir/crontab.bak.$(date +%Y%m%d%H%M%S)
+	printf '%s\n' "$current" > "$before"
+	# The rename in #633 moved the drain's binary. This script only ever adds
+	# lines, so the old one would stay and point at a path the deploy removes once
+	# the crontab is clean; a line cron cannot run mails the operator every minute.
+	# `before` keeps the real old crontab, so the backup and the --check diff show
+	# the removal.
+	printf '%s\n' "$current" | drop_old_drain_line > "$work"
+	cat "$block" >> "$work"
+	rm -f "$block"
+
+	# Belt and braces: whatever the read said, an empty current beside a tab that
+	# holds lines is every entry already there about to be dropped. The check
+	# runs before --check too, so the printed diff is never one this script
+	# would refuse to apply.
+	if [ -z "$current" ] && [ -s "$tab_path" ]; then
+		die "cannot read root's crontab; nothing was written"
+	fi
+
+	if [ "$check_only" = yes ]; then
+		printf '\n--- the change that would be made ---\n'
+		diff -u "$before" "$work" || true
+		rm -f "$before" "$work"
+		printf '\n--check: nothing was written.\n'
+		exit 0
+	fi
+
+	printf '%s\n' "$current" > "$bak"
+	crontab "$work"
+	rm -f "$before" "$work"
+	printf '\nbacked up as %s\n' "$bak"
+	# The summary is best effort: the write above is the verdict, and a read that
+	# fails here must not turn a successful install into an error.
+	printf "installed. the lines now scheduled from /root/bin:\n"
+	crontab -l | grep '/root/bin/' | awk '{ print "\t" $0 }' || true
+	printf 'the drain:\n'
+	crontab -l | grep -F "$drain_bin" | awk '{ print "\t" $0 }' || true
+	# The two that run from the checkout are on cron too, and a summary that left
+	# them out read as if a clean run had scheduled nothing new.
+	printf 'the checkout-run checks:\n'
+	crontab -l | grep -E 'scripts/(check-hygiene|self-test-all)\.sh' | awk '{ print "\t" $0 }' || true
+	printf '\nrevert with: crontab %s\n' "$bak"
 }
 
 if [ "$self_test_mode" = yes ]; then
@@ -827,117 +1038,5 @@ if [ "$web_only" = yes ]; then
 	exit 0
 fi
 
-read_scheduled_scripts
-current=$(crontab -l 2>/dev/null || true)
-
-missing_scripts=""
-to_add=""
-pending=$(mktemp)
-: >"$pending"
-for s in $needed_scripts; do
-	path=$(script_path "$s") || die "$install_set names $s for no destination this schedules"
-	[ -f "$path" ] || missing_scripts="$missing_scripts $s"
-	if ! printf '%s\n' "$current" | grep -qF "$path"; then
-		to_add="$to_add $s"
-		line_for "$s" >>"$pending"
-	fi
-done
-
-# The drain, checked at its own installed path. A line whose binary the deploy
-# never installed is caught here rather than added for cron to fail on in
-# silence.
-if [ ! -x "$drain_bin" ]; then
-	missing_scripts="$missing_scripts kyriakon-control-drain"
-fi
-if ! printf '%s\n' "$current" | grep -qF "$drain_bin"; then
-	to_add="$to_add kyriakon-control-drain"
-	line_for kyriakon-control-drain >>"$pending"
-fi
-
-if [ -n "$missing_scripts" ]; then
-	printf 'not installed:%s\n' "$missing_scripts"
-fi
-if [ -z "$to_add" ]; then
-	rm -f "$pending"
-	printf 'nothing to do: every script this schedules is already in the crontab\n\n'
-	printf 'Compare what is there against the lines this would have added:\n\n'
-	for s in $needed_scripts; do
-		line_for "$s"
-	done
-	line_for kyriakon-control-drain
-	exit 0
-fi
-printf 'to be added:%s\n' "$to_add"
-
-# The block is assembled in a file, not a variable: command substitution strips
-# the trailing newline, which puts the closing marker on the last cron line and
-# leaves that job running a command with a comment glued to the end of it.
-block=$(mktemp)
-{
-	printf '\n# --- kyriakon: scheduled by scripts/cron-apply.sh ---\n'
-	cat "$pending"
-	printf '# --- end kyriakon ---\n'
-} >"$block"
-rm -f "$pending"
-
-if [ -n "$missing_scripts" ]; then
-	die "install the missing scripts first: scripts/deploy-control.sh installs the drain and the mail deploy the rest"
-fi
-# A missing or half-filled env is the likely first run, so report which variables
-# are at fault and point at the one script that owns the file.
-missing_vars=""
-placeholder_vars=""
-for v in $needed_vars; do
-	if ! grep -q "^export $v=" "$env_file" 2>/dev/null; then
-		missing_vars="$missing_vars $v"
-	elif grep -q "^export $v='.*REPLACE_ME" "$env_file"; then
-		placeholder_vars="$placeholder_vars $v"
-	fi
-done
-if [ -n "$missing_vars" ] || [ -n "$placeholder_vars" ]; then
-	printf 'cron-apply: %s is not usable\n' "$env_file" >&2
-	if [ -n "$missing_vars" ]; then
-		printf '  not set:%s\n' "$missing_vars" >&2
-	fi
-	if [ -n "$placeholder_vars" ]; then
-		printf '  still a placeholder:%s\n' "$placeholder_vars" >&2
-	fi
-	printf 'Run: doas ksh %s/setup-env.sh\n' "$(dirname "$0")" >&2
-	printf 'Nothing was written.\n' >&2
-	exit 1
-fi
-
-work=$(mktemp)
-before=$(mktemp)
-bak=/root/crontab.bak.$(date +%Y%m%d%H%M%S)
-printf '%s\n' "$current" > "$before"
-# The rename in #633 moved the drain's binary. This script only ever adds lines,
-# so the old one would stay and point at a path the deploy removes once the
-# crontab is clean; a line cron cannot run mails the operator every minute.
-# `before` keeps the real old crontab, so the backup and the --check diff show
-# the removal.
-printf '%s\n' "$current" | drop_old_drain_line > "$work"
-cat "$block" >> "$work"
-rm -f "$block"
-
-if [ "$check_only" = yes ]; then
-	printf '\n--- the change that would be made ---\n'
-	diff -u "$before" "$work" || true
-	rm -f "$before" "$work"
-	printf '\n--check: nothing was written.\n'
-	exit 0
-fi
-
-printf '%s\n' "$current" > "$bak"
-crontab "$work"
-rm -f "$before" "$work"
-printf '\nbacked up as %s\n' "$bak"
-printf "installed. the lines now scheduled from /root/bin:\n"
-crontab -l | grep '/root/bin/' | awk '{ print "\t" $0 }'
-printf 'the drain:\n'
-crontab -l | grep -F "$drain_bin" | awk '{ print "\t" $0 }'
-# The two that run from the checkout are on cron too, and a summary that left
-# them out read as if a clean run had scheduled nothing new.
-printf 'the checkout-run checks:\n'
-crontab -l | grep -E 'scripts/(check-hygiene|self-test-all)\.sh' | awk '{ print "\t" $0 }'
-printf '\nrevert with: crontab %s\n' "$bak"
+# The functions are all defined by here, so the self-test can reach apply_crontab.
+apply_crontab
