@@ -88,7 +88,7 @@ had no manual step.
 
 There is no provider-level firewall. Reachability is decided by which daemon binds where, over the stock `block return all` / `pass all` `pf.conf` that `scripts/pf-apply.sh` appends its pass rules to. That is the intended posture, decided in #703: the public mail and web surface is the product, and there is no stable operator source address to restrict 22 and 2222 to.
 
-Open to the world by design: 22, 25, 53, 80, 443, 465, 587, 993, 995, 1965, 4190, and 1966 when the Titan upload is enabled, plus 2222 for the member git-shell. Ports 22 and 2222 are reachable from anywhere as well; their bound is key authentication and, on 2222, the confinement in `scripts/member-git-shell.sh`, not a source address.
+Open to the world by design: 22, 25, 53, 79, 80, 443, 465, 993, 1965, and 1966 when the Titan upload is enabled, plus 2222 for the member git-shell and the onboarding TUI's `TUI_PORT` while the portal runs. `scripts/pf-apply.sh` appends the rules for 79 (the finger service `scripts/deploy-mail.sh` installs into `inetd`), 1965, 1966, 2222 and `TUI_PORT`; the rest are daemons listening under the stock `pass all`. Ports 22 and 2222 are reachable from anywhere as well; their bound is key authentication and, on 2222, the confinement in `scripts/member-git-shell.sh`, not a source address.
 
 `pf.conf` and `sshd_config` stay propose-only: `scripts/deploy.sh` prints the commands and never applies them, and a host rule change is made by hand after review. A provider firewall was considered and declined; the second-host and second-jurisdiction trigger in ADR 0007 is the point to revisit the layering, so it is not decided twice.
 
@@ -768,7 +768,7 @@ The box is a Hetzner `cx23` in `hel1`: 2 vCPU, 3.9 GiB of memory, and one 40 GB 
 
 The promise is the one that is sold, so the box's resource is grown when it becomes the wall rather than a member count being fixed in advance, and the choice between the two ways of growing it is made at the time: attaching a volume, or moving to a larger server type.
 
-A move to a larger server type is made by hand in the Hetzner console, not by `terraform apply`: the provider's update path for a type change powers the box off and back on, and it stops at the softraid passphrase prompt, so `server_type` sits in the resource's `ignore_changes`. After a console resize, `terraform plan` should show no `server_type` diff; a diff there means the declaration changed, not the box.
+A move to a larger server type is made by hand in the Hetzner console, not by `terraform apply`: the provider's update path for a type change (1.68.0, `internal/server/resource.go`) powers the box off, changes the type, and does not power it back on, so an apply leaves the box off at the softraid passphrase prompt. `server_type` therefore sits in the resource's `ignore_changes`. After a console resize, `terraform plan` should show no `server_type` diff; a diff means that `ignore_changes` entry was removed or the state was edited by hand.
 
 The trigger is the `/home` partition, looked at in the quarterly pass in `## Run the quarterly indirect-tax check`:
 

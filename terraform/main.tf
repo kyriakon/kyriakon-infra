@@ -13,18 +13,20 @@ resource "hcloud_server" "mail" {
   location    = var.location
   image       = data.hcloud_image.openbsd.id
 
-  # The live box must never be rebuilt from whatever the selector currently
-  # resolves to. `image` is ForceNew in the provider, so a change to the data
-  # source is not an in-place update: it is destroy and recreate, and the server
-  # it would destroy is the only copy of the mail. The selector moves on its own
-  # as snapshots are taken and relabelled, and the existing server's image is a
-  # historical fact about when it was built, not a setting to keep in sync.
   lifecycle {
+    # `image` is ForceNew in the provider, so a change to the data source is not
+    # an in-place update: it is destroy and recreate, and the server it would
+    # destroy is the only copy of the mail. The live box must never be rebuilt
+    # from whatever the selector currently resolves to. The selector moves on
+    # its own as snapshots are taken and relabelled, and the existing server's
+    # image is a historical fact about when it was built, not a setting to keep
+    # in sync.
+    #
     # `server_type` is ignored for the same console reason as `public_net`
     # below: the provider's update path for a type change powers the server
-    # off, does its work, and powers it back on, and this box stops at the
-    # softraid passphrase prompt on every boot. A resize is a hand step in the
-    # Hetzner console (docs/runbook.md, "How much the box carries"), and
+    # off, changes the type, and does not power it back on, so an apply leaves
+    # the box off at the softraid passphrase prompt. A resize is a hand step in
+    # the Hetzner console (docs/runbook.md, "How much the box carries"), and
     # `terraform plan` should show no diff after one.
     ignore_changes = [image, server_type]
 
