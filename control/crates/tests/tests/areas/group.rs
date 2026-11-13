@@ -133,6 +133,33 @@ fn a_body_approval_sends_the_confirmation() {
     assert!(sent.contains("fourteen days"), "{sent}");
 }
 
+/// A body with no address outside the platform gets the durable-medium
+/// confirmation in its approval mail, at the site owner's mailbox on the body's
+/// own domain, and no separate confirmation mail.
+#[test]
+fn a_body_approval_without_an_outside_address_carries_the_confirmation() {
+    let fix = Fix::new("group-confirmation-none");
+    let record = fix.filed_body("warden");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let sent = fix.sent();
+    assert_eq!(sent.matches("was confirmed").count(), 0, "{sent}");
+    assert!(
+        sent.contains("To: parish-secretary@parish.example"),
+        "{sent}"
+    );
+    assert!(sent.contains("digital content"), "{sent}");
+    assert!(sent.contains("fourteen days"), "{sent}");
+    assert!(
+        sent.contains("I give notice that I cancel my contract"),
+        "{sent}"
+    );
+}
+
 /// An address the applicant wrote cannot become a second recipient or a header
 /// line when the decision email is built.
 #[test]

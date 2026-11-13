@@ -1152,9 +1152,21 @@ fn approval_body(
     password_until: &str,
     password_link: &str,
 ) -> String {
-    let mut out = format!(
+    let out = format!(
         "{decision}\n\nSet your mail password from this one-time link, which works until {password_until}:\n\n{password_link}\n\nIt works once. The same link is on your status page.\n"
     );
+    with_confirmation(cfg, record, no_charge, out)
+}
+
+/// Appends the durable-medium confirmation when the applicant gave no address
+/// outside the platform. Both approval mails call this, so the rule for when the
+/// confirmation travels with an approval mail lives in one place.
+fn with_confirmation(
+    cfg: &DrainConfig,
+    record: &Record,
+    no_charge: bool,
+    mut out: String,
+) -> String {
     if record.outside_address.is_none() {
         out.push('\n');
         out.push_str(&confirmation_body(cfg, record, no_charge));
@@ -1174,15 +1186,11 @@ fn group_approval_body(
     payment_note: &str,
     recipe: &str,
 ) -> String {
-    let mut out = format!(
+    let out = format!(
         "Your application for {domain} has been approved. The mailboxes in the group are \
          ready to receive mail as soon as the records below are live.{payment_note}\n{recipe}"
     );
-    if record.outside_address.is_none() {
-        out.push('\n');
-        out.push_str(&confirmation_body(cfg, record, no_charge));
-    }
-    out
+    with_confirmation(cfg, record, no_charge, out)
 }
 
 /// The decision email for an approval. The words are short because #333 owns
