@@ -643,7 +643,8 @@ async fn approve(
     } else {
         "approval.paid"
     };
-    notice::send_account_notice(cfg, store, username, notice_type, &subject, &to, &body).await?;
+    notice::send_account_notice_retryable(cfg, store, username, notice_type, &subject, &to, &body)
+        .await?;
 
     // The decision is recorded last, so a crash anywhere above leaves the
     // application undecided and rerunnable.
@@ -875,7 +876,7 @@ async fn approve_group(
         &payment_note,
         &recipe.text(),
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         &site_owner,
