@@ -30,14 +30,15 @@ on:
     workflows: [checks]
     types: [completed]
 
-permissions:
-  contents: write
-  pull-requests: write
-
 jobs:
   merge:
     if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
+    # The approval and the merge are the only writes this needs: the rest of the
+    # run reads the pull request and its files.
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - name: merge the green publish-key pull request
         env:
@@ -92,6 +93,23 @@ jobs:
           # thing the published set exists to prevent.
           files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr/files" --paginate \
             --jq '.[] | "\(.status) \(.filename)"')
+          # The files endpoint returns at most 3000 entries and --paginate cannot
+          # follow the list past that, so a larger pull request lists less than
+          # it changes and whatever sits past the cap is never inspected. The
+          # pull request's own count is the only way to tell a complete list from
+          # a truncated one; a mismatch blocks the merge.
+          changed=$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json changedFiles --jq .changedFiles)
+          case "$changed" in
+          '' | *[!0-9]*)
+            printf 'leaving #%s alone: its changed file count is unreadable (%s)\n' "$pr" "$changed"
+            exit 0
+            ;;
+          esac
+          listed=$(printf '%s\n' "$files" | grep -c . || true)
+          if [ "$changed" -ne "$listed" ]; then
+            printf 'leaving #%s alone: %s files changed, only %s listed\n' "$pr" "$changed" "$listed"
+            exit 0
+          fi
           bad=$(printf '%s\n' "$files" | grep -vE '^added keys/[^/]+\.asc$' || true)
           if [ -n "$bad" ]; then
             printf 'leaving #%s alone: these are not new key files:\n%s\n' "$pr" "$bad"

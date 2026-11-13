@@ -25,12 +25,21 @@ on:
     branches: [main]
   pull_request:
 
+# Every job here compiles or runs pull-request-controlled code, so the default
+# token gets read access and nothing more; a job that needs to push overrides it.
+# No job pushes, and no checkout persists the token into .git/config where the
+# code under test could read it.
+permissions:
+  contents: read
+
 jobs:
   control:
     name: control crate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # The runner's own stable Rust rather than a toolchain action: the bar is
       # that the crate builds and its tests pass, and the versions are printed
       # so a failure is diagnosable without a second run.
@@ -52,10 +61,23 @@ jobs:
         run: cargo clippy --manifest-path control/Cargo.toml --all-targets -- -D warnings
       # The package cut is a rule, not a convention: the unprivileged handler
       # must not link the root drain, and the terminal must not link the handler.
+      # The tree is captured before it is searched: piped into grep under `bash
+      # -e` without pipefail, a failed `cargo tree` would look like "no match"
+      # and pass the check.
       - name: package boundary
         run: |
-          ! cargo tree --manifest-path control/Cargo.toml -p kyriakon-control-handler --edges normal | grep -q kyriakon-control-drain
-          ! cargo tree --manifest-path control/Cargo.toml -p kyriakon-control-tui --edges normal | grep -q kyriakon-control-handler
+          set -eu
+          boundary() {
+            tree=$(cargo tree --manifest-path control/Cargo.toml -p "$1" --edges normal) || return 1
+            case "$tree" in
+            *"$2"*)
+              printf 'package boundary crossed: %s depends on %s\n' "$1" "$2" >&2
+              return 1
+              ;;
+            esac
+          }
+          boundary kyriakon-control-handler kyriakon-control-drain
+          boundary kyriakon-control-tui kyriakon-control-handler
       # The handler links the prototype crate's check, so its fixtures, format
       # and lint run here; no other job in this file sees that crate.
       - name: key check fixtures
@@ -74,6 +96,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: toolchain
         run: rustc --version && cargo --version
       # Hand formatted until now; this is what stops the next drift arriving as a
@@ -96,21 +120,60 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # Every script in the tree, not only scripts/: the restore template's
       # prepare-disk.sh is tracked here too. It runs on the rescue host rather
       # than on this box and it is bash, which is why it is not in the ksh
       # half of this repository's conventions, but it is still a script nobody
       # reads before it is run.
       - name: shellcheck
-        # The hooks have no .sh suffix, so git ls-files misses them, and nothing else
-        # lints them: a quoting mistake there fires on every commit in every clone.
-        run: shellcheck $(git ls-files '*.sh') .githooks/commit-msg .githooks/pre-commit .githooks/pre-push
+        # NUL-separated, so a path holding a space stays one argument. The hooks
+        # and the three ksh programs have no .sh suffix, so their paths are
+        # named: nothing else lints them, and a quoting mistake in a hook fires
+        # on every commit in every clone.
+        run: |
+          git ls-files -z '*.sh' \
+            .githooks/commit-msg .githooks/pre-commit .githooks/pre-push \
+            openbsd/etc/kyriakon-finger \
+            openbsd/etc/rc.d/kyriakon_control \
+            openbsd/etc/rc.d/kyriakon_onboard_sshd |
+            xargs -0 shellcheck
+      # A path with a space has to reach shellcheck as one argument. A
+      # word-split list lints two names that do not exist and never reads this
+      # file, which is what #746 was.
+      - name: shellcheck a spaced path
+        run: |
+          set -eu
+          dir=$(mktemp -d)
+          git -C "$dir" init -q
+          printf '#!/bin/sh\necho $1\n' > "$dir/a b.sh"
+          git -C "$dir" add -A
+          if out=$(cd "$dir" && git ls-files -z '*.sh' | xargs -0 shellcheck 2>&1); then
+            printf 'a broken script was not linted at all:\n%s\n' "$out" >&2
+            exit 1
+          fi
+          case "$out" in
+          *"a b.sh"*) ;;
+          *)
+            printf 'shellcheck did not see the spaced path:\n%s\n' "$out" >&2
+            exit 1
+            ;;
+          esac
       # A tracked binary is a build artifact, not source: it is unreviewable and
       # platform-specific. The pre-commit hook refuses a new one; this catches a
       # commit made with --no-verify.
       - name: no tracked binaries
+        # `file` is run to completion before its output is searched: in a
+        # pipeline its failure (or xargs') would reach grep as an empty stream
+        # and pass the step.
         run: |
-          if git ls-files -z | xargs -0 file | grep -E ': (ELF|Mach-O|PE32)'; then
+          set -eu
+          types=$(git ls-files -z | xargs -0 file) || {
+            printf 'file(1) failed, so nothing was scanned\n' >&2
+            exit 1
+          }
+          if printf '%s\n' "$types" | grep -E ': (ELF|Mach-O|PE32)'; then
             printf 'tracked build artifact: remove it and add its path to .gitignore\n' >&2
             exit 1
           fi
@@ -136,10 +199,10 @@ jobs:
     name: script self-tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: self-tests on OpenBSD 7.9
         uses: vmactions/openbsd-vm@v1.4.9
         with:
@@ -155,6 +218,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: hashicorp/setup-terraform@v3
         with:
           # The action's wrapper rewrites terraform's output and its exit status,
