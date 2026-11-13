@@ -210,6 +210,21 @@ deployed_drift() {
 	done
 }
 
+# record_dir_problems <dir>: one line per record directory under it that is not
+# 0750 with the parent's group. The page runs as _onboard, so a 0700 directory
+# reads as a missing record however the file inside is owned.
+record_dir_problems() {
+	typeset dir="$1" d mode group want
+	want=$(stat -f '%Sg' "$dir" 2>/dev/null) || return 0
+	for d in "$dir"/*/; do
+		[ -d "$d" ] || continue
+		mode=$(stat -f '%Lp' "$d")
+		group=$(stat -f '%Sg' "$d")
+		[ "$mode" = 750 ] && [ "$group" = "$want" ] && continue
+		printf '%s: %s %s\n' "$d" "$group" "$mode"
+	done
+}
+
 # store_drift <store-dir> <owner>
 #
 # Every file under the store directory that the owner does not own. The handler
@@ -596,6 +611,21 @@ EOF
 		printf 'FAIL: a matching libexec copy is not a finding; got [%s]\n' "$out" >&2
 		exit 1
 	}
+
+	# Record directories: 0750 with the parent's group is readable by the
+	# handler; 0700 is a finding, whatever the file inside says.
+	mkdir -p "$dir/records/accounts/hall"
+	chmod 750 "$dir/records/accounts/hall"
+	[ "$(record_dir_problems "$dir/records/accounts")" = "" ] || {
+		printf 'FAIL: a 0750 record directory is not a finding\n' >&2
+		exit 1
+	}
+	chmod 700 "$dir/records/accounts/hall"
+	out=$(record_dir_problems "$dir/records/accounts")
+	case "$out" in
+	*hall*) ;;
+	*) printf 'FAIL: a 0700 record directory is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
 
 	printf 'mine\n' > "$dir/store/record.json"
 	[ -z "$(store_drift "$dir/store" "$(id -un)")" ] || {
@@ -1065,5 +1095,21 @@ else
 	printf 'store records: %s is gone\n' "$applications_dir"
 	status=1
 fi
+# The per-account and per-group directories have the same reader: a directory
+# the handler cannot enter hides every record inside it, so the mode is checked
+# beside the records.
+for sub in accounts groups; do
+	dir="/var/db/onboard/$sub"
+	[ -d "$dir" ] || continue
+	dir_drift=$(record_dir_problems "$dir")
+	if [ -n "$dir_drift" ]; then
+		printf '%s/ directories: these are not 0750 with the parent group, so the handler cannot enter them:\n' "$sub"
+		printf '%s\n' "$dir_drift" | sed -e 's/^/  /'
+		printf '  the fix is the next record write (the drain repairs the mode), or chmod 750 and chgrp by hand\n'
+		status=1
+	else
+		printf '%s/ directories: every record directory is group-readable\n' "$sub"
+	fi
+done
 
 exit "$status"

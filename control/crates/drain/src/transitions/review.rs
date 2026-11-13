@@ -552,7 +552,13 @@ async fn approve(
         closing_until: None,
         grace_until: None,
     };
-    store.ensure_dir(&format!("accounts/{username}")).await?;
+    store
+        .ensure_dir_owned(
+            &format!("accounts/{username}"),
+            0o750,
+            store.dir_owner("accounts"),
+        )
+        .await?;
     let account_bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
         context: "encode the account",
         source,

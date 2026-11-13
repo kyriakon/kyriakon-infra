@@ -51,6 +51,7 @@ pub enum Action {
     Remove,
     Lock,
     Chown,
+    Chmod,
 }
 
 impl fmt::Display for Error {
@@ -76,6 +77,7 @@ impl fmt::Display for Error {
                 Action::Chown => {
                     write!(f, "cannot hand {} to its owner: {source}", path.display())
                 }
+                Action::Chmod => write!(f, "cannot set the mode of {}: {source}", path.display()),
             },
             Error::Parse { path, source } => {
                 write!(f, "{} does not parse: {source}", path.display())

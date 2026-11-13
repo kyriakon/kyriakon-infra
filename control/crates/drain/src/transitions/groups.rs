@@ -560,7 +560,13 @@ async fn write_group_application(
     let Some(copy) = copy else {
         return Ok(());
     };
-    store.ensure_dir(&format!("accounts/{mailbox}")).await?;
+    store
+        .ensure_dir_owned(
+            &format!("accounts/{mailbox}"),
+            0o750,
+            store.dir_owner("accounts"),
+        )
+        .await?;
     store
         .write_record(
             &format!("accounts/{mailbox}"),
@@ -627,7 +633,13 @@ async fn write_group_account(
         context: "encode the account",
         source,
     })?;
-    store.ensure_dir(&format!("accounts/{mailbox}")).await?;
+    store
+        .ensure_dir_owned(
+            &format!("accounts/{mailbox}"),
+            0o750,
+            store.dir_owner("accounts"),
+        )
+        .await?;
     write_account_record(store, mailbox, &bytes).await
 }
 
@@ -639,7 +651,11 @@ pub(super) async fn write_group_record(store: &Store, group: &GroupRecord) -> Re
         source,
     })?;
     store
-        .ensure_dir(&format!("groups/{}", group.domain))
+        .ensure_dir_owned(
+            &format!("groups/{}", group.domain),
+            0o750,
+            store.dir_owner("groups"),
+        )
         .await?;
     write_group_state(store, &group.domain, &bytes).await
 }
@@ -654,6 +670,15 @@ pub async fn write_account_record(
     username: &str,
     bytes: &[u8],
 ) -> Result<(), Error> {
+    // The repair lives here, not only at creation: a directory an earlier build
+    // left at 0700 must become readable on the next record write.
+    store
+        .ensure_dir_owned(
+            &format!("accounts/{username}"),
+            0o750,
+            store.dir_owner("accounts"),
+        )
+        .await?;
     store
         .write_record_mode(
             &format!("accounts/{username}"),
@@ -674,6 +699,13 @@ pub(super) async fn write_group_state(
     domain: &str,
     bytes: &[u8],
 ) -> Result<(), Error> {
+    store
+        .ensure_dir_owned(
+            &format!("groups/{domain}"),
+            0o750,
+            store.dir_owner("groups"),
+        )
+        .await?;
     store
         .write_record_mode(
             &format!("groups/{domain}"),
