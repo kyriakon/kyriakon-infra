@@ -265,10 +265,10 @@ remove_member() {
 	# nothing to expand to, so the address starts bouncing at RCPT time, which is
 	# the point: a deleted member is not a catch-all.
 	#
-	# The submitter allowlist beside it holds the same identity, and is the set
-	# the auth match reads: a line left there still lets some other account name
-	# this deleted address as its envelope sender. Both tables go under one
-	# restart, because smtpd reads either at start.
+	# The senders mapping beside it holds the same identity on this account's
+	# line, and is what the listeners check: a line left there still lets the
+	# account submit this deleted address as its envelope sender. Both tables go
+	# under one restart, because smtpd reads either at start.
 	mail_changed=no
 	if [ -f "$virtuals" ]; then
 		if [ "$show" = yes ]; then
@@ -300,19 +300,19 @@ remove_member() {
 	fi
 	if [ -f "$mail_from" ]; then
 		if [ "$show" = yes ]; then
-			if awk -v u="$user" -F: '$1 ~ ("^" u "@")' "$mail_from" | grep -q .; then
-				printf 'would remove the sender lines for %s@\n' "$user"
+			if awk -v u="$user" -F: '$1 == u' "$mail_from" | grep -q .; then
+				printf 'would remove the sender line for %s\n' "$user"
 			fi
 		else
 			drop_rc=0
 			remove_own_senders || drop_rc=$?
 			if [ "$drop_rc" -gt 1 ]; then
-				printf 'the sender lines for %s@ were not removed from %s; fix the table, then rerun\n' \
+				printf 'the sender line for %s was not removed from %s; fix the table, then rerun\n' \
 					"$user" "$mail_from" >&2
 				return 1
 			fi
 			if [ "$drop_rc" -eq 0 ]; then
-				printf 'removed the sender lines for %s@ from %s\n' "$user" "$mail_from"
+				printf 'removed the sender line for %s from %s\n' "$user" "$mail_from"
 				mail_changed=yes
 			fi
 		fi
@@ -365,12 +365,13 @@ remove_own_addresses() {
 	table_drop "$virtuals" prefix "$user@"
 }
 
-# remove_own_senders: drop the same identities from the submitter allowlist. The
-# prefix is literal, so only this member's own addresses go; a body's alias that
-# happens to name them stays, as its virtuals line does, and is the note above.
+# remove_own_senders: drop this account's line from the sender mapping. The key
+# is the account name compared literally, so no other account's list is touched;
+# an address that delivered into this account was in its list, so it goes with
+# the line, as its virtuals line does, and the note above names it.
 # Returns 0 when the file changed, 1 when it did not, and 2 when the write failed.
 remove_own_senders() {
-	table_drop "$mail_from" prefix "$user@"
+	table_drop "$mail_from" exact "$user"
 }
 
 # --- the self-test ----------------------------------------------------------
@@ -432,14 +433,12 @@ self_test() {
 		printf 'secretary@parish.example: alice\n'
 		printf 'oliver@kyriakon.net: oliver\n'
 	} >"$virtuals"
-	# The submitter allowlist as deploy-mail.sh and provisioning leave it: the
-	# member's own identity, an address that delivers into them, and another
-	# account's. The alias stays, as its virtuals line does, because it names a
-	# body's address rather than the member's own.
+	# The sender mapping as deploy-mail.sh and provisioning leave it: the
+	# member's own line, with the address that delivers into them on it, and
+	# another account's line.
 	{
-		printf 'alice@kyriakon.net: alice\n'
-		printf 'secretary@parish.example: alice\n'
-		printf 'oliver@kyriakon.net: oliver\n'
+		printf 'alice: alice@kyriakon.net,secretary@parish.example\n'
+		printf 'oliver: oliver@kyriakon.net\n'
 	} >"$mail_from"
 
 	remove_member >"$tree/first.out" 2>"$tree/first.err"
@@ -458,10 +457,11 @@ self_test() {
 	check "the alias into them stayed" "$(awk '/^secretary@/' "$virtuals" | wc -l | tr -d ' ')" 1
 	check "and the note names it" "$(grep -c 'secretary@parish.example' "$tree/first.err")" 1
 	check "the member's own sender line went" \
-		"$(awk '/^alice@/' "$mail_from" | wc -l | tr -d ' ')" 0
-	check "and another account's stayed" "$(awk '/^oliver@/' "$mail_from" | wc -l | tr -d ' ')" 1
-	check "and the address that delivers into them stayed" \
-		"$(awk '/^secretary@/' "$mail_from" | wc -l | tr -d ' ')" 1
+		"$(awk -F: '$1 == "alice"' "$mail_from" | wc -l | tr -d ' ')" 0
+	check "and another account's stayed" \
+		"$(awk -F: '$1 == "oliver"' "$mail_from" | wc -l | tr -d ' ')" 1
+	check "and the address that delivered into them went with its line" \
+		"$(grep -c 'secretary@parish.example' "$mail_from" || true)" 0
 	check "the order starts with the indexes" "$(awk 'NR == 1' "$case_dir/calls")" 'cron-apply --web'
 	check "and the account goes last of the tools" "$(awk 'NR == 3' "$case_dir/calls")" 'userdel -r alice'
 	check "smtpd restarted once, after both mail tables" \

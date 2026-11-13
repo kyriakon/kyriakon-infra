@@ -347,20 +347,15 @@ fn a_group_intent_provisions_its_record_accounts_and_addresses() {
             "{virtuals}"
         );
     }
-    // Each address is also a sender the auth match allows, the shape
-    // deploy-mail.sh generates: without it the mailbox is refused at MAIL FROM
+    // Each address is also a sender the mailbox may submit as, on the mailbox's
+    // own line of the senders mapping: without it it is refused at MAIL FROM
     // until the next deploy.
     let mail_from = fix.table("mail_from");
-    for address in ["secretary", "office"] {
-        assert_eq!(
-            mail_from
-                .lines()
-                .filter(|l| *l == format!("{address}@parish.example: parish-secretary"))
-                .count(),
-            1,
-            "{mail_from}"
-        );
-    }
+    assert!(
+        mail_from.contains("parish-secretary: secretary@parish.example,office@parish.example"),
+        "{mail_from}"
+    );
+    assert_eq!(mail_from.lines().count(), 1, "{mail_from}");
 
     // The block's upload key is where provision-member.sh reads it.
     let key = fix.read("keys/parish-secretary.pub");
@@ -1078,7 +1073,7 @@ fn an_alias_added_to_a_group_writes_one_entry_and_no_account() {
     );
     assert!(
         fix.table("mail_from")
-            .contains("office@parish.example: parish-secretary"),
+            .contains("parish-secretary: secretary@parish.example,office@parish.example"),
         "the alias cannot be submitted as: {}",
         fix.table("mail_from")
     );
@@ -1155,7 +1150,7 @@ fn a_mailbox_added_to_a_group_gets_an_account_key_and_entry() {
     );
     assert!(
         fix.table("mail_from")
-            .contains("office@parish.example: parish-office"),
+            .contains("parish-office: office@parish.example"),
         "the new mailbox cannot be submitted as: {}",
         fix.table("mail_from")
     );
@@ -1228,15 +1223,12 @@ fn upgrading_an_alias_repoints_it_without_changing_the_count() {
     assert!(fix.passwd_file().contains("parish-office:"));
     assert!(fix.dir.join("keyring/parish-office.asc").exists());
     // The sender identity follows the route: the upgraded address submits as
-    // its new mailbox, not the shared one.
-    let mail_from = fix.table("mail_from");
-    assert!(
-        mail_from.contains("office@parish.example: parish-office"),
-        "{mail_from}"
-    );
-    assert!(
-        !mail_from.contains("office@parish.example: parish-secretary"),
-        "{mail_from}"
+    // its new mailbox, not the shared one, and the new mailbox had no line
+    // before this pass.
+    assert_eq!(
+        fix.table("mail_from"),
+        "parish-secretary: secretary@parish.example\nparish-office: office@parish.example\n",
+        "the address did not move to the upgraded mailbox's own line"
     );
     let log = fix.scripts_log();
     let built = log
@@ -1322,7 +1314,7 @@ fn retrying_a_non_owner_removal_does_not_take_the_sites_key() {
         "the removed address can still be submitted as: {mail_from}"
     );
     assert!(
-        mail_from.contains("secretary@parish.example: parish-secretary"),
+        mail_from.contains("parish-secretary: secretary@parish.example"),
         "the remaining mailbox lost its sender identity: {mail_from}"
     );
 }

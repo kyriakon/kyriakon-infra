@@ -209,12 +209,13 @@ pub struct DrainConfig {
     /// `passwd` is one.
     pub mail_domains: String,
     pub virtuals: String,
-    /// The submitter allowlist the auth match reads, `/etc/mail/mail_from`: the
-    /// envelope senders an authenticated account may name. deploy-mail.sh
-    /// generates one line per account and per full-address virtuals entry, and
-    /// a group's transition appends its addresses as it provisions them, so a
-    /// mailbox provisioned after the last deploy is not refused at MAIL FROM. A
-    /// configuration value for the reason `passwd` is one.
+    /// The senders mapping the submission listeners read, `/etc/mail/mail_from`:
+    /// account name to the comma-separated addresses that account may submit
+    /// as. deploy-mail.sh generates it from the accounts and the virtuals
+    /// table, and a group's transition adds its addresses to the owning
+    /// mailbox's line as it provisions them, so a mailbox provisioned after the
+    /// last deploy is not refused at MAIL FROM. A configuration value for the
+    /// reason `passwd` is one.
     pub mail_from: String,
     /// The DKIM filter's domain list, one domain per line. A body's domain is
     /// appended here when its group is provisioned, and reload-smtpd.sh

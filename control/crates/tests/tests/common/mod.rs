@@ -199,7 +199,7 @@ impl Fix {
                  done\n\
                  awk -v s=\"@$d\" '$0 != s' '{spamd_allowed}' > '{spamd_allowed}.new' && mv '{spamd_allowed}.new' '{spamd_allowed}'\n\
                  awk -v s=\"@$d\" -F: '{{ k = $1; gsub(/^[ \\t]+|[ \\t]+$/, \"\", k); if (length(k) >= length(s) && substr(k, length(k) - length(s) + 1) == s) next; print }}' '{virtuals}' > '{virtuals}.new' && mv '{virtuals}.new' '{virtuals}'\n\
-                 awk -v s=\"@$d\" -F: '{{ k = $1; gsub(/^[ \\t]+|[ \\t]+$/, \"\", k); if (length(k) >= length(s) && substr(k, length(k) - length(s) + 1) == s) next; print }}' '{mail_from}' > '{mail_from}.new' && mv '{mail_from}.new' '{mail_from}'\n\
+                 awk -v s=\"@$d\" -F: '{{ k = $1; v = $2; gsub(/^[ \\t]+|[ \\t]+$/, \"\", v); n = split(v, p, \",\"); out = \"\"; for (i = 1; i <= n; i++) {{ q = p[i]; gsub(/^[ \\t]+|[ \\t]+$/, \"\", q); if (q == \"\") continue; if (length(q) >= length(s) && substr(q, length(q) - length(s) + 1) == s) continue; out = (out == \"\") ? q : out \",\" q }} if (out != \"\") print k \": \" out }}' '{mail_from}' > '{mail_from}.new' && mv '{mail_from}.new' '{mail_from}'\n\
                  rm -f '{host}/httpd.d/'\"$d\"'.conf' '{host}/gmid.d/'\"$d\"'.conf' '{host}/acme-client.d/'\"$d\"'.conf'\n\
                  rm -f '{host}/ssl/'\"$d\"'.fullchain.pem' '{host}/ssl/private/'\"$d\"'.key' '{host}/ssl/'\"$d\"'.crt'\n\
                  rm -f '{host}/ssl/capsule-'\"$d\"'.cnf' '{host}/ssl/capsule-'\"$d\"'.crt' '{host}/ssl/private/capsule-'\"$d\"'.key'\n\

@@ -161,22 +161,22 @@ merge_spamd_allowed() {
 	done <"$domains"
 }
 
-# mail_from_entries <passwd-file> <virtuals-file>: the mail-from table's lines,
-# of two kinds. Every account whose home is under /home gets its own identity,
-# <user>@<platform-domain>: <user>. Every full-address virtuals entry whose
-# target is one of those accounts gets a line too, so a group mailbox that
-# authenticates as itself can send as the address it publishes
-# (secretary@parish.example) rather than only as its login name. A bare
-# localpart is not an identity and is left out, as is an address aimed at a
-# service account, and the identity line is not repeated when virtuals already
-# carries it. The value is unused by the mail-from lookup; it keeps the file in
-# the "name: value" shape virtuals uses.
+# mail_from_entries <passwd-file> <virtuals-file>: the mail-from table, mapped
+# from account to the addresses that account may submit as. Every account whose
+# home is under /home gets a line starting with its own identity,
+# <user>@<platform-domain>, and every full-address virtuals entry whose target is
+# one of those accounts is appended to that account's list, so a group mailbox
+# that publishes secretary@parish.example can send as it. A bare localpart is not
+# an identity and is left out, as is an address aimed at a service account, and
+# an address already in the account's list is not repeated. smtpd's `senders`
+# option reads this as a mapping, so one account's line never carries another
+# account's address.
 mail_from_entries() {
 	awk -F: -v d="$platform_domain" '
 		FILENAME == ARGV[1] {
 			if ($6 ~ /^\/home\//) {
-				home[$1] = 1
-				print $1 "@" d ": " $1
+				account[++n] = $1
+				own[$1] = $1 "@" d
 				seen[$1 "@" d] = 1
 			}
 			next
@@ -188,9 +188,17 @@ mail_from_entries() {
 			sub(/^[ \t]+/, "", target)
 			sub(/[ \t]+$/, "", target)
 			sub(/\+.*$/, "", target)
-			if ((target in home) && !(addr in seen)) {
-				print addr ": " target
+			if ((target in own) && !(addr in seen)) {
 				seen[addr] = 1
+				extra[target] = (extra[target] == "") ? addr : extra[target] "," addr
+			}
+		}
+		END {
+			for (i = 1; i <= n; i++) {
+				acct = account[i]
+				line = own[acct]
+				if (extra[acct] != "") line = line "," extra[acct]
+				print acct ": " line
 			}
 		}
 	' "$1" "$2"
@@ -386,11 +394,12 @@ self_test() {
 		"$(grep -c -e '@parish.example ' -e '@parish.example#' "$tree/spamd.alloweddomains")" 0
 
 	# --- the mail-from table ---
-	# The submission rule is only as good as this table: it is a set of allowed
-	# envelope senders, not a per-user mapping. An account's own identity is in it,
-	# and so is a full-address virtuals line that delivers into an account, which
-	# is how a group mailbox sends as the address it publishes. A bare alias and
-	# an address aimed at a service account are not account identities.
+	# The submission check is only as good as this table: smtpd's `senders`
+	# option looks the authenticated account up and refuses any other address, so
+	# the line must be per-account. An account's own identity heads its list, and
+	# a full-address virtuals line that delivers into it is appended, which is how
+	# a group mailbox sends as the address it publishes. A bare alias and an
+	# address aimed at a service account are not account identities.
 	printf '%s\n' 'oliver:x:1000:1000::/home/oliver:/bin/ksh' \
 		'alice:x:1001:1001::/home/alice:/bin/ksh' \
 		'_onboard:x:800:800::/var/db/onboard:/sbin/nologin' > "$tree/passwd"
@@ -400,16 +409,23 @@ self_test() {
 		'hello: alice' \
 		'apply@kyriakon.net: _onboard' > "$tree/virtuals_mail_from"
 	mail_from_entries "$tree/passwd" "$tree/virtuals_mail_from" > "$tree/mail_from"
-	check "each account under /home gets its own address" \
-		"$(grep -c -e '^oliver@kyriakon.net: oliver$' -e '^alice@kyriakon.net: alice$' "$tree/mail_from")" 2
-	check "and an address that delivers into an account is sendable" \
-		"$(grep -c '^secretary@parish.example: alice$' "$tree/mail_from")" 1
-	check "and a delivery detail resolves to the account" \
-		"$(grep -c '^admin@kyriakon.net: alice$' "$tree/mail_from")" 1
+	check "each account under /home gets its own line" \
+		"$(grep -c -e '^oliver: ' -e '^alice: ' "$tree/mail_from")" 2
+	check "and the platform identity alone is on it" \
+		"$(grep -c '^oliver: oliver@kyriakon.net$' "$tree/mail_from")" 1
+	check "and the addresses that deliver into it are on that line" \
+		"$(grep -c '^alice: alice@kyriakon.net,secretary@parish.example,admin@kyriakon.net$' "$tree/mail_from")" 1
+	check "a delivery detail resolves to the account" \
+		"$(grep -c 'admin@kyriakon.net' "$tree/mail_from")" 1
 	check "but a bare alias and a service account's address are not" \
-		"$(grep -c -e '^hello' -e '^apply@' -e '_onboard' "$tree/mail_from")" 0
-	check "and an identity virtuals already carries is not repeated" \
-		"$(wc -l < "$tree/mail_from" | tr -d ' ')" 4
+		"$(grep -c -e 'hello' -e 'apply@' -e '_onboard' "$tree/mail_from")" 0
+	check "and no account's line carries another account's address" \
+		"$(awk -F': ' '$1 == "alice" && $2 ~ /oliver@/ { found = 1 } END { exit !found }' "$tree/mail_from" \
+			&& printf yes || printf no)" no
+	check "an identity virtuals already carries is not repeated" \
+		"$(grep -c 'alice@kyriakon.net' "$tree/mail_from")" 1
+	check "and there is one line per account" \
+		"$(wc -l < "$tree/mail_from" | tr -d ' ')" 2
 
 	# --- the MTA configuration ---
 	# Against the file that gets installed rather than a fixture: the substitution
@@ -450,11 +466,12 @@ self_test() {
 	check "and a domain dropped from the list leaves the filter" \
 		"$(grep -c '^filter.*-d parish.example' "$tree/smtpd.conf")" 0
 
-	# The two routing rules the mail cannot do without. The enqueuer's rule is
-	# what carries cron's own failure copy and every operator alert off the box:
-	# with it gone they are refused at RCPT and the alert path disappears silently.
-	# The submission rule is what stops an authenticated account naming a sender
-	# that is not its own, which filter-dkimsign would sign for that domain.
+	# The routing rules the mail cannot do without. The enqueuer's rule is what
+	# carries cron's own failure copy and every operator alert off the box: with
+	# it gone they are refused at RCPT and the alert path disappears silently.
+	# The submission listener's `senders` option is what binds an authenticated
+	# account to its own addresses, which filter-dkimsign would otherwise sign
+	# for whatever domain the sender names.
 	#
 	# Each is an exact line of the installed file, so removing the line from the
 	# shipped config makes this self-test fail rather than pass on a substring.
@@ -470,10 +487,16 @@ self_test() {
 		"$([ -n "$relay_match" ] && [ -n "$mail_domains_local" ] && [ -n "$local_for_local" ] \
 			&& [ "$relay_match" -gt "$mail_domains_local" ] && [ "$relay_match" -gt "$local_for_local" ] \
 			&& printf yes || printf no)" yes
-	check "authenticated submission is held to the mail-from table" \
-		"$(grep -c '^match auth from any mail-from <mail_from> for any action "relay"$' "$tree/smtpd.conf")" 1
-	check "and the table that rule names is installed" \
+	check "authenticated submission is held to the sender mapping" \
+		"$(grep -c '^match auth from any for any action "relay"$' "$tree/smtpd.conf")" 1
+	check "and the submission listener reads it" \
+		"$(grep -c '^listen on egress smtps pki mail.kyriakon.net auth filter "dkimsign" senders <mail_from>$' "$tree/smtpd.conf")" 1
+	check "and so does the auth-optional port, so it is not a way around it" \
+		"$(grep -c '^listen on egress tls pki mail.kyriakon.net auth-optional senders <mail_from>$' "$tree/smtpd.conf")" 1
+	check "and the table the listeners name is installed" \
 		"$(grep -c '^table mail_from file:/etc/mail/mail_from$' "$tree/smtpd.conf")" 1
+	check "no unauthenticated TCP loopback listener is left" \
+		"$(grep -c '^listen on lo0' "$tree/smtpd.conf" || true)" 0
 
 	# The apply@ route: a plaintext Maildir for _onboard, matched before the
 	# general local delivery. The order is the whole property: a match after it
@@ -1012,10 +1035,10 @@ fi
 #
 # The drain hooks in here. Its group-provision step appends one line to
 # /etc/mail/mail_domains per body domain, a "full-address account" line to
-# /etc/mail/virtuals per body address, and the same address to
-# /etc/mail/mail_from, then runs reload-smtpd.sh, which re-expands the filter's
-# -d list and restarts smtpd. The mail_from generation below is the same table's
-# other writer, under the same lock.
+# /etc/mail/virtuals per body address, and that address to the delivering
+# mailbox's list in /etc/mail/mail_from, then runs reload-smtpd.sh, which
+# re-expands the filter's -d list and restarts smtpd. The mail_from generation
+# below is the same table's other writer, under the same lock.
 # The platform's own domain. Every account under /home answers for it, and it is
 # the one line this deploy owns in mail_domains.
 platform_domain=kyriakon.net
@@ -1157,21 +1180,22 @@ done <<EOF
 $(awk -F: '$6 ~ /^\/home\// { print $1 }' /etc/passwd)
 EOF
 
-# The submitter allowlist the auth match reads. Generated rather than appended,
-# so an account deleted from /etc/passwd loses its submission identity at the
-# next deploy. It is written in the same pass as the tables above, before
-# smtpd -n and the restart, because smtpd fails to start on a file table it
-# cannot open.
+# The sender mapping the listeners' `senders` option reads. Generated rather
+# than appended, so an account deleted from /etc/passwd loses its submission
+# identity at the next deploy. It is written in the same pass as the tables
+# above, before smtpd -n and the restart, because smtpd fails to start on a file
+# table it cannot open.
 #
-# It holds an address when an account owns it: the account's login identity, and
-# every full-address virtuals line that delivers into an account with a home
-# under /home. A bare alias and an address aimed at a service account are not
-# account identities and stay out. The generation covers everything the box holds
-# at that moment; provision-member.sh and the drain's group transition append a
-# new line as they make it, so a member provisioned after this deploy submits
-# without waiting for the next one. The read-modify-replace runs under the same
-# table lock those writers take: an append landing between the virtuals read and
-# the rename would otherwise be dropped.
+# Each line maps an account to the addresses it may submit as: its login
+# identity first, then every full-address virtuals line that delivers into an
+# account with a home under /home. A bare alias and an address aimed at a service
+# account are not account identities and stay out. The generation covers
+# everything the box holds at that moment; provision-member.sh and the drain's
+# group transition add an address to the owning account's line as they make it,
+# so a member provisioned after this deploy submits without waiting for the next
+# one. The read-modify-replace runs under the same table lock those writers take:
+# an append landing between the virtuals read and the rename would otherwise be
+# dropped.
 mail_from_table=/etc/mail/mail_from
 mail_from_tmp=$(mktemp "$mail_from_table.XXXXXX")
 table_lock "$mail_from_table" || exit 1

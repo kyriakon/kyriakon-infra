@@ -181,12 +181,12 @@ put_key() {
 # a note rather than a failure: the account is usable for everything but mail
 # until then.
 #
-# mail_from is the submitter allowlist the auth match reads: an authenticated
-# account may only name an envelope sender that some account owns. The deploy
-# generates it from /etc/passwd and this table, and it is written here too,
-# because the member is made after the last deploy and is refused at MAIL FROM
-# until the next one. The same table lock the table helpers take keeps a deploy's
-# regeneration and this append from losing each other's lines.
+# mail_from is the sender mapping the listeners' `senders` option reads: an
+# authenticated account may only name an envelope sender in its own list. The
+# deploy generates it from /etc/passwd and this table, and it is written here
+# too, because the member is made after the last deploy and is refused at MAIL
+# FROM until the next one. The same table lock the table helpers take keeps a
+# deploy's regeneration and this append from losing each other's lines.
 virtuals=${VIRTUALS:-/etc/mail/virtuals}
 mail_domains_table=${MAIL_DOMAINS:-/etc/mail/mail_domains}
 mail_from_table=${MAIL_FROM:-/etc/mail/mail_from}
@@ -195,26 +195,30 @@ smtpd_template=${SMTPD_TEMPLATE:-/etc/mail/smtpd.conf.template}
 dkim_domains_table=${DKIM_DOMAINS:-/etc/mail/dkim_domains}
 queue_key_file=${QUEUE_KEY:-/etc/mail/queue.key}
 
-# mail_from_ensure <address> <account>: add the sender identity, saying so when
-# it was not there. A box that has not run the mail deploy has no table yet,
-# which is the same note the virtual table gives rather than a failure.
+# mail_from_ensure <address> <account>: add the address to the account's sender
+# list, saying so when it was not there. A box that has not run the mail deploy
+# has no table yet, which is the same note the virtual table gives rather than a
+# failure.
 mail_from_ensure() {
-	typeset address="$1" account="$2"
+	typeset address="$1" account="$2" rc=0
 	if [ ! -f "$mail_from_table" ]; then
 		printf 'note: no %s yet, so %s cannot submit until the mail deploy runs\n' \
 			"$mail_from_table" "$address" >&2
 		return 0
 	fi
-	if awk -F: -v k="$address" '$1 == k { found = 1 } END { exit !found }' "$mail_from_table"; then
-		return 0
-	fi
-	table_set "$mail_from_table" "$address" "$address: $account" \
-		|| { printf 'could not add %s to %s\n' "$address" "$mail_from_table" >&2; exit 1; }
-	awk -F: -v k="$address" '$1 == k { found = 1 } END { exit !found }' "$mail_from_table" \
-		|| { printf 'could not add %s to %s\n' "$address" "$mail_from_table" >&2; exit 1; }
-	printf 'mail-from %s added\n' "$address"
-	changed=yes
-	mail_changed=yes
+	table_map_add "$mail_from_table" "$account" "$address" || rc=$?
+	case $rc in
+	0)
+		printf 'mail-from %s added for %s\n' "$address" "$account"
+		changed=yes
+		mail_changed=yes
+		;;
+	1) ;;
+	*)
+		printf 'could not add %s to %s\n' "$address" "$mail_from_table" >&2
+		exit 1
+		;;
+	esac
 }
 
 # ensure_mail_address: the address line, and the smtpd restart that makes it
@@ -298,7 +302,7 @@ self_test() {
 	queue_key_file="$tree/queue.key"
 	printf 'kyriakon.net\nparish.example\n' > "$mail_domains_table"
 	printf 'hello: oliver' > "$virtuals"
-	printf 'oliver@kyriakon.net: oliver' > "$mail_from_table"
+	printf 'oliver: oliver@kyriakon.net' > "$mail_from_table"
 	printf 'kyriakon.net\nparish.example\n' > "$dkim_domains_table"
 	printf '0123456789abcdef0123456789abcdef\n' > "$queue_key_file"
 	# The tracked template, placeholders and all, as deploy-mail.sh installs it.
@@ -314,10 +318,13 @@ self_test() {
 	check "the table is left 0644" "$(stat -f '%Lp' "$virtuals")" 644
 	check "and the run says what it added" \
 		"$(grep -c '^virtual alice@kyriakon.net added$' "$tree/first.out")" 1
-	check "the address is also a sender the auth match allows" \
-		"$(grep -c '^alice@kyriakon.net: alice$' "$mail_from_table")" 1
-	check "and the earlier sender line survives" \
-		"$(grep -c '^oliver@kyriakon.net: oliver$' "$mail_from_table")" 1
+	check "the address is also on the account's sender line" \
+		"$(grep -c '^alice: alice@kyriakon.net$' "$mail_from_table")" 1
+	check "and the earlier account's line survives" \
+		"$(grep -c '^oliver: oliver@kyriakon.net$' "$mail_from_table")" 1
+	check "and one account's line never carries another's address" \
+		"$(awk -F': ' '$1 == "alice" && $2 ~ /oliver@/ { found = 1 } END { exit !found }' "$mail_from_table" \
+			&& printf yes || printf no)" no
 	check "the body's domain is in the filter's -d list" \
 		"$(grep -c '^filter \"dkimsign\" proc-exec \"filter-dkimsign -d kyriakon.net -d parish.example' "$smtpd_conf")" 1
 	check "with no placeholder left" "$(grep -c REPLACE_ME "$smtpd_conf")" 0
