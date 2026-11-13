@@ -2287,6 +2287,123 @@ fn a_mailed_key_from_another_address_does_not_replace_the_drafts_key() {
     );
 }
 
+/// A draft holds one key per mailbox: a second mailed key is refused rather than
+/// replacing the first, even when the draft recorded no outside address to
+/// compare the sender against. Nothing in smtpd.conf authenticates the sender,
+/// so the refusal is the control.
+#[test]
+fn a_second_mailed_key_does_not_replace_the_first() {
+    let fix = Fix::new("mail-key-second");
+    fix.write_draft(TOKEN, &[("username", "secretary"), ("whose", "person")]);
+    fix.mail("one", "applicant@example.invalid", TOKEN, GOOD_KEY);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let before: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
+    let key = before["mail_keys"][0].clone();
+
+    const OTHER_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
+                             mAYEAAAAABK4BgQAAAAAEQ==\n\
+                             -----END PGP PUBLIC KEY BLOCK-----\n";
+    fix.mail("two", "attacker@example.invalid", TOKEN, OTHER_KEY);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let after: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
+    assert_eq!(after["mail_keys"], json!([key]), "the key was replaced");
+    assert!(
+        fix.sent().contains("already filed"),
+        "the second sender is told why it was refused: {}",
+        fix.sent()
+    );
+}
+
+/// The web form files a person's key under no mailbox; a mailed key takes the
+/// account's name. They are the same mailbox, so the mailed key must not replace
+/// the form's.
+#[test]
+fn a_mailed_key_does_not_replace_a_key_the_form_filed() {
+    let fix = Fix::new("mail-key-form-first");
+    fix.write_draft(TOKEN, &[("username", "secretary"), ("whose", "person")]);
+    fix.mail("one", "applicant@example.invalid", TOKEN, GOOD_KEY);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    // Re-file the key the way the web form does: under no mailbox.
+    let path = fix.dir.join("store/drafts").join(format!("{TOKEN}.json"));
+    let mut draft: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    draft["mail_keys"][0]["mailbox"] = json!("");
+    std::fs::write(&path, serde_json::to_vec_pretty(&draft).unwrap()).unwrap();
+    let key = draft["mail_keys"][0].clone();
+
+    const OTHER_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
+                             mAYEAAAAABK4BgQAAAAAEQ==\n\
+                             -----END PGP PUBLIC KEY BLOCK-----\n";
+    fix.mail("two", "attacker@example.invalid", TOKEN, OTHER_KEY);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let after: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
+    assert_eq!(
+        after["mail_keys"],
+        json!([key]),
+        "the form's key was replaced"
+    );
+    assert!(
+        fix.sent().contains("already filed"),
+        "the sender is told why it was refused: {}",
+        fix.sent()
+    );
+}
+
+/// One collision does not take the message's other blocks with it: a mailbox
+/// with no key yet still gets the key, and the reply names only the refused one.
+#[test]
+fn a_colliding_block_does_not_discard_the_others() {
+    let fix = Fix::new("mail-key-partition");
+    fix.write_draft(
+        TOKEN,
+        &[
+            ("whose", "body"),
+            ("body_domain", "parish.example"),
+            ("body_account_names", "secretary\nhall"),
+        ],
+    );
+    fix.mail(
+        "one",
+        "applicant@example.invalid",
+        TOKEN,
+        &format!("secretary\n{GOOD_KEY}"),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    const HALL_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
+                            mAYEAAAAABK4BgQAAAAAEQ==\n\
+                            -----END PGP PUBLIC KEY BLOCK-----\n";
+    fix.mail(
+        "two",
+        "applicant@example.invalid",
+        TOKEN,
+        &format!("secretary\n{GOOD_KEY}\nhall\n{HALL_KEY}"),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let after: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
+    let names: Vec<&str> = after["mail_keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["mailbox"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["secretary", "hall"], "the fresh block was filed");
+    assert!(
+        fix.sent().contains("A key for secretary is already filed"),
+        "the reply names the refused mailbox: {}",
+        fix.sent()
+    );
+}
+
 /// The address the draft recorded still files its key, including when the From
 /// header carries a display name.
 #[test]

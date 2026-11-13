@@ -149,13 +149,38 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
             return reply_or_drop(cfg, store, &message, &body).await;
         }
     }
+    // A draft holds one key per mailbox, and a person's key is filed under no
+    // mailbox, so it takes the account's name - the same localpart a mailed key
+    // lands on. A second key for a mailbox that already holds one is refused
+    // rather than replacing it: smtpd cannot authenticate the sender, so the
+    // refusal is the control, as it is on the Titan route. A replacement for a
+    // live mailbox goes through the account's rotation instead. One collision
+    // does not take the message's other blocks with it.
+    let username = draft
+        .answers
+        .get("username")
+        .map(String::as_str)
+        .unwrap_or_default();
+    fn localpart<'a>(username: &'a str, mailbox: &'a str) -> &'a str {
+        if mailbox.is_empty() {
+            username
+        } else {
+            mailbox
+        }
+    }
+    let (refused, fresh): (Vec<_>, Vec<_>) = keys.into_iter().partition(|(mailbox, _)| {
+        draft
+            .mail_keys
+            .iter()
+            .any(|k| localpart(username, &k.mailbox) == localpart(username, mailbox))
+    });
     let body = draft.answers.get("whose").map(String::as_str) == Some("body");
     let domain = draft
         .answers
         .get("body_domain")
         .cloned()
         .unwrap_or_default();
-    for (mailbox, material) in keys {
+    for (mailbox, material) in fresh {
         let address = if body {
             if domain.is_empty() {
                 mailbox.clone()
@@ -165,14 +190,26 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
         } else {
             format!("{mailbox}@kyriakon.net")
         };
-        draft.mail_keys.retain(|k| k.mailbox != mailbox);
         draft
             .mail_keys
             .push(keycheck::mail_key(mailbox.clone(), &address, &material));
     }
     let saved = draft::save(store, &mut draft).await;
     drop(lock);
-    saved.map_err(Error::from)
+    saved.map_err(Error::from)?;
+    if !refused.is_empty() {
+        let names: Vec<&str> = refused
+            .iter()
+            .map(|(mailbox, _)| mailbox.as_str())
+            .collect();
+        let body = format!(
+            "A key for {} is already filed against this application. \
+             The approval mail names who to contact if it is wrong.\n",
+            names.join(", ")
+        );
+        return reply_or_drop(cfg, store, &message, &body).await;
+    }
+    Ok(())
 }
 
 /// Answer the sender when there is one to answer. A message with no usable From
