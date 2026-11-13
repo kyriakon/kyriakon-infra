@@ -807,7 +807,9 @@ pub(super) async fn account_export(app: &App, request: &Request) -> Reply {
                 "Your data export is on its way",
                 "The platform is gathering the written record of your account. It will \
                  appear in your sftp space as export/<timestamp>/ beside www/ and \
-                 gemini/, and a notice will say when it is ready.",
+                 gemini/, and a notice will say when it is ready. An account with no \
+                 site or upload key gets the same record mailed encrypted to its mail \
+                 key instead.",
             );
             Reply::html(200, page_html(&page))
         }

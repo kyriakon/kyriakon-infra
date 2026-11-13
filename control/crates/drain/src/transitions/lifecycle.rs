@@ -833,7 +833,7 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
 /// The contact address the member gave, when it validates as a mail header. It
 /// is validated again because it becomes a mail header, and a record that
 /// reached it from outside the drain is not trusted.
-fn valid_contact(address: Option<&str>) -> Option<String> {
+pub(super) fn valid_contact(address: Option<&str>) -> Option<String> {
     address
         .filter(|addr| validate::address(addr).is_none())
         .map(str::to_string)
@@ -3090,7 +3090,29 @@ pub async fn export_account(
                 .map(str::to_string)
         })
         .unwrap_or_default();
-    let bundle = kyriakon_control_core::account::export::deliver(cfg, store, username).await?;
+    let account = store
+        .account(username)
+        .await?
+        .ok_or_else(|| Error::Failed(format!("accounts/{username}/account.json is missing")))?;
+    // A member with no site or no upload key cannot reach a bundle written into
+    // the chroot, so the same written part goes by mail instead. An existing
+    // path that cannot be read is left to `deliver` to report rather than
+    // silently mailed around.
+    let chroot = std::path::Path::new(&cfg.public_root).join(format!("{username}.kyriakon.net"));
+    let absent =
+        std::fs::symlink_metadata(&chroot).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+    let mailed = absent || account.upload_keys.is_empty();
+    let (bundle, done) = if mailed {
+        (
+            export::deliver_by_mail(cfg, store, username).await?,
+            "mailed encrypted to the member's mail key",
+        )
+    } else {
+        (
+            export::deliver(cfg, store, username).await?,
+            "delivered to the member's export directory",
+        )
+    };
     // Record the delivery and close the line it answers, so the page's own
     // export is not left open in the operator's docket. A pass that delivered
     // and closed but crashed before its journal line is replayed by the next
@@ -3104,19 +3126,17 @@ pub async fn export_account(
         let delivered_on = kyriakon_control_core::util::date_string(
             kyriakon_control_core::account::requests::today(),
         );
-        kyriakon_control_core::account::requests::close(
-            store,
-            &id,
-            &delivered_on,
-            "delivered to the member's export directory",
-        )
-        .await?;
+        kyriakon_control_core::account::requests::close(store, &id, &delivered_on, done).await?;
     }
     let application = ApplicationRef::application(username.to_string(), status_token);
     Ok(Settlement::line(
         "applied",
         application.clone(),
-        Some(format!("the bundle is at {bundle}")),
+        Some(if mailed {
+            format!("the bundle was {bundle}")
+        } else {
+            format!("the bundle is at {bundle}")
+        }),
     ))
 }
 

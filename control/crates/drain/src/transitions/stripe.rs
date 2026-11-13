@@ -5,7 +5,7 @@
 
 use super::boxrun::{run_script, script_error, spawn_script};
 use super::groups::{group_record, write_account_record, write_group_record};
-use super::lifecycle::{dns_contact, report_record};
+use super::lifecycle::{dns_contact, report_record, valid_contact};
 use super::payments::{restore_group_mailboxes, token_join, write_payment_copy};
 use super::report_failure;
 use super::Error;
@@ -519,10 +519,9 @@ impl BillingTarget {
     /// domain rather than the platform's.
     async fn recipient(&self, store: &Store) -> String {
         match self {
-            BillingTarget::Account(a) => a
-                .outside_address
-                .clone()
-                .unwrap_or_else(|| format!("{}@kyriakon.net", a.username)),
+            BillingTarget::Account(a) => {
+                valid_contact(a.outside_address.as_deref()).unwrap_or_else(|| a.platform_address())
+            }
             BillingTarget::Group(g) => dns_contact(store, g)
                 .await
                 .unwrap_or_else(|_| format!("{}@{}", g.site_owner, g.domain)),

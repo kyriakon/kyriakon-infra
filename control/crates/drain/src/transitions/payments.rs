@@ -7,7 +7,7 @@
 
 use super::boxrun::{cancel_stripe_if_active, run_script};
 use super::groups::{group_record, write_account_record, write_group_record};
-use super::lifecycle::dns_contact;
+use super::lifecycle::{dns_contact, valid_contact};
 use super::Error;
 use super::{AfterLine, Settlement};
 use kyriakon_control_core::config::DrainConfig;
@@ -455,10 +455,8 @@ async fn apply_payment(
 
     // The receipt is for every payment, including a shortfall: the money
     // arrived, and the account page quotes what still does.
-    let to = account
-        .outside_address
-        .clone()
-        .unwrap_or_else(|| format!("{username}@kyriakon.net"));
+    let to = valid_contact(account.outside_address.as_deref())
+        .unwrap_or_else(|| account.platform_address());
     let (subject, body) = if applied.paid {
         let paid = util::date_string(until);
         (
@@ -989,10 +987,8 @@ pub async fn refund(
     )
     .await?;
 
-    let to = account
-        .outside_address
-        .clone()
-        .unwrap_or_else(|| format!("{username}@kyriakon.net"));
+    let to = valid_contact(account.outside_address.as_deref())
+        .unwrap_or_else(|| account.platform_address());
     let (subject, body) = refund_notice(
         rail,
         &util::gbp(amount),

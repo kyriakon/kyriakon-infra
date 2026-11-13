@@ -503,13 +503,16 @@ fn write_tree(
     Ok(stamp)
 }
 
-/// The address the ready notice goes to: the contact the member gave, and the
-/// mailbox on the platform otherwise.
-fn member_address(account: &Account, username: &str) -> String {
+/// The address the ready notice goes to: the contact the member gave, when it
+/// validates as a mail header, and the mailbox on the platform otherwise. A
+/// group mailbox's platform address is its mailbox on the group's own domain.
+fn member_address(account: &Account) -> String {
     account
         .outside_address
-        .clone()
-        .unwrap_or_else(|| format!("{username}@kyriakon.net"))
+        .as_deref()
+        .filter(|addr| crate::flow::validate::address(addr).is_none())
+        .map(str::to_string)
+        .unwrap_or_else(|| account.platform_address())
 }
 
 /// Write the written part into the member's sftp chroot and append the ready
@@ -541,7 +544,7 @@ pub async fn deliver(cfg: &DrainConfig, store: &Store, username: &str) -> Result
     let name = stamp(now);
     let export = export_dir(&chroot)?;
     write_tree(&export, &name, &docs, owner)?;
-    let to = member_address(&account, username);
+    let to = member_address(&account);
     notice::send_again(
         cfg,
         store,
@@ -662,7 +665,7 @@ pub async fn deliver_by_mail(
     let (account, answer, docs) = written(cfg, store, username, now, true).await?;
     let armored = encrypt(&cfg.gpg, &key, bundle_text(&docs).as_bytes()).await?;
     let filename = format!("export-{}.txt.asc", stamp(now));
-    let to = member_address(&account, username);
+    let to = member_address(&account);
     notice::send_account_notice_attachment(
         cfg,
         store,
