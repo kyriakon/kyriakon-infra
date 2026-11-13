@@ -29,6 +29,7 @@ async fn a_webhook_post_stores_the_raw_body_and_the_signature_header() {
 
     let mut bodies = Vec::new();
     let mut sigs = Vec::new();
+    let mut arrivals = Vec::new();
     for entry in std::fs::read_dir(dir.join("webhooks")).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -38,12 +39,25 @@ async fn a_webhook_post_stores_the_raw_body_and_the_signature_header() {
             bodies.push(entry.path());
         } else if name.ends_with(".sig") {
             sigs.push(entry.path());
+        } else if name.ends_with(".at") {
+            arrivals.push(entry.path());
         }
     }
     assert_eq!(bodies.len(), 1, "{bodies:?}");
     assert_eq!(sigs.len(), 1, "{sigs:?}");
     assert_eq!(std::fs::read(&bodies[0]).unwrap(), body);
     assert_eq!(std::fs::read(&sigs[0]).unwrap(), header.as_bytes());
+    assert_eq!(arrivals.len(), 1, "{arrivals:?}");
+    let arrival = std::fs::read_to_string(&arrivals[0])
+        .unwrap()
+        .trim()
+        .parse::<i64>()
+        .expect("the arrival is a unix timestamp");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    assert!(
+        (now - arrival).abs() <= 5,
+        "the arrival stamp {arrival} is not now ({now})"
+    );
 }
 
 /// A request that is not a signed POST is refused without writing: the handler

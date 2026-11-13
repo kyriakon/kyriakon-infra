@@ -14,14 +14,18 @@ use crate::page;
 use crate::page::ReceivedPage;
 use kyriakon_control_core::config::HOST;
 use kyriakon_control_core::store;
+use time::OffsetDateTime;
 
-/// Store one Stripe delivery for the drain: the raw body and the
-/// `Stripe-Signature` header, under `webhooks/`, named by a ULID so the
-/// directory sorts by age. Nothing is verified here and no store record is
-/// written; the handler holds no secret. The row's method is POST and the table
-/// is the half that refuses another one; a delivery with no signature header is
-/// refused without writing, and a successful store answers 2xx at once so Stripe
-/// does not retry a delivery the drain has not settled yet.
+/// Store one Stripe delivery for the drain: the raw body, the
+/// `Stripe-Signature` header and the arrival time, under `webhooks/`, named by
+/// a ULID so the directory sorts by age. Nothing is verified here and no store
+/// record is written; the handler holds no secret. The row's method is POST and
+/// the table is the half that refuses another one; a delivery with no signature
+/// header is refused without writing, and a successful store answers 2xx at
+/// once so Stripe does not retry a delivery the drain has not settled yet.
+///
+/// The arrival stamp is what the drain's recency guard is measured against, so
+/// a delivery is not refused for being old by the time a pass reaches it.
 pub(super) async fn webhook(app: &App, request: &Request) -> Reply {
     let signature = request.get("HTTP_STRIPE_SIGNATURE").unwrap_or("");
     if signature.trim().is_empty() {
@@ -31,13 +35,18 @@ pub(super) async fn webhook(app: &App, request: &Request) -> Reply {
         return Reply::html(413, String::new());
     }
     let id = ulid::Ulid::new().to_string();
-    // The signature is written before the body. The drain iterates `.body`
-    // files, so the other order leaves a body with no signature for a window,
-    // which it would refuse and delete: a delivery Stripe will not send again.
+    let received = OffsetDateTime::now_utc().unix_timestamp().to_string();
+    // The signature and the arrival are written before the body. The drain
+    // iterates `.body` files, so the other order leaves a body with no
+    // signature or no receipt for a window, which it would refuse and delete: a
+    // delivery Stripe will not send again.
     let placed = async {
         app.store.ensure_dir("webhooks").await?;
         app.store
             .write_record("webhooks", &format!("{id}.sig"), signature.as_bytes())
+            .await?;
+        app.store
+            .write_record("webhooks", &format!("{id}.at"), received.as_bytes())
             .await?;
         app.store
             .write_record("webhooks", &format!("{id}.body"), &request.body)
