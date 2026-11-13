@@ -155,14 +155,23 @@ out of the URL's filename, and answering that prompt is one more thing to type.
 
 The prompts worth knowing, all read out of the ramdisk: the location prompt re-asks when the
 answer is empty, so a mistyped URL costs a retry rather than a Ctrl-C, and the questions
-this file answers are `System hostname? (short form, e.g. 'foo')`, `Password for root
-account?`, `Public ssh key for root account?`, `What timezone are you in?`, `Location of
-sets?`, `HTTP Server?`, and `Encrypt the root disk with a (p)assphrase or (k)eydisk?`. This
-matters: autoinstall matches questions by their text and silently falls back to the
-installer's default when it cannot match an answer, so a response file taken from an older
-write-up installs something other than what it says. The prompts that bit are `Password for
-root account?` and `Use (A)uto layout, (E)dit auto layout, or create (C)ustom layout?`,
-neither of which appears in older guides in that form.
+this file answers are `System hostname? (short form, e.g. 'foo')`, `Public ssh key for root
+account?`, `Password for root account?`, `What timezone are you in?`, `Location of sets?`,
+`HTTP Server?`, and `Encrypt the root disk with a (p)assphrase or (k)eydisk?`. This matters: autoinstall matches questions
+by their text and silently falls back to the installer's default when it cannot match an
+answer, so a response file taken from an older write-up installs something other than what it
+says. The prompts that bit are `Password for root account?` and `Use (A)uto layout, (E)dit
+auto layout, or create (C)ustom layout?`, neither of which appears in older guides in that
+form.
+
+`Password for root account?` is answered with `*************`, the 13-asterisk sentinel
+`autoinstall(8)` names: `encr_pwd()` writes it through unchanged, so root has no password and
+is reached only by the SSH key above, with `PermitRootLogin prohibit-password`. The file
+cannot simply leave the question out: autoinstall calls `ask_password` with no default, so an
+unanswered question stops the run with "Question has no answer in response file" instead of
+prompting. A real bcrypt verifier is password material this repository does not track; the
+one that used to sit here is still in the public history and in any snapshot built before
+this change, so treat that old template password as compromised.
 
 Before any of that, the disk needs writing, and the rescue host is where that happens:
 `openbsd/restore-template/prepare-disk.sh`, run as root there, fetches the miniroot, checks it
@@ -175,7 +184,8 @@ Two ways to put that file in front of the installer.
 
 Straightforward, and what the four differences above assume: choose **(A)utoinstall** at the
 ramdisk's prompt. Hetzner's DHCP carries no `next-server`, so it then asks `Response file
-location?`, and the answer is that file's URL. One prompt at the console instead of twenty.
+location?`, and the answer is that file's URL. One prompt at the console instead of
+twenty: the URL.
 
 Fully unattended is not built yet, and the image's shape is why.
 
