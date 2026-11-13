@@ -106,12 +106,32 @@ settle_old_names() { # <dir> <yes|no>
 }
 
 # approval_key_ok <path>: the file holds the key `openssl rand -base64 32`
-# makes, which is one line of 44 base64 characters and what sign::read_key
-# strips back to 32 bytes. Anything else — the empty file a killed write left,
-# a line cut short — is not a key, and `-e` alone reported it as kept forever
-# while every drain pass stopped on it.
+# makes, which is one line of 44 base64 characters; sign::read_key trims the
+# trailing newline and uses those characters as the HMAC key. Anything else —
+# the empty file a killed write left, a line cut short — is not a key, and `-e`
+# alone reported it as kept forever while every drain pass stopped on it.
+#
+# The content check is deliberately stricter than read_key, which takes any
+# non-empty file: a key installed by hand in another shape is replaced with a
+# warning rather than trusted, because the shape this adds is the only one the
+# deploy itself can vouch for. A key of the right shape whose owner or mode
+# read_key refuses is not this check's case: the caller names the fix, since
+# rotating it would invalidate links already signed with it.
 approval_key_ok() { # <path>
-	LC_ALL=C tr -d '[:space:]' <"$1" 2>/dev/null | grep -qxE '[A-Za-z0-9+/]{43}='
+	[ -f "$1" ] || return 1
+	LC_ALL=C tr -d '[:space:]' <"$1" | grep -qxE '[A-Za-z0-9+/]{43}='
+}
+
+# approval_key_private <path> <uid>: <uid> owns the file and group and others
+# have no access to it, which are the two predicates sign::read_key applies
+# beside the empty check. The last two octal digits of the mode are the group
+# and other bits, so a mode ending in 00 is one read_key accepts.
+approval_key_private() { # <path> <uid>
+	[ "$(stat -f '%u' "$1" 2>/dev/null)" = "$2" ] || return 1
+	case "$(stat -f '%Lp' "$1" 2>/dev/null)" in
+	*00) return 0 ;;
+	esac
+	return 1
 }
 
 # write_approval_key <dest> <generator...>: generate the key into a sibling temp
@@ -308,6 +328,28 @@ STUB
 			exit 1
 		fi
 	done
+
+	# The owner and mode read_key refuses even with the right content. Both are
+	# read with BSD stat, which the Ubuntu step of checks.yml does not have and
+	# the OpenBSD VM does, so the check runs where it can and the probe says so
+	# rather than failing the run on a toolchain this script does not target.
+	if [ "$(stat -f '%u' "$work/key/real" 2>/dev/null)" = "$(id -u)" ]; then
+		chmod 600 "$work/key/real"
+		approval_key_private "$work/key/real" "$(id -u)" || {
+			printf 'self-test: a 0600 key of the right owner was refused\n' >&2
+			exit 1
+		}
+		chmod 644 "$work/key/real"
+		if approval_key_private "$work/key/real" "$(id -u)"; then
+			printf 'self-test: a key group and others can read was accepted\n' >&2
+			exit 1
+		fi
+		if approval_key_private "$work/key/real" "$(( $(id -u) + 1 ))"; then
+			printf 'self-test: a key another uid owns was accepted\n' >&2
+			exit 1
+		fi
+		chmod 600 "$work/key/real"
+	fi
 
 	mkdir "$work/key-fail"
 	if write_approval_key "$work/key-fail/fresh" "$work/bin/keygen-fail" 2>/dev/null; then
@@ -755,6 +797,12 @@ done
 # can sign with it, so it is replaced.
 approval_key=/etc/kyriakon/onboard/approval-signing-key
 if approval_key_ok "$approval_key"; then
+	# sign::read_key refuses a key root does not own, or one group or others
+	# can read, on the same pass it refuses an empty one, so the drain would stop
+	# while this deploy printed that it kept the key. Those links are signed
+	# already, so this names the fix rather than rotating the key under them.
+	approval_key_private "$approval_key" 0 \
+		|| die "$approval_key must be owned by root and mode 0600, or the drain refuses every pass: doas chown root:wheel $approval_key && doas chmod 600 $approval_key"
 	printf 'kept the existing %s\n' "$approval_key"
 else
 	# A file there that is not a key is the empty one an interrupted write used
