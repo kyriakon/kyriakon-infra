@@ -562,7 +562,8 @@ fi
 
 # The login check: the one fixed-argument program the account page may run as
 # root. It takes a username and the proof directory, reads the password from
-# stdin and runs only `doveadm auth test`. doas.conf cannot name the check's
+# stdin, runs only `doveadm auth test`, and keeps the failed-login records that
+# bound the guesses per member name. doas.conf cannot name the check's
 # arguments (they are the username), so it names this program, and the program
 # is what keeps the subcommand fixed and mints the login proof.
 install -d -m 0755 -o root -g wheel /usr/local/libexec
@@ -578,6 +579,10 @@ install_staged "$repo_dir/scripts/kyriakon-authcheck.sh" /usr/local/libexec/kyri
 # or replace would prove nothing. install -d creates the missing parent too.
 install -d -m 0755 -o root -g wheel /var/db/kyriakon
 install -d -m 0700 -o root -g wheel /var/db/kyriakon/logins
+# The failed-login records the checker keeps, one file per member name, for the
+# proof directory's reason: a directory the handler could write would let it
+# erase the failures that throttle its own guesses.
+install -d -m 0700 -o root -g wheel /var/db/kyriakon/login-attempts
 
 # The release this box is running, as the config's own comment describes it: the
 # deployed commit and its date. The acceptance records carry it as the version of
