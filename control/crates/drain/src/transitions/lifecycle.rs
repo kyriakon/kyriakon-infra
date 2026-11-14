@@ -1534,15 +1534,13 @@ pub async fn delete_account(
     // delete-user.sh removes the account, so a retry after a failure still knows
     // which group to clean.
     if let Some(domain) = account.group.as_deref() {
-        let routes = remove_addresses(&cfg.virtuals, domain, username)?;
-        let senders = remove_senders_for_domain(&cfg.mail_from, domain, username)?;
-        // delete-user.sh restarts smtpd only when it dropped the mailbox's own
-        // lines; these are the body's, so this pass makes the change live. A
-        // body whose site owner has gone surfaces through the group notice's own
-        // report, where the operator can appoint one.
-        if routes || senders {
-            run_script(cfg, "reload-smtpd.sh", &[]).await?;
-        }
+        remove_addresses(&cfg.virtuals, domain, username)?;
+        remove_senders_for_domain(&cfg.mail_from, domain, username)?;
+        // Reload even when this pass changed nothing: a previous pass may have
+        // written the tables and failed the reload, and the intent retries. A
+        // group-mailbox deletion is rare, so one redundant reload is cheaper
+        // than a daemon left mapping a body address to a deleted mailbox.
+        run_script(cfg, "reload-smtpd.sh", &[]).await?;
         if let Some(mut group) = group_record(store, domain).await? {
             if group.accounts.iter().any(|mailbox| mailbox == username) {
                 group.accounts.retain(|mailbox| mailbox != username);
