@@ -149,8 +149,12 @@ async fn the_card_pages_carry_the_keyed_payment_link() {
     let view = payment_for(&app, Some(&record)).expect("a paid approval has a block");
     let text = view.instructions.join("\n");
     assert!(
-        text.contains("client_reference_id=KYR-AAAA-BBBB-CCCC"),
-        "the link is keyed to the account's token: {text}"
+        text.contains("client_reference_id=abcdefghjkmnpqrstvwxyz0123"),
+        "the link is keyed to the application's identifier: {text}"
+    );
+    assert!(
+        !text.contains("KYR-"),
+        "the payment token reached the link: {text}"
     );
     assert!(
         !text.contains("subscription_data"),
@@ -181,7 +185,7 @@ async fn a_group_status_page_carries_the_group_payment_link() {
     let text = view.instructions.join("\n");
     assert!(
         text.contains(
-            "https://buy.stripe.com/test_group_example?client_reference_id=KYR-AAAA-BBBB-CCCC"
+            "https://buy.stripe.com/test_group_example?client_reference_id=abcdefghjkmnpqrstvwxyz0123"
         ),
         "the page carried the group link: {text}"
     );

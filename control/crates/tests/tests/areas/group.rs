@@ -2917,8 +2917,8 @@ fn a_card_renewal_writes_one_date_on_the_group() {
     let token = group["payment"]["token_ref"].as_str().unwrap().to_string();
     assert_eq!(group["payment"]["rail"], json!("card"), "{group}");
     assert!(
-        fix.sent().contains(&format!("client_reference_id={token}")),
-        "the approval mail keys the link to the group's token: {}",
+        fix.sent().contains(&format!("client_reference_id={TOKEN}")),
+        "the approval mail keys the link to the group's application: {}",
         fix.sent()
     );
 
@@ -2927,7 +2927,7 @@ fn a_card_renewal_writes_one_date_on_the_group() {
         "checkout.session.completed",
         json!({
             "id": "cs_example",
-            "client_reference_id": token,
+            "client_reference_id": TOKEN,
             "subscription": SUBSCRIPTION,
             "customer": "cus_example",
         }),
@@ -3660,12 +3660,13 @@ fn a_card_renewal_restores_a_lapsed_groups_mailboxes() {
     group["payment"]["window"]["state"] = json!("closed");
     std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
     let token = group["payment"]["token_ref"].as_str().unwrap().to_string();
+    fix.application_record(TOKEN, "warden", &token);
     fix.webhook(
         "evt_01_checkout",
         "checkout.session.completed",
         json!({
             "id": "cs_example",
-            "client_reference_id": token,
+            "client_reference_id": TOKEN,
             "subscription": SUBSCRIPTION,
             "customer": "cus_example",
         }),
@@ -3869,15 +3870,19 @@ fn a_group_on_the_card_rail_receives_the_group_payment_link() {
     let sent = fix.sent();
     assert!(
         sent.contains(&format!(
-            "https://buy.stripe.com/test_group_example?client_reference_id={token}"
+            "https://buy.stripe.com/test_group_example?client_reference_id={TOKEN}"
         )),
         "the group's approval did not carry the group link: {sent}"
     );
     assert!(
         !sent.contains(&format!(
-            "https://buy.stripe.com/test_example?client_reference_id={token}"
+            "https://buy.stripe.com/test_example?client_reference_id={TOKEN}"
         )),
         "the group's approval carried the account link: {sent}"
+    );
+    assert!(
+        !sent.contains(&format!("client_reference_id={token}")),
+        "the group's payment token reached the link: {sent}"
     );
 
     // The status page reads the application record, so the body's block has to

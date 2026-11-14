@@ -43,7 +43,7 @@ pub(super) async fn capsule_account(app: &App, incoming: &Incoming) -> Reply {
                     &block,
                     &app.cfg.price_gbp,
                     &app.cfg.postal_address,
-                    card_link(app, block.token_ref.as_deref(), false).as_deref(),
+                    card_link(app, block.application_ref.as_deref(), false).as_deref(),
                     OffsetDateTime::now_utc(),
                 )
             });

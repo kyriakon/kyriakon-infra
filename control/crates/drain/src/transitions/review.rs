@@ -586,6 +586,7 @@ async fn approve(
         Some(Payment {
             token_ref: token_ref.clone(),
             token_issued_at: Some(now.clone()),
+            application_ref: Some(record.status_token.clone()),
             paid_until: None,
             window: window.clone(),
             rail: Some(record.rail.clone()),
@@ -753,6 +754,7 @@ async fn approve(
             &record.rail,
             no_charge,
             token_ref.as_deref(),
+            Some(&record.status_token),
             &window,
             account.payment.as_ref().and_then(|p| p.monero.as_ref()),
         )?,
@@ -959,11 +961,7 @@ async fn approve_group(
     // A group on a cash rail has no Stripe link, and asking for one would fail
     // the approval of a body that never chose the card rail.
     let link = if written.payment.rail == "card" {
-        card_link(
-            &cfg.stripe_group_payment_link,
-            written.payment.token_ref.as_deref().unwrap_or(""),
-        )
-        .map_err(|_| {
+        card_link(&cfg.stripe_group_payment_link, &record.status_token).map_err(|_| {
             Error::Failed(
                 "stripe_group_payment_link is not configured, so a group card approval has no \
                  link to send"
@@ -1409,12 +1407,14 @@ fn group_approval_body(
 /// The decision email for an approval. The words are short because #333 owns
 /// the notice copy; what matters here is that the token and the rail's own
 /// instructions are on it, and that the free path says neither.
+#[allow(clippy::too_many_arguments)]
 fn decision_body(
     cfg: &DrainConfig,
     username: &str,
     rail: &str,
     no_charge: bool,
     token: Option<&str>,
+    application: Option<&str>,
     window: &Option<Window>,
     monero: Option<&Monero>,
 ) -> Result<String, Error> {
@@ -1430,7 +1430,7 @@ fn decision_body(
         .as_ref()
         .ok_or_else(|| Error::Failed("a charged approval has no window".to_string()))?;
     let card_link = if rail == "card" {
-        card_link(&cfg.stripe_payment_link, token)?
+        card_link(&cfg.stripe_payment_link, application.unwrap_or(""))?
     } else {
         None
     };
@@ -1512,6 +1512,7 @@ pub async fn resend(
         &account.rail,
         false,
         payment.token_ref.as_deref(),
+        payment.application_ref.as_deref(),
         &payment.window,
         payment.monero.as_ref(),
     )?;

@@ -96,16 +96,18 @@ pub fn rail_instructions(
     }
 }
 
-/// The card rail's Payment Link, keyed to one payment token.
+/// The card rail's Payment Link, keyed to one application.
 ///
-/// The reference is the account's `KYR-` token, which is what the token index
-/// joins to the account: the same join `credit()` uses. `client_reference_id`
-/// is the one Payment Link parameter that carries it, and it is what
-/// `checkout.session.completed` names the account by. A placeholder that
-/// reached the box is refused rather than mailed, because a member cannot pay
-/// at REPLACE_ME.
-pub fn card_link(payment_link: &str, token: &str) -> Result<Option<String>, Error> {
-    if token.is_empty() {
+/// The reference is the application's identifier, the token the status page is
+/// filed under: `checkout.session.completed` resolves it through the application
+/// record to the payment token and the account. It is not the payment token,
+/// which is a bearer secret the custody section keeps from every third party,
+/// and Stripe's dashboard, logs and exports are a third party. A value that is
+/// not an application identifier keys no link, so a `KYR-` token cannot reach
+/// one again. A placeholder that reached the box is refused rather than mailed,
+/// because a member cannot pay at REPLACE_ME.
+pub fn card_link(payment_link: &str, application: &str) -> Result<Option<String>, Error> {
+    if application.is_empty() || !crate::store::is_status_token(application) {
         return Ok(None);
     }
     let link = payment_link.trim_end_matches(['&', '?']);
@@ -116,5 +118,7 @@ pub fn card_link(payment_link: &str, token: &str) -> Result<Option<String>, Erro
         ));
     }
     let joiner = if link.contains('?') { '&' } else { '?' };
-    Ok(Some(format!("{link}{joiner}client_reference_id={token}")))
+    Ok(Some(format!(
+        "{link}{joiner}client_reference_id={application}"
+    )))
 }
