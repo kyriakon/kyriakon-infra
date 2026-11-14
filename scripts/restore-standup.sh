@@ -50,12 +50,14 @@
 # takes and is not wiped when Hetzner frees it. The restored mail is PGP ciphertext and
 # the read-only key cannot write to the repository, but the same restore carries the
 # control store (the payment ledger and every member's account record) and the drain's
-# secrets under /etc/kyriakon, so the restore target and the credentials are kept in the
-# memory filesystem described below rather than on that disk. What a future holder of the
-# disk could then read is the restored site and git content plus read access to the
-# backups. An encrypted scratch volume would remove that, and is a follow-up rather than
-# part of this: it needs a throwaway box to prove the unlock works on, and there is no
-# spare box.
+# secrets under /etc/kyriakon, so the restore target and the credentials are kept in a
+# memory filesystem sized from the snapshot itself, rather than on that disk. The one
+# exception is a payload larger than the box's swap: there the target falls back to disk
+# and only the credentials stay in memory, which is the residue #111 records. What a
+# future holder of the disk could then read is the restored site and git content plus
+# read access to the backups. An encrypted scratch volume would remove that, and is a
+# follow-up rather than part of this: it needs a throwaway box to prove the unlock works
+# on, and there is no spare box.
 #
 # The read-only sub-account is the point rather than a detail: the test restores from the
 # repository and must not be able to write to it, so a fault on a throwaway box cannot
@@ -147,7 +149,8 @@ if [ "$dry_run" = yes ]; then
 	printf 'dry-run: hcloud image list -t snapshot -l %s -o noheader -o columns=id\n' "$image_label"
 	printf 'dry-run: hcloud server create --name %s --type %s --image <id> --location %s -o json\n' "$server_name" "$server_type" "$location"
 	printf 'dry-run: hcloud server ip <id>\n'
-	printf 'dry-run: mount_mfs -s 128M swap /root/scratch, with the credentials, the restore target and the cache inside it\n'
+	printf 'dry-run: restic stats latest --json against %s, to size the scratch from the snapshot\n' "$RESTORE_TEST_REPOSITORY"
+	printf 'dry-run: mount_mfs -s <snapshot size + restic cache headroom> swap /root/scratch, with the credentials inside it; the restore target and the cache go there too when they fit, else the target goes to /home/restore-test and only the credentials stay in memory\n'
 	printf 'dry-run: ssh -i %s root@<address> mkdir -p /root/.ssh\n' "$ssh_key"
 	printf 'dry-run: scp-equivalent: %s -> root@<address>:/root/.ssh/id_ed25519\n' "$ro_key"
 	printf 'dry-run: scp-equivalent: %s -> root@<address>:/root/scratch/restic-pass\n' "$ro_password"
@@ -208,10 +211,40 @@ cleanup() {
 	exit "$cleanup_status"
 }
 trap cleanup EXIT
-trap 'exit 1' INT TERM HUP
+# A signal re-exits rather than running cleanup itself, so the EXIT trap above runs once
+# and the teardown cannot be skipped by the way the run was stopped.
+trap 'exit 1' HUP INT TERM
 
 command -v hcloud >/dev/null 2>&1 || die "no hcloud on this box, run: doas pkg_add hcloud"
 command -v jq >/dev/null 2>&1 || die "no jq on this box, run: doas pkg_add jq"
+command -v restic >/dev/null 2>&1 || die "no restic on this box, run: doas pkg_add restic"
+
+# The scratch's size comes from the snapshot rather than a constant, because the payload
+# is unbounded: a fixed 128 MB stopped proving a restore as soon as one member's mail
+# exceeded it, and the failure read as ENOSPC mid-restore rather than "this box is too
+# small". The query runs here, on the mail box, against the same read-only repository the
+# test restores from. It cannot run on the throwaway, because the throwaway has no
+# credentials until the scratch exists, and the repository password is the one thing that
+# must not reach its disk.
+stats_json=$(RESTIC_REPOSITORY="$RESTORE_TEST_REPOSITORY" \
+	RESTIC_PASSWORD_FILE="$ro_password" \
+	RESTIC_CACHE_DIR="${RESTIC_CACHE_DIR:-/root/.cache/restic}" \
+	restic -o "sftp.args=-i $ro_key -o IdentitiesOnly=yes" \
+	stats latest --json --no-lock) \
+	|| die "could not read the latest snapshot's size from $RESTORE_TEST_REPOSITORY; restic's own words are above"
+snapshot_bytes=$(printf '%s' "$stats_json" | jq -r '.total_size // empty')
+case "${snapshot_bytes:-}" in
+''|*[!0-9]*) die "restic stats returned no total_size for the latest snapshot: $stats_json" ;;
+esac
+snapshot_mb=$(( (snapshot_bytes + 1048575) / 1048576 ))
+# The restic cache and the restore target share the scratch, so the scratch carries a
+# tenth of the payload again for the cache, and never less than the 128 MB this used to
+# be fixed at.
+headroom_mb=$(( snapshot_mb / 10 ))
+[ "$headroom_mb" -ge 128 ] || headroom_mb=128
+required_mb=$(( snapshot_mb + headroom_mb ))
+printf 'latest snapshot is %s MB; scratch needs %s MB, cache headroom included\n' \
+	"$snapshot_mb" "$required_mb"
 
 # The image is looked up by label rather than pinned by id, so rebuilding the template is
 # snapshot and label with nothing to edit here. An empty answer stops the run, because
@@ -279,8 +312,14 @@ printf 'box is at %s\n' "$server_ip"
 # mid-run.
 : >"$known_hosts"
 
+# ConnectTimeout covers only the connection being established. The restore runs for
+# minutes, and a silently dropped path (a NAT idle timeout, a blip) would otherwise leave
+# ssh waiting forever, the EXIT trap unrun, and the billable box holding the credentials
+# until someone notices. The keepalive ends such a path after about two minutes, so the
+# failure reaches the trap and the box is deleted.
 remote() {
 	ssh -i "$ssh_key" -o BatchMode=yes -o ConnectTimeout=10 \
+		-o ServerAliveInterval=30 -o ServerAliveCountMax=4 \
 		-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$known_hosts" \
 		"root@$server_ip" "$@"
 }
@@ -293,12 +332,26 @@ push() {
 }
 
 # hcloud server create returns once the API has the server, which is before it has
-# finished booting, so this is a short wait for ssh rather than for the API.
+# finished booting, so this is a short wait for ssh rather than for the API. A refusal is
+# different from a slow boot: sshd starts early and a template built without the response
+# file's `Allow root ssh login? = prohibit-password` refuses the standup key immediately,
+# then forever. Waiting the full 450 s for it is how the weekly run came to report "restore
+# test failed" every week without ever testing a restore.
 attempt=0
-until remote true 2>/dev/null; do
+while :; do
+	ssh_err=$(remote true 2>&1) && break
+	case "$ssh_err" in
+	*"Permission denied"*)
+		die "the template image $image_id refuses the standup key on $server_ip: $ssh_err
+The image labelled $image_label must answer 'Allow root ssh login? = prohibit-password'
+at install, and 'sshd -T | grep permitrootlogin' must say prohibit-password before it is
+snapshotted. ssh reports 'Server accepts key' and then refuses the login for the wrong
+policy, which is the failure this message names."
+		;;
+	esac
 	attempt=$((attempt + 1))
 	if [ "$attempt" -ge 45 ]; then
-		die "no ssh on $server_ip after $((attempt * 10))s"
+		die "no ssh on $server_ip after $((attempt * 10))s: ${ssh_err:-<no output>}"
 	fi
 	sleep 10
 done
@@ -320,10 +373,53 @@ printf 'ssh answered after %ss\n' "$((attempt * 10))"
 # "Operation not supported". On mount_mfs the -m flag is the minfree percentage rather than
 # a mode, so the mount point's own mode is what the filesystem inherits, and it is set
 # there. -s takes a size with a multiplier, or sectors.
-remote 'mkdir -p -m 0700 /root/scratch && mount_mfs -s 128M swap /root/scratch' \
-	|| die "could not mount the scratch memory filesystem on $server_ip"
-remote 'mount | grep " /root/scratch "'
-printf 'scratch is a memory filesystem\n'
+#
+# mount_mfs draws its space from swap, so the size derived from the snapshot is compared
+# with what this box can give before anything is mounted. Nothing is mounted undersized:
+# that is the ENOSPC mid-restore this replaces. When the payload does not fit, it goes to
+# disk and only the credentials stay in memory, which is the fallback #111 records.
+scratch='/root/scratch'
+target_root="$scratch/restore"
+cache_dir="$scratch/restic-cache"
+tmp_dir="$scratch"
+
+swap_out=$(remote 'swapctl -sk' 2>&1) \
+	|| die "could not read the swap size on $server_ip: $swap_out"
+# `total: N 1K-blocks allocated, M used, K available`: K is what this mount can
+# take. The configured total is not free space; a box with most of its swap in
+# use would pass a total-based check and still die with ENOSPC mid-restore.
+swap_kb=$(printf '%s\n' "$swap_out" | awk '/^total:/ {print $7; exit}')
+case "${swap_kb:-}" in
+''|*[!0-9]*) die "swapctl on $server_ip reported no available swap: $swap_out" ;;
+esac
+available_mb=$(( swap_kb / 1024 ))
+
+if [ "$required_mb" -le "$available_mb" ]; then
+	remote "mkdir -p -m 0700 $scratch && mount_mfs -s ${required_mb}M swap $scratch" \
+		|| die "could not mount the ${required_mb} MB scratch memory filesystem on $server_ip, which has ${available_mb} MB of swap available"
+	printf 'scratch is a %s MB memory filesystem (the box has %s MB of swap available)\n' \
+		"$required_mb" "$available_mb"
+else
+	target_root=/home/restore-test
+	cache_dir=/home/restic-cache
+	tmp_dir=/home/tmp
+	printf 'refusing a %s MB memory filesystem: the scratch needs %s MB and the box has %s MB of swap available\n' \
+		"$required_mb" "$required_mb" "$available_mb"
+	printf 'restoring the payload to /home on disk instead, with only the credentials in memory. That disk is plaintext and is not wiped when Hetzner frees it, and the payload carries the DKIM keys and the control store: this is the #111 tradeoff. More swap, through RESTORE_TEST_SERVER_TYPE, keeps the payload in memory\n'
+	disk_out=$(remote 'df -k /home' 2>&1) \
+		|| die "could not read the free space on /home of $server_ip: $disk_out"
+	disk_free_kb=$(printf '%s\n' "$disk_out" | awk 'NR == 2 {print $4}')
+	case "${disk_free_kb:-}" in
+	''|*[!0-9]*) die "df on $server_ip reported no free space for /home: $disk_out" ;;
+	esac
+	disk_free_mb=$(( disk_free_kb / 1024 ))
+	[ "$required_mb" -le "$disk_free_mb" ] \
+		|| die "the snapshot needs ${required_mb} MB but $server_ip has ${available_mb} MB of swap and ${disk_free_mb} MB free on /home, so it does not fit either way"
+	remote "mkdir -p -m 0700 $scratch && mount_mfs -s 64M swap $scratch" \
+		|| die "could not mount the credentials memory filesystem on $server_ip"
+	remote "mkdir -p -m 0700 $target_root $cache_dir $tmp_dir"
+fi
+remote "mount | grep ' $scratch '"
 # That the tmpfs is safe rests on one assumption: pages pushed out to swap are encrypted
 # with a key the kernel made at boot and keeps only in memory. If encryption were off, the
 # same pages would sit in the clear on a disk that outlives the box, which is precisely
@@ -345,7 +441,7 @@ push /root/.ssh/known_hosts /root/.ssh/known_hosts
 # read-only against one sub-account and reveals ciphertext, since the repository is
 # encrypted; the password is what makes it readable, which is why that one has to be
 # somewhere the box does not keep.
-push /root/scratch/restic-pass "$ro_password"
+push "$scratch/restic-pass" "$ro_password"
 printf 'credentials in place\n'
 
 # The test script itself comes from this box's checkout, not from the image. The
@@ -360,10 +456,10 @@ printf 'test scripts in place, from %s\n' "$test_script_dir"
 
 set +e
 remote "RESTIC_REPOSITORY='$RESTORE_TEST_REPOSITORY' \
-RESTIC_PASSWORD_FILE=/root/scratch/restic-pass \
-RESTORE_TARGET_ROOT=/root/scratch/restore \
-RESTIC_CACHE_DIR=/root/scratch/restic-cache \
-TMPDIR=/root/scratch \
+RESTIC_PASSWORD_FILE=$scratch/restic-pass \
+RESTORE_TARGET_ROOT=$target_root \
+RESTIC_CACHE_DIR=$cache_dir \
+TMPDIR=$tmp_dir \
 HEALTHCHECKS_URL='$healthchecks' /root/bin/restore-test.sh"
 test_status=$?
 set -e

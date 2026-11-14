@@ -119,15 +119,19 @@ residue is the open follow-up recorded in #111 rather than a property of this im
 
 Two things about the installed sshd cost real time here and are worth knowing.
 
-The installer writes `PermitRootLogin no`, uncommented, so a fresh install refuses root
-over ssh whatever is in `authorized_keys`. Keys are read per connection and the policy is
-applied after, so sshd answers `Server accepts key` and then refuses the login anyway,
-which reads like the key being wrong. The template needs `PermitRootLogin prohibit-password`.
+The installer sets `PermitRootLogin` from its `Allow root ssh login?` answer, and the
+tracked response file answers `prohibit-password`. That is the key-only posture the
+standup needs: it logs in as root with the key in `authorized_keys`, and no password login
+is offered. An image built without that answer falls through to the installer's default of
+`no`, written uncommented, so a fresh install refuses root over ssh whatever is in
+`authorized_keys`. Keys are read per connection and the policy is applied after, so sshd
+answers `Server accepts key` and then refuses the login anyway, which reads like the key
+being wrong. `sshd -T | grep permitrootlogin` reports what the daemon would use, and is
+the check to make before snapshotting.
 
-sshd reads that file only at startup. Editing it changes nothing until the daemon restarts,
-which is indistinguishable from an edit that failed to apply. `sshd -T | grep
-permitrootlogin` reports what the daemon would use, and is the check to make before
-believing an edit landed.
+sshd reads that file only at startup. An edit changes nothing until the daemon restarts,
+which looks the same as an edit that failed to apply. On a box being prepared by hand,
+restart it with `/etc/rc.d/sshd restart` and read `sshd -T` afterwards.
 
 So the template is section 1 with these differences:
 
@@ -158,7 +162,8 @@ out of the URL's filename, and answering that prompt is one more thing to type.
 The prompts worth knowing, all read out of the ramdisk: the location prompt re-asks when the
 answer is empty, so a mistyped URL costs a retry rather than a Ctrl-C, and the questions
 this file answers are `System hostname? (short form, e.g. 'foo')`, `Public ssh key for root
-account?`, `Password for root account?`, `What timezone are you in?`, `Location of sets?`,
+account?`, `Password for root account?`, `Allow root ssh login? (yes, no,
+prohibit-password)`, `What timezone are you in?`, `Location of sets?`,
 `HTTP Server?`, and `Encrypt the root disk with a (p)assphrase or (k)eydisk?`. This matters: autoinstall matches questions
 by their text and silently falls back to the installer's default when it cannot match an
 answer, so a response file taken from an older write-up installs something other than what it
@@ -214,21 +219,16 @@ The client's config is a trap of its own, found the hard way. `PermitRootLogin` 
 `sshd_config` directive. In `/etc/ssh/ssh_config`, which is the client's file, ssh refuses
 to parse the file at all, so every outbound connection from the box fails, and the restore
 test is one of them: it reaches the storage box over sftp. One build wrote that line into
-the wrong file by hand, `template-setup.sh` checked the server file and had nothing to say
-about the client one, and the snapshot carried the line until a test run failed with `Bad
-configuration option: permitrootlogin`. The setup script now removes such a line, and
-parses the client file with `ssh -G` to prove it, so a build that repeats the slip says so
-instead of shipping a box that cannot reach the network.
+the wrong file by hand, and the snapshot carried it until a test run failed with `Bad
+configuration option: permitrootlogin`. Before a box is snapshotted, `ssh -G localhost`
+has to parse.
 
-The other trap on this box is that `sshd` reads `sshd_config` only when it starts. An edit
-without a restart looks exactly like an edit that failed, which is why the setup script
-prints both what the file says and what `sshd -T` reports, and restarts rather than
-signalling.
-
-Repairing a snapshot without rebuilding it: create a box from it, remove the line, confirm
-`ssh -G localhost` parses, snapshot that box under the same `kind=restore` label, then
-delete the old image and the box. The standup takes the first image carrying the label, so
-the old one has to go, or the label has to be taken off it.
+Repairing a snapshot without rebuilding it: create a box from it, make the change, confirm
+`sshd -T | grep permitrootlogin` and `ssh -G localhost`, snapshot that box under the same
+`kind=restore` label, then delete the old image and the box. `scripts/restore-standup.sh`
+refuses to run when more than one image carries the label, because which one boots the
+test would otherwise be the order of an API reply. The old image therefore has to go, or
+its label has to be removed.
 
 ## The weekly restore box
 
