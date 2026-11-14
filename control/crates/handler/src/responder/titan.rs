@@ -16,6 +16,10 @@ use crate::fastcgi::Reply;
 use kyriakon_control_core::config::HOST;
 use kyriakon_control_core::{flow::rate, mail::keycheck, store::draft};
 
+/// How long the accept loop waits for a concurrency permit before closing a
+/// connection it cannot serve. Short, so the loop keeps draining the backlog.
+const TITAN_PERMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Accept Titan connections for as long as the listener holds. One connection
 /// carries one upload and closes, like the gemini front-end's.
 ///
@@ -41,14 +45,18 @@ pub(super) async fn titan_accept(listener: TcpListener, app: Arc<App>) -> Result
                 continue;
             }
         };
-        let app = app.clone();
-        let slots = slots.clone();
-        tokio::spawn(async move {
-            // A permit bounds the tasks that hold a socket. Waiting tasks are
-            // cheap; unbounded sockets are not.
-            let Ok(_permit) = slots.acquire().await else {
-                return;
+        // A permit is waited for here rather than in the spawned task, so a flood
+        // costs the listening backlog and one accepted socket, not a descriptor
+        // per waiting connection. When none frees up in time the stream is
+        // dropped, which closes it without a task of its own.
+        let permit =
+            match tokio::time::timeout(TITAN_PERMIT_TIMEOUT, slots.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                _ => continue,
             };
+        let app = app.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = titan_connection(stream, &app, &peer.ip().to_string()).await {
                 e.report("the titan request");
             }

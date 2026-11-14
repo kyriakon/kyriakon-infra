@@ -352,13 +352,24 @@ pub fn id(cookie: &str) -> Option<&str> {
     crate::store::is_status_token(id).then_some(id)
 }
 
-/// Remove the session a cookie names. A cookie that names nothing is a no-op:
-/// logging out twice is not an error.
+/// Remove the session a cookie names, when its signature is the one the
+/// record's own secret makes. A cookie that names nothing, or names a record
+/// without carrying that record's signature, is a no-op: logging out twice is
+/// not an error, and an id is not the authority the signature exists to prove.
 pub async fn close(store: &Store, cookie: &str) {
-    let Some((id, _)) = cookie.split_once('.') else {
+    let Some((id, sig)) = cookie.split_once('.') else {
         return;
     };
     if !crate::store::is_status_token(id) {
+        return;
+    }
+    let Some(text) = store.read_record("sessions", &format!("{id}.json")).await else {
+        return;
+    };
+    let Ok(record) = serde_json::from_str::<Record>(&text) else {
+        return;
+    };
+    if !sign::verify(record.secret.as_bytes(), id, sig) {
         return;
     }
     let _ = store.remove("sessions", &format!("{id}.json")).await;
@@ -550,6 +561,25 @@ mod tests {
         assert!(lookup(&store, "../account", now()).await.is_none());
         assert!(lookup(&store, "", now()).await.is_none());
         // Closing removes the record, so the cookie answers nothing afterwards.
+        close(&store, &cookie).await;
+        assert!(lookup(&store, &cookie, now()).await.is_none());
+    }
+
+    /// A logout is authority to remove the record only when the cookie carries
+    /// the signature that record's secret makes. A real id with a wrong one
+    /// deletes nothing; the valid cookie still closes the session.
+    #[tokio::test]
+    async fn a_forged_logout_signature_deletes_nothing() {
+        let store = store("logout-forged");
+        let proof = mint(&store, "alice", now().unix_timestamp() + 3600);
+        let cookie = open(&store, "alice", &proof, now()).await.unwrap();
+        let (id, sig) = cookie.split_once('.').unwrap();
+        let forged = format!("{id}.{}", "0".repeat(sig.len()));
+        close(&store, &forged).await;
+        assert!(
+            lookup(&store, &cookie, now()).await.is_some(),
+            "a forged signature deleted the session"
+        );
         close(&store, &cookie).await;
         assert!(lookup(&store, &cookie, now()).await.is_none());
     }
