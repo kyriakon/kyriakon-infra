@@ -1022,6 +1022,13 @@ mod tests {
                 .as_nanos()
         ));
         let bomb = PACKET_BOMB.as_bytes();
+        // Without gpg on the host, every listing returns None and the bomb
+        // assertion below would pass without reading anything. A real packet
+        // must list, or this test is not testing the cap.
+        assert!(
+            list_packets(ARMOR, &home).is_some(),
+            "gpg must be available to judge the bomb"
+        );
         // gpg emits ~18 MB for this part; at the cap there is no listing to
         // judge, so the decision is "not our ciphertext" and the message is
         // encrypted as usual.
