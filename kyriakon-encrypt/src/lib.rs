@@ -22,10 +22,10 @@
 //! short is a failed save and plaintext is never stored.
 
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// On-box keyring location - sync of the git-tracked published key set.
 pub const DEFAULT_KEYRING: &str = "/etc/kyriakon/keys";
@@ -190,12 +190,12 @@ const ENVELOPE_PREAMBLE: &str = "This is an OpenPGP/MIME encrypted message (RFC 
 /// match all fall through to normal encryption.
 fn already_encrypted<'a>(input: &'a [u8], cert: &Path, gpg_home: &Path) -> Option<&'a [u8]> {
     let ciphertext = envelope_ciphertext(input)?;
-    let packets = list_packets(ciphertext, gpg_home);
+    let packets = list_packets(ciphertext, gpg_home)?;
     if !is_ciphertext_packets(&packets) {
         return None;
     }
     let cert_packets = std::fs::read(cert).ok()?;
-    let ours = cert_key_ids(&list_packets(&cert_packets, gpg_home));
+    let ours = cert_key_ids(&list_packets(&cert_packets, gpg_home)?);
     if ours.is_empty() {
         return None;
     }
@@ -471,36 +471,68 @@ fn is_ciphertext_packets(packets: &[u8]) -> bool {
     encrypted
 }
 
-/// `gpg --list-packets` over `input`. Inspection only, and best effort: a
-/// stream gpg cannot parse produces no output, which the caller reads as "not
-/// our ciphertext" and encrypts as usual rather than failing the save.
+/// Cap on the packet listing read from gpg. A listing is a few short lines per
+/// packet; a stream that needs more is built to amplify (a compressed packet
+/// inflates to thousands of tiny packets, ~14x their size per line), not a
+/// message. Well past any legitimate PGP/MIME part.
+const PACKET_LISTING_CAP: usize = 1 << 20;
+
+/// How long gpg gets to finish a listing. A stream that cannot be listed in
+/// this long is a stall attempt, not a message.
+const PACKET_LISTING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Read at most `PACKET_LISTING_CAP` bytes from `reader`. `None` when the
+/// stream carries more: that is an amplifying listing, not a packet dump, and
+/// reading it is what #823 exploited.
+fn read_listing(mut reader: impl Read) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    // One byte past the cap is enough to tell an oversized listing apart from
+    // one that exactly fills it.
+    reader
+        .by_ref()
+        .take(PACKET_LISTING_CAP as u64 + 1)
+        .read_to_end(&mut out)
+        .ok()?;
+    (out.len() <= PACKET_LISTING_CAP).then_some(out)
+}
+
+/// `gpg --list-packets` over `input`, bounded in both bytes and time. `None`
+/// means no usable listing: gpg could not be run, the listing ran past
+/// `PACKET_LISTING_CAP` (the child is killed at the cap), or it did not finish
+/// within `PACKET_LISTING_TIMEOUT` (the child is killed). Inspection only, and
+/// best effort: every `None` reads as "not our ciphertext", so the caller
+/// encrypts the message as usual rather than failing the save.
 ///
 /// The exit status is deliberately ignored. gpg prints the packet listing and
 /// then exits non-zero for a message it cannot decrypt, which is every message
 /// here: the encryptor's gpg homedir holds no secret key, by design. Treating that
 /// status as fatal discards the listing and the caller sees no recipients at
 /// all.
-fn list_packets(input: &[u8], gpg_home: &Path) -> Vec<u8> {
+fn list_packets(input: &[u8], gpg_home: &Path) -> Option<Vec<u8>> {
     if ensure_gpg_home(gpg_home).is_err() {
-        return Vec::new();
+        return None;
     }
-    let spawned = Command::new("gpg")
+    let mut child = Command::new("gpg")
         .args([
             "--batch",
             "--no-tty",
             "--no-options",
             "--list-packets",
+            // A listing never needs an agent, and starting one per message
+            // costs the save path a socket connect and a daemon. With a
+            // secretless homedir gpg would otherwise stall on that connect
+            // before printing anything.
+            "--no-autostart",
             "--homedir",
         ])
         .arg(gpg_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn();
-    let Ok(mut child) = spawned else {
-        return Vec::new();
-    };
+        .spawn()
+        .ok()?;
     let stdin = child.stdin.take();
+    let stdout = child.stdout.take()?;
     // Same pipe-buffer hazard as `armored_ciphertext`: gpg lists packets while
     // it reads, so the write must not block this thread's drain. Best effort
     // throughout, so both failures stay silent.
@@ -510,14 +542,24 @@ fn list_packets(input: &[u8], gpg_home: &Path) -> Vec<u8> {
                 let _ = stdin.write_all(input);
             })
         });
-        let out = child.wait_with_output();
+        let (tx, rx) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            let _ = tx.send(read_listing(stdout));
+        });
+        let out = match rx.recv_timeout(PACKET_LISTING_TIMEOUT) {
+            Ok(Some(out)) => Some(out),
+            // Over the cap or unreadable, or too slow: gpg is still writing
+            // into a pipe nobody drains, so it has to go before it is reaped.
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                None
+            }
+        };
+        let _ = child.wait();
         if let Some(writer) = writer {
             let _ = writer.join();
         }
-        match out {
-            Ok(out) => out.stdout,
-            Err(_) => Vec::new(),
-        }
+        out
     })
 }
 
@@ -922,6 +964,84 @@ mod tests {
 
     fn envelope() -> Vec<u8> {
         rfc3156_envelope("b", ARMOR, MESSAGE)
+    }
+
+    /// A 618-byte armoured message: a compressed packet (algo 1, raw deflate)
+    /// holding 200,000 two-byte packets. `gpg --list-packets` emits about
+    /// 18 MB for it, the amplification #823 measured. Deflating needs a
+    /// compressor, so the fixture is a file rather than built in the test.
+    const PACKET_BOMB: &str = include_str!("../tests/fixtures/packet-bomb.asc");
+
+    /// A reader that yields at most `left` bytes, counting what was read.
+    struct Counting {
+        left: usize,
+        read: usize,
+    }
+
+    impl std::io::Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.left);
+            buf[..n].fill(b'x');
+            self.left -= n;
+            self.read += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_packet_listing_is_read_only_up_to_the_cap() {
+        let mut under = Counting {
+            left: PACKET_LISTING_CAP,
+            read: 0,
+        };
+        assert_eq!(
+            read_listing(&mut under).map(|listing| listing.len()),
+            Some(PACKET_LISTING_CAP)
+        );
+        assert_eq!(under.read, PACKET_LISTING_CAP);
+
+        // Four caps of output: an amplifying stream. Only one byte past the
+        // cap is read, and the answer is "no listing" rather than megabytes of
+        // packets to scan.
+        let mut over = Counting {
+            left: PACKET_LISTING_CAP * 4,
+            read: 0,
+        };
+        assert_eq!(read_listing(&mut over), None);
+        assert_eq!(over.read, PACKET_LISTING_CAP + 1);
+    }
+
+    #[test]
+    fn a_compressed_packet_bomb_is_not_ciphertext() {
+        let home = std::env::temp_dir().join(format!(
+            "ke{}-{:x}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bomb = PACKET_BOMB.as_bytes();
+        // Without gpg on the host, every listing returns None and the bomb
+        // assertion below would pass without reading anything. A real packet
+        // must list, or this test is not testing the cap.
+        assert!(
+            list_packets(ARMOR, &home).is_some(),
+            "gpg must be available to judge the bomb"
+        );
+        // gpg emits ~18 MB for this part; at the cap there is no listing to
+        // judge, so the decision is "not our ciphertext" and the message is
+        // encrypted as usual.
+        assert!(
+            list_packets(bomb, &home).is_none(),
+            "an over-cap listing must not be read"
+        );
+        let envelope = rfc3156_envelope("b", bomb, MESSAGE);
+        assert!(
+            already_encrypted(&envelope, Path::new("no-such-cert"), &home).is_none(),
+            "a packet bomb is encrypted, not kept as ciphertext"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
