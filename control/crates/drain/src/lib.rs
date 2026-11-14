@@ -239,6 +239,15 @@ pub async fn verify(
                     "there is no application for this token".to_string(),
                 ));
             };
+            // The signature covers the record's username; the intent's is
+            // handler-written. A decision intent naming another account than
+            // the record it authorizes is refused here, before any transition
+            // reads the record a second time.
+            if intent.application.username != record.username {
+                return Err(Error::Failed(
+                    "the intent's username is not the application's".to_string(),
+                ));
+            }
             if !sign::verify(
                 key,
                 &sign::decide_payload(&record, &intent.action),

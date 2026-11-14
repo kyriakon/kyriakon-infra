@@ -39,6 +39,8 @@ struct Index {
     started: HashMap<String, String>,
     /// Status token → the covered fields its review mail described.
     reviews: HashMap<String, crate::account::sign::Reviewed>,
+    /// Status token → (intent id, kind) of the decision that has taken effect.
+    decided: HashMap<String, (String, String)>,
     /// Intent id → the progress its first `applying` credit line carried.
     credits: HashMap<String, CreditProgress>,
 }
@@ -95,6 +97,20 @@ impl Index {
         if line.outcome == "applying" {
             if let Some(credit) = line.credit.clone() {
                 self.credits.entry(line.intent.clone()).or_insert(credit);
+            }
+        }
+        // A decision that has taken effect is single-use, and this is the only
+        // record of it the handler cannot write. The first line wins, as the
+        // approval's name does: a later one is the replay this refuses.
+        if line.outcome == "applied"
+            && matches!(line.kind.as_str(), "approve" | "provision" | "decline")
+        {
+            if let Some(token) = line.application.status_token.as_deref() {
+                if crate::store::is_status_token(token) {
+                    self.decided
+                        .entry(token.to_string())
+                        .or_insert_with(|| (line.intent.clone(), line.kind.clone()));
+                }
             }
         }
         // Only a real capability token is a mark's key. An old line that put a
@@ -210,6 +226,20 @@ impl Journal {
     /// handler and can be rewritten after the mail.
     pub fn reviewed(&self, token: &str) -> Option<crate::account::sign::Reviewed> {
         self.lock().reviews.get(token).cloned()
+    }
+
+    /// The decision that has taken effect for this application: the id and kind
+    /// of its `applied` line, if it has one.
+    ///
+    /// A decision is single-use, and `decided_at` cannot make it so: that field
+    /// is in `applications/<token>.json`, which the unprivileged handler owns
+    /// and can clear. This index is built from the root-written journal, so a
+    /// captured decision signature replayed after its decision took effect is
+    /// refused whatever the record says. The id is returned beside the kind so
+    /// the decision that wrote the line is recognised as its own retry, rather
+    /// than as the replay.
+    pub fn decision_applied(&self, token: &str) -> Option<(String, String)> {
+        self.lock().decided.get(token).cloned()
     }
 
     /// The values a credit recorded on its `applying` line, if it has got that
@@ -540,6 +570,49 @@ mod tests {
                 journal.reviewed(TOKEN),
                 Some(reviewed),
                 "a later line replaced the fields the mail described"
+            );
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Only an applied decision line makes a token decided: an approval's
+    /// `applying` line, a failed pass and a refusal do not. The first applied
+    /// line wins, so a later replay cannot replace the decision it repeats.
+    #[test]
+    fn only_an_applied_decision_line_makes_a_token_decided() {
+        let (store, dir) = store("decided");
+        runtime().block_on(async {
+            let journal = Journal::load(&store).await.unwrap();
+            assert_eq!(journal.decision_applied(TOKEN), None);
+            journal
+                .append(&store, &line("01H", "approve", "applying", None))
+                .await
+                .unwrap();
+            journal
+                .append(&store, &line("01H", "approve", "failed", Some("boom")))
+                .await
+                .unwrap();
+            assert_eq!(
+                journal.decision_applied(TOKEN),
+                None,
+                "an approval that only began made the token decided"
+            );
+            journal
+                .append(&store, &line("01H", "approve", "applied", None))
+                .await
+                .unwrap();
+            assert_eq!(
+                journal.decision_applied(TOKEN),
+                Some(("01H".to_string(), "approve".to_string()))
+            );
+            journal
+                .append(&store, &line("01J", "decline", "applied", None))
+                .await
+                .unwrap();
+            assert_eq!(
+                journal.decision_applied(TOKEN),
+                Some(("01H".to_string(), "approve".to_string())),
+                "a second decision replaced the one that took effect"
             );
         });
         std::fs::remove_dir_all(dir).unwrap();
