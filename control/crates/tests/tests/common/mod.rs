@@ -103,6 +103,7 @@ impl Fix {
             "store/intents",
             "store/applications",
             "store/mail/new",
+            "store/bounce/new",
             "bin",
             "host/httpd.d",
             "host/gmid.d",
@@ -249,6 +250,7 @@ impl Fix {
              group_price_gbp = \"40.00\"\n\
              postal_address = \"1 Example Street, Example\"\n\
              mail_dir = \"{}/store/mail/new\"\n\
+             bounce_dir = \"{}/store/bounce/new\"\n\
              release = \"2026-10-10 abc1234\"\n\
              mail_host = \"mail.kyriakon.net\"\n\
              ipv4 = \"192.0.2.10\"\n\
@@ -277,6 +279,7 @@ impl Fix {
             fix.path("spamd.alloweddomains"),
             fix.path("key"),
             fix.path("keyring"),
+            fix.dir.display(),
             fix.dir.display(),
             fix.dir.display(),
             fix.dir.display(),
@@ -1390,6 +1393,47 @@ impl Fix {
         std::fs::write(
             self.dir.join("store/mail/new").join(name),
             format!("From: {from}\nSubject: {subject}\n\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    /// One delivery-status report in the bounce spool, the way smtpd delivers
+    /// it: a multipart report whose per-recipient part names the failed
+    /// recipient and status, and whose last part returns the original message.
+    pub fn bounce(&self, name: &str, status: &str, recipient: &str, subject: &str) {
+        std::fs::write(
+            self.dir.join("store/bounce/new").join(name),
+            format!(
+                "From: MAILER-DAEMON@mail.example\n\
+                 To: bounce@kyriakon.net\n\
+                 Subject: Undelivered Mail Returned to Sender\n\
+                 MIME-Version: 1.0\n\
+                 Content-Type: multipart/report; report-type=delivery-status; boundary=\"b1\"\n\
+                 \n\
+                 --b1\n\
+                 Content-Type: text/plain\n\
+                 \n\
+                 The mail could not be delivered.\n\
+                 --b1\n\
+                 Content-Type: message/delivery-status\n\
+                 \n\
+                 Reporting-MTA: dns; mail.example\n\
+                 \n\
+                 Final-Recipient: rfc822; {recipient}\n\
+                 Action: failed\n\
+                 Status: {status}\n\
+                 Diagnostic-Code: smtp; {status} rejected\n\
+                 \n\
+                 --b1\n\
+                 Content-Type: message/rfc822\n\
+                 \n\
+                 From: kyriakon <hello@kyriakon.net>\n\
+                 To: {recipient}\n\
+                 Subject: {subject}\n\
+                 \n\
+                 The notice.\n\
+                 --b1--\n"
+            ),
         )
         .unwrap();
     }

@@ -644,6 +644,7 @@ async fn write_group_account(
         group: Some(domain.to_string()),
         closing_until: None,
         grace_until: None,
+        notice_stopped: None,
     };
     let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
         context: "encode the account",

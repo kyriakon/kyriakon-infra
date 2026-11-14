@@ -23,6 +23,7 @@
 //!       [--site-owner <account>]
 //!   kyriakon-admin [--config PATH] group remove <domain>
 //!   kyriakon-admin [--config PATH] token resend <username>
+//!   kyriakon-admin [--config PATH] notice resend <username> [--to <address>]
 //!   kyriakon-admin [--config PATH] credit (--token <t> | --username <u> | --note <text>) \
 //!       --rail <cash|cash-hand|monero> --amount <gbp> --received <YYYY-MM-DD>
 //!   kyriakon-admin [--config PATH] prepaid list --window open [--expiring <days>]
@@ -85,6 +86,7 @@ mod account;
 mod address;
 mod decisions;
 mod group;
+mod notices;
 mod payments;
 mod requests;
 
@@ -92,6 +94,7 @@ use account::{delete, free, password, resume, show, suspend};
 use address::address;
 use decisions::sign_and_file;
 use group::group;
+use notices::notices;
 use payments::credit::{credit, token, window};
 use payments::ledger::ledger;
 use payments::monero::monero;
@@ -140,6 +143,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), Error> {
         "address" => address(&cfg, &store, &rest[1..]).await,
         "group" => group(&cfg, &store, &rest[1..]).await,
         "token" => token(&cfg, &store, &rest[1..]).await,
+        "notice" => notices(&cfg, &store, &rest[1..]).await,
         "credit" => credit(&cfg, &store, &rest[1..]).await,
         "prepaid" => prepaid(&store, &rest[1..]).await,
         "window" => window(&cfg, &store, &rest[1..]).await,
@@ -186,6 +190,7 @@ fn usage() -> String {
        kyriakon-admin resume <username>
        kyriakon-admin free
        kyriakon-admin token resend <username>
+       kyriakon-admin notice resend <username> [--to <address>]
        kyriakon-admin credit (--token <t> | --username <u> | --note <text>) \
      --rail <cash|cash-hand|monero> --amount <gbp> --received <YYYY-MM-DD> \
      [--txid <id>] [--xmr <amount>] [--rate <gbp-per-xmr>] \

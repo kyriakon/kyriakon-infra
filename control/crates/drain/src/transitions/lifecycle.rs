@@ -640,6 +640,9 @@ pub async fn window_sweep(
         window.state = "closed".to_string();
         account.state = "lapsed".to_string();
         account.grace_until = Some(util::date_after_days(40));
+        // A new clock starts from a fresh state; a stop from an earlier
+        // lifecycle would otherwise halt this one before its first notice.
+        account.notice_stopped = None;
         account.payment = Some(payment.clone());
         let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
             context: "encode the account",
@@ -904,6 +907,16 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
         if today >= grace {
             let id = format!("delete-{}-{}", username, account.created_at);
             if !due(journal, &id, now) {
+                continue;
+            }
+            // The clock is stopped when the bounce ingest found a permanent
+            // failure at every address a lifecycle notice went to: no channel
+            // reached the member, so the delete transition must not run. The
+            // sweep reads the latched state rather than the notice history,
+            // because a later notice that is also not delivered must not
+            // restart the clock. Only `notice resend` clears it, and that
+            // extends the grace.
+            if account.notice_stopped.is_some() {
                 continue;
             }
             if let Err(e) = delete_account(cfg, store, journal, &username).await {
@@ -1200,6 +1213,99 @@ async fn suspension_final_notice(
     Ok(())
 }
 
+/// `kyriakon-admin notice resend`: the runbook's step for a lifecycle notice
+/// that hard-bounced at every address the account holds. It sends the notice
+/// again over a channel the operator names, records the send, and restarts the
+/// grace at forty days from today, so the account is not deleted before the
+/// member has a chance to read it.
+///
+/// The stop itself is derived from the notice record: the new line has no
+/// delivery status, so the newest notice to that address is no longer a
+/// failure. If the address bounces too, its next DSN stops the clock again.
+/// Returns the address used and the new grace date for the console to print.
+pub async fn resend_notice(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+    to: Option<&str>,
+) -> Result<(String, String), Error> {
+    if let Some(why) = validate::username_shape(username) {
+        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+    }
+    let Some(mut account) = store.account(username).await? else {
+        return Err(Error::Failed(format!("no account for {username}")));
+    };
+    if account.state != "lapsed" && account.state != "suspended" {
+        return Err(Error::Failed(format!(
+            "{username} is {}, so it has no grace clock to restart",
+            account.state
+        )));
+    }
+    let to = match to {
+        Some(to) => {
+            if let Some(why) = validate::address(to) {
+                return Err(Error::Failed(format!("the address {to:?}: {why}")));
+            }
+            to.to_string()
+        }
+        // The operator names a channel that works when they know one; the
+        // platform mailbox is the one address this command can assume exists,
+        // and a lapsed account can still read it.
+        None => account.platform_address(),
+    };
+    let token = account
+        .payment_state()
+        .and_then(|payment| payment.token_ref)
+        .unwrap_or_default();
+    let reason = account.suspension_reason.clone().unwrap_or_default();
+    let grace = util::date_after_days(40);
+    account.grace_until = Some(grace.clone());
+    // The operator has confirmed a channel; clear the latch and record the
+    // resend, so a later automatic notice cannot re-hold this member unseen.
+    account.notice_stopped = None;
+    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+        context: "encode the account",
+        source,
+    })?;
+    write_account_record(store, username, &bytes).await?;
+    let (kind, subject, body) = if account.state == "suspended" {
+        (
+            "account.suspended.final",
+            format!(
+                "Your suspended kyriakon.net account: notice re-sent, grace ends {grace} \
+                 ({username})"
+            ),
+            format!(
+                "The account {username} was suspended: {reason}\n\n\
+                 Earlier notices did not reach you at any address we hold, so this one is\n\
+                 being sent again. Outbound mail has stopped, and uploading to your site\n\
+                 and pushing to git with it. Inbound mail keeps arriving and stays\n\
+                 readable, and your account page stays open and shows this reason. The\n\
+                 account is due to be deleted on {grace}, forty days from this notice.\n\n\
+                 To answer it, reply to this message or write to admin@kyriakon.net.\n"
+            ),
+        )
+    } else {
+        (
+            "prepaid.final",
+            format!("Your kyriakon.net account: notice re-sent, grace ends {grace} ({username})"),
+            format!(
+                "The payment window for {username} closed and no payment was recorded.\n\n\
+                 Earlier notices did not reach you at any address we hold, so this one is\n\
+                 being sent again. Mail keeps arriving and stays readable, and everything\n\
+                 you published stays up, but sending, uploading and pushing are stopped.\n\
+                 The account is due to be deleted on {grace}, forty days from this notice.\n\n\
+                 Your payment reference is {token}. If you have posted the money, write to\n\
+                 admin@kyriakon.net before that date.\n"
+            ),
+        )
+    };
+    // `send_again` bypasses the dedup: the point of the verb is that the member
+    // gets this notice even though the record already holds the earlier one.
+    notice::send_again(cfg, store, username, kind, &subject, &to, &body).await?;
+    Ok((to, grace))
+}
+
 /// The lapse notice. The words that say what still works and what stopped are
 /// `account::LAPSE_NOTE`, the same constant both account pages render, so the mail
 /// and the page cannot drift.
@@ -1286,6 +1392,9 @@ pub async fn suspend(
     // same suspension keeps the date it first set.
     if account.grace_until.is_none() {
         account.grace_until = Some(util::date_after_days(40));
+        // A first suspension starts a fresh clock; a retry keeps the date and
+        // any stop a bounce already set on it.
+        account.notice_stopped = None;
     }
     let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
         context: "encode the account",
@@ -1398,6 +1507,7 @@ pub async fn resume(
     account.suspension_reason = None;
     if !lapsed {
         account.grace_until = None;
+        account.notice_stopped = None;
     }
     let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
         context: "encode the account",
