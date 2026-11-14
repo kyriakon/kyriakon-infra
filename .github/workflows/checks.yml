@@ -212,6 +212,18 @@ jobs:
             ksh scripts/install-packages.sh --ci
             ksh scripts/install-packages.sh --check
             ksh scripts/self-test-all.sh
+      # The daemon half, which no self-test runs: a real httpd and gmid against
+      # a two-member fixture chroot, reading the served paths back. It is its own
+      # VM so a daemon that refuses to start has its own failure and its own log,
+      # and the packages are installed again because the VM is fresh.
+      - name: hosting daemons on OpenBSD 7.9
+        uses: vmactions/openbsd-vm@v1.4.9
+        with:
+          release: "7.9"
+          run: |
+            set -eu
+            ksh scripts/install-packages.sh --ci
+            ksh scripts/verify-hosting.sh
 
   terraform:
     name: terraform
