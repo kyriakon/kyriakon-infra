@@ -3524,7 +3524,7 @@ pub async fn purge_declined(
             // makes the group's mailboxes, not an account of the site owner's,
             // so only a person application can hold a half-made account here.
             let half_made =
-                record.domain.is_none() && journal.approval_started(&record.status_token);
+                record.domain.is_none() && journal.approval_started(&record.status_token).is_some();
             if !release_username(
                 cfg,
                 store,
@@ -3758,8 +3758,8 @@ pub async fn purge_applications(
                 .await?;
             }
             if abandoned {
-                let half_made =
-                    record.domain.is_none() && journal.approval_started(&record.status_token);
+                let half_made = record.domain.is_none()
+                    && journal.approval_started(&record.status_token).is_some();
                 if !release_username(
                     cfg,
                     store,

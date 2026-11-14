@@ -1112,7 +1112,7 @@ async fn decline(
     // over a live account. A body's approval makes the group's mailboxes, not an
     // account of the site owner's, so that path is left to its own transition.
     let mut erased = false;
-    if record.domain.is_none() && journal.approval_started(token) {
+    if record.domain.is_none() && journal.approval_started(token).is_some() {
         erased = super::lifecycle::erase_half_made(cfg, store, journal, username).await?;
     }
     write_journal(
