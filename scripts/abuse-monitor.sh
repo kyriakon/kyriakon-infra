@@ -543,11 +543,16 @@ state_dir() {
 	umask 077
 }
 
-# state_write <file>: write stdin to a state file only root can read. The chmod
-# covers a file an older run left 0644; umask 077 only covers new ones.
+# state_write <file>: write stdin to a state file only root can read, by staging
+# a sibling and renaming it. A kill between a truncate and a write would
+# otherwise leave a partial deferred-senders, and the next run would re-alert on
+# every sender. The chmod covers a file an older run left 0644; umask 077 only
+# covers new ones.
 state_write() {
-	cat > "$1"
-	chmod 0600 "$1"
+	typeset tmp="$1.new.$$"
+	(umask 077; cat > "$tmp")
+	chmod 0600 "$tmp"
+	mv "$tmp" "$1"
 }
 
 # drain_backlog <intents-dir> <max-minutes>: alert when the oldest unapplied
@@ -567,7 +572,8 @@ drain_backlog() {
 	pending=$(find "$intents" -type f 2>/dev/null | wc -l | tr -d ' ')
 	age_min=$(( ( $(date +%s) - oldest ) / 60 ))
 	if [ "$age_min" -gt "$max_min" ]; then
-		alert control "drain backlog" "$pending unapplied intent(s) in the store, oldest $age_min minutes (max $max_min). The drain is the service's privileged half; an intent this old is a member whose payment or approval was accepted and who still has no account"
+		alert control "drain backlog" "$pending unapplied intent(s) in the store, oldest $age_min minutes (max $max_min). The drain is the service's privileged half; an intent this old is a member whose payment or approval was accepted and who still has no account" "check the drain's log and restart it" fail
+		return 1
 	fi
 	return 0
 }
@@ -842,9 +848,14 @@ STUB
 	mkdir -p "$work/onboard/intents"
 	printf '{}\n' > "$work/onboard/intents/one.json"
 	touch -t 202001010000 "$work/onboard/intents/one.json"
-	drain_backlog "$work/onboard/intents" 240 >"$work/drain.out" 2>&1
+	if drain_backlog "$work/onboard/intents" 240 >"$work/drain.out" 2>&1; then
+		drain_rc=0
+	else
+		drain_rc=$?
+	fi
 	check "a pending intent past the limit alerts" \
 		"$(grep -c 'kyriakon: control: drain backlog' "$work/drain.out")" "1"
+	check "and the run fails rather than pinging the check green" "$drain_rc" "1"
 	check "and the alert carries the count, not the filename" \
 		"$(grep -c '1 unapplied intent' "$work/drain.out")" "1"
 	rm -f "$work/onboard/intents/one.json"
