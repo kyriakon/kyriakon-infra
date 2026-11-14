@@ -1557,30 +1557,32 @@ pub async fn group_address(
                 || store.account(&intent.mailbox).await?.is_some()
                 || account_on_box(cfg, &intent.mailbox)?;
             // Only a pass that still sees the departing mailbox owning the site
-            // moves the upload key and the lanes. Once the group record names
-            // the replacement, a retry must not copy anything: an intent that
-            // merely named the sitting owner while removing somebody else would
-            // otherwise hand that member's key to the site.
+            // moves the lanes. Once the group record names the replacement, a
+            // retry must not re-root anything: an intent that merely named the
+            // sitting owner while removing somebody else would otherwise hand
+            // that member the site.
             let site_owner_leaving = group.site_owner == intent.mailbox;
             if site_owner_leaving {
                 let replacement = intent.site_owner.as_deref().ok_or_else(|| {
                     Error::Failed("the site owner is leaving without a replacement".to_string())
                 })?;
-                let old_key = store
-                    .read_record("keys", &format!("{}.pub", intent.mailbox))
-                    .await;
-                if let Some(material) = &old_key {
-                    write_public_key(store, replacement, material).await?;
-                }
+                // The departing owner's upload key is never copied: the leaver
+                // would keep the site's sftp and git sessions, and a key the
+                // replacement had already added would be overwritten. The site
+                // is handed over keyless and the replacement adds their own.
                 run_script(cfg, "provision-member.sh", &[replacement]).await?;
                 // The vhosts root at the site owner's tree, and
                 // `cron-apply.sh --web` rewrites only the indexes: without the
                 // lanes the new root is never written and the old one is
                 // deleted with the departing account. They run before the
                 // record is written, so a retry after a lane refusal repeats
-                // them; a group with no upload key has no tree and the lanes
-                // would refuse.
-                if old_key.is_some() {
+                // them; a site whose owner never added an upload key has no
+                // tree and the lanes would refuse.
+                if store
+                    .read_record("keys", &format!("{}.pub", intent.mailbox))
+                    .await
+                    .is_some()
+                {
                     for lane in [
                         "provision-group-web.sh",
                         "provision-group-capsule.sh",
