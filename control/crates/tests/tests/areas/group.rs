@@ -3063,12 +3063,24 @@ fn a_group_lapse_skips_a_mailbox_the_box_no_longer_has() {
     );
     assert!(fix.drain().status.success());
 
-    // The console's delete removes the box account and the store record, but
-    // not the group's list: the sweep has to survive a record that still names
-    // the deleted mailbox.
+    // The sweep has to survive a group record that names a mailbox the box no
+    // longer has. The console's delete removes the box account and the store
+    // record and now prunes the group's list too, so the fixture puts the stale
+    // name back by hand after it.
     let out = fix.ctl(&["delete", "parish-office"]);
     assert!(out.status.success(), "{}", body(&out));
     assert!(!fix.passwd_file().contains("parish-office:"));
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["accounts"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("parish-office"));
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
     let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
     assert!(
         group["accounts"]
