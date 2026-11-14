@@ -343,6 +343,22 @@ self_test() {
 	ensure_mail_address > "$tree/second.out" 2>&1
 	check "a second run writes nothing" "$(wc -c < "$tree/second.out" | tr -d ' ')" 0
 
+	# The renderer refuses a table whose first line is malformed, because the
+	# filter falls back to its first -d and skipping that line moves the fallback
+	# onto a body's domain. A failed render is a note here, as it was before, but
+	# the live configuration stays as it was rather than being restarted onto a
+	# moved fallback.
+	user=carol
+	printf ' parish.example\nkyriakon.net\nparish.example\n' > "$dkim_domains_table"
+	cp "$smtpd_conf" "$tree/anchor.expected"
+	ensure_mail_address > "$tree/moved.out" 2>&1
+	check "a malformed first line refuses the render here too" \
+		"$(grep -c 'could not be re-expanded' "$tree/moved.out")" 1
+	check "and the live configuration is unchanged" \
+		"$(cmp -s "$smtpd_conf" "$tree/anchor.expected" && printf same || printf changed)" same
+	user=alice
+	printf 'kyriakon.net\nparish.example\n' > "$dkim_domains_table"
+
 	# The post-condition the run ends with: a path in the shape it wants passes,
 	# and one whose mode has drifted fails. Both run in a subshell because
 	# assert_shape exits on a mismatch rather than returning.

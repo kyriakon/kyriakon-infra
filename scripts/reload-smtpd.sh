@@ -152,6 +152,23 @@ self_test() {
 	check "and the warning names it" \
 		"$(grep -c 'not signed: parish.12' "$tree/badline.out")" 1
 
+	# The filter's fallback is its first -d, so a line skipped *before* the first
+	# valid one moves the fallback onto a body's domain and signs the platform's
+	# own mail unaligned. The renderer refuses that, so the daemon is left alone
+	# rather than restarted onto a list whose fallback has moved.
+	: >"$calls"
+	printf ' parish.example\nkyriakon.net\n' > "$dkim_domains"
+	if reload_smtpd >"$tree/moved.out" 2>&1; then
+		code=0
+	else
+		code=$?
+	fi
+	check "a malformed first line refuses the reload" "$code" 1
+	check "and restarts nothing" "$(wc -l <"$calls" | tr -d ' ')" 0
+	check "and the refusal names the line" \
+		"$(grep -c 'line 1 is not a domain' "$tree/moved.out")" 1
+	printf 'kyriakon.net\n' > "$dkim_domains"
+
 	# A list with nothing acceptable is still refused before the daemon is
 	# touched: there is no filter to render.
 	: >"$calls"
@@ -178,8 +195,8 @@ self_test() {
 		code=$?
 	fi
 	check "a wrong-length queue key is refused" "$code" 1
-	check "and names the file and the deploy that regenerates it" \
-		"$(grep -c 'queue key, not 32; run scripts/deploy-mail.sh' "$tree/badkey.out")" 1
+	check "and names the file and the decision" \
+		"$(grep -c 'queue key, not 32; it is replaced only deliberately' "$tree/badkey.out")" 1
 	check "and a bad key restarts nothing" \
 		"$(wc -l <"$calls" | tr -d ' ')" 0
 	printf '0123456789abcdef0123456789abcdef\n' > "$queue_key_file"

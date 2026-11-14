@@ -25,7 +25,9 @@
 # pull_request trigger would start beside the checks rather than after them.
 # Two guards keep it narrow: the head branch must be a publish-key or remove-key
 # branch, and the diff must touch nothing outside keys/: additions for a
-# publication, exactly one deletion for a removal.
+# publication, exactly one deletion for a removal, and every added key a regular
+# file rather than a symlink (the file list has no mode, so the blob is resolved
+# at the head commit).
 name: auto-merge key publications
 
 on:
@@ -126,6 +128,36 @@ jobs:
               printf 'leaving #%s alone: these are not new key files, and not one deletion:\n%s\n' "$pr" "$files"
               exit 0
             fi
+          fi
+          # --- added key blob guard: run by scripts/deploy-mail.sh --self-test ---
+          # keys_regular <path>...: 0 when every path is a regular file at the head
+          # commit, 1 with the offending path printed when one is not. The pull
+          # request's file list carries status and name but no mode, so an added
+          # blob that is a symlink reads there as a new key. The contents API says
+          # what the blob is: "file" for mode 100644, "symlink" for mode 120000. A
+          # path it cannot answer for is refused as well, because a guard that
+          # fails open is not one.
+          keys_regular() {
+            typeset path blob_type
+            for path in "$@"; do
+              blob_type=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$HEAD_SHA" --jq .type) || blob_type=''
+              if [ "$blob_type" != file ]; then
+                printf '%s is not a regular file (%s)\n' "$path" "${blob_type:-no answer}"
+                return 1
+              fi
+            done
+          }
+          # --- end added key blob guard ---
+          # The name is not the file: scripts/deploy-mail.sh installs every
+          # keys/*.asc with `install -m 0644`, which dereferences a link, so an
+          # added keys/<name>.asc pushed with mode 120000 would publish the
+          # target's contents into the keyring on every deploy: the DKIM key, the
+          # TLS key, the publish token, an account's secrets.
+          added=$(printf '%s\n' "$files" | awk '$1 == "added" { print $2 }')
+          # shellcheck disable=SC2086 # one keys/<localpart>.asc per line, and a key file has no space
+          if ! why=$(keys_regular $added); then
+            printf 'leaving #%s alone: %s\n' "$pr" "$why"
+            exit 0
           fi
           # The token has to be the machine account's for the merge to be
           # attributable to the credential that pushed the branch, and the author
