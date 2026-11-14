@@ -65,11 +65,22 @@ usage() {
 
 state_dir=
 
-# clean_session <sessid>: drop one session's state. Called at commit and at
-# disconnect, so a reconnect gets a fresh answer rather than the last one.
+# clean_transaction <sessid>: drop one message's header state. Called at commit,
+# because a second message in the same SMTP session is a second message and must
+# be checked from scratch.
+clean_transaction() {
+	rm -f "$state_dir/$1".from "$state_dir/$1".infrom "$state_dir/$1".count \
+		"$state_dir/$1".body
+}
+
+# clean_session <sessid>: drop the whole connection's state. Called at
+# disconnect, so a reconnect gets a fresh answer rather than the last one. The
+# account and the connect source live for the connection, not the transaction:
+# smtpd reports them once, and forgetting them at commit would leave every later
+# message in the session looking like inbound mail.
 clean_session() {
-	rm -f "$state_dir/$1".user "$state_dir/$1".local "$state_dir/$1".from \
-		"$state_dir/$1".infrom "$state_dir/$1".count "$state_dir/$1".body
+	rm -f "$state_dir/$1".user "$state_dir/$1".local
+	clean_transaction "$1"
 }
 
 # add_domain <domain>
@@ -125,6 +136,7 @@ from_problem() {
 		a = tolower(trim(a))
 		if (a == "")
 			return
+		added++
 		if (mode == "auth") {
 			if (index(a, "@") == 0 ||
 			    index(allowed[user] ",", "," a ",") == 0)
@@ -176,19 +188,34 @@ from_problem() {
 		while (match(value, /\([^()]*\)/)) {
 			value = substr(value, 1, RSTART - 1) " " substr(value, RSTART + RLENGTH)
 		}
-		if (match(value, /<[^>]*>/)) {
-			# Every angle-bracketed address, which also keeps a display name
-			# containing a comma from being split as two addresses.
-			while (match(value, /<[^>]*>/)) {
-				add(substr(value, RSTART + 1, RLENGTH - 2))
-				value = substr(value, RSTART + RLENGTH)
-			}
-			exit
-		}
-		# No brackets: split on commas.
+		# Blank quoted display-name strings in one regex pass, so the comma in
+		# `"A, Inc." <a@b>` is not read as an address separator. The alternation
+		# keeps an escaped quote inside the string; a quote left over after it
+		# is one that never closed, and an unreadable header must not pass.
+		gsub(/"[^"\\]*(\\.?[^"\\]*)*"/, " ", value)
+		if (index(value, "\"") > 0)
+			problem("5.7.1 the From header has an unterminated quoted string")
+		added = 0
 		n = split(value, part, ",")
-		for (i = 1; i <= n; i++)
-			add(part[i])
+		for (i = 1; i <= n; i++) {
+			p = part[i]
+			if (index(p, "<") == 0) {
+				add(p)
+				continue
+			}
+			# Every <...> is an address; the text beside it is a display name.
+			# A bracket still in the part after the extraction never closed.
+			while (match(p, /<[^>]*>/)) {
+				add(substr(p, RSTART + 1, RLENGTH - 2))
+				p = substr(p, 1, RSTART - 1) substr(p, RSTART + RLENGTH)
+			}
+			if (index(p, "<") > 0 || index(p, ">") > 0)
+				problem("5.7.1 the From header has an unterminated angle address")
+		}
+		# A header that parsed to no address at all (a quoted string with no
+		# mailbox beside it) has nothing to check, so it cannot pass.
+		if (mode == "auth" && added == 0)
+			problem("5.7.1 the From header names no address")
 	}'
 }
 
@@ -239,7 +266,7 @@ handle_commit() {
 	else
 		printf 'filter-result|%s|%s|proceed\n' "$sid" "$token"
 	fi
-	clean_session "$sid"
+	clean_transaction "$sid"
 }
 
 # handle_report <line>: the events the policies are read from — the source of the
@@ -460,6 +487,58 @@ $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: a@kyriakon.net, al
 	check_reject "any unlisted address in a list is refused" \
 		"550 5.7.1 a@kyriakon.net"
 
+	# A mailbox-list mixes the two address forms freely, and every one of them
+	# is an address the header names: the bracketed one must not hide the bare
+	# one beside it.
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: hello@kyriakon.net, <alice@kyriakon.net>")"
+	check_reject "a bare address beside a bracketed one is checked" \
+		"550 5.7.1 hello@kyriakon.net"
+
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: <alice@kyriakon.net>, bob@kyriakon.net")"
+	check_reject "a bare address after a bracketed one is checked" \
+		"550 5.7.1 bob@kyriakon.net"
+
+	# The comma in a quoted display name is not a separator, and an escaped
+	# quote does not end the string at the wrong place.
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: \"A, Inc.\" <alice@kyriakon.net>")"
+	check "a quoted display name's comma is not an address separator" \
+		"$(decision)" proceed
+
+	quoted_from='From: "Alice \"Q\" Public, Inc." <alice@kyriakon.net>'
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|$quoted_from")"
+	check "an escaped quote does not split a display name" \
+		"$(decision)" proceed
+
+	# A header the parser cannot read must be refused, not pass unchecked.
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: \" <hello@kyriakon.net>")"
+	check_reject "an unterminated quoted string is refused" \
+		"550 5.7.1 the From header has an unterminated quoted string"
+
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: alice@kyriakon.net, \" <hello@kyriakon.net>")"
+	check_reject "an unterminated quote cannot blank the rest of the header" \
+		"550 5.7.1 the From header has an unterminated quoted string"
+
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: <hello@kyriakon.net")"
+	check_reject "an unterminated angle address is refused" \
+		"550 5.7.1 the From header has an unterminated angle address"
+
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: \"hello@kyriakon.net\"")"
+	check_reject "a quoted string with no mailbox is refused" \
+		"550 5.7.1 the From header names no address"
+
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: \"\"")"
+	check_reject "an empty quoted header is refused" \
+		"550 5.7.1 the From header names no address"
+
 	run_case "$(connect_remote)
 $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: alice")"
 	check_reject "a bare localpart is not an authenticated identity" \
@@ -498,6 +577,25 @@ $(message_no_from)"
 	check_reject "a message with no From header is refused" \
 		"550 5.7.1 the message has no From header"
 
+	# --- the account outlives a commit, the connection does not ---
+	# smtpd reports link-auth and link-connect once per connection. Clearing
+	# them at commit would make every later message in the session look like
+	# inbound mail and skip the check entirely.
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: alice@kyriakon.net")
+$(message "filter|0.7|3.0|smtp-in|data-line|$session|u9|From: hello@kyriakon.net")"
+	check "the first message in a session proceeds" \
+		"$(grep -c 'filter-result|.*|t5|proceed' "$work/out")" 1
+	check_reject "a second message in the same session is still checked" \
+		"550 5.7.1 hello@kyriakon.net"
+
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: alice@kyriakon.net")
+report|0.7|4.0|smtp-in|link-disconnect|$session
+report|0.7|5.0|smtp-in|link-connect|$session|mail.example|pass|192.0.2.5:41001|192.0.2.1:25
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: anyone@example.org")"
+	check "a reconnect starts with no identity" "$(decision)" proceed
+
 	# --- the local enqueuer's policy ---
 	run_case "$(connect_local)
 $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: kyriakon <hello@kyriakon.net>")"
@@ -519,6 +617,17 @@ $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: secretary@parish.e
 	run_case "$(connect_local)
 $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: x@evil.example (x <hello@kyriakon.net>)")"
 	check_reject "the enqueuer cannot hide a foreign domain in a comment" \
+		"550 5.7.1 x@evil.example"
+
+	run_case "$(connect_local)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: hello@kyriakon.net, <anything@evil.example>")"
+	check_reject "the enqueuer checks both addresses of a mixed header" \
+		"550 5.7.1 anything@evil.example"
+
+	run_case "$(connect_local)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: hello@kyriakon.net")
+$(message "filter|0.7|3.0|smtp-in|data-line|$session|u9|From: x@evil.example")"
+	check_reject "the enqueuer's second message in a session is still checked" \
 		"550 5.7.1 x@evil.example"
 
 	# A From: line in the body is body text, not a header: the header block
