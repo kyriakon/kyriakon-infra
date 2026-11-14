@@ -127,6 +127,12 @@ attempts_file() {
 valid_source() {
 	case "$1" in
 	'' | *[!0-9a-fA-F:./]*) return 1 ;;
+	*..*) return 1 ;;
+	*.* | *:*) ;;
+	*) return 1 ;;
+	esac
+	case "$1" in
+	*/*) case "${1##*/}" in '' | *[!0-9]*) return 1 ;; esac ;;
 	esac
 	[ "${#1}" -le 64 ]
 }
@@ -543,6 +549,12 @@ self_test() {
 		"$(valid_source '198.51.100.7 x' && printf yes || printf no)" no
 	check "an empty source is not" \
 		"$(valid_source '' && printf yes || printf no)" no
+	check "a bare word is not" \
+		"$(valid_source 'not-an-address' && printf yes || printf no)" no
+	check "a path traversal is not" \
+		"$(valid_source '../etc/passwd' && printf yes || printf no)" no
+	check "a non-numeric prefix is not" \
+		"$(valid_source '2001:db8::/zz' && printf yes || printf no)" no
 	auth_rc=1
 	( login_check theophilus-1 "$work" 'not an address' ) >/dev/null 2>&1 || true
 	check "a source that is not an address shares the unknown key" \
