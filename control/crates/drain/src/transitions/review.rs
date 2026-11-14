@@ -152,9 +152,6 @@ pub async fn filed_application(
             util::clean(&intent.application.username)
         )));
     }
-    // The record's name is the one the mail prints, so it carries the name check
-    // as well as the intent's.
-    name_allowed(cfg, &record.username).await?;
 
     // One review email per application, not per intent: the journal is the
     // record and it is written before the send, so a crash loses an email
@@ -179,9 +176,9 @@ pub async fn filed_application(
     // where the operator can tell them apart before opening either.
     let subject = notice::operator_subject(
         "control",
-        // The subject is a header the operator's terminal shows, so it carries
-        // the same display sanitiser as the body.
-        &util::clean_body(&format!(
+        // The subject is a mail header: `clean` drops every control,
+        // newlines included, so nothing here can add a header line.
+        &util::clean(&format!(
             "application filed ({}, {})",
             intent.application.username,
             intent.application.status_token.as_deref().unwrap_or("")
