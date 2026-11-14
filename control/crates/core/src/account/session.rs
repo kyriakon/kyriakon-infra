@@ -69,16 +69,24 @@ impl Authenticator {
     /// prints its token; the handler stores the token and cannot make one. Any
     /// failure of the check itself is a refusal: a box whose `doas` or checker
     /// is missing must not admit anyone.
+    ///
+    /// `source` is the client as the rate counters key it, and the checker keys
+    /// the failed-attempt record on it: ten wrong passwords then refuse that
+    /// pair rather than the member's name, which anyone who reads `keys/` knows.
+    /// It is an argument rather than the environment because the checker is run
+    /// through `doas`, which scrubs the environment.
     pub async fn authenticate(
         &self,
         username: &str,
         password: &str,
         proof_dir: &Path,
+        source: &str,
     ) -> Option<String> {
         let mut child = match Command::new(&self.program)
             .args(&self.args)
             .arg(username)
             .arg(proof_dir)
+            .arg(source)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -464,6 +472,38 @@ mod tests {
         OffsetDateTime::parse("2026-10-31T09:00:00Z", &Rfc3339).unwrap()
     }
 
+    /// The source the tests pass to the checker: the address the rate counters
+    /// key on, so both counters name the same client.
+    const SOURCE: &str = "203.0.113.10";
+
+    /// The throttle is the checker's, and it is keyed on the pair. A handler that
+    /// did not pass the source would leave the checker one field and every
+    /// failure under the same key, which is the lockout this fixes.
+    #[tokio::test]
+    async fn the_checker_is_given_the_source_after_the_proof_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("onboard-auth-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kyriakon-authcheck");
+        // Reads the password as the real checker does, then answers with its
+        // third argument as the "proof", so the value the test reads back is the
+        // one the handler passed rather than one the stub made up.
+        std::fs::write(&path, "#!/bin/sh\nread -r given\nprintf '%s\\n' \"$3\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let auth = Authenticator {
+            program: path,
+            args: Vec::new(),
+        };
+        let proof_dir = std::path::Path::new("/var/db/kyriakon/logins");
+        assert_eq!(
+            auth.authenticate("alice", "right horse battery", proof_dir, "2001:db8::/64")
+                .await
+                .as_deref(),
+            Some("2001:db8::/64")
+        );
+    }
+
     #[tokio::test]
     async fn a_correct_password_admits_and_a_wrong_one_does_not() {
         let store = store("admits");
@@ -472,11 +512,11 @@ mod tests {
             args: Vec::new(),
         };
         assert!(auth
-            .authenticate("alice", "right horse battery", &proofs(&store))
+            .authenticate("alice", "right horse battery", &proofs(&store), SOURCE)
             .await
             .is_some());
         assert!(auth
-            .authenticate("alice", "wrong horse battery", &proofs(&store))
+            .authenticate("alice", "wrong horse battery", &proofs(&store), SOURCE)
             .await
             .is_none());
     }
@@ -489,7 +529,7 @@ mod tests {
             args: Vec::new(),
         };
         assert!(auth
-            .authenticate("alice", "right horse battery", &proofs(&store))
+            .authenticate("alice", "right horse battery", &proofs(&store), SOURCE)
             .await
             .is_none());
     }
@@ -695,7 +735,7 @@ mod tests {
             args: Vec::new(),
         };
         assert!(auth
-            .authenticate("alice", &"x".repeat(256 * 1024), &proofs(&store))
+            .authenticate("alice", &"x".repeat(256 * 1024), &proofs(&store), SOURCE)
             .await
             .is_none());
     }

@@ -17,7 +17,8 @@
 //! down.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -86,6 +87,19 @@ fn bucket(ip: IpAddr) -> Key {
             Key::V6(u64::from_be_bytes([
                 o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7],
             ]))
+        }
+    }
+}
+
+/// The key as one field: what the login checker's failed-attempt record keys on,
+/// so a source is the same address in both counters. A `Key::V6` is the /64 as a
+/// prefix, because a delegated prefix otherwise mints unlimited sources.
+impl fmt::Display for Key {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Key::V4(addr) => write!(f, "{addr}"),
+            Key::V6(prefix) => write!(f, "{}/64", Ipv6Addr::from(u128::from(*prefix) << 64)),
+            Key::UnknownForward => f.write_str("-"),
         }
     }
 }

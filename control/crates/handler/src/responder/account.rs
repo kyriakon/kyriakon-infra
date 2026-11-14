@@ -84,7 +84,8 @@ pub(super) async fn account_web(app: &App, request: &Request) -> Reply {
 /// The login submission. A correct password opens a session and sends the
 /// member to their page; a wrong one, an unknown username and a submission with
 /// a field missing all return the same login page with no cookie set.
-pub(super) async fn login(app: &App, request: &Request) -> Reply {
+pub(super) async fn login(app: &App, call: &Call<'_>) -> Reply {
+    let request = call.request;
     let form = fields(&String::from_utf8_lossy(&request.body));
     let username = form.get("username").map(String::as_str).unwrap_or("");
     let password = form.get("password").map(String::as_str).unwrap_or("");
@@ -95,13 +96,21 @@ pub(super) async fn login(app: &App, request: &Request) -> Reply {
     // `bsdauth`. It mints the proof in the root-owned directory and prints its
     // token; the handler stores it and cannot make one.
     let proof_dir = std::path::Path::new(&app.cfg.proof_dir);
+    // The source the checker's failed-attempt record keys on. It is the address
+    // the rate counters key on, which the front-end observed: relayd's own
+    // forwarded value for the web, the socket peer for the capsule, never a
+    // string a client composed. Ten failures then refuse that pair rather than
+    // the member's name.
+    let source = call.incoming.key.to_string();
     let proof = if username.is_empty()
         || password.is_empty()
         || validate::username_shape(username).is_some()
     {
         None
     } else {
-        app.auth.authenticate(username, password, proof_dir).await
+        app.auth
+            .authenticate(username, password, proof_dir, &source)
+            .await
     };
     let Some(proof) = proof else {
         return Reply::capability(200, page_html(&LoginPage {
@@ -203,7 +212,7 @@ pub(super) async fn closure_refund(app: &App, account: &Account) -> Option<Strin
 /// image tag. The path's remainder is the control's name.
 pub(super) async fn account_action(app: &App, call: &Call<'_>) -> Reply {
     match call.rest {
-        "password" => account_password(app, call.request).await,
+        "password" => account_password(app, call).await,
         "upload-key" => account_upload_key(app, call.request).await,
         "address" => account_address(app, call.request).await,
         "serving" => account_serving(app, call.request).await,
@@ -219,7 +228,8 @@ pub(super) async fn account_action(app: &App, call: &Call<'_>) -> Reply {
 /// erasure text. The handler holds no privilege and writes nothing but the
 /// intent; the drain verifies the session, owns the state change and runs the
 /// deletion.
-pub(super) async fn account_close(app: &App, request: &Request) -> Reply {
+pub(super) async fn account_close(app: &App, call: &Call<'_>) -> Reply {
+    let request = call.request;
     let (cookie, account) = match session_account(app, request).await {
         Ok(Some(found)) => found,
         Ok(None) => return refused("Sign in to the account you want to close."),
@@ -227,6 +237,7 @@ pub(super) async fn account_close(app: &App, request: &Request) -> Reply {
     };
     let form = fields(&String::from_utf8_lossy(&request.body));
     let password = form.get("password").map(String::as_str).unwrap_or("");
+    let source = call.incoming.key.to_string();
     if password.is_empty()
         || !app
             .auth
@@ -234,6 +245,7 @@ pub(super) async fn account_close(app: &App, request: &Request) -> Reply {
                 &account.username,
                 password,
                 std::path::Path::new(&app.cfg.proof_dir),
+                &source,
             )
             .await
             .is_some()
@@ -270,7 +282,8 @@ pub(super) async fn account_close(app: &App, request: &Request) -> Reply {
 /// here and filed as plaintext for the drain to hash, because a handler that
 /// supplies the stored hash can choose one the member never typed. The drain
 /// writes the hash as root because the check only verifies.
-pub(super) async fn account_password(app: &App, request: &Request) -> Reply {
+pub(super) async fn account_password(app: &App, call: &Call<'_>) -> Reply {
+    let request = call.request;
     let (cookie, account) = match session_account(app, request).await {
         Ok(Some(found)) => found,
         Ok(None) => return refused("Sign in to the account whose password you want to change."),
@@ -281,6 +294,8 @@ pub(super) async fn account_password(app: &App, request: &Request) -> Reply {
     };
     let form = fields(&String::from_utf8_lossy(&request.body));
     let current = form.get("password").map(String::as_str).unwrap_or("");
+    // The same key the login uses, so the throttle's record is one pair's.
+    let source = call.incoming.key.to_string();
     let new = form.get("new_password").map(String::as_str).unwrap_or("");
     let confirm = form
         .get("confirm_password")
@@ -296,6 +311,7 @@ pub(super) async fn account_password(app: &App, request: &Request) -> Reply {
                 &account.username,
                 current,
                 std::path::Path::new(&app.cfg.proof_dir),
+                &source,
             )
             .await
             .is_some()

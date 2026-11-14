@@ -177,6 +177,39 @@ async fn a_correct_mail_password_opens_a_session_and_a_wrong_one_does_not() {
     assert!(page.contains("Referrer-Policy: no-referrer"), "{page}");
 }
 
+/// #804: the login hands the checker the source the request came from, because
+/// the throttle refuses a (name, source) pair rather than a name anyone can read
+/// out of `keys/`. The source is the address the rate counters key on: relayd's
+/// own forwarded value for the web front-end, never a header the client wrote.
+#[tokio::test]
+async fn a_login_gives_the_checker_the_observed_source() {
+    let (mut app, _dir) = handler("login-source").await;
+    let (program, log) = checker_logging("login-source", "right horse battery");
+    app.auth = session::Authenticator {
+        program,
+        args: Vec::new(),
+    };
+
+    let (code, body) = ask(
+        &app,
+        &httpd_post("/login", "username=alice&password=right+horse+battery"),
+    )
+    .await;
+    assert_eq!(code, 303, "{body}");
+    let logged = std::fs::read_to_string(&log).expect("the checker ran");
+    let args: Vec<&str> = logged.split_whitespace().collect();
+    assert_eq!(
+        args.len(),
+        3,
+        "username, proof directory, source: {logged:?}"
+    );
+    assert_eq!(args[0], "alice");
+    assert_eq!(
+        args[2], "203.0.113.10",
+        "the source is the address relayd observed, not httpd's peer: {logged:?}"
+    );
+}
+
 /// #761: a login that cannot name itself as this page is refused before the
 /// password is read, so the reply carries no session cookie. These are the rows
 /// an attacker can drive; the same-origin submit above is the ordinary path.
