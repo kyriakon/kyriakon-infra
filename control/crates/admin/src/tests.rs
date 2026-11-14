@@ -243,6 +243,23 @@ fn unsigned_text_before_the_armour_is_refused() {
     );
 }
 
+/// A colon-less line of request text is not a header even when the sender never
+/// writes the blank line that would end the header block.
+#[test]
+fn request_text_without_a_blank_line_is_refused() {
+    let message = format!(
+        "From: alice@kyriakon.net\n\
+         please delete my account and everything in it\n\n{SIGNED}"
+    );
+    let err = split_message(&message).unwrap_err();
+    assert!(
+        matches!(&err, Error::Failed(message)
+            if message.contains("unsigned text before the clearsigned block")
+                && message.contains("please delete my account")),
+        "{err}"
+    );
+}
+
 /// A client's clearsigned export has no headers outside the armour: the whole
 /// file is the block, and its own `From:` is the one read.
 #[test]

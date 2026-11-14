@@ -49,7 +49,11 @@ pub(crate) async fn request_record(store: &Store, args: &[String]) -> Result<(),
         },
     )
     .await?;
-    println!("recorded {}; answer due {}", line.id, line.due);
+    println!(
+        "recorded {}; answer due {}",
+        safe(&line.id),
+        safe(&line.due)
+    );
     Ok(())
 }
 
@@ -227,21 +231,44 @@ pub(crate) fn split_message(message: &str) -> Result<Message, Error> {
 }
 
 /// The region before a clearsigned block: header lines, the blank line that ends
-/// them, and nothing else.
+/// them, and nothing else. Every non-blank line before the blank line must look
+/// like a header (`Name: value`, or a continuation), and nothing may follow the
+/// blank line. gpg verifies the armour wherever it sits, so a colon-less line of
+/// request text above it would otherwise be read as part of the request.
 fn headers_only(region: &str) -> Result<(), Error> {
     let mut ended = false;
+    let mut saw_header = false;
     for (index, line) in region.lines().enumerate() {
         if line.trim().is_empty() {
             ended = true;
-        } else if ended {
-            return Err(Error::Failed(format!(
-                "the message has unsigned text before the clearsigned block, at line {}: {:?}",
-                index + 1,
-                line.chars().take(80).collect::<String>()
-            )));
+            continue;
         }
+        if ended {
+            return Err(unsigned_text(index, line));
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if saw_header {
+                continue;
+            }
+            return Err(unsigned_text(index, line));
+        }
+        let Some((name, _)) = line.split_once(':') else {
+            return Err(unsigned_text(index, line));
+        };
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(unsigned_text(index, line));
+        }
+        saw_header = true;
     }
     Ok(())
+}
+
+fn unsigned_text(index: usize, line: &str) -> Error {
+    Error::Failed(format!(
+        "the message has unsigned text before the clearsigned block, at line {}: {:?}",
+        index + 1,
+        line.chars().take(80).collect::<String>()
+    ))
 }
 
 /// The address in one header block's `From:`, with RFC 5322 continuation lines
@@ -301,7 +328,7 @@ pub(crate) async fn request_extend(store: &Store, args: &[String]) -> Result<(),
     .await?;
     println!(
         "extended {}; answer due {} (was {})",
-        line.id,
+        safe(&line.id),
         safe(line.effective_due()),
         safe(&line.due)
     );
@@ -318,7 +345,7 @@ pub(crate) async fn request_close(store: &Store, args: &[String]) -> Result<(), 
         account_requests::close(store, id, need(&flags, "done")?, need(&flags, "note")?).await?;
     println!(
         "closed {} (done {})",
-        line.id,
+        safe(&line.id),
         safe(line.done_at.as_deref().unwrap_or(""))
     );
     Ok(())
@@ -337,7 +364,7 @@ pub(crate) async fn request_list(store: &Store) -> Result<(), Error> {
     for line in open {
         let state = match line
             .state(today)
-            .map_err(|e| Error::context(format!("request {}", line.id), e))?
+            .map_err(|e| Error::context(format!("request {}", safe(&line.id)), e))?
         {
             account_requests::DueState::Overdue => {
                 overdue += 1;
