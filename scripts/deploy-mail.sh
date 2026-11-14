@@ -1721,9 +1721,11 @@ say "keyring"
 install -d -m 0755 "$keyring_dir"
 for k in "$repo_dir"/keys/*.asc; do
 	# A dangling symlink is matched by the glob but not by -e; it still reaches
-	# install_keyring_key, whose refusal is the point.
+	# install_keyring_key, whose refusal is the point. The refusal is one bad
+	# tracked file, not a reason to abandon the rest of the deploy: the config
+	# is already installed and the services still have to be restarted.
 	[ -e "$k" ] || [ -L "$k" ] || continue
-	install_keyring_key "$k"
+	install_keyring_key "$k" || continue
 done
 
 # --- 6. services --------------------------------------------------------
