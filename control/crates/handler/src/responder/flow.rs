@@ -62,7 +62,7 @@ pub(super) fn applicant(app: &App, query: BTreeMap<String, String>) -> Reply {
 /// same question is settled the same way when the application is submitted, which
 /// is what the terminal and the capsule inherit.
 pub(super) fn branch_step(app: &App, form: BTreeMap<String, String>) -> Reply {
-    let body = form.get("whose").map(String::as_str) == Some("body");
+    let body = form.get("whose").map(|v| v.trim()) == Some("body");
     render_applicant(app, body, &form, &[])
 }
 
@@ -151,7 +151,7 @@ pub(super) fn own_origin(request: &Request, reaches: Reaches) -> bool {
 /// the handler files anything, so the two cannot disagree about what is
 /// acceptable.
 pub(super) fn application_problems(app: &App, form: &BTreeMap<String, String>) -> Vec<String> {
-    let body = form.get("whose").map(String::as_str) == Some("body");
+    let body = form.get("whose").map(|v| v.trim()) == Some("body");
     let monastic = questions::is_monastic(form.get("orders").map(String::as_str));
     let mut errors = Vec::new();
     for q in questions::shown(&app.questions, !body) {
@@ -186,14 +186,26 @@ pub(super) fn build_record(
 ) -> Result<Record, Error> {
     let answers: BTreeMap<String, String> = questions::shown(&app.questions, !body)
         .iter()
-        .map(|q| (q.id.clone(), form.get(&q.id).cloned().unwrap_or_default()))
+        .map(|q| {
+            (
+                q.id.clone(),
+                form.get(&q.id)
+                    .map(|v| v.trim())
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
         .collect();
-    let rail = form.get("rail").cloned().unwrap_or_default();
+    let rail = form
+        .get("rail")
+        .map(|v| v.trim())
+        .unwrap_or_default()
+        .to_string();
 
     let mail_key_id = if body { "body_mail_key" } else { "mail_key" };
     let blocks = keycheck::blocks(form.get(mail_key_id).map(String::as_str).unwrap_or(""));
     let mailboxes: Vec<String> = if body {
-        questions::account_names(form)
+        questions::account_names(form)?
     } else {
         vec![String::new()]
     };
@@ -203,7 +215,10 @@ pub(super) fn build_record(
         // A person's key is filed under no mailbox, but its identity is the
         // username answer; a body mailbox's identity is its own address.
         let address = if body {
-            let domain = form.get("body_domain").cloned().unwrap_or_default();
+            let domain = form
+                .get("body_domain")
+                .map(|v| v.trim())
+                .unwrap_or_default();
             if domain.is_empty() {
                 mailbox.clone()
             } else {
@@ -251,7 +266,11 @@ pub(super) fn build_record(
     }
 
     Ok(Record {
-        username: form.get("username").cloned().unwrap_or_default(),
+        username: form
+            .get("username")
+            .map(|v| v.trim())
+            .unwrap_or_default()
+            .to_string(),
         status_token: token.to_string(),
         filed_at: util::filed_at(),
         front_end: front_end.to_string(),
@@ -261,12 +280,18 @@ pub(super) fn build_record(
         decided_at: None,
         password_link: None,
         domain: body
-            .then(|| form.get("body_domain").cloned().unwrap_or_default())
-            .filter(|d| !d.trim().is_empty()),
+            .then(|| {
+                form.get("body_domain")
+                    .map(|v| v.trim())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .filter(|d| !d.is_empty()),
         outside_address: form
             .get("address_outside")
-            .cloned()
-            .filter(|a| !a.trim().is_empty()),
+            .map(|v| v.trim())
+            .filter(|a| !a.is_empty())
+            .map(str::to_string),
         // The drain copies the account's block here at approval, which is the
         // only way the unprivileged handler can render it.
         payment: None,

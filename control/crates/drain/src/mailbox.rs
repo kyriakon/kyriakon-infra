@@ -376,6 +376,7 @@ fn assign(
         .unwrap_or_default();
     let names: Vec<String> = if body {
         kyriakon_control_core::flow::questions::account_names(&draft.answers)
+            .map_err(|e| Unlabelled(vec![e.to_string()]))?
     } else {
         draft
             .answers

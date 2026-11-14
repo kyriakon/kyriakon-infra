@@ -1,6 +1,6 @@
 //! Tests for the flow module.
 
-use super::build_record;
+use super::{application_problems, build_record};
 use crate::fastcgi::fixture;
 use crate::responder::test_support::*;
 use kyriakon_control_core::flow::applicant::{body_cross_checks, label};
@@ -287,6 +287,81 @@ async fn a_padded_yes_records_the_acceptance_it_names() {
     assert!(
         record.contains("immediate supply"),
         "the trimmed acceptance is recorded: {record}"
+    );
+}
+
+/// The form validates the trimmed answer, so the filed record must carry that
+/// same value: a stored trailing space made the drain refuse an application the
+/// form had accepted, and hid the space in the review mail.
+#[tokio::test]
+async fn a_whitespace_bearing_answer_is_filed_trimmed() {
+    let (app, dir) = handler("answer-trimmed").await;
+    let answers: Vec<(&str, &str)> = body_answers()
+        .into_iter()
+        .map(|(k, v)| match k {
+            "whose" => (k, " body "),
+            "username" => (k, " theophilus "),
+            "body_domain" => (k, "example.invalid "),
+            _ => (k, v),
+        })
+        .collect();
+    let (code, page) = ask(&app, &httpd_post("/apply", &encoded(&answers))).await;
+    assert_eq!(code, 200, "{page}");
+    let entry = std::fs::read_dir(dir.join("applications"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let record = std::fs::read_to_string(entry.path()).unwrap();
+    assert!(record.contains("\"username\": \"theophilus\""), "{record}");
+    assert!(
+        record.contains("\"domain\": \"example.invalid\""),
+        "{record}"
+    );
+    assert!(record.contains("\"whose\": \"body\""), "{record}");
+    assert!(!record.contains("\"theophilus \""), "{record}");
+}
+
+/// `orders` is compared as validation compares it, so a padded monastic answer
+/// still requires the blessing the monastic path requires.
+#[tokio::test]
+async fn a_padded_monastic_answer_still_requires_the_blessing() {
+    let (app, _dir) = handler("monastic-padded").await;
+    let mut form: BTreeMap<String, String> = body_answers()
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    form.insert("orders".to_string(), "monk ".to_string());
+    form.insert("blessing".to_string(), String::new());
+    let errors = application_problems(&app, &form);
+    assert!(
+        errors.iter().any(|e| e.contains("blessing")),
+        "the monastic blessing is still required: {errors:?}"
+    );
+}
+
+/// A duplicated account name is refused at the form rather than filed as two
+/// key records under one mailbox.
+#[tokio::test]
+async fn a_duplicate_account_name_is_refused_at_the_form() {
+    let (app, dir) = handler("duplicate-name").await;
+    let answers: Vec<(&str, &str)> = body_answers()
+        .into_iter()
+        .map(|(k, v)| match k {
+            "body_addresses" => (k, "secretary: own\nhall: alias secretary"),
+            "body_account_names" => (k, "secretary\nsecretary"),
+            _ => (k, v),
+        })
+        .collect();
+    let (code, page) = ask(&app, &httpd_post("/apply", &encoded(&answers))).await;
+    assert_eq!(code, 422, "{page}");
+    assert!(
+        page.contains("secretary") && page.contains("twice"),
+        "the refusal names the duplicate: {page}"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.join("applications")).unwrap().count(),
+        0
     );
 }
 

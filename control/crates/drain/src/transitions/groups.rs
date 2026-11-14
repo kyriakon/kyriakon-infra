@@ -56,7 +56,7 @@ pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
-    let names = questions::account_names(&record.answers);
+    let names = questions::account_names(&record.answers)?;
     if names.len() != lines.len() {
         return Err(Error::Failed(format!(
             "{} addresses and {} account names; there is one name per address",
@@ -100,11 +100,11 @@ pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec
         })?;
         let local = local.trim();
         if rest.trim() != "own" {
-            let target = rest
-                .trim()
-                .strip_prefix("alias ")
-                .map(str::trim)
-                .unwrap_or_default();
+            let target = validate::alias_target(rest).ok_or_else(|| {
+                Error::Failed(format!(
+                    "the address line {line:?} is not localpart: own or localpart: alias localpart"
+                ))
+            })?;
             let shared = own.get(target).ok_or_else(|| {
                 Error::Failed(format!(
                     "the address {local} is an alias into {target}, which is not a mailbox in the table"
@@ -316,6 +316,12 @@ pub async fn provision_group(
         if mine.is_empty() {
             return Err(Error::Failed(format!(
                 "the mailbox {mailbox} has no mail key, so its mail would bounce"
+            )));
+        }
+        if mine.len() > 1 {
+            return Err(Error::Failed(format!(
+                "the mailbox {mailbox} has {} keys; there is one key per mailbox",
+                mine.len()
             )));
         }
         keys.insert(mailbox.clone(), mine);
@@ -1881,6 +1887,56 @@ mod tests {
     use kyriakon_control_core::account::sign;
     use kyriakon_control_core::store::GroupIntent;
     use serde_json::json;
+
+    /// The form accepts a tab between `alias` and its target, and the drain
+    /// reads the same line through the same parser, so both verdicts agree.
+    #[test]
+    fn a_tab_after_alias_names_the_same_mailbox_as_a_space() {
+        let record = |addresses: &str| Record {
+            username: "warden".into(),
+            status_token: "abcdefghjkmnpqrstvwxyz0123".into(),
+            filed_at: "2026-10-02T09:00:00Z".into(),
+            front_end: "web".into(),
+            stage: "received".into(),
+            decided_at: None,
+            password_link: None,
+            domain: Some("parish.example".into()),
+            outside_address: None,
+            payment: None,
+            answers: std::collections::BTreeMap::from([
+                ("body_addresses".to_string(), addresses.to_string()),
+                (
+                    "body_account_names".to_string(),
+                    "secretary\nhall".to_string(),
+                ),
+            ]),
+            mail_keys: Vec::new(),
+            upload_key: None,
+            rail: "cash".into(),
+            no_charge: false,
+            confirmation_at: None,
+            acceptances: Vec::new(),
+            question_list: "test".into(),
+        };
+        let (tabs, mailboxes) =
+            group_addresses(&record("secretary: own\noffice: alias\tsecretary")).unwrap();
+        let (spaces, _) =
+            group_addresses(&record("secretary: own\noffice: alias secretary")).unwrap();
+        let pairs = |a: &[GroupAddress]| {
+            a.iter()
+                .map(|x| (x.address.clone(), x.mailbox.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pairs(&tabs), pairs(&spaces));
+        assert_eq!(
+            pairs(&tabs),
+            [
+                ("secretary".to_string(), "secretary".to_string()),
+                ("office".to_string(), "secretary".to_string()),
+            ]
+        );
+        assert_eq!(mailboxes, ["secretary"]);
+    }
 
     /// The `provision-group` payload covers every field the transition acts on:
     /// changing any one of them changes the payload, so a signature made for one

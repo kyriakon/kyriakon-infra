@@ -127,7 +127,11 @@ pub fn username_shape(value: &str) -> Option<String> {
 /// set included, and the refusal names the offending line: these lines become OS
 /// account names, created as root by the drain.
 pub fn usernames(value: &str, reserved: &HashSet<String>) -> Option<String> {
+    let mut seen = HashSet::new();
     for line in value.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if !seen.insert(line) {
+            return Some(format!("the name {line:?} is given twice"));
+        }
         if let Some(why) = username(line, reserved) {
             return Some(format!("the name {line:?}: {why}"));
         }
@@ -231,6 +235,17 @@ pub fn address_lines(value: &str) -> Option<String> {
     None
 }
 
+/// The target of an address line's rest when it is exactly `alias <target>`.
+/// The form and the drain both read a line here, so a tab cannot pass one and
+/// fail the other.
+pub fn alias_target(rest: &str) -> Option<&str> {
+    let mut words = rest.split_whitespace();
+    match (words.next(), words.next(), words.next()) {
+        (Some("alias"), Some(target), None) => Some(target),
+        _ => None,
+    }
+}
+
 fn address_line(line: &str) -> Option<String> {
     let malformed =
         || format!("the address line {line:?} is not localpart: own or localpart: alias localpart");
@@ -242,12 +257,13 @@ fn address_line(line: &str) -> Option<String> {
     if let Some(why) = address_localpart_shape(local) {
         return Some(format!("the address line {line:?}: {why}"));
     }
-    let mut words = rest.split_whitespace();
-    match (words.next(), words.next(), words.next()) {
-        (Some("own"), None, None) => None,
-        (Some("alias"), Some(target), None) => address_localpart_shape(target)
+    if rest == "own" {
+        return None;
+    }
+    match alias_target(rest) {
+        Some(target) => address_localpart_shape(target)
             .map(|why| format!("the address line {line:?}: the alias target {target:?} {why}")),
-        _ => Some(malformed()),
+        None => Some(malformed()),
     }
 }
 
@@ -562,6 +578,19 @@ mod tests {
         assert!(why.contains("starts with"), "{why}");
         let why = usernames("mail", &r).unwrap();
         assert!(why.contains("held back"), "{why}");
+    }
+
+    #[test]
+    fn a_duplicate_account_name_is_refused_and_the_name_is_in_the_refusal() {
+        let why = usernames("secretary\nhall\nhall", &name()).unwrap();
+        assert!(why.contains("hall"), "{why}");
+        assert!(why.contains("twice"), "{why}");
+    }
+
+    #[test]
+    fn a_tab_after_alias_is_the_same_line_as_a_space() {
+        assert!(address_lines("secretary: own\noffice: alias\tsecretary").is_none());
+        assert!(address_lines("secretary: own\noffice: alias secretary").is_none());
     }
 
     #[test]

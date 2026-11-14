@@ -1,4 +1,6 @@
 use crate::common::*;
+use kyriakon_control_core::account::sign;
+use kyriakon_control_core::store::GroupIntent;
 
 /// One of the key-check fixtures, by file name, for a key whose verdict is the
 /// point of the test.
@@ -974,6 +976,77 @@ fn a_body_alias_may_name_itself_and_shares_the_mailbox() {
         "the alias names no account: {}",
         fix.passwd_file()
     );
+}
+
+/// A tab between `alias` and its target is the whitespace the form accepts, so
+/// the drain reads the same target and provisions the address.
+#[test]
+fn a_tab_after_alias_provisions_the_address() {
+    let fix = Fix::new("group-alias-tab");
+    let mut record = fix.filed_body("warden");
+    record["answers"]["body_addresses"] = json!("secretary: own\noffice: alias\tsecretary");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.journal().contains("\"failed\""),
+        "a tab alias was refused: {}",
+        fix.journal()
+    );
+    let virtuals = fix.table("virtuals");
+    assert!(
+        virtuals.contains("office@parish.example: parish-secretary"),
+        "{virtuals}"
+    );
+}
+
+/// Two key records for one mailbox are refused before the journal line, the
+/// account or the keyring entry: the record can never name a fingerprint the
+/// keyring does not hold.
+#[test]
+fn two_keys_for_one_mailbox_are_refused_before_anything_is_written() {
+    let fix = Fix::new("group-duplicate-keys");
+    let id = ulid();
+    let key = json!({
+        "mailbox": "parish-secretary",
+        "fingerprint": "1111 2222 3333 4444",
+        "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n-----END PGP PUBLIC KEY BLOCK-----",
+        "verdict": "works",
+    });
+    let mut intent = json!({
+        "id": id.clone(),
+        "kind": "provision-group",
+        "filed_at": "2026-10-02T09:00:00Z",
+        "application": {"username": "warden", "status_token": TOKEN},
+        "domain": "parish.example",
+        "name": "Parish of Example",
+        "body_kind": "parish",
+        "payment": {"rail": "cash", "no_charge": false, "paid_until": null},
+        "addresses": [{"address": "secretary", "mailbox": "parish-secretary"}],
+        "mailboxes": ["parish-secretary"],
+        "site_owner": "parish-secretary",
+        "upload_key": "",
+        "mail_keys": [key.clone(), key],
+        "sig": "",
+    });
+    let parsed: GroupIntent = serde_json::from_value(intent.clone()).unwrap();
+    intent["sig"] =
+        json!(sign::sign(b"the approval key", &sign::group_provision_payload(&parsed)).unwrap());
+    fix.write_intent(&id, &intent);
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.intents(), vec![format!("{id}.json")]);
+    assert!(
+        fix.failed_note().contains("2 keys"),
+        "{}",
+        fix.failed_note()
+    );
+    assert!(!fix.dir.join("keyring/parish-secretary.asc").exists());
+    assert!(!fix.passwd_file().contains("parish-secretary:"));
+    assert!(!fix.journal().contains("\"applying\""), "{}", fix.journal());
 }
 
 /// A virtual table line that already points elsewhere is a refusal, and the

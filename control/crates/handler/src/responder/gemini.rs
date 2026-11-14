@@ -296,13 +296,14 @@ pub(super) fn capsule_skip_mailed(path: &[Page], record: &mut draft::Draft) -> b
 
 /// The query as the draft stores it. gmid leaves the query percent-encoded, and
 /// the handler decodes it itself so a `+` stays a plus and only `%0D%0A` becomes
-/// a line break; a bare CR stays an ordinary character. A single full stop is the
-/// clients' empty answer.
+/// a line break. A single full stop is the clients' empty answer.
 pub(super) fn capsule_value(raw: &str) -> String {
     let decoded = decode(raw, false).replace("\r\n", "\n");
-    // Only the answer's own padding is removed. `str::trim` also removes `\r`,
-    // and the specification says a bare CR is an ordinary character.
-    let trimmed = decoded.trim_matches(|c: char| matches!(c, ' ' | '\n' | '\t'));
+    // `validate::validate` trims with `str::trim`, and the stored answer must be
+    // the value validation checked, so this uses the same set. That also trims a
+    // bare CR, which the gemini spec calls an ordinary character; keeping it
+    // would store a value the validator never saw, the #807 class.
+    let trimmed = decoded.trim();
     if trimmed == "." {
         String::new()
     } else {
