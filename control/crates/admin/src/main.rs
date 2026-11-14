@@ -281,6 +281,14 @@ fn need<'a>(flags: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str, 
         .ok_or_else(|| Error::Failed(format!("--{name} is needed")))
 }
 
+/// Stored text on the operator's terminal. The handler writes the application's
+/// `stage` and `rail`, the account's fields and a ledger line's own words, so a
+/// print of one is a sink like the log and the report: a control, a bidi
+/// override or a line separator never reaches the screen.
+pub(crate) fn safe(text: &str) -> String {
+    util::clean(text)
+}
+
 /// `export <username>`: the written part of the member's data export.
 ///
 /// It goes into the member's own sftp chroot, with a ready notice, because that

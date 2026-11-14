@@ -7,6 +7,7 @@
 //! after-line work and the file's disposition stay here. The retry schedule and
 //! the failure report are the other half of the same seam.
 
+use kyriakon_control_core::account::sign::Reviewed;
 use kyriakon_control_core::config::{self, DrainConfig};
 use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::store::journal::Journal;
@@ -125,7 +126,21 @@ async fn write_journal(
     outcome: &str,
     note: Option<&str>,
 ) -> Result<(), Error> {
-    let line = JournalLine {
+    let line = journal_line(intent, kind, release, application, outcome, note);
+    journal.append(store, &line).await.map_err(Error::from)
+}
+
+/// One line's construction, shared by every writer so a field added to the
+/// record reaches them all.
+fn journal_line(
+    intent: &str,
+    kind: &str,
+    release: &str,
+    application: &ApplicationRef,
+    outcome: &str,
+    note: Option<&str>,
+) -> JournalLine {
+    JournalLine {
         version: 1,
         at: util::filed_at(),
         intent: intent.to_string(),
@@ -135,7 +150,30 @@ async fn write_journal(
         outcome: outcome.to_string(),
         note: note.map(str::to_string),
         credit: None,
-    };
+        review: None,
+    }
+}
+
+/// The `review-sent` line, carrying the decision fields the mail described, so
+/// the console can refuse a record the handler rewrote after the mail. Written
+/// before the send like every other line.
+pub(crate) async fn write_review_journal(
+    store: &Store,
+    journal: &Journal,
+    release: &str,
+    intent: &str,
+    application: &ApplicationRef,
+    reviewed: &Reviewed,
+) -> Result<(), Error> {
+    let mut line = journal_line(
+        intent,
+        "application",
+        release,
+        application,
+        "review-sent",
+        None,
+    );
+    line.review = Some(reviewed.clone());
     journal.append(store, &line).await.map_err(Error::from)
 }
 

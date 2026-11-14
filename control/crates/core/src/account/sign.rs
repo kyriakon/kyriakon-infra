@@ -18,6 +18,7 @@
 use crate::store::{KeyRecord, Record};
 use crate::Error;
 use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -110,18 +111,93 @@ pub fn verify_bytes(key: &[u8], payload: &[u8], sig: &str) -> bool {
 /// prefixed, and the two large fields — the answers and the key material — are
 /// covered by a digest so the link stays a link.
 pub fn decide_payload(record: &Record, action: &str) -> String {
-    format!(
-        "decide:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-        free_text(&record.status_token),
-        free_text(action),
-        free_text(&record.username),
-        record.no_charge,
-        free_text(&record.rail),
-        free_text(record.domain.as_deref().unwrap_or("")),
-        free_text(record.outside_address.as_deref().unwrap_or("")),
-        answers_digest(&record.answers),
-        key_digest(&record.mail_keys, record.upload_key.as_ref()),
-    )
+    review_fields(record).payload(&record.status_token, action, &record.username)
+}
+
+/// The fields [`decide_payload`] covers, as they stood. The action is not among
+/// them: the review mail is sent before one is chosen, so the journal's review
+/// line records these and the console rebuilds the payload from them and the
+/// action it is about to sign. A record rewritten after the mail differs here,
+/// and [`Reviewed::changed`] names the field.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reviewed {
+    pub no_charge: bool,
+    pub rail: String,
+    /// Empty when the record carries no domain, which is what the payload says
+    /// for an absent one too.
+    #[serde(default)]
+    pub domain: String,
+    #[serde(default)]
+    pub outside_address: String,
+    /// The answers digest the payload carries.
+    pub answers: String,
+    /// The key-material digest the payload carries.
+    pub keys: String,
+}
+
+/// The covered fields of one application record.
+pub fn review_fields(record: &Record) -> Reviewed {
+    Reviewed {
+        no_charge: record.no_charge,
+        rail: record.rail.clone(),
+        domain: record.domain.clone().unwrap_or_default(),
+        outside_address: record.outside_address.clone().unwrap_or_default(),
+        answers: answers_digest(&record.answers),
+        keys: key_digest(&record.mail_keys, record.upload_key.as_ref()),
+    }
+}
+
+impl Reviewed {
+    /// The payload for one action against the record these fields came from.
+    fn payload(&self, token: &str, action: &str, username: &str) -> String {
+        format!(
+            "decide:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            free_text(token),
+            free_text(action),
+            free_text(username),
+            self.no_charge,
+            free_text(&self.rail),
+            free_text(&self.domain),
+            free_text(&self.outside_address),
+            self.answers,
+            self.keys,
+        )
+    }
+
+    /// The first field that differs from what the reviewer saw, named as the
+    /// review mail names it and carrying both values, or `None` when the record
+    /// is still the one that was reviewed. The values are quoted so a rewritten
+    /// one cannot pose as the line's own words.
+    pub fn changed(&self, now: &Reviewed) -> Option<String> {
+        let text =
+            |name: &str, was: &str, is: &str| Some(format!("{name} was {was:?}, is now {is:?}"));
+        if self.no_charge != now.no_charge {
+            return Some(format!(
+                "no_charge was {}, is now {}",
+                self.no_charge, now.no_charge
+            ));
+        }
+        if self.rail != now.rail {
+            return text("rail", &self.rail, &now.rail);
+        }
+        if self.domain != now.domain {
+            return text("domain", &self.domain, &now.domain);
+        }
+        if self.outside_address != now.outside_address {
+            return text(
+                "outside_address",
+                &self.outside_address,
+                &now.outside_address,
+            );
+        }
+        if self.answers != now.answers {
+            return text("answers", &self.answers, &now.answers);
+        }
+        if self.keys != now.keys {
+            return text("keys", &self.keys, &now.keys);
+        }
+        None
+    }
 }
 
 /// A digest of the application's answers. `answers` is a `BTreeMap`, so the
@@ -527,6 +603,36 @@ mod tests {
         let mut changed = filed.clone();
         changed.upload_key = Some(key_record("", "2222", "ssh-ed25519 AAAA"));
         refused(&changed);
+    }
+
+    /// What the review mail described is what the console compares the record
+    /// against, and a rewrite names the field it touched rather than a digest
+    /// the operator cannot read.
+    #[test]
+    fn a_record_rewritten_after_review_names_the_changed_field() {
+        let filed = record(vec![key_record("", "1111", "mail material")], None);
+        let reviewed = review_fields(&filed);
+        assert_eq!(reviewed.changed(&review_fields(&filed)), None);
+        let mut changed = filed.clone();
+        changed.no_charge = true;
+        let why = reviewed.changed(&review_fields(&changed)).unwrap();
+        assert!(
+            why.contains("no_charge") && why.contains("true") && why.contains("false"),
+            "{why}"
+        );
+        let mut changed = filed.clone();
+        changed.domain = Some("attacker.example".to_string());
+        let why = reviewed.changed(&review_fields(&changed)).unwrap();
+        assert!(
+            why.contains("domain") && why.contains("attacker.example"),
+            "{why}"
+        );
+        let mut changed = filed.clone();
+        changed
+            .answers
+            .insert("intended_use".to_string(), "changed".to_string());
+        let why = reviewed.changed(&review_fields(&changed)).unwrap();
+        assert!(why.contains("answers"), "{why}");
     }
 
     #[test]

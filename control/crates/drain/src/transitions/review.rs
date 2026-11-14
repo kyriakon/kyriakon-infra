@@ -12,7 +12,7 @@ use super::groups::{
 };
 use super::lifecycle::group_recipient;
 use super::Error;
-use super::{write_journal, Settlement};
+use super::{write_journal, write_review_journal, Settlement};
 use kyriakon_control_core::account::dns;
 use kyriakon_control_core::account::sign;
 use kyriakon_control_core::config::DrainConfig;
@@ -148,15 +148,13 @@ pub async fn filed_application(
         // The line is the settlement; a crash left only the file.
         return Ok(Settlement::nothing());
     }
-    write_journal(
+    write_review_journal(
         store,
         journal,
         &cfg.release,
         &intent.id,
-        "application",
         &intent.application,
-        "review-sent",
-        None,
+        &sign::review_fields(&record),
     )
     .await?;
 

@@ -37,6 +37,8 @@ struct Index {
     marks: HashMap<(String, String, String), Vec<(usize, String)>>,
     /// Status token → the username its approval began under.
     started: HashMap<String, String>,
+    /// Status token → the covered fields its review mail described.
+    reviews: HashMap<String, crate::account::sign::Reviewed>,
     /// Intent id → the progress its first `applying` credit line carried.
     credits: HashMap<String, CreditProgress>,
 }
@@ -77,6 +79,17 @@ impl Index {
                 self.started
                     .entry(token.to_string())
                     .or_insert_with(|| line.application.username.clone());
+            }
+        }
+        if line.outcome == "review-sent" {
+            if let (Some(token), Some(review)) = (
+                line.application.status_token.as_deref(),
+                line.review.clone(),
+            ) {
+                // The first mail wins: the mark is written before the send and
+                // an application is mailed once, so a later line for the same
+                // token cannot describe a different record as the reviewed one.
+                self.reviews.entry(token.to_string()).or_insert(review);
             }
         }
         if line.outcome == "applying" {
@@ -191,6 +204,14 @@ impl Journal {
         self.lock().started.get(token).cloned()
     }
 
+    /// The fields this application's review mail described, if a release that
+    /// records them wrote its `review-sent` line. The console compares the
+    /// record against them before signing, because the record belongs to the
+    /// handler and can be rewritten after the mail.
+    pub fn reviewed(&self, token: &str) -> Option<crate::account::sign::Reviewed> {
+        self.lock().reviews.get(token).cloned()
+    }
+
     /// The values a credit recorded on its `applying` line, if it has got that
     /// far.
     pub fn credit_progress(&self, id: &str) -> Option<CreditProgress> {
@@ -249,6 +270,7 @@ mod tests {
             application,
             outcome: outcome.to_string(),
             note: note.map(str::to_string),
+            review: None,
             credit: None,
         }
     }
@@ -481,6 +503,43 @@ mod tests {
                 journal.approval_started(declined),
                 None,
                 "a decline began an approval"
+            );
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The review line's covered fields are indexed by token, so the console can
+    /// compare a record against what the mail described. An older line without
+    /// them answers `None`, and a later line cannot replace the first.
+    #[test]
+    fn a_review_line_remembers_the_fields_the_mail_described() {
+        use crate::account::sign::Reviewed;
+        let (store, dir) = store("reviewed");
+        runtime().block_on(async {
+            let journal = Journal::load(&store).await.unwrap();
+            assert_eq!(journal.reviewed(TOKEN), None);
+            let reviewed = Reviewed {
+                no_charge: false,
+                rail: "cash".to_string(),
+                domain: String::new(),
+                outside_address: String::new(),
+                answers: "aa".to_string(),
+                keys: "bb".to_string(),
+            };
+            let mut first = line("01H", "application", "review-sent", None);
+            first.review = Some(reviewed.clone());
+            journal.append(&store, &first).await.unwrap();
+            assert_eq!(journal.reviewed(TOKEN), Some(reviewed.clone()));
+            let mut later = line("01J", "application", "review-sent", None);
+            later.review = Some(Reviewed {
+                no_charge: true,
+                ..reviewed.clone()
+            });
+            journal.append(&store, &later).await.unwrap();
+            assert_eq!(
+                journal.reviewed(TOKEN),
+                Some(reviewed),
+                "a later line replaced the fields the mail described"
             );
         });
         std::fs::remove_dir_all(dir).unwrap();

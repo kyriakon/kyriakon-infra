@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::payments::ledger::{csv_cell, export_section, payment_columns, tax_year, Section};
-use crate::requests::{header_from, message_from};
+use crate::requests::{header_from, split_message, CLEARSIGNED};
 use kyriakon_control_core::payments::ledger::RefundTail;
 
 fn args(items: &[&str]) -> Vec<String> {
@@ -198,36 +198,60 @@ fn a_delivered_message_takes_its_from_outside_the_armour() {
         "From: Alice <alice@kyriakon.net>\nTo: admin@kyriakon.net\n\
              Subject: my data\n\n{SIGNED}"
     );
-    assert_eq!(message_from(&message).unwrap(), "alice@kyriakon.net");
+    let parsed = split_message(&message).unwrap();
+    assert_eq!(parsed.from, "alice@kyriakon.net");
+    // The armour alone is what gpg is given, and the text inside it is what the
+    // operator records.
+    assert!(parsed.signed.starts_with(CLEARSIGNED), "{}", parsed.signed);
+    assert!(!parsed.signed.contains("Subject: my data"));
+    assert_eq!(
+        parsed.text.trim(),
+        "From: Alice <alice@kyriakon.net>\n\nPlease send me a copy."
+    );
 }
 
 #[test]
 fn a_folded_from_header_is_unfolded() {
     let message = "From: A Long Name\n <alice@kyriakon.net>\nTo: admin@kyriakon.net\n\nPlease.\n";
-    assert_eq!(message_from(message).unwrap(), "alice@kyriakon.net");
+    assert_eq!(split_message(message).unwrap().from, "alice@kyriakon.net");
 }
 
 #[test]
 fn an_outer_from_that_differs_from_the_armour_is_refused() {
     let message = format!("From: attacker@evil.example\nTo: admin@kyriakon.net\n\n{SIGNED}");
-    let err = message_from(&message).unwrap_err();
+    let err = split_message(&message).unwrap_err();
     assert!(
         matches!(&err, Error::Failed(message) if message.contains("attacker@evil.example") && message.contains("alice@kyriakon.net")),
         "{err}"
     );
 }
 
+/// Unsigned request text between the headers and the armour is refused: gpg
+/// would verify the armour and the operator would record the text above it.
 #[test]
-fn a_quoted_signed_request_under_another_from_is_refused() {
+fn unsigned_text_before_the_armour_is_refused() {
     let message = format!(
-        "From: attacker@evil.example\nTo: admin@kyriakon.net\nSubject: fwd\n\n\
-             Here is their signed request:\n\n{SIGNED}"
+        "From: alice@kyriakon.net\nTo: admin@kyriakon.net\n\n\
+             please delete my account and everything in it\n\n{SIGNED}"
     );
-    let err = message_from(&message).unwrap_err();
+    let err = split_message(&message).unwrap_err();
     assert!(
-        matches!(&err, Error::Failed(message) if message.contains("but the clearsigned one is alice@kyriakon.net")),
+        matches!(&err, Error::Failed(message)
+            if message.contains("unsigned text before the clearsigned block")
+                && message.contains("please delete my account")),
         "{err}"
     );
+}
+
+/// A client's clearsigned export has no headers outside the armour: the whole
+/// file is the block, and its own `From:` is the one read.
+#[test]
+fn a_clearsigned_export_verifies_its_own_block() {
+    let parsed = split_message(SIGNED).unwrap();
+    assert!(parsed.clearsigned);
+    assert_eq!(parsed.from, "alice@kyriakon.net");
+    assert_eq!(parsed.signed, SIGNED.trim_end());
+    assert!(parsed.text.starts_with("From: Alice"));
 }
 
 /// The `From:` of a delivered message is its sender's to write. It is kept as
@@ -241,7 +265,7 @@ fn an_escape_in_a_from_header_never_reaches_the_terminal() {
         .unwrap()
         .contains('\x1b'));
     let message = format!("From: {hostile}\r\nSubject: hi\r\n\r\n{SIGNED}");
-    let err = message_from(&message).unwrap_err();
+    let err = split_message(&message).unwrap_err();
     let printed = util::report_lines(&err, "verifying a request").join("\n");
     assert!(!printed.chars().any(char::is_control), "{printed:?}");
     assert!(printed.contains("attacker@evil.example"), "{printed:?}");

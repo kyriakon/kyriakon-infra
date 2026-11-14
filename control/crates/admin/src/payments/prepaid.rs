@@ -41,7 +41,11 @@ pub(crate) async fn prepaid(store: &Store, args: &[String]) -> Result<(), Error>
     for row in rows {
         println!(
             "{}  {}  {}  closes {}  {} days left",
-            row.token, row.username, row.rail, row.closes_on, row.days_left
+            safe(&row.token),
+            safe(&row.username),
+            safe(&row.rail),
+            safe(&row.closes_on),
+            row.days_left
         );
     }
     Ok(())
@@ -78,11 +82,11 @@ pub(crate) async fn reconcile_list(store: &Store) -> Result<(), Error> {
     for line in held {
         println!(
             "{}  {}  {}  received {}  {}",
-            line.id,
-            line.rail,
-            line.amount_gbp,
-            line.received_on,
-            line.note.as_deref().unwrap_or("")
+            safe(&line.id),
+            safe(&line.rail),
+            safe(&line.amount_gbp),
+            safe(&line.received_on),
+            safe(line.note.as_deref().unwrap_or(""))
         );
     }
     Ok(())

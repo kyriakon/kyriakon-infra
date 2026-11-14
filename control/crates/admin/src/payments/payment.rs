@@ -20,7 +20,7 @@ pub(crate) async fn payment(store: &Store, args: &[String]) -> Result<(), Error>
     println!("account {username}");
     print_payment(&payment, false);
 
-    println!("ledger for {token}");
+    println!("ledger for {}", safe(&token));
     let mut any = false;
     for line in Ledger::open(store).lines().await? {
         if line.token != token {
@@ -39,7 +39,13 @@ pub(crate) async fn payment(store: &Store, args: &[String]) -> Result<(), Error>
         }
         println!(
             "  {:>5}  {:<8}  {:<4}  {}  {}  applied {}{}",
-            line.seq, line.kind, line.rail, received_on, amount_gbp, applied_gbp, extra,
+            line.seq,
+            safe(&line.kind),
+            safe(&line.rail),
+            safe(received_on),
+            safe(amount_gbp),
+            safe(applied_gbp),
+            safe(&extra),
         );
     }
     if !any {

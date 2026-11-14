@@ -1617,6 +1617,7 @@ async fn journal_credit_applying(
         application: ApplicationRef::account(username.to_string()),
         outcome: "applying".to_string(),
         note: None,
+        review: None,
         credit: Some(progress.clone()),
     };
     journal.append(store, &line).await.map_err(Error::from)

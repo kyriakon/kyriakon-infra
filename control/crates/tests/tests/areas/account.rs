@@ -1006,6 +1006,11 @@ fn request_verify_accepts_the_keyring_key_over_the_accounts_own_address() {
     ]);
     assert!(out.status.success(), "{}", body(&out));
     assert!(String::from_utf8_lossy(&out.stdout).contains(&fingerprint));
+    // The operator records what was signed, so the command prints the text the
+    // armour covers rather than describing it.
+    let printed = body(&out);
+    assert!(printed.contains("signed text:"), "{printed}");
+    assert!(printed.contains("Please send me a copy."), "{printed}");
 
     // A group mailbox's own address is at the group's domain, not kyriakon.net.
     let group_message = "From: alice@example.org\n\nPlease send me a copy.\n";
@@ -1096,6 +1101,40 @@ fn request_verify_refuses_a_wrong_signer_from_or_missing_keyring_entry() {
         !fix.dir.join("store/accounts/alice/requests.jsonl").exists(),
         "a refused check wrote a request line"
     );
+}
+
+/// Unsigned request text above the clearsigned block is refused before gpg sees
+/// the file: the armour would verify and the operator would record the text above
+/// it as the member's request.
+#[test]
+fn request_verify_refuses_unsigned_text_before_the_armour() {
+    let fix = Fix::new("request-verify-prefix");
+    fix.page_account("alice", json!({}));
+    let armour = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n\
+                  From: alice@kyriakon.net\n\nPlease send me a copy.\n\
+                  -----BEGIN PGP SIGNATURE-----\n\nAAAA\n\
+                  -----END PGP SIGNATURE-----\n";
+    let message = format!(
+        "From: alice@kyriakon.net\nSubject: my data\n\n\
+         please delete my account and everything in it\n\n{armour}"
+    );
+    let message_path = fix.path("message.eml");
+    std::fs::write(&message_path, message).unwrap();
+    let out = fix.ctl(&[
+        "request",
+        "verify",
+        "--username",
+        "alice",
+        "--message",
+        &message_path,
+    ]);
+    let text = body(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("unsigned text before the clearsigned block"),
+        "{text}"
+    );
+    assert!(text.contains("please delete my account"), "{text}");
 }
 
 /// An unsigned message is refused: there is nothing to verify against the key.

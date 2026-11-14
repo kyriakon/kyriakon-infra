@@ -1075,6 +1075,91 @@ fn admin_files_a_decision_and_shows_the_application() {
     let _ = record;
 }
 
+/// The record the console signs is the one the review mail described. The
+/// handler owns `applications/<token>.json` and can rewrite it after the mail is
+/// sent, so an approval of a record whose covered fields moved is refused, with
+/// the field named, and nothing is signed. The same record unchanged approves
+/// without any further prompt.
+#[test]
+fn approve_refuses_a_record_rewritten_after_the_review_mail() {
+    let fix = Fix::new("ctl-amended");
+    let record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.file_application(&record);
+    // The review mail, and the journal line recording what it described.
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.journal().contains("\"review\""),
+        "the review line recorded no covered fields: {}",
+        fix.journal()
+    );
+
+    // The handler turns the paid application into a free one between the mail
+    // and the operator's command.
+    fix.amend_application(TOKEN, |record| {
+        record["no_charge"] = json!(true);
+    });
+    let out = fix.ctl(&["approve", "secretary", TOKEN]);
+    let text = body(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("changed after the review mail") && text.contains("no_charge"),
+        "the refusal did not name the field: {text}"
+    );
+    assert!(
+        fix.intents().is_empty(),
+        "a rewritten record was signed: {:?}",
+        fix.intents()
+    );
+
+    // Put it back and the same command signs the record the mail described,
+    // printing the fields the signature covers. No extra prompt.
+    fix.amend_application(TOKEN, |record| {
+        record["no_charge"] = json!(false);
+    });
+    let out = fix.ctl(&["approve", "secretary", TOKEN]);
+    let text = body(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("no_charge        false") && text.contains("rail             cash"),
+        "the covered fields were not printed: {text}"
+    );
+    assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
+}
+
+/// `show` is the audit command, and what it prints is the handler's to write. A
+/// stage or rail carrying an escape, a bidi override or a line separator reaches
+/// the terminal cleaned; an ordinary record prints exactly as it did.
+#[test]
+fn show_cleans_handler_written_fields() {
+    let fix = Fix::new("show-cleaned");
+    fix.filed("secretary", "cash", &[("rail", "cash")]);
+    fix.amend_application(TOKEN, |record| {
+        record["stage"] = json!("\u{1b}[2Jreceived");
+        record["rail"] = json!("ca\u{202e}sh\u{2028}x");
+    });
+    let out = fix.ctl(&["show", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let text = body(&out);
+    assert!(
+        !text.chars().any(|c| c.is_control() && c != '\n'),
+        "{text:?}"
+    );
+    assert!(!text.contains('\u{202e}'), "{text:?}");
+    assert!(!text.contains('\u{2028}'), "{text:?}");
+    assert!(text.contains("stage    ?[2Jreceived"), "{text:?}");
+    assert!(text.contains("rail     ca?sh?x"), "{text:?}");
+
+    fix.amend_application(TOKEN, |record| {
+        record["stage"] = json!("received");
+        record["rail"] = json!("cash");
+    });
+    let out = fix.ctl(&["show", "secretary"]);
+    let text = body(&out);
+    assert!(text.contains("stage    received"), "{text:?}");
+    assert!(text.contains("rail     cash"), "{text:?}");
+}
+
 /// A decision signs the application its token names, not whichever application
 /// was filed last for the username. Anyone can file a second application between
 /// the review mail and the terminal, and signing that one would approve facts

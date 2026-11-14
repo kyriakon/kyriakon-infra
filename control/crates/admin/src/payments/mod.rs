@@ -106,7 +106,7 @@ pub(crate) fn group_payment(payment: &store::GroupPayment) -> store::Payment {
 /// unless the payment really was free, which a legacy paid record never is.
 pub(crate) fn print_payment(payment: &store::Payment, no_charge: bool) {
     if let Some(rail) = payment.rail.as_deref() {
-        println!("  rail     {rail}");
+        println!("  rail     {}", safe(rail));
     }
     // `paid_until` is null while a window runs, so null alone says nothing
     // about whether one exists: the window does.
@@ -115,14 +115,18 @@ pub(crate) fn print_payment(payment: &store::Payment, no_charge: bool) {
         (None, Some(_)) => "null: the window is open",
         (None, None) => "null: no window was opened",
     };
-    println!("  paid     {paid}");
+    println!("  paid     {}", safe(paid));
     let token = match (payment.token_ref.as_deref(), no_charge) {
         (Some(token), _) => token,
         (None, true) => "none (no charge)",
         (None, false) => "none",
     };
-    println!("  token    {token}");
+    println!("  token    {}", safe(token));
     if let Some(w) = &payment.window {
-        println!("  window   {} to {}", w.opened_at, w.closes_at);
+        println!(
+            "  window   {} to {}",
+            safe(&w.opened_at),
+            safe(&w.closes_at)
+        );
     }
 }

@@ -36,8 +36,39 @@ pub fn stamp(at: OffsetDateTime) -> String {
 /// expects it, and one character for one character keeps a line's width.
 pub fn clean(text: &str) -> String {
     text.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| if terminal_safe(c) { c } else { '?' })
         .collect()
+}
+
+/// Whether a character may reach a terminal. Controls are the escapes, and the
+/// invisible formatters are the rest: a bidirectional override or isolate would
+/// let a stored name display as another account's, and Unicode's line and
+/// paragraph separators would break a record's one line into two. The set is
+/// the Cf, Zl and Zp categories.
+fn terminal_safe(c: char) -> bool {
+    !c.is_control()
+        && !matches!(c,
+            '\u{00ad}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061c}'
+                | '\u{06dd}'
+                | '\u{070f}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08e2}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{110bd}'
+                | '\u{110cd}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0001}'
+                | '\u{e0020}'..='\u{e007f}')
 }
 
 /// The lines one failure prints: the error under the service prefix, then each
@@ -262,6 +293,9 @@ mod tests {
             super::clean("a\x1b]52;c;cG93bmVk\x07b\rc\nd\u{9b}e\u{7f}f"),
             "a?]52;c;cG93bmVk?b?c?d?e?f"
         );
+        // A bidi override cannot reorder a name, and a line separator cannot
+        // split the one line a record's field prints as.
+        assert_eq!(super::clean("ali\u{202e}ce\u{2028}bob"), "ali?ce?bob");
         assert_eq!(
             super::report_lines(&Hostile, "verifying a request"),
             vec![

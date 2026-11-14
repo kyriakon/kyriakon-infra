@@ -1910,6 +1910,13 @@ pub struct JournalLine {
     pub outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The fields `sign::decide_payload` covers, as the review mail described
+    /// them, written on the `review-sent` line. `applications/<token>.json`
+    /// belongs to the handler and can be rewritten after the mail, so the
+    /// console signs only a record whose fields still match these. Absent on
+    /// every other line, and on a line a release before this one wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<crate::account::sign::Reviewed>,
     /// The values a credit computed before it wrote the account, so a crash
     /// between the write and the ledger append is recoverable. Absent on every
     /// other line and on a credit's own `applied` line.
@@ -2073,6 +2080,7 @@ mod tests {
             application: ApplicationRef::application("secretary", ""),
             outcome: "refused".to_string(),
             note: None,
+            review: None,
             credit: None,
         };
         let text = serde_json::to_string(&line).unwrap();
