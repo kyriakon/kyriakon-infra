@@ -219,6 +219,7 @@ pub(super) async fn account_action(app: &App, call: &Call<'_>) -> Reply {
         "renewal" => account_renewal(app, call.request).await,
         "mail-key" => account_mail_key(app, call.request).await,
         "test-mail" => account_test_mail(app, call.request).await,
+        "cancel-close" => account_cancel_close(app, call.request).await,
         _ => Reply::html(404, String::new()),
     }
 }
@@ -271,6 +272,44 @@ pub(super) async fn account_close(app: &App, call: &Call<'_>) -> Reply {
         }
         Err(e) => respond(
             &Error::Failed(format!("the closure could not be filed: {e}")),
+            FrontEnd::Httpd,
+        ),
+    }
+}
+
+/// The member's change of mind: cancel a closure while its seven-day window is
+/// still running. The session is the whole proof; the drain clears the state
+/// and the date, and refuses if the purge has already taken the account.
+pub(super) async fn account_cancel_close(app: &App, request: &Request) -> Reply {
+    let (cookie, account) = match session_account(app, request).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return refused("Sign in to the account whose closure you want to cancel."),
+        Err(e) => return respond(&e, FrontEnd::Httpd),
+    };
+    if account.state != "closing" || account.closing_until.is_none() {
+        return refused("This account is not closing, so there is no closure to cancel.");
+    }
+    let Some(session_id) = session::id(&cookie) else {
+        return refused("Sign in to the account whose closure you want to cancel.");
+    };
+    match intent::Intent::CancelClose(intent::CancelCloseIntent {
+        username: account.username.clone(),
+        session: session_id.to_string(),
+        ..Default::default()
+    })
+    .file(&app.store)
+    .await
+    {
+        Ok(_) => {
+            let page = notice(
+                "The closure is cancelled",
+                "The account is active again and nothing will be deleted. Closing it again is \
+                 still on this page if you change your mind.",
+            );
+            Reply::html(200, page_html(&page))
+        }
+        Err(e) => respond(
+            &Error::Failed(format!("the cancellation could not be filed: {e}")),
             FrontEnd::Httpd,
         ),
     }

@@ -425,6 +425,58 @@ async fn a_closure_is_filed_even_when_the_ledger_cannot_be_read() {
     assert_eq!(filed[0]["username"].as_str(), Some("alice"), "{filed:?}");
 }
 
+/// The closing page offers the cancellation the terms promise. The POST files
+/// one cancel-close intent carrying the session, an account that is not closing
+/// is refused and files nothing, and the page shows the control the terms name.
+#[tokio::test]
+async fn the_closing_page_files_one_cancel_close_intent() {
+    let (app, dir) = handler("cancel-close").await;
+    file_account(&dir);
+    amend_account(&dir, "alice", |account| {
+        account["state"] = serde_json::json!("closing");
+        account["closing_until"] =
+            serde_json::json!(kyriakon_control_core::util::date_after_days(7));
+    });
+    let cookie = signed_in(&app, "alice").await;
+
+    // The page carries the control beside the banner that says it is closing.
+    let (code, page) = ask(&app, &httpd_get_session("account", "", &cookie)).await;
+    assert_eq!(code, 200, "{page}");
+    assert!(page.contains("/account/cancel-close"), "{page}");
+    assert!(page.contains("Cancel the closure"), "{page}");
+
+    let (code, page) = ask(
+        &app,
+        &httpd_post_with("/account/cancel-close", "", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 200, "{page}");
+    assert!(page.contains("The closure is cancelled"), "{page}");
+    let intent = filed_intent(&dir);
+    assert_eq!(intent["kind"], "cancel-close", "{intent}");
+    assert_eq!(intent["username"], "alice", "{intent}");
+    assert_eq!(
+        intent["session"],
+        serde_json::json!(cookie.split_once('.').unwrap().0),
+        "{intent}"
+    );
+
+    // An account that is not closing has nothing to cancel, and the refusal
+    // files no second intent.
+    amend_account(&dir, "alice", |account| {
+        account["state"] = serde_json::json!("active");
+        account["closing_until"] = serde_json::Value::Null;
+    });
+    let (code, body) = ask(
+        &app,
+        &httpd_post_with("/account/cancel-close", "", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(code, 403, "{body}");
+    assert!(body.contains("not closing"), "{body}");
+    assert_eq!(filed(&dir), 1, "a refusal filed a second intent");
+}
+
 /// No key admits anyone, and neither does a header the front-end did not
 /// authenticate: a request naming a member in `REMOTE_USER` with no session gets
 /// the login page.

@@ -1599,6 +1599,35 @@ fn an_approved_applications_answers_are_kept_inside_ninety_days() {
     );
 }
 
+/// An application draft nobody returned to goes on the seven days the capsule's
+/// spec sets, counted from its last answer. One saved inside the window stays,
+/// so an applicant still walking the flow is not swept mid-way.
+#[test]
+fn an_abandoned_draft_is_purged_after_seven_days_and_a_younger_one_survives() {
+    let fix = Fix::new("draft-purge");
+    fix.write_draft(TOKEN, &[("username", "secretary"), ("whose", "person")]);
+    fix.write_draft(
+        OTHER_TOKEN,
+        &[("username", "treasurer"), ("whose", "person")],
+    );
+    // The abandoned one: last answered eight days ago.
+    let path = fix.dir.join(format!("store/drafts/{TOKEN}.json"));
+    let mut draft: Value =
+        serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
+    draft["updated_at"] = json!(kyriakon_control_core::util::after_days(-8));
+    std::fs::write(&path, serde_json::to_vec_pretty(&draft).unwrap()).unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(!path.exists(), "the abandoned draft survived the sweep");
+    assert!(
+        fix.dir
+            .join(format!("store/drafts/{OTHER_TOKEN}.json"))
+            .exists(),
+        "a draft saved inside the seven days was swept"
+    );
+}
+
 /// An application that was never decided is abandoned after the window: its
 /// record goes and its username is released when nothing holds it. A record
 /// whose filing date cannot be read is left alone, because the boundary cannot
@@ -4108,6 +4137,184 @@ fn resuming_a_lapsed_account_keeps_it_lapsed() {
         json!("lapsed"),
         "a later pass left the account active with its window closed"
     );
+}
+
+/// The terms promise a closure can be cancelled from the account page until the
+/// deletion runs. A close then cancel leaves the account active and the next
+/// sweep does not delete it, the ordinary close still deletes, and a cancel
+/// filed after the purge is refused with the account gone.
+#[test]
+fn a_closure_can_be_cancelled_until_the_purge_runs() {
+    let fix = Fix::new("cancel-close");
+    fix.page_account("secretary", json!({}));
+
+    fix.file_close("secretary");
+    assert!(fix.drain().status.success());
+    assert_eq!(fix.account("secretary")["state"], json!("closing"));
+
+    fix.file_page_action("cancel-close", "secretary", json!({}));
+    assert!(fix.drain().status.success());
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("active"), "{account}");
+    assert!(
+        account.get("closing_until").is_none(),
+        "the window stayed after the cancellation: {account}"
+    );
+    assert!(
+        fix.journal().contains("the closure is cancelled"),
+        "{}",
+        fix.journal()
+    );
+    assert!(fix.drain().status.success());
+    assert!(
+        fix.dir.join("store/accounts/secretary").exists(),
+        "the sweep deleted an account whose closure was cancelled"
+    );
+
+    // The ordinary close is unchanged: the date ends and the account goes.
+    fix.file_close("secretary");
+    assert!(fix.drain().status.success());
+    fix.amend_account("secretary", |account| {
+        account["closing_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    });
+    assert!(fix.drain().status.success());
+    assert!(
+        !fix.dir.join("store/accounts/secretary").exists(),
+        "a plain close did not delete the account"
+    );
+
+    // A cancel filed before the purge but applied after it is refused with the
+    // account gone, and the page action's file goes with the refusal.
+    let id = fix.file_page_action("cancel-close", "secretary", json!({}));
+    assert!(fix.dir.join(format!("store/intents/{id}.json")).exists());
+    assert!(fix.drain().status.success());
+    assert!(
+        fix.journal().contains("already been deleted"),
+        "{}",
+        fix.journal()
+    );
+    assert!(
+        !fix.dir.join(format!("store/intents/{id}.json")).exists(),
+        "a page refusal left its intent file"
+    );
+}
+
+/// A group mailbox that closes leaves the group's list, so cancelling the
+/// closure puts it back: the body's address keeps delivering to it.
+#[test]
+fn cancelling_a_group_mailboxs_closure_returns_it_to_the_group() {
+    let fix = Fix::new("cancel-close-group");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+
+    fix.file_close("parish-secretary");
+    assert!(fix.drain().status.success());
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(group["accounts"], json!(["parish-office"]), "{group}");
+
+    fix.file_page_action("cancel-close", "parish-secretary", json!({}));
+    assert!(fix.drain().status.success());
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let mut accounts: Vec<String> = serde_json::from_value(group["accounts"].clone()).unwrap();
+    accounts.sort();
+    assert_eq!(
+        accounts,
+        vec!["parish-office", "parish-secretary"],
+        "the cancelled mailbox did not return to the group: {group}"
+    );
+    assert_eq!(fix.account("parish-secretary")["state"], json!("active"));
+}
+
+/// A suspension inside a group completes the ladder: the final notice at
+/// grace - 7 and the mailbox's own deletion at grace, while the paid, active
+/// group and its other mailboxes stay. Setting the group's grace from one
+/// mailbox's suspension would delete a group nobody suspended.
+#[test]
+fn a_suspended_group_mailbox_is_deleted_on_its_own_grace() {
+    let fix = Fix::new("suspend-group-mailbox");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    // A group somebody has paid for, on a date of its own.
+    let path = fix.dir.join("store/groups/parish.example/group.json");
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["payment"]["paid_until"] = json!(kyriakon_control_core::util::date_after_days(300));
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+
+    let reason = "Published material is outside the acceptable use policy.";
+    let out = fix.ctl(&["suspend", "parish-secretary", "--reason", reason]);
+    assert!(out.status.success(), "{}", body(&out));
+    // One mailbox's suspension is not the group's: its grace and its window are
+    // untouched.
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert!(group.get("grace_until").is_none(), "{group}");
+    assert_eq!(
+        group["payment"]["window"]["state"],
+        json!("open"),
+        "{group}"
+    );
+
+    // The final week: the suspension's own notice, naming the reason.
+    fix.amend_account("parish-secretary", |account| {
+        account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(6));
+    });
+    assert!(fix.drain().status.success());
+    let notices = fix.read("accounts/parish-secretary/notices.jsonl");
+    assert_eq!(
+        notices.matches("account.suspended.final").count(),
+        1,
+        "{notices}"
+    );
+    assert!(notices.contains(reason), "the reason again: {notices}");
+
+    // The date: the mailbox goes with its routes and keys, and the group and its
+    // other mailbox stay.
+    fix.amend_account("parish-secretary", |account| {
+        account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    });
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/parish-secretary").exists(),
+        "the suspended mailbox survived its grace"
+    );
+    assert!(
+        fix.dir.join("store/accounts/parish-office").exists(),
+        "the other mailbox went with it"
+    );
+    assert_eq!(fix.account("parish-office")["state"], json!("active"));
+    let virtuals = fix.table("virtuals");
+    assert!(
+        !virtuals.contains("parish-secretary"),
+        "the deleted mailbox's addresses stayed: {virtuals}"
+    );
+    assert!(virtuals.contains("parish-office"), "{virtuals}");
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(group["accounts"], json!(["parish-office"]), "{group}");
+    assert_eq!(
+        group["payment"]["window"]["state"],
+        json!("open"),
+        "the paid group lapsed: {group}"
+    );
+    assert!(group.get("grace_until").is_none(), "{group}");
 }
 
 /// A corrupt account record is reported and skipped, not read as an account

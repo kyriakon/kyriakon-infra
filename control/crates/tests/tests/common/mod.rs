@@ -1368,13 +1368,14 @@ impl Fix {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
+        let now = kyriakon_control_core::util::filed_at();
         let draft = json!({
             "version": 1,
             "token": token,
             "answers": answers,
             "cursor": 0,
-            "created_at": "2026-10-10T00:00:00Z",
-            "updated_at": "2026-10-10T00:00:00Z",
+            "created_at": now,
+            "updated_at": now,
         });
         std::fs::create_dir_all(self.dir.join("store/drafts")).unwrap();
         std::fs::write(

@@ -86,6 +86,10 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), Error> {
     // away on the first pass after the window ends.
     transitions::lifecycle::purge_applications(cfg, store, &journal).await?;
     transitions::lifecycle::purge_closing(cfg, store, &journal).await?;
+    // The capsule's abandoned drafts, on the seven-day bound its spec sets: an
+    // active draft is saved on every answer, so only one nobody returned to is
+    // old enough to go.
+    transitions::lifecycle::purge_drafts(cfg, store, &journal).await?;
     // The free accounts' yearly note, on the same pass: a free account never
     // lapses, and this is the one message it is sent each year.
     transitions::lifecycle::free_anniversaries(cfg, store, &journal).await?;
@@ -350,6 +354,9 @@ pub async fn verify(
             account_name(&intent.username)?;
             session_proved(store, proofs, &intent.session, &intent.username).await
         }
+        Intent::CancelClose(intent) => {
+            page_proved(store, proofs, &intent.session, &intent.username).await
+        }
         Intent::Resend(intent) => {
             if sign::verify(
                 key,
@@ -533,6 +540,9 @@ pub async fn apply(
             Intent::Close(intent) => {
                 transitions::lifecycle::close_account(cfg, store, intent).await
             }
+            Intent::CancelClose(intent) => {
+                transitions::lifecycle::cancel_close(store, intent).await
+            }
             Intent::Resend(intent) => transitions::review::resend(cfg, store, intent).await,
             Intent::Credit(intent) => {
                 transitions::payments::credit(cfg, store, journal, intent).await
@@ -596,6 +606,7 @@ fn disposition(intent: &Intent) -> transitions::Disposition {
         | Intent::ProvisionGroup(_)
         | Intent::GroupAddress(_)
         | Intent::Close(_)
+        | Intent::CancelClose(_)
         | Intent::Resend(_)
         | Intent::Credit(_)
         | Intent::WindowExtend(_)
@@ -624,6 +635,7 @@ fn disposition(intent: &Intent) -> transitions::Disposition {
         | Intent::CancelRenewal(_)
         | Intent::MailKey(_)
         | Intent::Close(_)
+        | Intent::CancelClose(_)
         | Intent::Export(_)
         | Intent::TestMail(_)
         | Intent::RemoveGroup(_)
