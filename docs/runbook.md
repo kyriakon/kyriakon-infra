@@ -515,8 +515,8 @@ saved clearsigned needs no `--signature`; the command reads the headers outside
 the armour first and falls back to the ones inside it, and refuses a file that
 carries anything but header lines between them and the armour. The signature
 covers the armour, so unsigned text above it would be a request read from the
-file and never sent by the member. PGP/MIME is not read, so
-export the clearsigned message or the detached signature from the client. The
+file and never sent by the member. PGP/MIME is not read, so export the
+clearsigned message or the detached signature from the client. The
 command checks the `From:` header is the account's own address and verifies the
 signature against `/etc/kyriakon/keys/<username>.asc`, printing the verified
 fingerprint and the signed text itself, which is what the evidence line records.
