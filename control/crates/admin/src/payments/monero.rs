@@ -41,7 +41,7 @@ pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), Error> 
     let block = payment.monero.get_or_insert_with(Default::default);
     match block.address.as_deref() {
         Some(existing) if existing == address => {
-            println!("{username}'s Monero subaddress is already {address}");
+            println!("{username}'s Monero subaddress is already {}", safe(address));
             return Ok(());
         }
         Some(existing) => {
@@ -59,7 +59,10 @@ pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), Error> 
     // block.
     transitions::groups::write_account_record(store, username, &bytes).await?;
     transitions::payments::write_payment_copy(store, username, &payment).await?;
-    println!("recorded Monero subaddress for {username}: {address}");
+    println!(
+        "recorded Monero subaddress for {username}: {}",
+        safe(address)
+    );
     Ok(())
 }
 

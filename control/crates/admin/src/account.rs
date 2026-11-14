@@ -81,13 +81,16 @@ pub(crate) async fn show(store: &Store, username: &str) -> Result<(), Error> {
     let account = store.account(username).await?;
     match find_application(store, username).await? {
         Some((token, record)) => {
-            println!("application {username} (token {token})");
-            println!("  filed    {}", record.filed_at);
-            println!("  stage    {}", record.stage);
-            println!("  rail     {}", record.rail);
+            println!("application {username} (token {})", safe(&token));
+            println!("  filed    {}", safe(&record.filed_at));
+            println!("  stage    {}", safe(&record.stage));
+            println!("  rail     {}", safe(&record.rail));
             println!(
                 "  decided  {}",
-                record.decided_at.as_deref().unwrap_or("not yet")
+                record
+                    .decided_at
+                    .as_deref()
+                    .map_or_else(|| "not yet".to_string(), safe)
             );
         }
         None if account.is_some() => {
@@ -98,15 +101,18 @@ pub(crate) async fn show(store: &Store, username: &str) -> Result<(), Error> {
     match account {
         Some(account) => {
             println!("account {username}");
-            println!("  state    {}", account.state);
-            println!("  decision {}", account.decision);
+            println!("  state    {}", safe(&account.state));
+            println!("  decision {}", safe(&account.decision));
             // A group mailbox holds no payment of its own: the group does. The
             // console prints the group's one rail, token, window and date, which
             // is what the body's page shows too.
             if let Some(group) = &account.group {
-                println!("  group    {group}");
+                println!("  group    {}", safe(group));
                 let Some(record) = store.group(group).await? else {
-                    println!("  payment  no group record at groups/{group}/group.json");
+                    println!(
+                        "  payment  no group record at groups/{}/group.json",
+                        safe(group)
+                    );
                     return Ok(());
                 };
                 let payment = group_payment(&record.payment);

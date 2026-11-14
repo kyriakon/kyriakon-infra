@@ -305,6 +305,12 @@ same name between the mail and the terminal is never what gets signed. Take the
 token from the review mail. `kyriakon-admin show <username>` prints only the newest
 application, so it cannot say which one the operator is deciding.
 
+The console prints the fields the signature covers before it signs them, and
+refuses a record whose fields are not the ones the review mail described: the
+handler owns `applications/`, and a record rewritten after the mail is refused
+with the changed field named instead of being signed. Re-read the application
+against the mail and decide again.
+
 Prune the review mail by hand. Delete each `Subject: kyriakon: control: application
 filed (...)` message from `admin@kyriakon.net` once the decision is made, and no
 later than the 90th day after the application was filed. The first exclusion in
@@ -506,11 +512,15 @@ signature must be over that saved file itself, headers included: one made over
 the body alone does not match a message that carries headers, so a client that
 can sign only the body should send the message clearsigned instead. A message
 saved clearsigned needs no `--signature`; the command reads the headers outside
-the armour first and falls back to the ones inside it. PGP/MIME is not read, so
-export the clearsigned message or the detached signature from the client. The
+the armour first and falls back to the ones inside it, and refuses a file that
+carries anything but header lines between them and the armour. The signature
+covers the armour, so unsigned text above it would be a request read from the
+file and never sent by the member. PGP/MIME is not read, so export the
+clearsigned message or the detached signature from the client. The
 command checks the `From:` header is the account's own address and verifies the
 signature against `/etc/kyriakon/keys/<username>.asc`, printing the verified
-fingerprint. It writes nothing; the request is recorded afterwards.
+fingerprint and the signed text itself, which is what the evidence line records.
+It writes nothing; the request is recorded afterwards.
 
 	cat /etc/kyriakon/keys/<localpart>.asc
 
