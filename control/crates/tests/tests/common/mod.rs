@@ -1612,6 +1612,27 @@ pub fn cash_credit(fix: &Fix, token: &str) -> Value {
     payment_lines(fix).remove(0)
 }
 
+/// One cash credit larger than the price, applied, returning its ledger line:
+/// GBP 20.00 buys the year and GBP 5.00 is held, so an `--excess` refund of the
+/// held part is one the cap allows.
+pub fn cash_overpayment(fix: &Fix, token: &str) -> Value {
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        token,
+        "--rail",
+        "cash",
+        "--amount",
+        "25.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    payment_lines(fix).remove(0)
+}
+
 /// One Monero credit on a paid account, applied, returning its ledger line.
 pub fn monero_credit(fix: &Fix, token: &str) -> Value {
     let out = fix.ctl(&[

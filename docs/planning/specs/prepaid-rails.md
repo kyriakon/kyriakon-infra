@@ -122,7 +122,7 @@ A payment that carries no token, or a Monero payment to the wallet's main addres
 
 A cancellation inside the fourteen days is refunded in full, in the rail the member paid, or held against the next year if they would rather (from [#152](https://github.com/kyriakon/kyriakon-infra/issues/152)). A refund under the cancellation right closes the account and starts the seven-day closing window; a refund of an overpayment or a duplicate does not touch the account.
 
-The command is `kyriakon-admin refund (--token <t> | --username <u>) --amount <gbp> --rail <rail> --reason <text>`, with `--close` for a cancellation and `--excess` otherwise. It writes a negative ledger line naming the `seq` it reverses, and it does not move `paid_until` on an `--excess` refund. Reg 34(4) gives fourteen days to pay it back, so the notice that goes with the refund states the date it will be settled.
+The command is `kyriakon-admin refund (--token <t> | --username <u>) --amount <gbp> --rail <rail> --reason <text>`, with `--close` for a cancellation and `--excess` otherwise. It writes a negative ledger line naming the `seq` it reverses, and it does not move `paid_until` on an `--excess` refund. An `--excess` refund is capped at the part of the payment that never bought time, so returning the whole payment is `--close`. Reg 34(4) gives fourteen days to pay it back, so the notice that goes with the refund states the date it will be settled.
 
 Card refunds go through Stripe with an `Idempotency-Key`, which is the same mechanism the research note describes for the rail's other calls.
 
