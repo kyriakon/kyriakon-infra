@@ -2934,7 +2934,8 @@ fn a_retry_naming_another_account_than_the_journal_is_refused() {
 /// domain, an outside address or an answer.
 #[test]
 fn a_decision_is_refused_when_an_acted_on_field_changes_after_signing() {
-    let cases: &[(&str, fn(&mut Value))] = &[
+    type Amendment = fn(&mut Value);
+    let cases: &[(&str, Amendment)] = &[
         ("no-charge", |record| record["no_charge"] = json!(true)),
         ("rail", |record| record["rail"] = json!("monero")),
         ("domain", |record| {
@@ -2956,7 +2957,7 @@ fn a_decision_is_refused_when_an_acted_on_field_changes_after_signing() {
         );
         fix.file_application(&record);
         let sig = fix.sign_action("approve");
-        fix.amend_application(TOKEN, |record| amend(record));
+        fix.amend_application(TOKEN, amend);
         fix.write_decision("approve", "approve", &sig, "secretary");
 
         let out = fix.drain();
