@@ -140,6 +140,18 @@ pub async fn filed_application(
     // approved; failing here leaves the intent and the record for the next pass
     // rather than sending links that could never be carried out.
     let record = application_record(store, token).await?;
+    // The command the mail prints and the name the approval installs both come
+    // from this record, which the handler owns and can rewrite. The intent's
+    // username is the one the signature and the application page agree on, so a
+    // record that names another account is refused before any mail is composed.
+    // `settle` writes the refusal line, which names the mismatch.
+    if record.username != intent.application.username {
+        return Ok(Settlement::refused(format!(
+            "the record's username {:?} is not the intent's {:?}",
+            util::clean(&record.username),
+            util::clean(&intent.application.username)
+        )));
+    }
 
     // One review email per application, not per intent: the journal is the
     // record and it is written before the send, so a crash loses an email
@@ -164,11 +176,13 @@ pub async fn filed_application(
     // where the operator can tell them apart before opening either.
     let subject = notice::operator_subject(
         "control",
-        &format!(
+        // The subject is a mail header: `clean` drops every control,
+        // newlines included, so nothing here can add a header line.
+        &util::clean(&format!(
             "application filed ({}, {})",
             intent.application.username,
             intent.application.status_token.as_deref().unwrap_or("")
-        ),
+        )),
     );
     let body = review_body(cfg, key, &record)?;
     notice::enqueue(cfg, &cfg.reviewer, &subject, &body).await?;
@@ -270,7 +284,11 @@ fn review_body(cfg: &DrainConfig, key: &[u8], record: &Record) -> Result<String,
             sign::decide_link(&cfg.base_url, key, record, d.action)?
         ));
     }
-    Ok(out)
+    // Every field above is the handler's to write and the answers are the
+    // applicant's: the body goes to an operator's terminal, so C0/C1, the
+    // format characters and the line separators are replaced. Newlines and tabs
+    // survive, so a multi-line answer still reads as it was written.
+    Ok(util::clean_body(&out))
 }
 
 /// A decision intent: an approval with the charge, an approval without it, or a
@@ -287,7 +305,7 @@ pub async fn decision(
     match intent.kind.as_str() {
         "approve" => approve(cfg, store, journal, key, &intent, false).await,
         "provision" => approve(cfg, store, journal, key, &intent, true).await,
-        "decline" => decline(cfg, store, journal, &intent).await,
+        "decline" => decline(cfg, store, journal, key, &intent).await,
         // Unreachable after the kind match the seam makes, kept so the dispatch
         // is total.
         other => Err(Error::Failed(format!("kind {other:?} is not a decision"))),
@@ -317,6 +335,23 @@ async fn approve(
         return Err(Error::Failed(
             "the intent's username is not the application's".to_string(),
         ));
+    }
+    // A decision is single-use, and the journal is the only record of it the
+    // handler cannot rewrite. This intent's own retry is recognised by the
+    // signature, which is its identity: a completed decision never reaches here,
+    // because `settle` finds its applied line first. A decision that only
+    // `applying` (a failed approval being declined) has no applied line, so the
+    // recovery path below still runs.
+    if let Some((id, kind)) = journal.decision_applied(token) {
+        if id != kyriakon_control_core::intent::id_for(&intent.sig) {
+            return Ok(Settlement::line(
+                "already-decided",
+                intent.application.clone(),
+                Some(format!(
+                    "the application was already decided ({kind}); nothing was carried out"
+                )),
+            ));
+        }
     }
     let no_charge = no_charge || record.no_charge;
     if record.decided_at.is_some() {
@@ -1062,6 +1097,7 @@ async fn decline(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
+    key: &[u8],
     intent: &DecisionIntent,
 ) -> Result<Settlement, Error> {
     let token = intent
@@ -1076,11 +1112,42 @@ async fn decline(
             "the intent's username is not the application's".to_string(),
         ));
     }
+    // A decision is single-use, and the journal is the only record of it the
+    // handler cannot rewrite. This is also what refuses a decline over an
+    // already-approved application whose `decided_at` the handler cleared: the
+    // approval's applied line is root-written, and its erase must not follow. An
+    // approval that only started and failed has no applied line, so the
+    // half-made recovery below is unchanged.
+    if let Some((id, kind)) = journal.decision_applied(token) {
+        if id != kyriakon_control_core::intent::id_for(&intent.sig) {
+            return Ok(Settlement::line(
+                "already-decided",
+                intent.application.clone(),
+                Some(format!(
+                    "the application was already decided ({kind}); nothing was carried out"
+                )),
+            ));
+        }
+    }
     if record.decided_at.is_some() {
         return Ok(Settlement::line(
             "already-decided",
             intent.application.clone(),
             Some("the application was already decided; nothing was carried out".to_string()),
+        ));
+    }
+    // The signature is checked again against the record this decline will act
+    // on, not only against the one `verify` read a moment before, exactly as an
+    // approval does. Both reads are handler-rewritable and the record can change
+    // between them; this is the read whose username decides what is erased and
+    // whose address receives the notice.
+    if !sign::verify(
+        key,
+        &sign::decide_payload(&record, &intent.action),
+        &intent.sig,
+    ) {
+        return Err(Error::Failed(
+            "the decision intent's signature does not verify against this record".to_string(),
         ));
     }
     // The address is validated before the journal line, so a record whose
@@ -1159,6 +1226,10 @@ async fn application_record(store: &Store, token: &str) -> Result<Record, Error>
 
 /// Write the decision onto the application record. `password_link` is written
 /// only when there is one: a decline has no account and so no password to set.
+///
+/// `decided_at` is the status page's record and the notice's dedup, not the
+/// single-use gate: the handler owns this file and can clear the field. The
+/// journal's applied decision line is what refuses a second decision.
 async fn mark_decided(
     store: &Store,
     token: &str,

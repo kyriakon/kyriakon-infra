@@ -71,6 +71,22 @@ fn terminal_safe(c: char) -> bool {
                 | '\u{e0020}'..='\u{e007f}')
 }
 
+/// Text safe to put in a mail body: every character [`clean`] replaces, except
+/// that a newline and a tab survive so a multi-line answer still reads as the
+/// applicant wrote it. One predicate with [`clean`], so a character stripped
+/// from a console line is stripped from a mail body too.
+pub fn clean_body(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if matches!(c, '\n' | '\t') || terminal_safe(c) {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
 /// The lines one failure prints: the error under the service prefix, then each
 /// source that says something the line already printed does not. A wrapper whose
 /// `Display` delegates to its source would otherwise print the same sentence
