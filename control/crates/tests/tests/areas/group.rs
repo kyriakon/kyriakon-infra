@@ -2186,9 +2186,10 @@ fn the_console_files_a_group_removal_and_refuses_a_bad_domain() {
     ));
 }
 
-/// A departing site owner hands the upload key and the generated roots to a
-/// replacement before the account is deleted. Without a replacement the intent
-/// is refused and nothing moves.
+/// A departing site owner hands the site and the generated roots to a
+/// replacement before the account is deleted, but never the upload key: the
+/// replacement is provisioned keyless so the leaver keeps no session on the
+/// site. Without a replacement the intent is refused and nothing moves.
 #[test]
 fn a_departing_site_owner_must_name_a_replacement() {
     let fix = Fix::new("group-site-owner");
@@ -2204,6 +2205,22 @@ fn a_departing_site_owner_must_name_a_replacement() {
     );
     assert!(fix.drain().status.success());
     assert!(fix.dir.join("store/keys/parish-secretary.pub").exists());
+
+    // The box installs a member's authorized-keys file from the store, as
+    // provision-member.sh does. Nothing else in the fixture builds one, so this
+    // is what shows whether the leaver's key reaches the replacement.
+    let log = fix.path("scripts.log");
+    let keys = fix.path("store/keys");
+    let installed = fix.path("host/authorized_keys");
+    fix.script(
+        "provision-member.sh",
+        &format!(
+            "#!/bin/sh\n\
+             echo \"provision-member.sh $*\" >> '{log}'\n\
+             mkdir -p '{installed}'\n\
+             if [ -f '{keys}/'\"$1\"'.pub' ]; then cp '{keys}/'\"$1\"'.pub' '{installed}/'\"$1\"; fi\n",
+        ),
+    );
 
     let refused = fix.file_address(
         "parish.example",
@@ -2252,8 +2269,18 @@ fn a_departing_site_owner_must_name_a_replacement() {
     );
 
     assert!(!fix.passwd_file().contains("parish-secretary:"));
-    let moved = fix.read("keys/parish-office.pub");
-    assert!(moved.contains(UPLOAD_KEY), "{moved}");
+    // The leaver's key is gone and no copy is made for the replacement: a copy
+    // would keep the departing member's sftp and git sessions on the site.
+    assert!(
+        !fix.dir.join("store/keys/parish-office.pub").exists(),
+        "the departing owner's key was copied to the replacement"
+    );
+    let installed_key = std::fs::read_to_string(fix.dir.join("host/authorized_keys/parish-office"))
+        .unwrap_or_default();
+    assert!(
+        !installed_key.contains(UPLOAD_KEY),
+        "the replacement's authorized-keys file holds the leaver's key: {installed_key}"
+    );
     assert!(
         !fix.dir.join("store/keys/parish-secretary.pub").exists(),
         "the old owner kept the upload key"
@@ -2281,6 +2308,42 @@ fn a_departing_site_owner_must_name_a_replacement() {
             "{lane} did not re-root the site at the replacement: {log}"
         );
     }
+}
+
+/// A replacement who already added their own key keeps it: the handover writes
+/// nothing over the file, so the leaver's key is never installed beside it.
+#[test]
+fn a_departing_site_owner_leaves_the_replacements_own_key_alone() {
+    let fix = Fix::new("group-site-owner-own-key");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let own = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOffice example";
+    std::fs::write(fix.dir.join("store/keys/parish-office.pub"), own).unwrap();
+
+    fix.file_address(
+        "parish.example",
+        "remove",
+        "",
+        "parish-secretary",
+        None,
+        Some("parish-office"),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.read("keys/parish-office.pub").trim(),
+        own.trim(),
+        "the departing owner's key replaced the replacement's own"
+    );
 }
 
 /// The console files a signed address intent the drain then applies, which is
