@@ -385,22 +385,25 @@ tmp_dir="$scratch"
 
 swap_out=$(remote 'swapctl -sk' 2>&1) \
 	|| die "could not read the swap size on $server_ip: $swap_out"
-swap_kb=$(printf '%s\n' "$swap_out" | awk '/^total:/ {print $2; exit}')
+# `total: N 1K-blocks allocated, M used, K available`: K is what this mount can
+# take. The configured total is not free space; a box with most of its swap in
+# use would pass a total-based check and still die with ENOSPC mid-restore.
+swap_kb=$(printf '%s\n' "$swap_out" | awk '/^total:/ {print $7; exit}')
 case "${swap_kb:-}" in
-''|*[!0-9]*) die "swapctl on $server_ip reported no total: $swap_out" ;;
+''|*[!0-9]*) die "swapctl on $server_ip reported no available swap: $swap_out" ;;
 esac
 available_mb=$(( swap_kb / 1024 ))
 
 if [ "$required_mb" -le "$available_mb" ]; then
 	remote "mkdir -p -m 0700 $scratch && mount_mfs -s ${required_mb}M swap $scratch" \
-		|| die "could not mount the ${required_mb} MB scratch memory filesystem on $server_ip, which has ${available_mb} MB of swap"
-	printf 'scratch is a %s MB memory filesystem (the box has %s MB of swap)\n' \
+		|| die "could not mount the ${required_mb} MB scratch memory filesystem on $server_ip, which has ${available_mb} MB of swap available"
+	printf 'scratch is a %s MB memory filesystem (the box has %s MB of swap available)\n' \
 		"$required_mb" "$available_mb"
 else
 	target_root=/home/restore-test
 	cache_dir=/home/restic-cache
 	tmp_dir=/home/tmp
-	printf 'refusing a %s MB memory filesystem: the scratch needs %s MB and the box has %s MB of swap\n' \
+	printf 'refusing a %s MB memory filesystem: the scratch needs %s MB and the box has %s MB of swap available\n' \
 		"$required_mb" "$required_mb" "$available_mb"
 	printf 'restoring the payload to /home on disk instead, with only the credentials in memory. That disk is plaintext and is not wiped when Hetzner frees it, and the payload carries the DKIM keys and the control store: this is the #111 tradeoff. More swap, through RESTORE_TEST_SERVER_TYPE, keeps the payload in memory\n'
 	disk_out=$(remote 'df -k /home' 2>&1) \
