@@ -224,6 +224,12 @@ from_problem() {
 				inangle = 1
 			clean = clean c
 		}
+		# A quote or angle bracket that never closes leaves no address to
+		# check, and an unchecked header must not pass: dkimsign would sign
+		# whatever domain the unreadable header names.
+		if (inq || inangle)
+			problem("5.7.1 the From header has an unterminated " \
+				(inq ? "quoted string" : "angle address"))
 		n = split(clean, part, ",")
 		for (i = 1; i <= n; i++) {
 			p = part[i]
@@ -532,6 +538,22 @@ $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: \"A, Inc.\" <alice
 $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|$quoted_from")"
 	check "an escaped quote does not split a display name" \
 		"$(decision)" proceed
+
+	# A header the parser cannot read must be refused, not pass unchecked.
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: \" <hello@kyriakon.net>")"
+	check_reject "an unterminated quoted string is refused" \
+		"550 5.7.1 the From header has an unterminated quoted string"
+
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: alice@kyriakon.net, \" <hello@kyriakon.net>")"
+	check_reject "an unterminated quote cannot blank the rest of the header" \
+		"550 5.7.1 the From header has an unterminated quoted string"
+
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: <hello@kyriakon.net")"
+	check_reject "an unterminated angle address is refused" \
+		"550 5.7.1 the From header has an unterminated angle address"
 
 	run_case "$(connect_remote)
 $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: alice")"
