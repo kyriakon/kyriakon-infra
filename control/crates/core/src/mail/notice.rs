@@ -35,6 +35,12 @@ fn message(from: &str, to: &str, subject: &str, body: &str) -> String {
     )
 }
 
+/// The envelope sender every notice leaves with, so a delivery-status report
+/// comes back to the plaintext Maildir the drain reads rather than to root's
+/// mailbox. `openbsd/etc/smtpd.conf` routes this one address to that spool; the
+/// From header stays [`DrainConfig::from`], which is what the member reads.
+pub const BOUNCE_ADDRESS: &str = "bounce@kyriakon.net";
+
 /// Enqueue one message through the enqueuer the config names.
 pub async fn enqueue(cfg: &DrainConfig, to: &str, subject: &str, body: &str) -> Result<(), Error> {
     enqueue_raw(cfg, &message(&cfg.from, to, subject, body)).await
@@ -46,6 +52,8 @@ pub async fn enqueue(cfg: &DrainConfig, to: &str, subject: &str, body: &str) -> 
 async fn enqueue_raw(cfg: &DrainConfig, raw: &str) -> Result<(), Error> {
     let mut child = Command::new(&cfg.sendmail)
         .arg("-i")
+        .arg("-f")
+        .arg(BOUNCE_ADDRESS)
         .arg("-t")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -250,6 +258,7 @@ async fn record(
         notice_type: notice_type.to_string(),
         subject: subject.to_string(),
         to: to.to_string(),
+        delivery: None,
     };
     let encoded =
         serde_json::to_string(&line).map_err(|e| Error::context("cannot encode a notice", e))?;
@@ -321,14 +330,25 @@ async fn unrecord(store: &Store, username: &str, line: &str) -> Result<(), Error
 mod tests {
     use super::*;
 
-    /// A stub enqueuer: it appends its own stdin to `$ONBOARD_SENT`, so a test
-    /// reads exactly what would have reached the box's smtpd.
+    /// A stub enqueuer: it appends its own stdin to `sent` beside it and its
+    /// arguments to `sent.args`, so a test reads exactly what would have
+    /// reached the box's smtpd and under which envelope sender. The paths are
+    /// written into the script rather than passed through the environment,
+    /// because the tests share one process and an environment variable is a
+    /// race between them.
     fn stub(dir: &std::path::Path) -> String {
         let path = dir.join("enqueuer.sh");
-        std::fs::write(&path, "#!/bin/sh\ncat >> \"$ONBOARD_SENT\"\n").unwrap();
+        let sent = dir.join("sent");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{sent}.args'\ncat >> '{sent}'\n",
+                sent = sent.display()
+            ),
+        )
+        .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::env::set_var("ONBOARD_SENT", dir.join("sent"));
         path.to_str().unwrap().to_string()
     }
 
@@ -362,6 +382,7 @@ mod tests {
             group_price_gbp: "40.00".to_string(),
             postal_address: "REPLACE_ME".to_string(),
             mail_dir: dir.join("mail").to_str().unwrap().to_string(),
+            bounce_dir: dir.join("bounce").to_str().unwrap().to_string(),
             release: "2026-10-10 abc1234".to_string(),
             mail_host: "mail.kyriakon.net".to_string(),
             ipv4: "192.0.2.10".to_string(),
@@ -379,6 +400,31 @@ mod tests {
             proof_dir: dir.join("logins").to_str().unwrap().to_string(),
             public_root: "/home/www".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn every_notice_leaves_with_the_bounce_mailbox_as_its_envelope_sender() {
+        let dir = std::env::temp_dir().join(format!("control-notice-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg(&dir);
+        enqueue(&cfg, "a@b.c", "Your application", "hello")
+            .await
+            .unwrap();
+        // The From header is what the member reads; the envelope sender is
+        // where smtpd sends the DSN, and it must be the routed mailbox or the
+        // bounce record never sees the report.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sent.args"))
+                .unwrap()
+                .trim(),
+            "-i -f bounce@kyriakon.net -t"
+        );
+        let sent = std::fs::read_to_string(dir.join("sent")).unwrap();
+        assert!(
+            sent.contains("From: kyriakon <hello@example.invalid>\n"),
+            "{sent}"
+        );
     }
 
     #[tokio::test]

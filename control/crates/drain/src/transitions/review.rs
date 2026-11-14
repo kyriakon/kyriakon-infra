@@ -662,6 +662,7 @@ async fn approve(
         group: None,
         closing_until: None,
         grace_until: None,
+        notice_stopped: None,
     };
     store
         .ensure_dir_owned(

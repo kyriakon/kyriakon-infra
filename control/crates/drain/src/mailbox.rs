@@ -22,11 +22,12 @@ use time::OffsetDateTime;
 use crate::transitions::Error;
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::config::HOST;
+use kyriakon_control_core::mail::bounce;
 use kyriakon_control_core::mail::keycheck;
 use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::store::draft::{self, Draft};
 use kyriakon_control_core::store::journal::Journal;
-use kyriakon_control_core::store::Store;
+use kyriakon_control_core::store::{NoticeStop, Store};
 
 const BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
 const END: &str = "-----END PGP PUBLIC KEY BLOCK-----";
@@ -634,6 +635,133 @@ fn parameter(value: &str, name: &str) -> Option<String> {
         let value = value.trim().trim_matches('"');
         (!value.is_empty()).then(|| value.to_string())
     })
+}
+
+/// Read the bounce spool and record every delivery-status report in it. `smtpd`
+/// delivers `bounce@kyriakon.net` here because every notice leaves with that
+/// envelope sender; the drain reads the report and marks the notice it names.
+///
+/// A message that is not a permanent-failure DSN is removed without a record:
+/// the mailbox is for reports and nothing else, and leaving it would make the
+/// next pass read it again. A report that no notice matches is removed for the
+/// same reason. A read or store failure leaves the file for the next pass and
+/// is reported once, exactly as the key spool's failures are.
+pub async fn bounces(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<(), Error> {
+    let dir = std::path::Path::new(&cfg.bounce_dir);
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::context(format!("cannot read {}", dir.display()), e)),
+    };
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?
+    {
+        let path = entry.path();
+        if !entry.file_type().await.is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') {
+            continue;
+        }
+        let text = match tokio::fs::read(&path).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(e) => {
+                crate::transitions::report_failure(
+                    cfg,
+                    store,
+                    journal,
+                    name.as_ref(),
+                    "mail",
+                    &Error::Failed(format!("cannot read {}: {e}", path.display())),
+                )
+                .await;
+                continue;
+            }
+        };
+        if let Some(report) = bounce::parse(&text) {
+            match bounce::record(store, &report).await {
+                Ok(usernames) => {
+                    let mut failed = false;
+                    for username in &usernames {
+                        if let Err(e) = stop_clock(store, username, &report).await {
+                            crate::transitions::report_failure(
+                                cfg,
+                                store,
+                                journal,
+                                name.as_ref(),
+                                "mail",
+                                &e,
+                            )
+                            .await;
+                            failed = true;
+                            break;
+                        }
+                    }
+                    // A latch that could not be written leaves the report for
+                    // the next pass; the notice lines are already marked, which
+                    // is idempotent to repeat.
+                    if failed {
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    crate::transitions::report_failure(
+                        cfg,
+                        store,
+                        journal,
+                        name.as_ref(),
+                        "mail",
+                        &Error::from(e),
+                    )
+                    .await;
+                    continue;
+                }
+            }
+        }
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            crate::transitions::report_failure(
+                cfg,
+                store,
+                journal,
+                name.as_ref(),
+                "mail",
+                &Error::Failed(format!("cannot remove {}: {e}", path.display())),
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+/// Latch the stop on the account when the recorded failure leaves no address
+/// the lifecycle notices reached. The sweep reads the latch rather than the
+/// notice history, so a later notice that is also not delivered cannot restart
+/// the clock; `kyriakon-admin notice resend` clears it and restarts the grace.
+///
+/// The notice line is the history and the latch is the state the sweep acts on.
+/// A write failure leaves the spool file in place, so the next pass marks the
+/// same notice and tries again.
+async fn stop_clock(store: &Store, username: &str, report: &bounce::Bounce) -> Result<(), Error> {
+    if !bounce::every_address_failed(store, username).await? {
+        return Ok(());
+    }
+    let Some(mut account) = store.account(username).await? else {
+        return Ok(());
+    };
+    account.notice_stopped = Some(NoticeStop {
+        address: report.recipient.clone(),
+        status: report.status.clone(),
+        at: kyriakon_control_core::util::filed_at(),
+    });
+    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+        context: "encode the account",
+        source,
+    })?;
+    crate::transitions::groups::write_account_record(store, username, &bytes).await
 }
 
 #[cfg(test)]

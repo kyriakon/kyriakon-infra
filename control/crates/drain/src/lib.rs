@@ -106,6 +106,10 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), Error> {
     // active, or lapses the account and starts the grace. One sweep, so a
     // member who paid on the last day is not lapsed by a later pass.
     transitions::lifecycle::window_sweep(cfg, store, &journal).await?;
+    // The delivery-status reports are read before the grace sweep, so a bounce
+    // that arrived since the last pass stops the clock on this one rather than
+    // after a deletion.
+    crate::mailbox::bounces(cfg, store, &journal).await?;
     // A lapsed account's grace: the final notice at day 33, and the one
     // deletion transition when the 40 days end.
     transitions::lifecycle::grace_sweep(cfg, store, &journal).await?;

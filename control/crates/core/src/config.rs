@@ -283,6 +283,15 @@ pub struct DrainConfig {
     /// drain reads the key to file it. `scripts/control-store.sh` owns the
     /// directory and its `_onboard` ownership.
     pub mail_dir: String,
+    /// The `bounce/new` directory `smtpd` delivers a DSN for a platform notice
+    /// to. Every notice leaves with `bounce@kyriakon.net` as its envelope
+    /// sender, so a permanent failure comes back here instead of to root's
+    /// mailbox, and the drain reads it and marks the notice. Plaintext for the
+    /// same reason `mail_dir` is: the drain has to read what it says. Absent
+    /// from a config written before the bounce record existed, which reads the
+    /// deployed path.
+    #[serde(default = "bounce_dir")]
+    pub bounce_dir: String,
     /// The deployed commit and date, e.g. "2026-10-10 1a2b3c4". The drain records
     /// it on a journal line so a transition can be traced to the release that
     /// carried it out, and it is the confirmation email's document version.
@@ -349,6 +358,10 @@ pub struct DrainConfig {
 
 fn public_root() -> String {
     "/home/www".to_string()
+}
+
+fn bounce_dir() -> String {
+    "/var/db/onboard/bounce/new".to_string()
 }
 
 impl DrainConfig {
@@ -502,6 +515,9 @@ mod tests {
         assert_eq!(c.group_price_gbp, "40.00");
         assert_eq!(c.scripts, "/root/bin");
         assert_eq!(c.spamd_alloweddomains, "/etc/mail/spamd.alloweddomains");
+        // A config written before the bounce record existed reads the deployed
+        // spool rather than refusing to start.
+        assert_eq!(c.bounce_dir, "/var/db/onboard/bounce/new");
         let bad: Result<DrainConfig, _> = toml::from_str(&text.replace("sendmail", "sendmaill"));
         assert!(bad.is_err());
     }
