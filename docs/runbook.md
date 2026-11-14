@@ -252,7 +252,7 @@ The service is decided in #156, and the drain it needs is built: `scripts/deploy
 
 Two halves run with different privilege. The handler is a FastCGI responder, reached by httpd's `signup.kyriakon.net` vhost for the web form and by gmid's signup block for the capsule, with `relayd` terminating TLS ahead of both. It holds no secrets, writes the raw Stripe body and its signature header, files applications, and writes account-page intents. The drain is a one-minute cron job, with a second hourly job for the sweeps, and it owns provisioning, manual payment credits, key publication pull requests, certificate requests, the lifecycle transitions and their notices, the 90-day application purge and the grace sweeps. Notices leave through the local `smtpd` enqueuer, so `filter-dkimsign` signs them the way it signs everything else.
 
-The state is flat files, one directory per account. `account.json` holds the state, the contact and recovery addresses, the upload-key fingerprints and dates, the rail and token reference, the paid-until date and the approval decision. `notices.jsonl` appends each notice with its timestamp. `application.json` holds the application answers and the purge deletes it. An own-domain body has `groups/<domain>/group.json` instead of one account record holding its payment state: it carries the domain, the body's name and kind, the payment block, the mailbox accounts and the site owner, and each mailbox's `account.json` carries a `group` reference and no paid-until date of its own. A top level `intents/` directory holds pending work, one file per item, and `journal.jsonl` records transitions. The drain appends the journal entry before it carries the transition out, so a crash leaves a record it can rerun. The build fixes the store's path, and the drain adds that path to the payload of `scripts/backup.sh`, which today copies `/home`, `/etc/mail` and the capsule certificate pair.
+The state is flat files, one directory per account. `account.json` holds the state, the contact and recovery addresses, the upload-key fingerprints and dates, the rail and token reference, the paid-until date and the approval decision. `notices.jsonl` appends each notice with its timestamp, address and any permanent delivery failure a bounce reported. `application.json` holds the application answers and the purge deletes it. An own-domain body has `groups/<domain>/group.json` instead of one account record holding its payment state: it carries the domain, the body's name and kind, the payment block, the mailbox accounts and the site owner, and each mailbox's `account.json` carries a `group` reference and no paid-until date of its own. A top level `intents/` directory holds pending work, one file per item, and `journal.jsonl` records transitions. The drain appends the journal entry before it carries the transition out, so a crash leaves a record it can rerun. The build fixes the store's path, and the drain adds that path to the payload of `scripts/backup.sh`, which today copies `/home`, `/etc/mail` and the capsule certificate pair.
 
 An account approved without charge has no `payment` block at all, so it has no token, no window and no paid-until date, and its approval writes no ledger line. It never lapses and no grace or deletion notice runs for it. The drain sends it one note a year, on the creation anniversary, and `kyriakon-admin free` prints how many such accounts the store holds. It ends by the member's request, a breach of the acceptable use policy, or the operator closing one that has been unreachable and unused for a year, and then takes the ordinary deletion path.
 
@@ -421,10 +421,13 @@ The link is signed for one mailbox and one purpose, so a link for one address ca
 
 ## A lifecycle notice that bounces
 
-The lifecycle notices go to the member's platform address and to every other address on the account. The drain records each send. A hard bounce at the platform address means the mailbox cannot receive, which is one of the things a notice may be about. A hard bounce at the only address we hold means no channel reached the member, and the grace clock stops until a channel works. Decided in #153.
+A lifecycle notice goes to the one address the account records: the contact outside the platform when it validates as a mail header, and otherwise the member's platform mailbox. The drain records each send in `notices.jsonl` before the message leaves. Every notice carries `bounce@kyriakon.net` as its envelope sender, so a hard bounce comes back as a delivery-status report. `openbsd/etc/smtpd.conf` delivers that address to the spool at `/var/db/onboard/bounce`, the drain reads it before the grace sweep, and the matching notice line gains a `delivery` status.
 
-1. Find the bounce.
+A permanent failure at every address the lifecycle notices went to means no channel reached the member, so the grace clock stops. `grace_sweep` refuses to delete the account while that is true. A soft bounce does not stop it: the sender's queue is still trying, and no failure is recorded for it.
 
+1. Read the failure.
+
+		doas grep -h '"delivery"' /var/db/onboard/accounts/<username>/notices.jsonl
 		doas grep <localpart> /var/log/maillog | tail -20
 		mailq
 
@@ -432,11 +435,15 @@ The lifecycle notices go to the member's platform address and to every other add
 
 2. Read the addresses and the notice history in `account.json` and `notices.jsonl`.
 
-3. Send the notice again over a channel that works and record the send. With the drain built, `kyriakon-admin` re-sends and writes the record. Without it, append one object to `notices.jsonl` in the same shape as the objects already there, because a deletion has to be able to show what was sent and when.
+3. Send the notice again over a channel that works.
 
-4. Check the account's grace date. A bounce at every address extends the grace until a channel works, so the date moves out rather than the account being deleted unread.
+		doas kyriakon-admin notice resend <username> [--to <address>]
 
-Do not let a deletion proceed on an account whose only notice bounced. That is the case the automated deletion path carries safeguards for, and the safeguards are the notices and the extended clock.
+   The command records the new notice line before it enqueues, clears the stop, and moves the grace to forty days from today. Without `--to` it goes to the account's platform mailbox, which a lapsed or suspended account can still read. Name an outside address when the mailbox is the thing that failed. If the new address bounces too, its report stops the clock again.
+
+4. Check the account's grace date in `account.json`. The date is the one the command printed, so the account is not deleted before the member has had the notice.
+
+The automated deletion path carries this safeguard. An operator who must delete anyway runs `kyriakon-admin delete <username>`, which runs the deletion transition directly rather than through the sweep.
 
 ## Suspend an account
 

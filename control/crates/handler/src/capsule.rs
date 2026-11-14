@@ -624,6 +624,7 @@ mod tests {
             notice_type: "approval.free".into(),
             subject: "Application approved, account opened.".into(),
             to: "alice@kyriakon.net".into(),
+            delivery: None,
         }];
         let text = account(&member(), &notices, None, None, None);
         assert!(text.contains("State: active"), "{text}");

@@ -506,6 +506,7 @@ impl BillingTarget {
                     run_script(cfg, "lapse-user.sh", &["--restore", &a.username]).await?;
                     a.state = "active".to_string();
                     a.grace_until = None;
+                    a.notice_stopped = None;
                 }
                 let payment = a
                     .payment

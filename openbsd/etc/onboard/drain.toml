@@ -155,6 +155,13 @@ postal_address = "REPLACE_ME"
 # _onboard ownership.
 mail_dir = "/var/db/onboard/mail/new"
 
+# The Maildir's `new` directory smtpd delivers a DSN to: every notice leaves with
+# bounce@kyriakon.net as its envelope sender, openbsd/etc/smtpd.conf routes that
+# address here, and the drain reads it before the grace sweep. Plaintext for the
+# reason mail_dir is: the drain reads the report to know a notice did not arrive.
+# scripts/control-store.sh owns the directory and its _onboard ownership.
+bounce_dir = "/var/db/onboard/bounce/new"
+
 # The deployed commit and date, substituted at install, e.g. "2026-10-10 1a2b3c4".
 # The drain records it on a journal line so a transition can be traced to the
 # release that carried it out, and it is the document version the confirmation
