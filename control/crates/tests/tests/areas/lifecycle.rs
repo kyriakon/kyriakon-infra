@@ -1620,6 +1620,11 @@ fn an_abandoned_draft_is_purged_after_seven_days_and_a_younger_one_survives() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     assert!(!path.exists(), "the abandoned draft survived the sweep");
+    let journal = fix.journal();
+    assert!(
+        journal.contains(&format!("purge-draft-{TOKEN}")) && journal.contains("\"purged\""),
+        "the draft purge was not journalled: {journal}"
+    );
     assert!(
         fix.dir
             .join(format!("store/drafts/{OTHER_TOKEN}.json"))

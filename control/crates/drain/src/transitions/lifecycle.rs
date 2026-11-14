@@ -3906,8 +3906,37 @@ pub async fn purge_drafts(
         if updated > cutoff {
             continue;
         }
+        let purge_id = format!("purge-draft-{token}");
+        let subject = ApplicationRef::application("", token);
+        if !journal.has(&purge_id, "purged") && !journal.has(&purge_id, "applying") {
+            write_journal(
+                store,
+                journal,
+                &cfg.release,
+                &purge_id,
+                "draft",
+                &subject,
+                "applying",
+                Some("the draft's seven days are up; the answers are being cleared away"),
+            )
+            .await?;
+        }
         if let Err(e) = store::draft::remove(store, token).await {
             report_record(cfg, store, journal, "draft", token, &Error::from(e)).await;
+            continue;
+        }
+        if !journal.has(&purge_id, "purged") {
+            write_journal(
+                store,
+                journal,
+                &cfg.release,
+                &purge_id,
+                "draft",
+                &subject,
+                "purged",
+                Some("the abandoned draft answers were cleared away"),
+            )
+            .await?;
         }
     }
     Ok(())
