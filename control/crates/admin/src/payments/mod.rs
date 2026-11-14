@@ -89,6 +89,7 @@ pub(crate) fn group_payment(payment: &store::GroupPayment) -> store::Payment {
     store::Payment {
         token_ref: payment.token_ref.clone(),
         token_issued_at: None,
+        application_ref: None,
         paid_until: payment.paid_until.clone(),
         window: payment.window.clone(),
         rail: Some(payment.rail.clone()),

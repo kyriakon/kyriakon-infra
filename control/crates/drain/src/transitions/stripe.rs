@@ -813,6 +813,30 @@ async fn target_for_payment_reference(
     Ok(Some(TargetRef::Group(domain.to_string())))
 }
 
+/// The account or group an application identifier names: the value the card
+/// Payment Link carries as `client_reference_id`. The application record the
+/// drain wrote at approval holds the payment block, and the token in it is what
+/// the token index joins to the account. An identifier of another shape, a
+/// record that is gone, and one with no token are refused: the payment token
+/// never left the box, so an event naming anything but an application settles
+/// nothing. The purge takes the record ninety days in, long after the fourteen
+/// the window runs.
+async fn target_for_application(
+    store: &Store,
+    application: &str,
+) -> Result<Option<TargetRef>, Error> {
+    if !store::is_status_token(application) {
+        return Ok(None);
+    }
+    let Some(record) = store.application(application).await? else {
+        return Ok(None);
+    };
+    let Some(token) = record.payment.and_then(|payment| payment.token_ref) else {
+        return Ok(None);
+    };
+    target_for_payment_reference(store, &token).await
+}
+
 /// Attach a subscription and its customer to an account or a group, which is
 /// all a checkout does. The date stays `invoice.paid`'s to set.
 async fn attach_subscription(
@@ -828,9 +852,10 @@ async fn attach_subscription(
 }
 
 /// `checkout.session.completed`: the `client_reference_id` is the account's or
-/// the group's `KYR-` token, and the subscription and customer are attached to
-/// what it indexes. Nothing else happens: `invoice.paid` owns the date, so a
-/// first payment extends exactly one year and never two.
+/// the group's application identifier, and the subscription and customer are
+/// attached to what its record's token indexes. Nothing else happens:
+/// `invoice.paid` owns the date, so a first payment extends exactly one year and
+/// never two.
 async fn checkout_completed(store: &Store, object: &Value) -> Result<Settled, Error> {
     let Some(reference) = object
         .get("client_reference_id")
@@ -842,7 +867,7 @@ async fn checkout_completed(store: &Store, object: &Value) -> Result<Settled, Er
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
-    let Some(target) = target_for_payment_reference(store, reference).await? else {
+    let Some(target) = target_for_application(store, reference).await? else {
         return Ok(Settled::Ignored);
     };
     let Some(mut billing) = load_target(store, &target).await? else {
@@ -888,11 +913,11 @@ async fn invoice_paid(
             // A missed `checkout.session.completed` leaves no store record, so
             // the session the subscription came from is the repair: the list
             // filter names it, and its `client_reference_id` is the account's or
-            // the group's token. A subscription with no session reference stays
-            // deferred.
+            // the group's application identifier. A subscription with no
+            // reference stays deferred.
             let session = retrieve_session(cfg, subscription).await?;
             let reference = card_reference(&session, &subscription_json);
-            let Some(target) = target_for_payment_reference(store, reference).await? else {
+            let Some(target) = target_for_application(store, reference).await? else {
                 return Ok(Settled::Deferred);
             };
             let Some(mut billing) = load_target(store, &target).await? else {

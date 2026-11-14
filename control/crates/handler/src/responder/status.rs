@@ -48,23 +48,24 @@ pub(super) fn payment_for(app: &App, record: Option<&Record>) -> Option<page::Pa
         payment,
         price,
         &app.cfg.postal_address,
-        card_link(app, payment.token_ref.as_deref(), group).as_deref(),
+        card_link(app, Some(&record.status_token), group).as_deref(),
         OffsetDateTime::now_utc(),
     ))
 }
 
 /// The card rail's Payment Link for a page, or `None` when the rail is not card,
-/// there is no token yet, or the box's link is unconfigured. `group` picks the
-/// body's own link, because its year is the group price. A page is not the place
-/// to refuse an approval for a placeholder: the approval email already does, and
-/// the page simply shows no link rather than a broken one.
-pub(super) fn card_link(app: &App, token: Option<&str>, group: bool) -> Option<String> {
+/// the application's identifier is not on the record, or the box's link is
+/// unconfigured. `group` picks the body's own link, because its year is the group
+/// price. A page is not the place to refuse an approval for a placeholder: the
+/// approval email already does, and the page simply shows no link rather than a
+/// broken one.
+pub(super) fn card_link(app: &App, application: Option<&str>, group: bool) -> Option<String> {
     let link = if group {
         &app.cfg.stripe_group_payment_link
     } else {
         &app.cfg.stripe_payment_link
     };
-    rails::card_link(link, token?).ok().flatten()
+    rails::card_link(link, application?).ok().flatten()
 }
 
 /// The page one token's record renders, or the one notice that covers a token
