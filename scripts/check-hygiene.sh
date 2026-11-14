@@ -167,6 +167,19 @@ alert_address_problem() {
 	fi
 }
 
+# install_renames <destination>: "installed-name checkout-source" pairs for the
+# files a deploy installs under a name with no .sh suffix, which neither a table
+# row nor the *.sh glob can see. deploy-control.sh installs kyriakon-authcheck
+# that way: it runs as root under a doas nopass rule and decides which page
+# sessions are trusted, so a stale copy keeps the old behaviour while §9 says the
+# tree is clean. The table row is deliberately absent (install-set.tsv explains
+# why), so the pairing is named here.
+install_renames() {
+	case "$1" in
+	/usr/local/libexec) printf 'kyriakon-authcheck kyriakon-authcheck.sh\n' ;;
+	esac
+}
+
 # deployed_drift <checkout-scripts> <table> <destination> <dir>
 #
 # One line per table row for <destination> with no installed copy, per installed
@@ -179,7 +192,7 @@ alert_address_problem() {
 # cron-apply.sh reads it from there, so a stale or missing copy is the same
 # finding: the box would schedule the set the checkout has left behind.
 deployed_drift() {
-	typeset checkout="$1" table="$2" token="$3" dir="$4" file name names
+	typeset checkout="$1" table="$2" token="$3" dir="$4" file name names renamed
 	if [ ! -d "$dir" ]; then
 		printf '%s: the directory is gone\n' "$dir"
 		return 0
@@ -208,6 +221,19 @@ deployed_drift() {
 		cmp -s "$file" "$checkout/$name" \
 			|| printf '%s differs from %s\n' "$file" "$checkout/$name"
 	done
+	renamed=$(install_renames "$token")
+	[ -n "$renamed" ] || return 0
+	while read -r installed src; do
+		if [ ! -f "$dir/$installed" ]; then
+			printf '%s: not installed, and install_renames names it\n' \
+				"$dir/$installed"
+			continue
+		fi
+		cmp -s "$dir/$installed" "$checkout/$src" \
+			|| printf '%s differs from %s\n' "$dir/$installed" "$checkout/$src"
+	done <<EOF
+$renamed
+EOF
 }
 
 # record_dir_problems <dir>: one line per record directory under it that is not
@@ -600,6 +626,10 @@ EOF
 	mkdir -p "$dir/libexec"
 	printf 'new\n' > "$dir/checkout/wrap.sh"
 	printf 'old\n' > "$dir/libexec/wrap.sh"
+	# install_renames always names the suffixless login checker for libexec, so
+	# the fixture installs a matching copy before the clean case.
+	printf 'new\n' > "$dir/checkout/kyriakon-authcheck.sh"
+	printf 'new\n' > "$dir/libexec/kyriakon-authcheck"
 	out=$(deployed_drift "$dir/checkout" "$dir/libexec-table" /usr/local/libexec "$dir/libexec")
 	case "$out" in
 	*wrap.sh*) ;;
@@ -611,6 +641,36 @@ EOF
 		printf 'FAIL: a matching libexec copy is not a finding; got [%s]\n' "$out" >&2
 		exit 1
 	}
+
+	# The suffixless install: deploy-control.sh installs kyriakon-authcheck from
+	# scripts/kyriakon-authcheck.sh, and the login checker runs as root under a
+	# doas rule, so a stale copy keeps old behaviour while §9 says the tree is
+	# clean. No table row or *.sh glob sees it, so install_renames names the pair.
+	printf 'new\n' > "$dir/checkout/kyriakon-authcheck.sh"
+	printf 'old\n' > "$dir/libexec/kyriakon-authcheck"
+	out=$(deployed_drift "$dir/checkout" "$dir/libexec-table" /usr/local/libexec "$dir/libexec")
+	case "$out" in
+	*kyriakon-authcheck*) ;;
+	*)
+		printf 'FAIL: a stale suffixless install is a finding; got [%s]\n' "$out" >&2
+		exit 1
+		;;
+	esac
+	printf 'new\n' > "$dir/libexec/kyriakon-authcheck"
+	out=$(deployed_drift "$dir/checkout" "$dir/libexec-table" /usr/local/libexec "$dir/libexec")
+	[ -z "$out" ] || {
+		printf 'FAIL: a matching suffixless install is not a finding; got [%s]\n' "$out" >&2
+		exit 1
+	}
+	rm -f "$dir/libexec/kyriakon-authcheck"
+	out=$(deployed_drift "$dir/checkout" "$dir/libexec-table" /usr/local/libexec "$dir/libexec")
+	case "$out" in
+	*"$dir/libexec/kyriakon-authcheck: not installed"*) ;;
+	*)
+		printf 'FAIL: a missing suffixless install is a finding; got [%s]\n' "$out" >&2
+		exit 1
+		;;
+	esac
 
 	# Record directories: 0750 with the parent's group is readable by the
 	# handler; 0700 is a finding, whatever the file inside says.

@@ -54,9 +54,11 @@
 #                          not exist here before alerting (default 50). With no
 #                          members there is no mailbox to enter, so a scanner
 #                          probing one is background and a bound is the signal.
-#   HEALTHCHECKS_URL       this box's check: a ping every run, with any finding
-#                          attached to the event log. Not /fail, because a finding
-#                          is not an outage; silence is what marks it down.
+#   HEALTHCHECKS_URL       this box's check: a ping every run, with the finding's
+#                          component attached to the event log and never the
+#                          member or address detail, which stays in the mail.
+#                          Not /fail, because a finding is not an outage;
+#                          silence is what marks it down.
 #   PUBLIC_IP              IPv4 for the DNSBL check (default: auto-detect from `ifconfig egress`)
 #   DNSBL_ZONES            blocklists to query, strongest first (default in lib.sh:
 #                          zen.spamhaus.org bl.spamcop.net all.s5h.net dnsbl.dronebl.org)
@@ -69,7 +71,7 @@
 #   GREY_MAX               spamd greylist entries before "flood" alert (default 100)
 #   DEFER_MIN              distinct addresses one sender may be deferred from before it alerts (default 6)
 #   ONBOARD_DIR            the store the drain applies intents from
-#                          (default /var/db/kyriakon-onboard)
+#                          (default /var/db/onboard, the store drain.toml names)
 #   DRAIN_INTENT_MAX_MIN   minutes an intent may sit unapplied (default 240)
 #   ACME_QUEUE_DIR         the certificate queue store, whose pending/ directory
 #                          this reads for the oldest request (default
@@ -81,7 +83,8 @@
 #   ROOT_FS_WARN_PCT       usage % on / that trips the alert (default 80)
 #   DAEMONLOG              spamd's verbose log, carrying greylist envelopes (default /var/log/daemon)
 #   ALERT_COOLDOWN_MINUTES alert suppression window, per signal (default 60)
-#   STATE_DIR              state-file dir (default /var/db/kyriakon-monitor)
+#   STATE_DIR              state-file dir, created 0700 with its files 0600
+#                          (default /var/db/kyriakon-monitor)
 #
 # Runs as root (reads /var/log/*, spamdb, quota, and the backup repository).
 # Every threshold is deliberately a tunable, not fixed. Log-line formats below
@@ -495,8 +498,12 @@ alert() {
 	printf '%s\n' "$now" > "$last_file"
 	when=$(date '+%F %T')
 	notify_operator "$component" "$event" "$body" "$to_do"
-	# The body lands in the check's event log, which is what makes an alert
-	# raised while mail is broken still readable somewhere.
+	# The check's event log is a third party's and the operator's notice names
+	# only Stripe and Hetzner, so nothing that names a member or an address goes
+	# here: the body is the timestamp and the component, and every identifying
+	# detail stays in the mail above. The event string is left out with it because
+	# a sender-cap event carries the username, and one body shape has to be safe
+	# for every caller.
 	#
 	# A finding is not an outage, so the default is the success URL: pinging /fail
 	# marked the dead-man's switch down and the ping at the end of the same run
@@ -509,7 +516,7 @@ alert() {
 	if [ -n "${HEALTHCHECKS_URL:-}" ]; then
 		check_url="$HEALTHCHECKS_URL"
 		[ "${5:-ok}" = "fail" ] && check_url="$HEALTHCHECKS_URL/fail"
-		curl -fsS -m 10 --retry 3 --data "$when $component $event: $body" \
+		curl -fsS -m 10 --retry 3 --data "$when $component" \
 			"$check_url" >/dev/null 2>&1 || true
 	fi
 }
@@ -523,6 +530,52 @@ log_failure() {
 	alert mail "log unreadable" \
 		"cannot read $1, so the signals that read it did not run and this run is not a clean one" \
 		"restore it, or point MAILLOG/AUTHLOG at the file the service writes, and check the rotation that removed it" fail
+}
+
+# state_dir <dir>: create the monitor's state directory private, and tighten one
+# an older run left group- or world-readable. umask 077 then covers every file
+# this run writes: deferred-senders holds correspondents' envelope senders and
+# spamd-trapped-list every blocked host, and no local unprivileged process has
+# any business reading either.
+state_dir() {
+	install -d -m 0700 "$1"
+	chmod 0700 "$1"
+	umask 077
+}
+
+# state_write <file>: write stdin to a state file only root can read, by staging
+# a sibling and renaming it. A kill between a truncate and a write would
+# otherwise leave a partial deferred-senders, and the next run would re-alert on
+# every sender. The chmod covers a file an older run left 0644; umask 077 only
+# covers new ones.
+state_write() {
+	typeset tmp="$1.new.$$"
+	(umask 077; cat > "$tmp")
+	chmod 0600 "$tmp"
+	mv "$tmp" "$1"
+}
+
+# drain_backlog <intents-dir> <max-minutes>: alert when the oldest unapplied
+# intent has waited past the drain's limit. A missing intents/ directory is a
+# finding, not a quiet pass: the check exists for a drain that stopped, and a
+# store with no intents/ is the one shape a healthy drain never has. Returning 1
+# stops the run the way an unreadable log does.
+drain_backlog() {
+	typeset intents="$1" max_min="$2" oldest pending age_min
+	if [ ! -d "$intents" ]; then
+		alert control "drain store" "$intents is missing, so the drain backlog could not be read. scripts/control-store.sh creates it on a box running the control plane, so this is the drain's half not deployed or the store root moved" "run scripts/control-store.sh, or point ONBOARD_DIR at the store root drain.toml names" fail
+		return 1
+	fi
+	oldest=$(find "$intents" -type f -exec stat -f '%m' {} + 2>/dev/null \
+		| awk 'NR == 1 || $1 < m { m = $1 } END { print m }' || true)
+	[ -n "$oldest" ] || return 0
+	pending=$(find "$intents" -type f 2>/dev/null | wc -l | tr -d ' ')
+	age_min=$(( ( $(date +%s) - oldest ) / 60 ))
+	if [ "$age_min" -gt "$max_min" ]; then
+		alert control "drain backlog" "$pending unapplied intent(s) in the store, oldest $age_min minutes (max $max_min). The drain is the service's privileged half; an intent this old is a member whose payment or approval was accepted and who still has no account" "check the drain's log and restart it" fail
+		return 1
+	fi
+	return 0
 }
 
 self_test() {
@@ -767,6 +820,79 @@ STUB
 	check "the non-member alert says what stopped the lapse" \
 		"$(grep -c 'is not in the members group; not lapsed' "$work/cap.out")" "1"
 
+	# The state directory and the two sensitive state files are root-only: the
+	# directory is 0700, a loose one from an older run is tightened, and a state
+	# file is 0600 whether it is new or was world-readable. The rewrite is also
+	# what a later run reads back, so the state survives across runs.
+	state_dir "$work/fresh-state"
+	check "a fresh state directory is 0700" \
+		"$(stat -f '%Lp' "$work/fresh-state")" "700"
+	mkdir -p "$work/loose-state"
+	chmod 0755 "$work/loose-state"
+	state_dir "$work/loose-state"
+	check "an existing loose state directory is tightened to 0700" \
+		"$(stat -f '%Lp' "$work/loose-state")" "700"
+	printf 'old\n' | state_write "$work/fresh-state/deferred-senders"
+	check "a new state file is 0600" \
+		"$(stat -f '%Lp' "$work/fresh-state/deferred-senders")" "600"
+	chmod 0644 "$work/fresh-state/deferred-senders"
+	printf 'new\n' | state_write "$work/fresh-state/deferred-senders"
+	check "an existing loose state file is tightened to 0600" \
+		"$(stat -f '%Lp' "$work/fresh-state/deferred-senders")" "600"
+	check "and the run reads its state back" \
+		"$(cat "$work/fresh-state/deferred-senders")" "new"
+
+	# The drain backlog reads the store the drain actually owns. An intent past
+	# the limit alerts, and never names its file; an empty backlog is silent; a
+	# missing intents/ directory is a named failure rather than a clean pass.
+	mkdir -p "$work/onboard/intents"
+	printf '{}\n' > "$work/onboard/intents/one.json"
+	touch -t 202001010000 "$work/onboard/intents/one.json"
+	if drain_backlog "$work/onboard/intents" 240 >"$work/drain.out" 2>&1; then
+		drain_rc=0
+	else
+		drain_rc=$?
+	fi
+	check "a pending intent past the limit alerts" \
+		"$(grep -c 'kyriakon: control: drain backlog' "$work/drain.out")" "1"
+	check "and the run fails rather than pinging the check green" "$drain_rc" "1"
+	check "and the alert carries the count, not the filename" \
+		"$(grep -c '1 unapplied intent' "$work/drain.out")" "1"
+	rm -f "$work/onboard/intents/one.json"
+	drain_backlog "$work/onboard/intents" 240 >"$work/drain.out" 2>&1
+	check "an empty backlog does not alert" "$(cat "$work/drain.out")" ""
+	if drain_backlog "$work/absent-store/intents" 240 >"$work/drain.out" 2>&1; then
+		drain_rc=0
+	else
+		drain_rc=$?
+	fi
+	check "a missing intents directory is a named failure" "$drain_rc" "1"
+	check "and the failure names the directory" \
+		"$(grep -c "$work/absent-store/intents is missing" "$work/drain.out")" "1"
+
+	# The Healthchecks body is a third party's, and the operator's notice names
+	# only Stripe and Hetzner: an alert that names an account and an address must
+	# send neither. curl is stubbed to record its whole command line, and the
+	# operator mail is captured separately by notify_operator's ALERT_EMAIL-unset
+	# fallback, so the detail can only be in the mail.
+	cat > "$work/bin/curl" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >>"$CURL_LOG"
+STUB
+	chmod 0700 "$work/bin/curl"
+	rm -f "$CURL_LOG"
+	export HEALTHCHECKS_URL="$health_url"
+	alert mail "sender cap bob" \
+		"bob submitted 55 recipients since last run (max 50) from 203.0.113.9" \
+		>"$work/privacy.out" 2>&1
+	check "the check is still pinged" "$(grep -c "$health_url" "$CURL_LOG")" "1"
+	check "the check body carries no username" "$(grep -c 'bob' "$CURL_LOG")" "0"
+	check "the check body carries no address" \
+		"$(grep -c '203\.0\.113\.9' "$CURL_LOG")" "0"
+	check "the operator mail still names the account" \
+		"$(grep -c 'sender cap bob' "$work/privacy.out")" "1"
+	unset HEALTHCHECKS_URL
+
 	# A cold resolver must be retried rather than skipped past, which is the
 	# 2026-10-05 alert: the box had just rebooted, the probe gave up, the query fell
 	# through to the system resolver, Spamhaus ignored that by design, and the verdict
@@ -853,7 +979,7 @@ trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true' EXIT
 maillog="${MAILLOG:-/var/log/maillog}"
 authlog="${AUTHLOG:-/var/log/authlog}"
 state="${STATE_DIR:-/var/db/kyriakon-monitor}"
-mkdir -p "$state"
+state_dir "$state"
 
 alert_cooldown="${ALERT_COOLDOWN_MINUTES:-60}"
 mail_spike_max="${MAIL_SPIKE_MAX:-50}"
@@ -865,7 +991,7 @@ trapped_rise_min="${TRAPPED_RISE_MIN:-3}"
 trapped_max="${TRAPPED_MAX:-20}"
 defer_min="${DEFER_MIN:-6}"
 daemon_log="${DAEMONLOG:-/var/log/daemon}"
-onboard_dir="${ONBOARD_DIR:-/var/db/kyriakon-onboard}"
+onboard_dir="${ONBOARD_DIR:-/var/db/onboard}"
 drain_intent_max_min="${DRAIN_INTENT_MAX_MIN:-240}"
 acme_queue_dir="${ACME_QUEUE_DIR:-/var/db/kyriakon-acme-queue}"
 acme_pending_max_min="${ACME_PENDING_MAX_MIN:-1440}"
@@ -1070,7 +1196,7 @@ if [ -f "$state/spamd-trapped-list" ]; then
 fi
 rm -f "$work_trapped"
 printf '%s\n' "$trapped" > "$state/spamd-trapped"
-printf '%s\n' "$trapped_list" > "$state/spamd-trapped-list"
+printf '%s\n' "$trapped_list" | state_write "$state/spamd-trapped-list"
 
 # --- 5. senders deferred from several addresses --------------------------
 # Greylisting promotes an address only when a retry arrives for the same tuple,
@@ -1114,7 +1240,7 @@ reported=$(cat "$state/deferred-senders" 2>/dev/null || true)
 if [ -n "$flagged" ] && [ "$flagged" != "$reported" ]; then
 	alert spamd "deferred senders" "deferred from several addresses today: $(printf '%s' "$flagged" | tr '\n' ';'). If one is a real correspondent, add its mail ranges to /etc/mail/nospamd (docs/planning/research/spamd-greylisting.md)"
 fi
-printf '%s\n' "$flagged" > "$state/deferred-senders"
+printf '%s\n' "$flagged" | state_write "$state/deferred-senders"
 
 # --- 6. IP reputation blocklist ------------------------------------------
 ip="${PUBLIC_IP:-$(ifconfig egress inet 2>/dev/null | awk '/inet / { print $2; exit }')}"
@@ -1220,11 +1346,13 @@ fi
 # --- 7. drain: health and backlog -----------------------------
 # The drain is the privileged half of the control plane (issue #156): a
 # root cron job that applies the intents the unprivileged handler files, one
-# file per intent under the store's intents/ directory. It is not built yet, so
-# on a box without the store this check reads nothing and says nothing; it
-# starts working the day the store appears. The interface it needs is the one
-# #156 already fixes: an applied intent is deleted, a failed one is left in
-# place, so the age of the oldest file is how long something has waited.
+# file per intent under the store's intents/ directory. The store root is
+# /var/db/onboard (drain.toml and control-store.sh), and a missing intents/
+# directory there is a finding rather than a quiet pass, because a store without
+# one is the drain's half not deployed or its root moved, and this check exists
+# for a drain that stopped. The interface it needs is the one #156 already fixes:
+# an applied intent is deleted, a failed one is left in place, so the age of the
+# oldest file is how long something has waited.
 #
 # That one age answers all three conditions the ticket names. A drain that has
 # not run leaves the file, a drain that fails to apply leaves the file, and a
@@ -1240,18 +1368,7 @@ fi
 # the value is set above the one wait that is legitimate, the certificate queue
 # draining against Let's Encrypt's refill of one certificate every 202 minutes
 # (issue #166), because a queued certificate request is not a stuck intent.
-intents_dir="$onboard_dir/intents"
-if [ -d "$intents_dir" ]; then
-	oldest=$(find "$intents_dir" -type f -exec stat -f '%m' {} + 2>/dev/null \
-		| awk 'NR == 1 || $1 < m { m = $1 } END { print m }' || true)
-	if [ -n "$oldest" ]; then
-		pending=$(find "$intents_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
-		age_min=$(( ( $(date +%s) - oldest ) / 60 ))
-		if [ "$age_min" -gt "$drain_intent_max_min" ]; then
-			alert control "drain backlog" "$pending unapplied intent(s) in the store, oldest $age_min minutes (max $drain_intent_max_min). The drain is the service's privileged half; an intent this old is a member whose payment or approval was accepted and who still has no account"
-		fi
-	fi
-fi
+drain_backlog "$onboard_dir/intents" "$drain_intent_max_min" || exit 1
 
 # --- 8. backup recency ---------------------------------------------------
 # A missing nightly restic snapshot is invisible until the weekly restore test
