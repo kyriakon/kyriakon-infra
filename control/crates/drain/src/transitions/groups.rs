@@ -990,7 +990,7 @@ fn repoint_table_line(path: &str, name: &str, want: &str) -> Result<(), Error> {
 /// Drop every line for `domain` that points at `mailbox`. That is the mailbox's
 /// own address and any alias into it, so no entry is left delivering nowhere.
 /// Returns whether the table changed.
-fn remove_addresses(path: &str, domain: &str, mailbox: &str) -> Result<bool, Error> {
+pub(super) fn remove_addresses(path: &str, domain: &str, mailbox: &str) -> Result<bool, Error> {
     let lock = TableLock::acquire(path)?;
     let text = std::fs::read_to_string(path).map_err(|e| {
         Error::context(
@@ -1127,7 +1127,11 @@ fn repoint_sender(path: &str, address: &str, keep: &str) -> Result<bool, Error> 
 /// Drop every address on `domain` from `mailbox`'s sender line, dropping the
 /// line when no address is left. Other accounts' lines and the mailbox's own
 /// platform identity are untouched. Returns whether the table changed.
-fn remove_senders_for_domain(path: &str, domain: &str, mailbox: &str) -> Result<bool, Error> {
+pub(super) fn remove_senders_for_domain(
+    path: &str,
+    domain: &str,
+    mailbox: &str,
+) -> Result<bool, Error> {
     let lock = TableLock::acquire(path)?;
     let text = std::fs::read_to_string(path).map_err(|e| {
         Error::context(

@@ -225,6 +225,7 @@ fn every_variant() -> Vec<Intent> {
         Intent::GroupAddress(st::GroupAddressIntent::default()),
         Intent::RemoveGroup(st::GroupRemoveIntent::default()),
         Intent::Close(intent::CloseIntent::default()),
+        Intent::CancelClose(intent::CancelCloseIntent::default()),
         Intent::Resend(intent::ResendIntent::default()),
         Intent::Credit(intent::CreditIntent::default()),
         Intent::WindowExtend(intent::WindowExtendIntent::default()),
@@ -249,6 +250,7 @@ fn every_variant() -> Vec<Intent> {
             | Intent::GroupAddress(_)
             | Intent::RemoveGroup(_)
             | Intent::Close(_)
+            | Intent::CancelClose(_)
             | Intent::Resend(_)
             | Intent::Credit(_)
             | Intent::WindowExtend(_)

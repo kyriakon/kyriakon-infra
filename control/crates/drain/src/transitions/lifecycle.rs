@@ -10,8 +10,8 @@ use super::boxrun::{
 };
 use super::groups::{
     account_on_box, application_token, close_group_tokens, group_record, hold_name,
-    remove_group_record, take_group_down, write_account_record, write_group_record,
-    write_group_state,
+    remove_addresses, remove_group_record, remove_senders_for_domain, take_group_down,
+    write_account_record, write_group_record, write_group_state,
 };
 use super::payments::{resolve_payment, token_join, write_payment_copy};
 use super::Error;
@@ -20,9 +20,9 @@ use kyriakon_control_core::account::{dns, export, session};
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::validate;
 use kyriakon_control_core::intent::{
-    CancelRenewalIntent, ChangePasswordIntent, CloseIntent, ExportIntent, MailKeyIntent,
-    OutsideAddressIntent, PasswordIntent, ServingIntent, TestMailIntent, UploadKeyIntent,
-    WindowExtendIntent,
+    CancelCloseIntent, CancelRenewalIntent, ChangePasswordIntent, CloseIntent, ExportIntent,
+    MailKeyIntent, OutsideAddressIntent, PasswordIntent, ServingIntent, TestMailIntent,
+    UploadKeyIntent, WindowExtendIntent,
 };
 use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::payments::ledger::Ledger;
@@ -882,9 +882,12 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
         let Some(account) = sweep_account(cfg, store, journal, &username).await else {
             continue;
         };
-        // A group mailbox's grace is the group's: one conversation and one
-        // deletion for the whole body, handled below.
-        if account.group.is_some() {
+        // A lapsed group mailbox's grace is the group's: one conversation and
+        // one deletion for the whole body, handled below. A suspended mailbox's
+        // grace is its own, even inside a group: the suspension is a decision
+        // about that mailbox, and deleting the paid, active group with it would
+        // take its siblings down too.
+        if account.group.is_some() && account.state == "lapsed" {
             continue;
         }
         // A suspension runs the same clock as a lapse: the same final week and
@@ -1524,6 +1527,28 @@ pub async fn delete_account(
         .await?;
     }
 
+    // A mailbox deleted on its own clock leaves its group's routes and list with
+    // its record: mail to the body's address must not point at a box that has
+    // gone, and a group that still named it would try to lapse it forever. The
+    // group itself and its other mailboxes are left alone. This runs before
+    // delete-user.sh removes the account, so a retry after a failure still knows
+    // which group to clean.
+    if let Some(domain) = account.group.as_deref() {
+        remove_addresses(&cfg.virtuals, domain, username)?;
+        remove_senders_for_domain(&cfg.mail_from, domain, username)?;
+        // Reload even when this pass changed nothing: a previous pass may have
+        // written the tables and failed the reload, and the intent retries. A
+        // group-mailbox deletion is rare, so one redundant reload is cheaper
+        // than a daemon left mapping a body address to a deleted mailbox.
+        run_script(cfg, "reload-smtpd.sh", &[]).await?;
+        if let Some(mut group) = group_record(store, domain).await? {
+            if group.accounts.iter().any(|mailbox| mailbox == username) {
+                group.accounts.retain(|mailbox| mailbox != username);
+                write_group_record(store, &group).await?;
+            }
+        }
+    }
+
     hold_name(store, username).await?;
     store.remove("keys", &format!("{username}.pub")).await?;
     run_script(cfg, "delete-user.sh", &[username]).await?;
@@ -1691,6 +1716,60 @@ pub async fn close_account(
         "applied",
         application.clone(),
         Some("the account is closing; the deletion runs when the seven days end".to_string()),
+    ))
+}
+
+/// Apply one `cancel-close` intent: the member's change of mind while the
+/// seven-day window is still running. The state goes back to `active`, the
+/// window is cleared, and a mailbox that left its group's list when it closed
+/// returns to it. The purge is the sweep's and runs on the date, so an intent
+/// that arrives after it finds no record and is refused with the reason the
+/// member needs.
+pub async fn cancel_close(store: &Store, intent: CancelCloseIntent) -> Result<Settlement, Error> {
+    if intent.kind != "cancel-close" {
+        return Err(Error::Failed(format!(
+            "kind {:?} is not a cancel-close intent",
+            intent.kind
+        )));
+    }
+    let application = ApplicationRef::account(intent.username.clone());
+    let Some(mut account) = store.account(&intent.username).await? else {
+        return Ok(Settlement::refused(format!(
+            "the account {} has already been deleted, so there is no closure to cancel",
+            intent.username
+        )));
+    };
+    if account.state != "closing" || account.closing_until.is_none() {
+        return Ok(Settlement::refused(format!(
+            "{} is not closing, so there is no closure to cancel",
+            intent.username
+        )));
+    }
+    account.state = "active".to_string();
+    account.closing_until = None;
+    // The closure took the mailbox out of its group's list, so a cancellation
+    // puts it back: the group's address keeps delivering to it.
+    if let Some(domain) = account.group.clone() {
+        if let Some(mut group) = group_record(store, &domain).await? {
+            if !group
+                .accounts
+                .iter()
+                .any(|mailbox| mailbox == &intent.username)
+            {
+                group.accounts.push(intent.username.clone());
+                write_group_record(store, &group).await?;
+            }
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+        context: "encode the account",
+        source,
+    })?;
+    write_account_record(store, &intent.username, &bytes).await?;
+    Ok(Settlement::line(
+        "applied",
+        application,
+        Some("the closure is cancelled; the account is active again".to_string()),
     ))
 }
 
@@ -3788,6 +3867,75 @@ pub async fn purge_applications(
             .await?;
         }
         store.remove("applications", &name).await?;
+    }
+    Ok(())
+}
+
+/// Remove every application draft nobody returned to. The capsule writes one
+/// answer per request and stamps `updated_at` on each save, so the seven days
+/// run from the last answer and a member still walking the flow is never swept
+/// mid-way. A file that does not read as a draft is reported and left: it is
+/// the applicant's answers, and deleting one on a guess is worse than a line in
+/// the journal.
+pub async fn purge_drafts(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+) -> Result<(), Error> {
+    let cutoff = OffsetDateTime::now_utc()
+        - Duration::days(kyriakon_control_core::store::draft::RETENTION_DAYS);
+    for name in store.list("drafts").await? {
+        let Some(token) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let draft = match store::draft::load(store, token).await {
+            Ok(Some(draft)) => draft,
+            Ok(None) => continue,
+            Err(e) => {
+                report_record(cfg, store, journal, "draft", token, &Error::from(e)).await;
+                continue;
+            }
+        };
+        // A stamp that cannot be read is not an age this sweep can prove, so
+        // the file stays for the operator's report rather than being deleted.
+        let Ok(updated) = OffsetDateTime::parse(&draft.updated_at, &Rfc3339) else {
+            continue;
+        };
+        if updated > cutoff {
+            continue;
+        }
+        let purge_id = format!("purge-draft-{token}");
+        let subject = ApplicationRef::application("", token);
+        if !journal.has(&purge_id, "purged") && !journal.has(&purge_id, "applying") {
+            write_journal(
+                store,
+                journal,
+                &cfg.release,
+                &purge_id,
+                "draft",
+                &subject,
+                "applying",
+                Some("the draft's seven days are up; the answers are being cleared away"),
+            )
+            .await?;
+        }
+        if let Err(e) = store::draft::remove(store, token).await {
+            report_record(cfg, store, journal, "draft", token, &Error::from(e)).await;
+            continue;
+        }
+        if !journal.has(&purge_id, "purged") {
+            write_journal(
+                store,
+                journal,
+                &cfg.release,
+                &purge_id,
+                "draft",
+                &subject,
+                "purged",
+                Some("the abandoned draft answers were cleared away"),
+            )
+            .await?;
+        }
     }
     Ok(())
 }

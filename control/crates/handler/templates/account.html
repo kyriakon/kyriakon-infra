@@ -25,6 +25,11 @@
 {% if let Some(date) = closing_until %}
 <div class="warn">
   <p>This account is closing. It works normally until {{ date }}, so you can take everything out before then.</p>
+  {# The terms promise this: a closure can be cancelled from the account page
+     until the deletion runs. #}
+  <form method="post" action="/account/cancel-close">
+    <button class="btn" type="submit">Cancel the closure</button>
+  </form>
 </div>
 {% endif %}
 

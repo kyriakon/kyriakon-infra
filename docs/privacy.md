@@ -48,6 +48,7 @@ That covers stored content, not the addressing information mail needs to move. S
 | Log records that identify you: smtpd envelope, Dovecot authentication, sshd, dns, the onboarding handler and httpd access logs | 7 days |
 | Spam greylist and whitelist entries | about 36 days on the whitelist |
 | Application data for an application that is rejected or abandoned, and the text the triage model saw | 90 days |
+| An application draft you started but did not submit, with the answers given so far | 7 days after the last answer |
 | Your account, mailbox, website, gemini capsule and git repositories | while the account exists, then deleted |
 | The hold on your username, and the transition journal lines for your account | 90 days after deletion. A journal line written before the hold recorded the application token may remain |
 | A suspended account | a 40-day grace, then deletion |

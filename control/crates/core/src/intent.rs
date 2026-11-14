@@ -178,6 +178,24 @@ pub struct CloseIntent {
     pub session: String,
 }
 
+/// A `cancel-close` intent: undo a closure filed from the account page, while
+/// the seven-day window is still running. It carries the account and the page
+/// session that proved the request, the same shape `close` has, because the
+/// drain owns the state write and the session is what proves it.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct CancelCloseIntent {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub filed_at: String,
+    pub username: String,
+    /// The id of the page session that filed this. The drain reads
+    /// `sessions/<id>.json` and refuses the intent when the record names another
+    /// account or the session has expired.
+    #[serde(default)]
+    pub session: String,
+}
+
 /// An `export` intent: the page's "Take my data out", filed by the handler with
 /// the account and the session that asked for it and nothing else. The drain
 /// proves the session before it writes the bundle as root.
@@ -450,6 +468,7 @@ pub enum Intent {
     GroupAddress(GroupAddressIntent),
     RemoveGroup(GroupRemoveIntent),
     Close(CloseIntent),
+    CancelClose(CancelCloseIntent),
     Resend(ResendIntent),
     Credit(CreditIntent),
     WindowExtend(WindowExtendIntent),
@@ -493,6 +512,7 @@ impl Intent {
             "group-address" => Intent::GroupAddress(parsed(value, "the address intent")?),
             "remove-group" => Intent::RemoveGroup(parsed(value, "the remove-group intent")?),
             "close" => Intent::Close(parsed(value, "the close intent")?),
+            "cancel-close" => Intent::CancelClose(parsed(value, "the cancel-close intent")?),
             "token-resend" => Intent::Resend(parsed(value, "the token resend intent")?),
             "credit" => Intent::Credit(parsed(value, "the credit intent")?),
             "window-extend" => Intent::WindowExtend(parsed(value, "the window extension intent")?),
@@ -544,6 +564,7 @@ impl Intent {
             Intent::GroupAddress(intent) => &mut intent.id,
             Intent::RemoveGroup(intent) => &mut intent.id,
             Intent::Close(intent) => &mut intent.id,
+            Intent::CancelClose(intent) => &mut intent.id,
             Intent::Resend(intent) => &mut intent.id,
             Intent::Credit(intent) => &mut intent.id,
             Intent::WindowExtend(intent) => &mut intent.id,
@@ -576,6 +597,7 @@ impl Intent {
             Intent::GroupAddress(_) => "group-address",
             Intent::RemoveGroup(_) => "remove-group",
             Intent::Close(_) => "close",
+            Intent::CancelClose(_) => "cancel-close",
             Intent::Resend(_) => "token-resend",
             Intent::Credit(_) => "credit",
             Intent::WindowExtend(_) => "window-extend",

@@ -53,6 +53,11 @@ impl Draft {
     }
 }
 
+/// The spec's bound on an untouched draft: seven days after its last answer.
+/// The drain's sweep removes an older one; a draft saved while the applicant is
+/// still walking the flow carries a fresh `updated_at` and is never swept.
+pub const RETENTION_DAYS: i64 = 7;
+
 /// Whether a path segment could name a draft. Checked before it is used as a
 /// record name, so a token never becomes a path.
 pub fn valid_token(token: &str) -> bool {
