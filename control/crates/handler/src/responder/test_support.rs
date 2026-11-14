@@ -540,17 +540,41 @@ pub(crate) fn read_draft(dir: &Path, token: &str) -> kyriakon_control_core::stor
     .expect("the draft parses")
 }
 
-/// A fake `kyriakon-authcheck`: it checks one password and prints a proof.
+/// A fake `kyriakon-authcheck` that checks one password and prints a proof.
 pub(crate) fn checker(name: &str, password: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
+    let dir = checker_dir(name);
+    write_checker(&dir, password, "")
+}
+
+/// The same checker, and the file it writes the arguments it was given to. A
+/// test that asserts what the handler passed uses this: the source the throttle
+/// keys on is an argument, so the only place to see it is the checker's side.
+pub(crate) fn checker_logging(
+    name: &str,
+    password: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = checker_dir(name);
+    let log = dir.join("args");
+    let record = format!("printf '%s\\n' \"$*\" >>'{}'", log.display());
+    (write_checker(&dir, password, &record), log)
+}
+
+fn checker_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("onboard-auth-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A checker in `dir` that reads one password, runs `body`, and answers with a
+/// proof token when the password matches.
+fn write_checker(dir: &Path, password: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("kyriakon-authcheck");
     std::fs::write(
         &path,
         format!(
-            "#!/bin/sh\nread -r given\n[ \"$given\" = '{password}' ] || exit 1\n\
+            "#!/bin/sh\nread -r given\n{body}\n[ \"$given\" = '{password}' ] || exit 1\n\
              printf '%s\\n' '{}'\n",
             "ab".repeat(32)
         ),

@@ -484,18 +484,23 @@ uid_warnings() {
 # read-modify-write: a signup and an operator deploy can overlap, and a rewrite
 # that read before the other's append would move the old table back over it.
 
-# table_lock <table> / table_unlock <table>
+# table_lock <table> [tries] [interval]
 #
 # mkdir(2) is the lock: it fails when the directory exists, and nothing else
 # needs a base tool. The owner writes its pid inside, so a lock left by a killed
-# writer can be told from one being held. A writer waits five seconds in whole
-# seconds; a lock whose pid is gone, or that has been held for more than thirty
-# seconds, is reaped once and the acquisition retried. The drain's Rust writer
-# takes the same <table>.lock directory with the same pid file, so the two
-# exclude each other.
+# writer can be told from one being held. By default a writer waits five seconds
+# in whole seconds; a lock whose pid is gone, or that has been held for more than
+# thirty seconds, is reaped once and the acquisition retried. `tries` and
+# `interval` pace that wait: a caller whose lock is held for milliseconds under a
+# burst passes a finer interval so a queue of waiters drains in the time it
+# takes, where the mail tables' one-write-a-minute callers are happy with the
+# second.
+# The drain's Rust writer takes the same <table>.lock directory with the same
+# pid file, so the two exclude each other.
 table_lock() {
 	typeset table="$1" lock="$1.lock" tries=0 reaped=no stale
-	while [ "$tries" -lt 5 ]; do
+	typeset limit=${2:-5} interval=${3:-1}
+	while [ "$tries" -lt "$limit" ]; do
 		if mkdir "$lock" 2>/dev/null; then
 			if ! printf '%s\n' "$$" > "$lock/pid"; then
 				rm -rf "$lock"
@@ -518,7 +523,7 @@ table_lock() {
 			fi
 		fi
 		tries=$((tries + 1))
-		[ "$tries" -ge 5 ] || sleep 1
+		[ "$tries" -ge "$limit" ] || sleep "$interval"
 	done
 	printf 'could not lock %s: %s exists and did not clear; remove it if no writer is running\n' \
 		"$table" "$lock" >&2
