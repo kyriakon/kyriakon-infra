@@ -21,11 +21,13 @@
 #   landing/www/.git/config                  [core], the blocked-path target
 #   logs/                                    httpd fatals without it
 #
-# The assertions are the behaviour #815 found: the plain file is served, the
-# relative link serves bob's bytes, the absolute link serves the landing
-# checkout's `.git/config`, and a direct `/.git/config` request is blocked. A
-# change in any of the four fails the run, so the residual is not silently
-# forgotten and a fix to the chroot shape arrives as a deliberate edit here.
+# The default assertions are the contract #829 names: the plain file is served,
+# the two links serve nothing outside alice's tree, and a direct `/.git/config`
+# request is blocked. CI sets KYRIAKON_815_OPEN=1 while #815 is open, which pins
+# the known behaviour instead — the relative link serves bob's bytes and the
+# absolute link serves the landing checkout's `.git/config` — so the daemons are
+# still exercised. When the chroot shape changes, the default run starts passing
+# and the CI branch is deleted; if it changes the other way, both fail.
 #
 # The full run is OpenBSD-only: it needs root for chroot(2), the www and _gmid
 # accounts, and the two daemons. --self-test builds the same fixture and checks
@@ -47,6 +49,9 @@ gmid_pid=''
 # command substitution strips trailing newlines, so these are what `$(cat)`
 # returns from the files below.
 BOB_SECRET='bob wrote this and linked it from nowhere'
+# While #815 is open, CI pins the leak it describes rather than the contract;
+# see the header. The default is the contract.
+known_815=${KYRIAKON_815_OPEN:-0}
 GIT_CONFIG='[core]
 	repositoryformatversion = 0
 	bare = false'
@@ -234,6 +239,44 @@ expect_gemini() {
 	printf 'ok: gemini %s: GET %s -> %s\n' "$what" "$path" "$status"
 }
 
+# expect_http_denied <port> <path> <secret> <what>: the link is refused (403 or
+# 404) and its body does not carry the bytes outside the member's tree.
+expect_http_denied() {
+	typeset port="$1" path="$2" secret="$3" what="$4" body status
+	body=$(mktemp "$chroot_dir/http-body.XXXXXX") || return 1
+	status=$(curl -sS --max-time 5 -o "$body" -w '%{http_code}' \
+		"http://127.0.0.1:$port$path" 2>/dev/null) || status='no answer'
+	case "$status" in
+	403 | 404) ;;
+	*)
+		rm -f "$body"
+		die "http $what: GET $path answered [$status], wanted 403 or 404"
+		;;
+	esac
+	if grep -q "$secret" "$body"; then
+		rm -f "$body"
+		die "http $what: GET $path served bytes outside the member tree"
+	fi
+	rm -f "$body"
+	printf 'ok: http %s: GET %s refused as %s\n' "$what" "$path" "$status"
+}
+
+# expect_gemini_denied <port> <path> <secret> <what>: the capsule answers 51
+# (not found) and carries none of the bytes outside the member's tree.
+expect_gemini_denied() {
+	typeset port="$1" path="$2" secret="$3" what="$4" response status line
+	response=$(gemini_get "$port" "$path")
+	line=$(printf '%s\n' "$response" | sed -n 1p)
+	status=$(printf '%s\n' "$line" | cut -d' ' -f1)
+	if [ "$status" != "51" ]; then
+		die "gemini $what: GET $path answered [$line], wanted 51"
+	fi
+	if printf '%s\n' "$response" | grep -q "$secret"; then
+		die "gemini $what: GET $path served bytes outside the member tree"
+	fi
+	printf 'ok: gemini %s: GET %s refused as %s\n' "$what" "$path" "$status"
+}
+
 cleanup() {
 	typeset pid
 	for pid in "$httpd_pid" "$gmid_pid"; do
@@ -285,8 +328,13 @@ full_run() {
 		die "httpd did not answer on 127.0.0.1:$http_port"
 	}
 	expect_http "$http_port" '/index.html' 200 'alice' 'plain file'
-	expect_http "$http_port" '/leak' 200 "$BOB_SECRET" 'relative link'
-	expect_http "$http_port" '/gitleak' 200 '\[core\]' 'absolute .git link'
+	if [ "$known_815" = 1 ]; then
+		expect_http "$http_port" '/leak' 200 "$BOB_SECRET" 'relative link (known #815)'
+		expect_http "$http_port" '/gitleak' 200 '\[core\]' 'absolute .git link (known #815)'
+	else
+		expect_http_denied "$http_port" '/leak' "$BOB_SECRET" 'relative link'
+		expect_http_denied "$http_port" '/gitleak' '[core]' 'absolute .git link'
+	fi
 	expect_http "$http_port" '/.git/config' 403 '' 'direct .git'
 
 	# --- gmid ------------------------------------------------------------
@@ -304,8 +352,13 @@ full_run() {
 		die "gmid did not answer on 127.0.0.1:$gemini_port"
 	}
 	expect_gemini "$gemini_port" '/index.html' 20 'alice' 'plain file'
-	expect_gemini "$gemini_port" '/leak' 20 "$BOB_SECRET" 'relative link'
-	expect_gemini "$gemini_port" '/gitleak' 20 '\[core\]' 'absolute .git link'
+	if [ "$known_815" = 1 ]; then
+		expect_gemini "$gemini_port" '/leak' 20 "$BOB_SECRET" 'relative link (known #815)'
+		expect_gemini "$gemini_port" '/gitleak' 20 '\[core\]' 'absolute .git link (known #815)'
+	else
+		expect_gemini_denied "$gemini_port" '/leak' "$BOB_SECRET" 'relative link'
+		expect_gemini_denied "$gemini_port" '/gitleak' '[core]' 'absolute .git link'
+	fi
 	expect_gemini "$gemini_port" '/.git/config' 51 '' 'direct .git'
 
 	printf '\nverify-hosting: httpd and gmid served the fixture\n'
