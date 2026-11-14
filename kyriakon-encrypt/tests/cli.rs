@@ -602,6 +602,53 @@ fn a_session_key_packet_with_a_literal_packet_is_encrypted_normally() {
 }
 
 #[test]
+fn a_burst_of_packets_in_the_ciphertext_part_is_encrypted_normally() {
+    let env = TestEnv::get();
+    // The same compressed-packet fixture the unit test uses: 618 bytes that
+    // gpg lists as about 18 MB, which is the amplification #823 is about.
+    let armour = include_str!("fixtures/packet-bomb.asc").trim_end();
+
+    let boundary = "kt823-burst";
+    let mut inbound = format!(
+        "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";\n\
+         \tboundary=\"{boundary}\"\n\
+         Subject: a burst of packets\n\
+         MIME-Version: 1.0\n\
+         \n\
+         --{boundary}\n\
+         Content-Type: application/pgp-encrypted\n\
+         \n\
+         Version: 1\n\
+         \n\
+         --{boundary}\n\
+         Content-Type: application/octet-stream\n\
+         \n\
+         {armour}"
+    )
+    .into_bytes();
+    inbound.extend_from_slice(format!("\n--{boundary}--\n").as_bytes());
+
+    // The listing is capped and the child killed, so the save completes instead
+    // of allocating the whole burst, and the part is encrypted like any other
+    // input that is not our ciphertext.
+    let (ok, out) = encrypt_seam_input(env, "alice", &inbound, &scratch_gpg_home(env));
+    assert!(ok, "a packet burst must not fail the save");
+    assert_valid_envelope(&out);
+    assert_ne!(out, inbound);
+
+    let expected = String::from_utf8(inbound.clone()).unwrap().replacen(
+        "\tboundary=\"kt823-burst\"\n",
+        "\tboundary=\"kt823-burst\"; protected-headers=\"v1\"\n",
+        1,
+    );
+    assert_eq!(
+        env.decrypt(&octet_stream(&out)),
+        expected.as_bytes(),
+        "the burst is the payload, not kept in the clear"
+    );
+}
+
+#[test]
 fn a_bare_cr_message_keeps_its_body_out_of_the_clear_wrapper() {
     let env = TestEnv::get();
 
