@@ -845,16 +845,28 @@ table_map_add() {
 # was tightened, or a hand edit, must not stop every body's mail being signed.
 # The skipped domain is absent from the filter, which the warning says.
 #
+# A skipped line *before* the first valid one is refused, because the filter
+# falls back to the first -d: with the platform's line malformed, the fallback
+# moves onto whatever body's domain comes next, its d= stops matching its From
+# and DMARC alignment fails. That is silent, so every caller refuses the render
+# rather than the deploy alone; a later bad line still only warns.
+#
 # The shape is the intake rule: control/crates/core/src/flow/validate.rs's
 # domain() is stricter, and everything it accepts this regex accepts. The
 # guarantee runs that way only: this accepts uppercase and unbounded labels,
 # which the form never produces.
 dkim_domains_args() {
-	typeset dk_args='' dk_domain
+	typeset dk_args='' dk_domain dk_line=0
 	while IFS= read -r dk_domain; do
+		dk_line=$((dk_line + 1))
 		[ -n "$dk_domain" ] || continue
 		if ! printf '%s\n' "$dk_domain" \
 			| grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$'; then
+			if [ -z "$dk_args" ]; then
+				printf '%s: line %s is not a domain (%s) and it is before the first valid line, so nothing is rendered: the filter falls back to the first -d, which would then come from one of the later lines\n' \
+					"$1" "$dk_line" "$dk_domain" >&2
+				return 1
+			fi
 			printf 'warning: %s holds a line that is not a domain, so it is not signed: %s\n' \
 				"$1" "$dk_domain" >&2
 			continue
@@ -889,10 +901,12 @@ install_smtpd_conf() {
 	[ -n "$conf_key" ] || { printf '%s holds no queue key\n' "$conf_keyfile" >&2; return 1; }
 	# smtpd's crypto_setup() rejects anything but exactly 32 characters and
 	# exits, so a restored or hand-edited key of another length is a daemon that
-	# will not start. deploy-mail.sh regenerates one of the right length; this
-	# refuses to install a config that would take the running MTA down.
+	# will not start. A replacement key is only safe when the queue is empty, so
+	# this refuses to install a config built from it and names the decision the
+	# operator has to make; deploy-mail.sh refuses the same file for the same
+	# reason rather than rotating over it.
 	if [ "${#conf_key}" -ne 32 ]; then
-		printf '%s holds a %s-character queue key, not 32; run scripts/deploy-mail.sh to regenerate it\n' \
+		printf '%s holds a %s-character queue key, not 32; it is replaced only deliberately: remove it and run scripts/deploy-mail.sh, which discards anything still queued under it\n' \
 			"$conf_keyfile" "${#conf_key}" >&2
 		return 1
 	fi

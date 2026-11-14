@@ -234,15 +234,31 @@ fpr_of() {
 # new key into the keyring and the record together; installing the tracked key
 # over it would silently revert delivery to a key the member no longer holds, and
 # the published set is the operator's to update after a rotation.
+#
+# The file has to be a regular file gpg can read. `install -m 0644` dereferences a
+# symlink, so a link pushed as keys/<localpart>.asc would copy its target into
+# /etc/kyriakon/keys as a world-readable key on every deploy: the auto-merge guard
+# refuses one, but a human merge is enough to get one in, so the deploy is the
+# boundary that matters. Both refusals name the file and stop the install; a
+# skipped key that the published set names is drift, which
+# scripts/check-keyring-drift.sh would then report for ever.
 install_keyring_key() {
 	typeset name localpart account recorded tracked
 	name=$(basename "$1")
 	localpart=${name%.asc}
+	if [ -L "$1" ] || [ ! -f "$1" ]; then
+		printf 'refused %s: not a regular file\n' "$1" >&2
+		return 1
+	fi
+	tracked=$(fpr_of "$1")
+	if [ -z "$tracked" ]; then
+		printf 'refused %s: gpg can read no key from it\n' "$1" >&2
+		return 1
+	fi
 	account="$store_root/accounts/$localpart/account.json"
 	if [ -f "$account" ] && command -v jq >/dev/null 2>&1; then
 		recorded=$(jq -r '.mail_key // empty' "$account")
-		tracked=$(fpr_of "$1")
-		if [ -n "$recorded" ] && [ -n "$tracked" ] && [ "$recorded" != "$tracked" ]; then
+		if [ -n "$recorded" ] && [ "$recorded" != "$tracked" ]; then
 			printf 'kept %s: the account record names %s and the tracked key is %s\n' \
 				"$name" "$recorded" "$tracked" >&2
 			printf '  the box keeps delivering with the rotated key; publish it to keys/%s.asc and deploy again\n' \
@@ -269,6 +285,61 @@ warn_aead() {
 		printf 'warning: %s advertises AEAD, so delivery would use packet tag 20 rather than SEIPD\n' "$(basename "$1")" >&2
 		printf '  fix on the workstation holding the key: scripts/rekey-mail-key.sh\n' >&2
 	fi
+}
+
+# queue_key_ensure <file>: leave <file> holding a queue key smtpd accepts, or
+# refuse and say why.
+#
+# A missing file is a first deploy and gets a fresh key: 32 hex characters, the
+# shape smtpd's crypto_setup() takes (base64 of 32 bytes is 44 and is rejected at
+# startup). An existing key of the right length is kept, which is the whole point
+# of the file: changing it makes everything still queued undecryptable.
+#
+# A file that exists and is unreadable or the wrong length is refused rather than
+# rotated. A fresh key is only safe once the queue is empty, which the operator
+# knows and the deploy does not, so replacing it is a decision: remove the file
+# and run the deploy again.
+#
+# The new key is written beside the live file at 0600 and renamed onto it. A
+# redirect onto the live path truncates it first, so a kill or a full disk
+# between the truncate and the write leaves a zero-length key: install_smtpd_conf
+# then refuses, and the next deploy would rotate over the key the queue's mail
+# was encrypted with.
+queue_key_ensure() {
+	typeset key_file="$1" key candidate
+	if [ -e "$key_file" ]; then
+		key=$(cat "$key_file" 2>/dev/null) || {
+			printf 'refusing: could not read the queue key in %s; remove it and run this deploy again to generate a new one, which makes anything still queued undecryptable\n' \
+				"$key_file" >&2
+			return 1
+		}
+		[ "${#key}" -eq "$queue_key_len" ] || {
+			printf 'refusing: %s holds a %s-character queue key and smtpd requires %s; remove it and run this deploy again to generate a new one, which makes anything still queued undecryptable\n' \
+				"$key_file" "${#key}" "$queue_key_len" >&2
+			return 1
+		}
+		return 0
+	fi
+	key=$(openssl rand -hex 16) || {
+		printf 'could not generate a queue key for %s\n' "$key_file" >&2
+		return 1
+	}
+	candidate="$key_file.new.$$"
+	# The redirection runs in the subshell whose umask applies to the file it
+	# creates, so the candidate is never readable by anyone else even before the
+	# chmod.
+	if ! (umask 077; printf '%s\n' "$key" > "$candidate"); then
+		rm -f "$candidate"
+		printf 'could not write %s, so %s was left alone\n' "$candidate" "$key_file" >&2
+		return 1
+	fi
+	if ! { chmod 0600 "$candidate" && mv "$candidate" "$key_file"; }; then
+		rm -f "$candidate"
+		printf 'could not install the queue key at %s, which was left alone\n' "$key_file" >&2
+		return 1
+	fi
+	printf 'generated the queue-encryption key in %s (%s characters) - store it in your password manager.\n' \
+		"$key_file" "$queue_key_len"
 }
 
 # dkim_selector <smtpd.conf>: the selector the dkimsign filter signs under, read
@@ -527,6 +598,45 @@ self_test() {
 		"$(grep -c -- '-d parish.12' "$tree/skipped.out" || true)" 0
 	printf 'kyriakon.net\n' > "$tree/dkim_domains"
 
+	# The first -d is the filter's fallback domain, so a line skipped before it
+	# moves the fallback onto a body's domain: every sender whose From domain is
+	# not in the list is then signed with d=<body> and fails DMARC alignment. That
+	# is silent, so the render refuses instead of skipping, and it does so in the
+	# renderer, which is what reload-smtpd.sh and provision-member.sh call too.
+	printf ' parish.example\nkyriakon.net\n' > "$tree/dkim_domains"
+	code=0
+	( dkim_domains_args "$tree/dkim_domains" ) > "$tree/firstbad.out" 2>&1 || code=$?
+	check "a malformed first line fails the render" "$code" 1
+	check "and the refusal names the file, the line and the text" \
+		"$(grep -cF "line 1 is not a domain ( parish.example)" "$tree/firstbad.out")" 1
+	check "and renders no -d at all" \
+		"$(grep -c -- '-d ' "$tree/firstbad.out" || true)" 0
+	printf 'parish.12\nkyriakon.net\n' > "$tree/dkim_domains"
+	code=0
+	( dkim_domains_args "$tree/dkim_domains" ) >/dev/null 2>&1 || code=$?
+	check "a malformed line before the first valid one fails the render" "$code" 1
+	# A blank line is not a skipped domain: the first -d is still the platform's.
+	printf '\nkyriakon.net\n' > "$tree/dkim_domains"
+	check "a blank first line does not move the fallback" \
+		"$(dkim_domains_args "$tree/dkim_domains")" '-d kyriakon.net'
+	printf 'kyriakon.net\nparish.12\n' > "$tree/dkim_domains"
+	check "a malformed later line still only warns" \
+		"$(dkim_domains_args "$tree/dkim_domains" 2>/dev/null)" '-d kyriakon.net'
+
+	# Through the render every caller uses, so the live file is left alone.
+	printf ' parish.example\nkyriakon.net\n' > "$tree/dkim_domains"
+	cp "$tree/smtpd.conf" "$tree/expected-dkim"
+	code=0
+	( install_smtpd_conf "$template" "$tree/dkim_domains" "$tree/queue.key" \
+		"$tree/smtpd.conf" ) >/dev/null 2>&1 || code=$?
+	check "a malformed first line fails the smtpd render" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and the live configuration is unchanged" \
+		"$(cmp -s "$tree/smtpd.conf" "$tree/expected-dkim" && printf same || printf changed)" same
+	check "and no candidate is left beside it" \
+		"$(find "$tree" -maxdepth 1 -name 'smtpd.conf.*' | wc -l | tr -d ' ')" 0
+	printf 'kyriakon.net\n' > "$tree/dkim_domains"
+
 	# The routing rules the mail cannot do without. The enqueuer's rule is what
 	# carries cron's own failure copy and every operator alert off the box: with
 	# it gone they are refused at RCPT and the alert path disappears silently.
@@ -691,6 +801,7 @@ self_test() {
 	# what it prints. gpg is stubbed: this checks the decision, not GnuPG.
 	gpg() {
 		case " $* " in
+		*carol.asc*) return 0 ;;
 		*" --list-packets "*) return 0 ;;
 		esac
 		printf 'fpr:::::::::BBBB BBBB BBBB BBBB:\n'
@@ -723,6 +834,141 @@ self_test() {
 	install_keyring_key "$tree/alice.asc" > "$tree/published.out" 2>&1
 	check "a published rotation installs the tracked key" \
 		"$(cat "$keyring_dir/alice.asc")" 'tracked alice key'
+
+	# A symlink at keys/<localpart>.asc is refused before install: `install -m
+	# 0644` follows it, so the target's bytes would land in the keyring as a key
+	# every account on the box can read. The auto-merge guard refuses one too, but
+	# a human merge is enough to publish it, so this boundary is the one that has
+	# to hold.
+	printf 'a target that must not be published\n' > "$tree/secret"
+	ln -s "$tree/secret" "$tree/mallory.asc"
+	code=0
+	( install_keyring_key "$tree/mallory.asc" ) > "$tree/link.out" 2>&1 || code=$?
+	check "a symlinked key is refused" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and nothing is installed under its name" \
+		"$([ -e "$keyring_dir/mallory.asc" ] && printf yes || printf no)" no
+	check "and the refusal names the link" \
+		"$(grep -cF "refused $tree/mallory.asc: not a regular file" "$tree/link.out")" 1
+	# Any other non-regular file is refused the same way: -f is the check, not
+	# only -L.
+	mkdir "$tree/kept.asc"
+	code=0
+	( install_keyring_key "$tree/kept.asc" ) > "$tree/kept.out" 2>&1 || code=$?
+	check "a directory in keys/ is refused" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and the refusal names it" \
+		"$(grep -cF "refused $tree/kept.asc: not a regular file" "$tree/kept.out")" 1
+
+	# gpg finding no key in the file used to pass: the rotation comparison was
+	# skipped for an empty fingerprint and the install ran, putting a file that
+	# delivers nothing into the keyring. It is a refusal now, naming the file.
+	printf 'not a key at all\n' > "$tree/carol.asc"
+	code=0
+	( install_keyring_key "$tree/carol.asc" ) > "$tree/nokey.out" 2>&1 || code=$?
+	check "a file gpg can read no key from is refused" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and nothing is installed for it" \
+		"$([ -e "$keyring_dir/carol.asc" ] && printf yes || printf no)" no
+	check "and the refusal names the file" \
+		"$(grep -cF "refused $tree/carol.asc: gpg can read no key" "$tree/nokey.out")" 1
+
+	# --- the queue key ---
+	# smtpd's crypto_setup() takes exactly 32 characters and exits otherwise, and
+	# the key has to stay the one the queue's mail was encrypted with. A new key is
+	# written whole, beside the live file and renamed onto it, so an interruption
+	# cannot leave a zero-length key where the old one was; an existing key this
+	# cannot read or of the wrong length is refused rather than rotated over.
+	qk="$tree/fresh-queue.key"
+	queue_key_ensure "$qk" > "$tree/qk-new.out" 2>&1
+	check "a missing queue key is generated" \
+		"$([ -s "$qk" ] && printf yes || printf no)" yes
+	check "with the length smtpd requires, and a newline" \
+		"$(wc -c < "$qk" | tr -d ' ')" 33
+	check "at 0600" "$(stat -f %Lp "$qk")" 600
+	check "and the run says to store it" \
+		"$(grep -c 'generated the queue-encryption key' "$tree/qk-new.out")" 1
+	before=$(stat -f %i "$qk")
+	queue_key_ensure "$qk" > "$tree/qk-again.out" 2>&1
+	check "an existing key is kept, not rotated" \
+		"$([ "$(stat -f %i "$qk")" = "$before" ] && printf yes || printf no)" yes
+	check "and a second run says nothing" \
+		"$(wc -c < "$tree/qk-again.out" | tr -d ' ')" 0
+
+	: > "$tree/qk-empty"
+	code=0
+	( queue_key_ensure "$tree/qk-empty" ) > "$tree/qk-empty.out" 2>&1 || code=$?
+	check "a zero-length queue key stops the deploy" "$code" 1
+	check "and is left as it was" \
+		"$(wc -c < "$tree/qk-empty" | tr -d ' ')" 0
+	check "and the refusal names the file" \
+		"$(grep -cF "$tree/qk-empty" "$tree/qk-empty.out")" 1
+	printf '0123456789abcdef\n' > "$tree/qk-short"
+	cp "$tree/qk-short" "$tree/qk-short.expected"
+	code=0
+	( queue_key_ensure "$tree/qk-short" ) > "$tree/qk-short.out" 2>&1 || code=$?
+	check "a wrong-length queue key stops the deploy" "$code" 1
+	check "and is not replaced" \
+		"$(cmp -s "$tree/qk-short" "$tree/qk-short.expected" && printf same || printf changed)" same
+	check "and the refusal names the file and the decision" \
+		"$(grep -cF 'remove it and run this deploy again' "$tree/qk-short.out")" 1
+
+	# An interruption between generation and the rename leaves no key and no
+	# candidate: the live path is either the old key or the new one, which is what
+	# the in-place redirect could not promise.
+	openssl() { return 1; }
+	code=0
+	( queue_key_ensure "$tree/qk-nogen" ) > "$tree/qk-nogen.out" 2>&1 || code=$?
+	check "a generation that fails installs nothing" \
+		"$([ "$code" -eq 1 ] && [ ! -e "$tree/qk-nogen" ] && printf yes || printf no)" yes
+	unset -f openssl
+	mv() { return 1; }
+	code=0
+	( queue_key_ensure "$tree/qk-nomv" ) > "$tree/qk-nomv.out" 2>&1 || code=$?
+	check "a rename that fails installs nothing" \
+		"$([ "$code" -eq 1 ] && [ ! -e "$tree/qk-nomv" ] && printf yes || printf no)" yes
+	check "and leaves no candidate beside it" \
+		"$(find "$tree" -maxdepth 1 -name 'qk-nomv.new.*' | wc -l | tr -d ' ')" 0
+	unset -f mv
+
+	# --- the auto-merge guard ---
+	# A key's name is not the key. The pull request's file list carries no mode, so
+	# the workflow reads what the blob is from the contents API; the snippet is run
+	# here from the workflow's own bytes, with gh stubbed, because it is the only
+	# check standing between a symlink pushed as keys/x.asc and the install above.
+	workflow="$repo_dir/.github/workflows/auto-merge-key.yml"
+	guard=$(awk '/# --- added key blob guard: run by/ { found = 1 }
+		found { print }
+		/# --- end added key blob guard ---/ { found = 0 }' "$workflow")
+	check "the workflow's guard is a snippet this test can read" \
+		"$([ -n "$guard" ] && printf yes || printf no)" yes
+	# shellcheck disable=SC2294 # the shipped snippet, read from the workflow above
+	eval "$guard"
+	# Exported because the workflow's snippet reads them from the environment, the
+	# same way lib.sh exports cert_chain so shellcheck sees the cross-file use.
+	export GITHUB_REPOSITORY=kyriakon/kyriakon-infra
+	export HEAD_SHA=0123456789abcdef0123456789abcdef01234567
+	gh() {
+		case "$*" in
+		*keys/link.asc*) printf 'symlink\n' ;;
+		*keys/absent.asc*) return 1 ;;
+		*) printf 'file\n' ;;
+		esac
+	}
+	code=0
+	( keys_regular keys/good.asc ) >/dev/null 2>&1 || code=$?
+	check "the guard accepts a regular added key" "$code" 0
+	code=0
+	( keys_regular keys/good.asc keys/link.asc ) > "$tree/guard.out" 2>&1 || code=$?
+	check "a symlinked added key is not merged" "$code" 1
+	check "and the guard names it and what it is" \
+		"$(grep -c '^keys/link.asc is not a regular file (symlink)$' "$tree/guard.out")" 1
+	code=0
+	( keys_regular keys/absent.asc ) > "$tree/guard-absent.out" 2>&1 || code=$?
+	check "a blob the contents API cannot answer for is not merged" "$code" 1
+	code=0
+	( keys_regular ) >/dev/null 2>&1 || code=$?
+	check "a removal with no added key passes the guard" "$code" 0
 
 	# --- the install-set reader ---
 	# The /root/bin installs are the table's rows, so this reader decides what
@@ -1154,24 +1400,11 @@ start_service inetd
 # --- 3. smtpd + dovecot configs -----------------------------------------
 
 say "configs"
-queue_key=
-if [ -s "$queue_key_file" ]; then
-	queue_key=$(cat "$queue_key_file")
-fi
-if [ "${#queue_key}" -ne "$queue_key_len" ]; then
-	if [ -n "$queue_key" ]; then
-		printf 'warning: %s holds a %s-character key and smtpd requires %s; replacing it. Anything still queued under the old key becomes undecryptable.\n' \
-			"$queue_key_file" "${#queue_key}" "$queue_key_len"
-	fi
-	# 32 hex characters, as smtpd's crypto_setup() comment suggests. base64 of
-	# 32 bytes is 44 characters and is rejected at startup.
-	queue_key=$(openssl rand -hex 16)
-	(umask 077; printf '%s\n' "$queue_key" > "$queue_key_file")
-	# umask only governs creation, so an existing file could carry looser bits.
-	chmod 0600 "$queue_key_file"
-	printf 'generated the queue-encryption key in %s (%s characters) - store it in your password manager.\n' \
-		"$queue_key_file" "$queue_key_len"
-fi
+# The queue key is only ever written whole: queue_key_ensure generates into a
+# sibling file and renames it, and refuses an existing key it cannot read or that
+# is the wrong length rather than rotating over it. Replacing the key is the
+# operator's decision, made by removing the file.
+queue_key_ensure "$queue_key_file" || exit 1
 
 # The two tables smtpd.conf reads. Both are generated on the box: this deploy
 # seeds only the platform's own entries and leaves the rest of each file alone,
@@ -1487,7 +1720,9 @@ install -m 0755 "$repo_dir/kyriakon-encrypt/target/release/kyriakon-encrypt" "$e
 say "keyring"
 install -d -m 0755 "$keyring_dir"
 for k in "$repo_dir"/keys/*.asc; do
-	[ -e "$k" ] || continue
+	# A dangling symlink is matched by the glob but not by -e; it still reaches
+	# install_keyring_key, whose refusal is the point.
+	[ -e "$k" ] || [ -L "$k" ] || continue
 	install_keyring_key "$k"
 done
 
