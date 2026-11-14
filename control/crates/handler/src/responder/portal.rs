@@ -135,7 +135,7 @@ pub(super) async fn portal_file(app: &App, address: &str, body: &str) -> String 
             return ipc::file_answer(None, "Temporary failure. Try again in a moment.");
         }
     };
-    let body_branch = form.get("whose").map(String::as_str) == Some("body");
+    let body_branch = form.get("whose").map(|v| v.trim()) == Some("body");
     let record = match build_record(app, &form, body_branch, &token, "tui") {
         Ok(record) => record,
         Err(e) => {

@@ -398,7 +398,10 @@ fn the_capsule_query_decoding_is_the_gemini_one() {
     assert_eq!(capsule_value("line1\r\nline2"), "line1\nline2");
     assert_eq!(capsule_value("a+b"), "a+b");
     assert_eq!(capsule_value("a\rb"), "a\rb");
-    assert_eq!(capsule_value("line%0D"), "line\r");
+    // Validation trims with `str::trim`, so the padding the capsule stores is
+    // the padding that was checked; a bare CR inside the answer is still kept.
+    assert_eq!(capsule_value("line%0D"), "line");
+    assert_eq!(capsule_value("line%0Dmore"), "line\rmore");
     assert_eq!(capsule_value("."), "");
 }
 

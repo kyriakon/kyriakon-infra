@@ -14,7 +14,7 @@
 //! wording change is therefore a rebuild rather than a deploy, which is the
 //! accepted price of one home for the list.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::Error;
 use serde::Deserialize;
@@ -270,23 +270,33 @@ pub fn shown(list: &[Question], person: bool) -> Vec<&Question> {
 /// Whether an answer selects the monastic path: the monastic answer to `orders`
 /// makes the elder's or confessor's blessing required.
 pub fn is_monastic(orders: Option<&str>) -> bool {
-    matches!(orders, Some("monk") | Some("nun"))
+    matches!(orders.map(str::trim), Some("monk") | Some("nun"))
 }
 
 /// The body's account names, one per mailbox, in the order the answers gave.
 /// The form, the capsule and the mail route all pair a key with one of these
-/// names, so the parsing lives here rather than in three places.
-pub fn account_names(answers: &BTreeMap<String, String>) -> Vec<String> {
-    answers
+/// names, so the parsing lives here rather than in three places. A name given
+/// twice is an error: two key records under one mailbox cannot agree on which
+/// fingerprint the account holds.
+pub fn account_names(answers: &BTreeMap<String, String>) -> Result<Vec<String>, Error> {
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    for line in answers
         .get("body_account_names")
-        .map(|s| {
-            s.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+        .map(String::as_str)
+        .unwrap_or("")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
+        if !seen.insert(line) {
+            return Err(Error::Failed(format!(
+                "the account name {line:?} is given twice"
+            )));
+        }
+        names.push(line.to_string());
+    }
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -387,8 +397,26 @@ required = true
     fn the_monastic_answer_selects_the_monastic_path() {
         assert!(is_monastic(Some("monk")));
         assert!(is_monastic(Some("nun")));
+        assert!(is_monastic(Some("monk ")));
         assert!(!is_monastic(Some("layman")));
         assert!(!is_monastic(None));
+    }
+
+    #[test]
+    fn account_names_are_the_lines_in_order_and_a_repeat_is_an_error() {
+        let mut answers = BTreeMap::new();
+        answers.insert(
+            "body_account_names".to_string(),
+            " secretary \n\nhall\n".to_string(),
+        );
+        assert_eq!(account_names(&answers).unwrap(), ["secretary", "hall"]);
+
+        answers.insert(
+            "body_account_names".to_string(),
+            "secretary\nhall\nsecretary".to_string(),
+        );
+        let why = account_names(&answers).unwrap_err().to_string();
+        assert!(why.contains("secretary") && why.contains("twice"), "{why}");
     }
 
     #[test]

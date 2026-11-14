@@ -34,7 +34,7 @@ pub struct Mailbox {
 /// one mail-key page per mailbox. The capsule and the terminal both walk it, so
 /// the counter and the branches cannot disagree between the two.
 pub fn flow_path<'a>(list: &'a [Question], answers: &BTreeMap<String, String>) -> Vec<Page<'a>> {
-    let body = answers.get("whose").map(String::as_str) == Some("body");
+    let body = answers.get("whose").map(|v| v.trim()) == Some("body");
     let monastic = questions::is_monastic(answers.get("orders").map(String::as_str));
     let mut out = Vec::new();
     for q in questions::shown(list, !body) {
@@ -54,7 +54,7 @@ pub fn flow_path<'a>(list: &'a [Question], answers: &BTreeMap<String, String>) -
             });
         } else if q.id == "body_mail_key" && body {
             let domain = answers.get("body_domain").cloned().unwrap_or_default();
-            for name in questions::account_names(answers) {
+            for name in questions::account_names(answers).unwrap_or_default() {
                 let address = if domain.is_empty() {
                     name.clone()
                 } else {
@@ -118,7 +118,10 @@ pub fn flow_problem(
 pub fn flow_answers(record: &draft::Draft, body: bool) -> BTreeMap<String, String> {
     let mut answers = record.answers.clone();
     let (id, mailboxes) = if body {
-        ("body_mail_key", questions::account_names(&record.answers))
+        (
+            "body_mail_key",
+            questions::account_names(&record.answers).unwrap_or_default(),
+        )
     } else {
         (
             "mail_key",
@@ -153,7 +156,7 @@ pub struct Reading {
 /// field whichever front-end filed the submission: the web form posts its select,
 /// and the terminal and the capsule post the same answer.
 pub fn reading(form: &BTreeMap<String, String>) -> Reading {
-    let body = form.get("whose").map(String::as_str) == Some("body");
+    let body = form.get("whose").map(|v| v.trim()) == Some("body");
     let shown = match form.get("branch") {
         // The web form posts the branch its page was rendered for. An answer
         // naming the other one means the applicant changed the select without
@@ -187,11 +190,16 @@ pub fn label(form: &BTreeMap<String, String>) -> Result<&'static str, Error> {
 pub fn body_cross_checks(form: &BTreeMap<String, String>, errors: &mut Vec<String>) {
     let addresses = form.get("body_addresses").map(String::as_str).unwrap_or("");
     let a = addresses.lines().filter(|l| !l.trim().is_empty()).count();
-    let n = questions::account_names(form).len();
-    if a != n {
-        errors.push(format!(
-            "The addresses, one per line: {a} addresses and {n} account names; there is one account name per address"
-        ));
+    match questions::account_names(form) {
+        Ok(names) => {
+            if a != names.len() {
+                errors.push(format!(
+                    "The addresses, one per line: {a} addresses and {} account names; there is one account name per address",
+                    names.len()
+                ));
+            }
+        }
+        Err(why) => errors.push(format!("The account names, one per line: {why}")),
     }
     if let Some(why) = validate::address_lines(addresses) {
         errors.push(format!("The addresses, one per line: {why}"));
@@ -206,7 +214,9 @@ pub fn mail_key_errors(q: &Question, value: &str, form: &BTreeMap<String, String
         return vec!["a public key is needed".to_string()];
     }
     if q.id == "body_mail_key" {
-        let mailboxes = questions::account_names(form).len();
+        let mailboxes = questions::account_names(form)
+            .map(|names| names.len())
+            .unwrap_or_default();
         if blocks.len() != mailboxes {
             return vec![format!(
                 "one key per mailbox: {mailboxes} mailboxes and {} keys",

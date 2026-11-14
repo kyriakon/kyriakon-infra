@@ -300,9 +300,9 @@ pub(super) fn capsule_skip_mailed(path: &[Page], record: &mut draft::Draft) -> b
 /// clients' empty answer.
 pub(super) fn capsule_value(raw: &str) -> String {
     let decoded = decode(raw, false).replace("\r\n", "\n");
-    // Only the answer's own padding is removed. `str::trim` also removes `\r`,
-    // and the specification says a bare CR is an ordinary character.
-    let trimmed = decoded.trim_matches(|c: char| matches!(c, ' ' | '\n' | '\t'));
+    // The same trim validation applies, so the stored answer is the value that
+    // was checked.
+    let trimmed = decoded.trim();
     if trimmed == "." {
         String::new()
     } else {

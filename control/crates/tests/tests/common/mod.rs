@@ -938,7 +938,7 @@ impl Fix {
             ("body_domain", "parish.example"),
             ("body_records", "yes"),
             ("body_addresses", "secretary: own\noffice: alias secretary"),
-            ("body_account_names", "parish-secretary\nparish-secretary"),
+            ("body_account_names", "parish-secretary\nparish-office"),
             ("body_dns_contact", "warden@example.invalid"),
             ("rail", "cash"),
         ]
