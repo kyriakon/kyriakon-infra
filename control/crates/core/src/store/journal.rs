@@ -35,8 +35,8 @@ struct Index {
     failed_at: HashMap<String, Vec<usize>>,
     /// (status token, kind, outcome) → (position, intent id) for each line.
     marks: HashMap<(String, String, String), Vec<(usize, String)>>,
-    /// Status tokens whose approval has an `applying` line.
-    started: HashSet<String>,
+    /// Status token → the username its approval began under.
+    started: HashMap<String, String>,
     /// Intent id → the progress its first `applying` credit line carried.
     credits: HashMap<String, CreditProgress>,
 }
@@ -71,7 +71,12 @@ impl Index {
         }
         if line.outcome == "applying" && (line.kind == "approve" || line.kind == "provision") {
             if let Some(token) = line.application.status_token.as_deref() {
-                self.started.insert(token.to_string());
+                // The first line wins: it names the account the approval began,
+                // and a later retry under a rewritten record must not replace
+                // it. The line is root-written from the signed decision.
+                self.started
+                    .entry(token.to_string())
+                    .or_insert_with(|| line.application.username.clone());
             }
         }
         if line.outcome == "applying" {
@@ -166,18 +171,24 @@ impl Journal {
         })
     }
 
-    /// Whether this application's approval already began. The journal records
-    /// "applying" after the name check and before provisioning, so a name that is
-    /// on the box and has that line is one this application made, and the retry
-    /// continues with it rather than refusing it as taken.
+    /// The username this application's approval began under, if it began. The
+    /// journal records "applying" after the name check and before provisioning,
+    /// so a name that is on the box and has that line is one this application
+    /// made, and the retry continues with it rather than refusing it as taken.
+    ///
+    /// The name is returned rather than a bare bool. The record in
+    /// `applications/<token>.json` belongs to the unprivileged handler, and a
+    /// retry that trusted a token-keyed yes would let a record rewritten to
+    /// another name adopt the account this application made under the first.
+    /// The caller compares the two and refuses the rewrite.
     ///
     /// The kind is matched as well. Three transitions write that word for a token:
     /// the approval, the decline and the purge. Without the kind, a decline that
     /// could not finish would make a later approval of the same application believe
     /// the account on the box was its own, and it would adopt a name this
     /// application never made.
-    pub fn approval_started(&self, token: &str) -> bool {
-        self.lock().started.contains(token)
+    pub fn approval_started(&self, token: &str) -> Option<String> {
+        self.lock().started.get(token).cloned()
     }
 
     /// The values a credit recorded on its `applying` line, if it has got that
@@ -402,6 +413,76 @@ mod tests {
             text.contains("\"username\":\"secretary\""),
             "the page's subject lost its account: {text}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An approval's `applying` line is indexed with the name it began under,
+    /// which is what lets a retry refuse a record rewritten to another account.
+    /// The first name wins, and a decline's line is not an approval.
+    #[test]
+    fn an_applying_line_remembers_the_name_the_approval_began_under() {
+        let (store, dir) = store("started");
+        runtime().block_on(async {
+            let journal = Journal::load(&store).await.unwrap();
+            assert_eq!(journal.approval_started(TOKEN), None);
+            journal
+                .append(
+                    &store,
+                    &line_for(
+                        "01H",
+                        "approve",
+                        "applying",
+                        None,
+                        ApplicationRef::application("secretary", TOKEN),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                journal.approval_started(TOKEN).as_deref(),
+                Some("secretary")
+            );
+            // A later line cannot rename the account the approval began; the
+            // account was made under the first name.
+            journal
+                .append(
+                    &store,
+                    &line_for(
+                        "01J",
+                        "provision",
+                        "applying",
+                        None,
+                        ApplicationRef::application("www", TOKEN),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                journal.approval_started(TOKEN).as_deref(),
+                Some("secretary"),
+                "a later name replaced the one the approval began under"
+            );
+            // A decline's "applying" line is not an approval.
+            let declined = "0123456789abcdefghjkmnpqrt";
+            journal
+                .append(
+                    &store,
+                    &line_for(
+                        "01K",
+                        "decline",
+                        "applying",
+                        None,
+                        ApplicationRef::application("www", declined),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                journal.approval_started(declined),
+                None,
+                "a decline began an approval"
+            );
+        });
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

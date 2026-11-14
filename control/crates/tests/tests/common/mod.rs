@@ -90,6 +90,9 @@ mAYEAAAAABK4BgQAAAAAEg==\n-----END PGP PUBLIC KEY BLOCK-----\n";
 
 pub struct Fix {
     pub dir: PathBuf,
+    /// Applications filed by this fixture; the first keeps `TOKEN` so the many
+    /// tests that read `applications/TOKEN.json` still see it.
+    filed_count: std::cell::Cell<usize>,
 }
 
 impl Fix {
@@ -112,7 +115,10 @@ impl Fix {
         ] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
-        let fix = Fix { dir };
+        let fix = Fix {
+            dir,
+            filed_count: std::cell::Cell::new(0),
+        };
         std::fs::write(fix.path("key"), KEY).unwrap();
         std::fs::set_permissions(fix.path("key"), std::fs::Permissions::from_mode(0o600)).unwrap();
         // Stripe's webhook signing secret and the restricted API key, both
@@ -611,6 +617,21 @@ impl Fix {
         self.filed_with(username, rail, answers, None, Some((UPLOAD_KEY, "works")))
     }
 
+    /// The next application's status token: the module `TOKEN` for the first
+    /// filing, a fresh ULID after that, so two accounts filed into one fixture
+    /// do not share a record while the tests that name `TOKEN` keep working.
+    pub fn fresh_token(&self) -> String {
+        let n = self.filed_count.get();
+        self.filed_count.set(n + 1);
+        if n == 0 {
+            TOKEN.to_string()
+        } else {
+            // The store's token shape is lowercase Crockford; Ulid's Display is
+            // uppercase, which the intent contract refuses.
+            ulid().to_ascii_lowercase()
+        }
+    }
+
     pub fn filed_with(
         &self,
         username: &str,
@@ -632,9 +653,13 @@ impl Fix {
         // Relative, so a fixture filed today is inside ADR 0005's window
         // whenever the suite runs; a fixed date would be purged after it.
         let filed_at = kyriakon_control_core::util::after_days(-40);
+        // Production draws a fresh capability token per application, and two
+        // approvals in one `Fix` must not collide on one record. The first
+        // keeps the module TOKEN because tests name its path directly.
+        let token = self.fresh_token();
         let record = json!({
             "username": username,
-            "status_token": TOKEN,
+            "status_token": token,
             "filed_at": filed_at,
             "front_end": "web",
             "stage": "received",
@@ -643,7 +668,9 @@ impl Fix {
             "mail_keys": [{
                 "mailbox": "",
                 "fingerprint": "1111 2222 3333 4444",
-                "material": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n-----END PGP PUBLIC KEY BLOCK-----",
+                // The approval re-runs the key check before it installs, so the
+                // fixture carries a block the check can frame.
+                "material": GOOD_KEY,
                 "verdict": "works",
             }],
             "upload_key": upload_key,
@@ -655,7 +682,7 @@ impl Fix {
         std::fs::write(
             self.dir
                 .join("store/applications")
-                .join(format!("{TOKEN}.json")),
+                .join(format!("{token}.json")),
             serde_json::to_vec_pretty(&record).unwrap(),
         )
         .unwrap();
@@ -717,6 +744,19 @@ impl Fix {
         let mut account = self.account(username);
         amend(&mut account);
         self.write_account(username, &account);
+    }
+
+    /// Change a filed application record in place, as the unprivileged handler
+    /// that owns `applications/` can.
+    pub fn amend_application(&self, token: &str, amend: impl FnOnce(&mut Value)) {
+        let path = self
+            .dir
+            .join("store/applications")
+            .join(format!("{token}.json"));
+        let mut record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        amend(&mut record);
+        std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
     }
 
     /// Write one `provision-group` intent under `id`, as an approval files it.
@@ -942,13 +982,17 @@ impl Fix {
         record
     }
 
-    /// Replace the application record `filed_body` wrote, when a test changes
-    /// its answers after building it.
+    /// Replace the application record a fixture wrote, when a test changes its
+    /// answers after building it. The record names its own token, and `filed`
+    /// draws a fresh one per call.
     pub fn rewrite_record(&self, record: &Value) {
+        let token = record["status_token"]
+            .as_str()
+            .expect("a filed record names its status token");
         std::fs::write(
             self.dir
                 .join("store/applications")
-                .join(format!("{TOKEN}.json")),
+                .join(format!("{token}.json")),
             serde_json::to_vec_pretty(record).unwrap(),
         )
         .unwrap();
@@ -977,15 +1021,76 @@ impl Fix {
         .unwrap();
     }
 
-    pub fn decide(&self, kind: &str, username: &str) -> String {
-        let action = action_for(kind);
-        let sig = self.sign_action(action);
-        self.write_decision(kind, action, &sig, username)
+    /// The latest filed application for a username. `filed` draws a fresh
+    /// status token per call, as production does, so a decision resolves the
+    /// record by the account the caller names rather than by the module token.
+    /// Two applications for one name are the same case the console refuses by
+    /// token, and the fixture takes the latest filing.
+    pub fn find_record(&self, username: &str) -> Option<Record> {
+        let mut best: Option<(String, String, Record)> = None;
+        for name in self.names("applications") {
+            if !name.ends_with(".json") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(self.dir.join("store/applications").join(&name))
+            else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_str::<Record>(&text) else {
+                continue;
+            };
+            if record.username != username {
+                continue;
+            }
+            let newer = best.as_ref().is_none_or(|(filed_at, file, _)| {
+                (record.filed_at.as_str(), name.as_str()) > (filed_at.as_str(), file.as_str())
+            });
+            if newer {
+                best = Some((record.filed_at.clone(), name, record));
+            }
+        }
+        best.map(|(_, _, record)| record)
     }
 
-    /// A decision intent with whatever action and signature the caller gives, so
-    /// a test can try one the drain must refuse.
+    /// File the decision for a username's latest application, signed over that
+    /// record and carrying its token.
+    pub fn decide(&self, kind: &str, username: &str) -> String {
+        let action = action_for(kind);
+        match self.find_record(username) {
+            Some(record) => {
+                let sig = sign::sign(b"the approval key", &sign::decide_payload(&record, action))
+                    .unwrap();
+                self.write_decision_at(kind, action, &sig, username, &record.status_token)
+            }
+            None => {
+                // A decision for an application never filed: signed so the
+                // drain's missing-record refusal is what the pass reports.
+                let sig =
+                    sign::sign(b"the approval key", &format!("decide:{TOKEN}:{action}")).unwrap();
+                self.write_decision_at(kind, action, &sig, username, TOKEN)
+            }
+        }
+    }
+
+    /// A decision intent for a username's latest application, with whatever
+    /// signature the caller gives, so a test can try one the drain must refuse.
     pub fn write_decision(&self, kind: &str, action: &str, sig: &str, username: &str) -> String {
+        let token = self
+            .find_record(username)
+            .map_or_else(|| TOKEN.to_string(), |record| record.status_token);
+        self.write_decision_at(kind, action, sig, username, &token)
+    }
+
+    /// A decision intent naming an explicit token, for a test whose intent
+    /// username deliberately differs from the record it is aimed at.
+    pub fn write_decision_at(
+        &self,
+        kind: &str,
+        action: &str,
+        sig: &str,
+        username: &str,
+        token: &str,
+    ) -> String {
         let id = ulid();
         self.write_intent(
             &id,
@@ -993,7 +1098,7 @@ impl Fix {
                 "id": id,
                 "kind": kind,
                 "filed_at": "2026-10-02T09:00:00Z",
-                "application": {"username": username, "status_token": TOKEN},
+                "application": {"username": username, "status_token": token},
                 "action": action,
                 "sig": sig,
             }),
@@ -1001,10 +1106,34 @@ impl Fix {
         id
     }
 
-    /// The signature the drain will accept for an action, from the same key the
-    /// fixture's kyriakon-admin reads.
+    /// The payload a decision signs for the record at the module `TOKEN` (the
+    /// group fixtures write one there), built exactly as the console builds it.
+    pub fn decision_payload(&self, action: &str) -> String {
+        let record: Record =
+            serde_json::from_str(&self.read(&format!("applications/{TOKEN}.json"))).unwrap();
+        sign::decide_payload(&record, action)
+    }
+
+    /// The signature for an action against the record at the module `TOKEN`,
+    /// for the tests that build an intent by hand. A decision for a username
+    /// uses `decide`, which resolves that username's own record.
     pub fn sign_action(&self, action: &str) -> String {
-        sign::sign(b"the approval key", &sign::decide_payload(TOKEN, action)).unwrap()
+        let payload =
+            match serde_json::from_str::<Record>(&self.read(&format!("applications/{TOKEN}.json")))
+            {
+                Ok(record) => sign::decide_payload(&record, action),
+                Err(_) => format!("decide:{TOKEN}:{action}"),
+            };
+        sign::sign(b"the approval key", &payload).unwrap()
+    }
+
+    /// The signature the drain will accept for an action against a username's
+    /// latest application, from the same key the fixture's kyriakon-admin reads.
+    pub fn sign_action_for(&self, action: &str, username: &str) -> String {
+        let record = self
+            .find_record(username)
+            .unwrap_or_else(|| panic!("the fixture filed no application for {username}"));
+        sign::sign(b"the approval key", &sign::decide_payload(&record, action)).unwrap()
     }
 
     /// A provision-member.sh that refuses when the upload key file is not there,
