@@ -188,60 +188,29 @@ from_problem() {
 		while (match(value, /\([^()]*\)/)) {
 			value = substr(value, 1, RSTART - 1) " " substr(value, RSTART + RLENGTH)
 		}
-		# One pass for every mailbox in the header. Quoted display-name
-		# strings are blanked first, so the comma in `"A, Inc." <a@b>` is
-		# not read as an address separator; quotes inside <...> belong to
-		# the addr-spec and are left alone. A comma-separated part that has
-		# brackets carries its addresses in them and the text beside them is
-		# only a display name; a part without brackets is a bare addr-spec
-		# and is checked too, or `hello@kyriakon.net, <alice@kyriakon.net>`
-		# would pass by naming one usable address.
-		clean = ""; inq = 0; esc = 0; inangle = 0; added = 0
-		for (i = 1; i <= length(value); i++) {
-			c = substr(value, i, 1)
-			if (inq) {
-				if (esc) {
-					esc = 0
-				} else if (c == "\\") {
-					esc = 1
-				} else if (c == "\"") {
-					inq = 0
-				}
-				clean = clean " "
-				continue
-			}
-			if (inangle) {
-				if (c == ">")
-					inangle = 0
-				clean = clean c
-				continue
-			}
-			if (c == "\"") {
-				inq = 1
-				clean = clean " "
-				continue
-			}
-			if (c == "<")
-				inangle = 1
-			clean = clean c
-		}
-		# A quote or angle bracket that never closes leaves no address to
-		# check, and an unchecked header must not pass: dkimsign would sign
-		# whatever domain the unreadable header names.
-		if (inq || inangle)
-			problem("5.7.1 the From header has an unterminated " \
-				(inq ? "quoted string" : "angle address"))
-		n = split(clean, part, ",")
+		# Blank quoted display-name strings in one regex pass, so the comma in
+		# `"A, Inc." <a@b>` is not read as an address separator. The alternation
+		# keeps an escaped quote inside the string; a quote left over after it
+		# is one that never closed, and an unreadable header must not pass.
+		gsub(/"[^"\\]*(\\.?[^"\\]*)*"/, " ", value)
+		if (index(value, "\"") > 0)
+			problem("5.7.1 the From header has an unterminated quoted string")
+		added = 0
+		n = split(value, part, ",")
 		for (i = 1; i <= n; i++) {
 			p = part[i]
 			if (index(p, "<") == 0) {
 				add(p)
 				continue
 			}
+			# Every <...> is an address; the text beside it is a display name.
+			# A bracket still in the part after the extraction never closed.
 			while (match(p, /<[^>]*>/)) {
 				add(substr(p, RSTART + 1, RLENGTH - 2))
 				p = substr(p, 1, RSTART - 1) substr(p, RSTART + RLENGTH)
 			}
+			if (index(p, "<") > 0 || index(p, ">") > 0)
+				problem("5.7.1 the From header has an unterminated angle address")
 		}
 		# A header that parsed to no address at all (a quoted string with no
 		# mailbox beside it) has nothing to check, so it cannot pass.
