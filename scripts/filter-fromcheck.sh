@@ -136,6 +136,7 @@ from_problem() {
 		a = tolower(trim(a))
 		if (a == "")
 			return
+		added++
 		if (mode == "auth") {
 			if (index(a, "@") == 0 ||
 			    index(allowed[user] ",", "," a ",") == 0)
@@ -195,7 +196,7 @@ from_problem() {
 		# only a display name; a part without brackets is a bare addr-spec
 		# and is checked too, or `hello@kyriakon.net, <alice@kyriakon.net>`
 		# would pass by naming one usable address.
-		clean = ""; inq = 0; esc = 0; inangle = 0
+		clean = ""; inq = 0; esc = 0; inangle = 0; added = 0
 		for (i = 1; i <= length(value); i++) {
 			c = substr(value, i, 1)
 			if (inq) {
@@ -242,6 +243,10 @@ from_problem() {
 				p = substr(p, 1, RSTART - 1) substr(p, RSTART + RLENGTH)
 			}
 		}
+		# A header that parsed to no address at all (a quoted string with no
+		# mailbox beside it) has nothing to check, so it cannot pass.
+		if (mode == "auth" && added == 0)
+			problem("5.7.1 the From header names no address")
 	}'
 }
 
@@ -554,6 +559,16 @@ $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: alice@kyriakon.net
 $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: <hello@kyriakon.net")"
 	check_reject "an unterminated angle address is refused" \
 		"550 5.7.1 the From header has an unterminated angle address"
+
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: \"hello@kyriakon.net\"")"
+	check_reject "a quoted string with no mailbox is refused" \
+		"550 5.7.1 the From header names no address"
+
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: \"\"")"
+	check_reject "an empty quoted header is refused" \
+		"550 5.7.1 the From header names no address"
 
 	run_case "$(connect_remote)
 $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: alice")"
