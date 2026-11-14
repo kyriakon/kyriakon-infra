@@ -8,8 +8,9 @@
 # `box` is the checkout itself: git updates it, and no deploy owns that. The CI
 # column is not "the box has it", it is "the CI VM installs it", so rust
 # and dovecot stay out because the self-tests do not build the plugin or start
-# the mail daemons, and gmid and the DKIM filter stay out until a CI step checks
-# the configs that need them.
+# the mail daemons, and the DKIM filter stays out until a CI step checks the
+# config that needs it. gmid is in because scripts/verify-hosting.sh starts it
+# against a fixture chroot, alongside httpd from base.
 #
 # curl and jq are the clients the onboarding and keyring scripts use. jq is also
 # the only base64 encoder on the box: OpenBSD ships no base64(1).
@@ -18,7 +19,7 @@
 curl	deploy-mail.sh,deploy-control.sh	yes
 dovecot	deploy-mail.sh	no
 git	box	yes
-gmid	deploy-mail.sh,deploy-control.sh	no
+gmid	deploy-mail.sh,deploy-control.sh	yes
 gnupg	deploy-mail.sh	yes
 hcloud	deploy-mail.sh	no
 helix	deploy-mail.sh	no
