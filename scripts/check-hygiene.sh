@@ -224,7 +224,11 @@ deployed_drift() {
 	renamed=$(install_renames "$token")
 	[ -n "$renamed" ] || return 0
 	while read -r installed src; do
-		[ -f "$dir/$installed" ] || continue
+		if [ ! -f "$dir/$installed" ]; then
+			printf '%s: not installed, and install_renames names it\n' \
+				"$dir/$installed"
+			continue
+		fi
 		cmp -s "$dir/$installed" "$checkout/$src" \
 			|| printf '%s differs from %s\n' "$dir/$installed" "$checkout/$src"
 	done <<EOF
@@ -622,6 +626,10 @@ EOF
 	mkdir -p "$dir/libexec"
 	printf 'new\n' > "$dir/checkout/wrap.sh"
 	printf 'old\n' > "$dir/libexec/wrap.sh"
+	# install_renames always names the suffixless login checker for libexec, so
+	# the fixture installs a matching copy before the clean case.
+	printf 'new\n' > "$dir/checkout/kyriakon-authcheck.sh"
+	printf 'new\n' > "$dir/libexec/kyriakon-authcheck"
 	out=$(deployed_drift "$dir/checkout" "$dir/libexec-table" /usr/local/libexec "$dir/libexec")
 	case "$out" in
 	*wrap.sh*) ;;
@@ -655,6 +663,14 @@ EOF
 		exit 1
 	}
 	rm -f "$dir/libexec/kyriakon-authcheck"
+	out=$(deployed_drift "$dir/checkout" "$dir/libexec-table" /usr/local/libexec "$dir/libexec")
+	case "$out" in
+	*"$dir/libexec/kyriakon-authcheck: not installed"*) ;;
+	*)
+		printf 'FAIL: a missing suffixless install is a finding; got [%s]\n' "$out" >&2
+		exit 1
+		;;
+	esac
 
 	# Record directories: 0750 with the parent's group is readable by the
 	# handler; 0700 is a finding, whatever the file inside says.
