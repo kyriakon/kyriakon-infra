@@ -269,6 +269,14 @@ store_dir mail/cur     "$onboard_user" "$onboard_user" 700
 store_dir mail/new     "$onboard_user" "$onboard_user" 700
 store_dir mail/tmp     "$onboard_user" "$onboard_user" 700
 
+# bounce/ is the delivery-status spool, in the same shape and ownership as mail/.
+# smtpd delivers bounce@kyriakon.net here (a notice's envelope sender), the
+# drain reads it as root, and a mailbox delivery has to be writable by _onboard.
+store_dir bounce       "$onboard_user" "$onboard_user" 700
+store_dir bounce/cur   "$onboard_user" "$onboard_user" 700
+store_dir bounce/new   "$onboard_user" "$onboard_user" 700
+store_dir bounce/tmp   "$onboard_user" "$onboard_user" 700
+
 # The drain's own configuration, outside the store and root-only.
 [ "$(stat -f '%Su %Sg %Lp' "$drain_conf" 2>/dev/null)" = "root wheel 700" ] || changed=1
 install -d -m 0700 -o root -g wheel "$drain_conf"

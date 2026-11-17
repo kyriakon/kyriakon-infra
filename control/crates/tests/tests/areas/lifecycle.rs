@@ -4097,6 +4097,337 @@ fn a_suspension_starts_the_grace_and_resume_clears_it() {
     );
 }
 
+/// The last notice an account recorded: the address it went to and the
+/// Message-ID it left with, which are the two facts a DSN carries. The bounce
+/// fixture uses them so a test writes the report the receiving host would have
+/// written.
+fn last_notice(fix: &Fix, username: &str) -> (String, String) {
+    let text = fix.read(&format!("accounts/{username}/notices.jsonl"));
+    let notice: Value =
+        serde_json::from_str(text.lines().last().expect("a notice line")).expect("a notice object");
+    (
+        notice["to"].as_str().unwrap().to_string(),
+        notice["id"].as_str().unwrap().to_string(),
+    )
+}
+
+/// A hard bounce at the only address an account holds stops the grace clock:
+/// the expired grace does not delete it, the notice line records the failure,
+/// and `notice resend` clears the stop and restarts the forty days. Without the
+/// resend the same record and date would be deleted, which the last assertion
+/// drives.
+#[test]
+fn a_hard_bounced_notice_stops_the_grace_and_the_resend_restarts_it() {
+    let fix = Fix::new("bounce-stop");
+    approved_paid(&fix, "secretary", "cash");
+    let reason = "Published material is outside the acceptable use policy.";
+    let out = fix.ctl(&["suspend", "secretary", "--reason", reason]);
+    assert!(out.status.success(), "{}", body(&out));
+    let (to, id) = last_notice(&fix, "secretary");
+    fix.bounce("dsn-1", "5.1.1", &to, &id);
+
+    // The clock has run out. With a reachable address this pass deletes.
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    fix.write_account("secretary", &account);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.dir.join("store/accounts/secretary").exists(),
+        "a hard bounce at the only address deleted the account unseen"
+    );
+    assert!(
+        !fix.journal().contains("delete-secretary-"),
+        "the deletion transition ran: {}",
+        fix.journal()
+    );
+    // The failure is on the notice line, and the spool has been read.
+    let notices = fix.read("accounts/secretary/notices.jsonl");
+    assert!(
+        notices.contains("\"delivery\":{\"status\":\"5.1.1\""),
+        "the report was not recorded: {notices}"
+    );
+    assert!(
+        fix.names("bounce/new").is_empty(),
+        "the spool was not drained: {:?}",
+        fix.names("bounce/new")
+    );
+    // The stop is latched on the account, not only derived from the file, and
+    // the operator is told once through the journal-deduped alert.
+    let held = fix.account("secretary");
+    assert_eq!(
+        held["notice_stopped"]["status"],
+        json!("5.1.1"),
+        "the clock was not stopped: {held}"
+    );
+    assert!(
+        fix.journal().contains("notice-secretary"),
+        "the stop was not journalled: {}",
+        fix.journal()
+    );
+    assert!(
+        fix.sent().contains("no lifecycle notice reached secretary"),
+        "the operator was not told: {}",
+        fix.sent()
+    );
+    let out = fix.ctl(&["show", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        body(&out).contains("notice   stopped"),
+        "the console does not show the stop: {}",
+        body(&out)
+    );
+    assert!(
+        body(&out).contains(&to),
+        "the console does not name the failed address: {}",
+        body(&out)
+    );
+
+    // A later automatic notice that is also not delivered must not restart the
+    // clock: the day-six final notice appends an unmarked line, and the expired
+    // date still does not delete while the stop is latched.
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(6));
+    fix.write_account("secretary", &account);
+    assert!(fix.drain().status.success());
+    assert!(
+        fix.read("accounts/secretary/notices.jsonl")
+            .contains("account.suspended.final"),
+        "the day-six notice did not go out"
+    );
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    fix.write_account("secretary", &account);
+    assert!(fix.drain().status.success());
+    assert!(
+        fix.dir.join("store/accounts/secretary").exists(),
+        "a later notice cleared the stop without a channel working"
+    );
+
+    // The console's resend is the way out: a fresh notice, recorded, and a new
+    // grace of forty days from today.
+    let out = fix.ctl(&["notice", "resend", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.account("secretary")["grace_until"],
+        json!(kyriakon_control_core::util::date_after_days(40)),
+        "the resend did not restart the clock"
+    );
+    assert!(
+        fix.account("secretary").get("notice_stopped").is_none(),
+        "the resend did not clear the stop"
+    );
+    assert!(
+        fix.sent().contains("notice re-sent"),
+        "the resend sent nothing: {}",
+        fix.sent()
+    );
+    assert!(
+        fix.read("accounts/secretary/notices.jsonl")
+            .matches("notice re-sent")
+            .count()
+            == 1,
+        "the resend did not record its send"
+    );
+
+    // The stop is cleared by the new record: with the date moved back out of
+    // the way, the ordinary deletion runs.
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    fix.write_account("secretary", &account);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/secretary").exists(),
+        "the resend did not clear the stop"
+    );
+}
+
+/// A soft bounce and ordinary mail to the bounce address move nothing: the
+/// sender's queue is still trying, and a message that is not a permanent-failure
+/// DSN is not a report. The expired grace deletes the account as it would with
+/// no bounce at all.
+#[test]
+fn a_soft_bounce_or_ordinary_mail_does_not_stop_the_grace() {
+    let fix = Fix::new("bounce-soft");
+    approved_paid(&fix, "secretary", "cash");
+    let reason = "Published material is outside the acceptable use policy.";
+    let out = fix.ctl(&["suspend", "secretary", "--reason", reason]);
+    assert!(out.status.success(), "{}", body(&out));
+    let (to, id) = last_notice(&fix, "secretary");
+    fix.bounce("dsn-soft", "4.4.1", &to, &id);
+    std::fs::write(
+        fix.dir.join("store/bounce/new/receipt"),
+        "From: hello@kyriakon.net\nSubject: Your message\n\nStatus: 5.1.1\n",
+    )
+    .unwrap();
+
+    // The report is read and dropped, and no notice line is marked.
+    assert!(fix.drain().status.success());
+    assert!(
+        fix.names("bounce/new").is_empty(),
+        "the spool was not drained"
+    );
+    assert!(
+        !fix.read("accounts/secretary/notices.jsonl")
+            .contains("\"delivery\""),
+        "a soft bounce was recorded as a failure"
+    );
+
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    fix.write_account("secretary", &account);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/secretary").exists(),
+        "a soft bounce or ordinary mail stopped a clock it never touched"
+    );
+}
+
+/// A resend whose mail cannot leave changes nothing: the grace stays expired
+/// and the stop stays latched, so the next pass still refuses to delete. The
+/// line it recorded is taken back, and the retry with a working path clears it.
+#[test]
+fn a_resend_that_cannot_leave_keeps_the_stop() {
+    let fix = Fix::new("bounce-resend-fails");
+    approved_paid(&fix, "secretary", "cash");
+    let reason = "Published material is outside the acceptable use policy.";
+    let out = fix.ctl(&["suspend", "secretary", "--reason", reason]);
+    assert!(out.status.success(), "{}", body(&out));
+    let (to, id) = last_notice(&fix, "secretary");
+    fix.bounce("dsn-fail", "5.1.1", &to, &id);
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    fix.write_account("secretary", &account);
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.account("secretary")["notice_stopped"]["status"],
+        json!("5.1.1")
+    );
+
+    let before = fix.read("accounts/secretary/notices.jsonl").lines().count();
+    fix.enqueuer_fails();
+    let out = fix.ctl(&["notice", "resend", "secretary"]);
+    assert!(
+        !out.status.success(),
+        "a resend that could not leave reported success: {}",
+        body(&out)
+    );
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["grace_until"],
+        json!(kyriakon_control_core::util::date_after_days(-1)),
+        "the date moved before the mail left: {account}"
+    );
+    assert_eq!(
+        account["notice_stopped"]["status"],
+        json!("5.1.1"),
+        "the stop cleared before the mail left: {account}"
+    );
+    assert_eq!(
+        fix.read("accounts/secretary/notices.jsonl").lines().count(),
+        before,
+        "the failed send left its notice line behind"
+    );
+
+    // With the mail path back, the same command clears it.
+    fix.enqueuer_works();
+    let out = fix.ctl(&["notice", "resend", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.account("secretary").get("notice_stopped").is_none());
+}
+
+/// A group's lifecycle notice is recorded against its site owner, so a hard
+/// bounce at that account's only address stops the group's clock too. The
+/// expired grace leaves every mailbox in place, `notice resend --group` clears
+/// the stop and moves the group's date, and the ordinary deletion then runs.
+#[test]
+fn a_hard_bounced_group_notice_stops_the_group_deletion() {
+    let fix = Fix::new("group-bounce-stop");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let path = fix.dir.join("store/groups/parish.example/group.json");
+    let mut group: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    group["payment"]["window"]["state"] = json!("closed");
+    group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(6));
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+
+    // The final week's notice, recorded against the site owner.
+    assert!(fix.drain().status.success());
+    let notices = fix.read("accounts/parish-secretary/notices.jsonl");
+    let notice: Value = notices
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .find(|notice: &Value| notice["type"] == json!("group.final"))
+        .expect("a group final notice");
+    let to = notice["to"].as_str().unwrap().to_string();
+    let id = notice["id"].as_str().unwrap().to_string();
+    fix.bounce("group-dsn", "5.1.1", &to, &id);
+
+    // The grace has run out. The bounce leaves the body in place.
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.dir.join("store/groups/parish.example").exists(),
+        "a hard-bounced group notice deleted the whole body unseen"
+    );
+    assert!(
+        fix.dir.join("store/accounts/parish-secretary").exists(),
+        "the site owner was deleted with the group"
+    );
+    let owner = fix.account("parish-secretary");
+    assert_eq!(
+        owner["notice_stopped"]["status"],
+        json!("5.1.1"),
+        "the group's clock was not stopped: {owner}"
+    );
+
+    // The resend names the body and clears the stop on the site owner.
+    let out = fix.ctl(&[
+        "notice",
+        "resend",
+        "parish-secretary",
+        "--group",
+        "parish.example",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(
+        group["grace_until"],
+        json!(kyriakon_control_core::util::date_after_days(40)),
+        "the group's clock was not restarted: {group}"
+    );
+    assert!(
+        fix.account("parish-secretary")
+            .get("notice_stopped")
+            .is_none(),
+        "the resend did not clear the group's stop"
+    );
+
+    // With the date expired again, the ordinary group deletion runs.
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/groups/parish.example").exists(),
+        "the resend did not clear the stop for the group"
+    );
+}
+
 /// Resuming a lapsed account does not hand back full access while its payment
 /// window is still closed: it stays lapsed, no restore runs, and the next pass
 /// leaves it lapsed rather than finding nothing left to do.

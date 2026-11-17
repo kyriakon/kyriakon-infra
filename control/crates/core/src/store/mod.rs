@@ -1404,6 +1404,23 @@ pub struct Account {
     /// deletion sweeps measure from one date rather than from the lapse notice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grace_until: Option<String>,
+    /// Set when a permanent delivery failure leaves no address the lifecycle
+    /// notices reached. While it is present the deletion sweep refuses to run,
+    /// so a later notice that is also not delivered cannot restart the clock.
+    /// `kyriakon-admin notice resend` clears it and restarts the grace; a
+    /// payment or a resume clears it because that clock is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice_stopped: Option<NoticeStop>,
+}
+
+/// The stop a hard bounce sets on an account's grace clock: the failed
+/// recipient, the status the receiving host gave, and when it was read. The
+/// notice line keeps the whole history; this is the one fact the sweep needs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NoticeStop {
+    pub address: String,
+    pub status: String,
+    pub at: String,
 }
 
 /// One upload key the account carries: its fingerprint and the day it was
@@ -1976,9 +1993,47 @@ pub struct Notice {
     #[serde(rename = "type")]
     pub notice_type: String,
     pub subject: String,
+    /// The Message-ID this notice left with, minted before the line was
+    /// written. A delivery-status report must return this exact id from the
+    /// message it quotes, so a report forged against a guessed recipient and
+    /// subject moves nothing. Absent on a line written before the id existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     /// The address it went to, so the account page is an audit of what the
     /// platform told the member and where.
     pub to: String,
+    /// The permanent failure a DSN reported for this message, when one did.
+    /// Absent until the bounce arrives and on every notice that was delivered,
+    /// which is the ordinary state: a DSN is the only report this platform
+    /// gets, so no record means no report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<Delivery>,
+}
+
+/// A delivery-status report for one notice: the permanent SMTP status the
+/// receiving host answered with, and when the DSN was read.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Delivery {
+    /// The DSN's `Status`, e.g. `5.1.1`. Only a permanent failure is recorded;
+    /// a soft bounce stays in the sender's queue and is not a lost channel.
+    pub status: String,
+    pub at: String,
+}
+
+impl Delivery {
+    /// Whether the status is a permanent failure: the DSN's 5.x.x class. The
+    /// parser and the record read the same function, so a status cannot mean
+    /// one thing when it is stored and another when it is consulted.
+    pub fn permanent(&self) -> bool {
+        is_permanent_status(&self.status)
+    }
+}
+
+/// Whether a DSN status is a permanent failure: the 5.x.x class, and nothing
+/// else. The digits-and-dots check keeps a diagnostic word out of the class.
+pub fn is_permanent_status(status: &str) -> bool {
+    let status = status.trim();
+    status.starts_with("5.") && status.bytes().all(|b| b.is_ascii_digit() || b == b'.')
 }
 
 #[cfg(test)]

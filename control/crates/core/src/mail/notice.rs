@@ -27,17 +27,58 @@ use crate::Error;
 /// account that ran the drain, which is root: a member's first mail from the
 /// platform read "Charlie Root <root@mail.kyriakon.net>". The DKIM signer covers
 /// whatever From is present (`h=subject:to:date:from` in the signature the smtpd
-/// adds), so naming it here is signed like any other header. Message-ID stays the
-/// enqueuer's, which is the one header it is better at.
-fn message(from: &str, to: &str, subject: &str, body: &str) -> String {
+/// adds), so naming it here is signed like any other header.
+///
+/// Message-ID is ours for the notices we track: it is minted from 128 bits and
+/// recorded on the notice line before the send, and a delivery-status report
+/// must return it from the message it quotes. That is what keeps a forged report
+/// from stopping an account's clock.
+fn message(from: &str, to: &str, subject: &str, body: &str, id: &str) -> String {
     format!(
-        "From: {from}\nTo: {to}\nSubject: {subject}\nMIME-Version: 1.0\nContent-Type: text/plain; charset=utf-8\n\n{body}\n"
+        "From: {from}\nTo: {to}\nSubject: {subject}\nMessage-ID: <{id}@{MESSAGE_ID_DOMAIN}>\nMIME-Version: 1.0\nContent-Type: text/plain; charset=utf-8\n\n{body}\n"
     )
 }
 
-/// Enqueue one message through the enqueuer the config names.
+/// The envelope sender every notice leaves with, so a delivery-status report
+/// comes back to the plaintext Maildir the drain reads rather than to root's
+/// mailbox. `openbsd/etc/smtpd.conf` routes this one address to that spool; the
+/// From header stays [`DrainConfig::from`], which is what the member reads.
+pub const BOUNCE_ADDRESS: &str = "bounce@kyriakon.net";
+
+/// The domain the notice Message-ID carries. The parser accepts an id from this
+/// domain only, and the notice line stores the local part it minted.
+pub const MESSAGE_ID_DOMAIN: &str = "kyriakon.net";
+
+/// The notice types that open, carry and close a grace clock. Defined once so a
+/// send site and the bounce parser cannot disagree about which notices the
+/// deletion path waits on.
+pub const PREPAID_LAPSED: &str = "prepaid.lapsed";
+pub const PREPAID_GRACE: &str = "prepaid.grace";
+pub const PREPAID_FINAL: &str = "prepaid.final";
+pub const ACCOUNT_SUSPENDED: &str = "account.suspended";
+pub const ACCOUNT_SUSPENDED_FINAL: &str = "account.suspended.final";
+pub const GROUP_LAPSED: &str = "group.lapsed";
+pub const GROUP_GRACE: &str = "group.grace";
+pub const GROUP_FINAL: &str = "group.final";
+
+/// The ones the grace sweeps act on.
+pub const LIFECYCLE: [&str; 8] = [
+    PREPAID_LAPSED,
+    PREPAID_GRACE,
+    PREPAID_FINAL,
+    ACCOUNT_SUSPENDED,
+    ACCOUNT_SUSPENDED_FINAL,
+    GROUP_LAPSED,
+    GROUP_GRACE,
+    GROUP_FINAL,
+];
+
+/// Enqueue one message through the enqueuer the config names. The message gets a
+/// fresh Message-ID; nothing records it, because this path is for a reply or an
+/// operator alert rather than a notice a DSN can be matched against.
 pub async fn enqueue(cfg: &DrainConfig, to: &str, subject: &str, body: &str) -> Result<(), Error> {
-    enqueue_raw(cfg, &message(&cfg.from, to, subject, body)).await
+    let id = crate::store::status_token().await?;
+    enqueue_raw(cfg, &message(&cfg.from, to, subject, body, &id)).await
 }
 
 /// Enqueue an already-built message. The plain path builds one through
@@ -46,6 +87,8 @@ pub async fn enqueue(cfg: &DrainConfig, to: &str, subject: &str, body: &str) -> 
 async fn enqueue_raw(cfg: &DrainConfig, raw: &str) -> Result<(), Error> {
     let mut child = Command::new(&cfg.sendmail)
         .arg("-i")
+        .arg("-f")
+        .arg(BOUNCE_ADDRESS)
         .arg("-t")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -148,7 +191,8 @@ pub async fn send_account_notice(
     if already_sent(store, username, notice_type, subject).await? {
         return Ok(false);
     }
-    record_and_enqueue(cfg, store, username, notice_type, subject, to, body).await?;
+    let id = crate::store::status_token().await?;
+    record_and_enqueue(cfg, store, username, notice_type, subject, to, body, &id).await?;
     Ok(true)
 }
 
@@ -167,8 +211,24 @@ pub async fn send_account_notice_retryable(
     if already_sent(store, username, notice_type, subject).await? {
         return Ok(false);
     }
-    record_and_enqueue_retryable(cfg, store, username, notice_type, subject, to, body).await?;
+    let id = crate::store::status_token().await?;
+    record_and_enqueue_retryable(cfg, store, username, notice_type, subject, to, body, &id).await?;
     Ok(true)
+}
+
+/// [`send_again`]'s retryable form: if the enqueue fails, the notice line is
+/// taken back, so a console resend that could not leave does not read as sent.
+pub async fn send_again_retryable(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+    notice_type: &str,
+    subject: &str,
+    to: &str,
+    body: &str,
+) -> Result<(), Error> {
+    let id = crate::store::status_token().await?;
+    record_and_enqueue_retryable(cfg, store, username, notice_type, subject, to, body, &id).await
 }
 
 /// Record a notice and enqueue it whether or not the account already records
@@ -184,7 +244,8 @@ pub async fn send_again(
     to: &str,
     body: &str,
 ) -> Result<(), Error> {
-    record_and_enqueue(cfg, store, username, notice_type, subject, to, body).await
+    let id = crate::store::status_token().await?;
+    record_and_enqueue(cfg, store, username, notice_type, subject, to, body, &id).await
 }
 
 /// Record a notice and enqueue it with one file attached, already encrypted to
@@ -204,10 +265,11 @@ pub async fn send_account_notice_attachment(
     filename: &str,
     attachment: &[u8],
 ) -> Result<(), Error> {
-    record(store, username, notice_type, subject, to).await?;
+    let id = crate::store::status_token().await?;
+    record(store, username, notice_type, subject, to, &id).await?;
     enqueue_raw(
         cfg,
-        &attachment_message(&cfg.from, to, subject, body, filename, attachment),
+        &attachment_message(&cfg.from, to, subject, body, filename, attachment, &id),
     )
     .await
 }
@@ -223,9 +285,10 @@ fn attachment_message(
     body: &str,
     filename: &str,
     attachment: &[u8],
+    id: &str,
 ) -> String {
     format!(
-        "From: {from}\nTo: {to}\nSubject: {subject}\nMIME-Version: 1.0\n\
+        "From: {from}\nTo: {to}\nSubject: {subject}\nMessage-ID: <{id}@{MESSAGE_ID_DOMAIN}>\nMIME-Version: 1.0\n\
          Content-Type: multipart/mixed; boundary=\"kyriakon-export\"\n\n\
          --kyriakon-export\nContent-Type: text/plain; charset=utf-8\n\n{body}\n\
          --kyriakon-export\nContent-Type: application/pgp-encrypted; name=\"{filename}\"\n\
@@ -243,13 +306,16 @@ async fn record(
     notice_type: &str,
     subject: &str,
     to: &str,
+    id: &str,
 ) -> Result<String, Error> {
     let line = Notice {
         version: 1,
         at: crate::util::filed_at(),
         notice_type: notice_type.to_string(),
         subject: subject.to_string(),
+        id: id.to_string(),
         to: to.to_string(),
+        delivery: None,
     };
     let encoded =
         serde_json::to_string(&line).map_err(|e| Error::context("cannot encode a notice", e))?;
@@ -261,6 +327,7 @@ async fn record(
     Ok(encoded)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_and_enqueue(
     cfg: &DrainConfig,
     store: &Store,
@@ -269,15 +336,17 @@ async fn record_and_enqueue(
     subject: &str,
     to: &str,
     body: &str,
+    id: &str,
 ) -> Result<(), Error> {
-    record(store, username, notice_type, subject, to).await?;
-    enqueue(cfg, to, subject, body).await
+    record(store, username, notice_type, subject, to, id).await?;
+    enqueue_raw(cfg, &message(&cfg.from, to, subject, body, id)).await
 }
 
 /// The approval's send: unlike the other notices, a failed enqueue must not
 /// leave the line recorded, because the approval is retried after provisioning
 /// and `already_sent` would then skip the mail forever. The line is taken back
 /// before the error leaves, as the application's confirmation stamp is cleared.
+#[allow(clippy::too_many_arguments)]
 async fn record_and_enqueue_retryable(
     cfg: &DrainConfig,
     store: &Store,
@@ -286,9 +355,10 @@ async fn record_and_enqueue_retryable(
     subject: &str,
     to: &str,
     body: &str,
+    id: &str,
 ) -> Result<(), Error> {
-    let line = record(store, username, notice_type, subject, to).await?;
-    if let Err(e) = enqueue(cfg, to, subject, body).await {
+    let line = record(store, username, notice_type, subject, to, id).await?;
+    if let Err(e) = enqueue_raw(cfg, &message(&cfg.from, to, subject, body, id)).await {
         unrecord(store, username, &line).await?;
         return Err(e);
     }
@@ -321,14 +391,25 @@ async fn unrecord(store: &Store, username: &str, line: &str) -> Result<(), Error
 mod tests {
     use super::*;
 
-    /// A stub enqueuer: it appends its own stdin to `$ONBOARD_SENT`, so a test
-    /// reads exactly what would have reached the box's smtpd.
+    /// A stub enqueuer: it appends its own stdin to `sent` beside it and its
+    /// arguments to `sent.args`, so a test reads exactly what would have
+    /// reached the box's smtpd and under which envelope sender. The paths are
+    /// written into the script rather than passed through the environment,
+    /// because the tests share one process and an environment variable is a
+    /// race between them.
     fn stub(dir: &std::path::Path) -> String {
         let path = dir.join("enqueuer.sh");
-        std::fs::write(&path, "#!/bin/sh\ncat >> \"$ONBOARD_SENT\"\n").unwrap();
+        let sent = dir.join("sent");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{sent}.args'\ncat >> '{sent}'\n",
+                sent = sent.display()
+            ),
+        )
+        .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::env::set_var("ONBOARD_SENT", dir.join("sent"));
         path.to_str().unwrap().to_string()
     }
 
@@ -362,6 +443,7 @@ mod tests {
             group_price_gbp: "40.00".to_string(),
             postal_address: "REPLACE_ME".to_string(),
             mail_dir: dir.join("mail").to_str().unwrap().to_string(),
+            bounce_dir: dir.join("bounce").to_str().unwrap().to_string(),
             release: "2026-10-10 abc1234".to_string(),
             mail_host: "mail.kyriakon.net".to_string(),
             ipv4: "192.0.2.10".to_string(),
@@ -379,6 +461,31 @@ mod tests {
             proof_dir: dir.join("logins").to_str().unwrap().to_string(),
             public_root: "/home/www".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn every_notice_leaves_with_the_bounce_mailbox_as_its_envelope_sender() {
+        let dir = std::env::temp_dir().join(format!("control-notice-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg(&dir);
+        enqueue(&cfg, "a@b.c", "Your application", "hello")
+            .await
+            .unwrap();
+        // The From header is what the member reads; the envelope sender is
+        // where smtpd sends the DSN, and it must be the routed mailbox or the
+        // bounce record never sees the report.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sent.args"))
+                .unwrap()
+                .trim(),
+            "-i -f bounce@kyriakon.net -t"
+        );
+        let sent = std::fs::read_to_string(dir.join("sent")).unwrap();
+        assert!(
+            sent.contains("From: kyriakon <hello@example.invalid>\n"),
+            "{sent}"
+        );
     }
 
     #[tokio::test]
@@ -410,6 +517,21 @@ mod tests {
             "{sent}"
         );
         assert!(sent.contains("Subject: Your application"), "{sent}");
+        // The Message-ID on the wire is the one the line records, so a DSN
+        // quoting that message can be matched and a guessed one cannot.
+        let recorded: Notice = serde_json::from_str(
+            std::fs::read_to_string(dir.join("store/accounts/secretary/notices.jsonl"))
+                .unwrap()
+                .lines()
+                .last()
+                .expect("a notice line"),
+        )
+        .unwrap();
+        assert_eq!(recorded.id.len(), 26, "128 bits in Crockford base32");
+        assert!(
+            sent.contains(&format!("Message-ID: <{}@kyriakon.net>", recorded.id)),
+            "the recorded marker is not the one that left: {sent}"
+        );
         // The handler renders the notice list from this file, so it is group
         // readable by the accounts directory's group rather than root-only.
         use std::os::unix::fs::MetadataExt;

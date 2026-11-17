@@ -14,19 +14,25 @@
 //! The parser is deliberately small: headers, multipart, and the two transfer
 //! encodings a mail client uses for an armoured block. Anything it cannot read
 //! has no key block, and is dropped rather than answered.
+//!
+//! The `bounce@kyriakon.net` spool is read here too. A delivery-status report
+//! for a notice is a machine message with no key, and the drain latches a stop
+//! on the account when the report leaves no channel that reached the member.
 
 use std::collections::BTreeMap;
 
 use time::OffsetDateTime;
+use tokio::io::AsyncReadExt;
 
 use crate::transitions::Error;
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::config::HOST;
+use kyriakon_control_core::mail::bounce;
 use kyriakon_control_core::mail::keycheck;
 use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::store::draft::{self, Draft};
 use kyriakon_control_core::store::journal::Journal;
-use kyriakon_control_core::store::Store;
+use kyriakon_control_core::store::{NoticeStop, Store};
 
 const BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
 const END: &str = "-----END PGP PUBLIC KEY BLOCK-----";
@@ -634,6 +640,175 @@ fn parameter(value: &str, name: &str) -> Option<String> {
         let value = value.trim().trim_matches('"');
         (!value.is_empty()).then(|| value.to_string())
     })
+}
+
+/// One report is a DSN; a message larger than this is not, and reading it whole
+/// would let a stranger make the drain allocate unbounded bytes.
+const MAX_REPORT_BYTES: u64 = 256 * 1024;
+
+/// Read the bounce spool and record every delivery-status report in it. `smtpd`
+/// delivers `bounce@kyriakon.net` here because every notice leaves with that
+/// envelope sender; the drain reads the report and marks the notice it names.
+///
+/// A message that is not a permanent-failure DSN is removed without a record:
+/// the mailbox is for reports and nothing else, and leaving it would make the
+/// next pass read it again. A report that no notice matches is removed for the
+/// same reason. A read, store or latch failure keeps its file and sets the
+/// returned flag to `false`, so the caller skips the deletion sweep this pass
+/// and retries rather than settling on a state it could not write.
+pub async fn bounces(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<bool, Error> {
+    let dir = std::path::Path::new(&cfg.bounce_dir);
+    let mut settled = true;
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(Error::context(format!("cannot read {}", dir.display()), e)),
+    };
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?
+    {
+        let path = entry.path();
+        if !entry.file_type().await.is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') {
+            continue;
+        }
+        let text = match read_bounded(&path).await {
+            Ok(text) => text,
+            Err(e) => {
+                crate::transitions::report_failure(
+                    cfg,
+                    store,
+                    journal,
+                    name.as_ref(),
+                    "mail",
+                    &Error::Failed(format!("cannot read {}: {e}", path.display())),
+                )
+                .await;
+                settled = false;
+                continue;
+            }
+        };
+        let mut file_settled = true;
+        if let Some(report) = bounce::parse(&text) {
+            match bounce::record(store, &report).await {
+                Ok(usernames) => {
+                    for username in &usernames {
+                        if let Err(e) = stop_clock(cfg, store, journal, username, &report).await {
+                            crate::transitions::report_failure(
+                                cfg,
+                                store,
+                                journal,
+                                name.as_ref(),
+                                "mail",
+                                &e,
+                            )
+                            .await;
+                            file_settled = false;
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    crate::transitions::report_failure(
+                        cfg,
+                        store,
+                        journal,
+                        name.as_ref(),
+                        "mail",
+                        &Error::from(e),
+                    )
+                    .await;
+                    file_settled = false;
+                }
+            }
+        }
+        if !file_settled {
+            // The notice lines may be marked already, which is idempotent to
+            // repeat; the latch is what must be written before the sweep runs.
+            settled = false;
+            continue;
+        }
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            crate::transitions::report_failure(
+                cfg,
+                store,
+                journal,
+                name.as_ref(),
+                "mail",
+                &Error::Failed(format!("cannot remove {}: {e}", path.display())),
+            )
+            .await;
+        }
+    }
+    Ok(settled)
+}
+
+/// A report's first 256 KiB, which is far more than a DSN's headers and status
+/// fields need. The returned original can be a whole message, and its size is
+/// the sender's to choose.
+async fn read_bounded(path: &std::path::Path) -> std::io::Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_REPORT_BYTES)
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Latch the stop on the account when the recorded failure leaves no address
+/// the lifecycle notices reached. The sweep reads the latch rather than the
+/// notice history, so a later notice that is also not delivered cannot restart
+/// the clock; `kyriakon-admin notice resend` clears it and restarts the grace.
+///
+/// The notice line is the history and the latch is the state the sweep acts on.
+/// A write failure leaves the spool file in place, so the next pass marks the
+/// same notice and tries again. The operator is told once per distinct failure,
+/// through the same journal-deduped alert as every other drain failure.
+async fn stop_clock(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    username: &str,
+    report: &bounce::Bounce,
+) -> Result<(), Error> {
+    if !bounce::every_address_failed(store, username).await? {
+        return Ok(());
+    }
+    let Some(mut account) = store.account(username).await? else {
+        return Ok(());
+    };
+    account.notice_stopped = Some(NoticeStop {
+        address: report.recipient.clone(),
+        status: report.status.clone(),
+        at: kyriakon_control_core::util::filed_at(),
+    });
+    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
+        context: "encode the account",
+        source,
+    })?;
+    crate::transitions::groups::write_account_record(store, username, &bytes).await?;
+    crate::transitions::report_failure(
+        cfg,
+        store,
+        journal,
+        &format!("notice-{username}"),
+        "notice",
+        &Error::Failed(format!(
+            "no lifecycle notice reached {username}: {} reported {}. The grace clock is \
+             stopped, so no deletion runs. Run `kyriakon-admin notice resend {username}` \
+             over a channel that works.",
+            report.recipient, report.status
+        )),
+    )
+    .await;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -32,6 +32,7 @@ pub(crate) fn quota_config(dir: &std::path::Path) -> DrainConfig {
         group_price_gbp: "40.00".to_string(),
         postal_address: "1 Example Street".to_string(),
         mail_dir: dir.join("mail").to_str().unwrap().to_string(),
+        bounce_dir: dir.join("bounce/new").to_str().unwrap().to_string(),
         release: "2026-10-10 abc1234".to_string(),
         mail_host: "mail.kyriakon.net".to_string(),
         ipv4: "192.0.2.10".to_string(),

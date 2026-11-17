@@ -106,9 +106,16 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), Error> {
     // active, or lapses the account and starts the grace. One sweep, so a
     // member who paid on the last day is not lapsed by a later pass.
     transitions::lifecycle::window_sweep(cfg, store, &journal).await?;
-    // A lapsed account's grace: the final notice at day 33, and the one
-    // deletion transition when the 40 days end.
-    transitions::lifecycle::grace_sweep(cfg, store, &journal).await?;
+    // The delivery-status reports are read before the grace sweep, so a bounce
+    // that arrived since the last pass stops the clock on this one rather than
+    // after a deletion. A report that could not be settled skips the sweep: a
+    // failure is a reason to retry, and a deletion is not a settlement.
+    let bounces_settled = crate::mailbox::bounces(cfg, store, &journal).await?;
+    if bounces_settled {
+        // A lapsed account's grace: the final notice at day 33, and the one
+        // deletion transition when the 40 days end.
+        transitions::lifecycle::grace_sweep(cfg, store, &journal).await?;
+    }
     // The key spool is read after the intents so a filed application is not
     // waiting behind a mailbox pass. The pass handles each message on its own:
     // one that cannot be dealt with is reported and left for the next run.

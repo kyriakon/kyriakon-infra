@@ -432,6 +432,7 @@ async fn apply_payment(
         if account.state == "lapsed" || account.state == "active" {
             account.state = "active".to_string();
             account.grace_until = None;
+            account.notice_stopped = None;
         }
     }
     account.payment = Some(payment.clone());
@@ -730,6 +731,7 @@ pub(super) async fn restore_group_mailboxes(
         run_script(cfg, "lapse-user.sh", &["--restore", mailbox]).await?;
         account.state = "active".to_string();
         account.grace_until = None;
+        account.notice_stopped = None;
         let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
             context: "encode the account",
             source,

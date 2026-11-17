@@ -49,7 +49,7 @@ The enforcement ladder applies uniformly to every account, with no exception for
 1. **Detect.** We use automated volume and health monitoring, and we take abuse reports at `abuse@kyriakon.net`.
 2. **Warn.** We notify you and give you 72 hours to respond, except where outbound mail or hosting must be paused immediately to stop active spam, a compromised credential, or ongoing unlawful conduct.
 3. **Suspend.** Outbound mail, SFTP uploads, and git pushes stop, and the published site and Gemini capsule are taken down. Inbound mail keeps arriving and stays readable, and the account page stays open so you can see the reason and reply at `admin@kyriakon.net`.
-4. **Delete.** A suspension that is not resolved starts a 40-day grace period, so answering a warning and resolving the breach ends the suspension before this step is reached. We send a final notice 7 days before the end of the grace period, and the account is then deleted automatically. Copies in the encrypted backup repository expire within about seven months.
+4. **Delete.** A suspension that is not resolved starts a 40-day grace period, so answering a warning and resolving the breach ends the suspension before this step is reached. We send a final notice 7 days before the end of the grace period, and the account is then deleted automatically. If no notice reached you at any address we hold, because every one bounced, the deletion waits until one does. Copies in the encrypted backup repository expire within about seven months.
 
 ## 6. Statement of position: UK and Scottish speech law
 
