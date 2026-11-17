@@ -4204,10 +4204,22 @@ fn a_hard_bounced_notice_stops_the_grace_and_the_resend_restarts_it() {
         "a later notice cleared the stop without a channel working"
     );
 
-    // The console's resend is the way out: a fresh notice, recorded, and a new
-    // grace of forty days from today.
-    let out = fix.ctl(&["notice", "resend", "secretary"]);
+    // The console's resend is the way out: a fresh notice to a working address,
+    // recorded, and a new grace of forty days from today. The address must be
+    // persisted, or the day-33 notice goes back to the dead one.
+    let out = fix.ctl(&[
+        "notice",
+        "resend",
+        "secretary",
+        "--to",
+        "working@example.org",
+    ]);
     assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.account("secretary")["outside_address"],
+        json!("working@example.org"),
+        "the resend did not persist the working channel"
+    );
     assert_eq!(
         fix.account("secretary")["grace_until"],
         json!(kyriakon_control_core::util::date_after_days(40)),
@@ -4393,15 +4405,23 @@ fn a_hard_bounced_group_notice_stops_the_group_deletion() {
         "the group's clock was not stopped: {owner}"
     );
 
-    // The resend names the body and clears the stop on the site owner.
+    // The resend names the body and clears the stop on the site owner. A named
+    // working address is persisted on the owner so the next group notice uses it.
     let out = fix.ctl(&[
         "notice",
         "resend",
         "parish-secretary",
         "--group",
         "parish.example",
+        "--to",
+        "working-group@example.org",
     ]);
     assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.account("parish-secretary")["outside_address"],
+        json!("working-group@example.org"),
+        "the group resend did not persist the working channel"
+    );
     let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
     assert_eq!(
         group["grace_until"],
