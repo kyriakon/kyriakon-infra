@@ -508,9 +508,9 @@ pub async fn provision_group(
     }
 
     // The body's hosting, rooted in the site owner's own tree. The upload key
-    // decides hosting the way it does for a member: provision-member.sh builds
-    // no tree without one, so a group that left it empty has no site to serve
-    // and the lanes would refuse.
+    // decides whether the body has a site: a group that left it empty has the
+    // tree but no site, and the upload-key transition runs these lanes when the
+    // site owner adds a key.
     if !intent.upload_key.trim().is_empty() {
         run_script(
             cfg,
@@ -1574,24 +1574,49 @@ pub async fn group_address(
                 // The vhosts root at the site owner's tree, and
                 // `cron-apply.sh --web` rewrites only the indexes: without the
                 // lanes the new root is never written and the old one is
-                // deleted with the departing account. They run before the
-                // record is written, so a retry after a lane refusal repeats
-                // them; a site whose owner never added an upload key has no
-                // tree and the lanes would refuse.
-                if store
-                    .read_record("keys", &format!("{}.pub", intent.mailbox))
-                    .await
-                    .is_some()
-                {
-                    for lane in [
-                        "provision-group-web.sh",
-                        "provision-group-capsule.sh",
-                        "provision-group-acme.sh",
-                    ] {
-                        run_script(cfg, lane, &[&intent.domain, replacement]).await?;
-                    }
+                // deleted with the departing account. They always run, because
+                // `provision-member.sh` builds the replacement's tree whether
+                // or not there is a key, and a pass that skipped them would
+                // leave the vhost on a tree the deletion removes. They run
+                // before the record is written, so a retry after a lane
+                // refusal repeats them.
+                for lane in [
+                    "provision-group-web.sh",
+                    "provision-group-capsule.sh",
+                    "provision-group-acme.sh",
+                ] {
+                    run_script(cfg, lane, &[&intent.domain, replacement]).await?;
                 }
                 group.site_owner = replacement.to_string();
+                // A replacement with no key of their own needs telling what to
+                // do next, because the handover gives them none. One who
+                // already has a key needs nothing. The fixed subject is the
+                // dedupe: a retry after a failed enqueue sends the one copy.
+                if store
+                    .read_record("keys", &format!("{replacement}.pub"))
+                    .await
+                    .is_none()
+                {
+                    let to = dns_contact(store, &group).await?;
+                    let subject = format!("You now own {}", intent.domain);
+                    let body = format!(
+                        "The site {domain} is now yours. Add an upload key from the account \
+                         page and the upload session is built for it. Until then the site \
+                         serves what is already there and nothing can be uploaded.\n\n\
+                         If you did not expect this, write to admin@kyriakon.net.\n",
+                        domain = intent.domain
+                    );
+                    notice::send_account_notice_retryable(
+                        cfg,
+                        store,
+                        replacement,
+                        "group.site_owner",
+                        &subject,
+                        &to,
+                        &body,
+                    )
+                    .await?;
+                }
             }
             group.accounts.retain(|a| a != &intent.mailbox);
             write_group_record(store, &group).await?;

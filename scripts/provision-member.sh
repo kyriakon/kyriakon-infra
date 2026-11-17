@@ -12,10 +12,12 @@
 #   doas ksh scripts/provision-member.sh <username>
 #
 # The key is optional. A member who only wants mail leaves it empty, and the run
-# then does the mail work and stops: the address, the allowance and the login
-# class are the whole account. A member with a key also gets the public tree, the
-# upload session and the two daemon lanes, which is everything the key is needed
-# for. Mail is never behind the key.
+# then does the mail work and builds the public tree, then stops: the address,
+# the allowance, the login class and the tree are the whole account, and no key
+# file, upload session or daemon lane is built. A member with a key also gets
+# those. The tree is built either way because an own-domain body is served from
+# the site owner's tree, and a site handed to a keyless replacement still needs
+# a root. Mail is never behind the key.
 #
 # add-user.sh creates the account, its Maildir and its quota record. This script
 # asserts the account is there rather than making one: a second creation path
@@ -466,14 +468,14 @@ fi
 
 # --- whether this member has hosting at all ---------------------------------
 #
-# A member with an upload key gets the public tree, the upload session and the
-# daemon lanes. A member without one gets mail and nothing else: the key is
+# A member with an upload key gets the key files, the upload session and the
+# daemon lanes. A member without one gets the public tree and mail: the key is
 # optional in the spec and in the question list, and someone who only wants mail
-# leaves it empty. So the key decides hosting and nothing else, the address and
-# the allowance below are provisioned either way, and a missing default key is a
-# mail-only member rather than an error. A key named on the command line is
-# different: it was asked for explicitly, so a path that is not there is
-# refused, and the check is below.
+# leaves it empty. So the key decides the session and the lanes, the address,
+# the allowance and the tree below are provisioned either way, and a missing
+# default key is a keyless member rather than an error. A key named on the
+# command line is different: it was asked for explicitly, so a path that is not
+# there is refused, and the check is below.
 key_src="$key_arg"
 have_key=yes
 if [ -z "$key_src" ]; then
@@ -668,20 +670,10 @@ if ! id -Gn "$user" | tr ' ' '\n' | grep -qx members; then
 fi
 
 
-# Mail is the account's whole job when there is no key, so a mail-only member
-# stops here: the class, the address and the allowance are in place, and the
-# tree, the upload session and the daemon lanes are not built because there is
-# no key to reach them with. The class is set for a mail-only account too, the
-# same as for one with a key: an own-domain mailbox carries no key of its own,
-# and the spec gives every mailbox the class whose shell is confined git. An
-# account with no `authorized_keys` cannot use that session either way.
-if [ "$have_key" = no ]; then
-	printf 'provisioned %s: mail only, no upload key\n' "$user"
-	printf '  the class, the address and the allowance are in place; the public tree, the upload\n'
-	printf '  session and the daemon lanes are not built, because the member holds no key\n'
-	printf 'next: add a key from the member page, then run this script again\n'
-	exit 0
-fi
+# The class is set for an account without a key too, the same as for one with a
+# key: an own-domain mailbox carries no key of its own, and the spec gives every
+# mailbox the class whose shell is confined git. An account with no
+# `authorized_keys` cannot use that session either way.
 
 # --- the upload key's source -------------------------------------------------
 #
@@ -703,29 +695,32 @@ fi
 # The second argument names the file explicitly, for a key collected by some
 # other route and for exercising this script before the service writes that tree.
 # Whether there is a key at all was settled at the top, and a member with none
-# stopped there on the mail-only path; this run has one, so what is left is to
-# check that the file it names can become an authorized_keys line. An explicitly
-# named file that is not there is a refusal, not a mail-only member: the caller
-# asked for it, and building the member without the tree they asked about would
-# silently ignore them.
-if [ ! -f "$key_src" ]; then
-	printf 'no such public key file: %s\n' "$key_src" >&2
-	exit 1
-fi
-if [ ! -s "$key_src" ]; then
-	printf 'public key file is empty: %s\n' "$key_src" >&2
-	exit 1
-fi
+# skips this section and stops after the tree; this run has one, so what is left
+# is to check that the file it names can become an authorized_keys line. An
+# explicitly named file that is not there is a refusal, not a keyless member:
+# the caller asked for it, and building the member without the key they asked
+# about would silently ignore them.
+if [ "$have_key" = yes ]; then
+	if [ ! -f "$key_src" ]; then
+		printf 'no such public key file: %s\n' "$key_src" >&2
+		exit 1
+	fi
+	if [ ! -s "$key_src" ]; then
+		printf 'public key file is empty: %s\n' "$key_src" >&2
+		exit 1
+	fi
 
-# Only bare key lines, checked before anything is built. An authorized_keys line
-# may carry options before its key type, and the spec writes none of them: the
-# port decides whether a session is the sftp upload or the git session, not a forced
-# command, so a line that begins with anything but a key type is refused here
-# rather than installed into an account root later authenticates against.
-if ! awk 'NF && $1 !~ /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9-]+@openssh\.com)$/ { exit 1 }' "$key_src"; then
-	printf '%s is not a bare SSH public key file: a line begins with something\n' "$key_src" >&2
-	printf 'other than a key type, and no authorized_keys options are written here\n' >&2
-	exit 1
+	# Only bare key lines, checked before anything is built. An authorized_keys
+	# line may carry options before its key type, and the spec writes none of
+	# them: the port decides whether a session is the sftp upload or the git
+	# session, not a forced command, so a line that begins with anything but a
+	# key type is refused here rather than installed into an account root later
+	# authenticates against.
+	if ! awk 'NF && $1 !~ /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9-]+@openssh\.com)$/ { exit 1 }' "$key_src"; then
+		printf '%s is not a bare SSH public key file: a line begins with something\n' "$key_src" >&2
+		printf 'other than a key type, and no authorized_keys options are written here\n' >&2
+		exit 1
+	fi
 fi
 
 # --- paths ------------------------------------------------------------------
@@ -747,49 +742,56 @@ group=$(id -gn "$user")
 # (Definition above the self-test, which drives it.)
 
 # The chroot root is root:wheel so sshd will chroot into it, and the two
-# directories that carry content belong to the member.
+# directories that carry content belong to the member. The tree is built with or
+# without a key: an own-domain body is served from the site owner's tree, so a
+# site handed to a keyless replacement needs this root before its lanes run.
 if ensure_dir "$public" 0755 root wheel; then changed=yes; fi
 if ensure_dir "$public/www" 0755 "$user" members; then changed=yes; fi
 if ensure_dir "$public/gemini" 0755 "$user" members; then changed=yes; fi
 
-# Beside Maildir, which add-user.sh made, and outside the chroot above. The
-# managed key under /etc is the one on a root-owned path. The .ssh copy below is
-# for a box that has not applied the sshd hand step, and after it is defence in
-# depth only: the home stays member-owned, so the member can replace the
-# directory, and sshd accepts a user-owned file under StrictModes.
-if ensure_dir "$home/repos" 0700 "$user" "$group"; then changed=yes; fi
-if ensure_dir "$home/.ssh" 0750 root "$group"; then changed=yes; fi
-if ensure_dir "$managed_keys_dir" 0755 root wheel; then changed=yes; fi
+# The rest is the key's. Beside Maildir, which add-user.sh made, and outside the
+# chroot above. The managed key under /etc is the one on a root-owned path. The
+# .ssh copy inside the home is for a box that has not applied the sshd hand
+# step, and after it is defence in depth only: the home stays member-owned, so
+# the member can replace the directory, and sshd accepts a user-owned file under
+# StrictModes.
+if [ "$have_key" = yes ]; then
+	if ensure_dir "$home/repos" 0700 "$user" "$group"; then changed=yes; fi
+	if ensure_dir "$home/.ssh" 0750 root "$group"; then changed=yes; fi
+	if ensure_dir "$managed_keys_dir" 0755 root wheel; then changed=yes; fi
 
-# The key is installed whole rather than appended: the source file is the record
-# of which keys the account holds, one line each, so a line removed there is gone
-# from the account on the next run. The managed copy under /etc is the one sshd
-# will read for members; the ~/.ssh copy keeps the session working until the
-# sshd_config hand step lands.
-if put_key "$key_src" "$authorized_keys" root "$group" 0640; then changed=yes; fi
-if put_key "$key_src" "$managed_key" root wheel 0644; then changed=yes; fi
+	# The key is installed whole rather than appended: the source file is the
+	# record of which keys the account holds, one line each, so a line removed
+	# there is gone from the account on the next run. The managed copy under
+	# /etc is the one sshd will read for members; the ~/.ssh copy keeps the
+	# session working until the sshd_config hand step lands.
+	if put_key "$key_src" "$authorized_keys" root "$group" 0640; then changed=yes; fi
+	if put_key "$key_src" "$managed_key" root wheel 0644; then changed=yes; fi
+fi
 
 # --- the post-conditions ----------------------------------------------------
 
 assert_shape "$public" root:wheel 0755
 assert_shape "$public/www" "$user:members" 0755
 assert_shape "$public/gemini" "$user:members" 0755
-assert_shape "$home/repos" "$user:$group" 0700
-assert_shape "$home/.ssh" "root:$group" 0750
-assert_shape "$authorized_keys" "root:$group" 0640
-assert_shape "$managed_keys_dir" root:wheel 0755
-assert_shape "$managed_key" root:wheel 0644
-assert_shape "$shell_dst" root:wheel 0755
+if [ "$have_key" = yes ]; then
+	assert_shape "$home/repos" "$user:$group" 0700
+	assert_shape "$home/.ssh" "root:$group" 0750
+	assert_shape "$authorized_keys" "root:$group" 0640
+	assert_shape "$managed_keys_dir" root:wheel 0755
+	assert_shape "$managed_key" root:wheel 0644
 
-# cmp, not a size: install could copy a truncated file and the mode would still
-# be right. The source is checked above, so this proves each copy is the file
-# that was checked.
-for key_copy in "$authorized_keys" "$managed_key"; do
-	if ! cmp -s "$key_src" "$key_copy"; then
-		printf '%s and %s differ after the install\n' "$key_src" "$key_copy" >&2
-		exit 1
-	fi
-done
+	# cmp, not a size: install could copy a truncated file and the mode would
+	# still be right. The source is checked above, so this proves each copy is
+	# the file that was checked.
+	for key_copy in "$authorized_keys" "$managed_key"; do
+		if ! cmp -s "$key_src" "$key_copy"; then
+			printf '%s and %s differ after the install\n' "$key_src" "$key_copy" >&2
+			exit 1
+		fi
+	done
+fi
+assert_shape "$shell_dst" root:wheel 0755
 
 # The home belongs to the member, or the git session's ~ and everything the member
 # writes inside it land somewhere they cannot use.
@@ -820,6 +822,19 @@ for d in /home /home/www "$public"; do
 		;;
 	esac
 done
+
+# A member with no key stops here: the class, the address, the allowance and the
+# public tree are in place, and the key files, the upload session and the daemon
+# lanes wait for a key. The tree is what an own-domain site is served from, so a
+# site handed to a keyless replacement has a root; the replacement adds a key
+# from the member page, and the upload-key intent runs this again.
+if [ "$have_key" = no ]; then
+	printf 'provisioned %s: no upload key\n' "$user"
+	printf '  the class, the address, the allowance and the public tree are in place\n'
+	printf '  the key files, the upload session and the daemon lanes wait for a key\n'
+	printf 'next: add a key from the member page, then run this script again\n'
+	exit 0
+fi
 
 # --- the daemon lanes -------------------------------------------------------
 #
