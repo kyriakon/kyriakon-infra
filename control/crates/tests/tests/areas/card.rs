@@ -3,7 +3,8 @@ use crate::common::*;
 /// A card ledger line carries what the invoice paid and when, not the
 /// configured price and the drain's clock: an invoice on 10 September is a
 /// September line for GBP 25.00, even though the drain runs in October and the
-/// year's price is GBP 20.00.
+/// year's price is GBP 20.00. What the year bought is the price, so `applied`
+/// is 20.00 and the 5.00 above it stays an overpayment.
 #[test]
 fn a_card_ledger_line_uses_the_invoice_amount_and_paid_date() {
     let fix = Fix::new("card-ledger-invoice");
@@ -19,7 +20,7 @@ fn a_card_ledger_line_uses_the_invoice_amount_and_paid_date() {
     let payments = payment_lines(&fix);
     assert_eq!(payments.len(), 1, "{payments:?}");
     assert_eq!(payments[0]["amount_gbp"], json!("25.00"), "{payments:?}");
-    assert_eq!(payments[0]["applied_gbp"], json!("25.00"), "{payments:?}");
+    assert_eq!(payments[0]["applied_gbp"], json!("20.00"), "{payments:?}");
     assert_eq!(
         payments[0]["received_on"],
         json!("2026-09-10"),
