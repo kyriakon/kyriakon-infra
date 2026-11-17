@@ -2186,9 +2186,10 @@ fn the_console_files_a_group_removal_and_refuses_a_bad_domain() {
     ));
 }
 
-/// A departing site owner hands the upload key and the generated roots to a
-/// replacement before the account is deleted. Without a replacement the intent
-/// is refused and nothing moves.
+/// A departing site owner hands the site and the generated roots to a
+/// replacement before the account is deleted, but never the upload key: the
+/// replacement is provisioned keyless so the leaver keeps no session on the
+/// site. Without a replacement the intent is refused and nothing moves.
 #[test]
 fn a_departing_site_owner_must_name_a_replacement() {
     let fix = Fix::new("group-site-owner");
@@ -2204,6 +2205,40 @@ fn a_departing_site_owner_must_name_a_replacement() {
     );
     assert!(fix.drain().status.success());
     assert!(fix.dir.join("store/keys/parish-secretary.pub").exists());
+
+    // The box builds the member's public tree whether or not there is a key,
+    // and installs an authorized-keys file from the store when there is one.
+    // The three group lanes refuse without that tree, which is the failure a
+    // keyless handover hit. The stubs carry both halves, so a drain that runs a
+    // lane before the tree exists fails here.
+    let log = fix.path("scripts.log");
+    let keys = fix.path("store/keys");
+    let installed = fix.path("host/authorized_keys");
+    let public = fix.path("host/home/www");
+    fix.script(
+        "provision-member.sh",
+        &format!(
+            "#!/bin/sh\n\
+             echo \"provision-member.sh $*\" >> '{log}'\n\
+             mkdir -p '{public}/'\"$1\"'.kyriakon.net/www' '{public}/'\"$1\"'.kyriakon.net/gemini'\n\
+             mkdir -p '{installed}'\n\
+             if [ -f '{keys}/'\"$1\"'.pub' ]; then cp '{keys}/'\"$1\"'.pub' '{installed}/'\"$1\"; fi\n",
+        ),
+    );
+    for lane in [
+        "provision-group-web.sh",
+        "provision-group-capsule.sh",
+        "provision-group-acme.sh",
+    ] {
+        fix.script(
+            lane,
+            &format!(
+                "#!/bin/sh\n\
+                 echo \"{lane} $*\" >> '{log}'\n\
+                 [ -d '{public}/'\"$2\"'.kyriakon.net/www' ] || {{ echo \"{lane}: no tree for $2\" >> '{log}'; exit 1; }}\n",
+            ),
+        );
+    }
 
     let refused = fix.file_address(
         "parish.example",
@@ -2252,12 +2287,35 @@ fn a_departing_site_owner_must_name_a_replacement() {
     );
 
     assert!(!fix.passwd_file().contains("parish-secretary:"));
-    let moved = fix.read("keys/parish-office.pub");
-    assert!(moved.contains(UPLOAD_KEY), "{moved}");
+    // The leaver's key is gone and no copy is made for the replacement: a copy
+    // would keep the departing member's sftp and git sessions on the site.
+    assert!(
+        !fix.dir.join("store/keys/parish-office.pub").exists(),
+        "the departing owner's key was copied to the replacement"
+    );
+    let installed_key = std::fs::read_to_string(fix.dir.join("host/authorized_keys/parish-office"))
+        .unwrap_or_default();
+    assert!(
+        !installed_key.contains(UPLOAD_KEY),
+        "the replacement's authorized-keys file holds the leaver's key: {installed_key}"
+    );
     assert!(
         !fix.dir.join("store/keys/parish-secretary.pub").exists(),
         "the old owner kept the upload key"
     );
+    // The replacement's tree exists even though they hold no key, because the
+    // group lanes root the vhost at it and refuse without one.
+    assert!(
+        fix.dir
+            .join("host/home/www/parish-office.kyriakon.net/www")
+            .is_dir(),
+        "the replacement has no public tree, so the group lanes had no root"
+    );
+    // The handover mails the replacement once, naming the domain and the key
+    // they still have to add.
+    let notices = fix.read("accounts/parish-office/notices.jsonl");
+    assert!(notices.contains("group.site_owner"), "{notices}");
+    assert!(notices.contains("You now own parish.example"), "{notices}");
     let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
     assert_eq!(group["site_owner"], "parish-office");
     assert_eq!(group["accounts"], json!(["parish-office"]));
@@ -2279,6 +2337,108 @@ fn a_departing_site_owner_must_name_a_replacement() {
         assert!(
             log.contains(&format!("{lane} parish.example parish-office")),
             "{lane} did not re-root the site at the replacement: {log}"
+        );
+    }
+}
+
+/// A replacement who already added their own key keeps it: the handover writes
+/// nothing over the file, so the leaver's key is never installed beside it.
+#[test]
+fn a_departing_site_owner_leaves_the_replacements_own_key_alone() {
+    let fix = Fix::new("group-site-owner-own-key");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let own = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOffice example";
+    std::fs::write(fix.dir.join("store/keys/parish-office.pub"), own).unwrap();
+
+    fix.file_address(
+        "parish.example",
+        "remove",
+        "",
+        "parish-secretary",
+        None,
+        Some("parish-office"),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.read("keys/parish-office.pub").trim(),
+        own.trim(),
+        "the departing owner's key replaced the replacement's own"
+    );
+    // They already have a key, so the keyless handover's mail is not sent.
+    assert!(
+        !fix.read("accounts/parish-office/notices.jsonl")
+            .contains("group.site_owner"),
+        "a replacement with a key was told to add one"
+    );
+}
+
+/// A site owner who adds their first upload key after a keyless handover gets
+/// the three group lanes run again, so the vhost stops pointing at the tree the
+/// handover replaced.
+#[test]
+fn the_replacement_adding_a_key_re_roots_the_group_site() {
+    let fix = Fix::new("group-owner-key-later");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    fix.file_address(
+        "parish.example",
+        "remove",
+        "",
+        "parish-secretary",
+        None,
+        Some("parish-office"),
+    );
+    assert!(fix.drain().status.success());
+
+    let lanes = [
+        "provision-group-web.sh",
+        "provision-group-capsule.sh",
+        "provision-group-acme.sh",
+    ];
+    for lane in lanes {
+        assert_eq!(
+            fix.scripts_log()
+                .matches(&format!("{lane} parish.example parish-office"))
+                .count(),
+            1,
+            "{lane} did not run at the handover"
+        );
+    }
+
+    fix.file_page_action(
+        "upload-key",
+        "parish-office",
+        json!({"action": "add", "material": UPLOAD_KEY}),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let log = fix.scripts_log();
+    for lane in lanes {
+        assert_eq!(
+            log.matches(&format!("{lane} parish.example parish-office"))
+                .count(),
+            2,
+            "{lane} did not run for the group site the replacement now owns: {log}"
         );
     }
 }

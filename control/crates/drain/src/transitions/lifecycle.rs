@@ -1906,6 +1906,26 @@ pub async fn upload_key(
             }
             account.site_served = Some(site);
             account.capsule_served = Some(capsule);
+            // A group's site is rooted at its site owner's tree, and the
+            // handover leaves that site keyless. The member lanes above build
+            // this mailbox's own vhost and know nothing of the group file, so
+            // the site owner adding the first key afterwards has to run the
+            // three group lanes too: otherwise the vhost keeps the root of the
+            // tree the handover replaced, and nothing later corrects it.
+            if let Some(domain) = account.group.clone() {
+                if let Some(group) = group_record(store, &domain).await? {
+                    if group.site_owner == account.username {
+                        for lane in [
+                            "provision-group-web.sh",
+                            "provision-group-capsule.sh",
+                            "provision-group-acme.sh",
+                        ] {
+                            run_script(cfg, lane, &[domain.as_str(), account.username.as_str()])
+                                .await?;
+                        }
+                    }
+                }
+            }
             // The first key builds the tree and the two daemon files, so the
             // index and the reload are due exactly as they are at approval.
             run_script(cfg, "cron-apply.sh", &["--web"]).await?;

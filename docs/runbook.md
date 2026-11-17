@@ -219,7 +219,7 @@ The drain applies the hosting from the group intent on approval. For a body alre
 	doas ksh scripts/provision-group-acme.sh <domain> <site-account>
 	doas ksh scripts/cron-apply.sh --web
 
-The site owner's tree has to exist first. `provision-member.sh <site-account> <upload-key-file>` builds it, and a group that left the upload key empty has no tree, so no site.
+The site owner's tree has to exist first. `provision-member.sh <site-account> [upload-key-file]` builds it with or without a key, and a group whose site owner has no key has a tree and no site until they add one.
 
 The three lanes write `/etc/httpd.d/<domain>.conf`, `/etc/gmid.d/<domain>.conf` and `/etc/acme-client.d/<domain>.conf`. `cron-apply.sh --web` rewrites the three indexes, fills the relayd keypair region and reloads what changed. The web lane writes the apex and `www` port 80 vhosts first, each with its challenge location before the redirect. The two loopback vhosts appear only once `/etc/ssl/<domain>.fullchain.pem` exists, so the name answers the challenge and serves nothing over TLS until the certificate lands. `relayd-members.sh` adds the domain's keypair line on the same pass.
 
@@ -245,6 +245,17 @@ To remove a body's domain, close it from the console:
 	doas kyriakon-admin group remove <domain>
 
 The drain removes the domain's lines from the mail tables, its generated vhosts, capsule block, certificate material and queued order, then closes every account in the group through the deletion path and deletes the group record. A card-paying group's subscription is stopped with `scripts/stripe-api.sh cancel <subscription-id> <key-file>` before its token goes, so the body is not billed again. The records in the body's own zone stay there, and the body removes them.
+
+### Hand a site to a replacement owner
+
+A site owner leaving the group hands the role to the replacement the removal intent names. The drain builds the replacement's tree, runs the three lanes at it, writes the replacement into `group.json`, and mails them once if they hold no key. It copies no key. The replacement adds their own upload key from the account page, and that runs the three lanes again. Until then the site serves what is already in the tree and nothing can be uploaded.
+
+Past handovers copied the departing owner's key into the replacement's key file, so compare the two when a site changes hands:
+
+	doas grep -o '"fingerprint": "[^"]*"' /var/db/onboard/accounts/<username>/account.json
+	ssh-keygen -lf /etc/ssh/authorized_keys/<username>
+
+Every line of the key file has to match a fingerprint the record lists. Remove a line that matches none with an editor and run `ssh-keygen -lf` again. That key reaches the same sftp tree and the git session on 2222.
 
 ## Provision through the control plane
 

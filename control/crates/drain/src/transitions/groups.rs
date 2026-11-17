@@ -508,9 +508,9 @@ pub async fn provision_group(
     }
 
     // The body's hosting, rooted in the site owner's own tree. The upload key
-    // decides hosting the way it does for a member: provision-member.sh builds
-    // no tree without one, so a group that left it empty has no site to serve
-    // and the lanes would refuse.
+    // decides whether the body has a site: a group that left it empty has the
+    // tree but no site, and the upload-key transition runs these lanes when the
+    // site owner adds a key.
     if !intent.upload_key.trim().is_empty() {
         run_script(
             cfg,
@@ -1557,39 +1557,66 @@ pub async fn group_address(
                 || store.account(&intent.mailbox).await?.is_some()
                 || account_on_box(cfg, &intent.mailbox)?;
             // Only a pass that still sees the departing mailbox owning the site
-            // moves the upload key and the lanes. Once the group record names
-            // the replacement, a retry must not copy anything: an intent that
-            // merely named the sitting owner while removing somebody else would
-            // otherwise hand that member's key to the site.
+            // moves the lanes. Once the group record names the replacement, a
+            // retry must not re-root anything: an intent that merely named the
+            // sitting owner while removing somebody else would otherwise hand
+            // that member the site.
             let site_owner_leaving = group.site_owner == intent.mailbox;
             if site_owner_leaving {
                 let replacement = intent.site_owner.as_deref().ok_or_else(|| {
                     Error::Failed("the site owner is leaving without a replacement".to_string())
                 })?;
-                let old_key = store
-                    .read_record("keys", &format!("{}.pub", intent.mailbox))
-                    .await;
-                if let Some(material) = &old_key {
-                    write_public_key(store, replacement, material).await?;
-                }
+                // The departing owner's upload key is never copied: the leaver
+                // would keep the site's sftp and git sessions, and a key the
+                // replacement had already added would be overwritten. The site
+                // is handed over keyless and the replacement adds their own.
                 run_script(cfg, "provision-member.sh", &[replacement]).await?;
                 // The vhosts root at the site owner's tree, and
                 // `cron-apply.sh --web` rewrites only the indexes: without the
                 // lanes the new root is never written and the old one is
-                // deleted with the departing account. They run before the
-                // record is written, so a retry after a lane refusal repeats
-                // them; a group with no upload key has no tree and the lanes
-                // would refuse.
-                if old_key.is_some() {
-                    for lane in [
-                        "provision-group-web.sh",
-                        "provision-group-capsule.sh",
-                        "provision-group-acme.sh",
-                    ] {
-                        run_script(cfg, lane, &[&intent.domain, replacement]).await?;
-                    }
+                // deleted with the departing account. They always run, because
+                // `provision-member.sh` builds the replacement's tree whether
+                // or not there is a key, and a pass that skipped them would
+                // leave the vhost on a tree the deletion removes. They run
+                // before the record is written, so a retry after a lane
+                // refusal repeats them.
+                for lane in [
+                    "provision-group-web.sh",
+                    "provision-group-capsule.sh",
+                    "provision-group-acme.sh",
+                ] {
+                    run_script(cfg, lane, &[&intent.domain, replacement]).await?;
                 }
                 group.site_owner = replacement.to_string();
+                // A replacement with no key of their own needs telling what to
+                // do next, because the handover gives them none. One who
+                // already has a key needs nothing. The fixed subject is the
+                // dedupe: a retry after a failed enqueue sends the one copy.
+                if store
+                    .read_record("keys", &format!("{replacement}.pub"))
+                    .await
+                    .is_none()
+                {
+                    let to = dns_contact(store, &group).await?;
+                    let subject = format!("You now own {}", intent.domain);
+                    let body = format!(
+                        "The site {domain} is now yours. Add an upload key from the account \
+                         page and the upload session is built for it. Until then the site \
+                         serves what is already there and nothing can be uploaded.\n\n\
+                         If you did not expect this, write to admin@kyriakon.net.\n",
+                        domain = intent.domain
+                    );
+                    notice::send_account_notice_retryable(
+                        cfg,
+                        store,
+                        replacement,
+                        "group.site_owner",
+                        &subject,
+                        &to,
+                        &body,
+                    )
+                    .await?;
+                }
             }
             group.accounts.retain(|a| a != &intent.mailbox);
             write_group_record(store, &group).await?;
