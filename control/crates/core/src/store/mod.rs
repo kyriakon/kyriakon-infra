@@ -1633,6 +1633,13 @@ pub struct Payment {
     pub token_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_issued_at: Option<String>,
+    /// The application's identifier, the token the status page is filed under.
+    /// It is what the card Payment Link carries as `client_reference_id`, so no
+    /// payment token reaches Stripe, and the webhook resolves it back through
+    /// the application record to `token_ref`. Absent on a record written before
+    /// the link carried it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub application_ref: Option<String>,
     /// Null while the window runs, which is the state a paid approval opens in.
     pub paid_until: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1832,6 +1839,7 @@ impl FlatPayment {
         Some(Payment {
             token_ref: self.token_ref.clone(),
             token_issued_at: self.token_issued_at.clone(),
+            application_ref: None,
             paid_until: self.paid_until.clone(),
             window: self.window.clone(),
             rail: None,

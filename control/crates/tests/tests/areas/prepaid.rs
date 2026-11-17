@@ -2068,6 +2068,66 @@ fn a_token_resend_sends_the_same_token_and_mints_nothing() {
     assert!(free.intents().is_empty(), "{:?}", free.intents());
 }
 
+/// A card account approved before the payment block carried the application's
+/// identifier still gets a link keyed to that identifier, and none at all once
+/// the purge has taken the application record: a link keyed to a record that is
+/// gone would take a payment the webhook cannot settle.
+#[test]
+fn a_resend_keys_the_card_link_to_the_application() {
+    let fix = Fix::new("resend-card-link");
+    let record = fix.filed("secretary", "card", &[("rail", "card")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    // A record written before the link carried the identifier: the payment
+    // block has no `application_ref`.
+    let path = fix.dir.join("store/accounts/secretary/account.json");
+    let mut account: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let token = account["payment"]["token_ref"]
+        .as_str()
+        .expect("a paid approval's token")
+        .to_string();
+    account["payment"]
+        .as_object_mut()
+        .unwrap()
+        .remove("application_ref");
+    std::fs::write(&path, serde_json::to_vec_pretty(&account).unwrap()).unwrap();
+
+    let link = format!("https://buy.stripe.com/test_example?client_reference_id={TOKEN}");
+    let out = fix.ctl(&["token", "resend", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let sent = fix.sent();
+    assert!(
+        sent.contains(&link),
+        "the resend carried no card link: {sent}"
+    );
+    assert!(
+        !sent.contains(&format!("client_reference_id={token}")),
+        "the resend's link carried the payment token: {sent}"
+    );
+
+    // The purge takes the application record while the block keeps the
+    // identifier, so no link is minted for what the webhook could no longer
+    // resolve.
+    std::fs::remove_file(fix.dir.join(format!("store/applications/{TOKEN}.json"))).unwrap();
+    let links = fix.sent().matches(&link).count();
+    let out = fix.ctl(&["token", "resend", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.sent().matches(&link).count(),
+        links,
+        "a link was minted for a purged application"
+    );
+}
+
 /// Criterion (d): the token is a bearer secret, so the drain's own output never
 /// carries it. Cron mails what the drain prints, and that log is read by more
 /// people than the member's mail is.

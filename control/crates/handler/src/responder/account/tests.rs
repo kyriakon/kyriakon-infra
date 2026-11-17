@@ -1267,3 +1267,45 @@ async fn the_account_page_offers_every_action() {
     let (_, body) = ask(&app, &httpd_get_session("account", "", &cookie)).await;
     assert!(!body.contains("/account/test-mail"), "{body}");
 }
+
+/// A card link is keyed to an application the store can still resolve. The
+/// purge takes `applications/<id>.json` ninety days in while the payment block
+/// keeps the identifier, and the page then shows no link rather than one that
+/// would take a payment the webhook can settle nothing against.
+#[tokio::test]
+async fn the_account_page_shows_a_card_link_only_for_a_filed_application() {
+    let (app, dir) = handler("account-card-link").await;
+    file_account(&dir);
+    amend_account(&dir, "alice", |value| {
+        value["rail"] = serde_json::json!("card");
+        value["no_charge"] = serde_json::json!(false);
+        value["payment"] = serde_json::json!({
+            "token_ref": "KYR-4F2M-9QH7-XT3B",
+            "application_ref": TOKEN,
+            "window": {"opened_at": "2026-10-02T09:00:00Z",
+                       "closes_at": "2099-10-16T09:00:00Z",
+                       "state": "open", "extensions": 0}
+        });
+    });
+    let record = decided(
+        "approved: an account was made",
+        Some("2026-10-02T09:00:00Z"),
+        None,
+    );
+    stage_application(&dir, &record);
+
+    let cookie = signed_in(&app, "alice").await;
+    let (code, page) = ask(&app, &httpd_get_session("account", "", &cookie)).await;
+    assert_eq!(code, 200);
+    assert!(
+        page.contains(&format!("client_reference_id={TOKEN}")),
+        "the page carried no card link: {page}"
+    );
+
+    std::fs::remove_file(dir.join("applications").join(format!("{TOKEN}.json"))).unwrap();
+    let (_, page) = ask(&app, &httpd_get_session("account", "", &cookie)).await;
+    assert!(
+        !page.contains("client_reference_id="),
+        "a link outlived its application record: {page}"
+    );
+}

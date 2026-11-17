@@ -612,6 +612,33 @@ impl Fix {
         .unwrap();
     }
 
+    /// The application record a test's account was approved from, named by the
+    /// identifier the card link carries, so a webhook naming that identifier
+    /// resolves to the account's token without a whole approval.
+    pub fn application_record(&self, application: &str, username: &str, token: &str) {
+        let record = json!({
+            "username": username,
+            "status_token": application,
+            "filed_at": "2026-10-02T09:00:00Z",
+            "front_end": "web",
+            "stage": "decided",
+            "answers": {},
+            "mail_keys": [],
+            "rail": "card",
+            "no_charge": false,
+            "acceptances": [],
+            "question_list": "2026-10-13 test",
+            "payment": {"token_ref": token}
+        });
+        let dir = self.dir.join("store/applications");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{application}.json")),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
     /// Write the application record the handler would have written.
     pub fn filed(&self, username: &str, rail: &str, answers: &[(&str, &str)]) -> Value {
         self.filed_with(username, rail, answers, None, Some((UPLOAD_KEY, "works")))

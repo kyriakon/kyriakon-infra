@@ -23,8 +23,8 @@ use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::payments::rails::{card_link, rail_instructions};
 use kyriakon_control_core::store::journal::Journal;
 use kyriakon_control_core::store::{
-    self, Account, ApplicationRef, FlatPayment, GroupIntent, GroupPayment, Intent, Monero,
-    PasswordLink, Payment, Record, Store, TokenRecord, UploadKey, Window,
+    self, Account, ApplicationRef, FlatPayment, GroupIntent, GroupPayment, Intent, PasswordLink,
+    Payment, Record, Store, TokenRecord, UploadKey, Window,
 };
 use kyriakon_control_core::util;
 use serde_json::json;
@@ -586,6 +586,7 @@ async fn approve(
         Some(Payment {
             token_ref: token_ref.clone(),
             token_issued_at: Some(now.clone()),
+            application_ref: Some(record.status_token.clone()),
             paid_until: None,
             window: window.clone(),
             rail: Some(record.rail.clone()),
@@ -752,9 +753,8 @@ async fn approve(
             &record.username,
             &record.rail,
             no_charge,
-            token_ref.as_deref(),
-            &window,
-            account.payment.as_ref().and_then(|p| p.monero.as_ref()),
+            account.payment.as_ref(),
+            Some(&record.status_token),
         )?,
         &password_until,
         &password_link,
@@ -959,11 +959,7 @@ async fn approve_group(
     // A group on a cash rail has no Stripe link, and asking for one would fail
     // the approval of a body that never chose the card rail.
     let link = if written.payment.rail == "card" {
-        card_link(
-            &cfg.stripe_group_payment_link,
-            written.payment.token_ref.as_deref().unwrap_or(""),
-        )
-        .map_err(|_| {
+        card_link(&cfg.stripe_group_payment_link, &record.status_token).map_err(|_| {
             Error::Failed(
                 "stripe_group_payment_link is not configured, so a group card approval has no \
                  link to send"
@@ -1414,9 +1410,8 @@ fn decision_body(
     username: &str,
     rail: &str,
     no_charge: bool,
-    token: Option<&str>,
-    window: &Option<Window>,
-    monero: Option<&Monero>,
+    payment: Option<&Payment>,
+    application: Option<&str>,
 ) -> Result<String, Error> {
     if no_charge {
         return Ok(format!(
@@ -1424,13 +1419,18 @@ fn decision_body(
              There is nothing to pay and no payment window. The account does not lapse.\n"
         ));
     }
-    let token =
-        token.ok_or_else(|| Error::Failed("a charged approval has no token".to_string()))?;
-    let window = window
+    let payment = payment
+        .ok_or_else(|| Error::Failed("a charged approval has no payment block".to_string()))?;
+    let token = payment
+        .token_ref
+        .as_deref()
+        .ok_or_else(|| Error::Failed("a charged approval has no token".to_string()))?;
+    let window = payment
+        .window
         .as_ref()
         .ok_or_else(|| Error::Failed("a charged approval has no window".to_string()))?;
     let card_link = if rail == "card" {
-        card_link(&cfg.stripe_payment_link, token)?
+        card_link(&cfg.stripe_payment_link, application.unwrap_or(""))?
     } else {
         None
     };
@@ -1445,7 +1445,7 @@ fn decision_body(
         rail,
         &cfg.postal_address,
         card_link.as_deref(),
-        monero,
+        payment.monero.as_ref(),
         &cfg.price_gbp,
     ) {
         out.push_str(&line);
@@ -1506,14 +1506,36 @@ pub async fn resend(
             "the token the resend names is not the one {username}'s account holds"
         )));
     }
+    // The application the account was made from, from the account's own copy:
+    // the journal line below names it, and it is where a record written before
+    // the payment block carried `application_ref` still has its identifier.
+    let application = store
+        .account_application_text(username)
+        .await?
+        .and_then(|copy| serde_json::from_str::<Value>(&copy).ok())
+        .and_then(|copy| {
+            let status_token = copy.get("status_token")?.as_str()?.to_string();
+            Some(ApplicationRef::application(
+                username.to_string(),
+                status_token,
+            ))
+        })
+        .ok_or_else(|| Error::Failed(format!("no application record for {username}")))?;
+    // A card link is only minted for an identifier the webhook can still
+    // resolve. The purge takes `applications/<id>.json` ninety days in while
+    // the payment block keeps the identifier, and a link keyed to a record that
+    // is gone would take a payment nothing can settle.
+    let card_application = match application.status_token.as_deref() {
+        Some(token) if store.application(token).await?.is_some() => Some(token),
+        _ => None,
+    };
     let body = decision_body(
         cfg,
         username,
         &account.rail,
         false,
-        payment.token_ref.as_deref(),
-        &payment.window,
-        payment.monero.as_ref(),
+        Some(&payment),
+        card_application,
     )?;
     let to = account
         .outside_address
@@ -1532,18 +1554,6 @@ pub async fn resend(
     .await?;
     // Every settling transition journals its outcome, and the line names the
     // application the account was made from.
-    let application = store
-        .account_application_text(username)
-        .await?
-        .and_then(|copy| serde_json::from_str::<Value>(&copy).ok())
-        .and_then(|copy| {
-            let status_token = copy.get("status_token")?.as_str()?.to_string();
-            Some(ApplicationRef::application(
-                username.to_string(),
-                status_token,
-            ))
-        })
-        .ok_or_else(|| Error::Failed(format!("no application record for {username}")))?;
     Ok(Settlement::line("applied", application, None))
 }
 

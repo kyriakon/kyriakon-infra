@@ -6,7 +6,7 @@ use super::connection::fields;
 use super::gemini::{account_notices, capsule_account};
 use super::reply::{notice, page_html, refused, respond};
 use super::route::Call;
-use super::status::card_link;
+use super::status::{card_link, live_application};
 
 use time::OffsetDateTime;
 
@@ -64,14 +64,19 @@ pub(super) async fn account_web(app: &App, request: &Request) -> Reply {
         Err(e) => return respond(&e, FrontEnd::Httpd),
     };
     let dns = group_recipe(app, &account);
-    let payment = account.payment_state().map(|block| {
+    let block = account.payment_state();
+    let application = match block.as_ref() {
+        Some(block) => live_application(app, block.application_ref.as_deref()).await,
+        None => None,
+    };
+    let payment = block.map(|block| {
         page::payment(
             &account.state,
             &account.rail,
             &block,
             &app.cfg.price_gbp,
             &app.cfg.postal_address,
-            card_link(app, block.token_ref.as_deref(), false).as_deref(),
+            card_link(app, application.as_deref(), false).as_deref(),
             now,
         )
     });

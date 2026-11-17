@@ -234,14 +234,19 @@ fn a_first_payment_with_a_checkout_and_an_invoice_extends_one_year() {
         .expect("a paid approval draws a token")
         .to_string();
     assert!(
-        fix.sent().contains(&format!("client_reference_id={token}")),
-        "the approval email keys the link to the account's token: {}",
+        fix.sent().contains(&format!("client_reference_id={TOKEN}")),
+        "the approval email keys the link to the application's identifier: {}",
+        fix.sent()
+    );
+    assert!(
+        !fix.sent().contains(&format!("client_reference_id={token}")),
+        "the payment token reached the link: {}",
         fix.sent()
     );
 
     // Both events of a first payment, the invoice filed first to prove the pass
-    // settles the checkout before it. The reference is the account's `KYR-`
-    // token, which is what the approval email carried.
+    // settles the checkout before it. The reference is the application's
+    // identifier, which is what the approval email carried.
     fix.webhook(
         "evt_00_invoice",
         "invoice.paid",
@@ -252,7 +257,7 @@ fn a_first_payment_with_a_checkout_and_an_invoice_extends_one_year() {
         "checkout.session.completed",
         json!({
             "id": "cs_example",
-            "client_reference_id": token,
+            "client_reference_id": TOKEN,
             "subscription": SUBSCRIPTION,
             "customer": "cus_example",
         }),
@@ -618,10 +623,15 @@ fn an_invoice_with_no_checkout_repairs_the_attachment_from_the_session() {
     let path = fix.dir.join("store/accounts/secretary/account.json");
     let mut account: Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let token = account["payment"]["token_ref"]
+        .as_str()
+        .expect("a card account holds its token")
+        .to_string();
     account["payment"]["stripe"]["subscription"] = Value::Null;
     std::fs::write(&path, serde_json::to_vec_pretty(&account).unwrap()).unwrap();
+    fix.application_record(TOKEN, "secretary", &token);
 
-    fix.stripe_session_repair("KYR-AAAA-BBBB-CCCC");
+    fix.stripe_session_repair(TOKEN);
     fix.webhook("evt_repair", "invoice.paid", invoice("in_repair"));
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
@@ -831,6 +841,70 @@ fn a_missing_webhook_secret_is_mailed_once_and_keeps_the_delivery() {
     assert!(fix.webhooks().is_empty(), "{:?}", fix.webhooks());
 }
 
+/// A link mailed before the change carried the payment token, and those links
+/// are already in inboxes. A checkout naming one still attaches the
+/// subscription, because Stripe charges it either way and refusing it would take
+/// the money and grant nothing. The window closes with the last pre-release
+/// window; no link minted since carries a token.
+#[test]
+fn a_checkout_naming_a_payment_token_still_settles_the_old_link() {
+    let fix = Fix::new("webhook-kyr-reference");
+    fix.card_account("secretary", None);
+    let path = fix.dir.join("store/accounts/secretary/account.json");
+    let mut account: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let token = account["payment"]["token_ref"]
+        .as_str()
+        .expect("a card account holds its token")
+        .to_string();
+    account["payment"]["stripe"]["subscription"] = Value::Null;
+    std::fs::write(&path, serde_json::to_vec_pretty(&account).unwrap()).unwrap();
+
+    fix.webhook(
+        "evt_kyr",
+        "checkout.session.completed",
+        json!({
+            "id": "cs_example",
+            "client_reference_id": token,
+            "subscription": SUBSCRIPTION,
+            "customer": "cus_example",
+        }),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["payment"]["stripe"]["subscription"], SUBSCRIPTION,
+        "the old link's checkout attached nothing: {account}"
+    );
+}
+
+/// A reference of neither shape names nothing, so the checkout is settled as
+/// nobody's: no subscription is attached and no record changes.
+#[test]
+fn a_checkout_naming_no_known_reference_settles_nothing() {
+    let fix = Fix::new("webhook-bad-reference");
+    fix.card_account("secretary", None);
+    let before = fix.account("secretary");
+    fix.webhook(
+        "evt_bad",
+        "checkout.session.completed",
+        json!({
+            "id": "cs_example",
+            "client_reference_id": "cs_example?not-a-reference",
+            "subscription": SUBSCRIPTION,
+            "customer": "cus_example",
+        }),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.account("secretary"),
+        before,
+        "a reference of neither shape settled"
+    );
+}
+
 /// An account record that is there and does not parse is drift, not an account
 /// that is gone: the webhook names the record, the checkout is left for the next
 /// pass, and the sweeps before it carry on with the other accounts.
@@ -838,14 +912,19 @@ fn a_missing_webhook_secret_is_mailed_once_and_keeps_the_delivery() {
 fn a_corrupt_account_record_keeps_the_checkout_and_reports() {
     let fix = Fix::new("webhook-corrupt-account");
     fix.card_account("secretary", None);
+    let token = fix.account("secretary")["payment"]["token_ref"]
+        .as_str()
+        .expect("a card account holds its token")
+        .to_string();
     let path = fix.dir.join("store/accounts/secretary/account.json");
     std::fs::write(&path, b"{\"version\": 1, \"username\": \"secre").unwrap();
+    fix.application_record(TOKEN, "secretary", &token);
     fix.webhook(
         "evt_corrupt",
         "checkout.session.completed",
         json!({
             "id": "cs_corrupt",
-            "client_reference_id": "KYR-AAAA-BBBB-CCCC",
+            "client_reference_id": TOKEN,
             "subscription": SUBSCRIPTION,
             "customer": "cus_example",
         }),
