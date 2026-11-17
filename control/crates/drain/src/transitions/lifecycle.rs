@@ -1357,6 +1357,12 @@ async fn resend_account(
         )
     };
     notice::send_again_retryable(cfg, store, username, kind, &subject, &to, &body).await?;
+    // The working channel has to outlive this command: the day-33 final notice
+    // reads notice_address, so a resend to a new address that is not persisted
+    // would bounce again and re-latch the clock the resend just cleared.
+    if to != account.notice_address() {
+        account.outside_address = Some(to.clone());
+    }
     account.grace_until = Some(grace.clone());
     account.notice_stopped = None;
     let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
@@ -1435,6 +1441,11 @@ async fn resend_group(
     let Some(mut account) = store.account(username).await? else {
         return Err(Error::Failed(format!("no account for {username}")));
     };
+    // The group's later notices go to the site owner's notice_address, so a
+    // working channel named here has to be recorded there, not just used once.
+    if to != account.notice_address() {
+        account.outside_address = Some(to.clone());
+    }
     account.notice_stopped = None;
     let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
         context: "encode the account",
