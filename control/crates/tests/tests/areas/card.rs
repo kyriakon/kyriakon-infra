@@ -911,9 +911,13 @@ fn a_checkout_naming_no_known_reference_settles_nothing() {
 fn a_corrupt_account_record_keeps_the_checkout_and_reports() {
     let fix = Fix::new("webhook-corrupt-account");
     fix.card_account("secretary", None);
+    let token = fix.account("secretary")["payment"]["token_ref"]
+        .as_str()
+        .expect("a card account holds its token")
+        .to_string();
     let path = fix.dir.join("store/accounts/secretary/account.json");
     std::fs::write(&path, b"{\"version\": 1, \"username\": \"secre").unwrap();
-    fix.application_record(TOKEN, "secretary", "KYR-AAAA-BBBB-CCCC");
+    fix.application_record(TOKEN, "secretary", &token);
     fix.webhook(
         "evt_corrupt",
         "checkout.session.completed",
