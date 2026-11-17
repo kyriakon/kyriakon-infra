@@ -778,6 +778,41 @@ async fn last_payment_line(store: &Store, token: &str) -> Result<Option<PaymentL
     }))
 }
 
+/// The part of a payment that never bought time. An `--excess` refund may
+/// return only this. Money that did buy time returns through the transition
+/// that ends the access: `--close` on an account, `group remove` on a group.
+///
+/// A line with no applied figure is unknown rather than fully unapplied: an old
+/// or truncated payment line must not make the whole payment refundable.
+fn unapplied(original: &PaymentLine) -> Option<i64> {
+    original
+        .applied_gbp
+        .map(|applied| original.amount - applied)
+}
+
+/// Refuse an `--excess` refund that asks for money the payment applied, with
+/// both figures named. `full_return` names the transition that ends the access
+/// instead of the refund.
+fn excess_cap(original: &PaymentLine, amount: i64, full_return: &str) -> Result<(), String> {
+    let Some(unapplied) = unapplied(original) else {
+        return Err(format!(
+            "ledger seq {} records no applied amount, so an --excess refund cannot tell what never bought time; a full return goes through {full_return}",
+            original.seq
+        ));
+    };
+    if amount > unapplied {
+        return Err(format!(
+            "an --excess refund is GBP {}, more than the GBP {} of ledger seq {} that never bought time (GBP {} arrived, GBP {} of it was applied); a full return goes through {full_return}",
+            util::gbp(amount),
+            util::gbp(unapplied.max(0)),
+            original.seq,
+            util::gbp(original.amount),
+            util::gbp(original.applied_gbp.unwrap_or(0))
+        ));
+    }
+    Ok(())
+}
+
 /// Refund one payment, or settle a refund already recorded. The console signs
 /// every field, and `verify` checks the signature before anything else
 /// because `intents/` belongs to the unprivileged half.
@@ -950,24 +985,13 @@ pub async fn refund(
         },
         None => 0,
     };
-    let applied = original.applied_gbp.unwrap_or(0);
-    let unapplied = original.amount - applied;
-    if intent.excess && amount > unapplied {
-        return Ok(Settlement::refused(format!(
-            "an --excess refund is GBP {}, more than the GBP {} of ledger seq {} that never bought time (GBP {} arrived, GBP {} of it was applied); a full return goes through --close",
-            util::gbp(amount),
-            util::gbp(unapplied),
-            original.seq,
-            util::gbp(original.amount),
-            util::gbp(applied)
-        )));
+    if intent.excess {
+        if let Err(problem) = excess_cap(&original, amount, "--close") {
+            return Ok(Settlement::refused(&problem));
+        }
     }
-    let ceiling = if intent.excess {
-        unapplied
-    } else {
-        original.amount
-    };
-    if let Err(problem) = refund_total(store, &intent.token, &original, amount, ceiling).await {
+    if let Err(problem) = refund_total(store, &intent.token, &original, amount, intent.excess).await
+    {
         return Ok(Settlement::refused(&problem));
     }
 
@@ -1066,8 +1090,13 @@ async fn refund_total(
     token: &str,
     original: &PaymentLine,
     amount: i64,
-    ceiling: i64,
+    excess: bool,
 ) -> Result<(), Error> {
+    let ceiling = if excess {
+        unapplied(original).unwrap_or(0)
+    } else {
+        original.amount
+    };
     let deducted = format!("-{}", util::gbp(amount));
     let ledger = Ledger::open(store);
     // A line this cannot read is not zero: counting it as zero would let this
@@ -1083,10 +1112,10 @@ async fn refund_total(
         }
     }
     if refunds.total + amount > ceiling {
-        let what = if ceiling == original.amount {
-            "that arrived"
-        } else {
+        let what = if excess {
             "that never bought time"
+        } else {
+            "that arrived"
         };
         return Err(Error::Failed(format!(
             "refunds of ledger seq {} already total GBP {}; another GBP {} would exceed the GBP {} {what}",
@@ -1100,8 +1129,9 @@ async fn refund_total(
 }
 
 /// Refund one group payment. The group holds no balance and no closing state,
-/// so only `--excess` is meaningful: the negative ledger line reverses the
-/// year, and the group's own removal is the transition that ends the domain.
+/// so only `--excess` is meaningful, and it may return only the part of the
+/// payment that never bought time: the group's own removal is the transition
+/// that ends the domain and the year with it.
 // The fields are the refund's own, resolved by the caller; one list keeps the
 // group and account paths' checks identical.
 #[allow(clippy::too_many_arguments)]
@@ -1122,11 +1152,12 @@ async fn refund_group(
         ));
     };
     if intent.close {
-        return Ok(Settlement::refused("a group has no closing state, so --close cannot cancel one; reverse the payment with --excess, and end the group with `kyriakon-admin group remove <domain>`"));
+        return Ok(Settlement::refused("a group has no closing state, so --close cannot cancel one; end the group with `kyriakon-admin group remove <domain>`"));
     }
-    if let Err(problem) =
-        refund_total(store, &intent.token, original, amount, original.amount).await
-    {
+    if let Err(problem) = excess_cap(original, amount, "`kyriakon-admin group remove <domain>`") {
+        return Ok(Settlement::refused(&problem));
+    }
+    if let Err(problem) = refund_total(store, &intent.token, original, amount, true).await {
         return Ok(Settlement::refused(&problem));
     }
     let received_on = util::filed_at()[..10].to_string();

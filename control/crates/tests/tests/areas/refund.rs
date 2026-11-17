@@ -363,11 +363,113 @@ fn an_excess_refund_of_a_payment_that_applied_nothing_is_the_full_amount() {
     assert_eq!(after["state"], before["state"], "{after}");
 }
 
+/// An `--excess` refund on a payment line with no applied figure is refused:
+/// an old or truncated line is unknown, not fully unapplied, and a refund must
+/// not treat the whole payment as held money.
+#[test]
+fn an_excess_refund_of_a_line_with_no_applied_figure_is_refused() {
+    let fix = Fix::new("refund-excess-no-applied");
+    let token = approved_paid(&fix, "secretary", "cash");
+    cash_credit(&fix, &token);
+    let path = fix.dir.join("store/ledger/payments.jsonl");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let mut value: Value = serde_json::from_str(line).unwrap();
+        if value["kind"] == json!("payment") {
+            value.as_object_mut().unwrap().remove("applied_gbp");
+        }
+        lines.push(serde_json::to_string(&value).unwrap());
+    }
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+    let out = fix.ctl(&[
+        "refund", "--token", &token, "--amount", "5.00", "--rail", "cash", "--reason", "overpaid",
+        "--excess",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(refund_lines(&fix).is_empty(), "{:?}", refund_lines(&fix));
+    assert!(
+        fix.journal()
+            .contains("records no applied amount, so an --excess refund cannot tell"),
+        "{}",
+        fix.journal()
+    );
+}
+
+/// The one-percent tolerance can apply the price to money slightly below it, so
+/// the unapplied part is negative. The refusal names GBP 0.00 rather than a
+/// negative amount, and no excess refund can pass it.
+#[test]
+fn an_excess_refund_of_a_rounded_up_shortfall_shows_zero() {
+    let fix = Fix::new("refund-excess-band");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "19.80",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+    let credit = payment_lines(&fix).remove(0);
+    assert_eq!(credit["amount_gbp"], json!("19.80"), "{credit}");
+    assert_eq!(credit["applied_gbp"], json!("20.00"), "{credit}");
+    let before = fix.account("secretary");
+    assert_eq!(
+        before["payment"]["paid_until"],
+        json!("2027-10-04"),
+        "{before}"
+    );
+
+    let out = fix.ctl(&[
+        "refund",
+        "--token",
+        &token,
+        "--amount",
+        "1.00",
+        "--rail",
+        "cash",
+        "--reason",
+        "asked for it back",
+        "--excess",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(refund_lines(&fix).is_empty(), "{:?}", refund_lines(&fix));
+    let journal = fix.journal();
+    assert!(
+        journal.contains(&format!(
+            "more than the GBP 0.00 of ledger seq {} that never bought time (GBP 19.80 arrived, GBP 20.00 of it was applied)",
+            credit["seq"]
+        )),
+        "{journal}"
+    );
+    assert!(
+        !journal.contains("0.-"),
+        "the refusal printed a negative amount: {journal}"
+    );
+    let after = fix.account("secretary");
+    assert_eq!(
+        after["payment"]["paid_until"],
+        json!("2027-10-04"),
+        "{after}"
+    );
+}
+
 /// Refunds of one payment sum to no more than its unapplied part, whatever
 /// their sizes: the per-refund check alone lets two partial refunds overshoot.
 /// The sums are checked across lines naming the same `refund_of`.
 #[test]
-fn refunds_of_one_payment_cannot_exceed_it() {
+fn excess_refunds_of_one_payment_cannot_exceed_the_unapplied_part() {
     let fix = Fix::new("refund-sum");
     let token = approved_paid(&fix, "secretary", "cash");
     let out = fix.ctl(&[
@@ -742,12 +844,12 @@ fn a_card_invoice_appends_a_line_and_a_card_refund_names_it() {
     );
 }
 
-/// A group's payment is reversible: the token names the group's one payment and
-/// the mailbox name resolves to that token, the negative ledger line names the
-/// year it reverses, and `--close` is refused because a group has no closing
-/// state to enter.
+/// A group's fee is one payment of the whole price, applied in full, so there
+/// is no unapplied part for `--excess` to return. The refusal names the
+/// payment and the applied part, and points at the transition that ends the
+/// group and its year.
 #[test]
-fn a_group_refund_reverses_the_groups_one_payment() {
+fn a_group_excess_refund_is_capped_and_names_group_remove() {
     let fix = Fix::new("group-refund");
     fix.file_group(
         "parish.example",
@@ -772,17 +874,36 @@ fn a_group_refund_reverses_the_groups_one_payment() {
     ]);
     assert!(out.status.success(), "{}", body(&out));
     assert!(fix.drain().status.success());
+    let credit = payment_lines(&fix).remove(0);
+    assert_eq!(credit["applied_gbp"], json!("40.00"), "{credit}");
+    let credit_seq = credit["seq"].as_u64().unwrap();
     let paid_until = serde_json::from_str::<Value>(&fix.read("groups/parish.example/group.json"))
         .unwrap()["payment"]["paid_until"]
         .clone();
-    let credit_seq = payment_lines(&fix)[0]["seq"].as_u64().unwrap();
 
-    // A mailbox name resolves to the group's token, and the line reverses the
-    // payment keyed by that token.
+    // A mailbox name resolves to the group's token, and the whole fee cannot
+    // come back as excess.
     let out = fix.ctl(&[
         "refund",
         "--username",
         "parish-secretary",
+        "--amount",
+        "40.00",
+        "--rail",
+        "cash",
+        "--reason",
+        "the year ended early",
+        "--excess",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    // The token form reaches the same cap with a partial amount.
+    let out = fix.ctl(&[
+        "refund",
+        "--token",
+        &token,
         "--amount",
         "10.00",
         "--rail",
@@ -794,13 +915,21 @@ fn a_group_refund_reverses_the_groups_one_payment() {
     assert!(out.status.success(), "{}", body(&out));
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
-    let refunds = refund_lines(&fix);
-    assert_eq!(refunds.len(), 1, "{refunds:?}");
-    assert_eq!(refunds[0]["token"], json!(token), "{refunds:?}");
-    assert_eq!(refunds[0]["amount_gbp"], json!("-10.00"), "{refunds:?}");
-    assert_eq!(refunds[0]["refund_of"], json!(credit_seq), "{refunds:?}");
 
-    // The group's date and state are the refund's to leave alone.
+    assert!(refund_lines(&fix).is_empty(), "{:?}", refund_lines(&fix));
+    let journal = fix.journal();
+    assert!(
+        journal.contains(&format!(
+            "an --excess refund is GBP 40.00, more than the GBP 0.00 of ledger seq {credit_seq} that never bought time (GBP 40.00 arrived, GBP 40.00 of it was applied)"
+        )),
+        "{journal}"
+    );
+    assert!(
+        journal.contains("an --excess refund is GBP 10.00, more than the GBP 0.00 of ledger seq"),
+        "{journal}"
+    );
+
+    // The group's date and state are the refusal's to leave alone.
     let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
     assert_eq!(group["payment"]["paid_until"], paid_until, "{group}");
     assert_eq!(
@@ -809,25 +938,7 @@ fn a_group_refund_reverses_the_groups_one_payment() {
         "{group}"
     );
 
-    // The rest by token. A settlement still works against the group's token.
-    let out = fix.ctl(&[
-        "refund",
-        "--token",
-        &token,
-        "--amount",
-        "30.00",
-        "--rail",
-        "cash",
-        "--reason",
-        "the year ended early",
-        "--excess",
-    ]);
-    assert!(out.status.success(), "{}", body(&out));
-    assert!(fix.drain().status.success());
-    assert_eq!(refund_lines(&fix).len(), 2, "{:?}", refund_lines(&fix));
-
-    // `--close` is not a group transition: it is refused, with the way to end
-    // the group named, and writes no line.
+    // `--close` is not a group transition either, and names the way out.
     let out = fix.ctl(&[
         "refund",
         "--token",
@@ -843,23 +954,69 @@ fn a_group_refund_reverses_the_groups_one_payment() {
     assert!(out.status.success(), "{}", body(&out));
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
+    assert!(refund_lines(&fix).is_empty(), "{:?}", refund_lines(&fix));
+    let journal = fix.journal();
+    assert!(
+        journal.contains("a group has no closing state, so --close cannot cancel one"),
+        "{journal}"
+    );
+    assert!(
+        journal.contains("group remove"),
+        "the refusal names the transition that ends a group: {journal}"
+    );
+}
+
+/// A card invoice above the year's price buys one year and holds the rest: the
+/// applied figure is the price, not the invoice's total, so the overpayment can
+/// come back as excess and the year stays.
+#[test]
+fn a_card_overpayment_is_refundable_as_excess() {
+    let fix = Fix::new("card-refund-excess");
+    fix.card_account("secretary", None);
+    fix.webhook(
+        "evt_card_over",
+        "invoice.paid",
+        invoice_with("in_card_over", 2500, 1_790_000_000),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let payments = payment_lines(&fix);
+    assert_eq!(payments.len(), 1, "{payments:?}");
+    assert_eq!(payments[0]["amount_gbp"], json!("25.00"), "{payments:?}");
+    assert_eq!(payments[0]["applied_gbp"], json!("20.00"), "{payments:?}");
+    let paid_seq = payments[0]["seq"].as_u64().unwrap();
+    let before = fix.account("secretary");
+    let paid_until = before["payment"]["paid_until"].clone();
+    assert!(!paid_until.is_null(), "{before}");
+
+    let out = fix.ctl(&[
+        "refund",
+        "--username",
+        "secretary",
+        "--amount",
+        "5.00",
+        "--rail",
+        "card",
+        "--reason",
+        "invoice was higher than the year",
+        "--excess",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let refunds = refund_lines(&fix);
+    assert_eq!(refunds.len(), 1, "{refunds:?}");
+    assert_eq!(refunds[0]["amount_gbp"], json!("-5.00"), "{refunds:?}");
+    assert_eq!(refunds[0]["refund_of"], json!(paid_seq), "{refunds:?}");
+    assert_eq!(refunds[0]["rail"], json!("card"), "{refunds:?}");
+    let after = fix.account("secretary");
     assert_eq!(
-        refund_lines(&fix).len(),
-        2,
-        "a refused --close wrote a line: {:?}",
-        refund_lines(&fix)
+        after["payment"]["paid_until"], paid_until,
+        "the excess refund moved the year: {after}"
     );
-    assert!(
-        fix.journal()
-            .contains("a group has no closing state, so --close cannot cancel one"),
-        "{}",
-        fix.journal()
-    );
-    assert!(
-        fix.journal().contains("group remove"),
-        "the refusal names the transition that ends a group: {}",
-        fix.journal()
-    );
+    assert!(after["payment"]["balance_gbp"].is_null(), "{after}");
 }
 
 /// An earlier refund whose amount cannot be read is not counted as zero: the
