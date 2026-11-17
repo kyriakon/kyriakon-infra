@@ -948,6 +948,7 @@ async fn invoice_paid(
         billing.save(store).await?;
         return Ok(Settled::Applied);
     }
+    let applied_gbp = invoice_applied(cfg, &billing, &amount_gbp)?;
     if billing.stripe().last_invoice.as_deref() == Some(invoice) {
         // The date was saved on an earlier pass. The ledger line it opens may
         // still be missing if that pass died between the save and the append,
@@ -958,6 +959,7 @@ async fn invoice_paid(
             billing.paid_until(),
             invoice,
             &amount_gbp,
+            &applied_gbp,
             &received_on,
         )
         .await?;
@@ -985,6 +987,7 @@ async fn invoice_paid(
         billing.paid_until(),
         invoice,
         &amount_gbp,
+        &applied_gbp,
         &received_on,
     )
     .await?;
@@ -1016,6 +1019,21 @@ fn invoice_covers(
         .and_then(Value::as_i64)
         .unwrap_or(0);
     Ok(paid >= price)
+}
+
+/// The part of a card invoice's money that bought time. The year is one year
+/// whatever was paid above the price, so only the price is applied and the
+/// rest stays refundable as excess.
+fn invoice_applied(
+    cfg: &DrainConfig,
+    billing: &BillingTarget,
+    amount_gbp: &str,
+) -> Result<String, Error> {
+    let (field, price) = billing.price(cfg);
+    let price = util::pence(price)
+        .map_err(|e| Error::context(format!("the drain's configured {field}"), e))?;
+    let amount = util::pence(amount_gbp).map_err(|e| Error::context("the invoice's amount", e))?;
+    Ok(util::gbp(amount.min(price)))
 }
 
 /// What a paid invoice says it paid, in pounds, and the day it was paid. The
@@ -1052,6 +1070,7 @@ async fn append_invoice_ledger(
     paid_until_after: Option<&str>,
     invoice: &str,
     amount_gbp: &str,
+    applied_gbp: &str,
     received_on: &str,
 ) -> Result<(), Error> {
     let Some(token) = token else {
@@ -1063,7 +1082,7 @@ async fn append_invoice_ledger(
     let mut line = LedgerLine::empty(token, "payment", "card");
     line.received_on = Some(received_on.to_string());
     line.amount_gbp = Some(amount_gbp.to_string());
-    line.applied_gbp = Some(amount_gbp.to_string());
+    line.applied_gbp = Some(applied_gbp.to_string());
     line.paid_until_after = paid_until_after.map(str::to_string);
     line.intent = Some(invoice.to_string());
     Ledger::open(store).append(line).await?;

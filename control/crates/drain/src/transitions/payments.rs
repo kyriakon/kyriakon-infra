@@ -746,6 +746,10 @@ struct PaymentLine {
     seq: u64,
     rail: String,
     amount: i64,
+    /// The part of `amount` that bought time. An `--excess` refund may only
+    /// give back what is left, because money that bought time returns through
+    /// `--close`, which also takes the access away.
+    applied_gbp: Option<i64>,
     amount_xmr: Option<String>,
     paid_until_after: Option<String>,
 }
@@ -763,9 +767,50 @@ async fn last_payment_line(store: &Store, token: &str) -> Result<Option<PaymentL
         rail: line.rail,
         amount: util::pence(amount)
             .map_err(|e| Error::context("the payment line's amount cannot be read", e))?,
+        applied_gbp: match line.applied_gbp.as_deref() {
+            Some(text) => Some(util::pence(text).map_err(|e| {
+                Error::context("the payment line's applied amount cannot be read", e)
+            })?),
+            None => None,
+        },
         amount_xmr: line.amount_xmr,
         paid_until_after: line.paid_until_after,
     }))
+}
+
+/// The part of a payment that never bought time. An `--excess` refund may
+/// return only this. Money that did buy time returns through the transition
+/// that ends the access: `--close` on an account, `group remove` on a group.
+///
+/// A line with no applied figure is unknown rather than fully unapplied: an old
+/// or truncated payment line must not make the whole payment refundable.
+fn unapplied(original: &PaymentLine) -> Option<i64> {
+    original
+        .applied_gbp
+        .map(|applied| original.amount - applied)
+}
+
+/// Refuse an `--excess` refund that asks for money the payment applied, with
+/// both figures named. `full_return` names the transition that ends the access
+/// instead of the refund.
+fn excess_cap(original: &PaymentLine, amount: i64, full_return: &str) -> Result<(), String> {
+    let Some(unapplied) = unapplied(original) else {
+        return Err(format!(
+            "ledger seq {} records no applied amount, so an --excess refund cannot tell what never bought time; a full return goes through {full_return}",
+            original.seq
+        ));
+    };
+    if amount > unapplied {
+        return Err(format!(
+            "an --excess refund is GBP {}, more than the GBP {} of ledger seq {} that never bought time (GBP {} arrived, GBP {} of it was applied); a full return goes through {full_return}",
+            util::gbp(amount),
+            util::gbp(unapplied.max(0)),
+            original.seq,
+            util::gbp(original.amount),
+            util::gbp(original.applied_gbp.unwrap_or(0))
+        ));
+    }
+    Ok(())
 }
 
 /// Refund one payment, or settle a refund already recorded. The console signs
@@ -773,8 +818,10 @@ async fn last_payment_line(store: &Store, token: &str) -> Result<Option<PaymentL
 /// because `intents/` belongs to the unprivileged half.
 ///
 /// The refund form appends one negative line naming the `seq` it reverses and,
-/// with `--close`, sets the account closing. The settlement form rewrites the
-/// newest unsettled refund line under the ledger's lock. The ledger's own
+/// with `--close`, sets the account closing. An `--excess` refund is capped at
+/// the part of the payment that never bought time, so a full return has to go
+/// through `--close`, which also ends the access. The settlement form rewrites
+/// the newest unsettled refund line under the ledger's lock. The ledger's own
 /// `intent` field is the dedup key for a refund, and `settled_intent` for a
 /// settlement, so a replay writes nothing.
 pub async fn refund(
@@ -923,9 +970,10 @@ pub async fn refund(
     };
 
     // An excess refund gives back held overpayment, so whatever it takes has
-    // to leave the balance too. The sum check caps the refund at the payment; a
-    // duplicate payment that bought a year has no balance, and this leaves that
-    // year alone as the spec says.
+    // to leave the balance too. Its ceiling is the part of the payment that
+    // never bought time, not the balance: the card rail holds no balance, and
+    // a full return of money that did buy time is `--close`, which also takes
+    // the access away.
     let balance = match payment.balance_gbp.as_deref() {
         Some(text) => match util::pence(text) {
             Ok(pence) => pence,
@@ -937,7 +985,13 @@ pub async fn refund(
         },
         None => 0,
     };
-    if let Err(problem) = refund_total(store, &intent.token, &original, amount).await {
+    if intent.excess {
+        if let Err(problem) = excess_cap(&original, amount, "--close") {
+            return Ok(Settlement::refused(&problem));
+        }
+    }
+    if let Err(problem) = refund_total(store, &intent.token, &original, amount, intent.excess).await
+    {
         return Ok(Settlement::refused(&problem));
     }
 
@@ -1026,15 +1080,23 @@ pub async fn refund(
     .with_after(printed))
 }
 
-/// Refunds of one payment sum to no more than that payment, whatever their
-/// sizes: the per-refund check alone lets two partial refunds overshoot. An
-/// identical line is the same refund seen twice.
+/// Refunds of one payment sum to no more than their ceiling, whatever their
+/// sizes: the per-refund check alone lets two partial refunds overshoot. The
+/// ceiling is the payment's amount for a `--close`, and the part of it that
+/// never bought time for an `--excess`. An identical line is the same refund
+/// seen twice.
 async fn refund_total(
     store: &Store,
     token: &str,
     original: &PaymentLine,
     amount: i64,
+    excess: bool,
 ) -> Result<(), Error> {
+    let ceiling = if excess {
+        unapplied(original).unwrap_or(0)
+    } else {
+        original.amount
+    };
     let deducted = format!("-{}", util::gbp(amount));
     let ledger = Ledger::open(store);
     // A line this cannot read is not zero: counting it as zero would let this
@@ -1049,21 +1111,27 @@ async fn refund_total(
             )));
         }
     }
-    if refunds.total + amount > original.amount {
+    if refunds.total + amount > ceiling {
+        let what = if excess {
+            "that never bought time"
+        } else {
+            "that arrived"
+        };
         return Err(Error::Failed(format!(
-            "refunds of ledger seq {} already total GBP {}; another GBP {} would exceed the GBP {} that arrived",
+            "refunds of ledger seq {} already total GBP {}; another GBP {} would exceed the GBP {} {what}",
             original.seq,
             util::gbp(refunds.total),
             util::gbp(amount),
-            util::gbp(original.amount)
+            util::gbp(ceiling)
         )));
     }
     Ok(())
 }
 
 /// Refund one group payment. The group holds no balance and no closing state,
-/// so only `--excess` is meaningful: the negative ledger line reverses the
-/// year, and the group's own removal is the transition that ends the domain.
+/// so only `--excess` is meaningful, and it may return only the part of the
+/// payment that never bought time: the group's own removal is the transition
+/// that ends the domain and the year with it.
 // The fields are the refund's own, resolved by the caller; one list keeps the
 // group and account paths' checks identical.
 #[allow(clippy::too_many_arguments)]
@@ -1084,9 +1152,12 @@ async fn refund_group(
         ));
     };
     if intent.close {
-        return Ok(Settlement::refused("a group has no closing state, so --close cannot cancel one; reverse the payment with --excess, and end the group with `kyriakon-admin group remove <domain>`"));
+        return Ok(Settlement::refused("a group has no closing state, so --close cannot cancel one; end the group with `kyriakon-admin group remove <domain>`"));
     }
-    if let Err(problem) = refund_total(store, &intent.token, original, amount).await {
+    if let Err(problem) = excess_cap(original, amount, "`kyriakon-admin group remove <domain>`") {
+        return Ok(Settlement::refused(&problem));
+    }
+    if let Err(problem) = refund_total(store, &intent.token, original, amount, true).await {
         return Ok(Settlement::refused(&problem));
     }
     let received_on = util::filed_at()[..10].to_string();
