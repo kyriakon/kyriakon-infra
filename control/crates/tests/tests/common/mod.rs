@@ -1426,8 +1426,9 @@ impl Fix {
 
     /// One delivery-status report in the bounce spool, the way smtpd delivers
     /// it: a multipart report whose per-recipient part names the failed
-    /// recipient and status, and whose last part returns the original message.
-    pub fn bounce(&self, name: &str, status: &str, recipient: &str, subject: &str) {
+    /// recipient and status, and whose last part returns the original message
+    /// with the Message-ID that notice was recorded under.
+    pub fn bounce(&self, name: &str, status: &str, recipient: &str, id: &str) {
         std::fs::write(
             self.dir.join("store/bounce/new").join(name),
             format!(
@@ -1456,7 +1457,8 @@ impl Fix {
                  \n\
                  From: kyriakon <hello@kyriakon.net>\n\
                  To: {recipient}\n\
-                 Subject: {subject}\n\
+                 Subject: A kyriakon.net notice\n\
+                 Message-ID: <{id}@kyriakon.net>\n\
                  \n\
                  The notice.\n\
                  --b1--\n"

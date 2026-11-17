@@ -23,7 +23,8 @@
 //!       [--site-owner <account>]
 //!   kyriakon-admin [--config PATH] group remove <domain>
 //!   kyriakon-admin [--config PATH] token resend <username>
-//!   kyriakon-admin [--config PATH] notice resend <username> [--to <address>]
+//!   kyriakon-admin [--config PATH] notice resend <username> [--to <address>] \
+//!       [--group <domain>]
 //!   kyriakon-admin [--config PATH] credit (--token <t> | --username <u> | --note <text>) \
 //!       --rail <cash|cash-hand|monero> --amount <gbp> --received <YYYY-MM-DD>
 //!   kyriakon-admin [--config PATH] prepaid list --window open [--expiring <days>]
@@ -190,7 +191,7 @@ fn usage() -> String {
        kyriakon-admin resume <username>
        kyriakon-admin free
        kyriakon-admin token resend <username>
-       kyriakon-admin notice resend <username> [--to <address>]
+       kyriakon-admin notice resend <username> [--to <address>] [--group <domain>]
        kyriakon-admin credit (--token <t> | --username <u> | --note <text>) \
      --rail <cash|cash-hand|monero> --amount <gbp> --received <YYYY-MM-DD> \
      [--txid <id>] [--xmr <amount>] [--rate <gbp-per-xmr>] \

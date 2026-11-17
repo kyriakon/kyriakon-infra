@@ -103,6 +103,16 @@ pub(crate) async fn show(store: &Store, username: &str) -> Result<(), Error> {
             println!("account {username}");
             println!("  state    {}", safe(&account.state));
             println!("  decision {}", safe(&account.decision));
+            if let Some(stop) = &account.notice_stopped {
+                println!(
+                    "  notice   stopped: {} hard-bounced with {} on {}; run \
+                     `kyriakon-admin notice resend {}`",
+                    safe(&stop.address),
+                    safe(&stop.status),
+                    safe(&stop.at),
+                    safe(username)
+                );
+            }
             // A group mailbox holds no payment of its own: the group does. The
             // console prints the group's one rail, token, window and date, which
             // is what the body's page shows too.

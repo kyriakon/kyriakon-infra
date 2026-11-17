@@ -4,10 +4,11 @@
 //! Every notice leaves with `bounce@kyriakon.net` as its envelope sender, and
 //! `openbsd/etc/smtpd.conf` delivers that address to a plaintext Maildir the
 //! drain reads. A DSN is parsed conservatively: it must be a delivery-status
-//! report for a **failed** recipient with a **permanent** (5.x.x) status, and it
-//! must carry the subject of the message we sent. A soft bounce is the sender's
-//! queue still trying, and ordinary mail to the bounce address is not a report;
-//! neither moves anything.
+//! report for a **failed** recipient with a **permanent** (5.x.x) status, and
+//! the returned original must carry the Message-ID this platform minted and
+//! recorded on the notice line. A soft bounce is the sender's queue still
+//! trying, ordinary mail to the bounce address is not a report, and a report
+//! without our marker is not ours; none of them moves anything.
 //!
 //! The record it writes is on the notice line itself, because that line is
 //! already the audit of what was sent and where. `every_address_failed` then
@@ -18,7 +19,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::store::{Delivery, Notice, Store};
+use crate::mail::notice::{LIFECYCLE, MESSAGE_ID_DOMAIN};
+use crate::store::{is_permanent_status, Delivery, Notice, Store};
 use crate::util;
 use crate::Error;
 
@@ -29,8 +31,8 @@ pub struct Bounce {
     pub recipient: String,
     /// The DSN's `Status`, e.g. `5.1.1`.
     pub status: String,
-    /// The subject of the message we sent, from the returned original.
-    pub subject: String,
+    /// The local part of the recorded Message-ID, from the returned original.
+    pub id: String,
 }
 
 /// Parse one message as a permanent-failure DSN. Anything else is `None`: a
@@ -58,7 +60,7 @@ pub fn parse(raw: &str) -> Option<Bounce> {
         return None;
     }
     let status = field(report, "status")?;
-    if !permanent(&status) {
+    if !is_permanent_status(&status) {
         return None;
     }
     let final_recipient = field(report, "final-recipient")?;
@@ -72,15 +74,26 @@ pub fn parse(raw: &str) -> Option<Bounce> {
     if crate::flow::validate::address(recipient).is_some() {
         return None;
     }
-    let subject = field(returned_headers(&raw[original_at..])?, "subject")?;
-    if subject.is_empty() {
-        return None;
-    }
+    let id = message_id(returned_headers(&raw[original_at..])?)?;
     Some(Bounce {
         recipient: recipient.to_string(),
         status,
-        subject,
+        id,
     })
+}
+
+/// The local part of the Message-ID on the returned original, when it is the
+/// shape this platform mints: `<26 crockford characters@kyriakon.net>`. A report
+/// that drops or changes the marker is not a report for a notice we sent.
+fn message_id(headers: &str) -> Option<String> {
+    let value = field(headers, "message-id")?;
+    let value = value.trim();
+    let inner = value.strip_prefix('<')?.strip_suffix('>')?;
+    let (local, domain) = inner.split_once('@')?;
+    if domain.contains('@') || !domain.eq_ignore_ascii_case(MESSAGE_ID_DOMAIN) {
+        return None;
+    }
+    crate::store::is_status_token(local).then(|| local.to_string())
 }
 
 /// The headers of the returned original message: the part's content starts
@@ -89,18 +102,6 @@ pub fn parse(raw: &str) -> Option<Bounce> {
 fn returned_headers(part: &str) -> Option<&str> {
     let body = part.split_once("\n\n")?.1;
     Some(body.split_once("\n\n").map_or(body, |(headers, _)| headers))
-}
-
-/// Whether a DSN status is a permanent failure. The parser has already narrowed
-/// it; this is the check that keeps the record's meaning in one place.
-fn permanent(status: &str) -> bool {
-    let mut bytes = status.trim().bytes();
-    matches!(bytes.next(), Some(b'5'))
-        && matches!(bytes.next(), Some(b'.'))
-        && status
-            .trim()
-            .bytes()
-            .all(|b| b.is_ascii_digit() || b == b'.')
 }
 
 /// One header's value from a header block, unfolded. A continuation line starts
@@ -128,12 +129,11 @@ fn field(block: &str, name: &str) -> Option<String> {
     None
 }
 
-/// Record a permanent failure on every notice that matches: the most recent
-/// notice to that recipient carrying that subject in each account's history. A
-/// contact address may be shared and a subject may be shared, so more than one
-/// account can match, and marking one while deleting the other unseen is the
-/// failure this exists to stop. An empty list means no notice matched and the
-/// report moves nothing.
+/// Record a permanent failure on every notice that matches the report's
+/// Message-ID and recipient. An id is minted per send, so two accounts cannot
+/// share one; a contact address can be shared, which is why the recipient is
+/// checked as well. An empty list means no notice matched and the report moves
+/// nothing.
 pub async fn record(store: &Store, bounce: &Bounce) -> Result<Vec<String>, Error> {
     let mut marked = Vec::new();
     for username in store.list("accounts").await? {
@@ -146,8 +146,9 @@ pub async fn record(store: &Store, bounce: &Bounce) -> Result<Vec<String>, Error
 
 /// Mark one account's notice line, under the record's own lock so an append
 /// that lands meanwhile is either seen or follows the rewrite rather than being
-/// dropped. The line is the last match by file order: a resend to the same
-/// address is the later decision, and the older failure stays as history.
+/// dropped. A line that cannot be parsed is an error, not a skip: the report
+/// may be the match, and deleting it on a guess is the failure this exists to
+/// stop. The report stays in the spool for the operator.
 async fn mark(store: &Store, username: &str, bounce: &Bounce) -> Result<bool, Error> {
     let path = format!("accounts/{username}/notices.jsonl");
     let log = store.log(&path);
@@ -155,10 +156,12 @@ async fn mark(store: &Store, username: &str, bounce: &Bounce) -> Result<bool, Er
     let mut lines = log.raw_lines().await?;
     let mut found = None;
     for (index, line) in lines.iter().enumerate() {
-        let Ok(notice) = serde_json::from_str::<Notice>(line) else {
-            continue;
-        };
-        if notice.to.eq_ignore_ascii_case(&bounce.recipient) && notice.subject == bounce.subject {
+        let notice: Notice = serde_json::from_str(line)
+            .map_err(|e| Error::context(format!("{path} line {} is not a notice", index + 1), e))?;
+        if !notice.id.is_empty()
+            && notice.id == bounce.id
+            && notice.to.eq_ignore_ascii_case(&bounce.recipient)
+        {
             found = Some((index, notice));
         }
     }
@@ -181,23 +184,10 @@ async fn mark(store: &Store, username: &str, bounce: &Bounce) -> Result<bool, Er
     Ok(true)
 }
 
-/// The notice types that open, carry and close the account's own grace clock.
-/// Only these answer whether a channel reached the member before the account is
-/// deleted: a password link or a test message that bounced says nothing about
-/// the final notice. A group's lifecycle is the site owner's notice but the
-/// group's own clock, so it is not read here; the group deletion path is not
-/// this sweep's member-account gate.
-const LIFECYCLE: [&str; 5] = [
-    "prepaid.lapsed",
-    "prepaid.grace",
-    "prepaid.final",
-    "account.suspended",
-    "account.suspended.final",
-];
-
 /// Whether **every** address a lifecycle notice went to has reported a
 /// permanent failure: no channel reached the member, so the grace clock stops
-/// rather than running out into a deletion nobody was told about.
+/// rather than running out into a deletion nobody was told about. The types are
+/// [`LIFECYCLE`] in `notice`, shared with every send site.
 ///
 /// Any failure at the address counts, not only the latest notice's. The
 /// platform gets no successful-delivery report, so a later notice with no
@@ -230,6 +220,9 @@ mod tests {
     use super::*;
     use crate::store::Store;
 
+    /// A 26-character Crockford token, the shape the platform mints.
+    const ID: &str = "0123456789abcdefghjkmnpqrs";
+
     const HARD: &str = "From: MAILER-DAEMON@mail.example\n\
 To: bounce@kyriakon.net\n\
 Subject: Undelivered Mail Returned to Sender\n\
@@ -257,29 +250,39 @@ Content-Type: message/rfc822\n\
 From: kyriakon <hello@kyriakon.net>\n\
 To: secretary@example.invalid\n\
 Subject: Your kyriakon.net account will be deleted in seven days\n\
+Message-ID: <0123456789abcdefghjkmnpqrs@kyriakon.net>\n\
 \n\
 The body.\n\
 --b1--\n";
 
     #[test]
-    fn a_permanent_failure_is_read_with_its_recipient_and_subject() {
+    fn a_permanent_failure_is_read_with_its_recipient_and_marker() {
         assert_eq!(
             parse(HARD),
             Some(Bounce {
                 recipient: "secretary@example.invalid".to_string(),
                 status: "5.1.1".to_string(),
-                subject: "Your kyriakon.net account will be deleted in seven days".to_string(),
+                id: ID.to_string(),
             })
         );
-        // A subject folded over two lines is one subject.
-        let folded = HARD.replace(
-            "Subject: Your kyriakon.net account will be deleted in seven days",
-            "Subject: Your kyriakon.net account\n will be deleted in seven days",
+        // A marker that is not the platform's shape, or is not from its domain,
+        // is not read at all.
+        let other_domain = HARD.replace(
+            "Message-ID: <0123456789abcdefghjkmnpqrs@kyriakon.net>",
+            "Message-ID: <0123456789abcdefghjkmnpqrs@example.invalid>",
         );
-        assert_eq!(
-            parse(&folded).map(|b| b.subject),
-            Some("Your kyriakon.net account will be deleted in seven days".to_string())
+        assert_eq!(parse(&other_domain), None);
+        let short = HARD.replace(
+            "Message-ID: <0123456789abcdefghjkmnpqrs@kyriakon.net>",
+            "Message-ID: <abc@kyriakon.net>",
         );
+        assert_eq!(parse(&short), None);
+        // A report that drops the marker is not a report for one of ours.
+        let dropped = HARD.replace(
+            "Message-ID: <0123456789abcdefghjkmnpqrs@kyriakon.net>\n",
+            "",
+        );
+        assert_eq!(parse(&dropped), None);
     }
 
     #[test]
@@ -322,10 +325,62 @@ The body.\n\
         .unwrap();
     }
 
-    fn notice_line(kind: &str, subject: &str, to: &str) -> String {
+    fn notice_line(kind: &str, subject: &str, to: &str, id: &str) -> String {
         format!(
-            "{{\"version\":1,\"at\":\"2026-11-12T09:00:00Z\",\"type\":\"{kind}\",\"subject\":\"{subject}\",\"to\":\"{to}\"}}\n"
+            "{{\"version\":1,\"at\":\"2026-11-12T09:00:00Z\",\"type\":\"{kind}\",\"subject\":\"{subject}\",\"id\":\"{id}\",\"to\":\"{to}\"}}\n"
         )
+    }
+
+    /// A valid marker that no notice in these tests carries.
+    const OTHER_ID: &str = "9876543210zyxwvtsrqpnmgkhj";
+
+    #[tokio::test]
+    async fn a_report_with_a_changed_marker_latches_nothing() {
+        let dir =
+            std::env::temp_dir().join(format!("control-bounce-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("store/accounts")).unwrap();
+        let store = Store::new_for_test(dir.join("store").to_str().unwrap());
+        account(
+            &store,
+            "secretary",
+            &notice_line(
+                "prepaid.final",
+                "Your kyriakon.net account will be deleted in seven days",
+                "secretary@example.invalid",
+                ID,
+            ),
+        )
+        .await;
+        // A forged report can name the recipient and the known subject; it
+        // cannot name the 128-bit marker the notice left with.
+        let forged = HARD.replace(ID, OTHER_ID);
+        let report = parse(&forged).expect("the forged report is well formed");
+        assert_eq!(report.id, OTHER_ID);
+        assert!(record(&store, &report).await.unwrap().is_empty());
+        assert!(!every_address_failed(&store, "secretary").await.unwrap());
+        assert!(
+            !std::fs::read_to_string(dir.join("store/accounts/secretary/notices.jsonl"))
+                .unwrap()
+                .contains("\"delivery\""),
+            "the forged report marked the notice"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_notice_line_keeps_the_report_for_the_operator() {
+        let dir =
+            std::env::temp_dir().join(format!("control-bounce-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("store/accounts")).unwrap();
+        let store = Store::new_for_test(dir.join("store").to_str().unwrap());
+        account(&store, "secretary", "{\"version\":1,\"type\":\n").await;
+        let error = record(&store, &parse(HARD).unwrap())
+            .await
+            .expect_err("a corrupt line must not be skipped");
+        assert!(error.to_string().contains("is not a notice"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -341,6 +396,7 @@ The body.\n\
                 "prepaid.final",
                 "Your kyriakon.net account will be deleted in seven days",
                 "secretary@example.invalid",
+                ID,
             ),
         )
         .await;
@@ -363,10 +419,11 @@ The body.\n\
             "prepaid.final",
             "Your kyriakon.net account will be deleted in seven days",
             "secretary@example.invalid",
+            OTHER_ID,
         ));
         std::fs::write(dir.join("store/accounts/secretary/notices.jsonl"), text).unwrap();
         assert!(every_address_failed(&store, "secretary").await.unwrap());
-        // A report for a recipient or subject no notice carries marks nothing.
+        // A report for a recipient no notice carries marks nothing.
         let mut other = parse(HARD).unwrap();
         other.recipient = "warden@example.invalid".to_string();
         assert!(record(&store, &other).await.unwrap().is_empty());
@@ -386,6 +443,7 @@ The body.\n\
                 "prepaid.lapsed",
                 "Your kyriakon.net account will be deleted in seven days",
                 "secretary@example.invalid",
+                ID,
             ),
         )
         .await;
@@ -402,6 +460,7 @@ The body.\n\
             "prepaid.lapsed",
             "Your kyriakon.net account will be deleted in seven days",
             "secretary@kyriakon.net",
+            OTHER_ID,
         ));
         std::fs::write(dir.join("store/accounts/secretary/notices.jsonl"), text).unwrap();
         assert!(!every_address_failed(&store, "secretary").await.unwrap());

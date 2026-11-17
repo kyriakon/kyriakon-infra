@@ -8,10 +8,12 @@
 
 use crate::*;
 
-/// `notice resend <username> [--to <address>]`: send the lifecycle notice again
-/// and restart the grace. The address defaults to the account's platform
-/// mailbox, which a lapsed or suspended account can still read; `--to` names a
-/// channel outside the platform when the mailbox is the thing that failed.
+/// `notice resend <username> [--to <address>] [--group <domain>]`: send the
+/// lifecycle notice again and restart the grace. The address defaults to the
+/// account's platform mailbox, which a lapsed or suspended account can still
+/// read; `--to` names a channel outside the platform when the mailbox is the
+/// thing that failed. `--group` names the body when a site owner has more than
+/// one lapsed group, whose clock the resend is for.
 pub(crate) async fn notices(
     cfg: &DrainConfig,
     store: &Store,
@@ -28,12 +30,13 @@ pub(crate) async fn notices(
         [username, rest @ ..] => (username.as_str(), rest),
         _ => return Err(Error::Failed(usage())),
     };
-    let flags = flags(rest, &["to"])?;
+    let flags = flags(rest, &["to", "group"])?;
     let (to, grace) = transitions::lifecycle::resend_notice(
         cfg,
         store,
         username,
         flags.get("to").map(String::as_str),
+        flags.get("group").map(String::as_str),
     )
     .await?;
     println!("re-sent the lifecycle notice for {username} to {to}; the grace now ends {grace}");

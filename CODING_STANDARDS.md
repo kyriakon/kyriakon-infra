@@ -26,14 +26,18 @@ The handler holds no key. Anything it cannot prove is proved by the drain: a lin
 
 A store file ending `.jsonl` is a record and stays append-only. It is reached
 through `Store::log`, which has no write, and `Store::write_record` refuses the
-name. Three writes complete a line that has to be completed later rather than
-appended again: a refund's settlement, a held payment's attribution and a
-request's close. A retention prune removes whole lines once their window has
-run, as `lifecycle::holds_sweep` does for a released username. Each takes
-`Store::log(...).lock()` across its read and its write and calls the one named
-API, `Store::rewrite_log`. Appends take the same lock, and the code says why: a
-rewrite without it can drop a line another process appended between the read
-and the rename.
+name. Four writes complete a line that has to be completed later rather than
+appended again: a refund's settlement, a held payment's attribution, a
+request's close, and a notice's delivery status when a DSN reports a permanent
+failure. The notice completion is `mail::bounce`, and it calls
+`Store::rewrite_log_mode` rather than `Store::rewrite_log` because
+`notices.jsonl` is 0640 for the handler to read and the rewrite must keep that
+mode and the accounts directory's group. A retention prune removes whole lines
+once their window has run, as `lifecycle::holds_sweep` does for a released
+username. Each takes `Store::log(...).lock()` across its read and its write and
+calls the one named API, `Store::rewrite_log` or `Store::rewrite_log_mode`.
+Appends take the same lock, and the code says why: a rewrite without it can drop
+a line another process appended between the read and the rename.
 
 ## Docs
 

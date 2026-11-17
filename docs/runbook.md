@@ -432,9 +432,9 @@ The link is signed for one mailbox and one purpose, so a link for one address ca
 
 ## A lifecycle notice that bounces
 
-A lifecycle notice goes to the one address the account records: the contact outside the platform when it validates as a mail header, and otherwise the member's platform mailbox. The drain records each send in `notices.jsonl` before the message leaves. Every notice carries `bounce@kyriakon.net` as its envelope sender, so a hard bounce comes back as a delivery-status report. `openbsd/etc/smtpd.conf` delivers that address to the spool at `/var/db/onboard/bounce`, the drain reads it before the grace sweep, and the matching notice line gains a `delivery` status.
+A lifecycle notice goes to the one address the account records: the contact outside the platform when it validates as a mail header, and otherwise the member's platform mailbox. The drain records each send in `notices.jsonl` before the message leaves, with the Message-ID it minted. Every notice carries `bounce@kyriakon.net` as its envelope sender, so a hard bounce comes back as a delivery-status report. `openbsd/etc/smtpd.conf` delivers that address to the spool at `/var/db/onboard/bounce`, the drain reads it before the grace sweep, and the matching notice line gains a `delivery` status. The report must quote that recorded Message-ID; a report for a guessed address or subject moves nothing.
 
-A permanent failure at every address the lifecycle notices went to means no channel reached the member, so the grace clock stops. `grace_sweep` refuses to delete the account while that is true. A soft bounce does not stop it: the sender's queue is still trying, and no failure is recorded for it.
+A permanent failure at every address the lifecycle notices went to means no channel reached the member, so the grace clock stops. `grace_sweep` refuses to delete the account, or the group whose notices are recorded against its site owner, while that is true. A soft bounce does not stop it: the sender's queue is still trying, and no failure is recorded for it.
 
 1. Read the failure.
 
@@ -448,9 +448,11 @@ A permanent failure at every address the lifecycle notices went to means no chan
 
 3. Send the notice again over a channel that works.
 
-		doas kyriakon-admin notice resend <username> [--to <address>]
+		doas kyriakon-admin notice resend <username> [--to <address>] [--group <domain>]
 
    The command records the new notice line before it enqueues, clears the stop, and moves the grace to forty days from today. Without `--to` it goes to the account's platform mailbox, which a lapsed or suspended account can still read. Name an outside address when the mailbox is the thing that failed. If the new address bounces too, its report stops the clock again.
+
+   A body's lifecycle notices are recorded against its site owner, so a stopped group is cleared by naming the owner and the body: `--group <domain>`. Without `--group`, the command uses the owner's own clock when it is lapsed or suspended, and otherwise the one lapsed body they own.
 
 4. Check the account's grace date in `account.json`. The date is the one the command printed, so the account is not deleted before the member has had the notice.
 
