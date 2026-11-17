@@ -68,6 +68,25 @@ pub(super) fn card_link(app: &App, application: Option<&str>, group: bool) -> Op
     rails::card_link(link, application?).ok().flatten()
 }
 
+/// The application's identifier a page may key a card link to, when the record
+/// it names is still filed. The payment block keeps the identifier after the
+/// purge takes `applications/<id>.json` ninety days in, and a link keyed to a
+/// record that is gone would take a payment nothing can settle.
+pub(super) async fn live_application(app: &App, application: Option<&str>) -> Option<String> {
+    let application = application?;
+    if !kyriakon_control_core::store::is_status_token(application) {
+        return None;
+    }
+    match app.store.application(application).await {
+        Ok(Some(_)) => Some(application.to_string()),
+        Ok(None) => None,
+        Err(e) => {
+            e.report("the application a card link names");
+            None
+        }
+    }
+}
+
 /// The page one token's record renders, or the one notice that covers a token
 /// that is unknown, expired or spent alike. The window is read here and not in the
 /// store, because a record is still on disk after its link has stopped answering:

@@ -622,9 +622,13 @@ fn an_invoice_with_no_checkout_repairs_the_attachment_from_the_session() {
     let path = fix.dir.join("store/accounts/secretary/account.json");
     let mut account: Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let token = account["payment"]["token_ref"]
+        .as_str()
+        .expect("a card account holds its token")
+        .to_string();
     account["payment"]["stripe"]["subscription"] = Value::Null;
     std::fs::write(&path, serde_json::to_vec_pretty(&account).unwrap()).unwrap();
-    fix.application_record(TOKEN, "secretary", "KYR-AAAA-BBBB-CCCC");
+    fix.application_record(TOKEN, "secretary", &token);
 
     fix.stripe_session_repair(TOKEN);
     fix.webhook("evt_repair", "invoice.paid", invoice("in_repair"));
@@ -836,21 +840,57 @@ fn a_missing_webhook_secret_is_mailed_once_and_keeps_the_delivery() {
     assert!(fix.webhooks().is_empty(), "{:?}", fix.webhooks());
 }
 
-/// The old link carried the payment token, and that token is still real in the
-/// index. A checkout naming it settles nothing: the reference is the
-/// application's identifier, and no application record is filed under a `KYR-`
-/// token, so the bearer token no longer names an account from outside the box.
+/// A link mailed before the change carried the payment token, and those links
+/// are already in inboxes. A checkout naming one still attaches the
+/// subscription, because Stripe charges it either way and refusing it would take
+/// the money and grant nothing. The window closes with the last pre-release
+/// window; no link minted since carries a token.
 #[test]
-fn a_checkout_naming_the_payment_token_settles_nothing() {
+fn a_checkout_naming_a_payment_token_still_settles_the_old_link() {
     let fix = Fix::new("webhook-kyr-reference");
     fix.card_account("secretary", None);
-    let before = fix.account("secretary");
+    let path = fix.dir.join("store/accounts/secretary/account.json");
+    let mut account: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let token = account["payment"]["token_ref"]
+        .as_str()
+        .expect("a card account holds its token")
+        .to_string();
+    account["payment"]["stripe"]["subscription"] = Value::Null;
+    std::fs::write(&path, serde_json::to_vec_pretty(&account).unwrap()).unwrap();
+
     fix.webhook(
         "evt_kyr",
         "checkout.session.completed",
         json!({
             "id": "cs_example",
-            "client_reference_id": "KYR-AAAA-BBBB-CCCC",
+            "client_reference_id": token,
+            "subscription": SUBSCRIPTION,
+            "customer": "cus_example",
+        }),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["payment"]["stripe"]["subscription"], SUBSCRIPTION,
+        "the old link's checkout attached nothing: {account}"
+    );
+}
+
+/// A reference of neither shape names nothing, so the checkout is settled as
+/// nobody's: no subscription is attached and no record changes.
+#[test]
+fn a_checkout_naming_no_known_reference_settles_nothing() {
+    let fix = Fix::new("webhook-bad-reference");
+    fix.card_account("secretary", None);
+    let before = fix.account("secretary");
+    fix.webhook(
+        "evt_bad",
+        "checkout.session.completed",
+        json!({
+            "id": "cs_example",
+            "client_reference_id": "cs_example?not-a-reference",
             "subscription": SUBSCRIPTION,
             "customer": "cus_example",
         }),
@@ -860,7 +900,7 @@ fn a_checkout_naming_the_payment_token_settles_nothing() {
     assert_eq!(
         fix.account("secretary"),
         before,
-        "the payment token attached a subscription"
+        "a reference of neither shape settled"
     );
 }
 

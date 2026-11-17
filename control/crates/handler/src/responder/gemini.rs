@@ -7,7 +7,7 @@ use super::connection::decode;
 use super::flow::{build_record, file_application};
 use super::reply::{respond, too_many, Which};
 use super::route::Call;
-use super::status::card_link;
+use super::status::{card_link, live_application};
 use kyriakon_control_core::flow::applicant::{
     body_cross_checks, flow_answers, flow_path, flow_problem, Page,
 };
@@ -36,14 +36,19 @@ pub(super) async fn capsule_account(app: &App, incoming: &Incoming) -> Reply {
                 Ok(group) => group,
                 Err(e) => return respond(&e, FrontEnd::Gemini),
             };
-            let payment = account.payment_state().map(|block| {
+            let block = account.payment_state();
+            let application = match block.as_ref() {
+                Some(block) => live_application(app, block.application_ref.as_deref()).await,
+                None => None,
+            };
+            let payment = block.map(|block| {
                 page::payment(
                     &account.state,
                     &account.rail,
                     &block,
                     &app.cfg.price_gbp,
                     &app.cfg.postal_address,
-                    card_link(app, block.application_ref.as_deref(), false).as_deref(),
+                    card_link(app, application.as_deref(), false).as_deref(),
                     OffsetDateTime::now_utc(),
                 )
             });

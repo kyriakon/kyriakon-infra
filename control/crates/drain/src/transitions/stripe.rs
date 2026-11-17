@@ -818,13 +818,20 @@ async fn target_for_payment_reference(
 /// drain wrote at approval holds the payment block, and the token in it is what
 /// the token index joins to the account. An identifier of another shape, a
 /// record that is gone, and one with no token are refused: the payment token
-/// never left the box, so an event naming anything but an application settles
-/// nothing. The purge takes the record ninety days in, long after the fourteen
-/// the window runs.
+/// never leaves the box now, so an event naming anything else settles nothing.
+/// The purge takes the record ninety days in, long after the fourteen the
+/// window runs.
 async fn target_for_application(
     store: &Store,
     application: &str,
 ) -> Result<Option<TargetRef>, Error> {
+    // Transition: approvals mailed before the link carried the application's
+    // identifier put the `KYR-` payment token here instead. Those links are in
+    // inboxes and Stripe will charge them, so a token of that shape still
+    // resolves the way it did. No link minted since carries one.
+    if store::is_payment_token(application) {
+        return target_for_payment_reference(store, application).await;
+    }
     if !store::is_status_token(application) {
         return Ok(None);
     }
