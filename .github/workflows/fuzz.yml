@@ -48,8 +48,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      # The compiler is pinned by date for the same reason cargo-fuzz is: the
+      # sanitizer and coverage flags this job passes are nightly-only and can be
+      # renamed between dates, which would fail all four targets at once with no
+      # committed change. Bump the date deliberately.
       - name: nightly toolchain
-        run: rustup toolchain install nightly --profile minimal
+        run: rustup toolchain install nightly-2026-11-16 --profile minimal
       # Pinned: a red run must be a finding, not a tool release. `--locked`
       # builds the crate's own lockfile rather than resolving today's.
       - name: cargo-fuzz
@@ -69,7 +73,7 @@ jobs:
         # job that sits until the runner's own timeout. `-rss_limit_mb` is the
         # default made explicit: an amplifier is a finding too.
         run: >
-          cargo +nightly fuzz run ${{ matrix.target }} --
+          cargo +nightly-2026-11-16 fuzz run ${{ matrix.target }} --
           -max_total_time=120 -timeout=25 -rss_limit_mb=2048
         working-directory: ${{ matrix.crate }}/fuzz
       - name: keep the crash

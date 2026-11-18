@@ -59,38 +59,43 @@ each for two minutes every Monday and on demand. That is coverage over time, not
 merge gate: a crash is filed as a bug with a regression test, not treated as a
 blocked PR.
 
-Run one for as long as you want, by hand:
+Run one for as long as you want, by hand. The paths below are relative to the
+`fuzz` directory the first command enters:
 
-```sh
-cd kyriakon-encrypt/fuzz     # or control/fuzz
-cargo +nightly fuzz list     # the targets in this crate
-cargo +nightly fuzz run message -- -max_total_time=300
-```
+	cd kyriakon-encrypt/fuzz     # or control/fuzz
+	cargo +nightly fuzz list     # the targets in this crate
+	cargo +nightly fuzz run message -- -max_total_time=300
 
 Nightly is required, because libFuzzer needs rustc's `-Zsanitizer`; install
 `cargo-fuzz` once with `cargo install cargo-fuzz --locked --version 0.13.2`. The
-seeds in `fuzz/corpus/` are committed, so a fresh clone starts from the same
-cases, and the corpus the run grows is kept between CI runs by the cache. The
-exception is the FastCGI reader's corpus: its seeds are the wire format, which is
-bytes, and the repository does not track binaries. To start from the record the
-front-ends send:
+workflow pins the nightly it uses, in its `nightly toolchain` step, because a
+nightly that renames one of those flags fails every target at once; bump the date
+there on purpose. A by-hand run can use whichever nightly is installed.
 
-```sh
-printf '\x01\x01\x00\x01\x00\x08\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00' \
-  > control/fuzz/corpus/request/begin
-```
+The seeds in `corpus/` are committed, so a fresh clone starts from the same cases,
+and the corpus a run grows is kept between CI runs by the cache. The exception is
+the FastCGI reader: its seeds are the wire format, which is bytes, and this
+repository tracks no binaries. From `control/fuzz`, this writes a request the
+reader accepts, up to and including its parameter pairs:
 
-A crash or a hang is written to `fuzz/artifacts/<target>/`. The file alone
-reproduces it:
+	mkdir -p corpus/request
+	printf '%b' \
+	  '\x01\x01\x00\x01\x00\x08\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00' \
+	  '\x01\x04\x00\x01\x00\x14\x00\x00\x0b\x07REQUEST_URI/signup' \
+	  '\x01\x05\x00\x01\x00\x00\x00\x00' > corpus/request/request
 
-```sh
-cargo +nightly fuzz run message fuzz/artifacts/message/crash-<hash>
-```
+A crash or a hang is written to `artifacts/<target>/` in that same `fuzz`
+directory. The file alone reproduces it:
+
+	cargo +nightly fuzz run message artifacts/message/crash-<hash>
 
 Treat it as a bug like any other: it gets a test in the crate it came from, and
-the corpus entry that found it is committed beside the seeds. The encryptor's
-targets call the pure parsers only; the gpg packet listings they gate on are
-covered by unit tests, not by libFuzzer.
+the input that found it is added beside the seeds with `git add -f`, because
+`corpus` is ignored. That works for text only: the pre-commit hook refuses a
+tracked binary, so a FastCGI crash becomes a test with the bytes written out in
+the test rather than a corpus file. The encryptor's targets call the pure parsers
+only; the gpg packet listings they gate on are covered by unit tests, not by
+libFuzzer.
 
 ## Deploy a merged change
 

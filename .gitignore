@@ -23,12 +23,6 @@ tfplan
 *.tfplan
 tfplan.*
 
-# libFuzzer crash artifacts. The file alone reproduces the crash when passed
-# back to `cargo fuzz run`, so it is a working note, not something to commit;
-# what is committed is the test written from it. `fuzz/target/` is covered by
-# the pattern above.
-fuzz/artifacts/
-
 # macOS desktop metadata.
 .DS_Store
 
