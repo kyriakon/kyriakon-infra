@@ -1,0 +1,37 @@
+# The message parser under libFuzzer. Not part of the service build: `cargo-fuzz`
+# builds it on nightly, which is why it is a crate of its own rather than a test.
+#
+#   cargo +nightly fuzz run message
+#   cargo +nightly fuzz run envelope
+#
+# Seeds are committed in `corpus/`; a crash lands in `artifacts/<target>/` and is
+# turned into a test in `../src/lib.rs`. See docs/runbook.md, "Fuzz the parsers".
+[package]
+name = "kyriakon-encrypt-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.kyriakon-encrypt]
+path = ".."
+features = ["fuzz"]
+
+[[bin]]
+name = "message"
+path = "fuzz_targets/message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false

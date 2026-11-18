@@ -4,4 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Zero-access mail encryptor: RFC 5322 message in, whole-message RFC 3156 PGP/MIME ciphertext out"
 
+[features]
+# Exposes the pure message parser to `fuzz/`; nothing in the crate turns it on.
+fuzz = []
+
 [dependencies]

@@ -1,0 +1,22 @@
+Return-Path: <sender@example.invalid>
+Received: from mail.example.invalid by mx.example.invalid
+Content-Type: multipart/encrypted; protocol="application/pgp-encrypted";
+	boundary="b"
+
+This is an OpenPGP/MIME encrypted message (RFC 4880 and 3156).
+
+--b
+Content-Type: application/pgp-encrypted
+
+Version: 1
+
+--b
+Content-Type: application/octet-stream
+
+-----BEGIN PGP MESSAGE-----
+
+YWJjZA==
+=abcd
+-----END PGP MESSAGE-----
+
+--b--

@@ -1,0 +1,81 @@
+# libFuzzer over the parsers that read input the box does not control.
+#
+# This is coverage over time, not a merge gate: a crash found here is a bug
+# filed with a regression test, not a pull request blocked. Weekly, plus on
+# demand. The four targets are named in docs/runbook.md, "Fuzz the parsers",
+# which is also where the by-hand run is written down.
+#
+# Nightly is required: libFuzzer needs rustc's `-Zsanitizer`, which stable does
+# not take. That is why the targets are their own crates pointing at the ones
+# under test, not tests inside them, and why nothing here runs on a pull
+# request.
+name: fuzz
+
+on:
+  schedule:
+    # 04:17 Monday, in the quiet before the weekly script self-tests, so the two
+    # never contend for the same runner minute.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: ${{ matrix.crate }}/${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # One target's crash must not cancel the other three: a crash file is the
+      # whole point, and four small jobs cost less than one flaky sequence.
+      fail-fast: false
+      matrix:
+        include:
+          - crate: kyriakon-encrypt
+            target: message
+          - crate: kyriakon-encrypt
+            target: envelope
+          - crate: control
+            target: request
+          - crate: control
+            target: form
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # The compiler is pinned by date for the same reason cargo-fuzz is: the
+      # sanitizer and coverage flags this job passes are nightly-only and can be
+      # renamed between dates, which would fail all four targets at once with no
+      # committed change. Bump the date deliberately.
+      - name: nightly toolchain
+        run: rustup toolchain install nightly-2026-11-16 --profile minimal
+      # Pinned: a red run must be a finding, not a tool release. `--locked`
+      # builds the crate's own lockfile rather than resolving today's.
+      - name: cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+      # The corpus is the only thing that makes week two cheaper than week one,
+      # so it is carried between runs. The run id in the key is what allows a
+      # new save; `restore-keys` takes the newest match for this target.
+      - name: restore the corpus
+        uses: actions/cache@v4
+        with:
+          path: ${{ matrix.crate }}/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-${{ matrix.crate }}-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-${{ matrix.crate }}-${{ matrix.target }}-
+      - name: fuzz
+        # `-timeout` turns a hang into a crash with an artifact, rather than a
+        # job that sits until the runner's own timeout. `-rss_limit_mb` is the
+        # default made explicit: an amplifier is a finding too.
+        run: >
+          cargo +nightly-2026-11-16 fuzz run ${{ matrix.target }} --
+          -max_total_time=120 -timeout=25 -rss_limit_mb=2048
+        working-directory: ${{ matrix.crate }}/fuzz
+      - name: keep the crash
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.crate }}-${{ matrix.target }}
+          path: ${{ matrix.crate }}/fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

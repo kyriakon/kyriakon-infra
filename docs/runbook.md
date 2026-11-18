@@ -50,6 +50,53 @@ rows marked `yes` in `openbsd/packages.tsv`; a test that needs another tool adds
 a row there. It holds no deployed configuration or credentials for kyriakon.net,
 and `terraform apply`/`destroy` remain human-only.
 
+## Fuzz the parsers
+
+Four `cargo-fuzz` targets cover the parsers that read input the box does not
+control: the encryptor's message and envelope parsers, and the handler's FastCGI
+reader and form decoder. The `fuzz` workflow in `.github/workflows/fuzz.yml` runs
+each for two minutes every Monday and on demand. That is coverage over time, not a
+merge gate: a crash is filed as a bug with a regression test, not treated as a
+blocked PR.
+
+Run one for as long as you want, by hand. The paths below are relative to the
+`fuzz` directory the first command enters:
+
+	cd kyriakon-encrypt/fuzz     # or control/fuzz
+	cargo +nightly fuzz list     # the targets in this crate
+	cargo +nightly fuzz run message -- -max_total_time=300
+
+Nightly is required, because libFuzzer needs rustc's `-Zsanitizer`; install
+`cargo-fuzz` once with `cargo install cargo-fuzz --locked --version 0.13.2`. The
+workflow pins the nightly it uses, in its `nightly toolchain` step, because a
+nightly that renames one of those flags fails every target at once; bump the date
+there on purpose. A by-hand run can use whichever nightly is installed.
+
+The seeds in `corpus/` are committed, so a fresh clone starts from the same cases,
+and the corpus a run grows is kept between CI runs by the cache. The exception is
+the FastCGI reader: its seeds are the wire format, which is bytes, and this
+repository tracks no binaries. From `control/fuzz`, this writes a request the
+reader accepts, up to and including its parameter pairs:
+
+	mkdir -p corpus/request
+	printf '%b' \
+	  '\x01\x01\x00\x01\x00\x08\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00' \
+	  '\x01\x04\x00\x01\x00\x14\x00\x00\x0b\x07REQUEST_URI/signup' \
+	  '\x01\x05\x00\x01\x00\x00\x00\x00' > corpus/request/request
+
+A crash or a hang is written to `artifacts/<target>/` in that same `fuzz`
+directory. The file alone reproduces it:
+
+	cargo +nightly fuzz run message artifacts/message/crash-<hash>
+
+Treat it as a bug like any other: it gets a test in the crate it came from, and
+the input that found it is added beside the seeds with `git add -f`, because
+`corpus` is ignored. That works for text only: the pre-commit hook refuses a
+tracked binary, so a FastCGI crash becomes a test with the bytes written out in
+the test rather than a corpus file. The encryptor's targets call the pure parsers
+only; the gpg packet listings they gate on are covered by unit tests, not by
+libFuzzer.
+
 ## Deploy a merged change
 
 `scripts/deploy.sh` is the normal deploy. It reads the last deployed commit from

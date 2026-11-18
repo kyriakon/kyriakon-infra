@@ -1,0 +1,8 @@
+# `cargo fuzz` writes a hash-named entry here for every input that finds new
+# coverage, so the directory is a local build artifact and CI keeps it in a
+# cache. The hand-written seeds under `corpus/<target>/` are force-added on
+# purpose: they are the cases a fresh clone starts from.
+target
+corpus
+artifacts
+coverage

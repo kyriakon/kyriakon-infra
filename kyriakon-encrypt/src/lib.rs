@@ -167,6 +167,16 @@ const ENVELOPE_MARKER: &str =
 /// sender's client put there and the rebuild replaces it.
 const ENVELOPE_PREAMBLE: &str = "This is an OpenPGP/MIME encrypted message (RFC 4880 and 3156).";
 
+/// A bare armoured message: no armor header comment, a base64 body and a
+/// checksum line, as gpg emits it. Shared by the tests and the envelope fuzz
+/// target, which both need a ciphertext these parsers accept.
+#[cfg(any(test, feature = "fuzz"))]
+const ARMOR: &[u8] = b"-----BEGIN PGP MESSAGE-----\n\
+    \n\
+    YWJjZA==\n\
+    =abcd\n\
+    -----END PGP MESSAGE-----\n";
+
 /// The verified armoured ciphertext of `input` when it is already an RFC 3156
 /// envelope to the recipient of `cert`, in which case the caller rebuilds the
 /// outer message around it instead of encrypting again.
@@ -768,6 +778,40 @@ fn make_boundary() -> String {
     format!("kyriakon-{}-{nanos:x}", std::process::id())
 }
 
+/// Entry points for the fuzz targets in `fuzz/`, behind the `fuzz` feature so
+/// the parsers stay private in every other build.
+///
+/// The save path parses whatever an SMTP client sent, and the parsing is byte
+/// indexing in this file rather than a crate's, so it is the part a fuzzer can
+/// find a panic in. Nothing here shells out to gpg: the listings that do are
+/// covered by tests, not by libFuzzer.
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub mod fuzz {
+    use super::*;
+
+    /// Every pure parse a message goes through: the header split, the header
+    /// spans, the payload rewrite, the gate that decides a re-uploaded message
+    /// is already ciphertext, and the recipient guard on the save path.
+    pub fn message(input: &[u8]) {
+        let (block, _, _) = split_message(input);
+        let _ = header_spans(block);
+        let _ = nl_style(input);
+        let payload = protected_payload(input);
+        let _ = envelope_ciphertext(input);
+        let _ = rfc3156_envelope("fuzz-boundary", &[], &payload);
+        let _ = base_localpart(&String::from_utf8_lossy(input));
+    }
+
+    /// A wrapper this crate built must read back as the ciphertext it wraps,
+    /// whatever the message was. The build and the gate have to agree, or a
+    /// re-uploaded message is encrypted a second time.
+    pub fn envelope(input: &[u8]) {
+        let wrapper = rfc3156_envelope("fuzz-boundary", ARMOR, input);
+        assert_eq!(envelope_ciphertext(&wrapper), Some(ARMOR));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,14 +823,6 @@ mod tests {
         Content-Type: text/plain; charset=utf-8\n\
         \n\
         body line\n";
-
-    /// A bare armoured message: no armor header comment, a base64 body and a
-    /// checksum line, as gpg emits it.
-    const ARMOR: &[u8] = b"-----BEGIN PGP MESSAGE-----\n\
-        \n\
-        YWJjZA==\n\
-        =abcd\n\
-        -----END PGP MESSAGE-----\n";
 
     fn payload(msg: &[u8]) -> String {
         String::from_utf8_lossy(&protected_payload(msg)).into_owned()
@@ -1049,6 +1085,72 @@ mod tests {
         // The envelope's own ciphertext part comes back as the armour alone, so
         // the key-id scan sees ciphertext and nothing else.
         assert_eq!(envelope_ciphertext(&envelope()), Some(ARMOR));
+    }
+
+    #[test]
+    fn only_the_exposed_headers_reach_the_wrapper() {
+        // The wrapper is what the mail store keeps in the clear, so a header
+        // outside EXPOSED_HEADERS that lands there is correspondence content
+        // handed to the provider. The sentinel proves each hidden header and
+        // the body stayed in the payload; the exposed six are proved present,
+        // because routing and the client's sender and date read them. Every
+        // line ending a client can send gets the same answer.
+        const SENTINEL: &str = "SENTINEL-7f3c";
+        let exposed = [
+            ("From", "alice@example.invalid"),
+            ("To", "bob@example.invalid"),
+            ("Cc", "carol@example.invalid"),
+            ("Reply-To", "alice@example.invalid"),
+            ("Date", "Mon, 1 Jan 2024 00:00:00 +0000"),
+            ("Message-ID", "<id@example.invalid>"),
+        ];
+        let hidden = [
+            format!("Subject: {SENTINEL}-subject"),
+            format!("Bcc: {SENTINEL}-bcc"),
+            format!("X-Custom: {SENTINEL}-custom"),
+            format!("Content-Type: text/plain;\n\tboundary={SENTINEL}-folded"),
+        ];
+
+        for (sep, blank) in [("\n", "\n"), ("\r\n", "\r\n"), ("\r", "\r\r")] {
+            // The hidden headers go at every position among the exposed ones: a
+            // header that leaks only when it follows another is still a leak.
+            for at in 0..=exposed.len() {
+                let mut msg = String::new();
+                for (name, value) in &exposed[..at] {
+                    msg.push_str(&format!("{name}: {value}{sep}"));
+                }
+                for line in &hidden {
+                    msg.push_str(&line.replace('\n', sep));
+                    msg.push_str(sep);
+                }
+                for (name, value) in &exposed[at..] {
+                    msg.push_str(&format!("{name}: {value}{sep}"));
+                }
+                msg.push_str(&format!("{blank}body {SENTINEL}-body{sep}"));
+
+                let wrapper =
+                    String::from_utf8_lossy(&rfc3156_envelope("b", ARMOR, msg.as_bytes()))
+                        .into_owned();
+                for (name, value) in &exposed {
+                    assert!(
+                        wrapper.contains(&format!("{name}: {value}")),
+                        "{name} is missing from the wrapper ({sep:?}, hidden at {at}):\n{wrapper}"
+                    );
+                }
+                assert!(
+                    !wrapper.contains(SENTINEL),
+                    "a header or the body leaked into the wrapper ({sep:?}, hidden at {at}):\n{wrapper}"
+                );
+
+                let p = payload(msg.as_bytes());
+                for marker in ["-subject", "-bcc", "-custom", "-folded", "-body"] {
+                    assert!(
+                        p.contains(&format!("{SENTINEL}{marker}")),
+                        "{marker} is missing from the payload ({sep:?}, hidden at {at}):\n{p}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -72,6 +72,13 @@ mod portal;
 mod reply;
 mod route;
 pub mod status;
+
+/// See `connection::fuzz_decode`. Present only with the `fuzz` feature, which
+/// `control/fuzz` turns on and the service never does.
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub use connection::fuzz_decode;
+
 #[cfg(test)]
 pub(crate) mod test_support;
 mod titan;
