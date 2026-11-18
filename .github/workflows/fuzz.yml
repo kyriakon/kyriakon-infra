@@ -12,10 +12,6 @@
 name: fuzz
 
 on:
-  # TEMPORARY: this pull request only, so the job's own provisioning (nightly,
-  # cargo-fuzz, the sanitizer build) is exercised before it is trusted weekly.
-  # Removed before merge.
-  pull_request:
   schedule:
     # 04:17 Monday, in the quiet before the weekly script self-tests, so the two
     # never contend for the same runner minute.
