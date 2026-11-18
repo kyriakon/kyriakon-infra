@@ -318,5 +318,16 @@ pub(super) fn form_post(request: &Request) -> bool {
         .is_some_and(|t| t.eq_ignore_ascii_case("application/x-www-form-urlencoded"))
 }
 
+/// The fuzz crate's entry point: the decoders the public form runs on, over an
+/// arbitrary string. Nothing in the crate calls it, and the module it lives in
+/// stays private.
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub fn fuzz_decode(raw: &str) {
+    let _ = fields(raw);
+    let _ = decode(raw, true);
+    let _ = decode(raw, false);
+}
+
 #[cfg(test)]
 mod tests;

@@ -50,6 +50,48 @@ rows marked `yes` in `openbsd/packages.tsv`; a test that needs another tool adds
 a row there. It holds no deployed configuration or credentials for kyriakon.net,
 and `terraform apply`/`destroy` remain human-only.
 
+## Fuzz the parsers
+
+Four `cargo-fuzz` targets cover the parsers that read input the box does not
+control: the encryptor's message and envelope parsers, and the handler's FastCGI
+reader and form decoder. The `fuzz` workflow in `.github/workflows/fuzz.yml` runs
+each for two minutes every Monday and on demand. That is coverage over time, not a
+merge gate: a crash is filed as a bug with a regression test, not treated as a
+blocked PR.
+
+Run one for as long as you want, by hand:
+
+```sh
+cd kyriakon-encrypt/fuzz     # or control/fuzz
+cargo +nightly fuzz list     # the targets in this crate
+cargo +nightly fuzz run message -- -max_total_time=300
+```
+
+Nightly is required, because libFuzzer needs rustc's `-Zsanitizer`; install
+`cargo-fuzz` once with `cargo install cargo-fuzz --locked --version 0.13.2`. The
+seeds in `fuzz/corpus/` are committed, so a fresh clone starts from the same
+cases, and the corpus the run grows is kept between CI runs by the cache. The
+exception is the FastCGI reader's corpus: its seeds are the wire format, which is
+bytes, and the repository does not track binaries. To start from the record the
+front-ends send:
+
+```sh
+printf '\x01\x01\x00\x01\x00\x08\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00' \
+  > control/fuzz/corpus/request/begin
+```
+
+A crash or a hang is written to `fuzz/artifacts/<target>/`. The file alone
+reproduces it:
+
+```sh
+cargo +nightly fuzz run message fuzz/artifacts/message/crash-<hash>
+```
+
+Treat it as a bug like any other: it gets a test in the crate it came from, and
+the corpus entry that found it is committed beside the seeds. The encryptor's
+targets call the pure parsers only; the gpg packet listings they gate on are
+covered by unit tests, not by libFuzzer.
+
 ## Deploy a merged change
 
 `scripts/deploy.sh` is the normal deploy. It reads the last deployed commit from

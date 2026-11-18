@@ -1,0 +1,13 @@
+From: alice+tag@example.invalid
+To: bob@example.invalid,
+	carol@example.invalid
+Subject: folded
+	continuation
+Content-Type: multipart/mixed;
+	boundary="m"
+
+--m
+Content-Type: text/plain
+
+body
+--m--

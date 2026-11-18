@@ -8,6 +8,10 @@ publish.workspace = true
 name = "kyriakon-control"
 path = "src/main.rs"
 
+[features]
+# Exposes the form decoder to `control/fuzz`; nothing in the service turns it on.
+fuzz = []
+
 [dependencies]
 askama.workspace = true
 kyriakon-control-core = { path = "../core" }
