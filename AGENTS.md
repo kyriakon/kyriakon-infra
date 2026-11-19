@@ -59,8 +59,9 @@ Pointers, so a search starts where the thing is.
   `privacy.md`, `aup.md`, `transparency.md`, `refusals.md`, `planning/` (specs,
   research, prototypes), `agents/` (issue tracker, triage labels, domain docs).
 - `.github/workflows/`: `checks.yml` (the five CI jobs, including the OpenBSD 7.9
-  self-test VM) and `auto-merge-key.yml` (a green key publication merges itself, as
-  the machine account).
+  self-test VM), `fuzz.yml` (the four libFuzzer targets, weekly), and
+  `auto-merge-key.yml` (a green key publication merges itself, as the machine
+  account).
 - `.githooks/`: commit shape, pre-commit, pre-push.
 - Root: `reserved-usernames.txt` (the held-back names), `CONTEXT.md` (repo vocabulary),
   `CODING_STANDARDS.md` (what a review enforces), `README.md`.
@@ -93,6 +94,10 @@ repo's own root. Two terms most likely to matter while working in this repo:
 - Fast loop while iterating: `cargo test --manifest-path control/Cargo.toml --lib`, and
   `--test drain -- <area>` for one area; the area map is `control/crates/tests/tests/README.md`.
   Run the full crate suite once before pushing, or let CI run it.
+- Fuzz targets: `kyriakon-encrypt/fuzz/` and `control/fuzz/` hold one per parser, run
+  with `cargo +nightly fuzz run <target>` from either directory. Fuzzing is not in the
+  merge gate; a crash found by the weekly `fuzz` job becomes a test in the crate it
+  came from. See `docs/runbook.md` "Fuzz the parsers".
 - Shell scripts (`scripts/`): `shellcheck scripts/*.sh`, and
   `ksh scripts/self-test-all.sh` runs every script's `--self-test` with the arguments
   each one needs. On the box, `ksh scripts/check-hygiene.sh` reports its live state.
