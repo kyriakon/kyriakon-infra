@@ -33,13 +33,22 @@ pub use serde_json::{json, Value};
 
 pub use time::OffsetDateTime;
 
-/// The test binary sits in `target/debug/deps`; the service binaries sit one
-/// directory above it.
+/// The test binary sits somewhere under the target directory's profile dir, and
+/// the service binaries sit directly in it. Where the test binary goes is not a
+/// stable interface: cargo put it in `deps/` through 1.99 and under
+/// `build/<package>/<hash>/out/` from 1.100, with no end to that churn in sight.
+/// So climb to the directory named for the profile rather than counting parents.
+fn target_dir() -> PathBuf {
+    std::env::current_exe()
+        .expect("the test binary has a path")
+        .ancestors()
+        .find(|dir| matches!(dir.file_name(), Some(name) if name == "debug" || name == "release"))
+        .expect("the test binary sits under the target directory's profile dir")
+        .to_path_buf()
+}
+
 fn bin(name: &str) -> PathBuf {
-    let mut path = std::env::current_exe().expect("the test binary has a path");
-    path.pop();
-    path.pop();
-    path.push(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    let path = target_dir().join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     assert!(path.exists(), "missing built binary {}", path.display());
     path
 }
