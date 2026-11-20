@@ -231,7 +231,7 @@ wait_sockets() {
 wait_http() {
 	typeset port="$1" tries=0
 	while [ "$tries" -lt 50 ]; do
-		curl -s -o /dev/null --max-time 1 -H "Host: $HOST" \
+		curl -s -o /dev/null --max-time 1 --path-as-is -H "Host: $HOST" \
 			"http://127.0.0.1:$port/index.html" >/dev/null 2>&1 && return 0
 		sleep 0.2
 		tries=$((tries + 1))
@@ -264,7 +264,7 @@ wait_gemini() {
 expect_http() {
 	typeset port="$1" path="$2" want="$3" pattern="$4" what="$5" body status
 	body=$(mktemp "$chroot_dir/http-body.XXXXXX") || return 1
-	status=$(curl -sS --max-time 5 -o "$body" -w '%{http_code}' -H "Host: $HOST" \
+	status=$(curl -sS --max-time 5 --path-as-is -o "$body" -w '%{http_code}' -H "Host: $HOST" \
 		"http://127.0.0.1:$port$path" 2>/dev/null) || status='no answer'
 	if [ "$status" != "$want" ]; then
 		rm -f "$body"
@@ -283,8 +283,8 @@ expect_http() {
 # the same path with its trailing separator.
 expect_http_redirect() {
 	typeset port="$1" path="$2" want="$3" what="$4" seen
-	seen=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code} %{redirect_url}' \
-		-H "Host: $HOST" "http://127.0.0.1:$port$path" 2>/dev/null) || seen='no answer'
+	seen=$(curl -sS --max-time 5 --path-as-is -o /dev/null \
+		-w '%{http_code} %{redirect_url}' -H "Host: $HOST" "http://127.0.0.1:$port$path" 2>/dev/null) || seen='no answer'
 	[ "$seen" = "301 http://$HOST:$port$want" ] ||
 		die "http $what: GET $path answered [$seen], wanted 301 to $want"
 	printf 'ok: http %s: GET %s -> 301 %s\n' "$what" "$path" "$want"
@@ -310,7 +310,7 @@ expect_gemini() {
 expect_http_denied() {
 	typeset port="$1" path="$2" secret="$3" what="$4" body status
 	body=$(mktemp "$chroot_dir/http-body.XXXXXX") || return 1
-	status=$(curl -sS --max-time 5 -o "$body" -w '%{http_code}' -H "Host: $HOST" \
+	status=$(curl -sS --max-time 5 --path-as-is -o "$body" -w '%{http_code}' -H "Host: $HOST" \
 		"http://127.0.0.1:$port$path" 2>/dev/null) || status='no answer'
 	case "$status" in
 	403 | 404) ;;
