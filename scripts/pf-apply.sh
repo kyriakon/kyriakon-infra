@@ -72,6 +72,57 @@ block_port() {
 		}' "$1"
 }
 
+# Whether the file carries a live `set skip on lo`, and in which form. Only the
+# stock spelling is rewritten: a box that wrote the line another way needs a
+# human to decide, and the caller stops rather than adding a rule the skip would
+# make unreachable.
+lo_skip_form() {
+	awk '
+	/^[[:space:]]*#/ { next }
+	/^[[:space:]]*set[[:space:]]+skip[[:space:]]+on[[:space:]]+lo[[:space:]]*$/ { plain = 1; next }
+	/^[[:space:]]*set[[:space:]]+skip[[:space:]]+on/ { other = 1 }
+	END {
+		if (plain) print "plain"
+		else if (other) print "other"
+		else print "none"
+	}' "$1"
+}
+
+# Comment the stock `set skip on lo` line, marked so a re-run finds nothing to
+# do. pf evaluates nothing on an interface the ruleset skips, so the signup-hop
+# block below cannot match until this line is gone (#758).
+remove_lo_skip() {
+	tmp="$1.kyriakon-lo"
+	awk '
+	!done && !/^[[:space:]]*#/ && /^[[:space:]]*set[[:space:]]+skip[[:space:]]+on[[:space:]]+lo[[:space:]]*$/ {
+		print "# kyriakon: removed by pf-apply.sh so loopback can be filtered (#758)"
+		print "#" $0
+		done = 1
+		next
+	}
+	{ print }
+	' "$1" > "$tmp"
+	mv "$tmp" "$1"
+}
+
+# The signup hop: relayd runs as root, so an outbound rule limited to root is
+# the one thing a local unprivileged process cannot match. `flags S/SA` keeps
+# the block to connection setup, so replies ride the state the pass rule
+# creates and httpd's own answers are never blocked. Any other loopback service
+# keeps the stock `pass` above.
+append_signup_hop() {
+	if has_block_in "$1" "signup hop"; then
+		return 1
+	fi
+	cat >>"$1" <<'EOF'
+
+# --- kyriakon: signup hop (#758, openbsd/etc/httpd.conf) ---
+block out on lo proto tcp to 127.0.0.1 port 8080 flags S/SA
+pass  out on lo proto tcp to 127.0.0.1 port 8080 user root keep state
+# --- end kyriakon: signup hop ---
+EOF
+}
+
 # One value from the box's values file, or the empty string. Sourced in a
 # subshell so a file that errors cannot end this run, which is the same reason
 # the onboarding TUI's read below disables errexit for its own read.
@@ -199,6 +250,37 @@ self_test() {
 	check "and the file is byte-identical" "$(cksum "$first")" "$before"
 	check "the block's port is readable" "$(block_port "$first" 'titan upload')" "1966"
 
+	# The loopback change and the hop pair that depends on it (#758). Only the
+	# stock spelling of the skip line is rewritten; anything else stops the run,
+	# because a block that a skip makes unreachable would report a fix that is
+	# not in force.
+	lo="$tree/lo.conf"
+	printf '%s\n' 'set skip on lo' 'block return' 'pass' > "$lo"
+	check "the stock skip line is recognised" "$(lo_skip_form "$lo")" plain
+	remove_lo_skip "$lo"
+	check "the skip line is commented" "$(grep -c '^#set skip on lo$' "$lo")" 1
+	check "with the reason and the issue" \
+		"$(grep -c '^# kyriakon: removed by pf-apply.sh.*#758' "$lo")" 1
+	check "and nothing else was touched" "$(awk 'END { print NR }' "$lo")" 4
+	check "a re-run finds nothing to rewrite" "$(lo_skip_form "$lo")" none
+	printf '%s\n' '#set skip on lo' 'pass' > "$lo"
+	check "a commented skip line is not live" "$(lo_skip_form "$lo")" none
+	printf '%s\n' 'set skip on { lo }' 'pass' > "$lo"
+	check "another spelling stops the run" "$(lo_skip_form "$lo")" other
+
+	hop="$tree/hop.conf"
+	: > "$hop"
+	append_signup_hop "$hop"
+	check "the hop block is written" "$(has_block_in "$hop" 'signup hop' && printf yes)" yes
+	check "the block precedes the pass" \
+		"$(awk '/^block out on lo/ { b = NR } /^pass  out on lo/ { p = NR } END { print (b && p && b < p) }' "$hop")" 1
+	check "the pass is limited to root" "$(grep -c 'user root keep state' "$hop")" 1
+	check "the block is limited to connection setup" "$(grep -c 'flags S/SA' "$hop")" 1
+	before=$(cksum "$hop")
+	if append_signup_hop "$hop"; then second=added; else second=quiet; fi
+	check "a second hop run changes nothing" "$second" quiet
+	check "and the file is byte-identical" "$(cksum "$hop")" "$before"
+
 	# The greylisting scans once matched a commented-out stock rule and dropped
 	# the live block, leaving SMTP on smtpd while the output said it was already
 	# there (#692). A file carrying both a commented stock copy and our live block
@@ -300,6 +382,27 @@ if [ -s "$dropped" ]; then
 fi
 rm -f "$dropped"
 added=0
+lo_removed=0
+
+# --- loopback filtering ------------------------------------------------------
+# A stock pf.conf skips the loopback interface entirely, so no rule can be
+# applied to it. The signup hop below needs one, so the skip line goes, and the
+# only traffic this changes is what a later rule names: everything else on lo
+# still matches the stock `pass`. A spelling this script does not recognise is a
+# stop rather than a skip, because appending a block that `set skip on lo` makes
+# unreachable would report a fix that is not in force (#758).
+case "$(lo_skip_form "$pf_conf")" in
+plain)
+	remove_lo_skip "$work"
+	lo_removed=1
+	printf 'loopback:     set skip on lo removed (#758)\n'
+	;;
+other)
+	die "pf.conf carries a 'set skip on lo' line this script does not rewrite; filter loopback by hand before the signup hop is added (#758)"
+	;;
+none)
+	;;
+esac
 
 # --- greylisting ------------------------------------------------------------
 # The divert sends every inbound SMTP connection to spamd. The second rule is
@@ -502,7 +605,22 @@ EOF
 	printf 'finger:       to be added\n'
 fi
 
-if [ "$added" -eq 0 ] && [ "$collapsed" -eq 0 ]; then
+# --- signup hop -------------------------------------------------------------
+# httpd's signup vhost listens on loopback and the handler cannot tell relayd
+# from any other local process: both arrive from 127.0.0.1, and every header
+# relayd sets can be set by the caller. relayd runs as root, so the socket
+# owner is the one discriminator the kernel can make without a secret in the
+# handler (#758). Deliberately paired with the skip-line removal above: alone,
+# this block matches nothing.
+if has_block 'signup hop'; then
+	printf 'signup hop:   already in %s\n' "$pf_conf"
+else
+	append_signup_hop "$work"
+	added=$((added + 1))
+	printf 'signup hop:   to be added\n'
+fi
+
+if [ "$added" -eq 0 ] && [ "$collapsed" -eq 0 ] && [ "$lo_removed" -eq 0 ]; then
 	# A `persist file` table is read when the ruleset loads, so replacing the list
 	# file leaves the kernel holding the old one until something reloads. Compare
 	# them, ignoring order, and reload when they differ: that is what makes this
@@ -564,5 +682,5 @@ pfctl -f "$pf_conf"
 printf '\nbacked up as %s\n' "$bak"
 printf 'loaded %s\n\n' "$pf_conf"
 printf 'rules now loaded from these fragments:\n'
-pfctl -sr | grep -E 'divert-to 127\.0\.0\.1|spamd-white|nospamd|port = 1965|port = 2222|port = 79|max-src-conn 4' | awk '{print "\t" $0}'
+pfctl -sr | grep -E 'divert-to 127\.0\.0\.1|spamd-white|nospamd|port = 1965|port = 2222|port = 79|port = 8080|max-src-conn 4' | awk '{print "\t" $0}'
 printf '\nrevert with: pfctl -f %s\n' "$bak"
