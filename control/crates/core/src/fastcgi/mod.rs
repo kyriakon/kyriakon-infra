@@ -363,6 +363,16 @@ impl Http {
         }
     }
 
+    /// A file's bytes and the type its name announces. A header can be added
+    /// with `with_header`, which is how a change time reaches the reply.
+    pub fn file(status: u16, media: &str, body: Vec<u8>) -> Http {
+        Http {
+            status,
+            headers: vec![("Content-Type".to_string(), media.to_string())],
+            body,
+        }
+    }
+
     /// A 301 to `location`, for a directory asked for without its trailing
     /// separator: a browser resolves a relative link against the URL, so serving
     /// `sub/index.html` at `/sub` sends every request for a sibling of that page
@@ -457,11 +467,7 @@ impl Reply {
     /// the only header this server has an opinion about is the one that decides
     /// whether it renders or downloads.
     pub fn file(status: u16, media: &str, body: Vec<u8>) -> Reply {
-        Reply::Http(Http {
-            status,
-            headers: vec![("Content-Type".to_string(), media.to_string())],
-            body,
-        })
+        Reply::Http(Http::file(status, media, body))
     }
 
     /// The code this reply answers with, for the log line.
@@ -541,6 +547,7 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         301 => "Moved Permanently",
+        304 => "Not Modified",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",

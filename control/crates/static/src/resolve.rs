@@ -22,8 +22,14 @@ use crate::mime::media_type;
 
 /// What a request resolved to.
 pub enum Served {
-    /// The file to send, and the type to announce it as.
-    File { file: File, media: &'static str },
+    /// The file to send, the type to announce it as, and when it last changed.
+    /// The time is what lets a browser ask whether its copy is still current;
+    /// it is `None` only when the filesystem cannot say.
+    File {
+        file: File,
+        media: &'static str,
+        modified: Option<std::time::SystemTime>,
+    },
     /// The request named a directory without its trailing separator. The caller
     /// answers with a redirect to the same path with one: a browser resolves a
     /// relative link against the URL, so serving `sub/index.html` at `/sub` sends
@@ -79,6 +85,7 @@ pub fn open(root: &Path, request: &str, index: &str) -> Result<Served, Refusal> 
         return Ok(Served::File {
             file: next,
             media: media_type(name),
+            modified: metadata.modified().ok(),
         });
     }
     // `names` is non-empty here and the loop returns on its last component.
@@ -128,6 +135,7 @@ fn index_in(directory: &File, index: &str) -> Result<Served, Refusal> {
     Ok(Served::File {
         file,
         media: media_type(index),
+        modified: metadata.modified().ok(),
     })
 }
 
