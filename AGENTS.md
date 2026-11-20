@@ -25,18 +25,20 @@ written down. This repo has no decisions directory of its own.
 Pointers, so a search starts where the thing is.
 
 - `control/`: the control plane, a Cargo workspace under `crates/`. `crates/core/`
-  holds the store, configuration, intent contract, IPC request and the shared
-  flow; `crates/handler/` serves the web form and renders the HTML and gemtext
-  pages; `crates/tui/` is the terminal library and binary; `crates/drain/` is the
-  root-side intent loop and transition verbs; `crates/admin/` is the operator
-  console; `crates/tests/` is the acceptance suite. `templates/*.html` live under
-  `crates/handler/`. The four binaries are `kyriakon-control`, `kyriakon-control-drain`,
-  `kyriakon-control-tui` and `kyriakon-admin`. The deployed state paths keep their old
-  names (`/var/db/onboard`, `/etc/onboard`, `/etc/kyriakon/onboard`), the service
-  account is still `_onboard`, and moving either is a data migration rather than a
-  rename. A package's `src/` root holds only its crate root, binary roots, and (in core)
-  `config.rs`, `util.rs` and `intent.rs`; a new module goes in its section
-  directory, or a new directory with a `mod.rs` that names its job.
+  holds the store, configuration, intent contract, IPC request, the shared flow and
+  the FastCGI wire; `crates/handler/` serves the web form and renders the HTML and
+  gemtext pages; `crates/tui/` is the terminal library and binary; `crates/drain/` is
+  the root-side intent loop and transition verbs; `crates/admin/` is the operator
+  console; `crates/tests/` is the acceptance suite; `crates/static/` is the member
+  content server's resolver, which opens a member's published file without following
+  a symlink. `templates/*.html` live under `crates/handler/`. The four binaries are
+  `kyriakon-control`, `kyriakon-control-drain`, `kyriakon-control-tui` and
+  `kyriakon-admin`. The deployed state paths keep their old names (`/var/db/onboard`,
+  `/etc/onboard`, `/etc/kyriakon/onboard`), the service account is still `_onboard`,
+  and moving either is a data migration rather than a rename. A package's `src/` root
+  holds only its crate root, binary roots, and (in core) `config.rs`, `util.rs` and
+  `intent.rs`; a new module goes in its section directory, or a new directory with a
+  `mod.rs` that names its job.
 - `kyriakon-encrypt/`: the CLI the save path runs to encrypt each message; `src/lib.rs`
   builds the PGP/MIME wrapper.
 - `dovecot-plugin/`: the C plugin that forks the encryptor for each save and turns its
@@ -59,7 +61,7 @@ Pointers, so a search starts where the thing is.
   `privacy.md`, `aup.md`, `transparency.md`, `refusals.md`, `planning/` (specs,
   research, prototypes), `agents/` (issue tracker, triage labels, domain docs).
 - `.github/workflows/`: `checks.yml` (the five CI jobs, including the OpenBSD 7.9
-  self-test VM), `fuzz.yml` (the four libFuzzer targets, weekly), and
+  self-test VM), `fuzz.yml` (the five libFuzzer targets, weekly), and
   `auto-merge-key.yml` (a green key publication merges itself, as the machine
   account).
 - `.githooks/`: commit shape, pre-commit, pre-push.
@@ -94,10 +96,12 @@ repo's own root. Two terms most likely to matter while working in this repo:
 - Fast loop while iterating: `cargo test --manifest-path control/Cargo.toml --lib`, and
   `--test drain -- <area>` for one area; the area map is `control/crates/tests/tests/README.md`.
   Run the full crate suite once before pushing, or let CI run it.
-- Fuzz targets: `kyriakon-encrypt/fuzz/` and `control/fuzz/` hold one per parser, run
-  with `cargo +nightly fuzz run <target>` from either directory. Fuzzing is not in the
-  merge gate; a crash found by the weekly `fuzz` job becomes a test in the crate it
-  came from. See `docs/runbook.md` "Fuzz the parsers".
+- Fuzz targets: `kyriakon-encrypt/fuzz/` and `control/fuzz/` hold one per parser: the
+  encryptor's message and envelope, the FastCGI reader and form decoder, and the
+  member path resolver, which asserts that a served file is always one inside the
+  member's own root. Run one with `cargo +nightly fuzz run <target>` from either
+  directory. Fuzzing is not in the merge gate; a crash found by the weekly `fuzz` job
+  becomes a test in the crate it came from. See `docs/runbook.md` "Fuzz the parsers".
 - Shell scripts (`scripts/`): `shellcheck scripts/*.sh`, and
   `ksh scripts/self-test-all.sh` runs every script's `--self-test` with the arguments
   each one needs. On the box, `ksh scripts/check-hygiene.sh` reports its live state.
