@@ -139,6 +139,21 @@ Open to the world by design: 22, 25, 53, 79, 80, 143, 443, 465, 993, 1965, and 1
 
 `pf.conf` and `sshd_config` stay propose-only: `scripts/deploy.sh` prints the commands and never applies them, and a host rule change is made by hand after review. A provider firewall was considered and declined; the second-host and second-jurisdiction trigger in ADR 0007 is the point to revisit the layering, so it is not decided twice.
 
+Loopback is filtered for one port. `scripts/pf-apply.sh` comments out the stock `set skip on lo` and appends a block-then-pass pair for `127.0.0.1:8080`, the signup vhost: a connection to it is blocked unless the sending socket belongs to root, and on this box that is relayd. So the client address under a relayed request is trustworthy at last, because no unprivileged local process can reach the vhost to forge the header (#758). Nothing else on loopback changes: the stock `pass` still matches every other packet, and the block is limited to connection setup (`flags S/SA`), so replies ride the state the pass rule creates. The one thing that stops the change working is a `set skip on lo` spelling the script does not rewrite, and that stops the run rather than being ignored.
+
+Check it after applying:
+
+	# as a normal user: must fail, so the direct path is gone
+	curl -sS -o /dev/null -H 'Host: signup.kyriakon.net' http://127.0.0.1:8080/apply || printf 'blocked\n'
+	# through relayd: must serve the page
+	curl -sS -o /dev/null -w '%{http_code}\n' https://signup.kyriakon.net/apply
+	# loopback DNS is untouched
+	dig +short @127.0.0.1 kyriakon.net.
+	# both rules are loaded, in this order
+	doas pfctl -sr | grep 'port = 8080'
+
+The handler's log line for an ordinary application must then carry the client's address, never `127.0.0.1`.
+
 ## Publish the governance documents
 
 The terms, the acceptable use policy and the privacy notice are `docs/terms.md`,
@@ -782,7 +797,7 @@ To prove a restored copy becomes a working mail server, rather than merely resto
 		doas ksh scripts/cron-apply.sh --check
 		doas ksh scripts/cron-apply.sh
 
-   `pf-apply.sh` appends the firewall fragments and is the human step. It prints the diff first, checks the candidate with `pfctl -n` before touching the live file, keeps a timestamped copy of the file it replaces, and loads nothing that `pfctl` rejects.
+   `pf-apply.sh` appends the firewall fragments and is the human step. It also comments out the stock `set skip on lo`, which the signup hop rule needs, and `--check` shows both changes. It prints the diff first, checks the candidate with `pfctl -n` before touching the live file, keeps a timestamped copy of the file it replaces, and loads nothing that `pfctl` rejects.
 
 The offline copy of the repository does not exist yet (#109 and #116). Until it does, the repository password is the only thing standing between a lost storage box and a lost archive, and the storage box sits with the same provider as the box itself. Keep the offline copy of the password where the private half says.
 
