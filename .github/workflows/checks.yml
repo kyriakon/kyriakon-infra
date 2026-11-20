@@ -305,7 +305,7 @@ jobs:
             # OpenBSD kernel can prove that: a missing promise aborts the
             # process. The binary is the commit under test, built here for the
             # same reason the responder is.
-            cargo build --release --manifest-path control/Cargo.toml -p kyriakon-control-drain
+            cargo build --release --manifest-path control/Cargo.toml -p kyriakon-control-drain -p kyriakon-admin
             ksh scripts/verify-drain-sandbox.sh
 
   terraform:
