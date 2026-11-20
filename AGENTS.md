@@ -29,10 +29,11 @@ Pointers, so a search starts where the thing is.
   the FastCGI wire; `crates/handler/` serves the web form and renders the HTML and
   gemtext pages; `crates/tui/` is the terminal library and binary; `crates/drain/` is
   the root-side intent loop and transition verbs; `crates/admin/` is the operator
-  console; `crates/tests/` is the acceptance suite; `crates/static/` is the member
-  content server's resolver, which opens a member's published file without following
-  a symlink. `templates/*.html` live under `crates/handler/`. The four binaries are
-  `kyriakon-control`, `kyriakon-control-drain`, `kyriakon-control-tui` and
+  console; `crates/tests/` is the acceptance suite; `crates/static/` serves a member's
+  published tree, opening each path component without following a link, because the
+  daemons' chroot holds every member's tree at once. `templates/*.html` live under
+  `crates/handler/`. The five binaries are `kyriakon-control`,
+  `kyriakon-control-static`, `kyriakon-control-drain`, `kyriakon-control-tui` and
   `kyriakon-admin`. The deployed state paths keep their old names (`/var/db/onboard`,
   `/etc/onboard`, `/etc/kyriakon/onboard`), the service account is still `_onboard`,
   and moving either is a data migration rather than a rename. A package's `src/` root
@@ -51,10 +52,11 @@ Pointers, so a search starts where the thing is.
   harness); `install-set.tsv` is the one table naming what each destination gets; and
   `install-packages.sh` installs from `openbsd/packages.tsv`.
 - `openbsd/`: what the box runs: `etc/` (smtpd, httpd, relayd, gmid, unbound, nsd,
-  spamd, sshd, `login.conf.d/`, `rc.d/`, `kyriakon.env`, and the control plane's three
-  configs (`catalogue.toml`, `drain.toml`, `onboard.toml`) under `etc/onboard/`),
-  `dovecot/`, `restore-template/` for the throwaway box, and `packages.tsv`, the one
-  package list naming each row's owning scripts and whether the CI VM installs it.
+  spamd, sshd, `login.conf.d/`, `rc.d/`, `kyriakon.env`, and the control plane's four
+  configs (`catalogue.toml`, `drain.toml`, `onboard.toml`, `static.toml`) under
+  `etc/onboard/`), `dovecot/`, `restore-template/` for the throwaway box, and
+  `packages.tsv`, the one package list naming each row's owning scripts and whether the
+  CI VM installs it.
 - `terraform/`: the box itself, and the throwaway's stack.
 - `docs/`: `runbook.md` (every operator procedure, including the repository settings
   the automation depends on), `operations/`, `threat-model.md`, `terms.md`,
