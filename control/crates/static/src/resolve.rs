@@ -29,6 +29,9 @@ pub enum Served {
         file: File,
         media: &'static str,
         modified: Option<std::time::SystemTime>,
+        /// The length the descriptor reported. A `HEAD` answers with it and the
+        /// over-cap check uses it, without either reading the bytes.
+        len: u64,
     },
     /// The request named a directory without its trailing separator. The caller
     /// answers with a redirect to the same path with one: a browser resolves a
@@ -62,7 +65,7 @@ pub enum Refusal {
 /// tree's is `index.html`, a capsule's is `index.gmi`.
 pub fn open(root: &Path, request: &str, index: &str) -> Result<Served, Refusal> {
     let names = components(request)?;
-    let mut current = File::open(root).map_err(|_| Refusal::Missing)?;
+    let mut current = open_root(root).ok_or(Refusal::Missing)?;
     if names.is_empty() {
         return index_in(&current, index);
     }
@@ -82,10 +85,17 @@ pub fn open(root: &Path, request: &str, index: &str) -> Result<Served, Refusal> 
         if !metadata.is_file() {
             return Err(Refusal::NotAFile);
         }
+        // `a.html/` and `a.html` are two spellings of one file, and only one of
+        // them should resolve. A browser at the first resolves a relative link
+        // against a directory that does not exist.
+        if request.ends_with('/') {
+            return Err(Refusal::Missing);
+        }
         return Ok(Served::File {
             file: next,
             media: media_type(name),
             modified: metadata.modified().ok(),
+            len: metadata.len(),
         });
     }
     // `names` is non-empty here and the loop returns on its last component.
@@ -136,7 +146,37 @@ fn index_in(directory: &File, index: &str) -> Result<Served, Refusal> {
         file,
         media: media_type(index),
         modified: metadata.modified().ok(),
+        len: metadata.len(),
     })
+}
+
+/// The tree root, as a directory descriptor that was opened without following a
+/// link and cannot block.
+///
+/// Every step below this already refuses a link, but the root itself is a
+/// composed path: `File::open` would follow a link at any component of
+/// `<root>/<host>/<www|gemini>`, and it would block on a FIFO placed at the last
+/// one until a writer arrived. `O_DIRECTORY` refuses a FIFO and a regular file
+/// at once; `O_NOFOLLOW` refuses the link. Ownership already keeps a member out
+/// of the directory that holds these names, and this is the second lock on the
+/// same door.
+fn open_root(root: &Path) -> Option<File> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(root.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `path` is a NUL-terminated string that outlives the call, and the
+    // returned descriptor is taken ownership of by the `File` built from it.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: the descriptor is fresh and owned here, and nothing else holds it.
+    Some(unsafe { File::from_raw_fd(fd) })
 }
 
 /// One path component, relative to an open directory and refusing a link.

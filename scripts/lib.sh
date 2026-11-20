@@ -583,6 +583,22 @@ mail_domains_first() {
 	awk 'NR == 1 { print; exit }' "$1"
 }
 
+# domain_is_platform <name> <mail-domains>: whether <name> is the platform's own
+# domain or anything under it, or the defensive registration. The drain refuses
+# these before it runs a group lane; the lanes an operator can run by hand read
+# the same rule from here, so the rule has one home and one test shape. A missing
+# or empty table refuses every name rather than guessing which side of the line a
+# name is on.
+domain_is_platform() {
+	typeset name="$1" platform
+	platform=$(mail_domains_first "$2" 2>/dev/null) || return 0
+	[ -n "$platform" ] || return 0
+	case "$name" in
+	"$platform" | *."$platform" | kyriakon.com | *.kyriakon.com) return 0 ;;
+	esac
+	return 1
+}
+
 # mail_domains_first_problem <file> <platform-domain>: why the first line is not
 # the platform domain, one line, or nothing when it is. A restore or a hand edit
 # that reorders the table is otherwise silent, and provision-member.sh addresses

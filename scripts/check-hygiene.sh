@@ -264,21 +264,26 @@ store_drift() {
 	find "$1" -type f ! -user "$2" -print
 }
 
-# rooted_vhosts <dir>...: the generated vhosts that still serve their tree from a
-# `root` inside the shared chroot. A member content vhost is the socket shape now,
-# and has no 8080 block without it; a file that has the block and no socket was
-# written before the change and its lane has not been run since.
+# rooted_vhosts <dir>...: the generated vhosts that still serve a tree from a
+# `root` of their own. The current shape hands every path to the responder over
+# `fastcgi socket` and keeps no root except the ACME challenge's "/acme". A file
+# with any other root and no socket was written before the change, from httpd
+# (port 8080) or gmid (port 1965), and its lane has not been run since. The
+# listener's port cannot decide it: a capsule vhost never carries the loopback
+# block, and skipping those is the one state this check exists to report.
 rooted_vhosts() {
-	typeset dir file
+	typeset dir file roots bad
 	for dir in "$@"; do
 		for file in "$dir"/*.conf; do
 			[ -f "$file" ] || continue
 			case "$file" in */index.conf) continue ;; esac
-			grep -q 'port 8080' "$file" || continue
-			grep -q 'fastcgi socket' "$file" && continue
-			printf '%s\n' "$file"
+			grep -Eq '^[[:space:]]*fastcgi[[:space:]]+socket' "$file" && continue
+			roots=$(grep -E '^[[:space:]]*root[[:space:]]+"' "$file") || continue
+			bad=$(printf '%s\n' "$roots" | grep -E -v '^[[:space:]]*root[[:space:]]+"/acme"([[:space:]]|$)') || :
+			[ -n "$bad" ] && printf '%s\n' "$file"
 		done
 	done
+	return 0
 }
 
 # permission_drift <mtree-spec>
@@ -360,8 +365,10 @@ self_test() {
 	# shellcheck disable=SC2064
 	trap "rm -rf '$dir'" EXIT
 
-	# A vhost is stale only when it has the loopback block and no socket: a port
-	# 80 only file carries root "/acme" and is current, and a socket file is too.
+	# A vhost is stale only when it roots a tree of its own: the current shape is
+	# a socket, and the one root it keeps is the ACME challenge's "/acme". The
+	# port does not decide, so a gmid block (1965, no 8080 anywhere) is checked
+	# the same way as httpd's loopback block.
 	mkdir "$dir/httpd.d" "$dir/gmid.d"
 	printf 'server "alice.kyriakon.net" {\n\tlocation "/.well-known/acme-challenge/*" {\n\t\troot "/acme"\n\t}\n}\n' \
 		> "$dir/httpd.d/alice.kyriakon.net.conf"
@@ -369,7 +376,11 @@ self_test() {
 		> "$dir/httpd.d/parish.example.conf"
 	printf 'server "bob.kyriakon.net" {\n\tlisten on 127.0.0.1 port 8080\n\tlocation "/*" {\n\t\tfastcgi socket "/run/onboard-static-httpd/static.sock"\n\t}\n}\n' \
 		> "$dir/httpd.d/bob.kyriakon.net.conf"
-	want="$dir/httpd.d/parish.example.conf"
+	printf 'server "dave.kyriakon.net" {\n\tlisten on * port 1965\n\troot "/dave.kyriakon.net/gemini"\n}\n' \
+		> "$dir/gmid.d/dave.kyriakon.net.conf"
+	printf 'server "erin.kyriakon.net" {\n\tlisten on * port 1965\n\tfastcgi socket "/run/onboard-static/static.sock"\n}\n' \
+		> "$dir/gmid.d/erin.kyriakon.net.conf"
+	want=$(printf '%s\n%s' "$dir/httpd.d/parish.example.conf" "$dir/gmid.d/dave.kyriakon.net.conf")
 	out=$(rooted_vhosts "$dir/httpd.d" "$dir/gmid.d")
 	[ "$out" = "$want" ] || {
 		printf 'FAIL: the stale vhost check; expected [%s], got [%s]\n' "$want" "$out" >&2

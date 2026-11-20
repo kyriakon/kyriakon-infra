@@ -32,7 +32,6 @@ use kyriakon_control_core::util::{self, percent_decode};
 use kyriakon_control_core::Error;
 use kyriakon_control_static::{open, Refusal, Served};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
-use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 
 /// The web tree's index. A directory request serves this and never a listing,
@@ -42,13 +41,17 @@ const WWW_INDEX: &str = "index.html";
 /// capsule's `index.html` would arrive as raw markup.
 const GEMINI_INDEX: &str = "index.gmi";
 
-/// The most of one file this process will hold in memory to send it. A member
-/// site is pages and images; the cap is what stops one upload from pinning a
-/// megabyte count per concurrent download.
+/// The largest file this process will serve. The bytes are streamed, so the cap
+/// is a policy about what a member site is, not a memory bound: it is what stops
+/// one upload from being a bulk download this box carries.
 ///
-/// shortcut: files over this are refused rather than streamed, raise it (or
-/// stream through the wire) if a member publishes something larger.
+/// shortcut: files over this are refused, raise it if a member publishes
+/// something larger.
 const MAX_FILE: usize = 16 * 1024 * 1024;
+
+/// The most of a host-to-tree map entry this process will read. The writer puts
+/// one name in it, so anything longer is not a map this process understands.
+const ALIAS_MAX: u64 = 4096;
 
 /// The most of a request body this process will read. A static request has none:
 /// httpd sends the form posts to the control plane's socket, not this one.
@@ -56,6 +59,14 @@ const MAX_BODY: usize = 0;
 
 /// The wait before the next accept after an error that is not the connection's.
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Connections served at once, across both listeners. Above this the accept loop
+/// waits for a permit, so a flood costs the listening backlog and one socket
+/// rather than a descriptor each. The unit runs under the `daemon` login class's
+/// 128 descriptors, and a front-end opens one backend connection per request, so
+/// the ceiling is what keeps an anonymous flood from exhausting the table and
+/// stopping both listeners from accepting.
+const CONNECTIONS: usize = 64;
 
 #[derive(Clone, serde::Deserialize)]
 struct Config {
@@ -69,6 +80,16 @@ struct Config {
     /// served under the body's own domain while its files live in the site
     /// owner's member tree, so the host alone does not choose the tree.
     hosts: PathBuf,
+}
+
+/// What an alias lookup found.
+enum Alias {
+    /// No entry: the host's directory is named for the host.
+    None,
+    /// An entry that names a tree.
+    Name(String),
+    /// An entry that exists but cannot be read as one name.
+    Refused,
 }
 
 impl Config {
@@ -95,9 +116,12 @@ impl Config {
             return None;
         }
         let name = match self.alias(host) {
-            Some(alias) if is_name(&alias) => alias,
-            Some(_) => return None,
-            None => host.to_string(),
+            Alias::None => host.to_string(),
+            Alias::Name(alias) if is_name(&alias) => alias,
+            // An entry that exists but is not a name is a broken map, not a
+            // host without one: serving `root/<host>` instead would quietly
+            // answer from the wrong tree.
+            Alias::Name(_) | Alias::Refused => return None,
         };
         Some(self.root.join(name).join(front_end.subdirectory()))
     }
@@ -109,10 +133,40 @@ impl Config {
     /// owner's member tree. The directory is root-owned, so a member cannot put a
     /// name in it, and the value is checked against the same alphabet before it is
     /// joined, so an entry cannot point outside `root` either.
-    fn alias(&self, host: &str) -> Option<String> {
-        let name = std::fs::read_to_string(self.hosts.join(host)).ok()?;
-        let name = name.trim();
-        (!name.is_empty()).then(|| name.to_string())
+    ///
+    /// The read is bounded and refuses a link: an entry is a name, and a FIFO or
+    /// a link there is a broken map rather than something to follow. `O_NONBLOCK`
+    /// is what keeps a FIFO from hanging the worker that opened it.
+    fn alias(&self, host: &str) -> Alias {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(self.hosts.join(host))
+        {
+            Ok(file) => file,
+            // No entry is the ordinary case: the host's directory is its own name.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Alias::None,
+            Err(_) => return Alias::Refused,
+        };
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => return Alias::Refused,
+        };
+        if !metadata.is_file() || metadata.len() > ALIAS_MAX {
+            return Alias::Refused;
+        }
+        let mut text = String::new();
+        if file.take(ALIAS_MAX).read_to_string(&mut text).is_err() {
+            return Alias::Refused;
+        }
+        let name = text.trim();
+        if name.is_empty() {
+            Alias::Refused
+        } else {
+            Alias::Name(name.to_string())
+        }
     }
 }
 
@@ -185,9 +239,10 @@ async fn run() -> Result<(), Error> {
         cfg.gemini_socket.display(),
         cfg.root.display()
     ));
+    let slots = Arc::new(tokio::sync::Semaphore::new(CONNECTIONS));
     tokio::try_join!(
-        accept(httpd, cfg.clone(), FrontEnd::Httpd),
-        accept(gemini, cfg, FrontEnd::Gemini),
+        accept(httpd, cfg.clone(), FrontEnd::Httpd, slots.clone()),
+        accept(gemini, cfg, FrontEnd::Gemini, slots),
     )
     .map(|_| ())
 }
@@ -233,6 +288,7 @@ async fn accept(
     listener: UnixListener,
     cfg: Arc<Config>,
     front_end: FrontEnd,
+    slots: Arc<tokio::sync::Semaphore>,
 ) -> Result<(), Error> {
     loop {
         let (stream, _) = match listener.accept().await {
@@ -245,8 +301,15 @@ async fn accept(
                 continue;
             }
         };
+        // Taken before the task is spawned, so a flood waits on the backlog with
+        // one accepted socket rather than a task and a descriptor per connection.
+        let permit = match slots.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return Ok(()),
+        };
         let cfg = cfg.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = connection(stream, &cfg, front_end).await {
                 e.report("serving a connection");
             }
@@ -265,21 +328,30 @@ async fn connection(stream: UnixStream, cfg: &Config, front_end: FrontEnd) -> Re
         let Some(request) = request else {
             return Ok(());
         };
-        let (reply, route) = answer(cfg, front_end, &request);
+        let (answer, route) = answer(cfg, front_end, &request);
+        let id = request.id();
         util::log(&format!(
             "kyriakon-control-static: {} {} {}",
             front_end.word(),
             route,
-            reply.code()
+            answer.code()
         ));
-        let bytes = fastcgi::reply_bytes(&reply, request.id());
-        writer.write_all(&bytes).await.map_err(|source| Error::Io {
+        match answer {
+            Answer::Reply(reply) => {
+                let head = reply.head_block();
+                fastcgi::write_reply(&mut writer, &head, fastcgi::Body::Bytes(reply.body()), id)
+                    .await
+            }
+            Answer::File {
+                head, file, len, ..
+            } => {
+                let mut file = tokio::fs::File::from_std(file);
+                fastcgi::write_reply(&mut writer, &head, fastcgi::Body::File(&mut file, len), id)
+                    .await
+            }
+        }
+        .map_err(|source| Error::Io {
             what: "write the reply",
-            path: None,
-            source,
-        })?;
-        writer.flush().await.map_err(|source| Error::Io {
-            what: "flush the reply",
             path: None,
             source,
         })?;
@@ -289,10 +361,34 @@ async fn connection(stream: UnixStream, cfg: &Config, front_end: FrontEnd) -> Re
     }
 }
 
+/// One request's answer. A file is written as it is read, so a member's upload
+/// costs one buffer rather than one whole copy per in-flight request.
+enum Answer {
+    /// A reply that already holds its body: a page, a refusal, a redirect.
+    Reply(Reply),
+    /// A member's file, whose body is streamed behind `head`.
+    File {
+        head: Vec<u8>,
+        file: std::fs::File,
+        len: u64,
+        code: u16,
+    },
+}
+
+impl Answer {
+    /// The status this answer carries, for the log line and the tests.
+    fn code(&self) -> u16 {
+        match self {
+            Answer::Reply(reply) => reply.code(),
+            Answer::File { code, .. } => *code,
+        }
+    }
+}
+
 /// One request's reply, and the path the log line names. The path is the decoded
 /// one without its query: the query is the member's, and one that carries an
 /// answer should not be written down.
-fn answer(cfg: &Config, front_end: FrontEnd, request: &Request) -> (Reply, String) {
+fn answer(cfg: &Config, front_end: FrontEnd, request: &Request) -> (Answer, String) {
     let path = match front_end {
         // httpd passes the client's spelling of the request line, query and all.
         FrontEnd::Httpd => percent_decode(
@@ -307,62 +403,106 @@ fn answer(cfg: &Config, front_end: FrontEnd, request: &Request) -> (Reply, Strin
         FrontEnd::Gemini => request.value("GEMINI_URL_PATH").to_string(),
     };
     let host = normalise_host(request.value("SERVER_NAME"));
-    let route = format!("{host}{path}");
+    let route = log_route(&host, &path);
     let Some(root) = cfg.tree(front_end, &host) else {
-        return (refuse(front_end), route);
+        return (Answer::Reply(refuse(front_end)), route);
     };
+
+    // A published tree is read, never written. Answering a `PUT` or a `DELETE`
+    // with the file would tell a client the write succeeded, which is what httpd
+    // answered 405 for before the vhost handed the request here.
+    let method = request.value("REQUEST_METHOD");
+    if front_end == FrontEnd::Httpd && method != "GET" && method != "HEAD" {
+        return (Answer::Reply(method_not_allowed()), route);
+    }
+    let head_request = front_end == FrontEnd::Httpd && method == "HEAD";
+
     match open(&root, &path, front_end.index()) {
         Ok(Served::File {
             file,
             media,
             modified,
+            len,
         }) => {
+            // RFC 9110 §8.8.2.1: a future modification date is sent as the
+            // origination date. sftp can set one up to 2106, and a client that
+            // cached it would otherwise be told "not modified" for every later
+            // write; a raw one also panics the date formatter.
+            let modified = modified.map(|m| m.min(SystemTime::now()));
             let last_modified = modified.and_then(http_date);
             // A browser that already holds this copy asks with the date it was
             // given; answering 304 keeps a member's page from being re-sent on
             // every navigation, which httpd's own file server did for the vhosts
             // this replaced.
             if front_end == FrontEnd::Httpd && unchanged(modified, request) {
-                return (not_modified(media, last_modified), route);
+                return (Answer::Reply(not_modified(media, last_modified)), route);
             }
-            match read_capped(file) {
-                Some(body) => (serve(front_end, media, body, last_modified), route),
-                None => (too_large(front_end), route),
+            if len > MAX_FILE as u64 {
+                return (Answer::Reply(too_large(front_end)), route);
             }
+            if head_request {
+                // The header block and the length, not the bytes: native httpd
+                // answered a HEAD the same way, and reading a file only to
+                // discard it is work the client cannot see.
+                return (
+                    Answer::Reply(file_head(front_end, media, last_modified, Some(len))),
+                    route,
+                );
+            }
+            let head = file_head(front_end, media, last_modified, None).head_block();
+            (
+                Answer::File {
+                    head,
+                    file,
+                    len,
+                    code: match front_end {
+                        FrontEnd::Httpd => 200,
+                        FrontEnd::Gemini => 20,
+                    },
+                },
+                route,
+            )
         }
-        Ok(Served::Redirect) => (redirect(front_end, &host, &path), route),
+        Ok(Served::Redirect) => (Answer::Reply(redirect(front_end, &host, &path)), route),
         // Both refusals are the same answer: a client that could tell "no such
         // file" from "not a file" would learn which of its guesses resolved.
-        Err(Refusal::Missing | Refusal::NotAFile) => (refuse(front_end), route),
+        Err(Refusal::Missing | Refusal::NotAFile) => (Answer::Reply(refuse(front_end)), route),
     }
 }
 
-/// The file's bytes, or `None` when it is over the cap.
-fn read_capped(file: std::fs::File) -> Option<Vec<u8>> {
-    let metadata = file.metadata().ok()?;
-    if metadata.len() > MAX_FILE as u64 {
-        return None;
+/// The path a log line names, bounded so one request cannot write an arbitrary
+/// number of bytes into the log.
+fn log_route(host: &str, path: &str) -> String {
+    let mut route = format!("{host}{path}");
+    if route.chars().nth(512).is_some() {
+        route = route.chars().take(512).collect();
+        route.push('\u{2026}');
     }
-    let mut body = Vec::with_capacity(metadata.len() as usize);
-    // `take` rather than a second length check, so a file that grew between the
-    // metadata read and this one cannot read past the cap.
-    file.take(MAX_FILE as u64 + 1).read_to_end(&mut body).ok()?;
-    (body.len() <= MAX_FILE).then_some(body)
+    route
 }
 
-/// A file's bytes, framed for the front-end that asked. The web announces the
-/// type in a header; a capsule announces it in the reply line, which is the only
-/// place a gemini client reads it.
-fn serve(front_end: FrontEnd, media: &str, body: Vec<u8>, last_modified: Option<String>) -> Reply {
+/// What precedes a member's file: the type and the change time, and the length
+/// when the body is not being sent. The web announces the type in a header; a
+/// capsule announces it in the reply line, which is the only place a gemini
+/// client reads it.
+fn file_head(
+    front_end: FrontEnd,
+    media: &str,
+    last_modified: Option<String>,
+    len: Option<u64>,
+) -> Reply {
     match front_end {
         FrontEnd::Httpd => {
-            let mut http = Http::file(200, media, body);
+            let mut http = Http::file(200, media, Vec::new());
             if let Some(date) = last_modified {
                 http = http.with_header("Last-Modified", date);
             }
+            if let Some(len) = len {
+                http = http.with_header("Content-Length", len.to_string());
+            }
             Reply::Http(http)
         }
-        FrontEnd::Gemini => Reply::gemini(20, media, body),
+        FrontEnd::Gemini => Reply::gemini(20, media, Vec::new()),
     }
 }
 
@@ -464,6 +604,21 @@ fn refuse(front_end: FrontEnd) -> Reply {
     }
 }
 
+/// A method a static tree cannot answer. Only httpd reaches this: a gemini
+/// request has no method.
+fn method_not_allowed() -> Reply {
+    // `Allow` is required on a 405 (RFC 9110 §15.5.6), and it is the only thing
+    // that tells a client probing for a write surface what this host answers.
+    Reply::Http(
+        Http::file(
+            405,
+            "text/plain; charset=utf-8",
+            b"Method not allowed\n".to_vec(),
+        )
+        .with_header("Allow", "GET, HEAD".to_string()),
+    )
+}
+
 fn too_large(front_end: FrontEnd) -> Reply {
     match front_end {
         FrontEnd::Httpd => Reply::file(
@@ -488,11 +643,16 @@ fn redirect(front_end: FrontEnd, host: &str, path: &str) -> Reply {
     let path = encode_path(path.trim_end_matches('/'));
     match front_end {
         FrontEnd::Httpd => Reply::Http(fastcgi::Http::moved(&format!("{path}/"))),
-        FrontEnd::Gemini => Reply::gemini(
-            31,
-            &format!("gemini://{host}/{}/", path.trim_start_matches('/')),
-            "",
-        ),
+        FrontEnd::Gemini => {
+            let meta = format!("gemini://{host}/{}/", path.trim_start_matches('/'));
+            // gmid's reply header is 1029 bytes and a longer META is answered
+            // with `42 CGI error`, so the client sees nothing at all. The path
+            // is too deep to redirect; say the request failed instead.
+            if meta.len() > 1024 {
+                return Reply::gemini(51, "Not found", "");
+            }
+            Reply::gemini(31, &meta, "")
+        }
     }
 }
 
@@ -580,6 +740,31 @@ mod tests {
         }
     }
 
+    /// An answer as the front-end receives it, for the tests below.
+    async fn wire(cfg: &Config, front_end: FrontEnd, request: &Request) -> (u16, String) {
+        let (answer, _) = answer(cfg, front_end, request);
+        let code = answer.code();
+        let mut out = Vec::new();
+        match answer {
+            Answer::Reply(reply) => {
+                let head = reply.head_block();
+                fastcgi::write_reply(&mut out, &head, fastcgi::Body::Bytes(reply.body()), 1)
+                    .await
+                    .unwrap();
+            }
+            Answer::File {
+                head, file, len, ..
+            } => {
+                let mut file = tokio::fs::File::from_std(file);
+                fastcgi::write_reply(&mut out, &head, fastcgi::Body::File(&mut file, len), 1)
+                    .await
+                    .unwrap();
+            }
+        }
+        let (body, _) = fixture::reply(&out);
+        (code, String::from_utf8_lossy(&body).into_owned())
+    }
+
     /// The whole path a front-end takes: request bytes in, reply bytes out.
     async fn httpd(cfg: &Config, uri: &str) -> (u16, String) {
         let raw = fixture::httpd(
@@ -590,10 +775,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let (reply, _) = answer(cfg, FrontEnd::Httpd, &request);
-        let (body, _) = fixture::reply(&fastcgi::reply_bytes(&reply, 1));
-        let text = String::from_utf8_lossy(&body).into_owned();
-        (reply.code(), text)
+        wire(cfg, FrontEnd::Httpd, &request).await
     }
 
     async fn gemini(cfg: &Config, path: &str) -> (u16, String) {
@@ -605,9 +787,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let (reply, _) = answer(cfg, FrontEnd::Gemini, &request);
-        let (body, _) = fixture::reply(&fastcgi::reply_bytes(&reply, 1));
-        (reply.code(), String::from_utf8_lossy(&body).into_owned())
+        wire(cfg, FrontEnd::Gemini, &request).await
     }
 
     #[tokio::test]
@@ -686,10 +866,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let (reply, _) = answer(&cfg, FrontEnd::Httpd, &request);
-        let (body, _) = fixture::reply(&fastcgi::reply_bytes(&reply, 1));
-        assert_eq!(reply.code(), 200);
-        assert!(String::from_utf8_lossy(&body).ends_with("alice"));
+        let (code, body) = wire(&cfg, FrontEnd::Httpd, &request).await;
+        assert_eq!(code, 200);
+        assert!(body.ends_with("alice"));
 
         // An entry is a path component too, so one with a separator is refused
         // rather than joined.
@@ -777,6 +956,15 @@ mod tests {
         assert_eq!(got, want);
         let (want, got) = at_cap(200, "/edge.bin");
         assert_eq!(got, want);
+
+        // The one answer whose body is streamed from the file: the whole
+        // MAX_FILE arrives, in order. A loop that short-reads or drops a record
+        // would still pass the status check above.
+        let (code, text) = block_on(httpd_env(&cfg, &[("REQUEST_URI", "/edge.bin")]));
+        assert_eq!(code, 200);
+        let body = &text[text.find("\r\n\r\n").expect("a header block") + 4..];
+        assert_eq!(body.len(), MAX_FILE, "a streamed body arrives whole");
+        assert!(body.bytes().all(|b| b == 0), "and in order");
     }
 
     /// One request through the answer path, for the tests above.
@@ -792,9 +980,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let (reply, _) = answer(cfg, FrontEnd::Httpd, &request);
-        let (body, _) = fixture::reply(&fastcgi::reply_bytes(&reply, 1));
-        (reply.code(), String::from_utf8_lossy(&body).into_owned())
+        wire(cfg, FrontEnd::Httpd, &request).await
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -865,6 +1051,117 @@ mod tests {
         )
         .await;
         assert_eq!(code, 200);
+    }
+
+    #[tokio::test]
+    async fn a_tree_root_that_is_a_link_is_refused() {
+        let cfg = config(fixture_root());
+        let host = cfg.root.join("alice.kyriakon.net");
+        std::fs::rename(host.join("www"), host.join("www.real")).unwrap();
+        symlink(host.join("www.real"), host.join("www")).unwrap();
+        assert_eq!(httpd(&cfg, "/index.html").await.0, 404);
+    }
+
+    #[tokio::test]
+    async fn a_file_name_ending_in_a_separator_is_refused() {
+        let cfg = config(fixture_root());
+        assert_eq!(httpd(&cfg, "/index.html/").await.0, 404);
+        assert_eq!(httpd(&cfg, "/").await.0, 200);
+    }
+
+    /// A published tree is read, never written: a method that would write
+    /// answered with the file tells a client its write succeeded.
+    #[tokio::test]
+    async fn a_method_that_cannot_be_served_is_refused() {
+        let cfg = config(fixture_root());
+        for method in ["PUT", "DELETE", "POST", "PATCH", "OPTIONS"] {
+            let (code, _) = httpd_env(
+                &cfg,
+                &[("REQUEST_URI", "/index.html"), ("REQUEST_METHOD", method)],
+            )
+            .await;
+            assert_eq!(code, 405, "{method}");
+        }
+    }
+
+    /// `HEAD` carries the length and none of the bytes.
+    #[tokio::test]
+    async fn head_answers_with_the_headers_and_no_body() {
+        let cfg = config(fixture_root());
+        let (code, text) = httpd_env(
+            &cfg,
+            &[("REQUEST_URI", "/index.html"), ("REQUEST_METHOD", "HEAD")],
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert!(text.contains("Content-Length: 5\r\n"), "{text}");
+        assert!(text.ends_with("\r\n\r\n"), "a HEAD body: {text:?}");
+    }
+
+    /// RFC 9110 §8.8.2.1: a future change time goes out as now, so a client
+    /// cannot cache a date that outlives every later write.
+    #[tokio::test]
+    async fn a_future_change_time_is_never_sent() {
+        let cfg = config(fixture_root());
+        let path = cfg.root.join("alice.kyriakon.net/www/index.html");
+        let future = SystemTime::now() + std::time::Duration::from_secs(60 * 60 * 24 * 365 * 10);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+        let (code, text) = httpd(&cfg, "/index.html").await;
+        assert_eq!(code, 200);
+        let date = text
+            .lines()
+            .find(|line| line.starts_with("Last-Modified: "))
+            .expect("the reply carries the change time");
+        let date = parse_http_date(date.trim_start_matches("Last-Modified: ")).unwrap();
+        assert!(
+            date.unix_timestamp()
+                <= SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64,
+            "{text}"
+        );
+    }
+
+    /// An entry that exists but is not one name is a broken map, not a host
+    /// without one: the host must not fall back to a directory named for it.
+    #[tokio::test]
+    async fn an_alias_entry_that_is_not_a_name_is_refused() {
+        let cfg = config(fixture_root());
+        std::fs::create_dir_all(&cfg.hosts).unwrap();
+        std::fs::write(cfg.hosts.join("parish.example"), "").unwrap();
+        let (code, _) = httpd_env(
+            &cfg,
+            &[
+                ("SERVER_NAME", "parish.example"),
+                ("REQUEST_URI", "/index.html"),
+            ],
+        )
+        .await;
+        assert_eq!(code, 404);
+    }
+
+    /// gmid answers a META over 1024 bytes with `42 CGI error`, so a redirect
+    /// that cannot be delivered is refused rather than mangled.
+    #[tokio::test]
+    async fn a_redirect_too_long_for_gmid_is_refused() {
+        // The limit is in the reply line, so the path need not exist: a
+        // directory 1200 bytes deep is one gmid cannot be redirected to.
+        let reply = redirect(
+            FrontEnd::Gemini,
+            "alice.kyriakon.net",
+            &format!("/{}", "z".repeat(1200)),
+        );
+        assert_eq!(reply.code(), 51);
+        assert_eq!(
+            redirect(FrontEnd::Gemini, "alice.kyriakon.net", "/a").code(),
+            31
+        );
     }
 
     #[test]

@@ -55,8 +55,9 @@
 # Nothing is written when the file already holds the bytes this script would
 # write, so a run after a certificate has not landed yet is free.
 #
-# Env: none. The self-test rebinds this script's own paths to a throwaway tree
-# under TMPDIR, so it needs no root and touches nothing outside it.
+# Env: MAIL_DOMAINS names the mail table the platform's own domain is read from.
+# The self-test rebinds it and this script's own paths to a throwaway tree under
+# TMPDIR, so it needs no root and touches nothing outside it.
 #
 # Not this script's job: the site owner's tree (scripts/provision-member.sh), the
 # capsule (scripts/provision-group-capsule.sh), the acme-client block and the
@@ -84,6 +85,9 @@ public_root=/home/www
 # The responder's host-to-tree map: one file per domain whose files live in the
 # site owner's member tree rather than in a directory named after the domain.
 static_hosts=/etc/onboard/static-hosts
+# The mail table whose first line is the platform's own domain, read the way
+# remove-group.sh and the drain read it.
+mail_domains=${MAIL_DOMAINS:-/etc/mail/mail_domains}
 conf_owner="root:wheel"
 
 usage() {
@@ -103,6 +107,12 @@ die() {
 # of them, and no label starting or ending with a hyphen. It is the stem of the
 # generated file, the server name and a path component under /etc/ssl, so a name
 # outside this set could not be a body's domain.
+#
+# The platform's own domain and everything under it are refused here too, the
+# rule the drain applies before it runs this lane: a hand-run
+# `provision-group-web.sh kyriakon.net alice` would otherwise write a vhost and a
+# host map that collide with the platform's own. The name is the first line of
+# mail_domains, and kyriakon.com is refused for the reason remove-group.sh gives.
 domain_ok() {
 	typeset name="$1"
 	[ "${#name}" -le 253 ] || return 1
@@ -110,7 +120,12 @@ domain_ok() {
 	*.*) ;;
 	*) return 1 ;;
 	esac
-	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$' || return 1
+	# The platform's own names are the operator's, the rule the drain applies
+	# before it runs this lane; lib.sh holds the rule and its `kyriakon.com`
+	# clause so a hand-run does not need a second copy.
+	domain_is_platform "$name" "$mail_domains" && return 1
+	return 0
 }
 
 # The paths, as functions so the self-test rebinds them once.
@@ -271,10 +286,13 @@ self_test() {
 	ssl_private="$ssl_dir/private"
 	public_root="$tree/home/www"
 	static_hosts="$tree/etc/onboard/static-hosts"
+	mail_domains="$tree/etc/mail/mail_domains"
 	domain=parish.example
 	account=parish-secretary
 	install -d -m 0755 "$httpd_d" "$ssl_private" "$public_root/parish-secretary.kyriakon.net/www" \
-		"$static_hosts"
+		"$static_hosts" "$tree/etc/mail"
+	# The platform's own domain is the table's first line, as on the box.
+	printf 'kyriakon.net\n' > "$mail_domains"
 	conf_owner="$(id -un):$(stat -f '%Sg' "$httpd_d")"
 	conf=$(group_conf)
 
@@ -354,6 +372,23 @@ self_test() {
 	check "a leading hyphen is refused" "$(domain_ok -parish.example && printf yes || printf no)" no
 	check "a name with a slash is refused" "$(domain_ok parish.example/x && printf yes || printf no)" no
 
+	# 8. the platform's own names are refused, the rule the drain applies before
+	# this lane runs: a hand-run write here would collide with the platform's own
+	# vhost, map and certificate.
+	check "the platform's own domain is refused" \
+		"$(domain_ok kyriakon.net && printf yes || printf no)" no
+	check "and a name under it" "$(domain_ok parish.kyriakon.net && printf yes || printf no)" no
+	check "and the defensive registration" "$(domain_ok kyriakon.com && printf yes || printf no)" no
+	check "and a name under that" "$(domain_ok www.kyriakon.com && printf yes || printf no)" no
+	check "a name that only ends in the same letters is a body's" \
+		"$(domain_ok notkyriakon.net && printf yes || printf no)" yes
+	# No table means no way to tell the operator's domain from a body's, so every
+	# name is refused rather than guessed at.
+	mail_domains="$tree/etc/mail/absent"
+	check "a missing mail table refuses the name" \
+		"$(domain_ok parish.example && printf yes || printf no)" no
+	mail_domains="$tree/etc/mail/mail_domains"
+
 	self_test_end
 }
 
@@ -374,7 +409,7 @@ case "${1:-}" in
 	[ "$#" -eq 2 ] || usage
 	domain="$1"
 	account="$2"
-	domain_ok "$domain" || die "not a domain: $domain (lowercase FQDN, at least two labels)"
+	domain_ok "$domain" || die "not a domain: $domain (lowercase FQDN, at least two labels, and not the platform's own)"
 	valid_localpart "$account" || die "not an account name: $account"
 	[ "$(id -u)" -eq 0 ] || die "run this with doas: it writes $httpd_d"
 	[ -d "$httpd_d" ] || die "no $httpd_d: doas ksh scripts/deploy-mail.sh creates it, with the index httpd.conf includes"
