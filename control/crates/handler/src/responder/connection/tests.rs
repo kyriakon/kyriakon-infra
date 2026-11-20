@@ -403,7 +403,7 @@ fn a_control_character_in_the_path_never_forges_a_log_line() {
         crate::fastcgi::Reply::Gemini {
             status: 20,
             meta: "text/gemini".to_string(),
-            body: String::new(),
+            body: Vec::new(),
         },
     );
     assert!(!outcome.route.contains('\n'), "{}", outcome.route);

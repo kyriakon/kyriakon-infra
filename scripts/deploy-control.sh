@@ -2,11 +2,12 @@
 # deploy-control.sh: put the control plane on the box and start its handler.
 #
 # The release's front door, installed from this repository: the store under
-# /var/db/onboard, the four binaries built from control/ and installed to
-# /usr/local/sbin (the handler, the root drain, kyriakon-admin and the portal), the
-# handler's config at /etc/onboard/onboard.toml and the drain's own root-only
-# config at /etc/kyriakon/onboard/drain.toml, both with the deployed release
-# substituted, and the rc.d unit. Every step is idempotent, so a rebuild, or a
+# /var/db/onboard, the five binaries built from control/ and installed to
+# /usr/local/sbin (the handler, the member content responder, the root drain,
+# kyriakon-admin and the portal), the handler's config at /etc/onboard/onboard.toml,
+# the responder's at /etc/onboard/static.toml, and the drain's own root-only config
+# at /etc/kyriakon/onboard/drain.toml, the first and last with the deployed release
+# substituted, and the two rc.d units. Every step is idempotent, so a rebuild, or a
 # second run after a fix, is one command.
 #
 # Installing the drain's binary does not schedule it: its crontab line, the same
@@ -490,8 +491,9 @@ onboard_user='_onboard'
 # Every source this installs, checked before anything on the box is changed, so a
 # half-copied checkout fails here rather than after the store has been written.
 for f in control/Cargo.toml openbsd/etc/onboard/onboard.toml openbsd/etc/onboard/drain.toml \
-	control/questions.toml \
-	openbsd/etc/rc.d/kyriakon_control scripts/control-store.sh scripts/render-docs.sh \
+	openbsd/etc/onboard/static.toml control/questions.toml \
+	openbsd/etc/rc.d/kyriakon_control openbsd/etc/rc.d/kyriakon_control_static \
+	scripts/control-store.sh scripts/render-docs.sh \
 	scripts/kyriakon-authcheck.sh openbsd/etc/doas.conf.control \
 	docs/terms.md docs/privacy.md docs/aup.md docs/key-walkthrough.md \
 	reserved-usernames.txt; do
@@ -533,12 +535,12 @@ say "build"
 # jq for the publish path, and gmid for the capsule socket directory.
 need_packages "$repo_dir/openbsd/packages.tsv" deploy-control.sh
 cargo build --release --manifest-path "$repo_dir/control/Cargo.toml"
-# The handler, the root drain, kyriakon-admin and the portal are one crate and four
-# programs: a build that produced some of them but not the others is half a
-# service. The portal is the one the applicant's ssh session runs, so a build
-# without it would install nothing the login class names and every connection
-# would land on a file that is not there.
-for b in kyriakon-control kyriakon-control-drain kyriakon-admin kyriakon-control-tui; do
+# The handler, the member content responder, the root drain, kyriakon-admin and the
+# portal are one workspace and five programs: a build that produced some of them
+# but not the others is half a service. The portal is the one the applicant's ssh
+# session runs, so a build without it would install nothing the login class names
+# and every connection would land on a file that is not there.
+for b in kyriakon-control kyriakon-control-static kyriakon-control-drain kyriakon-admin kyriakon-control-tui; do
 	[ -x "$repo_dir/control/target/release/$b" ] \
 		|| die "the build produced no binary at control/target/release/$b"
 done
@@ -546,6 +548,11 @@ done
 say "install"
 install -d -m 0755 -o root -g wheel /etc/onboard
 install -m 0755 "$repo_dir/control/target/release/kyriakon-control" /usr/local/sbin/kyriakon-control
+# The member content responder, which serves /home/www for both front-ends. Its
+# config names the two sockets and the tree, and is installed verbatim: nothing
+# in it is a deployed value.
+install -m 0755 "$repo_dir/control/target/release/kyriakon-control-static" /usr/local/sbin/kyriakon-control-static
+install_staged "$repo_dir/openbsd/etc/onboard/static.toml" /etc/onboard/static.toml
 install -m 0755 "$repo_dir/control/target/release/kyriakon-control-drain" /usr/local/sbin/kyriakon-control-drain
 install -m 0755 "$repo_dir/control/target/release/kyriakon-admin" /usr/local/sbin/kyriakon-admin
 # The portal, at the path openbsd/etc/login.conf.d/hello names as the session's
@@ -555,6 +562,7 @@ install -m 0755 "$repo_dir/control/target/release/kyriakon-admin" /usr/local/sbi
 # fallback runs it.
 install -m 0755 "$repo_dir/control/target/release/kyriakon-control-tui" /usr/local/sbin/kyriakon-control-tui
 install -m 0755 "$repo_dir/openbsd/etc/rc.d/kyriakon_control" /etc/rc.d/kyriakon_control
+install -m 0755 "$repo_dir/openbsd/etc/rc.d/kyriakon_control_static" /etc/rc.d/kyriakon_control_static
 
 # Three paths applied by hand still name the old programs: the login class's
 # shell, sshd_config.onboard's ForceCommand, and the crontab's drain line. The
@@ -906,10 +914,14 @@ printf 'drain scripts installed in %s\n' "$scripts_dir"
 # than written here, so the directories this script creates and the check at the
 # end are the ones the service itself uses: a box whose paths were changed is
 # deployed to where it answers.
-config_value() {
+config_value() { # <key> [file]
 	awk -F'"' -v key="$1" '$1 ~ "^" key "[[:space:]]*=" { print $2; exit }' \
-		/etc/onboard/onboard.toml
+		"${2:-/etc/onboard/onboard.toml}"
 }
+static_httpd_socket=$(config_value httpd_socket /etc/onboard/static.toml)
+static_gemini_socket=$(config_value gemini_socket /etc/onboard/static.toml)
+[ -n "$static_httpd_socket" ] || die "/etc/onboard/static.toml names no httpd_socket"
+[ -n "$static_gemini_socket" ] || die "/etc/onboard/static.toml names no gemini_socket"
 httpd_socket_path=$(config_value httpd_socket)
 gemini_socket_path=$(config_value gemini_socket)
 portal_socket_path=$(config_value portal_socket)
@@ -935,7 +947,9 @@ titan_listener=$(config_value titan_listener)
 # that group unlink the live socket and plant a file at its path, and the handler
 # then refuses to bind it. Only _onboard, the owner, creates anything here.
 say "sockets"
-for pair in "www:$httpd_socket_path" "_gmid:$gemini_socket_path" "$portal_group:$portal_socket_path"; do
+for pair in "www:$httpd_socket_path" "_gmid:$gemini_socket_path" \
+	"www:$static_httpd_socket" "_gmid:$static_gemini_socket" \
+	"$portal_group:$portal_socket_path"; do
 	group=${pair%%:*}
 	dir=$(dirname "${pair#*:}")
 	install -d -o "$onboard_user" -g "$group" -m 2750 "$dir"
@@ -947,14 +961,16 @@ for pair in "www:$httpd_socket_path" "_gmid:$gemini_socket_path" "$portal_group:
 done
 
 say "service"
-rcctl enable kyriakon_control
-if rcctl check kyriakon_control >/dev/null 2>&1; then
-	rcctl restart kyriakon_control
-else
-	rcctl start kyriakon_control
-fi
-rcctl check kyriakon_control >/dev/null 2>&1 \
-	|| die "kyriakon_control did not come up; check /var/log/daemon"
+for unit in kyriakon_control kyriakon_control_static; do
+	rcctl enable "$unit"
+	if rcctl check "$unit" >/dev/null 2>&1; then
+		rcctl restart "$unit"
+	else
+		rcctl start "$unit"
+	fi
+	rcctl check "$unit" >/dev/null 2>&1 \
+		|| die "$unit did not come up; check /var/log/daemon"
+done
 
 # The sockets, taken from the installed config rather than assumed, so a box whose
 # paths were changed is checked where they are. A responder that came up but could
@@ -963,10 +979,12 @@ rcctl check kyriakon_control >/dev/null 2>&1 \
 # every other local user out. The pages themselves are checked by the front-ends'
 # own deploys, which are the only things that can ask for one.
 say "verify"
-for pair in "httpd:$httpd_socket_path" "gemini:$gemini_socket_path" "portal:$portal_socket_path"; do
+for pair in "httpd:$httpd_socket_path" "gemini:$gemini_socket_path" \
+	"static-httpd:$static_httpd_socket" "static-gemini:$static_gemini_socket" \
+	"portal:$portal_socket_path"; do
 	front=${pair%%:*}
 	path=${pair#*:}
-	[ -S "$path" ] || die "$path is not a socket: is kyriakon_control running, and is its directory there?"
+	[ -S "$path" ] || die "$path is not a socket: is its unit running, and is its directory there?"
 	[ "$(stat -f '%Lp' "$path")" = "660" ] || die "$path is not mode 660"
 	printf '%s: %s\n' "$front" "$path"
 done
@@ -992,8 +1010,9 @@ sockstat "$family" -ln | awk -v p=":$titan_port" '$2 == "kyriakon_control" && $6
 	|| die "kyriakon_control is not listening on titan_listener $titan_listener"
 printf 'titan: %s\n' "$titan_listener"
 
-printf '\ninstalled. the responder answers %s, %s and %s, and no other local user may connect.\n' \
-	"$httpd_socket_path" "$gemini_socket_path" "$portal_socket_path"
+printf '\ninstalled. the responders answer %s, %s, %s, %s and %s, and no other local user may connect.\n' \
+	"$httpd_socket_path" "$gemini_socket_path" "$static_httpd_socket" "$static_gemini_socket" \
+	"$portal_socket_path"
 # The command the drain's rate fetch runs. It is a package rather than a base
 # tool, and nothing else on the pass needs it, so a box without it would open
 # every Monero window with no quote and log a failure per attempt. The check is

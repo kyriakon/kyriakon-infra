@@ -1,0 +1,48 @@
+#!/bin/ksh
+#
+# rc.d unit for the member content responder: the process that serves what
+# members publish under /home/www. httpd and gmid hand a member's vhost here
+# rather than serving the tree themselves, because neither daemon can refuse a
+# symlink a member plants in their own writable root (#815). The responder
+# resolves every path one component at a time with O_NOFOLLOW, so the file it
+# serves was reached without a link being followed.
+#
+# scripts/deploy-control.sh installs this unit, the config it names and the
+# binary, then enables it. Installed by hand instead, copy it to
+# /etc/rc.d/kyriakon_control_static, copy openbsd/etc/onboard/static.toml to
+# /etc/onboard/static.toml, then `rcctl enable kyriakon_control_static` and
+# `rcctl start kyriakon_control_static`.
+#
+# Two things have to exist before it starts, and neither is created here: the
+# _onboard account, and the two socket directories inside the front-ends'
+# chroot, created by the deploy with the group each daemon connects as. The
+# responder binds its sockets there at start-up and exits with the path in its
+# message if it cannot.
+
+# No privilege: the responder reads member trees and nothing else, and the trees
+# are world-readable by design (they are published). rc.subr's rc_exec drops to
+# daemon_user with su(1), as the control plane's own unit does.
+# shellcheck disable=SC2034 # rc.subr reads daemon, daemon_flags and daemon_user at run time
+daemon="/usr/local/sbin/kyriakon-control-static"
+# shellcheck disable=SC2034 # rc.subr reads daemon_flags at run time
+daemon_flags="--config /etc/onboard/static.toml"
+# shellcheck disable=SC2034 # rc.subr reads daemon_user at run time
+daemon_user="_onboard"
+
+# shellcheck source=/dev/null # /etc/rc.d/rc.subr exists on the box, not in this repo
+. /etc/rc.d/rc.subr
+
+# The binary is a foreground accept loop and does not daemonize, so rc.subr has
+# to background it or the boot would block here.
+# shellcheck disable=SC2034 # rc.subr reads rc_bg at run time
+rc_bg=YES
+# shellcheck disable=SC2034 # rc.subr reads rc_reload at run time
+rc_reload=NO
+
+# Diagnostics go to stderr, which rc.subr would otherwise discard. They land in
+# /var/log/daemon, which newsyslog.conf already bounds.
+# shellcheck disable=SC2034 # rc.subr reads daemon_logger at run time
+daemon_logger="daemon.info"
+
+# shellcheck disable=SC2086 # stock shape: rc.subr's rc_cmd takes the action word, which is absent when rc.d sources the unit
+rc_cmd $1

@@ -957,7 +957,11 @@ dependencies = [
 name = "kyriakon-control-static"
 version = "0.1.0"
 dependencies = [
+ "kyriakon-control-core",
  "libc",
+ "serde",
+ "tokio",
+ "toml",
 ]
 
 [[package]]

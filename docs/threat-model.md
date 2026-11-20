@@ -87,6 +87,25 @@ key and in their jurisdiction. Deleting it here does not touch that.
 Physical coercion of the operator. Out of scope for this class and for the suppression class alike.
 It is named so that its absence is a decision rather than an oversight.
 
+### One member's site against another's
+
+Members' published trees share one chroot. `/home/www/<name>.kyriakon.net` sits beside
+every other member's, because that is where httpd and gmid chroot and a daemon has one
+root, not one per name. The uploader's own tree is writable by them, so a link planted in
+it was a read of any neighbour's tree, and of the landing site's `.git`, through either
+daemon's request path; a check on the request cannot see it, because the file a link
+reaches never carries the requested path.
+
+What confines a request is the resolution, not the request. Both daemons hand the path
+to `kyriakon-control-static`, which opens each component with `openat` and `O_NOFOLLOW`
+from the member's own tree and refuses anything that is not a regular file reached
+without following a link, so a link is refused wherever it points, including inside the
+member's own tree. A name beginning with a dot is refused under every spelling, which is
+what makes `.git` unreachable rather than trusting a `location` block to match a path.
+Each member's sftp session is chrooted to their own tree, so the filesystem is not
+shared between their sessions; it is the two daemons' chroot that is shared, and the
+responder is what stops one member's request from crossing into another's tree.
+
 ## Log minimization
 
 Logs carrying user-identifiable data are bounded rather than eliminated. `openbsd/etc/newsyslog.conf`

@@ -40,11 +40,12 @@ _Avoid_: gemini certificate, TOFU certificate
 
 **The control plane**:
 The subsystem under `control/`: the handler that serves the web form and the capsule,
-the ssh portal, the root drain that settles intents, and the operator console, built as
-four programs and installed in `/usr/local/sbin`. It is the layer between a public
-front-end and a privileged change on the box: a front-end files one intent and the
-drain carries it out. The name says what the layer does, because only one of its four
-programs is onboarding; the applicant journey keeps that word.
+the member content responder both front-ends hand a member's site to, the ssh portal,
+the root drain that settles intents, and the operator console, built as five programs
+and installed in `/usr/local/sbin`. It is the layer between a public front-end and a
+privileged change on the box: a front-end files one intent and the drain carries it
+out. The name says what the layer does, because only one of its five programs is
+onboarding; the applicant journey keeps that word.
 _Avoid_: onboarding service (names the signup form and misdescribes the drain and the console)
 
 **The console**:

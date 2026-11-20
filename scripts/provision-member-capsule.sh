@@ -42,14 +42,14 @@
 # fingerprint the help page publishes has to be updated by hand. A run that finds
 # one half missing generates both and says so, because half a pair serves nothing.
 #
-# The member's block is one server on port 1965 with the member's gemini root,
-# the .git block, and the pair. gmid chroots to /home/www, so root
-# "/<name>.kyriakon.net/gemini" is /home/www/<name>.kyriakon.net/gemini, which is
-# the member's own tree, and the cert and key paths stay absolute because
-# gmid.conf(5) makes those two the exceptions to the chroot rule. The .git block
-# is there because a member's gemini root is a checkout they upload over sftp:
-# without it the capsule would serve the whole history, including anything deleted
-# from the working tree.
+# The member's block is one server on port 1965 with a fastcgi socket and the
+# pair. The socket is the same one for every member: gmid chroots to /home/www,
+# where every member's tree lives, and a root there is what let a symlink reach a
+# neighbour's tree or the platform's .git (#815). The responder behind the socket
+# resolves the path against the member's own gemini tree and refuses every link
+# and every dot component, so there is no .git block to add and no root to name.
+# The cert and key paths stay absolute because gmid.conf(5) makes those two the
+# exceptions to the chroot rule.
 #
 # The index and the reload are not this script's job. /etc/gmid.d/index.conf is
 # regenerated and gmid is checked with gmid -n and then reloaded by
@@ -226,11 +226,7 @@ member_conf_body() {
 	printf '\tcert "%s"\n' "$(capsule_cert)"
 	printf '\tkey "%s"\n' "$(capsule_key)"
 	printf '\n'
-	printf '\troot "/%s.kyriakon.net/gemini"\n' "$user"
-	printf '\n'
-	printf '\tlocation "/.git/*" {\n'
-	printf '\t\tblock\n'
-	printf '\t}\n'
+	printf '\tfastcgi socket "/run/onboard-static/static.sock"\n'
 	printf '}\n'
 }
 
@@ -270,7 +266,7 @@ remove_member_conf() {
 	printf '  next: doas ksh scripts/cron-apply.sh --web   # regenerate the index, check gmid, reload\n'
 }
 
-# The tree the block's root names, which provision-member.sh builds.
+# The tree the responder serves for this member, which provision-member.sh builds.
 assert_member_tree() {
 	typeset public
 	public="$public_root/$user.kyriakon.net"
@@ -312,8 +308,12 @@ self_test() {
 	check "it listens on the gemini port" "$(grep -c 'listen on \* port 1965' "$conf")" 1
 	check "it names the capsule certificate" "$(grep -cF "cert \"$ssl_dir/capsule-kyriakon.net.crt\"" "$conf")" 1
 	check "and the capsule key" "$(grep -cF "key \"$ssl_private/capsule-kyriakon.net.key\"" "$conf")" 1
-	check "the root is the member's gemini tree" "$(grep -c 'root "/alice.kyriakon.net/gemini"' "$conf")" 1
-	check ".git is blocked" "$(grep -c 'location "/.git/\*"' "$conf")" 1
+	check "every path goes to the responder" \
+		"$(grep -c 'fastcgi socket "/run/onboard-static/static.sock"' "$conf")" 1
+	check "and no root names the member's tree" \
+		"$(grep -c 'root "/alice.kyriakon.net/gemini"' "$conf")" 0
+	check "and there is no .git block to match a path the responder refuses" \
+		"$(grep -c 'location "/.git/' "$conf")" 0
 	check "one server block exactly" "$(grep -c '^server ' "$conf")" 1
 	check "the file is mode 644 and the writer's" "$(stat -f '%Su:%Sg %Lp' "$conf")" "$conf_owner 644"
 	assert_member_conf

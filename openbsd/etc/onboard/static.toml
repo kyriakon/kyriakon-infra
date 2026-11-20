@@ -1,0 +1,20 @@
+# static.toml — the member content server's settings.
+#
+# kyriakon-control-static serves what members publish under the chroot httpd and
+# gmid share. Neither daemon serves a member's tree itself: a member's root is
+# writable by that member, and a symlink planted in it is followed by both
+# daemons out of their shared chroot into any other member's tree (#815). The
+# responder resolves the path one component at a time and refuses every link, so
+# the two daemons only decide which name a request is for.
+#
+# Both socket paths are inside the chroot because a FastCGI socket path is
+# resolved after the daemon chroots. One directory per socket, each set-group-id,
+# so the socket carries the group of the daemon that connects to it and no other
+# local user can.
+#
+# The tree is `<root>/<host>/www` for the web and `<root>/<host>/gemini` for the
+# capsule: the layout scripts/provision-member.sh builds, where the two
+# protocols' files differ and nothing else does.
+root = "/home/www"
+httpd_socket = "/home/www/run/onboard-static-httpd/static.sock"
+gemini_socket = "/home/www/run/onboard-static/static.sock"

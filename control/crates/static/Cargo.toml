@@ -4,5 +4,18 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "kyriakon-control-static"
+path = "src/main.rs"
+
 [dependencies]
+kyriakon-control-core = { path = "../core" }
 libc.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+# The FastCGI requests the tests send, built in core so the wire has one
+# description.
+kyriakon-control-core = { path = "../core", features = ["test-fixtures"] }

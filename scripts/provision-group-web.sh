@@ -44,8 +44,10 @@
 # together.
 #
 # The paths inside the blocks are httpd's. httpd chroots to /home/www, so
-# root "/<site-account>.kyriakon.net/www" is that account's public tree, and
-# root "/acme" is the challenge directory the mail deploy created.
+# The site's content is not a root: every path goes to the member content
+# responder, which serves the site account's own tree and refuses links, because
+# that tree is writable by the account (#815). root "/acme" is the challenge
+# directory the mail deploy created.
 #
 # Nothing is written when the file already holds the bytes this script would
 # write, so a run after a certificate has not landed yet is free.
@@ -152,11 +154,12 @@ group_conf_body() {
 	printf 'server "%s" {\n' "$domain"
 	printf '\tlisten on 127.0.0.1 port 8080\n'
 	printf '\tlog { style forwarded }\n'
-	printf '\tlocation "/.git/*" {\n'
-	printf '\t\tblock\n'
-	printf '\t}\n'
+	# No `.git` block and no root: the site owner uploads into their own tree
+	# over sftp, so a link planted in it would reach a neighbour's tree or the
+	# landing checkout (#815). Every path goes to the responder, which resolves
+	# it from the owner's own tree and refuses links and dot components.
 	printf '\tlocation "/*" {\n'
-	printf '\t\troot "/%s.kyriakon.net/www"\n' "$account"
+	printf '\t\tfastcgi socket "/run/onboard-static-httpd/static.sock"\n'
 	printf '\t}\n'
 	printf '}\n'
 
@@ -275,10 +278,11 @@ self_test() {
 	write_group_conf > "$tree/certrun.out"
 	check "the apex block is still first" "$(awk 'NR == 1' "$conf")" 'server "parish.example" {'
 	check "both names now have a loopback block" "$(grep -c 'listen on 127.0.0.1 port 8080' "$conf")" 2
-	check "the apex site roots the site owner's www tree" \
-		"$(grep -c 'root "/parish-secretary.kyriakon.net/www"' "$conf")" 1
-	check "and not a directory named after the domain" "$(grep -c 'root "/parish.example' "$conf")" 0
-	check "the loopback apex blocks .git" "$(grep -c 'location "/.git/\*"' "$conf")" 1
+	check "the apex site hands every path to the responder" \
+		"$(grep -c 'fastcgi socket "/run/onboard-static-httpd/static.sock"' "$conf")" 1
+	check "and names no root" "$(grep -c '^[[:space:]]*root "/parish' "$conf")" 0
+	check "and no .git block to match a path the responder refuses" \
+		"$(grep -c 'location "/.git/' "$conf")" 0
 	# shellcheck disable=SC2016 # as above
 	check "the www loopback name redirects to the apex" \
 		"$(awk '/server "www.parish.example" \{/{n++} n == 2' "$conf" | grep -cF 'block return 301 "https://parish.example$REQUEST_URI"')" 1

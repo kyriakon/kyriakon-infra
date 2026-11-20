@@ -116,15 +116,25 @@ not follow an include.
 
 The httpd member file holds two server blocks. The port 80 block comes first, with
 `root "/acme"`, `request strip 2` and a 301 to HTTPS, because the ACME challenge must be
-answered before any other location. The port 443 block is written only when the member's
-certificate file exists, and carries
-`certificate "/etc/ssl/<name>.kyriakon.net.fullchain.pem"`,
-`key "/etc/ssl/private/<name>.kyriakon.net.key"`,
-`location "/.git/*" { block }` and `location "/*" { root "/<name>.kyriakon.net/www" }`.
+answered before any other location. The loopback block is written only when the member's
+certificate file exists, and holds one location, `location "/*" { fastcgi socket
+"/run/onboard-static-httpd/static.sock" }`.
 
 The gmid member file is one `server "<name>.kyriakon.net"` block on port 1965 with
-`location "/.git/*" { block }`, `root "/<name>.kyriakon.net/gemini"`, and the capsule
-certificate pair of the next section rather than the ACME pair.
+`fastcgi socket "/run/onboard-static/static.sock"` and the capsule certificate pair of
+the next section rather than the ACME pair.
+
+Neither generated file names a `root` for the member's content, and the reason is
+[#815](https://github.com/kyriakon/kyriakon-infra/issues/815). A `root` is relative to
+the `/home/www` chroot, where every member's tree sits beside every other's, and both
+daemons follow a symlink planted in a member's own writable tree: a relative link
+served a neighbour's file, and an absolute one served the landing checkout's `.git`
+config past a `location "/.git/*" { block }`, because the block matched the request
+path and the file a link reaches never carries that path. `kyriakon-control-static`
+resolves the request one component at a time with `openat` and `O_NOFOLLOW` from the
+member's own tree, refuses any component beginning with a dot, and answers 404 for
+both a missing file and a refused one. A link is refused wherever it points, including
+inside the member's own tree; one rule is cheaper to keep right than two.
 
 The acme-client member file is one `domain <name>.kyriakon.net { ... }` block carrying the
 same lines every hand-written block carries, including
