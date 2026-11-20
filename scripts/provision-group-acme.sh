@@ -45,8 +45,9 @@
 # moved into place only when the bytes differ. The queue call comes after the
 # write, so a request never names a file that is not there.
 #
-# Env: none. The self-test rebinds this script's paths and points ACME_QUEUE at a
-# stub, so it needs no root and touches nothing outside its tree.
+# Env: MAIL_DOMAINS names the mail table the platform's own domain is read from.
+# The self-test rebinds it, this script's paths and ACME_QUEUE, so it needs no
+# root and touches nothing outside its tree.
 #
 # Not this script's job: the site owner's tree (scripts/provision-member.sh), the
 # vhosts (scripts/provision-group-web.sh), the capsule
@@ -65,6 +66,9 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 acme_d=${ACME_D:-/etc/acme-client.d}
 public_root=${PUBLIC_ROOT:-/home/www}
 acme_queue=${ACME_QUEUE:-/root/bin/acme-queue.sh}
+# The mail table whose first line is the platform's own domain, read the way
+# remove-group.sh and the drain read it.
+mail_domains=${MAIL_DOMAINS:-/etc/mail/mail_domains}
 conf_owner="root:wheel"
 
 usage() {
@@ -82,14 +86,29 @@ die() {
 
 # A validated FQDN: labels of lowercase letters, digits and hyphens, at least two
 # of them, and no label starting or ending with a hyphen.
+#
+# The platform's own domain and everything under it are refused here too, the
+# rule the drain applies before it runs this lane: a hand-run
+# `provision-group-acme.sh kyriakon.net alice` would otherwise file a certificate
+# order for the platform's own name. The name is the first line of mail_domains,
+# and kyriakon.com is refused for the reason remove-group.sh gives.
 domain_ok() {
-	typeset name="$1"
+	typeset name="$1" platform
 	[ "${#name}" -le 253 ] || return 1
 	case "$name" in
 	*.*) ;;
 	*) return 1 ;;
 	esac
-	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$' || return 1
+	# A table that is missing or empty refuses every name rather than guessing:
+	# without its first line there is no way to tell the operator's domain from a
+	# body's.
+	platform=$(mail_domains_first "$mail_domains" 2>/dev/null) || return 1
+	[ -n "$platform" ] || return 1
+	case "$name" in
+	"$platform" | *."$platform" | kyriakon.com | *.kyriakon.com) return 1 ;;
+	esac
+	return 0
 }
 
 # The paths, as functions so the self-test rebinds the directory once.
@@ -169,7 +188,10 @@ self_test() {
 
 	acme_d="$tree/etc/acme-client.d"
 	public_root="$tree/home/www"
-	install -d -m 0755 "$acme_d" "$public_root/parish-secretary.kyriakon.net"
+	mail_domains="$tree/etc/mail/mail_domains"
+	install -d -m 0755 "$acme_d" "$public_root/parish-secretary.kyriakon.net" "$tree/etc/mail"
+	# The platform's own domain is the table's first line, as on the box.
+	printf 'kyriakon.net\n' > "$mail_domains"
 	conf_owner="$(id -un):$(stat -f '%Sg' "$acme_d")"
 	domain=parish.example
 	account=parish-secretary
@@ -230,7 +252,24 @@ self_test() {
 	check "a single label is refused" "$(domain_ok parish && printf yes || printf no)" no
 	check "a path is refused" "$(domain_ok ../parish.example && printf yes || printf no)" no
 
-	# 5. a missing queue is a refusal, not a silent file with no request
+	# 5. the platform's own names are refused, the rule the drain applies before
+	# this lane runs: a hand-run order here would queue a certificate for the
+	# platform's own name.
+	check "the platform's own domain is refused" \
+		"$(domain_ok kyriakon.net && printf yes || printf no)" no
+	check "and a name under it" "$(domain_ok parish.kyriakon.net && printf yes || printf no)" no
+	check "and the defensive registration" "$(domain_ok kyriakon.com && printf yes || printf no)" no
+	check "and a name under that" "$(domain_ok www.kyriakon.com && printf yes || printf no)" no
+	check "a name that only ends in the same letters is a body's" \
+		"$(domain_ok notkyriakon.net && printf yes || printf no)" yes
+	# No table means no way to tell the operator's domain from a body's, so every
+	# name is refused rather than guessed at.
+	mail_domains="$tree/etc/mail/absent"
+	check "a missing mail table refuses the name" \
+		"$(domain_ok parish.example && printf yes || printf no)" no
+	mail_domains="$tree/etc/mail/mail_domains"
+
+	# 6. a missing queue is a refusal, not a silent file with no request
 	acme_queue="$tree/bin/missing.sh"
 	code=0
 	( queue_request ) > "$tree/noqueue.out" 2>&1 || code=$?
@@ -259,7 +298,7 @@ case "${1:-}" in
 	[ "$#" -eq 2 ] || usage
 	domain="$1"
 	account="$2"
-	domain_ok "$domain" || die "not a domain: $domain (lowercase FQDN, at least two labels)"
+	domain_ok "$domain" || die "not a domain: $domain (lowercase FQDN, at least two labels, and not the platform's own)"
 	valid_localpart "$account" || die "not an account name: $account"
 	[ "$(id -u)" -eq 0 ] || die "run this with doas: it writes $acme_d and files a root-only queue request"
 	[ -d "$acme_d" ] || die "no $acme_d: doas ksh scripts/deploy-mail.sh creates it, with the index acme-client.conf includes"

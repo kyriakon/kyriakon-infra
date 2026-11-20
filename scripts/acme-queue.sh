@@ -101,6 +101,16 @@
 # exits 1 while leaving the certificate and the closed request as they are, since
 # those are the state and the apply is the step left undone.
 #
+# An own-domain lane runs against the site owner the drain's store names now, not
+# the one recorded with the request. A transfer rewrites `groups/<domain>/group.json`
+# after the order was filed, so the request's answer can name the departing member:
+# the web lane would then write the responder's host map over that member's tree,
+# and a later retry while the old tree still exists would serve the departed
+# member's pages under the body's name. The record is read at apply time from the
+# store root the same file's `store_root` key names (ONBOARD_DIR points it at a
+# copy), and a missing or unreadable record refuses the lane rather than falling
+# back to the request.
+#
 # acme-queue.sh notes its schedule here, as each scheduled script does, for
 # scripts/cron-apply.sh to install rather than for an operator to paste in. Every
 # fifteen minutes, so a slot that opens is used inside the quarter hour; a pass
@@ -165,6 +175,19 @@ else
 	if [ -r "$drain_toml" ]; then
 		configured_scripts=$(awk -F'"' '/^scripts[[:space:]]*=/ { print $2; exit }' "$drain_toml")
 		[ -z "$configured_scripts" ] || drain_scripts=$configured_scripts
+	fi
+fi
+
+# The store root the drain owns, where one own-domain body's current site owner
+# lives (`groups/<domain>/group.json`). Read from the same file's `store_root` key
+# rather than typed twice, with the compiled-in default; ONBOARD_DIR points it at
+# a copy and is what the self-test uses.
+store_root="${ONBOARD_DIR:-}"
+if [ -z "$store_root" ]; then
+	store_root=/var/db/onboard
+	if [ -r "$drain_toml" ]; then
+		configured_store=$(awk -F'"' '/^store_root[[:space:]]*=/ { print $2; exit }' "$drain_toml")
+		[ -z "$configured_store" ] || store_root=$configured_store
 	fi
 fi
 
@@ -360,6 +383,23 @@ EOF
 	return 0
 }
 
+# group_site_owner <domain> : the site owner the store's group record names, one
+# line, or a non-zero return when there is no record or it cannot be read. The
+# record is the current owner; see the header for why the request's answer is
+# not used.
+#
+# shortcut: the record is read as the drain writes it, serde_json's pretty
+# printer with one field per line. A hand-reformatted record is refused rather
+# than guessed at; upgrade to jq(1) if anything ever writes it another way.
+group_site_owner() {
+	typeset record owner
+	record="$store_root/groups/$1/group.json"
+	[ -r "$record" ] || return 1
+	owner=$(awk -F'"' '$2 == "site_owner" { print $4; found = 1; exit } END { exit !found }' "$record") || return 1
+	valid_localpart "$owner" || return 1
+	printf '%s' "$owner"
+}
+
 # apply_member <name> : the two steps a new certificate makes due, run from the
 # drain's script directory. The web lane is what writes the member's block behind
 # the relay, and cron-apply.sh --web is what regenerates the indexes and the
@@ -372,7 +412,7 @@ EOF
 # is the report. On failure the failing step's output is printed, which is what
 # the operator needs and the notice cannot carry.
 apply_member() {
-	typeset apply_name="$1" apply_owner="${2:-}" apply_web_lane="" apply_apply step step_out
+	typeset apply_name="$1" apply_owner="" apply_web_lane="" apply_apply step step_out
 	case "$apply_name" in
 	*.kyriakon.net)
 		apply_web_lane="$drain_scripts/provision-member-web.sh"
@@ -380,20 +420,20 @@ apply_member() {
 		;;
 	*)
 		# An own-domain name's 443 vhost names the site owner's tree, and the
-		# account was recorded with the request because this lane runs after the
-		# provisioning pass that knew it.
-		if [ -n "$apply_owner" ]; then
-			apply_web_lane="$drain_scripts/provision-group-web.sh"
-			set -- "$apply_name" "$apply_owner"
+		# record names the owner now. A transfer rewrites it after the request was
+		# filed, so a stale answer here writes the host map over the departing
+		# member's tree; a record that is gone or unreadable refuses the lane
+		# rather than guessing.
+		if ! apply_owner=$(group_site_owner "$apply_name"); then
+			printf 'acme-queue: no readable group record at %s/groups/%s/group.json, so %s has no current site owner and its 443 vhost cannot be written\n' \
+				"$store_root" "$apply_name" "$apply_name" >&2
+			return 1
 		fi
+		apply_web_lane="$drain_scripts/provision-group-web.sh"
+		set -- "$apply_name" "$apply_owner"
 		;;
 	esac
 	apply_apply="$drain_scripts/cron-apply.sh"
-	if [ -z "${apply_web_lane:-}" ]; then
-		printf 'acme-queue: %s has no site owner recorded, so its 443 vhost cannot be written: file it again with --add %s <account>\n' \
-			"$apply_name" "$apply_name" >&2
-		return 1
-	fi
 	for step in "$apply_web_lane" "$apply_apply"; do
 		if [ ! -f "$step" ]; then
 			printf 'acme-queue: no %s, so %s has a certificate and still no site: scripts/deploy-control.sh installs the drain scripts\n' \
@@ -418,11 +458,8 @@ apply_member() {
 # printed. On any outcome but success the request is left pending and the run exits
 # 1, because a swallowed refusal is a member who waits for nothing.
 attempt() {
-	typeset request_owner apply_command
+	typeset apply_owner hint
 	name="$1"
-	# The request file carries the site owner for an own-domain name, so the web
-	# lane can be run again when the certificate lands. A member's file is empty.
-	request_owner=$(cat "$pending_dir/$name" 2>/dev/null || true)
 	cert="$ssl_dir/$name.fullchain.pem"
 	rc=0
 	log=$("$client" "$name" 2>&1) || rc=$?
@@ -443,15 +480,24 @@ attempt() {
 		# here rather than left for a human, because nothing else runs on a new
 		# certificate and the page would otherwise promise a padlock that never
 		# arrives.
-		if ! apply_member "$name" "$request_owner"; then
+		if ! apply_member "$name"; then
 			found=$(printf '%s: issued or current, and %s is in place, so the request is closed.\nThe web lane or the web apply then failed, so %s still answers with the default certificate.' \
 				"$name" "$cert" "$name")
 			case "$name" in
-			*.kyriakon.net) apply_command="provision-member-web.sh ${name%.kyriakon.net}" ;;
-			*) apply_command="provision-group-web.sh $name $request_owner" ;;
+			*.kyriakon.net)
+				hint="run doas ksh scripts/provision-member-web.sh ${name%.kyriakon.net}, then doas ksh scripts/cron-apply.sh --web, on the box: the first writes the vhost and the second the indexes, the relayd keypair and the reload"
+				;;
+			*)
+				# The hint names the current owner, so it can only name a command
+				# when the record can be read; otherwise it says what is wrong.
+				if apply_owner=$(group_site_owner "$name"); then
+					hint="run doas ksh scripts/provision-group-web.sh $name $apply_owner, then doas ksh scripts/cron-apply.sh --web, on the box: the first writes the vhost and the second the indexes, the relayd keypair and the reload"
+				else
+					hint="the group record at $store_root/groups/$name/group.json is missing or unreadable, so $name has no current site owner to write the vhost from. A removed group leaves its request behind: remove $pending_dir/$name, or repair the record and run doas ksh scripts/provision-group-web.sh $name <account>, then doas ksh scripts/cron-apply.sh --web"
+				fi
+				;;
 			esac
-			notify_operator acme "apply failed" "$found" \
-				"run doas ksh scripts/$apply_command, then doas ksh scripts/cron-apply.sh --web, on the box: the first writes the vhost and the second the indexes, the relayd keypair and the reload"
+			notify_operator acme "apply failed" "$found" "$hint"
 			exit 1
 		fi
 		# The two outcomes get different events, so a list of subjects says which
@@ -520,8 +566,9 @@ add_request() {
 	fi
 	# The file is written once and never rewritten: its mtime is the queue time,
 	# and rewriting it would reset the age and let a name that had waited jump back
-	# to the head of the queue. Its content is the site owner for an own-domain
-	# name and empty for a member's.
+	# to the head of the queue. Its content is the site owner the order was filed
+	# with, and empty for a member's; the apply reads the group record for the
+	# owner, so this is what was filed rather than who owns the site now.
 	printf '%s\n' "$owner" > "$req"
 	[ -f "$req" ] || die "could not file a request for $name"
 	printf 'queued: %s\n' "$name"
@@ -855,16 +902,38 @@ apply --web"
 	check "and leaves the own-domain log alone" \
 		"$(wc -l < "$own_log" | tr -d ' ')" "0"
 
-	# An own-domain request carries its site owner, and the web lane is run with
-	# the domain and that account, because the 443 vhost roots the owner's tree.
+	# An own-domain request carries the site owner it was filed with, and the web
+	# lane runs with the owner the store's record names now. The record here
+	# names parish-office and the request says parish-secretary, which is the
+	# stale answer a transfer leaves: the lane must use the record's account and
+	# never the request's, because the host map it writes names that account's
+	# tree.
+	store_root="$work/store"
+	mkdir -p "$store_root/groups/parish.example"
+	cat > "$store_root/groups/parish.example/group.json" <<JSON
+{
+  "version": 1,
+  "domain": "parish.example",
+  "name": "Parish",
+  "kind": "community",
+  "accounts": ["parish-office"],
+  "site_owner": "parish-office"
+}
+JSON
+	# The lane-gating checks below attempt both.example, so it has a record too.
+	mkdir -p "$store_root/groups/both.example"
+	printf '{\n  "version": 1,\n  "site_owner": "parish-secretary"\n}\n' \
+		> "$store_root/groups/both.example/group.json"
 	rm -f "$work/calls"
 	printf 'parish-secretary\n' > "$pending_dir/parish.example"
 	attempt parish.example > "$work/domain.out" 2>&1
 	check "an issued own-domain certificate closes its request" \
 		"$([ -e "$pending_dir/parish.example" ] && printf yes || printf no)" no
-	check "and runs the domain's web lane with its owner, then the web apply" \
-		"$(cat "$work/calls")" "web parish.example parish-secretary
+	check "and runs the domain's web lane with the record's owner, then the web apply" \
+		"$(cat "$work/calls")" "web parish.example parish-office
 apply --web"
+	check "and never the owner the request was filed with" \
+		"$(grep -c 'parish-secretary' "$work/calls" 2>/dev/null || true)" "0"
 	check "an issued own-domain certificate records its attempt in the own-domain log" \
 		"$(wc -l < "$own_log" | tr -d ' ')" "1"
 	check "and leaves the member log alone" \
@@ -979,13 +1048,35 @@ STUB
 	pending_dir="$work/apply-pending"
 	client="$work/bin/acme-client"
 
-	# An own-domain request with no owner cannot name a document root, so the hook
-	# refuses rather than writing a vhost it would have to guess.
+	# An own-domain request whose group record is gone cannot name a document
+	# root, so the hook refuses rather than writing a vhost from the request's
+	# stale answer.
 	code=0
-	( apply_member parish.example ) > "$work/noowner.out" 2>&1 || code=$?
-	check "an own-domain name with no owner is refused" "$code" 1
-	check "and the refusal names the account that must be filed with it" \
-		"$(grep -c 'file it again with --add parish.example <account>' "$work/noowner.out")" 1
+	( apply_member gone.example ) > "$work/norecord.out" 2>&1 || code=$?
+	check "an own-domain name with no group record is refused" "$code" 1
+	check "and the refusal names the record it could not read" \
+		"$(grep -c "no readable group record at $store_root/groups/gone.example/group.json" "$work/norecord.out")" 1
+
+	# A record that cannot be read is refused for the same reason: a guess here
+	# writes the host map over whichever account the guess names.
+	mkdir -p "$store_root/groups/broken.example"
+	printf '{"domain":"broken.example"}\n' > "$store_root/groups/broken.example/group.json"
+	code=0
+	( apply_member broken.example ) > "$work/brokenrecord.out" 2>&1 || code=$?
+	check "a group record with no site owner is refused" "$code" 1
+	check "and the refusal names that record" \
+		"$(grep -c "no readable group record at $store_root/groups/broken.example/group.json" "$work/brokenrecord.out")" 1
+
+	# The notice a failed apply sends carries the same finding, and names no
+	# command against the owner the request was filed with.
+	printf 'parish-secretary\n' > "$pending_dir/gone.example"
+	code=0
+	( attempt gone.example ) > "$work/norecord-notice.out" 2>&1 || code=$?
+	check "an apply with no group record fails the attempt" "$code" 1
+	check "and the notice names the record it could not read" \
+		"$(grep -c "the group record at $store_root/groups/gone.example/group.json is missing or unreadable" "$work/norecord-notice.out")" 1
+	check "and names no web-lane command against the request's owner" \
+		"$(grep -c 'provision-group-web.sh gone.example parish-secretary' "$work/norecord-notice.out")" 0
 
 	# A web lane that fails stops the hook, and the notice names the command an
 	# operator runs to finish the job by hand.
@@ -1012,7 +1103,7 @@ STUB
 	pending_dir="$queue_dir/pending"
 	add_request parish.example parish-secretary > "$work/add.out"
 	check "an own-domain request is queued" "$(grep -c '^queued: parish.example$' "$work/add.out")" 1
-	check "and records the site owner for the later apply" \
+	check "and records the owner the order was filed with" \
 		"$(cat "$pending_dir/parish.example")" "parish-secretary"
 	before=$(stat -f '%i %m' "$pending_dir/parish.example")
 	add_request parish.example parish-secretary > "$work/add-again.out"

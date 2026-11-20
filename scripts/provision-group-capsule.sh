@@ -44,8 +44,9 @@
 # regenerated and gmid is checked with gmid -n and then reloaded by
 # scripts/cron-apply.sh --web, once for every generated file at once.
 #
-# Env: none. The self-test rebinds this script's own paths to a throwaway tree
-# under TMPDIR, so it needs no root and touches nothing outside it.
+# Env: MAIL_DOMAINS names the mail table the platform's own domain is read from.
+# The self-test rebinds it and this script's own paths to a throwaway tree under
+# TMPDIR, so it needs no root and touches nothing outside it.
 #
 # Not this script's job: the site owner's tree (scripts/provision-member.sh), the
 # httpd vhosts (scripts/provision-group-web.sh), the acme-client block
@@ -75,6 +76,9 @@ ssl_private=/etc/ssl/private
 public_root=/home/www
 # Written by scripts/provision-group-web.sh; the capsule reads the same tree.
 static_hosts=/etc/onboard/static-hosts
+# The mail table whose first line is the platform's own domain, read the way
+# remove-group.sh and the drain read it.
+mail_domains=${MAIL_DOMAINS:-/etc/mail/mail_domains}
 conf_owner="root:wheel"
 
 usage() {
@@ -93,14 +97,26 @@ die() {
 # A validated FQDN: labels of lowercase letters, digits and hyphens, at least two
 # of them, and no label starting or ending with a hyphen. It is the stem of the
 # generated file, a server name and a path component under /etc/ssl.
+#
+# The platform's own domain and everything under it are refused here too: a
+# hand-run capsule lane for kyriakon.net would write a second server for the
+# platform's own capsule. The name is the first line of mail_domains, and
+# kyriakon.com is refused for the reason remove-group.sh gives.
 domain_ok() {
-	typeset name="$1"
+	typeset name="$1" platform
 	[ "${#name}" -le 253 ] || return 1
 	case "$name" in
 	*.*) ;;
 	*) return 1 ;;
 	esac
-	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$' || return 1
+	# A table that is missing or empty refuses every name rather than guessing.
+	platform=$(mail_domains_first "$mail_domains" 2>/dev/null) || return 1
+	[ -n "$platform" ] || return 1
+	case "$name" in
+	"$platform" | *."$platform" | kyriakon.com | *.kyriakon.com) return 1 ;;
+	esac
+	return 0
 }
 
 # The paths, as functions so the self-test rebinds them once.
@@ -256,6 +272,18 @@ assert_site_tree() {
 	[ -d "$public/gemini" ] || die "no $public/gemini: run scripts/provision-member.sh $account first"
 }
 
+# The responder's map for the domain, written by scripts/provision-group-web.sh:
+# one line naming the tree the domain is served from. A map naming another account
+# is the stale one a transfer leaves behind, and a capsule written against it
+# serves a tree the current owner does not have.
+assert_host_map() {
+	typeset map
+	map="$static_hosts/$domain"
+	[ -f "$map" ] || die "no $map: run scripts/provision-group-web.sh $domain $account first"
+	[ "$(cat "$map")" = "$account.kyriakon.net" ] \
+		|| die "$map names $(cat "$map"), wanted $account.kyriakon.net: run scripts/provision-group-web.sh $domain $account first"
+}
+
 # --- self-test ---------------------------------------------------------------
 #
 # The block and the pair are the whole risk, so both are exercised against a
@@ -274,9 +302,14 @@ self_test() {
 	ssl_dir="$tree/etc/ssl"
 	ssl_private="$ssl_dir/private"
 	public_root="$tree/home/www"
+	static_hosts="$tree/etc/onboard/static-hosts"
+	mail_domains="$tree/etc/mail/mail_domains"
 	domain=parish.example
 	account=parish-secretary
-	install -d -m 0755 "$gmid_d" "$ssl_private" "$public_root/parish-secretary.kyriakon.net/gemini"
+	install -d -m 0755 "$gmid_d" "$ssl_private" "$public_root/parish-secretary.kyriakon.net/gemini" \
+		"$static_hosts" "$tree/etc/mail"
+	# The platform's own domain is the table's first line, as on the box.
+	printf 'kyriakon.net\n' > "$mail_domains"
 	conf_owner="$(id -un):$(stat -f '%Sg' "$gmid_d")"
 	conf=$(group_conf)
 
@@ -356,10 +389,35 @@ self_test() {
 	check "and the refusal names provision-member.sh" \
 		"$(grep -c 'scripts/provision-member.sh nobody' "$tree/notree.out")" 1
 
-	# 8. a name that is not a validated FQDN is refused at the door
+	# 8. the responder's map has to name this owner. A map left by the
+	# departing member is refused rather than served; one naming the owner passes,
+	# and a missing map is refused.
+	account=parish-secretary
+	printf 'parish-warden.kyriakon.net\n' > "$static_hosts/parish.example"
+	code=0
+	( assert_host_map ) > "$tree/stalemap.out" 2>&1 || code=$?
+	check "a map naming another account is refused" "$code" 1
+	check "and the refusal names the lane that rewrites it" \
+		"$(grep -c 'provision-group-web.sh parish.example parish-secretary' "$tree/stalemap.out")" 1
+	printf 'parish-secretary.kyriakon.net\n' > "$static_hosts/parish.example"
+	code=0
+	( assert_host_map ) > "$tree/map.out" 2>&1 || code=$?
+	check "a map naming the site owner is accepted" "$code" 0
+	rm -f "$static_hosts/parish.example"
+	code=0
+	( assert_host_map ) > "$tree/nomap.out" 2>&1 || code=$?
+	check "a missing map is refused" "$code" 1
+	check "and the refusal names the lane that writes it" \
+		"$(grep -c 'provision-group-web.sh parish.example parish-secretary' "$tree/nomap.out")" 1
+
+	# 9. a name that is not a validated FQDN is refused at the door
 	check "a domain is accepted" "$(domain_ok parish.example && printf yes || printf no)" yes
 	check "a single label is refused" "$(domain_ok parish && printf yes || printf no)" no
 	check "a leading hyphen is refused" "$(domain_ok -parish.example && printf yes || printf no)" no
+	check "the platform's own domain is refused" \
+		"$(domain_ok kyriakon.net && printf yes || printf no)" no
+	check "and a name under it" "$(domain_ok parish.kyriakon.net && printf yes || printf no)" no
+	check "and the defensive registration" "$(domain_ok kyriakon.com && printf yes || printf no)" no
 
 	self_test_end
 }
@@ -389,9 +447,9 @@ case "${1:-}" in
 	assert_site_tree
 	# The capsule is served from the same tree as the site, and the responder
 	# learns which one from the map the web lane writes. A capsule written
-	# without it answers 51 for every path.
-	[ -f "$static_hosts/$domain" ] \
-		|| die "no $static_hosts/$domain: run scripts/provision-group-web.sh $domain $account first"
+	# against that map when it names another account answers for a tree the
+	# current owner does not have.
+	assert_host_map
 	# The pair before the block, so no block is ever written naming a certificate
 	# that is not there: gmid -n in the --web pass would refuse for every body at
 	# once.
