@@ -20,6 +20,7 @@ use crate::transitions::Error;
 
 pub mod mailbox;
 pub mod prepaid;
+pub mod sandbox;
 pub mod transitions;
 
 use serde_json::Value;

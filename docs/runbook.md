@@ -415,6 +415,26 @@ A failed publish is reported by the drain, which names the member and the finger
 
 `scripts/publish-mail-key.sh` refuses a key that advertises AEAD, expires, is revoked, or has no encryption-capable subkey, matching the application form: the form and the script refuse an inspected key with any of those faults, while a well-framed block the parser cannot inspect proceeds with its warning. The refusal keeps the published set from claiming a key the box cannot deliver with. It does not change delivery in either direction, because the box keyring is what encrypts, and a key that needs it is repaired where the secret lives (`scripts/rekey-mail-key.sh`). A key already installed on the box with any of those faults is reported by `scripts/check-keyring-drift.sh` on every run until it is replaced, which is louder than the seven-day unpublished-key alert beside it.
 
+### The drain's first run under unveil and pledge
+
+The drain is the one program that runs as root from cron, and since #849 it cuts its own view before the first pass. `control/crates/drain/src/sandbox.rs` unveils every path a pass opens, locks the list with `unveil(NULL, NULL)`, then pledges `stdio rpath wpath cpath fattr flock proc exec`. The file's comments name the call site for each entry.
+
+`scripts/deploy-control.sh` rebuilds the release and installs `/usr/local/sbin/kyriakon-control-drain`, so the ordinary deploy is the install step. The first run after it is the one to watch, because a path or promise the pass needs and the list misses fails there and not in a test:
+
+	doas ksh scripts/deploy-control.sh
+	doas /usr/local/sbin/kyriakon-control-drain --config /etc/kyriakon/onboard/drain.toml
+
+A clean pass exits 0 and leaves the store as it found it. Its stderr is what cron would mail, and it carries a notice only for an intent that fails. Then read the kernel's record and the journal:
+
+	doas lastcomm kyriakon-control-drain | sed -n 1,5p
+	doas tail -n 3 /var/db/onboard/journal.jsonl
+
+`lastcomm` marks the process with `U` when unveil refused an access it tried. A `U` line and a pass that still exited 0 means a path is missing from the list and a transition silently did less than it should; add that path to `sandbox.rs` with the mode its call site needs. A non-zero exit names the path and the errno text, for example `unveil /var/db/onboard/rates: No such file or directory` when a configured directory does not exist. Fix the config or create the directory; do not widen the list to make the error go away.
+
+A promise the pass needs and the list lacks does not produce an error. The kernel sends `SIGABRT` at the first such syscall, so a pass that dies abruptly after the first intent is a promise problem, and the fix is one word in `PROMISES` beside the comment naming the operation that needs it.
+
+`ksh scripts/verify-drain-sandbox.sh` runs the same contract on the OpenBSD VM in CI, over a fixture store, before any deploy is proposed.
+
 ### The repository settings the publish depends on
 
 None of these is visible from the repository, and each one has cost an hour to find
