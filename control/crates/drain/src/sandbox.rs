@@ -111,7 +111,7 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Error> {
     unveil(parent_of(&cfg.rates)?, "rwc")?;
     // The export and key-verification scratch directories are made under the
     // process's temp directory, with gpg's homedir inside one of them.
-    unveil(temp_dir()?, "rwc")?;
+    unveil(&temp_dir()?, "rwc")?;
     // `Stdio::null` opens this in the parent for an enqueued notice's stdout
     // and stderr and for a session check's stderr.
     unveil("/dev/null", "rw")?;
