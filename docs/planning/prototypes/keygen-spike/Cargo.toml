@@ -2,6 +2,8 @@
 name = "keygen-spike"
 version = "0.1.0"
 edition = "2024"
+# Linked into the control workspace from this path, never published.
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]

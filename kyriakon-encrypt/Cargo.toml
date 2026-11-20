@@ -3,6 +3,9 @@ name = "kyriakon-encrypt"
 version = "0.1.0"
 edition = "2021"
 description = "Zero-access mail encryptor: RFC 5322 message in, whole-message RFC 3156 PGP/MIME ciphertext out"
+# Deployed from this tree, never published; cargo deny reads this to know the
+# crate needs no licence field of its own.
+publish = false
 
 [features]
 # Exposes the pure message parser to `fuzz/`; nothing in the crate turns it on.
