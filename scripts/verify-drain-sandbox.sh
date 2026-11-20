@@ -70,6 +70,20 @@ die() {
 	exit 1
 }
 
+# fail <why>: the pass's own output and the journal, then exit. A failed
+# assertion in CI is otherwise one line with no state to read.
+fail() {
+	if [ -n "${work:-}" ] && [ -f "$work/out" ]; then
+		printf -- '--- drain output\n' >&2
+		sed -n 1,40p "$work/out" >&2
+	fi
+	if [ -n "${tree:-}" ] && [ -f "$tree/store/journal.jsonl" ]; then
+		printf -- '--- journal\n' >&2
+		tail -n 10 "$tree/store/journal.jsonl" >&2
+	fi
+	die "$*"
+}
+
 # stub <path> <body...>: a script the drain runs instead of a system binary.
 # The body is written as given, so a stub that answers on stdout and one that
 # records its arguments are the same line here.
@@ -277,24 +291,24 @@ full_run() {
 	# which is expected; the exit status is what says unveil and pledge held.
 	if ! "$drain_bin" --config "$work/drain.toml" > "$work/out" 2>&1; then
 		sed -n 1,40p "$work/out" >&2
-		die "the drain failed under unveil and pledge"
+		fail "the drain failed under unveil and pledge"
 	fi
 
 	# The approval reached the store, the keyring and the privileged scripts:
 	# account_on_box read /etc/passwd, name_allowed read the reserved names, and
 	# the four scripts ran by execve under the pledge.
 	[ -f "$tree/store/accounts/alice/account.json" ] ||
-		die "the approval wrote no account record"
+		fail "the approval wrote no account record"
 	grep -q '"no_charge": true' "$tree/store/accounts/alice/account.json" ||
-		die "the approval did not record the free decision"
+		fail "the approval did not record the free decision"
 	[ -f "$tree/keyring/alice.asc" ] ||
-		die "the approval did not write the member's key into the keyring"
+		fail "the approval did not write the member's key into the keyring"
 	for script in add-user.sh provision-member.sh publish-mail-key.sh; do
 		grep -q "$script" "$tree/log/scripts" ||
-			die "the approval did not run $script"
+			fail "the approval did not run $script"
 	done
 	grep -q '"outcome":"applied"' "$tree/store/journal.jsonl" ||
-		die "the approval was not journalled as applied"
+		fail "the approval was not journalled as applied"
 	# The malformed intent is a pass failure the drain mails about: the stub's
 	# marker is proof that fork and exec of sendmail survived the pledge.
 	grep -q 'the drain failed' "$tree/log/sendmail" ||
@@ -315,10 +329,10 @@ full_run() {
 	file_export "$tree"
 	if ! "$drain_bin" --config "$work/drain.toml" > "$work/export-out" 2>&1; then
 		sed -n 1,40p "$work/export-out" >&2
-		die "the drain failed on the export pass"
+		fail "the drain failed on the export pass"
 	fi
 	[ -n "$(find "$tree/home/www/alice.kyriakon.net/export" -type f -print -quit 2>/dev/null)" ] ||
-		die "the export wrote no bundle under public_root"
+		fail "the export wrote no bundle under public_root"
 
 	# A path whose parent does not exist fails at unveil, and the message names
 	# the path and the errno text: the operator can fix the config from cron mail.
