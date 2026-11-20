@@ -29,8 +29,11 @@ use kyriakon_control_core::config::DrainConfig;
 ///   the export bundle.
 /// * `cpath`: creating, renaming and removing those files, the `<table>.lock`
 ///   directories and the store's intent/record removals.
-/// * `fattr`: `set_permissions` on the rate cache, the table temp file and the
-///   keyring `.asc`; `chown` on the export's files.
+/// * `fattr`: `set_permissions` on the rate cache, the table temp file, the
+///   keyring `.asc` and every directory `ensure_dir_owned` repairs.
+/// * `chown`: changing the owner, which `fattr` alone refuses with `EPERM`:
+///   `export::write_tree` hands each bundle file to the member's uid, and
+///   `Store::ensure_dir_owned` hands `accounts/<name>/` to the store's owner.
 /// * `flock`: `Store::try_lock`'s `.drain.lock` and the ledger's
 ///   `payments.jsonl.lock`.
 /// * `proc`: fork for every `Command`, and `wait4` on the child.
@@ -43,7 +46,7 @@ use kyriakon_control_core::config::DrainConfig;
 /// `getpwnam`), `dpath` (no device or fifo), `id` (the drain never changes uid),
 /// and `prot_exec` (the binary is linked with a non-lazy PLT).
 #[cfg(target_os = "openbsd")]
-const PROMISES: &str = "stdio rpath wpath cpath fattr flock proc exec";
+const PROMISES: &str = "stdio rpath wpath cpath fattr chown flock proc exec";
 
 /// Narrow the pass's file view to the paths it opens, then its syscalls.
 ///
