@@ -964,6 +964,7 @@ name = "kyriakon-control-fuzz"
 version = "0.0.0"
 dependencies = [
  "kyriakon-control-handler",
+ "kyriakon-control-static",
  "libfuzzer-sys",
  "tokio",
 ]
@@ -979,6 +980,13 @@ dependencies = [
  "time",
  "tokio",
  "ulid",
+]
+
+[[package]]
+name = "kyriakon-control-static"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
