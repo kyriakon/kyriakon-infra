@@ -6,6 +6,12 @@
 //! so a link fails the open itself: there is no window between a check and a use
 //! for a member to win, and the file that comes back was reached without a single
 //! link being followed.
+//!
+//! `O_NONBLOCK` goes with it. A FIFO in a served tree cannot be created over
+//! sftp today, but a read-only open of one blocks until a writer arrives, and a
+//! request that hangs instead of being refused costs a worker for as long as the
+//! member leaves it there. With the flag the open returns at once and the
+//! non-regular check refuses it.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -14,10 +20,15 @@ use std::path::Path;
 
 use crate::mime::media_type;
 
-/// A file that may be served, and the type it is announced as.
-pub struct Served {
-    pub file: File,
-    pub media: &'static str,
+/// What a request resolved to.
+pub enum Served {
+    /// The file to send, and the type to announce it as.
+    File { file: File, media: &'static str },
+    /// The request named a directory without its trailing separator. The caller
+    /// answers with a redirect to the same path with one: a browser resolves a
+    /// relative link against the URL, so serving `sub/index.html` at `/sub` sends
+    /// every request for a sibling of that page to the wrong place.
+    Redirect,
 }
 
 /// Why a request is refused.
@@ -35,15 +46,19 @@ pub enum Refusal {
 
 /// Open the file `request` names under `root`, or refuse it.
 ///
-/// `request` is the path the front end passed, with the query already gone and
-/// still percent-encoded. It is deliberately not decoded here: both daemons
-/// decode the path they send, so decoding again would turn `%252e%252e` into a
-/// traversal that neither of them intended to allow.
-pub fn open(root: &Path, request: &str) -> Result<Served, Refusal> {
+/// `request` is the decoded path with its query already cut, and the caller is
+/// what makes it so: gmid's `GEMINI_URL_PATH` arrives that way, and httpd's
+/// `REQUEST_URI` is decoded by the responder the same way it decodes its own
+/// routes. Decoding here instead would turn `%252e%252e` into a traversal
+/// neither front end meant to allow.
+///
+/// `index` is the file a directory serves, and it differs by protocol: the web
+/// tree's is `index.html`, a capsule's is `index.gmi`.
+pub fn open(root: &Path, request: &str, index: &str) -> Result<Served, Refusal> {
     let names = components(request)?;
     let mut current = File::open(root).map_err(|_| Refusal::Missing)?;
     if names.is_empty() {
-        return index_in(&current);
+        return index_in(&current, index);
     }
     for (position, name) in names.iter().enumerate() {
         let next = step(&current, name).ok_or(Refusal::Missing)?;
@@ -53,14 +68,17 @@ pub fn open(root: &Path, request: &str) -> Result<Served, Refusal> {
         }
         let metadata = next.metadata().map_err(|_| Refusal::Missing)?;
         if metadata.is_dir() {
-            return index_in(&next);
+            if !request.ends_with('/') {
+                return Ok(Served::Redirect);
+            }
+            return index_in(&next, index);
         }
         if !metadata.is_file() {
             return Err(Refusal::NotAFile);
         }
-        return Ok(Served {
-            media: media_type(name),
+        return Ok(Served::File {
             file: next,
+            media: media_type(name),
         });
     }
     // `names` is non-empty here and the loop returns on its last component.
@@ -76,6 +94,9 @@ pub fn open(root: &Path, request: &str) -> Result<Served, Refusal> {
 /// one of them should resolve. Exactly one leading and one trailing separator are
 /// stripped for the same reason: a second one is an empty component, not spelling.
 fn components(request: &str) -> Result<Vec<&str>, Refusal> {
+    if request.starts_with("//") || request.ends_with("//") {
+        return Err(Refusal::Missing);
+    }
     let trimmed = request.strip_prefix('/').unwrap_or(request);
     let trimmed = trimmed.strip_suffix('/').unwrap_or(trimmed);
     if trimmed.is_empty() {
@@ -96,17 +117,17 @@ fn components(request: &str) -> Result<Vec<&str>, Refusal> {
     Ok(names)
 }
 
-/// `index.html` in a directory, which is the only file a directory request ever
+/// The index file in a directory, which is the only file a directory request ever
 /// serves: a listing would publish names the member did not link.
-fn index_in(directory: &File) -> Result<Served, Refusal> {
-    let file = step(directory, "index.html").ok_or(Refusal::Missing)?;
+fn index_in(directory: &File, index: &str) -> Result<Served, Refusal> {
+    let file = step(directory, index).ok_or(Refusal::Missing)?;
     let metadata = file.metadata().map_err(|_| Refusal::Missing)?;
     if !metadata.is_file() {
         return Err(Refusal::NotAFile);
     }
-    Ok(Served {
+    Ok(Served::File {
         file,
-        media: media_type("index.html"),
+        media: media_type(index),
     })
 }
 
@@ -116,12 +137,13 @@ fn step(directory: &File, name: &str) -> Option<File> {
     // SAFETY: `directory` is an open descriptor, `name` is a NUL-terminated string
     // that outlives the call, and the returned descriptor is taken ownership of by
     // the `File` built from it. `O_NOFOLLOW` is the entire point of the call: a
-    // symlink makes `openat` fail instead of being followed.
+    // symlink makes `openat` fail instead of being followed. `O_NONBLOCK` is what
+    // keeps a FIFO from blocking the open before it can be refused.
     let fd = unsafe {
         libc::openat(
             directory.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
         )
     };
     if fd < 0 {
@@ -159,6 +181,7 @@ mod tests {
             for dir in [
                 root.join("sub"),
                 root.join("empty"),
+                root.join("badindex/index.html"),
                 root.join(".git"),
                 outside.parent().unwrap().to_path_buf(),
             ] {
@@ -167,64 +190,142 @@ mod tests {
             std::fs::write(root.join("index.html"), b"alice site").expect("index");
             std::fs::write(root.join("sub/index.html"), b"sub site").expect("sub index");
             std::fs::write(root.join("sub/page.css"), b"body{}").expect("css");
+            std::fs::write(root.join("my page.html"), b"spaced").expect("spaced name");
             std::fs::write(root.join(".git/config"), b"[core]").expect("git config");
             std::fs::write(&outside, b"bob wrote this").expect("outside");
+            // The absolute target is the real file, so the refusal cannot pass for
+            // a missing one: an absent target makes `openat` answer ENOENT with or
+            // without `O_NOFOLLOW`.
+            symlink(&outside, root.join("gitleak")).expect("absolute link");
             symlink("../../bob.kyriakon.net/www/secret.html", root.join("leak"))
                 .expect("relative link");
-            symlink(
-                "/home/www/bob.kyriakon.net/www/secret.html",
-                root.join("gitleak"),
-            )
-            .expect("absolute link");
             symlink("index.html", root.join("selflink")).expect("in-tree link");
             symlink("sub", root.join("sublink")).expect("directory link");
+            // A FIFO, which a plain read-only open would block on.
+            let pipe = CString::new(root.join("pipe").to_str().unwrap()).expect("path");
+            // SAFETY: `pipe` is a NUL-terminated path under the fixture, and the
+            // call only creates it.
+            unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) };
             Tree { root, outside }
         }
     }
 
     impl Drop for Tree {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(self.root.parent().and_then(|p| p.parent()).unwrap());
+            let base = self.root.parent().and_then(|p| p.parent()).expect("base");
+            let _ = std::fs::remove_dir_all(base);
         }
     }
 
-    fn body(root: &Path, request: &str) -> Result<String, Refusal> {
-        let mut served = open(root, request)?;
-        let mut text = String::new();
-        served
-            .file
-            .read_to_string(&mut text)
-            .expect("the fixture is text");
-        Ok(text)
+    /// The body of a served file, or what the resolver refused with.
+    fn body(root: &Path, request: &str, index: &str) -> Result<String, Refusal> {
+        match open(root, request, index)? {
+            Served::File { mut file, .. } => {
+                let mut text = String::new();
+                file.read_to_string(&mut text).expect("the fixture is text");
+                Ok(text)
+            }
+            Served::Redirect => Ok("<redirect>".to_string()),
+        }
+    }
+
+    fn media(root: &Path, request: &str) -> &'static str {
+        match open(root, request, "index.html").expect("served") {
+            Served::File { media, .. } => media,
+            Served::Redirect => panic!("expected a file"),
+        }
     }
 
     #[test]
     fn a_plain_file_is_served_with_its_type() {
         let tree = Tree::new();
-        assert_eq!(body(&tree.root, "/sub/page.css"), Ok("body{}".to_string()));
-        assert_eq!(media_type("page.css"), "text/css; charset=utf-8");
+        assert_eq!(
+            body(&tree.root, "/sub/page.css", "index.html"),
+            Ok("body{}".to_string())
+        );
+        assert_eq!(
+            media(&tree.root, "/sub/page.css"),
+            "text/css; charset=utf-8"
+        );
+        // The caller hands over the decoded path, so a name with a space arrives
+        // as the name on disk.
+        assert_eq!(
+            body(&tree.root, "/my page.html", "index.html"),
+            Ok("spaced".to_string())
+        );
     }
 
     #[test]
     fn a_directory_serves_its_index() {
         let tree = Tree::new();
-        assert_eq!(body(&tree.root, "/"), Ok("alice site".to_string()));
-        assert_eq!(body(&tree.root, "/sub/"), Ok("sub site".to_string()));
+        assert_eq!(
+            body(&tree.root, "/", "index.html"),
+            Ok("alice site".to_string())
+        );
+        assert_eq!(
+            body(&tree.root, "/sub/", "index.html"),
+            Ok("sub site".to_string())
+        );
         // With no index there is nothing to serve, and no listing is invented.
-        assert_eq!(body(&tree.root, "/empty/"), Err(Refusal::Missing));
+        assert_eq!(
+            body(&tree.root, "/empty/", "index.html"),
+            Err(Refusal::Missing)
+        );
+    }
+
+    #[test]
+    fn a_capsule_serves_its_own_index_name() {
+        let tree = Tree::new();
+        std::fs::write(tree.root.join("gemini.gmi"), b"20 text/gemini\r\nhi").expect("gemtext");
+        std::fs::rename(
+            tree.root.join("gemini.gmi"),
+            tree.root.join("sub/index.gmi"),
+        )
+        .expect("rename into sub");
+        assert_eq!(
+            body(&tree.root, "/sub/", "index.gmi"),
+            Ok("20 text/gemini\r\nhi".to_string())
+        );
+        assert_eq!(
+            media(&tree.root, "/sub/index.gmi"),
+            "text/gemini; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn a_directory_without_its_separator_is_a_redirect() {
+        let tree = Tree::new();
+        assert_eq!(
+            body(&tree.root, "/sub", "index.html"),
+            Ok("<redirect>".to_string())
+        );
     }
 
     #[test]
     fn a_link_is_never_followed() {
         let tree = Tree::new();
-        // Out of the tree, by a relative target and by an absolute one.
-        assert_eq!(body(&tree.root, "/leak"), Err(Refusal::Missing));
-        assert_eq!(body(&tree.root, "/gitleak"), Err(Refusal::Missing));
+        // Out of the tree, by a relative target and by an absolute one, and the
+        // absolute one names a file that exists, so ENOENT cannot be mistaken for
+        // the refusal.
+        assert_eq!(
+            body(&tree.root, "/leak", "index.html"),
+            Err(Refusal::Missing)
+        );
+        assert_eq!(
+            body(&tree.root, "/gitleak", "index.html"),
+            Err(Refusal::Missing)
+        );
         // And even a link that points inside it: the daemons cannot tell, and one
         // rule is cheaper to keep right than two.
-        assert_eq!(body(&tree.root, "/selflink"), Err(Refusal::Missing));
+        assert_eq!(
+            body(&tree.root, "/selflink", "index.html"),
+            Err(Refusal::Missing)
+        );
         // A linked directory is refused at the component that is a link.
-        assert_eq!(body(&tree.root, "/sublink/page.css"), Err(Refusal::Missing));
+        assert_eq!(
+            body(&tree.root, "/sublink/page.css", "index.html"),
+            Err(Refusal::Missing)
+        );
         // The file outside really is there, so the refusals above are the walk,
         // not a broken fixture.
         assert_eq!(
@@ -234,13 +335,36 @@ mod tests {
     }
 
     #[test]
+    fn a_non_file_is_refused_rather_than_hanging_or_served() {
+        let tree = Tree::new();
+        // A FIFO opened read-only without `O_NONBLOCK` blocks; here it is refused.
+        assert_eq!(
+            body(&tree.root, "/pipe", "index.html"),
+            Err(Refusal::NotAFile)
+        );
+        // A directory standing where the index should be is refused for the same
+        // reason: neither is a file to send.
+        assert_eq!(
+            body(&tree.root, "/badindex/", "index.html"),
+            Err(Refusal::NotAFile)
+        );
+    }
+
+    #[test]
     fn a_dot_component_is_never_served() {
         let tree = Tree::new();
-        assert_eq!(body(&tree.root, "/.git/config"), Err(Refusal::Missing));
-        // Percent-encoded, because neither daemon decodes here and a file literally
-        // named `%2e%2e` is not one of the member's.
         assert_eq!(
-            body(&tree.root, "/%2e%2e/bob.kyriakon.net/www/secret.html"),
+            body(&tree.root, "/.git/config", "index.html"),
+            Err(Refusal::Missing)
+        );
+        // Percent-encoded, because the resolver is handed the decoded path and a
+        // file literally named `%2e%2e` is not one of the member's.
+        assert_eq!(
+            body(
+                &tree.root,
+                "/%2e%2e/bob.kyriakon.net/www/secret.html",
+                "index.html"
+            ),
             Err(Refusal::Missing)
         );
     }
@@ -252,12 +376,13 @@ mod tests {
             "/../bob.kyriakon.net/www/secret.html",
             "/sub/../../bob.kyriakon.net/www/secret.html",
             "/./index.html",
+            "//",
             "//index.html",
             "/sub//index.html",
             "/nul\0byte",
         ] {
             assert_eq!(
-                body(&tree.root, request),
+                body(&tree.root, request, "index.html"),
                 Err(Refusal::Missing),
                 "{request}"
             );
@@ -267,7 +392,13 @@ mod tests {
     #[test]
     fn a_missing_file_is_missing() {
         let tree = Tree::new();
-        assert_eq!(body(&tree.root, "/nothing.html"), Err(Refusal::Missing));
-        assert_eq!(body(&tree.root, "/sub"), Ok("sub site".to_string()));
+        assert_eq!(
+            body(&tree.root, "/nothing.html", "index.html"),
+            Err(Refusal::Missing)
+        );
+        assert_eq!(
+            body(&tree.root, "/sub/", "index.html"),
+            Ok("sub site".to_string())
+        );
     }
 }
