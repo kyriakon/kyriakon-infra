@@ -25,11 +25,13 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use kyriakon_control_core::fastcgi::{self, Reply, Request};
+use kyriakon_control_core::fastcgi::{self, Http, Reply, Request};
 use kyriakon_control_core::util::{self, percent_decode};
 use kyriakon_control_core::Error;
 use kyriakon_control_static::{open, Refusal, Served};
+use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -118,7 +120,7 @@ impl Config {
 /// is decided by the socket the connection arrived on, not by a variable in the
 /// request: a peer that sent the other front-end's spelling could not make this
 /// process frame an answer for it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum FrontEnd {
     Httpd,
     Gemini,
@@ -310,10 +312,24 @@ fn answer(cfg: &Config, front_end: FrontEnd, request: &Request) -> (Reply, Strin
         return (refuse(front_end), route);
     };
     match open(&root, &path, front_end.index()) {
-        Ok(Served::File { file, media }) => match read_capped(file) {
-            Some(body) => (serve(front_end, media, body), route),
-            None => (too_large(front_end), route),
-        },
+        Ok(Served::File {
+            file,
+            media,
+            modified,
+        }) => {
+            let last_modified = modified.and_then(http_date);
+            // A browser that already holds this copy asks with the date it was
+            // given; answering 304 keeps a member's page from being re-sent on
+            // every navigation, which httpd's own file server did for the vhosts
+            // this replaced.
+            if front_end == FrontEnd::Httpd && unchanged(modified, request) {
+                return (not_modified(media, last_modified), route);
+            }
+            match read_capped(file) {
+                Some(body) => (serve(front_end, media, body, last_modified), route),
+                None => (too_large(front_end), route),
+            }
+        }
         Ok(Served::Redirect) => (redirect(front_end, &host, &path), route),
         // Both refusals are the same answer: a client that could tell "no such
         // file" from "not a file" would learn which of its guesses resolved.
@@ -337,11 +353,108 @@ fn read_capped(file: std::fs::File) -> Option<Vec<u8>> {
 /// A file's bytes, framed for the front-end that asked. The web announces the
 /// type in a header; a capsule announces it in the reply line, which is the only
 /// place a gemini client reads it.
-fn serve(front_end: FrontEnd, media: &str, body: Vec<u8>) -> Reply {
+fn serve(front_end: FrontEnd, media: &str, body: Vec<u8>, last_modified: Option<String>) -> Reply {
     match front_end {
-        FrontEnd::Httpd => Reply::file(200, media, body),
+        FrontEnd::Httpd => {
+            let mut http = Http::file(200, media, body);
+            if let Some(date) = last_modified {
+                http = http.with_header("Last-Modified", date);
+            }
+            Reply::Http(http)
+        }
         FrontEnd::Gemini => Reply::gemini(20, media, body),
     }
+}
+
+/// Whether the client's copy is still the file on disk. The header is only
+/// present on httpd's requests: a gemini request has none.
+fn unchanged(modified: Option<SystemTime>, request: &Request) -> bool {
+    let (Some(modified), Some(since)) = (
+        modified,
+        parse_http_date(request.value("HTTP_IF_MODIFIED_SINCE")),
+    ) else {
+        return false;
+    };
+    match modified.duration_since(UNIX_EPOCH) {
+        Ok(age) => age.as_secs() <= since.unix_timestamp().max(0) as u64,
+        Err(_) => false,
+    }
+}
+
+/// A 304 carries the same `Content-Type` the 200 would have, which is what the
+/// specification allows, and no body.
+fn not_modified(media: &str, last_modified: Option<String>) -> Reply {
+    let mut http = Http::file(304, media, Vec::new());
+    if let Some(date) = last_modified {
+        http = http.with_header("Last-Modified", date);
+    }
+    Reply::Http(http)
+}
+
+/// An HTTP date, as the header carries it: `Sun, 06 Nov 1994 08:49:37 GMT`.
+///
+/// One form only. The specification lets a sender produce this one and lets a
+/// recipient read two obsolete ones as well, and neither front-end here sends
+/// those; the `time` crate does the calendar arithmetic and this does the
+/// spelling, so no format description has to be parsed at startup.
+fn http_date(modified: SystemTime) -> Option<String> {
+    let at = OffsetDateTime::from(modified);
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let day = DAYS[at.weekday().number_days_from_monday() as usize];
+    let month = MONTHS[at.month() as usize - 1];
+    Some(format!(
+        "{day}, {:02} {month} {} {:02}:{:02}:{:02} GMT",
+        at.day(),
+        at.year(),
+        at.hour(),
+        at.minute(),
+        at.second()
+    ))
+}
+
+fn parse_http_date(raw: &str) -> Option<OffsetDateTime> {
+    // `Sun, 06 Nov 1994 08:49:37 GMT`
+    let (_, rest) = raw.trim().split_once(", ")?;
+    let mut fields = rest.split_whitespace();
+    let day: u8 = fields.next()?.parse().ok()?;
+    let month = Month::try_from(match fields.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    })
+    .ok()?;
+    let year: i32 = fields.next()?.parse().ok()?;
+    let clock = fields.next()?;
+    if fields.next()? != "GMT" || fields.next().is_some() {
+        return None;
+    }
+    let mut hms = clock.split(':');
+    let hour: u8 = hms.next()?.parse().ok()?;
+    let minute: u8 = hms.next()?.parse().ok()?;
+    let second: u8 = hms.next()?.parse().ok()?;
+    if hms.next().is_some() {
+        return None;
+    }
+    Some(
+        PrimitiveDateTime::new(
+            Date::from_calendar_date(year, month, day).ok()?,
+            Time::from_hms(hour, minute, second).ok()?,
+        )
+        .assume_utc(),
+    )
 }
 
 fn refuse(front_end: FrontEnd) -> Reply {
@@ -668,10 +781,13 @@ mod tests {
 
     /// One request through the answer path, for the tests above.
     async fn httpd_answer(cfg: &Config, uri: &str) -> (u16, String) {
-        let raw = fixture::httpd(
-            &[("SERVER_NAME", "alice.kyriakon.net"), ("REQUEST_URI", uri)],
-            b"",
-        );
+        httpd_env(cfg, &[("REQUEST_URI", uri)]).await
+    }
+
+    async fn httpd_env(cfg: &Config, env: &[(&str, &str)]) -> (u16, String) {
+        let mut env = env.to_vec();
+        env.insert(0, ("SERVER_NAME", "alice.kyriakon.net"));
+        let raw = fixture::httpd(&env, b"");
         let request = fastcgi::read_request(&mut &raw[..], 1024)
             .await
             .unwrap()
@@ -687,6 +803,68 @@ mod tests {
             .build()
             .unwrap()
             .block_on(future)
+    }
+
+    /// A page that has not changed is not sent again: the reply carries its
+    /// time, and a client that quotes that time back gets 304.
+    #[tokio::test]
+    async fn a_client_that_holds_the_copy_is_told_it_is_current() {
+        let cfg = config(fixture_root());
+        let path = cfg.root.join("alice.kyriakon.net/www/index.html");
+        let when = UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        let date = http_date(when).expect("the change time formats");
+
+        let (code, body) = httpd_answer(&cfg, "/index.html").await;
+        assert_eq!(code, 200);
+        assert!(
+            body.contains(&format!("Last-Modified: {date}\r\n")),
+            "{body}"
+        );
+
+        let (code, body) = httpd_env(
+            &cfg,
+            &[
+                ("REQUEST_URI", "/index.html"),
+                ("HTTP_IF_MODIFIED_SINCE", &date),
+            ],
+        )
+        .await;
+        assert_eq!(code, 304, "{body}");
+        assert!(
+            body.contains(&format!("Last-Modified: {date}\r\n")),
+            "{body}"
+        );
+        assert!(!body.contains("alice"), "a 304 carries no body: {body}");
+
+        // A copy from before the change is not current, so the page is sent.
+        let earlier = http_date(when - std::time::Duration::from_secs(60)).unwrap();
+        let (code, body) = httpd_env(
+            &cfg,
+            &[
+                ("REQUEST_URI", "/index.html"),
+                ("HTTP_IF_MODIFIED_SINCE", &earlier),
+            ],
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert!(body.ends_with("alice"), "{body}");
+
+        // A date this server cannot read is not a reason to answer 304.
+        let (code, _) = httpd_env(
+            &cfg,
+            &[
+                ("REQUEST_URI", "/index.html"),
+                ("HTTP_IF_MODIFIED_SINCE", "yesterday"),
+            ],
+        )
+        .await;
+        assert_eq!(code, 200);
     }
 
     #[test]
