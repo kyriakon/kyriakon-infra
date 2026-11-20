@@ -34,7 +34,7 @@
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// The version byte of the FastCGI specification this speaks. A record that does
 /// not carry it is not a record this responder can read, so the connection fails
@@ -210,8 +210,23 @@ pub async fn read_request<R: AsyncRead + Unpin>(
             ));
         }
 
+        // One request per connection at a time, numbered by its begin record.
+        // A record that carries another number belongs to a request this reader
+        // is not in, and accepting it would merge two requests: the reply would
+        // carry one request's id and the other's date.
+        if begun && kind != BEGIN_REQUEST && record_id != id {
+            return Err(Error::Malformed(format!(
+                "record id {record_id} inside request {id}"
+            )));
+        }
+
         match kind {
             BEGIN_REQUEST => {
+                if begun {
+                    return Err(Error::Malformed(
+                        "a second begin record inside one request".to_string(),
+                    ));
+                }
                 if content.len() != 8 {
                     return Err(Error::Malformed(format!(
                         "a begin record of {} bytes",
@@ -487,6 +502,15 @@ impl Reply {
     /// between the handler and the client there, so gemini's framing is the wire
     /// format.
     pub fn head(&self) -> Vec<u8> {
+        let mut out = self.head_block();
+        out.extend_from_slice(self.body());
+        out
+    }
+
+    /// The header block alone: the status line, the headers, the blank line.
+    /// A file reply writes this and then streams the bytes, and a `HEAD` answer
+    /// is this and nothing else.
+    pub fn head_block(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
             Reply::Http(http) => {
@@ -497,15 +521,78 @@ impl Reply {
                     out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
                 }
                 out.extend_from_slice(b"\r\n");
-                out.extend_from_slice(&http.body);
             }
-            Reply::Gemini { status, meta, body } => {
+            Reply::Gemini { status, meta, .. } => {
                 out.extend_from_slice(format!("{status} {meta}\r\n").as_bytes());
-                out.extend_from_slice(body);
             }
         }
         out
     }
+
+    /// The body, which is empty for every reply the form renders and a member's
+    /// file for the responder.
+    pub fn body(&self) -> &[u8] {
+        match self {
+            Reply::Http(http) => &http.body,
+            Reply::Gemini { body, .. } => body,
+        }
+    }
+}
+
+/// Where a reply's body comes from when it is written.
+pub enum Body<'a> {
+    /// Bytes already in memory.
+    Bytes(&'a [u8]),
+    /// A file read as it is written. A member's upload costs one buffer here
+    /// rather than one whole file per in-flight request, and both front-ends
+    /// take the body into their own buffer anyway, so a copy here would double
+    /// what one download costs.
+    File(&'a mut tokio::fs::File, u64),
+}
+
+/// Write a reply to the front-end: the header block as stdout records, the body,
+/// then the end marker. The header block is never empty, which matters: httpd
+/// aborts a request whose first stdout record is empty ("empty stdout",
+/// server_fcgi.c), and gmid waits for a header it would then never see.
+pub async fn write_reply<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    head: &[u8],
+    body: Body<'_>,
+    id: u16,
+) -> std::io::Result<()> {
+    for chunk in head.chunks(MAX_CONTENT) {
+        writer.write_all(&record(STDOUT, id, chunk)).await?;
+    }
+    match body {
+        Body::Bytes(bytes) => {
+            for chunk in bytes.chunks(MAX_CONTENT) {
+                writer.write_all(&record(STDOUT, id, chunk)).await?;
+            }
+        }
+        Body::File(file, len) => {
+            // One record's content, not a round number: the length field is two
+            // bytes, so 64 KiB would wrap to zero.
+            let mut buf = vec![0u8; MAX_CONTENT];
+            let mut left = len;
+            while left > 0 {
+                let want = (buf.len() as u64).min(left) as usize;
+                let read = file.read(&mut buf[..want]).await?;
+                if read == 0 {
+                    break;
+                }
+                left -= read as u64;
+                writer.write_all(&record(STDOUT, id, &buf[..read])).await?;
+            }
+        }
+    }
+    writer.write_all(&record(END_REQUEST, id, &[0; 8])).await?;
+    writer.flush().await
+}
+
+fn record(kind: u8, id: u16, content: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HEADER + content.len());
+    push_record(&mut out, kind, id, content);
+    out
 }
 
 /// The reply as the front-end reads it: the header block and the body across as
@@ -617,6 +704,11 @@ pub mod fixture {
     pub fn httpd(env: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
         let mut out = record(BEGIN_REQUEST, 1, &[0, 1, 0, 0, 0, 0, 0, 0]);
         let mut params = Vec::new();
+        // httpd always sends the method (server_fcgi.c); the tests that care
+        // about another one pass it themselves.
+        if !env.iter().any(|(name, _)| *name == "REQUEST_METHOD") {
+            param_short(&mut params, "REQUEST_METHOD", "GET");
+        }
         for (name, value) in env {
             param_short(&mut params, name, value);
         }
@@ -636,6 +728,10 @@ pub mod fixture {
     pub fn gmid(env: &[(&str, &str)]) -> Vec<u8> {
         let mut out = record(BEGIN_REQUEST, 1, &[0, 1, 1, 0, 0, 0, 0, 0]);
         let mut params = Vec::new();
+        // gmid hardcodes GET (fcgi.c).
+        if !env.iter().any(|(name, _)| *name == "REQUEST_METHOD") {
+            param_long(&mut params, "REQUEST_METHOD", "GET");
+        }
         for (name, value) in env {
             param_long(&mut params, name, value);
         }
@@ -674,6 +770,29 @@ pub mod fixture {
 mod tests {
     use super::fixture::{self, END};
     use super::*;
+
+    /// One request at a time: a second begin record would merge two requests,
+    /// and a record carrying another number belongs to one this reader is not
+    /// in.
+    #[tokio::test]
+    async fn a_second_begin_or_a_foreign_id_is_refused() {
+        let begin = |id: u16| record(BEGIN_REQUEST, id, &[0, 1, 0, 0, 0, 0, 0, 0]);
+
+        let mut merged = begin(1);
+        merged.extend(begin(2));
+        assert!(read_request(&mut &merged[..], 1024).await.is_err());
+
+        let mut foreign = begin(1);
+        foreign.extend(record(PARAMS, 9, b""));
+        assert!(read_request(&mut &foreign[..], 1024).await.is_err());
+
+        // The same stream with the right id is a request.
+        let mut fine = begin(1);
+        fine.extend(record(PARAMS, 1, b""));
+        fine.extend(record(STDIN, 1, b""));
+        fine.extend(record(STDIN, 1, b""));
+        assert!(read_request(&mut &fine[..], 1024).await.unwrap().is_some());
+    }
 
     #[tokio::test]
     async fn a_request_reads_its_parameters_in_either_length_form() {
