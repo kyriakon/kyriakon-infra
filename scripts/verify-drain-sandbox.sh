@@ -331,8 +331,10 @@ full_run() {
 		sed -n 1,40p "$work/export-out" >&2
 		fail "the drain failed on the export pass"
 	fi
-	[ -n "$(find "$tree/home/www/alice.kyriakon.net/export" -type f -print -quit 2>/dev/null)" ] ||
-		fail "the export wrote no bundle under public_root"
+	# A file list rather than `find -quit`: OpenBSD's find has no `-quit`, and
+	# grep exiting early would make the pipeline a SIGPIPE under pipefail.
+	find "$tree/home/www/alice.kyriakon.net/export" -type f > "$work/export-files" 2>/dev/null
+	[ -s "$work/export-files" ] || fail "the export wrote no bundle under public_root"
 
 	# A path whose parent does not exist fails at unveil, and the message names
 	# the path and the errno text: the operator can fix the config from cron mail.
