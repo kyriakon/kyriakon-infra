@@ -32,8 +32,9 @@ group, the `userquota` mount option with `/home/quota.user` live and quotas on, 
 A member is one OS account in `members` whose password entry keeps `/sbin/nologin`, with
 the session shell coming from a login class. Private data stays at
 `/home/<name>/{Maildir,repos}`; everything published lives at
-`/home/www/<name>.kyriakon.net/{www,gemini}`, which is where `httpd` and `gmid` chroot to
-serve it. Sessions split by port: 22 is the chrooted `internal-sftp` upload, 2222 runs
+`/home/www/<name>.kyriakon.net/{www,gemini}`, inside the chroot `httpd` and `gmid` share,
+and both daemons hand it to the member content responder rather than serving it from a
+root of their own (see "The generated configuration"). Sessions split by port: 22 is the chrooted `internal-sftp` upload, 2222 runs
 `git-shell`, and one key serves both. Per-member configuration is generated and never
 hand-edited: one file per member per daemon, listed by a generated index that the tracked
 config includes, written member file first and index second, syntax-checked, then applied
