@@ -89,6 +89,7 @@ dkim_domains=${DKIM_DOMAINS:-/etc/mail/dkim_domains}
 spamd_alloweddomains=${SPAMD_ALLOWEDDOMAINS:-/etc/mail/spamd.alloweddomains}
 httpd_d=${HTTPD_D:-/etc/httpd.d}
 gmid_d=${GMID_D:-/etc/gmid.d}
+static_hosts=${STATIC_HOSTS:-/etc/onboard/static-hosts}
 acme_d=${ACME_D:-/etc/acme-client.d}
 ssl_dir=${SSL_DIR:-/etc/ssl}
 ssl_private=${SSL_PRIVATE:-/etc/ssl/private}
@@ -202,6 +203,7 @@ remove_group() {
 	remove_path "daemon block" "$httpd_d/$domain.conf"
 	remove_path "daemon block" "$gmid_d/$domain.conf"
 	remove_path "daemon block" "$acme_d/$domain.conf"
+	remove_path "responder tree map" "$static_hosts/$domain"
 	cert_paths "$ssl_dir" "$ssl_private" "$domain"
 	remove_path "certificate chain" "$cert_chain"
 	remove_path "certificate key" "$cert_key"
@@ -243,13 +245,14 @@ self_test() {
 	httpd_d="$tree/etc/httpd.d"
 	gmid_d="$tree/etc/gmid.d"
 	acme_d="$tree/etc/acme-client.d"
+	static_hosts="$tree/etc/onboard/static-hosts"
 	ssl_dir="$tree/etc/ssl"
 	ssl_private="$ssl_dir/private"
 	acme_queue_dir="$tree/queue"
 	calls="$tree/calls"
 
 	install -d -m 0755 "$(dirname "$mail_domains")" "$httpd_d" "$gmid_d" \
-		"$acme_d" "$ssl_private" "$acme_queue_dir/pending"
+		"$acme_d" "$ssl_private" "$acme_queue_dir/pending" "$static_hosts"
 
 	reload_smtpd() { printf 'reload-smtpd\n' >>"$calls"; }
 	reload_spamd() { printf 'reload-spamd\n' >>"$calls"; }
@@ -303,6 +306,7 @@ self_test() {
 		: >"$ssl_dir/capsule-$d.crt"
 		: >"$ssl_private/capsule-$d.key"
 		: >"$acme_queue_dir/pending/$d"
+		printf '%s.kyriakon.net\n' "$d" >"$static_hosts/$d"
 	done
 
 	: >"$calls"
@@ -343,6 +347,10 @@ self_test() {
 	check "the vhost went" "$([ -e "$httpd_d/$domain.conf" ] && echo present || echo gone)" gone
 	check "the capsule block went" "$([ -e "$gmid_d/$domain.conf" ] && echo present || echo gone)" gone
 	check "the ACME block went" "$([ -e "$acme_d/$domain.conf" ] && echo present || echo gone)" gone
+	check "the responder's tree map went" \
+		"$([ -e "$static_hosts/$domain" ] && echo present || echo gone)" gone
+	check "and the other body's map stayed" \
+		"$([ -e "$static_hosts/$other" ] && echo present || echo gone)" present
 	check "the certificate went" \
 		"$([ -e "$ssl_dir/$domain.fullchain.pem" ] && echo present || echo gone)" gone
 	check "the certificate key went" \
@@ -365,7 +373,7 @@ self_test() {
 	check "and spamd, whose allow list lost the line" \
 		"$(grep -c '^reload-spamd$' "$calls")" 1
 	check "and the first run said what it did" \
-		"$(grep -c '^removed ' "$tree/first.out")" 15
+		"$(grep -c '^removed ' "$tree/first.out")" 16
 
 	# A second run against the same tree must do nothing and say nothing.
 	: >"$calls"

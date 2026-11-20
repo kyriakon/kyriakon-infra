@@ -26,6 +26,8 @@
 #   alice.kyriakon.net/gemini/gitleak ->         capsule's own tree
 #   bob.kyriakon.net/www/secret.html             bob's bytes, no link to them
 #   landing/www/.git/config                      [core], the link's target
+#   static-hosts/parish.example                  a group site: the domain names
+#                                                the vhost, alice names the tree
 #   logs/                                        httpd fatals without it
 #
 # The contract asserted: the plain file is served, a directory without its
@@ -88,13 +90,15 @@ make_fixture() {
 	typeset tree="$1"
 	mkdir -p "$tree/alice.kyriakon.net/www/sub" "$tree/alice.kyriakon.net/gemini/sub" \
 		"$tree/bob.kyriakon.net/www" "$tree/landing/www/.git" "$tree/run" \
-		"$tree/logs" || return 1
+		"$tree/static-hosts" "$tree/logs" || return 1
 	printf 'alice\n' > "$tree/alice.kyriakon.net/www/index.html"
 	printf 'sub page\n' > "$tree/alice.kyriakon.net/www/sub/index.html"
 	printf '# alice capsule\n' > "$tree/alice.kyriakon.net/gemini/index.gmi"
 	printf '# sub capsule\n' > "$tree/alice.kyriakon.net/gemini/sub/index.gmi"
 	printf '%s\n' "$BOB_SECRET" > "$tree/bob.kyriakon.net/www/secret.html"
 	printf '%s\n' "$GIT_CONFIG" > "$tree/landing/www/.git/config"
+	# The group site's map: the vhost is the body's domain, the files are alice's.
+	printf 'alice.kyriakon.net\n' > "$tree/static-hosts/parish.example"
 	# Relative: from alice's own tree, up to the chroot root and into bob's.
 	# #815's first case, from each of her two trees.
 	ln -s ../../bob.kyriakon.net/www/secret.html "$tree/alice.kyriakon.net/www/leak"
@@ -165,6 +169,7 @@ static_conf() {
 root = "$1"
 httpd_socket = "$1/run/static-httpd.sock"
 gemini_socket = "$1/run/static-gemini.sock"
+hosts = "$1/static-hosts"
 EOF
 }
 
@@ -174,6 +179,12 @@ httpd_conf() {
 	cat <<EOF
 chroot "$1"
 server "$HOST" {
+	listen on 127.0.0.1 port $2
+	location "/*" {
+		fastcgi socket "/run/static-httpd.sock"
+	}
+}
+server "parish.example" {
 	listen on 127.0.0.1 port $2
 	location "/*" {
 		fastcgi socket "/run/static-httpd.sock"
@@ -262,9 +273,9 @@ wait_gemini() {
 # expect_http <port> <path> <status> <pattern> <what>: the status and, when a
 # pattern is given, that the body carries it.
 expect_http() {
-	typeset port="$1" path="$2" want="$3" pattern="$4" what="$5" body status
+	typeset port="$1" path="$2" want="$3" pattern="$4" what="$5" host="${6:-$HOST}" body status
 	body=$(mktemp "$chroot_dir/http-body.XXXXXX") || return 1
-	status=$(curl -sS --max-time 5 --path-as-is -o "$body" -w '%{http_code}' -H "Host: $HOST" \
+	status=$(curl -sS --max-time 5 --path-as-is -o "$body" -w '%{http_code}' -H "Host: $host" \
 		"http://127.0.0.1:$port$path" 2>/dev/null) || status='no answer'
 	if [ "$status" != "$want" ]; then
 		rm -f "$body"
@@ -314,9 +325,9 @@ expect_gemini() {
 # expect_http_denied <port> <path> <secret> <what>: the link is refused (403 or
 # 404) and its body does not carry the bytes outside the member's tree.
 expect_http_denied() {
-	typeset port="$1" path="$2" secret="$3" what="$4" body status
+	typeset port="$1" path="$2" secret="$3" what="$4" host="${5:-$HOST}" body status
 	body=$(mktemp "$chroot_dir/http-body.XXXXXX") || return 1
-	status=$(curl -sS --max-time 5 --path-as-is -o "$body" -w '%{http_code}' -H "Host: $HOST" \
+	status=$(curl -sS --max-time 5 --path-as-is -o "$body" -w '%{http_code}' -H "Host: $host" \
 		"http://127.0.0.1:$port$path" 2>/dev/null) || status='no answer'
 	case "$status" in
 	403 | 404) ;;
@@ -426,6 +437,11 @@ full_run() {
 	expect_http_denied "$http_port" '/gitleak' 'repositoryformatversion' 'absolute .git link'
 	expect_http_denied "$http_port" '/.git/config' 'repositoryformatversion' 'direct .git'
 	expect_http_denied "$http_port" '/sub/../leak' "$BOB_SECRET" 'traversal spelling'
+	# A group site: the vhost is the body's domain, the tree is the site owner's,
+	# and the responder only knows that from the map.
+	expect_http "$http_port" '/index.html' 200 'alice' 'group site under its own domain' \
+		'parish.example'
+	expect_http_denied "$http_port" '/leak' "$BOB_SECRET" 'group site link' 'parish.example'
 
 	# --- gmid ------------------------------------------------------------
 	gemini_port=$(free_port) || die "no free port for gmid"
@@ -507,14 +523,20 @@ self_test() {
 		"$(printf '%s\n' "$conf" | grep -cF "root = \"$tree\"")" 1
 	check "static.toml puts both sockets inside it" \
 		"$(printf '%s\n' "$conf" | grep -cF "socket = \"$tree/run/")" 2
+	check "static.toml names the host map" \
+		"$(printf '%s\n' "$conf" | grep -cF "hosts = \"$tree/static-hosts\"")" 1
+	check "the fixture maps the group domain to alice's tree" \
+		"$(cat "$tree/static-hosts/parish.example")" "alice.kyriakon.net"
 
 	conf=$(httpd_conf "$tree" 19650)
 	check "httpd.conf chroots to the fixture" \
 		"$(printf '%s\n' "$conf" | grep -cF "chroot \"$tree\"")" 1
 	check "httpd.conf serves the member's name" \
 		"$(printf '%s\n' "$conf" | grep -cF "server \"$HOST\"")" 1
+	check "and the group site's domain" \
+		"$(printf '%s\n' "$conf" | grep -cF 'server "parish.example"')" 1
 	check "httpd.conf hands every path to the responder" \
-		"$(printf '%s\n' "$conf" | grep -cF 'fastcgi socket "/run/static-httpd.sock"')" 1
+		"$(printf '%s\n' "$conf" | grep -cF 'fastcgi socket "/run/static-httpd.sock"')" 2
 	check "httpd.conf names no root" \
 		"$(printf '%s\n' "$conf" | grep -c '^[[:space:]]*root ')" 0
 

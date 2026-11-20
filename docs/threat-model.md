@@ -104,7 +104,9 @@ member's own tree. A name beginning with a dot is refused under every spelling, 
 what makes `.git` unreachable rather than trusting a `location` block to match a path.
 Each member's sftp session is chrooted to their own tree, so the filesystem is not
 shared between their sessions; it is the two daemons' chroot that is shared, and the
-responder is what stops one member's request from crossing into another's tree.
+responder is what stops one member's request from crossing into another's tree. A group
+site is served from its owner's tree under the body's own domain, and the mapping lives
+in a root-owned file the responder reads, so naming a domain does not name a directory.
 
 ## Log minimization
 

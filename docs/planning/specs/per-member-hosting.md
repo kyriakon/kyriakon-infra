@@ -125,6 +125,14 @@ The gmid member file is one `server "<name>.kyriakon.net"` block on port 1965 wi
 `fastcgi socket "/run/onboard-static/static.sock"` and the capsule certificate pair of
 the next section rather than the ACME pair.
 
+A group site is the exception the responder has to be told about: its vhost is named
+for the body's domain while its files live in the site owner's member tree, so
+`scripts/provision-group-web.sh` writes `/etc/onboard/static-hosts/<domain>` holding
+`<site-account>.kyriakon.net`, and the responder serves that tree under that name. The
+map is root-owned, and the name it holds is checked against the hostname alphabet
+before it is joined, so an entry cannot leave the root either. `remove-group.sh`
+removes it with the rest.
+
 Neither generated file names a `root` for the member's content, and the reason is
 [#815](https://github.com/kyriakon/kyriakon-infra/issues/815). A `root` is relative to
 the `/home/www` chroot, where every member's tree sits beside every other's, and both

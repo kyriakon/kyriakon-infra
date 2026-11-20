@@ -87,6 +87,53 @@ pub fn clean_body(text: &str) -> String {
         .collect()
 }
 
+/// Percent-decode one value. A plus is a space in a form, which is what a browser
+/// writes for one in `application/x-www-form-urlencoded`, and an ordinary
+/// character in a path, where the specification requires `%20` for a space.
+///
+/// A percent sign that is not followed by two hex digits stays literal, so a
+/// caller's next step sees the name it was sent rather than an error. Both
+/// front-ends decode here: the signup responder decodes the request path and the
+/// form fields, and the member content responder decodes httpd's `REQUEST_URI`.
+pub fn percent_decode(value: &str, plus_is_space: bool) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => match hex_pair(&bytes[i + 1..i + 3]) {
+                Some(byte) => {
+                    out.push(byte);
+                    i += 3;
+                }
+                None => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
+            b'+' if plus_is_space => {
+                out.push(b' ');
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_pair(pair: &[u8]) -> Option<u8> {
+    let digit = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    Some(digit(pair[0])? << 4 | digit(pair[1])?)
+}
+
 /// The lines one failure prints: the error under the service prefix, then each
 /// source that says something the line already printed does not. A wrapper whose
 /// `Display` delegates to its source would otherwise print the same sentence
