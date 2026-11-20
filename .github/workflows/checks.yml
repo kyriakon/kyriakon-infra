@@ -213,11 +213,12 @@ jobs:
             ksh scripts/install-packages.sh --check
             ksh scripts/self-test-all.sh
             # The daemon half no self-test runs: a real httpd and gmid against a
-            # two-member fixture chroot, reading the served paths back. #815 is
-            # the open chroot design call, so the flag pins the leak it
-            # describes; drop it when the fix lands and the default contract
-            # assertions run.
-            KYRIAKON_815_OPEN=1 ksh scripts/verify-hosting.sh
+            # two-member fixture chroot, handing every request to the member
+            # content responder and reading the served paths back. The responder
+            # is the commit under test, so it is built here rather than taken
+            # from a package.
+            cargo build --release --manifest-path control/Cargo.toml -p kyriakon-control-static
+            ksh scripts/verify-hosting.sh
 
   terraform:
     name: terraform

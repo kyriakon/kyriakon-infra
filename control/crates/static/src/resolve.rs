@@ -168,9 +168,13 @@ mod tests {
 
     impl Tree {
         fn new() -> Tree {
+            // The clock alone is not unique: macOS reports microseconds, and the
+            // tests run in parallel, so two trees can be built in one tick.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let base = std::env::temp_dir().join(format!(
-                "kyriakon-static-{}-{:x}",
+                "kyriakon-static-{}-{:x}-{}",
                 std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())

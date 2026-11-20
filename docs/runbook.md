@@ -39,9 +39,11 @@ Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box witho
 
 The `script self-tests` job in `.github/workflows/checks.yml` boots a real OpenBSD
 7.9 machine with `vmactions/openbsd-vm` and runs
-`scripts/install-packages.sh --ci`, `scripts/install-packages.sh --check`, and
-`scripts/self-test-all.sh`. This is the authoritative check for the shell and
-tools the box runs; macOS and Linux are only proxies.
+`scripts/install-packages.sh --ci`, `scripts/install-packages.sh --check`,
+`scripts/self-test-all.sh`, then builds `kyriakon-control-static` and runs
+`scripts/verify-hosting.sh`, which starts that responder and both daemons against
+a fixture chroot. This is the authoritative check for the shell and tools the box
+runs; macOS and Linux are only proxies, and neither can run the daemon half.
 
 Push a branch and open a PR, then read the job's log. To exercise something the
 suite does not cover, add a step to that job on the branch and remove it before
@@ -200,7 +202,7 @@ page is missing.
 
 These procedures name the pieces that exist at this commit, and mark the ones that do not:
 
-- The control plane is decided in #156 and partly built: the handler is a FastCGI responder, and the drain, `kyriakon-admin` and the portal (`kyriakon-control-tui`, the program an applicant's ssh session runs) are built and installed by `scripts/deploy-control.sh`. The portal reads an application's stage from the handler, holds one address to two concurrent sessions and the box to a small total, with its session files under `/var/db/kyriakon-onboard-tui`; a clean exit removes a session's file and a killed one is pruned by the next start. The account page, the portal's application flow and its member path are still to come, so provisioning a member is manual until they land.
+- The control plane is decided in #156 and partly built: the handler is a FastCGI responder, the member content responder (`kyriakon-control-static`) serves what members publish, and the drain, `kyriakon-admin` and the portal (`kyriakon-control-tui`, the program an applicant's ssh session runs) are built and installed by `scripts/deploy-control.sh`. The portal reads an application's stage from the handler, holds one address to two concurrent sessions and the box to a small total, with its session files under `/var/db/kyriakon-onboard-tui`; a clean exit removes a session's file and a killed one is pruned by the next start. The account page, the portal's application flow and its member path are still to come, so provisioning a member is manual until they land.
 - The portal's stage events (a status read, an abandoned session) go to `authlog` at facility `AUTH`, and carry no address and no answer. The handler's own line in `/var/log/daemon` carries the route, its token and the address, and no answer.
 - The portal's account is `hello`, as the TUI spec names it. The live box still has it as `onboard`, so rename it before the portal is enabled: `doas usermod -l hello onboard` (the rename leaves the group named `onboard`; `deploy-control.sh` uses `id -gn hello`, so no group rename is needed), install `openbsd/etc/login.conf.d/hello`, `doas usermod -L hello hello`, `doas cap_mkdb /etc/login.conf`, remove `/etc/login.conf.d/onboard`, then install the tracked `sshd_config.onboard` with its port substituted and run `doas sshd -t -f /etc/ssh/sshd_config.onboard`. It is locked with `usermod -p '*'` while unreleased; at release restore the empty field with `usermod -p '' hello`.
 - The per-member hosting configuration is merged into the repository and not applied: the chroot under `/home/www`, the generated vhost indexes, the port split that separates git from the chrooted sftp server. Applying it is a sequence of propose-only steps rather than a script, so it is done once, by hand, and the order is in the pull request that added it (#160).
@@ -258,6 +260,8 @@ Provisioning is manual today. The service that will take it over is covered in t
 
 		doas ksh scripts/cron-apply.sh --web --check
 		doas ksh scripts/cron-apply.sh --web
+
+   A published file is reached through `kyriakon-control-static`, not through a `root` in the member's vhost: both daemons hand every path to it over a socket, and it opens the path one component at a time with `O_NOFOLLOW` from the member's own tree. Two things an operator will meet because of that. A symlink is refused as a 404 wherever it points, including into the member's own `www/` or `gemini/`: the member's tree is theirs to arrange, but not with links, and `scripts/verify-hosting.sh` asserts that on both front-ends. A file over 16 MiB is refused (413 on the web, 59 on the capsule) rather than streamed, so a member who uploads a video should be told the limit rather than left wondering why it does not appear.
 
    The certificate is issued later. The queue attempts a name on the next fifteen-minute pass while fewer than 40 `kyriakon.net` attempts sit in the last seven days, and one name every 202 minutes once the count reaches 40. `doas ksh scripts/acme-queue.sh --status` shows the request and its age. On the pass that issues it, the queue itself runs the web lane and `cron-apply.sh --web` again, which writes the member's block behind the relay, adds its keypair to `/etc/relayd.conf` and reloads. `curl -sI https://<username>.kyriakon.net/` reads 200 only after that has happened.
 

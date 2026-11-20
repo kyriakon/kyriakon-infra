@@ -23,7 +23,7 @@ Built on OpenBSD via Hetzner, with Terraform describing the box.
 | TLS | `acme-client`, with `relayd` terminating 443 |
 | Firewall | `pf` |
 | Provisioning | Terraform (`hcloud`) and the `hcloud` CLI for throwaways |
-| Control plane | `control`, a Rust FastCGI responder, a root-side drain and the operator console |
+| Control plane | `control`, Rust FastCGI responders for the form and for member sites, a root-side drain and the operator console |
 
 ## Layout
 

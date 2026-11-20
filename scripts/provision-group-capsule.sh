@@ -219,11 +219,10 @@ group_conf_body() {
 	printf '\tcert "%s"\n' "$(capsule_cert)"
 	printf '\tkey "%s"\n' "$(capsule_key)"
 	printf '\n'
-	printf '\troot "/%s.kyriakon.net/gemini"\n' "$account"
-	printf '\n'
-	printf '\tlocation "/.git/*" {\n'
-	printf '\t\tblock\n'
-	printf '\t}\n'
+	# The owner's gemini tree is a checkout they upload over sftp, so it is not a
+	# root here: the responder resolves the path from that tree and refuses links
+	# and dot components (#815).
+	printf '\tfastcgi socket "/run/onboard-static/static.sock"\n'
 	printf '}\n'
 }
 
@@ -287,9 +286,11 @@ self_test() {
 		"$(grep -cF "cert \"$ssl_dir/capsule-parish.example.crt\"" "$conf")" 1
 	check "and its key" \
 		"$(grep -cF "key \"$ssl_private/capsule-parish.example.key\"" "$conf")" 1
-	check "the root is the site owner's gemini tree" \
-		"$(grep -c 'root "/parish-secretary.kyriakon.net/gemini"' "$conf")" 1
-	check ".git is blocked" "$(grep -c 'location "/.git/\*"' "$conf")" 1
+	check "every path goes to the responder" \
+		"$(grep -c 'fastcgi socket "/run/onboard-static/static.sock"' "$conf")" 1
+	check "and no root names the owner's tree" \
+		"$(grep -c 'root "/parish-secretary.kyriakon.net/gemini"' "$conf")" 0
+	check "and no .git block" "$(grep -c 'location "/.git/' "$conf")" 0
 	check "one server block exactly" "$(grep -c '^server ' "$conf")" 1
 	check "the file is mode 644 and the writer's" "$(stat -f '%Su:%Sg %Lp' "$conf")" "$conf_owner 644"
 	assert_group_conf

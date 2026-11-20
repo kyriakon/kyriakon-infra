@@ -1128,8 +1128,10 @@ install -d -m 0700 /etc/acme
 # block there, so the tracked config never gains a per-member line.
 install_indexes /etc
 # One root per hostname the box serves, each with the www and gemini halves, so
-# httpd's root "/<host>/www" and gmid's root "/<host>/gemini" are relative to the
-# same chroot and the whole public surface is one tree that the backup covers.
+# the platform's own vhosts' root "/<host>/www" and "/<host>/gemini" are relative
+# to the same chroot and the whole public surface is one tree that the backup
+# covers. A member's tree sits under it too, and is served by the member content
+# responder rather than by a root, because a member can write inside their own.
 # www.kyriakon.net is absent because it only redirects. The signup hostname has
 # no capsule, so it gets www only.
 for host in kyriakon.net oliver.kyriakon.net kleio.kyriakon.net press.kyriakon.net; do

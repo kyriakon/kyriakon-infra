@@ -324,7 +324,7 @@ pub enum Reply {
     Gemini {
         status: u8,
         meta: String,
-        body: String,
+        body: Vec<u8>,
     },
 }
 
@@ -334,7 +334,9 @@ pub enum Reply {
 pub struct Http {
     status: u16,
     headers: Vec<(String, String)>,
-    body: String,
+    /// Bytes rather than a `String`: the web form's pages are text, and a
+    /// member's file is whatever the member uploaded.
+    body: Vec<u8>,
 }
 
 impl Http {
@@ -357,7 +359,25 @@ impl Http {
                 ),
                 ("Location".to_string(), location.to_string()),
             ],
-            body: String::new(),
+            body: Vec::new(),
+        }
+    }
+
+    /// A 301 to `location`, for a directory asked for without its trailing
+    /// separator: a browser resolves a relative link against the URL, so serving
+    /// `sub/index.html` at `/sub` sends every request for a sibling of that page
+    /// to the wrong place.
+    pub fn moved(location: &str) -> Http {
+        Http {
+            status: 301,
+            headers: vec![
+                (
+                    "Content-Type".to_string(),
+                    "text/html; charset=utf-8".to_string(),
+                ),
+                ("Location".to_string(), location.to_string()),
+            ],
+            body: Vec::new(),
         }
     }
 
@@ -394,7 +414,7 @@ impl Reply {
                     CONTENT_SECURITY_POLICY.to_string(),
                 ),
             ],
-            body,
+            body: body.into_bytes(),
         })
     }
 
@@ -415,17 +435,33 @@ impl Reply {
                     CONTENT_SECURITY_POLICY.to_string(),
                 ),
             ],
-            body,
+            body: body.into_bytes(),
         })
     }
 
-    /// A gemini page.
-    pub fn gemini(status: u8, meta: &str, body: String) -> Reply {
+    /// A gemini page. The body is anything that converts to bytes, so a capsule
+    /// page passes the `String` it built and a member's file passes the bytes it
+    /// read.
+    pub fn gemini(status: u8, meta: &str, body: impl Into<Vec<u8>>) -> Reply {
         Reply::Gemini {
             status,
             meta: meta.to_string(),
-            body,
+            body: body.into(),
         }
+    }
+
+    /// A file the member published: its bytes and the type its name announces,
+    /// under the status the resolver's answer calls for.
+    ///
+    /// No policy headers: the bytes are the member's page, not one of ours, and
+    /// the only header this server has an opinion about is the one that decides
+    /// whether it renders or downloads.
+    pub fn file(status: u16, media: &str, body: Vec<u8>) -> Reply {
+        Reply::Http(Http {
+            status,
+            headers: vec![("Content-Type".to_string(), media.to_string())],
+            body,
+        })
     }
 
     /// The code this reply answers with, for the log line.
@@ -455,11 +491,11 @@ impl Reply {
                     out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
                 }
                 out.extend_from_slice(b"\r\n");
-                out.extend_from_slice(http.body.as_bytes());
+                out.extend_from_slice(&http.body);
             }
             Reply::Gemini { status, meta, body } => {
                 out.extend_from_slice(format!("{status} {meta}\r\n").as_bytes());
-                out.extend_from_slice(body.as_bytes());
+                out.extend_from_slice(body);
             }
         }
         out
@@ -504,6 +540,7 @@ fn push_record(out: &mut Vec<u8>, kind: u8, id: u16, content: &[u8]) {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        301 => "Moved Permanently",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
@@ -712,7 +749,7 @@ mod tests {
 
     #[test]
     fn a_gemini_reply_is_the_header_the_body_and_the_end_marker() {
-        let bytes = reply_bytes(&Reply::gemini(20, "text/gemini", "# hello\n".into()), 1);
+        let bytes = reply_bytes(&Reply::gemini(20, "text/gemini", "# hello\n"), 1);
         let (body, last) = fixture::reply(&bytes);
         assert_eq!(last, END, "the reply is finished, not truncated");
         assert_eq!(body, b"20 text/gemini\r\n# hello\n");

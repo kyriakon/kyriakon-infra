@@ -38,11 +38,14 @@
 # and the reload land together without a human.
 #
 # The paths inside the blocks are httpd's. httpd's chroot is /home/www, so
-# root "/<name>.kyriakon.net/www" is /home/www/<name>.kyriakon.net/www, which is
-# the member's own public tree, and root "/acme" is the challenge directory
-# deploy-mail.sh created. The certificate paths are not, which is why the
-# certificate check below names the one under /etc/ssl in full: relayd reads the
-# pair from there, out of the chroot, before it drops privileges.
+# root "/acme" is the challenge directory deploy-mail.sh created. The member's
+# own site is not a root: it is a fastcgi socket, the same one for every member,
+# because /home/www is where all their trees live and a root there is what let a
+# symlink reach a neighbour's tree (#815). The responder behind the socket
+# resolves the path against the member's own tree and refuses every link. The
+# certificate paths are not httpd's, which is why the certificate check below
+# names the one under /etc/ssl in full: relayd reads the pair from there, out of
+# the chroot, before it drops privileges.
 #
 # The index and the reload are not this script's job. /etc/httpd.d/index.conf is
 # regenerated and httpd is checked with httpd -n and then reloaded by
@@ -135,11 +138,11 @@ member_conf_body() {
 	printf 'server "%s.kyriakon.net" {\n' "$user"
 	printf '\tlisten on 127.0.0.1 port 8080\n'
 	printf '\tlog { style forwarded }\n'
-	printf '\tlocation "/.git/*" {\n'
-	printf '\t\tblock\n'
-	printf '\t}\n'
+	# No `.git` block: a block matches the request path, and the responder
+	# refuses every name beginning with a dot whatever the request spells, so
+	# there is nothing left for the block to match that would otherwise be served.
 	printf '\tlocation "/*" {\n'
-	printf '\t\troot "/%s.kyriakon.net/www"\n' "$user"
+	printf '\t\tfastcgi socket "/run/onboard-static-httpd/static.sock"\n'
 	printf '\t}\n'
 	printf '}\n'
 }
@@ -218,8 +221,8 @@ remove_member_conf() {
 	printf '  next: doas ksh scripts/cron-apply.sh --web   # regenerate the index, check httpd, reload\n'
 }
 
-# The tree this file names, which provision-member.sh builds and which no vhost
-# can serve from if it is gone.
+# The tree the responder serves for this member, which provision-member.sh builds
+# and which no request can be served from if it is gone.
 assert_member_tree() {
 	typeset public
 	public="$public_root/$user.kyriakon.net"
@@ -293,9 +296,12 @@ self_test() {
 		"$(grep -cE 'certificate|key "|tls' "$conf")" 0
 	check "it logs the forwarded address the relay sets" \
 		"$(grep -c 'log { style forwarded }' "$conf")" 1
-	check "it blocks .git" "$(grep -c 'location "/.git/\*"' "$conf")" 1
-	check "and roots the member's www directory" \
-		"$(grep -c 'root "/alice.kyriakon.net/www"' "$conf")" 1
+	check "every path goes to the responder, not to a root" \
+		"$(grep -c 'fastcgi socket "/run/onboard-static-httpd/static.sock"' "$conf")" 1
+	check "and no location roots the member's tree" \
+		"$(grep -c 'root "/alice.kyriakon.net/www"' "$conf")" 0
+	check "and there is no .git block to match a path the responder refuses" \
+		"$(grep -c 'location "/.git/' "$conf")" 0
 
 	# 4. a second run in that shape, and the file it compares is the one just written
 	before=$(stat -f '%i %m' "$conf")

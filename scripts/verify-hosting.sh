@@ -1,5 +1,6 @@
 #!/bin/ksh
-# verify-hosting.sh — the web and gemini daemons against a two-member fixture.
+# verify-hosting.sh — the web and gemini daemons, and the responder behind them,
+# against a two-member fixture.
 #
 # Usage:
 #   doas ksh scripts/verify-hosting.sh              # OpenBSD, as root
@@ -10,29 +11,36 @@
 # tests never start httpd or gmid, so the behaviour #815 recorded — a member's
 # symlink resolved from the shared chroot into another member's tree, and a
 # `.git` block matched on the request path while the link is served — had no
-# guardrail. This starts both daemons and reads the paths back.
+# guardrail. This starts both daemons, and the responder they hand requests to,
+# and reads the paths back.
 #
-# The fixture is two member trees and the landing checkout in one chroot:
+# The fixture is one member's two trees and another member's, plus the landing
+# checkout, in one chroot:
 #
-#   alice.kyriakon.net/www/index.html        a plain file, the 200 control
+#   alice.kyriakon.net/www/index.html            a plain file, the 200 control
+#   alice.kyriakon.net/www/sub/index.html        a directory, for the redirect
 #   alice.kyriakon.net/www/leak -> ../../bob.kyriakon.net/www/secret.html
-#   alice.kyriakon.net/www/gitleak -> /landing/www/.git/config
-#   bob.kyriakon.net/www/secret.html         bob's bytes, no link to them
-#   landing/www/.git/config                  [core], the blocked-path target
-#   logs/                                    httpd fatals without it
+#   alice.kyriakon.net/www/gitleak -> <fixture>/landing/www/.git/config
+#   alice.kyriakon.net/gemini/index.gmi          the capsule's control
+#   alice.kyriakon.net/gemini/leak ->            the same two links, from the
+#   alice.kyriakon.net/gemini/gitleak ->         capsule's own tree
+#   bob.kyriakon.net/www/secret.html             bob's bytes, no link to them
+#   landing/www/.git/config                      [core], the link's target
+#   logs/                                        httpd fatals without it
 #
-# The default assertions are the contract #829 names: the plain file is served,
-# the two links serve nothing outside alice's tree, and a direct `/.git/config`
-# request is blocked. CI sets KYRIAKON_815_OPEN=1 while #815 is open, which pins
-# the known behaviour instead — the relative link serves bob's bytes and the
-# absolute link serves the landing checkout's `.git/config` — so the daemons are
-# still exercised. When the chroot shape changes, the default run starts passing
-# and the CI branch is deleted; if it changes the other way, both fail.
+# The contract asserted: the plain file is served, a directory without its
+# trailing separator is redirected to it, the two links serve nothing outside
+# alice's tree on either front-end, and a direct `/.git/config` request is
+# refused. The daemons are configured the way scripts/provision-member-*.sh
+# writes a member's block — a fastcgi socket and no root — so a change to either
+# shape without the other fails here.
 #
 # The full run is OpenBSD-only: it needs root for chroot(2), the www and _gmid
-# accounts, and the two daemons. --self-test builds the same fixture and checks
-# its layout and bytes without starting anything, so a wrong fixture fails
-# loudly instead of a daemon quietly answering 404s on the box.
+# accounts, the two daemons, and a built responder. KYRIAKON_STATIC_BIN names the
+# binary; the default is the release build under control/target. --self-test
+# builds the same fixture and checks its layout, its bytes and the generated
+# configs without starting anything, so a wrong fixture fails loudly instead of a
+# daemon quietly answering 404s on the box.
 
 set -euo pipefail
 
@@ -41,17 +49,21 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 . "$script_dir/lib.sh"
 
 openssl=/usr/bin/openssl
+static_bin=${KYRIAKON_STATIC_BIN:-$script_dir/../control/target/release/kyriakon-control-static}
 chroot_dir=''
+static_pid=''
 httpd_pid=''
 gmid_pid=''
+
+# The one name both daemons serve. It is the member's hostname, not localhost:
+# the responder chooses the tree by it, so a request under another name would be
+# a request for another member.
+HOST='alice.kyriakon.net'
 
 # The bytes the fixture serves. Written with a newline, compared without one:
 # command substitution strips trailing newlines, so these are what `$(cat)`
 # returns from the files below.
 BOB_SECRET='bob wrote this and linked it from nowhere'
-# While #815 is open, CI pins the leak it describes rather than the contract;
-# see the header. The default is the contract.
-known_815=${KYRIAKON_815_OPEN:-0}
 GIT_CONFIG='[core]
 	repositoryformatversion = 0
 	bare = false'
@@ -69,56 +81,76 @@ die() {
 	exit 1
 }
 
-# make_fixture <dir>: the tree both daemon configs point at and both halves of
+# make_fixture <dir>: the tree the daemon configs point at and both halves of
 # the test read. One function, so the configs and --self-test cannot describe
 # two different fixtures.
 make_fixture() {
 	typeset tree="$1"
-	mkdir -p "$tree/alice.kyriakon.net/www" "$tree/bob.kyriakon.net/www" \
-		"$tree/landing/www/.git" "$tree/logs" || return 1
+	mkdir -p "$tree/alice.kyriakon.net/www/sub" "$tree/alice.kyriakon.net/gemini/sub" \
+		"$tree/bob.kyriakon.net/www" "$tree/landing/www/.git" "$tree/run" \
+		"$tree/logs" || return 1
 	printf 'alice\n' > "$tree/alice.kyriakon.net/www/index.html"
+	printf 'sub page\n' > "$tree/alice.kyriakon.net/www/sub/index.html"
+	printf '# alice capsule\n' > "$tree/alice.kyriakon.net/gemini/index.gmi"
+	printf '# sub capsule\n' > "$tree/alice.kyriakon.net/gemini/sub/index.gmi"
 	printf '%s\n' "$BOB_SECRET" > "$tree/bob.kyriakon.net/www/secret.html"
 	printf '%s\n' "$GIT_CONFIG" > "$tree/landing/www/.git/config"
-	# Relative: resolved from the daemon's root after chroot, so it leaves
-	# alice's own tree and lands in bob's. #815's first case.
+	# Relative: from alice's own tree, up to the chroot root and into bob's.
+	# #815's first case, from each of her two trees.
 	ln -s ../../bob.kyriakon.net/www/secret.html "$tree/alice.kyriakon.net/www/leak"
-	# Absolute: after chroot "/landing" is the fixture's landing tree, so this
-	# serves a .git config that the request-path block never sees.
-	ln -s /landing/www/.git/config "$tree/alice.kyriakon.net/www/gitleak"
+	ln -s ../../bob.kyriakon.net/www/secret.html "$tree/alice.kyriakon.net/gemini/leak"
+	# Absolute: the responder is not chrooted, so this names the landing checkout
+	# on the real filesystem. It resolves, and only `O_NOFOLLOW` refuses it.
+	ln -s "$tree/landing/www/.git/config" "$tree/alice.kyriakon.net/www/gitleak"
+	ln -s "$tree/landing/www/.git/config" "$tree/alice.kyriakon.net/gemini/gitleak"
 }
 
 # assert_fixture <dir>: the layout and the bytes, before any daemon starts. A
 # fixture that is wrong here would make the daemon assertions pass or fail for
 # the wrong reason, so it is a hard stop.
 assert_fixture() {
-	typeset tree="$1" ok=yes want
+	typeset tree="$1" ok=yes want kind
 
-	if [ ! -d "$tree/logs" ]; then
-		printf 'verify-hosting: fixture: no %s/logs\n' "$tree" >&2
+	if [ ! -d "$tree/logs" ] || [ ! -d "$tree/run" ]; then
+		printf 'verify-hosting: fixture: no %s/logs or %s/run\n' "$tree" "$tree" >&2
 		ok=no
 	fi
+	for kind in www gemini; do
+		if [ ! -d "$tree/alice.kyriakon.net/$kind" ]; then
+			printf 'verify-hosting: fixture: no alice %s tree\n' "$kind" >&2
+			ok=no
+		fi
+	done
 	if [ ! -f "$tree/alice.kyriakon.net/www/index.html" ]; then
 		printf 'verify-hosting: fixture: no alice index.html\n' >&2
 		ok=no
 	fi
-
-	want='../../bob.kyriakon.net/www/secret.html'
-	if [ "$(readlink "$tree/alice.kyriakon.net/www/leak" 2>/dev/null)" != "$want" ]; then
-		printf 'verify-hosting: fixture: leak is not a link to %s\n' "$want" >&2
-		ok=no
-	elif [ "$(cat "$tree/alice.kyriakon.net/www/leak" 2>/dev/null)" != "$BOB_SECRET" ]; then
-		printf 'verify-hosting: fixture: leak does not resolve to bob bytes\n' >&2
+	if [ ! -f "$tree/alice.kyriakon.net/gemini/index.gmi" ]; then
+		printf 'verify-hosting: fixture: no alice index.gmi\n' >&2
 		ok=no
 	fi
 
-	# The link's target cannot be read through the link off OpenBSD: "/landing"
-	# there is the host's root, not the fixture. Check the target the daemon will
-	# resolve and the file it resolves to.
-	want='/landing/www/.git/config'
-	if [ "$(readlink "$tree/alice.kyriakon.net/www/gitleak" 2>/dev/null)" != "$want" ]; then
-		printf 'verify-hosting: fixture: gitleak is not a link to %s\n' "$want" >&2
-		ok=no
-	elif ! grep -q '^\[core\]$' "$tree/landing/www/.git/config" 2>/dev/null; then
+	want='../../bob.kyriakon.net/www/secret.html'
+	for kind in www gemini; do
+		if [ "$(readlink "$tree/alice.kyriakon.net/$kind/leak" 2>/dev/null)" != "$want" ]; then
+			printf 'verify-hosting: fixture: %s/leak is not a link to %s\n' "$kind" "$want" >&2
+			ok=no
+		elif [ "$(cat "$tree/alice.kyriakon.net/$kind/leak" 2>/dev/null)" != "$BOB_SECRET" ]; then
+			printf 'verify-hosting: fixture: %s/leak does not resolve to bob bytes\n' "$kind" >&2
+			ok=no
+		fi
+	done
+
+	# The link's target is a real path here, so it can be read: the refusal must
+	# not be passing for a missing file.
+	want="$tree/landing/www/.git/config"
+	for kind in www gemini; do
+		if [ "$(readlink "$tree/alice.kyriakon.net/$kind/gitleak" 2>/dev/null)" != "$want" ]; then
+			printf 'verify-hosting: fixture: %s/gitleak is not a link to %s\n' "$kind" "$want" >&2
+			ok=no
+		fi
+	done
+	if ! grep -q '^\[core\]$' "$tree/landing/www/.git/config" 2>/dev/null; then
 		printf 'verify-hosting: fixture: the gitleak target has no [core]\n' >&2
 		ok=no
 	fi
@@ -126,35 +158,41 @@ assert_fixture() {
 	[ "$ok" = yes ]
 }
 
-# httpd_conf <chroot> <port>: the smallest config that has the deployed shape.
+# static_conf <chroot>: the responder's config for this fixture. Its root is the
+# chroot and its sockets are inside it, which is the deployed relation.
+static_conf() {
+	cat <<EOF
+root = "$1"
+httpd_socket = "$1/run/static-httpd.sock"
+gemini_socket = "$1/run/static-gemini.sock"
+EOF
+}
+
+# httpd_conf <chroot> <port>: the shape scripts/provision-member-web.sh writes
+# for a member's loopback block — a fastcgi socket and no root.
 httpd_conf() {
 	cat <<EOF
 chroot "$1"
-server "*" {
+server "$HOST" {
 	listen on 127.0.0.1 port $2
-	location "/.git/*" {
-		block
-	}
 	location "/*" {
-		root "/alice.kyriakon.net/www"
+		fastcgi socket "/run/static-httpd.sock"
 	}
 }
 EOF
 }
 
-# gmid_conf <chroot> <port>: the capsule counterpart, same chroot and root.
+# gmid_conf <chroot> <port>: the capsule counterpart, the shape
+# scripts/provision-member-capsule.sh writes.
 gmid_conf() {
 	cat <<EOF
 chroot "$1"
 user "_gmid"
-server "localhost" {
+server "$HOST" {
 	listen on 127.0.0.1 port $2
 	cert "$1/tls.crt"
 	key "$1/tls.key"
-	root "/alice.kyriakon.net/www"
-	location "/.git/*" {
-		block return 51
-	}
+	fastcgi socket "/run/static-gemini.sock"
 }
 EOF
 }
@@ -175,11 +213,26 @@ free_port() {
 	return 1
 }
 
+# wait_sockets: both responder sockets exist and accept, which is what the
+# daemons need before their first request. A responder that failed at bind exits
+# with the path in its message, and the log is printed above the failure.
+wait_sockets() {
+	typeset tries=0
+	while [ "$tries" -lt 50 ]; do
+		[ -S "$chroot_dir/run/static-httpd.sock" ] &&
+			[ -S "$chroot_dir/run/static-gemini.sock" ] && return 0
+		kill -0 "$static_pid" 2>/dev/null || return 1
+		sleep 0.2
+		tries=$((tries + 1))
+	done
+	return 1
+}
+
 wait_http() {
 	typeset port="$1" tries=0
 	while [ "$tries" -lt 50 ]; do
-		curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$port/index.html" \
-			>/dev/null 2>&1 && return 0
+		curl -s -o /dev/null --max-time 1 --path-as-is -H "Host: $HOST" \
+			"http://127.0.0.1:$port/index.html" >/dev/null 2>&1 && return 0
 		sleep 0.2
 		tries=$((tries + 1))
 	done
@@ -187,17 +240,19 @@ wait_http() {
 }
 
 # gemini_get <port> <path>: the whole response, CRs stripped. curl has no
-# gemini support, so the request line goes through openssl s_client.
+# gemini support, so the request line goes through openssl s_client. The name in
+# the request and the SNI is the member's, because that is what gmid routes and
+# the responder keys the tree on.
 gemini_get() {
-	printf 'gemini://localhost:%s%s\r\n' "$1" "$2" |
-		"$openssl" s_client -connect "127.0.0.1:$1" -servername localhost -quiet \
+	printf 'gemini://%s:%s%s\r\n' "$HOST" "$1" "$2" |
+		"$openssl" s_client -connect "127.0.0.1:$1" -servername "$HOST" -quiet \
 			2>/dev/null | tr -d '\r'
 }
 
 wait_gemini() {
 	typeset port="$1" tries=0
 	while [ "$tries" -lt 50 ]; do
-		[ -n "$(gemini_get "$port" /index.html | sed -n 1p)" ] && return 0
+		[ -n "$(gemini_get "$port" /index.gmi | sed -n 1p)" ] && return 0
 		sleep 0.2
 		tries=$((tries + 1))
 	done
@@ -209,7 +264,7 @@ wait_gemini() {
 expect_http() {
 	typeset port="$1" path="$2" want="$3" pattern="$4" what="$5" body status
 	body=$(mktemp "$chroot_dir/http-body.XXXXXX") || return 1
-	status=$(curl -sS --max-time 5 -o "$body" -w '%{http_code}' \
+	status=$(curl -sS --max-time 5 --path-as-is -o "$body" -w '%{http_code}' -H "Host: $HOST" \
 		"http://127.0.0.1:$port$path" 2>/dev/null) || status='no answer'
 	if [ "$status" != "$want" ]; then
 		rm -f "$body"
@@ -222,6 +277,23 @@ expect_http() {
 	fi
 	rm -f "$body"
 	printf 'ok: http %s: GET %s -> %s\n' "$what" "$path" "$status"
+}
+
+# expect_http_redirect <port> <path> <location> <what>: a 301 whose Location
+# header is the same path with its trailing separator. The header is asserted
+# rather than curl's resolved URL, because a relative Location is resolved
+# against the connection's address, not against the Host this request carries.
+expect_http_redirect() {
+	typeset port="$1" path="$2" want="$3" what="$4" headers status location
+	headers=$(curl -sS --max-time 5 --path-as-is -o /dev/null -D - -H "Host: $HOST" \
+		"http://127.0.0.1:$port$path" 2>/dev/null | tr -d '\r') || headers=''
+	status=$(printf '%s\n' "$headers" | sed -n 1p)
+	location=$(printf '%s\n' "$headers" | awk 'tolower($1) == "location:" { print $2 }')
+	[ "$status" = "HTTP/1.1 301 Moved Permanently" ] ||
+		die "http $what: GET $path answered [$status], wanted 301"
+	[ "$location" = "$want" ] ||
+		die "http $what: GET $path redirects to [$location], wanted $want"
+	printf 'ok: http %s: GET %s -> 301 %s\n' "$what" "$path" "$location"
 }
 
 # expect_gemini <port> <path> <status> <pattern> <what>
@@ -244,7 +316,7 @@ expect_gemini() {
 expect_http_denied() {
 	typeset port="$1" path="$2" secret="$3" what="$4" body status
 	body=$(mktemp "$chroot_dir/http-body.XXXXXX") || return 1
-	status=$(curl -sS --max-time 5 -o "$body" -w '%{http_code}' \
+	status=$(curl -sS --max-time 5 --path-as-is -o "$body" -w '%{http_code}' -H "Host: $HOST" \
 		"http://127.0.0.1:$port$path" 2>/dev/null) || status='no answer'
 	case "$status" in
 	403 | 404) ;;
@@ -253,7 +325,7 @@ expect_http_denied() {
 		die "http $what: GET $path answered [$status], wanted 403 or 404"
 		;;
 	esac
-	if grep -q "$secret" "$body"; then
+	if grep -qF "$secret" "$body"; then
 		rm -f "$body"
 		die "http $what: GET $path served bytes outside the member tree"
 	fi
@@ -271,7 +343,7 @@ expect_gemini_denied() {
 	if [ "$status" != "51" ]; then
 		die "gemini $what: GET $path answered [$line], wanted 51"
 	fi
-	if printf '%s\n' "$response" | grep -q "$secret"; then
+	if printf '%s\n' "$response" | grep -qF "$secret"; then
 		die "gemini $what: GET $path served bytes outside the member tree"
 	fi
 	printf 'ok: gemini %s: GET %s refused as %s\n' "$what" "$path" "$status"
@@ -279,7 +351,7 @@ expect_gemini_denied() {
 
 cleanup() {
 	typeset pid
-	for pid in "$httpd_pid" "$gmid_pid"; do
+	for pid in "$httpd_pid" "$gmid_pid" "$static_pid"; do
 		[ -n "$pid" ] || continue
 		kill "$pid" 2>/dev/null || true
 		wait "$pid" 2>/dev/null || true
@@ -291,13 +363,15 @@ cleanup() {
 }
 
 full_run() {
-	typeset http_port gemini_port httpd_conf_file gmid_conf_file
+	typeset http_port gemini_port static_conf_file httpd_conf_file gmid_conf_file
 
 	[ "$(uname -s)" = OpenBSD ] ||
 		die "the daemon half is OpenBSD-only; run --self-test on this host"
 	[ "$(id -u)" -eq 0 ] ||
 		die "run this with doas: httpd and gmid chroot(2) and drop to their own users"
 	[ -x "$openssl" ] || die "no $openssl"
+	[ -x "$static_bin" ] ||
+		die "no $static_bin: build it with cargo build --release --manifest-path control/Cargo.toml"
 	for prog in httpd gmid curl nc; do
 		command -v "$prog" >/dev/null 2>&1 ||
 			die "no $prog: ksh scripts/install-packages.sh --ci"
@@ -313,6 +387,23 @@ full_run() {
 	make_fixture "$chroot_dir" || die "could not build the fixture under $chroot_dir"
 	assert_fixture "$chroot_dir" || die "the fixture's layout or bytes are wrong"
 
+	# --- the responder ---------------------------------------------------
+	# It starts first: both daemons connect lazily, and a socket that is not
+	# there yet is a 502 on the first request rather than a startup failure.
+	static_conf_file="$chroot_dir/static.toml"
+	static_conf "$chroot_dir" > "$static_conf_file"
+	"$static_bin" --config "$static_conf_file" > "$chroot_dir/static.log" 2>&1 &
+	static_pid=$!
+	wait_sockets || {
+		sed -n 1,20p "$chroot_dir/static.log" >&2
+		die "the responder did not bind its sockets under $chroot_dir/run"
+	}
+	# The live deploy gives each socket a set-group-id directory and 0660, so the
+	# daemon's group is what may connect. The fixture has no such directory, so
+	# the sockets are opened to the daemons' users here; the mode itself is
+	# asserted by scripts/deploy-control.sh's self-test.
+	chmod 0666 "$chroot_dir/run/static-httpd.sock" "$chroot_dir/run/static-gemini.sock"
+
 	# --- httpd -----------------------------------------------------------
 	http_port=$(free_port) || die "no free port for httpd"
 	httpd_conf_file="$chroot_dir/httpd.conf"
@@ -325,23 +416,22 @@ full_run() {
 	printf '%s\n' "$httpd_pid" > "$chroot_dir/httpd.pid"
 	wait_http "$http_port" || {
 		sed -n 1,20p "$chroot_dir/httpd.log" >&2
+		sed -n 1,20p "$chroot_dir/static.log" >&2
 		die "httpd did not answer on 127.0.0.1:$http_port"
 	}
 	expect_http "$http_port" '/index.html' 200 'alice' 'plain file'
-	if [ "$known_815" = 1 ]; then
-		expect_http "$http_port" '/leak' 200 "$BOB_SECRET" 'relative link (known #815)'
-		expect_http "$http_port" '/gitleak' 200 '\[core\]' 'absolute .git link (known #815)'
-	else
-		expect_http_denied "$http_port" '/leak' "$BOB_SECRET" 'relative link'
-		expect_http_denied "$http_port" '/gitleak' '[core]' 'absolute .git link'
-	fi
-	expect_http "$http_port" '/.git/config' 403 '' 'direct .git'
+	expect_http "$http_port" '/' 200 'alice' 'the index a directory serves'
+	expect_http_redirect "$http_port" '/sub' '/sub/' 'directory without its separator'
+	expect_http_denied "$http_port" '/leak' "$BOB_SECRET" 'relative link'
+	expect_http_denied "$http_port" '/gitleak' 'repositoryformatversion' 'absolute .git link'
+	expect_http_denied "$http_port" '/.git/config' 'repositoryformatversion' 'direct .git'
+	expect_http_denied "$http_port" '/sub/../leak' "$BOB_SECRET" 'traversal spelling'
 
 	# --- gmid ------------------------------------------------------------
 	gemini_port=$(free_port) || die "no free port for gmid"
 	gmid_conf_file="$chroot_dir/gmid.conf"
 	gmid_conf "$chroot_dir" "$gemini_port" > "$gmid_conf_file"
-	"$openssl" req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" \
+	"$openssl" req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=$HOST" \
 		-keyout "$chroot_dir/tls.key" -out "$chroot_dir/tls.crt" >/dev/null 2>&1 ||
 		die "could not make the self-signed certificate"
 	gmid -n -c "$gmid_conf_file" || die "gmid refused the fixture config"
@@ -349,29 +439,26 @@ full_run() {
 	gmid_pid=$!
 	wait_gemini "$gemini_port" || {
 		sed -n 1,20p "$chroot_dir/gmid.log" >&2
+		sed -n 1,20p "$chroot_dir/static.log" >&2
 		die "gmid did not answer on 127.0.0.1:$gemini_port"
 	}
-	expect_gemini "$gemini_port" '/index.html' 20 'alice' 'plain file'
-	if [ "$known_815" = 1 ]; then
-		expect_gemini "$gemini_port" '/leak' 20 "$BOB_SECRET" 'relative link (known #815)'
-		expect_gemini "$gemini_port" '/gitleak' 20 '\[core\]' 'absolute .git link (known #815)'
-	else
-		expect_gemini_denied "$gemini_port" '/leak' "$BOB_SECRET" 'relative link'
-		expect_gemini_denied "$gemini_port" '/gitleak' '[core]' 'absolute .git link'
-	fi
-	expect_gemini "$gemini_port" '/.git/config' 51 '' 'direct .git'
+	expect_gemini "$gemini_port" '/index.gmi' 20 'alice capsule' 'plain file'
+	expect_gemini "$gemini_port" '/sub' 31 "gemini://$HOST/sub/" 'directory without its separator'
+	expect_gemini_denied "$gemini_port" '/leak' "$BOB_SECRET" 'relative link'
+	expect_gemini_denied "$gemini_port" '/gitleak' 'repositoryformatversion' 'absolute .git link'
+	expect_gemini_denied "$gemini_port" '/.git/config' 'repositoryformatversion' 'direct .git'
 
-	printf '\nverify-hosting: httpd and gmid served the fixture\n'
+	printf '\nverify-hosting: httpd, gmid and the responder served the fixture as the contract says\n'
 }
 
 # --- self-test ---------------------------------------------------------------
 #
-# The fixture and the two config shapes are what the daemon run rests on, and
-# both are built with no root and no daemon here. The daemons themselves are
+# The fixture and the config shapes are what the daemon run rests on, and both
+# are built with no root and no daemon here. The daemons themselves are
 # exercised by the full run in CI's OpenBSD VM.
 
 self_test() {
-	typeset tree bad conf first_location
+	typeset tree bad conf
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work/fixture
@@ -383,15 +470,19 @@ self_test() {
 
 	check "the fixture has httpd's log directory" \
 		"$([ -d "$tree/logs" ] && printf yes || printf no)" yes
-	check "alice's plain file is there" \
-		"$([ -f "$tree/alice.kyriakon.net/www/index.html" ] && printf yes || printf no)" yes
-	check "leak is a relative link out of alice's tree" \
+	check "alice's plain files are there" \
+		"$([ -f "$tree/alice.kyriakon.net/www/index.html" ] &&
+			[ -f "$tree/alice.kyriakon.net/gemini/index.gmi" ] && printf yes || printf no)" yes
+	check "leak is a relative link out of alice's web tree" \
 		"$(readlink "$tree/alice.kyriakon.net/www/leak")" \
+		'../../bob.kyriakon.net/www/secret.html'
+	check "and out of her capsule tree" \
+		"$(readlink "$tree/alice.kyriakon.net/gemini/leak")" \
 		'../../bob.kyriakon.net/www/secret.html'
 	check "leak resolves to bob's bytes" \
 		"$(cat "$tree/alice.kyriakon.net/www/leak")" "$BOB_SECRET"
 	check "gitleak is an absolute link to the landing checkout" \
-		"$(readlink "$tree/alice.kyriakon.net/www/gitleak")" '/landing/www/.git/config'
+		"$(readlink "$tree/alice.kyriakon.net/www/gitleak")" "$tree/landing/www/.git/config"
 	check "the gitleak target holds a git config" \
 		"$(grep -c '^\[core\]$' "$tree/landing/www/.git/config")" 1
 	check "a complete fixture passes its own check" \
@@ -409,26 +500,35 @@ self_test() {
 	check "a leak serving the wrong bytes is refused" \
 		"$(assert_fixture "$bad" >/dev/null 2>&1 && printf yes || printf no)" no
 
-	# The configs the daemons will read: chroot, root and first match.
+	# The configs the daemons will read, and the responder's: the socket, not a
+	# root, and no `.git` block to rely on.
+	conf=$(static_conf "$tree")
+	check "static.toml roots at the fixture" \
+		"$(printf '%s\n' "$conf" | grep -cF "root = \"$tree\"")" 1
+	check "static.toml puts both sockets inside it" \
+		"$(printf '%s\n' "$conf" | grep -cF "socket = \"$tree/run/")" 2
+
 	conf=$(httpd_conf "$tree" 19650)
 	check "httpd.conf chroots to the fixture" \
 		"$(printf '%s\n' "$conf" | grep -cF "chroot \"$tree\"")" 1
-	check "httpd.conf roots at alice's tree" \
-		"$(printf '%s\n' "$conf" | grep -cF 'root "/alice.kyriakon.net/www"')" 1
-	first_location=$(printf '%s\n' "$conf" | sed -n 's/.*location "\([^"]*\)".*/\1/p' | sed -n 1p)
-	check "httpd.conf matches .git before the catch-all" "$first_location" '/.git/*'
-	check "httpd.conf blocks rather than redirects .git" \
-		"$(printf '%s\n' "$conf" | grep -c 'block$')" 1
+	check "httpd.conf serves the member's name" \
+		"$(printf '%s\n' "$conf" | grep -cF "server \"$HOST\"")" 1
+	check "httpd.conf hands every path to the responder" \
+		"$(printf '%s\n' "$conf" | grep -cF 'fastcgi socket "/run/static-httpd.sock"')" 1
+	check "httpd.conf names no root" \
+		"$(printf '%s\n' "$conf" | grep -c '^[[:space:]]*root ')" 0
 
 	conf=$(gmid_conf "$tree" 19650)
 	check "gmid.conf chroots to the fixture" \
 		"$(printf '%s\n' "$conf" | grep -cF "chroot \"$tree\"")" 1
-	check "gmid.conf roots at alice's tree" \
-		"$(printf '%s\n' "$conf" | grep -cF 'root "/alice.kyriakon.net/www"')" 1
-	first_location=$(printf '%s\n' "$conf" | sed -n 's/.*location "\([^"]*\)".*/\1/p' | sed -n 1p)
-	check "gmid.conf matches .git before serving a root" "$first_location" '/.git/*'
-	check "gmid.conf answers a blocked path with 51" \
-		"$(printf '%s\n' "$conf" | grep -c 'block return 51')" 1
+	check "gmid.conf serves the member's name" \
+		"$(printf '%s\n' "$conf" | grep -cF "server \"$HOST\"")" 1
+	check "gmid.conf hands every path to the responder" \
+		"$(printf '%s\n' "$conf" | grep -cF 'fastcgi socket "/run/static-gemini.sock"')" 1
+	check "gmid.conf names no root" \
+		"$(printf '%s\n' "$conf" | grep -c '^[[:space:]]*root ')" 0
+	check "and no .git block" \
+		"$(printf '%s\n' "$conf" | grep -c 'location')" 0
 
 	self_test_end
 }
