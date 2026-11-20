@@ -279,15 +279,21 @@ expect_http() {
 	printf 'ok: http %s: GET %s -> %s\n' "$what" "$path" "$status"
 }
 
-# expect_http_redirect <port> <path> <location> <what>: a 301 whose Location is
-# the same path with its trailing separator.
+# expect_http_redirect <port> <path> <location> <what>: a 301 whose Location
+# header is the same path with its trailing separator. The header is asserted
+# rather than curl's resolved URL, because a relative Location is resolved
+# against the connection's address, not against the Host this request carries.
 expect_http_redirect() {
-	typeset port="$1" path="$2" want="$3" what="$4" seen
-	seen=$(curl -sS --max-time 5 --path-as-is -o /dev/null \
-		-w '%{http_code} %{redirect_url}' -H "Host: $HOST" "http://127.0.0.1:$port$path" 2>/dev/null) || seen='no answer'
-	[ "$seen" = "301 http://$HOST:$port$want" ] ||
-		die "http $what: GET $path answered [$seen], wanted 301 to $want"
-	printf 'ok: http %s: GET %s -> 301 %s\n' "$what" "$path" "$want"
+	typeset port="$1" path="$2" want="$3" what="$4" headers status location
+	headers=$(curl -sS --max-time 5 --path-as-is -o /dev/null -D - -H "Host: $HOST" \
+		"http://127.0.0.1:$port$path" 2>/dev/null | tr -d '\r') || headers=''
+	status=$(printf '%s\n' "$headers" | sed -n 1p)
+	location=$(printf '%s\n' "$headers" | awk 'tolower($1) == "location:" { print $2 }')
+	[ "$status" = "HTTP/1.1 301 Moved Permanently" ] ||
+		die "http $what: GET $path answered [$status], wanted 301"
+	[ "$location" = "$want" ] ||
+		die "http $what: GET $path redirects to [$location], wanted $want"
+	printf 'ok: http %s: GET %s -> 301 %s\n' "$what" "$path" "$location"
 }
 
 # expect_gemini <port> <path> <status> <pattern> <what>
