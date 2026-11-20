@@ -423,12 +423,12 @@ The drain is the one program that runs as root from cron, and since #849 it cuts
 	doas ksh scripts/deploy-control.sh
 	doas /usr/local/sbin/kyriakon-control-drain --config /etc/kyriakon/onboard/drain.toml
 
-A clean pass exits 0 and leaves the store as it found it. Its stderr is what cron would mail, and it carries a notice only for an intent that fails. Then read the kernel's record and the journal:
+A clean pass exits 0 and leaves the store as it found it. Its stderr is what cron would mail, and it carries a notice only for an intent that fails. Then read the journal and the kernel log:
 
-	doas lastcomm kyriakon-control-drain | sed -n 1,5p
 	doas tail -n 3 /var/db/onboard/journal.jsonl
+	doas grep 'kyriakon-control-drain' /var/log/messages | tail -n 5
 
-`lastcomm` marks the process with `U` when unveil refused an access it tried. A `U` line and a pass that still exited 0 means a path is missing from the list and a transition silently did less than it should; add that path to `sandbox.rs` with the mode its call site needs. A non-zero exit names the path and the errno text, for example `unveil /var/db/onboard/rates: No such file or directory` when a configured directory does not exist. Fix the config or create the directory; do not widen the list to make the error go away.
+A line naming `signal ABRT` means pledge stopped a syscall the pass attempted, so a promise is missing. If BSD accounting is enabled (`rcctl get accounting`), `doas lastcomm kyriakon-control-drain` marks the process with `U` when unveil refused an access it tried. A `U` line with exit 0 means a path is missing from the list and a transition did less than it should; add that path to `sandbox.rs` with the mode its call site needs. A non-zero exit names the path and the errno text, for example `unveil /var/db/onboard/rates: No such file or directory` when a configured directory does not exist. Fix the config or create the directory; do not widen the list to make the error go away.
 
 A promise the pass needs and the list lacks does not produce an error. The kernel sends `SIGABRT` at the first such syscall, so a pass that dies abruptly after the first intent is a promise problem, and the fix is one word in `PROMISES` beside the comment naming the operation that needs it.
 
