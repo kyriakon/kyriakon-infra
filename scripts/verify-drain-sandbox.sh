@@ -46,7 +46,16 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 
 repo=$(cd "$script_dir/.." && pwd)
 drain_bin=${KYRIAKON_DRAIN_BIN:-$repo/control/target/release/kyriakon-control-drain}
+admin_bin=${KYRIAKON_ADMIN_BIN:-$repo/control/target/release/kyriakon-admin}
 config_src=$repo/openbsd/etc/onboard/drain.toml
+# The member key the fixture's application carries: the throwaway public key
+# the export tests use. It carries an encryption subkey, which is what the
+# approval insists on, and it has no private half anywhere. It is extracted from
+# the Rust source so the suite holds one copy of it.
+key_src=$repo/control/crates/tests/tests/areas/export.rs
+# The application's status token: 26 Crockford characters, the shape
+# Store::is_status_token accepts.
+status_token=01arz3ndektsv4rrffq69g5fav
 
 usage() {
 	cat >&2 <<'USAGE'
@@ -80,6 +89,7 @@ make_fixture() {
 	typeset tree=$1
 	mkdir -p "$tree/store/intents" "$tree/store/accounts" "$tree/store/groups" \
 		"$tree/store/holds" "$tree/store/webhooks" "$tree/store/ledger" \
+		"$tree/store/sessions" \
 		"$tree/store/rates" "$tree/store/drafts" "$tree/store/applications" \
 		"$tree/logins" "$tree/keyring" "$tree/mail/new" "$tree/mail/cur" \
 		"$tree/bounce/new" "$tree/home/www" "$tree/bin" "$tree/log" || return 1
@@ -118,6 +128,13 @@ make_fixture() {
 	stub "$tree/bin/dig" 'exit 0'
 	stub "$tree/bin/repquota" 'exit 0'
 	stub "$tree/bin/gpg" 'exit 0'
+	# Every privileged script the approval runs. Each records its own name, which
+	# is what proves the drain exec'd it under the pledge.
+	typeset name
+	for name in add-user.sh provision-member.sh publish-mail-key.sh cron-apply.sh; do
+		stub "$tree/bin/$name" \
+			"printf '%s %s\\n' \"\$0\" \"\$*\" >> '$tree/log/scripts'"
+	done
 }
 
 # config_for <tree>: the tracked drain.toml with every path pointed at <tree>.
@@ -150,7 +167,67 @@ config_for() {
 		-e "s|^gpg = .*|gpg = \"$tree/bin/gpg\"|" \
 		-e "s|^proof_dir = .*|proof_dir = \"$tree/logins\"|" \
 		-e "s|^public_root = .*|public_root = \"$tree/home/www\"|" \
+		-e "s|^ipv4 = .*|ipv4 = \"192.0.2.10\"|" \
+		-e "s|^ipv6 = .*|ipv6 = \"2001:db8::10\"|" \
+		-e "s|^dkim_selector = .*|dkim_selector = \"mail\"|" \
+		-e "s|^dkim_public_key = .*|dkim_public_key = \"v=DKIM1; k=rsa; p=example\"|" \
+		-e "s|^postal_address = .*|postal_address = \"1 Example Street, Example\"|" \
 		"$config_src"
+}
+
+# extract_member_key <out>: the public key block the export tests carry, with
+# the Rust string quoting and continuations removed. The approval re-inspects
+# the material, so a real frame with a subkey is what lets that check run.
+extract_member_key() {
+	awk '
+		/BEGIN PGP PUBLIC KEY BLOCK/ { started = 1 }
+		started {
+			line = $0
+			sub(/^.*BEGIN PGP PUBLIC KEY BLOCK-----/, "-----BEGIN PGP PUBLIC KEY BLOCK-----", line)
+			gsub(/\\n/, "\n", line)
+			gsub(/\\/, "", line)
+			print line
+			if (line ~ /END PGP PUBLIC KEY BLOCK-----/) exit
+		}
+	' "$key_src" | sed '/^[[:space:]]*$/d' > "$1"
+}
+
+# file_approval <tree> <key>: the handler-shaped application the console's
+# decision needs, filed in applications/ under its own token. Every field the
+# approval reads is here, and there is no outside address, so the confirmation
+# letter has nowhere to go and the pass does not depend on it.
+file_approval() {
+	typeset tree=$1 key=$2
+	mkdir -p "$tree/store/applications"
+	jq -n --arg token "$status_token" --arg key "$(cat "$key")" '{
+		username: "alice",
+		status_token: $token,
+		filed_at: "2026-11-01T09:00:00Z",
+		front_end: "web",
+		stage: "received",
+		answers: {},
+		mail_keys: [{mailbox: "", fingerprint: "", material: $key, verdict: "works"}],
+		upload_key: {mailbox: "", fingerprint: "SHA256:fixture", material: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample alice@example", verdict: "unchecked"},
+		rail: "",
+		no_charge: true,
+		acceptances: [],
+		question_list: "fixture"
+	}' > "$tree/store/applications/$status_token.json"
+}
+
+# file_export <tree>: a proved session and the intent the account page files.
+# The proof is the root-written file the drain checks, with a real 64 hex name
+# and a live expiry, and the intent's id sorts after the console's ULID so the
+# second pass reads it after the account exists.
+file_export() {
+	typeset tree=$1 session proof
+	session=01arz3ndektsv4rrffq69g5faw
+	proof=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+	printf '{"username":"alice","expires":%s}\n' "$(( $(date +%s) + 3600 ))" \
+		> "$tree/logins/$proof"
+	printf '{"proof":"%s"}\n' "$proof" > "$tree/store/sessions/$session.json"
+	printf '{"id":"09ZZZZZZZZZZZZZZZZZZZZZZZZ","kind":"export","filed_at":"2026-11-01T09:05:00Z","username":"alice","session":"%s"}\n' \
+		"$session" > "$tree/store/intents/09ZZZZZZZZZZZZZZZZZZZZZZZZ.json"
 }
 
 # assert_fixture <dir>: the shape the pass depends on, before anything runs.
@@ -179,6 +256,23 @@ full_run() {
 	assert_fixture "$tree" || die "the fixture is incomplete"
 	config_for "$tree" > "$work/drain.toml"
 
+	[ -x "$admin_bin" ] ||
+		missing "no console at $admin_bin; set KYRIAKON_ADMIN_BIN"
+	[ -f "$key_src" ] || missing "no test key source at $key_src"
+	command -v jq >/dev/null 2>&1 || missing "jq is needed to write the fixture's application"
+	extract_member_key "$work/member-key.asc"
+	grep -q '^-----BEGIN PGP PUBLIC KEY BLOCK-----$' "$work/member-key.asc" ||
+		die "could not extract the test key"
+
+	# The console signs an approval of the fixture's application with the same
+	# key the drain verifies, so the pass below carries a real root verb.
+	file_approval "$tree" "$work/member-key.asc"
+	if ! "$admin_bin" --config "$work/drain.toml" approve-free alice "$status_token" \
+		> "$work/admin-out" 2>&1; then
+		sed -n 1,20p "$work/admin-out" >&2
+		die "the console could not sign the fixture's decision"
+	fi
+
 	# The pass must finish. Its stderr carries the malformed intent's report,
 	# which is expected; the exit status is what says unveil and pledge held.
 	if ! "$drain_bin" --config "$work/drain.toml" > "$work/out" 2>&1; then
@@ -186,6 +280,21 @@ full_run() {
 		die "the drain failed under unveil and pledge"
 	fi
 
+	# The approval reached the store, the keyring and the privileged scripts:
+	# account_on_box read /etc/passwd, name_allowed read the reserved names, and
+	# the four scripts ran by execve under the pledge.
+	[ -f "$tree/store/accounts/alice/account.json" ] ||
+		die "the approval wrote no account record"
+	grep -q '"no_charge": true' "$tree/store/accounts/alice/account.json" ||
+		die "the approval did not record the free decision"
+	[ -f "$tree/keyring/alice.asc" ] ||
+		die "the approval did not write the member's key into the keyring"
+	for script in add-user.sh provision-member.sh publish-mail-key.sh; do
+		grep -q "$script" "$tree/log/scripts" ||
+			die "the approval did not run $script"
+	done
+	grep -q '"outcome":"applied"' "$tree/store/journal.jsonl" ||
+		die "the approval was not journalled as applied"
 	# The malformed intent is a pass failure the drain mails about: the stub's
 	# marker is proof that fork and exec of sendmail survived the pledge.
 	grep -q 'the drain failed' "$tree/log/sendmail" ||
@@ -198,6 +307,18 @@ full_run() {
 	# The rate cache was fetched by curl and written by the pass.
 	grep -q '409.44' "$tree/store/rates/xmr-gbp.json" ||
 		die "the rate cache was not written"
+
+	# A second pass, with the member now on the box and a proved session, carries
+	# the export: public_root is written and every file is chowned.
+	printf 'alice:*:1001:1001::0:0:Alice:/nonexistent:/sbin/nologin\n' >> "$tree/passwd"
+	mkdir -p "$tree/home/www/alice.kyriakon.net"
+	file_export "$tree"
+	if ! "$drain_bin" --config "$work/drain.toml" > "$work/export-out" 2>&1; then
+		sed -n 1,40p "$work/export-out" >&2
+		die "the drain failed on the export pass"
+	fi
+	[ -n "$(find "$tree/home/www/alice.kyriakon.net/export" -type f -print -quit 2>/dev/null)" ] ||
+		die "the export wrote no bundle under public_root"
 
 	# A path whose parent does not exist fails at unveil, and the message names
 	# the path and the errno text: the operator can fix the config from cron mail.
