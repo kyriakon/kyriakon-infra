@@ -416,7 +416,7 @@ A failed publish is reported by the drain, which names the member and the finger
 
 ### The drain's first run under unveil and pledge
 
-The drain is the one program that runs as root from cron, and since #849 it cuts its own view before the first pass. `control/crates/drain/src/sandbox.rs` unveils every path a pass opens, locks the list with `unveil(NULL, NULL)`, then pledges `stdio rpath wpath cpath fattr flock proc exec`. The file's comments name the call site for each entry.
+The drain is the one program that runs as root from cron, and since #849 it cuts its own view before the first pass. `control/crates/drain/src/sandbox.rs` unveils every path a pass opens, locks the list with `unveil(NULL, NULL)`, then pledges `stdio rpath wpath cpath fattr chown flock proc exec`. `chown` is separate from `fattr` because fattr permits the syscall but refuses to change the owner. The file's comments name the call site for each entry.
 
 `scripts/deploy-control.sh` rebuilds the release and installs `/usr/local/sbin/kyriakon-control-drain`, so the ordinary deploy is the install step. The first run after it is the one to watch, because a path or promise the pass needs and the list misses fails there and not in a test:
 
