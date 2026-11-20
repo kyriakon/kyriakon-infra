@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# Exposes the FastCGI request fixtures to the packages whose tests read them.
+# Never enabled for the service binaries.
+test-fixtures = []
+
 [dependencies]
 bcrypt.workspace = true
 hmac.workspace = true

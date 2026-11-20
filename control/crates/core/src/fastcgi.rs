@@ -114,7 +114,7 @@ pub enum Error {
     /// A failure whose context is the value the caller needs, with its source.
     Context {
         context: String,
-        source: Box<kyriakon_control_core::Source>,
+        source: Box<crate::Source>,
     },
 }
 
@@ -148,10 +148,7 @@ impl From<std::io::Error> for Error {
 }
 
 impl Error {
-    pub fn context(
-        context: impl Into<String>,
-        source: impl Into<kyriakon_control_core::Source>,
-    ) -> Self {
+    pub fn context(context: impl Into<String>, source: impl Into<crate::Source>) -> Self {
         Error::Context {
             context: context.into(),
             source: Box::new(source.into()),
@@ -447,7 +444,7 @@ impl Reply {
     /// The Titan listener writes this straight to its socket: there is no front-end
     /// between the handler and the client there, so gemini's framing is the wire
     /// format.
-    pub(crate) fn head(&self) -> Vec<u8> {
+    pub fn head(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
             Reply::Http(http) => {
@@ -521,8 +518,8 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod fixture {
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod fixture {
     //! Requests as the two front-ends write them, for the tests of what reads
     //! them. The responder's check sends a request the way httpd and gmid send
     //! one, so the bytes are built once, here, rather than in each test that
@@ -532,7 +529,7 @@ pub(crate) mod fixture {
 
     /// One record, with the request id and type given, which is what a test that
     /// is deliberately sending something malformed needs.
-    pub(crate) fn raw(id: u16, kind: u8, content: &[u8]) -> Vec<u8> {
+    pub fn raw(id: u16, kind: u8, content: &[u8]) -> Vec<u8> {
         let mut out = vec![VERSION, kind];
         out.extend_from_slice(&id.to_be_bytes());
         out.extend_from_slice(&(content.len() as u16).to_be_bytes());
@@ -573,7 +570,7 @@ pub(crate) mod fixture {
 
     /// A request as httpd sends one: the responder role, no keep-connection flag,
     /// the short length form, and the body in stdin records.
-    pub(crate) fn httpd(env: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+    pub fn httpd(env: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
         let mut out = record(BEGIN_REQUEST, 1, &[0, 1, 0, 0, 0, 0, 0, 0]);
         let mut params = Vec::new();
         for (name, value) in env {
@@ -592,7 +589,7 @@ pub(crate) mod fixture {
 
     /// A request as gmid sends one: the responder role, the keep-connection flag,
     /// the four-byte length form, and no body, because a gemini request has none.
-    pub(crate) fn gmid(env: &[(&str, &str)]) -> Vec<u8> {
+    pub fn gmid(env: &[(&str, &str)]) -> Vec<u8> {
         let mut out = record(BEGIN_REQUEST, 1, &[0, 1, 1, 0, 0, 0, 0, 0]);
         let mut params = Vec::new();
         for (name, value) in env {
@@ -607,7 +604,7 @@ pub(crate) mod fixture {
     /// The bytes a front-end reads out of a reply: the stdout records'
     /// contents, concatenated, which is the header block and the body, and the
     /// end marker's type as the last thing in the stream.
-    pub(crate) fn reply(bytes: &[u8]) -> (Vec<u8>, u8) {
+    pub fn reply(bytes: &[u8]) -> (Vec<u8>, u8) {
         let mut body = Vec::new();
         let mut at = 0;
         let mut last = 0;
@@ -626,7 +623,7 @@ pub(crate) mod fixture {
 
     /// The end marker's type, so a test can say a reply was finished rather than
     /// truncated.
-    pub(crate) const END: u8 = END_REQUEST;
+    pub const END: u8 = END_REQUEST;
 }
 
 #[cfg(test)]

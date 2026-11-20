@@ -20,3 +20,8 @@ serde_json.workspace = true
 time.workspace = true
 tokio.workspace = true
 ulid.workspace = true
+
+[dev-dependencies]
+# The FastCGI fixtures the responder's tests send, built in core so the wire has
+# one description.
+kyriakon-control-core = { path = "../core", features = ["test-fixtures"] }
