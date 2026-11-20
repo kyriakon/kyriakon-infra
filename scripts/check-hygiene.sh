@@ -264,6 +264,23 @@ store_drift() {
 	find "$1" -type f ! -user "$2" -print
 }
 
+# rooted_vhosts <dir>...: the generated vhosts that still serve their tree from a
+# `root` inside the shared chroot. A member content vhost is the socket shape now,
+# and has no 8080 block without it; a file that has the block and no socket was
+# written before the change and its lane has not been run since.
+rooted_vhosts() {
+	typeset dir file
+	for dir in "$@"; do
+		for file in "$dir"/*.conf; do
+			[ -f "$file" ] || continue
+			case "$file" in */index.conf) continue ;; esac
+			grep -q 'port 8080' "$file" || continue
+			grep -q 'fastcgi socket' "$file" && continue
+			printf '%s\n' "$file"
+		done
+	done
+}
+
 # permission_drift <mtree-spec>
 #
 # The mode, uid, gid, type, size and link differences mtree reports, one per line.
@@ -342,6 +359,22 @@ self_test() {
 	# a name this function scoped and set -u would then refuse.
 	# shellcheck disable=SC2064
 	trap "rm -rf '$dir'" EXIT
+
+	# A vhost is stale only when it has the loopback block and no socket: a port
+	# 80 only file carries root "/acme" and is current, and a socket file is too.
+	mkdir "$dir/httpd.d" "$dir/gmid.d"
+	printf 'server "alice.kyriakon.net" {\n\tlocation "/.well-known/acme-challenge/*" {\n\t\troot "/acme"\n\t}\n}\n' \
+		> "$dir/httpd.d/alice.kyriakon.net.conf"
+	printf 'server "parish.example" {\n\tlisten on 127.0.0.1 port 8080\n\tlocation "/*" {\n\t\troot "/parish-secretary.kyriakon.net/www"\n\t}\n}\n' \
+		> "$dir/httpd.d/parish.example.conf"
+	printf 'server "bob.kyriakon.net" {\n\tlisten on 127.0.0.1 port 8080\n\tlocation "/*" {\n\t\tfastcgi socket "/run/onboard-static-httpd/static.sock"\n\t}\n}\n' \
+		> "$dir/httpd.d/bob.kyriakon.net.conf"
+	want="$dir/httpd.d/parish.example.conf"
+	out=$(rooted_vhosts "$dir/httpd.d" "$dir/gmid.d")
+	[ "$out" = "$want" ] || {
+		printf 'FAIL: the stale vhost check; expected [%s], got [%s]\n' "$want" "$out" >&2
+		exit 1
+	}
 
 	printf 'kyriakon.net\nparish.example\nschool.example\n' > "$dir/mail_domains"
 	printf '# the platform domain, and nothing else yet\n@kyriakon.net\n' > "$dir/allowed"
@@ -1171,5 +1204,25 @@ for sub in accounts groups; do
 		printf '%s/ directories: every record directory is group-readable\n' "$sub"
 	fi
 done
+
+# --- 11. a generated vhost that still roots the member's tree -------------
+# Every generated vhost served from `root` inside the shared /home/www chroot
+# until the member content responder landed, and there a symlink a member planted
+# reached a neighbour's tree and the platform's .git (#815). The generators write
+# the socket shape now, but a generator rewrites a file only when its bytes
+# differ, so a file written before the change keeps serving from a root until its
+# own lane runs again. The site works either way, which is what makes this silent.
+stale_vhosts=$(rooted_vhosts /etc/httpd.d /etc/gmid.d)
+if [ -n "$stale_vhosts" ]; then
+	printf 'generated vhosts still serving from a root inside the chroot:\n'
+	printf '%s\n' "$stale_vhosts" | sed -e 's/^/  /'
+	printf "  each one is served by httpd or gmid out of /home/www, so a symlink a member\n"
+	printf "  plants there reaches another member's tree (#815). Run that site's lane\n"
+	printf '  (scripts/provision-member-web.sh <user>, scripts/provision-member-capsule.sh\n'
+	printf '  <user>, or the group pair), then scripts/cron-apply.sh --web.\n'
+	status=1
+else
+	printf 'generated vhosts: every one hands its paths to the responder\n'
+fi
 
 exit "$status"

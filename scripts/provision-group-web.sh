@@ -46,8 +46,11 @@
 # The paths inside the blocks are httpd's. httpd chroots to /home/www, so
 # The site's content is not a root: every path goes to the member content
 # responder, which serves the site account's own tree and refuses links, because
-# that tree is writable by the account (#815). root "/acme" is the challenge
-# directory the mail deploy created.
+# that tree is writable by the account (#815). The vhost is named for the body's
+# domain and the files live in the site owner's tree, so this script also writes
+# /etc/onboard/static-hosts/<domain> with that tree's name: the responder has no
+# other way to know the two differ. root "/acme" is the challenge directory the
+# mail deploy created.
 #
 # Nothing is written when the file already holds the bytes this script would
 # write, so a run after a certificate has not landed yet is free.
@@ -78,6 +81,9 @@ httpd_d=/etc/httpd.d
 ssl_dir=/etc/ssl
 ssl_private=/etc/ssl/private
 public_root=/home/www
+# The responder's host-to-tree map: one file per domain whose files live in the
+# site owner's member tree rather than in a directory named after the domain.
+static_hosts=/etc/onboard/static-hosts
 conf_owner="root:wheel"
 
 usage() {
@@ -112,6 +118,12 @@ cert_file() { printf '%s/%s.fullchain.pem' "$ssl_dir" "$domain"; }
 key_file() { printf '%s/%s.key' "$ssl_private" "$domain"; }
 group_conf() { printf '%s/%s.conf' "$httpd_d" "$domain"; }
 site_public() { printf '%s/%s.kyriakon.net' "$public_root" "$account"; }
+host_map() { printf '%s/%s' "$static_hosts" "$domain"; }
+
+# The tree this domain is served from, as the responder reads it: the site
+# owner's member tree, named rather than derived, because the vhost is named for
+# the domain and the files are not under it.
+host_map_body() { printf '%s.kyriakon.net\n' "$account"; }
 
 # The file body, printed rather than written so the caller can hold it in a work
 # file and compare it with what is already there.
@@ -180,6 +192,13 @@ group_conf_body() {
 write_group_conf() {
 	typeset target
 
+	# The map first, so a vhost that names the socket is never live before the
+	# responder knows which tree the name belongs to. Its write also leaves
+	# conf_changed set, which the vhost's write below replaces.
+	if ! write_generated "$(host_map)" host_map_body; then
+		return 1
+	fi
+
 	target=$(group_conf)
 
 	# A certificate without its key is refused by write_generated, which returns 1
@@ -211,11 +230,19 @@ write_group_conf() {
 # it, and root's. The expected owner is a variable because the self-test's tree
 # belongs to whoever runs the test.
 assert_group_conf() {
-	typeset conf shape
+	typeset conf shape map
 	conf=$(group_conf)
 	[ -f "$conf" ] || die "$conf is not there after writing it"
 	shape=$(stat -f '%Su:%Sg %Lp' "$conf")
 	[ "$shape" = "$conf_owner 644" ] || die "$conf is $shape, wanted $conf_owner 644"
+	# Without this file the responder looks for a directory named after the
+	# domain, finds none and answers 404 for the whole site.
+	map=$(host_map)
+	[ -f "$map" ] || die "$map is not there after writing it"
+	[ "$(cat "$map")" = "$account.kyriakon.net" ] \
+		|| die "$map names $(cat "$map"), wanted $account.kyriakon.net"
+	shape=$(stat -f '%Su:%Sg %Lp' "$map")
+	[ "$shape" = "$conf_owner 644" ] || die "$map is $shape, wanted $conf_owner 644"
 }
 
 # The site owner's tree, built by scripts/provision-member.sh. A vhost for a
@@ -234,7 +261,7 @@ assert_site_tree() {
 # in each state, and the refusals. Runs as anyone, writes only under TMPDIR.
 
 self_test() {
-	typeset tree conf before code
+	typeset tree conf before code map_before
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work
@@ -243,9 +270,11 @@ self_test() {
 	ssl_dir="$tree/etc/ssl"
 	ssl_private="$ssl_dir/private"
 	public_root="$tree/home/www"
+	static_hosts="$tree/etc/onboard/static-hosts"
 	domain=parish.example
 	account=parish-secretary
-	install -d -m 0755 "$httpd_d" "$ssl_private" "$public_root/parish-secretary.kyriakon.net/www"
+	install -d -m 0755 "$httpd_d" "$ssl_private" "$public_root/parish-secretary.kyriakon.net/www" \
+		"$static_hosts"
 	conf_owner="$(id -un):$(stat -f '%Sg' "$httpd_d")"
 	conf=$(group_conf)
 
@@ -260,6 +289,8 @@ self_test() {
 		"$(grep -cF 'block return 301 "https://parish.example$REQUEST_URI"' "$conf")" 2
 	check "there is no site behind the relay yet" "$(grep -c '127.0.0.1 port 8080' "$conf")" 0
 	check "the file is mode 644 and the writer's" "$(stat -f '%Su:%Sg %Lp' "$conf")" "$conf_owner 644"
+	check "the responder's map names the site owner's tree" \
+		"$(cat "$(host_map)")" "parish-secretary.kyriakon.net"
 	assert_group_conf
 	printf '\n%s:\n' "$conf"
 	cat "$conf"
@@ -267,8 +298,10 @@ self_test() {
 
 	# 2. the same again: nothing rewritten
 	before=$(stat -f '%i %m' "$conf")
+	map_before=$(stat -f '%i %m' "$(host_map)")
 	write_group_conf > "$tree/again.out"
 	check "a second run leaves the file alone" "$(stat -f '%i %m' "$conf")" "$before"
+	check "and leaves the map alone" "$(stat -f '%i %m' "$(host_map)")" "$map_before"
 	check "and says the port 80 shape is unchanged" \
 		"$(grep -c 'unchanged, port 80 only until' "$tree/again.out")" 1
 

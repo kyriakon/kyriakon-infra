@@ -547,12 +547,15 @@ done
 
 say "install"
 install -d -m 0755 -o root -g wheel /etc/onboard
+# The responder's host-to-tree map. Empty on a box with no group site; the group
+# lanes write one file per domain into it.
+install -d -m 0755 -o root -g wheel /etc/onboard/static-hosts
 install -m 0755 "$repo_dir/control/target/release/kyriakon-control" /usr/local/sbin/kyriakon-control
 # The member content responder, which serves /home/www for both front-ends. Its
 # config names the two sockets and the tree, and is installed verbatim: nothing
 # in it is a deployed value.
 install -m 0755 "$repo_dir/control/target/release/kyriakon-control-static" /usr/local/sbin/kyriakon-control-static
-install_staged "$repo_dir/openbsd/etc/onboard/static.toml" /etc/onboard/static.toml
+install_staged "$repo_dir/openbsd/etc/onboard/static.toml" /etc/onboard/static.toml -m 0644 -o root -g wheel
 install -m 0755 "$repo_dir/control/target/release/kyriakon-control-drain" /usr/local/sbin/kyriakon-control-drain
 install -m 0755 "$repo_dir/control/target/release/kyriakon-admin" /usr/local/sbin/kyriakon-admin
 # The portal, at the path openbsd/etc/login.conf.d/hello names as the session's

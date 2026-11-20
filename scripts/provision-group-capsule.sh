@@ -73,6 +73,8 @@ gmid_d=/etc/gmid.d
 ssl_dir=/etc/ssl
 ssl_private=/etc/ssl/private
 public_root=/home/www
+# Written by scripts/provision-group-web.sh; the capsule reads the same tree.
+static_hosts=/etc/onboard/static-hosts
 conf_owner="root:wheel"
 
 usage() {
@@ -385,6 +387,11 @@ case "${1:-}" in
 	[ -x "$openssl" ] || die "no $openssl"
 	[ -d "$gmid_d" ] || die "no $gmid_d: doas ksh scripts/deploy-mail.sh creates it, with the index gmid.conf includes"
 	assert_site_tree
+	# The capsule is served from the same tree as the site, and the responder
+	# learns which one from the map the web lane writes. A capsule written
+	# without it answers 51 for every path.
+	[ -f "$static_hosts/$domain" ] \
+		|| die "no $static_hosts/$domain: run scripts/provision-group-web.sh $domain $account first"
 	# The pair before the block, so no block is ever written naming a certificate
 	# that is not there: gmid -n in the --web pass would refuse for every body at
 	# once.

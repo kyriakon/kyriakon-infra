@@ -3,7 +3,6 @@
 use super::*;
 
 use super::account::{group_recipe, group_state};
-use super::connection::decode;
 use super::flow::{build_record, file_application};
 use super::reply::{respond, too_many, Which};
 use super::route::Call;
@@ -19,6 +18,7 @@ use crate::{capsule, page};
 use kyriakon_control_core::config::HOST;
 use kyriakon_control_core::flow::questions::{Kind, Rule};
 use kyriakon_control_core::store::{Account, Certificate, Notice};
+use kyriakon_control_core::util::percent_decode;
 use kyriakon_control_core::{mail::keycheck, store, store::draft};
 
 /// The account page for a gemini client: the member its certificate is pinned
@@ -303,7 +303,7 @@ pub(super) fn capsule_skip_mailed(path: &[Page], record: &mut draft::Draft) -> b
 /// the handler decodes it itself so a `+` stays a plus and only `%0D%0A` becomes
 /// a line break. A single full stop is the clients' empty answer.
 pub(super) fn capsule_value(raw: &str) -> String {
-    let decoded = decode(raw, false).replace("\r\n", "\n");
+    let decoded = percent_decode(raw, false).replace("\r\n", "\n");
     // `validate::validate` trims with `str::trim`, and the stored answer must be
     // the value validation checked, so this uses the same set. That also trims a
     // bare CR, which the gemini spec calls an ordinary character; keeping it

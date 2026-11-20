@@ -15,6 +15,7 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::fastcgi::{self, Reply, Request};
 use kyriakon_control_core::flow::rate;
 use kyriakon_control_core::store::Certificate;
+use kyriakon_control_core::util::percent_decode;
 
 /// How long the loop waits after an accept error it cannot attribute to a dead
 /// connection. A full descriptor table (`EMFILE`, `ENFILE`) leaves the backlog
@@ -192,7 +193,7 @@ pub(super) fn read(front_end: FrontEnd, request: &Request) -> Incoming {
         // stays part of the path and the query starts at the first real one.
         FrontEnd::Httpd => {
             let path = request.value("REQUEST_URI");
-            decode(path.split('?').next().unwrap_or(""), false)
+            percent_decode(path.split('?').next().unwrap_or(""), false)
         }
     };
     let path = path.trim_start_matches('/').to_string();
@@ -248,48 +249,6 @@ pub(super) fn certificate(request: &Request) -> Option<Certificate> {
     })
 }
 
-/// Percent-decode one value. A plus is a space in a form, which is what a browser
-/// writes for one in `application/x-www-form-urlencoded`, and an ordinary
-/// character in a path, where the specification requires `%20` for a space.
-pub(super) fn decode(value: &str, plus_is_space: bool) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => match hex(&bytes[i + 1..i + 3]) {
-                Some(byte) => {
-                    out.push(byte);
-                    i += 3;
-                }
-                None => {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            },
-            b'+' if plus_is_space => {
-                out.push(b' ');
-                i += 1;
-            }
-            byte => {
-                out.push(byte);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-pub(super) fn hex(pair: &[u8]) -> Option<u8> {
-    let digit = |b: u8| match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    };
-    Some(digit(pair[0])? << 4 | digit(pair[1])?)
-}
-
 /// The form's fields, which is where a submission's answers arrive for either
 /// method: the query of a GET and the body of a POST are one encoding.
 pub(super) fn fields(raw: &str) -> BTreeMap<String, String> {
@@ -302,7 +261,7 @@ pub(super) fn fields(raw: &str) -> BTreeMap<String, String> {
             Some((name, value)) => (name, value),
             None => (pair, ""),
         };
-        out.insert(decode(name, true), decode(value, true));
+        out.insert(percent_decode(name, true), percent_decode(value, true));
     }
     out
 }
@@ -325,8 +284,8 @@ pub(super) fn form_post(request: &Request) -> bool {
 #[doc(hidden)]
 pub fn fuzz_decode(raw: &str) {
     let _ = fields(raw);
-    let _ = decode(raw, true);
-    let _ = decode(raw, false);
+    let _ = percent_decode(raw, true);
+    let _ = percent_decode(raw, false);
 }
 
 #[cfg(test)]

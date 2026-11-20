@@ -134,6 +134,13 @@ The marker is `/var/db/kyriakon/deployed`, one line holding the commit and the
 UTC time it was recorded. It is written by `--record`, or by a run whose range
 had no manual step.
 
+A deploy rewrites only what a script writes unconditionally. A generated member
+or group vhost is rewritten when its own lane runs, so after a change to the
+vhost shape, run each site's lane once (`scripts/provision-member-web.sh <user>`
+and `scripts/provision-member-capsule.sh <user>`, or the group pair) and then
+`scripts/cron-apply.sh --web`. `ksh scripts/check-hygiene.sh` reports any
+generated vhost that still serves its tree from a `root` inside the chroot.
+
 ## The network edge
 
 There is no provider-level firewall. Reachability is decided by which daemon binds where, over the stock `block return all` / `pass all` `pf.conf` that `scripts/pf-apply.sh` appends its pass rules to. That is the intended posture, decided in #703: the public mail and web surface is the product, and there is no stable operator source address to restrict 22 and 2222 to.
@@ -277,7 +284,7 @@ The per-member hosting design in #154 adds three things to this path: membership
 
 ## Provision own-domain hosting
 
-An own-domain body's hosting is keyed by the body's domain, and it is served from the site owner's member tree. The upload session is chrooted to `/home/www/<site-account>.kyriakon.net`, and `sshd_config` is applied by hand, so a domain-named document root would need that file changed. Instead the vhosts root the site owner's `www` and `gemini` directories, and a body's upload path is the same as a member's.
+An own-domain body's hosting is keyed by the body's domain, and it is served from the site owner's member tree. The upload session is chrooted to `/home/www/<site-account>.kyriakon.net`, and `sshd_config` is applied by hand, so a domain-named document root would need that file changed. Instead the vhost names the domain and the responder is told which tree that name belongs to: `scripts/provision-group-web.sh` writes `/etc/onboard/static-hosts/<domain>` holding `<site-account>.kyriakon.net`, and both front-ends' paths go to the responder. A body's upload path is the same as a member's. The map file is root-owned; without it the responder looks for a directory named after the domain and answers 404 for the whole site, so `provision-group-capsule.sh` refuses to run until the web lane has written it.
 
 The drain applies the hosting from the group intent on approval. For a body already approved, or to repair a generated file, run the three lanes with the domain and the site owner's account:
 

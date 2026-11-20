@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kyriakon_control_core::fastcgi::{self, Reply, Request};
-use kyriakon_control_core::util;
+use kyriakon_control_core::util::{self, percent_decode};
 use kyriakon_control_core::Error;
 use kyriakon_control_static::{open, Refusal, Served};
 use tokio::io::AsyncWriteExt;
@@ -63,6 +63,10 @@ struct Config {
     httpd_socket: PathBuf,
     /// gmid's socket, likewise.
     gemini_socket: PathBuf,
+    /// One file per host whose tree is not named after it. A group site is
+    /// served under the body's own domain while its files live in the site
+    /// owner's member tree, so the host alone does not choose the tree.
+    hosts: PathBuf,
 }
 
 impl Config {
@@ -85,20 +89,35 @@ impl Config {
     /// could reach outside `root`, and the resolver cannot refuse what it is never
     /// given.
     fn tree(&self, front_end: FrontEnd, host: &str) -> Option<PathBuf> {
-        if host.is_empty()
-            || host.starts_with('.')
-            || !host
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
-        {
+        if !is_name(host) {
             return None;
         }
-        Some(self.root.join(host).join(front_end.subdirectory()))
+        let name = match self.alias(host) {
+            Some(alias) if is_name(&alias) => alias,
+            Some(_) => return None,
+            None => host.to_string(),
+        };
+        Some(self.root.join(name).join(front_end.subdirectory()))
+    }
+
+    /// The tree name for a host whose own name is not its directory.
+    ///
+    /// scripts/provision-group-web.sh writes one file per group site, because the
+    /// vhost is named for the body's domain and the files live in the site
+    /// owner's member tree. The directory is root-owned, so a member cannot put a
+    /// name in it, and the value is checked against the same alphabet before it is
+    /// joined, so an entry cannot point outside `root` either.
+    fn alias(&self, host: &str) -> Option<String> {
+        let name = std::fs::read_to_string(self.hosts.join(host)).ok()?;
+        let name = name.trim();
+        (!name.is_empty()).then(|| name.to_string())
     }
 }
 
-/// Which front-end asked. gmid always sends `GEMINI_URL_PATH` and httpd never
-/// does, so one variable decides it rather than a socket of its own.
+/// Which front-end asked. Each listener answers for one of them, so the channel
+/// is decided by the socket the connection arrived on, not by a variable in the
+/// request: a peer that sent the other front-end's spelling could not make this
+/// process frame an answer for it.
 #[derive(Clone, Copy)]
 enum FrontEnd {
     Httpd,
@@ -273,7 +292,16 @@ async fn connection(stream: UnixStream, cfg: &Config, front_end: FrontEnd) -> Re
 /// answer should not be written down.
 fn answer(cfg: &Config, front_end: FrontEnd, request: &Request) -> (Reply, String) {
     let path = match front_end {
-        FrontEnd::Httpd => decode(request.value("REQUEST_URI")),
+        // httpd passes the client's spelling of the request line, query and all.
+        FrontEnd::Httpd => percent_decode(
+            request
+                .value("REQUEST_URI")
+                .split('?')
+                .next()
+                .unwrap_or_default(),
+            false,
+        ),
+        // gmid decodes and strips the leading slash before it sends it.
         FrontEnd::Gemini => request.value("GEMINI_URL_PATH").to_string(),
     };
     let host = normalise_host(request.value("SERVER_NAME"));
@@ -337,18 +365,37 @@ fn too_large(front_end: FrontEnd) -> Reply {
 /// A directory asked for without its trailing separator: answer with the same
 /// path and the separator, so a relative link in the page resolves against the
 /// directory rather than against its parent.
+///
+/// The path is encoded on the way out, because it arrived decoded. A member may
+/// name a directory with a space, a non-ASCII byte or a control character, and a
+/// raw CR or LF in a header splits it: httpd reads the reply as a header block
+/// line by line, so an unencoded newline in `Location` would become a header the
+/// member chose.
 fn redirect(front_end: FrontEnd, host: &str, path: &str) -> Reply {
+    let path = encode_path(path.trim_end_matches('/'));
     match front_end {
-        FrontEnd::Httpd => Reply::Http(fastcgi::Http::moved(&format!(
-            "{}/",
-            path.trim_end_matches('/')
-        ))),
+        FrontEnd::Httpd => Reply::Http(fastcgi::Http::moved(&format!("{path}/"))),
         FrontEnd::Gemini => Reply::gemini(
             31,
-            &format!("gemini://{host}/{}/", path.trim_matches('/')),
+            &format!("gemini://{host}/{}/", path.trim_start_matches('/')),
             "",
         ),
     }
+}
+
+/// A path as a URL carries it: everything but the unreserved characters and `/`
+/// is percent-encoded.
+fn encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// The host a request names, lowercased and without a port.
@@ -361,43 +408,18 @@ fn normalise_host(host: &str) -> String {
     host.split(':').next().unwrap_or(host).to_ascii_lowercase()
 }
 
-/// The request path, percent-decoded and without its query.
+/// Whether a name may be joined into the root as one directory.
 ///
-/// httpd passes the client's own spelling of the request line, so a member's file
-/// named `my page.html` arrives as `my%20page.html` here and has to become the
-/// name on disk. gmid decodes the path before it sends it, which is why this is
-/// only applied to httpd's.
-///
-/// A percent sign that is not followed by two hex digits stays literal, which is
-/// what makes `%zz` a name that cannot resolve rather than a decoding error. A
-/// decoded `.` is refused downstream with every other dot component, so `%2e%2e`
-/// is not a way to walk upwards.
-fn decode(raw: &str) -> String {
-    let path = raw.split('?').next().unwrap_or(raw);
-    let bytes = path.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                out.push(high << 4 | low);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+/// The host and a group site's tree name are both path components, so the
+/// alphabet is what keeps the reading local: a name with a separator, or one
+/// beginning with a dot, could reach outside `root`, and the resolver cannot
+/// refuse what it is never given.
+fn is_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
 }
 
 #[cfg(test)]
@@ -438,9 +460,10 @@ mod tests {
 
     fn config(root: PathBuf) -> Config {
         Config {
-            root,
+            root: root.clone(),
             httpd_socket: PathBuf::new(),
             gemini_socket: PathBuf::new(),
+            hosts: root.join("static-hosts"),
         }
     }
 
@@ -530,6 +553,37 @@ mod tests {
         );
     }
 
+    /// A group site is served under the body's own domain while its files live in
+    /// the site owner's member tree, so the host names a file rather than a
+    /// directory. This is the case that was 404ing before the map existed.
+    #[tokio::test]
+    async fn a_host_with_a_tree_of_its_own_is_served_from_that_tree() {
+        let cfg = config(fixture_root());
+        std::fs::create_dir_all(cfg.hosts.join("parish.example").parent().unwrap()).unwrap();
+        std::fs::write(cfg.hosts.join("parish.example"), "alice.kyriakon.net\n").unwrap();
+
+        let raw = fixture::httpd(
+            &[
+                ("SERVER_NAME", "parish.example"),
+                ("REQUEST_URI", "/index.html"),
+            ],
+            b"",
+        );
+        let request = fastcgi::read_request(&mut &raw[..], 1024)
+            .await
+            .unwrap()
+            .unwrap();
+        let (reply, _) = answer(&cfg, FrontEnd::Httpd, &request);
+        let (body, _) = fixture::reply(&fastcgi::reply_bytes(&reply, 1));
+        assert_eq!(reply.code(), 200);
+        assert!(String::from_utf8_lossy(&body).ends_with("alice"));
+
+        // An entry is a path component too, so one with a separator is refused
+        // rather than joined.
+        std::fs::write(cfg.hosts.join("parish.example"), "../bob.kyriakon.net\n").unwrap();
+        assert!(cfg.tree(FrontEnd::Httpd, "parish.example").is_none());
+    }
+
     #[test]
     fn a_host_normalises_before_it_names_a_tree() {
         assert_eq!(normalise_host("Alice.Kyriakon.Net"), "alice.kyriakon.net");
@@ -564,11 +618,83 @@ mod tests {
         }
     }
 
+    /// A directory name a member chose must not be able to split the reply.
+    #[tokio::test]
+    async fn a_redirect_encodes_the_name_it_carries() {
+        let cfg = config(fixture_root());
+        let www = cfg.root.join("alice.kyriakon.net/www");
+
+        // A control character in a directory name would end the header line.
+        std::fs::create_dir_all(www.join("evil\r\nX-Injected: yes")).unwrap();
+        let (code, text) = httpd_answer(&cfg, "/evil%0D%0AX-Injected:%20yes").await;
+        assert_eq!(code, 301);
+        assert!(
+            text.contains("Location: /evil%0D%0AX-Injected%3A%20yes/\r\n"),
+            "{text}"
+        );
+        // One status line, one Content-Type, one Location, and the blank line.
+        assert_eq!(text.matches("\r\n").count(), 4, "{text}");
+
+        // A space is a legal directory name and an illegal URL, so it is encoded.
+        std::fs::create_dir_all(www.join("my dir")).unwrap();
+        let (code, text) = httpd_answer(&cfg, "/my%20dir").await;
+        assert_eq!(code, 301);
+        assert!(text.contains("Location: /my%20dir/\r\n"), "{text}");
+    }
+
+    /// The one bound on what a download may cost in memory: the cap is checked
+    /// on the metadata and again while reading, because a file can grow between
+    /// the two.
     #[test]
-    fn a_query_is_cut_and_a_percent_escape_is_decoded() {
-        assert_eq!(decode("/my%20page.html?x=1"), "/my page.html");
-        assert_eq!(decode("/%2e%2e/x"), "/../x");
-        assert_eq!(decode("/100%"), "/100%");
-        assert_eq!(decode("/a%zz"), "/a%zz");
+    fn a_file_over_the_cap_is_refused_and_one_at_it_is_not() {
+        let cfg = config(fixture_root());
+        let www = cfg.root.join("alice.kyriakon.net/www");
+        let at_cap = |code: u16, path: &str| {
+            let cfg = &cfg;
+            let path = path.to_string();
+            (
+                code,
+                block_on(async move { httpd_answer(cfg, &path).await.0 }),
+            )
+        };
+
+        std::fs::write(www.join("big.bin"), vec![0u8; MAX_FILE + 1]).unwrap();
+        std::fs::write(www.join("edge.bin"), vec![0u8; MAX_FILE]).unwrap();
+        let (want, got) = at_cap(413, "/big.bin");
+        assert_eq!(got, want);
+        let (want, got) = at_cap(200, "/edge.bin");
+        assert_eq!(got, want);
+    }
+
+    /// One request through the answer path, for the tests above.
+    async fn httpd_answer(cfg: &Config, uri: &str) -> (u16, String) {
+        let raw = fixture::httpd(
+            &[("SERVER_NAME", "alice.kyriakon.net"), ("REQUEST_URI", uri)],
+            b"",
+        );
+        let request = fastcgi::read_request(&mut &raw[..], 1024)
+            .await
+            .unwrap()
+            .unwrap();
+        let (reply, _) = answer(cfg, FrontEnd::Httpd, &request);
+        let (body, _) = fixture::reply(&fastcgi::reply_bytes(&reply, 1));
+        (reply.code(), String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    #[test]
+    fn a_query_is_cut_before_the_path_is_decoded() {
+        let uri = |raw: &str| percent_decode(raw.split('?').next().unwrap_or_default(), false);
+        assert_eq!(uri("/my%20page.html?x=1"), "/my page.html");
+        assert_eq!(uri("/%2e%2e/x"), "/../x");
+        assert_eq!(uri("/100%"), "/100%");
+        assert_eq!(uri("/a%zz"), "/a%zz");
     }
 }

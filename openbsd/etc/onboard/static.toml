@@ -18,3 +18,10 @@
 root = "/home/www"
 httpd_socket = "/home/www/run/onboard-static-httpd/static.sock"
 gemini_socket = "/home/www/run/onboard-static/static.sock"
+# One file per host whose tree is not named after it. A group site is served
+# under the body's own domain while its files live in the site owner's member
+# tree, so scripts/provision-group-web.sh writes `<hosts>/<domain>` holding
+# `<account>.kyriakon.net`. The directory is root-owned, and the name it holds is
+# checked against the hostname alphabet before it is joined, so an entry cannot
+# leave the root either.
+hosts = "/etc/onboard/static-hosts"
