@@ -55,6 +55,9 @@ async fn main() -> ExitCode {
 
 async fn run(cfg_path: &Path) -> Result<(), Error> {
     let cfg = DrainConfig::load(cfg_path)?;
+    // Read the config first, then cut the pass's file view and syscall set to
+    // what the transitions in this crate use. Nothing below may widen it.
+    kyriakon_control_drain::sandbox::restrict(&cfg)?;
     let store = Store::new(&cfg.store_root);
     // One pass at a time. cron starts the drain every minute, and a pass that
     // runs long (a forge publish, a slow sendmail) would otherwise overlap the
