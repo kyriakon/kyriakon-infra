@@ -43,9 +43,27 @@ fn backoff(error: &std::io::Error) -> std::time::Duration {
 const PORTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Portal connections served at once. The rest wait for a permit before the
 /// socket is accepted, so a flood costs the listening backlog rather than a
-/// descriptor each. The web form and the capsule have no ceiling of this kind
-/// and do not share this one.
-const PORTAL_CONNECTIONS: usize = 64;
+/// descriptor each.
+///
+/// The three counts here and `TITAN_CONNECTIONS` are chosen against the login
+/// class the unit runs under: `rc.subr` gives it the `daemon` class's
+/// `openfiles-cur=128`, and the four listeners share that table with the store.
+/// A flood that filled the table stopped every listener answering, which the
+/// deadline alone only lets recover between waves. The sum is 24 + 24 + 16 + 32
+/// = 96, leaving the descriptors the process itself needs.
+const PORTAL_CONNECTIONS: usize = 16;
+/// How long one FastCGI connection may take. The front-end writes the request
+/// and reads the reply without pausing, so a peer that stalls is the front-end
+/// failing, not a slow client; the deadline is what keeps a stalled one from
+/// pinning a task and a descriptor for the life of the process.
+const FRONTEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// FastCGI connections served at once per listener. Above this the accept loop
+/// waits for a permit, so a flood costs the backlog and one socket, not a
+/// descriptor and a task each. The form and the capsule share the process, so
+/// the ceiling is what keeps one front-end's flood from exhausting the
+/// descriptors the other three listeners need. Two FastCGI listeners, so the
+/// pair costs 48 of the 128.
+const FRONTEND_CONNECTIONS: usize = 24;
 
 /// Accept connections for as long as the process lives. An accept error is a
 /// connection a flood provoked, not the listener: returning it would cancel the
@@ -56,8 +74,11 @@ pub(super) async fn accept(
     app: Arc<App>,
     channel: Channel,
 ) -> Result<(), Error> {
-    let slots = matches!(channel, Channel::Portal)
-        .then(|| Arc::new(tokio::sync::Semaphore::new(PORTAL_CONNECTIONS)));
+    let (limit, timeout) = match channel {
+        Channel::Portal => (PORTAL_CONNECTIONS, PORTAL_TIMEOUT),
+        Channel::FrontEnd => (FRONTEND_CONNECTIONS, FRONTEND_TIMEOUT),
+    };
+    let slots = Arc::new(tokio::sync::Semaphore::new(limit));
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(pair) => pair,
@@ -72,31 +93,32 @@ pub(super) async fn accept(
         // costs the listening backlog and one accepted socket, not a descriptor
         // per waiting connection. It is released when the task that holds the
         // connection ends.
-        let permit = match &slots {
-            Some(slots) => match slots.clone().acquire_owned().await {
-                Ok(permit) => Some(permit),
-                Err(_) => return Ok(()),
-            },
-            None => None,
+        let permit = match slots.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            // The semaphore is never closed while the process lives.
+            Err(_) => return Ok(()),
         };
         let app = app.clone();
         tokio::spawn(async move {
             // Held for as long as this connection is served.
             let _permit = permit;
-            let outcome = match channel {
-                Channel::FrontEnd => connection(stream, &app).await,
-                Channel::Portal => {
-                    match tokio::time::timeout(PORTAL_TIMEOUT, portal_connection(stream, &app))
-                        .await
-                    {
-                        Ok(outcome) => outcome,
-                        Err(_) => {
-                            kyriakon_control_core::util::log(
-                                "kyriakon-control: the portal connection timed out",
-                            );
-                            return;
-                        }
-                    }
+            let served = async {
+                match channel {
+                    Channel::FrontEnd => connection(stream, &app).await,
+                    Channel::Portal => portal_connection(stream, &app).await,
+                }
+            };
+            let outcome = match tokio::time::timeout(timeout, served).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    let name = match channel {
+                        Channel::FrontEnd => "front-end",
+                        Channel::Portal => "portal",
+                    };
+                    kyriakon_control_core::util::log(&format!(
+                        "kyriakon-control: the {name} connection timed out"
+                    ));
+                    return;
                 }
             };
             if let Err(e) = outcome {

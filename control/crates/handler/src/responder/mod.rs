@@ -111,7 +111,8 @@ const MAX_TITAN_LINE: usize = 1024;
 const TITAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Titan connections served at once. The rest wait for a permit, so a flood
 /// costs waiting tasks rather than open sockets.
-const TITAN_CONNECTIONS: usize = 64;
+// 32, not 64: see the count arithmetic on `PORTAL_CONNECTIONS`.
+const TITAN_CONNECTIONS: usize = 32;
 /// The reply for a failure the client can retry.
 const TEMP_FAILURE: &str = "Temporary failure";
 
