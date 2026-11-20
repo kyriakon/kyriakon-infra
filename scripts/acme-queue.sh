@@ -178,17 +178,24 @@ else
 	fi
 fi
 
+# store_root_of <drain.toml> : the store root that file names, one line, or
+# nothing when it cannot be read or has no `store_root` key. One function so the
+# key's spelling is tested rather than assumed: a typo here would silently keep
+# the compiled-in default on a box whose store lives elsewhere.
+store_root_of() {
+	[ -r "$1" ] || return 0
+	awk -F'"' '/^store_root[[:space:]]*=/ { print $2; exit }' "$1"
+}
+
 # The store root the drain owns, where one own-domain body's current site owner
 # lives (`groups/<domain>/group.json`). Read from the same file's `store_root` key
-# rather than typed twice, with the compiled-in default; ONBOARD_DIR points it at
-# a copy and is what the self-test uses.
+# rather than typed twice, with the compiled-in default; ONBOARD_DIR still points
+# a copy of the store at a test tree.
 store_root="${ONBOARD_DIR:-}"
 if [ -z "$store_root" ]; then
 	store_root=/var/db/onboard
-	if [ -r "$drain_toml" ]; then
-		configured_store=$(awk -F'"' '/^store_root[[:space:]]*=/ { print $2; exit }' "$drain_toml")
-		[ -z "$configured_store" ] || store_root=$configured_store
-	fi
+	configured_store=$(store_root_of "$drain_toml")
+	[ -z "$configured_store" ] || store_root=$configured_store
 fi
 
 # The published refill: 50 new certificates per registered domain per seven days is
@@ -1124,6 +1131,17 @@ STUB
 	check "a missing drain script fails the hook" "$code" 1
 	check "and the refusal names the deploy that installs it" \
 		"$(grep -c 'scripts/deploy-control.sh' "$work/attempt-missing.out")" 1
+
+	# The store root comes from drain.toml's own key; a wrong key name would
+	# otherwise keep /var/db/onboard on a box whose store moved.
+	printf 'store_root = "/srv/store"\nscripts = "/srv/scripts"\n' > "$work/drain.toml"
+	check "the store root is read from drain.toml" \
+		"$(store_root_of "$work/drain.toml")" /srv/store
+	printf 'scripts = "/srv/scripts"\n' > "$work/nodrain.toml"
+	check "and an absent key reads as nothing" \
+		"$(store_root_of "$work/nodrain.toml"; printf x)" x
+	check "and a missing file reads as nothing" \
+		"$(store_root_of "$work/absent.toml"; printf x)" x
 
 	self_test_end
 }

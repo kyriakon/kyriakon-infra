@@ -60,6 +60,14 @@ const MAX_BODY: usize = 0;
 /// The wait before the next accept after an error that is not the connection's.
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Connections served at once, across both listeners. Above this the accept loop
+/// waits for a permit, so a flood costs the listening backlog and one socket
+/// rather than a descriptor each. The unit runs under the `daemon` login class's
+/// 128 descriptors, and a front-end opens one backend connection per request, so
+/// the ceiling is what keeps an anonymous flood from exhausting the table and
+/// stopping both listeners from accepting.
+const CONNECTIONS: usize = 64;
+
 #[derive(Clone, serde::Deserialize)]
 struct Config {
     /// The directory holding every member's tree, which is httpd's chroot root.
@@ -231,9 +239,10 @@ async fn run() -> Result<(), Error> {
         cfg.gemini_socket.display(),
         cfg.root.display()
     ));
+    let slots = Arc::new(tokio::sync::Semaphore::new(CONNECTIONS));
     tokio::try_join!(
-        accept(httpd, cfg.clone(), FrontEnd::Httpd),
-        accept(gemini, cfg, FrontEnd::Gemini),
+        accept(httpd, cfg.clone(), FrontEnd::Httpd, slots.clone()),
+        accept(gemini, cfg, FrontEnd::Gemini, slots),
     )
     .map(|_| ())
 }
@@ -279,6 +288,7 @@ async fn accept(
     listener: UnixListener,
     cfg: Arc<Config>,
     front_end: FrontEnd,
+    slots: Arc<tokio::sync::Semaphore>,
 ) -> Result<(), Error> {
     loop {
         let (stream, _) = match listener.accept().await {
@@ -291,8 +301,15 @@ async fn accept(
                 continue;
             }
         };
+        // Taken before the task is spawned, so a flood waits on the backlog with
+        // one accepted socket rather than a task and a descriptor per connection.
+        let permit = match slots.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return Ok(()),
+        };
         let cfg = cfg.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = connection(stream, &cfg, front_end).await {
                 e.report("serving a connection");
             }
@@ -427,14 +444,12 @@ fn answer(cfg: &Config, front_end: FrontEnd, request: &Request) -> (Answer, Stri
                 // The header block and the length, not the bytes: native httpd
                 // answered a HEAD the same way, and reading a file only to
                 // discard it is work the client cannot see.
-                let mut http = Http::file(200, media, Vec::new());
-                if let Some(date) = last_modified {
-                    http = http.with_header("Last-Modified", date);
-                }
-                http = http.with_header("Content-Length", len.to_string());
-                return (Answer::Reply(Reply::Http(http)), route);
+                return (
+                    Answer::Reply(file_head(front_end, media, last_modified, Some(len))),
+                    route,
+                );
             }
-            let head = serve(front_end, media, Vec::new(), last_modified).head_block();
+            let head = file_head(front_end, media, last_modified, None).head_block();
             (
                 Answer::File {
                     head,
@@ -466,19 +481,28 @@ fn log_route(host: &str, path: &str) -> String {
     route
 }
 
-/// A file's bytes, framed for the front-end that asked. The web announces the
-/// type in a header; a capsule announces it in the reply line, which is the only
-/// place a gemini client reads it.
-fn serve(front_end: FrontEnd, media: &str, body: Vec<u8>, last_modified: Option<String>) -> Reply {
+/// What precedes a member's file: the type and the change time, and the length
+/// when the body is not being sent. The web announces the type in a header; a
+/// capsule announces it in the reply line, which is the only place a gemini
+/// client reads it.
+fn file_head(
+    front_end: FrontEnd,
+    media: &str,
+    last_modified: Option<String>,
+    len: Option<u64>,
+) -> Reply {
     match front_end {
         FrontEnd::Httpd => {
-            let mut http = Http::file(200, media, body);
+            let mut http = Http::file(200, media, Vec::new());
             if let Some(date) = last_modified {
                 http = http.with_header("Last-Modified", date);
             }
+            if let Some(len) = len {
+                http = http.with_header("Content-Length", len.to_string());
+            }
             Reply::Http(http)
         }
-        FrontEnd::Gemini => Reply::gemini(20, media, body),
+        FrontEnd::Gemini => Reply::gemini(20, media, Vec::new()),
     }
 }
 
@@ -583,10 +607,15 @@ fn refuse(front_end: FrontEnd) -> Reply {
 /// A method a static tree cannot answer. Only httpd reaches this: a gemini
 /// request has no method.
 fn method_not_allowed() -> Reply {
-    Reply::file(
-        405,
-        "text/plain; charset=utf-8",
-        b"Method not allowed\n".to_vec(),
+    // `Allow` is required on a 405 (RFC 9110 §15.5.6), and it is the only thing
+    // that tells a client probing for a write surface what this host answers.
+    Reply::Http(
+        Http::file(
+            405,
+            "text/plain; charset=utf-8",
+            b"Method not allowed\n".to_vec(),
+        )
+        .with_header("Allow", "GET, HEAD".to_string()),
     )
 }
 
@@ -927,6 +956,15 @@ mod tests {
         assert_eq!(got, want);
         let (want, got) = at_cap(200, "/edge.bin");
         assert_eq!(got, want);
+
+        // The one answer whose body is streamed from the file: the whole
+        // MAX_FILE arrives, in order. A loop that short-reads or drops a record
+        // would still pass the status check above.
+        let (code, text) = block_on(httpd_env(&cfg, &[("REQUEST_URI", "/edge.bin")]));
+        assert_eq!(code, 200);
+        let body = &text[text.find("\r\n\r\n").expect("a header block") + 4..];
+        assert_eq!(body.len(), MAX_FILE, "a streamed body arrives whole");
+        assert!(body.bytes().all(|b| b == 0), "and in order");
     }
 
     /// One request through the answer path, for the tests above.
@@ -1037,23 +1075,12 @@ mod tests {
     async fn a_method_that_cannot_be_served_is_refused() {
         let cfg = config(fixture_root());
         for method in ["PUT", "DELETE", "POST", "PATCH", "OPTIONS"] {
-            let raw = fixture::httpd(
-                &[
-                    ("SERVER_NAME", "alice.kyriakon.net"),
-                    ("REQUEST_URI", "/index.html"),
-                    ("REQUEST_METHOD", method),
-                ],
-                b"",
-            );
-            let request = fastcgi::read_request(&mut &raw[..], 1024)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                wire(&cfg, FrontEnd::Httpd, &request).await.0,
-                405,
-                "{method}"
-            );
+            let (code, _) = httpd_env(
+                &cfg,
+                &[("REQUEST_URI", "/index.html"), ("REQUEST_METHOD", method)],
+            )
+            .await;
+            assert_eq!(code, 405, "{method}");
         }
     }
 
@@ -1061,19 +1088,11 @@ mod tests {
     #[tokio::test]
     async fn head_answers_with_the_headers_and_no_body() {
         let cfg = config(fixture_root());
-        let raw = fixture::httpd(
-            &[
-                ("SERVER_NAME", "alice.kyriakon.net"),
-                ("REQUEST_URI", "/index.html"),
-                ("REQUEST_METHOD", "HEAD"),
-            ],
-            b"",
-        );
-        let request = fastcgi::read_request(&mut &raw[..], 1024)
-            .await
-            .unwrap()
-            .unwrap();
-        let (code, text) = wire(&cfg, FrontEnd::Httpd, &request).await;
+        let (code, text) = httpd_env(
+            &cfg,
+            &[("REQUEST_URI", "/index.html"), ("REQUEST_METHOD", "HEAD")],
+        )
+        .await;
         assert_eq!(code, 200);
         assert!(text.contains("Content-Length: 5\r\n"), "{text}");
         assert!(text.ends_with("\r\n\r\n"), "a HEAD body: {text:?}");

@@ -121,10 +121,14 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
             ))
         }
         Err(why) => {
+            // The error is the socket's, not the client's: it goes to the log and
+            // the client gets a constant, so a stranger learns nothing about the
+            // read that failed.
+            why.report("the titan request line");
             return Ok((
-                Reply::gemini(59, &why.to_string(), String::new()),
+                Reply::gemini(59, "Bad request", String::new()),
                 peer.unwrap_or("").to_string(),
-            ))
+            ));
         }
     };
     let (line, address, key) = if first.starts_with("PROXY ") {
@@ -138,10 +142,11 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
                 ))
             }
             Err(why) => {
+                why.report("the titan request line");
                 return Ok((
-                    Reply::gemini(59, &why.to_string(), String::new()),
+                    Reply::gemini(59, "Bad request", String::new()),
                     address.unwrap_or_default(),
-                ))
+                ));
             }
         };
         // Only a PROXY line relayd wrote gives a client address. With none, or

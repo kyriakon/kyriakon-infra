@@ -529,8 +529,8 @@ impl Reply {
         out
     }
 
-    /// The body, which is empty for every reply the form renders and a member's
-    /// file for the responder.
+    /// The body bytes. Empty only for the replies a file is written after,
+    /// whose bytes are streamed rather than held.
     pub fn body(&self) -> &[u8] {
         match self {
             Reply::Http(http) => &http.body,
@@ -561,12 +561,12 @@ pub async fn write_reply<W: AsyncWrite + Unpin>(
     id: u16,
 ) -> std::io::Result<()> {
     for chunk in head.chunks(MAX_CONTENT) {
-        writer.write_all(&record(STDOUT, id, chunk)).await?;
+        put_record(writer, STDOUT, id, chunk).await?;
     }
     match body {
         Body::Bytes(bytes) => {
             for chunk in bytes.chunks(MAX_CONTENT) {
-                writer.write_all(&record(STDOUT, id, chunk)).await?;
+                put_record(writer, STDOUT, id, chunk).await?;
             }
         }
         Body::File(file, len) => {
@@ -581,18 +581,33 @@ pub async fn write_reply<W: AsyncWrite + Unpin>(
                     break;
                 }
                 left -= read as u64;
-                writer.write_all(&record(STDOUT, id, &buf[..read])).await?;
+                put_record(writer, STDOUT, id, &buf[..read]).await?;
             }
         }
     }
-    writer.write_all(&record(END_REQUEST, id, &[0; 8])).await?;
+    put_record(writer, END_REQUEST, id, &[0; 8]).await?;
     writer.flush().await
 }
 
-fn record(kind: u8, id: u16, content: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HEADER + content.len());
-    push_record(&mut out, kind, id, content);
-    out
+/// One record, written header then content: the bytes go straight to the socket
+/// rather than through a buffer the size of the chunk, so streaming a file costs
+/// the read buffer and nothing else.
+async fn put_record<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    kind: u8,
+    id: u16,
+    content: &[u8],
+) -> std::io::Result<()> {
+    let mut header = [0u8; HEADER];
+    header[0] = VERSION;
+    header[1] = kind;
+    header[2..4].copy_from_slice(&id.to_be_bytes());
+    header[4..6].copy_from_slice(&(content.len() as u16).to_be_bytes());
+    writer.write_all(&header).await?;
+    if !content.is_empty() {
+        writer.write_all(content).await?;
+    }
+    Ok(())
 }
 
 /// The reply as the front-end reads it: the header block and the body across as
@@ -770,6 +785,13 @@ pub mod fixture {
 mod tests {
     use super::fixture::{self, END};
     use super::*;
+
+    /// One record, for the tests that build a stream by hand.
+    fn record(kind: u8, id: u16, content: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_record(&mut out, kind, id, content);
+        out
+    }
 
     /// One request at a time: a second begin record would merge two requests,
     /// and a record carrying another number belongs to one this reader is not

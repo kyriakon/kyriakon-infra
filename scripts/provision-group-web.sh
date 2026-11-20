@@ -114,21 +114,17 @@ die() {
 # host map that collide with the platform's own. The name is the first line of
 # mail_domains, and kyriakon.com is refused for the reason remove-group.sh gives.
 domain_ok() {
-	typeset name="$1" platform
+	typeset name="$1"
 	[ "${#name}" -le 253 ] || return 1
 	case "$name" in
 	*.*) ;;
 	*) return 1 ;;
 	esac
 	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$' || return 1
-	# A table that is missing or empty refuses every name rather than guessing:
-	# without its first line there is no way to tell the operator's domain from a
-	# body's.
-	platform=$(mail_domains_first "$mail_domains" 2>/dev/null) || return 1
-	[ -n "$platform" ] || return 1
-	case "$name" in
-	"$platform" | *."$platform" | kyriakon.com | *.kyriakon.com) return 1 ;;
-	esac
+	# The platform's own names are the operator's, the rule the drain applies
+	# before it runs this lane; lib.sh holds the rule and its `kyriakon.com`
+	# clause so a hand-run does not need a second copy.
+	domain_is_platform "$name" "$mail_domains" && return 1
 	return 0
 }
 
