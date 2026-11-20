@@ -109,9 +109,12 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Error> {
     // The rate cache's directory: the cache is written through `<name>.new`
     // and a failed fetch is stamped in `<name>.attempt` beside it.
     unveil(parent_of(&cfg.rates)?, "rwc")?;
-    // The export and key-verification scratch directories are made under the
-    // process's temp directory, with gpg's homedir inside one of them.
+    // The export's scratch directory is made under the process's temp
+    // directory, with gpg's homedir inside it.
     unveil(&temp_dir()?, "rwc")?;
+    // `keycheck::verify_signature` names `/tmp` literally for the scratch
+    // homedir a mail-key signature is checked in, whatever `TMPDIR` says.
+    unveil("/tmp", "rwc")?;
     // `Stdio::null` opens this in the parent for an enqueued notice's stdout
     // and stderr and for a session check's stderr.
     unveil("/dev/null", "rw")?;
