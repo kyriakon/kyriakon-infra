@@ -954,6 +954,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kyriakon-control-static"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "kyriakon-control-tests"
 version = "0.1.0"
 dependencies = [
