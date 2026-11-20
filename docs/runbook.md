@@ -52,9 +52,10 @@ and `terraform apply`/`destroy` remain human-only.
 
 ## Fuzz the parsers
 
-Four `cargo-fuzz` targets cover the parsers that read input the box does not
-control: the encryptor's message and envelope parsers, and the handler's FastCGI
-reader and form decoder. The `fuzz` workflow in `.github/workflows/fuzz.yml` runs
+Five `cargo-fuzz` targets cover the parsers that read input the box does not
+control: the encryptor's message and envelope parsers, the handler's FastCGI
+reader and form decoder, and the member path resolver, which asserts that a
+served file is always one inside the member's own root. The `fuzz` workflow in `.github/workflows/fuzz.yml` runs
 each for two minutes every Monday and on demand. That is coverage over time, not a
 merge gate: a crash is filed as a bug with a regression test, not treated as a
 blocked PR.
