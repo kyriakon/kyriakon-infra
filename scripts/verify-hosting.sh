@@ -325,7 +325,7 @@ expect_http_denied() {
 		die "http $what: GET $path answered [$status], wanted 403 or 404"
 		;;
 	esac
-	if grep -q "$secret" "$body"; then
+	if grep -qF "$secret" "$body"; then
 		rm -f "$body"
 		die "http $what: GET $path served bytes outside the member tree"
 	fi
@@ -343,7 +343,7 @@ expect_gemini_denied() {
 	if [ "$status" != "51" ]; then
 		die "gemini $what: GET $path answered [$line], wanted 51"
 	fi
-	if printf '%s\n' "$response" | grep -q "$secret"; then
+	if printf '%s\n' "$response" | grep -qF "$secret"; then
 		die "gemini $what: GET $path served bytes outside the member tree"
 	fi
 	printf 'ok: gemini %s: GET %s refused as %s\n' "$what" "$path" "$status"
@@ -423,8 +423,8 @@ full_run() {
 	expect_http "$http_port" '/' 200 'alice' 'the index a directory serves'
 	expect_http_redirect "$http_port" '/sub' '/sub/' 'directory without its separator'
 	expect_http_denied "$http_port" '/leak' "$BOB_SECRET" 'relative link'
-	expect_http_denied "$http_port" '/gitleak' '[core]' 'absolute .git link'
-	expect_http_denied "$http_port" '/.git/config' '[core]' 'direct .git'
+	expect_http_denied "$http_port" '/gitleak' 'repositoryformatversion' 'absolute .git link'
+	expect_http_denied "$http_port" '/.git/config' 'repositoryformatversion' 'direct .git'
 	expect_http_denied "$http_port" '/sub/../leak' "$BOB_SECRET" 'traversal spelling'
 
 	# --- gmid ------------------------------------------------------------
@@ -445,8 +445,8 @@ full_run() {
 	expect_gemini "$gemini_port" '/index.gmi' 20 'alice capsule' 'plain file'
 	expect_gemini "$gemini_port" '/sub' 31 "gemini://$HOST/sub/" 'directory without its separator'
 	expect_gemini_denied "$gemini_port" '/leak' "$BOB_SECRET" 'relative link'
-	expect_gemini_denied "$gemini_port" '/gitleak' '[core]' 'absolute .git link'
-	expect_gemini_denied "$gemini_port" '/.git/config' '[core]' 'direct .git'
+	expect_gemini_denied "$gemini_port" '/gitleak' 'repositoryformatversion' 'absolute .git link'
+	expect_gemini_denied "$gemini_port" '/.git/config' 'repositoryformatversion' 'direct .git'
 
 	printf '\nverify-hosting: httpd, gmid and the responder served the fixture as the contract says\n'
 }
