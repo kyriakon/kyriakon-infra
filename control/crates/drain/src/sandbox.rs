@@ -115,6 +115,9 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Error> {
     // `Stdio::null` opens this in the parent for an enqueued notice's stdout
     // and stderr and for a session check's stderr.
     unveil("/dev/null", "rw")?;
+    // `store::status_token` reads sixteen bytes from the kernel pool for every
+    // notice id and capability token; it opens this path itself.
+    unveil("/dev/urandom", "r")?;
 
     // Lock the list: after this, no later unveil can widen the view and a path
     // not named above is invisible. Strongly recommended by unveil(2), and the
