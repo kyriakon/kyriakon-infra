@@ -39,6 +39,28 @@ calls the one named API, `Store::rewrite_log` or `Store::rewrite_log_mode`.
 Appends take the same lock, and the code says why: a rewrite without it can drop
 a line another process appended between the read and the rename.
 
+## Errors and outcomes
+
+An outcome a caller branches on is an enum whose variants are the outcomes:
+`Settlement`, `Resolution`, `Refusal`, `Reply`. The names are the decision, and a
+new outcome adds a variant rather than a fourth `if` on a string.
+
+`Error` is the other case: a failure that ends the request, carried to one place
+that decides the answer. It holds a message and its context, not a taxonomy. A
+variant earns its place only when some caller acts differently on it: the
+handler's `Refused`/`Line` arms are unreachable in production because nothing
+constructs them on a served path, and the handler's 12 variants collapse into
+one 500/40 mapper for nine of them. Add a variant when the reply, the retry or
+the journal line changes; otherwise add the sentence to the message.
+
+A client-visible reply is built from a constant or a value that passed its
+validation, never from an internal error's `to_string()`. A `59` that carries
+`cannot read the titan request: <os error>` tells a stranger what the socket
+did.
+
+Error text that reaches a log goes through `util::clean`, like every other line a
+member can influence.
+
 ## Docs
 
 Cite the command, path or symbol that makes a claim checkable. A line number is
