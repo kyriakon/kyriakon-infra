@@ -39,9 +39,11 @@ Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box witho
 
 The `script self-tests` job in `.github/workflows/checks.yml` boots a real OpenBSD
 7.9 machine with `vmactions/openbsd-vm` and runs
-`scripts/install-packages.sh --ci`, `scripts/install-packages.sh --check`, and
-`scripts/self-test-all.sh`. This is the authoritative check for the shell and
-tools the box runs; macOS and Linux are only proxies.
+`scripts/install-packages.sh --ci`, `scripts/install-packages.sh --check`,
+`scripts/self-test-all.sh`, then builds `kyriakon-control-static` and runs
+`scripts/verify-hosting.sh`, which starts that responder and both daemons against
+a fixture chroot. This is the authoritative check for the shell and tools the box
+runs; macOS and Linux are only proxies, and neither can run the daemon half.
 
 Push a branch and open a PR, then read the job's log. To exercise something the
 suite does not cover, add a step to that job on the branch and remove it before
