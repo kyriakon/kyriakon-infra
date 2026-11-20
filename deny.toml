@@ -1,0 +1,81 @@
+# Dependency policy for the three Cargo trees here, run by the `deps` job
+# in .github/workflows/checks.yml alongside `cargo audit`.
+#
+# A licence, a source or an advisory outside this file fails the job, so adding
+# one is a review question rather than something the next `cargo update`
+# absorbs. Every allowance below is one the committed lockfiles need today,
+# named with the crate that brought it.
+
+[advisories]
+# RustSec is the reason this job exists: a known advisory fails. A yanked
+# version only warns, because the lockfile pins what was reviewed and cargo
+# refuses to select a yank on its own.
+yanked = "warn"
+# Two advisories reach the control tree through `pgp` 0.20, which
+# docs/planning/prototypes/keygen-spike uses to read public certificates and to
+# generate keys locally. Both advisories are about secret-key operations and
+# neither is reachable here. .cargo/audit.toml carries the same two IDs, so
+# `cargo audit` and this file agree.
+ignore = [
+  # rsa 0.9.10: the Marvin attack times PKCS#1 v1.5 decryption against the
+  # private key. Nothing here decrypts; the key check reads public packets and
+  # the generator makes keys from local randomness. pgp requires rsa ^0.9 and
+  # 0.9.10 is the last 0.9 release, so the >=0.10 fix is pgp's to take.
+  "RUSTSEC-2023-0071",
+  # crypto-bigint 0.5.5: timing variability in arithmetic that is meant to be
+  # constant-time, in secret-scalar operations. It is pinned by
+  # elliptic-curve 0.13 and cx448, both required by pgp, and patched only in
+  # 0.7.6, which needs a pgp release on top of elliptic-curve 0.14.
+  "RUSTSEC-2026-0387",
+]
+
+[bans]
+# Duplicates are a warning: a second `syn` or `rand` is ordinary in a dependency
+# tree and is reviewed as a diff, not blocked. A requirement that pins nothing
+# is not fine, and the only wildcards here are workspace paths, which
+# allow-wildcard-paths covers.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = []
+
+[licenses]
+# The tree is permissive throughout. A copyleft or unrecognised licence arrives
+# as a failure, which is the point: someone reads it and adds the line here.
+allow = [
+  # The bulk, 150-odd crates including every kyriakon dependency proper: the
+  # usual Rust dual licence, either half of which is fine.
+  "MIT",
+  "Apache-2.0",
+  # The dalek/curve25519 and zerocopy chain: curve25519-dalek, ed25519-dalek,
+  # x25519-dalek, subtle, cx448, num_enum, zerocopy. Permissive, notice only.
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  # unicode-ident, through proc-macro2: its MIT/Apache pair is ANDed with the
+  # Unicode licence, which asks for the copyright notice and nothing more.
+  "Unicode-3.0",
+  # byteorder and memchr offer public domain as one arm of their dual licence.
+  "Unlicense",
+  # zlib-rs, the pure-Rust zlib behind flate2: notice only.
+  "Zlib",
+  # libbz2-rs-sys, the pure-Rust bzip2: the bzip2 licence is BSD-shaped, notice
+  # and no misrepresentation of origin.
+  "bzip2-1.0.6",
+  # wasi, wasip2 and wit-bindgen, the wasm target shims nobody builds here.
+  "Apache-2.0 WITH LLVM-exception",
+]
+exceptions = []
+# The workspace crates and keygen-spike carry no licence field: they are paths
+# inside this repository, workspace `publish = false`, and nobody receives them
+# as a package.
+[licenses.private]
+ignore = true
+
+[sources]
+# Everything comes from crates.io or is a path into this repository. A git or
+# alternative-registry dependency is unversioned in the way a lockfile pin does
+# not cover, so it fails rather than arrives quietly.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
