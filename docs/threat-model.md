@@ -228,6 +228,32 @@ Registry lock is the other half, and it is not in place today. Verisign's own cr
 three of Update, Delete and Transfer read `server...Prohibited`; `kyriakon.net` currently carries
 `client...Prohibited` statuses, which is registrar-level only. ADR 0001 holds the assessment.
 
+## Supply chain
+
+The Rust dependencies are pinned by two committed lockfiles. `control/Cargo.lock` records the exact
+version and checksum of every crate the control plane builds: 213 entries, 205 resolved from
+crates.io and 8 paths into this repository. `kyriakon-encrypt/Cargo.lock` does the same for the
+encryptor, which has no dependencies today; committing it means the first crate it gains arrives
+pinned and scanned on the pull request that adds it. `deny.toml` at the repository root names the
+licences the tree may carry, each with the crate that brought it in, so a new licence is a reviewed
+change rather than an upgrade nobody reads.
+
+The `dependencies` job in `.github/workflows/checks.yml` runs `cargo audit` against both lockfiles
+and `cargo deny check` against that policy, on every pull request and every push to `main`. It fails
+on a crate version with a published RustSec advisory, on a licence absent from `deny.toml`, and on a
+crate fetched from a git remote or a registry other than crates.io. Both scanners are pinned by
+version, so the check changes only when this repository changes it. Two advisories are ignored in
+`deny.toml` and `.cargo/audit.toml`, both in `pgp`'s RSA arithmetic: this tree parses public
+certificates and generates keys from local randomness, and neither advisory is reachable without
+decrypting to a private key.
+
+A compromised upstream release is the risk this does not cover. An advisory is published after
+someone notices, so a backdoored or malicious version of a crate that nobody has reported passes both
+checks. The lockfile narrows the window rather than closing it: reaching the build takes a published
+crate plus a lockfile diff that a reviewer can see, and the diff is the whole of the protection.
+Cargo checks the checksum recorded in the lockfile, not the signature of the release, so a
+maintainer's stolen crates.io token and a matching release still land.
+
 ## The provider and the hypervisor ceiling
 
 Everything runs on one Hetzner virtual machine in Germany, with the backup repository on a Hetzner
