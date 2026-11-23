@@ -764,7 +764,7 @@ self_test() {
 	# --- the log retention config ---
 	# docs/privacy.md promises a seven-day window on the logs that hold a member's
 	# address or timestamp. That promise is only a property of the config while
-	# these two lines say seven daily generations, so the shipped file is checked
+	# these lines say seven daily generations, so the shipped file is checked
 	# here rather than left to a reader to notice.
 	# shellcheck disable=SC2016 # $D0 is the literal newsyslog token
 	check "the daemon log keeps seven daily generations" \
@@ -773,6 +773,10 @@ self_test() {
 	# shellcheck disable=SC2016 # as above
 	check "the access log keeps seven daily generations at root:wheel 600" \
 		"$(grep -E -c '^/home/www/logs/access\.log[[:space:]]+root:wheel[[:space:]]+600[[:space:]]+7[[:space:]]+\*[[:space:]]+\$D0' \
+			"$repo_dir/openbsd/etc/newsyslog.conf" || true)" 1
+	# shellcheck disable=SC2016 # as above
+	check "the error log keeps seven daily generations at root:wheel 600" \
+		"$(grep -E -c '^/home/www/logs/error\.log[[:space:]]+root:wheel[[:space:]]+600[[:space:]]+7[[:space:]]+\*[[:space:]]+\$D0' \
 			"$repo_dir/openbsd/etc/newsyslog.conf" || true)" 1
 
 	# --- the generated indexes ---
@@ -1125,17 +1129,25 @@ install -d -m 0755 -o root -g wheel /home/www
 # refuses to start without it, so it is created here owned the way /var/www/logs
 # was: root:daemon 0755.
 install -d -m 0755 -o root -g daemon /home/www/logs
-# The access log can name a capability URL (/status/<token>, /password/…?sig=),
-# so it is root's alone. newsyslog.conf keeps each new rotation at 600; this
-# repairs the files already on the box, which a deploy reaches before the first
-# rotation after the change.
-# httpd creates a missing log 0644, so it must exist at 600 before httpd starts
+# The access log can name a capability URL (/status/<token>, /password/…?sig=)
+# and the error log names request paths and client addresses, so both are root's
+# alone. newsyslog.conf keeps each new rotation at 600; this repairs the files
+# already on the box, which a deploy reaches before the first rotation after the
+# change.
+# httpd creates a missing log 0644, so each must exist at 600 before httpd starts
 # in this same deploy; an empty file does not disturb a live one.
-[ -e /home/www/logs/access.log ] || : > /home/www/logs/access.log
-for log in /home/www/logs/access.log /home/www/logs/access.log.*; do
-	[ -f "$log" ] || continue
-	chmod 600 "$log"
-	chown root:wheel "$log"
+# shellcheck disable=SC2086 # HTTPD_LOGS is a deliberate space-separated list
+for name in $HTTPD_LOGS; do
+	log=/home/www/logs/$name
+	[ -e "$log" ] || : > "$log"
+done
+# shellcheck disable=SC2086 # HTTPD_LOGS is a deliberate space-separated list
+for name in $HTTPD_LOGS; do
+	for log in "/home/www/logs/$name" "/home/www/logs/$name".*; do
+		[ -f "$log" ] || continue
+		chmod 600 "$log"
+		chown root:wheel "$log"
+	done
 done
 # acme-client writes the HTTP-01 challenge here. The challenge is served by the
 # httpd vhosts, so it has to be inside httpd's chroot, and the default of

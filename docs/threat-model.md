@@ -113,8 +113,9 @@ in a root-owned file the responder reads, so naming a domain does not name a dir
 Logs carrying user-identifiable data are bounded rather than eliminated. `openbsd/etc/newsyslog.conf`
 enforces a seven-day retention window on `maillog` (smtpd envelopes and Dovecot authentication),
 `authlog` (sshd), `nsd.log`, `/var/log/daemon` (the onboarding handler's route, token and client
-address) and httpd's access log (client addresses and capability URLs), so the raw per-user record,
-meaning source address, timestamps and message size, expires about a week after it is written. Seven
+address), httpd's access log (client addresses and capability URLs) and its error log (client
+addresses and request paths, including failed capability URLs), so the raw per-user record, meaning
+source address, timestamps and message size, expires about a week after it is written. Seven
 days is the shortest window that still lets abuse monitoring catch a slow-burn compromise such as a
 low-and-slow relay or a credential-stuffing ramp, without keeping a permanent per-user log.
 
