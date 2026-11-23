@@ -381,11 +381,33 @@ impl Store {
         R: RecordKind,
         E: From<Error>,
     {
-        let _lock = self.lock(&R::lock_path(name)).await.map_err(E::from)?;
+        // Read before locking, because taking the lock creates the record's
+        // directory. A name with no record and a closure that refuses must not
+        // leave a phantom directory behind.
         let mut current = R::load(self, name).await.map_err(E::from)?;
-        let (out, changed) = f(&mut current)?;
+        if current.is_none() {
+            let (out, changed) = f(&mut current)?;
+            if !changed || current.is_none() {
+                return Ok(out);
+            }
+            // This update creates the record. The lock protects the write, and
+            // a record that appeared in the meantime is left for the retry
+            // rather than overwritten by a copy built before it existed.
+            let _lock = self.lock(&R::lock_path(name)).await.map_err(E::from)?;
+            if R::load(self, name).await.map_err(E::from)?.is_some() {
+                return Err(E::from(Error::Refused(format!(
+                    "{name} appeared while it was being created; retry"
+                ))));
+            }
+            let record = current.as_mut().expect("the closure created a record");
+            R::write(self, record).await.map_err(E::from)?;
+            return Ok(out);
+        }
+        let _lock = self.lock(&R::lock_path(name)).await.map_err(E::from)?;
+        let mut fresh = R::load(self, name).await.map_err(E::from)?;
+        let (out, changed) = f(&mut fresh)?;
         if changed {
-            if let Some(record) = current.as_mut() {
+            if let Some(record) = fresh.as_mut() {
                 R::write(self, record).await.map_err(E::from)?;
             }
         }
@@ -808,7 +830,12 @@ impl Store {
                     fchown(&f, Some(uid), Some(gid))?;
                 }
             }
-            tokio::fs::rename(&tmp, &target).await
+            tokio::fs::rename(&tmp, &target).await?;
+            if self.sync {
+                // The rename is durable only when the directory entry is too.
+                tokio::fs::File::open(&d).await?.sync_all().await?;
+            }
+            Ok(())
         }
         .await;
         placed.map_err(|source| {
@@ -3870,6 +3897,29 @@ mod tests {
             "the body was removed on a transient signature read"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Taking the lock creates the record's directory, so an update that
+    /// refuses because there is no record must leave nothing behind.
+    #[tokio::test]
+    async fn an_update_for_an_unknown_account_leaves_no_directory() {
+        let dir =
+            std::env::temp_dir().join(format!("control-unknown-account-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.to_str().unwrap());
+        let err = store
+            .update_account::<(), Error>("typo", |current| {
+                assert!(current.is_none(), "a record appeared for an unknown name");
+                Err(Error::Refused("no account for typo".to_string()))
+            })
+            .await
+            .expect_err("an unknown account was updated");
+        assert!(matches!(&err, Error::Refused(_)), "{err}");
+        assert!(
+            !dir.join("accounts/typo").exists(),
+            "a phantom account directory was created"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A record from a schema this build does not read fails closed, rather than
