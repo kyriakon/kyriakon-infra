@@ -11,6 +11,8 @@ use std::process::ExitCode;
 
 use kyriakon_encrypt::{encrypt, DEFAULT_GPG_HOME, DEFAULT_KEYRING};
 
+mod sandbox;
+
 fn usage() -> ! {
     eprintln!(
         "usage: kyriakon-encrypt encrypt --user <localpart> [--keyring DIR] [--gpg-home DIR]"
@@ -25,6 +27,10 @@ fn main() -> ExitCode {
     }
     let cfg = parse_flags(&args[1..]);
     let Some(user) = cfg.user else { usage() };
+    if let Err(error) = sandbox::restrict(&cfg.keyring, &cfg.gpg_home) {
+        eprintln!("kyriakon-encrypt: {error}");
+        return ExitCode::FAILURE;
+    }
     let mut input = Vec::new();
     if std::io::stdin().read_to_end(&mut input).is_err() {
         eprintln!("kyriakon-encrypt: cannot read message from stdin");

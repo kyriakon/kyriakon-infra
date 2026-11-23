@@ -22,6 +22,8 @@
 
 use crate::transitions::Error;
 use kyriakon_control_core::config::DrainConfig;
+#[cfg(target_os = "openbsd")]
+use kyriakon_control_core::sandbox;
 
 /// The promises a full pass needs, one per operation the pass performs:
 ///
@@ -141,9 +143,7 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Error> {
     // Lock the list: after this, no later unveil can widen the view and a path
     // not named above is invisible. Strongly recommended by unveil(2), and the
     // only state a pass cannot undo.
-    if unsafe { libc::unveil(std::ptr::null(), std::ptr::null()) } == -1 {
-        return Err(failure("unveil (lock)", std::io::Error::last_os_error()));
-    }
+    sandbox::lock().map_err(Error::Failed)?;
 
     // With the list locked, a read path named above is reachable and one that
     // is not fails with `ENOENT`. Probe every path the pass reads here, before
@@ -154,10 +154,7 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Error> {
     // The exec promise set is NULL on purpose: the scripts and helpers are
     // themselves OpenBSD programs with their own pledge or none, and forcing
     // this pass's file view on a `/root/bin` script would fail its own reads.
-    let promises = std::ffi::CString::new(PROMISES).expect("the promise list has no NUL");
-    if unsafe { libc::pledge(promises.as_ptr(), std::ptr::null()) } == -1 {
-        return Err(failure("pledge", std::io::Error::last_os_error()));
-    }
+    sandbox::pledge(PROMISES).map_err(Error::Failed)?;
     Ok(())
 }
 
@@ -168,24 +165,11 @@ pub fn restrict(_cfg: &DrainConfig) -> Result<(), Error> {
     Ok(())
 }
 
-/// `unveil(path, permissions)`, with the path and errno text in the error.
+/// The policy's spelling of the shared wrapper: the drain's error is
+/// `Failed`, so one mapping turns a refused call into the pass's own failure.
 #[cfg(target_os = "openbsd")]
 fn unveil(path: &str, permissions: &str) -> Result<(), Error> {
-    let c_path = std::ffi::CString::new(path)
-        .map_err(|_| Error::Failed(format!("unveil {path:?}: the path contains a NUL")))?;
-    let c_permissions = std::ffi::CString::new(permissions).expect("the unveil modes have no NUL");
-    if unsafe { libc::unveil(c_path.as_ptr(), c_permissions.as_ptr()) } == -1 {
-        return Err(failure(
-            &format!("unveil {path}"),
-            std::io::Error::last_os_error(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "openbsd")]
-fn failure(what: &str, source: std::io::Error) -> Error {
-    Error::Failed(format!("{what}: {source}"))
+    sandbox::unveil(path, permissions).map_err(Error::Failed)
 }
 
 /// The directory an atomic rewrite creates its temp file and lock in.
@@ -250,25 +234,10 @@ fn probe_pass_paths(cfg: &DrainConfig) -> Result<(), Error> {
     Ok(())
 }
 
-/// `access(path, R_OK)` after the list is locked. A path the list omitted has
-/// no rule, so the call fails and the pass stops here with its name.
+/// The policy's spelling of the shared probe.
 #[cfg(target_os = "openbsd")]
 fn probe(path: &str) -> Result<(), Error> {
-    let c_path = std::ffi::CString::new(path)
-        .map_err(|_| Error::Failed(format!("unveil {path:?} (probe): the path contains a NUL")))?;
-    if unsafe { libc::access(c_path.as_ptr(), libc::R_OK) } == -1 {
-        let source = std::io::Error::last_os_error();
-        // ENOENT here is not a missing file: the first unveil that named this
-        // path would have failed on that. It is the shape of "no rule covers
-        // this path", which is the omission the probe exists to report.
-        if source.raw_os_error() == Some(libc::ENOENT) {
-            return Err(Error::Failed(format!(
-                "unveil {path} (probe): no rule covers this path after the list was locked"
-            )));
-        }
-        return Err(failure(&format!("unveil {path} (probe)"), source));
-    }
-    Ok(())
+    sandbox::probe(path).map_err(Error::Failed)
 }
 
 #[cfg(all(test, target_os = "openbsd"))]

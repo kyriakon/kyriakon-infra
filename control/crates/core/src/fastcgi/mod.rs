@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 
 use crate::socket;
 
@@ -724,7 +724,22 @@ where
     F: Fn(Request) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Answer> + Send + 'static,
 {
-    let listener = socket::bind(path)?;
+    serve_listener(socket::bind(path)?, limits, body_cap, answer).await
+}
+
+/// Answer requests on a listener the caller already bound. A binary that unveils
+/// its view at startup binds first, so the socket's create and unlink are not
+/// paths the narrowed view has to carry.
+pub async fn serve_listener<F, Fut>(
+    listener: UnixListener,
+    limits: socket::Limits,
+    body_cap: usize,
+    answer: F,
+) -> std::io::Result<()>
+where
+    F: Fn(Request) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Answer> + Send + 'static,
+{
     let answer = Arc::new(answer);
     let deadline = limits.deadline;
     let program = limits.program;

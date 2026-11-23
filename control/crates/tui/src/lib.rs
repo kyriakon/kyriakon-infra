@@ -31,6 +31,7 @@
 //!
 //! [#381]: https://github.com/kyriakon/kyriakon-infra/issues/381
 pub mod error;
+pub mod sandbox;
 
 pub use error::Error;
 

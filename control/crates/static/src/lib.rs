@@ -14,6 +14,7 @@
 
 mod mime;
 mod resolve;
+pub mod sandbox;
 
 pub use mime::media_type;
 pub use resolve::{open, Refusal, Served};

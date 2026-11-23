@@ -5,5 +5,6 @@
 pub mod capsule;
 pub mod page;
 pub mod responder;
+pub mod sandbox;
 
 pub use kyriakon_control_core::fastcgi;

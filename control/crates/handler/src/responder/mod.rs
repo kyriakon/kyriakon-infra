@@ -274,6 +274,23 @@ struct Outcome {
 /// TCP and a permit timeout there closes the socket rather than queueing it.
 pub async fn serve(cfg: config::Config) -> Result<(), Error> {
     let app = Arc::new(App::load(cfg).await?);
+    // Every listener is bound before the view narrows: bind(2) removes whatever
+    // a previous run left at a path and creates the socket, and neither is an
+    // operation a request needs again.
+    let httpd = kyriakon_control_core::socket::bind(Path::new(&app.cfg.httpd_socket)).map_err(
+        |source| Error::Io {
+            what: "listen on",
+            path: Some(app.cfg.httpd_socket.clone().into()),
+            source,
+        },
+    )?;
+    let gemini = kyriakon_control_core::socket::bind(Path::new(&app.cfg.gemini_socket)).map_err(
+        |source| Error::Io {
+            what: "listen on",
+            path: Some(app.cfg.gemini_socket.clone().into()),
+            source,
+        },
+    )?;
     let portal = kyriakon_control_core::socket::bind(Path::new(&app.cfg.portal_socket)).map_err(
         |source| Error::Io {
             what: "listen on",
@@ -288,6 +305,7 @@ pub async fn serve(cfg: config::Config) -> Result<(), Error> {
             path: Some(app.cfg.titan_listener.clone().into()),
             source,
         })?;
+    crate::sandbox::restrict(&app.cfg).map_err(Error::Failed)?;
     kyriakon_control_core::util::log(&format!(
         "kyriakon-control: httpd {}, gemini {}, portal {}, titan {}, store {}, {} questions",
         app.cfg.httpd_socket,
@@ -303,8 +321,8 @@ pub async fn serve(cfg: config::Config) -> Result<(), Error> {
         program: "kyriakon-control",
     };
     tokio::try_join!(
-        serve_front_end(app.cfg.httpd_socket.clone(), limits, app.clone()),
-        serve_front_end(app.cfg.gemini_socket.clone(), limits, app.clone()),
+        serve_front_end(httpd, app.cfg.httpd_socket.clone(), limits, app.clone()),
+        serve_front_end(gemini, app.cfg.gemini_socket.clone(), limits, app.clone()),
         portal_listener(portal, app.clone()),
         titan_accept(titan, app),
     )
@@ -313,11 +331,12 @@ pub async fn serve(cfg: config::Config) -> Result<(), Error> {
 
 /// Answer one FastCGI listener for the life of the process.
 async fn serve_front_end(
+    listener: tokio::net::UnixListener,
     path: String,
     limits: kyriakon_control_core::socket::Limits,
     app: Arc<App>,
 ) -> Result<(), Error> {
-    crate::fastcgi::serve(Path::new(&path), limits, MAX_BODY, move |request| {
+    crate::fastcgi::serve_listener(listener, limits, MAX_BODY, move |request| {
         let app = app.clone();
         async move { connection::fastcgi_answer(app, request).await }
     })
