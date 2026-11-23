@@ -1604,13 +1604,13 @@ fn an_application_approved_on_the_purge_boundary_survives_its_open_window() {
     let copy = "accounts/secretary/application.json";
     let application = format!("applications/{TOKEN}.json");
     assert!(
-        fix.dir.join("store").join(&copy).exists(),
+        fix.dir.join("store").join(copy).exists(),
         "the approval copies the answers"
     );
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     assert!(
-        fix.dir.join("store").join(&copy).exists(),
+        fix.dir.join("store").join(copy).exists(),
         "the purge removed the copy while the payment window is open"
     );
     assert!(
@@ -1931,7 +1931,7 @@ fn a_groups_application_copy_in_every_mailbox_purges_once() {
     for mailbox in ["parish-secretary", "parish-office"] {
         let copy = format!("accounts/{mailbox}/application.json");
         assert!(
-            fix.dir.join("store").join(&copy).exists(),
+            fix.dir.join("store").join(copy).exists(),
             "{mailbox} has no copy"
         );
         age_filed_at(&fix, &copy, 100);
