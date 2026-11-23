@@ -4169,15 +4169,22 @@ async fn release_username(
     Ok(true)
 }
 
-/// Clear away every declined application whose week is up, and release the
-/// username. Run once per drain pass, after the intents: this is what carries
-/// the decline's week out without the application being touched again.
+/// Clear away every declined application once ADR 0005's ninety days are up,
+/// and release the username. Run once per drain pass, after the intents: this
+/// is what carries the decline out without the application being touched again.
+///
+/// The status link is the shorter window: it stops answering a week after the
+/// decision while the record itself is application data, which the privacy
+/// notice holds for ninety days. A decision taken late can leave the link
+/// answering after the ninety days, so the answers are cleared on time and only
+/// the shell the page renders stays until the week is over.
 pub async fn purge_declined(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
 ) -> Result<(), Error> {
     let now = OffsetDateTime::now_utc();
+    let today = now.date();
     for name in store.list("applications").await? {
         if !name.ends_with(".json") {
             continue;
@@ -4193,9 +4200,16 @@ pub async fn purge_declined(
         let Some(decided_at) = record.decided_at.as_deref() else {
             continue;
         };
-        // The status link's own window is the week: inside it the record
-        // answers and nothing is purged.
+        // The link's week and ADR 0005's ninety days are both promises. Before
+        // the ninety days end the record is held whatever the link does.
+        if !purge_due(&record.filed_at, today) {
+            continue;
+        }
+        // A decision taken late can leave the link answering after the ninety
+        // days. Keep the facts the status page renders and clear the answers,
+        // so the data ends on time without cutting the week short.
         if util::link_answers(decided_at, now) {
+            keep_record_join(store, &record.status_token, &record).await?;
             continue;
         }
         // The record was written by the unprivileged half, so the username is
@@ -4228,7 +4242,7 @@ pub async fn purge_declined(
                     "decline",
                     &app,
                     "applying",
-                    Some("the week passed; the username is being released"),
+                    Some("ADR 0005's ninety days are up; the username is being released"),
                 )
                 .await?;
             }
@@ -4529,9 +4543,9 @@ pub async fn purge_applications(
             continue;
         }
         // A declined record belongs to [`purge_declined`], which owns its
-        // seven-day window and its release; one still here after ninety days is
-        // a release that keeps failing, and clearing it here would lose the
-        // release rather than complete it.
+        // ninety-day window and its release; one still here is a release that
+        // keeps failing or a late decision's link still answering, and clearing
+        // it here would lose the release rather than complete it.
         if record.stage.starts_with("declined") {
             continue;
         }

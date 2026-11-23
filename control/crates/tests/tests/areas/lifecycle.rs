@@ -1217,10 +1217,11 @@ fn a_decision_signs_the_application_its_token_names() {
     assert_eq!(fix.intents().len(), 1, "{:?}", fix.intents());
 }
 
-/// A decline purges nothing on the first run; the run after its week clears the
-/// application away and releases the username.
+/// A decline is not purged inside either window: the status link answers for a
+/// week, and the record is application data held for ADR 0005's ninety days.
+/// The drain waits for both before it clears the record and releases the name.
 #[test]
-fn a_decline_purges_after_its_week_and_releases_the_username() {
+fn a_decline_waits_for_ninety_days_and_for_its_week_long_link() {
     let fix = Fix::new("decline");
     // The applicant gave an address outside the platform, so the decline is
     // mailed. Without one nothing is sent, which the next test covers.
@@ -1237,17 +1238,18 @@ fn a_decline_purges_after_its_week_and_releases_the_username() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
 
-    // The first run decides and holds; nothing is purged.
+    // The first run decides; the record is fresh and the link live, so nothing
+    // is purged.
     assert!(
         fix.dir
             .join(format!("store/applications/{TOKEN}.json"))
             .exists(),
-        "a fresh decline is held for its week"
+        "a fresh decline is held inside its ninety days"
     );
     assert!(fix.sent().contains("was declined"), "{}", fix.sent());
     assert!(
         !fix.scripts_log().contains("delete-user.sh"),
-        "nothing is released before the week: {}",
+        "nothing is released before the windows: {}",
         fix.scripts_log()
     );
     assert!(
@@ -1255,23 +1257,44 @@ fn a_decline_purges_after_its_week_and_releases_the_username() {
         "a decline over no approval holds no name"
     );
 
-    // Move the decision a week back, as a week of cron would, and run again.
-    let mut app: Value =
-        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
-    app["decided_at"] = json!("2026-09-01T00:00:00Z");
-    std::fs::write(
-        fix.dir.join(format!("store/applications/{TOKEN}.json")),
-        serde_json::to_vec_pretty(&app).unwrap(),
-    )
-    .unwrap();
+    // Past ninety days from filing but inside the link's week, which a decision
+    // taken late leaves open after the ninety days end: the page keeps
+    // answering, the answers are cleared on time, and the name is not released.
+    age_filed_at(&fix, &format!("applications/{TOKEN}.json"), 100);
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
+    let kept: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    assert!(
+        kept["answers"].as_object().is_some_and(|a| a.is_empty()),
+        "the answers survived the ninety days while the link was live: {kept}"
+    );
+    assert!(
+        kept.get("outside_address").is_none(),
+        "the applicant's address survived the ninety days: {kept}"
+    );
+    assert!(
+        kept["stage"].as_str().unwrap().starts_with("declined"),
+        "the page's stage went with the answers: {kept}"
+    );
+    assert!(
+        !fix.scripts_log().contains("delete-user.sh"),
+        "the name was released while the link still answered: {}",
+        fix.scripts_log()
+    );
 
+    // Both windows past: the record is cleared and the username released.
+    let mut app: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    app["decided_at"] = json!(kyriakon_control_core::util::after_days(-8));
+    fix.rewrite_record(&app);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
     assert!(
         !fix.dir
             .join(format!("store/applications/{TOKEN}.json"))
             .exists(),
-        "the week past, the application is cleared away"
+        "both windows past, the application is cleared away"
     );
     assert!(
         fix.scripts_log().contains("delete-user.sh secretary"),
@@ -1279,6 +1302,39 @@ fn a_decline_purges_after_its_week_and_releases_the_username() {
         fix.scripts_log()
     );
     let _ = record;
+}
+
+/// The record boundary is the ninetieth day: a declined application filed
+/// ninety days ago is still held, and the next day's pass clears it.
+#[test]
+fn a_declined_record_survives_ninety_days_and_purges_on_the_ninety_first() {
+    let fix = Fix::new("decline-boundary");
+    let mut record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    record["stage"] = json!("declined: no reason given");
+    record["decided_at"] = json!(kyriakon_control_core::util::after_days(-8));
+    record["filed_at"] = json!(kyriakon_control_core::util::after_days(-90));
+    fix.rewrite_record(&record);
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let path = fix.dir.join(format!("store/applications/{TOKEN}.json"));
+    assert!(path.exists(), "the ninetieth day is inside the window");
+    assert!(
+        !fix.scripts_log().contains("delete-user.sh"),
+        "the name was released on the boundary: {}",
+        fix.scripts_log()
+    );
+
+    record["filed_at"] = json!(kyriakon_control_core::util::after_days(-91));
+    fix.rewrite_record(&record);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(!path.exists(), "the record survived the ninety-first day");
+    assert!(
+        fix.scripts_log().contains("delete-user.sh secretary"),
+        "the username is released: {}",
+        fix.scripts_log()
+    );
 }
 
 /// An approval that fails after `add-user.sh` leaves a live OS account, its
@@ -1360,7 +1416,7 @@ fn a_decline_after_a_failed_approval_erases_the_half_made_account() {
     )
     .unwrap();
     assert!(until > OffsetDateTime::now_utc(), "{hold}");
-    // The application is still held for its week, decided.
+    // The application is still on file, decided.
     let app: Value =
         serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
     assert!(
@@ -1368,23 +1424,20 @@ fn a_decline_after_a_failed_approval_erases_the_half_made_account() {
         "{app}"
     );
 
-    // A week later the purge clears the application and leaves the name held and
-    // the box empty.
+    // Past the ninety days and the link's week, the purge clears the
+    // application and leaves the name held and the box empty.
     let mut app: Value =
         serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
     app["decided_at"] = json!("2026-09-01T00:00:00Z");
-    std::fs::write(
-        fix.dir.join(format!("store/applications/{TOKEN}.json")),
-        serde_json::to_vec_pretty(&app).unwrap(),
-    )
-    .unwrap();
+    fix.rewrite_record(&app);
+    age_filed_at(&fix, &format!("applications/{TOKEN}.json"), 100);
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     assert!(
         !fix.dir
             .join(format!("store/applications/{TOKEN}.json"))
             .exists(),
-        "the week past, the application is cleared away"
+        "the windows past, the application is cleared away"
     );
     assert!(
         !fix.passwd_file().contains("secretary:"),
@@ -5024,15 +5077,12 @@ fn a_corrupt_application_does_not_stop_another_applications_purge() {
     fix.decide("decline", "secretary");
     assert!(fix.drain().status.success());
 
-    // Move the decision a week back, as a week of cron would.
+    // Past the ninety days and the link's week, as the calendar does.
     let mut app: Value =
         serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
     app["decided_at"] = json!("2026-09-01T00:00:00Z");
-    std::fs::write(
-        fix.path(&format!("store/applications/{TOKEN}.json")),
-        serde_json::to_vec_pretty(&app).unwrap(),
-    )
-    .unwrap();
+    fix.rewrite_record(&app);
+    age_filed_at(&fix, &format!("applications/{TOKEN}.json"), 100);
     // An unrelated record that sorts before it and does not parse.
     std::fs::write(
         fix.path("store/applications/000-broken.json"),
@@ -5094,7 +5144,7 @@ fn a_damaged_declinee_does_not_stop_a_healthy_closing_deletion() {
             "closing_until": kyriakon_control_core::util::date_after_days(-1),
         }),
     );
-    // A declined application whose week is up, for a name whose account record
+    // A declined application past both windows, for a name whose account record
     // is damaged: the purge cannot tell whether releasing the name would take an
     // account with it.
     let record = fix.filed("broken", "cash", &[("rail", "cash")]);
@@ -5102,6 +5152,7 @@ fn a_damaged_declinee_does_not_stop_a_healthy_closing_deletion() {
     app["stage"] = json!("declined");
     app["decided_at"] = json!("2026-09-01T00:00:00Z");
     fix.rewrite_record(&app);
+    age_filed_at(&fix, &format!("applications/{TOKEN}.json"), 100);
     std::fs::create_dir_all(fix.dir.join("store/accounts/broken")).unwrap();
     std::fs::write(
         fix.dir.join("store/accounts/broken/account.json"),

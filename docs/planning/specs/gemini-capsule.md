@@ -101,7 +101,7 @@ The token is 128 random bits drawn from `getrandom` when the draft is created, e
 
 A draft is a JSON document at `/var/db/onboard/drafts/<token>.json`: the answers given so far, the page cursor, the key fingerprints and check verdicts, `created_at` and `updated_at`. On file it becomes `/var/db/onboard/applications/<token>.json` and an `intents/<id>.json` is written for the drain, which validates and applies it the way it applies every other intent.
 
-The expiry is the protocol's. The answer arrives as the query of the page that asked for it, and the redirect to the next page drops it, so the query cannot accumulate answers, and a cancelled prompt sends nothing, so the server never learns the applicant stopped. There is no disconnect event. The drain purges any draft whose `updated_at` is more than seven days old. The status page answers for a filed application until the application is cleared away, seven days after a decision, which is [#159](https://github.com/kyriakon/kyriakon-infra/issues/159)'s hold; the answers themselves stay inside the 90-day window of ADR 0005.
+The expiry is the protocol's. The answer arrives as the query of the page that asked for it, and the redirect to the next page drops it, so the query cannot accumulate answers, and a cancelled prompt sends nothing, so the server never learns the applicant stopped. There is no disconnect event. The drain purges any draft whose `updated_at` is more than seven days old. The status page answers for a filed application for seven days after a decision, which is [#159](https://github.com/kyriakon/kyriakon-infra/issues/159)'s hold; the answers themselves stay inside the 90-day window of ADR 0005 and are cleared when that window ends.
 
 ## The questions
 
@@ -208,7 +208,7 @@ The capsule is not only an applicant's front-end. When a client presents a certi
 
 `gemini://signup.kyriakon.net/status/<token>` is a `text/gemini` page keyed by the same 128-bit token the draft carries, which is also what the web form shows an applicant who gave no outside address. The page shows the stage: with us, waiting to be read (received); being read (with the reviewer); or decided, with the outcome being an account on the paid tier, an account without charge, or a decline, which offers the way back of [#159](https://github.com/kyriakon/kyriakon-infra/issues/159). The `KYR-` token the prototype's status link showed is the payment token drawn at approval, and is superseded here.
 
-The page never echoes an answer, the contact address or the key. A token that is unknown and a token that has expired return the same page, so the endpoint cannot be used to test whether a token exists. The page answers while the record exists: a draft until seven days after its last update, a filed application until seven days after the decision.
+The page never echoes an answer, the contact address or the key. A token that is unknown and a token that has expired return the same page, so the endpoint cannot be used to test whether a token exists. The page answers while its window runs: a draft until seven days after its last update, a filed application until seven days after the decision.
 
 ## The services it lists
 
@@ -241,7 +241,7 @@ Trust on first use. The specification recommends it, and it means the capsule re
 | Path | Written by | Contents | Lifetime |
 |---|---|---|---|
 | `drafts/<token>.json` | handler | answers so far, page cursor, keys and check verdicts, timestamps | purged by the drain seven days after the last update |
-| `applications/<token>.json` | handler on file, drain on decision | answers, key fingerprints, verdicts, status | seven days after the decision, inside the 90-day window |
+| `applications/<token>.json` | handler on file, drain on decision | answers, key fingerprints, verdicts, status | answers purged ninety days after filing; the status page stops seven days after the decision |
 | `intents/<id>.json` | handler | one filed application | consumed and deleted by the drain |
 | `mail/` | `smtpd` | the Maildir for `apply@kyriakon.net` | drained each run; a message is deleted once acted on |
 | `catalogue.toml` | `scripts/control-store.sh` | the shared service catalogue, read by the handler and by the terminal | with the service |
