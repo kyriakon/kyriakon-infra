@@ -1994,10 +1994,16 @@ pub async fn delete_account(
         // group-mailbox deletion is rare, so one redundant reload is cheaper
         // than a daemon left mapping a body address to a deleted mailbox.
         run_script(cfg, "reload-smtpd.sh", &[]).await?;
-        if let Some(mut group) = group_record(store, domain).await? {
+        if let Some(group) = group_record(store, domain).await? {
             if group.accounts.iter().any(|mailbox| mailbox == username) {
-                group.accounts.retain(|mailbox| mailbox != username);
-                store.write_group_record(&group).await?;
+                store
+                    .update_group(domain, |current| {
+                        if let Some(group) = current.as_mut() {
+                            group.accounts.retain(|mailbox| mailbox != username);
+                        }
+                        Ok::<(), Error>(())
+                    })
+                    .await?;
             }
         }
     }
