@@ -979,8 +979,20 @@ mod tests {
         // prove the application lines, so only the token-less lines after
         // creation remain: the boundary fails closed rather than opening up.
         let reduced = own_journal(lines, "alice", None, "2026-06-01T00:00:00Z");
-        assert_eq!(reduced.len(), 1);
-        assert!(reduced[0].contains("current member"), "{:?}", reduced[0]);
+        let reduced_text = reduced.join("\n");
+        assert!(
+            reduced_text.contains("credit current member"),
+            "{reduced_text}"
+        );
+        assert!(
+            reduced_text.contains("group transition current site owner"),
+            "{reduced_text}"
+        );
+        assert!(
+            !reduced_text.contains("current applicant"),
+            "{reduced_text}"
+        );
+        assert_eq!(reduced.len(), 2);
 
         assert_eq!(
             application_token(&format!(r#"{{"status_token":"{current}"}}"#)).as_deref(),
