@@ -1116,7 +1116,7 @@ fn answer_limit(page: &Page) -> usize {
 /// the connection, which is what the page would have done without the cap; the
 /// bytes are dropped as they arrive, so the process stays at its bound.
 fn drain_answer(page: &Page, input: &mut dyn Input) {
-    let multiline = matches!(page.q.kind, Kind::Multiline | Kind::Addresses);
+    let multiline = page.q.kind.is_list();
     let key = page.q.kind == Kind::Key && page.q.rule != Rule::UploadKey;
     if !multiline && !key {
         return;
@@ -1161,7 +1161,7 @@ fn drain_answer(page: &Page, input: &mut dyn Input) {
 /// rest of that paste is dropped before this returns, so the retry starts clean.
 fn read_answer(page: &Page, input: &mut dyn Input) -> Result<Entered, Error> {
     let key = page.q.kind == Kind::Key;
-    let multiline = matches!(page.q.kind, Kind::Multiline | Kind::Addresses);
+    let multiline = page.q.kind.is_list();
     let limit = answer_limit(page);
     let mut lines: Vec<String> = Vec::new();
     let mut kept = 0;

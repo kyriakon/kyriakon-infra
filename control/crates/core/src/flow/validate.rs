@@ -78,7 +78,7 @@ pub fn reason(
         // caller prefixes the question's own prompt, so this fragment does not
         // repeat it.
         Rule::SingleLine => {
-            if !value.chars().all(util::terminal_safe) {
+            if !printable(value) {
                 Some("one line, without control or invisible characters".to_string())
             } else {
                 (value.chars().count() > SINGLE_LINE_MAX)
@@ -88,17 +88,31 @@ pub fn reason(
     }
 }
 
+/// Whether every character in `text` may reach a terminal unchanged.
+fn printable(text: &str) -> bool {
+    text.chars().all(util::terminal_safe)
+}
+
 /// A free-text answer may not carry a control or invisible formatter onto a
-/// terminal, where it would repaint the screen or reorder a name. A multiline
-/// answer, and an address list, keep their line breaks, because those are the
-/// shape they were asked for; every other character has to survive
-/// [`util::clean`] unchanged.
+/// terminal, where it would repaint the screen or reorder a name. A list's
+/// line breaks are the shape it was asked for: a lone newline, as the portal
+/// and the terminal read one, or the CRLF pair a browser posts for a textarea.
+/// A tab survives too, because an address line may separate `alias` from its
+/// target with one and [`util::clean_body`] keeps it. Every other character has
+/// to survive [`util::clean`] unchanged.
 fn free_text(kind: Kind, value: &str) -> Option<String> {
-    let multiline = matches!(kind, Kind::Multiline | Kind::Addresses);
-    (!value
-        .chars()
-        .all(|c| (multiline && c == '\n') || util::terminal_safe(c)))
-    .then(|| "without control or invisible characters".to_string())
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if kind.is_list()
+            && (matches!(c, '\n' | '\t') || (c == '\r' && chars.peek() == Some(&'\n')))
+        {
+            continue;
+        }
+        if !util::terminal_safe(c) {
+            return Some("without control or invisible characters".to_string());
+        }
+    }
+    None
 }
 
 /// The username rule: the single DNS label `scripts/add-user.sh` enforces, 1-31
@@ -452,11 +466,12 @@ mod tests {
             rule: Rule::None,
         };
         assert!(reason(&text, "GB 123 4567 89", &name(), false).is_none());
-        // A text answer is one line however it arrived, so a newline is refused
-        // with the rest of the control characters.
+        // A text answer is one line however it arrived, so a newline and a tab
+        // are refused with the rest of the control characters.
         for hostile in [
             "a\rb",
             "a\nb",
+            "a\tb",
             "a\u{1b}[2Jb",
             "a\u{7f}b",
             "a\u{9b}b",
@@ -472,15 +487,42 @@ mod tests {
 
         let multiline = Question {
             kind: Kind::Multiline,
-            ..text
+            ..text.clone()
         };
-        assert!(reason(&multiline, "first\nsecond", &name(), false).is_none());
+        // The terminal reads LF. A browser posts a textarea's line break as
+        // CRLF, and a tab is the shape an answer may carry.
+        for accepted in [
+            "first\nsecond",
+            "first\r\nsecond",
+            "first\r\nsecond\nthird",
+            "first\tsecond",
+        ] {
+            assert!(
+                reason(&multiline, accepted, &name(), false).is_none(),
+                "{accepted:?}"
+            );
+        }
         for hostile in ["first\rsecond", "first\u{1b}second", "first\u{202e}second"] {
             assert!(
                 reason(&multiline, hostile, &name(), false).is_some(),
                 "{hostile:?}"
             );
         }
+
+        // The address list is the other list kind, and its own rule reads a tab
+        // between `alias` and its target as a space: the check before it must
+        // let the line through.
+        let addresses = Question {
+            kind: Kind::Addresses,
+            ..multiline
+        };
+        assert!(reason(
+            &addresses,
+            "secretary: own\noffice: alias\tsecretary",
+            &name(),
+            false
+        )
+        .is_none());
     }
 
     #[test]
