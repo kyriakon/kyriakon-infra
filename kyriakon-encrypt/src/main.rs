@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use kyriakon_encrypt::{encrypt, DEFAULT_GPG_HOME, DEFAULT_KEYRING};
+use kyriakon_encrypt::{encrypt, ensure_gpg_home, DEFAULT_GPG_HOME, DEFAULT_KEYRING};
 
 mod sandbox;
 
@@ -27,6 +27,12 @@ fn main() -> ExitCode {
     }
     let cfg = parse_flags(&args[1..]);
     let Some(user) = cfg.user else { usage() };
+    // The scratch directory must exist before unveil can name it. The call also
+    // sets its 0700 mode, which `create_dir_all` on the flag's path would not.
+    if let Err(error) = ensure_gpg_home(&cfg.gpg_home) {
+        eprintln!("kyriakon-encrypt: {error}");
+        return ExitCode::FAILURE;
+    }
     if let Err(error) = sandbox::restrict(&cfg.keyring, &cfg.gpg_home) {
         eprintln!("kyriakon-encrypt: {error}");
         return ExitCode::FAILURE;

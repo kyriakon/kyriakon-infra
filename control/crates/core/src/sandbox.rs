@@ -1,10 +1,11 @@
 //! The one wrapper over OpenBSD's `unveil(2)` and `pledge(2)`.
 //!
-//! Each binary states its own policy beside itself and calls these primitives;
-//! the drain, the responders, the terminal and the encryptor therefore share one
-//! spelling of a failed call, not four. On a workstation every function is a
-//! no-op, so the acceptance suite still runs the real binaries on Linux and
-//! macOS.
+//! Each binary states its own policy beside itself and calls these primitives,
+//! so the drain, the responders and the terminal share one spelling of a failed
+//! call. The encryptor keeps its own small declaration of the same three calls,
+//! because that crate keeps no dependency of its own. On a workstation every
+//! function is a no-op, so the acceptance suite still runs the real binaries on
+//! Linux and macOS.
 //!
 //! A failure is returned to the caller rather than ignored: a process that
 //! started with half a list would fail later as an unexplained `ENOENT`, so the
@@ -121,5 +122,8 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("no rule covers this path"), "{message}");
+        // A readable path must pass, or the probe would fail every process on a
+        // correctly configured box.
+        probe("/").unwrap();
     }
 }

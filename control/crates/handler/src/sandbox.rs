@@ -18,11 +18,13 @@ use kyriakon_control_core::config::Config;
 use kyriakon_control_core::sandbox;
 
 /// The promises a request uses: stdio for the connection it already holds,
-/// rpath/wpath/cpath/fattr for the store records and their modes, flock for the
-/// log rewrites, unix for the three unix listeners, inet for the Titan accept,
-/// and proc/exec for the login check. `/dev/urandom` is opened directly for a
+/// rpath/wpath/cpath/fattr for the store records and their modes, unix for the
+/// three unix listeners, inet for the Titan accept, and proc/exec for the login
+/// check. The handler appends no record: it writes records through the
+/// temp-file rename that takes no lock, and it only reads `notices.jsonl`, so it
+/// does not carry the `flock` promise. `/dev/urandom` is opened directly for a
 /// capability token, hence no reliance on getentropy alone.
-const PROMISES: &str = "stdio rpath wpath cpath fattr flock unix inet proc exec";
+const PROMISES: &str = "stdio rpath wpath cpath fattr unix inet proc exec";
 
 pub fn restrict(cfg: &Config) -> Result<(), String> {
     sandbox::unveil(&cfg.store_root, "rwc")?;

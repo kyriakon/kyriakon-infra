@@ -181,6 +181,7 @@ full_run() {
 		[ -f "$file" ] || die "no $file"
 	done
 	command -v gpg >/dev/null 2>&1 || die "gpg is needed for the encryptor smoke run"
+	command -v perl >/dev/null 2>&1 || die "perl is needed to write one FastCGI request"
 	# The pledge probe is *meant* to abort; a core file in the checkout would be
 	# an artifact, not evidence.
 	ulimit -c 0
@@ -234,7 +235,12 @@ full_run() {
 	wait "$spid" 2>/dev/null || status=$?
 	assert_signal_only "$status" "static"
 
-	# 3. handler: bind four listeners, keep its view, answer one portal read.
+	# 3. handler: bind four listeners, keep its view, answer one portal read,
+	# then run one login through doas. The VM has no doas rule for the checker,
+	# so doas refuses and the login answers its ordinary failure page. What the
+	# step proves is that the handler could exec the fixed program at all: a
+	# missing `unveil(DOAS, "x")` or `exec` promise shows as "cannot run the
+	# login check", while a killed process fails the wait below.
 	"$handler_bin" serve --config "$tree/handler.toml" > "$tree/logs/handler" 2>&1 &
 	hpid=$!
 	wait_for "$tree/run/portal.sock" || fail "the handler bound no portal socket"
@@ -246,18 +252,76 @@ full_run() {
 		fail "the portal status read failed"
 	grep -q '^notice ' "$tree/logs/portal-reply" ||
 		fail "the portal answered no notice for an unknown token"
+
+	# One FastCGI POST to /login. The fields are the minimum the route reads,
+	# and the origin names the one the handler accepts. The request is built in
+	# Perl because the OpenBSD base has it and the wire has two length forms to
+	# encode.
+	cat > "$work/fcgi-login.pl" <<'PERL'
+use strict;
+use warnings;
+use IO::Socket::UNIX;
+
+my ($path, $body, @env) = @ARGV;
+sub record {
+	my ($type, $content) = @_;
+	return pack('CCnnCC', 1, $type, 1, length($content), 0, 0) . $content;
+}
+sub param {
+	my ($name, $value) = @_;
+	return pack('CC', length($name), length($value)) . $name . $value;
+}
+my $params = join '', map {
+	my ($name, $value) = split /=/, $_, 2;
+	param($name, defined $value ? $value : '');
+} @env;
+my $request = record(1, pack('CCCCCCCC', 0, 1, 0, 0, 0, 0, 0, 0))
+	. record(4, $params) . record(4, '')
+	. record(5, $body) . record(5, '');
+my $socket = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $path)
+	or die "connect: $!";
+print {$socket} $request or die "write: $!";
+my $reply = '';
+while (1) {
+	my $read = sysread($socket, my $chunk, 65536);
+	die "read: $!" unless defined $read;
+	last if $read == 0;
+	$reply .= $chunk;
+}
+print $reply;
+PERL
+	perl "$work/fcgi-login.pl" "$tree/run/httpd.sock" \
+		'username=alice&password=wrong' \
+		REQUEST_METHOD=POST REQUEST_URI=/login REMOTE_ADDR=127.0.0.1 \
+		SERVER_NAME=signup.kyriakon.net \
+		CONTENT_TYPE=application/x-www-form-urlencoded \
+		HTTP_ORIGIN=https://signup.kyriakon.net \
+		> "$tree/logs/login-reply" 2>&1 ||
+		fail "the login request could not be sent"
+	grep -q 'http /login 200' "$tree/logs/handler" ||
+		fail "the handler did not answer the login route"
+	if grep -q 'cannot run the login check' "$tree/logs/handler"; then
+		fail "the handler could not exec doas under its pledge"
+	fi
+
+	# 4. tui: a plain session reads its catalogue, takes its session lock, asks
+	# the handler for a status so the unix connect is exercised, and leaves. The
+	# start screen's word is "quit"; the menu's is "q", which this session never
+	# reaches. The handler is still up for the status read.
+	printf 'status\n%s\n\nquit\n' "$status_token" |
+		"$tui_bin" --plain --config "$tree/handler.toml" --state "$tree/state" \
+		> "$tree/logs/tui" 2>&1 ||
+		fail "the plain terminal session failed"
+	grep -q 'This link is not in use' "$tree/logs/tui" ||
+		fail "the terminal did not read the handler's status"
+	if grep -q 'status service is not answering' "$tree/logs/tui"; then
+		fail "the terminal could not connect to the portal socket"
+	fi
+
 	kill "$hpid" 2>/dev/null || true
 	status=0
 	wait "$hpid" 2>/dev/null || status=$?
 	assert_signal_only "$status" "the handler"
-
-	# 4. tui: a plain session reads its catalogue, locks a session, and leaves
-	# from its start screen. The start screen's word is "quit"; the menu's is
-	# "q", which this session never reaches.
-	printf 'quit\n' |
-		"$tui_bin" --plain --config "$tree/handler.toml" --state "$tree/state" \
-		> "$tree/logs/tui" 2>&1 ||
-		fail "the plain terminal session failed"
 
 	# 5. encrypt: a real gpg encrypted the message under the veil.
 	printf 'From: alice@kyriakon.net\nTo: alice@kyriakon.net\nSubject: probe\n\nbody\n' |

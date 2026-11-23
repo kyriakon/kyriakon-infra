@@ -24,10 +24,12 @@ pub fn restrict(cfg: &Config, state: &Path, tty: bool) -> Result<(), String> {
     sandbox::unveil(&cfg.reserved, "r")?;
     sandbox::unveil(state, "rwc")?;
     sandbox::unveil(&cfg.portal_socket, "rw")?;
+    // `authlog` writes AUTH events through syslog, and syslog connects to this
+    // socket. It is a write-only entry, so it is not probed.
+    sandbox::unveil("/dev/log", "w")?;
     sandbox::lock()?;
     sandbox::probe(&cfg.catalogue)?;
     sandbox::probe(&cfg.reserved)?;
-    sandbox::probe(state)?;
     sandbox::pledge(if tty {
         "stdio rpath wpath cpath flock unix tty"
     } else {

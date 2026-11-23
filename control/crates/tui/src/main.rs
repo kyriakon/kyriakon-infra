@@ -116,6 +116,15 @@ fn run() -> Result<Departure, Error> {
         &std::fs::read_to_string(&cfg.reserved)
             .map_err(|e| Error::context(format!("cannot read {}", cfg.reserved), e))?,
     );
+    // The session directory is created while the view is still whole: the
+    // deploy makes the live one, and a run whose `--state` names a new directory
+    // must not fail because the veil cannot create it.
+    std::fs::create_dir_all(&state).map_err(|e| {
+        Error::context(
+            format!("cannot create the state directory {}", state.display()),
+            e,
+        )
+    })?;
     // The mode is decided before the view narrows, because the full screen needs
     // the `tty` promise and the plain one does not.
     let mode = forced.unwrap_or_else(chosen);

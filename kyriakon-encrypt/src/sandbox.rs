@@ -28,7 +28,6 @@ pub fn restrict(keyring: &Path, gpg_home: &Path) -> Result<(), String> {
         unveil("/dev/null", "rw")?;
         lock()?;
         probe(keyring)?;
-        probe(gpg_home)?;
         pledge("stdio rpath wpath cpath fattr proc exec")
     }
     #[cfg(not(target_os = "openbsd"))]

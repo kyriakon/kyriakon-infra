@@ -321,6 +321,9 @@ jobs:
             # behaviour they exercise. `--lib` keeps it to the crate's own
             # tests; the acceptance suite runs its Linux half above.
             cargo test --manifest-path control/Cargo.toml -p kyriakon-control-drain --lib
+            # The shared wrapper's tests are cfg(openbsd), so the drain's run
+            # alone never compiled them. Filter keeps this to the sandbox module.
+            cargo test --manifest-path control/Cargo.toml -p kyriakon-control-core --lib -- sandbox::
             # The fromcheck sandbox is cfg(openbsd), so only this run compiles
             # it. The plugin test also runs here because OpenBSD is the host
             # whose SIGCHLD disposition rules the grandchild case exercises.
