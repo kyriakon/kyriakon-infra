@@ -1,81 +1,121 @@
-# install-set.tsv: every script this repository installs on the box, and where.
+# install-set.tsv: the box manifest. Every file this repository puts on the box,
+# where it lands, when it runs, and which deploy or manual step a change needs.
 #
-# The one list, read by the four places that used to keep their own.
-# scripts/deploy.sh routes a changed script to the deploy that installs it,
-# scripts/deploy-mail.sh and scripts/deploy-control.sh install it,
-# scripts/cron-apply.sh schedules it, and scripts/check-hygiene.sh compares the
-# installed copy with the checkout. Adding an installed script is one line here.
+# One table, read by scripts/lib.sh's manifest queries: scripts/deploy.sh routes
+# a changed script to its deploy, deploy-mail.sh and deploy-control.sh install
+# and remove it, cron-apply.sh schedules it, and check-hygiene.sh compares the
+# installed copy with the checkout. Adding, renaming or retiring an installed
+# file is one row here.
 #
 # Columns, tab-separated:
 #
-#   script       the file in scripts/, by name
-#   destination  /root/bin, /usr/local/libexec for the member session shell,
-#                drain for the directory the drain's own config names
-#                at run time (installed into by scripts/deploy-control.sh), or
-#                checkout for a script cron runs from the checkout itself, which
-#                nothing installs
-#   schedule     the five cron fields, or - when nothing schedules the script
-#   args         the arguments the cron line passes, present only when there are
-#                some
+#   script         the file in scripts/, or a compiled binary's name
+#   destination    /root/bin, /usr/local/libexec, /usr/local/sbin for the drain
+#                  binary, drain for the directory the drain's own config names,
+#                  or checkout for a script cron runs from the checkout itself
+#   schedule       the five cron fields, or - when nothing schedules it
+#   args           the arguments the cron line passes, empty when there are none
+#   deploy_route   comma-separated: the deploys a change needs (mail, control,
+#                  relayd, nsd) and the manual steps (cron, env, pf, doas), or
+#                  none. A retired row's route is the deploy that removes it.
+#   installed_name the name at the destination, - when it keeps its own
+#   status         active, or retired for an uninstall step
 #
-# A script installed in two places has one line per place. lib.sh is sourced by
-# the /root/bin scripts and by the drain's, so it is in both. deploy-control.sh
-# also installs it beside kyriakon-authcheck in /usr/local/libexec, which has no
-# row here because that deploy owns the directory.
-#
-# Two scripts are not here, because a row is one file installed under its own
-# name:
-#   - kyriakon-authcheck.sh, which deploy-control.sh installs as
-#     /usr/local/libexec/kyriakon-authcheck, with lib.sh beside it;
-#   - render-docs.sh, which deploy-control.sh runs from the checkout.
-#
-# member-git-shell.sh has two rows: the /usr/local/libexec one the login class
-# names, and a drain row that puts the source beside provision-member.sh, which
-# installs it again when it runs. deploy-mail.sh installs it directly; the drain
-# copy is the source the per-member run reads, the way the login class below is.
-lib.sh	/root/bin	-
-lib/atomic-fs.sh	/root/bin	-
-lib/tls-acme.sh	/root/bin	-
-lib/identity.sh	/root/bin	-
-abuse-monitor.sh	/root/bin	*/15 * * * *
-check-keyring-drift.sh	/root/bin	0 4 * * *	--box
-renew-acme.sh	/root/bin	0 3 * * *
-backup.sh	/root/bin	30 2 * * *
+# A script installed in two places has one line per place. A retired row is a
+# destination that must not carry the file: the deploy removes it if present.
+lib.sh	/root/bin	-		mail	-	active
+lib/atomic-fs.sh	/root/bin	-		mail	-	active
+lib/tls-acme.sh	/root/bin	-		mail	-	active
+lib/identity.sh	/root/bin	-		mail	-	active
+lib/manifest.sh	/root/bin	-		mail	-	active
+lib/paths.sh	/root/bin	-		mail	-	active
+abuse-monitor.sh	/root/bin	*/15 * * * *		mail	-	active
+check-keyring-drift.sh	/root/bin	0 4 * * *	--box	mail	-	active
+renew-acme.sh	/root/bin	0 3 * * *		mail	-	active
+backup.sh	/root/bin	30 2 * * *		mail	-	active
 # Monday, not Sunday. The run creates a box, restores the snapshot into it and
 # mails the operator when it fails, and a failure mailed at 03:45 on a Sunday is
 # one nobody can act on until Monday anyway: the day is chosen for the morning
 # the mail is read, not for the test.
-restore-standup.sh	/root/bin	45 3 * * 1
-acme-queue.sh	/root/bin	*/15 * * * *	--run
+restore-standup.sh	/root/bin	45 3 * * 1		mail	-	active
+acme-queue.sh	/root/bin	*/15 * * * *	--run	mail	-	active
 # Read from the checkout rather than installed, so a pull that fixes one is the
 # whole change. Both are weekly and an hour apart, so a failure is one mail.
-check-hygiene.sh	checkout	30 4 * * 1
-self-test-all.sh	checkout	0 5 * * 1
+check-hygiene.sh	checkout	30 4 * * 1		none	-	active
+self-test-all.sh	checkout	0 5 * * 1		none	-	active
+# Rendered into the capsule by the control deploy, and the finger page written
+# by the mail deploy, both from the checkout rather than installed.
+gen-finger-page.sh	checkout	-		mail	-	active
+render-docs.sh	checkout	-		control	-	active
+# Operator-run: the plan prints the env step, whether the reason is the script or
+# the values file it writes.
+setup-env.sh	-	-		env	-	active
+# A deploy script's own path needs the deploy it runs.
+deploy-mail.sh	-	-		mail	-	active
+deploy-control.sh	-	-		control	-	active
+deploy-relayd.sh	-	-		relayd	-	active
+deploy-nsd.sh	-	-		nsd	-	active
+# The pf fragments live in the script; a change is still the propose-only step.
+pf-apply.sh	-	-		pf	-	active
+# Nothing installs or runs these: a change reaches the next run through the pull.
+deploy.sh	-	-		none	-	active
+install-packages.sh	-	-		none	-	active
+merge-pr.sh	-	-		none	-	active
+rehearsal.sh	-	-		none	-	active
+rekey-mail-key.sh	-	-		none	-	active
+restore-test.sh	-	-		none	-	active
+# The drain binary is compiled, installed by deploy-control.sh into sbin and
+# scheduled every minute: its line is a row like the scripts', not an arm.
+kyriakon-control-drain	/usr/local/sbin	* * * * *		control	kyriakon-control-drain	active
 
-lib.sh	drain	-
-lib/atomic-fs.sh	drain	-
-lib/tls-acme.sh	drain	-
-lib/identity.sh	drain	-
-add-user.sh	drain	-
-provision-member.sh	drain	-
-delete-user.sh	drain	-
-lapse-user.sh	drain	-
-quota-apply.sh	drain	-
-provision-member-web.sh	drain	-
-provision-member-capsule.sh	drain	-
-provision-member-acme.sh	drain	-
-provision-group-web.sh	drain	-
-provision-group-capsule.sh	drain	-
-provision-group-acme.sh	drain	-
-remove-group.sh	drain	-
-remove-upload-key.sh	drain	-
-cron-apply.sh	drain	-
-relayd-members.sh	drain	-
-publish-mail-key.sh	drain	-
-set-mail-password.sh	drain	-
-stripe-api.sh	drain	-
-reload-smtpd.sh	drain	-
-reload-spamd.sh	drain	-
-member-git-shell.sh	drain	-
-member-git-shell.sh	/usr/local/libexec	-
-filter-fromcheck.sh	/usr/local/libexec	-
+lib.sh	drain	-		control	-	active
+lib/atomic-fs.sh	drain	-		control	-	active
+lib/tls-acme.sh	drain	-		control	-	active
+lib/identity.sh	drain	-		control	-	active
+lib/manifest.sh	drain	-		control	-	active
+lib/paths.sh	drain	-		control	-	active
+add-user.sh	drain	-		control	-	active
+provision-member.sh	drain	-		control	-	active
+delete-user.sh	drain	-		control	-	active
+lapse-user.sh	drain	-		control	-	active
+quota-apply.sh	drain	-		control	-	active
+provision-member-web.sh	drain	-		control	-	active
+provision-member-capsule.sh	drain	-		control	-	active
+provision-member-acme.sh	drain	-		control	-	active
+provision-group-web.sh	drain	-		control	-	active
+provision-group-capsule.sh	drain	-		control	-	active
+provision-group-acme.sh	drain	-		control	-	active
+remove-group.sh	drain	-		control	-	active
+remove-upload-key.sh	drain	-		control	-	active
+# The crontab it writes is a manual step in addition to its install.
+cron-apply.sh	drain	-		control,cron	-	active
+# A helper of the relay deploy and of the drain's web pass.
+relayd-members.sh	drain	-		control,relayd	-	active
+publish-mail-key.sh	drain	-		control	-	active
+set-mail-password.sh	drain	-		control	-	active
+stripe-api.sh	drain	-		control	-	active
+reload-smtpd.sh	drain	-		control	-	active
+reload-spamd.sh	drain	-		control	-	active
+member-git-shell.sh	drain	-		control	-	active
+
+member-git-shell.sh	/usr/local/libexec	-		mail	-	active
+filter-fromcheck.sh	/usr/local/libexec	-		mail	-	active
+# The checker runs as root under a doas rule, so it is installed under a name
+# without the .sh suffix; the name is the row's, not a private rename table's.
+kyriakon-authcheck.sh	/usr/local/libexec	-		control	kyriakon-authcheck	active
+
+# The pre-split copies in /root/bin that a box from before the control-plane
+# split still carries. Each is an uninstall step for deploy-mail.sh.
+add-user.sh	/root/bin	-		mail	-	retired
+check-hygiene.sh	/root/bin	-		mail	-	retired
+cron-apply.sh	/root/bin	-		mail	-	retired
+delete-user.sh	/root/bin	-		mail	-	retired
+deploy-mail.sh	/root/bin	-		mail	-	retired
+deploy-onboard.sh	/root/bin	-		mail	-	retired
+deploy-relayd.sh	/root/bin	-		mail	-	retired
+onboard-store.sh	/root/bin	-		mail	-	retired
+provision-member.sh	/root/bin	-		mail	-	retired
+provision-member-capsule.sh	/root/bin	-		mail	-	retired
+provision-member-web.sh	/root/bin	-		mail	-	retired
+quota-apply.sh	/root/bin	-		mail	-	retired
+restore-test.sh	/root/bin	-		mail	-	retired

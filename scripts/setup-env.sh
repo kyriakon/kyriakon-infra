@@ -24,7 +24,7 @@
 # is an update, not a typo.
 #
 # With arguments and no file at all, it writes the whole file and insists on all
-# thirteen, because there is nothing to merge into and a half-filled new file is
+# fifteen, because there is nothing to merge into and a half-filled new file is
 # more likely a mistake than an intention. Nothing is written until the values it
 # was given have been checked.
 #
@@ -246,6 +246,8 @@ export HCLOUD_TOKEN='example'
 export RESTORE_TEST_REPOSITORY='sftp://example.invalid/'
 export RESTORE_TEST_HEALTHCHECKS_URL='https://hc-ping.com/example'
 export POSTAL_ADDRESS='1 Example Street'
+export STRIPE_PAYMENT_LINK='https://buy.stripe.com/person'
+export STRIPE_GROUP_PAYMENT_LINK='https://buy.stripe.com/group'
 EOF
 	code=0
 	KYRIAKON_ENV="$broken" ksh "$script_dir/setup-env.sh" \
@@ -258,10 +260,17 @@ EOF
 		"$(grep -c '^export TUI_PORT=' "$broken")" 1
 	check "and TITAN_PORT too" "$(grep -c '^export TITAN_PORT=' "$broken")" 1
 
+	# The registry, the template and deploy-control's required keys are one set
+	# of names; a value a deploy requires must be one setup-env can write.
+	env_keys_agree "$template" "$script_dir/deploy-control.sh" || {
+		printf 'FAIL: the env template, registry and deploy-control disagree\n' >&2
+		exit 1
+	}
+
 	self_test_end
 }
 
-vars="KYRIAKON_IPV4 KYRIAKON_IPV6 KYRIAKON_TSIG_SECRET RESTIC_REPOSITORY RESTIC_PASSWORD_FILE ALERT_EMAIL HEALTHCHECKS_URL KEYRING_HEALTHCHECKS_URL REHEARSAL_HEALTHCHECKS_URL HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL POSTAL_ADDRESS"
+vars="$KYRIAKON_ENV_KEYS"
 
 usage() {
 	cat >&2 <<'EOF'
@@ -273,8 +282,10 @@ usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
                              --hcloud-token J --restore-test-repository K
                              --restore-test-healthchecks-url L
                              --postal-address M
-                             [--ico-reference N --eu-representative O
-                              --eu-representative-contact P]]
+                             --stripe-payment-link N
+                             --stripe-group-payment-link O
+                             [--ico-reference P --eu-representative Q
+                              --eu-representative-contact R]]
        ksh scripts/setup-env.sh --self-test
 
   No arguments: install the template if /root/.kyriakon-env is absent, then
@@ -302,7 +313,9 @@ usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
       --hcloud-token "$(pass kyriakon/hetzner-terraform-api-key)" \
       --restore-test-repository 'sftp://user-sub1@host:23/' \
       --restore-test-healthchecks-url https://hc-ping.com/<uuid> \
-      --postal-address '1 Example Street, Example'
+      --postal-address '1 Example Street, Example' \
+      --stripe-payment-link 'https://buy.stripe.com/<person>' \
+      --stripe-group-payment-link 'https://buy.stripe.com/<group>'
 EOF
 	exit 2
 }
@@ -327,6 +340,8 @@ a_hcloud=
 a_restrepo=
 a_resthc=
 a_postal=
+a_stripe=
+a_group_stripe=
 a_ico=
 a_rep=
 a_rep_contact=
@@ -346,6 +361,8 @@ while [ "$#" -gt 0 ]; do
 	--restore-test-repository) a_restrepo="$2" ;;
 	--restore-test-healthchecks-url) a_resthc="$2" ;;
 	--postal-address) a_postal="$2" ;;
+	--stripe-payment-link) a_stripe="$2" ;;
+	--stripe-group-payment-link) a_group_stripe="$2" ;;
 	--ico-reference) a_ico="$2" ;;
 	--eu-representative) a_rep="$2" ;;
 	--eu-representative-contact) a_rep_contact="$2" ;;
@@ -379,8 +396,10 @@ if [ "$given" -gt 0 ]; then
 		if [ -z "$a_restrepo" ]; then missing="$missing RESTORE_TEST_REPOSITORY"; fi
 		if [ -z "$a_resthc" ]; then missing="$missing RESTORE_TEST_HEALTHCHECKS_URL"; fi
 		if [ -z "$a_postal" ]; then missing="$missing POSTAL_ADDRESS"; fi
+		if [ -z "$a_stripe" ]; then missing="$missing STRIPE_PAYMENT_LINK"; fi
+		if [ -z "$a_group_stripe" ]; then missing="$missing STRIPE_GROUP_PAYMENT_LINK"; fi
 		if [ -n "$missing" ]; then
-			printf 'setup-env: %s does not exist yet, so all thirteen arguments are needed; missing:%s\n\n' "$env_dst" "$missing" >&2
+			printf 'setup-env: %s does not exist yet, so all fifteen arguments are needed; missing:%s\n\n' "$env_dst" "$missing" >&2
 			usage
 		fi
 	fi
@@ -406,6 +425,13 @@ if [ "$given" -gt 0 ]; then
 		[ -n "$u" ] || continue
 		printf '%s' "$u" | grep -Eq '^https?://' \
 			|| { printf 'setup-env: not a URL: %s\n' "$u" >&2; exit 2; }
+	done
+	# deploy-control writes these into TOML strings, so it accepts only a plain
+	# https URL; check the same shape here rather than at deploy time.
+	for u in "$a_stripe" "$a_group_stripe"; do
+		[ -n "$u" ] || continue
+		printf '%s' "$u" | grep -Eq '^https://[A-Za-z0-9._~:/?#@!$&*+,;=%-]+$' \
+			|| { printf 'setup-env: not a plain https Payment Link: %s\n' "$u" >&2; exit 2; }
 	done
 	if [ -n "$a_restrepo" ]; then
 		printf '%s' "$a_restrepo" | grep -Eq '^sftp://' \
@@ -443,7 +469,8 @@ if [ "$given" -gt 0 ]; then
 			"HEALTHCHECKS_URL=$a_hc" "KEYRING_HEALTHCHECKS_URL=$a_keyring_hc" \
 			"REHEARSAL_HEALTHCHECKS_URL=$a_reh" "HCLOUD_TOKEN=$a_hcloud" \
 			"RESTORE_TEST_REPOSITORY=$a_restrepo" "RESTORE_TEST_HEALTHCHECKS_URL=$a_resthc" \
-			"POSTAL_ADDRESS=$a_postal" "ICO_REFERENCE=$a_ico" \
+			"POSTAL_ADDRESS=$a_postal" "STRIPE_PAYMENT_LINK=$a_stripe" \
+			"STRIPE_GROUP_PAYMENT_LINK=$a_group_stripe" "ICO_REFERENCE=$a_ico" \
 			"EU_REPRESENTATIVE=$a_rep" "EU_REPRESENTATIVE_CONTACT=$a_rep_contact"; do
 			case "$kv" in
 			*=) continue ;;
@@ -478,6 +505,8 @@ $kv"
 		printf "export RESTORE_TEST_REPOSITORY='%s'\n" "$a_restrepo"
 		printf "export RESTORE_TEST_HEALTHCHECKS_URL='%s'\n" "$a_resthc"
 		printf "export POSTAL_ADDRESS='%s'\n" "$a_postal"
+		printf "export STRIPE_PAYMENT_LINK='%s'\n" "$a_stripe"
+		printf "export STRIPE_GROUP_PAYMENT_LINK='%s'\n" "$a_group_stripe"
 		if [ -n "$a_ico" ]; then printf "export ICO_REFERENCE='%s'\n" "$a_ico"; fi
 		if [ -n "$a_rep" ]; then printf "export EU_REPRESENTATIVE='%s'\n" "$a_rep"; fi
 		if [ -n "$a_rep_contact" ]; then printf "export EU_REPRESENTATIVE_CONTACT='%s'\n" "$a_rep_contact"; fi
@@ -559,6 +588,8 @@ if [ -n "$missing" ] || [ -n "$placeholder" ]; then
 	printf '  HEALTHCHECKS_URL              this box'"'"'s own check, not another box'"'"'s\n'
 	printf '  REHEARSAL_HEALTHCHECKS_URL    belongs on the rehearsal box, not this one\n'
 	printf '  POSTAL_ADDRESS                the address the cash-by-post rail gives out\n'
+	printf "  STRIPE_PAYMENT_LINK           the person's Payment Link from the Stripe dashboard\n"
+	printf "  STRIPE_GROUP_PAYMENT_LINK     the own-domain group's Payment Link\n"
 	exit 1
 fi
 
