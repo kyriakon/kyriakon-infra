@@ -263,7 +263,7 @@ jobs:
       # coreutils, not BSD stat, so it runs here rather than waiting behind the
       # OpenBSD VM job. Ubuntu has no oksh package; mksh is the same lineage and
       # this step checks the scan, not the shell's portability. The full suite
-      # runs in the OpenBSD 7.9 VM below.
+      # runs in the OpenBSD 8.0 VM below.
       - name: deploy source-scan self-test
         run: |
           sudo apt-get update
@@ -274,7 +274,7 @@ jobs:
   # they run weekly on the box: without this a break reaches main and stays until
   # Monday. They assert scripts written for OpenBSD's ksh and BSD userland:
   # Linux's GNU coreutils answers `stat -f` differently, and macOS was only ever
-  # a proxy. This job boots a real OpenBSD 7.9 VM on the Ubuntu runner, so the
+  # a proxy. This job boots a real OpenBSD 8.0 VM on the Ubuntu runner, so the
   # shell and tools under test are the ones the box runs.
   self-tests:
     name: script self-tests
@@ -284,10 +284,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: self-tests on OpenBSD 7.9
+      - name: self-tests on OpenBSD 8.0
         uses: vmactions/openbsd-vm@v1.4.9
         with:
-          release: "7.9"
+          release: "8.0"
           run: |
             set -eu
             ksh scripts/install-packages.sh --ci

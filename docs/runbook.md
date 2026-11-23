@@ -38,7 +38,7 @@ Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box witho
 ## Test on the OpenBSD VM
 
 The `script self-tests` job in `.github/workflows/checks.yml` boots a real OpenBSD
-7.9 machine with `vmactions/openbsd-vm` and runs
+8.0 machine with `vmactions/openbsd-vm` and runs
 `scripts/install-packages.sh --ci`, `scripts/install-packages.sh --check`,
 `scripts/self-test-all.sh`, then builds `kyriakon-control-static` and runs
 `scripts/verify-hosting.sh`, which starts that responder and both daemons against
