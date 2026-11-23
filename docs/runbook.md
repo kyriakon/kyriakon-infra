@@ -18,7 +18,7 @@ Three paths appear throughout:
 		doas mv /root/src/kyriakon-infra /usr/local/src/kyriakon-infra
 		doas chown -R root:wheel /usr/local/src/kyriakon-infra
 		ls /usr/local/src/kyriakon-infra   # as the operator, this should list
-- `/root/bin` holds the copies that cron runs. `scripts/deploy-mail.sh` installs the `/root/bin` rows of `scripts/install-set.tsv` there, and `scripts/cron-apply.sh` writes the crontab lines that call them. Two rows have the `checkout` destination instead and are run from `/usr/local/src/kyriakon-infra/scripts`: `check-hygiene.sh` and `self-test-all.sh`, which both read the tree they are in and so have no installed copy.
+- `/root/bin` holds the copies that cron runs. `scripts/deploy-mail.sh` installs the `/root/bin` rows of `scripts/install-set.tsv` there, and `scripts/cron-apply.sh` writes the crontab lines that call them. Four rows have the `checkout` destination instead and are run from `/usr/local/src/kyriakon-infra/scripts`: `check-hygiene.sh`, `self-test-all.sh`, `gen-finger-page.sh` and `render-docs.sh`, which read the tree they are in and so have no installed copy. The compiled programs live at `/usr/local/sbin`, and the drain binary there is the scheduled row that cron runs every minute.
 - `/root/.kyriakon-env` holds the box's values, mode 0600, one `export VAR=value` per line. `scripts/setup-env.sh` installs and merges it, and every cron line sources it, so no value is typed twice.
 
 Deploy the configuration with `doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-mail.sh`. It is idempotent, it installs the mail and web configuration, it rebuilds the Dovecot plugin and the encryptor, it installs every `keys/*.asc` into the keyring, and it restarts the daemons. It prints the firewall and `sshd_config` steps instead of taking them, because both are propose-only changes that a human applies.
@@ -116,6 +116,8 @@ From the workstation, one command updates the checkout and prints the plan:
 
 	ssh -t kyriakon 'cd /usr/local/src/kyriakon-infra && doas git pull --ff-only && doas ksh scripts/deploy.sh --check'
 
+The gold image installs `git` and `openbsd/packages.tsv` assigns it to `deploy.sh` and `deploy-control.sh`. A box built before that change needs `doas pkg_add git` once, because the pull above cannot run without it. `scripts/deploy.sh` installs its own row when it starts without `git`, so a checkout that already exists recovers without the manual step.
+
 Run the same command without `--check` to apply the plan. A later run can be
 narrowed with `--since <commit>`. The first run on a box with no marker is
 `--all`, which runs every script and does not record, because with no diff it
@@ -124,9 +126,7 @@ it:
 
 	ssh -t kyriakon 'cd /usr/local/src/kyriakon-infra && doas ksh scripts/deploy.sh --record'
 
-The script never applies `pf.conf`, `sshd_config` or a login class. It prints
-the commands for each, and it does not advance the marker while one of them
-remains in the range. Apply the diff by hand, then run `--record`. A
+The script never applies `pf.conf`, `sshd_config`, a login class or the control rule in `openbsd/etc/doas.conf.control`. It prints the commands for each, and it does not advance the marker while one of them remains in the range. Apply the diff by hand, then run `--record`. A
 `kyriakon.env` change also needs `doas ksh scripts/setup-env.sh` to merge the new
 value, a `cron-apply.sh` change needs `doas ksh scripts/cron-apply.sh`, and a
 terraform change needs the plan and apply you already run from the workstation.
@@ -179,6 +179,8 @@ is both the cash-by-post address and the published trading address, by decision
 (#397), so the two cannot disagree: `scripts/deploy-control.sh` writes the same
 value into `postal_address` in both the drain's config and the handler's, which
 are the two copies the approval email and the account page read it from.
+
+The card rail needs two live Stripe Payment Link URLs, one for a person's year and one for an own-domain group's year. `scripts/setup-env.sh --stripe-payment-link` and `--stripe-group-payment-link` write them, or fill `STRIPE_PAYMENT_LINK` and `STRIPE_GROUP_PAYMENT_LINK` in `/root/.kyriakon-env` by hand. `deploy-control.sh` refuses an unset or placeholder value.
 
 The same deploy writes the public DNS values every body's recipe is generated
 from. `KYRIAKON_IPV4` and `KYRIAKON_IPV6` come from `/root/.kyriakon-env`, and

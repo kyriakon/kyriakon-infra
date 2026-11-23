@@ -17,10 +17,11 @@
 # to HEAD and runs only what the changed paths need. `--check` prints the same
 # plan and writes nothing.
 #
-# Two changes are never applied here. pf.conf is the operator's propose-only
-# step, and sshd_config and its login class are installed by hand; the script
-# prints the commands for both and does not advance the marker while one of
-# them remains in the range. Apply the diff by hand, then run `--record`.
+# Three changes are never applied here. pf.conf is the operator's propose-only
+# step, sshd_config and its login class are installed by hand, and the control
+# doas rule is a fragment copied into /etc/doas.conf by hand; the script prints
+# the commands for each and does not advance the marker while one of them
+# remains in the range. Apply the diff by hand, then run `--record`.
 #
 # A path this script does not recognise is an error, not a silent skip: a new
 # directory has to choose its deploy, which is how a config file added under
@@ -59,114 +60,59 @@ reset_plan() {
 	manual_lapsed_class=no
 	manual_cron=no
 	manual_env=no
+	manual_doas=no
 	manual_terraform=no
+	uninstall_list=''
 }
 
-# install_dests <script name> <table> — set the deploy flags for one script's
-# install-set rows. A table this cannot read, or a destination no deploy
-# installs, is an error rather than a silent skip: the alternative is a script
-# that never reaches the box. Returns 1 when the table has no row for the
-# script, so its caller can refuse a change nothing would install.
-install_dests() {
-	typeset name="$1" table="$2" dest dests
-	[ -f "$table" ] || die "no install-set table at $table"
-	dests=$(awk -F'\t' -v n="$name" '!/^#/ && $1 == n { print $2 }' "$table") ||
-		die "cannot read $table"
-	[ -n "$dests" ] || return 1
-	for dest in $dests; do
-		case "$dest" in
-		/root/bin) needs_mail=yes ;;
-		# The member session shell: deploy-mail.sh installs it, the class that
-		# names it is a manual step printed with the plan.
-		/usr/local/libexec) needs_mail=yes ;;
-		drain) needs_control=yes ;;
-		# Run from the checkout, so a change to it is installed by nothing: the
-		# pull that changes it is the whole deploy.
-		checkout) ;;
-		*) die "unknown destination $dest for $name in $table" ;;
+# apply_routes <token>... — set the flags one manifest row's deploy_route names.
+# The tokens are the deploys that install the file and the manual steps a change
+# needs; an unknown one is refused rather than skipped.
+apply_routes() {
+	typeset route
+	for route in "$@"; do
+		case "$route" in
+		mail) needs_mail=yes ;;
+		control) needs_control=yes ;;
+		relayd) needs_relayd=yes ;;
+		nsd) needs_nsd=yes ;;
+		cron) manual_cron=yes ;;
+		env) manual_env=yes ;;
+		pf) manual_pf=yes ;;
+		doas) manual_doas=yes ;;
+		none) ;;
+		*) die "unknown deploy_route $route for a script in $install_set" ;;
 		esac
 	done
 }
 
-# classify_script <path> — the scripts/ arms. Most scripts are routed by their
-# install-set row, through install_dests at the end. The arms above it are the
-# ones whose deploy is not their install: the scripts nothing installs, and the
-# deploy scripts themselves, which plan the deploy they are. A script with
-# neither an arm nor a row returns 1, so the plan fails on it rather than
-# skipping a change nothing on the box would pick up.
+# classify_script <path> — a scripts/ path is routed by its manifest rows. The
+# table is the manifest: a script nothing names returns 1 so the plan fails on
+# it, and a retired row with no active one still routes the deploy that removes
+# the installed copy.
 classify_script() {
-	case "$1" in
-	# A helper of both the relay deploy and the drain's web pass, so a change to
-	# it is both. Its one install row is the drain's.
-	scripts/relayd-members.sh) needs_relayd=yes ;;
-	# Its install row is the drain's, and the crontab it writes is a manual step.
-	scripts/cron-apply.sh) manual_cron=yes ;;
+	typeset name="${1#scripts/}" routes
+	case "$name" in
 	# The table itself: a row added or removed is an install on one side or the
 	# other, and a schedule changed is the crontab, so a change here is both
 	# deploys and the manual cron step rather than nothing.
-	scripts/install-set.tsv)
+	install-set.tsv)
 		needs_mail=yes
 		needs_control=yes
 		manual_cron=yes
 		return 0
 		;;
-	# Installed by deploy-control.sh under a name its own row could not carry
-	# (/usr/local/libexec/kyriakon-authcheck), so its install is that script's
-	# explicit line and this is its route.
-	scripts/kyriakon-authcheck.sh)
-		needs_control=yes
-		return 0
-		;;
-	# Rendered into the capsule by the deploy and run from the checkout, so there
-	# is no install row: the pages the handler serves are written by a deploy.
-	scripts/render-docs.sh)
-		needs_control=yes
-		return 0
-		;;
-	# deploy-mail.sh runs it from the checkout to write /etc/kyriakon/finger.txt,
-	# so no row installs it and a change here is that deploy.
-	scripts/gen-finger-page.sh)
-		needs_mail=yes
-		return 0
-		;;
-	# Operator-run: the plan prints the run as the env step, whether the reason is
-	# the script or the values file it writes.
-	scripts/setup-env.sh)
-		manual_env=yes
-		return 0
-		;;
-	# Nothing installs these and no deploy runs them: the dispatcher itself, an
-	# operator script read from the checkout, and the workstation/throwaway-box
-	# scripts. A change reaches the next run through the pull.
-	scripts/deploy.sh | scripts/install-packages.sh | scripts/merge-pr.sh | \
-		scripts/rehearsal.sh | scripts/rekey-mail-key.sh | scripts/restore-test.sh)
-		return 0
-		;;
-	# A deploy script's own code changed, so run it.
-	scripts/deploy-mail.sh)
-		needs_mail=yes
-		return 0
-		;;
-	scripts/deploy-relayd.sh)
-		needs_relayd=yes
-		return 0
-		;;
-	scripts/deploy-control.sh)
-		needs_control=yes
-		return 0
-		;;
-	scripts/deploy-nsd.sh)
-		needs_nsd=yes
-		return 0
-		;;
-	# The pf fragments live in the script; a change to it is still the propose-only
-	# step, not a deploy this dispatcher runs.
-	scripts/pf-apply.sh)
-		manual_pf=yes
-		return 0
-		;;
 	esac
-	install_dests "${1#scripts/}" "$install_set"
+	manifest_has "$install_set" "$name" || return 1
+	routes=$(manifest_routes "$install_set" "$name")
+	if [ -z "$routes" ]; then
+		routes=$(manifest_retired_routes "$install_set" "$name")
+	fi
+	[ -n "$routes" ] || return 0
+	# Shell word splitting turns the newline-separated tokens into arguments.
+	# shellcheck disable=SC2086 # one token per line, refusals on anything else
+	apply_routes $routes
+	return 0
 }
 
 # classify <path> — set the flags for one changed path. Returns 1 when the path
@@ -192,8 +138,13 @@ classify() {
 	openbsd/etc/sshd_config) manual_sshd=yes ;;
 	openbsd/etc/sshd_config.onboard | openbsd/etc/login.conf.d/hello) manual_sshd_onboard=yes ;;
 	# A hand-applied fragment, printed by the control deploy when the rule is
-	# missing from /etc/doas.conf.
-	openbsd/etc/doas.conf.control) needs_control=yes ;;
+	# missing from /etc/doas.conf. It gates the marker like pf.conf does: the
+	# deploy history must not say applied while the rule is still uninstalled.
+	openbsd/etc/doas.conf.control)
+		needs_control=yes
+		manual_doas=yes
+		;;
+
 	openbsd/etc/login.conf.d/member)
 		needs_control=yes
 		manual_member_class=yes
@@ -244,10 +195,28 @@ plan() {
 	unknown=''
 	while IFS= read -r path; do
 		[ -n "$path" ] || continue
-		# A deleted script has no worktree file to classify, and nothing for a
-		# deploy to install; retiring one must not block the rest of the range.
+		# A deleted script is an uninstall, not a skip: the manifest must carry
+		# it as retired, the deploy that owns the destination removes the
+		# installed copy, and the plan says so. A deletion whose rows are still
+		# active (or absent) is refused, because the box would keep invoking it.
 		case "$path" in
-		scripts/*) [ -e "$plan_repo/$path" ] || continue ;;
+		scripts/*)
+			if [ ! -e "$plan_repo/$path" ]; then
+				name=${path#scripts/}
+				if ! manifest_has "$install_set" "$name"; then
+					unknown="$unknown $path"
+					continue
+				fi
+				if [ -n "$(manifest_routes "$install_set" "$name")" ]; then
+					die "scripts/$name is deleted but its manifest row is active; mark the row retired"
+				fi
+				uninstall_list="$uninstall_list $name"
+				routes=$(manifest_retired_routes "$install_set" "$name")
+				# shellcheck disable=SC2086 # one token per line
+				[ -z "$routes" ] || apply_routes $routes
+				continue
+			fi
+			;;
 		esac
 		if ! classify "$path"; then
 			unknown="$unknown $path"
@@ -306,8 +275,8 @@ render_onboard_sshd() {
 manual_any() {
 	[ "$manual_pf" = yes ] || [ "$manual_sshd" = yes ] || [ "$manual_sshd_onboard" = yes ] ||
 		[ "$manual_member_class" = yes ] || [ "$manual_lapsed_class" = yes ] ||
-		[ "$manual_cron" = yes ] ||
-		[ "$manual_env" = yes ] || [ "$manual_terraform" = yes ]
+	[ "$manual_cron" = yes ] || [ "$manual_doas" = yes ] ||
+	[ "$manual_env" = yes ] || [ "$manual_terraform" = yes ]
 }
 
 print_manual() {
@@ -364,6 +333,16 @@ print_manual() {
 	fi
 	if [ "$manual_cron" = yes ]; then
 		printf 'the crontab or its scripts changed:\n  doas ksh scripts/cron-apply.sh\n'
+	fi
+	if [ "$manual_doas" = yes ]; then
+		printf 'the control doas rule changed; apply it by hand, then run --record:\n'
+		printf '  doas ksh scripts/deploy-control.sh   # prints the rule when /etc/doas.conf lacks it\n'
+	fi
+	if [ -n "${uninstall_list:-}" ]; then
+		printf 'retired scripts are removed by their deploy:\n'
+		for s in $uninstall_list; do
+			printf '  scripts/%s\n' "$s"
+		done
 	fi
 	if [ "$manual_env" = yes ]; then
 		printf 'the environment template changed; merge it into /root/.kyriakon-env:\n'
@@ -454,6 +433,14 @@ main() {
 		die '--record stands alone'
 	fi
 	[ "$(id -u)" -eq 0 ] || die "run as root (doas ksh $0)"
+	# git is assigned to this script in packages.tsv: on a fresh box it is the
+	# first command that needs it, before any deploy has run, so it installs
+	# itself here rather than leaving the documented pull as the failure.
+	if ! command -v git >/dev/null 2>&1; then
+		say 'git is not installed; installing the bootstrap packages'
+		ksh "$script_dir/install-packages.sh" deploy.sh \
+			|| die "cannot install git; install it and re-run"
+	fi
 	[ -d "$repo_dir/.git" ] || die "$repo_dir is not a git checkout"
 	if ! git -C "$repo_dir" diff --quiet || ! git -C "$repo_dir" diff --cached --quiet; then
 		die "$repo_dir has uncommitted changes; commit or discard them first"
@@ -577,22 +564,30 @@ self_test() {
 	( classify 'scripts/no-such-helper.sh' ) || got=$?
 	check 'an uninstalled script with no rule is refused' "$got" 1
 
-	# Retiring an installed script deletes the script and its row in one commit.
-	# The dead path must not refuse the whole range.
-	printf 'gone.sh\t/usr/local/bin\tdeploy-mail.sh\n' > "$self_test_work/table.tsv"
+	# Retiring an installed script deletes the script and marks its manifest row
+	# retired in one commit. The deletion is an explicit uninstall step, and the
+	# deploy that owns the destination is still planned.
+	printf 'gone.sh\t/usr/local/bin\t-\t\tmail\t-\tretired\n' > "$self_test_work/table.tsv"
 	install_set="$self_test_work/table.tsv"
 	printf 'x\n' > "$repo/scripts/gone.sh"
 	git -C "$repo" add -A
 	git -C "$repo" commit -qm five
 	fifth=$(git -C "$repo" rev-parse HEAD)
 	rm "$repo/scripts/gone.sh"
-	: > "$self_test_work/table.tsv"
 	git -C "$repo" add -A
 	git -C "$repo" commit -qm six
 	got=0
 	plan "$repo" "$fifth" || got=$?
+	check 'a retired deletion plans its deploy' "$got" 0
+	check 'and is surfaced as an uninstall' "$uninstall_list" ' gone.sh'
+	check 'and the deploy removing it runs' "$(plan_order)" 'deploy-mail.sh'
+	# A deletion whose row is still active would leave the box invoking a file
+	# that no longer exists, so it is refused rather than recorded.
+	printf 'gone.sh\t/usr/local/bin\t-\t\tmail\t-\tactive\n' > "$self_test_work/table.tsv"
+	got=0
+	( plan "$repo" "$fifth" ) >/dev/null 2>&1 || got=$?
+	check 'a deletion with an active row is refused' "$got" 1
 	install_set="$script_dir/install-set.tsv"
-	check 'a deleted script does not block the plan' "$got" 0
 
 	reset_plan
 	classify 'scripts/backup.sh'
@@ -681,12 +676,11 @@ self_test() {
 	# Every row of the install-set table has to plan the deploy that installs it,
 	# or a fix to that script lands in the checkout and never reaches the box. The
 	# rows are read from the table rather than retyped here, so the check cannot
-	# agree with a stale copy of it. render-docs.sh and kyriakon-authcheck.sh are
-	# not rows: the one runs from the checkout and the other is installed under a
-	# name its row could not carry.
-	drain_rows=$(awk -F'\t' '!/^#/ && $2 == "drain" { print $1 }' "$install_set")
-	root_bin_rows=$(awk -F'\t' '!/^#/ && $2 == "/root/bin" { print $1 }' "$install_set")
-	libexec_rows=$(awk -F'\t' '!/^#/ && $2 == "/usr/local/libexec" { print $1 }' "$install_set")
+	# agree with a stale copy of it. A retired row is not installed.
+	drain_rows=$(awk -F'\t' '!/^#/ && $2 == "drain" && $7 == "active" { print $1 }' "$install_set")
+	root_bin_rows=$(awk -F'\t' '!/^#/ && $2 == "/root/bin" && $7 == "active" { print $1 }' "$install_set")
+	libexec_rows=$(awk -F'\t' '!/^#/ && $2 == "/usr/local/libexec" && $7 == "active" { print $1 }' "$install_set")
+	libexec_mail_rows=$(awk -F'\t' '!/^#/ && $2 == "/usr/local/libexec" && $7 == "active" && $5 ~ /(^|,)mail(,|$)/ { print $1 }' "$install_set")
 	check 'the table names drain scripts' \
 		"$([ -n "$drain_rows" ] && printf yes || printf no)" yes
 	check 'the table names /root/bin scripts' \
@@ -703,7 +697,7 @@ self_test() {
 		classify "scripts/$installed"
 		check "scripts/$installed plans deploy-mail" "$needs_mail" yes
 	done
-	for installed in $libexec_rows; do
+	for installed in $libexec_mail_rows; do
 		reset_plan
 		classify "scripts/$installed"
 		check "scripts/$installed plans deploy-mail" "$needs_mail" yes
@@ -722,15 +716,20 @@ self_test() {
 	reset_plan
 	classify 'scripts/render-docs.sh'
 	check 'the pages renderer plans deploy-control' "$needs_control" yes
-	# A destination nothing installs is refused rather than skipped: a row with a
-	# typo in it would otherwise be a script no deploy puts on the box.
-	printf 'new.sh\tsomewhere-else\t-\n' >"$self_test_work/unknown-dest.tsv"
+	# A route token no deploy or manual step names is refused rather than
+	# skipped: a typo would otherwise route a change nowhere.
 	got=0
-	( install_dests new.sh "$self_test_work/unknown-dest.tsv" ) >/dev/null 2>&1 || got=$?
-	check 'an unknown destination is refused' "$got" 1
+	( apply_routes somewhere-else ) >/dev/null 2>&1 || got=$?
+	check 'an unknown deploy route is refused' "$got" 1
 	got=0
-	( install_dests new.sh "$self_test_work/no-such-table.tsv" ) >/dev/null 2>&1 || got=$?
-	check 'a missing install-set table is refused' "$got" 1
+	( manifest_has "$self_test_work/no-such-table.tsv" new.sh ) >/dev/null 2>&1 || got=$?
+	check 'a missing manifest table is refused' "$got" 1
+	# The doas rule is hand-applied, so its diff must gate the marker.
+	reset_plan
+	classify 'openbsd/etc/doas.conf.control'
+	check 'the doas fragment plans deploy-control' "$needs_control" yes
+	check 'and gates the marker' \
+		"$(if manual_any; then printf yes; else printf no; fi)" yes
 	reset_plan
 	classify '.omp/lsp.json'
 	check 'developer tooling plans nothing' "$(plan_order)" ''
@@ -813,6 +812,21 @@ self_test() {
 	got=0
 	( plan "$repo" "$head" ) >/dev/null 2>&1 || got=$?
 	check 'an uninstalled script fails the plan' "$got" 1
+
+	# A range that only changes the hand-applied doas fragment must not record:
+	# the rule is copied into /etc/doas.conf by hand, and the marker says the
+	# release is applied.
+	doas_base=$(git -C "$repo" rev-parse HEAD)
+	printf 'permit nopass _onboard as root cmd /usr/local/libexec/kyriakon-authcheck\n' \
+		>"$repo/openbsd/etc/doas.conf.control"
+	git -C "$repo" add -A
+	git -C "$repo" commit -qm doas
+	all_scripts=no
+	plan "$repo" "$doas_base"
+	check 'a doas-only range plans deploy-control' "$needs_control" yes
+	check 'and marks the rule as manual' "$manual_doas" yes
+	check 'and does not advance the marker' \
+		"$(if gate; then printf yes; else printf no; fi)" no
 
 	self_test_end
 }

@@ -167,50 +167,40 @@ alert_address_problem() {
 	fi
 }
 
-# install_renames <destination>: "installed-name checkout-source" pairs for the
-# files a deploy installs under a name with no .sh suffix, which neither a table
-# row nor the *.sh glob can see. deploy-control.sh installs kyriakon-authcheck
-# that way: it runs as root under a doas nopass rule and decides which page
-# sessions are trusted, so a stale copy keeps the old behaviour while §9 says the
-# tree is clean. The table row is deliberately absent (install-set.tsv explains
-# why), so the pairing is named here.
-install_renames() {
-	case "$1" in
-	/usr/local/libexec) printf 'kyriakon-authcheck kyriakon-authcheck.sh\n' ;;
-	esac
-}
-
 # deployed_drift <checkout-scripts> <table> <destination> <dir>
 #
 # One line per table row for <destination> with no installed copy, per installed
-# file whose copy is not the checkout's, and per directory that is gone. The
-# table's rows are what the deploys install, so a row with nothing installed is a
-# finding: comparing only the copies that happen to be there cannot see the
-# install a deploy never made.
+# file whose copy is not the checkout's, per a retired row that is still
+# installed, and per directory that is gone. The table's rows are what the
+# deploys install, so a row with nothing installed is a finding: comparing only
+# the copies that happen to be there cannot see the install a deploy never made.
+# The installed name is the row's, so a file installed without its .sh suffix is
+# compared like any other.
 #
 # The drain's directory also holds the table itself, because the installed
 # cron-apply.sh reads it from there, so a stale or missing copy is the same
 # finding: the box would schedule the set the checkout has left behind.
 deployed_drift() {
-	typeset checkout="$1" table="$2" token="$3" dir="$4" file name names renamed
+	typeset checkout="$1" table="$2" token="$3" dir="$4" file name source targets
 	if [ ! -d "$dir" ]; then
 		printf '%s: the directory is gone\n' "$dir"
 		return 0
 	fi
-	names=$(install_rows "$table" "$token") || return 1
-	for name in $names; do
+	targets=$(manifest_targets "$table" "$token") || return 1
+	while IFS="$(printf '\t')" read -r source name; do
+		[ -n "$name" ] || continue
 		if [ ! -f "$dir/$name" ]; then
 			printf '%s: not installed, and %s names it\n' "$dir/$name" "$table"
 			continue
 		fi
-		# The *.sh glob below cannot see a nested row such as lib/atomic-fs.sh,
-		# so a stale module would otherwise pass on existence alone.
-		case "$name" in
-		*/*)
-			cmp -s "$dir/$name" "$checkout/$name" \
-				|| printf '%s differs from %s\n' "$dir/$name" "$checkout/$name"
-			;;
-		esac
+		cmp -s "$dir/$name" "$checkout/$source" \
+			|| printf '%s differs from %s\n' "$dir/$name" "$checkout/$source"
+	done <<EOF
+$targets
+EOF
+	for name in $(manifest_retired_names "$table" "$token"); do
+		[ -e "$dir/$name" ] || continue
+		printf '%s: retired by %s, still installed\n' "$dir/$name" "$table"
 	done
 	if [ "$token" = drain ]; then
 		if [ ! -f "$dir/install-set.tsv" ]; then
@@ -230,19 +220,6 @@ deployed_drift() {
 		cmp -s "$file" "$checkout/$name" \
 			|| printf '%s differs from %s\n' "$file" "$checkout/$name"
 	done
-	renamed=$(install_renames "$token")
-	[ -n "$renamed" ] || return 0
-	while read -r installed src; do
-		if [ ! -f "$dir/$installed" ]; then
-			printf '%s: not installed, and install_renames names it\n' \
-				"$dir/$installed"
-			continue
-		fi
-		cmp -s "$dir/$installed" "$checkout/$src" \
-			|| printf '%s differs from %s\n' "$dir/$installed" "$checkout/$src"
-	done <<EOF
-$renamed
-EOF
 }
 
 # record_dir_problems <dir>: one line per record directory under it that is not
@@ -661,6 +638,16 @@ EOF
 	*gone*) ;;
 	*) printf 'FAIL: a missing directory is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
 	esac
+	# A retired row is an uninstall: a copy still at its destination is stale
+	# even though no active row names it.
+	printf 'gone.sh\t/root/bin\t-\t\tmail\t-\tretired\n' >>"$dir/table"
+	printf 'old\n' >"$dir/deployed/gone.sh"
+	out=$(deployed_drift "$dir/checkout" "$dir/table" /root/bin "$dir/deployed")
+	case "$out" in
+	*"gone.sh: retired"*) ;;
+	*) printf 'FAIL: a retired installed copy is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
+	rm -f "$dir/deployed/gone.sh"
 	# A destination the table does not use takes nothing from it: the rows above
 	# are /root/bin's, so a drain check on a directory holding an identical table
 	# copy and no drain rows has nothing to report.
@@ -687,14 +674,14 @@ EOF
 	*) printf 'FAIL: a missing installed table is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
 	esac
 
-	# The member session shell is the one /usr/local/libexec row, and a stale
-	# copy there is a finding for the same reason /root/bin's is.
-	printf 'wrap.sh\t/usr/local/libexec\t-\n' >"$dir/libexec-table"
+	# The member session shell and the renamed login checker are the
+	# /usr/local/libexec rows; a stale copy is a finding for the same reason
+	# /root/bin's is, and the installed name comes from the row.
+	printf 'wrap.sh\t/usr/local/libexec\t-\t\tmail\t-\tactive\nkyriakon-authcheck.sh\t/usr/local/libexec\t-\t\tcontrol\tkyriakon-authcheck\tactive\n' \
+		>"$dir/libexec-table"
 	mkdir -p "$dir/libexec"
 	printf 'new\n' > "$dir/checkout/wrap.sh"
 	printf 'old\n' > "$dir/libexec/wrap.sh"
-	# install_renames always names the suffixless login checker for libexec, so
-	# the fixture installs a matching copy before the clean case.
 	printf 'new\n' > "$dir/checkout/kyriakon-authcheck.sh"
 	printf 'new\n' > "$dir/libexec/kyriakon-authcheck"
 	out=$(deployed_drift "$dir/checkout" "$dir/libexec-table" /usr/local/libexec "$dir/libexec")
@@ -712,7 +699,7 @@ EOF
 	# The suffixless install: deploy-control.sh installs kyriakon-authcheck from
 	# scripts/kyriakon-authcheck.sh, and the login checker runs as root under a
 	# doas rule, so a stale copy keeps old behaviour while §9 says the tree is
-	# clean. No table row or *.sh glob sees it, so install_renames names the pair.
+	# clean. The manifest row's installed_name is what pairs them.
 	printf 'new\n' > "$dir/checkout/kyriakon-authcheck.sh"
 	printf 'old\n' > "$dir/libexec/kyriakon-authcheck"
 	out=$(deployed_drift "$dir/checkout" "$dir/libexec-table" /usr/local/libexec "$dir/libexec")
@@ -1010,7 +997,7 @@ fi
 # rendering of it, because the point of the file is that it is the same file
 # everywhere, and a diff here is what a person reads to see which way.
 catalogue="$repo_root/openbsd/etc/onboard/catalogue.toml"
-deployed_catalogue=/var/db/onboard/catalogue.toml
+deployed_catalogue=$KYRIAKON_STORE_ROOT/catalogue.toml
 if [ ! -f "$deployed_catalogue" ]; then
 	printf 'catalogue: %s is missing; scripts/control-store.sh installs it\n' "$deployed_catalogue"
 	status=1
@@ -1071,9 +1058,9 @@ fi
 # greylist diverts are in place, so the failure is seen by whoever writes to that
 # parish and not by anything here. The allow list's own header says the same,
 # which is what made the pair worth checking rather than trusting.
-mail_domains_table=/etc/mail/mail_domains
+mail_domains_table=$KYRIAKON_MAIL_DOMAINS
 platform_domain=kyriakon.net
-spamd_allowed=/etc/mail/spamd.alloweddomains
+spamd_allowed=$KYRIAKON_SPAMD_ALLOWED
 mail_domains_ok=yes
 if [ ! -f "$mail_domains_table" ]; then
 	printf 'mail domains: %s is missing; scripts/deploy-mail.sh seeds it with the platform domain\n' \
@@ -1113,7 +1100,7 @@ fi
 # A writer killed while holding a table lock leaves <table>.lock, and every later
 # writer waits five seconds and then refuses. Report a stale one here rather than
 # letting the next signup be the thing that discovers it.
-for mail_table in "$mail_domains_table" /etc/mail/virtuals /etc/mail/mail_from /etc/mail/dkim_domains; do
+for mail_table in "$mail_domains_table" "$KYRIAKON_VIRTUALS" "$KYRIAKON_MAIL_FROM" "$KYRIAKON_DKIM_DOMAINS"; do
 	lock_problem=$(table_lock_stale "$mail_table")
 	if [ -n "$lock_problem" ]; then
 		printf 'mail domains: %s.lock is stale: %s; remove it if no writer is running\n' \
@@ -1145,8 +1132,8 @@ fi
 
 # --- 9. the scripts the box runs are the scripts the checkout has ---------
 # The deploys install the rows of scripts/install-set.tsv into /root/bin, the
-# drain's directory, and /usr/local/libexec, and nothing reads them again
-# afterwards. A box running
+# drain's directory, /usr/local/libexec and /usr/local/sbin, and nothing reads
+# them again afterwards. A box running
 # copies older than its checkout gives no sign at all: operator mail went out
 # without the subject fix for months, and it surfaced because someone happened to
 # look at a subject line. A row with no installed file is the same finding from
@@ -1207,7 +1194,7 @@ fi
 # The handler renders the status page from applications/ and runs as _onboard. A
 # record left root-owned reads as missing to it, which is why the drain hands each
 # one back to the directory's owner after it writes.
-applications_dir=/var/db/onboard/applications
+applications_dir=$KYRIAKON_STORE_ROOT/applications
 if [ -d "$applications_dir" ]; then
 	owner_drift=$(store_drift "$applications_dir" _onboard)
 	if [ -n "$owner_drift" ]; then
@@ -1226,7 +1213,7 @@ fi
 # the handler cannot enter hides every record inside it, so the mode is checked
 # beside the records.
 for sub in accounts groups; do
-	dir="/var/db/onboard/$sub"
+	dir="$KYRIAKON_STORE_ROOT/$sub"
 	[ -d "$dir" ] || continue
 	dir_drift=$(record_dir_problems "$dir")
 	if [ -n "$dir_drift" ]; then

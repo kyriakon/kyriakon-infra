@@ -55,7 +55,7 @@ Hetzner has no native OpenBSD image, so install once by hand and snapshot it:
 6. Post-install, before snapshotting:
    ```sh
    syspatch
-   pkg_add dovecot restic
+   pkg_add dovecot git restic
    pkg_add -u
    ```
    Not `rspamd`: the spam and blocklist work is OpenBSD's `spamd` plus
