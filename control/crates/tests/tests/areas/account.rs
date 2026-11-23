@@ -1124,6 +1124,9 @@ fn request_verify_refuses_a_wrong_signer_from_or_missing_keyring_entry() {
 fn request_verify_refuses_unsigned_text_before_the_armour() {
     let fix = Fix::new("request-verify-prefix");
     fix.page_account("alice", json!({}));
+    // The keyring entry has to exist for the framing check to be reached; the
+    // signed block below is never verified because the text above it is refused.
+    fix.mail_key("alice", GOOD_KEY);
     let armour = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n\
                   From: alice@kyriakon.net\n\nPlease send me a copy.\n\
                   -----BEGIN PGP SIGNATURE-----\n\nAAAA\n\
