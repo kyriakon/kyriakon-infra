@@ -1470,10 +1470,13 @@ impl Log<'_> {
     /// The record's lines as written. For the one reader that copies a record
     /// into an artefact verbatim — the export — rather than reading it.
     pub async fn raw_lines(&self) -> Result<Vec<String>, Error> {
-        self.store
-            .read_lines(self.path)
-            .await
-            .map(|(lines, _)| lines)
+        let (mut lines, terminated) = self.store.read_lines(self.path).await?;
+        // A re-terminating consumer would turn a crash fragment into an
+        // interior parse error on its next load, so it never sees one.
+        if !terminated && lines.last().is_some_and(|line| not_json(line)) {
+            lines.pop();
+        }
+        Ok(lines)
     }
 }
 
@@ -3753,6 +3756,12 @@ mod tests {
                 .unwrap();
             f.write_all(br#"{"version":1,"at":"#).unwrap();
         }
+        // A re-terminating consumer must not see the fragment: that would turn
+        // it into an interior parse error on the next load.
+        assert_eq!(
+            store.log("journal.jsonl").raw_lines().await.unwrap().len(),
+            1
+        );
         let journal = journal::Journal::load(&store).await.unwrap();
         assert!(
             journal.has("01H", "applied"),
