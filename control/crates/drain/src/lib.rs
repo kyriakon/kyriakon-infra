@@ -26,6 +26,7 @@ pub mod transitions;
 use serde_json::Value;
 
 use kyriakon_control_core::intent::*;
+use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use kyriakon_control_core::account::sign;
@@ -81,6 +82,10 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), Error> {
         OffsetDateTime::now_utc(),
     )
     .await;
+    // The page sessions' expiry sweep. A login writes only its own account's
+    // record and does not list the directory, so this pass is what clears the
+    // spent ones, including any an earlier build left under a random name.
+    kyriakon_control_core::account::session::prune(store, OffsetDateTime::now_utc()).await;
     transitions::lifecycle::purge_declined(cfg, store, &journal).await?;
     // ADR 0005's application answers: the ninety days are counted from filing,
     // so this clears an approved application's copies and an abandoned record
@@ -378,10 +383,24 @@ pub async fn verify(
             // A close reports a name it cannot use as a pass failure, where
             // a page action refuses it; the session proof is shared.
             account_name(&intent.username)?;
-            session_proved(store, proofs, &intent.session, &intent.username).await
+            session_proved(
+                store,
+                proofs,
+                &intent.session,
+                &intent.username,
+                &intent.filed_at,
+            )
+            .await
         }
         Intent::CancelClose(intent) => {
-            page_proved(store, proofs, &intent.session, &intent.username).await
+            page_proved(
+                store,
+                proofs,
+                &intent.session,
+                &intent.username,
+                &intent.filed_at,
+            )
+            .await
         }
         Intent::Resend(intent) => {
             if sign::verify(
@@ -490,7 +509,14 @@ pub async fn verify(
                     intent.username
                 ))));
             }
-            session_proved(store, proofs, &intent.session, &intent.username).await
+            session_proved(
+                store,
+                proofs,
+                &intent.session,
+                &intent.username,
+                &intent.filed_at,
+            )
+            .await
         }
         // A page action is proved by the session the handler filed, and by
         // the account name being one an account record can name.
@@ -500,25 +526,74 @@ pub async fn verify(
                     "the intent carries a hash rather than a plaintext",
                 )));
             }
-            page_proved(store, proofs, &intent.session, &intent.username).await
+            page_proved(
+                store,
+                proofs,
+                &intent.session,
+                &intent.username,
+                &intent.filed_at,
+            )
+            .await
         }
         Intent::UploadKey(intent) => {
-            page_proved(store, proofs, &intent.session, &intent.username).await
+            page_proved(
+                store,
+                proofs,
+                &intent.session,
+                &intent.username,
+                &intent.filed_at,
+            )
+            .await
         }
         Intent::OutsideAddress(intent) => {
-            page_proved(store, proofs, &intent.session, &intent.username).await
+            page_proved(
+                store,
+                proofs,
+                &intent.session,
+                &intent.username,
+                &intent.filed_at,
+            )
+            .await
         }
         Intent::Serving(intent) => {
-            page_proved(store, proofs, &intent.session, &intent.username).await
+            page_proved(
+                store,
+                proofs,
+                &intent.session,
+                &intent.username,
+                &intent.filed_at,
+            )
+            .await
         }
         Intent::CancelRenewal(intent) => {
-            page_proved(store, proofs, &intent.session, &intent.username).await
+            page_proved(
+                store,
+                proofs,
+                &intent.session,
+                &intent.username,
+                &intent.filed_at,
+            )
+            .await
         }
         Intent::MailKey(intent) => {
-            page_proved(store, proofs, &intent.session, &intent.username).await
+            page_proved(
+                store,
+                proofs,
+                &intent.session,
+                &intent.username,
+                &intent.filed_at,
+            )
+            .await
         }
         Intent::TestMail(intent) => {
-            page_proved(store, proofs, &intent.session, &intent.username).await
+            page_proved(
+                store,
+                proofs,
+                &intent.session,
+                &intent.username,
+                &intent.filed_at,
+            )
+            .await
         }
         Intent::Unknown { .. } => Ok(Some(transitions::Settlement::refused(
             "this build does not implement this kind; the intent is left in place",
@@ -702,8 +777,9 @@ async fn session_proved(
     proofs: &std::path::Path,
     session: &str,
     username: &str,
+    filed_at: &str,
 ) -> Result<Option<transitions::Settlement>, Error> {
-    match verify_session(store, proofs, session, username).await {
+    match verify_session(store, proofs, session, username, filed_at).await {
         Ok(()) => Ok(None),
         Err(reason) => Ok(Some(transitions::Settlement::refused(reason))),
     }
@@ -716,25 +792,34 @@ async fn page_proved(
     proofs: &std::path::Path,
     session: &str,
     username: &str,
+    filed_at: &str,
 ) -> Result<Option<transitions::Settlement>, Error> {
     if let Err(why) = account_name(username) {
         return Ok(Some(transitions::Settlement::refused(why)));
     }
-    session_proved(store, proofs, session, username).await
+    session_proved(store, proofs, session, username, filed_at).await
 }
 
-/// Whether `id` names a live page session for `username`. The drain runs as
-/// root and the session record lives under the handler's store, so this is the
-/// one check that turns an unsigned intent into work for an authenticated
-/// account. The record is not trusted: it only names the proof token that the
-/// root-side login check minted in `proof_dir`, and that file's own username
-/// and expiry decide. A forged record, a session for another account and an
-/// expired one are refused with the reason the journal records.
+/// Whether `id` names a live page session for `username`, and whether it is the
+/// session the intent was filed with. The drain runs as root and the session
+/// record lives under the handler's store, so this is the one check that turns
+/// an unsigned intent into work for an authenticated account. The record is not
+/// trusted: it only names the proof token that the root-side login check minted
+/// in `proof_dir`, and that file's own username and expiry decide. A forged
+/// record, a session for another account and an expired one are refused with
+/// the reason the journal records.
+///
+/// The record's name comes from the username, so the member's next login writes
+/// the same path. An intent filed before that login is refused because the
+/// record's creation time is later: the cookie that asked for the action is not
+/// the one the record now carries, and a stolen cookie must not ride a later
+/// login through a pending intent.
 pub async fn verify_session(
     store: &Store,
     proof_dir: &std::path::Path,
     id: &str,
     username: &str,
+    filed_at: &str,
 ) -> Result<(), Error> {
     if !kyriakon_control_core::store::is_status_token(id) {
         return Err(Error::Failed(
@@ -748,6 +833,24 @@ pub async fn verify_session(
     };
     let value: Value = serde_json::from_str(&text)
         .map_err(|e| Error::context("the session record does not parse", e))?;
+    let created = value
+        .get("created_at")
+        .and_then(Value::as_str)
+        .and_then(|stamp| OffsetDateTime::parse(stamp, &Rfc3339).ok());
+    let filed = OffsetDateTime::parse(filed_at, &Rfc3339).ok();
+    match (created, filed) {
+        (Some(created), Some(filed)) if created > filed => {
+            return Err(Error::Failed(
+                "the session was opened after the intent was filed".to_string(),
+            ));
+        }
+        (Some(_), Some(_)) => {}
+        _ => {
+            return Err(Error::Failed(
+                "the intent or its session carries no comparable filing time".to_string(),
+            ));
+        }
+    }
     let proof = value.get("proof").and_then(Value::as_str).unwrap_or("");
     kyriakon_control_core::account::session::verify_proof(
         proof_dir,

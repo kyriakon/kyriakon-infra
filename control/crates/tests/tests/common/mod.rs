@@ -731,15 +731,50 @@ impl Fix {
     /// One call to a page action's route as the handler files it: the account,
     /// a real page session opened for it, and the action's own fields. The
     /// session is real because the drain re-proves it, so a fixture that
-    /// hand-wrote an id would only be testing itself.
+    /// hand-wrote an id would only be testing itself. The filing time is now,
+    /// as the handler's own writer stamps it.
     pub fn file_page_action(&self, kind: &str, username: &str, fields: Value) -> String {
         let cookie = self.open_session(username);
-        let session = Self::session_id(&cookie);
+        let session = Self::session_id(&cookie).to_string();
+        self.file_page_action_with_session(kind, username, &session, fields)
+    }
+
+    /// The same, filed with a session the caller already holds: a test that
+    /// must show the drain proves the record the cookie came from, not a login
+    /// made on the way to filing.
+    pub fn file_page_action_with_session(
+        &self,
+        kind: &str,
+        username: &str,
+        session: &str,
+        fields: Value,
+    ) -> String {
+        self.file_page_action_at(
+            kind,
+            username,
+            session,
+            &kyriakon_control_core::util::filed_at(),
+            fields,
+        )
+    }
+
+    /// The same, with the filing time the test chose: the test-mail case names
+    /// its own day so the subject date is the intent's, not this pass's clock.
+    /// A time later than the session it is filed under passes the drain's
+    /// creation check; an earlier one is a different test's subject.
+    pub fn file_page_action_at(
+        &self,
+        kind: &str,
+        username: &str,
+        session: &str,
+        filed_at: &str,
+        fields: Value,
+    ) -> String {
         let id = ulid();
         let mut intent = fields;
         intent["id"] = json!(id);
         intent["kind"] = json!(kind);
-        intent["filed_at"] = json!("2026-10-02T09:00:00Z");
+        intent["filed_at"] = json!(filed_at);
         intent["username"] = json!(username);
         intent["session"] = json!(session);
         self.write_intent(&id, &intent);

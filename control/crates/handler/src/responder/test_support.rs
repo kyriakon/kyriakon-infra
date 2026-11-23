@@ -177,6 +177,17 @@ pub(crate) async fn signed_in(app: &App, username: &str) -> String {
         .expect("the fixture store takes a session")
 }
 
+/// The session value a login reply's `Set-Cookie` carries, for a test that then
+/// presents it as the browser would.
+pub(crate) fn session_cookie(reply: &str) -> String {
+    reply
+        .split("Set-Cookie: __Host-kyriakon_session=")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .expect("the login reply sets a session cookie")
+        .to_string()
+}
+
 /// The request httpd builds for a form post.
 pub(crate) fn httpd_post(path: &str, body: &str) -> Vec<u8> {
     httpd_post_with(path, body, None)

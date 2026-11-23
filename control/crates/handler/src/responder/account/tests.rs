@@ -153,12 +153,8 @@ async fn a_correct_mail_password_opens_a_session_and_a_wrong_one_does_not() {
 
     // The cookie it set opens the account page, and a wrong password sets
     // nothing and comes back as the login page.
-    let cookie = body
-        .split("Set-Cookie: __Host-kyriakon_session=")
-        .nth(1)
-        .and_then(|rest| rest.split(';').next())
-        .expect("the cookie value");
-    let (code, _) = ask(&app, &httpd_get_session("account", "", cookie)).await;
+    let cookie = session_cookie(&body);
+    let (code, _) = ask(&app, &httpd_get_session("account", "", &cookie)).await;
     assert_eq!(code, 200);
 
     let (code, wrong) = ask(
@@ -178,6 +174,46 @@ async fn a_correct_mail_password_opens_a_session_and_a_wrong_one_does_not() {
     assert_eq!(code, 200);
     assert!(page.contains("Cache-Control: no-store"), "{page}");
     assert!(page.contains("Referrer-Policy: no-referrer"), "{page}");
+}
+
+/// A repeated successful login leaves one session record, and the cookies from
+/// before it no longer open the page: an account holds one live session.
+#[tokio::test]
+async fn a_second_login_ends_the_first_sessions_authority() {
+    let (mut app, dir) = handler("login-cap").await;
+    file_account(&dir);
+    app.auth = session::Authenticator {
+        program: checker("login-cap", "right horse battery"),
+        args: Vec::new(),
+    };
+
+    let mut cookies = Vec::new();
+    for _ in 0..3 {
+        let (code, body) = ask(
+            &app,
+            &httpd_post("/login", "username=alice&password=right+horse+battery"),
+        )
+        .await;
+        assert_eq!(code, 303, "{body}");
+        cookies.push(session_cookie(&body));
+    }
+    let records = std::fs::read_dir(dir.join("sessions"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+        .count();
+    assert_eq!(records, 1, "each login added a session file");
+    for stale in &cookies[..cookies.len() - 1] {
+        let (_, body) = ask(&app, &httpd_get_session("account", "", stale)).await;
+        assert!(body.contains("Log in with your mail password"), "{body}");
+    }
+    let (code, body) = ask(
+        &app,
+        &httpd_get_session("account", "", cookies.last().unwrap()),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("Log out"), "{body}");
 }
 
 /// #804: the login hands the checker the source the request came from, because
