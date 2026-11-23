@@ -47,7 +47,7 @@ if [ ${#scripts[@]} -gt 0 ]; then
 	done
 fi
 if [ "$rust" = 1 ]; then
-	for crate in control kyriakon-encrypt; do
+	for crate in control kyriakon-encrypt mailparse; do
 		[ -f "$crate/Cargo.toml" ] || continue
 		cargo fmt --manifest-path "$crate/Cargo.toml" --all --check
 	done

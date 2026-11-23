@@ -121,6 +121,26 @@ jobs:
       - name: process glue
         run: make -C dovecot-plugin test
 
+  # The shared parser is its own build root, so nothing above runs its tests:
+  # the encrypt job builds it as a dependency and the control job does not see
+  # it at all. A crate this small is cheap to check on its own, and a fuzz crash
+  # is turned into a test here.
+  mailparse:
+    name: shared mail parser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: toolchain
+        run: rustc --version && cargo --version
+      - name: fmt
+        run: cargo fmt --manifest-path mailparse/Cargo.toml --check
+      - name: test
+        run: cargo test --manifest-path mailparse/Cargo.toml
+      - name: clippy
+        run: cargo clippy --manifest-path mailparse/Cargo.toml --all-targets -- -D warnings
+
   shell:
     name: shell scripts
     runs-on: ubuntu-latest

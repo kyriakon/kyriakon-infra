@@ -1,0 +1,20 @@
+From: MAILER-DAEMON@mail.example
+To: bounce@kyriakon.net
+Content-Type: multipart/report; report-type=delivery-status; boundary="b1"
+
+--b1
+Content-Type: text/plain
+
+--b1 is not a boundary
+Content-Type: message/delivery-status
+
+Action: failed
+Status: 5.1.1
+--b1
+Content-Type: message/delivery-status
+
+Reporting-MTA: dns; mail.example
+
+Action: failed
+Status: 5.1.1
+--b1--

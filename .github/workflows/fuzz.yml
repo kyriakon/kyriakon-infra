@@ -2,8 +2,8 @@
 #
 # This is coverage over time, not a merge gate: a crash found here is a bug
 # filed with a regression test, not a pull request blocked. Weekly, plus on
-# demand. The five targets are named in docs/runbook.md, "Fuzz the parsers",
-# which is also where the by-hand run is written down.
+# demand. The targets are named in docs/runbook.md, "Fuzz the parsers", which is
+# also where the by-hand run is written down.
 #
 # Nightly is required: libFuzzer needs rustc's `-Zsanitizer`, which stable does
 # not take. That is why the targets are their own crates pointing at the ones
@@ -27,8 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
-      # One target's crash must not cancel the other three: a crash file is the
-      # whole point, and four small jobs cost less than one flaky sequence.
+      # One target's crash must not cancel the others: a crash file is the whole
+      # point, and six small jobs cost less than one flaky sequence.
       fail-fast: false
       matrix:
         include:
@@ -42,13 +42,15 @@ jobs:
             target: form
           - crate: control
             target: resolve
+          - crate: mailparse
+            target: mailparse
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       # The compiler is pinned by date for the same reason cargo-fuzz is: the
       # sanitizer and coverage flags this job passes are nightly-only and can be
-      # renamed between dates, which would fail all four targets at once with no
+      # renamed between dates, which would fail every target at once with no
       # committed change. Bump the date deliberately.
       - name: nightly toolchain
         run: rustup toolchain install nightly-2026-11-16 --profile minimal

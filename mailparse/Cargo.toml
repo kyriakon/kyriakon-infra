@@ -1,0 +1,8 @@
+[package]
+name = "kyriakon-mailparse"
+version = "0.1.0"
+edition = "2021"
+description = "Strict RFC 5322 header and address parsing and RFC 2046 multipart walking"
+publish = false
+
+[dependencies]
