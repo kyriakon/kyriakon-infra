@@ -173,7 +173,9 @@ fi
 # cron mails once.
 lock=$(acme_lock_path)
 lock_rc=0
-lock_message=$(lock_dir "$lock" 1 2>&1) || lock_rc=$?
+# A renewal pass can spend minutes at the CA, so a live pid is only reaped after
+# six hours rather than the table lock's thirty seconds.
+lock_message=$(lock_dir "$lock" 1 1 21600 2>&1) || lock_rc=$?
 case "$lock_rc" in
 0) ;;
 1) exit 0 ;;

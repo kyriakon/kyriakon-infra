@@ -364,7 +364,9 @@ take_web_lock() {
 	mkdir -p "$state_dir" \
 		|| die "could not create $state_dir, so no index was rewritten"
 	lock_rc=0
-	lock_message=$(lock_dir "$web_lock" 1 2>&1) || lock_rc=$?
+	# A web pass rewrites every index and can exceed the table lock's thirty
+	# seconds, so a live pid is held for an hour before it is reaped.
+	lock_message=$(lock_dir "$web_lock" 1 1 3600 2>&1) || lock_rc=$?
 	if [ "$lock_rc" -eq 0 ]; then
 		return 0
 	fi

@@ -624,7 +624,10 @@ run() {
 	# to do; the holder reports its own outcome.
 	lock=$(acme_lock_path)
 	lock_rc=0
-	lock_message=$(lock_dir "$lock" 1 2>&1) || lock_rc=$?
+	# A pass may run for minutes across the CA, so a live pid is only reaped
+	# after six hours; a shorter age would let a second lane in alongside a
+	# healthy run.
+	lock_message=$(lock_dir "$lock" 1 1 21600 2>&1) || lock_rc=$?
 	case "$lock_rc" in
 	0) ;;
 	1) return 0 ;;
