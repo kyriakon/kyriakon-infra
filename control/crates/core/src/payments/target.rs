@@ -26,6 +26,14 @@ pub enum PaymentTarget<'a> {
 
 impl<'a> PaymentTarget<'a> {
     pub fn account(account: &'a mut Account) -> Self {
+        // A record written before the payment block existed keeps its token,
+        // window and dates in the flat fields. Fold them in before anything
+        // reads the block, or a credit would journal, fail to find a block to
+        // set, and save a record with the token erased while the ledger holds
+        // the money.
+        if account.payment.is_none() {
+            account.payment = account.payment_state();
+        }
         PaymentTarget::Account(account)
     }
 
@@ -498,6 +506,36 @@ mod tests {
             target.monero().unwrap().address.as_deref(),
             Some("8example")
         );
+    }
+
+    /// A record whose token and dates live only in the flat fields is folded
+    /// into a block when the target is made, so the write cannot erase them.
+    #[test]
+    fn a_flat_payment_record_is_folded_into_a_block() {
+        let mut account: Account = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "username": "secretary",
+            "state": "active",
+            "decision": "approve",
+            "decided_at": "2026-10-01T09:00:00Z",
+            "rail": "cash",
+            "no_charge": false,
+            "created_at": "2026-10-01T09:00:00Z",
+            "token_ref": "KYR-AAAA-BBBB-CCCC",
+            "paid_until": "2027-10-01",
+            "window": {
+                "opened_at": "2026-10-01T00:00:00Z",
+                "closes_at": "2026-10-15T00:00:00Z",
+                "state": "open",
+                "extensions": 0
+            }
+        }))
+        .unwrap();
+        let _target = PaymentTarget::account(&mut account);
+        let payment = account.payment.expect("the flat fields became a block");
+        assert_eq!(payment.token_ref.as_deref(), Some("KYR-AAAA-BBBB-CCCC"));
+        assert_eq!(payment.paid_until.as_deref(), Some("2027-10-01"));
+        assert!(payment.window.is_some());
     }
 
     #[test]

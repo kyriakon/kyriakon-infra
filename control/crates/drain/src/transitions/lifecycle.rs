@@ -2236,17 +2236,19 @@ pub async fn cancel_close(store: &Store, intent: CancelCloseIntent) -> Result<Se
             intent.username
         )));
     };
-    // A refund line is the record of the money going back, and it is the
-    // authority for a closure written before the flag existed. A cancellation
-    // would restore both the year and the balance without a payment.
-    if let Some(token) = account
-        .payment_state()
-        .and_then(|payment| payment.token_ref)
-    {
-        if !Ledger::open(store).refunds(&token).await?.is_empty() {
-            return Ok(Settlement::refused(
-                "the closure was paid out by a refund, so it cannot be cancelled",
-            ));
+    // A refund line is the authority only for a closure written before the
+    // prior state and flag existed. This release's closures carry both, and an
+    // excess refund before the close is not a reason to refuse the cancel.
+    if account.closing_prior_state.is_none() {
+        if let Some(token) = account
+            .payment_state()
+            .and_then(|payment| payment.token_ref)
+        {
+            if !Ledger::open(store).refunds(&token).await?.is_empty() {
+                return Ok(Settlement::refused(
+                    "the closure was paid out by a refund, so it cannot be cancelled",
+                ));
+            }
         }
     }
     // The state machine restores the standing the closure came from and refuses
@@ -2534,6 +2536,15 @@ pub async fn set_serving(
     let Some(account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
+    // A suspended account's lanes are the operator's takedown. The masked
+    // serving() makes both read false, so a member ticking a box would look like
+    // turning a lane back on; that would republish the vhost the suspension
+    // removed. Refuse it and keep the mask for display.
+    if account.state == Standing::Suspended && (intent.http || intent.gemini) {
+        return Ok(Settlement::refused(
+            "a suspended account cannot turn a published lane on; resolve the suspension first",
+        ));
+    }
     // An unrecorded lane on a hosting member is serving: provision-member.sh
     // wrote it and nobody has turned it off. Comparing the effective value keeps
     // a save from removing a lane the page showed as on.

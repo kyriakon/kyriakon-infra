@@ -1391,3 +1391,38 @@ fn a_repeated_settlement_does_not_settle_an_older_refund() {
         fix.journal()
     );
 }
+
+/// A member refunded a held overpayment can still close and cancel later. The
+/// refund line is not a paid-out closure, and this release's close records the
+/// prior state that proves it.
+#[test]
+fn an_excess_refund_does_not_block_a_later_close_and_cancel() {
+    let fix = Fix::new("refund-excess-then-cancel");
+    let token = approved_paid(&fix, "secretary", "cash");
+    cash_overpayment(&fix, &token);
+    let out = fix.ctl(&[
+        "refund", "--token", &token, "--amount", "2.00", "--rail", "cash", "--reason", "overpaid",
+        "--excess",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+
+    fix.file_close("secretary");
+    assert!(fix.drain().status.success());
+    assert_eq!(fix.account("secretary")["state"], json!("closing"));
+
+    fix.file_page_action("cancel-close", "secretary", json!({}));
+    assert!(fix.drain().status.success());
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["state"],
+        json!("active"),
+        "an excess refund blocked the cancellation: {account}"
+    );
+    assert!(
+        !fix.journal()
+            .contains("the closure was paid out by a refund, so it cannot be cancelled"),
+        "{}",
+        fix.journal()
+    );
+}

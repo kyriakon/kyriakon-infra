@@ -33,24 +33,28 @@ pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), Error> 
     // subaddress on the account would give a charged group mailbox a block of
     // its own and still leave the group's payments without one (#905).
     if let Some(domain) = account.group.clone() {
-        let mut group = transitions::groups::group_record(store, &domain)
-            .await?
-            .ok_or_else(|| Error::Failed(format!("no group record for {domain}")))?;
-        if group.payment.no_charge {
-            return Err(Error::Failed(format!(
-                "the group {domain} was approved without charge, so it has no Monero rail"
-            )));
-        }
-        if group.payment.rail != "monero" {
-            return Err(Error::Failed(format!(
-                "the group {domain} chose the {} rail, so it has no Monero subaddress to record",
-                group.payment.rail
-            )));
-        }
-        let written = {
-            let mut target = PaymentTarget::group(&mut group);
-            target.set_monero_address(address).map_err(Error::from)?
-        };
+        let inside = domain.clone();
+        let written = store
+            .update_group(&domain, move |current| {
+                let Some(group) = current.as_mut() else {
+                    return Err(Error::Failed(format!("no group record for {inside}")));
+                };
+                if group.payment.no_charge {
+                    return Err(Error::Failed(format!(
+                        "the group {inside} was approved without charge, so it has no Monero rail"
+                    )));
+                }
+                if group.payment.rail != "monero" {
+                    return Err(Error::Failed(format!(
+                        "the group {inside} chose the {} rail, so it has no Monero subaddress to record",
+                        group.payment.rail
+                    )));
+                }
+                PaymentTarget::group(group)
+                    .set_monero_address(address)
+                    .map_err(Error::from)
+            })
+            .await?;
         if !written {
             println!(
                 "{username}'s group Monero subaddress is already {}",
@@ -58,16 +62,19 @@ pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), Error> 
             );
             return Ok(());
         }
-        let domain = group.domain.clone();
-        let payment = group.payment.clone();
-        store
-            .update_group(&domain, move |current| {
-                if let Some(group) = current.as_mut() {
-                    group.payment = payment.clone();
-                }
-                Ok::<(), Error>(())
-            })
-            .await?;
+        // The payer's page renders the filed application record, not the
+        // root-owned group record, so the block is copied there too. The group
+        // was read inside the lock above, so a concurrent credit's date is not
+        // replaced by a stale snapshot.
+        if let Some(group) = transitions::groups::group_record(store, &domain).await? {
+            if let Some(token) =
+                transitions::groups::application_token(store, &group.site_owner).await
+            {
+                store
+                    .write_filed_payment(&token, &group.payment.as_payment())
+                    .await?;
+            }
+        }
         println!(
             "recorded Monero subaddress for the group {domain} ({username}): {}",
             safe(address)

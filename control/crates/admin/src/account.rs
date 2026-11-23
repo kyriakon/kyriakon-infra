@@ -170,9 +170,10 @@ pub(crate) async fn suspend(
     Ok(())
 }
 
-/// `resume`: lift a suspension, the inverse of `suspend`. The three access
-/// paths come back, the state returns to active, and the reason and grace the
-/// suspension started are cleared.
+/// `resume`: lift a suspension, the inverse of `suspend`. With the payment in
+/// order the three access paths come back, the state returns to active, and the
+/// reason and grace the suspension started are cleared. A closed payment window
+/// leaves it lapsed, and the command fails with that outcome.
 pub(crate) async fn resume(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(), Error> {
     let username = one_username(rest)?;
     let journal = Journal::load(store).await?;

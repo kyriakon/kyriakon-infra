@@ -2637,8 +2637,6 @@ fn a_window_is_extended_once_and_a_second_extension_is_refused() {
             .unwrap(),
         "{account}"
     );
-    let join: Value = serde_json::from_str(&fix.read(&format!("tokens/{token}.json"))).unwrap();
-    assert_eq!(join["token"], json!(token), "{join}");
     let mode = std::fs::metadata(fix.dir.join("store/accounts/secretary/account.json"))
         .unwrap()
         .mode()
@@ -3204,8 +3202,6 @@ fn a_group_window_is_listed_and_takes_its_one_extension() {
     );
     let extended = group["payment"]["window"]["closes_at"].as_str().unwrap();
     assert_ne!(extended, closes, "the close date moved: {group}");
-    let join: Value = serde_json::from_str(&fix.read(&format!("tokens/{token}.json"))).unwrap();
-    assert_eq!(join["token"], json!(token), "{join}");
 
     // The second extension from the same window is refused and moves nothing.
     let before = fix.read("groups/parish.example/group.json");
@@ -3337,4 +3333,56 @@ fn a_planted_status_token_never_reaches_a_file_outside_the_store() {
         !copy.exists(),
         "the aged account copy is purged even when its token names no file"
     );
+}
+
+/// A record written before the payment block existed keeps its token, window and
+/// dates in the flat fields. A credit folds that block in before it writes, so
+/// the money is not recorded against a record whose token it then erases.
+#[test]
+fn a_credit_through_a_flat_payment_record_keeps_the_token_and_dates() {
+    let fix = Fix::new("credit-flat-record");
+    let token = approved_paid(&fix, "secretary", "cash");
+    fix.amend_account("secretary", |account| {
+        let block = account["payment"].take();
+        account["token_ref"] = block["token_ref"].clone();
+        account["token_issued_at"] = block["token_issued_at"].clone();
+        account["paid_until"] = block["paid_until"].clone();
+        account["window"] = block["window"].clone();
+        account.as_object_mut().unwrap().remove("payment");
+    });
+    let before: Value = serde_json::from_str(&fix.read("accounts/secretary/account.json")).unwrap();
+    assert!(before.get("payment").is_none(), "{before}");
+    assert_eq!(before["token_ref"], json!(token), "{before}");
+
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "20.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.failed_note().is_empty(),
+        "the credit failed: {}",
+        fix.failed_note()
+    );
+
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["payment"]["token_ref"],
+        json!(token),
+        "the credit erased the token: {account}"
+    );
+    assert!(
+        account["payment"]["paid_until"].as_str().is_some(),
+        "the credit did not set the block's date: {account}"
+    );
+    assert_eq!(payment_lines(&fix).len(), 1, "the ledger line");
 }

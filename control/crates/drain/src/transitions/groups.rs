@@ -1139,7 +1139,7 @@ pub(super) async fn name_held(store: &Store, username: &str) -> Result<Option<St
 /// The account's application status token from its retained application copy,
 /// where the copy is still there and readable. `None` leaves the journal prune
 /// keeping token-bearing lines rather than guessing whose they are.
-pub(super) async fn application_token(store: &Store, username: &str) -> Option<String> {
+pub async fn application_token(store: &Store, username: &str) -> Option<String> {
     let text = store
         .account_application_text(username)
         .await

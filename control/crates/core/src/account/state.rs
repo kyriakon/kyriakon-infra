@@ -178,6 +178,12 @@ impl Account {
         if self.suspension_reason.is_some() {
             return Standing::Suspended;
         }
+        // A group mailbox has no block of its own, so the record that carried a
+        // lapse is the grace date. Without this a closure written by an earlier
+        // release would cancel to active and stop the deletion clock.
+        if self.payment_state().is_none() && self.grace_until.is_some() {
+            return Standing::Lapsed;
+        }
         let lapsed = self.payment_state().is_some_and(|payment| {
             payment.paid_until.is_none()
                 && payment
@@ -372,6 +378,34 @@ mod tests {
         assert_eq!(account.serving(), (false, false));
         account.resume(false).unwrap();
         assert_eq!(account.serving(), (true, true));
+    }
+
+    /// An old closure of a group mailbox has no payment block; the grace date
+    /// is the lapse it recorded, so cancelling returns to lapsed rather than
+    /// restoring access and stopping the deletion clock.
+    #[test]
+    fn an_old_group_mailbox_closure_returns_to_lapsed() {
+        let mut account: Account = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "username": "parish-secretary",
+            "state": "closing",
+            "decision": "approve",
+            "decided_at": "2026-10-01T09:00:00Z",
+            "rail": "cash",
+            "no_charge": false,
+            "created_at": "2026-10-01T09:00:00Z",
+            "group": "parish.example",
+            "closing_until": "2026-12-01",
+            "grace_until": "2027-01-01",
+        }))
+        .unwrap();
+        assert_eq!(
+            account.closing_prior_state(),
+            Standing::Lapsed,
+            "a group mailbox with a grace date read as active"
+        );
+        assert_eq!(account.cancel_close().unwrap(), Standing::Lapsed);
+        assert_eq!(account.state, Standing::Lapsed);
     }
 
     /// A resume reports the state the account is actually left in.
