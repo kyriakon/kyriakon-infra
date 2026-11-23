@@ -4,6 +4,9 @@
  * keyring, or Dovecot: each mode is one outcome the real CLI can produce.
  */
 
+/* POSIX nanosleep under -std=c99. */
+#define _POSIX_C_SOURCE 200809L
+
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
